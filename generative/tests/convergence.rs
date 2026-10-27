@@ -499,8 +499,8 @@ async fn the_harness_detects_a_corrupted_target() {
         .expect("program must converge before we corrupt it");
     assert!(outcome.as_pass(), "run did not pass: {outcome}");
 
-    // Corrupt one target cell directly; the source is untouched, so both the
-    // SQL oracle and the evaluator still compute the right value.
+    // Corrupt one target cell directly; the source is untouched, so the
+    // SQL oracle still computes the right value.
     let qualified = qualified_target_table("public", &def);
     let client = pool.get().await.expect("pool connection");
     client
@@ -524,10 +524,6 @@ async fn the_harness_detects_a_corrupted_target() {
         report.target_vs_sql.len(),
         1,
         "corruption localizes to target != SQL: {report}"
-    );
-    assert!(
-        report.evaluator_vs_sql.is_empty(),
-        "only the persisted target is wrong; the evaluator agrees with the SQL oracle: {report}"
     );
 }
 

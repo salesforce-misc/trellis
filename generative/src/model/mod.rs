@@ -664,14 +664,10 @@ pub struct RestorePlan {
 /// scoped out of the generator for now); this function still handles a
 /// `NULL` component correctly regardless, since a hand-built pin can
 /// construct one directly (see [`crate::generate::TableSpec::grain_values`]'s
-/// doc comment), and [`trellis::dev::defs::oracle::recompute_aggregate`]'s own
-/// private `group_key` this mirrors has no such restriction either.
-/// [`crate::oracle`]'s SQL
-/// oracle, its evaluator oracle (via [`trellis::dev::defs::oracle::recompute_aggregate`],
-/// whose own private `group_key` uses this exact same length-prefixing
-/// scheme independently), and [`crate::backend::ManualBackend`]'s persisted-
-/// target reader all key their rows through this one function, so a group's
-/// identity lines up across all three sources of the three-way comparison
+/// doc comment).
+/// [`crate::oracle`]'s SQL oracle and [`crate::backend::ManualBackend`]'s
+/// persisted-target reader both key their rows through this one function, so
+/// a group's identity lines up across both sides of the comparison
 /// regardless of whether any grouping column is `NULL`.
 ///
 /// Each component is length-prefixed (`"{len}:{value}"`, `NULL` rendered as

@@ -44,7 +44,7 @@ use tokio_postgres::{GenericClient, Transaction};
 use crate::defs::ast::{KeySpace, TransformDef};
 use crate::defs::catalog;
 use crate::defs::ddl::{self, DdlError};
-use crate::defs::eval::AliasReaders;
+use crate::defs::alias_readers::AliasReaders;
 use crate::defs::model::TransformStatus;
 use crate::locks::{ColumnPauseLock, ColumnPauseOp};
 use crate::pool::Pool;

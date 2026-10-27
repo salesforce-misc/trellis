@@ -1,81 +1,19 @@
-//! Postgres's **IEEE binary floating-point** types — `real`/`double
-//! precision` — as a real value model, split out of the
-//! arbitrary-precision [`crate::numeric::Numeric`] both of them used to
-//! collapse into.
+//! Postgres's **IEEE binary floating-point** widths and text forms:
+//! `real`/`double precision`.
 //!
-//! # Why this is not `Numeric`
+//! [`FloatWidth`] is the width payload of `ValueType::Float`. Postgres types
+//! `float4 + float4` as `real` and `avg(real)` as `double precision`, so a
+//! derived target column is declared with the type Postgres infers, and the
+//! width is the overflow boundary the define-time constant folding checks
+//! ([`checked_add`], [`literal_to_width`]).
 //!
-//! The exact integer types are not in `ValueType::Numeric`.
-//! `real` and `double precision` were the two left behind, and they are the
-//! *least* like `numeric` of the six: `numeric` is an exact,
-//! arbitrary-precision decimal, while these are fixed-width binary floats.
-//! ADR-0004 makes Postgres the correctness oracle, and the oracle disagrees
-//! with an exact-decimal model on every axis that matters:
-//!
-//! 1. **Arithmetic isn't exact, and isn't even associative.** In Postgres,
-//!    `select (1e16::float8 + 1) - 1e16::float8` is `0` while
-//!    `select (1e16::float8 - 1e16::float8) + 1` is `1`. A `Numeric` model
-//!    computes `1` for both — so the engine's incremental result and a
-//!    backfill's server-side `SELECT a + b` were free to disagree in the
-//!    last digits, with nothing to flag it.
-//! 2. **Special values exist.** `'NaN'`, `'Infinity'` and `'-Infinity'` are
-//!    ordinary float values Postgres ingests, computes with and renders.
-//!    `Numeric::parse` has no representation for any of them.
-//! 3. **Range is finite.** `select 3.4e38::float4 + 3.4e38::float4` raises
-//!    `22003` (`value out of range: overflow`); arbitrary precision never
-//!    does. Same class of divergence as `int4 + int4`.
-//! 4. **Result type.** Postgres types `float4 + float4` as `real`, not
-//!    `numeric`, and `avg(real)` as `double precision`. A derived column
-//!    declared `numeric` for an expression Postgres types `real` is a lie
-//!    about the type, which the ingest side and the computed side for
-//!    integers do not tell.
-//!
-//! # Postgres's float semantics are *not* IEEE 754's
-//!
-//! This decision is not a free one —
-//! Postgres already made it, and `docs/type-support.md`'s "IEEE edge cases
-//! need a decision" resolves to "do what the oracle does":
-//!
-//! * **`NaN = NaN` is true**, and **`NaN` sorts greater than every other
-//!   value, including `Infinity`.** IEEE 754 says `NaN != NaN` and that
-//!   every comparison against `NaN` is false; Postgres deliberately departs
-//!   from that (`float8_cmp_internal` in `src/backend/utils/adt/float.c`) so
-//!   that floats have a *total* order and can be used in `ORDER BY`,
-//!   `GROUP BY`, `DISTINCT` and btree indexes at all. Verified against a
-//!   live server: `select 'NaN'::float8 = 'NaN'::float8` is `t`, and
-//!   `order by v` over `{NaN, 1, Infinity, -Infinity}` yields
-//!   `-Infinity, 1, Infinity, NaN`.
-//! * **`-0 = 0` is true** — here Postgres *does* keep IEEE's behaviour, for
-//!   both widths. Verified: `select (-0.0::float8) = (0.0::float8)` is `t`.
-//!
-//! [`compare`] implements exactly that order, and it is the only comparison
-//! this crate should use on a float. See also
-//! [`crate::defs::eval::Value`]'s hand-written `PartialEq`, which routes
-//! through it rather than through `f64`'s IEEE `==`.
-//!
-//! # ±0 is why floats still aren't keys
-//!
-//! `-0` and `0` are *equal* but render as different text (`'-0'` vs `'0'`;
-//! verified on a live server), and Trellis matches join/primary/`GROUP BY`
-//! keys by raw `::text` today (`join_key_types::is_text_stable_join_key_type`).
-//! That is precisely the text-instability bar `numeric` already fails on
-//! (`1.0` vs `1.00`), so `real`/`double precision` stay off
-//! `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` and are rejected as `GROUP BY`
-//! keys. The unlock is the typed key index — comparing decoded values
-//! through [`compare`] — not a new encoding here. See
-//! `docs/type-support.md`.
-//!
-//! # Width is a payload, not two variants
-//!
-//! Same shape, and the same reasoning, as [`crate::integer::IntWidth`]: the
-//! width *is* the overflow boundary and the rounding grid (`float4` carries
-//! 24 significand bits, `float8` 53), and it is the result type of
-//! `float4 + float4`, so a width-less "binary float" model could not match
-//! the oracle. But two sibling `ValueType` variants would double every match
-//! arm in the engine for a distinction most sites don't care about, so
-//! [`FloatWidth`] rides as a payload on one `ValueType::Float` variant.
+//! Postgres's float order is not IEEE's (`NaN = NaN` is true and `NaN` sorts
+//! above `Infinity`), and `-0` and `0` are equal but render as different
+//! text. Trellis matches join, primary and `GROUP BY` keys by raw `::text`
+//! (`join_key_types::is_text_stable_join_key_type`), so `real` and
+//! `double precision` stay off `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`.
+//! See `docs/type-support.md`.
 
-use std::cmp::Ordering;
 use std::fmt;
 
 /// Which of Postgres's two binary float widths a value has.
@@ -201,52 +139,6 @@ impl fmt::Display for FloatWidth {
     }
 }
 
-/// Postgres's total order on floats — `float8_cmp_internal`
-/// (`src/backend/utils/adt/float.c`), which is what backs `<`/`=`/`ORDER BY`/
-/// `GROUP BY`/btree for `real` and `double precision` alike.
-///
-/// It is deliberately **not** IEEE 754's comparison:
-///
-/// * `NaN` compares **equal to itself**, so `'NaN'::float8 = 'NaN'::float8`
-///   is true and two `NaN` rows land in one `GROUP BY` group.
-/// * `NaN` compares **greater than every non-`NaN` value**, `Infinity`
-///   included, so it sorts last and `max()` over a group containing one is
-///   `NaN`.
-/// * `-0` compares **equal to `0`** (this part *is* IEEE), so they land in
-///   one group too.
-///
-/// Every one of those is verified against a live server in
-/// `trellis/tests/defs_floats.rs` rather than taken from this comment.
-#[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
-pub fn compare(a: f64, b: f64) -> Ordering {
-    // Ordinary (non-NaN) comparison first, exactly as Postgres does — this
-    // arm is also what makes `-0 == 0`, since IEEE `==` already says so.
-    if a < b {
-        return Ordering::Less;
-    }
-    if a > b {
-        return Ordering::Greater;
-    }
-    if a == b {
-        return Ordering::Equal;
-    }
-    // At least one operand is NaN (the only way to reach here).
-    match (a.is_nan(), b.is_nan()) {
-        (true, true) => Ordering::Equal,
-        (true, false) => Ordering::Greater,
-        (false, true) => Ordering::Less,
-        // Unreachable: `!(a<b) && !(a>b) && !(a==b)` implies a NaN operand.
-        (false, false) => Ordering::Equal,
-    }
-}
-
-/// Postgres's float equality — [`compare`] reduced to a bool, so
-/// `NaN = NaN` is true and `-0 = 0` is true.
-#[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
-pub fn equal(a: f64, b: f64) -> bool {
-    compare(a, b) == Ordering::Equal
-}
-
 /// `a + b` for binary floats, with Postgres's `float4pl`/`float8pl`/
 /// `float48pl`/`float84pl` semantics: the result type is the *wider
 /// operand's* type, the sum is computed in `double` and rounded onto that
@@ -258,7 +150,6 @@ pub fn equal(a: f64, b: f64) -> bool {
 /// operand was already infinite (`select 'Infinity'::float4 + 1e38::float4`
 /// is `Infinity`, `select 3.4e38::float4 + 3.4e38::float4` raises). `NaN`
 /// propagates silently — it is a value, not an error.
-#[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
 pub fn checked_add(
     a: f64,
     a_width: FloatWidth,
@@ -505,38 +396,12 @@ mod tests {
         );
     }
 
-    /// Postgres's order, not IEEE's. The live-server counterpart is
-    /// `nan_and_signed_zero_follow_postgres_not_ieee` in
-    /// `trellis/tests/defs_floats.rs`.
     #[test]
-    fn nan_equals_itself_and_sorts_above_everything() {
-        assert_eq!(compare(f64::NAN, f64::NAN), Ordering::Equal);
-        assert!(equal(f64::NAN, f64::NAN));
-        for other in [f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0, 1e308] {
-            assert_eq!(
-                compare(f64::NAN, other),
-                Ordering::Greater,
-                "NaN vs {other}"
-            );
-            assert_eq!(compare(other, f64::NAN), Ordering::Less, "{other} vs NaN");
-        }
-    }
-
-    #[test]
-    fn signed_zeros_are_equal() {
-        assert!(equal(-0.0, 0.0));
-        assert_eq!(compare(-0.0, 0.0), Ordering::Equal);
-        // ...but they still render differently, which is exactly why floats
-        // are not admitted as a text-matched key.
+    fn signed_zeros_render_differently() {
+        // `-0 = 0` in Postgres but the text differs, which is why floats are
+        // not admitted as a text-matched key.
         assert_eq!(render(-0.0, FloatWidth::Float8), "-0");
         assert_eq!(render(0.0, FloatWidth::Float8), "0");
-    }
-
-    #[test]
-    fn ordinary_order_is_unchanged() {
-        assert_eq!(compare(1.0, 2.0), Ordering::Less);
-        assert_eq!(compare(f64::INFINITY, 1e308), Ordering::Greater);
-        assert_eq!(compare(f64::NEG_INFINITY, -1e308), Ordering::Less);
     }
 
     /// Spot checks for [`render`]; the exhaustive comparison is against a

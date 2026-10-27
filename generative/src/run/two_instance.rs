@@ -145,7 +145,7 @@ impl<B: Backend> InstanceRun<'_, B> {
         Ok(())
     }
 
-    /// Quiesces this instance, snapshots it, and runs the three-way oracle
+    /// Quiesces this instance, snapshots it, and runs the oracle
     /// check for its own program against its own pool — reporting any
     /// divergence localized to `op_index` and tagged with this instance.
     async fn quiesce_and_check(&mut self, op_index: usize) -> Result<(), TwoInstanceError> {

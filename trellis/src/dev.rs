@@ -10,14 +10,11 @@
 //! ADR-0012 puts `defs`, `staging`, and `intake` behind `pub(crate)`: the
 //! sibling crates drive the system through the facade and verify against
 //! Postgres, not by calling engine functions. The exception the ADR sanctions
-//! is the generative fuzz suite's *independent, evaluator-driven cross-check
-//! leg* — a second recompute whose only job is to catch divergence between
-//! the engine's Rust evaluator and Postgres semantics. Because it must stay
-//! independent of both the shipped `self_check` audit (ADR-0013) and the
-//! suite's own SQL oracle, it cannot become a public
-//! method. This module is that leg's reach into the
-//! engine, plus the small set of type and registry lookups its
-//! correctness assertions need. `benchmark`'s scenario oracle, which renders
+//! is the generative fuzz suite's SQL oracle, which renders a definition back to
+//! a `SELECT` and must stay independent of the shipped `self_check` audit
+//! (ADR-0013), so it cannot become a public method. This module is the
+//! oracle's reach into the engine: the small set of type and registry lookups
+//! its correctness assertions need. `benchmark`'s scenario oracle, which renders
 //! the engine's own `SELECT` for a definition and compares a persisted target
 //! against it, is the same shape of consumer.
 //!
@@ -40,22 +37,10 @@ pub mod config {
     pub use crate::config::DEFAULT_SCHEMA;
 }
 
-/// The engine's Postgres-faithful `float4`/`float8` equality and text
-/// rendering, which `generative`'s oracle compares values with.
-pub mod float {
-    pub use crate::float::{equal, render};
-}
-
 /// The latency histogram boundaries and build-statement classes, for
 /// `benchmark`'s scrape of the engine's metrics.
 pub mod metrics {
     pub use crate::metrics::{BuildStatement, LATENCY_BUCKETS, increment_changes_applied};
-}
-
-/// The exact decimal `numeric` type, which `generative`'s oracle does
-/// Postgres-faithful arithmetic and comparison in.
-pub mod numeric {
-    pub use crate::numeric::Numeric;
 }
 
 /// The engine items `generative` and `benchmark` reach for under `defs`.
@@ -64,8 +49,8 @@ pub mod defs {
     /// and installs it through the public path (ADR-0012), but its oracle and
     /// coverage tracker still need to name the shapes it generated.
     pub use crate::defs::ast;
-    /// The evaluator-driven cross-check leg itself, plus the SQL renderers
-    /// `benchmark`'s scenario oracle compares a persisted target against.
+    /// The SQL renderers `benchmark`'s scenario oracle compares a persisted
+    /// target against.
     pub use crate::defs::oracle;
     /// Function/operator/aggregate registries: the source of truth the oracle
     /// consults instead of hardcoding the engine's accepted spellings.

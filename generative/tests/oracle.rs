@@ -1,8 +1,7 @@
-//! Proves the Postgres-SQL oracle and the three-way comparison
-//! (`generative::oracle`): render a 1-1 numeric-`+` definition back
+//! Proves the Postgres-SQL oracle and its comparison with the persisted
+//! target (`generative::oracle`): render a 1-1 numeric-`+` definition back
 //! to a `SELECT`, run it against the same `testkit` cluster the program ran
-//! in, and confirm the comparison localizes a divergence to the right layer
-//! (`target ≠ SQL` vs `evaluator ≠ SQL`). Comparator/report unit tests live
+//! in, and confirm a corrupted target is reported as `target ≠ SQL`. Comparator/report unit tests live
 //! beside the code in `src/oracle/mod.rs`; these are the ones that need a real
 //! database.
 
@@ -10,7 +9,7 @@ use std::collections::HashMap;
 
 use generative::backend::{Backend, ManualBackend};
 use generative::model::{NamePool, Op, OpOutcome, Program, Table};
-use generative::oracle::{self, evaluator_oracle, sql_oracle, three_way};
+use generative::oracle::{self, sql_oracle};
 use testkit::TestCluster;
 use trellis::dev::defs::ast::{
     Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType,
@@ -117,10 +116,10 @@ async fn sql_oracle_matches_the_persisted_target_and_a_hand_computed_expected() 
     assert_eq!(sql["1"]["total"], Some("11.50".to_string()));
     assert_eq!(sql["2"]["total"], Some("22.00".to_string()));
 
-    // And the full three-way check reports no divergence at all.
+    // And the full oracle check reports no divergence at all.
     let report = oracle::check(&pool, &program, &def, &pk_column, &columns, &target)
         .await
-        .expect("three-way check");
+        .expect("oracle check");
     assert!(
         !report.diverged(),
         "healthy run must not diverge:\n{report}"
@@ -145,7 +144,7 @@ async fn an_injected_target_corruption_reads_as_target_not_sql() {
 
     // Corrupt the persisted target directly — not via a source change, so the
     // maintenance pipeline won't correct it. Source is untouched, so the SQL
-    // oracle and the evaluator both still compute the right value.
+    // oracle still computes the right value.
     let qualified = qualified_target_table("public", &def);
     let client = pool.get().await.expect("pool connection");
     client
@@ -161,72 +160,12 @@ async fn an_injected_target_corruption_reads_as_target_not_sql() {
 
     let report = oracle::check(&pool, &program, &def, &pk_column, &columns, &target)
         .await
-        .expect("three-way check");
+        .expect("oracle check");
 
     assert!(report.diverged(), "corruption must be caught");
     assert_eq!(
         report.target_vs_sql.len(),
         1,
         "corruption localizes to target != SQL: {report}"
-    );
-    assert!(
-        report.evaluator_vs_sql.is_empty(),
-        "the evaluator agrees with the SQL oracle; only the persisted target is wrong: {report}"
-    );
-}
-
-#[tokio::test]
-async fn an_evaluator_disagreement_reads_as_evaluator_not_sql() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-
-    let (program, def, source, target_name) = numeric_add_program();
-    let pk_column = source.pk_col.clone();
-    let columns = source_columns(&source);
-    let a = source.columns[1].name.clone();
-
-    let mut backend = ManualBackend::connect(db.dsn())
-        .await
-        .expect("connect manual backend");
-    settle(&mut backend, &program).await;
-    let snapshot = backend.snapshot().await.expect("snapshot");
-    let target = oracle::target_fields(&snapshot[&target_name], &pk_column);
-
-    let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
-
-    // The SQL oracle and the persisted target both reflect the real def
-    // (c1 + c2). Simulate an eval-layer drift by running the evaluator over a
-    // *different* expression (c1 + c1) — standing in for an evaluator that
-    // computes the wrong thing while Postgres and the pipeline agree.
-    let drifted = TransformDef {
-        fields: vec![FieldDef {
-            name: "total".to_string(),
-            expr: Expr::BinaryOp {
-                op: Operator::Add,
-                lhs: Box::new(Expr::Column(a.clone())),
-                rhs: Box::new(Expr::Column(a.clone())),
-            },
-        }],
-        ..def.clone()
-    };
-
-    let sql = sql_oracle(&pool, &def, &pk_column)
-        .await
-        .expect("sql oracle");
-    let evaluator = evaluator_oracle(&pool, &drifted, &pk_column, &columns)
-        .await
-        .expect("evaluator oracle");
-
-    let report = three_way(&program, &def, &columns, &target, &evaluator, &sql);
-
-    assert!(report.diverged(), "drift must be caught");
-    assert!(
-        report.target_vs_sql.is_empty(),
-        "the persisted target agrees with the SQL oracle; only the evaluator drifted: {report}"
-    );
-    assert_eq!(
-        report.evaluator_vs_sql.len(),
-        2,
-        "both rows' evaluator values drift from the SQL oracle: {report}"
     );
 }

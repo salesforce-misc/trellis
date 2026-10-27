@@ -1600,7 +1600,7 @@ pub async fn alter_transform(
             .chain(&real_alters)
             .map(|f| f.name.clone())
             .collect();
-        super::eval::AliasReaders::of(&merged).close(&mut edited);
+        super::alias_readers::AliasReaders::of(&merged).close(&mut edited);
         merged
             .fields
             .iter()
@@ -2114,7 +2114,7 @@ fn field_over_retyped_column(
             over.insert(field.name.clone(), retyped);
         }
     }
-    let readers = super::eval::AliasReaders::of(merged);
+    let readers = super::alias_readers::AliasReaders::of(merged);
     let mut queue: Vec<String> = over.keys().cloned().collect();
     while let Some(field) = queue.pop() {
         let retyped = over[&field].clone();
@@ -2396,7 +2396,7 @@ async fn pause_readers_of_paused_columns(
         }
     }
 
-    let readers = super::eval::AliasReaders::of(def);
+    let readers = super::alias_readers::AliasReaders::of(def);
     let mut frontier: Vec<String> = txn
         .query(
             "select column_name from column_status \
@@ -2443,7 +2443,7 @@ async fn delete_stale_cascade_edges(
     qualified_source: &str,
     upstreams: &[(String, String)],
 ) -> Result<Vec<String>, CatalogError> {
-    let alias_readers = super::eval::AliasReaders::of(def);
+    let alias_readers = super::alias_readers::AliasReaders::of(def);
     let mut stale: Vec<String> = Vec::new();
     for field in altered {
         let edges = txn
@@ -5870,7 +5870,7 @@ pub async fn definition_by_target(
 /// recompute through its 1-1 field build.
 ///
 /// **Sibling readers first**. A 1-1 definition's own fields
-/// that read `upstream_column` by alias ([`super::eval::AliasReaders`])
+/// that read `upstream_column` by alias ([`super::alias_readers::AliasReaders`])
 /// come first, under `upstream_table` itself: a field reading a paused
 /// field is paused too (ADR-0003 freezes it rather than evaluating it over
 /// the paused field's absence), so the cascade gives it a `column_status`
@@ -5884,7 +5884,7 @@ pub(crate) async fn column_dependents(
 ) -> Result<Vec<(String, String)>, CatalogError> {
     let mut deps: Vec<(String, String)> = match definition_by_target(pool, upstream_table).await? {
         Some(definition) if matches!(definition.def.key_space, KeySpace::OneToOne) => {
-            super::eval::AliasReaders::of(&definition.def)
+            super::alias_readers::AliasReaders::of(&definition.def)
                 .direct(upstream_column)
                 .iter()
                 .map(|reader| (upstream_table.to_string(), reader.clone()))
@@ -5921,7 +5921,7 @@ pub(crate) async fn reads_column(
         if let Some((text, grammar_version)) = text {
             let def = grammar::load(&text, grammar_version)?;
             if matches!(def.key_space, KeySpace::OneToOne)
-                && super::eval::AliasReaders::of(&def)
+                && super::alias_readers::AliasReaders::of(&def)
                     .direct(upstream_column)
                     .iter()
                     .any(|reader| reader == reader_field)

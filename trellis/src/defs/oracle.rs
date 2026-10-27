@@ -1,96 +1,20 @@
-//! A from-scratch recompute of a 1-1 target from current source data,
-//! used to assert any incrementally-maintained target is
-//! byte-equal to a recompute (`docs/data-flow.md#correctness`).
+//! Renders a validated definition's expressions as Postgres SQL.
 //!
-//! **This module's [`recompute`] is the evaluator-driven recompute**: it reads
-//! each source row's text image and feeds it through the engine's own
-//! `evaluate`. Its role is a *secondary cross-check*, not the authority. The
-//! primary oracle is Postgres itself (by rendering the definition as a `SELECT`).
-//! Comparing the evaluator-driven recompute against the Postgres-SQL oracle
-//! ensures the engine mirrors Postgres semantics exactly.
+//! Postgres evaluates every calculated field: the engine renders the
+//! definition into the statement that writes it (ADR-0002) and computes no
+//! value itself. [`render_expr_sql`] and [`render_qualified_expr_sql`] are the
+//! renderers; [`render_aggregate_select_sql`] renders a whole aggregate
+//! definition as the `SELECT ... GROUP BY` that tests compare a target with.
 
-#[cfg(any(test, feature = "test-util"))]
-use std::collections::HashMap;
 use std::collections::HashSet;
-#[cfg(any(test, feature = "test-util"))]
-use std::fmt;
 
-#[cfg(any(test, feature = "test-util"))]
-use crate::pool::Pool;
 use crate::pool::quote_ident;
 
 #[cfg(any(test, feature = "test-util"))]
 use super::ast::KeySpace;
 use super::ast::{Expr, Operator, TransformDef, ValueType};
-#[cfg(any(test, feature = "test-util"))]
-use super::eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
 use super::typed_literal;
 use crate::integer::IntWidth;
-
-/// Why a from-scratch recompute failed.
-#[derive(Debug)]
-#[cfg(any(test, feature = "test-util"))]
-pub enum OracleError {
-    /// A direct Postgres protocol/query error.
-    Db(tokio_postgres::Error),
-    /// Acquiring a connection from the pool failed.
-    Pool(crate::error::Error),
-    /// Evaluating a source row's calculated fields failed (see
-    /// [`EvalError`]); a row that fails here would be quarantined by the
-    /// real apply path, not silently dropped from the recompute.
-    Eval(EvalError),
-}
-
-#[cfg(any(test, feature = "test-util"))]
-impl fmt::Display for OracleError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            OracleError::Db(err) => {
-                write!(f, "oracle recompute database error: ")?;
-                crate::error::write_pg_error(f, err)
-            }
-            OracleError::Pool(err) => write!(f, "failed to acquire a connection: {err}"),
-            OracleError::Eval(err) => write!(f, "oracle recompute evaluation error: {err}"),
-        }
-    }
-}
-
-#[cfg(any(test, feature = "test-util"))]
-impl std::error::Error for OracleError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            OracleError::Db(err) => Some(err),
-            OracleError::Pool(err) => Some(err),
-            OracleError::Eval(err) => Some(err),
-        }
-    }
-}
-
-#[cfg(any(test, feature = "test-util"))]
-impl From<tokio_postgres::Error> for OracleError {
-    fn from(err: tokio_postgres::Error) -> Self {
-        OracleError::Db(err)
-    }
-}
-
-#[cfg(any(test, feature = "test-util"))]
-impl From<crate::error::Error> for OracleError {
-    fn from(err: crate::error::Error) -> Self {
-        OracleError::Pool(err)
-    }
-}
-
-#[cfg(any(test, feature = "test-util"))]
-impl From<EvalError> for OracleError {
-    fn from(err: EvalError) -> Self {
-        OracleError::Eval(err)
-    }
-}
-
-/// A from-scratch recompute of `def`'s target: every source row's primary
-/// key (as text) mapped to its calculated columns.
-#[cfg(any(test, feature = "test-util"))]
-pub type Recomputed = HashMap<String, HashMap<String, Option<Value>>>;
 
 /// The `FROM`-clause identifier this test/benchmark-only oracle module
 /// should read `def`'s source through (ADR-0011 grammar clause
@@ -114,154 +38,6 @@ fn quoted_source_from(def: &TransformDef) -> String {
         Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(&def.source)),
         None => quote_ident(&def.source),
     }
-}
-
-/// Recomputes `def`'s entire target from `def.source`'s current contents,
-/// keyed by `pk_column` (the source table's single-column key, e.g. from
-/// [`super::ddl::source_primary_key`]). `source_columns` gives each
-/// referenced source column's [`ValueType`], the same map `def` was
-/// validated against.
-///
-/// A source keyed by a nullable unique index (an aggregate target's `GROUP
-/// BY` column) can hold a row whose key is `NULL`, and the 1-1 target keeps
-/// its row: it is keyed here by the key text such a key
-/// renders, [`super::ddl::NULL_KEY_SENTINEL`].
-///
-/// Reads `pk_column` plus every source column any calculated field
-/// references, as text, then runs each row through [`evaluate`] — the exact
-/// function the incremental path evaluates deltas with. No SQL expression
-/// here computes a calculated field's value; only column selection is SQL.
-#[cfg(any(test, feature = "test-util"))]
-pub async fn recompute(
-    pool: &Pool,
-    def: &TransformDef,
-    pk_column: &str,
-    source_columns: &HashMap<String, ValueType>,
-) -> Result<Recomputed, OracleError> {
-    let referenced = referenced_source_columns(def);
-
-    let mut select_list = vec![format!("{}::text", quote_ident(pk_column))];
-    select_list.extend(
-        referenced
-            .iter()
-            .map(|c| format!("{}::text", quote_ident(c))),
-    );
-
-    let sql = format!(
-        "select {} from {}",
-        select_list.join(", "),
-        quoted_source_from(def)
-    );
-
-    let client = pool.get().await?;
-    let rows = client.query(sql.as_str(), &[]).await?;
-
-    let mut result = Recomputed::with_capacity(rows.len());
-    // Reused across every row below: `def` is fixed for the
-    // whole recompute, so any `regexp_count` pattern it references compiles
-    // to the same `Regex` on every row.
-    let mut regex_cache = RegexCache::new();
-    for db_row in rows {
-        let pk_value: String = db_row
-            .get::<_, Option<String>>(0)
-            .unwrap_or_else(|| super::ddl::NULL_KEY_SENTINEL.to_string());
-        let mut image: Row = HashMap::with_capacity(referenced.len());
-        for (i, column) in referenced.iter().enumerate() {
-            let value: Option<String> = db_row.get(i + 1);
-            image.insert(column.clone(), value);
-        }
-        let evaluated = evaluate(def, &image, source_columns, &mut regex_cache)?;
-        result.insert(pk_value, evaluated);
-    }
-
-    Ok(result)
-}
-
-/// Recomputes an [`KeySpace::Aggregate`] `def`'s entire target from
-/// `def.source`'s current contents, keyed by the grouping columns' text
-/// values joined with `,` (there's no single primary-key column to key
-/// [`Recomputed`] by, unlike [`recompute`]'s 1-1 case — the group is the
-/// key). Groups rows in Rust (reading every grouping and referenced column
-/// as text, then partitioning by the grouping columns' values) rather than
-/// issuing a SQL `GROUP BY` itself, so this stays the same kind of
-/// evaluator-driven secondary cross-check `recompute` is: the real oracle is
-/// Postgres's own `GROUP BY` via [`render_aggregate_select_sql`], not this
-/// function.
-///
-/// # Panics
-///
-/// If `def.key_space` is not [`KeySpace::Aggregate`].
-#[cfg(any(test, feature = "test-util"))]
-pub async fn recompute_aggregate(
-    pool: &Pool,
-    def: &TransformDef,
-    source_columns: &HashMap<String, ValueType>,
-) -> Result<Recomputed, OracleError> {
-    let KeySpace::Aggregate { group_by } = &def.key_space else {
-        panic!("recompute_aggregate called on a non-aggregate definition");
-    };
-
-    let mut columns = referenced_source_columns(def);
-    for key in group_by {
-        columns.insert(key.clone());
-    }
-    let columns: Vec<String> = columns.into_iter().collect();
-
-    let select_list: Vec<String> = columns
-        .iter()
-        .map(|c| format!("{}::text", quote_ident(c)))
-        .collect();
-    let sql = format!(
-        "select {} from {}",
-        select_list.join(", "),
-        quoted_source_from(def)
-    );
-
-    let client = pool.get().await?;
-    let db_rows = client.query(sql.as_str(), &[]).await?;
-
-    let mut groups: HashMap<String, Vec<Row>> = HashMap::new();
-    for db_row in db_rows {
-        let mut image: Row = HashMap::with_capacity(columns.len());
-        for (i, column) in columns.iter().enumerate() {
-            let value: Option<String> = db_row.get(i);
-            image.insert(column.clone(), value);
-        }
-        let key = group_key(&image, group_by);
-        groups.entry(key).or_default().push(image);
-    }
-
-    let mut result = Recomputed::with_capacity(groups.len());
-    let mut regex_cache = RegexCache::new();
-    for rows in groups.values() {
-        let evaluated = evaluate_aggregate(def, rows, source_columns, &mut regex_cache)?;
-        let key = group_key(&rows[0], group_by);
-        result.insert(key, evaluated);
-    }
-
-    Ok(result)
-}
-
-/// The composite grouping-key text used by [`recompute_aggregate`] to key
-/// [`Recomputed`] — every row in a group shares these values, so any row's
-/// image gives the same key. A grouping column is assumed non-`NULL` (the
-/// typical case for a real foreign/primary key); this doesn't attempt to
-/// match Postgres's "`NULL` groups with `NULL`" `GROUP BY` semantics.
-#[cfg(any(test, feature = "test-util"))]
-fn group_key(image: &Row, group_by: &[String]) -> String {
-    // Length-prefix each component (`"{len}:{value}"`) rather than joining
-    // on a bare separator: a Text grouping column's value can itself
-    // contain any separator character (including a comma), which would
-    // make two distinct groupings collide, e.g. `(a="x,y", b="z")` vs.
-    // `(a="x", b="y,z")`. Prefixing each value with its own byte length
-    // makes the encoding unambiguous regardless of what characters the
-    // value contains — the length prefix itself is always parsed as a
-    // number, not searched for as a delimiter.
-    group_by
-        .iter()
-        .map(|k| image.get(k.as_str()).cloned().flatten().unwrap_or_default())
-        .map(|v| format!("{}:{v}", v.len()))
-        .collect::<String>()
 }
 
 /// Renders an [`KeySpace::Aggregate`] `def` back to the equivalent Postgres

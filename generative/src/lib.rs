@@ -7,7 +7,7 @@
 //!   engine internals beyond the AST types it deliberately reuses.
 //! - [`generate`] — generators producing only valid programs. Makes no
 //!   engine calls.
-//! - [`oracle`] — independent recompute, sharing no evaluation code with
+//! - [`oracle`] — independent recompute through Postgres, sharing no rendering code with
 //!   the engine.
 //! - [`backend`] — the ONLY module that drives the engine's pipeline and
 //!   reads back derived state.

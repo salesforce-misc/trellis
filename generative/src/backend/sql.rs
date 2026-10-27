@@ -758,7 +758,7 @@ pub(super) async fn read_table(
 }
 
 /// Reads an `Aggregate` key-space target table back as text, keyed by the
-/// same composite [`crate::model::group_key`] convention the SQL/evaluator
+/// same composite [`crate::model::group_key`] convention the SQL
 /// oracles use — see `ManualBackend`'s former doc comment (git history) for
 /// the full rationale; unchanged here.
 pub(super) async fn read_aggregate_table(

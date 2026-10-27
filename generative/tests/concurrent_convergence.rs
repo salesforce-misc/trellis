@@ -208,7 +208,7 @@
 //! size as-is.** Instead:
 //!
 //! 1. Print the failing case's [`Program`] (`{:?}`/`{:#?}`, or the printed
-//!    [`generative::oracle::ThreeWayReport`] the failure message already
+//!    [`generative::oracle::OracleReport`] the failure message already
 //!    carries) and hand-transcribe it into a `build_program`/
 //!    `build_program_multi_with_shapes`-style hand-built pin, exactly like
 //!    every other hand-built pin in this crate.
@@ -224,7 +224,7 @@
 //!    and then with bursting re-enabled if burst size 1 alone doesn't
 //!    reproduce it.
 //!
-//! [`Program`]/[`generative::oracle::ThreeWayReport`] are plain, mostly-`pub`,
+//! [`Program`]/[`generative::oracle::OracleReport`] are plain, mostly-`pub`,
 //! `Debug`-printable data (design doc §1) specifically so this
 //! hand-transcription is mechanical — no automatic shrink-replay tooling is
 //! built or needed for this.

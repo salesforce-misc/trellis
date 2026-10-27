@@ -1448,7 +1448,7 @@ async fn paused_columns(
         .await?;
     let mut paused: HashSet<String> = rows.into_iter().map(|row| row.get(0)).collect();
     if !paused.is_empty() {
-        crate::defs::eval::AliasReaders::of(def).close(&mut paused);
+        crate::defs::alias_readers::AliasReaders::of(def).close(&mut paused);
     }
     Ok(paused)
 }

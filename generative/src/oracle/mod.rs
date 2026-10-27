@@ -1,59 +1,60 @@
 //! The independent recompute oracle (design doc §2): renders a
 //! [`trellis::dev::defs::ast::TransformDef`]'s formulas back to a `SELECT` against
 //! the source and treats Postgres itself as the correctness authority. Uses
-//! only the shared components design doc §2 names — the parser AST, a small
-//! AST→`SELECT` printer written here (sharing no code with the engine's
-//! evaluator), and [`trellis::dev::defs::oracle::recompute`] (evaluation, a
-//! *secondary* parity check, not the pipeline-driving maintenance code that
-//! is [`crate::backend`]'s job alone).
+//! only the shared components design doc §2 names: the parser AST and a small
+//! AST→`SELECT` printer written here, sharing no code with the engine's
+//! renderer.
 //!
-//! # The three-way comparison
+//! # The comparison
 //!
-//! Per op we compare three renderings of the same logical target:
-//!
-//! - **persisted target** — what [`crate::backend::Backend::snapshot`] read
-//!   back from the maintained target table;
-//! - **evaluator** — [`trellis::dev::defs::oracle::recompute`], the engine's own
-//!   evaluator run from scratch;
-//! - **SQL oracle** — the definition rendered back to a `SELECT` and run by
-//!   Postgres itself.
-//!
-//! The SQL oracle is the authority (ADR-0004: the grammar is an immutable
-//! subset of Postgres, so a rendered `SELECT` can never be outgrown by the
-//! language). Comparing the other two *against it* localizes a divergence:
-//! `target ≠ SQL` is a pipeline / apply / fold / ordering bug;
-//! `evaluator ≠ SQL` is an eval-layer drift bug — the direct test of the
-//! ADR-0004 claim that expression semantics are an immutable subset of
-//! Postgres's.
+//! Per op the persisted target ([`crate::backend::Backend::snapshot`] read back
+//! from the maintained target table) is compared with the **SQL oracle**: the
+//! definition rendered back to a `SELECT` and run by Postgres itself. The SQL
+//! oracle is the authority (ADR-0004: the grammar is an immutable subset of
+//! Postgres, so a rendered `SELECT` can never be outgrown by the language). A
+//! divergence is a pipeline / apply / fold / ordering bug, or a rendering bug
+//! in the engine's compiler, which the independent printer here catches.
 //!
 //! # DB access
 //!
-//! Both oracles take an [`trellis::Pool`] — a connection handle — exactly as
-//! [`trellis::dev::defs::oracle::recompute`] already does. The oracle *reads*; it
-//! never imports `trellis::client`/`trellis::staging` or otherwise drives the
-//! maintenance pipeline (that seam is [`crate::backend`]'s alone). A
+//! The oracle takes a [`trellis::Pool`] (a connection handle). The oracle
+//! *reads*; it never imports `trellis::client`/`trellis::staging` or otherwise
+//! drives the maintenance pipeline (that seam is [`crate::backend`]'s alone). A
 //! pool connection has its `search_path` pinned, so an unqualified source
-//! table name resolves the same way `recompute` relies on.
+//! table name resolves the same way the engine's reads do.
 
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use trellis::Pool;
 use trellis::dev::defs::IntWidth;
 use trellis::dev::defs::ast::{Expr, KeySpace, Operator, Predicate, TransformDef, ValueType};
-use trellis::dev::defs::oracle::{OracleError, recompute, recompute_aggregate};
 use trellis::dev::defs::registry;
 use trellis::dev::defs::typed_literal;
-use trellis::dev::numeric::Numeric;
 
 use crate::model::{Program, group_key};
+
+/// Why an oracle read failed: a Postgres query error, or no pooled connection.
+#[derive(Debug)]
+pub struct OracleError(Box<dyn std::error::Error + Send + Sync>);
+
+impl fmt::Display for OracleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "oracle read failed: {}", self.0)
+    }
+}
+
+impl<E: std::error::Error + Send + Sync + 'static> From<E> for OracleError {
+    fn from(err: E) -> Self {
+        OracleError(Box::new(err))
+    }
+}
 
 /// One logical target's rows: `pk (rendered text) -> column -> value
 /// (rendered text, `None` is SQL `NULL`)`. Matches the inner shape of
 /// [`crate::backend::Snapshot`], and always excludes the primary-key column
 /// itself (the pk is the row key, so carrying it as a column too would show
-/// up as a spurious divergence against the evaluator recompute, which keys by
+/// up as a spurious divergence against the SQL oracle, which keys by
 /// pk but never emits it as a field).
 pub type Rows = BTreeMap<String, BTreeMap<String, Option<String>>>;
 
@@ -62,8 +63,7 @@ pub type Rows = BTreeMap<String, BTreeMap<String, Option<String>>>;
 enum Comparison {
     /// Byte-exact text equality — int, text, date, timestamp, uuid, boolean.
     Exact,
-    /// Decimal by value, ignoring scale (`2.50 ≡ 2.5`), via
-    /// [`trellis::numeric::Numeric`] rather than hand-rolled parsing.
+    /// Decimal by value, ignoring scale (`2.50 ≡ 2.5`).
     DecimalByValue,
     /// Combined absolute+relative tolerance for `real`/`double precision`
     /// (this arm exists because of [`ValueType::Float`]).
@@ -79,7 +79,7 @@ enum Comparison {
     /// a float `SUM`/`AVG` is refused at define.
     ///
     /// `NaN`/`±Infinity` are compared by Postgres's own float equality
-    /// ([`trellis::float::equal`]: `NaN = NaN` is true), not IEEE's, so a
+    /// ([`postgres_float_equal`]: `NaN = NaN` is true), not IEEE's, so a
     /// converged `NaN` column doesn't report as a perpetual divergence.
     #[allow(dead_code)]
     FloatTolerance,
@@ -116,13 +116,7 @@ impl Comparison {
             Comparison::Exact => expected == got,
             Comparison::DecimalByValue => match (expected, got) {
                 (None, None) => true,
-                (Some(a), Some(b)) => match (Numeric::parse(a), Numeric::parse(b)) {
-                    (Ok(a), Ok(b)) => a.compare(&b) == Ordering::Equal,
-                    // A value that doesn't parse as a decimal can't be
-                    // compared by value; fall back to exact so a genuine
-                    // difference still surfaces rather than being swallowed.
-                    _ => a == b,
-                },
+                (Some(a), Some(b)) => decimal_text(a) == decimal_text(b),
                 _ => false,
             },
             Comparison::FloatTolerance => match (expected, got) {
@@ -141,10 +135,46 @@ impl Comparison {
     }
 }
 
+/// Postgres's float equality: `NaN = NaN` is true (IEEE says false) and
+/// `-0 = 0` is true.
+fn postgres_float_equal(a: f64, b: f64) -> bool {
+    a == b || (a.is_nan() && b.is_nan())
+}
+
+/// A decimal's text with its scale and sign-of-zero normalized away, so two
+/// spellings of one value (`2.50`, `2.5`, `-0`, `0.0`) compare equal. Text that
+/// is not a plain decimal is returned as is, so a genuine difference still
+/// surfaces rather than being swallowed.
+fn decimal_text(text: &str) -> String {
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let plain = !digits.is_empty()
+        && digits.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && digits.matches('.').count() <= 1;
+    if !plain {
+        return text.to_string();
+    }
+    let (int, frac) = digits.split_once('.').unwrap_or((digits, ""));
+    let int = int.trim_start_matches('0');
+    let frac = frac.trim_end_matches('0');
+    if int.is_empty() && frac.is_empty() {
+        return "0".to_string();
+    }
+    format!(
+        "{}{}{}{}",
+        if negative { "-" } else { "" },
+        if int.is_empty() { "0" } else { int },
+        if frac.is_empty() { "" } else { "." },
+        frac
+    )
+}
+
 /// Whether two floats agree within the combined absolute+relative tolerance
 /// [`Comparison::FloatTolerance`] applies.
 ///
-/// Equality is checked first, through [`trellis::float::equal`] rather than
+/// Equality is checked first, through [`postgres_float_equal`] rather than
 /// `==`, so that `NaN`/`NaN` and `-0`/`0` pairs agree exactly as Postgres
 /// says they do. Only then does the tolerance apply, and it is deliberately
 /// tight: `1e-9` relative is roughly 10^7 times the `f64` epsilon, enough to
@@ -154,7 +184,7 @@ impl Comparison {
 fn floats_close(a: f64, b: f64) -> bool {
     const RELATIVE: f64 = 1e-9;
     const ABSOLUTE: f64 = 1e-12;
-    if trellis::dev::float::equal(a, b) {
+    if postgres_float_equal(a, b) {
         return true;
     }
     // A special value that isn't equal to the other side (e.g. `NaN` vs `1`,
@@ -169,7 +199,7 @@ fn floats_close(a: f64, b: f64) -> bool {
 
 /// One differing cell, row, or column found while comparing a candidate
 /// rendering against the SQL-oracle authority. `expected` is always the SQL
-/// oracle's value; `got` is the candidate's (target or evaluator).
+/// oracle's value; `got` is the persisted target's.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Divergence {
     Cell {
@@ -243,68 +273,32 @@ impl fmt::Display for Divergence {
     }
 }
 
-/// The result of a three-way comparison for one definition's target.
-///
-/// Splits the findings by *which* candidate diverged from the SQL oracle, so
-/// a caller learns which layer is wrong, not merely that something is
-/// (design doc §2). Prints the whole [`Program`] on any divergence — a diff
-/// without the program is unactionable (design doc §5).
+/// The result of comparing one definition's persisted target with the SQL
+/// oracle. Prints the whole [`Program`] on any divergence: a diff without the
+/// program is unactionable (design doc §5).
 #[derive(Debug, Clone)]
-pub struct ThreeWayReport {
-    /// `persisted target ≠ SQL oracle` — a pipeline/apply/fold/ordering bug.
+pub struct OracleReport {
+    /// `persisted target ≠ SQL oracle`: a pipeline/apply/fold/ordering bug, or
+    /// a rendering bug in the engine's compiler.
     pub target_vs_sql: Vec<Divergence>,
-    /// `evaluator ≠ SQL oracle` — an eval-layer drift bug (ADR-0004's
-    /// "immutable subset of Postgres's" semantics, tested directly).
-    pub evaluator_vs_sql: Vec<Divergence>,
-    /// Whether the evaluator leg ran at all. `false` for a `JOIN`,
-    /// where the engine's evaluator-driven recompute has nothing to compare
-    /// against — see [`check`]. An empty `evaluator_vs_sql` means
-    /// "agreed" when this is `true` and "never asked" when it is `false`,
-    /// and the two must never be confused for each other.
-    pub evaluator_checked: bool,
     program: String,
 }
 
-impl ThreeWayReport {
-    /// Whether any comparison diverged.
+impl OracleReport {
+    /// Whether the comparison diverged.
     pub fn diverged(&self) -> bool {
-        !self.target_vs_sql.is_empty() || !self.evaluator_vs_sql.is_empty()
+        !self.target_vs_sql.is_empty()
     }
 }
 
-impl fmt::Display for ThreeWayReport {
+impl fmt::Display for OracleReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if !self.diverged() {
-            return if self.evaluator_checked {
-                write!(f, "no divergence")
-            } else {
-                write!(f, "no divergence (evaluator leg not run: JOIN definition)")
-            };
+            return write!(f, "no divergence");
         }
-        if !self.target_vs_sql.is_empty() {
-            writeln!(
-                f,
-                "target != SQL oracle (localizes a pipeline/apply/fold/ordering bug):"
-            )?;
-            for divergence in &self.target_vs_sql {
-                writeln!(f, "  {divergence}")?;
-            }
-        }
-        if !self.evaluator_vs_sql.is_empty() {
-            writeln!(
-                f,
-                "evaluator != SQL oracle (localizes an eval-layer drift bug):"
-            )?;
-            for divergence in &self.evaluator_vs_sql {
-                writeln!(f, "  {divergence}")?;
-            }
-        }
-        if !self.evaluator_checked {
-            writeln!(
-                f,
-                "(evaluator leg not run: this definition is a JOIN, which the engine's \
-                 evaluator-driven recompute does not support — see oracle::check)"
-            )?;
+        writeln!(f, "target != SQL oracle:")?;
+        for divergence in &self.target_vs_sql {
+            writeln!(f, "  {divergence}")?;
         }
         write!(f, "program:\n{}", self.program)
     }
@@ -318,7 +312,7 @@ fn quote_ident(ident: &str) -> String {
 
 /// Renders a calculated-field expression back to Postgres SQL text.
 ///
-/// Deliberately independent of the engine's evaluator *and* of
+/// Deliberately independent of
 /// `trellis::dev::defs::oracle::render_expr_sql` — the oracle's whole value is that
 /// its `SELECT` shares no code with the thing it checks (both happen to
 /// choose the same idiomatic rendering — quoted identifiers, an explicit cast
@@ -450,7 +444,7 @@ fn render_select(def: &TransformDef, pk_column: &str) -> String {
 /// Runs `def` rendered as a `SELECT` (see [`render_select`]) in `pool`'s
 /// cluster and reads the result back into field-only [`Rows`] keyed by the
 /// primary key (1-1) or the grouping columns' composite [`group_key`]
-/// (`Aggregate`, task B4). The authority side of the three-way comparison.
+/// (`Aggregate`, task B4). The authority side of the comparison.
 ///
 /// For an `Aggregate` def, `pk_column` is unused: there is no single leading
 /// pk expression in the rendered `SELECT` (see [`render_select`]'s doc
@@ -524,60 +518,9 @@ pub async fn sql_oracle(
     }
 }
 
-/// Recomputes `def`'s target with the engine's own evaluator
-/// ([`trellis::dev::defs::oracle::recompute`] for 1-1,
-/// [`trellis::dev::defs::oracle::recompute_aggregate`] for `Aggregate` — task B4)
-/// and renders each `Value` to text, into field-only [`Rows`] keyed by the
-/// primary key (1-1) or the grouping columns' composite [`group_key`]
-/// (`Aggregate`, already computed by `recompute_aggregate` itself, since it's
-/// the engine's own private convention this generative-suite key deliberately
-/// mirrors — see [`group_key`]'s doc comment). The evaluator side of the
-/// three-way comparison — a secondary parity check on the mirror-Postgres
-/// claim, never the authority.
-///
-/// For an `Aggregate` def, `pk_column` is unused (there is no single source
-/// primary key to key an aggregate target by), and each group's grouping
-/// column(s) are excluded from `by_column`, matching [`sql_oracle`]'s
-/// `Aggregate` arm.
-pub async fn evaluator_oracle(
-    pool: &Pool,
-    def: &TransformDef,
-    pk_column: &str,
-    source_columns: &HashMap<String, ValueType>,
-) -> Result<Rows, OracleError> {
-    match &def.key_space {
-        KeySpace::Join(_) => unreachable!("the generator never produces a JOIN definition"),
-        KeySpace::OneToOne => {
-            let recomputed = recompute(pool, def, pk_column, source_columns).await?;
-            let mut rows: Rows = BTreeMap::new();
-            for (pk, fields) in recomputed {
-                let by_column = fields
-                    .into_iter()
-                    .map(|(column, value)| (column, value.map(|v| v.to_string())))
-                    .collect();
-                rows.insert(pk, by_column);
-            }
-            Ok(rows)
-        }
-        KeySpace::Aggregate { group_by } => {
-            let recomputed = recompute_aggregate(pool, def, source_columns).await?;
-            let mut rows: Rows = BTreeMap::new();
-            for (key, fields) in recomputed {
-                let by_column = fields
-                    .into_iter()
-                    .filter(|(column, _)| !group_by.iter().any(|k| k.as_str() == column))
-                    .map(|(column, value)| (column, value.map(|v| v.to_string())))
-                    .collect();
-                rows.insert(key, by_column);
-            }
-            Ok(rows)
-        }
-    }
-}
-
 /// Strips the primary-key column from a target's rows as read back by
 /// [`crate::backend::Backend::snapshot`], yielding the field-only [`Rows`] the
-/// three-way comparison expects. The pk stays as each row's key.
+/// comparison expects. The pk stays as each row's key.
 pub fn target_fields(target: &Rows, pk_column: &str) -> Rows {
     target
         .iter()
@@ -658,22 +601,21 @@ fn diff(
     divergences
 }
 
-/// Compares the three field-only renderings of `def`'s target against the SQL
-/// oracle `sql`, producing a localized [`ThreeWayReport`].
+/// Compares `def`'s persisted `target` (field-only, see [`target_fields`])
+/// with the SQL oracle `sql`, producing an [`OracleReport`].
 ///
 /// Field types drive the per-cell comparison: numeric fields (`total =
 /// c1 + c2`) compare by decimal value, `Text`/`Boolean`/`Uuid` passthrough
-/// fields (task B1) compare byte-exact — this resolves each field's type
+/// fields (task B1) compare byte-exact. This resolves each field's type
 /// from `def` and `source_columns` rather than assuming it, so it stays
 /// correct as the grammar widens.
-pub fn three_way(
+pub fn compare(
     program: &Program,
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
     target: &Rows,
-    evaluator: &Rows,
     sql: &Rows,
-) -> ThreeWayReport {
+) -> OracleReport {
     let field_types: HashMap<&str, ValueType> = def
         .fields
         .iter()
@@ -686,17 +628,14 @@ pub fn three_way(
             .unwrap_or(Comparison::Exact)
     };
 
-    ThreeWayReport {
+    OracleReport {
         target_vs_sql: diff(&def.target, sql, target, &comparison_for),
-        evaluator_vs_sql: diff(&def.target, sql, evaluator, &comparison_for),
-        evaluator_checked: true,
         program: format!("{program:#?}"),
     }
 }
 
 /// The [`ValueType`] a field expression produces, given `source_columns` (the
-/// source table's own column types — the same map [`evaluator_oracle`] and
-/// `check` already thread through). Panics on any shape [`render_expr`] also
+/// source table's own column types — the same map `check` threads through). Panics on any shape [`render_expr`] also
 /// refuses, keeping the two in lockstep so the oracle never infers a type for
 /// a shape it can't render.
 ///
@@ -709,7 +648,7 @@ pub fn three_way(
 /// Task B2 widens it again: `BinaryOp`/`FunctionCall`'s return type is no
 /// longer hardcoded `Numeric` either — it's read off
 /// `trellis::dev::defs::registry::operator_spec`/`lookup_function`, the same
-/// source of truth the parser/validator/evaluator all already share
+/// source of truth the parser and validator already share
 /// (ADR-0004), rather than this oracle keeping its own separate copy of
 /// "which operator/function returns which type" that could silently drift
 /// from the registry's. `COALESCE` is the one function whose return type
@@ -940,12 +879,9 @@ async fn join_sql_oracle(pool: &Pool, def: &TransformDef) -> Result<Rows, Oracle
     Ok(rows)
 }
 
-/// Runs the full three-way comparison for a 1-1 `def`: reads the SQL oracle
-/// and the evaluator recompute from `pool`, strips the pk column from the
-/// caller-supplied persisted `target` rows (as read back by
-/// [`crate::backend::Backend::snapshot`]), and diffs both against the SQL
-/// oracle.
-#[allow(clippy::too_many_arguments)]
+/// Runs the comparison for `def`: reads the SQL oracle from `pool`, strips
+/// the pk column from the caller-supplied persisted `target` rows (as read back
+/// by [`crate::backend::Backend::snapshot`]), and diffs them.
 pub async fn check(
     pool: &Pool,
     program: &Program,
@@ -953,30 +889,19 @@ pub async fn check(
     pk_column: &str,
     source_columns: &HashMap<String, ValueType>,
     target: &Rows,
-) -> Result<ThreeWayReport, OracleError> {
+) -> Result<OracleReport, OracleError> {
     // A `JOIN`'s oracle is its own `JOIN … GROUP BY` query over the
-    // two tables, compared byte for byte; there is no evaluator leg.
+    // two tables, compared byte for byte.
     if matches!(def.key_space, KeySpace::Join(_)) {
         let sql = join_sql_oracle(pool, def).await?;
-        return Ok(ThreeWayReport {
+        return Ok(OracleReport {
             target_vs_sql: diff(&def.target, &sql, target, &|_| Comparison::Exact),
-            evaluator_vs_sql: Vec::new(),
-            evaluator_checked: false,
             program: format!("{program:#?}"),
         });
     }
     let sql = sql_oracle(pool, def, pk_column).await?;
     let target = target_fields(target, pk_column);
-
-    let evaluator = evaluator_oracle(pool, def, pk_column, source_columns).await?;
-    Ok(three_way(
-        program,
-        def,
-        source_columns,
-        &target,
-        &evaluator,
-        &sql,
-    ))
+    Ok(compare(program, def, source_columns, &target, &sql))
 }
 
 #[cfg(test)]
@@ -1093,7 +1018,7 @@ mod tests {
             restart_after_ops: Vec::new(),
             scale_out_after_ops: Vec::new(),
         };
-        let report = ThreeWayReport {
+        let report = OracleReport {
             target_vs_sql: vec![Divergence::Cell {
                 table: "d0".into(),
                 pk: "1".into(),
@@ -1101,13 +1026,10 @@ mod tests {
                 expected: Some("5".into()),
                 got: Some("4".into()),
             }],
-            evaluator_vs_sql: Vec::new(),
-            evaluator_checked: true,
             program: format!("{program:#?}"),
         };
         let printed = report.to_string();
         assert!(printed.contains("target != SQL oracle"));
-        assert!(!printed.contains("evaluator != SQL oracle"));
         assert!(printed.contains("d0[1].total: expected=5 got=4"));
         assert!(printed.contains("program:"));
         assert!(printed.contains("Program"));
@@ -1280,21 +1202,6 @@ mod tests {
             render_join_select(&def),
             r#"select "ja"."ga"::text, "jb"."gb"::text, (count(*))::text as "n", (sum("jb"."y"))::text as "sy", (coalesce(sum("jb"."y"), 0::integer))::text as "sy0" from "ja" left join "jb" on "ja"."t" = "jb"."t" and "ja"."k" = "jb"."k" group by "ja"."ga", "jb"."gb""#
         );
-    }
-
-    /// `evaluator_checked: false` must read as "never asked", not "agreed":
-    /// an empty `evaluator_vs_sql` means opposite things in the two cases,
-    /// so the report says which one it is.
-    #[test]
-    fn a_report_says_so_when_the_evaluator_leg_did_not_run() {
-        let report = ThreeWayReport {
-            target_vs_sql: Vec::new(),
-            evaluator_vs_sql: Vec::new(),
-            evaluator_checked: false,
-            program: String::new(),
-        };
-        assert!(!report.diverged());
-        assert!(report.to_string().contains("evaluator leg not run"));
     }
 
     /// Improvement-plan task B2: `>` renders like `+` (parenthesized,

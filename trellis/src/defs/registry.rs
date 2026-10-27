@@ -141,7 +141,7 @@ pub fn operator_spec(operator: Operator) -> &'static OperatorSpec {
 /// `Integer + Numeric -> Numeric` mirrors Postgres promoting the integer
 /// operand through its implicit cast and then running `numeric_add`, which
 /// is *unbounded* — so a mixed-type sum correctly cannot overflow, while an
-/// all-integer one correctly can (see [`crate::integer::checked_add`]).
+/// all-integer one correctly can (the SQL raises on overflow).
 /// [`super::eval`]'s `apply_operator` dispatches on the same shape, and has
 /// to: if the two disagreed, the target column's declared type and the value
 /// written into it would disagree too.

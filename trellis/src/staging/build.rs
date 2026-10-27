@@ -1525,7 +1525,7 @@ impl FieldPlan {
             // other build writes once it is released. A chunk planned
             // before such an edit is planned again ([`plan_epoch`]).
             let mut fields: std::collections::HashSet<String> = fields.iter().cloned().collect();
-            crate::defs::eval::AliasReaders::of(&definition.def).close(&mut fields);
+            crate::defs::alias_readers::AliasReaders::of(&definition.def).close(&mut fields);
             let fields: Vec<String> = definition
                 .def
                 .fields

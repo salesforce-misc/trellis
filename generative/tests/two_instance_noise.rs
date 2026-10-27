@@ -158,7 +158,7 @@ thread_local! {
 
 /// Design doc §9: 12 rather than the 16 every single-instance property in
 /// this crate uses, because every case here stands up *two* engines, runs
-/// two programs, and runs the three-way oracle twice per checkpoint against
+/// two programs, and runs the oracle twice per checkpoint against
 /// two separate oracles. Override with `PROPTEST_CASES` for a deep run.
 fn proptest_config() -> ProptestConfig {
     let cases = std::env::var("PROPTEST_CASES")

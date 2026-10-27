@@ -36,7 +36,6 @@ use tokio_postgres::{GenericClient, Transaction};
 use crate::defs::ast::KeySpace;
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
-use crate::defs::eval::EvalError;
 use crate::defs::validate::ValidationError;
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident, quote_literal};
@@ -68,7 +67,7 @@ pub const MAX_HOP_GEN: i32 = 32;
 /// Why a drain attempt (fold, compute, or apply ∪ mark-drained) failed. A
 /// module-local enum, plain `Display` + `std::error::Error`, composing with
 /// the crate's other error types via `From` — matching
-/// [`StagingError`]/[`CatalogError`]/[`DdlError`]/`EvalError`'s own
+/// [`StagingError`]/[`CatalogError`]/[`DdlError`]'s own
 /// convention.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -79,8 +78,6 @@ pub enum ApplyError {
     Catalog(CatalogError),
     /// A failure introspecting a source table's primary key.
     Ddl(DdlError),
-    /// A failure evaluating a definition's calculated fields.
-    Eval(EvalError),
     /// A definition's calculated fields failed to type-infer against its own
     /// persisted `source_columns` — meaning a definition that already passed
     /// `crate::defs::validate::validate` at creation time no longer
@@ -289,7 +286,6 @@ impl ApplyError {
             ApplyError::Staging(err) => err.code(),
             ApplyError::Catalog(err) => err.code(),
             ApplyError::Ddl(err) => err.code(),
-            ApplyError::Eval(err) => err.code(),
             ApplyError::Validate(err) => err.code(),
             ApplyError::Backfill(err) => err.code(),
             ApplyError::Db(err) => error_code::classify_pg_error(err),
@@ -334,7 +330,6 @@ impl fmt::Display for ApplyError {
             ApplyError::Staging(err) => write!(f, "staging ring error: {err}"),
             ApplyError::Catalog(err) => write!(f, "transform catalog error: {err}"),
             ApplyError::Ddl(err) => write!(f, "target-table DDL error: {err}"),
-            ApplyError::Eval(err) => write!(f, "calculated-field evaluation error: {err}"),
             ApplyError::Validate(err) => {
                 write!(f, "calculated-field type inference error: {err}")
             }
@@ -456,7 +451,6 @@ impl std::error::Error for ApplyError {
             ApplyError::Staging(err) => Some(err),
             ApplyError::Catalog(err) => Some(err),
             ApplyError::Ddl(err) => Some(err),
-            ApplyError::Eval(err) => Some(err),
             ApplyError::Validate(err) => Some(err),
             ApplyError::Backfill(err) => Some(err),
             ApplyError::Db(err) => Some(err),
@@ -499,12 +493,6 @@ impl From<CatalogError> for ApplyError {
 impl From<DdlError> for ApplyError {
     fn from(err: DdlError) -> Self {
         ApplyError::Ddl(err)
-    }
-}
-
-impl From<EvalError> for ApplyError {
-    fn from(err: EvalError) -> Self {
-        ApplyError::Eval(err)
     }
 }
 

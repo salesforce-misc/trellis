@@ -81,7 +81,7 @@ pub struct OneToOnePlan {
     fields: Vec<(String, String)>,
     /// Which fields read which others by alias, so a field reading a paused
     /// one is left out with it.
-    alias_readers: crate::defs::eval::AliasReaders,
+    alias_readers: crate::defs::alias_readers::AliasReaders,
 }
 
 /// Whether `definition` is a 1-1 target the Re-derive build serves: a 1-1 key
@@ -143,7 +143,7 @@ impl OneToOnePlan {
             source_table: definition.source_table.clone(),
             pk,
             fields,
-            alias_readers: crate::defs::eval::AliasReaders::of(&definition.def),
+            alias_readers: crate::defs::alias_readers::AliasReaders::of(&definition.def),
         }))
     }
 }
