@@ -12,11 +12,11 @@
 //! 2. **validate** — the literal is in canonical form, and the field's
 //!    inferred `ValueType` is `Other(Date)`, not `Text`.
 //! 3. **DDL** — the target column is declared `date`, not `text`.
-//! 4. **apply / backfill** — the value survives the `$n::text::date` write.
+//! 4. **apply / backfill** — the value survives the rendered write.
 //! 5. **the rendering** — the literal's source text and Postgres's
-//!    `(expr)::text` are byte-identical, which is ADR-0013's continuous
-//!    cross-check and the reason `super::typed_literal` demands canonical
-//!    literals in the first place.
+//!    `(expr)::text` are byte-identical, which the self-check (ADR-0013) and
+//!    the generative suite compare byte for byte, and the reason
+//!    `super::typed_literal` demands canonical literals in the first place.
 //!
 //! Layer 5 is the one a parser test could never catch and the one the
 //! generative suite would otherwise catch only by luck, so it gets its own
@@ -540,9 +540,9 @@ async fn a_cdc_apply_writes_typed_literal_values_matching_the_source_text() {
 ///
 /// The canonical-form rule has two halves. The first — an ISO
 /// literal *parses* to the same value under every `DateStyle` — is a
-/// property of the literal itself and needs no help. The second — the literal's source text and Postgres's rendering are
-/// byte-identical — is only
-/// true if Postgres renders in ISO, and Trellis pinned no output GUC
+/// property of the literal itself and needs no help. The second — the
+/// literal's source text and Postgres's rendering are byte-identical — is
+/// only true if Postgres renders in ISO, and Trellis pinned no output GUC
 /// anywhere before this test's fix: `pool::session_bootstrap` and the
 /// non-pooled connect sites all set `search_path` and nothing else.
 ///
@@ -637,10 +637,9 @@ async fn a_hostile_database_level_output_guc_does_not_change_what_the_engine_rea
     // The float half of the same hazard. `extra_float_digits = 0` is the
     // pre-Postgres-12 default and rounds to `DBL_DIG` significant digits,
     // which is *lossy*: `0.1::float8 + 0.2::float8` renders `0.3` under `0`
-    // and `0.30000000000000004` under `1`. the engine's float
-    // text is the `>= 1` spelling, so a connection that inherited `0` would
-    // make the target and the server disagree byte-for-byte on a converged
-    // value.
+    // and `0.30000000000000004` under `1`. A staged image is a value's text,
+    // so an engine session that inherited `0` would carry a rounded value
+    // into the target.
     let rendered_float: String = pooled
         .query_one("select (0.1::float8 + 0.2::float8)::text", &[])
         .await

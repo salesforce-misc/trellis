@@ -952,6 +952,76 @@ mod tests {
         assert!(!Comparison::DecimalByValue.equal(&Some("2.5".into()), &None));
     }
 
+    /// The decimal comparison normalizes scale, leading zeros and the sign of
+    /// zero, and nothing else: a different value, a different sign or a
+    /// non-decimal spelling (`NaN`, `Infinity`) still compares by its text.
+    #[test]
+    fn decimal_text_normalizes_only_spellings_of_one_value() {
+        let same = |a: &str, b: &str| {
+            Comparison::DecimalByValue.equal(&Some(a.to_string()), &Some(b.to_string()))
+        };
+        for (a, b) in [
+            ("2.50", "2.5"),
+            ("10", "10.000"),
+            ("0", "0.00"),
+            ("-0", "0"),
+            ("-0.000", "0.0"),
+            ("0.5", ".50"),
+            ("007", "7"),
+            ("-1.10", "-1.1"),
+            (
+                "123456789012345678901234567890.10",
+                "123456789012345678901234567890.1",
+            ),
+            ("NaN", "NaN"),
+            ("Infinity", "Infinity"),
+            ("-Infinity", "-Infinity"),
+        ] {
+            assert!(same(a, b), "{a} and {b} are one value");
+        }
+        for (a, b) in [
+            ("1.5", "-1.5"),
+            ("10", "1"),
+            ("100", "1.00"),
+            ("0.01", "0.1"),
+            ("1", "1.0000000000000000000001"),
+            ("NaN", "0"),
+            ("Infinity", "-Infinity"),
+            ("1e2", "100"),
+        ] {
+            assert!(!same(a, b), "{a} and {b} differ");
+        }
+    }
+
+    /// Floats compare by Postgres's equality first (`NaN = NaN`, `-0 = 0`),
+    /// then within the tolerance, which never bridges a special value.
+    #[test]
+    fn floats_compare_by_postgres_equality_then_tolerance() {
+        assert!(postgres_float_equal(f64::NAN, f64::NAN));
+        assert!(postgres_float_equal(-0.0, 0.0));
+        assert!(postgres_float_equal(f64::INFINITY, f64::INFINITY));
+        assert!(!postgres_float_equal(f64::INFINITY, f64::NEG_INFINITY));
+        assert!(!postgres_float_equal(f64::NAN, 1.0));
+
+        assert!(floats_close(f64::NAN, f64::NAN));
+        assert!(floats_close(-0.0, 0.0));
+        assert!(floats_close(0.1 + 0.2, 0.3));
+        assert!(floats_close(1e300, 1e300 * (1.0 + 1e-12)));
+        assert!(!floats_close(1.0, 1.0 + 1e-6));
+        assert!(!floats_close(f64::NAN, 1.0));
+        assert!(!floats_close(f64::INFINITY, f64::MAX));
+        assert!(!floats_close(f64::INFINITY, f64::NEG_INFINITY));
+
+        let tolerant = |a: &str, b: &str| {
+            Comparison::FloatTolerance.equal(&Some(a.to_string()), &Some(b.to_string()))
+        };
+        assert!(tolerant("NaN", "NaN"));
+        assert!(tolerant("-0", "0"));
+        assert!(tolerant("Infinity", "Infinity"));
+        assert!(!tolerant("Infinity", "-Infinity"));
+        assert!(!tolerant("1", "2"));
+    }
+
     #[test]
     fn exact_comparison_distinguishes_text_scale() {
         // The exact path must NOT treat "1.50" and "1.500" as equal — only

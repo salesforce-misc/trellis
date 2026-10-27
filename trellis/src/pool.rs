@@ -430,7 +430,7 @@ impl Pool {
 /// Why Trellis needs it, concretely: a computed value travels through the
 /// engine as **text**, and correctness is established by comparing two
 /// independently-authored renderings of it — the target's and the SQL
-/// oracle's (ADR-0013's continuous cross-check;
+/// oracle's (ADR-0013's `self_check` and
 /// `docs/generative-test-suite.md`). For a
 /// [`crate::defs::ValueType::Other`] value that comparison is **byte-exact**
 /// (the generative suite's `Comparison::Exact`), so any GUC that changes how

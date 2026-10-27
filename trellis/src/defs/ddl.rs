@@ -857,7 +857,7 @@ pub(crate) fn null_key_escape_sql(col_text: &str) -> String {
 /// (`$n::text::{pk_cast}`), while three other writers/readers of that very
 /// column use the source's raw value instead —
 /// `defs::backfill`'s `insert into {target} select {pk} from {source}`,
-/// a 1-1 build chunk's key join, and `defs::oracle::recompute`'s `{pk}::text`. An encoding
+/// a 1-1 build chunk's key join, and the tests' `defs::oracle::render_one_to_one_select_sql`'s `{pk}::text`. An encoding
 /// that changes a real value's text therefore makes those paths disagree,
 /// duplicating or orphaning the target row for exactly the values it
 /// rewrites — empirically reproduced for a `text` primary key holding a

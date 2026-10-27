@@ -15,7 +15,7 @@
 #   Anything after `--` is passed on to cargo build.
 set -euo pipefail
 
-forbidden=(TRELLIS_TEST_PAUSE TRELLIS_TEST_PLANT render_aggregate_select_sql)
+forbidden=(TRELLIS_TEST_PAUSE TRELLIS_TEST_PLANT render_aggregate_select_sql render_one_to_one_select_sql)
 
 profile=release
 binary=""

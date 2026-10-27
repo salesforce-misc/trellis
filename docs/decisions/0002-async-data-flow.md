@@ -368,8 +368,9 @@ state that orders its writes. A 1-1 target owns it per source row.
   source's by construction, and a field means over the row what it means
   over the source table: the same result type, the same overflow, the same
   regex dialect and the same collation. *Evidence:* the `one-to-one-apply`
-  benchmark (a backlog of 1M inserts into one 1-1 target, disk-backed,
-  against the Rust evaluator as a control, two interleaved runs) ran 14–29%
+  benchmark (a backlog of 1M inserts into one 1-1 target, disk-backed, two
+  interleaved runs against a control that computed the fields in Rust and
+  wrote them as text) ran 14–29%
   more rows/s at about 26 µs of Postgres CPU per row instead of 33–36, and a page's
   transaction, which holds its locks, averaged 140–181 ms instead of
   236–296.

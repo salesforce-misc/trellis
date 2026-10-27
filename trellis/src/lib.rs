@@ -60,7 +60,8 @@
 //! `docs/decisions/0004-transform-definition-grammar.md` for what they do,
 //! and ADR-0012 for why they aren't API. `dev` (behind the off-by-default
 //! `test-util` feature) is the one curated, uncommitted door onto them, for
-//! the generative suite's independent cross-check leg.
+//! the generative suite's independent SQL oracle and the benchmark's scenario
+//! oracle.
 //!
 //! Trellis maintains target tables incrementally from source tables. A
 //! definition is one of three shapes: a 1-1 transform (one target row per
