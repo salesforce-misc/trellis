@@ -36,7 +36,7 @@ use trellis::capture::columns::{capture_spec, load_catalog};
 use trellis::capture::install::{self, CaptureAction, Installed, LockingOperation, Progress};
 use trellis::capture::sql::{CaptureEvent, CaptureSpec, function_name, trigger_name};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::{TransformStatus, ValueType, install_definition};
+use trellis::defs::{ValueType, install_definition};
 use trellis::intake::harness;
 use trellis::locks::USER_TABLE_DDL_LOCK_TIMEOUT;
 use trellis::staging::converge::table_changes_pending_through;
@@ -963,7 +963,7 @@ async fn a_schema_pre_created_by_another_role_still_captures_writes() {
         .expect("the definition exists");
     assert_eq!(
         def.status,
-        TransformStatus::Live,
+        trellis::defs::StoredStatus::Live,
         "so the capture audit runs"
     );
     let report = trellis
@@ -1462,7 +1462,10 @@ async fn a_new_reader_waits_for_the_rows_staged_before_its_widen_to_drain() {
     )
     .await
     .expect("install the aggregate");
-    assert_eq!(definition.status, TransformStatus::WaitingToBackfill);
+    assert_eq!(
+        definition.status,
+        trellis::defs::StoredStatus::WaitingToBackfill
+    );
     let wide = catalog_spec(&client, "public.sales").await;
     assert_eq!(wide.columns(), ["amount", "id", "sku"]);
     assert_eq!(

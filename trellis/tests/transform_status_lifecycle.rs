@@ -212,7 +212,7 @@ async fn status_of(client: &Client, target_table: &str) -> TransformStatus {
         .await
         .expect("query status")
         .get(0);
-    TransformStatus::from_persisted(&text).unwrap_or_else(|| panic!("unrecognized status {text}"))
+    trellis::defs::StoredStatus::from_row(&text).into()
 }
 
 /// One seal/drain/retire round, with no exit condition of its own — the
@@ -812,7 +812,7 @@ async fn every_build_reaches_live_through_three_stored_states() {
     )
     .await
     .expect("install_definition (chunked path)");
-    assert_eq!(plain.status, TransformStatus::WaitingToBackfill);
+    assert_eq!(plain.status, trellis::defs::StoredStatus::WaitingToBackfill);
     drain_backfill_chunks(&db.pool).await;
     assert_eq!(status_of(&raw, "plain_t").await, TransformStatus::Live);
 
@@ -827,7 +827,10 @@ async fn every_build_reaches_live_through_three_stored_states() {
     )
     .await
     .expect("install_definition (re-derive path)");
-    assert_eq!(summed.status, TransformStatus::WaitingToBackfill);
+    assert_eq!(
+        summed.status,
+        trellis::defs::StoredStatus::WaitingToBackfill
+    );
     trellis::intake::harness::start_registered_builds(&db.pool)
         .await
         .expect("start the build");

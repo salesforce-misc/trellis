@@ -62,7 +62,7 @@ use tokio_postgres::{GenericClient, Transaction};
 
 use crate::capture::columns::{CaptureCatalog, load_catalog, readers_of};
 use crate::defs::ddl::DdlError;
-use crate::defs::model::TransformStatus;
+use crate::defs::model::StoredStatus;
 use crate::defs::row_security;
 use crate::pool::Pool;
 
@@ -172,7 +172,7 @@ async fn pause_closure(
     let unfrozen: HashSet<i64> = txn
         .query(
             "select id from transform_definitions where status = any($1)",
-            &[&TransformStatus::dispatchable()],
+            &[&StoredStatus::dispatchable()],
         )
         .await?
         .iter()

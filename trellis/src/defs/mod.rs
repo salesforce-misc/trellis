@@ -64,7 +64,7 @@ pub mod validate;
 pub use ast::{AlterTransform, DefinitionRef, Statement, StatementKind, TransformRef, ValueType};
 pub use catalog::{CatalogError, alter_transform, install_definition, tables_to_capture};
 pub use error::ParseError;
-pub use model::TransformStatus;
+pub use model::{StoredStatus, TransformStatus};
 pub use parser::{parse_statement, statement_kind};
 // Stored text loads through `grammar::load`; the integration tests parse
 // fresh text directly.

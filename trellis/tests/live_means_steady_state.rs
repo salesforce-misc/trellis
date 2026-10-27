@@ -220,6 +220,15 @@ async fn a_one_to_one_rederive_build_applies_while_backfilling_and_is_steady_at_
             TransformStatus::CatchingUp,
             "a re-derive build never reports catching_up"
         );
+        let stored: String = raw
+            .query_one(
+                "select status from transform_definitions where target_table = 'public.order_view'",
+                &[],
+            )
+            .await
+            .expect("read the persisted status")
+            .get(0);
+        assert_ne!(stored, "catching_up", "catching_up is never persisted");
         if current == TransformStatus::Live {
             break;
         }

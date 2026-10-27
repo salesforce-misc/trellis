@@ -38,10 +38,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_status_crosses_as_its_persisted_word_and_parses_back() {
+    fn a_status_crosses_as_its_reported_word() {
         for status in TransformStatus::ALL {
-            let word = transform_status(status);
-            assert_eq!(TransformStatus::from_persisted(word), Some(status));
+            assert_eq!(transform_status(status), status.as_str());
         }
         assert_eq!(
             transform_status(TransformStatus::WaitingToBackfill),

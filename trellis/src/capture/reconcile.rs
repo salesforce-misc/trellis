@@ -117,7 +117,7 @@ use super::columns::{CaptureCatalog, capture_spec, load_catalog};
 use super::install::{self, CaptureAction, LockWait, Progress};
 use super::partitions;
 use super::sql::{CaptureEvent, trigger_name};
-use crate::defs::TransformStatus;
+use crate::defs::StoredStatus;
 
 /// What one [`reconcile`] pass did and found.
 #[derive(Debug, Default)]
@@ -583,7 +583,7 @@ async fn read_snapshot(client: &mut Client) -> Result<Snapshot, CaptureError> {
         .query(
             "select id, source_table, join_table \
              from transform_definitions where status = $1 order by id",
-            &[&TransformStatus::WaitingToBackfill.as_str()],
+            &[&StoredStatus::WaitingToBackfill.as_str()],
         )
         .await?;
     let targets = txn

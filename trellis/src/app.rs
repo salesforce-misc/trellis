@@ -113,7 +113,7 @@ use tokio_postgres::types::PgLsn;
 use crate::client::{Client, ClientError, ClientOptions};
 use crate::config::Config;
 use crate::defs::source_index::SourceIndexGap;
-use crate::defs::{self, CatalogError, ParseError, TransformStatus, ValueType};
+use crate::defs::{self, CatalogError, ParseError, StoredStatus, TransformStatus, ValueType};
 use crate::error_code::{self, ErrorCode};
 use crate::intake::IntakeError;
 use crate::pool::Pool;
@@ -845,9 +845,7 @@ impl Trellis {
             let mut correcting = Vec::new();
             if let Some(row) = &row {
                 let status_text: String = row.get(0);
-                let stored = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-                    panic!("transform_definitions.status held unrecognized value '{status_text}'")
-                });
+                let stored = StoredStatus::from_row(&status_text);
                 let (reported, causes) =
                     reported_status_with_causes(&*txn, row.get(1), stored).await?;
                 status = Some(reported);
@@ -861,7 +859,7 @@ impl Trellis {
                 // the table's lock or install failure.
                 let capture_failed = row.get::<_, Option<String>>("capture_table").is_some();
                 if !capture_failed
-                    && (stored == TransformStatus::WaitingToBackfill || row.get("awaiting_capture"))
+                    && (stored == StoredStatus::WaitingToBackfill || row.get("awaiting_capture"))
                 {
                     holdup = self.capture_holdup(&*txn, row.get(1), row.get(2)).await?;
                 }
@@ -1215,9 +1213,7 @@ impl Trellis {
                         .await?
                         .ok_or_else(|| TrellisError::TransformNotFound(t.clone()))?;
                     let status_text: String = row.get(0);
-                    let stored = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-                    panic!("transform_definitions.status held unrecognized value '{status_text}'")
-                });
+                    let stored = StoredStatus::from_row(&status_text);
                     // The status `Trellis::status` reports.
                     let status = reported_status(&**client, row.get(1), stored).await?;
                     Ok(QuarantineEntry {
@@ -1820,7 +1816,7 @@ fn resolve_backfill_table(captured: &[String], name: &str) -> Result<Option<Stri
 async fn reported_status(
     client: &impl tokio_postgres::GenericClient,
     id: i64,
-    stored: TransformStatus,
+    stored: StoredStatus,
 ) -> Result<TransformStatus, TrellisError> {
     Ok(reported_status_with_causes(client, id, stored).await?.0)
 }
@@ -1830,15 +1826,15 @@ async fn reported_status(
 async fn reported_status_with_causes(
     client: &impl tokio_postgres::GenericClient,
     id: i64,
-    stored: TransformStatus,
+    stored: StoredStatus,
 ) -> Result<(TransformStatus, Vec<String>), TrellisError> {
-    if stored != TransformStatus::Live {
-        return Ok((stored, Vec::new()));
+    if stored != StoredStatus::Live {
+        return Ok((stored.into(), Vec::new()));
     }
     let (statuses, mut causes) =
         crate::defs::catalog::reported_statuses_with_causes(client).await?;
     Ok((
-        statuses.get(&id).copied().unwrap_or(stored),
+        statuses.get(&id).copied().unwrap_or(stored.into()),
         causes.remove(&id).unwrap_or_default(),
     ))
 }

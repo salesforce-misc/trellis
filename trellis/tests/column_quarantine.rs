@@ -22,8 +22,8 @@ use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
-    TransformStatus, create_aggregate_target_table, create_definition, create_target_table,
-    install_definition, source_primary_key,
+    create_aggregate_target_table, create_definition, create_target_table, install_definition,
+    source_primary_key,
 };
 use trellis::dev::interleave::{PausePoint, PauseScope, with_scope};
 use trellis::staging::apply::{self, ApplyError};
@@ -2127,7 +2127,7 @@ async fn resume_column_refuses_a_column_on_a_not_yet_live_definition() {
     )
     .await
     .expect("install_definition records the definition and returns");
-    assert_eq!(def.status, TransformStatus::WaitingToBackfill);
+    assert_eq!(def.status, trellis::defs::StoredStatus::WaitingToBackfill);
 
     // Simulate a pause landing on `stuck.doubled` while it's mid-backfill —
     // reached past the mechanism, inserted directly (this file's own
@@ -2253,7 +2253,10 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
     )
     .await
     .expect("install_definition records the definition and returns");
-    assert_eq!(summary_def.status, TransformStatus::WaitingToBackfill);
+    assert_eq!(
+        summary_def.status,
+        trellis::defs::StoredStatus::WaitingToBackfill
+    );
     // The definition is frozen, which doesn't apply and which a column
     // release can't reach.
     client

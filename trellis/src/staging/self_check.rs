@@ -155,7 +155,7 @@ use tokio_postgres::types::PgLsn;
 use crate::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
-use crate::defs::model::{Definition, TransformStatus};
+use crate::defs::model::{Definition, StoredStatus, TransformStatus};
 use crate::defs::typed_literal;
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
@@ -761,14 +761,14 @@ pub(crate) async fn audit(
     // wait and the comparison, which a definition that is being built would
     // pass or fail for reasons that have nothing to do with its steady
     // state.
-    if def.status != TransformStatus::Live {
+    if def.status != StoredStatus::Live {
         let client = pool.get().await?;
         return Ok(SelfCheckPage {
             target: target_table.to_string(),
             checked_through: converge::watermark_token(&**client).await?,
             rows_compared: 0,
             next_after: scope.after.clone(),
-            outcome: SelfCheckOutcome::NotLive(def.status),
+            outcome: SelfCheckOutcome::NotLive(def.status.into()),
             held_keys: None,
             drain_failures: Vec::new(),
         });

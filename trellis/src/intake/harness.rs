@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio_postgres::GenericClient;
 
 use super::error::IntakeError;
-use crate::defs::model::TransformStatus;
+use crate::defs::model::StoredStatus;
 use crate::pool::quote_ident;
 use crate::staging::append::{self, StagedChange};
 
@@ -28,7 +28,7 @@ pub async fn start_registered_builds(pool: &crate::pool::Pool) -> Result<(), Int
         let waiting: Vec<i64> = client
             .query(
                 "select id from transform_definitions where status = $1 order by id",
-                &[&TransformStatus::WaitingToBackfill.as_str()],
+                &[&StoredStatus::WaitingToBackfill.as_str()],
             )
             .await?
             .into_iter()
@@ -50,7 +50,7 @@ async fn still_waiting(client: &tokio_postgres::Client) -> Result<bool, IntakeEr
     Ok(client
         .query_one(
             "select exists (select 1 from transform_definitions where status = $1)",
-            &[&TransformStatus::WaitingToBackfill.as_str()],
+            &[&StoredStatus::WaitingToBackfill.as_str()],
         )
         .await?
         .get(0))
@@ -97,7 +97,7 @@ pub async fn feed_from_a_test_definition(
                 &table,
                 &feed,
                 &format!("TRANSFORM {bare} FROM {bare}__feed SELECT 0 AS feed"),
-                &TransformStatus::Live.as_str(),
+                &StoredStatus::Live.as_str(),
             ],
         )
         .await?;

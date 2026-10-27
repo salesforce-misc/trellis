@@ -187,7 +187,7 @@ async fn the_probe_follows_the_claims_definition_status_gate() {
     trellis::client::reconcile_pass(&mut f.raw, &f.db.pool, DEFAULT_SCHEMA)
         .await
         .expect("reconcile pass");
-    for status in trellis::defs::TransformStatus::ALL {
+    for status in trellis::defs::StoredStatus::ALL {
         f.raw
             .batch_execute(&format!(
                 "update transform_definitions set build = null, status = '{}'",

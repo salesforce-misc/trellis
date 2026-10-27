@@ -126,7 +126,6 @@ function TransactionBuilder::isolation_level
 function TransactionBuilder::read_only
 function TransactionBuilder::start
 function TransformStatus::as_str
-function TransformStatus::from_persisted
 function TransformStatus::is_frozen
 function Trellis::apply
 function Trellis::await_converged

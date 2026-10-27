@@ -749,7 +749,7 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
     .expect("install_definition records the definition and returns");
     assert_eq!(
         def.status,
-        TransformStatus::WaitingToBackfill,
+        trellis::defs::StoredStatus::WaitingToBackfill,
         "install_definition must return before its build is even dispatched"
     );
     // No staging worker here (`staging_worker: false`): stand in for its
@@ -856,7 +856,7 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
     )
     .await
     .expect("install_definition records the definition and returns");
-    assert_eq!(def.status, TransformStatus::WaitingToBackfill);
+    assert_eq!(def.status, trellis::defs::StoredStatus::WaitingToBackfill);
     // No staging worker here (`staging_worker: false`): stand in for its
     // reconcile pass, which starts the Re-derive build.
     trellis::intake::harness::start_registered_builds(&db.pool)
@@ -989,7 +989,7 @@ async fn a_running_client_backfills_a_reclaimed_composite_key_chunk() {
     )
     .await
     .expect("install_definition records the definition and returns");
-    assert_eq!(def.status, TransformStatus::WaitingToBackfill);
+    assert_eq!(def.status, trellis::defs::StoredStatus::WaitingToBackfill);
     // No staging worker here (`staging_worker: false`): stand in for its
     // reconcile pass, which starts the Re-derive build.
     trellis::intake::harness::start_registered_builds(&db.pool)

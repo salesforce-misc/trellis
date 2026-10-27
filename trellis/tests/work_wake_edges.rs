@@ -231,7 +231,7 @@ async fn a_definition_entering_a_build_state_announces_itself() {
     // Every status a chunk is handed out in announces entering it (a resume
     // or an unfreeze makes the definition's existing chunks claimable
     // without touching a chunk row); a frozen status is no edge.
-    for status in trellis::defs::TransformStatus::ALL {
+    for status in trellis::defs::StoredStatus::ALL {
         f.sql("update transform_definitions set status = 'paused'")
             .await;
         f.listener.heard().await;

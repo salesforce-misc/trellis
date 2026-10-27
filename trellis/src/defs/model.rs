@@ -22,7 +22,7 @@ pub struct Definition {
     pub source_columns: HashMap<String, ValueType>,
     /// Where this transform is in its lifecycle — see
     /// [`TransformStatus`].
-    pub status: TransformStatus,
+    pub status: StoredStatus,
     /// The persisted, fully-qualified `"schema.table"` form of `def.source`
     /// — `transform_definitions.source_table` read back verbatim (it is
     /// resolved once, at acceptance time, via `search_path` for a bare
@@ -57,58 +57,54 @@ pub struct Definition {
 /// Whether Apply maintains a definition, as a SQL predicate over its
 /// `transform_definitions` row, unqualified: it folds every change to what
 /// it reads into its target, and the target-mutation seam stages its
-/// source's writes for it. A status [`TransformStatus::is_applying`] holds
+/// source's writes for it. A status [`StoredStatus::is_applying`] holds
 /// for, or `backfilling` under a Re-derive build
 /// (`transform_definitions.build = 'rederive'`), which applies from the
 /// commit that started it. Never NULL, so it is safe to select as a
 /// boolean column. Qualify the columns with [`applying_sql`] where
 /// the row has an alias.
-pub const APPLYING_SQL: &str = "(status in ('live', 'catching_up') or (status = 'backfilling' and build is not distinct from 'rederive'))";
+pub const APPLYING_SQL: &str =
+    "(status = 'live' or (status = 'backfilling' and build is not distinct from 'rederive'))";
 
 /// [`APPLYING_SQL`] over a `transform_definitions` row aliased `alias`.
 pub fn applying_sql(alias: &str) -> String {
     format!(
-        "({alias}.status in ('live', 'catching_up') \
+        "({alias}.status = 'live' \
          or ({alias}.status = 'backfilling' and {alias}.build is not distinct from 'rederive'))"
     )
 }
 
-/// A transform's lifecycle status, persisted as
-/// `transform_definitions.status`: `docs/transforms.md`'s "Status" section
-/// documents the full state machine this mirrors. Registration
-/// (`super::catalog::install_definition`) persists
-/// [`TransformStatus::WaitingToBackfill`]. The staging worker's capture pass
-/// moves it on, to [`TransformStatus::Backfilling`] with its Re-derive build's
+/// A transform's persisted lifecycle status, `transform_definitions.status`:
+/// `docs/transforms.md`'s "Status" section documents the full state machine
+/// this mirrors. Registration (`super::catalog::install_definition`) persists
+/// [`StoredStatus::WaitingToBackfill`]. The staging worker's capture pass
+/// moves it on, to [`StoredStatus::Backfilling`] with its Re-derive build's
 /// plan job (`crate::staging::build`); it applies from that commit
 /// (`APPLYING_SQL`), and the transaction that finishes its build (the last
 /// chunk, or the plan job's one absolute write for an aggregate or a `JOIN`)
-/// moves it to [`TransformStatus::Live`]. Its resume rebuilds it the same way.
+/// moves it to [`StoredStatus::Live`]. Its resume rebuilds it the same way.
 ///
-/// Apply maintains a definition that is applying:
-/// `live` or `catching_up`. Only `live` tells an operator the target is in
-/// its steady state (ADR-0002, "What `live` promises").
+/// Apply maintains a definition that is `live`. Only a `live` definition whose
+/// upstream is also `live` tells an operator the target is in its steady
+/// state (ADR-0002, "What `live` promises"); `catching_up` is the reported
+/// form of a `live` definition that isn't there yet, derived by
+/// [`StoredStatus::reported`] and never stored, so this type has no such
+/// variant.
 ///
-/// [`TransformStatus::Quarantined`] and [`TransformStatus::Paused`] are the
+/// [`StoredStatus::Quarantined`] and [`StoredStatus::Paused`] are the
 /// two triggers of ADR-0014's one freeze with several triggers: the poison fuse trips
 /// the first, an operator [`PAUSE`](crate::Trellis::apply) sets the
 /// second, and nothing else distinguishes them — neither is applying, which
 /// is the one gate the claim-time fold has ever honored (the status
 /// predicate in `super::catalog::dependents_of`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TransformStatus {
+pub enum StoredStatus {
     WaitingToBackfill,
     Backfilling,
-    /// Reported, never stored: a `live` definition reading an upstream that
-    /// isn't `live` (`super::catalog::reported_statuses`), or a
-    /// paused column of one. Apply maintains it exactly as a `live`
-    /// one, but its target doesn't reflect its source yet, so `live` holds
-    /// along a chain.
-    CatchingUp,
     Live,
     Quarantined,
     /// Deliberately frozen by an operator (ADR-0014) — the same
-    /// freeze [`TransformStatus::Quarantined`] is, reached by the other of
+    /// freeze [`StoredStatus::Quarantined`] is, reached by the other of
     /// the two triggers the ADR names. The target holds its current,
     /// now-stale value until
     /// `crate::staging::quarantine::resume_transform` rebuilds it by a
@@ -123,7 +119,36 @@ pub enum TransformStatus {
     Paused,
 }
 
-impl TransformStatus {
+/// A transform's status as reported (`DefinitionStatus`, the CLI, the
+/// bindings): a `StoredStatus`, except that a `live` definition whose
+/// target doesn't reflect its source yet reports
+/// [`TransformStatus::CatchingUp`]. Derive it with `StoredStatus::reported`
+/// (one definition) or `super::catalog::reported_statuses` (the catalog, where
+/// the upstream is looked up); nothing persists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TransformStatus {
+    WaitingToBackfill,
+    Backfilling,
+    /// Reported, never stored: a `live` definition reading an upstream that
+    /// isn't `live` (`super::catalog::reported_statuses`), or a
+    /// paused column of one. Apply maintains it exactly as a `live`
+    /// one, but its target doesn't reflect its source yet, so `live` holds
+    /// along a chain.
+    CatchingUp,
+    Live,
+    Quarantined,
+    /// A deliberately paused definition; see `StoredStatus::Paused`.
+    Paused,
+}
+
+impl From<StoredStatus> for TransformStatus {
+    fn from(stored: StoredStatus) -> Self {
+        stored.reported(false)
+    }
+}
+
+impl StoredStatus {
     /// Every variant, once — the list the engine derives the
     /// chunk queue's positive allowlist from, so that gate can never drift
     /// out of step with this enum the way a hand-written `status <> 'paused'`
@@ -133,13 +158,12 @@ impl TransformStatus {
     /// and [`Self::from_persisted`] (both of which the compiler will already
     /// stop you on) and to `transform_definitions.status`' `check`
     /// constraint; `every_variant_is_listed_in_all` below is the reminder.
-    pub const ALL: [TransformStatus; 6] = [
-        TransformStatus::WaitingToBackfill,
-        TransformStatus::Backfilling,
-        TransformStatus::CatchingUp,
-        TransformStatus::Live,
-        TransformStatus::Quarantined,
-        TransformStatus::Paused,
+    pub const ALL: [StoredStatus; 5] = [
+        StoredStatus::WaitingToBackfill,
+        StoredStatus::Backfilling,
+        StoredStatus::Live,
+        StoredStatus::Quarantined,
+        StoredStatus::Paused,
     ];
 
     /// ADR-0014's single **frozen** state, both of its triggers — the one
@@ -153,21 +177,21 @@ impl TransformStatus {
     /// a future third frozen state closes both gates by being named here and
     /// nowhere else.
     pub fn is_frozen(self) -> bool {
-        matches!(self, TransformStatus::Paused | TransformStatus::Quarantined)
+        matches!(self, StoredStatus::Paused | StoredStatus::Quarantined)
     }
 
     /// Whether apply maintains the definition: it folds every change to
     /// what it reads into its target, and the target-mutation seam stages
-    /// its source's writes for it. `live` and `catching_up`; a definition
+    /// its source's writes for it. Only `live`; a definition
     /// whose build hasn't finished, or that is frozen, is skipped.
     pub(crate) fn is_applying(self) -> bool {
-        matches!(self, TransformStatus::Live | TransformStatus::CatchingUp)
+        matches!(self, StoredStatus::Live)
     }
 
     /// The persisted words of every [`Self::is_applying`] status, for a SQL
     /// predicate (`status = any($n)`) that has to agree with it.
     pub(crate) fn applying() -> Vec<&'static str> {
-        TransformStatus::ALL
+        StoredStatus::ALL
             .iter()
             .filter(|status| status.is_applying())
             .map(|status| status.as_str())
@@ -186,7 +210,7 @@ impl TransformStatus {
     /// status added later has to be *chosen* into dispatch instead of falling
     /// into it.
     pub(crate) fn dispatchable() -> Vec<&'static str> {
-        TransformStatus::ALL
+        StoredStatus::ALL
             .iter()
             .filter(|status| !status.is_frozen())
             .map(|status| status.as_str())
@@ -197,31 +221,84 @@ impl TransformStatus {
     /// `transform_definitions.status`.
     pub fn as_str(self) -> &'static str {
         match self {
+            StoredStatus::WaitingToBackfill => "waiting_to_backfill",
+            StoredStatus::Backfilling => "backfilling",
+            StoredStatus::Live => "live",
+            StoredStatus::Quarantined => "quarantined",
+            StoredStatus::Paused => "paused",
+        }
+    }
+
+    /// Parses [`Self::as_str`]'s persisted form back, or `None` for any
+    /// other text — including `catching_up`, which is reported and never
+    /// stored — meaning the row was written by something other than this
+    /// module's own writers. Callers treat `None` as an internal error.
+    /// Named `from_persisted` because this isn't `std::str::FromStr` (no
+    /// matching `Err` type worth inventing for a value that should only ever
+    /// come from this table's own writers).
+    pub fn from_persisted(text: &str) -> Option<Self> {
+        match text {
+            "waiting_to_backfill" => Some(StoredStatus::WaitingToBackfill),
+            "backfilling" => Some(StoredStatus::Backfilling),
+            "live" => Some(StoredStatus::Live),
+            "quarantined" => Some(StoredStatus::Quarantined),
+            "paused" => Some(StoredStatus::Paused),
+            _ => None,
+        }
+    }
+
+    /// [`Self::from_persisted`] for a value read from
+    /// `transform_definitions.status`, where anything unrecognized (a stored
+    /// `catching_up` included) is an internal error.
+    pub fn from_row(text: &str) -> Self {
+        Self::from_persisted(text).unwrap_or_else(|| {
+            panic!("transform_definitions.status held unrecognized value '{text}'")
+        })
+    }
+
+    /// The one place a reported status is derived from a stored one:
+    /// `upstream_behind` is whether the definition reads something not yet
+    /// reflecting its source (an upstream not reported `live`, or a paused
+    /// upstream column), which turns a `live` definition into `catching_up`
+    /// and changes nothing else.
+    pub fn reported(self, upstream_behind: bool) -> TransformStatus {
+        match self {
+            StoredStatus::WaitingToBackfill => TransformStatus::WaitingToBackfill,
+            StoredStatus::Backfilling => TransformStatus::Backfilling,
+            StoredStatus::Live if upstream_behind => TransformStatus::CatchingUp,
+            StoredStatus::Live => TransformStatus::Live,
+            StoredStatus::Quarantined => TransformStatus::Quarantined,
+            StoredStatus::Paused => TransformStatus::Paused,
+        }
+    }
+}
+
+impl TransformStatus {
+    /// Every reported variant, once — the closed set the host bindings
+    /// allocate their status atoms/symbols from (ADR-0010 decision 4).
+    pub const ALL: [TransformStatus; 6] = [
+        TransformStatus::WaitingToBackfill,
+        TransformStatus::Backfilling,
+        TransformStatus::CatchingUp,
+        TransformStatus::Live,
+        TransformStatus::Quarantined,
+        TransformStatus::Paused,
+    ];
+
+    /// Whether the definition is frozen (`StoredStatus::is_frozen`).
+    pub fn is_frozen(self) -> bool {
+        matches!(self, TransformStatus::Paused | TransformStatus::Quarantined)
+    }
+
+    /// The word this status is reported as.
+    pub fn as_str(self) -> &'static str {
+        match self {
             TransformStatus::WaitingToBackfill => "waiting_to_backfill",
             TransformStatus::Backfilling => "backfilling",
             TransformStatus::CatchingUp => "catching_up",
             TransformStatus::Live => "live",
             TransformStatus::Quarantined => "quarantined",
             TransformStatus::Paused => "paused",
-        }
-    }
-
-    /// Parses [`Self::as_str`]'s persisted form back, or `None` for any
-    /// other text — meaning the row was written by something other than
-    /// this module's own writers, since `transform_definitions.status`'s
-    /// `check` constraint only allows these six values. Named
-    /// `from_persisted` because this isn't `std::str::FromStr` (no matching
-    /// `Err` type worth inventing for a value that should only ever come from
-    /// this table's own `check` constraint).
-    pub fn from_persisted(text: &str) -> Option<Self> {
-        match text {
-            "waiting_to_backfill" => Some(TransformStatus::WaitingToBackfill),
-            "backfilling" => Some(TransformStatus::Backfilling),
-            "catching_up" => Some(TransformStatus::CatchingUp),
-            "live" => Some(TransformStatus::Live),
-            "quarantined" => Some(TransformStatus::Quarantined),
-            "paused" => Some(TransformStatus::Paused),
-            _ => None,
         }
     }
 }
@@ -301,13 +378,13 @@ pub struct SchemaEdge {
 
 #[cfg(test)]
 mod tests {
-    use super::TransformStatus;
+    use super::{StoredStatus, TransformStatus};
 
     /// [`TransformStatus::ALL`] is hand-maintained, so this is the guard that
     /// makes forgetting it loud: the macro's `match` has no wildcard, so
     /// adding a variant fails to compile here until it is named, and every
     /// named variant must then be in `ALL` exactly once. That matters twice
-    /// over: [`TransformStatus::dispatchable`] is an allowlist built from
+    /// over: [`StoredStatus::dispatchable`] is an allowlist built from
     /// `ALL`, and the host bindings allocate their status atoms/symbols from
     /// it at load time (ADR-0010 decision 4), so a status missing from `ALL`
     /// would reach a host as a name outside that closed set. Each listed
@@ -322,16 +399,49 @@ mod tests {
             Quarantined,
             Paused,
         );
-        for status in TransformStatus::ALL {
+        crate::error_code::assert_all_is_every_variant!(
+            StoredStatus: WaitingToBackfill,
+            Backfilling,
+            Live,
+            Quarantined,
+            Paused,
+        );
+        for status in StoredStatus::ALL {
             assert_eq!(
-                TransformStatus::from_persisted(status.as_str()),
+                StoredStatus::from_persisted(status.as_str()),
                 Some(status),
                 "every listed variant round-trips through its persisted word"
             );
+            assert_eq!(status.as_str(), TransformStatus::from(status).as_str());
         }
         let names: std::collections::HashSet<&str> =
-            TransformStatus::ALL.iter().map(|s| s.as_str()).collect();
-        assert_eq!(names.len(), TransformStatus::ALL.len());
+            StoredStatus::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(names.len(), StoredStatus::ALL.len());
+        assert_eq!(TransformStatus::ALL.len(), StoredStatus::ALL.len() + 1);
+    }
+
+    /// `catching_up` is reported, never stored: the stored type cannot parse
+    /// it (callers treat that as an internal error), and `reported` is the
+    /// only way to reach it, from `live` alone.
+    #[test]
+    fn catching_up_is_not_a_stored_status() {
+        assert_eq!(StoredStatus::from_persisted("catching_up"), None);
+        for status in StoredStatus::ALL {
+            assert_ne!(status.as_str(), "catching_up");
+            let expected = if status == StoredStatus::Live {
+                TransformStatus::CatchingUp
+            } else {
+                TransformStatus::from(status)
+            };
+            assert_eq!(status.reported(true), expected);
+            assert_ne!(status.reported(false), TransformStatus::CatchingUp);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "unrecognized value 'catching_up'")]
+    fn a_stored_catching_up_row_is_an_internal_error() {
+        StoredStatus::from_row("catching_up");
     }
 
     /// The chunk queue's allowlist is exactly "not frozen" — asserted against
@@ -339,17 +449,17 @@ mod tests {
     #[test]
     fn dispatchable_is_every_unfrozen_status() {
         assert_eq!(
-            TransformStatus::dispatchable(),
-            vec!["waiting_to_backfill", "backfilling", "catching_up", "live"],
+            StoredStatus::dispatchable(),
+            vec!["waiting_to_backfill", "backfilling", "live"],
             "a frozen definition is handed no new work; everything else is"
         );
         assert_eq!(
-            TransformStatus::applying(),
-            vec!["catching_up", "live"],
-            "apply maintains a `live` definition, and one reporting `catching_up`"
+            StoredStatus::applying(),
+            vec!["live"],
+            "apply maintains a `live` definition (which may report `catching_up`)"
         );
-        assert!(TransformStatus::Paused.is_frozen());
-        assert!(TransformStatus::Quarantined.is_frozen());
+        assert!(StoredStatus::Paused.is_frozen());
+        assert!(StoredStatus::Quarantined.is_frozen());
     }
 
     /// [`APPLYING_SQL`] names exactly the statuses `is_applying` holds for,
@@ -357,18 +467,18 @@ mod tests {
     #[test]
     fn applying_sql_agrees_with_is_applying() {
         use super::{APPLYING_SQL, applying_sql};
-        let words: Vec<&str> = TransformStatus::applying();
+        let words: Vec<&str> = StoredStatus::applying();
         for word in &words {
             assert!(APPLYING_SQL.contains(&format!("'{word}'")));
         }
         assert_eq!(
             words.len(),
-            2,
-            "APPLYING_SQL spells out both applying words"
+            1,
+            "APPLYING_SQL spells out the one applying word"
         );
         assert_eq!(
             applying_sql("t"),
-            "(t.status in ('live', 'catching_up') \
+            "(t.status = 'live' \
              or (t.status = 'backfilling' and t.build is not distinct from 'rederive'))"
         );
     }

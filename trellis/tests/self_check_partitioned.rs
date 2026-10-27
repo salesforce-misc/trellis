@@ -279,7 +279,7 @@ async fn a_join_reading_a_partitioned_side_audits_clean_and_names_a_leafs_disabl
         .await
         .expect("read the definition")
         .expect("the definition");
-    def.status = trellis::defs::TransformStatus::Live;
+    def.status = trellis::defs::StoredStatus::Live;
     let audit = || trellis::staging::capture_audit::audit(&raw, DEFAULT_SCHEMA, &def);
     assert_eq!(audit().await.expect("audit"), [], "a complying JOIN side");
 

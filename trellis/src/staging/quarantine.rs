@@ -45,7 +45,7 @@ use crate::defs::ast::{KeySpace, TransformDef};
 use crate::defs::catalog;
 use crate::defs::ddl::{self, DdlError};
 use crate::defs::eval::AliasReaders;
-use crate::defs::model::TransformStatus;
+use crate::defs::model::{StoredStatus, TransformStatus};
 use crate::locks::{ColumnPauseLock, ColumnPauseOp};
 use crate::pool::Pool;
 
@@ -1920,7 +1920,7 @@ async fn evict_for(
              where id = $1 and fuse_rearmed_at is not distinct from $2 \
                and status = any($3) \
              for no key update",
-            &[&transform_id, &epoch, &TransformStatus::dispatchable()],
+            &[&transform_id, &epoch, &StoredStatus::dispatchable()],
         )
         .await?;
     if current.is_none() {
@@ -2105,7 +2105,7 @@ async fn take_fuse_gate(txn: &Transaction<'_>, transform_id: i64) -> Result<(), 
 /// the transaction already holds when [`isolate_and_evict`] took it first.
 ///
 /// Never relabels a freeze: a definition already frozen
-/// ([`TransformStatus::Quarantined`] or [`TransformStatus::Paused`]) is left
+/// ([`StoredStatus::Quarantined`] or [`StoredStatus::Paused`]) is left
 /// alone (no write, no log line), including when the freeze landed after the
 /// eviction read its candidates (see [`quarantine_if_crossed`]).
 ///
@@ -2131,7 +2131,7 @@ pub async fn trip_transform_fuse_if_crossed(
 /// a drain's eviction may quarantine a definition from: an applying one,
 /// and one building.
 fn not_frozen_sql() -> String {
-    let frozen = [TransformStatus::Paused, TransformStatus::Quarantined]
+    let frozen = [StoredStatus::Paused, StoredStatus::Quarantined]
         .map(|status| format!("'{}'", status.as_str()))
         .join(", ");
     format!("t.status not in ({frozen})")
@@ -2251,7 +2251,7 @@ async fn quarantine_if_crossed(
                  returning split_part(t.target_table, '.', 2), {COUNT}"
             ),
             &[
-                &TransformStatus::Quarantined.as_str(),
+                &StoredStatus::Quarantined.as_str(),
                 &id,
                 &(DEFAULT_TRANSFORM_DEATH_THRESHOLD as i64),
             ],
@@ -3432,16 +3432,14 @@ pub(crate) async fn resume_pairs(
             continue;
         };
         let status_text: String = row.get(0);
-        let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-            panic!("transform_definitions.status held unrecognized value '{status_text}'")
-        });
+        let status = StoredStatus::from_row(&status_text);
         let build: Option<String> = row.get(1);
         // A definition that has not started building has built nothing the
         // column's pause held out: every build of it, the Re-derive build
         // and the old path alike, reads the paused set when its chunks run,
         // after this commit. Releasing the pair is deleting its row; there
         // is no field build to start and none to wait for.
-        let unbuilt = status == TransformStatus::WaitingToBackfill;
+        let unbuilt = status == StoredStatus::WaitingToBackfill;
         if !unbuilt && !super::build::takes_field_build(status, build.as_deref()) {
             // Reached via cascade (the initial pair was already gated above
             // before any side effects ran, and a definition that left the
@@ -3701,8 +3699,8 @@ async fn reads_paused_sibling(
 /// `live`; a frozen definition is, by construction, never that).
 ///
 /// **One resume for both of ADR-0014's pause triggers**.
-/// `target`'s current status must be either [`TransformStatus::Quarantined`]
-/// (the poison fuse tripped it) or [`TransformStatus::Paused`] (an operator
+/// `target`'s current status must be either [`StoredStatus::Quarantined`]
+/// (the poison fuse tripped it) or [`StoredStatus::Paused`] (an operator
 /// froze it deliberately via `PAUSE TRANSFORM` — see [`crate::Trellis::apply`]) —
 /// [`ApplyError::TransformNotPaused`] otherwise, checked before any
 /// mutation, because resuming a transform that isn't frozen at all is caller
@@ -3714,7 +3712,7 @@ async fn reads_paused_sibling(
 /// recoverable by replay.
 ///
 /// This function itself only schedules that reconciliation. It drops the
-/// definition to [`TransformStatus::WaitingToBackfill`], unless a definition
+/// definition to [`StoredStatus::WaitingToBackfill`], unless a definition
 /// whose target it reads isn't `live`: then it records a resume
 /// request and returns, and the staging worker resumes it once every such
 /// upstream is ([`resume_locked`]'s step 0). The staging worker's next pass
@@ -3804,7 +3802,7 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
             crate::instance_log::info!(
                 transform = %target,
                 from = %status.as_str(),
-                to = %TransformStatus::WaitingToBackfill.as_str(),
+                to = %StoredStatus::WaitingToBackfill.as_str(),
                 "transform resumed; re-parked for a fresh backfill"
             );
         }
@@ -3858,7 +3856,7 @@ async fn lock_frozen(
     column: &str,
     value: &(dyn tokio_postgres::types::ToSql + Sync),
     fenced_source: &str,
-) -> Result<Option<(i64, TransformStatus)>, ApplyError> {
+) -> Result<Option<(i64, StoredStatus)>, ApplyError> {
     let fenced_join: Option<String> = txn
         .query_opt(
             &format!("select join_table from transform_definitions where {column} = $1"),
@@ -3892,9 +3890,7 @@ async fn lock_frozen(
         return Ok(None);
     }
     let status_text: String = row.get(2);
-    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-        panic!("transform_definitions.status held unrecognized value '{status_text}'")
-    });
+    let status = StoredStatus::from_row(&status_text);
     Ok(Some((row.get(0), status)))
 }
 
@@ -3955,7 +3951,7 @@ async fn upstream_not_live(
             &[&tables, &id],
         )
         .await?;
-    let live = TransformStatus::Live.as_str();
+    let live = StoredStatus::Live.as_str();
     // `live` as the operator reads it (`catalog::reported_statuses`):
     // an upstream stored `live` that reads one that isn't reports
     // `catching_up`, and its target may still change under a rebuild above
@@ -4126,7 +4122,7 @@ async fn resume_locked(
     target: &str,
     id: i64,
     source_table: &str,
-    status: TransformStatus,
+    status: StoredStatus,
     from_pass: bool,
 ) -> Result<ResumeStep, ApplyError> {
     let Some(definition) = catalog::definition_by_id_in(txn, id).await? else {
@@ -4299,7 +4295,7 @@ async fn complete_resume(
     schema: &str,
     id: i64,
     source_table: &str,
-    status: TransformStatus,
+    status: StoredStatus,
     definition: &crate::defs::model::Definition,
     revalidated: &catalog::Revalidated,
 ) -> Result<(), ApplyError> {
@@ -4321,7 +4317,7 @@ async fn complete_resume(
     txn.execute(
         "update transform_definitions \
          set status = $1, fuse_rearmed_at = now(), build = null where id = $2",
-        &[&TransformStatus::WaitingToBackfill.as_str(), &id],
+        &[&StoredStatus::WaitingToBackfill.as_str(), &id],
     )
     .await?;
     // The rebuild casts each source value through its live type,
@@ -4672,7 +4668,7 @@ pub(crate) async fn resume_caused_definitions(
     let candidates: Vec<(i64, i64)> = client
         .query_typed(
             &caused_candidates_sql(),
-            &[(&TransformStatus::Live.as_str(), Type::TEXT)],
+            &[(&StoredStatus::Live.as_str(), Type::TEXT)],
         )
         .await?
         .into_iter()
@@ -4695,7 +4691,7 @@ pub(crate) async fn resume_caused_definitions(
 /// The frozen definitions with a cause and no resume request, as `(id,
 /// cause)` in id order, whose cause has the status `$1`.
 fn caused_candidates_sql() -> String {
-    let frozen = [TransformStatus::Paused, TransformStatus::Quarantined]
+    let frozen = [StoredStatus::Paused, StoredStatus::Quarantined]
         .map(|status| format!("'{}'", status.as_str()))
         .join(", ");
     format!(
@@ -4741,7 +4737,7 @@ async fn resume_caused_definition(
                             join transform_definitions u on u.id = f.caused_by \
                             where f.transform_id = $1 and f.caused_by = $2 and u.status = $3) \
                     and not exists (select 1 from resume_requests where transform_id = $1)",
-            &[&id, &upstream, &TransformStatus::Live.as_str()],
+            &[&id, &upstream, &StoredStatus::Live.as_str()],
         )
         .await?
         .get(0);
@@ -4754,7 +4750,7 @@ async fn resume_caused_definition(
             crate::instance_log::info!(
                 transform = %target,
                 upstream_id = upstream,
-                to = %TransformStatus::WaitingToBackfill.as_str(),
+                to = %StoredStatus::WaitingToBackfill.as_str(),
                 "transform resumed once its upstream was live; re-parked for a fresh backfill"
             );
         }
@@ -4895,9 +4891,9 @@ async fn finish_requested_resume(
                 &[&id],
             )
             .await?;
-        let frozen = row.as_ref().is_some_and(|row| {
-            TransformStatus::from_persisted(row.get(2)).is_some_and(TransformStatus::is_frozen)
-        });
+        let frozen = row
+            .as_ref()
+            .is_some_and(|row| StoredStatus::from_row(row.get(2)).is_frozen());
         let Some(row) = row.filter(|_| frozen) else {
             // Dropped, or resumed some other way: nothing waits on this.
             txn.execute(
@@ -5084,7 +5080,7 @@ async fn finish_requested_resume(
             txn.commit().await?;
             crate::instance_log::info!(
                 transform = %target,
-                to = %TransformStatus::WaitingToBackfill.as_str(),
+                to = %StoredStatus::WaitingToBackfill.as_str(),
                 "transform resumed once its copies were re-typed; re-parked for a fresh backfill"
             );
         }
@@ -7904,7 +7900,7 @@ mod unit_tests {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let (pool, raw, _) = fuse_ready(&db).await;
-        let paused = TransformStatus::Paused;
+        let paused = StoredStatus::Paused;
         let pause = || async { pause_transform(&pool, "order_totals").await.expect("pause") };
         let record = || async {
             let row = raw

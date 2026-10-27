@@ -12,12 +12,12 @@
 //! the ADR:
 //!
 //! 1. **It does not invent a freezing mechanism.** Pausing writes
-//!    [`TransformStatus::Paused`] into the same `transform_definitions.status`
+//!    [`StoredStatus::Paused`] into the same `transform_definitions.status`
 //!    column the poison fuse already writes
-//!    [`TransformStatus::Quarantined`] into, and the claim-time fold stops
+//!    [`StoredStatus::Quarantined`] into, and the claim-time fold stops
 //!    dispatching to the target for exactly the reason it already stops for a
 //!    quarantined one: [`super::catalog::dependents_of`]'s applying-status
-//!    predicate ([`TransformStatus::is_applying`]), the single gate every
+//!    predicate ([`StoredStatus::is_applying`]), the single gate every
 //!    target resolution goes through. The one place that gate did not
 //!    previously reach is the durable
 //!    backfill-chunk queue, which is why
@@ -66,7 +66,7 @@
 use tokio_postgres::Transaction;
 
 use super::catalog::CatalogError;
-use super::model::{EdgeKind, TransformStatus};
+use super::model::{EdgeKind, StoredStatus};
 use crate::pool::{Pool, quote_ident};
 
 /// What [`pause_transform`] actually did — returned so a caller (and a test)
@@ -75,19 +75,19 @@ use crate::pool::{Pool, quote_ident};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PauseOutcome {
     /// The definition was live (or catching up, backfilling, or waiting to
-    /// backfill) and is now [`TransformStatus::Paused`].
+    /// backfill) and is now [`StoredStatus::Paused`].
     Paused,
     /// The definition was already frozen — by an earlier pause, or by the
     /// poison fuse — and was left exactly as it was. ADR-0014's idempotency
     /// clause: this is a success, not a conflict.
-    AlreadyFrozen(TransformStatus),
+    AlreadyFrozen(StoredStatus),
     /// The definition was already frozen, but waiting to be resumed: on its
     /// upstream's resume (`capture_failures.caused_by`), or on a
     /// resume request (`resume_requests`: an operator's `RESUME` waiting for
     /// an upstream to be live or for its copies to be re-typed). The
     /// pause withdrew that resume, so it stays paused like any operator
     /// pause.
-    Withdrawn(TransformStatus),
+    Withdrawn(StoredStatus),
 }
 
 /// What [`drop_transform`] actually did — same "distinguish the no-op from
@@ -110,8 +110,8 @@ pub(crate) enum DropOutcome {
 /// ([`crate::staging::quarantine::resume_transform`],
 /// [`crate::Trellis::status`]); see [`super::catalog::target_match_sql`].
 ///
-/// Idempotent: a definition already [`TransformStatus::Paused`] *or*
-/// [`TransformStatus::Quarantined`] keeps its status and is reported as
+/// Idempotent: a definition already [`StoredStatus::Paused`] *or*
+/// [`StoredStatus::Quarantined`] keeps its status and is reported as
 /// [`PauseOutcome::AlreadyFrozen`], unless it is waiting to be resumed: then
 /// the pause withdraws that resume ([`withdraw_resume`]) and reports
 /// [`PauseOutcome::Withdrawn`]. A quarantined definition is deliberately
@@ -169,7 +169,7 @@ pub(crate) async fn pause_transform(
 
     txn.execute(
         "update transform_definitions set status = $1 where id = $2",
-        &[&TransformStatus::Paused.as_str(), &id],
+        &[&StoredStatus::Paused.as_str(), &id],
     )
     .await?;
     txn.commit().await?;
@@ -177,7 +177,7 @@ pub(crate) async fn pause_transform(
     crate::instance_log::info!(
         transform = %target,
         from = %status.as_str(),
-        to = %TransformStatus::Paused.as_str(),
+        to = %StoredStatus::Paused.as_str(),
         "transform paused"
     );
     Ok(PauseOutcome::Paused)
@@ -294,7 +294,7 @@ pub(crate) async fn pause_for_disruption(
     let Some(row) = txn
         .query_opt(
             "select status = any($2) from transform_definitions where id = $1 for update",
-            &[&id, &TransformStatus::dispatchable()],
+            &[&id, &StoredStatus::dispatchable()],
         )
         .await?
     else {
@@ -325,7 +325,7 @@ pub(crate) async fn pause_for_restore(
     let Some(row) = txn
         .query_opt(
             "select status = any($2) from transform_definitions where id = $1 for update",
-            &[&id, &TransformStatus::dispatchable()],
+            &[&id, &StoredStatus::dispatchable()],
         )
         .await?
     else {
@@ -352,8 +352,8 @@ pub(crate) async fn pause_for_restore(
             "update transform_definitions set status = $2 where id = $1 and status = any($3)",
             &[
                 &id,
-                &TransformStatus::Paused.as_str(),
-                &TransformStatus::dispatchable(),
+                &StoredStatus::Paused.as_str(),
+                &StoredStatus::dispatchable(),
             ],
         )
         .await?
@@ -398,8 +398,8 @@ pub(crate) async fn pause_for_relabel(
             "update transform_definitions set status = $2 where id = $1 and status = any($3)",
             &[
                 &id,
-                &TransformStatus::Paused.as_str(),
-                &TransformStatus::dispatchable(),
+                &StoredStatus::Paused.as_str(),
+                &StoredStatus::dispatchable(),
             ],
         )
         .await?
@@ -457,8 +457,8 @@ async fn pause_with_record(
              where id = $1 and status = any($3)",
             &[
                 &id,
-                &TransformStatus::Paused.as_str(),
-                &TransformStatus::dispatchable(),
+                &StoredStatus::Paused.as_str(),
+                &StoredStatus::dispatchable(),
             ],
         )
         .await?
@@ -471,8 +471,8 @@ async fn pause_with_record(
 /// **Only ever acts on a frozen definition.** There is no direct live-to-gone
 /// edge in the lifecycle: quiescing first is a precondition, so the removal
 /// never has to reason about a fold still dispatching to the target. A
-/// definition that is not [`TransformStatus::Paused`] or
-/// [`TransformStatus::Quarantined`] is refused with
+/// definition that is not [`StoredStatus::Paused`] or
+/// [`StoredStatus::Quarantined`] is refused with
 /// [`CatalogError::TransformNotPaused`]; pause it first.
 ///
 /// **Always removes the associated data.** The target table is dropped, full
@@ -574,7 +574,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     if !status.is_frozen() {
         return Err(CatalogError::TransformNotPaused {
             transform: target.to_string(),
-            status,
+            status: status.into(),
         });
     }
 
@@ -820,7 +820,7 @@ async fn source_edge_dependents(
 /// under the lock it holds.
 struct LockedDefinition {
     id: i64,
-    status: TransformStatus,
+    status: StoredStatus,
     target_table: String,
 }
 
@@ -840,9 +840,7 @@ async fn locked_definition(
         .await?;
     Ok(row.map(|row| {
         let status_text: String = row.get(1);
-        let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-            panic!("transform_definitions.status held unrecognized value '{status_text}'")
-        });
+        let status = StoredStatus::from_row(&status_text);
         LockedDefinition {
             id: row.get(0),
             status,

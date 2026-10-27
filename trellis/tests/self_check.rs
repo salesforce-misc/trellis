@@ -1280,7 +1280,7 @@ async fn a_seam_fed_source_and_a_paused_definition_are_not_audited() {
     assert!(
         !matches!(
             status,
-            trellis::defs::model::TransformStatus::WaitingToBackfill
+            trellis::defs::model::StoredStatus::WaitingToBackfill
         ),
         "the reader of the target is dispatched, so it is audited: {status:?}"
     );
@@ -1304,7 +1304,7 @@ async fn a_seam_fed_source_and_a_paused_definition_are_not_audited() {
         .expect("pause");
     assert_eq!(
         audit("widget_totals").await,
-        (trellis::defs::model::TransformStatus::Paused, vec![]),
+        (trellis::defs::model::StoredStatus::Paused, vec![]),
         "once it's paused"
     );
 

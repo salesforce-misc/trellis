@@ -56,7 +56,7 @@ use std::time::Duration;
 
 use tokio_postgres::types::{PgLsn, Type};
 
-use crate::defs::model::TransformStatus;
+use crate::defs::model::StoredStatus;
 use crate::pool::Pool;
 
 use super::holdup::DrainFailure;
@@ -367,10 +367,7 @@ async fn report_of(
             let status: &str = row
                 .get::<_, Option<&str>>(7)
                 .expect("a not_live job saved the status it found");
-            SelfCheckOutcome::NotLive(
-                TransformStatus::from_persisted(status)
-                    .expect("self_check_jobs.not_live_status held a status"),
-            )
+            SelfCheckOutcome::NotLive(StoredStatus::from_row(status).into())
         }
         other => panic!("a done self_check job held outcome {other:?}"),
     };
@@ -938,7 +935,7 @@ mod tests {
     fn a_page_that_is_not_a_comparison_ends_the_walk_without_a_verdict() {
         for stopped in [
             SelfCheckOutcome::NotCaughtUp,
-            SelfCheckOutcome::NotLive(TransformStatus::Paused),
+            SelfCheckOutcome::NotLive(crate::defs::TransformStatus::Paused),
         ] {
             let mut progress = Progress::default();
             let finish = finished(fold_page(
