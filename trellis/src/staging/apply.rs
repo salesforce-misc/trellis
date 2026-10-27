@@ -175,8 +175,8 @@ pub enum ApplyError {
     ColumnNotPaused { transform: String, column: String },
     /// `super::quarantine::resume_column` was asked to resume a column
     /// whose owning definition is not currently applying
-    /// (`live` or
-    /// `catching_up`) — most concretely, a definition still `Backfilling`
+    /// (`live`, which may
+    /// report `catching_up`) — most concretely, a definition still `Backfilling`
     /// behind an in-flight `backfill_chunks` queue nothing is draining. `resume_column`
     /// takes one snapshot of the *source* table and only clears
     /// `column_status` after writing it back, so any row a still-running

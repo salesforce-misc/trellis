@@ -888,7 +888,8 @@ pub(crate) async fn pause_readers_of_retyped(
                     &[&pause.id],
                 )
                 .await?
-                .is_some_and(|row| StoredStatus::from_row(row.get(0)).is_frozen());
+                .and_then(|row| StoredStatus::from_persisted(row.get(0)))
+                .is_some_and(StoredStatus::is_frozen);
             if !frozen {
                 error = caused_error(table, &cause, &pause);
                 caused_by = Some(cause.upstream);

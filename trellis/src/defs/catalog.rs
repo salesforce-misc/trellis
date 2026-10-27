@@ -1058,8 +1058,8 @@ pub async fn install_definition(
     .await
 }
 
-/// Every applying definition (`live` or `catching_up`) that reads `table`
-/// ([`tables_read_by`]), in id order: the readers a rewrite of `table`
+/// Every applying definition (stored `live`, whatever it reports) that
+/// reads `table` ([`tables_read_by`]), in id order: the readers a rewrite of `table`
 /// outside the target-mutation seam has to rebuild
 /// (`intake::catch_up::park_target_catchup_if_read`).
 pub(crate) async fn applying_readers(
@@ -5351,8 +5351,8 @@ struct PendingDefinition {
 /// come back with zero entries, not disappear from the result entirely.
 ///
 /// **Applying definitions only** ([`super::model::APPLYING_SQL`]:
-/// `live` or `catching_up`, or `backfilling` under a Re-derive build, which
-/// applies from its start; ADR-0002): a `waiting_to_backfill`
+/// `live`, which may report `catching_up`, or `backfilling` under a
+/// Re-derive build, which applies from its start; ADR-0002): a `waiting_to_backfill`
 /// or `quarantined` definition's target may not reflect every pre-existing
 /// source row, so a live CDC delta folded into it now — via
 /// [`transforms_for_source`], the apply path's read of this function — could

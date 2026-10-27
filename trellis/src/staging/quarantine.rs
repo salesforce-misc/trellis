@@ -4891,9 +4891,9 @@ async fn finish_requested_resume(
                 &[&id],
             )
             .await?;
-        let frozen = row
-            .as_ref()
-            .is_some_and(|row| StoredStatus::from_row(row.get(2)).is_frozen());
+        let frozen = row.as_ref().is_some_and(|row| {
+            StoredStatus::from_persisted(row.get(2)).is_some_and(StoredStatus::is_frozen)
+        });
         let Some(row) = row.filter(|_| frozen) else {
             // Dropped, or resumed some other way: nothing waits on this.
             txn.execute(

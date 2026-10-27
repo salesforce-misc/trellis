@@ -778,8 +778,11 @@ async fn a_chained_reader_reports_catching_up_until_its_resumed_upstream_is_live
         .expect("pause the upstream");
     assert_eq!(reported(&trellis, "t").await, TransformStatus::Paused);
     assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
-    assert_eq!(stored(&raw, "d").await, "live", "reported, not stored");
-    assert_eq!(stored(&raw, "d").await, "live", "d keeps applying");
+    assert_eq!(
+        stored(&raw, "d").await,
+        "live",
+        "reported, not stored: d keeps applying"
+    );
     let listed: Vec<(String, TransformStatus)> = trellis
         .definitions()
         .await
@@ -895,8 +898,11 @@ async fn a_chained_reader_reports_catching_up_while_its_upstream_rederives() {
         "precondition: the Re-derive build runs t's rebuild"
     );
     assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
-    assert_eq!(stored(&raw, "d").await, "live", "reported, not stored");
-    assert_eq!(stored(&raw, "d").await, "live", "d keeps applying");
+    assert_eq!(
+        stored(&raw, "d").await,
+        "live",
+        "reported, not stored: d keeps applying"
+    );
 
     trellis::staging::build::settle_builds(&db.pool).await;
     assert_eq!(stored(&raw, "t").await, "live");

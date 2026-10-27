@@ -232,8 +232,10 @@ impl StoredStatus {
     /// Parses [`Self::as_str`]'s persisted form back, or `None` for any
     /// other text — including `catching_up`, which is reported and never
     /// stored — meaning the row was written by something other than this
-    /// module's own writers. Callers treat `None` as an internal error.
-    /// Named `from_persisted` because this isn't `std::str::FromStr` (no
+    /// module's own writers. Most callers treat `None` as an internal error
+    /// ([`Self::from_row`]); the two frozen checks (a cause's reader in
+    /// `staging::schema_change`, a pending resume in `staging::quarantine`)
+    /// read it as "not frozen". Named `from_persisted` because this isn't `std::str::FromStr` (no
     /// matching `Err` type worth inventing for a value that should only ever
     /// come from this table's own writers).
     pub fn from_persisted(text: &str) -> Option<Self> {

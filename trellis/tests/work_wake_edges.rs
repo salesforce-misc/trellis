@@ -222,9 +222,9 @@ async fn a_definition_entering_a_build_state_announces_itself() {
     f.sql("update transform_definitions set status = 'backfilling'")
         .await;
     assert_eq!(f.listener.heard().await, 1, "paused -> backfilling");
-    f.sql("update transform_definitions set status = 'catching_up'")
+    f.sql("update transform_definitions set status = 'live'")
         .await;
-    assert_eq!(f.listener.heard().await, 1, "backfilling -> catching_up");
+    assert_eq!(f.listener.heard().await, 1, "backfilling -> live");
     f.sql("update transform_definitions set build = 'rederive'")
         .await;
     assert_eq!(f.listener.heard().await, 1, "build changed");
