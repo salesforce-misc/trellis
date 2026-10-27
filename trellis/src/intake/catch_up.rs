@@ -20,7 +20,7 @@ use super::error::IntakeError;
 
 /// Rebuilds the readers of `definition_id`'s *target* table, which a build of
 /// the definition just rewrote outside the target-mutation seam
-/// (`staging::target_mutations`, issue #315): a reader already attached (only
+/// (`staging::target_mutations`): a reader already attached (only
 /// possible for a rebuilt, resumed upstream, since `defs::catalog` refuses to
 /// attach a new one to a target still being built) may be missing what the
 /// rebuild wrote. Called by the transaction that finishes the build.
@@ -47,7 +47,7 @@ pub(crate) async fn park_target_catchup_if_read(
 
 /// Rebuilds the readers of each of `tables` that may be missing changes to
 /// it: a table whose capture triggers are installed (`capture::install`), and
-/// an explicit re-backfill ([`crate::Trellis::request_backfill`], issue #522).
+/// an explicit re-backfill ([`crate::Trellis::request_backfill`]).
 /// Returns the rebuilt definitions' ids, for the caller to pass to
 /// [`crate::staging::build::stamp_rebuild_seg`] as the last statement before
 /// it commits, so the share lock on the active segment is held only for the
@@ -59,7 +59,7 @@ pub(crate) async fn park_target_catchup_if_read(
 /// (an aggregate, or a `JOIN` reading the root as either side) is then not
 /// rebuilt: the reconcile pass queues each new node's correction, which
 /// recomputes the groups (or the `JOIN` side's cells) of the node alone, the
-/// node's own rows' among them (#1103, #1111, #1147).
+/// node's own rows' among them.
 pub(crate) async fn park_table_catch_ups(
     client: &impl GenericClient,
     tables: &[String],
@@ -105,7 +105,7 @@ async fn rebuild(
 /// Whether the partition correction engine corrects `definition` for a node
 /// new to one of `tables`' recorded trees (`park_table_catch_ups`'s
 /// `new_nodes`): a `JOIN` reading the table as either side, whose node
-/// correction recomputes the side's cells that route to the node (#1111);
+/// correction recomputes the side's cells that route to the node;
 /// or an aggregate over the table that the engine re-derives
 /// ([`crate::staging::build::corrected_on_partitioned_source`]).
 async fn corrected_by_new_node(

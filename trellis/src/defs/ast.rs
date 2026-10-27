@@ -2,13 +2,13 @@
 //!
 //! Shapes mirror the logical model in `docs/transforms.md`: a definition
 //! picks a key-space, a set of calculated fields, and a partial-data
-//! predicate. This slice (issue #22) only populates the 1-1 key-space and
+//! predicate. This slice only populates the 1-1 key-space and
 //! the `+`-only expression language; [`KeySpace`] and [`Predicate`] have
 //! room to grow (aggregate/cross-join variants, general predicates) without
 //! changing the shape callers already match on.
 //!
-//! Issue #63 widens the value model from numeric-only to [`ValueType`]'s
-//! three variants; see `docs/transforms.md` and ADR-0004's growth policy.
+//! The value model is [`ValueType`]; see `docs/transforms.md` and ADR-0004's
+//! growth policy.
 
 use std::fmt;
 
@@ -16,12 +16,12 @@ use super::pg_type::PgType;
 use crate::float::FloatWidth;
 use crate::integer::IntWidth;
 
-/// A parsed transform definition, ready for the validator (issue #23) and
-/// evaluator (issue #24).
+/// A parsed transform definition, ready for the validator and
+/// evaluator.
 ///
 /// **`target`/`source` are always bare table names, never a dotted
 /// `schema.table` spelling — even when the definition explicitly qualified
-/// one (issue #76, ADR-0011).** That's a deliberate split,
+/// one (ADR-0011).** That's a deliberate split,
 /// not an oversight: a huge number of call sites (`backfill.rs`, `oracle.rs`,
 /// `ddl.rs`, `apply.rs`, `ledger.rs`, `quarantine.rs`) pass
 /// `&def.source`/`&def.target` straight into `quote_ident`, which quotes its
@@ -39,27 +39,27 @@ use crate::integer::IntWidth;
 pub struct TransformDef {
     pub target: String,
     /// `Some(schema)` when this definition's `TRANSFORM <target>` clause
-    /// explicitly spelled `<schema>.<target>` (issue #76) rather than a bare
+    /// explicitly spelled `<schema>.<target>` rather than a bare
     /// table name. When present, [`super::catalog::create_definition_inner`]
     /// validates that *exact* relation (schema and table both, via
     /// `information_schema.tables`) and persists it qualified, skipping
     /// `Config::target_schema` resolution entirely — a qualified spelling
     /// names its own schema, it doesn't inherit the configured default.
-    /// `None` (the bare, far more common case) keeps issue #73's
-    /// `Config::target_schema`-resolved behavior exactly as it was.
+    /// `None` (the bare, far more common case) resolves
+    /// through `Config::target_schema`.
     pub explicit_target_schema: Option<String>,
     pub source: String,
     /// The source-side twin of [`Self::explicit_target_schema`]: `Some(schema)`
     /// when `FROM <schema>.<source>` was written explicitly, in which case
     /// `create_definition_inner` validates that exact relation instead of
-    /// walking `search_path` the way issue #72's bare-name resolution
+    /// walking `search_path` the way bare-name resolution
     /// ([`super::catalog::resolve_source_schema_in_txn`]) does. `None` for a
-    /// bare `FROM <source>`, unchanged from before issue #76.
+    /// bare `FROM <source>`.
     pub explicit_source_schema: Option<String>,
     pub key_space: KeySpace,
     pub fields: Vec<FieldDef>,
     pub predicate: Predicate,
-    /// `WITHOUT SOURCE INDEX` was written (#1167): the definition runs without
+    /// `WITHOUT SOURCE INDEX` was written: the definition runs without
     /// the source index Trellis requires of a `GROUP BY` or `JOIN` target
     /// (`super::source_index`), accepting the per-page scan a `self_check`
     /// walk then costs. Never set for a 1-1 target, which pages by its
@@ -69,7 +69,7 @@ pub struct TransformDef {
 
 /// One whole statement in Trellis's grammar, as
 /// [`super::parser::parse_statement`] returns it — the single shape
-/// [`crate::Trellis::apply`] dispatches on (issue #227, ADR-0012: "parsing
+/// [`crate::Trellis::apply`] dispatches on (ADR-0012: "parsing
 /// the statement is where the operation is decided; the facade signature does
 /// not change as operations are added").
 ///
@@ -77,10 +77,10 @@ pub struct TransformDef {
 /// needs no lookahead past the first token to choose: `TRANSFORM` defines,
 /// `PAUSE` / `RESUME` / `DROP` act on something already defined, `ALTER`
 /// edits one. The kind keyword is repeated on the imperative forms
-/// (`PAUSE TRANSFORM x`, not `PAUSE x`) (issue #228, decision 1).
+/// (`PAUSE TRANSFORM x`, not `PAUSE x`).
 ///
 /// `AMEND` is deliberately absent: it needs its own semantics ADR before it
-/// can be a grammar addition (issue #228, decision 3).
+/// can be a grammar addition.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     /// `TRANSFORM <target> FROM <source> ... SELECT ...`
@@ -94,8 +94,7 @@ pub enum Statement {
     /// `DROP TRANSFORM <target>` — ADR-0014's terminal reap. Idempotent; refused if a still-registered dependent
     /// chains off the subject.
     Drop(DefinitionRef),
-    /// `ALTER TRANSFORM <target> <clause>[, <clause> ...]` (ADR-0015, issues
-    /// #241/#242) — edits an already-registered transform's calculated
+    /// `ALTER TRANSFORM <target> <clause>[, <clause> ...]` (ADR-0015) — edits an already-registered transform's calculated
     /// fields in place: `ADD`, `DROP`, and `ALTER` clauses, one calculated
     /// field each. The key-space is not named and cannot change; a
     /// granularity change is a new transform plus cutover, not an edit — the
@@ -123,7 +122,7 @@ impl Statement {
 }
 
 /// Which form a statement of Trellis's grammar is, without what it says —
-/// what [`crate::statement_kind`] returns (issue #580).
+/// what [`crate::statement_kind`] returns.
 ///
 /// One variant per statement head: the verb *and* the kind of definition it
 /// acts on, as the grammar spells them ([`StatementKind::keywords`]). A
@@ -200,8 +199,8 @@ impl fmt::Display for StatementKind {
 /// What a [`Statement::Pause`]/[`Statement::Resume`] addresses: a registered
 /// transform, whole (`column: None`) or one of its calculated fields.
 ///
-/// The parser reads a dotted address as `<transform>.<column>` (issue #228,
-/// decision 2: [`crate::QuarantineTarget`]'s `"transform"`/`"transform.column"`
+/// The parser reads a dotted address as `<transform>.<column>`
+/// ([`crate::QuarantineTarget`]'s `"transform"`/`"transform.column"`
 /// addressing, folded into this grammar), with `target` the bare transform.
 /// `<transform>.<column>` and `<schema>.<table>` are the same token shape, so
 /// [`crate::Trellis::apply`] reads `a.b` as the whole transform registered as
@@ -231,7 +230,7 @@ pub enum DefinitionRef {
     ///
     /// No column half, unlike [`TransformRef`]: dropping one calculated field
     /// is an `ALTER TRANSFORM ... DROP <field>`, a different operation
-    /// entirely (issue #228 decision 2; issues #241/#242), so a dotted
+    /// entirely, so a dotted
     /// address is a qualified name. [`crate::Trellis::apply`] refuses one that
     /// names no transform while its first half does, as the column address it
     /// reads as.
@@ -248,8 +247,7 @@ impl fmt::Display for DefinitionRef {
     }
 }
 
-/// `ALTER TRANSFORM <target> <clause>[, <clause> ...]` (ADR-0015, issues
-/// #241/#242).
+/// `ALTER TRANSFORM <target> <clause>[, <clause> ...]` (ADR-0015).
 ///
 /// `target` is the registered transform's target table, bare or
 /// `<schema>.<table>`, as [`DefinitionRef::Transform`] takes it: an edit acts
@@ -276,7 +274,7 @@ pub enum AlterClause {
 
 /// The target table's primary-key space (see `docs/transforms.md#granularity`).
 ///
-/// [`KeySpace::Aggregate`] (issue #11's groundwork) is a `GROUP BY <cols>`
+/// [`KeySpace::Aggregate`] is a `GROUP BY <cols>`
 /// definition, whose target's primary key is the grouping columns rather
 /// than an inherited source column. [`KeySpace::Join`] is the same over the
 /// join of two tables.
@@ -291,8 +289,8 @@ pub enum KeySpace {
     Aggregate {
         group_by: Vec<String>,
     },
-    /// `FROM a [LEFT|INNER] JOIN b ON <equi-join> GROUP BY <keys>` (ADR-0019,
-    /// epic #1091): an aggregate over the join of two tables.
+    /// `FROM a [LEFT|INNER] JOIN b ON <equi-join> GROUP BY <keys>` (ADR-0019):
+    /// an aggregate over the join of two tables.
     Join(JoinSpec),
 }
 
@@ -366,9 +364,9 @@ pub enum Expr {
     /// A numeric literal, kept as the source text so the evaluator picks
     /// the numeric type/precision rather than the parser.
     NumberLiteral(String),
-    /// A single-quoted string literal (issue #63).
+    /// A single-quoted string literal.
     StringLiteral(String),
-    /// A **typed literal** (issue #109): a constant of a Postgres type that
+    /// A **typed literal**: a constant of a Postgres type that
     /// has no literal syntax of its own in this grammar, spelled either
     /// `<type> '<text>'` (Postgres's typed-literal form — `DATE '2024-01-01'`)
     /// or `CAST('<text>' AS <type>)`. Both spellings build *this* node,
@@ -388,14 +386,13 @@ pub enum Expr {
     /// canonical Postgres output spelling. See
     /// [`super::typed_literal::TYPED_LITERALS`] for why both restrictions exist.
     ///
-    /// Issue #109 typed this field as a [`PgType`], since the allowlist then
-    /// held only passthrough families. Issue #112 widened it to a full
-    /// [`ValueType`] so `REAL '1.5'` / `CAST('1.5' AS double precision)` can
+    /// `value_type` is a full [`ValueType`] (not a bare [`PgType`]) so
+    /// `REAL '1.5'` / `CAST('1.5' AS double precision)` can
     /// produce a first-class [`ValueType::Float`] — floats need this grammar
     /// because Postgres gives them no bare literal syntax at all
     /// (`pg_typeof(1.5)` is `numeric`).
     TypedLiteral { value_type: ValueType, text: String },
-    /// A source column named through the `FROM` table (issue #830):
+    /// A source column named through the `FROM` table:
     /// `<table>.<column>` or `<schema>.<table>.<column>`. It always reads the
     /// source column, never a calculated field of the same name, which is how
     /// a definition reads a column that a field's name shadows (a bare name
@@ -420,7 +417,7 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
-    /// A `name(args)` function call (issue #64) — the first function-call
+    /// A `name(args)` function call — the first function-call
     /// syntax the grammar accepts. `name` is the uppercased canonical form
     /// looked up in [`super::registry::FUNCTIONS`]; arity and argument types
     /// are checked against that same registry entry, not hardcoded here.
@@ -428,12 +425,12 @@ pub enum Expr {
     /// In an [`KeySpace::Aggregate`] definition, `name` may instead be one of
     /// `SUM`/`MIN`/`MAX`/`AVG` (looked up in
     /// [`super::registry::AGGREGATE_FUNCTION_SPECS`]) with a single orderable
-    /// argument (issue #120 generalized `MIN`/`MAX` past `Numeric` to any
+    /// argument (`MIN`/`MAX` accept any
     /// type with a real Postgres ordering — see
     /// [`super::registry::aggregate_result_type`]), or `COUNT` with either an
-    /// empty `args` (`COUNT(*)` row-counting, issue #75 — `*` is not itself
+    /// empty `args` (`COUNT(*)` row-counting — `*` is not itself
     /// an expression, so this is the one arity-0 shape) or a single argument
-    /// of any type (`COUNT(<expr>)`, issue #120 — counts non-null
+    /// of any type (`COUNT(<expr>)` — counts non-null
     /// occurrences of `<expr>`, a different semantic from `COUNT(*)`).
     /// There's no separate AST node for aggregate calls, since they're
     /// syntactically identical `name(args)` calls, just resolved against a
@@ -441,29 +438,28 @@ pub enum Expr {
     FunctionCall { name: String, args: Vec<Expr> },
 }
 
-/// The value type a column or expression carries (issue #63). `Text` and
+/// The value type a column or expression carries. `Text` and
 /// `Boolean` are plumbed through so columns of those types can be declared
-/// and passed through a calculated field; issue #64 added `Text`-argument
-/// functions, and issue #65 adds the `>` comparison operator, the first
+/// and passed through a calculated field; `Text`-argument
+/// functions exist, and the `>` comparison operator is the first
 /// operator whose result type differs from its operands' (`Numeric,
-/// Numeric -> Boolean`). `Uuid` (issue #79) is narrower still: it's
+/// Numeric -> Boolean`). `Uuid` is narrower still: it's
 /// representable, comparable, and passthrough-able (including as an
 /// aggregate `GROUP BY` key), but has no arithmetic/regex operations the way
 /// `Numeric`/`Text` do — there's no real-world use for `uuid + uuid`, so
 /// [`super::registry`] never grants it an operator or function.
 ///
-/// [`ValueType::Other`] (issue #108) widens this from a 4-bucket lattice to
+/// [`ValueType::Other`] widens this from a 4-bucket lattice to
 /// an open one: any Postgres type the [`super::pg_type`] OID registry
 /// recognizes as a distinct family, but that hasn't yet earned its own
 /// first-class variant here, carries its [`PgType`] tag instead of silently
 /// collapsing into `Text` the way it used to. Per `docs/type-support.md`,
 /// it's passthrough-only — [`super::registry`] grants it no operator or
 /// function, [`super::validate`] rejects it as a key/predicate/computed
-/// target — until the type family's own epic child (#109, #111–#122)
-/// promotes it to a real variant with real semantics. This issue's job is
-/// only to stop lying about what the column is, not to add those semantics.
+/// target — until the type family is promoted to a real variant with real semantics.
+/// `Other` only says truthfully what the column is; it adds no semantics.
 ///
-/// [`ValueType::Integer`] (issue #111) is the first such promotion, and the
+/// [`ValueType::Integer`] is the first such promotion, and the
 /// first variant whose payload means something other than "this family is
 /// still opaque": `smallint`/`integer`/`bigint` used to *share*
 /// [`ValueType::Numeric`] with `numeric`/`real`/`double precision`, which
@@ -475,7 +471,7 @@ pub enum Expr {
 /// why `oid` deliberately stays an `Other(PgType::Oid)` instead of joining
 /// this family.
 ///
-/// [`ValueType::Float`] (issue #112) is the second promotion and finishes
+/// [`ValueType::Float`] is the second promotion and finishes
 /// the job: `real`/`double precision` were the last two types still sharing
 /// [`ValueType::Numeric`] with `numeric` itself, despite being fixed-width
 /// *binary* floats with their own arithmetic (inexact, non-associative,
@@ -517,7 +513,7 @@ impl ValueType {
     }
 
     /// Whether this is *any* numeric type — [`Self::is_exact_numeric_family`]
-    /// widened with [`ValueType::Float`] (issue #112).
+    /// widened with [`ValueType::Float`].
     ///
     /// This is the admissibility set for `+`, `>` and the four aggregates,
     /// because Postgres admits a float operand everywhere it admits an
@@ -551,7 +547,7 @@ impl fmt::Display for ValueType {
 /// An operator accepted by the expression grammar; see [`super::registry`]
 /// for the list the parser validates against and the evaluator reuses.
 /// [`Operator::Add`] is `Numeric, Numeric -> Numeric`; [`Operator::GreaterThan`]
-/// (issue #65) is `Numeric, Numeric -> Boolean`, matching Postgres's `>` on
+/// is `Numeric, Numeric -> Boolean`, matching Postgres's `>` on
 /// `numeric` exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operator {

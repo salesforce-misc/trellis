@@ -1,4 +1,4 @@
-//! `self_check` of an aggregate target on the group basis (#1104, ADR-0013
+//! `self_check` of an aggregate target on the group basis (ADR-0013
 //! "Scope", `super::group_basis`).
 //!
 //! One page is a keyset page of groups, by the `GROUP BY` columns
@@ -662,7 +662,7 @@ fn diff_groups(
     (all.len() as i64, page_end, divergences)
 }
 
-/// Groups and aggregate results compared by value (#1297, ADR-0020): pages
+/// Groups and aggregate results compared by value (ADR-0020): pages
 /// read from real tables, no definition and no waiting.
 #[cfg(test)]
 mod tests {

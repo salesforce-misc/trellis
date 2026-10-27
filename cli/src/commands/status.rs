@@ -145,7 +145,7 @@ fn format_poisoned(poisoned: &[trellis::PoisonEntry]) -> String {
     let mut out = format!("Quarantined source rows: {}\n", poisoned.len());
     // The transform, table and key are quoted for a POSIX shell where they
     // need it (`release::shell_quote`), so each pastes into `trellis
-    // release` as the engine reports it (#842). The error is only read, so
+    // release` as the engine reports it. The error is only read, so
     // it keeps Rust's escaping, which holds it on one line.
     for entry in poisoned {
         out.push_str(&format!(
@@ -191,9 +191,9 @@ fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> St
                 def.status.as_str(),
                 format_timestamp(def.created_at)
             );
-            // Issues #461 and #616: a failing backfill is retried after a
+            // A failing backfill is retried after a
             // backoff, narrowed to the key that fails it, or charged until
-            // the definition pauses (#625 F4). While it fails, this line is
+            // the definition pauses. While it fails, this line is
             // where the error, attempts and next attempt show; the status
             // alone still reads `backfilling`.
             if let Some(failure) = &def.backfill_failure {
@@ -205,7 +205,7 @@ fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> St
                     failure.last_error
                 ));
             }
-            // Issue #663: the drain halted on it, so it stays paused until
+            // The drain halted on it, so it stays paused until
             // the cause is fixed and it is resumed.
             if let Some(halt) = &def.halt {
                 line.push_str(&format!(
@@ -228,11 +228,11 @@ fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> St
             for node in &warnings.correcting {
                 line.push_str(&format_correcting(node));
             }
-            // #1167: a source index the target's `self_check` pages by.
+            // A source index the target's `self_check` pages by.
             for gap in &warnings.source_index_gaps {
                 line.push_str(&format_source_index_gap(gap));
             }
-            // #1208: why a `live` definition reads `catching_up`: it reads
+            // Why a `live` definition reads `catching_up`: it reads
             // a paused column of an upstream target, and resuming that column
             // writes through to it.
             if !warnings.paused_upstream_columns.is_empty() {
@@ -241,7 +241,7 @@ fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> St
                     warnings.paused_upstream_columns.join(", ")
                 ));
             }
-            // #1112: a JOIN's hidden tables and the size of its partials.
+            // A JOIN's hidden tables and the size of its partials.
             if let Some(join) = &warnings.join {
                 line.push_str(&format_join(join));
             }
@@ -810,7 +810,7 @@ mod tests {
     }
 
     /// A held key that needs quoting round-trips from `status`'s listing to
-    /// `release`'s arguments through a real POSIX shell (#842).
+    /// `release`'s arguments through a real POSIX shell.
     #[test]
     fn a_held_key_pastes_from_status_into_release_unchanged() {
         for entry in [
@@ -836,8 +836,7 @@ mod tests {
     /// A key with control characters in it, as every composite key has
     /// (its columns' separator, U+001F) and a NULL column's sentinel
     /// (U+0001) adds, is printed without them raw, and still round-trips:
-    /// through bash, which reads the `$'...'` words they're written as
-    /// (#842).
+    /// through bash, which reads the `$'...'` words they're written as.
     #[test]
     fn a_composite_or_control_character_key_pastes_from_status_into_release_unchanged() {
         for key in [

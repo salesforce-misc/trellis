@@ -1,4 +1,4 @@
-//! The segment lifecycle's legal-transition graph (issue #9, stage 03) —
+//! The segment lifecycle's legal-transition graph (stage 03) —
 //! see the `stateDiagram-v2` in
 //! docs/staging-and-claiming/03-sealing-and-the-fence.md.
 //!

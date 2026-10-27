@@ -1,10 +1,10 @@
-//! Typed-literal grammar for calculated fields (issue #109).
+//! Typed-literal grammar for calculated fields.
 //!
 //! # What this unlocks
 //!
 //! Before this module, a calculated-field expression could only *spell* a
 //! `Numeric` (`1.5`) or a `Text` (`'hi'`) constant. Every other family the
-//! OID registry recognizes ([`PgType`], issue #108) was passthrough-only:
+//! OID registry recognizes ([`PgType`]) was passthrough-only:
 //! `SELECT created AS created` copied a `date` through, but nothing in the
 //! grammar could produce a `date` that wasn't already sitting on a source
 //! column. `docs/type-support.md` calls that the gap between role 1
@@ -45,8 +45,7 @@
 //!   worth very little today, since [`super::registry`] grants
 //!   [`ValueType::Other`] no operator or function at all — the only operands
 //!   a general cast could have are a column or another literal. Each type
-//!   family's own epic child (#113 temporal, #114 `bytea`, #115 `jsonb`)
-//!   decides its own cast pairs; [`super::error::ParseError::UnsupportedCast`]
+//!   family decides its own cast pairs; [`super::error::ParseError::UnsupportedCast`]
 //!   says so by name.
 //!
 //! # Why the literal text must be canonical
@@ -122,14 +121,11 @@ pub struct TypedLiteralSpec {
     /// [`ValueType`] and hence its target column's Postgres type
     /// (`super::ddl::pg_type_name`).
     ///
-    /// Issue #109 declared this a [`PgType`], because every family in the
-    /// allowlist then was a passthrough `ValueType::Other`. Issue #112
-    /// widened it to a full [`ValueType`] — exactly the follow-up this
-    /// module's "which families are in the allowlist" note predicted —
-    /// because `real`/`double precision` are a first-class
-    /// [`ValueType::Float`] *and* have no bare literal syntax of their own
-    /// (`pg_typeof(1.5)` is `numeric`, not `double precision`), so they are
-    /// the first type that both needs this grammar and isn't an `Other`.
+    /// It is a full [`ValueType`], not just a [`PgType`], because
+    /// `real`/`double precision` are a first-class [`ValueType::Float`]
+    /// *and* have no bare literal syntax of their own (`pg_typeof(1.5)` is
+    /// `numeric`, not `double precision`), so they both need this grammar
+    /// and aren't an `Other`.
     pub value_type: ValueType,
     /// Checks the literal's text is in this family's canonical Postgres
     /// output spelling, returning a human-readable description of the
@@ -138,20 +134,20 @@ pub struct TypedLiteralSpec {
     pub canonical: fn(&str) -> Result<(), &'static str>,
 }
 
-/// The type keywords a typed literal may name (issue #109).
+/// The type keywords a typed literal may name.
 ///
-/// Scoped to the families issue #109 names as its motivating cases
+/// Scoped to the motivating cases
 /// (`date`/`timestamp`/`bytea`) — enough to prove the mechanism end-to-end
 /// across the three shapes it has to handle: a plain calendar value, a value
 /// with optional sub-second precision, and a binary value whose canonical
 /// text is an escape-prefixed hex string. Promoting a family here is
 /// deliberately *not* the same as fully supporting it: each family's own
-/// epic child (#113, #114) still owns its join-key, primary-key and
+/// epic child still owns its join-key, primary-key and
 /// aggregate roles.
 ///
 /// Families held back, and why:
 ///
-/// * **`jsonb`** (#115) — `jsonb_in`/`jsonb_out` are genuinely `IMMUTABLE`,
+/// * **`jsonb`** — `jsonb_in`/`jsonb_out` are genuinely `IMMUTABLE`,
 ///   so the volatility bar is met, but the *canonical form* bar is not
 ///   reachable here. Postgres stores `jsonb` parsed, not as text, and
 ///   `jsonb_out` re-renders it: object keys are re-sorted by length and then
@@ -159,11 +155,10 @@ pub struct TypedLiteralSpec {
 ///   2}`), duplicate keys collapse to the last, and numbers are renormalized
 ///   (`1e3` renders as `1000`). Checking a literal is already in that form
 ///   means implementing `jsonb_in` + `jsonb_out` in Rust — a real `jsonb`
-///   value model, which is #115's job and which it needs anyway for
-///   `jsonb_agg`. Adding `jsonb` here afterwards is one row in this table
-///   plus that canonicalizer.
-/// * **`timestamptz`** (#113, #246) — value comparison is immutable, and
-///   *text rendering* now is too: issue #246 pins `TimeZone = 'UTC'` on
+///   value model, which `jsonb` needs anyway for `jsonb_agg`. (See the
+///   note on `jsonb` below for how the allowlist handles it.)
+/// * **`timestamptz`** — value comparison is immutable, and
+///   *text rendering* now is too: Trellis pins `TimeZone = 'UTC'` on
 ///   every connection Trellis opens and in every capture function (see
 ///   [`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`]), which is what let
 ///   `timestamptz` join the join/`GROUP BY`/primary-key and `MIN`/`MAX`
@@ -172,13 +167,12 @@ pub struct TypedLiteralSpec {
 ///   typed literal here additionally needs its own canonical-form checker
 ///   (this module's narrower "one spelling, checked without a live
 ///   connection" bar — see `canonical_time`/`canonical_timetz` for what
-///   that looks like for a sibling family), which #246 did not write. Adding
+///   that looks like for a sibling family), which does not exist yet. Adding
 ///   one is a natural follow-up, not a reopened investigation — `timetz`'s
 ///   playbook (require a fully-numeric offset, canonicalize the way
 ///   `timestamptz_out` does under the now-pinned `TimeZone`) is the
-///   template — but it is new code this module doesn't have today, so it
-///   stays out of #246's scope.
-/// * **`interval`** (#113) — the one temporal family that stays out, and
+///   template — but it is new code this module doesn't have today.
+/// * **`interval`** — the one temporal family that stays out, and
 ///   for an *input*-side reason the other five don't have: `interval_in`
 ///   reads `IntervalStyle`, so the same literal text parses to different
 ///   values on different servers. `'-1 2:03:04'` is `-1 days +02:03:04`
@@ -189,10 +183,10 @@ pub struct TypedLiteralSpec {
 ///   explicitly cannot help with, since a definition installed against one
 ///   server must stay correct when read on another — is therefore
 ///   unreachable for `interval` without also pinning an input GUC, which
-///   Trellis does not do. (`interval`'s *output* side is fine: #113 pins
+///   Trellis does not do. (`interval`'s *output* side is fine: Trellis pins
 ///   `IntervalStyle` and `crate::temporal::Interval::render` reproduces the
 ///   `postgres` spelling exactly, which is what `SUM(interval)` needs.)
-/// * **`bit`** (fixed-length) — decided by #118, and permanently excluded,
+/// * **`bit`** (fixed-length) — permanently excluded,
 ///   not merely waiting: Postgres's *default* typmod for a `bit` literal
 ///   cast with no explicit length is `bit(1)`, and [`render_sql`] always
 ///   emits the bare, unmodified type name — `'101'::bit` truncates to
@@ -206,7 +200,7 @@ pub struct TypedLiteralSpec {
 ///   `validate::reject_unsupported_group_by_key_type`'s `VarBit` arm for
 ///   the `GROUP BY` key role's version of it.
 ///
-/// `jsonb` (issue #115) *is* in the allowlist below now, despite an earlier
+/// `jsonb` *is* in the allowlist below now, despite an earlier
 /// version of this doc comment predicting otherwise. `jsonb_in`/`jsonb_out`
 /// are `IMMUTABLE` (`pg_proc.provolatile`), clearing bar 1 as before. Bar 2
 /// (canonical form) turns out to need only a *checker*, not the
@@ -218,7 +212,7 @@ pub struct TypedLiteralSpec {
 /// module's doc comment for the full live evidence, including the
 /// `jsonb_agg`/key-role findings this same investigation produced.
 ///
-/// `inet`, `cidr`, `macaddr` and `macaddr8` (issue #116) *are* in the
+/// `inet`, `cidr`, `macaddr` and `macaddr8` *are* in the
 /// allowlist below now, each clearing both bars: `inet_in`/`cidr_in`/
 /// `macaddr_in`/`macaddr8_in` and their `_out` counterparts are all
 /// `IMMUTABLE` (checked against `pg_proc.provolatile`, the same check
@@ -230,16 +224,15 @@ pub struct TypedLiteralSpec {
 /// lowercase colon-grouped spelling for the other two
 /// (`crate::netaddr::canonical_macaddr`/`canonical_macaddr8`).
 /// * **`smallint`, `integer`, `bigint`** — these *do* have literal syntax of
-///   their own since issue #111, and it is Postgres's own: a bare `5` is
+///   their own, and it is Postgres's own: a bare `5` is
 ///   `integer` and a bare `3000000000` is `bigint`, exactly as
 ///   `pg_typeof(5)` reports, so `INTEGER '5'` would be a second spelling of
 ///   something already spellable. A `smallint` constant is the one gap — it
-///   has no bare spelling in Postgres either. Issue #112 did the widening
-///   that gap was waiting on ([`TypedLiteralSpec::value_type`] is a full
-///   [`ValueType`] now), so closing it is a one-row change plus a canonical
-///   checker; it is left to a #111 follow-up rather than smuggled in here.
+///   has no bare spelling in Postgres either. [`TypedLiteralSpec::value_type`]
+///   is a full [`ValueType`], so closing it is a one-row change plus a
+///   canonical checker; it is not done here.
 ///
-/// `oid` (#111) and `real`/`double precision` (#112) *are* in the allowlist
+/// `oid` and `real`/`double precision` *are* in the allowlist
 /// below. The floats are there out of necessity rather than convenience:
 /// unlike the integers, a float constant has **no** bare spelling in
 /// Postgres at all — `select pg_typeof(1.5)` is `numeric` and
@@ -266,7 +259,7 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         value_type: ValueType::Other(PgType::Bytea),
         canonical: canonical_bytea,
     },
-    // Issue #113. `time_out` and `timetz_out` are the only two output
+    // `time_out` and `timetz_out` are the only two output
     // functions in the temporal block `pg_proc` marks **IMMUTABLE**
     // outright — `date_out`, `timestamp_out`, `timestamptz_out` and
     // `interval_out` are all `STABLE` — and they read no GUC at all,
@@ -287,7 +280,7 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         value_type: ValueType::Other(PgType::TimeTz),
         canonical: canonical_timetz,
     },
-    // Issue #111. `oid` clears both bars this module sets easily: `oidin`
+    // `oid` clears both bars this module sets easily: `oidin`
     // and `oidout` are `IMMUTABLE` (no session state, no relative
     // spellings), and `oid_out`'s canonical form is plain unsigned decimal,
     // which needs no normalizer to check.
@@ -296,7 +289,7 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         value_type: ValueType::Other(PgType::Oid),
         canonical: canonical_oid,
     },
-    // Issue #112. `float4in`/`float8in` and `float4out`/`float8out` are all
+    // `float4in`/`float8in` and `float4out`/`float8out` are all
     // `IMMUTABLE` (checked against `pg_proc.provolatile`), and the canonical
     // form is whatever `float4out`/`float8out` emits — which
     // `crate::float::render` reproduces exactly, so the checkers below are
@@ -311,7 +304,7 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         value_type: ValueType::Float(FloatWidth::Float8),
         canonical: canonical_float8,
     },
-    // Issue #116. Canonical form is `network_show`'s (`<col>::text`'s)
+    // Canonical form is `network_show`'s (`<col>::text`'s)
     // always-explicit-netmask spelling, not `inet_out`'s host-elided one —
     // see `crate::netaddr`'s module doc for why those two differ and which
     // one every other renderer this engine uses actually produces.
@@ -339,7 +332,7 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         value_type: ValueType::Other(PgType::MacAddr8),
         canonical: crate::netaddr::canonical_macaddr8,
     },
-    // Issue #118. `varbit_in`/`varbit_out` are `IMMUTABLE` and read no GUC
+    // `varbit_in`/`varbit_out` are `IMMUTABLE` and read no GUC
     // (verified against `pg_proc.provolatile`), and `bit varying`'s bare
     // (no explicit length) default is genuinely unconstrained — unlike
     // fixed-length `bit`, whose bare default of `bit(1)` is why it is *not*
@@ -352,7 +345,7 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         value_type: ValueType::Other(PgType::VarBit),
         canonical: canonical_varbit,
     },
-    // Issue #115. `jsonb_in`/`jsonb_out` are `IMMUTABLE`, and
+    // `jsonb_in`/`jsonb_out` are `IMMUTABLE`, and
     // [`crate::jsonb::canonical_jsonb`] is the canonical-form checker — see
     // this module's "which families are in the allowlist" note and
     // `crate::jsonb`'s own module doc for the live evidence.
@@ -387,8 +380,8 @@ pub fn lookup_typed_literal(keyword: &str) -> Option<&'static TypedLiteralSpec> 
 ///
 /// Quote-escaping is the same `''` doubling the `Text` arms use. Backslashes
 /// need no escaping: `crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` pins
-/// `standard_conforming_strings` to `on` on every session Trellis opens
-/// (issue #672), so `'\x0102'` is six literal characters — which is exactly
+/// `standard_conforming_strings` to `on` on every session Trellis opens,
+/// so `'\x0102'` is six literal characters — which is exactly
 /// what a canonical `bytea` literal has to be.
 pub fn render_sql(value_type: ValueType, text: &str) -> String {
     format!(
@@ -421,7 +414,7 @@ fn canonical_float(text: &str, width: FloatWidth) -> Result<(), &'static str> {
 }
 
 /// Plain unsigned decimal in `0 ..= 4294967295`, the spelling `oid_out`
-/// emits (issue #111).
+/// emits.
 ///
 /// `oid` is Postgres's *unsigned* 32-bit identifier: `oid_out` never emits a
 /// sign, never pads, and never emits a leading zero, so a canonical literal
@@ -533,7 +526,7 @@ fn canonical_bytea(text: &str) -> Result<(), &'static str> {
 }
 
 /// A run of only `'0'`/`'1'` characters (any length, including empty) — the
-/// spelling `varbit_out` emits (issue #118). Unlike every temporal/`bytea`
+/// spelling `varbit_out` emits. Unlike every temporal/`bytea`
 /// checker above, there is no relative/session-dependent spelling to reject
 /// (`varbit_in` is `IMMUTABLE`, not `STABLE`) and no separate "canonical vs.
 /// merely parseable" gap to close: every string of `0`s and `1`s `varbit_in`
@@ -618,7 +611,7 @@ fn canonical_timetz(text: &str) -> Result<(), &'static str> {
     //
     // So a zero *minutes* field is canonical whenever the seconds field is
     // non-zero — `+05:00:30` is exactly what Postgres prints, and rejecting
-    // it (as this did before the #113 review) refuses a literal the user
+    // it refuses a literal the user
     // could read straight out of a `select`. The rule is therefore about
     // the *tail*, not about each field independently: seconds may appear
     // only if non-zero, and minutes only if minutes or seconds is.
@@ -765,8 +758,8 @@ mod tests {
 
     /// The allowlist may only hold types that genuinely have no bare
     /// literal syntax of their own in this grammar — every passthrough
-    /// [`ValueType::Other`] family (issue #109) plus the two floats (issue
-    /// #112, whose bare spelling `1.5` is `numeric` in Postgres). A type
+    /// [`ValueType::Other`] family plus the two floats
+    /// (whose bare spelling `1.5` is `numeric` in Postgres). A type
     /// with a bare spelling (`Numeric`, `Text`, `Integer`) must never gain a
     /// row, or one constant would have two syntaxes.
     #[test]

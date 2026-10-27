@@ -1,4 +1,4 @@
-//! The staging worker's capture reconcile pass (#622 C5).
+//! The staging worker's capture reconcile pass.
 //!
 //! Every reconcile pass of the maintenance loop brings each table's capture
 //! triggers to what the catalog needs, one table at a time, before the builds
@@ -11,8 +11,8 @@
 //!   uninstalled.
 //!
 //! First, the pass pauses every definition that reads a table in a
-//! partition or inheritance hierarchy, which it can't capture (#707,
-//! [`crate::staging::schema_change::pause_readers_in_hierarchy`]), and leaves
+//! partition or inheritance hierarchy, which it can't capture
+//! ([`crate::staging::schema_change::pause_readers_in_hierarchy`]), and leaves
 //! that table's capture as it is. Define refuses such a table, but it can
 //! join a hierarchy later, or be dropped and recreated as one.
 //!
@@ -24,50 +24,50 @@
 //! ([`super::complement`], P7).
 //!
 //! Before it regenerates a table's functions, the pass pauses every
-//! definition that reads a column the table no longer has (#622 C6,
-//! [`crate::staging::schema_change::pause_readers_of_missing`]), or reads a
-//! table whose row-level security now applies to Trellis's role (#745), or
-//! that a logical-replication subscription now replicates into (#751)
+//! definition that reads a column the table no longer has
+//! ([`crate::staging::schema_change::pause_readers_of_missing`]), or reads a
+//! table whose row-level security now applies to Trellis's role, or
+//! that a logical-replication subscription now replicates into
 //! ([`crate::staging::schema_change::pause_readers_of_unsupported`]), and
 //! leaves the table for the next pass. Those last two checks also run on
 //! each table another definition targets, which the pass doesn't capture
 //! (the target-mutation seam feeds it) but its readers still read. There the
 //! pass also pauses the definition that writes the target when its
 //! row-level security now applies to the worker's role, which would filter
-//! the writes (#765).
+//! the writes.
 //!
 //! It also pauses every definition one of whose key columns on the table
 //! (its source key, a `GROUP BY` key, a `JOIN`'s join column) now has a type
 //! or collation define would refuse, or changed type in a way that renders
 //! the keys already stored differently, or that created a column, typed from one the table widened, that can't hold
-//! the type define would give it now (#760, #767, #824,
-//! [`crate::staging::schema_change::pause_readers_of_retyped`]). Only an
+//! the type define would give it now
+//! ([`crate::staging::schema_change::pause_readers_of_retyped`]). Only an
 //! integer or float width outgrows such a column: Trellis creates it with
 //! no type modifier (ADR-0020). That check runs on the seam-fed tables too. It compares a
 //! definition's typed copies with the live schema only when something it
 //! reads has changed since the last comparison found them all current: the
 //! pass fingerprints those tables' columns once, before any check
-//! ([`crate::staging::drift_memo`], #858).
+//! ([`crate::staging::drift_memo`]).
 //!
 //! Last, it compares the table's read columns with the baseline the last
-//! install, widen, narrow or pass recorded (#703, `capture::baseline`): a
+//! install, widen, narrow or pass recorded (`capture::baseline`): a
 //! column dropped and re-added, retyped other than by a pure widening, or
 //! whose values a same-type `ALTER ... TYPE ... USING` rewrote. It rebuilds
 //! the table's applying readers as `Trellis::request_backfill` would, or
 //! pauses a definition the change may have left invalid.
 //!
 //! Before any of that, the pass resumes each definition an upstream's resume
-//! paused, once that upstream is `live` (#828, #970,
-//! [`crate::staging::quarantine::resume_caused_definitions`]), and finishes
-//! every resume left waiting on it to re-type Trellis's copies (#767,
-//! [`crate::staging::quarantine::finish_requested_resumes`]), so a re-type
+//! paused, once that upstream is `live`
+//! ([`crate::staging::quarantine::resume_caused_definitions`]), and finishes
+//! every resume left waiting on it to re-type Trellis's copies
+//! ([`crate::staging::quarantine::finish_requested_resumes`]), so a re-type
 //! the first step requests is done in the same pass.
 //!
 //! # Never waiting on `apply`'s path
 //!
 //! Defining a transform only registers it. Installing and widening take a
 //! lock on the application's table, which waits out every holder (an
-//! autovacuum included; nothing here cancels a backend, #622 plan Q1), so
+//! autovacuum included; nothing here cancels a backend), so
 //! they only run here, in the background. A pass spends at most its
 //! `deadline` retrying locked tables. The first attempt on each table always
 //! runs, so a table whose lock is held doesn't stop another's join: it only
@@ -75,7 +75,7 @@
 //! Its [`LockWait`] is recorded in `capture_holdups`, where
 //! [`crate::Trellis::status`], in any process, reports it on each definition
 //! it keeps waiting. So is the error of a table whose capture fails for
-//! another reason (no primary key, a failed statement, #687). Each pass
+//! another reason (no primary key, a failed statement). Each pass
 //! rewrites that table: a table it brings current, or no longer captures,
 //! loses its row.
 //!
@@ -157,16 +157,16 @@ pub async fn reconcile(
     desired: &[String],
     deadline: Instant,
 ) -> Result<PassOutcome, CaptureError> {
-    // #970: a definition paused by its upstream's re-type resumes once that
+    // A definition paused by its upstream's re-type resumes once that
     // upstream is live; a re-type that requests is done by the next call.
-    // #767: a resume left waiting on re-typed copies is finished first, so
+    // A resume left waiting on re-typed copies is finished first, so
     // this pass's snapshot sees the ones it completes as waiting.
     //
-    // #1205: before any resume, and before any table is looked at: a logical
+    // Before any resume, and before any table is looked at: a logical
     // restore pauses every definition and discards the ring, so nothing below
     // acts on the original database's records.
     super::restore::detect(client).await?;
-    // #1204, #1242: a type renamed or moved to another schema keeps its OID
+    // A type renamed or moved to another schema keeps its OID
     // and its values. Each definition recorded the OID beside the name, so
     // its name is re-recorded wherever Trellis casts by it, and the key-type
     // checks below find the name current. After the restore check, which
@@ -178,7 +178,7 @@ pub async fn reconcile(
             "a renamed type's new name could not be recorded; retrying next pass: {err}"
         );
     }
-    // #1241: an enum value relabelled (`RENAME VALUE`) pauses every reader of
+    // An enum value relabelled (`RENAME VALUE`) pauses every reader of
     // its type, whose staged changes and keys name the old label. After the
     // restore check too, and before the resumes below, so a resume finishing
     // in this pass is never one the relabel should have stopped. A failure
@@ -198,14 +198,14 @@ pub async fn reconcile(
         .get(0);
     let instance = instance_key(&database, schema);
     let instance = instance.as_str();
-    // #858: read before any check, so a change that commits during the pass
+    // Read before any check, so a change that commits during the pass
     // is checked again by the next one (`staging::drift_memo`).
     let drift =
         crate::staging::drift_memo::Fingerprints::read(&*client, schema, &snapshot.catalog).await?;
     let mut outcome = PassOutcome::default();
 
     for table in desired {
-        // #999: a table some definition reads that is gone from its name
+        // A table some definition reads that is gone from its name
         // (dropped, renamed away, moved to another schema) pauses its readers;
         // a resume re-validates them against whatever is there then.
         match super::triggers::pause_readers_of_gone_table(client, &snapshot.catalog, table).await {
@@ -216,7 +216,7 @@ pub async fn reconcile(
                 continue;
             }
         }
-        // #707: a table that joined a partition or inheritance hierarchy
+        // A table that joined a partition or inheritance hierarchy
         // after define, or was recreated as one, can't be captured: its
         // readers pause, and its capture is left as it is.
         //
@@ -259,8 +259,8 @@ pub async fn reconcile(
                 continue;
             }
         }
-        // #745: row-level security that applies to Trellis's role filters
-        // every read of the table, and #751: a subscription's changes to it
+        // Row-level security that applies to Trellis's role filters
+        // every read of the table, and a subscription's changes to it
         // are never captured, so its readers pause, whatever capture does.
         match crate::staging::schema_change::pause_readers_of_unsupported(
             client,
@@ -277,7 +277,7 @@ pub async fn reconcile(
                 continue;
             }
         }
-        // #707: capture triggers or functions changed outside Trellis pause
+        // Capture triggers or functions changed outside Trellis pause
         // the table's readers, and nothing is reinstalled until a resume.
         match super::triggers::check(client, schema, &snapshot.catalog, table).await {
             Ok(false) => {}
@@ -287,7 +287,7 @@ pub async fn reconcile(
                 continue;
             }
         }
-        // #622 C6: a definition that reads a column the table no longer has
+        // A definition that reads a column the table no longer has
         // pauses before the table's functions are regenerated, whether or
         // not a write has marked it yet. The next pass's catalog no longer
         // counts it.
@@ -309,7 +309,7 @@ pub async fn reconcile(
                 continue;
             }
         }
-        // #760, #767: a key column whose type or collation define would
+        // A key column whose type or collation define would
         // refuse now, a join pair that no longer matches, a type change that
         // renders the stored keys differently, or a widening past a typed
         // copy pauses the definitions it concerns. After the missing-column
@@ -331,7 +331,7 @@ pub async fn reconcile(
                 continue;
             }
         }
-        // #703 R1, R3b: a read column dropped and re-added, retyped, or
+        // A read column dropped and re-added, retyped, or
         // its values rewritten in place, since the last pass. Its readers
         // rebuild, or pause where their definition may no longer be valid.
         match super::baseline::check(client, schema, &snapshot.catalog, table).await {
@@ -399,11 +399,11 @@ pub async fn reconcile(
     }
 
     let desired_set: HashSet<&String> = desired.iter().collect();
-    // #745, #751: a table another definition targets isn't in `desired` (the
+    // A table another definition targets isn't in `desired` (the
     // seam feeds it, not a trigger), but its readers read it as the
     // worker's role all the same (not the ring's owner: no capture function
     // reads it), and the seam doesn't see a subscription's writes to it
-    // either. #765: and the definition that targets it writes it as the
+    // either. And the definition that targets it writes it as the
     // worker's role, so row-level security that applies to that role pauses
     // the writer. This loop runs over every target, read or not. A seam-fed
     // table whose check pauses a definition, or fails, isn't current for
@@ -435,7 +435,7 @@ pub async fn reconcile(
                 continue;
             }
         }
-        // #760, #767: a chained definition's key columns and typed copies
+        // A chained definition's key columns and typed copies
         // are checked on its source target too, which a resume upstream can
         // re-type.
         match crate::staging::schema_change::pause_readers_of_retyped(
@@ -538,7 +538,7 @@ struct Snapshot {
     targets: HashSet<String>,
 }
 
-/// The disruption half of a capture pass (#707, #999), alone and on the
+/// The disruption half of a capture pass, alone and on the
 /// caller's connection: for each of `desired`, pauses the readers of a table
 /// that is gone from its name or whose capture triggers or functions were
 /// changed outside Trellis, exactly as [`reconcile`] does, and installs and
@@ -546,8 +546,8 @@ struct Snapshot {
 /// earlier pass already paused the readers of).
 ///
 /// A test helper calls it after a fixture load so that the readers are
-/// paused when it returns, instead of at the staging worker's next pass
-/// (#1181). It is safe beside a running worker: a pause is recorded once per
+/// paused when it returns, instead of at the staging worker's next pass.
+/// It is safe beside a running worker: a pause is recorded once per
 /// definition.
 pub async fn detect_disruptions(
     client: &mut Client,
@@ -556,7 +556,7 @@ pub async fn detect_disruptions(
 ) -> Result<Vec<String>, CaptureError> {
     let snapshot = read_snapshot(client).await?;
     let mut found = Vec::new();
-    // #1205: a logical restore pauses every definition.
+    // A logical restore pauses every definition.
     if super::restore::detect(client).await? {
         found.extend(desired.iter().cloned());
         return Ok(found);
@@ -595,7 +595,7 @@ async fn read_snapshot(client: &mut Client) -> Result<Snapshot, CaptureError> {
     txn.commit().await?;
     let mut waiting = Vec::with_capacity(rows.len());
     for row in rows {
-        // #1107: a JOIN's joined table is read like its source.
+        // A JOIN's joined table is read like its source.
         let others: BTreeSet<String> = row.get::<_, Option<String>>(2).into_iter().collect();
         waiting.push((row.get(0), row.get(1), others));
     }
@@ -616,7 +616,7 @@ fn ready_definitions(
 ) -> Vec<i64> {
     let desired: HashSet<&String> = desired.iter().collect();
     // A table another definition targets is fed by the seam: nothing to
-    // capture, unless this pass held it back (`seam_held`, #745). Any other
+    // capture, unless this pass held it back (`seam_held`). Any other
     // table not in `desired` is read by a definition registered after the
     // pass read `desired` (which it does before the snapshot), so nothing
     // captures it yet.
@@ -903,7 +903,7 @@ mod tests {
 
     #[test]
     fn a_seam_fed_table_the_pass_held_back_holds_its_readers() {
-        // #745: row-level security applies to the target another definition
+        // Row-level security applies to the target another definition
         // reads, as its source or its JOIN table.
         let mut snap = snapshot(&[
             (1, "public.target", &[]),

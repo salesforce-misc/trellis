@@ -69,7 +69,7 @@ pub async fn settle_builds(pool: &crate::pool::Pool) {
     crate::staging::build::settle_builds(pool).await;
 }
 
-/// Test harness (#625 F8a, F6): records a `live` definition whose target is
+/// Test harness: records a `live` definition whose target is
 /// `table` (a schema-qualified identity, as `transform_definitions` holds
 /// it), feeding it from a table named `<table>__feed` that doesn't exist.
 /// Nothing runs that definition; it makes `table` read as another
@@ -127,7 +127,7 @@ pub(crate) async fn enumerate_and_append(
     let from = format!("{}.{}", quote_ident(schema), quote_ident(table));
     // The table's row-identity key as `ddl` defines it: its `PRIMARY KEY`,
     // or, for an aggregate target (which has none), the `UNIQUE NULLS NOT
-    // DISTINCT` grouping columns (issue #308).
+    // DISTINCT` grouping columns.
     let key_cols = crate::defs::ddl::identity_key_columns(txn, src_table).await?;
     if key_cols.is_empty() {
         return Err(IntakeError::NoIdentityKey {

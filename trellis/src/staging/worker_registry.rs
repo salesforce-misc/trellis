@@ -1,4 +1,4 @@
-//! Worker registry (issue #144; docs/decisions/0010-embeddable-clients.md,
+//! Worker registry (docs/decisions/0010-embeddable-clients.md,
 //! decision 3): a row per live [`Client`](crate::client::Client)
 //! process/connection running with `drain_threads > 0` (application
 //! workers), independent of whether it currently holds any claim.

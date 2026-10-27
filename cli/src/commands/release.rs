@@ -52,7 +52,7 @@ Options:
   -h, --help                 Print this help and exit.
 ";
 
-/// `text` as one word of a shell command line (#842). It's bare when every
+/// `text` as one word of a shell command line. It's bare when every
 /// character is one no POSIX shell, bash or zsh treats specially anywhere in
 /// a word (letters, digits and `_-.,:/@+`; not `=`, which zsh expands at a
 /// word's start, nor `%` or `~`). Otherwise it's inside single quotes, where

@@ -1,4 +1,4 @@
-//! The drain's halt (#663): what a [`FailureClass::Halting`] failure parks.
+//! The drain's halt: what a [`FailureClass::Halting`] failure parks.
 //!
 //! A halting failure is structural, not one row's fault: a key the drain
 //! can't use (`NoPrimaryKey`, `UnsupportedPrimaryKeyType`), a propagation
@@ -22,7 +22,7 @@
 //! Each is paused like a capture failure (`capture_failures`, with `kind`
 //! `halt`). Its rows then drain with the page: a paused definition's share is
 //! dropped, and a table with no reader that isn't frozen is skipped
-//! (`apply::source_key_for_apply`, #768), so the page commits, its claims
+//! (`apply::source_key_for_apply`), so the page commits, its claims
 //! are marked drained and its segments retire. Resuming a definition is the
 //! rebuild it is for any pause (`quarantine::resume_transform`).
 //!
@@ -31,7 +31,7 @@
 //! stop. A peer that met the same failure, or a retry that meets it again,
 //! finds the closure already frozen and records nothing.
 //!
-//! # A refused read or write (issue #766)
+//! # A refused read or write
 //!
 //! Every Trellis session runs with `row_security = off`
 //! ([`crate::pool::ROW_SECURITY_OFF`]), so a statement that row-level
@@ -126,8 +126,8 @@ pub async fn halt_closure(pool: &Pool, err: &ApplyError) -> Result<Vec<String>, 
     Ok(paused)
 }
 
-/// [`halt_closure`] for a Re-derive build's start (issue #986,
-/// `staging::build::start_ready_builds`): a start that failed in a way no
+/// [`halt_closure`] for a Re-derive build's start
+/// (`staging::build::start_ready_builds`): a start that failed in a way no
 /// retry gets past (its ledger table was dropped, say) pauses the
 /// definition writing `target` and everything downstream of its target, with
 /// kind `halt`, so one definition's failure doesn't stop the pass's other
@@ -221,7 +221,7 @@ async fn pause_closure(
     Ok(paused)
 }
 
-/// A table the drain's role was refused (issue #766), found by [`refusals`].
+/// A table the drain's role was refused, found by [`refusals`].
 struct Refusal {
     /// The readers of the table, or the writer of the target.
     seed: Seed,
@@ -423,7 +423,7 @@ mod tests {
         Seed::Tables(tables.iter().map(|t| t.to_string()).collect())
     }
 
-    /// A truncate with no `lsn` (#774) halts every definition reading the
+    /// A truncate with no `lsn` halts every definition reading the
     /// truncated table.
     #[test]
     fn a_truncate_without_an_lsn_seeds_its_table() {
@@ -510,7 +510,7 @@ mod tests {
         );
     }
 
-    /// Issue #766: what a `42501` halt seeds from, read off the catalog as the
+    /// What a `42501` halt seeds from, read off the catalog as the
     /// drain's own role. A source it can't select from seeds its readers; a
     /// target it can't write, or whose policies apply to it, seeds its
     /// writer; a table whose schema it can't use is named as such. A column

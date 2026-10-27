@@ -1,6 +1,6 @@
-//! The Client runtime (issue #11's runtime increment): the one thing an
+//! The Client runtime: the one thing an
 //! embedder starts to get a live Trellis pipeline — capture-trigger
-//! installation (issue #622), ring maintenance (seal/recover/reclaim), and N
+//! installation, ring maintenance (seal/recover/reclaim), and N
 //! application workers draining sealed batches into target tables.
 //!
 //! [`Client::start`] spawns one dedicated `std::thread` owning its own
@@ -20,7 +20,7 @@
 //!   runs, each independently claiming and draining sealed batches. Zero is
 //!   legal: a staging-only client stages and seals but drains nothing.
 //!
-//! **Which tables to capture** (issue #427, ADR-0002, issue #622): the
+//! **Which tables to capture** (ADR-0002): the
 //! staging worker derives them from the catalog alone
 //! ([`defs::tables_to_capture`]), at startup and on every reconcile pass
 //! ([`capture::reconcile`]). There is no caller-supplied list: a table's
@@ -36,7 +36,7 @@
 //! `LISTEN/NOTIFY` channel
 //! a seal actually completing
 //! (`staging::seal_if_active_nonempty`/`staging::recover_stuck_seals`, issue
-//! #271 — the transition that makes a batch claimable, as opposed to the
+//! The transition that makes a batch claimable, as opposed to the
 //! others in this list, which fire when rows merely land in the *active*
 //! segment), and [`super::staging::apply::drain_once`]'s own
 //! downstream-propagation `pg_notify` all wake — and the same name every
@@ -127,11 +127,11 @@ pub struct ClientOptions {
     /// that fails is retried on the next tick.
     pub housekeeping_interval: Duration,
     /// How often the maintenance loop re-derives the desired source-table
-    /// set from the catalog (issue #14) and re-runs the capture reconcile
+    /// set from the catalog and re-runs the capture reconcile
     /// (`capture::reconcile`) and the start of the builds it readies
     /// against it — so a transform registered while the client runs gets
     /// captured and backfilled without a restart, and a table whose last
-    /// reader was dropped loses its capture triggers (issue #427). Coarser
+    /// reader was dropped loses its capture triggers. Coarser
     /// than `maintenance_interval` by default: unlike seal/reclaim, this does
     /// a catalog query and (when a table is newly read) a `CREATE TRIGGER`,
     /// neither of which needs sub-second freshness.
@@ -171,12 +171,12 @@ pub struct ClientOptions {
     /// listener down the worker polls every `poll_interval`. Set equal to
     /// `poll_interval` to turn the backoff off.
     ///
-    /// The `self_check` job worker backs off the same way (#1075): a queued
+    /// The `self_check` job worker backs off the same way: a queued
     /// job announces itself on the work channel, and a job a dead worker left
     /// `running` is found within this past its reclaim TTL.
     pub idle_wake_cap: Duration,
-    /// The most folded records one drain batch holds at once (issue #620,
-    /// ADR-0002): a segment share larger than this drains in pages of at most
+    /// The most folded records one drain batch holds at once
+    /// (ADR-0002): a segment share larger than this drains in pages of at most
     /// this many, each its own compute-and-apply transaction, so a worker's
     /// memory is bounded by this cap rather than by how large a segment grew
     /// (a backlog built while seal was refused).
@@ -193,7 +193,7 @@ pub struct ClientOptions {
     /// headroom under the server's `max_connections`: without it, an
     /// oversized share fails to connect, is released, and retries each poll.
     pub drain_batch_cap: usize,
-    /// Source rows per Re-derive build chunk (#625 Q4), read by the drain
+    /// Source rows per Re-derive build chunk, read by the drain
     /// worker that runs a build's plan job. Defaults to
     /// `staging::build::DEFAULT_CHUNK_ROWS`. Zero is treated as one.
     pub build_chunk_rows: i64,
@@ -204,7 +204,7 @@ pub struct ClientOptions {
     /// anything. The cap is per client: two clients in one process each build
     /// a runtime of this size, and no budget is shared between them.
     pub worker_threads: Option<usize>,
-    /// Retries held quarantine keys automatically (#861): the staging worker
+    /// Retries held quarantine keys automatically: the staging worker
     /// releases each once its backoff is up, on the housekeeping cadence
     /// ([`Self::housekeeping_interval`]). `None` (the default) retries
     /// nothing. See [`TrellisOptions::held_key_retry`](crate::TrellisOptions::held_key_retry).
@@ -526,7 +526,7 @@ impl Client {
         Self::start_with_config(Config::from_dsn(dsn.into())?, options)
     }
 
-    /// [`Client::start`]'s instance-aware form (issue #234): starts a client
+    /// [`Client::start`]'s instance-aware form: starts a client
     /// against an already-resolved [`Config`], so the client runs in *that*
     /// config's schema (`docs/instance-identity.md`) rather than whatever a
     /// process-global `TRELLIS_SCHEMA` happens to say.
@@ -548,7 +548,7 @@ impl Client {
     ///   topology for one cluster — one process-global environment variable
     ///   cannot carry two different schemas.
     ///
-    /// Found by `generative/tests/two_instance_noise.rs` (issue #234's
+    /// Found by `generative/tests/two_instance_noise.rs` (the
     /// two-instance side-by-side property), which is also its regression
     /// coverage.
     ///
@@ -640,7 +640,7 @@ mod client_runtime_tests {
     use super::{ClientOptions, client_runtime};
     use crate::instance_log::Current;
 
-    /// Issue #874: the maintenance loop, the drain workers, the heartbeat
+    /// The maintenance loop, the drain workers, the heartbeat
     /// and the wake listener are tasks on the client's runtime, and they log
     /// under its instance from whichever worker or blocking thread runs them.
     #[test]
@@ -664,7 +664,7 @@ mod client_runtime_tests {
         assert_eq!(blocking, "app/tenant_a");
     }
 
-    /// Issue #873: a running client sets its instance's gauges again on a
+    /// A running client sets its instance's gauges again on a
     /// timer, so the recorder's idle timeout drops only a stopped instance's.
     /// A client with no staging worker and no drain workers never touches the
     /// database, so this needs none. The timeout only bounds a failure.
@@ -716,7 +716,7 @@ mod client_runtime_tests {
 /// for shutdown before stopping them.
 async fn run(
     dsn: String,
-    // Issue #234: resolved by the caller ([`Client::start_with_config`]) and
+    // Resolved by the caller ([`Client::start_with_config`]) and
     // passed in, rather than re-resolved from the process environment here —
     // see that constructor's doc comment for the two bugs the old
     // `Config::from_dsn(dsn)` on this line caused.
@@ -769,10 +769,10 @@ async fn run(
         )));
     }
 
-    // Unique across processes and restarts (issue #756): see `new_worker_id`.
+    // Unique across processes and restarts: see `new_worker_id`.
     let client_id = new_worker_id();
 
-    // Issue #144, ADR-0010 decision 3: register this process in the
+    // ADR-0010 decision 3: register this process in the
     // worker registry the moment it starts running drain workers — before
     // any app-worker task is even spawned, so a health check racing
     // `Client::start` sees this worker as soon as it's real. Deliberately
@@ -823,7 +823,7 @@ async fn run(
     }
 
     // The process's one worker-registry heartbeat and chunk-reclaim sweep
-    // (#1013, #273): see `worker_upkeep_loop`. A staging-only client has no
+    // see `worker_upkeep_loop`. A staging-only client has no
     // workers to be alive for, so it runs none.
     let upkeep_task = (options.application_threads > 0).then(|| {
         let pool = pool.clone();
@@ -837,7 +837,7 @@ async fn run(
         ))
     });
 
-    // #1023: `self_check` jobs run beside the drain workers, never in their
+    // `self_check` jobs run beside the drain workers, never in their
     // loop (see `self_check_loop`), wherever drain workers run.
     if options.application_threads > 0 {
         app_worker_tasks.push(tokio::spawn(self_check_loop(
@@ -898,7 +898,7 @@ async fn run(
         let _ = task.await;
     }
 
-    // Issue #144: clean-shutdown removal, once every app-worker task this
+    // Clean-shutdown removal, once every app-worker task this
     // process registered under `client_id` has actually stopped — the
     // counterpart to the registration above. An unclean shutdown (a crash,
     // `kill -9`, or a dropped `Client` that never reaches this point at all)
@@ -913,8 +913,8 @@ async fn run(
     }
 }
 
-/// Sets the instance's gauges again every `interval` until shutdown
-/// (issue #873). Spawned onto the client's runtime, whose threads carry the
+/// Sets the instance's gauges again every `interval` until shutdown.
+/// Spawned onto the client's runtime, whose threads carry the
 /// instance name the gauges are labeled with.
 async fn gauge_refresh_loop(interval: Duration, mut shutdown_rx: watch::Receiver<bool>) {
     loop {
@@ -931,7 +931,7 @@ async fn gauge_refresh_loop(interval: Duration, mut shutdown_rx: watch::Receiver
 /// `trellis-[{host}-]{pid}-{random}`, with 64 random bits as 16 hex digits.
 ///
 /// It must be unique across every process sharing the database, and across
-/// restarts of one process (issue #756). A claim is "mine" by `claimed_by`
+/// restarts of one process. A claim is "mine" by `claimed_by`
 /// alone: `held_share` hands a drain every `seg_claims` row carrying its
 /// `claimed_by`, and each page's claim check and completion `delete` match on
 /// it, as do the chunk queue's `ClaimFence` and `finish_chunk`. Two workers
@@ -988,7 +988,7 @@ fn worker_id(host: Option<&str>, pid: u32, random: u64) -> String {
 mod worker_id_tests {
     use super::*;
 
-    /// Issue #756: the old id was a function of the calling thread alone, so
+    /// The old id was a function of the calling thread alone, so
     /// two processes starting a `Client` from the same-numbered thread got
     /// the same one. Two ids minted on one thread stand in for them: they
     /// must differ, and so must every `claimed_by` derived from them.
@@ -1035,7 +1035,7 @@ mod worker_id_tests {
 // ---------------------------------------------------------------------
 
 /// Takes the staging-worker singleton and runs one capture reconcile pass
-/// ([`capture::reconcile::reconcile`], issue #622 C5) and starts the build
+/// ([`capture::reconcile::reconcile`]) and starts the build
 /// of every definition the pass finds ready.
 ///
 /// Returns the [`ProducerSession`] that holds the singleton. The
@@ -1049,8 +1049,8 @@ mod worker_id_tests {
 /// missing primary key) doesn't fail the start: the pass logs it, and every
 /// maintenance pass tries again.
 ///
-/// A pass that fails as a whole releases the singleton before this returns
-/// (#687), as the maintenance loop does when it stops. Dropping the session
+/// A pass that fails as a whole releases the singleton before this returns,
+/// as the maintenance loop does when it stops. Dropping the session
 /// would free it only once the server noticed the closed connection, so a
 /// client restarted at once could fail with `ProducerAlreadyRunning`.
 async fn setup_staging(
@@ -1088,7 +1088,7 @@ async fn first_capture_pass(
 }
 
 /// Releases the keys a capture pass asked for when it followed a renamed
-/// type (#1204, [`staging::quarantine::release_retyped_keys`]). A failure is logged, and
+/// type ([`staging::quarantine::release_retyped_keys`]). A failure is logged, and
 /// the next pass tries again: the requests stay until their keys are
 /// released.
 async fn release_retyped_keys(pool: &Pool) {
@@ -1100,8 +1100,8 @@ async fn release_retyped_keys(pool: &Pool) {
     }
 }
 
-/// Retries the keys the completion of an upstream build asked for (#1306,
-/// [`staging::quarantine::release_upstream_rebuilt_keys`]). A failure is
+/// Retries the keys the completion of an upstream build asked for
+/// ([`staging::quarantine::release_upstream_rebuilt_keys`]). A failure is
 /// logged, and the next pass tries again: the requests stay until their keys
 /// are released.
 async fn release_upstream_rebuilt_keys(pool: &Pool) {
@@ -1113,8 +1113,8 @@ async fn release_upstream_rebuilt_keys(pool: &Pool) {
     }
 }
 
-/// Finishes any column pause's cascade that didn't complete (#912,
-/// [`staging::quarantine::complete_pause_cascades`]). A walk that fails is
+/// Finishes any column pause's cascade that didn't complete
+/// ([`staging::quarantine::complete_pause_cascades`]). A walk that fails is
 /// logged there, and the next pass tries again: a pause stays marked until
 /// its cascade reaches every dependent. Only a failure to read the marks
 /// reaches here.
@@ -1172,8 +1172,8 @@ struct MaintenanceConfig {
 }
 
 /// Runs seal-on-demand, stuck-seal recovery, stale-claim reclaim,
-/// drained-segment retirement (stage 06, issue #13/#58), and — on its own,
-/// coarser cadence — capture/backfill re-reconciliation (issue #14) on a
+/// drained-segment retirement, and — on its own,
+/// coarser cadence — capture/backfill re-reconciliation on a
 /// fixed tick until shutdown. Rides only with the staging worker (see the
 /// module doc comment) — application-only clients never run this, since
 /// sealing/recovery/reclaim/retirement/reconciliation are ring-wide
@@ -1181,8 +1181,7 @@ struct MaintenanceConfig {
 ///
 /// Holds one dedicated connection across ticks (reconnecting lazily on
 /// error) rather than opening a fresh one every tick. That connection is a
-/// [`ProducerSession`]: it holds the staging-worker singleton (issue #622
-/// C5), and a reconnect takes it again. While another session holds it (this
+/// [`ProducerSession`]: it holds the staging-worker singleton, and a reconnect takes it again. While another session holds it (this
 /// worker's previous backend, until the server notices it is gone, or another
 /// staging worker that took over), the reconnect fails and is retried every
 /// tick.
@@ -1277,7 +1276,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                     failed = failures.check("reclaim_stale_chunks", reclaimed).is_err();
                 }
                 if !failed {
-                    // Issue #144: table hygiene for `worker_registry` after an
+                    // Table hygiene for `worker_registry` after an
                     // unclean shutdown elsewhere in the fleet — a crashed
                     // drain-only client's row would otherwise sit forever.
                     // `staging::has_live_workers` never depends on this having
@@ -1296,7 +1295,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                     failed = failures.check("reclaim_stale_workers", reclaimed).is_err();
                 }
                 if !failed {
-                    // Issue #756: the same hygiene for `drainers`. Worker ids are
+                    // The same hygiene for `drainers`. Worker ids are
                     // unique per process start, so a restarted or crashed
                     // process's drainer rows would otherwise sit forever. Kept at
                     // least a drainer window, so no row a claim still counts goes.
@@ -1328,7 +1327,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                     }
                 }
                 if !failed && let Some(policy) = &held_key_retry {
-                    // #861: its own pool connections, and a failure is logged
+                    // Its own pool connections, and a failure is logged
                     // and tried again at the next housekeeping, not a reason
                     // to reconnect this session.
                     if let Err(err) =
@@ -1384,7 +1383,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
 
 /// One staging-worker reconcile pass, exactly as the maintenance loop runs it
 /// ([`reconcile_source_tables`]), for tests that step the staging worker by
-/// hand (issue #622 C5). The error is the pass's, as text.
+/// hand. The error is the pass's, as text.
 #[cfg(feature = "internals")]
 pub async fn reconcile_pass(
     client: &mut tokio_postgres::Client,
@@ -1410,7 +1409,7 @@ async fn release_singleton(session: Option<ProducerSession>) {
 
 /// How long one [`reconcile_source_tables`] pass spends retrying capture
 /// installs, widens and uninstalls on tables whose lock is held (ADR-0002
-/// I6, issue #622 C5). Each attempt waits at most
+/// I6). Each attempt waits at most
 /// `locks::USER_TABLE_DDL_LOCK_TIMEOUT` (50 ms) for the table, so no
 /// application writer queues behind one for longer. The first attempt on
 /// each table always runs, so one blocked table can't starve another. The
@@ -1463,7 +1462,7 @@ impl HousekeepingSchedule {
 /// failing tick after tick. The ticks in between log at `debug`.
 const STEP_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Issue #408: reports [`maintenance_loop`]'s step failures, which it used
+/// Reports [`maintenance_loop`]'s step failures, which it used
 /// to discard. Every step is retried, so a failure is worth a `warn` but not
 /// a flood of them: the loop ticks every `maintenance_interval` (300ms by
 /// default), and a database outage fails the connect on every one. So each
@@ -1539,7 +1538,7 @@ impl StepFailures {
 /// keeps recurring. The occurrences in between log at `debug`.
 const DRAIN_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Issue #660: reports [`app_worker_loop`]'s failed drain calls, which it
+/// Reports [`app_worker_loop`]'s failed drain calls, which it
 /// used to release and retry without a word. A drain error is worth a
 /// `warn`, but a wedged segment fails the same way on every tick (the
 /// 200ms poll floor by default), and a drain that can't get a connection
@@ -1671,7 +1670,7 @@ enum ReconcileError {
     Catalog(CatalogError),
     Intake(IntakeError),
     Capture(CaptureError),
-    /// Starting a Re-derive build failed (#625 F2).
+    /// Starting a Re-derive build failed.
     Build(ApplyError),
 }
 
@@ -1710,15 +1709,15 @@ impl From<IntakeError> for ReconcileError {
     }
 }
 
-/// Issue #14: re-derives the desired source-table set from the catalog
+/// Re-derives the desired source-table set from the catalog
 /// ([`defs::tables_to_capture`]), brings every table's capture triggers to
-/// it ([`capture::reconcile::reconcile`], issue #622 C5), and starts the
+/// it ([`capture::reconcile::reconcile`]), and starts the
 /// build of every newly registered definition whose capture is now current
 /// ([`staging::build::start_ready_builds`]). Re-run periodically, so a
 /// transform registered while this client runs is picked up without a
 /// restart.
 ///
-/// Issue #427, ADR-0002: the catalog is the only input. A table's capture is
+/// ADR-0002: the catalog is the only input. A table's capture is
 /// uninstalled on the first pass after its last reader is dropped, and this
 /// is the only place that happens: a `DROP` removes catalog rows and nothing
 /// more.
@@ -1752,7 +1751,7 @@ async fn reconcile_source_tables(
             "couldn't schedule the queued partition corrections; trying again next pass"
         );
     }
-    // #625 F2/F3: a ready definition's Re-derive build starts here.
+    // A ready definition's Re-derive build starts here.
     staging::build::start_ready_builds(client, pool, &outcome.ready).await?;
     Ok(())
 }
@@ -1830,7 +1829,7 @@ pub async fn restore_gate_closed(pool: &Pool) -> bool {
     restore_pending(pool).await.unwrap_or(true)
 }
 
-/// A drain worker's one check before its first claim (#1249): waits, a poll
+/// A drain worker's one check before its first claim: waits, a poll
 /// interval at a time, while a logical restore is pending. It never responds
 /// to the restore itself; that is the staging pass's job. A check that fails
 /// holds too and is retried the same way; each kind of hold is logged once.
@@ -1935,11 +1934,11 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         // would otherwise cost an upsert, and a worker inside a long drain
         // or build chunk would not come back around to refresh it.
         //
-        // Issue #63 Milestone 2: asks for several segments at once rather
+        // Asks for several segments at once rather
         // than just the lowest one, so a burst of quickly sealing segments
         // (many ready before this worker gets back around to claiming)
         // drains in one coalesced `drain_many` call instead of one full
-        // compute-and-apply pass per segment. Issue #620: as many as fit
+        // compute-and-apply pass per segment. As many as fit
         // `drain_batch_cap` by row count; a segment over the cap comes back
         // alone and pages.
         let seg_seqs = match pool.get().await {
@@ -1951,7 +1950,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
             Ok(seqs) if !seqs.is_empty() => seqs,
             listed => {
                 // No claimable segment this tick (or the lookup itself
-                // failed): build work comes next (#625 B6). Only actually
+                // failed): build work comes next. Only actually
                 // wait if it made no progress — otherwise loop straight
                 // back around without an idle wait.
                 let step = build_step(&pool, &claimed_by, &build_options).await;
@@ -2001,7 +2000,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
             // longer helps, and every tick this worker holds a claim
             // un-refreshed is a tick some other worker can't pick it up.
             // The release reports the buckets it freed, so the log line
-            // (issue #660) can name them.
+            // can name them.
             let released = match pool.get().await {
                 Ok(client) => staging::release_segments(&**client, &seg_seqs, &claimed_by)
                     .await
@@ -2021,7 +2020,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         // them would otherwise be re-selected and spun on hot across every
         // worker with no sleep. Two no-progress cases:
         //   - `Err(_)`: a batch that fails deterministically (a poison
-        //     change); principled quarantine is issue #16.
+        //     change).
         //   - `Ok(None)`: this call won no buckets — every bucket of every
         //     requested segment is already claimed by a peer (or already
         //     drained) — but they're still `draining`, so
@@ -2030,7 +2029,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         // Only `Ok(Some(_))` re-loops immediately, to grab the next batch
         // promptly. The poll floor (or a wake/shutdown) bounds the idle wait.
         let drained = matches!(outcome, Ok(Some(_)));
-        // #625 B6: segments first, for every kind of build work. A worker
+        // Segments first, for every kind of build work. A worker
         // that drained loops straight back to the ring; one that won nothing
         // there takes build work instead.
         let build_progress = !drained
@@ -2062,8 +2061,8 @@ enum BuildStep {
     Waiting,
 }
 
-/// A drain worker's build work for one pass of its loop, after its segments
-/// (#625 B6, global since F3): one step of the Re-derive builds' work
+/// A drain worker's build work for one pass of its loop, after its segments:
+/// one step of the Re-derive builds' work
 /// ([`rederive_build_step`]).
 async fn build_step(
     pool: &Pool,
@@ -2154,11 +2153,11 @@ impl IdleBackoff {
     }
 }
 
-/// The task that runs `self_check` jobs (#1023) in a process that runs drain
+/// The task that runs `self_check` jobs in a process that runs drain
 /// workers: one page per pass ([`self_check_step`]), straight on to the next
 /// while there is one, until shutdown.
 ///
-/// With no job to run it waits like an idle drain worker (#273, #1075): from
+/// With no job to run it waits like an idle drain worker: from
 /// `poll_interval`, doubling up to `idle_wake_cap`, and starting over on
 /// work and whenever the wake listener changes state. A queued job ends the
 /// wait by itself: a `self_check` call inserts the row and the database
@@ -2259,7 +2258,7 @@ async fn self_check_step(
 }
 
 /// One step of the running Re-derive builds' work
-/// ([`staging::build::work_once`], #625 F2), after this worker's segments.
+/// ([`staging::build::work_once`]), after this worker's segments.
 /// Returns whether it did work. A failure of the step itself (not of a chunk,
 /// which `chunk_queue::fail_chunk` records and logs) is logged at
 /// warn and retried on the next pass.
@@ -2351,11 +2350,11 @@ fn upkeep_interval(reclaim_ttl: Duration) -> Duration {
 }
 
 /// A process's worker-registry heartbeat and backfill-chunk reclaim sweep,
-/// run by one task on the client runtime rather than by every drain worker
-/// (#1013, #273). They used to be due-timers inside each worker's loop, so
-/// eight workers upserted one shared row and ran the same sweep every ~405
-/// ms, and a process whose workers were all inside a drain or build chunk
-/// longer than [`staging::DEFAULT_RECLAIM_TTL`] let its row age out and read
+/// run by one task on the client runtime rather than by every drain worker,
+/// since a due-timer inside each worker's loop would make eight workers
+/// upsert one shared row and run the same sweep every ~405 ms, and a process
+/// whose workers were all inside a drain or build chunk longer than
+/// [`staging::DEFAULT_RECLAIM_TTL`] would let its row age out and read
 /// as dead. Both duties are independent of `staging_worker`: a drain-only
 /// fleet has no `maintenance_loop` anywhere to do them.
 ///
@@ -2427,7 +2426,7 @@ async fn drainer_registration_pass(pool: &Pool, workers: &LiveWorkers) {
 /// Waits for a wake notification, the poll-interval floor, or shutdown —
 /// whichever comes first.
 ///
-/// Issue #313: a closed wake channel is *not* a wake. It used to be read as
+/// A closed wake channel is *not* a wake. It used to be read as
 /// one — `recv()` on a closed channel returns `None` immediately — so an idle
 /// worker whose `LISTEN` connection had died looped at full speed with no
 /// sleep at all. [`WakeListener`] now reopens its own connection and never
@@ -2487,8 +2486,7 @@ const WAKE_REOPEN_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// can't be opened in the first place, the task backs off and reopens it
 /// (see [`keep_listening`]); meanwhile the worker polls on its
 /// `poll_interval` floor alone. The channel therefore stays open for as long
-/// as this struct lives, and a dead backend never looks like a wake
-/// (issue #313).
+/// as this struct lives, and a dead backend never looks like a wake.
 ///
 /// Dropping this aborts the task, which drops the connection's
 /// `tokio_postgres::Client` and so closes the connection.
@@ -2510,7 +2508,7 @@ impl WakeListener {
 
     /// Hears the work channel alone: for a worker whose work no seal,
     /// or apply makes claimable, so a steady stream of those would
-    /// only wake it to find nothing (the `self_check` worker, #1075).
+    /// only wake it to find nothing (the `self_check` worker).
     fn spawn_work_only(dsn: String, schema: String) -> Self {
         Self::spawn_on(dsn, schema, None)
     }
@@ -2652,7 +2650,7 @@ async fn open_wake_session(
 
 #[cfg(test)]
 mod wake_listener_tests {
-    //! Issue #313: a dead `LISTEN` connection must neither read as a wake nor
+    //! A dead `LISTEN` connection must neither read as a wake nor
     //! be reopened in a tight loop. Paused-clock tests, no Postgres.
 
     use std::sync::Arc;
@@ -2897,7 +2895,7 @@ mod wake_listener_tests {
 #[cfg(test)]
 pub(crate) mod log_capture {
     //! Captures `tracing` events on the test thread, for the tests that
-    //! assert what a failure logs (issues #325, #408).
+    //! assert what a failure logs.
 
     use std::collections::HashMap;
     use std::sync::{Arc, LazyLock, Mutex};
@@ -2975,7 +2973,7 @@ pub(crate) mod log_capture {
 
 #[cfg(test)]
 mod maintenance_failure_tests {
-    //! Issue #408: [`maintenance_loop`] used to drop every step's error.
+    //! [`maintenance_loop`] used to drop every step's error.
 
     use super::log_capture::{CapturedEvent, install_capture};
     use super::*;
@@ -3128,7 +3126,7 @@ mod maintenance_failure_tests {
         assert_eq!(events[5].fields["failures"], "1", "{events:?}");
     }
 
-    /// Review of #408: the reconcile runs only every `reconcile_interval`,
+    /// The reconcile runs only every `reconcile_interval`,
     /// so the ticks between two failing passes don't run it at all. Those
     /// ticks mustn't count as its recovery, or a reconcile that fails every
     /// pass would log a recovery and a fresh `warn` each pass (every 5s by
@@ -3394,7 +3392,7 @@ mod maintenance_failure_tests {
 
 #[cfg(test)]
 mod drain_failure_tests {
-    //! Issue #660: [`app_worker_loop`] used to release and retry a failed
+    //! [`app_worker_loop`] used to release and retry a failed
     //! drain without logging it.
 
     use super::log_capture::{CapturedEvent, install_capture};
@@ -3711,11 +3709,11 @@ mod option_validation_tests {
 
 #[cfg(test)]
 mod reconcile_tests {
-    //! Issue #427, ADR-0002, restated for trigger capture (issue #622 C5):
+    //! ADR-0002, restated for trigger capture:
     //! the staging worker's reconcile pass is the only thing that installs
     //! or uninstalls capture, and the catalog is its only source of truth for
     //! what to capture. These call [`reconcile_source_tables`] directly
-    //! rather than waiting on a running client (#297).
+    //! rather than waiting on a running client.
     use super::*;
     use crate::capture::install::{Installed, installed};
     use crate::config::DEFAULT_SCHEMA;
@@ -3808,7 +3806,7 @@ mod reconcile_tests {
     }
 
     /// A `setup_staging` whose first capture pass fails releases the
-    /// staging-worker singleton before it returns (#687), so a restart right
+    /// staging-worker singleton before it returns, so a restart right
     /// after doesn't fail with `ProducerAlreadyRunning`. Here the pass can't
     /// read the catalog: the schema has no Trellis tables.
     ///
@@ -3850,8 +3848,8 @@ mod reconcile_tests {
 
     /// The table was registered (and captured) before the worker started.
     /// Dropping its last reader must uninstall its capture on the next pass
-    /// and keep it uninstalled (issue #427's shape: a startup copy of the set
-    /// once re-added a dropped table on every pass).
+    /// and keep it uninstalled (a startup copy of the set
+    /// would re-add a dropped table on every pass).
     #[tokio::test]
     async fn a_pass_after_the_last_reader_drops_uninstalls_the_capture_for_good() {
         let mut f = fixture(&["t"]).await;
@@ -3882,7 +3880,7 @@ mod reconcile_tests {
         );
     }
 
-    /// Issue #427: a staging worker may start with nothing registered, so it
+    /// A staging worker may start with nothing registered, so it
     /// captures nothing. The pass after the first registration must install
     /// the table's capture and start the registration's build in the same
     /// pass, not strand it `waiting_to_backfill`.
@@ -3921,7 +3919,7 @@ mod reconcile_tests {
 
 #[cfg(test)]
 mod wake_channel_tests {
-    //! Issue #875: the default wake channel is derived from the catalog
+    //! The default wake channel is derived from the catalog
     //! schema. No Postgres.
 
     use super::*;
@@ -4049,7 +4047,7 @@ mod work_channel_tests {
             .expect("open");
     }
 
-    /// Issue #1075: the `self_check` worker's listener hears the work channel
+    /// The `self_check` worker's listener hears the work channel
     /// and not the engine's, which every seal and apply notifies: under steady
     /// writes those would wake it several times a second to find no job.
     /// Notifications reach a listener in commit order, so once the work
@@ -4100,7 +4098,7 @@ mod work_channel_tests {
 mod runtime_tests {
     use super::*;
 
-    /// Issue #141: an explicit `Some(n)` must actually cap the runtime's
+    /// An explicit `Some(n)` must actually cap the runtime's
     /// worker-thread count at `n`, not just get accepted and ignored.
     /// `RuntimeMetrics::num_workers` reports the runtime's real worker-thread
     /// count, so this exercises the same `Builder::worker_threads` call
@@ -4118,7 +4116,7 @@ mod runtime_tests {
         }
     }
 
-    /// Issue #141: leaving `worker_threads` at `None` (the default) must
+    /// Leaving `worker_threads` at `None` (the default) must
     /// preserve today's behavior untouched — `tokio`'s own per-core default
     /// — rather than this crate silently substituting some other number.
     /// `tokio` computes that default from `std::thread::available_parallelism`
@@ -4154,7 +4152,7 @@ mod runtime_tests {
         );
     }
 
-    /// Issue #876: the client's own runtime honors
+    /// The client's own runtime honors
     /// [`ClientOptions::worker_threads`]. Before, `Client::start_with_config`
     /// built it with `tokio`'s per-core default whatever the caller set, so a
     /// handle's cap bound only the blocking wrapper's runtime and N handles
@@ -4189,9 +4187,9 @@ mod runtime_tests {
 
 #[cfg(test)]
 mod worker_upkeep_tests {
-    //! #1013, #273: the process's one worker-registry heartbeat and
+    //! The process's one worker-registry heartbeat and
     //! chunk-reclaim sweep. The loop is stepped through its `pass` parameter
-    //! rather than a clock, so none of this waits for a tick (#297). The
+    //! rather than a clock, so none of this waits for a tick. The
     //! tests that start a real `Client` await a trigger's notification of
     //! the client's own write instead of polling for it.
 
@@ -4429,7 +4427,7 @@ mod drainer_registration_tests {
     //! #273: the drain threads' `drainers` rows are refreshed by one task on a
     //! cadence derived from `drainer_window`, not by each thread on every wake.
     //! The cadence is stepped with a paused clock and the pass is called
-    //! directly, so none of this waits for a tick (#297). The tests that start
+    //! directly, so none of this waits for a tick. The tests that start
     //! a real `Client` await a trigger's notification of its writes; the one
     //! negative assertion (no write per wake) ends on a sentinel the test sends
     //! itself.
@@ -4729,7 +4727,7 @@ mod drainer_registration_tests {
 
 #[cfg(test)]
 mod restore_gate_tests {
-    //! #1249: a drain worker checks the logical-restore signal before its
+    //! A drain worker checks the logical-restore signal before its
     //! first claim, through [`app_worker_loop`] itself (the gate's own
     //! answers are tested in `tests/logical_restore.rs`).
 

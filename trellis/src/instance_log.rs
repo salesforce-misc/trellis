@@ -1,4 +1,4 @@
-//! The instance every engine log event names (issue #874, epic #806).
+//! The instance every engine log event names.
 //!
 //! Several handles can share one process and one database, each with its own
 //! catalog schema, and they all log through the one `tracing` facade. Every
@@ -105,7 +105,7 @@ pub(crate) fn enter_thread(name: &Arc<str>) {
 }
 
 /// The current thread's instance name: the label value every metric carries
-/// (`metrics.rs`, issue #873) and the field value every log event carries.
+/// (`metrics.rs`) and the field value every log event carries.
 /// [`UNSCOPED`] on a thread no handle has scoped.
 pub(crate) fn current() -> Arc<str> {
     current_name().unwrap_or_else(|| Arc::from(UNSCOPED))

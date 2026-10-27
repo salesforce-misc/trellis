@@ -3,7 +3,7 @@
 //! method, independent of whichever internal Rust enum variant actually
 //! produced the failure.
 //!
-//! A future FFI boundary (issue #87) needs something with a stable shape to
+//! A future FFI boundary needs something with a stable shape to
 //! match on; a host language reimplementing a `match` over every internal
 //! enum this crate has — and keeps adding — isn't that. [`ErrorCode`] is the
 //! stable shape: a fixed, small set of categories a host language can match
@@ -56,14 +56,14 @@ pub enum ErrorCode {
     /// wider budget, or look at why the engine is behind. Today that's
     /// [`crate::Trellis::await_converged`] exhausting its `timeout`, and
     /// [`crate::Trellis::release_key`] waiting out the lock timeout for the
-    /// drain pages in flight on the key's table (issue #842), which changes
+    /// drain pages in flight on the key's table, which changes
     /// nothing and succeeds on a retry once they commit, and a column pause,
     /// resume, define, `ALTER` or `DROP TRANSFORM` waiting out the lock
-    /// timeout for the column-pause lock (issue #922), which is the same
+    /// timeout for the column-pause lock, which is the same
     /// kind of wait. It is also any public call running out of its deadline
     /// ([`crate::TrellisError::CallTimeout`], issue #599): the server stopped
     /// what the call started and rolled it back. Kept apart from
-    /// `Internal` so a host can tell it from a bug (issue #586). Not every
+    /// `Internal` so a host can tell it from a bug. Not every
     /// timeout is this: a pool checkout timing out before the call's deadline
     /// is `Connectivity`, and any other Postgres statement or lock timeout
     /// that fires before it is classified by its SQLSTATE like any other
@@ -168,7 +168,7 @@ pub(crate) use assert_all_is_every_variant;
 ///
 /// The exception to "a `DbError` reached the server, so it isn't
 /// connectivity" is the server telling us the connection itself is gone or
-/// unavailable (issue #340): SQLSTATE class `08` (connection exception) and
+/// unavailable: SQLSTATE class `08` (connection exception) and
 /// `57P01`/`57P02`/`57P03`/`57P05` (admin shutdown, which is what
 /// `pg_terminate_backend` sends; crash shutdown; cannot connect now; the
 /// server closing a session past `idle_session_timeout`) are
@@ -227,7 +227,7 @@ mod tests {
         assert_eq!(names.len(), ErrorCode::ALL.len());
     }
 
-    /// Issue #340: the server reporting a dead or unavailable connection is
+    /// The server reporting a dead or unavailable connection is
     /// connectivity, whichever connection it happened to.
     #[test]
     fn connection_loss_sqlstates_classify_as_connectivity() {

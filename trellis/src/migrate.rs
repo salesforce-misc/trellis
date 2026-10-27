@@ -51,7 +51,7 @@ use crate::pool::Pool;
 ///
 /// Attaches to one database run one at a time (see
 /// `identity::AttachLock`), and a catalog schema that belongs to another
-/// instance sharing the database is refused (issue #877).
+/// instance sharing the database is refused.
 ///
 /// Deliberately public — a tier-2 composable primitive under ADR-0012, not a
 /// leaked internal. [`crate::Trellis::migrate`] and

@@ -1,4 +1,4 @@
-//! Postgres-backed catalog for transform definitions (issue #23).
+//! Postgres-backed catalog for transform definitions.
 //!
 //! **Schema choice**: a definition is stored as its original source text
 //! (`transform_definitions.definition_text`) rather than a serialized AST.
@@ -7,8 +7,7 @@
 //! serialization format for the same information. The tradeoff is a
 //! re-parse on every read; given definitions are small and read
 //! infrequently relative to the source-row volume they govern, that's the
-//! right side to take the cost on. Flagged in the issue #23 report as the
-//! open question to confirm.
+//! right side to take the cost on.
 //!
 //! Every source table has exactly one monotonically increasing version, in
 //! `source_table_versions`, that definition creation bumps in the same
@@ -19,8 +18,8 @@
 //! v1 definitions are immutable: this module only exposes creation and
 //! read, no update/delete.
 //!
-//! **Source and target identity are both fully-qualified (issues #72/#73,
-//! ADR-0011).** `transform_definitions.source_table`/`target_table` and
+//! **Source and target identity are both fully-qualified
+//! (ADR-0011).** `transform_definitions.source_table`/`target_table` and
 //! `source_table_versions.source_table` hold `def.source`/`def.target`
 //! resolved to their `schema.table` identity exactly once, at
 //! definition-acceptance time (`create_definition_inner`'s
@@ -35,8 +34,8 @@
 //! every `app.rs` read reachable through
 //! `docs/decisions/0003-quarantine-storage-and-api.md`'s
 //! `transform.column` addressing scheme — because their callers only ever
-//! have the bare name that addressing scheme itself accepts (issue #76
-//! taught the *grammar* an explicit `schema.table` spelling for `TRANSFORM`/
+//! have the bare name that addressing scheme itself accepts (the *grammar*
+//! has an explicit `schema.table` spelling for `TRANSFORM`/
 //! `FROM`, but `transform.column` quarantine addressing is a separate,
 //! unrelated syntax this module's own read sites still speak, and it hasn't
 //! grown qualified-target syntax of its own) or because re-exposing the
@@ -46,8 +45,8 @@
 //! `target_table`'s bare table-name suffix via `split_part` rather than the
 //! qualified column directly.
 //!
-//! **`schema_nodes`/`schema_edges` key on qualified identity too (issue
-//! #74, ADR-0011).** `public.posts` and `archive.posts` are distinct nodes
+//! **`schema_nodes`/`schema_edges` key on qualified identity too
+//! (ADR-0011).** `public.posts` and `archive.posts` are distinct nodes
 //! with independent edges — `resolve_node_in_txn`/`resolve_node` and
 //! `reject_if_table_cycle` all require an already-qualified `table_name`
 //! now (see [`resolve_graph_identity_in_txn`]'s doc comment for how a bare
@@ -55,7 +54,7 @@
 //!
 //! **Bare target-table suffixes are still enforced globally unique, just no
 //! longer by `target_table`'s own `unique` constraint.** Qualifying
-//! `target_table` (#73) narrowed that constraint to the qualified spelling
+//! `target_table` narrowed that constraint to the qualified spelling
 //! only, which would otherwise let e.g. `public.foo` and `custom.foo`
 //! coexist as two live definitions — exactly the ambiguity every
 //! `split_part`-based bare-suffix read site above assumes can't happen.
@@ -63,9 +62,9 @@
 //! rejecting a new definition with [`CatalogError::TargetTableSuffixCollision`]
 //! if its qualified target would collide with another live definition's
 //! bare suffix under a different schema — see that check's own comment for
-//! why this stays provisional even now that issue #76's explicit
-//! `schema.table` grammar (and issue #74's graph qualification) have
-//! landed: every bare-suffix reader above is still bare-keyed, so the guard
+//! why this stays provisional even with the explicit
+//! `schema.table` grammar and the graph qualification:
+//! every bare-suffix reader above is still bare-keyed, so the guard
 //! still applies uniformly regardless of whether a colliding target arrived
 //! via explicit qualification or bare resolution. This is now double-enforced,
 //! not merely application-level: `transform_definitions_target_suffix_idx`
@@ -116,9 +115,9 @@ use super::validate::{
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum CatalogError {
-    /// The source text failed to parse (issue #22's grammar).
+    /// The source text failed to parse.
     Parse(ParseError),
-    /// The parsed definition failed validation (issue #23).
+    /// The parsed definition failed validation.
     Validate(ValidationError),
     /// Acquiring a connection or running a query against Postgres failed.
     Db(tokio_postgres::Error),
@@ -139,7 +138,7 @@ pub enum CatalogError {
     /// dropped between resolving it and a later check that reads it.
     SourceTableNotFound(String),
     /// A table a definition names exists, but the role
-    /// Trellis connects as can't use it (issue #933): it lacks `USAGE` on the
+    /// Trellis connects as can't use it: it lacks `USAGE` on the
     /// table's schema, holds no privilege on the table itself (it neither
     /// owns it nor inherits a role that does), or both. Postgres's name
     /// resolution and `information_schema` hide such a table, so without this
@@ -155,7 +154,7 @@ pub enum CatalogError {
         lacks_table_privilege: bool,
     },
     /// A 1-1 definition's source was given another row-identity key after
-    /// define (issues #687, #708): its target is keyed by the old one, so a
+    /// define: its target is keyed by the old one, so a
     /// resume can't rebuild into it. `revalidate` refuses it; the repair
     /// is to restore the key, or to drop the definition and define it again.
     SourceKeyChanged {
@@ -166,7 +165,7 @@ pub enum CatalogError {
         source_key: Vec<String>,
     },
     /// A `GROUP BY` or `JOIN` target's source lacks the index its `self_check`
-    /// walk pages by (#1167, `super::source_index`). Refused by define and by
+    /// walk pages by (`super::source_index`). Refused by define and by
     /// a whole-transform resume, unless the definition says `WITHOUT SOURCE
     /// INDEX`; `self_check` refuses it later too. The message names each
     /// table and columns and a `create index` to run.
@@ -175,7 +174,7 @@ pub enum CatalogError {
         missing: Vec<super::source_index::SourceIndex>,
     },
     /// A definition's ledger table doesn't exist, though define creates one
-    /// for every 1-1 definition (#986). Only Trellis writes its
+    /// for every 1-1 definition. Only Trellis writes its
     /// tables, so an operator dropped it; the build's `start` reads it and
     /// fails, and the apply writes into it. `check_ledger_table` refuses it,
     /// and Trellis doesn't re-create the table: the repair is to drop the
@@ -192,7 +191,7 @@ pub enum CatalogError {
     /// re-create the table: the repair is to drop the definition and define
     /// it again.
     TargetTableMissing { target: String },
-    /// A definition's target schema is a Trellis catalog schema (#979): this
+    /// A definition's target schema is a Trellis catalog schema: this
     /// instance's own (`own`), which target tables stay out of so they can't
     /// collide with Trellis's tables, or a schema holding another instance's
     /// `trellis_instance` table. The target and a 1-1 target's ledger would
@@ -217,23 +216,22 @@ pub enum CatalogError {
     /// some other still-persisted definition already uses — e.g.
     /// `public.foo` alongside `custom.foo`, most plausibly from
     /// `Config::target_schema` changing between deploys and a `TRANSFORM
-    /// ... TARGET foo` being redeclared under it. Issue #73 made
-    /// `transform_definitions.target_table` store the qualified spelling, so
+    /// ... TARGET foo` being redeclared under it.
+    /// `transform_definitions.target_table` stores the qualified spelling, so
     /// `target_table text not null unique` (the catalog migration)
-    /// only enforces uniqueness of *that* spelling now, not the bare suffix
-    /// it used to store outright — checked and rejected here, in
+    /// only enforces uniqueness of *that* spelling, not the bare suffix
+    /// — checked and rejected here, in
     /// `create_definition_inner`, rather than at any individual read site,
     /// because every `split_part(target_table, '.', 2)`-keyed reader
     /// (`definition_by_target`, `app.rs`'s status/quarantine polls,
     /// `generative`'s `unsettled_definitions`) assumes that suffix is
     /// globally unique and has no way to safely cope with two definitions
     /// colliding under it — see this variant's `Display` message for the
-    /// operator-facing explanation. (`dependents_of` used to be bare-suffix-
-    /// keyed here too, but issue #74 qualified its join — see that
-    /// function's own doc comment — so it's no longer in this list.)
+    /// operator-facing explanation. (`dependents_of` joins on the qualified
+    /// name, so it's not in this list.)
     ///
-    /// Double-enforced as of the reviewer follow-up to issue #73: this
-    /// application-level pre-check is still the primary path (it reports a
+    /// Double-enforced: this
+    /// application-level pre-check is the primary path (it reports a
     /// clean, typed error naming both spellings — see
     /// `docs/decisions/0008-public-api-design.md` on why that beats a raw
     /// Postgres unique-violation for callers), but it only ever sees its own
@@ -247,16 +245,15 @@ pub enum CatalogError {
     /// field's own doc comment) rather than letting it surface as a raw
     /// [`CatalogError::Db`].
     ///
-    /// Still provisional even now that issue #76 has landed the grammar's
+    /// Still provisional even with the grammar's
     /// explicit `schema.table` spelling: an operator *can* now write
     /// `TRANSFORM custom.foo FROM ...` to unambiguously address `custom.foo`
     /// as distinct from `public.foo`, but every bare-suffix reader named
-    /// above is still bare-suffix-keyed pending issue #74's migration of the
-    /// whole graph to qualified identity — so this variant is still raised
+    /// above is still bare-suffix-keyed — so this variant is still raised
     /// for an explicitly-qualified target exactly as it is for a
     /// resolved-bare one (the check it backs has no branch on how the target
     /// was qualified, only on the final qualified string and bare suffix);
-    /// only issue #74 (or a different addressing scheme) can relax this.
+    /// only a different addressing scheme can relax this.
     ///
     /// Raised from two different places, both folding into this one variant
     /// since callers only need one type to match on: `create_definition_inner`'s
@@ -281,7 +278,7 @@ pub enum CatalogError {
         existing: Option<String>,
     },
     /// Registering this definition would create its target table, but a
-    /// relation with that qualified name already exists (issue #440): a user
+    /// relation with that qualified name already exists: a user
     /// table, view, materialized view, foreign table, or another Trellis
     /// definition's target. Trellis never adopts a table it didn't create —
     /// the user's schema belongs to the user (ADR-0005), and `DROP` drops a
@@ -291,7 +288,7 @@ pub enum CatalogError {
         /// The qualified `schema.table` spelling that already exists.
         table: String,
     },
-    /// Issue #376: the definition's source would be captured by triggers,
+    /// The definition's source would be captured by triggers,
     /// but they can't key that table's changes (see `change_keyed`): it
     /// has no primary key, or isn't a plain table (a partitioned table, say).
     /// The case that motivated this is another Trellis instance's aggregate
@@ -303,15 +300,15 @@ pub enum CatalogError {
     /// (`super::partition_tree::PartitionRefusal`; every message names the
     /// column or the limit).
     PartitionedSource(super::partition_tree::PartitionRefusal),
-    /// Issue #745: row-level security on a table the definition reads
+    /// Row-level security on a table the definition reads
     /// (its source, or a `JOIN`'s joined table) applies to a role Trellis
     /// reads the table as, so its policies would filter Trellis's reads
-    /// (see `super::row_security`). Or (issue #765) row-level security on
+    /// (see `super::row_security`). Or row-level security on
     /// its newly created target applies to the session's role, which would
     /// filter Trellis's writes (`super::row_security::RowSecurity::target`).
     /// Not supported.
     RowSecurityApplies(super::row_security::RowSecurity),
-    /// Issue #751: a logical-replication subscription replicates into a
+    /// A logical-replication subscription replicates into a
     /// table the definition reads. The subscription's apply worker fires only row-level
     /// triggers, so Trellis's capture never sees its changes (see
     /// `super::subscription`). Not supported.
@@ -323,14 +320,14 @@ pub enum CatalogError {
     /// build.
     DirectBackfill(BackfillError),
     /// `super::lifecycle::pause_transform` was asked to pause a target with
-    /// no corresponding `transform_definitions` row at all (issue #142). Its
+    /// no corresponding `transform_definitions` row at all. Its
     /// sibling verb, `drop`, deliberately treats the same situation as an
     /// idempotent success instead — see
     /// `super::lifecycle::drop_transform`'s doc comment for why the two
     /// differ.
     TransformNotFound { transform: String },
     /// `super::lifecycle::drop_transform` was asked to drop a definition
-    /// that is not frozen (issue #142, ADR-0014). There is no direct
+    /// that is not frozen (ADR-0014). There is no direct
     /// live-to-gone edge in the lifecycle: quiescing through a pause is a
     /// precondition, so the removal never has to reason about a claim-time
     /// fold still dispatching to the target. Carries the status it actually
@@ -341,18 +338,17 @@ pub enum CatalogError {
         status: TransformStatus,
     },
     /// A still-live definition depends on the definition being dropped
-    /// (issue #142, ADR-0014's "Drops go in reverse dependency order — no
+    /// (ADR-0014's "Drops go in reverse dependency order — no
     /// cascade"). Trellis refuses rather than cascading, and names the
     /// blockers so the order to retire them in is explicit rather than
     /// something the operator has to reconstruct.
     DependentsBlockDrop {
         /// What the caller asked to drop: a bare transform name, or
-        /// `target.column` for an `ALTER TRANSFORM ... DROP <field>`
-        /// (issue #241).
+        /// `target.column` for an `ALTER TRANSFORM ... DROP <field>`.
         subject: String,
         /// The bare target names of the live definitions standing in the way.
         dependents: Vec<String>,
-        /// issue #242: for every blocker whose exact reference resolved to
+        /// For every blocker whose exact reference resolved to
         /// one specific column of the subject (column-granularity
         /// dependency edges — `column_dependents`), a human-readable
         /// `"<dependent>.<field> reads <subject>.<column>"` detail line.
@@ -362,11 +358,11 @@ pub enum CatalogError {
         column_detail: Vec<String>,
     },
     /// `alter_transform` was asked to edit a target that doesn't apply
-    /// (`staging::build::takes_field_build`, #625 F8b): one still
+    /// (`staging::build::takes_field_build`): one still
     /// `waiting_to_backfill`, `backfilling` behind an old-path build, or
     /// frozen (`paused`/`quarantined`). Retry once it applies.
     ///
-    /// Also returned (issue #315) when a new definition's source is another
+    /// Also returned when a new definition's source is another
     /// definition's target whose build hasn't finished (one that isn't
     /// applying yet). A target's own initial build
     /// writes it outside the target-mutation seam
@@ -403,7 +399,7 @@ pub enum CatalogError {
     UnsupportedAlter(String),
     /// A define, `ALTER TRANSFORM` or `DROP TRANSFORM` waited for the
     /// column-pause lock (`crate::locks::lock_column_pauses`) past its
-    /// transaction's `lock_timeout` (#922). Nothing changed: retry the call.
+    /// transaction's `lock_timeout`. Nothing changed: retry the call.
     ColumnPauseLockTimeout(crate::locks::ColumnPauseLockTimeout),
 }
 
@@ -793,13 +789,12 @@ impl From<crate::intake::IntakeError> for CatalogError {
 /// source table's known columns to their [`ValueType`] (see
 /// [`super::validate::validate`]).
 ///
-/// No production path calls this: registration never reads the source (issue
-/// #418). It waits for no writer, so the caller must be the only writer of
-/// the source.
+/// No production path calls this: registration never reads the source. It
+/// waits for no writer, so the caller must be the only writer of the source.
 /// The target table must already exist (see this module's doc comment).
 ///
-/// `pool.target_schema()`, not a parameter of this function's own (issue
-/// #73): this entry point never runs target-table DDL itself, so there is no
+/// `pool.target_schema()`, not a parameter of this function's own: this entry
+/// point never runs target-table DDL itself, so there is no
 /// sibling DDL call for a separately-threaded `target_schema` argument to
 /// drift from. See [`crate::pool::Pool::target_schema`]'s own doc comment.
 #[cfg(any(test, feature = "internals"))]
@@ -858,7 +853,7 @@ pub async fn create_definition_without_backfill(
 }
 
 /// The test fixtures above flip what they register `live` without a build,
-/// and a `JOIN` reaches `live` only through its build (#1109), so they refuse
+/// and a `JOIN` reaches `live` only through its build, so they refuse
 /// one. Text that doesn't parse is left to the fixture's own error.
 #[cfg(any(test, feature = "test-util"))]
 fn refuse_join_fixture(source_text: &str) {
@@ -870,11 +865,11 @@ fn refuse_join_fixture(source_text: &str) {
     }
 }
 
-/// The front door real callers use to stand up a new definition (issue #63
-/// C1): validates it, creates the target table, and records the definition.
+/// The front door real callers use to stand up a new definition:
+/// validates it, creates the target table, and records the definition.
 ///
 /// **The target table is created in the same transaction that records the
-/// definition (issue #440),** so a registration that fails anywhere leaves
+/// definition,** so a registration that fails anywhere leaves
 /// neither a catalog row nor a table behind and can simply be retried. A
 /// relation that already exists under the target's qualified name, of any
 /// kind, is refused with [`CatalogError::TargetTableExists`] and left
@@ -882,7 +877,7 @@ fn refuse_join_fixture(source_text: &str) {
 /// `DROP` would later drop it (ADR-0014). No build path creates the target
 /// itself.
 ///
-/// **Registration reads no source rows (ADR-0002, issues #418, #419).** Every
+/// **Registration reads no source rows.** Every
 /// definition is persisted [`TransformStatus::WaitingToBackfill`] and this
 /// returns, so its latency doesn't depend on the size of any table the
 /// definition reads. Its build runs in the background: the staging worker's
@@ -897,8 +892,7 @@ fn refuse_join_fixture(source_text: &str) {
 /// a live CDC delta folded into it before its build has started. From the
 /// start the definition applies, and the build's chunks and the pages agree
 /// through the ledger entry's `basis`: a delta for a commit a chunk's
-/// snapshot already saw is skipped rather than counted a second time (I1,
-/// #623 D5).
+/// snapshot already saw is skipped rather than counted a second time (I1).
 pub async fn install_definition(
     pool: &Pool,
     source_text: &str,
@@ -907,11 +901,11 @@ pub async fn install_definition(
 ) -> Result<Definition, CatalogError> {
     let def: TransformDef = parse(source_text)?;
 
-    // Issue #76 / ADR-0011: an explicit schema on either
+    // ADR-0011: an explicit schema on either
     // side is trusted outright rather than resolved — checked here, before
     // any DDL work runs, so a bogus explicit spelling fails fast with a
     // friendly `ValidationError` instead of surfacing as a confusing DDL
-    // failure partway through this function, or as issue #566's key read
+    // failure partway through this function, or as the key read
     // below reporting the missing table as one with no primary key.
     // `create_definition_inner` (below) repeats both checks inside its own
     // transaction; that repeat is the *authoritative* one — it's the only
@@ -924,8 +918,8 @@ pub async fn install_definition(
         confirm_qualified_source(&**pool.get().await?, schema, &def.source).await?;
     }
 
-    // Validate *before* any DDL is generated or executed, for every key-space
-    // (issue #94). DDL generation type-infers each target column from the same
+    // Validate *before* any DDL is generated or executed, for every key-space.
+    // DDL generation type-infers each target column from the same
     // expressions the validator checks, so an invalid definition reaching DDL
     // first surfaces whatever incidental error inference happens to hit —
     // masking the real validation error — and, worse, can leave a target table
@@ -933,7 +927,7 @@ pub async fn install_definition(
     // `create_definition_without_backfill` validate again below; that repeat is
     // cheap and keeps those entry points safe when called directly.
     //
-    // Issue #566: a 1-1 field named after a source primary key column is
+    // A 1-1 field named after a source primary key column is
     // refused ahead of `validate`, so it gets that error rather than
     // `CalculatedFieldShadowsSourceColumn`'s "make it a bare passthrough".
     // The same gate as the helper's own, checked first so that a definition
@@ -968,29 +962,29 @@ pub async fn install_definition(
     //
     // No matching existence check on the target here: registration is about
     // to *create* it, and `create_definition_inner` refuses one that already
-    // exists (issue #440) inside the transaction that creates it.
+    // exists inside the transaction that creates it.
     let target_schema = effective_target_schema(&def, target_schema);
 
-    // Issue #76, ADR-0011: resolved once, here, and threaded through every
+    // ADR-0011: resolved once, here, and threaded through every
     // DDL step below — see [`resolve_source_for_install`]'s own
     // doc comment for why this function needs its own copy rather than
     // waiting for `create_definition_inner`'s later, authoritative one.
     let qualified_source = resolve_source_to_define(pool, &def).await?;
-    // Issue #315: fail fast, before any DDL, on a source that is another
+    // Fail fast, before any DDL, on a source that is another
     // definition's not-yet-live target (see `reject_non_live_upstream`).
     reject_non_live_upstream(&**pool.get().await?, &qualified_source).await?;
 
-    // Issue #376: `reject_unkeyed_source` fails fast in both arms, before the
+    // `reject_unkeyed_source` fails fast in both arms, before the
     // target's DDL is rendered. `create_definition_inner` repeats it as the
     // authoritative check.
     //
     // Only *rendered* here: rendering reads source column types through
     // `pool`, but the statement itself runs inside
-    // `create_definition_inner`'s transaction (issue #440), so the table
+    // `create_definition_inner`'s transaction, so the table
     // commits or rolls back together with the catalog row.
     let target_ddl = match &def.key_space {
         KeySpace::Join(_) => {
-            // #1107: each side is held to the source rules (a primary key,
+            // Each side is held to the source rules (a primary key,
             // another definition's target, or a partitioned root whose
             // partial key holds its partition key). The target holds only
             // the declared columns; its hidden tables are created with the
@@ -1008,7 +1002,7 @@ pub async fn install_definition(
             )?
         }
         KeySpace::OneToOne => {
-            // Issue #121: the 1-1 target table's own primary key mirrors the
+            // The 1-1 target table's own primary key mirrors the
             // source's in full — at whatever arity the source declares it —
             // rather than narrowing to a single column. `target_table_ddl`
             // renders a composite `pk` as a real, multi-column `primary key
@@ -1029,7 +1023,7 @@ pub async fn install_definition(
             .map_err(CatalogError::Ddl)?
         }
         KeySpace::Aggregate { .. } => {
-            // Issue #371: live apply reads the source's primary key through
+            // Live apply reads the source's primary key through
             // `ddl::source_primary_key` for an aggregate too, and a key type
             // it refuses halts its readers there. Refuse it here instead,
             // before any DDL, exactly as the 1-1 arm above does.
@@ -1037,7 +1031,7 @@ pub async fn install_definition(
                 .await
                 .map_err(CatalogError::Ddl)?;
             reject_unkeyed_source(&**pool.get().await?, &qualified_source, &def).await?;
-            // #1096 decision 1: an aggregate outside the admitted set is
+            // An aggregate outside the admitted set is
             // refused by family, before the DDL (which only renders what the
             // group basis keeps).
             check_aggregate_admitted(&**pool.get().await?, &def, &qualified_source).await?;
@@ -1046,12 +1040,12 @@ pub async fn install_definition(
         }
     };
 
-    // ADR-0002 (issues #418, #419): registration reads no source rows. The
+    // ADR-0002: registration reads no source rows. The
     // definition waits for the staging worker's pass, which starts its build.
     //
     // `target_schema` — the exact value the DDL above was rendered under — is
-    // threaded straight through rather than re-derived from `pool` (issue
-    // #73's persisted qualification must never drift from what the DDL
+    // threaded straight through rather than re-derived from `pool` (the
+    // persisted qualification must never drift from what the DDL
     // builds).
     create_definition_inner(
         pool,
@@ -1066,8 +1060,8 @@ pub async fn install_definition(
 
 /// Every applying definition (`live` or `catching_up`) that reads `table`
 /// ([`tables_read_by`]), in id order: the readers a rewrite of `table`
-/// outside the target-mutation seam has to rebuild (issue #507,
-/// `intake::catch_up::park_target_catchup_if_read`).
+/// outside the target-mutation seam has to rebuild
+/// (`intake::catch_up::park_target_catchup_if_read`).
 pub(crate) async fn applying_readers(
     client: &impl GenericClient,
     table: &str,
@@ -1097,9 +1091,9 @@ pub(crate) async fn applying_readers(
 /// for its build, or under any build, counts as well as one that applies.
 ///
 /// The drain asks this only when `table`'s primary key can't be used
-/// (`staging::apply::compute`, issue #768), to tell a table whose rows no
+/// (`staging::apply::compute`), to tell a table whose rows no
 /// reader needs, which it skips, from one a reader still needs, which halts
-/// the page and pauses its readers (`staging::halt`, #663). A definition
+/// the page and pauses its readers (`staging::halt`). A definition
 /// waiting for its build, or under a chunked or direct one, doesn't apply
 /// the rows yet, but its build will read them. Only a frozen definition
 /// gives them up, and its resume rebuilds it
@@ -1129,7 +1123,7 @@ pub(crate) async fn has_unfrozen_reader(
 /// Every table a definition reads, fully qualified, sorted and
 /// deduplicated: its source (`qualified_source`, the persisted
 /// `transform_definitions.source_table`) and a `JOIN`'s joined table
-/// (`joined`, the persisted `join_table`, #1107).
+/// (`joined`, the persisted `join_table`).
 fn tables_read_by(qualified_source: String, joined: Option<String>) -> Vec<String> {
     let mut tables = vec![qualified_source];
     tables.extend(joined);
@@ -1139,7 +1133,7 @@ fn tables_read_by(qualified_source: String, joined: Option<String>) -> Vec<Strin
 }
 
 /// Every definition's status as an operator reads it (`Trellis::status`,
-/// `Trellis::definitions`), by id (issue #497, ADR-0002's "What `live`
+/// `Trellis::definitions`), by id (ADR-0002's "What `live`
 /// promises"): its persisted status, except that a `live` definition reading
 /// an upstream that isn't `live` reports [`TransformStatus::CatchingUp`].
 ///
@@ -1165,7 +1159,7 @@ pub(crate) async fn reported_statuses(
 }
 
 /// [`reported_statuses`] plus, per definition, the paused upstream columns
-/// that make it report `catching_up` (#1208), each `target.column`, sorted:
+/// that make it report `catching_up`, each `target.column`, sorted:
 /// the columns it reads directly and those its upstream readers do. The map
 /// holds only definitions with a cause.
 ///
@@ -1188,10 +1182,10 @@ pub(crate) async fn reported_statuses_with_causes(
 
 /// [`reported_statuses`] with paused upstream columns left out: `catching_up`
 /// only for a definition with an upstream that isn't stored `live`, down the
-/// chain. What a resume waits on (#971): an upstream that is rebuilding or
+/// chain. What a resume waits on: an upstream that is rebuilding or
 /// paused can still rewrite its target, but one that only reads a paused
 /// column applies as usual, so a reader rebuilt over it is exactly as current
-/// as a `live` reader of it (#1208), and a column paused for good mustn't
+/// as a `live` reader of it, and a column paused for good mustn't
 /// hold the resume.
 pub(crate) async fn reported_statuses_ignoring_column_pauses(
     client: &impl GenericClient,
@@ -1232,8 +1226,8 @@ async fn status_nodes(client: &impl GenericClient) -> Result<Vec<StatusNode>, Ca
     Ok(nodes)
 }
 
-/// Records on each `live` node the paused upstream columns it reads (#1208,
-/// [`reported_statuses_with_causes`]), each once.
+/// Records on each `live` node the paused upstream columns it reads
+/// ([`reported_statuses_with_causes`]), each once.
 async fn add_paused_column_causes(
     client: &impl GenericClient,
     nodes: &mut [StatusNode],
@@ -1292,7 +1286,7 @@ struct StatusNode {
     /// Every table it reads, qualified (needed only when `status` is `live`).
     reads: Vec<String>,
     /// The paused columns (`target.column`) of upstream 1-1 targets it
-    /// reads (#1208), only for a `live` definition.
+    /// reads, only for a `live` definition.
     paused_columns: Vec<String>,
 }
 
@@ -1308,7 +1302,7 @@ fn derive_reported_statuses(nodes: &[StatusNode]) -> HashMap<i64, TransformStatu
 }
 
 /// [`derive_reported_statuses`], and the paused upstream columns behind each
-/// `catching_up` it reports (#1208): a `live` definition reading a paused
+/// `catching_up` it reports: a `live` definition reading a paused
 /// column of an upstream target reports `catching_up`, and so does its
 /// reader in turn. A definition's causes are its own paused columns and
 /// those of every upstream that isn't reported `live`.
@@ -1376,7 +1370,7 @@ fn derive_reported(
 
 /// Refuses (with [`CatalogError::TransformNotLive`]) a new definition whose
 /// source, `qualified_source`, is the target of another definition whose
-/// build hasn't finished yet (issue #315): one that isn't
+/// build hasn't finished yet: one that isn't
 /// [`TransformStatus::is_applying`]. A target's initial build
 /// (`defs::backfill`, the chunk queue) writes it directly, outside the
 /// target-mutation seam that tells a chained reader about every other target
@@ -1402,7 +1396,7 @@ async fn reject_non_live_upstream(
         panic!("transform_definitions.status held unrecognized value '{status_text}'")
     });
     // A `catching_up` upstream's build has finished: every write to its
-    // target goes through the seam now (issue #476).
+    // target goes through the seam now.
     if status.is_applying() {
         return Ok(());
     }
@@ -1427,9 +1421,9 @@ pub(crate) async fn is_definition_target(
 }
 
 /// Edits an already-registered 1-1 transform's calculated fields in place —
-/// `ALTER TRANSFORM`'s catalog-side implementation (ADR-0015, issues
-/// #241/#242), reached through [`crate::Trellis::apply`] like every other
-/// definition-changing statement (issue #227).
+/// `ALTER TRANSFORM`'s catalog-side implementation (ADR-0015), reached
+/// through [`crate::Trellis::apply`] like every other definition-changing
+/// statement.
 ///
 /// **Scope, this release.** Only a [`KeySpace::OneToOne`] target is
 /// supported: any edit against an aggregate or `JOIN` target is refused with
@@ -1444,7 +1438,7 @@ pub(crate) async fn is_definition_target(
 /// a field that already exists with the exact same formula, re-`ALTER`ing a
 /// field to the formula it already has, and `DROP`ping a field already
 /// absent are each a no-op. The clauses are netted against each other
-/// first ([`plan_alter`], issue #919): a field added and dropped in the same
+/// first ([`plan_alter`]): a field added and dropped in the same
 /// edit, or altered and altered back, changes nothing, and the refusals
 /// below that look at what the edit adds, alters or drops judge that net
 /// change, not each clause. If the net change is empty, the whole call is a
@@ -1452,7 +1446,7 @@ pub(crate) async fn is_definition_target(
 /// pause/resume/drop's own "a replayed migration must be safe in both
 /// directions" discipline.
 ///
-/// **The field build (#625 F8b, #666).** The call only registers the edit:
+/// **The field build.** The call only registers the edit:
 /// the DDL, the catalog row and the version fence below, and, when it adds
 /// or alters a field, a field build of every such field, in the same
 /// transaction (`staging::build::start_field_build`). It moves the
@@ -1462,7 +1456,7 @@ pub(crate) async fn is_definition_target(
 /// the background. `apply` returns once that commits, and the definition
 /// reads `backfilling` until the build's last chunk is done, then `live`.
 /// The changed fields apply from the commit, as a new definition does under
-/// the Re-derive build (#625 B1): every page after it writes them, and each
+/// the Re-derive build: every page after it writes them, and each
 /// chunk rewrites them under the keys' entry lock, so no catch-up is needed.
 /// Only a definition that applies takes the edit
 /// (`staging::build::takes_field_build`). An edit that only drops fields
@@ -1493,7 +1487,7 @@ pub(crate) async fn is_definition_target(
 /// one already checked when the target was first defined — re-running it
 /// would only re-confirm the same edge is still not a cycle.
 ///
-/// **The live schema (issue #980).** The merged definition is validated
+/// **The live schema.** The merged definition is validated
 /// against the source's columns as they are when the edit commits
 /// ([`validate_edit`]), read in the edit's transaction under the version
 /// fence and the definition's row lock, not against the columns recorded when
@@ -1511,14 +1505,14 @@ pub(crate) async fn is_definition_target(
 /// and cast through the recorded types.
 ///
 /// **The `DROP <field>` refusal.** Requires column-granularity dependency
-/// edges finer than a whole-transform drop's table-level check — exactly
-/// issue #242's gap, closed once via [`column_dependents_any_keyspace`] and
+/// edges finer than a whole-transform drop's table-level check, which
+/// [`column_dependents_any_keyspace`] provides and which is
 /// used here as the *entire* correctness check (not just a naming nicety the
 /// way [`super::lifecycle::drop_transform`]'s own use of it is): a dropped
 /// field refuses, naming the specific reader, iff some other definition's
 /// field or `GROUP BY` key resolves to exactly this `(target, field)` pair.
 ///
-/// **The capture widen (issue #622).** An edited field can read a source
+/// **The capture widen.** An edited field can read a source
 /// column the old formula didn't, which the source's capture triggers may
 /// not image yet. The staging worker widens them in the background, not on
 /// this call's path, once it can take the table's lock, and a row the old
@@ -1577,7 +1571,7 @@ pub async fn alter_transform(
     if real_adds.is_empty() && real_alters.is_empty() && real_drops.is_empty() {
         // Every clause was an idempotent no-op — ADR-0015's "edits are
         // idempotent in both directions" — or the clauses cancelled (an
-        // `ADD` and a `DROP` of one name, issue #919): no version bump, no
+        // `ADD` and a `DROP` of one name): no version bump, no
         // DDL, nothing written.
         return Ok(AlterOutcome {
             definition: current,
@@ -1593,7 +1587,7 @@ pub async fn alter_transform(
     };
 
     // The fields the edit's field build rewrites: each added or altered one,
-    // and (issue #748) every field that reads one of them by alias, directly
+    // and every field that reads one of them by alias, directly
     // or through others, since its value moves with theirs.
     //
     // An added field an existing one already named, or a dropped one a
@@ -1617,7 +1611,7 @@ pub async fn alter_transform(
 
     // Fail fast, before the transaction's fence waits on any drain: the
     // edited definition against the source as it is now, as a define would
-    // read it (issue #980). Authoritative only after the locks below, which
+    // read it. Authoritative only after the locks below, which
     // read it again.
     let (field_types, pre_source_columns) = {
         let client = pool.get().await?;
@@ -1633,10 +1627,10 @@ pub async fn alter_transform(
         (edited.field_types, edited.source_columns)
     };
 
-    // Pre-transaction dependency check for every real `DROP` — issue #241's
-    // column-granularity refusal, using #242's same infrastructure.
-    // Best-effort here (re-checked for real under the row lock below, issue
-    // #231's discipline — a definition can register a brand-new dependent
+    // Pre-transaction dependency check for every real `DROP`: the
+    // column-granularity refusal.
+    // Best-effort here (re-checked for real under the row lock below — a
+    // definition can register a brand-new dependent
     // between this check and the transaction's commit).
     for field in &real_drops {
         check_no_column_dependents(pool, &alter.target, field).await?;
@@ -1646,7 +1640,7 @@ pub async fn alter_transform(
     // [`check_alter_column_types`]): a type change that would rewrite the
     // target is refused, as ADR-0015 promises no edit does. Best-effort
     // here, same as the `DROP` dependents check just above (re-checked for
-    // real under the row lock below, issue #231's discipline).
+    // real under the row lock below).
     {
         let pre_client = pool.get().await?;
         check_alter_column_types(
@@ -1678,7 +1672,7 @@ pub async fn alter_transform(
     // Taking the target's `ACCESS EXCLUSIVE` lock first deadlocks against
     // the drain itself, which row-locks the target; taking the definition
     // row first deadlocks against a drain queued on a transaction that
-    // wants that row, such as a build's completion (issue #744). A drain
+    // wants that row, such as a build's completion. A drain
     // that already holds the row finishes first, and one that arrives later
     // waits for this commit and then misses the fence. A refusal below
     // rolls the bump back with everything else.
@@ -1692,7 +1686,7 @@ pub async fn alter_transform(
     )
     .await?;
 
-    // The column-pause lock, exclusive (#922), after the fence and before the
+    // The column-pause lock, exclusive, after the fence and before the
     // definition row: an edit that builds a field can pause it at birth
     // (`pause_readers_of_paused_columns` below) and one that drops a field
     // deletes its pause rows and edges, so both write pause state, and what
@@ -1711,8 +1705,8 @@ pub async fn alter_transform(
 
     // Row-lock the definition and recheck its status: a pause, a drop, or
     // another concurrent alter must not interleave between the checks above
-    // and this commit (issue #231's lesson, applied here the same way
-    // `lifecycle::drop_transform` applies it to its own precondition).
+    // and this commit (as `lifecycle::drop_transform` does for its own
+    // precondition).
     let row = txn
         .query_opt(
             "select status, definition_version, build from transform_definitions \
@@ -1729,7 +1723,7 @@ pub async fn alter_transform(
     let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
         panic!("transform_definitions.status held unrecognized value '{status_text}'")
     });
-    // A field build (#625 F8b) needs a definition that applies
+    // A field build needs a definition that applies
     // (`staging::build::takes_field_build`): `live`, or
     // already under a Re-derive build, which it joins. An edit that only
     // drops fields builds nothing; it takes the same definitions.
@@ -1746,7 +1740,7 @@ pub async fn alter_transform(
 
     // The edited definition against the source's live columns, read under
     // the fence and the row lock: the same read and rules a define makes, so
-    // an edit never commits a definition define would refuse (issue #980).
+    // an edit never commits a definition define would refuse.
     // The columns recorded for the definition are consulted only for a
     // column whose type the host changed since, which a field this edit
     // builds can't read.
@@ -1794,7 +1788,7 @@ pub async fn alter_transform(
     )
     .await?;
 
-    // Issue #638's follow-up: an added or altered field's `STRPOS`/
+    // An added or altered field's `STRPOS`/
     // `REGEXP_COUNT` can't read a nondeterministic-collation column, exactly
     // as at install. Before any DDL, like the rechecks above.
     let edited: Vec<FieldDef> = real_adds.iter().chain(&real_alters).cloned().collect();
@@ -1809,7 +1803,7 @@ pub async fn alter_transform(
         .await?;
     }
     // An added bare passthrough takes its source column's type, as at
-    // `DEFINE` (issue #994): the same rule, not a second copy of it.
+    // `DEFINE`: the same rule, not a second copy of it.
     let add_pg_types = ddl::field_column_pg_types(
         &*txn,
         &merged,
@@ -1837,10 +1831,10 @@ pub async fn alter_transform(
     // same-type `ALTER` needs no physical change at all; only its data is
     // stale, which the field build recomputes, as for an `ADD`.
 
-    // Issue #915: an edit that builds fields can pause one at birth that
+    // An edit that builds fields can pause one at birth that
     // already has readers (see `pause_readers_of_paused_columns` below). The
     // column-pause lock it holds since its fence covers that and its
-    // upstreams' pauses it reads (#922).
+    // upstreams' pauses it reads.
     let upstreams = if builds_fields {
         definition_targets_read(&*txn, &current.source_table).await?
     } else {
@@ -1853,12 +1847,12 @@ pub async fn alter_transform(
         // clears for a whole target. A pause left behind here would outlive
         // its column and silently apply to a later `ADD` of the same name,
         // since that `ADD`'s own pause below only ever undoes a pause it
-        // created itself (issue #309). Edges *into* it are cleared so
+        // created itself. Edges *into* it are cleared so
         // resuming the upstream column never tries to recompute a column
         // that is gone. Edges *out of* it are cleared too, though the
         // dependents check above passed, so no live reader reads it: an
         // `ALTER` that stops a reader reading a column deletes the reader's
-        // edge from it (issue #950), and releases the reader if that was its
+        // edge from it, and releases the reader if that was its
         // last reason to be paused, so a drop strands no one. This only
         // makes sure no edge from a column that no longer exists remains.
         for table in ["column_status", "column_deaths", "column_failures"] {
@@ -1877,7 +1871,7 @@ pub async fn alter_transform(
         .await?;
     }
 
-    // Issue #950: an altered field that stopped reading an upstream column
+    // An altered field that stopped reading an upstream column
     // it was paused through is no longer held by it. The edges go here; the
     // fields left with no reason are released below, once the edit's own
     // pauses are written.
@@ -1895,7 +1889,7 @@ pub async fn alter_transform(
         .await?
     };
 
-    // The capture widen (issue #622): a field reading a source column the
+    // The capture widen: a field reading a source column the
     // old formula didn't read can't apply until the source's capture images
     // it, so it is held out of Apply, marked `awaiting_capture`, and the
     // field build's plan job releases it once capture is ready (see "The
@@ -1909,7 +1903,7 @@ pub async fn alter_transform(
     if holds_for_capture {
         // Every field the build rewrites, so a sibling reading an edited
         // field by alias is held out (and listed as paused) with it, rather
-        // than evaluated over its absence and written NULL (issue #748).
+        // than evaluated over its absence and written NULL.
         for field in &build_fields {
             txn.execute(
                 "insert into column_status \
@@ -1922,13 +1916,13 @@ pub async fn alter_transform(
         }
     }
 
-    // Issue #914: an edited field that now reads another definition's
+    // An edited field that now reads another definition's
     // paused column is paused at birth, as the cascade pauses a reader that
-    // was there when the pause ran. Issue #748: one that now reads a paused
+    // was there when the pause ran. One that now reads a paused
     // field by alias, directly or through others, is paused with it. A
     // field awaiting its capture gets no edges: the build that releases it
     // writes its readers, whenever they were added
-    // (`staging::build::FieldPlan::for_chunk`). Issue #915: an edited field,
+    // (`staging::build::FieldPlan::for_chunk`). An edited field,
     // or a sibling paused with it, may already have readers, so each row
     // this writes owes the cascade to them, which this call walks once this
     // commits.
@@ -1945,7 +1939,7 @@ pub async fn alter_transform(
         .await?;
     }
 
-    // Issue #950: the altered fields that lost an edge and have no reason
+    // The altered fields that lost an edge and have no reason
     // left to be paused are released into the edit's own field build, and
     // their readers in other definitions are resumed once this commits.
     let released_readers = if edge_losers.is_empty() {
@@ -1969,7 +1963,7 @@ pub async fn alter_transform(
     )
     .await?;
 
-    // The recompute is a field build (#625 F8b, #666): registered here, run
+    // The recompute is a field build: registered here, run
     // by the drain workers. See "The field build" in this function's doc
     // comment.
     if builds_fields {
@@ -1978,11 +1972,11 @@ pub async fn alter_transform(
 
     txn.commit().await?;
 
-    // Issue #950: the readers in other definitions that the released fields
+    // The readers in other definitions that the released fields
     // left with no reason, resumed now that the edit's lock is gone.
     crate::staging::build::resume_released_dependents(pool, &alter.target, released_readers).await;
 
-    // Issue #915: walk the cascade each field this paused owes, now that
+    // Walk the cascade each field this paused owes, now that
     // nothing is held. See `staging::quarantine::cascade_edit_pauses`.
     if builds_fields
         && let Err(err) = crate::staging::quarantine::cascade_edit_pauses(pool, &alter.target).await
@@ -2014,9 +2008,9 @@ struct EditedSchema {
 }
 
 /// Validates `merged`, the definition an `ALTER TRANSFORM` would leave,
-/// against `source_table`'s live columns (issue #980), with the rules a
+/// against `source_table`'s live columns, with the rules a
 /// define applies: the source still exists, no added field takes a key
-/// column's name (#566), and the definition passes [`validate`] over the
+/// column's name, and the definition passes [`validate`] over the
 /// live columns. A source column added, dropped or
 /// retyped since define is judged as it is now, for every field, edited or
 /// not: an edit that leaves a field reading a dropped column is refused
@@ -2046,7 +2040,7 @@ async fn validate_edit(
     if source_columns.is_empty() {
         return Err(CatalogError::SourceTableNotFound(source_table.to_string()));
     }
-    // Issue #566: an added field can't take a key column's name, exactly as
+    // An added field can't take a key column's name, exactly as
     // at install. Ahead of `validate` for the same reason as there.
     reject_fields_named_after_primary_key(client, source_table, real_adds, &source_columns).await?;
     // Reuse the exact validator (and, inside it, the exact column-cycle
@@ -2143,8 +2137,8 @@ fn field_over_retyped_column(
 }
 
 /// Records, as definition `id`'s persisted source column types, the live type
-/// of each source column `edited` reads that has none `recorded` (issue
-/// #980): a column the host added since the definition last recorded its
+/// of each source column `edited` reads that has none `recorded`:
+/// a column the host added since the definition last recorded its
 /// types. The builds and applies of an edit's fields infer and cast through
 /// the persisted types, so a field reading such a column couldn't apply
 /// without it, and no other field reads it, since none could have validated
@@ -2180,7 +2174,7 @@ async fn record_added_source_columns(
             &[&id, &keys, &vals],
         )
         .await?;
-    // #1242: the OID of an added column's type, beside the name its token
+    // The OID of an added column's type, beside the name its token
     // gives (`definition_types`). A type already recorded keeps its row.
     super::key_types::record_types(client, id, false).await?;
     Ok(())
@@ -2202,7 +2196,7 @@ struct AlterPlan {
 
 /// Applies an edit's `clauses`, in order, to the fields `current` the
 /// definition `target` has, and works out what the edit changes as a whole
-/// rather than clause by clause (issue #919): a field added and then dropped
+/// rather than clause by clause: a field added and then dropped
 /// in the same edit never had a column, so it is neither added nor dropped,
 /// and an `ALTER` of a field the edit added just changes what is added.
 ///
@@ -2307,8 +2301,8 @@ async fn definition_targets_read(
 }
 
 /// Pauses each of `fields`, of the 1-1 definition `def` targeting `target`
-/// (bare), that reads a paused column as it is defined or edited (issue
-/// #914), as `staging::quarantine`'s cascade pauses a reader that
+/// (bare), that reads a paused column as it is defined or edited,
+/// as `staging::quarantine`'s cascade pauses a reader that
 /// was already there when the pause ran (ADR-0003 decision #5): a
 /// `column_status` row, which `status` lists, and a cascade edge, which the
 /// paused column's resume walks to release it into that resume's field
@@ -2324,11 +2318,11 @@ async fn definition_targets_read(
 ///   reads that column. A column awaiting its capture widen
 ///   (`awaiting_capture`) pauses no reader, as it cascades to none.
 /// - **A paused field of `def` itself**, read by alias, directly or through
-///   other fields (issue #748): the same closure the cascade walks for a
+///   other fields: the same closure the cascade walks for a
 ///   sibling, from every field of `target` paused, including those paused
 ///   just above.
 ///
-/// **An edited field's readers** (`owes_cascade`, issue #915). A field an
+/// **An edited field's readers** (`owes_cascade`). A field an
 /// edit pauses may already have readers: definitions reading it, and
 /// fields of `def` reading it by alias that the edit didn't touch. Each row
 /// this writes then owes the cascade a pause writes
@@ -2377,7 +2371,7 @@ async fn pause_readers_of_paused_columns(
             .map(|row| (upstream.as_str(), qualified_upstream.as_str(), row.get(0))),
         );
     }
-    // Test-only pause point (#914). See `staging::interleave`.
+    // Test-only pause point. See `staging::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     crate::staging::interleave::pause_at(
         txn,
@@ -2429,8 +2423,8 @@ async fn pause_readers_of_paused_columns(
 
 /// Deletes the cascade edges into each of `altered` (fields of the 1-1
 /// definition `def` targeting `target`, bare, whose formula this edit
-/// changed) from an upstream column the new formula doesn't read (issue
-/// #950). An edge records that its reader is paused because the upstream
+/// changed) from an upstream column the new formula doesn't read. An edge
+/// records that its reader is paused because the upstream
 /// column is; a reader edited to stop reading the column is no longer held
 /// by it, and left in place the edge would keep the reader paused until
 /// that column's resume (or leave it with no reason at all once a `DROP`
@@ -2504,7 +2498,7 @@ async fn delete_stale_cascade_edges(
 
 /// Releases each of `candidates`, fields of `target` that
 /// [`delete_stale_cascade_edges`] took an edge from, that is left with no
-/// reason to stay paused (issue #950): no `local_fuse`, no edge into it
+/// reason to stay paused: no `local_fuse`, no edge into it
 /// (including those the edit's own pauses just wrote) and not awaiting its
 /// capture. The edit's field build rewrites it (a candidate is an altered
 /// field), as a resume's would. Its readers are un-cascaded as a resume's
@@ -2515,7 +2509,7 @@ async fn delete_stale_cascade_edges(
 /// ([`crate::staging::build::resume_released_dependents`]).
 ///
 /// With `holds_for_capture`, the edit's new formula reads a source column
-/// the capture may not image yet (issue #622), and the field, paused for
+/// the capture may not image yet, and the field, paused for
 /// another reason when the edit's capture widen skipped it, is held with
 /// `awaiting_capture` instead: the build's plan job releases it, and its
 /// readers, once capture is ready.
@@ -2626,7 +2620,7 @@ async fn pause_reader_in_txn(
     Ok(edged > 0)
 }
 
-/// Whether `edited` reads a source column `original` doesn't (issue #622):
+/// Whether `edited` reads a source column `original` doesn't:
 /// one the source's capture triggers may not image yet. A column `original`
 /// already read has been imaged since the definition was dispatched, since no
 /// capture narrows away a column a registered definition reads.
@@ -2664,7 +2658,7 @@ async fn check_no_column_dependents(
 }
 
 /// The transaction-scoped counterpart to [`check_no_column_dependents`],
-/// re-run under the target's own row lock (issue #231's discipline) so a
+/// re-run under the target's own row lock so a
 /// dependent registered between the pre-check and this commit cannot slip
 /// through.
 async fn check_no_column_dependents_in_txn(
@@ -2720,7 +2714,7 @@ struct AlterTypeContext<'a> {
 ///
 /// - the same type needs no change, and neither does a string column
 ///   (`text`, `varchar(n)` or `varchar`) altered to another: Trellis's
-///   copies of a string are unbounded (#1207), and no copy has a modifier
+///   copies of a string are unbounded, and no copy has a modifier
 ///   (ADR-0020), so a change of one never changes a column;
 /// - anything else (another width or value family) would rewrite the
 ///   target under an `ACCESS EXCLUSIVE` lock, so it is refused. `DROP` and
@@ -2728,7 +2722,7 @@ struct AlterTypeContext<'a> {
 ///
 /// `client` is a pooled connection for the best-effort pre-check before the
 /// transaction opens, and the transaction itself for the authoritative
-/// re-check under the row lock (issue #231's discipline).
+/// re-check under the row lock.
 async fn check_alter_column_types(
     client: &impl GenericClient,
     ctx: &AlterTypeContext<'_>,
@@ -2776,7 +2770,7 @@ async fn check_alter_column_types(
         let current = super::copies::describe(client, &mut described, current).await?;
         let wanted = super::copies::describe(client, &mut described, wanted).await?;
         // `text` and `varchar(n)` are one family, and a copy of either is an
-        // unbounded `varchar` or `text` (#1207): nothing to change.
+        // unbounded `varchar` or `text`: nothing to change.
         if current.ty.is_string() && wanted.ty.is_string() {
             continue;
         }
@@ -2799,7 +2793,7 @@ async fn check_alter_column_types(
 
 /// The `(atttypid, atttypmod)` of `qualified_table.column`: `None` if the
 /// column somehow doesn't exist (defensive; see this function's callers). A
-/// mixed-case name resolves through [`ddl::regclass_arg`] (issue #487).
+/// mixed-case name resolves through [`ddl::regclass_arg`].
 async fn target_column_type_via(
     client: &impl GenericClient,
     qualified_table: &str,
@@ -2821,8 +2815,8 @@ async fn target_column_type_via(
 
 /// Validates `source_text` and persists it as a definition in `status`, with
 /// its schema-graph nodes and edge and a `source_table_versions` bump, in one
-/// transaction. Reads the source's catalog shape (its key), never its rows
-/// (ADR-0002, issue #418): whoever builds the target does that later.
+/// transaction. Reads the source's catalog shape (its key), never its rows:
+/// whoever builds the target does that later.
 ///
 /// `target_ddl` is [`install_definition`]'s rendered `create table` for the
 /// target, run in this same transaction after refusing a target name that
@@ -2842,31 +2836,30 @@ async fn create_definition_inner(
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
 
-    // Issue #72 / #76, ADR-0011: resolve `def.source` — always a bare table
+    // ADR-0011: resolve `def.source` — always a bare table
     // name (see [`super::ast::TransformDef`]'s own doc comment for why the
     // dotted spelling never lands in this field) — to its fully-qualified
     // `schema.table` identity exactly once, here, at definition-acceptance
     // time. Two ways to get there, branching on
     // [`super::ast::TransformDef::explicit_source_schema`]:
     //
-    // * `Some(schema)` (issue #76): the definition wrote `FROM
+    // * `Some(schema)`: the definition wrote `FROM
     //   <schema>.<source>` explicitly, so `schema` is trusted outright —
     //   [`confirm_qualified_source`] checks that *exact*
     //   relation is real, never walking `search_path` the way the bare case
     //   does (ADR-0011: a qualified spelling resolves to
     //   that one relation, full stop).
     // * `None` (bare, the far more common case): [`resolve_graph_identity_in_txn`]
-    //   — issue #72's plain `search_path` walk, extended by issue #74 with a
+    //   — a plain `search_path` walk with a
     //   chained-target fallback (see that function's own doc comment for
-    //   why, and for why this can now safely run *before* the node/cycle
-    //   checks below rather than after them, unlike issue #72/#73's
-    //   original ordering here).
+    //   why, and for why this safely runs *before* the node/cycle
+    //   checks below).
     //
     // Either way, from this point on `qualified_source` — never `def.source`
     // — is what gets persisted
     // (`source_table_versions`/`transform_definitions.source_table` below)
     // and threaded into every side effect that must agree with the
-    // persisted row *and* (issue #74) `schema_nodes`/`schema_edges`
+    // persisted row *and* `schema_nodes`/`schema_edges`
     // themselves.
     //
     // This matters for the explicit-schema branch specifically: the test
@@ -2881,7 +2874,7 @@ async fn create_definition_inner(
             crate::intake::qualify(schema, &def.source)?
         }
         None => match resolve_graph_identity_in_txn(&txn, &def.source).await {
-            // Issue #933: a source the role can't see doesn't resolve.
+            // A source the role can't see doesn't resolve.
             Err(err @ CatalogError::SourceTableNotFound(_)) => {
                 reject_inaccessible_table(&*txn, None, &def.source).await?;
                 return Err(err);
@@ -2889,10 +2882,10 @@ async fn create_definition_inner(
             result => result?,
         },
     };
-    // Issue #315: the authoritative check (`install_definition` repeats it
+    // The authoritative check (`install_definition` repeats it
     // earlier, before any DDL, as a fail-fast).
     reject_non_live_upstream(&*txn, &qualified_source).await?;
-    // #1107: a JOIN's joined table resolves the way its `FROM` does, and is
+    // A JOIN's joined table resolves the way its `FROM` does, and is
     // held to the same checks. Its columns are read here, in this
     // transaction, for the catalog row and the hidden tables.
     let join_sides = match super::join::spec(&def) {
@@ -2916,14 +2909,14 @@ async fn create_definition_inner(
             Some(sides)
         }
         None => {
-            // Issue #830: a three-part qualified column names the source's
+            // A three-part qualified column names the source's
             // schema, which a bare `FROM` only now resolved. A JOIN's
             // qualified columns are `validate_join`'s.
             validate_qualified_columns(&def, source_columns, schema_of(&qualified_source))?;
             None
         }
     };
-    // #1167: the index a `self_check` walk of the target pages its source by.
+    // The index a `self_check` walk of the target pages its source by.
     if !def.without_source_index {
         let missing = super::source_index::unmet_for(
             &*txn,
@@ -2941,12 +2934,12 @@ async fn create_definition_inner(
         }
     }
 
-    // The source's version fence, bumped as this transaction's first lock
-    // (issues #744 and #770). The bump waits for every page holding the
+    // The source's version fence, bumped as this transaction's first lock.
+    // The bump waits for every page holding the
     // fence `for share`. Everything above only reads. A failure below rolls
     // the bump back.
     //
-    // A JOIN bumps both tables' fences (#1107), in table-name order, the
+    // A JOIN bumps both tables' fences, in table-name order, the
     // order every taker of two fences takes them in; it records the `FROM`
     // table's version.
     let fenced: Vec<&str> = match &join_sides {
@@ -2970,7 +2963,7 @@ async fn create_definition_inner(
             version = bumped;
         }
     }
-    // The column-pause lock, shared (#922), right after the fence and before
+    // The column-pause lock, shared, right after the fence and before
     // the definition row or any DDL: the pause state a field reading a
     // paused column is born under (below) is read under it, so a pause
     // either commits before this define reads it or waits for this commit
@@ -2985,13 +2978,13 @@ async fn create_definition_inner(
     )
     .await?;
 
-    // Issue #73 / #76, ADR-0011: resolve `def.target` — likewise always bare
+    // ADR-0011: resolve `def.target` — likewise always bare
     // — to its fully-qualified identity exactly once, here, mirroring
     // `qualified_source` immediately above. Unlike the source side,
-    // `def.target`'s schema was never search-path-resolved even before issue
-    // #76: a source table's schema is *discovered* (it already exists
+    // `def.target`'s schema is never search-path-resolved:
+    // a source table's schema is *discovered* (it already exists
     // somewhere on the path), but a target table's schema is a
-    // config-time *decision*, `target_schema` — which, as of issue #76, is
+    // config-time *decision*, `target_schema` — which is
     // itself already `def`-aware: this function's caller passes
     // [`effective_target_schema`]'s result (either `install_definition`'s own
     // call, or `pool.target_schema()` unmodified for the ring-path entry
@@ -3020,12 +3013,12 @@ async fn create_definition_inner(
     // (and still runs) ahead of the node/cycle checks below.
     let resolved_target_schema = effective_target_schema(&def, target_schema);
     let qualified_target = crate::intake::qualify(resolved_target_schema, &def.target)?;
-    // #979: not in a catalog schema, this instance's or another's. Before
+    // Not in a catalog schema, this instance's or another's. Before
     // any DDL, so nothing is created there.
     reject_target_in_catalog_schema(&*txn, pool.schema(), &qualified_target).await?;
     // The test-fixture entry points (`target_ddl` is `None`) register against
     // a target their caller already created; `install_definition` creates it
-    // below, after every check on the definition itself (issue #440).
+    // below, after every check on the definition itself.
     if target_ddl.is_none()
         && let Some(schema) = &def.explicit_target_schema
         && !qualified_table_exists(&*txn, schema, &def.target).await?
@@ -3037,14 +3030,14 @@ async fn create_definition_inner(
         .into());
     }
 
-    // Issue #745: Trellis reads the source (and a `JOIN`'s joined table) as
+    // Trellis reads the source (and a `JOIN`'s joined table) as
     // its own role, so row-level security that applies to that role would
     // filter the reads. A table another definition targets is checked for
     // the session's role alone: the target-mutation seam feeds it, no
     // capture function reads it, so the ring's owner never does (see
     // [`super::row_security::Readers::Session`]).
     //
-    // Every Trellis session runs with `row_security = off` (issue #766), so
+    // Every Trellis session runs with `row_security = off`, so
     // a read fails outright when the policies apply, and this check is what
     // names the table, the role and the fix. It reads only the catalog, so a
     // source that's another definition's not-yet-built target passes here
@@ -3055,23 +3048,21 @@ async fn create_definition_inner(
     }
     reject_row_security(&*txn, pool.schema(), &read_tables).await?;
 
-    // Issue #20: every definition's source and target resolve to a
+    // Every definition's source and target resolve to a
     // first-class `SchemaNode`, created on first reference (a source node
     // the moment something first transforms it; a target node the moment
     // its owning definition is created) — a side effect alongside the
     // catalog writes below rather than a change to `TransformDef`'s shape,
     // per the issue's "prefer the smaller change" guidance.
     //
-    // Keyed on `qualified_source`/`qualified_target` (issue #74, ADR-0011),
-    // not the bare `def.source`/`def.target` issue #72/#73 left this on:
-    // `schema_nodes`/`schema_edges` now key on the exact same qualified
-    // identity `transform_definitions` does, closing the node-splitting gap
-    // the old bare keying protected against only by never distinguishing
-    // schemas at all.
+    // Keyed on `qualified_source`/`qualified_target` (ADR-0011), not the
+    // bare `def.source`/`def.target`: `schema_nodes`/`schema_edges` key on
+    // the exact same qualified identity `transform_definitions` does, so
+    // `public.posts` and `archive.posts` are never one node.
     let source_node = resolve_node_in_txn(&txn, &qualified_source, NodeKind::Source).await?;
     let target_node = resolve_node_in_txn(&txn, &qualified_target, NodeKind::Target).await?;
 
-    // Issue #22 (generalized): reject this definition if the `Source` edge
+    // Reject this definition if the `Source` edge
     // it's about to add — def.source -> def.target — would close a cycle in
     // the table-level dependency graph, transitively through any edges
     // already persisted. Checked against the transaction's own view of
@@ -3086,18 +3077,18 @@ async fn create_definition_inner(
     // out of scope for this issue.
     //
     // Qualified `qualified_source`/`qualified_target`, matching the node
-    // resolution above (issue #74) — `schema_edges` is keyed by
+    // resolution above — `schema_edges` is keyed by
     // `schema_nodes.id`, so this walks the exact same qualified graph those
     // nodes were just resolved into.
     reject_if_table_cycle(&txn, &qualified_source, &qualified_target).await?;
 
-    // Issue #21: a transform's `FROM` is a `Source` dependency edge from its
+    // A transform's `FROM` is a `Source` dependency edge from its
     // source node to its target node — persisted alongside the node
     // resolutions above so `dependents_of` can walk the graph instead of
     // matching on `transform_definitions.source_table` string equality.
     persist_edge_in_txn(&txn, source_node.id, target_node.id, EdgeKind::Source).await?;
 
-    // #1107: a JOIN's joined table is a `Join` edge into the target, checked
+    // A JOIN's joined table is a `Join` edge into the target, checked
     // for a cycle on its own. Self-joins are refused, so it never collides
     // with the `Source` edge.
     if let Some(sides) = &join_sides {
@@ -3106,13 +3097,11 @@ async fn create_definition_inner(
         persist_edge_in_txn(&txn, joined_node.id, target_node.id, EdgeKind::Join).await?;
     }
 
-    // Reviewer follow-up to issue #73 / ADR-0011: reject this definition if
+    // ADR-0011: reject this definition if
     // `qualified_target` shares a bare table-name suffix with a *different*
     // qualified spelling some other still-persisted definition already
-    // uses. Before #73, `target_table` stored the bare name and its own
-    // `unique` constraint enforced this for
-    // free; now that the column stores the qualified spelling, that
-    // constraint only guarantees the qualified string is unique, and
+    // uses. `target_table` stores the qualified spelling, so its own
+    // `unique` constraint only guarantees the qualified string is unique, and
     // nothing else stopped `public.foo` and `custom.foo` from coexisting
     // (most plausibly: `Config::target_schema` changed between deploys and
     // an operator redeclared a same-named `TRANSFORM ... TARGET foo`).
@@ -3128,19 +3117,19 @@ async fn create_definition_inner(
     // against the same `transaction`'s view of `transform_definitions`
     // every other check in this function already reads.
     //
-    // Still provisional, not relaxed by issue #76 landing: the grammar now
+    // Still provisional: the grammar
     // accepts an explicit `TRANSFORM <schema>.<target>` spelling, so an
     // operator *can* write `TRANSFORM custom.foo FROM ...` to disambiguate
     // from an existing `public.foo` — but this check doesn't distinguish an
     // explicit qualification from a resolved-bare one, and still rejects the
     // collision either way. That's deliberate, not an oversight: every
     // `split_part(target_table, '.', 2)`-keyed read site named above is
-    // still bare-suffix-keyed — issue #74 (ADR-0011) qualified the
+    // still bare-suffix-keyed — ADR-0011 qualifies the
     // `schema_nodes`/`schema_edges` graph (and, with it, [`dependents_of`],
-    // which no longer needs `split_part` at all — see its own doc comment),
-    // but deliberately left `column_status`'s addressing scheme and the
+    // which needs no `split_part` — see its own doc comment),
+    // but leaves `column_status`'s addressing scheme and the
     // handful of `Trellis`-API-facing bare-name read sites named above
-    // exactly as issue #73 did, for the same reasons: ADR-0003's
+    // bare, for the same reasons: ADR-0003's
     // `transform.column` addressing still parses on the first `.`. So
     // `public.foo` and `custom.foo` coexisting would still silently corrupt
     // those reads regardless of whether the second one arrived via explicit
@@ -3167,7 +3156,7 @@ async fn create_definition_inner(
         });
     }
 
-    // Issue #121 (previously issue #177's arity gate): fail fast on a
+    // Fail fast on a
     // source with no primary key at all, or an unsafe-to-key-on primary key
     // type, before the definition is persisted — a composite (multi-column) source
     // primary key is no longer rejected here: it mirrors onto the target as
@@ -3182,7 +3171,7 @@ async fn create_definition_inner(
     // deliberately: a chained
     // definition's source can legitimately name another *not-yet-physically-
     // built* definition's target (`resolve_graph_identity_in_txn`'s own
-    // fallback, issue #74), and every check above this point tolerates that
+    // fallback), and every check above this point tolerates that
     // (they only ever read this transaction's own catalog rows/graph, never
     // the live source relation itself). `ddl::source_primary_key` is the
     // first thing in this function that actually queries the live relation
@@ -3198,7 +3187,7 @@ async fn create_definition_inner(
     // source relation's shape on a different snapshot than every other check
     // around it — see [`ddl::source_primary_key_in_txn`]'s own doc comment.
     //
-    // Issue #371: every key-space, not just `OneToOne`. Live apply calls
+    // Every key-space, not just `OneToOne`. Live apply calls
     // `ddl::source_primary_key` on an aggregate's source too
     // (`staging::apply`'s by-source and TRUNCATE loops), and
     // `quarantine::classify` halts the table's readers on the key-type error it
@@ -3213,7 +3202,7 @@ async fn create_definition_inner(
         }
     }
 
-    // Issue #440: registration creates the target here, in the transaction
+    // Registration creates the target here, in the transaction
     // that records the definition, so a failure anywhere after this rolls the
     // table back with the catalog row. Placed after every check on the
     // definition itself, so a definition that's wrong in its own right (a
@@ -3230,7 +3219,7 @@ async fn create_definition_inner(
         )
         .await?;
     }
-    // Issue #765: Trellis writes the target as the role each worker connects
+    // Trellis writes the target as the role each worker connects
     // as, and policies that apply to it would filter those writes. The table
     // was just created, as the session's role with RLS off, so this only
     // fires when DDL around the creation (an event trigger) forced RLS on it
@@ -3250,7 +3239,7 @@ async fn create_definition_inner(
 
     let status_text = status.as_str();
 
-    // Reviewer follow-up to issue #73: `transform_definitions_target_suffix_idx`
+    // `transform_definitions_target_suffix_idx`
     // is the DB-level
     // backstop for the exact same invariant the pre-check above enforces
     // optimistically — it's what actually closes the race between two
@@ -3269,7 +3258,7 @@ async fn create_definition_inner(
     // `Some`): the insert failure has already aborted this transaction, so
     // there's no further query available in it to look up what was won
     // against.
-    // #1107: a JOIN's joined table and its column types beside the source's.
+    // A JOIN's joined table and its column types beside the source's.
     let joined_types = join_sides.as_ref().map(JoinSides::joined_value_types);
     let (join_keys, join_vals) = joined_types
         .as_ref()
@@ -3311,12 +3300,12 @@ async fn create_definition_inner(
         }
         Err(err) => return Err(err.into()),
     };
-    // Issue #760: the type of each key column now, the one the target and
+    // The type of each key column now, the one the target and
     // ledger are built from, for the staging worker's
     // capture pass to compare against (`super::key_types`).
     super::key_types::record_definition(&*txn, id, &def, &qualified_source, join_table, false)
         .await?;
-    // #1107, #1096 decision 7: a JOIN's hidden tables, in the catalog schema,
+    // A JOIN's hidden tables, in the catalog schema,
     // named by this definition's id, created empty with its row.
     if let Some(sides) = &join_sides {
         txn.batch_execute(&super::join::hidden_tables_ddl(
@@ -3328,10 +3317,10 @@ async fn create_definition_inner(
         ))
         .await?;
     }
-    // #1096 decision 1: an aggregate outside the admitted set is refused by
+    // An aggregate outside the admitted set is refused by
     // family, whatever its arguments' types were when `validate` ran.
     check_aggregate_admitted(&*txn, &def, &qualified_source).await?;
-    // #1100, #1096 decision 7: an aggregate on the group basis keeps its
+    // An aggregate on the group basis keeps its
     // partials in a hidden table in the catalog schema, named by this
     // definition's id, created empty with its row. A JOIN's key space is
     // never an aggregate's, so it never routes here.
@@ -3352,12 +3341,12 @@ async fn create_definition_inner(
         .await?;
     }
 
-    // Issue #914: a field reading a column paused now is paused at birth, so
+    // A field reading a column paused now is paused at birth, so
     // the build this registration starts leaves it out rather than writing
     // the column's frozen value. The source's fence above is the one a pause
     // of this definition's fields bumps, so this takes no second one. Only a
     // 1-1 plan holds a paused column out; an aggregate or `JOIN` reading one
-    // reports `catching_up` instead (#1208, `reported_statuses_with_causes`).
+    // reports `catching_up` instead (`reported_statuses_with_causes`).
     if matches!(def.key_space, KeySpace::OneToOne) {
         let upstreams = definition_targets_read(&*txn, &qualified_source).await?;
         let all_fields: Vec<String> = def.fields.iter().map(|f| f.name.clone()).collect();
@@ -3389,7 +3378,7 @@ async fn create_definition_inner(
 /// Creates a definition's target table inside the registration transaction
 /// `txn`, running `ddl` ([`install_definition`]'s rendered `create table`) —
 /// unless a relation named `schema.table` already exists, which is refused
-/// with [`CatalogError::TargetTableExists`] and left untouched (issue #440).
+/// with [`CatalogError::TargetTableExists`] and left untouched.
 ///
 /// Any relation kind counts (table, view, materialized view, foreign table,
 /// and also an index or sequence, which would collide just the same), and so
@@ -3412,7 +3401,7 @@ async fn create_target_in_txn(
             format!("{schema}.{taken}")
         },
     };
-    // `ddl` also creates a 1-1 target's ledger (#623 D2), which Trellis owns
+    // `ddl` also creates a 1-1 target's ledger, which Trellis owns
     // just the same, so its name has to be free too.
     let ledger = super::ledger::ledger_table_name(table);
     let taken: Option<String> = txn
@@ -3483,13 +3472,13 @@ pub(crate) struct CaptureReaderRow {
     pub def: TransformDef,
     /// A `schema_changed` marker paused it (C6, `capture_failures`).
     pub capture_failed: bool,
-    /// The qualified `target_table` (#765).
+    /// The qualified `target_table`.
     pub target: String,
-    /// A `JOIN`'s qualified joined table (#1107).
+    /// A `JOIN`'s qualified joined table.
     pub join: Option<String>,
 }
 
-/// Issue #622 (C2): every registered definition ([`CaptureReaderRow`]).
+/// Every registered definition ([`CaptureReaderRow`]).
 /// This is the whole input `crate::capture::columns`
 /// needs to decide which columns a table's capture trigger images.
 ///
@@ -3541,7 +3530,7 @@ pub(crate) async fn capture_readers(
 /// read back from `transform_definitions.source_table`/
 /// `source_table_versions.source_table`. Those columns hold the *qualified*
 /// result this function already produced once, at the definition's own
-/// acceptance time (issue #72); feeding a qualified `"schema.table"` string
+/// acceptance time; feeding a qualified `"schema.table"` string
 /// back in here wouldn't just be redundant, it would always fail — this
 /// query filters `information_schema.tables` by bare `table_name`, which a
 /// qualified string never matches, so every call would return
@@ -3564,9 +3553,10 @@ async fn resolve_source_schema_in_txn(
 }
 
 /// Resolves a *bare* table name to its fully-qualified `schema.table`
-/// identity for the `schema_nodes`/`schema_edges` graph (issue #74,
-/// ADR-0011) — the single resolution [`create_definition_inner`] calls,
-/// early, before touching the graph at all: its two `resolve_node_in_txn` calls, [`reject_if_table_cycle`],
+/// identity for the `schema_nodes`/`schema_edges` graph
+/// (ADR-0011) — the single resolution [`create_definition_inner`] calls,
+/// early, before touching the graph at all: its two `resolve_node_in_txn`
+/// calls, [`reject_if_table_cycle`],
 /// and (for [`create_definition_inner`] specifically) the row persisted to
 /// `source_table_versions`/`transform_definitions.source_table` all share
 /// this one qualified value rather than each re-deriving their own.
@@ -3575,10 +3565,9 @@ async fn resolve_source_schema_in_txn(
 ///
 /// 1. The common case: `table` physically exists, so
 ///    [`resolve_source_schema_in_txn`]'s `search_path` walk finds it
-///    directly — same resolution issue #72 already used for
-///    `qualified_source`.
+///    directly — the same resolution used for `qualified_source`.
 /// 2. `table` instead names another definition's own persisted target
-///    (issue #73's `transform_definitions.target_table`) — a legitimate
+///    (`transform_definitions.target_table`) — a legitimate
 ///    chained `FROM`, but not guaranteed to be backed
 ///    by a physical table at the instant this call names it: the
 ///    catalog-only test-fixture entry points
@@ -3597,18 +3586,15 @@ async fn resolve_source_schema_in_txn(
 ///
 /// This ordering — physical resolution first, the catalog's own record of a
 /// chained target second — is what lets the graph resolution above run
-/// *before* [`reject_if_table_cycle`] without regressing the one case the
-/// old bare-keyed code's ordering used to protect by construction: a
+/// *before* [`reject_if_table_cycle`] without losing one case: a
 /// definition that both (a) closes a cycle and (b) names a not-yet-
 /// materialized chained source as its `FROM` must still report
-/// [`ValidationError::TableCycle`], not a confusing not-found error. Before
-/// issue #74, that was guaranteed by running the (bare, existence-free)
-/// cycle check *before* ever attempting (bare-name) qualification. Now that
-/// the graph itself requires qualified identity, qualification has to run
-/// first — so it's this function's step 2, not error-ordering, that keeps
+/// [`ValidationError::TableCycle`], not a confusing not-found error. The
+/// graph requires qualified identity, so qualification has to run
+/// first — and it's this function's step 2, not error-ordering, that keeps
 /// that guarantee: resolution itself succeeds for a not-yet-materialized
 /// chained target, so the cycle check that runs after it is reached at all,
-/// and reports the cycle exactly as before.
+/// and reports the cycle.
 ///
 /// Only ever call this on a bare name freshly parsed from a definition's
 /// own source text (same restriction as
@@ -3671,13 +3657,13 @@ pub(crate) async fn resolve_graph_identity(
     }
 }
 
-/// The target schema `def` actually resolves against (issue #76, ADR-0011
+/// The target schema `def` actually resolves against (ADR-0011
 /// grammar clause 4): an explicit `TRANSFORM <schema>.<target>` spelling
 /// ([`TransformDef::explicit_target_schema`]) overrides `target_schema`
 /// (`Config::target_schema`, or the caller's own override) outright — a
 /// qualified spelling names its own schema, it doesn't inherit the
 /// configured default. `None` (the bare, common case) keeps using
-/// `target_schema` exactly as issue #73 already did.
+/// `target_schema`.
 fn effective_target_schema<'a>(def: &'a TransformDef, target_schema: &'a str) -> &'a str {
     def.explicit_target_schema
         .as_deref()
@@ -3706,7 +3692,7 @@ async fn resolve_source_schema(pool: &Pool, source_table: &str) -> Result<String
 }
 
 /// Refuses `table` with [`CatalogError::TableNotAccessible`] when it exists
-/// but the role this session runs as can't use it (issue #933). `schema`
+/// but the role this session runs as can't use it. `schema`
 /// names the schema a qualified reference spelled; `None` looks where a bare
 /// name would resolve, the schemas this session's `search_path` setting
 /// lists.
@@ -3825,7 +3811,7 @@ fn search_path_schemas(setting: &str, user: &str) -> Vec<String> {
 
 /// [`resolve_source_for_install`] for a definition being defined: a bare
 /// source that doesn't resolve because the role can't see it is refused as
-/// [`CatalogError::TableNotAccessible`] rather than not found (issue #933).
+/// [`CatalogError::TableNotAccessible`] rather than not found.
 async fn resolve_source_to_define(pool: &Pool, def: &TransformDef) -> Result<String, CatalogError> {
     match resolve_source_for_install(pool, def).await {
         Err(err @ CatalogError::SourceTableNotFound(_)) => {
@@ -3837,7 +3823,7 @@ async fn resolve_source_to_define(pool: &Pool, def: &TransformDef) -> Result<Str
 }
 
 /// Confirms an explicitly qualified `FROM <schema>.<table>` names a table the
-/// role can use (issue #933) and that exists (issue #76), refusing it as
+/// role can use and that exists, refusing it as
 /// [`CatalogError::TableNotAccessible`] or
 /// [`ValidationError::QualifiedSourceTableNotFound`]. The privilege check
 /// runs first: a role without `USAGE` on the schema still finds the table in
@@ -3860,7 +3846,7 @@ async fn confirm_qualified_source(
 }
 
 /// Refuses a 1-1 field named after one of `qualified_source`'s primary key
-/// columns (issue #566) — see [`reject_primary_key_named_fields`]. Every key
+/// columns — see [`reject_primary_key_named_fields`]. Every key
 /// column is a source column, so the key is only introspected when some field
 /// shares a name with one of `source_columns`: a definition with none costs
 /// no query.
@@ -3886,8 +3872,8 @@ fn schema_of(qualified: &str) -> Option<&str> {
     qualified.split_once('.').map(|(schema, _)| schema)
 }
 
-/// [`validate`] for a definition whose source resolved to `qualified_source`
-/// (issue #830): a three-part qualified column must name that schema, and an
+/// [`validate`] for a definition whose source resolved to `qualified_source`:
+/// a three-part qualified column must name that schema, and an
 /// ambiguous-name refusal spells it in the qualified names it suggests.
 fn validate_with_source(
     def: &TransformDef,
@@ -3904,7 +3890,7 @@ fn validate_with_source(
 
 /// [`validate`] for a definition being defined, before its source is
 /// resolved. Resolves the source only to spell its schema in an
-/// ambiguous-name refusal (issue #830); a definition that fails some other
+/// ambiguous-name refusal; a definition that fails some other
 /// way, or passes, never resolves it here.
 ///
 /// A `JOIN` definition is checked against both tables' live columns instead
@@ -3937,7 +3923,7 @@ async fn validate_for_define(
     }
 }
 
-/// The two tables of a `JOIN` definition (#1106, #1107), resolved to their
+/// The two tables of a `JOIN` definition, resolved to their
 /// qualified identities, with their live columns as
 /// [`super::validate::validate_join`] reads them.
 #[derive(Debug, Clone)]
@@ -4005,7 +3991,7 @@ impl JoinSides {
 }
 
 /// Refuses a plain aggregate over `qualified_source` that calls an aggregate
-/// outside #1096 decision 1's admitted set, by family
+/// outside the admitted set, by family
 /// ([`super::validate::validate_aggregate_admitted`]), against the source's
 /// live columns. Define makes it in its transaction, and a resume's
 /// [`revalidate`] again, so a summed column re-typed since (to an
@@ -4090,15 +4076,14 @@ async fn join_columns_of(
 }
 
 /// The fully-qualified source [`install_definition`]'s own DDL steps read
-/// from (issue #76, ADR-0011) — computed once, early in
+/// from (ADR-0011) — computed once, early in
 /// that function, exactly like `target_schema`/[`effective_target_schema`]
 /// immediately above it, and threaded through every one of those steps
-/// (`ddl::source_primary_key`, `ddl::target_table_ddl`) so none of them can independently
-/// re-derive a different answer, and so every physical SQL builder among them
-/// emits the qualified identity rather than a bare `def.source` left to the
-/// executing connection's own `search_path` — the gap a reviewer flagged
-/// against issue #76's own new explicit-schema grammar (ADR-0011, clause 3:
-/// "Every generated statement emits qualified names").
+/// (`ddl::source_primary_key`, `ddl::target_table_ddl`) so none of them can
+/// independently re-derive a different answer, and so every physical SQL
+/// builder among them emits the qualified identity rather than a bare
+/// `def.source` left to the executing connection's own `search_path`
+/// (ADR-0011, clause 3: "Every generated statement emits qualified names").
 ///
 /// `create_definition_inner` (further below) computes its *own* copy inside
 /// its own transaction rather than receiving this one as a parameter — see
@@ -4112,24 +4097,16 @@ async fn join_columns_of(
 /// fail-fast explicit-schema check just above it, also redundant-but-harmless
 /// against `create_definition_inner`'s copy.
 ///
-/// Reviewer follow-up to issue #74 (epic #78's own whole-branch review): the
-/// bare (`None`) branch used to call [`resolve_source_schema`] directly — a
-/// plain `search_path` walk with no fallback — even though
+/// The bare (`None`) branch uses [`resolve_graph_identity`], the same
+/// two-step resolution (with the bare-target-suffix fallback) as
 /// `create_definition_inner`'s own resolution of the exact same bare
-/// `def.source` (its `qualified_source`, above) has carried issue #74's
-/// bare-target-suffix fallback ([`resolve_graph_identity`]) since that issue
-/// landed. That gap meant *this*, `install_definition`'s own "far more
-/// common" entry point (see its own doc comment), never actually got the
-/// fallback in practice: this function's DDL steps run and can
-/// fail *before* `create_definition_inner` is ever reached (only the plain
-/// 1-1 path reaches it at all, and only after this qualification already
-/// succeeded), so a bare `FROM <name>` chained off another definition's
-/// target explicitly qualified into a non-default schema (issue #76) failed
-/// here first, as a plain "not found on the search path" — never getting the
-/// chance to resolve the way the ring path always could. Switched to
-/// [`resolve_graph_identity`] itself, the same pooled two-step resolution
-/// `staging::apply::compute`'s `qualified_schema_node_key` already reuses,
-/// rather than re-implementing the fallback a third time.
+/// `def.source` (its `qualified_source`, above), and the same pooled
+/// resolution `staging::apply::compute`'s `qualified_schema_node_key` reuses.
+/// This function's DDL steps run and can fail *before*
+/// `create_definition_inner` is ever reached, so a bare `FROM <name>`
+/// chained off another definition's target explicitly qualified into a
+/// non-default schema must resolve here too, rather than failing as a plain
+/// "not found on the search path".
 pub(crate) async fn resolve_source_for_install(
     pool: &Pool,
     def: &TransformDef,
@@ -4140,7 +4117,7 @@ pub(crate) async fn resolve_source_for_install(
     }
 }
 
-/// Whether `schema.table` is a real relation (issue #76, ADR-0011 grammar
+/// Whether `schema.table` is a real relation (ADR-0011 grammar
 /// clause 4): the existence check an explicitly-qualified `FROM`/`TRANSFORM`
 /// reference gets *instead of* [`resolve_source_schema_in_txn`]'s
 /// `search_path` walk. A qualified spelling names its schema directly, so
@@ -4166,7 +4143,7 @@ async fn qualified_table_exists(
 }
 
 /// A column's type and collation as Postgres reports them (`pg_attribute`,
-/// `pg_collation`), for [`assert_deterministic_key_collation`] (issue #638)
+/// `pg_collation`), for [`assert_deterministic_key_collation`]
 /// and the collation check of a text function's argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveColumn {
@@ -4180,7 +4157,7 @@ struct LiveColumn {
 
 /// `query_table.column`'s collation: `None` for a table or column that
 /// doesn't exist. Serves the key-column collation check
-/// ([`assert_deterministic_key_collation_in_txn`], issue #638), whose caller
+/// ([`assert_deterministic_key_collation_in_txn`]), whose caller
 /// has already resolved the column some other way.
 async fn column_in_txn(
     txn: &impl GenericClient,
@@ -4206,8 +4183,8 @@ async fn column_in_txn(
 }
 
 /// Rejects `table.column`, a column the engine matches as a key in the role
-/// `key`, if [`column_in_txn`] finds it has a nondeterministic collation
-/// (issue #638). A column that doesn't exist passes: every caller has already
+/// `key`, if [`column_in_txn`] finds it has a nondeterministic collation.
+/// A column that doesn't exist passes: every caller has already
 /// resolved it (it came from the table's own key index, or [`validate`]
 /// checked it), and the check that resolved it owns that error.
 async fn assert_deterministic_key_collation_in_txn(
@@ -4225,12 +4202,12 @@ async fn assert_deterministic_key_collation_in_txn(
 }
 
 /// [`assert_deterministic_key_collation_in_txn`]'s decision, on a column
-/// already looked up (issue #638). The key-column twin of
+/// already looked up. The key-column twin of
 /// [`assert_deterministic_join_collation`]: a nondeterministic collation's
 /// `=` (and so its `GROUP BY` and unique indexes) treats distinct strings as
 /// equal, while the engine matches keys by their exact text, so Postgres
 /// would fold rows the engine keeps apart. Refused, never reinterpreted
-/// (#590's decision).
+/// by design.
 ///
 /// A column with no collation, or the database default's, always passes:
 /// Postgres has no nondeterministic database default (`CREATE DATABASE`
@@ -4261,20 +4238,20 @@ fn assert_deterministic_key_collation(
 /// Every check of definition `def`, sourced from `qualified_source`, that
 /// reads the live schema, in the order define runs them once its source
 /// resolves. Define runs it before it creates the target; every resume runs
-/// it again ([`revalidate`], #708, #760), so a definition the schema has
+/// it again ([`revalidate`]), so a definition the schema has
 /// drifted from is refused, by the same rule and with the same error, on
 /// either path. Returns the source's row-identity key.
 ///
 /// - **The source key** ([`ddl::source_primary_key_in_txn`]): every
-///   key-space's, since live apply keys an aggregate's changes by it too
-///   (#371), and a type off the key allowlist would halt its readers. Its
+///   key-space's, since live apply keys an aggregate's changes by it too,
+///   and a type off the key allowlist would halt its readers. Its
 ///   columns, and any `GROUP BY` key, need a deterministic collation, and
-///   so does any column a field's `STRPOS`/`REGEXP_COUNT` reads (#638). A
-///   source that capture can't key is refused (#376).
-/// - **Row-level security and subscriptions** (#745, #751): row-level
+///   so does any column a field's `STRPOS`/`REGEXP_COUNT` reads. A
+///   source that capture can't key is refused.
+/// - **Row-level security and subscriptions**: row-level
 ///   security that applies to a role reading the source
 ///   ([`side_read_table`]) would refuse the reads (every Trellis session runs
-///   with `row_security = off`, #766), and a table a logical-replication
+///   with `row_security = off`), and a table a logical-replication
 ///   subscription writes is one whose changes capture never sees. Define
 ///   checks row-level security once already; the second check here is the
 ///   resume's.
@@ -4301,7 +4278,7 @@ pub(crate) async fn validate_live_schema(
     Ok(source_key)
 }
 
-/// [`validate_live_schema`] for a `JOIN` definition (#1107): each side is
+/// [`validate_live_schema`] for a `JOIN` definition: each side is
 /// held to the rules a definition's source is (a usable row-identity key of
 /// deterministic collation, a primary key or another definition's target),
 /// and neither may be under row-level security that applies to its readers
@@ -4329,7 +4306,7 @@ pub(crate) async fn validate_live_join_schema(
 }
 
 /// A table a definition reads (its source, or a side of a `JOIN`) with the
-/// roles that read it as row-level security sees them (#745): the ring's
+/// roles that read it as row-level security sees them: the ring's
 /// owner, or the session's role alone when it is another definition's
 /// target, which the target-mutation seam feeds and no capture function
 /// reads ([`super::row_security::Readers::Session`]).
@@ -4348,7 +4325,7 @@ async fn side_read_table(
 /// Refuses `target` (`schema.table`) with
 /// [`CatalogError::TargetInCatalogSchema`] when its schema is
 /// `catalog_schema`, this instance's catalog schema, or holds a
-/// `trellis_instance` table, another instance's (#979). A 1-1 target's
+/// `trellis_instance` table, another instance's. A 1-1 target's
 /// ledger lives in the target's schema, so this covers it too.
 /// `pg_class`, not `information_schema`, which hides a table the role has no
 /// privilege on, as [`crate::identity`]'s scan does.
@@ -4390,12 +4367,12 @@ pub(crate) struct Revalidated {
     /// The source's columns and their value types, as define reads them
     /// ([`live_source_columns`]).
     pub source_columns: HashMap<String, ValueType>,
-    /// A `JOIN` definition's two tables and their live columns (#1107).
+    /// A `JOIN` definition's two tables and their live columns.
     pub join: Option<JoinSides>,
 }
 
-/// Re-runs define-time validation for `definition` against the live schema
-/// (#708, #760): the definition's own rules ([`validate`]) over the
+/// Re-runs define-time validation for `definition` against the live schema:
+/// the definition's own rules ([`validate`]) over the
 /// source's live columns, [`validate_live_schema`], and
 /// the checks on the target define makes once it exists. A resume calls it
 /// before it changes anything, and refuses while it fails; a definition the
@@ -4437,7 +4414,7 @@ pub(crate) async fn revalidate(
             });
         }
     }
-    // #1188, #1096 decision 1: the aggregates define refuses by family (a
+    // The aggregates define refuses by family (a
     // `SUM`/`AVG` over a numeric that lost its declared scale, or over a
     // column re-typed to a float), which define makes once the table exists.
     check_aggregate_admitted(txn, &definition.def, source).await?;
@@ -4456,7 +4433,7 @@ pub(crate) async fn revalidate(
     })
 }
 
-/// [`revalidate`] for a `JOIN` definition (#1107): both tables, and every
+/// [`revalidate`] for a `JOIN` definition: both tables, and every
 /// check define makes on each, so a failure on either side refuses the
 /// resume, naming that side's table.
 async fn revalidate_join(
@@ -4497,7 +4474,7 @@ async fn revalidate_join(
 
 /// Drops group-basis definition `id`'s hidden partials table from `schema`,
 /// the catalog schema, and creates it again, empty, at the shape `shape`
-/// gives it (#1101): a resume's, since its partials are fully derived. The
+/// gives it: a resume's, since its partials are fully derived. The
 /// shape is what define would give it now, so a `GROUP BY` column re-typed
 /// while the definition was paused resumes over correctly typed partials.
 pub(crate) async fn recreate_group_table(
@@ -4516,8 +4493,8 @@ pub(crate) async fn recreate_group_table(
 }
 
 /// Drops `JOIN` definition `id`'s hidden tables from `schema`, the catalog
-/// schema, and creates them again, empty, at the shape `sides` gives them
-/// (#1107): a resume's, since they're fully derived.
+/// schema, and creates them again, empty, at the shape `sides` gives them:
+/// a resume's, since they're fully derived.
 pub(crate) async fn recreate_hidden_tables(
     txn: &tokio_postgres::Transaction<'_>,
     schema: &str,
@@ -4534,7 +4511,7 @@ pub(crate) async fn recreate_hidden_tables(
     Ok(())
 }
 
-/// The qualified joined table of definition `id`, a `JOIN` (#1107); `None`
+/// The qualified joined table of definition `id`, a `JOIN`; `None`
 /// for any other definition, or an id with no row.
 pub(crate) async fn join_table_of(
     client: &impl GenericClient,
@@ -4550,7 +4527,7 @@ pub(crate) async fn join_table_of(
 }
 
 /// The qualified joined table of `JOIN` definition `id` and its column
-/// types as define or the last resume recorded them (#1107); `None` for any
+/// types as define or the last resume recorded them; `None` for any
 /// other definition, or an id with no row.
 pub(crate) async fn join_side_of(
     client: &impl GenericClient,
@@ -4587,8 +4564,8 @@ pub(crate) async fn join_side_of(
     Ok(Some((table, columns)))
 }
 
-/// Persists `columns` as `JOIN` definition `id`'s joined-table column types
-/// (#1107), as a resume reads them, beside [`record_source_columns`].
+/// Persists `columns` as `JOIN` definition `id`'s joined-table column types,
+/// as a resume reads them, beside [`record_source_columns`].
 pub(crate) async fn record_join_columns(
     client: &impl GenericClient,
     id: i64,
@@ -4606,7 +4583,7 @@ pub(crate) async fn record_join_columns(
 }
 
 /// Refuses a whole-transform resume of a 1-1 definition whose ledger table
-/// doesn't exist (#986). Define creates one for every 1-1 definition
+/// doesn't exist. Define creates one for every 1-1 definition
 /// ([`ddl::target_table_ddl`]), and the build's `start` reads it, so a resume that passed would leave
 /// every staging-worker pass failing on it until the definition was paused
 /// or dropped. Refusing before the resume changes anything leaves the
@@ -4644,7 +4621,7 @@ pub(crate) async fn check_ledger_table(
 }
 
 /// Refuses a whole-transform resume while a source index the definition
-/// needs is missing (#1167, `super::source_index`), as define would, unless
+/// needs is missing (`super::source_index`), as define would, unless
 /// it was defined `WITHOUT SOURCE INDEX`.
 async fn check_source_index(
     txn: &tokio_postgres::Transaction<'_>,
@@ -4741,7 +4718,7 @@ pub(crate) async fn record_source_columns(
 ///
 /// Classified by each column's `atttypid` through
 /// [`super::pg_type::value_type_for_oid`], which also places a user-defined
-/// enum (#108, #117). A column whose type the registry can't place at all
+/// enum. A column whose type the registry can't place at all
 /// (an array, a range, a composite, a domain, `citext`) is left out, so the
 /// validator reports a reference to it as an unknown column: everything
 /// downstream needs its real Postgres type, and `Unrecognized` isn't one.
@@ -4775,7 +4752,7 @@ pub(crate) async fn live_source_columns(
     Ok(columns)
 }
 
-/// Issue #638: refuses a definition if any column the engine matches as one
+/// Refuses a definition if any column the engine matches as one
 /// of its keys has a nondeterministic collation
 /// ([`assert_deterministic_key_collation`]). Those keys are:
 ///
@@ -4818,7 +4795,7 @@ async fn assert_deterministic_definition_keys(
     Ok(())
 }
 
-/// Issue #638's follow-up: refuses a definition whose field `STRPOS`/
+/// Refuses a definition whose field `STRPOS`/
 /// `REGEXP_COUNT` reads a column with a nondeterministic collation
 /// ([`super::validate::collation_refusing_function_reads`]). Postgres raises
 /// `0A000` for both under such a collation, while the engine computes them
@@ -4876,11 +4853,11 @@ async fn has_primary_key(
         .get(0))
 }
 
-/// Whether trigger capture can key `schema.table`'s changes (issue #622 C5):
+/// Whether trigger capture can key `schema.table`'s changes:
 /// it is a plain table (`relkind = 'r'`) with a primary key. Every ring row a
 /// capture trigger writes is keyed by the primary key, so a table without
 /// one can't be captured, whatever unique index it has. That also rules out
-/// #589's key mismatch between a unique index and the primary key.
+/// a key mismatch between a unique index and the primary key.
 ///
 /// A table in a partition or inheritance hierarchy (a partitioned table, a
 /// partition, an inheritance parent or an inheritance child) is refused as
@@ -4915,13 +4892,13 @@ pub(crate) async fn change_keyed(
     )
 }
 
-/// Issue #376: rejects a definition whose source this instance would capture
+/// Rejects a definition whose source this instance would capture
 /// by triggers when the triggers can't key its changes ([`change_keyed`]: a
-/// plain table with a primary key, issue #622) —
+/// plain table with a primary key) —
 /// [`CatalogError::SourceNotChangeKeyed`].
 ///
 /// This instance's own targets are exempt. Every write to one goes through
-/// the target-mutation seam (`staging::target_mutations`, issue #315), which
+/// the target-mutation seam (`staging::target_mutations`), which
 /// stages each changed key for the target's readers in the writing
 /// transaction, keyed by the same code that wrote the row, so an aggregate
 /// target's missing primary key never matters to its own instance.
@@ -4992,14 +4969,14 @@ async fn reject_unkeyed_source(
     })
 }
 
-/// Issue #745: rejects the first of `tables` (unquoted `schema.table`
+/// Rejects the first of `tables` (unquoted `schema.table`
 /// identities) whose row-level security applies to a role that reads it
 /// ([`super::row_security::applying`]): the ring's owner, and the session's
 /// role for a table registration itself reads ([`super::row_security::Readers`];
 /// not otherwise, since the session may belong to a process that never reads
 /// the table), or only the session's role for a table another definition
 /// targets, which no capture function reads, and for the target it creates
-/// (#765) — [`CatalogError::RowSecurityApplies`]. A table that doesn't
+/// — [`CatalogError::RowSecurityApplies`]. A table that doesn't
 /// exist passes: the checks that need it report that.
 async fn reject_row_security(
     client: &impl GenericClient,
@@ -5014,7 +4991,7 @@ async fn reject_row_security(
     Ok(())
 }
 
-/// Issue #751: rejects the first of `tables` (unquoted `schema.table`
+/// Rejects the first of `tables` (unquoted `schema.table`
 /// identities) that a logical-replication subscription replicates into
 /// ([`super::subscription::subscribed`]) — [`CatalogError::Subscribed`]. A
 /// table that doesn't exist passes: the checks that need it report that.
@@ -5038,7 +5015,7 @@ async fn reject_subscribed(
 /// see [`super::model::NodeKind`]'s doc comment) merges into one node with
 /// both flags set, rather than erroring.
 ///
-/// **`table_name` must already be fully-qualified (issue #74, ADR-0011)** —
+/// **`table_name` must already be fully-qualified (ADR-0011)** —
 /// `public.posts` and `archive.posts` resolve to distinct nodes; this
 /// function never resolves a bare name itself (see
 /// [`resolve_graph_identity_in_txn`] for the one place that does, ahead of
@@ -5148,8 +5125,8 @@ async fn persist_edge_in_txn(
 /// [`super::validate::detect_cycle`]'s column-level convention rather than
 /// pulling in a graph crate for a problem this small.
 ///
-/// **`source_table`/`target_table` must already be fully-qualified** (issue
-/// #74, ADR-0011) — `schema_nodes.table_name` is, so comparing a bare name
+/// **`source_table`/`target_table` must already be fully-qualified**
+/// (ADR-0011) — `schema_nodes.table_name` is, so comparing a bare name
 /// against it would simply never match anything, silently defeating cycle
 /// detection rather than erroring. See [`resolve_graph_identity_in_txn`] for
 /// how every caller here gets a qualified value before calling this.
@@ -5228,7 +5205,7 @@ fn find_table_path_from(
 
 /// The [`SchemaNode`] already resolved for `table_name`, or `None` if
 /// nothing has ever referenced it as a source or a target. `table_name`
-/// must already be fully-qualified (issue #74, ADR-0011).
+/// must already be fully-qualified (ADR-0011).
 #[cfg(any(test, feature = "internals"))]
 pub async fn node_for_table(
     pool: &Pool,
@@ -5255,8 +5232,8 @@ pub async fn node_for_table(
 /// generalized, `transform_definitions`-agnostic sibling of
 /// [`dependents_of`] that returns raw edges rather than joining onto any
 /// definition table, so it works for any [`EdgeKind`] without needing a
-/// kind-specific query. `node_table` must already be fully-qualified (issue
-/// #74, ADR-0011) — matched exactly against `schema_nodes.table_name`.
+/// kind-specific query. `node_table` must already be fully-qualified
+/// (ADR-0011) — matched exactly against `schema_nodes.table_name`.
 #[cfg(any(test, feature = "internals"))]
 pub async fn edges_from(
     pool: &Pool,
@@ -5291,24 +5268,24 @@ pub async fn edges_from(
 /// [`decode_value_type`], which every read site below (`dependents_of`,
 /// `definition_by_id`, `definition_by_target`) shares rather than
 /// re-implementing its own copy of this match, the way three independent
-/// copies used to (issue #108 review).
+/// copies used to.
 fn encode_value_type(value_type: &ValueType) -> &'static str {
     match value_type {
         ValueType::Numeric => "numeric",
-        // Issue #111: an exact integer persists under its own Postgres
+        // An exact integer persists under its own Postgres
         // spelling (`smallint`/`integer`/`bigint`), which is distinct from
         // every other token here *and* from every `PgType::name`, so all
         // three namespaces still share one column unambiguously. The
         // `every_value_type_round_trips_through_the_persisted_token` test
         // pins that.
         ValueType::Integer(width) => width.pg_name(),
-        // Issue #112: same shape — `real`/`double precision`, each distinct
+        // Same shape — `real`/`double precision`, each distinct
         // from every other token in all three namespaces.
         ValueType::Float(width) => width.pg_name(),
         ValueType::Text => "text",
         ValueType::Boolean => "boolean",
         ValueType::Uuid => "uuid",
-        // `PgType::name` doubles as this persisted token (issue #108): every
+        // `PgType::name` doubles as this persisted token: every
         // name is already a distinct, stable string disjoint from the four
         // above (see that method's doc comment).
         ValueType::Other(pg_type) => pg_type.name(),
@@ -5363,14 +5340,14 @@ struct PendingDefinition {
 }
 
 /// The transform definitions that depend on `node_table` via a `kind` edge
-/// in the persisted dependency graph (issue #21) — e.g. `EdgeKind::Source`
+/// in the persisted dependency graph — e.g. `EdgeKind::Source`
 /// answers "what reads from `node_table` as its `FROM`". Walking
 /// `schema_edges` (rather than matching on
 /// `transform_definitions.source_table` string equality) is what makes this
 /// a real graph lookup: multi-hop chains resolve by calling this again with
 /// a dependent's target table, not by any special-casing here.
 ///
-/// One query, not one-per-definition-row (issue #69): a `left join lateral
+/// One query, not one-per-definition-row: a `left join lateral
 /// jsonb_each_text(...)` unnests every dependent definition's persisted
 /// `source_columns` map inline, so this is still "decode JSON via SQL, no
 /// serde_json dependency" — matching `staging::apply::decode_images`'s
@@ -5381,7 +5358,7 @@ struct PendingDefinition {
 ///
 /// **Applying definitions only** ([`super::model::APPLYING_SQL`]:
 /// `live` or `catching_up`, or `backfilling` under a Re-derive build, which
-/// applies from its start, #625 F2; ADR-0002): a `waiting_to_backfill`
+/// applies from its start; ADR-0002): a `waiting_to_backfill`
 /// or `quarantined` definition's target may not reflect every pre-existing
 /// source row, so a live CDC delta folded into it now — via
 /// [`transforms_for_source`], the apply path's read of this function — could
@@ -5392,15 +5369,12 @@ struct PendingDefinition {
 /// re-derives every key the source has and sweeps the ones it no longer
 /// backs.
 ///
-/// `node_table` ($1) must already be fully-qualified (issue #74, ADR-0011)
-/// — matched exactly against `schema_nodes.table_name`, which is now always
+/// `node_table` ($1) must already be fully-qualified (ADR-0011)
+/// — matched exactly against `schema_nodes.table_name`, which is always
 /// qualified too, so `public.posts` and `archive.posts` resolve to
 /// disjoint dependent sets rather than colliding. The join from `to_node`
-/// onto `transform_definitions` is now a plain equality on `target_table`
-/// as well: before issue #74, `to_node.table_name` was bare while
-/// `target_table` had already been qualified (issue #73), so this join used
-/// to go through `target_table`'s bare suffix (`split_part`) instead — no
-/// longer necessary now both sides hold the exact same qualified string
+/// onto `transform_definitions` is a plain equality on `target_table`
+/// as well, since both sides hold the exact same qualified string
 /// (both ultimately derived from the same `qualified_target`, in the same
 /// transaction, by `create_definition_inner`).
 #[cfg(any(test, feature = "internals"))]
@@ -5496,9 +5470,9 @@ async fn dependents_via(
 /// The transform definitions currently subscribed to `source_table`: a thin
 /// wrapper over [`dependents_of`] following the edges a definition reads a
 /// table by, its `FROM` ([`EdgeKind::Source`]) and a `JOIN`'s joined table
-/// ([`EdgeKind::Join`], #1107). A self-join is refused at define, so a
+/// ([`EdgeKind::Join`]). A self-join is refused at define, so a
 /// definition is reached through at most one of them. `source_table` must
-/// already be fully-qualified (issue #74, ADR-0011) — see [`dependents_of`]'s
+/// already be fully-qualified (ADR-0011) — see [`dependents_of`]'s
 /// doc comment.
 pub async fn transforms_for_source(
     pool: &Pool,
@@ -5507,11 +5481,11 @@ pub async fn transforms_for_source(
     dependents_via(pool, source_table, &[EdgeKind::Source, EdgeKind::Join]).await
 }
 
-/// Every table that needs CDC capture for at least one registered transform
-/// (issue #65): every distinct `source_table` and `JOIN` `join_table`
-/// ([`reachable_tables_cte`]), fully qualified (issue #75, ADR-0011).
+/// Every table that needs CDC capture for at least one registered transform:
+/// every distinct `source_table` and `JOIN` `join_table`
+/// ([`reachable_tables_cte`]), fully qualified (ADR-0011).
 ///
-/// Issue #14: a running [`crate::Client`]'s maintenance loop polls this to
+/// A running [`crate::Client`]'s maintenance loop polls this to
 /// notice a transform registered against a table it hasn't seen before, so it
 /// can install that table's capture and start its build without
 /// waiting for a restart.
@@ -5529,7 +5503,7 @@ pub async fn all_source_tables(pool: &Pool) -> Result<Vec<String>, CatalogError>
     Ok(rows.into_iter().map(|r| r.get(0)).collect())
 }
 
-/// Forgets the capture records of every table no definition reads (#1217):
+/// Forgets the capture records of every table no definition reads:
 /// the trigger, baseline and partition-tree records and the queued partition
 /// corrections. A definition counts as reading a table whatever its status
 /// (paused and quarantined included), as its source or a `JOIN`'s joined
@@ -5583,9 +5557,9 @@ fn reachable_tables_cte(anchor_filter: &str) -> String {
     )
 }
 
-/// The tables this instance's capture triggers should cover (issue #622):
+/// The tables this instance's capture triggers should cover:
 /// every table [`all_source_tables`] reaches, minus the targets of this
-/// instance's own definitions (issue #315).
+/// instance's own definitions.
 ///
 /// A chained definition reads another definition's target, but that target
 /// never needs capturing: every write to it goes through the target-mutation
@@ -5605,8 +5579,8 @@ pub async fn tables_to_capture(pool: &Pool) -> Result<Vec<String>, CatalogError>
     Ok(tables.into_iter().filter(|t| !own.contains(t)).collect())
 }
 
-/// Which of `tables` are the target of some definition in this instance
-/// (issue #315): tables whose changes reach their readers only through the
+/// Which of `tables` are the target of some definition in this instance:
+/// tables whose changes reach their readers only through the
 /// target-mutation seam, never CDC. See [`tables_to_capture`].
 async fn own_targets(
     client: &impl GenericClient,
@@ -5628,13 +5602,12 @@ async fn own_targets(
 /// ever been created against it.
 ///
 /// `source_table` is the qualified identity `source_table_versions` persists
-/// (issue #72) and is matched exactly. Its one caller
+/// and is matched exactly. Its one caller
 /// (`staging::apply::compute`) passes the canonical identity it also keys
 /// `ApplyPlan::versions` on, and Phase 3's version fence re-reads the same row
-/// by the same key. Issue #380: this used to match the bare table-name suffix
-/// (`split_part(source_table, '.', 2)`), which returned two rows, and so
-/// failed every drain, once two schemas each had a source table of the same
-/// name.
+/// by the same key. The match is on the exact qualified name, not the bare
+/// table-name suffix, so two schemas that each have a source table of the
+/// same name stay distinct.
 pub async fn source_table_version(
     pool: &Pool,
     source_table: &str,
@@ -5872,7 +5845,7 @@ pub async fn definition_by_target(
 /// This function never reads `schema_nodes`/`schema_edges` at all — it
 /// scans `transform_definitions` directly. The bare `upstream_table` is
 /// resolved to its target's qualified identity, and matched against each
-/// definition's qualified `source_table` (issue #488), so a table
+/// definition's qualified `source_table`, so a table
 /// in another schema that merely shares the target's bare name is never a
 /// match. `upstream_table` itself stays bare for the same
 /// `column_status`-addressing reasons the `target` column below does (see
@@ -5896,7 +5869,7 @@ pub async fn definition_by_target(
 /// that `resume_column`'s cascade walk would later try (and fail) to
 /// recompute through its 1-1 field build.
 ///
-/// **Sibling readers first** (issue #748). A 1-1 definition's own fields
+/// **Sibling readers first**. A 1-1 definition's own fields
 /// that read `upstream_column` by alias ([`super::eval::AliasReaders`])
 /// come first, under `upstream_table` itself: a field reading a paused
 /// field is paused too (ADR-0003 freezes it rather than evaluating it over
@@ -5930,7 +5903,7 @@ pub(crate) async fn column_dependents(
 /// still reads the upstream column, directly or by alias. The cascade walk lists a column's readers outside any lock
 /// and re-asks this for each pair under the column-pause lock, which every
 /// edit of a definition holds exclusive, so the answer can't change before
-/// the pair commits (issue #955).
+/// the pair commits.
 pub(crate) async fn reads_column(
     client: &impl GenericClient,
     (reader_transform, reader_field): (&str, &str),
@@ -5968,8 +5941,8 @@ pub(crate) async fn reads_column(
 /// [`column_dependents`], generalized to *every* downstream key-space (not
 /// just [`KeySpace::OneToOne`]) and to any `impl GenericClient` (a plain
 /// pooled connection, or a transaction) rather than just a fresh pooled one —
-/// the column-granularity dependency-edge infrastructure issues #241/#242
-/// both need for a *drop* refusal, as opposed to [`column_dependents`]'s own
+/// the column-granularity dependency-edge infrastructure a *drop* refusal
+/// needs, as opposed to [`column_dependents`]'s own
 /// pause/cascade/resume use.
 ///
 /// **Why the wider key-space net matters here.** `column_dependents`'s
@@ -5977,7 +5950,7 @@ pub(crate) async fn reads_column(
 /// column-pause cascade — nothing outside the 1-1 tier has a `column_status`
 /// row to cascade onto), but is exactly *wrong* for a drop refusal: an
 /// aggregate transform's `GROUP BY` can key on a chained source column just
-/// as readily as a 1-1 field can (issue #137),
+/// as readily as a 1-1 field can,
 /// and dropping the column such a grouping key reads is exactly as
 /// destructive as dropping one a 1-1 field reads — the refusal must see it
 /// too. So this walks every downstream definition's [`KeySpace::Aggregate`]
@@ -6012,7 +5985,7 @@ pub(crate) struct RefusedReader {
 
 /// Every definition that reads one of `columns` of the target `upstream`
 /// (bare name) and that define's whole validation ([`revalidate`]) now
-/// refuses, as the schema stands in `txn` (#1188). The caller has re-typed
+/// refuses, as the schema stands in `txn`. The caller has re-typed
 /// the columns in `txn`, so the validation sees the new types. A reader
 /// that stays valid isn't returned; a database error propagates.
 pub(crate) async fn refused_readers(
@@ -6081,7 +6054,7 @@ async fn column_dependents_via(
     let def_rows = client
         .query(
             // `split_part(target_table, '.', 2)`, not the qualified column
-            // directly (issue #73): the `String` this returns for each row
+            // directly: the `String` this returns for each row
             // is pushed straight into `deps` below as a *downstream
             // transform* identifier, which flows into
             // `staging::quarantine`'s `column_status`/`column_pause_cascades`
@@ -6098,7 +6071,7 @@ async fn column_dependents_via(
         )
         .await?;
 
-    // Issue #488: `upstream_table` is a bare target name, but a reader is
+    // `upstream_table` is a bare target name, but a reader is
     // matched against it by qualified identity: a definition over
     // `other.t` doesn't read the target `public.t`. Bare target suffixes are
     // unique ([`CatalogError::TargetTableSuffixCollision`]), so the bare name
@@ -6116,7 +6089,7 @@ async fn column_dependents_via(
         let text: String = row.get(1);
         // The definition's qualified source, which it reads directly.
         let qualified_source: String = row.get(2);
-        // A `JOIN`'s joined table, which it reads directly too (#1107).
+        // A `JOIN`'s joined table, which it reads directly too.
         let joined: Option<String> = row.get(5);
         // A definition already persisted here is expected to always re-parse
         // (the same assumption every other read path in this module makes);
@@ -6144,7 +6117,7 @@ async fn column_dependents_via(
         if only_one_to_one && !matches!(def.key_space, KeySpace::OneToOne) {
             continue;
         }
-        // #1107: a `JOIN` names every column by its table. It reads the upstream column through whichever side
+        // A `JOIN` names every column by its table. It reads the upstream column through whichever side
         // is the upstream table: in a field, or in its `ON` or `GROUP BY`
         // (named by that column, which a `GROUP BY` key's target column is).
         if super::join::spec(&def).is_some() {
@@ -6228,7 +6201,7 @@ fn expr_references_column(
 mod live_fixture_tests {
     use super::*;
 
-    /// #1107: the fixtures that flip a definition `live` without a build
+    /// The fixtures that flip a definition `live` without a build
     /// refuse a `JOIN`, which only its build makes `live`; any other shape
     /// passes.
     #[test]
@@ -6242,7 +6215,7 @@ mod live_fixture_tests {
     }
 }
 
-/// Issue #488: a column's dependents are the definitions that actually read
+/// A column's dependents are the definitions that actually read
 /// its target, matched on qualified identity, not on a bare name another
 /// schema's table can share.
 #[cfg(test)]
@@ -6279,7 +6252,7 @@ mod column_dependents_tests {
         assert_eq!(deps, vec![("chained".to_string(), "a_copy".to_string())]);
     }
 
-    /// #1107: a `JOIN` reads an upstream target's column through whichever
+    /// A `JOIN` reads an upstream target's column through whichever
     /// of its tables the target is, in a field or in its `ON` or `GROUP BY`,
     /// so dropping that field is refused. A column of the other table that
     /// only shares the name isn't a read of the target's.
@@ -6328,7 +6301,7 @@ mod column_dependents_tests {
         }
     }
 
-    /// Issue #955: the cascade's per-pair re-check, [`reads_column`], says
+    /// The cascade's per-pair re-check, [`reads_column`], says
     /// yes for exactly the pairs [`column_dependents`] lists, in every shape
     /// a reader can take: a sibling reading by alias, a chained field (bare,
     /// qualified, inside a function call, two reads in one field), and an
@@ -6446,7 +6419,7 @@ mod column_dependents_tests {
     }
 }
 
-/// Issue #487: the `ALTER` type-change guard reads a mixed-case target's
+/// The `ALTER` type-change guard reads a mixed-case target's
 /// column, not the nonexistent lower-case table an unquoted `to_regclass`
 /// folds its name to (which read as "no such column" and let the type change
 /// through).
@@ -6502,7 +6475,7 @@ mod type_changing_alter_tests {
     }
 }
 
-/// Issue #919: [`plan_alter`] nets an edit's clauses against each other.
+/// [`plan_alter`] nets an edit's clauses against each other.
 #[cfg(test)]
 mod retyped_read_tests {
     use super::*;
@@ -6809,7 +6782,7 @@ mod error_code_tests {
         assert_eq!(
             CatalogError::UnknownValueType {
                 column: "price".to_string(),
-                // Issue #108: `money` used to be this test's example of an
+                // `money` used to be this test's example of an
                 // unrecognized persisted token — it isn't anymore (the OID
                 // registry now classifies it as `ValueType::Other(PgType::Money)`),
                 // so a genuinely made-up token stands in instead.
@@ -6847,7 +6820,7 @@ mod error_code_tests {
     }
 }
 
-/// Issue #108: [`encode_value_type`]/[`decode_value_type`] are the
+/// [`encode_value_type`]/[`decode_value_type`] are the
 /// persistence codec for `transform_definitions.source_columns` — every
 /// [`ValueType`] a real column can carry must round-trip through it exactly,
 /// and an unrecognized token must be rejected rather than silently
@@ -6869,12 +6842,12 @@ mod value_type_codec_tests {
             ValueType::Other(PgType::TimestampTz),
             ValueType::Other(PgType::Unrecognized),
         ];
-        // Issue #111's widths, from `IntWidth::ALL` so a future width is
+        // The integer widths, from `IntWidth::ALL` so a future width is
         // covered by construction rather than by remembering to add it.
         let all = all
             .into_iter()
             .chain(IntWidth::ALL.into_iter().map(ValueType::Integer))
-            // Issue #112's widths, from `FloatWidth::ALL` for the same
+            // The float widths, from `FloatWidth::ALL` for the same
             // reason: a future width is covered by construction.
             .chain(FloatWidth::ALL.into_iter().map(ValueType::Float));
         for value_type in all {
@@ -6889,10 +6862,10 @@ mod value_type_codec_tests {
 
     #[test]
     fn the_four_original_tokens_are_unchanged() {
-        // Issue #108 review: the pre-existing lattice's persisted spelling
-        // must stay byte-identical — these tokens are already durably stored
-        // in real `transform_definitions` rows, so changing them would break
-        // every definition persisted before this issue.
+        // The original lattice's persisted spelling must stay
+        // byte-identical — these tokens are durably stored in
+        // `transform_definitions` rows, so changing them would break every
+        // persisted definition.
         assert_eq!(encode_value_type(&ValueType::Numeric), "numeric");
         assert_eq!(encode_value_type(&ValueType::Text), "text");
         assert_eq!(encode_value_type(&ValueType::Boolean), "boolean");
@@ -7010,7 +6983,7 @@ mod reported_status_tests {
     }
 }
 
-/// Issue #638: the pure key-collation check, over hand-built
+/// The pure key-collation check, over hand-built
 /// [`LiveColumn`]s carrying the OIDs Postgres reports.
 #[cfg(test)]
 mod key_collation_tests {
@@ -7028,7 +7001,7 @@ mod key_collation_tests {
         column
     }
 
-    /// Issue #638: a key column with a nondeterministic collation is refused
+    /// A key column with a nondeterministic collation is refused
     /// in every key role, and the error names the column, its collation and
     /// the key it belongs to.
     #[test]
@@ -7064,7 +7037,7 @@ mod key_collation_tests {
         }
     }
 
-    /// Issue #638: a deterministic collation passes whether it's the default,
+    /// A deterministic collation passes whether it's the default,
     /// a non-default one (`"C"`), or absent (a type that isn't collatable).
     #[test]
     fn a_deterministic_or_absent_key_collation_passes() {

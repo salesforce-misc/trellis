@@ -1,7 +1,7 @@
-//! Transform-definition grammar and parser (issue #22).
+//! Transform-definition grammar and parser.
 //!
 //! Parses the concrete syntax documented in [`parser`] into the typed
-//! [`ast::TransformDef`] the validator (issue #23) and evaluator (issue #24)
+//! [`ast::TransformDef`] the validator and evaluator
 //! consume. Per ADR-0004, only constructs this crate can actually evaluate
 //! are accepted:
 //!
@@ -9,17 +9,17 @@
 //!   ([`ast::KeySpace::Aggregate`], a `GROUP BY <cols>` clause), or a `JOIN`
 //!   aggregate ([`ast::KeySpace::Join`], ADR-0019).
 //! - **Calculated fields**: column references, numeric and string literals,
-//!   the `+` operator (Numeric-only), the `>` comparison operator (issue
-//!   #65, `Numeric, Numeric -> Boolean`), and `name(args)` function calls,
+//!   the `+` operator (Numeric-only), the `>` comparison operator
+//!   (`Numeric, Numeric -> Boolean`), and `name(args)` function calls,
 //!   all via the shared [`registry`]. Values carry a [`ast::ValueType`]
-//!   (`Numeric`/`Text`/`Boolean`, issue #63). Issue #64 adds general
-//!   function-call syntax plus four Text-argument functions
+//!   (`Numeric`/`Text`/`Boolean`). General
+//!   function-call syntax comes with four Text-argument functions
 //!   (`strpos`, `octet_length`, `char_length`, `regexp_count`). In an
 //!   aggregate definition, a non-grouping-key column must be wrapped in
 //!   exactly one of `SUM`/`MIN`/`MAX`/`AVG` (Numeric-only), or a field may be
 //!   the row-counting `COUNT(*)` (no column argument; `COUNT(<column>)` is
-//!   not implemented). Issue #109 adds **typed literals** — `DATE
-//!   '2024-01-01'` / `CAST('2024-01-01' AS date)` — the one way an
+//!   not implemented). **Typed literals** — `DATE
+//!   '2024-01-01'` / `CAST('2024-01-01' AS date)` — are the one way an
 //!   expression can *produce* a [`ast::ValueType::Other`] value rather than
 //!   merely pass one through; see [`typed_literal`].
 //! - **Partial-data predicate**: a trivially-true predicate only.
@@ -269,7 +269,7 @@ mod tests {
         );
     }
 
-    /// Issue #120: `COUNT(<column>)` — counting non-null occurrences of a
+    /// `COUNT(<column>)` — counting non-null occurrences of a
     /// specific column, a different semantic from `COUNT(*)` — parses
     /// successfully in an aggregate definition.
     #[test]
@@ -720,15 +720,12 @@ mod tests {
         );
     }
 
-    /// Permanent regression pin for real operator precedence (issue #67,
-    /// see [`registry::OPERATORS`]'s doc comment): `a > b + c` must parse as
+    /// Permanent regression pin for real operator precedence
+    /// (see [`registry::OPERATORS`]'s doc comment): `a > b + c` must parse as
     /// `a > (b + c)`, since `+` ([`registry::precedence::ADDITIVE`]) binds
     /// tighter than `>` ([`registry::precedence::COMPARISON`]), matching
-    /// Postgres's own grouping — not the old flat left-to-right parse that
-    /// used to build `(a > b) + c` here (renamed from
-    /// `flat_parse_of_mixed_operators_is_caught_by_type_checking`, which
-    /// pinned that wrong behavior and relied on the type checker to catch
-    /// the resulting type mismatch). With real precedence, the types line
+    /// Postgres's own grouping — not a flat left-to-right parse that
+    /// would build `(a > b) + c` here. With real precedence, the types line
     /// up correctly by construction and `validate` accepts the expression.
     #[test]
     fn mixed_operators_respect_precedence() {
@@ -791,7 +788,7 @@ mod tests {
         validate(&def, &source_columns).expect("(a + b) > c type-checks cleanly");
     }
 
-    /// Parenthesized grouping (issue #67's follow-up, needed once a caller
+    /// Parenthesized grouping (needed once a caller
     /// composes `+` and `>` and wants a grouping the precedence table alone
     /// would never produce): `(a > b) + c` must override `+`'s tighter
     /// binding and group the comparison first, unlike the unparenthesized
@@ -870,7 +867,7 @@ mod tests {
         }
     }
 
-    // Issue #76 / ADR-0011: `TRANSFORM`/`FROM` accept an
+    // ADR-0011: `TRANSFORM`/`FROM` accept an
     // explicit `schema.table` spelling, in addition to the bare `<table>`
     // form these tests exercised above.
 
@@ -986,7 +983,7 @@ mod tests {
         }
     }
 
-    /// Issue #830: `<FROM table>.<column>` is a qualified source column; so is
+    /// `<FROM table>.<column>` is a qualified source column; so is
     /// any other two-part name, which the validator then refuses.
     #[test]
     fn a_two_part_name_headed_by_the_from_table_is_a_source_column() {
@@ -1121,8 +1118,7 @@ mod tests {
 }
 
 /// Grammar coverage for [`parse_statement`], the unified statement entry point
-/// issue #227 dispatches [`crate::Trellis::apply`] on (issue #228's settled
-/// grammar). Kept apart from the `tests` module above, which is about the
+/// [`crate::Trellis::apply`] dispatches on. Kept apart from the `tests` module above, which is about the
 /// expression/definition grammar `parse` covers, because what's under test
 /// here is *which statement* a text is — the dispatch decision itself.
 #[cfg(test)]
@@ -1378,11 +1374,9 @@ mod statement_grammar_tests {
     /// Decision 4: the flat imperative won for pause/resume/drop, so the
     /// SQL-DDL-flavoured alternative spelling of *those* is not quietly also
     /// accepted — `PAUSE` is not one of `ALTER TRANSFORM`'s own `ADD`/`DROP`/
-    /// `ALTER` clause keywords (ADR-0015, issues #241/#242, added after this
-    /// test was first written), so this still refuses, just via that later
-    /// grammar's own "expected a clause keyword" error now rather than
-    /// `ALTER` being entirely unrecognized. `ALTER TRANSFORM` itself is very
-    /// much accepted grammar today — see `statement_grammar_tests` in this
+    /// `ALTER` clause keywords (ADR-0015), so this
+    /// refuses via the grammar's "expected a clause keyword" error.
+    /// `ALTER TRANSFORM` itself is accepted grammar — see `statement_grammar_tests` in this
     /// same module for its own coverage — this test is only about the one
     /// spelling ADR-0015 still didn't resurrect.
     #[test]
@@ -1397,7 +1391,7 @@ mod statement_grammar_tests {
         assert!(parse_statement("AMEND TRANSFORM order_totals").is_err());
     }
 
-    // --- statement_kind (issue #580) -------------------------------------
+    // --- statement_kind -------------------------------------
 
     /// One well-formed statement of every form, with the kind it must
     /// classify as. Both `DROP` spellings (schema-qualified or not) and every

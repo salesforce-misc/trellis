@@ -1,4 +1,4 @@
-//! Claim liveness (issue #15, stage 04's third piece): keeping a claim
+//! Claim liveness (stage 04's third piece): keeping a claim
 //! alive across a drain, the two ways a claim comes back (release on error,
 //! reclaim on TTL), and the loop's own backoff on consecutive fence misses.
 //! See docs/staging-and-claiming/04-claiming-and-the-fold.md, "Keeping a
@@ -7,7 +7,7 @@
 //!
 //! The fleet-wide pause lease that once lived here (`acquire_pause_lease`,
 //! `heartbeat_pause_lease`, `release_pause_lease`, `claiming_is_paused`,
-//! `claim_unless_paused`) was deleted per issue #191: its sole documented
+//! `claim_unless_paused`) was deleted: its sole documented
 //! consumer, a self-check auditor's quiescent read, shipped as
 //! `Trellis::self_check` (ADR-0013) and deliberately gets quiescence from a
 //! watermark-await + snapshot + re-check instead, never pausing claiming
@@ -16,8 +16,8 @@
 //!
 //! No claim-epoch column exists anywhere here. `seg_claims` row identity
 //! *is* the epoch: [`release`] and [`reclaim_stale`] both work by deleting
-//! the claim row, so a stale claimant's later completion attempt (issue
-//! #11, scoped `claimed_by = me`) simply matches zero rows once the row is
+//! the claim row, so a stale claimant's later completion attempt
+//! (scoped `claimed_by = me`) simply matches zero rows once the row is
 //! gone. Deleting is the epoch bump.
 
 use std::collections::HashSet;
@@ -68,7 +68,7 @@ pub async fn release(
 /// [`release`] across every segment in `seg_seqs` in one statement, handing
 /// back the `(seg_seq, bucket)` claims it deleted, ordered. The worker loop
 /// releases this way after a failed drain so its log line can name the
-/// buckets it held when the drain failed (issue #660), which only the drain
+/// buckets it held when the drain failed, which only the drain
 /// itself knew until now.
 pub async fn release_segments(
     client: &impl GenericClient,
@@ -118,7 +118,7 @@ const RECLAIM_STALE_SQL: &str = "\
     ) \
     delete from seg_claims where ctid in (select ctid from dead)";
 
-/// The fleet's default reclaim TTL: how long a claim (or, since issue #144,
+/// The fleet's default reclaim TTL: how long a claim (or
 /// a [`super::worker_registry`] row) may go unrefreshed before it's treated
 /// as dead. [`crate::client::ClientOptions::default`] uses this for its own
 /// `reclaim_ttl` field; [`crate::app::Trellis::has_live_drain_workers`] uses
@@ -126,8 +126,8 @@ const RECLAIM_STALE_SQL: &str = "\
 /// to override it with — every `Trellis::connect` call already gets this
 /// same value today, whether or not that particular connection starts a
 /// background `Client`. Kept here, one constant, rather than the literal
-/// `30` duplicated at each call site — issue #144's explicit instruction to
-/// reuse this notion of liveness rather than invent a second one.
+/// `30` duplicated at each call site, so the fleet has one notion of
+/// liveness rather than a second one.
 pub const DEFAULT_RECLAIM_TTL: Duration = Duration::from_secs(30);
 
 /// Runs [`RECLAIM_STALE_SQL`] and returns how many claims it reclaimed.
@@ -163,9 +163,8 @@ pub const FENCE_MISS_MAX_DELAY: Duration = Duration::from_secs(1);
 /// Pure, no-DB backoff state for a drain loop's own fence-miss retries
 /// (doc 04, "Two ways a claim comes back"). `0` on the first miss, then
 /// doubling from [`FENCE_MISS_INITIAL_DELAY`] up to [`FENCE_MISS_MAX_DELAY`],
-/// reset by any clean drain. The drain loop itself is a later stage
-/// (unassembled today, issue #11, blocked on aggregate transform-defs);
-/// this is just the piece of state it will need.
+/// reset by any clean drain. The drain loop itself is a separate
+/// piece; this is just the piece of state it needs.
 #[derive(Debug, Clone)]
 pub struct FenceMissBackoff {
     /// The delay `next_delay` will return *after* the one it's about to
@@ -275,7 +274,7 @@ const DAEMON_REFRESH_SQL: &str = "\
 /// definition, a live drainer. A `Client` also registers its live drain
 /// threads on a cadence of its own ([`super::claim::register_drainers`]), so
 /// this is the same refresh from a second source: it keeps the row of a
-/// claimant that uses the daemon without a `Client` (issue #654) counted
+/// claimant that uses the daemon without a `Client` counted
 /// through a drain longer than the drainer window.
 const DAEMON_DRAINER_REFRESH_SQL: &str = "\
     insert into drainers (drainer_id, last_seen) \

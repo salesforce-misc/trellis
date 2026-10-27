@@ -13,7 +13,7 @@
 //! time, not against how much work is left" idiom
 //! `staging::liveness::HeartbeatDaemon` uses for segment claims.
 //!
-//! A chunk that fails never retries silently (#616). [`fail_chunk`] records
+//! A chunk that fails never retries silently. [`fail_chunk`] records
 //! the failure on the chunk's row, where `Trellis::status` reports it, logs
 //! it at warn, and by its kind backs the chunk off for a retry, splits it to
 //! narrow a failure on its data down to the key that causes it and
@@ -57,10 +57,10 @@ pub enum ChunkQueueError {
     /// expected outcome).
     DefinitionNotFound { definition_id: i64 },
     /// Quarantining the key a failed chunk narrowed to, or checking the
-    /// whole-transform fuse after it, failed (#616).
+    /// whole-transform fuse after it, failed.
     Quarantine(Box<crate::staging::ApplyError>),
-    /// A Re-derive build's plan job or chunk failed (#625 F2,
-    /// `staging::build`).
+    /// A Re-derive build's plan job or chunk failed
+    /// (`staging::build`).
     Build(Box<crate::staging::ApplyError>),
     /// A claimed row's `kind` and bounds were not one this build knows
     /// (`backfill_chunks_kind_bounds` rules out a mismatch), or a Re-derive
@@ -152,12 +152,12 @@ pub struct ClaimedChunk {
     pub id: i64,
     pub definition_id: i64,
     pub work: ChunkWork,
-    /// A field build's scope (#625 F8b, `backfill_chunks.fields`): the
+    /// A field build's scope (`backfill_chunks.fields`): the
     /// target columns a [`ChunkWork::Plan`] or [`ChunkWork::Rederive`] row
     /// writes. `None` for a whole build.
     pub fields: Option<Vec<String>>,
     /// The collations of the source key's columns this chunk's ranges were
-    /// planned under (`backfill_chunks.key_collations`, issue #769), which
+    /// planned under (`backfill_chunks.key_collations`), which
     /// its range is read under; see `ddl::PrimaryKeyColumn::collation`.
     /// `None` until a Re-derive plan job's first batch records them, and for
     /// a kind with no key range.
@@ -167,14 +167,14 @@ pub struct ClaimedChunk {
 /// What one `backfill_chunks` row builds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChunkWork {
-    /// A Re-derive build's plan job (#625 F2, `staging::build`): walks the
+    /// A Re-derive build's plan job (`staging::build`): walks the
     /// source's primary key from `cursor`, the last boundary it enqueued
     /// (`None` before the first), and enqueues [`ChunkWork::Rederive`] rows
     /// in batches.
     Plan { cursor: Option<String> },
     /// One `(lo, hi]` range of a Re-derive build (`staging::build::run_chunk`).
     Rederive { lo: Option<String>, hi: String },
-    /// A rebuilt Re-derive build's sweep (#625 F3, `staging::build`): walks
+    /// A rebuilt Re-derive build's sweep (`staging::build`): walks
     /// the target's ledger from `cursor`, the last entry key it has passed
     /// (`None` before the first), and re-derives every live entry the
     /// build's chunks didn't. It is claimed only once its build's plan job
@@ -204,14 +204,14 @@ impl ChunkWork {
 pub const KIND_PLAN: &str = "plan";
 /// `backfill_chunks.kind` of a Re-derive build's chunk.
 pub const KIND_REDERIVE: &str = "rederive";
-/// `backfill_chunks.kind` of a rebuild's sweep job (#625 F3).
+/// `backfill_chunks.kind` of a rebuild's sweep job.
 pub const KIND_SWEEP: &str = "sweep";
 /// `backfill_chunks.kind` of a partition correction (ADR-0017 P4a).
 pub const KIND_CORRECTION: &str = "correction";
 
 /// SQL predicate over a `backfill_chunks` row aliased `bc` joined to its
 /// definition's `transform_definitions` row aliased `d`: whether the chunk was
-/// planned before the definition's latest resume (issues #360/#418). Every
+/// planned before the definition's latest resume. Every
 /// resume (`staging::quarantine::resume_transform`) stamps a new
 /// `fuse_rearmed_at`, and every chunk copies the value it saw when it was
 /// planned, so a chunk from a build the resume superseded carries a different
@@ -227,7 +227,7 @@ pub const KIND_CORRECTION: &str = "correction";
 pub(crate) const STALE: &str = "bc.fuse_rearmed_at is distinct from d.fuse_rearmed_at";
 
 /// The claim a drain worker holds on one chunk, which fences every target
-/// write the chunk makes (issue #434).
+/// write the chunk makes.
 ///
 /// A chunk's write bypasses the target-mutation seam
 /// (`staging::target_mutations`), which is only safe while nothing reads the
@@ -347,8 +347,7 @@ impl<'a> ClaimFence<'a> {
     /// TTL, as [`hold`](Self::hold) does first. A fenced transaction that
     /// takes a lock before the claim's calls this before that lock, so the
     /// timeout bounds a stall that holds it too
-    /// (`staging::build::field_build_ready`'s version-fence bump, issue
-    /// #744).
+    /// (`staging::build::field_build_ready`'s version-fence bump).
     pub(crate) async fn arm(&self, txn: &impl GenericClient) -> Result<(), tokio_postgres::Error> {
         // Zero would disable the timeout, and the setting is an `int` of
         // milliseconds.
@@ -364,7 +363,7 @@ impl<'a> ClaimFence<'a> {
 /// chunk may be handed out in (`param` binds [`TransformStatus::dispatchable`]
 /// as a `text[]`). One predicate for the claim ([`claim_chunks_of`]) and for
 /// the idle probe (`staging::build::work_probe`), so the probe stays a
-/// superset of the claim and the two cannot drift (#1047).
+/// superset of the claim and the two cannot drift.
 pub(crate) fn dispatchable_gate_sql(param: &str) -> String {
     format!(
         "exists (select 1 from transform_definitions d \
@@ -388,11 +387,11 @@ pub async fn claim_chunks_of(
         return Ok(Vec::new());
     }
     // The allowlist, derived from the enum rather than spelled into the SQL
-    // (issue #231) — see [`TransformStatus::dispatchable`].
+    // — see [`TransformStatus::dispatchable`].
     let dispatchable = TransformStatus::dispatchable();
     let rows = client
         .query_typed(
-            // The `exists` gate is issue #142 / ADR-0014's: the pause is what
+            // The `exists` gate is ADR-0014's: the pause is what
             // quiesces in-flight work, and a *backfilling* definition's
             // in-flight work lives here rather than in the claim-time fold.
             // So this consults the same `transform_definitions.status` the
@@ -404,7 +403,7 @@ pub async fn claim_chunks_of(
             //
             // `= any($3)` binds an **allowlist** of the statuses a definition
             // may still be handed work in, not a denylist of the one it may
-            // not (issue #231): this gate used to read `status <> 'paused'`,
+            // not: this gate used to read `status <> 'paused'`,
             // which would have silently re-opened dispatch to any
             // frozen-but-not-`paused` status added later. The allowlist is
             // computed from [`TransformStatus::ALL`] minus
@@ -418,9 +417,9 @@ pub async fn claim_chunks_of(
             // can't starve its siblings out of the `limit $2` budget.
             //
             // A chunk whose last run failed waits out its backoff
-            // (`next_attempt_at`, #616) before it is handed out again.
+            // (`next_attempt_at`) before it is handed out again.
             //
-            // A Re-derive build's sweep (#625 F3) waits for its build's plan
+            // A Re-derive build's sweep waits for its build's plan
             // job and every chunk: it re-derives what they didn't, so it
             // reads their bases. A row held across a resume doesn't hold it.
             &format!(
@@ -495,7 +494,7 @@ pub async fn claim_chunks_of(
 /// next [`claim_chunks_of`] call.
 ///
 /// A chunk held across its definition's resume ([`STALE`]) is deleted
-/// instead of freed (issue #360) — see [`free_or_discard_claims`].
+/// instead of freed — see [`free_or_discard_claims`].
 /// Returns how many stale claims it dealt with either way.
 pub async fn reclaim_stale_chunks(
     client: &mut impl GenericClient,
@@ -528,14 +527,14 @@ pub async fn reclaim_stale_chunks(
 
 /// Releases a claim immediately, recording nothing — the `backfill_chunks`
 /// analogue of `staging::liveness::release`. A drain worker gives up a
-/// failed chunk through [`fail_chunk`] instead, which records the failure
-/// (#616); this is the bare release the tests drive a held chunk with.
+/// failed chunk through [`fail_chunk`] instead, which records the failure;
+/// this is the bare release the tests drive a held chunk with.
 /// Scoped `claimed_by = $2` for the same reason that function is: a claim
 /// already reclaimed out from under this caller (the TTL sweep, or another
 /// worker) is left untouched.
 ///
 /// A chunk held across its definition's resume ([`STALE`]) is deleted instead
-/// of freed (issue #360) — see [`free_or_discard_claims`]. Returns how many
+/// of freed — see [`free_or_discard_claims`]. Returns how many
 /// claims (zero or one) it released or discarded.
 #[cfg(any(test, feature = "internals"))]
 pub async fn release_chunk(
@@ -545,7 +544,7 @@ pub async fn release_chunk(
 ) -> Result<u64, ChunkQueueError> {
     let txn = client.transaction().await?;
     // The definition row first, then the chunk: the order resume takes them
-    // in (it locks a held chunk to wait out its write, issue #434), so the
+    // in (it locks a held chunk to wait out its write), so the
     // two can't deadlock.
     txn.execute(
         "select 1 from transform_definitions \
@@ -571,7 +570,7 @@ pub async fn release_chunk(
 }
 
 /// How many failures a chunk may be charged before its definition is paused
-/// with the error (#616). A failure is charged when it is neither transient
+/// with the error. A failure is charged when it is neither transient
 /// nor narrowed to a key: it says nothing about any one row, and retrying it
 /// without end would leave the definition `backfilling` forever with only a
 /// log line to show for it.
@@ -581,7 +580,7 @@ pub(crate) const MAX_CHARGED_ATTEMPTS: i32 = 5;
 const RETRY_BASE: Duration = Duration::from_secs(1);
 
 /// The longest a failed Re-derive chunk or plan job waits before it is
-/// claimed again (#625 F2). Its usual failure is its entry lock's short
+/// claimed again. Its usual failure is its entry lock's short
 /// timeout behind a drain page, which says nothing about the chunk.
 pub(crate) const REDERIVE_RETRY_CAP: Duration = Duration::from_secs(5);
 
@@ -595,7 +594,7 @@ pub(crate) fn retry_delay(attempts: i32, cap: Duration) -> Duration {
     RETRY_BASE.saturating_mul(1 << doublings).min(cap)
 }
 
-/// What a chunk's failure says about how to retry it (#616).
+/// What a chunk's failure says about how to retry it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailureKind {
     /// A lost connection, a lock or serialization conflict, a busy server:
@@ -664,7 +663,7 @@ pub enum ChunkFailure {
 /// Gives up `chunk` after running it failed with `error` — what a drain
 /// worker calls on a failure — and logs at warn what it did, with the
 /// definition, the chunk, its range or key, the attempt and when the next one
-/// is (#616).
+/// is.
 ///
 /// A Re-derive chunk records the failure on its row (`attempts`,
 /// `last_error`, `next_attempt_at`, which `Trellis::status` reports) and,
@@ -698,11 +697,11 @@ pub async fn fail_chunk(
     let sqlstate = crate::staging::quarantine::sqlstate_of(error);
     let (outcome, attempts, location) = match &chunk.work {
         // A Re-derive chunk narrows a data failure to a key as a 1-1 range
-        // chunk does (#625 F5, F-A5): its range holds the same keys, and
+        // chunk does: its range holds the same keys, and
         // it leaves a quarantined key out the same way.
         //
         // "The same keys" holds for a source that is another aggregate's
-        // target too (#625 F6), keyed by its nullable grouping columns: the
+        // target too, keyed by its nullable grouping columns: the
         // build's chunk leaves a key with a `NULL` part out, as
         // `narrow_one_to_one_chunk` never counts one (`key_not_null`), and
         // the plan job stages those keys for a page to re-derive instead
@@ -896,7 +895,7 @@ async fn pause_for_build_failure(
 ///
 /// `narrow` is the range a data failure is narrowed within, or `None` when
 /// the chunk isn't narrowed: its data failures are charged like any other.
-/// `sqlstate` is the failure's, which a key it quarantines keeps (#824).
+/// `sqlstate` is the failure's, which a key it quarantines keeps.
 /// `retry_cap` caps the backoff.
 #[allow(clippy::too_many_arguments)]
 async fn fail_range_chunk(
@@ -912,7 +911,7 @@ async fn fail_range_chunk(
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
     // The definition row first, as a resume locks it, then the chunk:
-    // the order resume takes them in (issue #434).
+    // the order resume takes them in.
     txn.execute(
         "select 1 from transform_definitions where id = $1 for update",
         &[&chunk.definition_id],
@@ -965,7 +964,7 @@ async fn fail_range_chunk(
         Some(backfill::ChunkNarrowing::Split { mid }) => {
             // This row keeps the lower half, and a new one takes the upper
             // half, of the same kind (a 1-1 range or a Re-derive chunk),
-            // field scope (#625 F8b) and key collations (#769). Both carry
+            // field scope and key collations. Both carry
             // the failure so far, so `status` keeps reporting it while the
             // build narrows, and the build's `fuse_rearmed_at`, so a resume
             // supersedes both alike.
@@ -1050,8 +1049,8 @@ async fn fail_range_chunk(
 ///
 /// A current chunk is freed, claimable again by the next [`claim_chunks`]. A
 /// chunk held across its definition's resume ([`STALE`]) is deleted
-/// instead (issue #360): resume discarded its unclaimed siblings and left
-/// this one only so its worker could finish it (#332), and running it again
+/// instead: resume discarded its unclaimed siblings and left
+/// this one only so its worker could finish it, and running it again
 /// would redo work the resumed definition's rebuild already covers.
 ///
 /// The share lock is what makes `stale` trustworthy: resume holds the
@@ -1154,7 +1153,7 @@ impl Drop for ChunkHeartbeat {
 }
 
 /// Gives up `chunk` after its fence stopped a Re-derive build's write
-/// (`staging::build`, #625 F2): deletes it if it was held across its
+/// (`staging::build`): deletes it if it was held across its
 /// definition's resume ([`STALE`]), and otherwise
 /// leaves it alone (its claim was reclaimed, or it is done).
 pub(crate) async fn discard_if_superseded(
@@ -1164,7 +1163,7 @@ pub(crate) async fn discard_if_superseded(
 ) -> Result<(), ChunkQueueError> {
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
-    // The definition row first, then the chunk: resume's order (#434).
+    // The definition row first, then the chunk: resume's order.
     txn.execute(
         "select 1 from transform_definitions where id = $1 for update",
         &[&chunk.definition_id],

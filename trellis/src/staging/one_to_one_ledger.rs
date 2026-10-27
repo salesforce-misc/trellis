@@ -1,4 +1,4 @@
-//! 1-1 targets on the ledger (#623 D6; epic #556, ADR-0002 invariants I1,
+//! 1-1 targets on the ledger (ADR-0002 invariants I1,
 //! I2 and I5).
 //!
 //! A 1-1 target's ledger (`<target>__ledger`, [`crate::defs::ledger`]) holds
@@ -11,7 +11,7 @@
 //!    entry, then every other entry `for update`, sorted by key. A new key's
 //!    Apply is settled by its insert, since with no entry I2 is only the
 //!    truncate floor; a Re-derive's is a placeholder. A key whose tombstone
-//!    the GC collects between the two fails the page transiently (#712).
+//!    the GC collects between the two fails the page transiently.
 //! 2. **Re-derive read** ([`read_rows`], I1): the Re-derived keys' source
 //!    rows, `pg_current_snapshot()` and the newest segment in one statement,
 //!    after the lock. The rows are evaluated in Rust, as Phase 2 evaluates
@@ -22,26 +22,26 @@
 //!    in `basis`, its `lsn` is above `applied_lsn` and it is above the
 //!    target's truncate floor. Either makes a tombstone when the key has no
 //!    row, and only a tombstone has its `applied_seg` raised: to the page's
-//!    latest segment, or to the read's segment when that is newer (#742, see
+//!    latest segment, or to the read's segment when that is newer (see
 //!    [`read_rows`]), so an Apply to a live entry can be HOT
-//!    ([`schema::tombstone_seg_sql`], #775). Returns the keys it changed.
+//!    ([`schema::tombstone_seg_sql`]). Returns the keys it changed.
 //!    Step 1's settled Applies skip it. A placeholder step 1 inserted that
 //!    neither step wrote (an Apply at or below the floor, or a Re-derive the
-//!    page skipped) is deleted ([`drop_placeholders`], #774): the tombstone
+//!    page skipped) is deleted ([`drop_placeholders`]): the tombstone
 //!    GC collects only tombstones.
 //! 4. The target rows of exactly those keys are upserted or deleted, as
 //!    before (`super::apply::apply_target`).
 //!
 //! An Apply the predicate refuses was already reflected by a Re-derive whose
 //! snapshot saw it, or overtaken by a later change: writing it would put an
-//! older state over a newer one (#344, #392). The entry lock is what makes
+//! older state over a newer one. The entry lock is what makes
 //! the check and the write one step: every writer of a key's target row
 //! holds its entry.
 //!
 //! The Re-derive build's 1-1 chunks (`super::build::one_to_one`) write target
 //! rows outside a page; each locks the entries of the keys it writes the
 //! same way. A whole build's chunk stamps them as a Re-derive does; a field
-//! build's chunk (`ALTER TRANSFORM`, a column resume, #625 F8b) rewrites
+//! build's chunk (`ALTER TRANSFORM`, a column resume) rewrites
 //! some columns only and leaves them as they are.
 
 use std::collections::{HashMap, HashSet};
@@ -79,11 +79,11 @@ pub(crate) struct Inserted {
 /// change (`seg_seq` and the tombstone as [`update_entries`] sets them), and
 /// a Re-derive's, or that of an Apply below the truncate floor, is a
 /// placeholder, and a Re-derive's `present` is ignored. That spares a new
-/// key's entry a second version and a lock (#623 D6's throughput miss).
+/// key's entry a second version and a lock.
 /// Only the keys that had an entry are then locked `for update`. `target`
 /// is the target's qualified identity; `predicate` is as for
 /// [`update_entries`]. `skip_lock` is the `chunk_without_entry_lock`
-/// plant's (#625 F3, a build chunk's only): the existing entries are read
+/// plant's (a build chunk's only): the existing entries are read
 /// without the lock.
 pub(crate) async fn lock_entries(
     txn: &Transaction<'_>,
@@ -141,7 +141,7 @@ pub(crate) async fn lock_entries(
         }
         inserted.keys.insert(key);
     }
-    // Test-only pause point (#623 D7). See `super::interleave`.
+    // Test-only pause point. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
         txn,
@@ -168,7 +168,7 @@ pub(crate) async fn lock_entries(
             });
         }
     }
-    // Test-only pause point (#623 D1). See `super::interleave`.
+    // Test-only pause point. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(txn, super::interleave::PausePoint::AfterEntryLock, target).await?;
     Ok(inserted)
@@ -187,7 +187,7 @@ pub(crate) struct ReadRows {
 /// newest segment (`max(seg_seq)`), in one statement. A key with no row is
 /// absent from the map. `keys` must not be empty.
 ///
-/// **The segment (#742).** The read is live, so its snapshot sees changes
+/// **The segment.** The read is live, so its snapshot sees changes
 /// in batches newer than the page's own, and the entries it writes must be
 /// stamped with a segment at least as new as every batch holding a change
 /// the snapshot saw. Otherwise the tombstone GC
@@ -231,7 +231,7 @@ pub(crate) async fn read_rows(
             }
         }
     }
-    // Test-only pause point (#623 D1), directly after the one
+    // Test-only pause point, directly after the one
     // read-and-snapshot statement. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
@@ -299,7 +299,7 @@ pub(crate) async fn update_entries(
 /// the target, `$7` the Re-derive read's snapshot and `$8` the page's
 /// latest segment. Returns the keys it changed. It reads the ledger only
 /// through `$1`'s keys, and runs under
-/// `super::ledger::ENTRY_PLAN_SETTINGS` (#778).
+/// `super::ledger::ENTRY_PLAN_SETTINGS`.
 fn update_statement(target: &str, predicate: bool) -> String {
     let q = |c: &str| quote_ident(c);
     let (key, basis, applied, seg, tombstone) = (
@@ -338,7 +338,7 @@ fn update_statement(target: &str, predicate: bool) -> String {
 }
 
 /// Deletes the placeholders among `keys` on `target`'s ledger: the entries
-/// [`lock_entries`] inserted that nothing then wrote (#774). `keys` are the
+/// [`lock_entries`] inserted that nothing then wrote. `keys` are the
 /// keys whose entry this transaction inserted and neither its insert nor
 /// [`update_entries`] changed: an Apply at or below the truncate floor, and
 /// a Re-derive the page skipped (re-staged, or a direct writer's row that
@@ -348,7 +348,7 @@ fn update_statement(target: &str, predicate: bool) -> String {
 /// change's outcome. The statement re-checks that state, so it can't delete
 /// an entry something wrote. It reads the ledger by key, so it runs under
 /// `super::ledger::ENTRY_PLAN_SETTINGS` like the page's other entry
-/// statements (#778): left to the planner, a never-analyzed ledger's delete
+/// statements: left to the planner, a never-analyzed ledger's delete
 /// of a few thousand keys is a sequential scan.
 pub(crate) async fn drop_placeholders(
     txn: &Transaction<'_>,
@@ -378,7 +378,7 @@ fn drop_statement(target: &str) -> String {
 }
 
 /// The plans of a page's statements that read the 1-1 target `target`'s
-/// ledger by entry key (#778), as `explain`'s text, each labelled, under the
+/// ledger by entry key, as `explain`'s text, each labelled, under the
 /// settings a page runs them with: the entry lock
 /// (`super::ledger::lock_statement`), [`update_entries`]' statement and
 /// [`drop_placeholders`]' delete, for a page of Applies to `keys`, which
@@ -444,7 +444,7 @@ pub async fn explain_page(
 /// Empties a 1-1 target's ledger for a source `TRUNCATE` and raises its
 /// truncate floor to `lsn`, the truncate's ring `lsn` (the D split's Q6). The caller
 /// clears the target rows. `lsn` is required: a truncate that raised no
-/// floor would let a change from before it apply over it (#774).
+/// floor would let a change from before it apply over it.
 pub(crate) async fn truncate(
     txn: &Transaction<'_>,
     target: &str,

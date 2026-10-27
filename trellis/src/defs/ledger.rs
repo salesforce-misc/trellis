@@ -1,4 +1,4 @@
-//! The 1-1 side ledger (ADR-0002, #623 part D2): one row per source key a 1-1
+//! The 1-1 side ledger: one row per source key a 1-1
 //! target has applied, recording the ordering state (`applied_lsn`,
 //! `applied_seg`, `basis`, `tombstone`) that decides whether a later change
 //! for the key is applied or skipped. The target row holds the values.
@@ -31,12 +31,12 @@ pub const RESERVED_TARGET_SUFFIXES: [&str; 1] = [LEDGER_SUFFIX];
 /// ([`super::ddl::pk_key_sql_expr`]).
 pub(crate) const KEY_COLUMN: &str = "__from_key";
 /// The `lsn` of the last change applied to the entry. A Re-derive leaves it
-/// unchanged (#623 Q1), so the build writes null.
+/// unchanged, so the build writes null.
 pub(crate) const APPLIED_LSN_COLUMN: &str = "__applied_lsn";
-/// The tombstone GC's watermark (#623 Q7): while the entry is a tombstone, a
+/// The tombstone GC's watermark: while the entry is a tombstone, a
 /// ring segment (`seg_seq`) at or above every batch that can hold a change
 /// the entry would refuse. Only a write that leaves the entry a tombstone
-/// sets it ([`tombstone_seg_sql`], #775); a live entry's is whatever its last
+/// sets it ([`tombstone_seg_sql`]); a live entry's is whatever its last
 /// tombstone left, or null, and nothing reads it.
 pub(crate) const APPLIED_SEG_COLUMN: &str = "__applied_seg";
 /// The `pg_current_snapshot()` of the read that last wrote the entry, taken
@@ -52,9 +52,9 @@ pub(crate) const TOMBSTONE_COLUMN: &str = "__tombstone";
 /// otherwise. `old` is the entry's current value (`None` for an insert,
 /// which has none) and `seg` the segment the write stamps: a page's latest
 /// segment, or for a Re-derive the newest one its read sees, if that is
-/// newer (#742).
+/// newer.
 ///
-/// **Only a tombstone carries the stamp (#775).** The GC
+/// **Only a tombstone carries the stamp.** The GC
 /// (`staging::retire::collect_tombstones`) reads `applied_seg` only on
 /// tombstones, through a partial index keyed on it. An update that changes
 /// an indexed column can't be HOT, so if every write moved it, no Apply to a
@@ -80,7 +80,7 @@ pub(crate) const TOMBSTONE_COLUMN: &str = "__tombstone";
 ///   D's batch covers everything, including a `basis` an earlier Re-derive
 ///   wrote while the entry was live, unstamped.
 /// - **A Re-derive** stamps at least the newest segment its read's snapshot
-///   sees (#742), which holds every change that snapshot saw: everything its
+///   sees, which holds every change that snapshot saw: everything its
 ///   `basis` refuses, and the change behind the entry's `applied_lsn`, which
 ///   an earlier page applied and committed before this one took the entry
 ///   lock and read.
@@ -124,16 +124,16 @@ fn ordering_state_columns() -> String {
     )
 }
 
-/// A 1-1 target's ledger DDL (#623 Q2 (c)): the key and the ordering state,
+/// A 1-1 target's ledger DDL: the key and the ordering state,
 /// with no values (the target row holds them), as a statement to append to
 /// the target's own. Created empty: the 1-1 build's writes are absolute, and
-/// the Re-derives that follow it stamp the entries (#623 D6). The partial
+/// the Re-derives that follow it stamp the entries. The partial
 /// index is the tombstone GC's (`staging::retire::collect_tombstones`), keyed
 /// on `applied_seg`, so that a GC batch seeks the
 /// collectable tombstones rather than walking every one above the drained
 /// prefix. An Apply to a live entry leaves `applied_seg` alone
 /// ([`tombstone_seg_sql`]), so it changes no indexed column and can be a HOT
-/// update (#775). The key sorts in `"C"`: every lock is taken in key order,
+/// update. The key sorts in `"C"`: every lock is taken in key order,
 /// and a byte comparison is far cheaper than a locale's.
 pub(crate) fn one_to_one_ledger_ddl(qualified_ledger: &str) -> String {
     format!(

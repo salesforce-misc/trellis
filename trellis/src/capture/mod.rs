@@ -1,12 +1,11 @@
-//! Trigger capture (ADR-0002, "Capture by statement triggers"; epic #556
-//! milestone C, #622).
+//! Trigger capture (ADR-0002, "Capture by statement triggers").
 //!
 //! A captured table carries four `AFTER … FOR EACH STATEMENT` triggers:
 //! insert, update and delete with transition tables, and truncate. Each one
 //! appends the statement's changes to the active ring segment inside the
 //! writer's own transaction. So a ring row's `row_txid` (the ring's `DEFAULT
 //! pg_current_xact_id()`) is the source commit's `xid8`: invariant I0,
-//! exact identity, which D (#623) relies on from its first ledger write.
+//! exact identity, which D relies on from its first ledger write.
 //!
 //! This module is built in parts:
 //!
@@ -35,9 +34,9 @@
 //! - **`lsn` and `origin_lsn`** are `pg_current_wal_insert_lsn()` when the
 //!   trigger runs, not the commit LSN. Per-key order stays `(lsn,
 //!   change_id)`. A second writer of the same key runs its trigger only
-//!   after the first commits, because it waits on the row lock (#565 E4).
+//!   after the first commits, because it waits on the row lock.
 //! - **`src_changed`** is `clock_timestamp()` when the statement's trigger
-//!   runs, which is change time, not commit time (#622 plan Q8).
+//!   runs, which is change time, not commit time.
 //!
 //! # Nested writes to the same key
 //!
@@ -45,10 +44,10 @@
 //! rewrites a row its own statement wrote. The nested statement's capture
 //! runs first, so the outer statement's ring row has the higher `lsn`. That
 //! row re-reads the live row, so its `new_image` carries the final values a
-//! 1-1 target needs (#623 D8a, #680). Where the live row isn't the statement's
+//! 1-1 target needs. Where the live row isn't the statement's
 //! own transition row, the row also records the transition images in
 //! `transition_images`, which a reader summing `f(new) − f(old)` uses so
-//! every transition row counts once (#1099; [`sql`]'s "Every transition row
+//! every transition row counts once ([`sql`]'s "Every transition row
 //! counts once").
 
 pub(crate) mod baseline;

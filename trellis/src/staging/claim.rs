@@ -1,4 +1,4 @@
-//! Bucket partitioning and multi-worker claims (issue #14, stage 04's
+//! Bucket partitioning and multi-worker claims (stage 04's
 //! second half). See docs/staging-and-claiming/04-claiming-and-the-fold.md,
 //! "Partitioning a batch across workers" and "The claim is a cursor".
 //!
@@ -9,10 +9,9 @@
 //! worker claim a share of a batch's free buckets ([`claim`]) with the
 //! `sealed -> draining` flip committing in the same statement. It does
 //! *not* compute deltas, apply them, or complete a batch (`draining ->
-//! drained`, issue #11, blocked on aggregate transform-defs) — a claimed
-//! batch sits in `draining` with rows in `seg_claims` until #11 closes the
-//! loop. Keeping a claim alive once it's made — the heartbeat cadence and
-//! reclaim TTL — is [`super::liveness`], issue #15.
+//! drained`) — a claimed batch sits in `draining` with rows in `seg_claims`
+//! until the apply path completes it. Keeping a claim alive once it's
+//! made — the heartbeat cadence and reclaim TTL — is [`super::liveness`].
 
 use std::time::Duration;
 
@@ -31,20 +30,20 @@ use super::fold::BucketFilter;
 /// immutable and safety-critical, so it must not be sampled from a registry
 /// that moves under it).
 ///
-/// Bounded to fit an `int8` bit-mask: issue #11's completion tracking is
-/// expected to fold a batch's drained buckets into a single signed
+/// Bounded to fit an `int8` bit-mask: completion tracking
+/// folds a batch's drained buckets into a single signed
 /// `bigint` mask, so every bucket index (`0..SEG_BUCKETS`) must fit one of
 /// its 63 usable bits (bit 63 is the sign bit).
 pub const SEG_BUCKETS: i64 = 8;
 
 const _: () = assert!(
     SEG_BUCKETS <= 63,
-    "SEG_BUCKETS must fit issue #11's planned int8 drained-bucket bit-mask"
+    "SEG_BUCKETS must fit the int8 drained-bucket bit-mask"
 );
 
 /// The minimum row count (measured over the fenced window, at seal time) a
 /// batch needs to be split into [`SEG_BUCKETS`] buckets; anything smaller
-/// seals to a single bucket — today's pre-#14 unsplit behaviour, exactly.
+/// seals to a single bucket, unsplit.
 pub const MIN_ROWS_TO_SPLIT: i64 = 256;
 
 /// The share denominator's default staleness window (see
@@ -84,8 +83,8 @@ pub async fn register_drainers<S: AsRef<str>>(
 
 /// Deletes every drainer row last seen more than `older_than` ago, returning
 /// how many it removed. Table hygiene, run by `trellis::client`'s maintenance
-/// loop: each `Client` registers drainers under a worker id of its own
-/// (issue #756), so every process start adds rows that nothing else ever
+/// loop: each `Client` registers drainers under a worker id of its own,
+/// so every process start adds rows that nothing else ever
 /// deletes. A row this old no longer counts toward [`count_live_drainers`]
 /// as long as `older_than` is at least that call's window, and a drainer that
 /// comes back re-registers. `skip locked`, so the sweep never waits behind a
@@ -138,10 +137,10 @@ const LOCK_SEGMENT_SQL: &str = "select 1 from segments where seg_seq = $1 for no
 /// NOTHING`), and flip the batch `sealed -> draining` — all in one `WITH`,
 /// so the claim rows and the flip commit together (doc 04, "The claim is
 /// one statement": splitting them would open a crash window where claim
-/// rows sit on a still-`sealed` batch and #11's `state = 'draining'`
+/// rows sit on a still-`sealed` batch and the `state = 'draining'`
 /// completion guard never matches).
 ///
-/// **Drained buckets stay claimed-out.** #11's Phase-3 completion deletes a
+/// **Drained buckets stay claimed-out.** The Phase-3 completion deletes a
 /// worker's `seg_claims` rows *and* ORs its buckets into `segments.drained_mask`
 /// in one commit, but leaves the batch `draining` while peers' buckets are still
 /// outstanding. Without the `drained_mask` term in `free`, those just-drained
@@ -204,7 +203,7 @@ const CLAIM_SQL: &str = "\
 /// still returns its share normally — the flip's `WHERE state = 'sealed'`
 /// just matches zero rows that time, which is not an error.
 ///
-/// **Lock the segment row first, then read (issue #690).** Under `READ
+/// **Lock the segment row first, then read.** Under `READ
 /// COMMITTED` a statement reads from the snapshot it took when it started. So
 /// [`CLAIM_SQL`] alone, racing a peer's claim of the same segment, computed
 /// its free buckets from before the peer's claim committed:

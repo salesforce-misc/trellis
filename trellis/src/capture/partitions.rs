@@ -1,5 +1,5 @@
 //! What the reconcile pass records about a partitioned source, and how it
-//! detects partition maintenance (ADR-0017, P3 of epic #897).
+//! detects partition maintenance (ADR-0017).
 //!
 //! A statement trigger fires only for the table a statement names, so
 //! `ATTACH`, `DETACH`, `DROP` and a new leaf change a partitioned root's rows
@@ -82,8 +82,8 @@
 //! by renames or dropped and recreated is table maintenance, not partition
 //! maintenance: before any fingerprint is read,
 //! [`super::triggers::pause_readers_of_gone_table`] finds the name missing or
-//! resolving to a root other than the recorded one and pauses every reader
-//! (#707, #1200). [`begin`] checks the root against the record again once it
+//! resolving to a root other than the recorded one and pauses every reader.
+//![`begin`] checks the root against the record again once it
 //! has read the fingerprints, for a swap that commits in between. Nothing is
 //! corrected or reinstalled until a resume, which forgets the recorded tree.
 //! A root renamed away and back after that
@@ -178,7 +178,7 @@ pub struct Key {
     /// none: the key column type's own (`typcollation`), schema-qualified,
     /// empty when the type has none. A text names its level's collation on a
     /// bound (`COLLATE`) only when it differs from this one, so a column
-    /// presented under it compares under each level's own (#1084).
+    /// presented under it compares under each level's own.
     pub collation: String,
     /// The level's own key collation (`partcollation`), schema-qualified,
     /// empty when the type has none: what Postgres compares this column
@@ -419,7 +419,7 @@ pub enum ClusterChange {
 }
 
 /// Classifies the live database against the recorded state, in the order
-/// #1052 decided: (1) the stored oid of `partition_sources` (`catalog`, as
+/// ADR-0017 decides: (1) the stored oid of `partition_sources` (`catalog`, as
 /// stored and live) differs: a restore; (2) otherwise a changed
 /// `system_identifier` compares the recorded nodes with the live ones; (3)
 /// otherwise nothing changed. `stored` is the identifier recorded with the
@@ -763,7 +763,7 @@ pub(crate) async fn begin(
     catalog: &CaptureCatalog,
     table: &str,
 ) -> Result<Begin, CaptureError> {
-    // Test-only pause point (#1200): after the pass's gone-table check,
+    // Test-only pause point: after the pass's gone-table check,
     // before the fingerprint read. See `staging::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     crate::staging::interleave::pause_between_transactions(
@@ -782,7 +782,7 @@ pub(crate) async fn begin(
         return Ok(Begin::NotPartitioned);
     }
     let stored = load_state(&*client, table).await?;
-    // #1200: a root other than the recorded one, under this database's own
+    // A root other than the recorded one, under this database's own
     // record, is table maintenance, not partition maintenance. The pass's
     // gone-table check pauses the readers for it before this; a swap that
     // commits between that check and the fingerprint read above lands here,
@@ -874,7 +874,7 @@ pub(crate) async fn begin(
         // Nothing reads the source until a resume rebuilds it, which covers
         // whatever changed (a source whose every reader is paused for a
         // capture failure included: a root renamed away and back after the
-        // pass paused them, #1200): record the tree and its fingerprints,
+        // pass paused them): record the tree and its fingerprints,
         // queue nothing, and, for a source that doesn't comply, look again on
         // every pass.
         plan.corrections.clear();
@@ -899,7 +899,7 @@ pub(crate) async fn begin(
         mark_checked(instance, table);
         return Ok(Begin::Held { deep: true });
     }
-    // Test-only pause point (#1129): after the tree read, before the text
+    // Test-only pause point: after the tree read, before the text
     // fetch. See `staging::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     crate::staging::interleave::pause_between_transactions(
@@ -1653,7 +1653,7 @@ mod tests {
         );
     }
 
-    /// #1052 rule 2, step 1: a changed catalog oid is a restore whatever the
+    /// Step 1 of the classification: a changed catalog oid is a restore whatever the
     /// identifier and the nodes say, so it comes before the `pg_upgrade`
     /// comparison.
     #[test]
@@ -1693,7 +1693,7 @@ mod tests {
     /// A `DROP` or `DETACH` that commits while the text fetch waits on the
     /// node's lock makes `pg_get_partition_constraintdef` fail with `XX000`.
     /// The fetch leaves the check for the next pass (`None`), as for a lock
-    /// that stays held, rather than failing the source (#1149).
+    /// that stays held, rather than failing the source.
     #[tokio::test]
     async fn a_drop_committed_during_the_text_fetch_defers_the_check() {
         async fn connect(dsn: &str) -> Client {

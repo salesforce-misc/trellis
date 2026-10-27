@@ -1,5 +1,5 @@
-//! The definition model (issue #23): a validated [`TransformDef`] (issue
-//! #22's AST) plus the identity the catalog assigns once it's persisted.
+//! The definition model: a validated [`TransformDef`]
+//! (the AST) plus the identity the catalog assigns once it's persisted.
 
 use std::collections::HashMap;
 
@@ -10,7 +10,7 @@ use super::ast::{TransformDef, ValueType};
 /// [`TransformDef`] already — plus the catalog-assigned id, the source
 /// table's version at the moment this definition was created (the value
 /// stage 05's version fence will read), and the source-column type map `def`
-/// was validated against (issue #63's write-path gap: persisted so the
+/// was validated against (persisted so the
 /// physical apply path — [`crate::staging::apply::compute`] — can evaluate
 /// non-Numeric fields the same way [`super::catalog::create_definition`]
 /// validated them, rather than re-deriving or defaulting to Numeric).
@@ -20,14 +20,14 @@ pub struct Definition {
     pub source_version: i64,
     pub def: TransformDef,
     pub source_columns: HashMap<String, ValueType>,
-    /// Where this transform is in its lifecycle (issue #55) — see
+    /// Where this transform is in its lifecycle — see
     /// [`TransformStatus`].
     pub status: TransformStatus,
     /// The persisted, fully-qualified `"schema.table"` form of `def.source`
-    /// — `transform_definitions.source_table` read back verbatim (issue #72
-    /// resolved it once, at acceptance time, via `search_path` for a bare
-    /// `FROM`, or trusted an explicit `FROM <schema>.<source>` outright as of
-    /// issue #76; see `catalog::create_definition_inner`'s `qualified_source`).
+    /// — `transform_definitions.source_table` read back verbatim (it is
+    /// resolved once, at acceptance time, via `search_path` for a bare
+    /// `FROM`, or trusted outright for an explicit `FROM <schema>.<source>`;
+    /// see `catalog::create_definition_inner`'s `qualified_source`).
     ///
     /// **This is the identity every physical SQL-builder that reads the live
     /// source table at backfill/CDC-apply/quarantine-recompute time must use**
@@ -43,10 +43,10 @@ pub struct Definition {
     /// string as-is.
     pub source_table: String,
     /// The persisted, fully-qualified `"schema.table"` form of `def.target`
-    /// — `transform_definitions.target_table` read back verbatim (issue #73
-    /// resolved it once, at acceptance time, mirroring `source_table` above;
-    /// issue #74 additionally made this the exact identity `schema_nodes`'
-    /// target-side node is keyed on, so it now doubles as the qualified key
+    /// — `transform_definitions.target_table` read back verbatim (it is
+    /// resolved once, at acceptance time, mirroring `source_table` above;
+    /// it is also the exact identity `schema_nodes`'
+    /// target-side node is keyed on, so it doubles as the qualified key
     /// a caller with only `def.target` (bare) can use to re-enter the
     /// `schema_nodes`/`schema_edges` graph — see
     /// `staging::apply::compute`'s `downstream_readers` check for the one
@@ -58,8 +58,8 @@ pub struct Definition {
 /// `transform_definitions` row, unqualified: it folds every change to what
 /// it reads into its target, and the target-mutation seam stages its
 /// source's writes for it. A status [`TransformStatus::is_applying`] holds
-/// for, or `backfilling` under a Re-derive build (#625 B1,
-/// `transform_definitions.build = 'rederive'`), which applies from the
+/// for, or `backfilling` under a Re-derive build
+/// (`transform_definitions.build = 'rederive'`), which applies from the
 /// commit that started it. Never NULL, so it is safe to select as a
 /// boolean column. Qualify the columns with [`applying_sql`] where
 /// the row has an alias.
@@ -73,7 +73,7 @@ pub fn applying_sql(alias: &str) -> String {
     )
 }
 
-/// A transform's lifecycle status (issue #55), persisted as
+/// A transform's lifecycle status, persisted as
 /// `transform_definitions.status`: `docs/transforms.md`'s "Status" section
 /// documents the full state machine this mirrors. Registration
 /// (`super::catalog::install_definition`) persists
@@ -100,14 +100,14 @@ pub enum TransformStatus {
     WaitingToBackfill,
     Backfilling,
     /// Reported, never stored: a `live` definition reading an upstream that
-    /// isn't `live` (issue #497, `super::catalog::reported_statuses`), or a
-    /// paused column of one (#1208). Apply maintains it exactly as a `live`
+    /// isn't `live` (`super::catalog::reported_statuses`), or a
+    /// paused column of one. Apply maintains it exactly as a `live`
     /// one, but its target doesn't reflect its source yet, so `live` holds
     /// along a chain.
     CatchingUp,
     Live,
     Quarantined,
-    /// Deliberately frozen by an operator (issue #142, ADR-0014) — the same
+    /// Deliberately frozen by an operator (ADR-0014) — the same
     /// freeze [`TransformStatus::Quarantined`] is, reached by the other of
     /// the two triggers the ADR names. The target holds its current,
     /// now-stale value until
@@ -127,7 +127,7 @@ impl TransformStatus {
     /// Every variant, once — the list the engine derives the
     /// chunk queue's positive allowlist from, so that gate can never drift
     /// out of step with this enum the way a hand-written `status <> 'paused'`
-    /// denylist did (issue #231).
+    /// denylist did.
     ///
     /// Adding a variant means adding it here as well as to [`Self::as_str`]
     /// and [`Self::from_persisted`] (both of which the compiler will already
@@ -184,7 +184,7 @@ impl TransformStatus {
     /// definition" would be wrong for the chunk queue. "Dispatch to anything
     /// that is not frozen" is the real rule, and stating it positively means a
     /// status added later has to be *chosen* into dispatch instead of falling
-    /// into it (issue #231).
+    /// into it.
     pub(crate) fn dispatchable() -> Vec<&'static str> {
         TransformStatus::ALL
             .iter()
@@ -255,22 +255,21 @@ pub enum NodeKind {
 pub struct SchemaNode {
     pub id: i64,
     /// The fully-qualified `"schema.table"` identity this node is keyed on
-    /// (issue #74, ADR-0011). `public.posts` and `archive.posts` are
+    /// (ADR-0011). `public.posts` and `archive.posts` are
     /// distinct rows with independent `is_source`/`is_target` flags and
-    /// independent `schema_edges` — before issue #74 this held the bare
-    /// table name, so same-named tables in different schemas collided into
-    /// one node; every caller must now pass (and compare against) the
-    /// qualified form, never re-deriving it here (same resolve-once
+    /// independent `schema_edges`, so same-named tables in different schemas
+    /// never collide into one node; every caller must pass (and compare
+    /// against) the qualified form, never re-deriving it here (same resolve-once
     /// discipline as `transform_definitions.source_table`/`target_table`).
     pub table_name: String,
     pub is_source: bool,
     pub is_target: bool,
 }
 
-/// Which kind of dependency a [`super::catalog`] edge represents (issue
-/// #21). A transform persists a [`EdgeKind::Source`] edge from its `FROM`
+/// Which kind of dependency a [`super::catalog`] edge represents.
+/// A transform persists a [`EdgeKind::Source`] edge from its `FROM`
 /// table to its target, and a `JOIN` transform a [`EdgeKind::Join`] edge
-/// from its joined table too (#1107).
+/// from its joined table too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeKind {
     Source,

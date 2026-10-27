@@ -9,9 +9,9 @@
 //! [WHERE <predicate>]
 //! ```
 //!
-//! `<target>` and `<source>` (issue #76, ADR-0011) each
-//! accept either a bare `<table>` (resolved once, later, via `search_path` —
-//! issues #72/#73) or an explicit `<schema>.<table>` spelling that names its
+//! `<target>` and `<source>` (ADR-0011) each
+//! accept either a bare `<table>` (resolved once, later, via `search_path`)
+//! or an explicit `<schema>.<table>` spelling that names its
 //! schema directly and skips that resolution — see [`Self::parse_table_ref`]
 //! for the shared parsing logic and why it doesn't collide with qualified
 //! column references elsewhere in this grammar despite reusing the same
@@ -20,12 +20,12 @@
 //! `FROM <source>` is where the key-space clause slots in: absent for 1-1,
 //! `GROUP BY <cols>` for an aggregate, `[LEFT|INNER] JOIN <other> ON <cond>
 //! GROUP BY <cols>` for a join aggregate (ADR-0019). `<expr>` supports column references,
-//! numeric and string literals, `+`, `>` (issue #65), parenthesized
-//! grouping (`(<expr>)`, issue #67 — needed once a caller composes `+` and
+//! numeric and string literals, `+`, `>`, parenthesized
+//! grouping (`(<expr>)` — needed once a caller composes `+` and
 //! `>` and must override the precedence table's own grouping), `name(args)`
-//! function calls against [`super::registry::FUNCTIONS`] (issue #64), and
+//! function calls against [`super::registry::FUNCTIONS`], and
 //! qualified columns, `<table>.<column>` or `<schema>.<table>.<column>`
-//! (issue #830, see [`Parser::parse_dotted_reference`]). Issue #109 adds **typed literals**, spelled
+//! (see [`Parser::parse_dotted_reference`]). **Typed literals** are spelled
 //! either `<type> '<text>'` or `CAST('<text>' AS <type>)` — see
 //! [`super::typed_literal`] for the allowlisted types, why both spellings
 //! build one AST node, and why `<expr>::<type>` and general casts are
@@ -70,13 +70,12 @@ pub fn parse(input: &str) -> Result<TransformDef, ParseError> {
 }
 
 /// Parses **any** statement in this grammar into a [`Statement`] — the one
-/// entry point [`crate::Trellis::apply`] uses (issue #227, ADR-0012).
+/// entry point [`crate::Trellis::apply`] uses (ADR-0012).
 ///
 /// The statement's leading keyword alone decides which form is parsed, so
 /// dispatch lives here rather than in the caller: a new form is a new arm.
 ///
-/// The forms, in full (issue #228's settled grammar, plus ADR-0015's
-/// `ALTER TRANSFORM`, issues #241/#242):
+/// The forms, in full (including ADR-0015's `ALTER TRANSFORM`):
 ///
 /// ```text
 /// TRANSFORM <target> FROM <source> [GROUP BY <keys>] SELECT <fields> [WHERE <predicate>]
@@ -91,7 +90,7 @@ pub fn parse(input: &str) -> Result<TransformDef, ParseError> {
 ///   where <clause> is  ADD <expr> AS <field>  |  DROP <field>  |  ALTER <field> AS <expr>
 /// ```
 ///
-/// `PAUSE`/`RESUME`/`DROP` keep the kind keyword (issue #228 decision 1) and
+/// `PAUSE`/`RESUME`/`DROP` keep the kind keyword and
 /// are flat imperatives rather than a `PAUSE`/`RESUME`-flavoured spelling of `ALTER TRANSFORM x PAUSE` (decision
 /// 4 — that specific spelling is still not accepted; `ALTER TRANSFORM` itself
 /// later became real grammar under ADR-0015, but only for the `ADD`/`DROP`/
@@ -125,7 +124,7 @@ pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
 /// [`StatementKind::DefineTransform`]).
 ///
 /// It is pure on the text: nothing is read from or written to the database.
-/// That is what lets an embedding binding (issue #580) refuse the wrong form
+/// That is what lets an embedding binding refuse the wrong form
 /// before it applies anything — a `define` that only defines transforms
 /// checks for [`StatementKind::DefineTransform`] and then calls `apply` with the
 /// same text, and nothing can happen between the two to change the answer.
@@ -214,7 +213,7 @@ impl Parser {
     /// The token `n` positions ahead of the cursor (`peek_at(0)` is
     /// [`Self::peek`]), clamped to the trailing `Eof` — two-token lookahead
     /// exists solely for `DOUBLE PRECISION`, the grammar's only multi-word
-    /// type keyword (issue #112).
+    /// type keyword.
     fn peek_at(&self, n: usize) -> &Token {
         let i = (self.pos + n).min(self.tokens.len() - 1);
         &self.tokens[i]
@@ -224,7 +223,7 @@ impl Parser {
     /// the first half of one, and returns the canonical uppercased keyword
     /// to look up in [`super::typed_literal::TYPED_LITERALS`].
     ///
-    /// `DOUBLE PRECISION` (issue #112) is the only such keyword: it is
+    /// `DOUBLE PRECISION` is the only such keyword: it is
     /// Postgres's own `format_type` spelling of `float8`, and
     /// `TypedLiteralSpec::keyword` is pinned to that spelling so the
     /// spelling a definition writes is the spelling the oracle renders back
@@ -260,9 +259,9 @@ impl Parser {
         }
     }
 
-    /// Parses a `TRANSFORM`/`FROM` table reference (issue #76, ADR-0011
-    /// grammar clause 4): either a bare `<table>` — today's only form,
-    /// returned as `(table, None)` — or an explicit `<schema>.<table>`
+    /// Parses a `TRANSFORM`/`FROM` table reference (ADR-0011
+    /// grammar clause 4): either a bare `<table>`,
+    /// returned as `(table, None)`, or an explicit `<schema>.<table>`
     /// spelling, returned as `(table, Some(schema))`. Rejects a third
     /// component (`a.b.c`) with a dedicated error naming the whole
     /// over-qualified reference, rather than leaving the trailing `.c`
@@ -367,9 +366,9 @@ impl Parser {
 
     /// Parses the `TRANSFORM <address>` tail of a `DROP` statement.
     ///
-    /// `DROP` is whole-definition only (issue #228, decision 2), so a dotted
+    /// `DROP` is whole-definition only, so a dotted
     /// transform address is its qualified name; dropping a single calculated
-    /// field is an `ALTER TRANSFORM ... DROP <field>` (issues #241/#242).
+    /// field is an `ALTER TRANSFORM ... DROP <field>`.
     fn parse_drop_ref(&mut self) -> Result<DefinitionRef, ParseError> {
         self.expect_keyword("TRANSFORM")?;
         let (target, qualified_table) = self.parse_transform_address(Verb::Drop)?;
@@ -384,7 +383,7 @@ impl Parser {
 
     /// Parses a `PAUSE`/`RESUME`/`DROP TRANSFORM` address: `<target>` or a
     /// two-part `a.b`, returned as its two halves. `PAUSE`/`RESUME` read the
-    /// halves as `<transform>.<column>` (issue #228 decision 2; the facade
+    /// halves as `<transform>.<column>` (the facade
     /// may resolve them to a qualified name, see [`TransformRef`]), `DROP` as
     /// `<schema>.<table>`. A third part is refused naming the whole address,
     /// the way [`Self::parse_table_ref`] does for its own over-qualified case.
@@ -469,8 +468,8 @@ impl Parser {
         })
     }
 
-    /// Parses `ALTER TRANSFORM <target> <clause>[, <clause> ...]` (ADR-0015,
-    /// issues #241/#242). `<target>` is a bare identifier
+    /// Parses `ALTER TRANSFORM <target> <clause>[, <clause> ...]` (ADR-0015).
+    /// `<target>` is a bare identifier
     /// ([`Self::expect_ident`], not [`Self::parse_table_ref`]) — an edit
     /// addresses an already-registered definition by its bare operator-facing
     /// identity, the same convention [`Self::parse_transform_address`] uses
@@ -724,8 +723,7 @@ impl Parser {
     }
 
     /// Parses one `GROUP BY` key of a non-`JOIN` aggregate: a plain
-    /// `<column>`, or `<source>.<column>` naming the `FROM` table (issue
-    /// #830). A key is always a source column, never a field, so the
+    /// `<column>`, or `<source>.<column>` naming the `FROM` table. A key is always a source column, never a field, so the
     /// qualifier changes nothing and isn't kept. Any other head is refused
     /// ([`ParseError::GroupByKeyNotFromSource`]).
     fn parse_group_by_key(&mut self) -> Result<String, ParseError> {
@@ -790,7 +788,7 @@ impl Parser {
     /// Parses a binary-operator expression via precedence climbing (a
     /// standard hand-rolled Pratt-parser loop, see [`Self::parse_binary_expr`]),
     /// so `a OP1 b OP2 c` groups the way [`super::registry::OPERATORS`]'s
-    /// precedence table (issue #67) says it should, matching a
+    /// precedence table says it should, matching a
     /// precedence-aware grammar like Postgres's rather than flat
     /// left-to-right.
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
@@ -846,7 +844,7 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         match self.advance() {
             Token::Symbol('(') => {
-                // Parenthesized grouping (issue #67's precedence-climbing
+                // Parenthesized grouping (the precedence-climbing
                 // parser needs this for the rare case a caller must override
                 // the precedence table's own grouping — e.g. wrapping a
                 // `>` comparison as an operand of `+`, which the precedence
@@ -868,7 +866,7 @@ impl Parser {
                     return Err(ParseError::NonImmutableConstruct { name });
                 }
 
-                // A typed literal's `<type> '<text>'` spelling (issue #109).
+                // A typed literal's `<type> '<text>'` spelling.
                 // Checked before the `.`/`(` branches below and gated on the
                 // *next* token being a string literal, which makes it
                 // unambiguous against every other use of an identifier here:
@@ -879,7 +877,7 @@ impl Parser {
                 // `SELECT date AS d` — only `date '...'` is a literal.
                 // `DOUBLE PRECISION '1.5'` puts an identifier between the
                 // type keyword and the string, so the one-token check below
-                // needs a second position for it (issue #112).
+                // needs a second position for it.
                 let is_two_word_type_literal = upper == "DOUBLE"
                     && matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("PRECISION"))
                     && matches!(self.peek_at(1), Token::String(_));
@@ -915,7 +913,7 @@ impl Parser {
                 if self.peek_is_symbol('(') {
                     self.advance();
 
-                    // `CAST('<literal>' AS <type>)` (issue #109) — standard
+                    // `CAST('<literal>' AS <type>)` — standard
                     // SQL's spelling of the same constant the `<type>
                     // '<literal>'` form above builds, and the same node,
                     // because Postgres folds both to one `Const`. Handled
@@ -945,7 +943,7 @@ impl Parser {
                         }
 
                         if upper == "COUNT" {
-                            // `COUNT(*)` (row-counting, issue #75) is `*`
+                            // `COUNT(*)` is `*`
                             // literally — not a `parse_call_args` expression —
                             // so it's parsed directly here rather than
                             // through `AGGREGATE_FUNCTION_SPECS`'s
@@ -971,7 +969,7 @@ impl Parser {
                                     args: Vec::new(),
                                 });
                             }
-                            // `COUNT(<expr>)` (issue #120): counts non-null
+                            // `COUNT(<expr>)`: counts non-null
                             // occurrences of `<expr>` rather than every row —
                             // a different Postgres semantic from `COUNT(*)`,
                             // sharing its name because Postgres's own grammar
@@ -1048,7 +1046,7 @@ impl Parser {
     }
 
     /// Parses the rest of a dotted name whose head `first` (and its `.`) is
-    /// at the cursor (issue #830): `<table>.<column>` or
+    /// at the cursor: `<table>.<column>` or
     /// `<schema>.<table>.<column>`, a qualified column either way. Whether it
     /// names the `FROM` (or `JOIN`) table and a real column is the
     /// validator's to check, so an `ALTER TRANSFORM` clause, parsed without
@@ -1126,7 +1124,7 @@ impl Parser {
 
     /// Parses a call's comma-separated argument list up to and including the
     /// `)` matching a `(` already consumed by the caller. General
-    /// expression syntax (issue #64): each argument is a full `parse_expr`,
+    /// expression syntax: each argument is a full `parse_expr`,
     /// so calls can nest.
     fn parse_call_args(&mut self) -> Result<Vec<Expr>, ParseError> {
         let mut args = Vec::new();

@@ -1,4 +1,4 @@
-//! A logical restore of a Trellis database (#1205, ADR-0017 P8).
+//! A logical restore of a Trellis database (ADR-0017 P8).
 //!
 //! A `pg_dump` and `pg_restore` of the whole database brings back every table
 //! Trellis keeps, ordering state included, into a cluster whose WAL position

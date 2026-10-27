@@ -39,13 +39,12 @@ pub enum BackfillError {
     /// definition edited since.
     Unsupported(String),
     /// Staging a changed row's downstream propagation through the
-    /// target-mutation seam failed (issue #315), wrapped where a backfill
+    /// target-mutation seam failed, wrapped where a backfill
     /// error is expected.
     Propagation(Box<crate::staging::ApplyError>),
-    /// The chunk-queue claim this build ran under no longer holds (issue
-    /// #434): its definition was resumed since the claim was taken, or the
-    /// claim was reclaimed from this worker. The write stopped before
-    /// touching the target; see `chunk_queue::ClaimFence`.
+    /// The chunk-queue claim this build ran under no longer holds: its definition was resumed
+    /// since the claim was taken, or the claim was reclaimed from this worker. The write stopped
+    /// before touching the target; see `chunk_queue::ClaimFence`.
     Superseded,
 }
 
@@ -149,7 +148,7 @@ impl From<ddl::DdlError> for BackfillError {
 /// After this pass the existing renderers (`render_expr_sql`) need no
 /// awareness of field aliases: every
 /// `Column` leaf is a real source column, which is exactly what they render.
-/// A qualified [`Expr::SourceColumn`] (issue #830) names a source column by
+/// A qualified [`Expr::SourceColumn`] names a source column by
 /// construction, so it is lowered to a plain `Column` here and never reaches
 /// them.
 ///
@@ -367,13 +366,11 @@ pub(crate) fn substitute_all_fields(def: &TransformDef) -> Result<Vec<Expr>, Bac
 /// and the test oracle's `oracle::render_aggregate_select_sql`) all
 /// need to look a field's self-contained expression up by name rather than
 /// walk `def.fields` positionally — this is the one substitution pass each of
-/// them shares (issue: a `GROUP BY` field like `total + total AS
+/// them shares (a `GROUP BY` field like `total + total AS
 /// double_total` referencing another calculated field `total = SUM(amount)`
-/// previously rendered the raw, un-substituted `Expr::Column("total")` as a
+/// would otherwise render the raw, un-substituted `Expr::Column("total")` as a
 /// bare SQL identifier, which Postgres rejects since `total` is neither a
-/// source column nor a same-SELECT-list-visible name; the 1-1 key-space fixed
-/// the equivalent bug via this same [`substitute_all_fields`] call for issue
-/// #83, but the Aggregate key-space's call sites never adopted it).
+/// source column nor a same-SELECT-list-visible name).
 pub(crate) fn substituted_field_exprs(
     def: &TransformDef,
 ) -> Result<HashMap<String, Expr>, BackfillError> {
@@ -389,8 +386,8 @@ pub(crate) fn substituted_field_exprs(
 /// The encoded keys of `source_table`'s rows in `(lo, hi]` of its primary
 /// key `pk`, leaving out a quarantined key and a key with a `NULL` part
 /// (which the build's plan stages instead, [`key_not_null`]), as a first
-/// build leaves them out: a field build's chunk (#625 F8b,
-/// `staging::build`).
+/// build leaves them out: a field build's chunk
+/// (`staging::build`).
 pub(crate) async fn range_keys(
     client: &impl GenericClient,
     source_table: &str,
@@ -445,8 +442,8 @@ const SOURCE_ALIAS: &str = "__trellis_src";
 /// SQL predicate over a source row aliased [`SOURCE_ALIAS`]: its key isn't
 /// quarantined (`poison`) for the source table bound as `$param` (the
 /// canonical, qualified identity quarantine keys on) and the definition whose
-/// bare target is bound as `$param + 1`. Whole-key poison is per transform
-/// (#799), so a key held for a sibling definition on the same source is
+/// bare target is bound as `$param + 1`. Whole-key poison is per transform,
+/// so a key held for a sibling definition on the same source is
 /// written as usual.
 fn not_quarantined(pk: &[PrimaryKeyColumn], param: usize) -> String {
     format!(
@@ -461,13 +458,12 @@ fn not_quarantined(pk: &[PrimaryKeyColumn], param: usize) -> String {
 
 /// SQL predicate: no part of the key `pk_idents` is `NULL`. A genuine
 /// `PRIMARY KEY` never has one, but a source keyed by a nullable `UNIQUE
-/// NULLS NOT DISTINCT` index (an aggregate target's grouping columns, issue
-/// #128) can, and a `(lo, hi]` row comparison still admits such a row
-/// whenever an earlier part decides it (`(2, NULL) <= (3, 'a')`), while it
-/// leaves out one whose `NULL` part decides it. A range therefore leaves out
+/// NULLS NOT DISTINCT` index (an aggregate target's grouping columns) can, and a `(lo, hi]` row
+/// comparison still admits such a row whenever an earlier part decides it (`(2, NULL) <= (3,
+/// 'a')`), while it leaves out one whose `NULL` part decides it. A range therefore leaves out
 /// every such key, so that the ranges partition exactly the keys without
 /// one, as [`next_pk_ranges`]' boundaries do. The target holds their rows all
-/// the same (issue #1141): the Re-derive build's plan stages them into the
+/// the same: the Re-derive build's plan stages them into the
 /// ring (`staging::build`).
 pub(crate) fn key_not_null(pk_idents: &[String]) -> String {
     pk_idents
@@ -491,15 +487,15 @@ pub(crate) enum ChunkNarrowing {
     Empty,
 }
 
-/// Narrows a failed chunk's range `(lo, hi]` of `source_table` (#616): counts
+/// Narrows a failed chunk's range `(lo, hi]` of `source_table`: counts
 /// the keys the chunk would write, leaving out the quarantined ones and any
 /// with a `NULL` part as the write does (a 1-1 range's, and a Re-derive
-/// chunk's since #625 F6, [`key_not_null`]), and either names the one key or
+/// chunk's too, [`key_not_null`]), and either names the one key or
 /// the key that splits them in half. The split point is found the way
 /// [`next_pk_ranges`] finds a chunk's upper bound: the largest key of the
 /// first half, in the primary key's own order. `key_collations` are the ones
-/// the chunk's build planned its ranges under (`backfill_chunks.key_collations`,
-/// issue #769), which the range is read and split under.
+/// the chunk's build planned its ranges under (`backfill_chunks.key_collations`),
+/// which the range is read and split under.
 pub(crate) async fn narrow_one_to_one_chunk(
     client: &impl GenericClient,
     source_table: &str,
@@ -596,7 +592,7 @@ pub(crate) async fn narrow_one_to_one_chunk(
 /// source table name) of about `rows` rows each, starting above `after` (an
 /// encoded key as `backfill_chunks` stores it; `None` from the first row):
 /// The walk for a source's ranges, a batch at a time, for the Re-derive build's
-/// plan job (#625 F2, Q13). Fewer than `max` ranges means the walk reached
+/// plan job. Fewer than `max` ranges means the walk reached
 /// the last row.
 pub(crate) async fn next_pk_ranges(
     client: &impl GenericClient,
@@ -635,7 +631,7 @@ async fn walk_pk_ranges(
     let pk_idents: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
     let col_list = pk_idents.join(", ");
     // Every comparison and sort here is under each column's
-    // [`PrimaryKeyColumn::collation`] (issue #769), as the chunks that read
+    // [`PrimaryKeyColumn::collation`], as the chunks that read
     // these ranges compare.
     let order_by = pk_idents
         .iter()
@@ -675,7 +671,7 @@ async fn walk_pk_ranges(
     // it), so this is a no-op filter there — it only ever excludes anything
     // when `pk` is the nullable fallback key `source_primary_key_in_txn`
     // resolves for a chained aggregate's `GROUP BY` (`UNIQUE NULLS NOT
-    // DISTINCT`, issue #128). `hi_select` reads each column as a bare
+    // DISTINCT`). `hi_select` reads each column as a bare
     // `col::text`, which panics on a genuine SQL `NULL` (`Row::get::<_,
     // String>` isn't `Option`-aware) — and a row-value comparison alone
     // doesn't reliably keep such a row out of the window: `(a, b) > (lo_a,
@@ -743,8 +739,8 @@ async fn walk_pk_ranges(
 /// full `(lo, hi]` predicate, and the range walk's lower-bound-only
 /// probe uses directly. Degenerates to a bare scalar comparison at arity 1
 /// (Postgres parses a single parenthesized expression as that expression, not
-/// a one-element row constructor), so this is byte-identical SQL to the
-/// pre-#121 single-column form there.
+/// a one-element row constructor), so this is byte-identical SQL to a
+/// single-column comparison there.
 pub(crate) fn pk_row_cmp(
     pk_idents: &[String],
     pk: &[PrimaryKeyColumn],
@@ -767,7 +763,7 @@ pub(crate) fn pk_row_cmp(
 }
 
 /// The `where` predicate restricting a PK-range chunk to `(lo, hi]` (issue
-/// #121: row-value comparison over `pk`'s full column list, not a single
+/// Row-value comparison over `pk`'s full column list, not a single
 /// scalar), binding the bounds as `$1..$n` (and `$n+1..$2n` when `lo` is
 /// present, `n = pk.len()`). Paired with [`next_pk_ranges`]; the caller
 /// binds `hi` (first chunk) or `lo, hi`.
@@ -792,7 +788,7 @@ mod tests {
     use super::super::oracle::render_expr_sql;
     use super::*;
 
-    /// Issue #769: every column of a key range is compared under its
+    /// Every column of a key range is compared under its
     /// recorded collation, and a column with none bare, so an index of that
     /// collation serves the range.
     #[test]
@@ -851,8 +847,8 @@ mod tests {
     }
 
     /// `total = double_price + tax`, where `double_price` is itself a
-    /// calculated field (`price + price`) — the alias-derived shape issue #83
-    /// asks a 1-1 build to render. Substitution must inline
+    /// calculated field (`price + price`) — the alias-derived shape a 1-1 build
+    /// must render. Substitution must inline
     /// `double_price` into `total`, leaving only real source columns.
     #[test]
     fn substitute_inlines_a_cross_field_alias_chain() {
@@ -879,7 +875,7 @@ mod tests {
         assert_eq!(render_expr_sql(&out[0]), r#""price""#);
     }
 
-    /// Issue #695: inside an aggregate's argument, the name of another
+    /// Inside an aggregate's argument, the name of another
     /// aggregate field is the source column (SQL's rule), so `MIN(val)` after
     /// `SUM(val) AS val` is not inlined into `MIN(SUM(val))`. Outside an
     /// aggregate's argument the name is still the field.
@@ -900,7 +896,7 @@ mod tests {
         );
     }
 
-    /// Issue #830: a qualified name is the source column even where a field
+    /// A qualified name is the source column even where a field
     /// of that name exists, and comes out of substitution as a plain column.
     #[test]
     fn substitute_reads_the_source_column_for_a_qualified_name() {

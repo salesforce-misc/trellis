@@ -1,4 +1,4 @@
-//! Typed keyset paging for a `self_check` walk (#1178, ADR-0013 "How a walk
+//! Typed keyset paging for a `self_check` walk (ADR-0013 "How a walk
 //! pages").
 //!
 //! A page selects its keys by a comparison on the key's raw columns,

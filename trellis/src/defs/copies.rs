@@ -5,7 +5,7 @@
 //!
 //! - a 1-1 target's key columns, typed as the source key's
 //!   ([`super::ddl::target_table_ddl`]), and its bare passthrough fields,
-//!   typed as the source column they copy (#45);
+//!   typed as the source column they copy;
 //! - an aggregate target's `GROUP BY` columns, typed as the key's value
 //!   family ([`super::ddl::pg_type_name`]: `integer`, `bigint`, `text`,
 //!   `numeric`);
@@ -365,7 +365,7 @@ async fn join_copies(
 /// table and the hidden tables.
 /// A superset of the tables the copies are in and read from: the capture
 /// pass fingerprints these to skip the comparison while none changed
-/// (`staging::drift_memo`, #858). A table `typed_copies` starts reading
+/// (`staging::drift_memo`). A table `typed_copies` starts reading
 /// belongs here.
 pub(crate) fn inputs(
     schema: &str,
@@ -557,7 +557,7 @@ pub(crate) struct CopyState {
     /// tells an integer outgrown by a bounded `numeric` from one that isn't.
     pub source_typmod: i32,
     /// The copy's collation, quoted and qualified, when it isn't its type's
-    /// default: a 1-1 target's key keeps its source key's (#769). A re-type
+    /// default: a 1-1 target's key keeps its source key's. A re-type
     /// keeps it.
     pub collation: Option<String>,
 }
@@ -565,7 +565,7 @@ pub(crate) struct CopyState {
 impl CopyState {
     /// Whether the copy's type is no longer the one define would create.
     ///
-    /// `text` and `varchar` are one family (#1207): Trellis's copy of a
+    /// `text` and `varchar` are one family: Trellis's copy of a
     /// `varchar(n)` column is an unbounded `varchar`, so a source column
     /// that changes between `text` and `varchar(n)`, or between bounds,
     /// leaves every copy as it should be.
@@ -578,7 +578,7 @@ impl CopyState {
 
     /// Whether a re-type to its live type discards the values the copy holds
     /// rather than casting them: its type is one enum and its live type
-    /// another (#1327). No value of the old type is one of the new, and a
+    /// another. No value of the old type is one of the new, and a
     /// stored label is trusted only under its own type's value identity
     /// (ADR-0020), so the resume's rebuild refills the copy from the source.
     pub(crate) fn discards_values(&self) -> bool {
@@ -780,7 +780,7 @@ pub(crate) async fn describe(
 /// the copies it re-types, for messages. Empty when nothing drifted.
 ///
 /// A copy re-typed from one enum to another casts no stored value
-/// ([`CopyState::discards_values`], #1327): it is re-typed `using null`,
+/// ([`CopyState::discards_values`]): it is re-typed `using null`,
 /// and the resume's rebuild refills it from the source. A key copy
 /// ([`CopyKind::is_key`]) can't be nulled in place, which would merge every
 /// group onto one key, so the table's rows with a key of the old type are
@@ -1024,7 +1024,7 @@ mod tests {
     }
 
     /// A re-type keeps the copy's own collation (a 1-1 key keeps its
-    /// source key's, #769): `alter column … type` would otherwise give the
+    /// source key's): `alter column … type` would otherwise give the
     /// column its new type's default, and rebuild its index. A type that
     /// takes none gets none.
     #[test]
@@ -1051,7 +1051,7 @@ mod tests {
         );
     }
 
-    /// `text` and `varchar(n)` are one family (#1207): a copy of either is
+    /// `text` and `varchar(n)` are one family: a copy of either is
     /// unbounded, so a source column changing between them, or between
     /// bounds, drifts nothing and re-types nothing.
     #[test]

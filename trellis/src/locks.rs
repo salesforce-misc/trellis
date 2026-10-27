@@ -1,4 +1,4 @@
-//! Lock discipline: ADR-0002 invariants I6 and I7 (issue #621).
+//! Lock discipline: ADR-0002 invariants I6 and I7.
 //!
 //! **I7: no Trellis transaction waits for a lock while it holds a snapshot
 //! open.** Every connection Trellis opens (pooled, unpooled and dedicated)
@@ -7,7 +7,7 @@
 //! transaction ends by then. That covers the explicit lock statements
 //! (`for update`, `for share`, advisory locks, DDL) and the implicit ones: an
 //! `insert ... on conflict` waiting on another transaction's uncommitted key,
-//! an `update` waiting on a locked row. #617's drain waited 1 h 50 min on the
+//! an `update` waiting on a locked row. A drain once waited 1 h 50 min on the
 //! second kind. A session setting, rather than a `set local` per transaction,
 //! is what makes this hold for a transaction nobody audited, including one
 //! written after this module. On `55P03` the transaction rolls back and the
@@ -17,16 +17,13 @@
 //! **I6: never block an application writer.** DDL on a user table runs in
 //! its own short transactions, each under a per-attempt `lock_timeout`, retried
 //! once per [`USER_TABLE_DDL_RETRY_INTERVAL`] until it lands ([`DdlRetry`]).
-//! That DDL is `CREATE`/`DROP TRIGGER` (#622), whose `SHARE ROW EXCLUSIVE`
+//! That DDL is `CREATE`/`DROP TRIGGER`, whose `SHARE ROW EXCLUSIVE`
 //! conflicts with writers' `ROW EXCLUSIVE`: a DDL statement queued for it
 //! makes every later writer queue behind it, so the queue must be short and
-//! keep emptying: [`USER_TABLE_DDL_LOCK_TIMEOUT`]. [#565 E7]: a bare `CREATE
+//! keep emptying: [`USER_TABLE_DDL_LOCK_TIMEOUT`]. A bare `CREATE
 //! TRIGGER` stalled every writer for 25 s behind one open transaction; a
 //! 50 ms `lock_timeout` retried every 200 ms held the worst writer wait to
-//! 52 ms. An autovacuum holding the table is waited out, never cancelled
-//! (#622 plan, Q1).
-//!
-//! [#565 E7]: https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119
+//! 52 ms. An autovacuum holding the table is waited out, never cancelled.
 
 use std::time::{Duration, Instant};
 
@@ -40,14 +37,13 @@ use std::time::{Duration, Instant};
 /// pages queued on the same ledger entries and group rows. The retries it
 /// forces are for a transaction that holds a lock for much longer than that:
 /// a long application transaction, a stuck chunk, an operator's `LOCK
-/// TABLE`. #617's drain waited 1 h 50 min; this bounds that to 30 seconds.
+/// TABLE`. A drain once waited 1 h 50 min; this bounds that to 30 seconds.
 ///
-/// **Sized by #623 D9**, once D5 had deleted the aggregate group pre-lock
-/// (#326) that the interim 120 s was sized for. The shape that queued worst
-/// on the pre-lock, `bench --disk fold-in-ratio --ratios 10` (40k groups at
-/// 400k rows/s, eight workers, every page touching most groups), now has
-/// its longest page transaction, wait included, at 6.6 s (it was 89 s), and
-/// no page waits out the cap at either 30 s or 10 s. D9's benchmark round,
+/// **Sizing.** There is no aggregate group pre-lock to wait on. The shape
+/// that queued worst on a pre-lock, `bench --disk fold-in-ratio --ratios 10`
+/// (40k groups at 400k rows/s, eight workers, every page touching most
+/// groups), has its longest page transaction, wait included, at 6.6 s, and
+/// no page waits out the cap at either 30 s or 10 s. The benchmark round,
 /// with a checkpoint every 30 s, saw 7.6 s at most. The rule was the
 /// smallest of 30 s and 10 s with no timeouts and the longest page under a
 /// third of the cap, which 10 s misses (6.6 s against 3.3 s): a cap that
@@ -57,8 +53,8 @@ use std::time::{Duration, Instant};
 pub const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The per-attempt `lock_timeout` for DDL on a user table whose lock
-/// conflicts with writers' `ROW EXCLUSIVE` (I6): `CREATE`/`DROP TRIGGER`
-/// (#622). See [`DdlRetry`].
+/// conflicts with writers' `ROW EXCLUSIVE` (I6): `CREATE`/`DROP TRIGGER`.
+/// See [`DdlRetry`].
 pub const USER_TABLE_DDL_LOCK_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// How long [`DdlRetry`] waits between two attempts at DDL on a user table.
@@ -78,7 +74,7 @@ fn millis(timeout: Duration) -> u128 {
 /// The setting in force is read with `current_setting`, whose text (`50ms`,
 /// `90s`, `2min`, `0`) parses as an interval, not from `pg_settings`: that
 /// view builds every setting the server has on each read, about 0.28 ms
-/// against 0.016 ms (#1010). `name` and `ms` are trusted, not user input.
+/// against 0.016 ms. `name` and `ms` are trusted, not user input.
 pub(crate) fn cap_timeout_sql(name: &str, ms: u128, local: bool) -> String {
     format!(
         "select set_config('{name}', \
@@ -122,18 +118,19 @@ pub fn is_lock_not_available(err: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// The first int of the column-pause lock's key (#922).
+/// The first int of the column-pause lock's key.
 const COLUMN_PAUSE_LOCK_CLASS: i32 = 922;
 
 /// The advisory lock key of `schema`'s column-pause lock, the one lock every
 /// read-to-decide and every write of that instance's column-pause state takes
-/// (#922, ADR-0014, "One lock orders every column-pause write and read"): `column_status` rows, the cascade edges
-/// (`column_pause_cascades`) and the pending marks on them.
+/// (ADR-0014, "One lock orders every column-pause write and read"):
+/// `column_status` rows, the cascade edges (`column_pause_cascades`) and the
+/// pending marks on them.
 ///
 /// Advisory locks are keyed by `(database, key)` and know nothing of schemas,
 /// so the instance schema is hashed into the key, as the producer singleton's
-/// is (`staging::session::producer_singleton_lock_key`, #234): instances
-/// sharing a database don't serialize each other's pauses (#978). A two-int
+/// is (`staging::session::producer_singleton_lock_key`): instances
+/// sharing a database don't serialize each other's pauses. A two-int
 /// key, so it shares nothing with the single-`bigint` session locks. Two
 /// schemas whose hashes collide would share the lock, which costs those two
 /// instances the coupling this avoids and nothing else.
@@ -244,7 +241,7 @@ pub enum ColumnPauseLockError {
 
 /// Takes the transaction-scoped column-pause lock of the instance whose
 /// schema is `schema` in `mode` for `op`: the only place a column-pause
-/// advisory lock is taken (rule 8 of #922; the guard
+/// advisory lock is taken (the guard
 /// `tests::only_the_helper_takes_the_column_pause_lock` greps for it).
 ///
 /// **Lock order.** A transaction that needs it takes these in this order,
@@ -292,8 +289,8 @@ pub async fn lock_column_pauses(
     }
 }
 
-/// The retry loop for DDL on a user table (I6): `CREATE`/`DROP TRIGGER`
-/// (#622), under [`USER_TABLE_DDL_LOCK_TIMEOUT`] per attempt (the module
+/// The retry loop for DDL on a user table (I6): `CREATE`/`DROP TRIGGER`,
+/// under [`USER_TABLE_DDL_LOCK_TIMEOUT`] per attempt (the module
 /// doc). Each attempt is its own transaction that runs its DDL under
 /// `set_local_lock_timeout(txn, retry.lock_timeout())`; the caller loops:
 ///
@@ -493,7 +490,7 @@ mod tests {
 
     /// The cap keeps a shorter setting in force whatever unit Postgres shows
     /// it in, and replaces a longer one or `0`, for both a session and a
-    /// transaction-local setting, on both GUCs that use it (#1010). The
+    /// transaction-local setting, on both GUCs that use it. The
     /// result is read from `pg_settings` (a bare count of ms), not with the
     /// `current_setting` conversion under test.
     #[tokio::test]
@@ -532,7 +529,7 @@ mod tests {
                 // One statement sets, caps and records the value in force:
                 // a 1 ms `statement_timeout` is armed per top-level
                 // statement, so a separate cap or verifying read would run
-                // under it and can time out (#1192). The setting is reset to
+                // under it and can time out. The setting is reset to
                 // 0 before the statement ends, so the read below runs with
                 // no timeout.
                 let cap_sql = cap_timeout_sql(name, cap, false).replace('\'', "''");
@@ -625,7 +622,7 @@ mod tests {
             .map_or(0, |count| count.trim().parse().expect("a counter value"))
     }
 
-    /// Rule 5 and 6 of #922: a wait that outlasts the transaction's
+    /// A wait that outlasts the transaction's
     /// `lock_timeout` returns the named, retryable error, counts the metric
     /// under its caller, and leaves the lock free for a retry. Two shared
     /// holders (defines) don't wait on each other; an exclusive one waits
@@ -744,7 +741,7 @@ mod tests {
         );
     }
 
-    /// #978: the lock is one per instance, not per database. Instance A holds
+    /// The lock is one per instance, not per database. Instance A holds
     /// its column-pause lock in an open transaction; instance B, in the same
     /// database, takes its own at once (a `lock_timeout` of a few
     /// milliseconds turns any wait into a failure, so no polling), and a
@@ -807,7 +804,7 @@ mod tests {
         assert_eq!(column_pause_lock_key("a").0, COLUMN_PAUSE_LOCK_CLASS);
     }
 
-    /// Rule 8 of #922: one function takes the column-pause lock, so a new
+    /// One function takes the column-pause lock, so a new
     /// call site can't skip the order or the timeout handling. Any
     /// `pg_advisory_xact_lock` in `src` outside that function's file fails
     /// this, except the test-only gates (`staging::interleave` and a gate

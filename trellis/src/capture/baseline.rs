@@ -1,6 +1,6 @@
 //! What a captured table's read columns looked like when Trellis last
 //! looked, and the capture pass's response to a change no capture trigger
-//! saw (#703 R1 and R3b).
+//! saw.
 //!
 //! Capture knows a column by its name, and two kinds of DDL change what a
 //! column holds without firing a DML trigger or changing its name:
@@ -54,7 +54,7 @@
 //! forgotten (a column renamed or dropped is
 //! `staging::schema_change::pause_readers_of_missing`'s).
 //!
-//! The response follows the definition's validity (the #703/#707 decision):
+//! The response follows the definition's validity:
 //!
 //! - **R3b, and R1 where every definition reading the column is still valid
 //!   as written:** only data was missed. The pass rebuilds every applying
@@ -75,7 +75,7 @@
 //!   left every reader valid, changed no value: nothing rebuilds.
 //!
 //! R1's type check leaves alone a definition that uses the column as a
-//! key: `pause_readers_of_retyped` owns a key column's type (#760). A key
+//! key: `pause_readers_of_retyped` owns a key column's type. A key
 //! column dropped and re-added is R1's.
 //!
 //! # A type renamed
@@ -400,7 +400,7 @@ pub(crate) async fn forget_except(
 
 /// Re-records the name of every type renamed or moved to another schema
 /// (`ALTER TYPE ... RENAME TO`, `... SET SCHEMA`) since a definition recorded
-/// it, in place (#1204, #1242). Each definition records the OID of every
+/// it, in place. Each definition records the OID of every
 /// user-defined type it names beside the name (`definition_types`,
 /// [`crate::defs::key_types::record_types`]), and this compares that record
 /// with `pg_type` by OID: the same OID under another qualified name is a
@@ -820,7 +820,7 @@ async fn respond(
         .into_iter()
         .any(|(c, _)| c == column);
     if key_use {
-        // #760: a key column's type is `pause_readers_of_retyped`'s.
+        // A key column's type is `pause_readers_of_retyped`'s.
         return Ok(readded.then_some(Response::Rebuild));
     }
     let what = if readded {
@@ -852,7 +852,7 @@ async fn respond(
         Some(ValueType::Integer(_)) => None,
         other => Some(other.cloned()),
     };
-    // #1110: a `JOIN` evaluates its joined table's columns as their types
+    // A `JOIN` evaluates its joined table's columns as their types
     // were recorded for it too.
     let (was, now) = if reader.source == table {
         (

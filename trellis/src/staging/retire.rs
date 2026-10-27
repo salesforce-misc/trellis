@@ -1,6 +1,5 @@
-//! Retirement: freeing a `drained` segment's ring slot for reuse (issue
-//! #13/#58, stage 06's cleanup half — quarantine, stage 06's other half, is
-//! issue #16). See
+//! Retirement: freeing a `drained` segment's ring slot for reuse (stage 06's
+//! cleanup half; quarantine is stage 06's other half). See
 //! docs/staging-and-claiming/06-cleanup-and-reclaim.md, "Retiring a batch".
 //!
 //! **The guarantee: no cleanup step can retire un-applied work.** Every
@@ -19,8 +18,8 @@
 //! wired into [`crate::client`]'s maintenance loop and (still) run as
 //! `seal_if_active_nonempty`'s one `RingFull` retry.
 //!
-//! [`collect_tombstones`] is the ledgers' half of the same cleanup (#623
-//! D7): a tombstone is only needed while an older change to its key can
+//! [`collect_tombstones`] is the ledgers' half of the same cleanup:
+//! a tombstone is only needed while an older change to its key can
 //! still arrive, and the drained prefix says when none can. It collects the
 //! group basis's zero groups by the same prefix, and a `JOIN`'s zero `T`
 //! groups, which have no basis, whatever the prefix
@@ -115,7 +114,7 @@ const LATE_ROWS_CANDIDATES_SQL: &str = "\
     order by s.seg_seq asc";
 
 /// Counts the rows of each drained segment's slot that its fence doesn't
-/// show (`segments.late_rows`, #1219): the late writers' rows, which its
+/// show (`segments.late_rows`): the late writers' rows, which its
 /// successor's window takes. `self_check` reads a drained slot only while
 /// the count is more than 0 (or not yet counted) and the successor hasn't
 /// drained. The count is final once [`LATE_ROWS_CANDIDATES_SQL`] holds, so
@@ -219,7 +218,7 @@ const DRAINED_PREFIX_SQL: &str = "\
 
 /// Every ledger table there is, schema-qualified and quoted: a
 /// definition's `<target>__ledger`, where it exists, with the definition's
-/// id. An aggregate target's and a 1-1 target's (#623 D6) carry the same
+/// id. An aggregate target's and a 1-1 target's carry the same
 /// ordering-state columns, so [`collect_tombstones`] collects both alike.
 const LEDGER_TABLES_SQL: &str = "\
     select format('%I.%I', n.nspname, c.relname), d.id \
@@ -249,7 +248,7 @@ pub(crate) fn may_leave_backlog(collected: u64) -> bool {
     collected >= TOMBSTONE_BATCH as u64 * TOMBSTONE_BATCHES_PER_PASS as u64
 }
 
-/// Deletes the tombstones no change can still need (#623 D7): in every
+/// Deletes the tombstones no change can still need: in every
 /// ledger, each `__tombstone` entry whose `__applied_seg` is at or below the
 /// contiguous drained prefix `P` ([`DRAINED_PREFIX_SQL`]), and then the
 /// group-basis aggregates' zero groups and the `JOIN`s' zero `P` and `M`
@@ -268,7 +267,7 @@ pub(crate) fn may_leave_backlog(collected: u64) -> bool {
 /// is at least the delete's batch (a page writes the highest `seg_seq` it
 /// drains, never lowering it). Only a write that leaves an entry a tombstone
 /// stamps it, which is enough whatever the entry carried while it was live
-/// (`defs::ledger::tombstone_seg_sql`, #775). At or below `P` every batch is drained: the
+/// (`defs::ledger::tombstone_seg_sql`). At or below `P` every batch is drained: the
 /// predecessor has already been applied, or skipped. The highest drained
 /// segment is not enough, since an older one may still lag (the
 /// `early_tombstone_gc` plant).
@@ -279,7 +278,7 @@ pub(crate) fn may_leave_backlog(collected: u64) -> bool {
 /// page draining an old batch can see a later batch's delete. Once that
 /// delete is refused (the basis saw it), nothing else would put the
 /// tombstone back, and an older change still pending in a batch between
-/// the two would apply to a fresh entry and bring the key back (#742). So
+/// the two would apply to a fresh entry and bring the key back. So
 /// every Re-derive stamps at least the newest segment its read's snapshot
 /// sees, and every change the snapshot saw is in that segment or an earlier
 /// one. A page's Re-derive reads that segment with its rows
@@ -287,7 +286,7 @@ pub(crate) fn may_leave_backlog(collected: u64) -> bool {
 /// statement, and the direct Re-derives stamp the latest segment there is.
 ///
 /// **Against a build.** A ledger whose definition is under a build is
-/// skipped ([`NOT_BUILDING_SQL`], #723): a build chunk's insert needs the
+/// skipped ([`NOT_BUILDING_SQL`]): a build chunk's insert needs the
 /// tombstones written since its snapshot.
 ///
 /// **Against a page.** Each batch is a short transaction of its own. It
@@ -298,7 +297,7 @@ pub(crate) fn may_leave_backlog(collected: u64) -> bool {
 /// page has just revived is no longer a tombstone. A delete that lands
 /// between a page's placeholder insert and its lock fails the page's entry
 /// lock with a transient error, and the page retries
-/// (`one_to_one_ledger::lock_entries`, #712).
+/// (`one_to_one_ledger::lock_entries`).
 pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError> {
     let row = client.query_typed_one(DRAINED_PREFIX_SQL, &[]).await?;
     let prefix: Option<i64> = row.get(0);
@@ -307,7 +306,7 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
     let Some(through) = prefix else {
         return Ok(0);
     };
-    // Planted bug (#557): collect through the highest drained segment, not
+    // Planted bug: collect through the highest drained segment, not
     // the contiguous drained prefix. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
     let through = match highest_drained {
@@ -452,7 +451,7 @@ async fn collect_zero_groups(client: &mut Client, through: i64) -> Result<u64, S
                 }
                 return Err(err.into());
             }
-            // Planted bug (#1114): collect every zero group, whatever its
+            // Planted bug: collect every zero group, whatever its
             // basis and stamp. See `crate::plant`.
             #[cfg(any(test, feature = "test-util"))]
             if *basis && crate::plant::armed() == Some(crate::plant::Plant::GbEarlyZeroGc) {
@@ -541,7 +540,7 @@ pub async fn explain_collect_zero_groups(
 /// Locks definition `$1`'s row `for key share`, without waiting, and
 /// returns it unless the definition is under a build: `backfilling`, or
 /// with a Re-derive build a pause or a quarantine froze (`build` set). A
-/// GC batch collects nothing from a ledger this returns no row for (#723),
+/// GC batch collects nothing from a ledger this returns no row for,
 /// and holds the lock until it commits.
 ///
 /// **Why.** A Re-derive build's chunk inserts the entries of keys that have
@@ -571,7 +570,7 @@ const NOT_BUILDING_SQL: &str = "\
     where id = $1 and status <> 'backfilling' and build is null \
     for key share nowait";
 
-/// The plan settings a GC batch's statement runs under (#738, #722): no
+/// The plan settings a GC batch's statement runs under: no
 /// sequential scan and no bitmap scan, so the batch walks the ledger's
 /// partial `where __tombstone` index and stops at its `limit`. Its cost is
 /// then the tombstones it walks, not the ledger's size.
@@ -585,8 +584,8 @@ const NOT_BUILDING_SQL: &str = "\
 /// entries and 20.7M at 100M, where the 100M run had 115 at most. An
 /// `analyze` right after a burst of deletes misleads it the same way. That
 /// scan reads the whole ledger to find the few tombstones there are: up to
-/// 0.6 s a tick at 10M entries, and, by the same plan, the 33 s transaction
-/// #722 saw holding `xmin` back for every table on a 28.6 GB ledger at
+/// 0.6 s a tick at 10M entries, and, by the same plan, a 33 s transaction
+/// holding `xmin` back for every table on a 28.6 GB ledger at
 /// 100M. Under these settings it was 65 ms at most at 100M (0.4 ms mean). A
 /// bitmap scan would build the bitmap of every collectable tombstone before
 /// the `limit` applies.

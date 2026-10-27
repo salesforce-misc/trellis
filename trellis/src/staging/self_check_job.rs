@@ -1,4 +1,4 @@
-//! `self_check` as a background job (#1023, part of #599).
+//! `self_check` as a background job.
 //!
 //! The comparison of a whole target against a fresh recompute can take far
 //! longer than a public call may (30 seconds, `docs/decisions/0008-public-api-design.md`
@@ -209,7 +209,7 @@ pub struct SelfCheckReport {
     pub truncated: bool,
     pub outcome: SelfCheckOutcome,
     /// The keys the audited definition holds in quarantine, read when the
-    /// job is polled, `None` if it holds none (#759). Reported with every
+    /// job is polled, `None` if it holds none. Reported with every
     /// outcome, because a held key is one the audit can't vouch for: the
     /// definition leaves its changes out, so its target row stays as it was
     /// when the key was poisoned. It is a [`SelfCheckOutcome::Diverged`] row
@@ -220,7 +220,7 @@ pub struct SelfCheckReport {
     /// `Trellis::release_key`, or resume the definition.
     pub held_keys: Option<HeldKeys>,
     /// Every page the drain keeps failing on with nothing charged or paused,
-    /// oldest first (#817), read when the job is polled: an instance-level
+    /// oldest first, read when the job is polled: an instance-level
     /// finding, reported with every outcome. Each holds back the targets of
     /// the tables it holds changes to, and with them the convergence the
     /// audit waits on. Empty when there is none.

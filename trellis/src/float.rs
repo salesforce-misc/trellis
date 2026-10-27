@@ -1,11 +1,11 @@
 //! Postgres's **IEEE binary floating-point** types — `real`/`double
-//! precision` (issue #112) — as a real value model, split out of the
+//! precision` — as a real value model, split out of the
 //! arbitrary-precision [`crate::numeric::Numeric`] both of them used to
 //! collapse into.
 //!
 //! # Why this is not `Numeric`
 //!
-//! Issue #111 took the exact integer types out of `ValueType::Numeric`.
+//! The exact integer types are not in `ValueType::Numeric`.
 //! `real` and `double precision` were the two left behind, and they are the
 //! *least* like `numeric` of the six: `numeric` is an exact,
 //! arbitrary-precision decimal, while these are fixed-width binary floats.
@@ -23,16 +23,16 @@
 //!    `Numeric::parse` has no representation for any of them.
 //! 3. **Range is finite.** `select 3.4e38::float4 + 3.4e38::float4` raises
 //!    `22003` (`value out of range: overflow`); arbitrary precision never
-//!    does. Same class of divergence #111 fixed for `int4 + int4`.
+//!    does. Same class of divergence as `int4 + int4`.
 //! 4. **Result type.** Postgres types `float4 + float4` as `real`, not
 //!    `numeric`, and `avg(real)` as `double precision`. A derived column
-//!    declared `numeric` for an expression Postgres types `real` is the lie
-//!    #108 removed from the ingest side and #111 removed from the computed
-//!    side for integers.
+//!    declared `numeric` for an expression Postgres types `real` is a lie
+//!    about the type, which the ingest side and the computed side for
+//!    integers do not tell.
 //!
 //! # Postgres's float semantics are *not* IEEE 754's
 //!
-//! This is the decision issue #112 asks for, and it is not a free one —
+//! This decision is not a free one —
 //! Postgres already made it, and `docs/type-support.md`'s "IEEE edge cases
 //! need a decision" resolves to "do what the oracle does":
 //!
@@ -61,7 +61,7 @@
 //! That is precisely the text-instability bar `numeric` already fails on
 //! (`1.0` vs `1.00`), so `real`/`double precision` stay off
 //! `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` and are rejected as `GROUP BY`
-//! keys. The unlock is #110's typed key index — comparing decoded values
+//! keys. The unlock is the typed key index — comparing decoded values
 //! through [`compare`] — not a new encoding here. See
 //! `docs/type-support.md`.
 //!

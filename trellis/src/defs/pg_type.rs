@@ -1,4 +1,4 @@
-//! The PG-OID → [`ValueType`] registry (issue #108).
+//! The PG-OID → [`ValueType`] registry.
 //!
 //! Before this module, a column's [`ValueType`] was inferred from
 //! [`pg_catalog.format_type`]'s *rendered text* (`"character varying(255)"`,
@@ -16,8 +16,8 @@
 //! instead of a lie. Per `docs/type-support.md`'s matrix, most of these
 //! families ([`PgType`]'s variants) are still passthrough-only here — no
 //! operators, casts, key, or aggregate role — that's deliberately left to
-//! each family's own epic child (#111–#122); this issue's job is only to
-//! stop mislabeling them, not to promote them.
+//! each family's own promotion; this registry only labels them honestly,
+//! it does not promote them.
 //!
 //! OIDs below are Postgres's own fixed `pg_type.oid` catalog constants
 //! (identical across every supported server version — see
@@ -36,8 +36,8 @@ use crate::integer::IntWidth;
 
 /// A recognized Postgres type family that doesn't (yet) have its own
 /// first-class [`ValueType`] variant. Carried inside [`ValueType::Other`]
-/// and [`super::eval::Value::Other`] so passthrough/ingest (issue #108's
-/// scope) can tag a value with its real type instead of collapsing it into
+/// and [`super::eval::Value::Other`] so passthrough/ingest
+/// can tag a value with its real type instead of collapsing it into
 /// `Text`, while filtering/keys/casts/aggregates for it stay gated until the
 /// matching epic child ([`docs/type-support.md`]) lands.
 ///
@@ -48,7 +48,7 @@ use crate::integer::IntWidth;
 pub enum PgType {
     /// `oid` — an *unsigned* 32-bit row/object identifier.
     ///
-    /// Issue #111 decided it does **not** join [`ValueType::Integer`]'s
+    /// It does **not** join [`ValueType::Integer`]'s
     /// family (see [`crate::integer`]'s module doc): Postgres gives `oid` no
     /// arithmetic operators at all — `pg_operator` carries only the
     /// comparison family for it, there is no `oidpl` — and its range is
@@ -58,7 +58,7 @@ pub enum PgType {
     /// It stays a passthrough [`PgType`] and gains only the roles it can
     /// honestly hold. Its text rendering *is* canonical (unsigned decimal,
     /// no sign, no leading zeros), so unlike every other family here it is
-    /// genuinely text-stable: #111 admits it as a `JOIN` key, a
+    /// genuinely text-stable: it is admitted as a `JOIN` key, a
     /// primary key (`join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`), a `GROUP BY` key
     /// (`validate`'s key gate) and a typed literal
     /// (`typed_literal::TYPED_LITERALS`).
@@ -82,13 +82,13 @@ pub enum PgType {
     Xml,
     TsVector,
     TsQuery,
-    /// `text[]` — the result type of `ARRAY_AGG` over a `text` argument
-    /// (issue #293). It is never read off a source column: introspection
+    /// `text[]` — the result type of `ARRAY_AGG` over a `text` argument.
+    /// It is never read off a source column: introspection
     /// classifies an array column as [`PgType::Unrecognized`], so this
     /// family exists only as an aggregate target's declared type.
     TextArray,
-    /// A user-defined enum type (`CREATE TYPE ... AS ENUM (...)`, issue
-    /// #117) — the one variant here that is not a single, universal
+    /// A user-defined enum type (`CREATE TYPE ... AS ENUM (...)`)
+    /// — the one variant here that is not a single, universal
     /// Postgres family. Every other [`PgType`] variant names exactly one
     /// fixed builtin type across every Postgres installation (`bytea` is
     /// always OID 17); `CREATE TYPE` instead mints an arbitrary, per-schema
@@ -194,7 +194,7 @@ impl PgType {
             PgType::TsVector => "tsvector",
             PgType::TsQuery => "tsquery",
             PgType::TextArray => "text[]",
-            // Issue #117: already the exact persisted token — see
+            // Already the exact persisted token — see
             // `PgType::Enum`'s own doc comment and `ENUM_TOKEN_PREFIX`.
             PgType::Enum(token) => token,
             PgType::Unrecognized => "unrecognized",
@@ -234,11 +234,11 @@ impl PgType {
     /// quoting. [`Self::Unrecognized`] is the first exception: `"unrecognized"`
     /// is not a Postgres type at all, and interpolating it produced a raw
     /// `type "unrecognized" does not exist` (SQLSTATE 42704) out of `create
-    /// table`/`insert` (issue #108 review); it renders as `text` instead,
-    /// exactly what the pre-#108 `value_type_from_pg` `_ => ValueType::Text`
-    /// fallthrough emitted for these same types.
+    /// table`/`insert`; it renders as `text` instead,
+    /// the same classification a `_ => ValueType::Text` fallthrough would give
+    /// these types.
     ///
-    /// [`Self::Enum`] is the second, newer exception (issue #117): its bare
+    /// [`Self::Enum`] is the second, newer exception: its bare
     /// [`Self::enum_qualified_name`] (`public.status_enum`) is *usually* a
     /// valid bare identifier pair, but nothing about a `CREATE TYPE ... AS
     /// ENUM` name guarantees that — an operator can quote arbitrary
@@ -279,7 +279,7 @@ impl PgType {
     /// this build doesn't recognize (a forward-compat guard, same as
     /// [`ValueType`]'s own decode sites — a newer writer's token reaching an
     /// older reader should be a named [`super::catalog::CatalogError::UnknownValueType`],
-    /// not a silent misparse). Issue #117: a token carrying
+    /// not a silent misparse). A token carrying
     /// [`ENUM_TOKEN_PREFIX`] decodes to [`PgType::Enum`] rather than falling
     /// through to `None` — see that prefix's own doc comment for why this
     /// stays a forward-compat-safe, unambiguous check rather than "anything
@@ -392,13 +392,13 @@ mod oid {
 /// a lie about what the column actually is. [`value_type_for_oid`] is the
 /// public, DB-aware entry point every real caller uses — it falls back to
 /// this function first and only reaches for a connection when `type_oid`
-/// isn't one of the fixed constants here, to also recognize issue #117's
+/// isn't one of the fixed constants here, to also recognize
 /// enum types before giving up and calling something `Unrecognized`.
 fn value_type_for_builtin_oid(type_oid: u32) -> ValueType {
     match type_oid {
         oid::BOOL => ValueType::Boolean,
         oid::UUID => ValueType::Uuid,
-        // Issues #111 and #112: the six types that used to share one
+        // The six types that used to share one
         // `ValueType::Numeric` bucket are now three families. `numeric` —
         // and only `numeric` — is the arbitrary-precision decimal the
         // bucket was always named after.
@@ -434,7 +434,7 @@ fn value_type_for_builtin_oid(type_oid: u32) -> ValueType {
 }
 
 /// Classifies a column's raw `pg_attribute.atttypid` into the evaluator's
-/// [`ValueType`] (issue #117) — [`value_type_for_builtin_oid`], widened to
+/// [`ValueType`] — [`value_type_for_builtin_oid`], widened to
 /// also recognize a user-defined enum type rather than collapsing it into
 /// [`PgType::Unrecognized`] the way every other unrecognized OID still does.
 ///
@@ -453,7 +453,7 @@ fn value_type_for_builtin_oid(type_oid: u32) -> ValueType {
 /// either), so this issue doesn't invent one for enums specifically — see
 /// `docs/type-support.md`'s enum section.
 ///
-/// Generic over [`GenericClient`] (issue #241's `ALTER TRANSFORM` type-change
+/// Generic over [`GenericClient`] (the `ALTER TRANSFORM` type-change
 /// refusal) rather than pinned to a pooled [`crate::PooledClient`): that
 /// refusal's authoritative recheck runs under `alter_transform`'s own
 /// row-locking transaction, and taking a *second* pooled connection while
@@ -538,7 +538,7 @@ mod tests {
             ValueType::Integer(IntWidth::Int8)
         );
         assert_eq!(value_type_for_builtin_oid(oid::NUMERIC), ValueType::Numeric);
-        // Issue #112: `real`/`double precision` are their own family now,
+        // `real`/`double precision` are their own family now,
         // no longer aliases of the arbitrary-precision decimal.
         assert_eq!(
             value_type_for_builtin_oid(oid::FLOAT4),
@@ -622,7 +622,7 @@ mod tests {
             );
             match pg_type {
                 PgType::Unrecognized => assert_eq!(sql, "text"),
-                // Issue #117: the one family whose SQL rendering isn't its
+                // The one family whose SQL rendering isn't its
                 // persisted token verbatim — it's quoted-and-qualified,
                 // since an enum type's name is chosen by whoever ran
                 // `CREATE TYPE`, not by this crate. See `PgType::sql_type_name`'s
@@ -651,7 +651,7 @@ mod tests {
 
     #[test]
     fn two_distinct_enum_types_are_not_the_same_pgtype() {
-        // Issue #117's own stated risk: "enum-ness" alone must not be
+        // The risk: "enum-ness" alone must not be
         // conflated across distinct `CREATE TYPE`s.
         let status = PgType::for_enum("public.status_enum");
         let priority = PgType::for_enum("public.priority_enum");

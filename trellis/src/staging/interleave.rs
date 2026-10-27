@@ -1,12 +1,12 @@
-//! Test-only pause points inside a drain page's apply transaction (epic
-//! #556, #623 D1). **Compiled only under `cfg(any(test, feature =
+//! Test-only pause points inside a drain page's apply transaction.
+//! **Compiled only under `cfg(any(test, feature =
 //! "test-util"))`**, like [`crate::plant`] and the pre-commit pause in
 //! [`super::apply`].
 //!
 //! The interleaving tests (`tests/one_to_one_ledger_interleavings.rs`) freeze one drain
 //! worker between two steps of its page transaction, do something else (commit
 //! a source write, drain another batch on another worker), then let it go. No
-//! test sleeps or polls for convergence (#297).
+//! test sleeps or polls for convergence.
 //!
 //! # How a test uses it
 //!
@@ -44,7 +44,7 @@
 //! | [`PausePoint::AfterRederiveRead`] | directly after the one read-and-snapshot statement, when the page re-derives any key |
 //! | [`PausePoint::BeforeCommit`] | after the page's last write |
 //!
-//! An aggregate (`super::group_basis`, #1100) fires `AfterEntryLock` after
+//! An aggregate (`super::group_basis`) fires `AfterEntryLock` after
 //! its sorted group lock, before the statement that reads the groups' bases,
 //! `AfterGroupUpsert` after that statement, and `BeforeCommit`.
 //!
@@ -57,7 +57,7 @@
 //! cell write of a side fires [`PausePoint::AfterJoinCellMatch`] between
 //! its match statement and its write.
 //!
-//! A 1-1 build chunk (`super::build::one_to_one::run_chunk`, #625 F8a) fires
+//! A 1-1 build chunk (`super::build::one_to_one::run_chunk`) fires
 //! `AfterPlaceholders` and `AfterEntryLock` around its entry lock, and
 //! `AfterRederiveRead` directly after its read-and-write statement
 //! (uncommitted). [`PausePoint::BeforeChunkTransaction`] is a chunk's alone:
@@ -72,30 +72,30 @@
 //! Each pair of a column pause's cascade (`super::quarantine::cascade_pause`)
 //! fires [`PausePoint::AfterCascadeFenceBump`] for the reader's transform
 //! after its fence bump, before it checks its upstream column is still
-//! paused (#912). A test runs the pause inside [`with_scope`].
+//! paused. A test runs the pause inside [`with_scope`].
 //!
 //! The walk also fires [`PausePoint::AfterCascadeDependentsRead`] for an
 //! upstream's transform after it reads that column's dependents, holding
-//! nothing, before the first of their pairs (#955).
+//! nothing, before the first of their pairs.
 //!
 //! A define or `ALTER TRANSFORM` fires [`PausePoint::AfterUpstreamPausesRead`]
 //! for its own target after it reads the paused columns its definition
-//! reads (#914). A test runs the define inside [`with_scope`].
+//! reads. A test runs the define inside [`with_scope`].
 //!
 //! Each pair of a column resume (`super::quarantine::resume_column`) fires
 //! [`PausePoint::AfterResumedColumnDeleted`] for its target after it deletes
-//! the resumed column's row, before it releases that column's readers
-//! (#917). A resume of a column that stays paused with a sibling it reads
+//! the resumed column's row, before it releases that column's readers.
+//! A resume of a column that stays paused with a sibling it reads
 //! fires [`PausePoint::BeforeSiblingHeldResume`] for its target, holding the
-//! column-pause lock, before it clears the column's `local_fuse` (#922). The
+//! column-pause lock, before it clears the column's `local_fuse`. The
 //! walk fires [`PausePoint::AfterResumePairDefinitionRead`] for a pair's
-//! target after it reads the pair's definition, holding nothing (#965).
+//! target after it reads the pair's definition, holding nothing.
 //! A test runs the resume inside [`with_scope`].
 //!
 //! A drain's eviction (`super::quarantine::isolate_and_evict`) fires
 //! [`PausePoint::BeforeEvictionLocks`] for each definition's bare target
 //! after its transaction begins, before it takes the definition's fuse gate
-//! and row (#880). A test runs the isolation inside [`with_scope`].
+//! and row. A test runs the isolation inside [`with_scope`].
 //!
 //! A Re-derive plan job's batch (`super::build::run_plan`) fires
 //! [`PausePoint::AfterPlanHold`] for the definition's target after it holds
@@ -106,21 +106,21 @@
 //! [`PausePoint::BeforeCorrectionCommit`] for the definition's target after
 //! it has re-derived its keys and recorded its progress, before it commits.
 //! A test runs the correction inside [`with_scope`]. A correction on the
-//! group basis (#1103) fires it after its recompute, and fires
+//! group basis fires it after its recompute, and fires
 //! [`PausePoint::BeforeCorrectionRecompute`] before it, once it has
 //! enumerated the groups to recompute.
 //!
 //! A partitioned source's every-pass sweep (`crate::capture::complement`)
 //! fires [`PausePoint::AfterSweepCatalogRead`] for the source after its
-//! catalog reads, before its search (#1066). A test runs the reconcile pass
+//! catalog reads, before its search. A test runs the reconcile pass
 //! inside [`with_scope`].
 //!
 //! A partitioned source's deep check (`crate::capture::partitions`) fires
 //! [`PausePoint::BeforeConstraintFetch`] for the source after it reads and
-//! classifies the tree, before it fetches the constraint texts (#1129), and
+//! classifies the tree, before it fetches the constraint texts, and
 //! [`PausePoint::BeforeFingerprintRead`] after the pass's check that the
 //! source's name still holds the recorded root, before it reads the
-//! fingerprints (#1200). A test runs the reconcile pass inside
+//! fingerprints. A test runs the reconcile pass inside
 //! [`with_scope`].
 //!
 //! A group-basis build or rebuild (`super::group_basis::rebuild`, run by a
@@ -129,7 +129,7 @@
 //! has enumerated its groups, before it locks them, [`PausePoint::AfterRebuildLock`] for
 //! the definition's target once it has locked its groups, before the
 //! statement that takes its snapshot, and [`PausePoint::BeforeRebuildCommit`]
-//! after its last write, before it commits (#1101). Over a partitioned
+//! after its last write, before it commits. Over a partitioned
 //! source the job is a transaction per leaf, and each fires
 //! [`PausePoint::BeforeRebuildCommit`] (an armed point fires once, at the
 //! first); between two of them it fires [`PausePoint::BetweenRebuildStructures`].
@@ -142,7 +142,7 @@
 //! The generative concurrent tier can't freeze a worker by hand: its drains
 //! run on the engine's own worker tasks, outside any [`PauseScope`]. What it
 //! can do is make the entry-lock step slow now and then, the way a busy or
-//! descheduled worker is ([`set_stall`], #720 and #725). While a stall is
+//! descheduled worker is ([`set_stall`]). While a stall is
 //! set, every page or build chunk that reaches [`PausePoint::AfterPlaceholders`]
 //! or [`PausePoint::AfterEntryLock`] sleeps a random time up to it, mostly
 //! short (the cube of a uniform draw, so about one in five sleeps is over
@@ -190,14 +190,14 @@ use tokio_postgres::GenericClient;
 /// See the module doc for where each sits today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PausePoint {
-    /// After a 1-1 target's placeholder insert, before its entry lock
-    /// (#623 D7): where a tombstone the insert found can be collected.
+    /// After a 1-1 target's placeholder insert, before its entry lock:
+    /// where a tombstone the insert found can be collected.
     AfterPlaceholders,
     /// After the page has locked the entries (on an aggregate, the group
     /// rows; on a `JOIN`, its `P` and `M` cells) it will write.
     AfterEntryLock,
     /// On a `JOIN` target (`super::join`), at the start of a build's write
-    /// (`super::join::build`, #1109): the definition row and the job row are
+    /// (`super::join::build`): the definition row and the job row are
     /// held, and no hidden table has been read yet.
     BeforeJoinBuild,
     /// On a `JOIN` target (`super::join`), after the page took the pair's
@@ -211,7 +211,7 @@ pub enum PausePoint {
     AfterJoinLock,
     /// On a `JOIN` target, after each side's cells are written (the `FROM`
     /// side's, then the joined side's), before the next side or the product:
-    /// a build's cross term (`super::join::build`, #1109).
+    /// a build's cross term (`super::join::build`).
     BetweenJoinSideWrites,
     /// On a `JOIN` target, in a build's cell write of one side
     /// (`super::group_basis::write_join_build_cells`), after the statement
@@ -230,7 +230,7 @@ pub enum PausePoint {
     /// forced group recompute).
     AfterRederiveRead,
     /// After a claimed build chunk is planned, before its transaction
-    /// begins (`super::build::run_rederive`, #832): the plan read the
+    /// begins (`super::build::run_rederive`): the plan read the
     /// definition, its fields and the range's keys, and holds no lock and
     /// no transaction id, so the ring seals and drains around it.
     BeforeChunkTransaction,
@@ -245,41 +245,41 @@ pub enum PausePoint {
     /// After a column pause cascade's pair bumps its reader's fence, before
     /// it takes the column-pause lock and reads its upstream column's
     /// `column_status` row, for the reader's transform
-    /// (`super::quarantine::cascade_pause`, #912).
+    /// (`super::quarantine::cascade_pause`).
     AfterCascadeFenceBump,
     /// After a column pause cascade's walk reads the dependents of an
     /// upstream column, before it goes to the first of their pairs, for the
-    /// upstream's transform (`super::quarantine::cascade_pause`, #955). The
+    /// upstream's transform (`super::quarantine::cascade_pause`). The
     /// walk holds no lock and no transaction, so an `ALTER TRANSFORM` of a
     /// reader it just listed can commit here.
     AfterCascadeDependentsRead,
     /// After a define or `ALTER TRANSFORM` reads the paused columns of the
     /// targets its definition reads, holding the column-pause lock (shared
-    /// for a define, exclusive for an edit, #922), before it pauses its
+    /// for a define, exclusive for an edit), before it pauses its
     /// readers of them, for its own (bare) target
-    /// (`defs::catalog`'s `pause_readers_of_paused_columns`, #914).
+    /// (`defs::catalog`'s `pause_readers_of_paused_columns`).
     AfterUpstreamPausesRead,
     /// After a drain's eviction transaction begins, before it takes a
     /// definition's fuse gate and row lock and writes the poison for its
     /// charged keys, for the definition's bare target
-    /// (`super::quarantine::isolate_and_evict`, #880). The isolation has
+    /// (`super::quarantine::isolate_and_evict`). The isolation has
     /// charged the keys and committed; the eviction holds no lock of this
     /// definition's yet (it may hold a lower-id definition's).
     BeforeEvictionLocks,
     /// After a column resume's walk reads the definition of a pair's target,
     /// before it opens the pair's transaction, for the pair's (bare) target
-    /// (`super::quarantine::resume_pairs`, #965). The walk holds no lock and
+    /// (`super::quarantine::resume_pairs`). The walk holds no lock and
     /// no transaction, so an `ALTER TRANSFORM` of that definition can commit
     /// here.
     AfterResumePairDefinitionRead,
     /// After a column resume deletes the `column_status` row of the column
     /// it resumes, before it releases that column's readers, for the
-    /// column's (bare) target (`super::quarantine::resume_column`, #917).
+    /// column's (bare) target (`super::quarantine::resume_column`).
     AfterResumedColumnDeleted,
     /// After a column resume finds its column reads a sibling field still
     /// paused, holding the column-pause lock, before it clears the column's
     /// own reason (`local_fuse`) and leaves it paused with that sibling, for
-    /// the column's (bare) target (`super::quarantine::resume_column`, #922).
+    /// the column's (bare) target (`super::quarantine::resume_column`).
     BeforeSiblingHeldResume,
     /// After a Re-derive plan job's batch transaction holds the job's claim
     /// and before it inserts the batch's chunks, for the definition's
@@ -287,7 +287,7 @@ pub enum PausePoint {
     /// row `for key share` and the plan row, and has written nothing.
     AfterPlanHold,
     /// After a worker claims a `self_check` job and before the page it runs
-    /// (`super::self_check_job::work_once`, #1023), for the audited target's
+    /// (`super::self_check_job::work_once`), for the audited target's
     /// bare name. The page holds no lock and no transaction, so the target
     /// can be dropped, written or checked again here.
     BeforeSelfCheckPage,
@@ -299,48 +299,48 @@ pub enum PausePoint {
     /// After a group-basis partition correction has enumerated the groups
     /// that route to its node, in its own committed statement, and before
     /// it locks and recomputes them, for the definition's target
-    /// (`super::partition_correction`, #1103). Its transaction holds only
+    /// (`super::partition_correction`). Its transaction holds only
     /// its row's claim fence, so the source can be written and drained here.
     BeforeCorrectionRecompute,
     /// After the every-pass sweep of a partitioned source has read the
     /// lifecycle fingerprint, the bounds and the queued corrections, before
     /// it searches the targets, for the source's unquoted `schema.table`
-    /// (`capture::complement`, #1066). The sweep's `READ COMMITTED`
+    /// (`capture::complement`). The sweep's `READ COMMITTED`
     /// transaction holds no lock, so a leaf can be created, written and
     /// drained here.
     AfterSweepCatalogRead,
     /// After a deep check of a partitioned source has read and classified
     /// the tree, before it fetches the new or changed nodes' constraint
     /// texts, for the source's unquoted `schema.table`
-    /// (`capture::partitions`, #1129). The pass holds no transaction, so a
+    /// (`capture::partitions`). The pass holds no transaction, so a
     /// node it read can be detached or dropped here.
     BeforeConstraintFetch,
     /// After the capture pass's check that a partitioned source's name still
     /// holds the recorded root, before the deep check reads the fingerprints,
-    /// for the source's unquoted `schema.table` (`capture::partitions`,
-    /// #1200). The pass holds no transaction, so the root can be swapped by
+    /// for the source's unquoted `schema.table` (`capture::partitions`).
+    /// The pass holds no transaction, so the root can be swapped by
     /// renames here.
     BeforeFingerprintRead,
     /// After a group-basis build or rebuild has enumerated the groups it
     /// covers, before the statement that locks them, for the definition's
-    /// target (`super::group_basis::rebuild`, #1101). No group is locked
+    /// target (`super::group_basis::rebuild`). No group is locked
     /// here: a page of any of them applies now, and a group a page creates
     /// is not enumerated.
     AfterRebuildEnumerate,
     /// After a group-basis build or rebuild has locked every group it covers, before
     /// the statement that takes its snapshot and replaces them, for the
-    /// definition's target (`super::group_basis::rebuild`, #1101). Pages of
+    /// definition's target (`super::group_basis::rebuild`). Pages of
     /// those groups queue on their locks here; a group a page creates now
     /// isn't locked.
     AfterRebuildLock,
     /// After a group-basis rebuild has replaced every group and marked its
     /// job done, just before it commits, for the definition's target
-    /// (`super::build`'s rebuild job, #1101). Readers still see the old
+    /// (`super::build`'s rebuild job). Readers still see the old
     /// values here.
     BeforeRebuildCommit,
     /// Between two transactions of a rebuild of a partitioned source's
     /// leaves, after one leaf committed and before the next begins, for the
-    /// definition's target (`super::build`'s rebuild job, #1101). Waits as
+    /// definition's target (`super::build`'s rebuild job). Waits as
     /// [`pause_between_transactions`] does, holding no snapshot.
     BetweenRebuildStructures,
 }

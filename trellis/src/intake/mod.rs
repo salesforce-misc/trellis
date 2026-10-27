@@ -1,5 +1,5 @@
-//! What is left of intake (issue #7) after trigger capture replaced the
-//! logical-replication stream (issue #622, ADR-0002): the table-name helper
+//! What is left of intake after trigger capture replaced the
+//! logical-replication stream (ADR-0002): the table-name helper
 //! and the rebuild of a table's readers.
 //!
 //! - [`catch_up`] rebuilds the readers of a table that may be missing

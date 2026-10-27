@@ -1,5 +1,5 @@
-//! A from-scratch recompute of a 1-1 target from current source data
-//! (issue #25), used to assert any incrementally-maintained target is
+//! A from-scratch recompute of a 1-1 target from current source data,
+//! used to assert any incrementally-maintained target is
 //! byte-equal to a recompute (`docs/data-flow.md#correctness`).
 //!
 //! **This module's [`recompute`] is the evaluator-driven recompute**: it reads
@@ -92,7 +92,7 @@ impl From<EvalError> for OracleError {
 pub type Recomputed = HashMap<String, HashMap<String, Option<Value>>>;
 
 /// The `FROM`-clause identifier this test/benchmark-only oracle module
-/// should read `def`'s source through (issue #76, ADR-0011 grammar clause
+/// should read `def`'s source through (ADR-0011 grammar clause
 /// 4): `"schema"."table"`, each component quoted independently, when `def`
 /// wrote an explicit `FROM <schema>.<source>`
 /// ([`TransformDef::explicit_source_schema`]); the plain `"table"` quoted
@@ -123,7 +123,7 @@ fn quoted_source_from(def: &TransformDef) -> String {
 ///
 /// A source keyed by a nullable unique index (an aggregate target's `GROUP
 /// BY` column) can hold a row whose key is `NULL`, and the 1-1 target keeps
-/// its row (issue #1141): it is keyed here by the key text such a key
+/// its row: it is keyed here by the key text such a key
 /// renders, [`super::ddl::NULL_KEY_SENTINEL`].
 ///
 /// Reads `pk_column` plus every source column any calculated field
@@ -156,7 +156,7 @@ pub async fn recompute(
     let rows = client.query(sql.as_str(), &[]).await?;
 
     let mut result = Recomputed::with_capacity(rows.len());
-    // Reused across every row below (issue #68): `def` is fixed for the
+    // Reused across every row below: `def` is fixed for the
     // whole recompute, so any `regexp_count` pattern it references compiles
     // to the same `Regex` on every row.
     let mut regex_cache = RegexCache::new();
@@ -264,7 +264,7 @@ fn group_key(image: &Row, group_by: &[String]) -> String {
 }
 
 /// Renders an [`KeySpace::Aggregate`] `def` back to the equivalent Postgres
-/// `SELECT ... GROUP BY ...` (issue #11 groundwork's correctness oracle):
+/// `SELECT ... GROUP BY ...` (the correctness oracle):
 /// each calculated field renders via [`render_expr_sql`] exactly as the 1-1
 /// case does (a `SUM`/`MIN`/`MAX`/`AVG` call renders like any other function
 /// call — `render_expr_sql` already lowercases the name and wraps its args),
@@ -349,7 +349,7 @@ pub fn render_aggregate_select_sql(def: &TransformDef) -> String {
 /// hasn't been through `validate()`, thread `source_columns` through here
 /// too and add the same guard.
 ///
-/// Issue #622 (C2): `crate::capture::columns` also calls this, to decide which
+/// `crate::capture::columns` also calls this, to decide which
 /// columns a table's capture trigger images. It runs against persisted
 /// definitions only, which `validate()` has already accepted, so the same
 /// invariant covers it. It leaves out `GROUP BY` keys; that caller adds
@@ -358,7 +358,7 @@ pub(crate) fn referenced_source_columns(def: &TransformDef) -> HashSet<String> {
     let field_names: HashSet<&str> = def.fields.iter().map(|f| f.name.as_str()).collect();
 
     // A name inside an aggregate's argument that matches an aggregate field is
-    // the source column of that name (issue #695), so it is read even though
+    // the source column of that name, so it is read even though
     // it isn't the enclosing field's own name.
     let aggregates = super::validate::aggregate_field_names(
         def.fields.iter().map(|f| (f.name.as_str(), &f.expr)),
@@ -410,7 +410,7 @@ fn collect_columns(
 }
 
 /// Renders a calculated-field expression back to the equivalent Postgres
-/// SQL expression text (issue #64), so the generative correctness oracle
+/// SQL expression text, so the generative correctness oracle
 /// (`docs/generative-test-suite.md`) can cross-check a function call's
 /// rendered `SELECT` against this evaluator's output over the same source
 /// data — the ADR-0004 claim ("our grammar is an immutable subset of
@@ -436,7 +436,7 @@ pub fn render_expr_sql(expr: &Expr) -> String {
             )
         }
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
-            // `COUNT(*)` (issue #75): the parser's only accepted `COUNT`
+            // `COUNT(*)`: the parser's only accepted `COUNT`
             // shape, but its AST has no argument to render — `count()` is
             // not valid Postgres, so this renders the `*` back explicitly
             // rather than falling through to the generic `name(args)` case
@@ -521,7 +521,7 @@ mod tests {
         }
     }
 
-    /// Issue #695: `MIN(b)` reads the source column `b` even though a field
+    /// `MIN(b)` reads the source column `b` even though a field
     /// named `b` exists (an aggregate), so the capture trigger must image it.
     #[test]
     fn referenced_source_columns_includes_a_source_column_named_like_an_aggregate_field() {
@@ -534,7 +534,7 @@ mod tests {
         assert!(columns.contains("a"), "{columns:?}");
     }
 
-    /// Issue #830: `SUM(s.val)` reads the source column `val` though a field
+    /// `SUM(s.val)` reads the source column `val` though a field
     /// named `val` exists, so the capture trigger images it and the SQL
     /// oracle sums it.
     #[test]

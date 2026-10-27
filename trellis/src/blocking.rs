@@ -1,6 +1,6 @@
 //! A synchronous wrapper around [`Trellis`] for callers that can't assume a
-//! `tokio` runtime already exists on the calling thread — chiefly issue
-//! #87's future FFI embedding (Rustler/Magnus-style NIF bindings), whose
+//! `tokio` runtime already exists on the calling thread — chiefly a
+//! future FFI embedding (Rustler/Magnus-style NIF bindings), whose
 //! calling convention is fundamentally synchronous: a call blocks until it
 //! returns. See `docs/decisions/0008-public-api-design.md`'s decision 1.
 //!
@@ -38,7 +38,7 @@
 //! [`Trellis::apply`] (see `app`'s module doc), which only registers: a new
 //! definition is built in the background from `waiting_to_backfill`
 //! (ADR-0002), and an `ALTER TRANSFORM` or a column resume starts a
-//! background field build (#666, #625 F8b).
+//! background field build.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -831,7 +831,7 @@ impl Calls {
     }
 }
 
-/// Issue #587: a public [`Trellis`] method with no [`BlockingTrellis`] twin
+/// A public [`Trellis`] method with no [`BlockingTrellis`] twin
 /// is unreachable from every binding, and nothing else notices the gap. This
 /// reads the crate's source and fails naming any method missing from the
 /// blocking side, so adding one to `Trellis` without bridging it (or listing

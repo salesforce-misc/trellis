@@ -1,16 +1,16 @@
 //! The correction of an aggregate on the group basis over a partitioned
-//! source (#1103, ADR-0002 "Aggregates: a basis per group, kept by deltas";
+//! source (ADR-0002 "Aggregates: a basis per group, kept by deltas";
 //! the parent module's "What a correction does"), and of a `JOIN` whose side is
-//! the partitioned source (#1111, ADR-0019), over that side's partial cells
+//! the partitioned source (ADR-0019), over that side's partial cells
 //! ([`Cells`]): below, a `JOIN`'s cells read as groups, its `P` or `M` as
 //! the hidden table, and the side's table as the source.
 //!
 //! Every group key contains every partition-key column (ADR-0017), so each
 //! group routes to exactly one node of the tree. A node's operation is
 //! corrected by **recomputing the groups that route to it**, never by
-//! zeroing them (#1043 F4a: a `TRUNCATE` and an `INSERT` into the node in one
+//! zeroing them (a `TRUNCATE` and an `INSERT` into the node in one
 //! transaction leaves a row a zero would erase). The set is, in one
-//! statement ([`routed_groups`], #1043 F4b):
+//! statement ([`routed_groups`]):
 //!
 //! - the target's groups that route to the node: every row of its hidden
 //!   table, zero groups included;
@@ -24,7 +24,7 @@
 //!   only here. A gone node without a usable text has its table read the
 //!   same way while it still exists: the
 //!   region it left is covered by the complement sweep, a `DEFAULT`'s
-//!   correction or the node that took it (#1129), with no full routing form.
+//!   correction or the node that took it, with no full routing form.
 //!
 //! One statement, because a page that applies a ring change and commits
 //! between two reads, its ring rows retired after it, would otherwise be in
@@ -65,7 +65,7 @@ use super::{
 use crate::defs::chunk_queue::ClaimFence;
 
 /// What a correction recomputes: a group-basis aggregate's groups, or one
-/// side's partial cells of a `JOIN` (#1111).
+/// side's partial cells of a `JOIN`.
 #[derive(Clone, Copy)]
 pub(super) enum Cells<'a> {
     /// The aggregate's groups, which the group basis takes with this shape.
@@ -156,7 +156,7 @@ pub(super) async fn correct(
         txn.rollback().await?;
         return Ok(Step::Superseded);
     }
-    // Test-only pause point (#1103): between the enumeration and the
+    // Test-only pause point: between the enumeration and the
     // recompute. See `super::super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     crate::staging::interleave::pause_at(

@@ -1,4 +1,4 @@
-//! Drain holdups (#817): a page the drain keeps failing on while charging no
+//! Drain holdups: a page the drain keeps failing on while charging no
 //! key and pausing no definition.
 //!
 //! Most of a page's failures end somewhere an operator can see: a key
@@ -44,7 +44,7 @@ use super::apply::{ApplyError, SegmentStep};
 use super::fold::FoldedChange;
 use super::quarantine::CanonicalSrcTables;
 
-/// A drain page that keeps failing with nothing charged or paused (#817):
+/// A drain page that keeps failing with nothing charged or paused:
 /// one `drain_holdups` row, as `Trellis::status` reports it on each reader
 /// (`DefinitionStatus::drain_failure`) and `self_check` reports every one
 /// (`SelfCheckReport::drain_failures`).

@@ -1,5 +1,5 @@
 //! An internal facade over the `metrics`/`metrics-exporter-prometheus`
-//! in-process registry (issue #51, `docs/decisions/0009-observability-decisions.md`).
+//! in-process registry (`docs/decisions/0009-observability-decisions.md`).
 //!
 //! Call sites elsewhere in this crate (`staging::apply::flush_apply_metrics`,
 //! today — called from `staging::apply::drain_once`/`drain_many` once a
@@ -13,7 +13,7 @@
 //! site.
 //!
 //! This module builds and populates the in-process registry, and exposes it
-//! as issue #53's [`Metrics::render_prometheus`] (Prometheus text
+//! as [`Metrics::render_prometheus`] (Prometheus text
 //! exposition, obtained through [`crate::app::Trellis::metrics`] or
 //! [`crate::blocking::BlockingTrellis::metrics`], matching
 //! `docs/observability.md`'s `trellis.metrics().render_prometheus()` sketch).
@@ -22,7 +22,7 @@
 //! Prometheus itself, not persisted by this crate — see
 //! `docs/observability.md`'s "Retention" section.
 //!
-//! ## One label on every series (issue #873, epic #806)
+//! ## One label on every series
 //!
 //! Several [`crate::app::Trellis`] handles can share a process, so every
 //! series carries `trellis_instance="<database>/<schema>"`, the same value
@@ -77,13 +77,13 @@ use crate::instance_log;
 pub const INSTANCE_LABEL: &str = "trellis_instance";
 
 /// 1 while a handle of the instance runs in this process, 0 once the last one
-/// has stopped (issue #873). Rendered by [`Metrics::render_prometheus`] from
+/// has stopped. Rendered by [`Metrics::render_prometheus`] from
 /// [`RUNNING`], not recorded through the recorder, so the idle timeout never
 /// drops it.
 const INSTANCE_UP_METRIC: &str = "trellis_instance_up";
 
-/// How long a gauge can go without being set before the recorder drops it
-/// (issue #873). A running instance sets every gauge it owns every
+/// How long a gauge can go without being set before the recorder drops it.
+/// A running instance sets every gauge it owns every
 /// maintenance interval (300 ms by default), so only a stopped instance's
 /// gauges age out. Counters and histograms never expire.
 pub const GAUGE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -91,8 +91,8 @@ pub const GAUGE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// ADR-0009 decision 6: exponential bucket boundaries spanning ~10ms-60s
 /// (`docs/observability.md`'s "sub-second to tens-of-seconds propagation
 /// range"), applied as a single global default to every histogram this
-/// crate records — per-transform latency today; end-to-end latency (issue
-/// #52) is expected to reuse the same set rather than introduce its own.
+/// crate records — per-transform latency today; end-to-end latency
+/// is expected to reuse the same set rather than introduce its own.
 pub const LATENCY_BUCKETS: &[f64] = &[
     0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 60.0,
 ];
@@ -106,7 +106,7 @@ pub const LATENCY_BUCKETS: &[f64] = &[
 /// see [`crate::defs::ast::TransformDef`]).
 const TRANSFORM_LATENCY_METRIC: &str = "trellis_transform_latency_seconds";
 
-/// Staged ring rows each transform folded and applied (issue #409): one
+/// Staged ring rows each transform folded and applied: one
 /// change per row a capture trigger staged, or per row an
 /// upstream hop's target write staged for this one. Counted in rows, not
 /// folded changes, so the number doesn't depend on how the rows happened to
@@ -121,67 +121,67 @@ const CHANGES_APPLIED_METRIC: &str = "trellis_changes_applied_total";
 /// [`TRANSFORM_LATENCY_METRIC`] — but only ever recorded for a transform
 /// whose target has no downstream reader of its own (a DAG sink), never for
 /// an intermediate hop: keyed by terminal transform only, summed across
-/// every source feeding it, not by source->sink pair (issue #52).
+/// every source feeding it, not by source->sink pair.
 const END_TO_END_LATENCY_METRIC: &str = "trellis_end_to_end_latency_seconds";
 
 /// ADR-0009 decision 5's cheap, system-level gauge: a count of `segments`
 /// rows by [`crate::staging::SegmentState`], labeled `state`.
 const STAGING_SEGMENTS_METRIC: &str = "trellis_staging_segments";
 
-/// #625 F2: worker time a Re-derive build spends in each of its statement
+/// Worker time a Re-derive build spends in each of its statement
 /// classes, labeled `class` ([`BuildStatement`]). The `_sum` per class is
 /// worker-seconds; the profile divides it by the rows built.
 const BUILD_STATEMENT_METRIC: &str = "trellis_build_statement_seconds";
 const JOIN_LOCK_WAIT_METRIC: &str = "trellis_join_lock_wait_seconds";
 
-/// #625 F2: one Re-derive build chunk's transaction, from its begin to its
+/// One Re-derive build chunk's transaction, from its begin to its
 /// commit (the span its entry locks and snapshot are held).
 const BUILD_CHUNK_METRIC: &str = "trellis_build_chunk_seconds";
 
-/// #625 F2: the longest [`BUILD_CHUNK_METRIC`] this instance has recorded.
+/// The longest [`BUILD_CHUNK_METRIC`] this instance has recorded.
 const BUILD_CHUNK_MAX_METRIC: &str = "trellis_build_chunk_seconds_max";
 
-/// #625 F2: source keys a Re-derive build's chunks re-derived.
+/// Source keys a Re-derive build's chunks re-derived.
 const BUILD_ROWS_METRIC: &str = "trellis_build_rows_total";
 
-/// #625 F2: Re-derive build chunks that gave up on their entry lock's short
+/// Re-derive build chunks that gave up on their entry lock's short
 /// timeout and were released for a retry.
 const BUILD_CHUNK_LOCK_TIMEOUTS_METRIC: &str = "trellis_build_chunk_lock_timeouts_total";
 
-/// #625 F2: seals refused because the ring had no free slot, after the
+/// Seals refused because the ring had no free slot, after the
 /// retirement the seal answers that with (`staging::seal_if_active_nonempty`).
 const SEAL_REFUSED_METRIC: &str = "trellis_seal_refused_total";
 
-/// #861: held keys the staging worker released on its own, and the retries
+/// Held keys the staging worker released on its own, and the retries
 /// that came out of quarantine (applied cleanly, so the key left it).
 const HELD_KEY_RETRIES_METRIC: &str = "trellis_held_key_retries_total";
 const HELD_KEY_RETRIES_SUCCEEDED_METRIC: &str = "trellis_held_key_retries_succeeded_total";
 
-/// #922: waits for the column-pause lock (`locks::lock_column_pauses`) that
+/// Waits for the column-pause lock (`locks::lock_column_pauses`) that
 /// ran out the transaction's `lock_timeout`, labeled `op` (`pause`, `resume`,
 /// `fuse`, `cascade`, `define`, `drop`, `alter`, `capture`). Nonzero means a
 /// holder stayed in the lock longer than the timeout, or the path got hot.
 const COLUMN_PAUSE_LOCK_TIMEOUTS_METRIC: &str = "trellis_column_pause_lock_timeouts_total";
 
-/// #703: rebuilds the capture pass started on its own, without pausing
+/// Rebuilds the capture pass started on its own, without pausing
 /// anyone, because a table's readers missed changes no capture trigger saw
 /// while their definitions stayed valid. Labeled `source_table` and `cause`
 /// ([`CaptureRebuildCause`]).
 const CAPTURE_AUTO_REBUILDS_METRIC: &str = "trellis_capture_auto_rebuilds_total";
 
 /// Why the capture pass rebuilt a table's readers on its own,
-/// [`CAPTURE_AUTO_REBUILDS_METRIC`]'s `cause` label (#703). Only changes
+/// [`CAPTURE_AUTO_REBUILDS_METRIC`]'s `cause` label. Only changes
 /// to what a read column holds are rebuilt without a pause: capture
 /// triggers or functions changed outside Trellis, or a table that is gone,
-/// pause the readers instead (#707, `capture::triggers`).
+/// pause the readers instead (`capture::triggers`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CaptureRebuildCause {
     /// A read column's values were rewritten in place by an `ALTER COLUMN
-    /// ... TYPE` to the same type with a `USING` (#703 R3b).
+    /// ... TYPE` to the same type with a `USING`.
     ValueRewrite,
     /// A read column was dropped and re-added, or changed type or modifier
     /// in a way that isn't a pure widening, and every definition reading it
-    /// is still valid (#703 R1).
+    /// is still valid.
     ColumnChanged,
 }
 
@@ -196,7 +196,7 @@ impl CaptureRebuildCause {
 }
 
 /// [`BUILD_CHUNK_METRIC`]'s buckets: finer than [`LATENCY_BUCKETS`], since a
-/// chunk's percentiles are a profile column (#625 §4). About 25% apart from
+/// chunk's percentiles are a profile column. About 25% apart from
 /// 1 ms to 2 minutes.
 const BUILD_CHUNK_BUCKETS: &[f64] = &[
     0.001, 0.00125, 0.0016, 0.002, 0.0025, 0.0032, 0.004, 0.005, 0.0063, 0.008, 0.01, 0.0125,
@@ -206,7 +206,7 @@ const BUILD_CHUNK_BUCKETS: &[f64] = &[
 ];
 
 /// A Re-derive build's statement classes, [`BUILD_STATEMENT_METRIC`]'s
-/// `class` label (#625 F2).
+/// `class` label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildStatement {
     /// A chunk's catalog reads before its transaction's work: its
@@ -253,7 +253,7 @@ impl BuildStatement {
 }
 
 /// Records `elapsed` worker time in Re-derive build statement class
-/// `class` (#625 F2).
+/// `class`.
 pub fn record_build_statement(class: BuildStatement, elapsed: Duration) {
     ensure_installed();
     metrics::histogram!(BUILD_STATEMENT_METRIC, INSTANCE_LABEL => instance(), "class" => class.label())
@@ -261,7 +261,7 @@ pub fn record_build_statement(class: BuildStatement, elapsed: Duration) {
 }
 
 /// Records how long a `JOIN` transform's page spent in the one sorted
-/// `select … for update` of the `J` rows of the join keys it names (#1112):
+/// `select … for update` of the `J` rows of the join keys it names:
 /// the wait for those rows' locks plus the statement's own read. A wait is
 /// another page, or a writer, holding a key.
 pub fn record_join_lock_wait(transform: &str, elapsed: Duration) {
@@ -270,7 +270,7 @@ pub fn record_join_lock_wait(transform: &str, elapsed: Duration) {
         .record(elapsed.as_secs_f64());
 }
 
-/// Records one committed Re-derive build chunk (#625 F2): its transaction's
+/// Records one committed Re-derive build chunk: its transaction's
 /// duration and the keys it re-derived.
 pub fn record_build_chunk(elapsed: Duration, keys: u64) {
     ensure_installed();
@@ -288,13 +288,13 @@ pub fn record_build_chunk(elapsed: Duration, keys: u64) {
     metrics::counter!(BUILD_ROWS_METRIC, INSTANCE_LABEL => instance).increment(keys);
 }
 
-/// Counts a Re-derive build chunk that gave up on its entry lock (#625 F2).
+/// Counts a Re-derive build chunk that gave up on its entry lock.
 pub fn increment_build_chunk_lock_timeouts() {
     ensure_installed();
     metrics::counter!(BUILD_CHUNK_LOCK_TIMEOUTS_METRIC, INSTANCE_LABEL => instance()).increment(1);
 }
 
-/// Counts a wait for the column-pause lock that timed out (#922). `op` is
+/// Counts a wait for the column-pause lock that timed out. `op` is
 /// `locks::ColumnPauseOp::label`.
 pub fn increment_column_pause_lock_timeouts(op: &'static str) {
     ensure_installed();
@@ -303,26 +303,26 @@ pub fn increment_column_pause_lock_timeouts(op: &'static str) {
 }
 
 /// Counts one rebuild of `source_table`'s readers that the capture pass
-/// started on its own for `cause` (#703).
+/// started on its own for `cause`.
 pub fn increment_capture_auto_rebuilds(source_table: &str, cause: CaptureRebuildCause) {
     ensure_installed();
     metrics::counter!(CAPTURE_AUTO_REBUILDS_METRIC, INSTANCE_LABEL => instance(), "source_table" => source_table.to_string(), "cause" => cause.label())
         .increment(1);
 }
 
-/// Counts a seal refused for a full ring (#625 F2).
+/// Counts a seal refused for a full ring.
 pub fn increment_seal_refused() {
     ensure_installed();
     metrics::counter!(SEAL_REFUSED_METRIC, INSTANCE_LABEL => instance()).increment(1);
 }
 
-/// Counts held keys the automatic retry released (#861).
+/// Counts held keys the automatic retry released.
 pub fn increment_held_key_retries(count: u64) {
     ensure_installed();
     metrics::counter!(HELD_KEY_RETRIES_METRIC, INSTANCE_LABEL => instance()).increment(count);
 }
 
-/// Counts automatic retries whose key stayed out of quarantine (#861).
+/// Counts automatic retries whose key stayed out of quarantine.
 pub fn increment_held_key_retries_succeeded(count: u64) {
     ensure_installed();
     metrics::counter!(HELD_KEY_RETRIES_SUCCEEDED_METRIC, INSTANCE_LABEL => instance())
@@ -374,7 +374,7 @@ fn described_recorder(
 /// `metrics-exporter-prometheus` still renders a `# TYPE` line per series
 /// (inferred from the macro used to record it — `histogram!`/`counter!`/
 /// `gauge!`) but omits `# HELP` entirely, since it has no description to
-/// put there; issue #53's exposition is meant to be self-documenting for an
+/// put there; the exposition is meant to be self-documenting for an
 /// operator reading a raw scrape, so every series gets one.
 fn describe_metrics() {
     metrics::describe_histogram!(
@@ -475,7 +475,7 @@ pub fn record_transform_latency(transform: &str, latency: Duration) {
 }
 
 /// Records one observation of [`END_TO_END_LATENCY_METRIC`] for `transform`
-/// — issue #52. Called from `staging::apply::flush_apply_metrics`
+/// Called from `staging::apply::flush_apply_metrics`
 /// (same post-commit timing as [`record_transform_latency`] — see that
 /// function's doc comment) once per applied change whose *consuming*
 /// transform is terminal (no downstream reader — see
@@ -650,8 +650,8 @@ fn escape_label_value(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
-/// Marks an instance as running in this process for as long as it lives
-/// (issue #873): `trellis_instance_up` is 1 while at least one has not been
+/// Marks an instance as running in this process for as long as it lives:
+/// `trellis_instance_up` is 1 while at least one has not been
 /// dropped, and 0 after the last one is, for as long as the process lives.
 /// [`crate::app::Trellis`] and [`crate::client::Client`] each hold one.
 ///
@@ -679,7 +679,7 @@ impl Drop for RunningInstance {
 }
 
 /// A handle onto this process's in-process metrics registry — the public,
-/// embedder-facing entry point for Prometheus exposition (issue #53).
+/// embedder-facing entry point for Prometheus exposition.
 ///
 /// Obtained via [`crate::app::Trellis::metrics`] (or
 /// [`crate::blocking::BlockingTrellis::metrics`]), matching
@@ -788,7 +788,7 @@ mod tests {
         );
     }
 
-    /// #625 F2: a build chunk's histogram renders with its own ~25% buckets,
+    /// A build chunk's histogram renders with its own ~25% buckets,
     /// not [`LATENCY_BUCKETS`], since the profile reads its percentiles off
     /// them.
     #[test]
@@ -899,7 +899,7 @@ mod tests {
         set_staging_segments("active", 1);
     }
 
-    /// Issue #873: two instances in one process write the same transform
+    /// Two instances in one process write the same transform
     /// name and stay two series, each with its own count.
     #[test]
     fn two_instances_writing_the_same_transform_stay_two_series() {
@@ -945,7 +945,7 @@ mod tests {
         });
     }
 
-    /// Issue #873: each instance's gauges keep their own value, and the
+    /// Each instance's gauges keep their own value, and the
     /// build chunk maximum is per instance (it was one process-wide static).
     #[test]
     fn each_instances_gauges_keep_their_own_value() {
@@ -978,7 +978,7 @@ mod tests {
         });
     }
 
-    /// Issue #873: every series carries the label, including one recorded
+    /// Every series carries the label, including one recorded
     /// outside any instance.
     #[test]
     fn every_series_carries_the_instance_label() {
@@ -1087,7 +1087,7 @@ mod tests {
         );
     }
 
-    /// Issue #873: a gauge nothing sets for the idle timeout drops out, one
+    /// A gauge nothing sets for the idle timeout drops out, one
     /// the running instance sets again stays, and counters never drop.
     #[test]
     fn a_stopped_instances_gauges_expire_and_a_running_ones_stay() {
@@ -1171,7 +1171,7 @@ mod tests {
         });
     }
 
-    /// Issue #873: `trellis_instance_up` is 1 while a handle runs and stays
+    /// `trellis_instance_up` is 1 while a handle runs and stays
     /// listed at 0 after the last one stops.
     #[test]
     fn instance_up_is_one_while_running_and_zero_after() {
@@ -1247,8 +1247,7 @@ mod tests {
         assert_eq!(escape_label_value("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
     }
 
-    /// Issue #53's acceptance criteria calls for "a snapshot test on the
-    /// rendered body." A byte-exact snapshot isn't a good fit here: the
+    /// A snapshot test on the rendered body. A byte-exact snapshot isn't a good fit here: the
     /// registry is one process-wide global (see the module doc comment's
     /// "Recorder installation" section) shared by every test in this binary,
     /// so the exact set/order of series `render_prometheus()` returns

@@ -1,4 +1,4 @@
-//! Row-level security that applies to the Trellis role (issue #745).
+//! Row-level security that applies to the Trellis role.
 //!
 //! Trellis doesn't support a table whose row-level security policies apply
 //! to its own role. Capture still sees every changed row, because transition
@@ -7,7 +7,7 @@
 //! row, a per-key Re-derive reads a hidden key as gone and deletes its target
 //! row, and `self_check`'s
 //! recompute agrees with the wrong answer. So does a capture function's
-//! re-read of the live row (#623 D8a), which runs as the function's owner,
+//! re-read of the live row, which runs as the function's owner,
 //! the role that owns the ring.
 //!
 //! Whether a policy actually hides a row depends on the row, so the check is
@@ -63,7 +63,7 @@
 //! seen from here: a deployment runs every worker as the Trellis role or a
 //! member of it.
 //!
-//! # `row_security = off` (issue #766)
+//! # `row_security = off`
 //!
 //! The checks above are the friendly half. Behind them, every connection
 //! Trellis opens sets `row_security = off` ([`crate::pool::ROW_SECURITY_OFF`]),
@@ -74,7 +74,7 @@
 //! [`applying`] as its own role (`staging::halt`). That is what covers the
 //! drain threads above.
 //!
-//! # A definition's target (issue #765)
+//! # A definition's target
 //!
 //! Trellis also *writes* each definition's target, and policies that apply
 //! to the writer filter those writes: an `UPDATE` or `DELETE` skips the rows
@@ -92,7 +92,7 @@
 //! checking it would refuse a target the workers write as its owner.
 //!
 //! **When it can fire.** Registration always creates the target, as the
-//! session's role (#440: Trellis never adopts a table), with row-level
+//! session's role (Trellis never adopts a table), with row-level
 //! security off. So the policies only come to apply to its writer if
 //! someone enables RLS and the writer doesn't own the table (another owner,
 //! or a membership taken away), forces RLS on it, or takes away the
@@ -131,7 +131,7 @@ pub struct RowSecurity {
     /// apply to it. Otherwise it neither owns the table nor has `BYPASSRLS`.
     pub owner_forced: bool,
     /// Whether the table is a definition's target, which Trellis writes
-    /// (issue #765, [`Readers::Target`]), rather than a table it reads.
+    /// ([`Readers::Target`]), rather than a table it reads.
     pub target: bool,
 }
 
@@ -208,8 +208,8 @@ pub enum Readers {
     /// owns the upstream's target, and the ring's owner owns nothing of it.
     /// The session stands in for the workers, as for [`Readers::Target`].
     Session,
-    /// The session's role alone, for a definition's target table (issue
-    /// #765). Only the workers write a target (applies, builds, a rebuild's
+    /// The session's role alone, for a definition's target table.
+    /// Only the workers write a target (applies, builds, a rebuild's
     /// orphan delete), each as its connection's login role, and no capture
     /// function touches one (the target-mutation seam feeds its readers), so
     /// the ring's owner never writes one unless it is that role. The session
@@ -295,7 +295,6 @@ mod tests {
 
     #[test]
     fn a_target_s_message_says_its_writes_are_filtered() {
-        // Issue #765.
         let mut rls = RowSecurity {
             table: "public.t".to_string(),
             role: "trellis".to_string(),

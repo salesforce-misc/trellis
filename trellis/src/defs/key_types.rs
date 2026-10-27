@@ -1,10 +1,10 @@
-//! Re-validating a definition's key columns after define (issue #760).
+//! Re-validating a definition's key columns after define.
 //!
 //! Define refuses a key column whose type or collation Trellis can't match
 //! by: a type off the key allowlist ([`super::join_key_types::is_text_stable_join_key_type`],
 //! [`super::ddl::source_primary_key`]), a `GROUP BY` type
 //! [`super::validate::reject_unsupported_group_by_key_type`] refuses, or a
-//! nondeterministic collation (#590, #638). An `ALTER COLUMN ... TYPE` or
+//! nondeterministic collation. An `ALTER COLUMN ... TYPE` or
 //! `... COLLATE` after define can give a key column such a type, or render
 //! the keys Trellis already stored differently, and a table rewrite fires no
 //! capture trigger.
@@ -68,7 +68,7 @@ pub(crate) enum KeyUse {
     SourceKey,
     /// A `GROUP BY` key.
     GroupBy,
-    /// A column of a `JOIN` transform's `ON` clause (#1107).
+    /// A column of a `JOIN` transform's `ON` clause.
     JoinOn,
 }
 
@@ -91,7 +91,7 @@ pub(crate) fn key_uses(
     table: &str,
     table_key: &[String],
 ) -> Vec<(String, KeyUse)> {
-    // #1107: each table of a JOIN is keyed by its own row-identity key, and
+    // Each table of a JOIN is keyed by its own row-identity key, and
     // matched by its join and `GROUP BY` columns.
     if let Some(side) = super::join::side_of_table(def, table) {
         let mut uses: Vec<(String, KeyUse)> = table_key
@@ -179,8 +179,7 @@ impl ColumnType {
     /// Whether this is `text` or `varchar`, bounded or not: one family to
     /// Postgres, which checks a `varchar(n)`'s length only on assignment.
     /// Trellis's copies of a string column are unbounded `varchar`, so a
-    /// copy and its source column are one family however either is spelled
-    /// (#1207).
+    /// copy and its source column are one family however either is spelled.
     pub(crate) fn is_string(&self) -> bool {
         self.string_bound().is_some()
     }
@@ -249,8 +248,7 @@ pub(crate) fn renders_differently(old: &ColumnType, new: &ColumnType) -> bool {
 }
 
 /// Whether a typed copy of type `copy` can't hold every value of its source
-/// column's live type `live`, because `live` is a wider *type* than it
-/// (#767, #824):
+/// column's live type `live`, because `live` is a wider *type* than it:
 ///
 /// - a wider integer (`smallint` → `integer` → `bigint`), or `real` →
 ///   `double precision`;
@@ -287,7 +285,7 @@ pub(crate) fn widens(copy: &ColumnType, live: &ColumnType) -> bool {
 }
 
 /// Whether a column retyped from `old` to `new` kept every value's text: a
-/// pure widening (#703 R1), which the capture pass's column check never
+/// pure widening, which the capture pass's column check never
 /// acts on. Exactly these:
 ///
 /// - a wider integer: `smallint` to `integer` to `bigint`;
@@ -370,7 +368,7 @@ fn integer_outgrown_by_numeric(width: u8, live: i32) -> bool {
 
 /// Whether a pure widening ([`pure_widening`]) takes away the declared scale
 /// of a `numeric` (`numeric(10,2)` to `numeric`). No value changes, but a
-/// reader that needs a declared scale (a `SUM`, #1096 decision 2) may no
+/// reader that needs a declared scale (a `SUM`) may no
 /// longer be valid.
 pub(crate) fn loses_declared_scale(old: &ColumnType, new: &ColumnType) -> bool {
     old.builtin()
@@ -695,7 +693,7 @@ pub(crate) const READ_ENUM_TYPES: &str = "\
 
 /// Records, for definition `id`, every value of every enum type it reads
 /// now ([`READ_ENUM_TYPES`]) by its `pg_enum` OID, beside its label
-/// (`definition_enum_values`, ADR-0020, #1241). A value already recorded
+/// (`definition_enum_values`, ADR-0020). A value already recorded
 /// keeps its label: a relabel the capture pass hasn't seen yet stays
 /// visible to it. A resume deletes the rows first
 /// ([`record_definition`]).
@@ -769,7 +767,7 @@ pub(crate) async fn record_definition(
                 &[&id],
             )
             .await?;
-        // #1241: the labels a resume rebuilds under.
+        // The labels a resume rebuilds under.
         client
             .execute(
                 "delete from definition_enum_values where transform_id = $1",
@@ -945,7 +943,7 @@ mod tests {
         ty("numeric", ((precision << 16) | (scale & 0x7ff)) + 4)
     }
 
-    /// #703 R1: the study's pure widenings keep every value's text; every
+    /// The study's pure widenings keep every value's text; every
     /// other change, narrowing or not, is acted on.
     #[test]
     fn only_a_widening_that_keeps_the_text_is_pure() {
@@ -1019,7 +1017,7 @@ mod tests {
             (ty("int4", -1), ty("int4", -1)),
             (ty("int8", -1), ty("int4", -1)),
             // A string column of any bound: the copy is an unbounded
-            // `varchar` (#1207).
+            // `varchar`.
             (varchar(50), varchar(100)),
             (varchar(50), ty("text", -1)),
             (varchar(50), ty("varchar", -1)),

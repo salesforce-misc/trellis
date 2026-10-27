@@ -1,5 +1,5 @@
-//! Sealing: turning the append stream into immutable batches (issue #9,
-//! stage 03). See docs/staging-and-claiming/03-sealing-and-the-fence.md —
+//! Sealing: turning the append stream into immutable batches (stage 03).
+//! See docs/staging-and-claiming/03-sealing-and-the-fence.md —
 //! this module implements the fence, the two-phase seal, the two guards
 //! plus `Raced`, seal-on-demand, and age-gated crash recovery, in that
 //! order below.
@@ -141,7 +141,7 @@ async fn seal_gate_blocked(
 ///
 /// Nor does it size the batch. `bucket_count`, `has_truncate` and
 /// `row_count` keep their column defaults here and are decided by
-/// [`seal_phase2`] over the fenced window (issue #598): a writer that
+/// [`seal_phase2`] over the fenced window: a writer that
 /// resolved this slot before the flip can still commit into it after this
 /// transaction does, so the slot's contents at the flip are not the batch.
 ///
@@ -224,7 +224,7 @@ pub async fn seal_phase1(client: &mut Client) -> Result<SealOutcome, StagingErro
 /// **autocommit**, immediately before the snapshot), then capturing and
 /// publishing `fence_snapshot`.
 ///
-/// **The publishing statement also sizes the batch** (issue #598). It counts
+/// **The publishing statement also sizes the batch**. It counts
 /// the fenced window, both halves ([`fenced_window`]'s own-slot rows visible
 /// in `S_k` plus the predecessor-slot rows visible in `S_k` and not in
 /// `S_{k-1}`), and writes `row_count`, `has_truncate` and `bucket_count`
@@ -235,7 +235,7 @@ pub async fn seal_phase1(client: &mut Client) -> Result<SealOutcome, StagingErro
 ///   straddler that resolved the slot before the flip and committed after it,
 ///   including one committing a truncate. It also never looked at the
 ///   predecessor half, where a straddler still open at `S_{k-1}` lands.
-/// - The truncate barrier (issue #60, `truncate-propagation-spec.md`) needs
+/// - The truncate barrier (`truncate-propagation-spec.md`) needs
 ///   `has_truncate` on every batch whose window holds a truncate row, and
 ///   such a batch seals single-bucket so one claimant runs the clear and the
 ///   same-batch post-truncate writes. A batch over the drain cap pages, but
@@ -250,7 +250,7 @@ pub async fn seal_phase1(client: &mut Client) -> Result<SealOutcome, StagingErro
 ///   fence sees the final sizing. A raced call publishes nothing, so the
 ///   winner's fence and sizing always agree.
 ///
-/// **The mirror set comes first** (issue #595). Ring writers resolve their
+/// **The mirror set comes first**. Ring writers resolve their
 /// slot from `ring_slot_mirror` ([`append::active_ring_slot`]), not from
 /// `segment_pointer`, so they keep targeting the sealed slot until this
 /// statement moves the mirror to the slot phase 1 activated. The fence
@@ -290,7 +290,7 @@ pub async fn seal_phase1(client: &mut Client) -> Result<SealOutcome, StagingErro
 /// matches zero rows — a benign no-op, not an error.
 ///
 /// `wake_channel` is `pg_notify`'d the instant this call is the one that
-/// actually publishes the fence (issue #271) — this is the one transition
+/// actually publishes the fence — this is the one transition
 /// that makes the segment claimable, so it is the edge a drain worker
 /// parked on `wake_channel` actually wants to hear about, not the "rows
 /// landed in the active segment" edge `apply::drain_once`'s
@@ -525,14 +525,14 @@ async fn predecessor_has_unfenced_row(
 /// ([`super::retire::retire_drained_segments`], stage 06) plus one retry, per
 /// the design doc — this is also the liveness unblock for a saturated ring:
 /// without it, a ring full of drained-but-not-yet-retired slots wedges every
-/// subsequent seal forever (issue #58). A `SealGateBlocked` guard is treated
+/// subsequent seal forever. A `SealGateBlocked` guard is treated
 /// as this call simply having nothing to do yet (`Ok(None)`), never an
 /// error — the design doc calls both guards "backpressure, never overwrite,"
 /// and a refused seal here is always a correct, retryable outcome, not a
 /// reason to tear down and reconnect the maintenance loop's connection.
 ///
-/// `wake_channel` is threaded straight through to [`seal_phase2`] (issue
-/// #271): a seal that actually completes here is the one transition that
+/// `wake_channel` is threaded straight through to [`seal_phase2`]:
+/// a seal that actually completes here is the one transition that
 /// makes a segment claimable, so it is exactly the edge a drain worker
 /// parked on `wake_channel` wants to wake to. A refused seal (`Ok(None)`,
 /// either guard, or a genuinely empty ring) never reaches `seal_phase2` at
@@ -601,8 +601,8 @@ async fn analyze_sealed_slot_best_effort(client: &Client, ring_slot: i16) {
 /// it, recovery would be a second, unsynchronized writer to the
 /// soon-to-be-published fence.
 ///
-/// `wake_channel` is threaded straight through to [`seal_phase2`] (issue
-/// #271), same as [`seal_if_active_nonempty`]: a recovered segment becomes
+/// `wake_channel` is threaded straight through to [`seal_phase2`],
+/// same as [`seal_if_active_nonempty`]: a recovered segment becomes
 /// claimable at exactly the moment its fence is (re)published here, which is
 /// the same edge a normal seal's completion wakes a listener to — recovery
 /// finishing what a crashed seal started is not a different transition.

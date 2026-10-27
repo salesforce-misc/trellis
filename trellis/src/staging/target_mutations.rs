@@ -1,5 +1,4 @@
-//! The one seam every write to a Trellis-owned target table goes through
-//! (issue #315).
+//! The one seam every write to a Trellis-owned target table goes through.
 //!
 //! # Why a seam, not capture
 //!
@@ -21,7 +20,7 @@
 //!   there is no window where a target changed but its downstream signal was
 //!   lost, and no window where the signal exists without the change.
 //!
-//! It also closes the double-apply class #312 patched: a target change now
+//! It also closes the double-apply class: a target change
 //! reaches the ring exactly once, not once from the apply and again from
 //! capture.
 //!
@@ -46,7 +45,7 @@
 //! `backfilling` until then, so `live` holds along a chain. A chunk a worker
 //! held across a resume can't write once the rebuild has made the target
 //! applying again: its claim fences every write it makes
-//! (`defs::chunk_queue::ClaimFence`, #434).
+//! (`defs::chunk_queue::ClaimFence`).
 //!
 //! The seam only stages for readers that are already applying when the
 //! writer checks, so a *new* reader built over a target waits on a fence
@@ -55,7 +54,7 @@
 //! A reader built by the Re-derive build waits
 //! on a fence, a transaction id taken after the build's start
 //! commits, until every transaction with a lower id has ended
-//! (`staging::build`'s "Seam-fed sources", #625 F6). That covers a writer
+//! (`staging::build`'s "Seam-fed sources"). That covers a writer
 //! that checked before the start only if the writer had its id when it
 //! checked, so the check takes the transaction's id first, in a statement
 //! of its own, so that the check's snapshot is taken after it. A writer that
@@ -63,7 +62,7 @@
 //! fence, and the build would read the target before the writer's write
 //! commits.
 //!
-//! # The image feed (issues #402, #403, #1100)
+//! # The image feed
 //!
 //! Some readers of a target need exact, ordered images of its changes, as
 //! capture gives a source:
@@ -105,7 +104,7 @@
 //! same rows: a 1-1 or ledger reader applies a delta from the images instead
 //! of re-reading. A seam row and a CDC row for the same write would be two
 //! deltas, applied twice when they land in different batches. Targets are
-//! not trigger-captured (#807).
+//! not trigger-captured.
 //!
 //! **A target gaining a reader that needs images.** [`TargetInfo`] is
 //! resolved once per transaction, so a writer that resolved it before the
@@ -115,7 +114,7 @@
 //! A group-basis or `JOIN` reader is built by the Re-derive build, whose plan
 //! waits on its fence (`staging::build`'s "Seam-fed sources") until every
 //! such writer has ended, so it reads their writes. The group basis' build
-//! (#1101) runs after that fence, in the plan job.
+//! runs after that fence, in the plan job.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
@@ -139,7 +138,7 @@ struct KeyMutation {
     hop_gen: i32,
     src_changed: Option<SystemTime>,
     /// The earliest source commit behind the key's writes, `None` if any is
-    /// unknown (issue #469): see [`StagedChange::Recompute::origin_lsn`].
+    /// unknown: see [`StagedChange::Recompute::origin_lsn`].
     origin_lsn: Option<PgLsn>,
 }
 
@@ -272,7 +271,7 @@ impl TargetMutations {
         }
         if !self.targets.contains_key(target) {
             // The transaction's id before the first check, in a statement
-            // of its own (#625 F6): see the module doc on a reader's
+            // of its own: see the module doc on a reader's
             // Re-derive build. A no-op once it has one.
             if self.targets.is_empty() {
                 txn.execute("select pg_current_xact_id()", &[]).await?;
@@ -315,7 +314,7 @@ impl TargetMutations {
     /// as the prior-image text a writer should capture, or `None` when no
     /// applying definition reads `target` and so nothing would ever consume it.
     /// Built with `apply::row_as_text_jsonb_sql`, the same rendering every
-    /// other image in the ring uses (issue #248).
+    /// other image in the ring uses.
     pub async fn image_sql(
         &mut self,
         txn: &Transaction<'_>,
@@ -510,8 +509,8 @@ struct NewImage {
 /// Every key comes back: an absent row is a deleted one (this transaction
 /// holds the deleted row's lock, so nothing else can have re-created it).
 ///
-/// An aggregate target's key can carry a NULL grouping component (issue
-/// #110's encoding, decoded by `ddl::split_pk_key`). See
+/// An aggregate target's key can carry a NULL grouping component (the
+/// encoding `ddl::split_pk_key` decodes). See
 /// [`new_images_query`] for how those keys are matched without giving up
 /// the index. Presence is read off `t.ctid`, since a key column can itself be
 /// NULL on a row that exists.
@@ -565,19 +564,19 @@ impl NewImagesQuery<'_> {
 }
 
 /// Builds [`read_new_images`]' statement: one `union all` arm per pattern of
-/// `NULL` identity columns present among `keys` (issue #433), usually just
+/// `NULL` identity columns present among `keys`, usually just
 /// one. Within an arm a `NULL` column matches with `t.<col> is null` and
 /// every other column with `=`, so each arm probes the target's index.
 ///
 /// Matching a whole batch with `is not distinct from` on any column one of
-/// its keys binds a NULL for (the pre-#433 shape) is correct but not
+/// its keys binds a NULL for is correct but not
 /// indexable: on a 500k-group aggregate target, a 500-key batch with one
 /// NULL group took 8.5s against 0.4ms without it.
 ///
 /// A single-column identity's non-`NULL` arm also restricts the column to
 /// its array (`t.<col> = any(<array>)`), which the match already implies,
 /// so the target's side of whatever join the planner picks is bounded by
-/// the batch (#790). A condition in a left join's `on` that names only the
+/// the batch. A condition in a left join's `on` that names only the
 /// target filters the target's scan. Without it, a target analyzed while
 /// small and grown since was read in full: at 1M rows, a 5,000-key batch
 /// hashed a sequential scan of the target, 102 ms against 31 ms through the
@@ -732,7 +731,7 @@ mod tests {
             .get(0)
     }
 
-    /// Caution 1 of #375's direction 1: two writers of one key serialize on
+    /// Two writers of one key serialize on
     /// its row lock, so a token read after the lock orders the second writer
     /// above the first one's commit. Writer B is shaped like every real seam
     /// writer (`image_sql`, then the locking write, then `record`, then
@@ -928,7 +927,7 @@ mod tests {
 
     /// `read_new_images` over an aggregate target's row identity: `UNIQUE
     /// NULLS NOT DISTINCT` grouping columns whose keys carry NULL components
-    /// (issue #110's encoding). A plain `=` match would never find a NULL
+    /// (the NULL-component key encoding). A plain `=` match would never find a NULL
     /// group's row, and a presence test on a key column would read the row
     /// as deleted; either way an existing NULL group would stage as a delete.
     #[tokio::test]
@@ -1005,7 +1004,7 @@ mod tests {
         );
     }
 
-    /// Issue #433: a batch of keys that includes NULL grouping components
+    /// A batch of keys that includes NULL grouping components
     /// still re-reads through the target's `UNIQUE NULLS NOT DISTINCT`
     /// index, at a single-column and a composite identity. Before the fix,
     /// one NULL key switched the whole batch's match on that column to `is
@@ -1091,8 +1090,8 @@ mod tests {
             );
         }
 
-        // The pre-#433 shape over the same single-column batch can only plan
-        // a sequential scan, so the difference above is real.
+        // An `is not distinct from` match over the same single-column batch
+        // can only plan a sequential scan, so the difference above is real.
         let groups: Vec<Option<String>> = std::iter::once(None)
             .chain((1..500).map(|i| Some((i * 397).to_string())))
             .collect();
@@ -1110,11 +1109,11 @@ mod tests {
             .join("\n");
         assert!(
             plan.contains("Seq Scan"),
-            "the pre-#433 shape should not be able to probe the index, got:\n{plan}"
+            "an `is not distinct from` match should not be able to probe the index, got:\n{plan}"
         );
     }
 
-    /// Issue #790: `read_new_images` reads only its batch's rows of a
+    /// `read_new_images` reads only its batch's rows of a
     /// single-column key's target whose statistics lag its size (analyzed at
     /// 100 rows, then grown to 400k with autovacuum off). Left to the join
     /// alone, the planner hashed a 5,000-key batch against a sequential scan
@@ -1256,7 +1255,7 @@ mod tests {
                  every row with every key, got:\n{plan}"
             );
             // What the scans actually read, not what the planner expected
-            // them to (#791).
+            // them to.
             let read = testkit::plan::rows_read(&plan, target);
             assert!(
                 read <= 2 * keys.len() as u64,
@@ -1287,7 +1286,7 @@ mod tests {
     /// far (`pg_stat_xact_user_tables` counts the open transaction's own).
     /// The plan test explains its statement through `query_by_entry_key`;
     /// this checks that [`read_new_images`] runs it that way too, which
-    /// PostgreSQL 16 would otherwise plan as a scan of a stale target (#790).
+    /// PostgreSQL 16 would otherwise plan as a scan of a stale target.
     async fn seq_scans_in_txn(txn: &Transaction<'_>, table: &str) -> i64 {
         txn.query_one(
             "select seq_scan from pg_stat_xact_user_tables where relid = $1::text::regclass",

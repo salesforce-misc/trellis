@@ -1,5 +1,5 @@
 //! The every-pass sweep of a partitioned source's rows that route to no
-//! current leaf (ADR-0017, P7 of epic #897).
+//! current leaf (ADR-0017).
 //!
 //! A leaf created, written and dropped between two reconcile passes changes
 //! neither fingerprint the pass compares ([`super::partitions`]), so no
@@ -708,7 +708,7 @@ pub(crate) async fn sweep(
         .filter_map(|r| match &r.def.key_space {
             KeySpace::Aggregate { .. } if r.source == table => Some((r.id, None)),
             // A `JOIN` reading the table as either side: its side's cells
-            // hold the partition-key columns, the target may not (#1111).
+            // hold the partition-key columns, the target may not.
             KeySpace::Join(_) if r.source == table || r.join.as_deref() == Some(table) => {
                 crate::defs::join::side_of_table(&r.def, table).map(|side| {
                     let hidden = crate::defs::join::HiddenTable::partials(side);
@@ -852,7 +852,7 @@ async fn attempt(
             }
         })
         .collect();
-    // Test-only pause point (#1066): after every catalog read, before the
+    // Test-only pause point: after every catalog read, before the
     // search. See `staging::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     crate::staging::interleave::pause_at(

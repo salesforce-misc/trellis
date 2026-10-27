@@ -1,5 +1,5 @@
 //! Dumping a database's Trellis definitions as SQL, so a schema-only dump
-//! can carry them (issue #644, `docs/embedding.md`, schema dumps).
+//! can carry them (`docs/embedding.md`, schema dumps).
 //!
 //! `pg_dump --schema-only` carries the Trellis schema's DDL, the target tables
 //! and the capture triggers, but no rows. Rails and Ecto solve the same
@@ -133,7 +133,7 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
 /// `definition_types` row whose name names no type is dropped, and so is one
 /// that resolves to a type the same definition records under another row.
 ///
-/// Each enum value a definition recorded (`definition_enum_values`, #1241)
+/// Each enum value a definition recorded (`definition_enum_values`)
 /// is resolved by its label within its type, the type named by the
 /// definition's `definition_types` row for the dumped OID, before those rows
 /// are replaced. One whose type or label resolves to nothing is dropped: the

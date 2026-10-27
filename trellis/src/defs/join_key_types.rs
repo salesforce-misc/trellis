@@ -14,11 +14,9 @@ use tokio_postgres::GenericClient;
 /// `timestamp(3) without time zone` becomes `timestamp without time zone`.
 ///
 /// That last case is why this is a function rather than the
-/// `split('(').next()` [`is_text_stable_join_key_type`] used before issue
-/// #113. Every type name
-/// they had to handle until then carried its modifier as a *suffix*, so
-/// truncating at the first `(` was equivalent. The SQL-standard temporal
-/// names do not: `format_type` renders a `timestamp(3)` column as
+/// `split('(').next()` that would suffice if every type name carried its
+/// modifier as a *suffix*, as the non-temporal names do. The SQL-standard
+/// temporal names do not: `format_type` renders a `timestamp(3)` column as
 /// `timestamp(3) without time zone`, which truncates to `timestamp` — a
 /// string matching neither the unmodified `timestamp without time zone` in
 /// [`TEXT_STABLE_JOIN_KEY_TYPES`] nor the same column declared without a
@@ -54,21 +52,21 @@ pub(crate) fn base_type_name(pg_type: &str) -> Cow<'_, str> {
 /// Only the join key's *own* type matters for this list, not what it's
 /// compared against, so allowed/rejected status is a per-type fact.
 /// Anything not named here — `numeric` (`1.0::text` != `1.00::text` though
-/// numerically equal), `real`/`double precision` (issue #112: `-0` and `0`
+/// numerically equal), `real`/`double precision` (`-0` and `0`
 /// are `=` in Postgres but render as `'-0'` and `'0'`, so text matching
 /// splits one value across two keys; verified on a live server, and the
-/// unlock is #110's typed key index comparing decoded values through
+/// unlock would be a typed key index comparing decoded values through
 /// `crate::float::compare`, not a new encoding), `character`/`citext`
 /// (blank-padding or
 /// case-insensitivity native to the type but not its `::text` form),
-/// `interval` (issue #113 admitted `timestamp` alongside `date`/`time`/
-/// `timetz` once issue #248 fixed its render-consistency defect, and
-/// `timestamptz` joined them too once issue #246 pinned `TimeZone` on every
+/// `interval` (`timestamp` is admitted alongside `date`/`time`/
+/// `timetz` because every renderer agrees on it, and
+/// `timestamptz` because `TimeZone` is pinned on every
 /// renderer; see the temporal block below for why `interval` alone stays
 /// off), `boolean`, `json`/`jsonb`, or any unknown type — is rejected as a
 /// join key.
 ///
-/// `bytea` (issue #114) joins the list below on the same "text-stability is
+/// `bytea` joins the list below on the same "text-stability is
 /// a property of the rendering" reasoning `oid` and four of the six temporal
 /// families were admitted under — `docs/type-support.md` had it marked
 /// `🎯 typed index`, and that turned out to be exactly the wrong prediction
@@ -82,17 +80,16 @@ pub(crate) fn base_type_name(pg_type: &str) -> Cow<'_, str> {
 /// grid spanning the empty value, embedded `NUL` bytes, and every byte value
 /// from `0x00` to `0xff` produces exactly as many distinct `::text` groups as
 /// distinct values (`defs_bytea.rs`'s
-/// `bytea_text_rendering_is_a_bijection_under_hex_output`). The issue's own
-/// scope note ("key role needs decoded comparison") assumed #110's typed key
-/// index was the prerequisite the way #113's temporal block once assumed it
-/// for the whole family; asked of a live server per #111's playbook, it is
+/// `bytea_text_rendering_is_a_bijection_under_hex_output`). The type
+/// matrix's scope note ("key role needs decoded comparison") assumed a typed
+/// key index was the prerequisite; asked of a live server, it is
 /// not — pinning `bytea_output` alone already makes raw `::text` matching
 /// agree with `bytea`'s native `=` for every value.
 pub(crate) const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     "smallint",
     "integer",
     "bigint",
-    // Issue #111: `oid` is an *unsigned* 32-bit integer whose `oid_out`
+    // `oid` is an *unsigned* 32-bit integer whose `oid_out`
     // rendering is canonical decimal — no sign, no leading zeros, no
     // padding — so `a::text = b::text` agrees with `oid`'s native `=` for
     // every value, exactly as it does for the three signed widths above.
@@ -103,10 +100,10 @@ pub(crate) const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     "uuid",
     "text",
     "character varying",
-    // Issue #113: four of the six temporal families, on the same
+    // Four of the six temporal families, on the same
     // "text-stability is a property of the rendering" reasoning `oid` was
     // admitted under. `docs/type-support.md` had all six marked `🎯 typed
-    // index`, assuming #110's typed key index was the prerequisite; for
+    // index`, assuming a typed key index was the prerequisite; for
     // these four it is not, and the evidence is per-family rather than
     // per-block — see `crate::temporal`'s module doc for the live queries.
     //
@@ -127,32 +124,29 @@ pub(crate) const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // prints.
     //
     // `timestamp without time zone` is a bijection under `::text` too, and
-    // it used to be refused anyway: `::text` was not the engine's only
-    // renderer. The live-row reads (`staging::apply`'s
-    // `read_live_rows_batch`, among others) used to build row
-    // bodies with `to_jsonb(t.*)`, which renders a `timestamp` through
+    // it would be refused if `::text` were not the engine's only renderer.
+    // A bare `to_jsonb(t.*)` row body renders a `timestamp` through
     // `jsonb`'s ISO-8601 writer: `2024-06-15T12:34:56`, not
-    // `2024-06-15 12:34:56`. A key seeded once each way became two target
-    // rows for one Postgres group. Issue #248 fixed that by replacing every
-    // such `to_jsonb(t.*)` call site with an explicit per-column
-    // `jsonb_build_object` rendered the same way `::text` is
-    // (`staging::apply::row_as_text_jsonb_sql`), which is why `timestamp`
-    // now joins `date`/`time`/`timetz` here — see
+    // `2024-06-15 12:34:56`, and a key seeded once each way would become two
+    // target rows for one Postgres group. The live-row reads therefore build
+    // an explicit per-column `jsonb_build_object` rendered the same way
+    // `::text` is (`staging::apply::row_as_text_jsonb_sql`), which is why
+    // `timestamp` joins `date`/`time`/`timetz` here — see
     // `crate::temporal::is_render_consistent`.
     //
     // One remaining deliberate absence:
     //
     // * `interval` — `'24 hours'` and `'1 day'` are one value with two
     //   renderings. The float `-0`/`0` defect; no GUC and no renderer
-    //   reconciliation fixes it, though #110's typed key index would.
+    //   reconciliation fixes it, though a typed key index would.
     "date",
     "time without time zone",
     "time with time zone",
     "timestamp without time zone",
-    // Issue #246: `timestamp with time zone` joins the four above.
+    // `timestamp with time zone` joins the four above.
     // `timestamptz_out` renders the stored instant in the session's `TimeZone`,
-    // so it needed two independent fixes before it could be text-stable — issue
-    // #248's `to_jsonb`/`::text` reconciliation (which it shares with
+    // so it needs two independent properties to be text-stable — the
+    // `to_jsonb`/`::text` reconciliation (which it shares with
     // `timestamp`) and, separately, `TimeZone` itself being pinned identically
     // everywhere Trellis renders a value. The pool pins
     // `crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` (which includes `TimeZone =
@@ -162,17 +156,17 @@ pub(crate) const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // `crate::temporal::is_bijective_under_text`/ `is_render_consistent` for
     // the per-family verdict this list mirrors.
     "timestamp with time zone",
-    // Issue #114: `byteaout` under the pinned `bytea_output = 'hex'` is a
+    // `byteaout` under the pinned `bytea_output = 'hex'` is a
     // bijection on its values — see the doc comment above for the live
     // evidence. `bytea` has no length/precision modifier, so
     // `base_type_name` never has anything to strip for it.
     "bytea",
-    // Issue #116: `cidr`/`macaddr`/`macaddr8` join the list; `inet` — despite
+    // `cidr`/`macaddr`/`macaddr8` join the list; `inet` — despite
     // sharing `cidr`'s `pg_cast` row — deliberately does not. Full account in
     // `crate::netaddr`'s module doc, condensed here:
     //
     // `macaddr`/`macaddr8` have no `pg_cast` row for `text` at all (checked
-    // the same way #119 checked `boolean`'s), so their `::text` *is*
+    // the same way `boolean`'s was checked), so their `::text` *is*
     // `macaddr_out`/`macaddr8_out`, and both are bijections — every accepted
     // input spelling (colon/hyphen/dot-grouped/bare hex) normalizes on
     // output to one canonical lowercase colon-separated form.
@@ -200,7 +194,7 @@ pub(crate) const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     "cidr",
     "macaddr",
     "macaddr8",
-    // Issue #119: `boolean` is deliberately *not* here, and the reason is
+    // `boolean` is deliberately *not* here, and the reason is
     // new — every other admission/refusal on this list turns on whether
     // `<type>_out` (the type's own output function, what capture images and
     // what `<col>::text` normally reduces to) is a bijection.
@@ -232,10 +226,10 @@ pub(crate) const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // `pg_catalog.text(boolean)` rendering (`'true'`/`'false'`) against a
     // CDC-derived `key` built from `boolout` (`'t'`/`'f'`) — and those two
     // strings are simply not equal. Admitting `boolean` here today would
-    // silently mismatch exactly the shape #248 fixed for `timestamp`
-    // (one value, two renderers, no arbiter), just from a different
-    // renderer pair no earlier type-family issue (#111–#114) had reason to
-    // find, since `boolean` is the only type with this second cast.
+    // silently mismatch exactly the shape `timestamp` would have under
+    // `to_jsonb` (one value, two renderers, no arbiter), just from a
+    // different renderer pair, since `boolean` is the only type with this
+    // second cast.
     //
     // The `GROUP BY` key role does *not* have this problem at the final SQL
     // layer — see `validate::reject_unsupported_group_by_key_type`'s own
@@ -243,16 +237,16 @@ pub(crate) const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // a group key's text into its native type, never a bare `col::text` comparison,
     // so it never touches `pg_catalog.text (boolean)` at all. Extending the SQL-layer
     // native-array-cast pattern to the remaining scalar lookup sites (or
-    // #110's typed key index, which would subsume it) is what would let
+    // a typed key index, which would subsume it) is what would let
     // `boolean` join this list; until then it stays off. See
     // `trellis/tests/defs_boolean.rs` for the live evidence and
     // `docs/type-support.md`'s "Boolean semantics" section.
     //
-    // Issue #118: `bit` and `bit varying` join this list on the *original*
+    // `bit` and `bit varying` join this list on the *original*
     // "text-stability is a property of the rendering" reasoning `oid`/
     // `bytea`/four of the six temporal families were admitted under —
-    // checked against `pg_cast`, not assumed, exactly the way #119's review
-    // taught this list to check every family going forward. `select
+    // checked against `pg_cast`, not assumed, as every family on this list
+    // must be. `select
     // castfunc::regproc from pg_cast where castsource in
     // ('bit'::regtype, 'varbit'::regtype) and casttarget = 'text'::regtype`
     // returns **no rows at all** on a live Postgres 17: unlike `boolean`,
@@ -278,7 +272,7 @@ pub(crate) const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // `validate::reject_unsupported_group_by_key_type`'s `VarBit` arm.
     "bit",
     "bit varying",
-    // Issue #115: `jsonb` is deliberately **absent**, and — unlike
+    // `jsonb` is deliberately **absent**, and — unlike
     // `boolean`/`inet` — not because of a second, disagreeing `::text`
     // renderer: `select castfunc from pg_cast where castsource =
     // 'jsonb'::regtype and casttarget = 'text'::regtype` returns no rows,
@@ -292,7 +286,7 @@ pub(crate) const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // equivalence-class shape `real`/`double precision`'s `-0`/`0` and
     // `interval`'s `'1 day'`/`'24 hours'` have. See `crate::jsonb`'s
     // module doc for the full live evidence and `trellis/tests/
-    // defs_jsonb.rs`. The unlock is #110's typed key index, exactly as it
+    // defs_jsonb.rs`. The unlock is a typed key index, exactly as it
     // is for `numeric`/`real`/`double precision`/`timestamptz` above —
     // `jsonb` needs no jsonb-specific mechanism, just the same one every
     // other numeric-bearing family here is waiting on.
@@ -303,9 +297,8 @@ pub(crate) const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
 /// [`super::validate::ValidationError::JoinUnsupportedKeyType`]'s `Display`
 /// cannot drift out of step with the allowlist it describes.
 ///
-/// It had drifted: the message still named only the pre-#111 six long
-/// after `oid` and the temporal families were admitted, which is exactly
-/// the failure mode a hand-maintained second copy has.
+/// A hand-maintained second copy of the list would drift whenever a family
+/// is admitted.
 pub(crate) fn supported_join_key_types() -> String {
     TEXT_STABLE_JOIN_KEY_TYPES.join(", ")
 }
@@ -313,8 +306,7 @@ pub(crate) fn supported_join_key_types() -> String {
 /// Whether `pg_type` (a `format_type` rendering, e.g. `integer`, `character
 /// varying(255)`) is in [`TEXT_STABLE_JOIN_KEY_TYPES`] — the single source of
 /// truth both [`super::validate::validate_join`] (`JOIN` keys) and
-/// [`super::ddl::source_primary_key`] (1-1 transform primary keys, issue
-/// #107) gate on. Any modifier (`(255)`, `(10,2)`, `(3)`) is
+/// [`super::ddl::source_primary_key`] (1-1 transform primary keys) gate on. Any modifier (`(255)`, `(10,2)`, `(3)`) is
 /// stripped by [`base_type_name`] before matching, so `varchar(255)` and
 /// `varchar(100)` are both recognized as `character varying` — and
 /// `timestamp(3) without time zone` as `timestamp without time zone` —
@@ -327,7 +319,7 @@ pub(crate) fn is_text_stable_join_key_type(pg_type: &str) -> bool {
 }
 
 /// The dynamic counterpart to [`TEXT_STABLE_JOIN_KEY_TYPES`]/
-/// [`is_text_stable_join_key_type`], for issue #117's enum types: `pg_type`
+/// [`is_text_stable_join_key_type`], for enum types: `pg_type`
 /// (a `format_type` rendering, the same string [`is_text_stable_join_key_type`]
 /// tests) cannot be enumerated in a fixed list the way every other family
 /// here can, because `CREATE TYPE ... AS ENUM` mints an arbitrary,
@@ -343,8 +335,8 @@ pub(crate) fn is_text_stable_join_key_type(pg_type: &str) -> bool {
 /// above already rejects.
 ///
 /// Admitting the result is safe on the same "text-stability is a property
-/// of the rendering, not of a fixed list" grounds #111/#114/#118 each
-/// established for their own families: `enumout` (what `<col>::text` calls
+/// of the rendering, not of a fixed list" grounds every other family on this
+/// list is admitted under: `enumout` (what `<col>::text` calls
 /// — verified live against `pg_cast`, `trellis/tests/defs_enum.rs`) renders
 /// each value as its own label text verbatim, with no separator, no
 /// escaping, and no GUC dependence. Unlike `bytea`'s hex encoding or

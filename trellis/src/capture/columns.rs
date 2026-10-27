@@ -1,16 +1,16 @@
-//! Which columns a table's capture triggers image (#622 C2).
+//! Which columns a table's capture triggers image.
 //!
 //! A trigger images the primary key plus every column some consumer of the
 //! table's ring rows reads. Imaging less poisons rows with
 //! `EvalError::MissingColumn`, or worse, silently reads a missing value as
-//! `NULL`. Imaging more costs the writer (#565 E3: every column of a table
+//! `NULL`. Imaging more costs the writer (every column of a table
 //! with a 100 KB column cost 40x a narrow image). The set, for table `T`:
 //!
 //! 1. **`T`'s primary key.**
 //! 2. **Columns `T`'s own definitions read.** For every definition whose
 //!    source is `T`, in any status (a `JOIN` reads both of its tables, and
 //!    from each its join key, its `GROUP BY` columns and every column its
-//!    fields read there, #1107):
+//!    fields read there):
 //!    - every source column its fields reference
 //!      ([`crate::defs::oracle::referenced_source_columns`]: a self-named
 //!      passthrough reads its own column, a reference to another calculated
@@ -49,13 +49,13 @@ pub struct CaptureReader {
     /// The qualified `source_table`.
     pub source: String,
     pub def: TransformDef,
-    /// A `schema_changed` marker paused it (#622 C6; `capture_failures`).
+    /// A `schema_changed` marker paused it (`capture_failures`).
     /// Until it resumes, which rebuilds it, it reads nothing, so its columns
     /// don't count and the table's capture can drop a column only it read.
     pub capture_failed: bool,
-    /// The qualified `target_table` it writes (#765).
+    /// The qualified `target_table` it writes.
     pub target: String,
-    /// A `JOIN`'s qualified joined table, its second source (#1107).
+    /// A `JOIN`'s qualified joined table, its second source.
     pub join: Option<String>,
 }
 
@@ -97,8 +97,8 @@ pub fn read_columns(catalog: &CaptureCatalog, table: &str) -> ReadColumns {
 }
 
 /// Every definition that reads one of `missing` from `table`'s images, or,
-/// with `key_missing`, every definition that reads `table` at all (#622 C6:
-/// the definitions a `schema_changed` marker pauses). In id order.
+/// with `key_missing`, every definition that reads `table` at all (the
+/// definitions a `schema_changed` marker pauses). In id order.
 pub fn readers_of(
     catalog: &CaptureCatalog,
     table: &str,
@@ -195,7 +195,7 @@ pub(crate) async fn live_columns(
 /// key, and with [`CaptureError::MissingColumn`] when a definition that
 /// isn't [`CaptureReader::capture_failed`] reads a column the table no
 /// longer has. A missing column no such definition reads is left out of the
-/// spec (#622 C6).
+/// spec.
 pub async fn capture_spec(
     client: &impl GenericClient,
     catalog: &CaptureCatalog,
@@ -237,7 +237,7 @@ pub async fn capture_spec(
         .cloned()
         .collect();
     if !missing.is_empty() {
-        // #622 C6: a column some definition still reads is gone. The
+        // A column some definition still reads is gone. The
         // reconcile pass pauses that definition before it gets here
         // (`staging::schema_change::pause_readers_of_missing`), as the drain
         // does on the table's next write's marker; after that it no longer

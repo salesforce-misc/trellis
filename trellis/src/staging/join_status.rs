@@ -1,9 +1,8 @@
-//! What `Trellis::status` reports about a `JOIN` transform (#1112): how big
+//! What `Trellis::status` reports about a `JOIN` transform: how big
 //! its hidden tables are, whether `P` has grown close to the fact table, and
 //! the step its build runs.
 //! The source indexes it needs are every target kind's
-//! (`DefinitionStatus::source_index_gaps`, #1167). Detection only
-//! ([#1096 decision 3](https://github.com/salesforce-misc/trellis/issues/1096)):
+//! (`DefinitionStatus::source_index_gaps`). Detection only:
 //! nothing here changes the definition's status or repairs anything.
 //!
 //! Sizes and row counts are the planner's estimates (`pg_class.reltuples`,

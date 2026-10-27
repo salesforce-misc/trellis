@@ -1,5 +1,4 @@
-//! The one place a Trellis-created column's type becomes SQL text (ADR-0020,
-//! #1289).
+//! The one place a Trellis-created column's type becomes SQL text (ADR-0020).
 //!
 //! A column Trellis creates from a source column, and every cast to such a
 //! column's type, is the source column's type **OID** (and collation OID)

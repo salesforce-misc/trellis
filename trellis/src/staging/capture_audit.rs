@@ -1,5 +1,5 @@
 //! The capture audit `self_check` runs before its recompute comparison
-//! (#622 C9, acceptance A5; ADR-0013, "The capture audit").
+//! (ADR-0013, "The capture audit").
 //!
 //! A captured table's changes reach the ring only through its five capture
 //! triggers ([`crate::capture`]). A trigger an operator disabled, dropped or
@@ -19,19 +19,19 @@
 //! naming the capture function. The audit names the cause either way.
 //!
 //! It also reports row-level security that applies to the Trellis role, the
-//! ring's owner, or to the role `self_check` runs as (issue #745,
-//! [`crate::defs::row_security`]). That doesn't break capture, which sees
+//! ring's owner, or to the role `self_check` runs as
+//! ([`crate::defs::row_security`]). That doesn't break capture, which sees
 //! every change, but it filters every read of the table, the recompute's
 //! included, so a comparison would agree with a wrong answer. The staging
 //! worker's capture pass pauses the table's readers for it.
 //!
-//! The same goes for the definition's target (issue #765), checked for the
+//! The same goes for the definition's target, checked for the
 //! role `self_check` runs as, standing in for the workers' role that writes
 //! it: policies that apply to the writer filter apply's updates and deletes
 //! and fail its inserts. The capture pass pauses the target's writer for it.
 //!
 //! And it reports a table a logical-replication subscription replicates
-//! into (issue #751, [`crate::defs::subscription`]). The triggers are all
+//! into ([`crate::defs::subscription`]). The triggers are all
 //! in place, but the subscription's apply worker fires only row-level
 //! triggers, so none of its changes reach the ring. The capture pass pauses
 //! the table's readers for that too.
@@ -44,7 +44,7 @@
 //!
 //! # What the audit expects
 //!
-//! What `capture::install` installs (#622 plan Q3: one Trellis role does
+//! What `capture::install` installs (one Trellis role does
 //! everything):
 //!
 //! - **Four triggers per captured table**, named by
@@ -55,14 +55,14 @@
 //!   owned by the role that owns the ring, the one `capture::install` hands
 //!   them to (its `RING_OWNER` query, which this audit shares). That is the
 //!   role that ran the migrations, and need not own the schema: a DBA can
-//!   pre-create the schema as another role (issue #701).
+//!   pre-create the schema as another role.
 //! - **The privileges a function's body uses, held by the role it runs
 //!   as** (its owner): `USAGE` on the instance schema, `INSERT` on every
 //!   ring segment, `USAGE` (or `UPDATE`) on `staging_change_id_seq`, which
 //!   the segments' `change_id` default draws from, `USAGE` (or `SELECT`) on
 //!   `ring_slot_mirror`, which `pg_sequence_last_value` reads, and `SELECT`
 //!   on the captured table, which the function re-reads when another write
-//!   to the table ran in the same statement (#623 D8a). The ring's owner holds them all (the schema's `USAGE` through a grant
+//!   to the table ran in the same statement. The ring's owner holds them all (the schema's `USAGE` through a grant
 //!   or membership in the schema's owner, if it isn't that role) unless
 //!   someone revokes them; a superuser always does.
 //!
@@ -160,8 +160,8 @@ pub enum CaptureFault {
         privilege: String,
         object: String,
     },
-    /// The table is in a partition or inheritance hierarchy (issue #707,
-    /// `crate::defs::hierarchy`): it became a partition or an inheritance
+    /// The table is in a partition or inheritance hierarchy
+    /// (`crate::defs::hierarchy`): it became a partition or an inheritance
     /// parent or child after its definition was accepted, or was dropped and
     /// recreated as a partitioned table or as one of those. Its statement
     /// triggers miss some writes to it, or capture another table's rows as
@@ -169,18 +169,18 @@ pub enum CaptureFault {
     /// pass pauses the table's readers for it.
     Hierarchy(Hierarchy),
     /// The table's row-level security policies apply to the ring's owner, or
-    /// to the role `self_check` runs as (issue #745,
-    /// `crate::defs::row_security`). Capture still sees
+    /// to the role `self_check` runs as
+    /// (`crate::defs::row_security`). Capture still sees
     /// every change, but each read of the table, `self_check`'s recompute
     /// included, sees only the rows the policies allow. Checked on every
     /// table the definition reads, including one the target-mutation seam
-    /// feeds. Also (issue #765) reported for the definition's own target
+    /// feeds. Also reported for the definition's own target
     /// (`RowSecurity::target`) when the policies apply to the caller's
     /// role, standing in for the workers' that write it: their updates and
     /// deletes skip the rows the policies hide, and their inserts fail.
     RowSecurity(RowSecurity),
-    /// A logical-replication subscription replicates into the table (issue
-    /// #751, `crate::defs::subscription`). Its apply worker fires only
+    /// A logical-replication subscription replicates into the table
+    /// (`crate::defs::subscription`). Its apply worker fires only
     /// row-level triggers, so the capture triggers, installed and enabled as
     /// they are, never see the changes it applies. Checked on every table the
     /// definition reads, including one the target-mutation seam feeds, which
@@ -278,7 +278,7 @@ impl fmt::Display for CaptureFault {
 /// order: per table (sorted), its trigger and function faults in event
 /// order, then its hierarchy faults, then its row-level security, then the
 /// subscription that replicates into it; then the row-level security on
-/// the definition's target (#765); then the privilege faults, per role.
+/// the definition's target; then the privilege faults, per role.
 /// Empty for a definition whose capture needn't be installed yet (see the
 /// module doc).
 pub async fn audit(
@@ -342,7 +342,7 @@ pub async fn audit(
         }
         // A table the seam feeds has no capture function, so only the
         // workers read it, as their own role, which the caller's stands in
-        // for (#765, [`row_security::Readers::Session`]).
+        // for ([`row_security::Readers::Session`]).
         let readers = if captured {
             row_security::Readers::RingAndSession
         } else {
@@ -355,7 +355,7 @@ pub async fn audit(
             faults.push(CaptureFault::Subscribed(sub));
         }
     }
-    // #765: the target, which Trellis writes as the worker's role and the
+    // The target, which Trellis writes as the worker's role and the
     // recompute comparison reads as the caller's. The caller's role stands
     // in for the workers'.
     if let Some(rls) = row_security::applying(
@@ -383,7 +383,7 @@ async fn read_tables(
     def: &Definition,
 ) -> Result<Vec<(String, bool)>, CatalogError> {
     let mut tables = BTreeSet::from([def.source_table.clone()]);
-    // #1110: a `JOIN` reads its joined table as it reads its `FROM`.
+    // A `JOIN` reads its joined table as it reads its `FROM`.
     tables.extend(catalog::join_table_of(client, def.id).await?);
     let tables: Vec<String> = tables.into_iter().collect();
     let seam_fed: BTreeSet<String> = client

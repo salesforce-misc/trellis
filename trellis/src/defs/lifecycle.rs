@@ -1,4 +1,4 @@
-//! The other half of a definition's lifecycle (issue #142, ADR-0014):
+//! The other half of a definition's lifecycle (ADR-0014):
 //! **pause** and **drop**.
 //!
 //! ```text
@@ -32,7 +32,7 @@
 //!    and its per-column quarantine bookkeeping (`column_status`,
 //!    `column_deaths`, `column_failures`, `column_pause_cascades`). Its
 //!    whole-key quarantine (`poison`, `poison_held`, `key_deaths` and its
-//!    `transform_fuse_gate` row) is per transform since #799 and goes with
+//!    `transform_fuse_gate` row) is per transform and goes with
 //!    the definition row by `on delete cascade` too. Everything keyed to the
 //!    *source* table and co-owned with sibling definitions — ring segments,
 //!    claims, and the siblings' own quarantine — is untouched, because a
@@ -46,7 +46,7 @@
 //!    dependents first, in reverse dependency order. *Any* registered
 //!    dependent blocks, whatever its status — see `drop_transform`'s doc
 //!    comment for why a frozen or mid-backfill one is no safer to strand than
-//!    a live one (issue #231).
+//!    a live one.
 //!
 //! Both verbs are **idempotent and non-transactional with any host
 //! migration** (ADR-0014, "Pause and drop are idempotent"): they run on
@@ -59,7 +59,7 @@
 //!
 //! **A drop never touches a source table.** It only removes catalog rows.
 //! The staging worker's reconcile pass uninstalls capture from the catalog,
-//! its only source of truth for what to capture (ADR-0002, issue #427), so
+//! its only source of truth for what to capture, so
 //! a process that drops a transform needs no privileges on the source
 //! tables.
 
@@ -82,9 +82,9 @@ pub(crate) enum PauseOutcome {
     /// clause: this is a success, not a conflict.
     AlreadyFrozen(TransformStatus),
     /// The definition was already frozen, but waiting to be resumed: on its
-    /// upstream's resume (`capture_failures.caused_by`, #828), or on a
+    /// upstream's resume (`capture_failures.caused_by`), or on a
     /// resume request (`resume_requests`: an operator's `RESUME` waiting for
-    /// an upstream to be live or for its copies to be re-typed, #971). The
+    /// an upstream to be live or for its copies to be re-typed). The
     /// pause withdrew that resume, so it stays paused like any operator
     /// pause.
     Withdrawn(TransformStatus),
@@ -184,7 +184,7 @@ pub(crate) async fn pause_transform(
 }
 
 /// Withdraws frozen definition `id`'s pending resume, in the pause's
-/// transaction, under its row lock (#971): the resume request
+/// transaction, under its row lock: the resume request
 /// (`resume_requests`) and the upstream cause (`capture_failures.caused_by`)
 /// that the staging worker's capture pass would otherwise complete
 /// (`staging::quarantine::finish_requested_resumes`,
@@ -245,8 +245,8 @@ const WITHDRAWN_REQUEST: &str = "paused by the operator, which withdrew its resu
      staging worker finished it. Resume it to rebuild it";
 
 /// Pauses definition `id` because a capture function found `columns` of
-/// `source_table` renamed or dropped (#622 C6), or the capture pass found
-/// its primary key redefined (#687), and records why in `capture_failures`:
+/// `source_table` renamed or dropped, or the capture pass found
+/// its primary key redefined, and records why in `capture_failures`:
 /// `error` is the sentence `Trellis::status` reports. The record is what `Trellis::status` reports as
 /// `capture_failure`, and what makes capture stop imaging for the
 /// definition (`capture::columns`). Runs in the caller's transaction, which
@@ -273,9 +273,9 @@ pub(crate) async fn pause_for_capture_failure(
 }
 
 /// Pauses definition `id` because Trellis's capture of a table it reads was
-/// changed outside Trellis, or the table is gone (#707, #999). The record's
+/// changed outside Trellis, or the table is gone. The record's
 /// `kind` is `disruption`, which is what a test helper selects to resume
-/// exactly these (#1181). Returns whether this call paused it.
+/// exactly these. Returns whether this call paused it.
 ///
 /// A definition already frozen (an operator's `PAUSE`, say) gets the record
 /// with kind `capture` instead, so it stays the operator's pause, which a
@@ -309,7 +309,7 @@ pub(crate) async fn pause_for_disruption(
 }
 
 /// Pauses definition `id` because the database was restored from a logical
-/// dump (#1205, `capture::restore`): its ordering state belongs to the
+/// dump (`capture::restore`): its ordering state belongs to the
 /// original database, so the record is marked `restored` and its resume resets
 /// that state before the rebuild. Kind `disruption` for a definition that was
 /// running (a test helper resumes those), `capture` for one already frozen,
@@ -362,8 +362,8 @@ pub(crate) async fn pause_for_restore(
 
 /// Pauses definition `id` because the enum values it reads changed identity
 /// (ADR-0020): an enum type it reads was relabelled (`ALTER TYPE ... RENAME
-/// VALUE`, #1241), or a column it reads was re-typed from one enum to
-/// another (#1327). The label text Trellis staged and keyed by names no
+/// VALUE`), or a column it reads was re-typed from one enum to
+/// another. The label text Trellis staged and keyed by names no
 /// value of the column's type. The record's
 /// `relabel_lsn` is `lsn`, the WAL insert position the capture pass read
 /// after finding it, raised by a later such change; its resume waits until no
@@ -418,8 +418,8 @@ pub(crate) async fn pause_for_grammar_version(
     pause_with_record(txn, id, source_table, &[], error, "capture", None).await
 }
 
-/// [`pause_for_capture_failure`] for a drain's halt (#663,
-/// `staging::halt`): pauses definition `id` because a page failed with a
+/// [`pause_for_capture_failure`] for a drain's halt
+/// (`staging::halt`): pauses definition `id` because a page failed with a
 /// halting error on `source_table` that it reads, directly or downstream of
 /// a definition that does. The record's
 /// `kind` is `halt`. Returns whether this call paused it.
@@ -485,7 +485,7 @@ async fn pause_with_record(
 ///
 /// **Refuses rather than cascades** when a definition still chains off this
 /// target ([`CatalogError::DependentsBlockDrop`], naming them). *Any*
-/// registered dependent blocks, not only a live one (issue #231): the
+/// registered dependent blocks, not only a live one: the
 /// refusal's question is "is this definition still registered and could it
 /// still need the target?", and every status other than gone answers yes.
 /// A `backfilling`/`waiting_to_backfill` dependent is building *from* the
@@ -498,7 +498,7 @@ async fn pause_with_record(
 ///
 /// **Everything — the status precondition, the dependency refusal, and every
 /// write — happens in one transaction, under the target's own `for update`
-/// row lock** (issue #231). The checks used to run on separate pooled
+/// row lock**. The checks used to run on separate pooled
 /// connections before the transaction opened, leaving a window in which a
 /// concurrent `resume` could unfreeze the row, or a concurrent `define`
 /// register a fresh dependent, after the check and before the commit. A
@@ -513,15 +513,15 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     let txn = client.transaction().await?;
 
     // The version fence of every table the definition reads, bumped as this
-    // transaction's first lock (#1291, #744). A frozen definition is out of
+    // transaction's first lock. A frozen definition is out of
     // every page planned from now on, but a page that planned it before it
     // froze (a pause by the operator, or a halt or quarantine from a peer
     // drain) may still be in flight, and would fail on the tables dropped
     // below. The bump waits for every page holding the fence `for share`
     // (Phase 3 holds it to its commit), and a page that reaches the fence
     // after this commit misses it and plans again, without the definition.
-    // A `JOIN` reads two tables, and a page of either may have planned it
-    // (#1107). The names are read without a lock and bumped in table-name
+    // A `JOIN` reads two tables, and a page of either may have planned it.
+    // The names are read without a lock and bumped in table-name
     // order, the order every taker of two fences takes them in.
     let mut fences: Vec<String> = txn
         .query(
@@ -542,7 +542,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
         crate::staging::build::bump_version_fence(&*txn, source).await?;
     }
 
-    // The column-pause lock, exclusive (#922, #921): this deletes the
+    // The column-pause lock, exclusive: this deletes the
     // target's pause rows and the cascade edges into and out of them, which
     // a column resume deletes too, in walk order, and a define reads. After
     // the fences, so it precedes the definition row below, as every taker of
@@ -580,7 +580,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
 
     // Before any write, and inside the same transaction as the writes, so a
     // `define` that registers a new dependent cannot interleave between the
-    // refusal check and the commit (issue #231).
+    // refusal check and the commit.
     let (blockers, column_detail) = dependency_blockers(&txn, target, &qualified, id).await?;
     if !blockers.is_empty() {
         return Err(CatalogError::DependentsBlockDrop {
@@ -598,7 +598,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // cascade).
     //
     // The whole-key quarantine (`poison`, `poison_held`, `key_deaths`,
-    // `transform_fuse_gate`) is keyed by the definition's id since #799, and
+    // `transform_fuse_gate`) is keyed by the definition's id, and
     // goes with its row below by `on delete cascade`. A sibling on the same
     // source keeps its own.
     for table in ["column_status", "column_deaths", "column_failures"] {
@@ -623,7 +623,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // `ChunkQueueError::DefinitionNotFound` when it is gone, and the worker's
     // write targets a table this same transaction is about to drop.
     //
-    // Deleted *before* the node cleanup below (issue #232): the node reap's
+    // Deleted *before* the node cleanup below: the node reap's
     // own `not exists (... transform_definitions ...)` guard has to run once
     // this row is actually gone, or it always finds itself still there and
     // never reaps the node — every drop would leave an orphaned
@@ -634,7 +634,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
 
     // Edges *into* the target node are the ones this definition owns: its
     // `source` edge from its own source table, plus a `JOIN`'s `join` edge
-    // from its joined table (#1107). Edges *out of* the target node
+    // from its joined table. Edges *out of* the target node
     // belong to whatever chains off it and are left alone.
     if let Some(node_id) = node_id_for(&txn, &qualified).await? {
         txn.execute(
@@ -646,7 +646,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
         // may well still be some other definition's source. This has to run
         // after the `transform_definitions` delete above, or the `not
         // exists` below always sees the row being dropped and never reaps
-        // the node (issue #232).
+        // the node.
         txn.execute(
             "delete from schema_nodes n \
              where n.id = $1 \
@@ -673,9 +673,9 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
         quote_qualified(&super::ledger::ledger_table_name(&qualified)),
     ))
     .await?;
-    // #1107, #1096 decision 7: the hidden tables Trellis keeps in its catalog
+    // The hidden tables Trellis keeps in its catalog
     // schema for a definition are named by its id, and go with it: a JOIN's
-    // and a group-basis aggregate's (#1100).
+    // and a group-basis aggregate's.
     txn.batch_execute(&super::join::drop_hidden_tables_sql(pool.schema(), id))
         .await?;
     txn.batch_execute(&crate::staging::group_basis::drop_hidden_table_sql(
@@ -683,8 +683,8 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
         id,
     ))
     .await?;
-    // The target's ledger (#623 D2) went with it
-    // just above. Its truncate floor (#623 D3) is keyed by the target's
+    // The target's ledger went with it
+    // just above. Its truncate floor is keyed by the target's
     // name, so without this a later target of the same name would inherit
     // it.
     txn.execute(
@@ -693,7 +693,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     )
     .await?;
 
-    // #1217: this definition may have been the last to read its tables.
+    // This definition may have been the last to read its tables.
     super::catalog::forget_unread_capture_records(&*txn).await?;
 
     txn.commit().await?;
@@ -707,10 +707,10 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
 
 /// Every still-registered definition that chains off the bare-named `target`
 /// — ADR-0014's refusal set, gathered on `txn` so [`drop_transform`] can
-/// run it inside the very transaction that does the removal (issue #231).
+/// run it inside the very transaction that does the removal.
 ///
 /// `qualified_target` is the target's `"schema.table"` identity (the key
-/// `schema_nodes` is on since issue #74); `definition_id` is the target's own
+/// `schema_nodes` is on);`definition_id` is the target's own
 /// `transform_definitions.id`, excluded from the result so a definition whose
 /// source node and target node happen to be the same row cannot block its own
 /// drop — previously impossible to hit only because the check was live-only
@@ -727,12 +727,12 @@ async fn dependency_blockers(
     blockers.sort();
     blockers.dedup();
 
-    // Issue #242: for naming precision only (every blocker found here is
+    // For naming precision only (every blocker found here is
     // already in `blockers` above, by the DAG-property argument
     // `catalog::column_dependents`'s own doc comment makes) — for each of
     // this target's own declared columns, ask the same column-granularity
     // dependency-edge infrastructure `ALTER TRANSFORM ... DROP <field>`
-    // (issue #241) uses for its own, load-bearing check, so a `DROP
+    // uses for its own, load-bearing check, so a `DROP
     // TRANSFORM` refusal can name the exact column a dependent reads instead
     // of only "something reads this table."
     let column_detail = match txn
@@ -775,10 +775,10 @@ async fn dependency_blockers(
 
 /// The bare target names of every definition reached by a `source` or
 /// `join` edge out of `qualified_target`'s schema node — i.e. everything
-/// defined `FROM <target>` or `JOIN <target>` (#1107).
+/// defined `FROM <target>` or `JOIN <target>`.
 ///
 /// The same graph walk [`super::catalog::dependents_of`] does, deliberately
-/// *without* its applying-status filter (issue #231): that filter is
+/// *without* its applying-status filter: that filter is
 /// right for the claim-time fold, which must not write a CDC delta into a
 /// target whose baseline isn't settled, and wrong for a drop, which is asking
 /// the different question of whether anything still *needs* the target. It is
@@ -865,12 +865,12 @@ async fn node_id_for(txn: &Transaction<'_>, qualified: &str) -> Result<Option<i6
 /// quoted — the same shape [`super::ddl::qualified_target_table`] produces,
 /// but from the already-qualified string this module reads back rather than
 /// from a `TransformDef` plus a configured schema. Reading it back is the
-/// point: a definition persists the schema it *was* created under (issue
-/// #73), and dropping its table must address that one, not whatever
+/// point: a definition persists the schema it *was* created under,
+/// and dropping its table must address that one, not whatever
 /// `Config::target_schema` happens to say today.
 ///
-/// `transform_definitions.target_table` has been fully qualified since issue
-/// #73 and neither component can itself contain a `.` (the grammar rejects a
+/// `transform_definitions.target_table` is fully qualified
+/// and neither component can itself contain a `.` (the grammar rejects a
 /// dotted identifier component), so the first `.` is the separator. A value
 /// somehow missing one is quoted as a bare name and left to the connection's
 /// `search_path`, rather than panicking over a row this crate's own writers

@@ -1,4 +1,4 @@
-//! Optional OTLP export layer (issue #56, ADR-0009 decisions 1 and 3).
+//! Optional OTLP export layer (ADR-0009 decisions 1 and 3).
 //!
 //! Compiled **only** when the `otlp` Cargo feature is enabled — off by
 //! default. With the feature off, none of this module's four dependencies
@@ -23,7 +23,7 @@
 //! no subscriber installed, or a subscriber built with no OTLP layer,
 //! spans/events cost only the `tracing` crate's own near-zero
 //! no-subscriber overhead ("local structured logs unaffected without a
-//! collector" — issue #56's acceptance criteria).
+//! collector").
 //!
 //! # Usage
 //!

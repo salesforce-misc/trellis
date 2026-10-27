@@ -1,5 +1,5 @@
 //! The ring rows a 1-1, group-basis or `JOIN` target hasn't applied yet, as
-//! `self_check` subtracts them (#1140, ADR-0013 "Quiescence").
+//! `self_check` subtracts them (ADR-0013 "Quiescence").
 //!
 //! Capture writes a change's ring row in the change's own transaction, so
 //! under one snapshot a source's current rows are exactly what its target

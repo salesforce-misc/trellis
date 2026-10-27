@@ -1,5 +1,5 @@
 //! Postgres's **exact integer** types — `smallint`/`integer`/`bigint`
-//! (issue #111) — as a real value model, split out of the arbitrary-precision
+//! — as a real value model, split out of the arbitrary-precision
 //! [`crate::numeric::Numeric`] every one of them used to collapse into.
 //!
 //! # Why this is not `Numeric`
@@ -20,8 +20,8 @@
 //!    disagreed about whether the very same definition errors at all.
 //! 2. **Result type.** Postgres types `int4 + int4` as `int4`, not `numeric`.
 //!    A derived target column declared `numeric` for an expression Postgres
-//!    types `integer` is the same class of lie #108 removed from the *ingest*
-//!    side; this module removes it from the *computed* side.
+//!    types `integer` is the same class of lie the *ingest*
+//!    side avoids; this module avoids it on the *computed* side.
 //!
 //! # Width is a payload, not three variants
 //!
@@ -30,7 +30,7 @@
 //! integer" model could not match the oracle. But three sibling `ValueType`
 //! variants would triple every match arm in the engine for a distinction most
 //! of them don't care about. [`IntWidth`] is therefore a payload on one
-//! variant, exactly the shape issue #108 established with
+//! variant, exactly the shape of
 //! `ValueType::Other(PgType)`: a site that cares matches
 //! `ValueType::Integer(IntWidth::Int2)`, and the (many) sites that don't
 //! match `ValueType::Integer(_)`.

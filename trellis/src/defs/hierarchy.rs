@@ -1,5 +1,4 @@
-//! A table in a partition or inheritance hierarchy (issues #376, #622 C9,
-//! #707).
+//! A table in a partition or inheritance hierarchy.
 //!
 //! Capture is statement-level triggers, and a statement trigger fires only
 //! for the table a statement names, never for its partitions or children

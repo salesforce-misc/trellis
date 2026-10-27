@@ -1,4 +1,4 @@
-//! Apply ∪ mark-drained (issue #11, stage 05). See
+//! Apply ∪ mark-drained (stage 05). See
 //! docs/staging-and-claiming/05-apply-and-exactly-once-deltas.md.
 //!
 //! A 1-1 definition's records are applied here; an aggregate's and a
@@ -11,7 +11,7 @@
 //!   block, reusing [`super::claim::claim`] directly. The fold runs after it
 //!   commits, in its own read transaction: [`super::fold::fold_limited`] for
 //!   a share that fits `drain_batch_cap`, pages from [`super::page`]
-//!   otherwise (issue #620).
+//!   otherwise.
 //! - Phase 2 (compute: evaluate `f()` against every folded change, no
 //!   transaction, no locks) is [`compute`].
 //! - Phase 3 (apply ∪ mark-drained, one transaction) is
@@ -20,8 +20,8 @@
 //! [`drain_once`] is the orchestrator tying the three together, including
 //! the version-fence/serialization retry loop the design calls for.
 //! [`next_claimable_segment`] is the "which batch should a free worker pick
-//! up next" query a real drain loop (not assembled here — issue #11,
-//! blocked on aggregate transform-defs) would call before it.
+//! up next" query a real drain loop (not assembled here)
+//! would call before it.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -114,7 +114,7 @@ pub enum ApplyError {
     ClaimLost,
     /// A non-final page found its buckets' `drain_cursor` already at its own
     /// last key once it held their claims: the same page committed before,
-    /// and only the reply to its `COMMIT` was lost (#856). Its transaction
+    /// and only the reply to its `COMMIT` was lost. Its transaction
     /// rolls back, so nothing applies twice, and the drain carries on from
     /// the next page (`drain_batch`). The group basis needs this: a page
     /// adds its deltas to the groups' partials, with nothing per key that
@@ -128,8 +128,8 @@ pub enum ApplyError {
     VersionFenceMiss { src_table: String },
     /// The entry lock of a 1-1 target (`super::one_to_one_ledger::lock_entries`)
     /// found a key with no entry: the tombstone GC
-    /// (`super::retire::collect_tombstones`, #623 D7) collected it between
-    /// the placeholder insert and the sorted `for update` (#712). Transient,
+    /// (`super::retire::collect_tombstones`) collected it between
+    /// the placeholder insert and the sorted `for update`. Transient,
     /// like a deadlock: the transaction rolls back, giving up every lock it
     /// took, and its retry inserts the key's placeholder afresh. Retaking
     /// the lock inside the transaction instead would insert that placeholder
@@ -140,14 +140,14 @@ pub enum ApplyError {
     /// needs to know a wave ran away, and which target tables it ran away
     /// through, rather than have the tail of it quietly disappear.
     HopBoundExceeded { hop_gen: i32, tables: Vec<String> },
-    /// A group-basis aggregate target (`super::group_basis`, #1100) met
+    /// A group-basis aggregate target (`super::group_basis`) met
     /// what it doesn't support yet: an aggregate it doesn't route, a ring
     /// row missing the images its change needs, a fresh build or
     /// resume over a partitioned source that has rows before its tree is
     /// recorded, or a build or rebuild over one whose tree is not recorded or
-    /// has a leaf with no usable constraint text (#1101); or, on a `JOIN`
-    /// (`super::join`, #1108), a field build, or a partitioned side whose tree
-    /// is not recorded or has a leaf with no usable constraint text (#1286).
+    /// has a leaf with no usable constraint text; or, on a `JOIN`
+    /// (`super::join`), a field build, or a partitioned side whose tree
+    /// is not recorded or has a leaf with no usable constraint text.
     /// Every page of the target would reproduce it, so it halts the target
     /// rather than charging each key a death.
     GroupBasisUnsupported { target: String, what: &'static str },
@@ -158,8 +158,8 @@ pub enum ApplyError {
     /// lock set, never a state of the data. The transaction rolls back.
     GroupLockGap { target: String, groups: i64 },
     /// A folded record names a source table Postgres no longer has
-    /// (`42P01` from a live query against it) — issue #16's "one sanctioned
-    /// exception to immutability": no retry or per-key quarantine can
+    /// (`42P01` from a live query against it) — the one sanctioned
+    /// exception to immutability: no retry or per-key quarantine can
     /// resolve this, since the table itself is gone, not any one row.
     /// `drain_once` routes this to `quarantine::purge_dropped_table`
     /// rather than the ordinary isolate/evict path.
@@ -192,7 +192,7 @@ pub enum ApplyError {
     DefinitionNotLive { transform: String },
     /// `super::quarantine::resume_column` was asked to resume an `ALTER
     /// TRANSFORM` field that is paused until its source's capture images the
-    /// column it reads (`column_status.awaiting_capture`, #687). Unpausing it
+    /// column it reads (`column_status.awaiting_capture`). Unpausing it
     /// before then would let a row the narrower capture function staged,
     /// which lacks that column, reach it and fail with `MissingColumn`. The
     /// field build's start unpauses it once the widened capture lands
@@ -229,7 +229,7 @@ pub enum ApplyError {
     /// `super::quarantine::release_key`'s first lock, the bump of the key's
     /// table's version fence, waited out the session's `lock_timeout`
     /// (`crate::locks::LOCK_TIMEOUT`, 30 s, unless the session set a
-    /// shorter one) (#842). The release waits for every drain page holding
+    /// shorter one). The release waits for every drain page holding
     /// that fence, the pages in flight on the table, so a page that parked a
     /// change for the key has committed before the release reads the key's
     /// rows; a page that holds it longer than the timeout makes the release
@@ -247,13 +247,13 @@ pub enum ApplyError {
     /// A column pause, resume, fuse trip or cascade pair, or a build's
     /// release of capture-widen pauses, waited for the column-pause lock
     /// (`crate::locks::lock_column_pauses`) past its transaction's
-    /// `lock_timeout` (#922). Its transaction rolled back with nothing
+    /// `lock_timeout`. Its transaction rolled back with nothing
     /// written: retry the call. A fuse trip and the capture pass's
     /// callers retry on their next pass.
     ColumnPauseLockTimeout(crate::locks::ColumnPauseLockTimeout),
     /// `super::quarantine::resume_transform` or
     /// `super::quarantine::resume_column` re-ran define-time validation
-    /// against the live schema and it failed (#708, #760): define would
+    /// against the live schema and it failed: define would
     /// refuse the definition as the schema stands now, so a rebuild would
     /// build from what it no longer matches. `reason` is define's own error,
     /// naming the column and what to change. Nothing changed: the
@@ -262,7 +262,7 @@ pub enum ApplyError {
         transform: String,
         reason: Box<crate::defs::catalog::CatalogError>,
     },
-    /// A folded truncate of `src_table` carries no ring `lsn` (#774). Not
+    /// A folded truncate of `src_table` carries no ring `lsn`. Not
     /// reachable: the capture trigger is the only writer of a truncate's
     /// ring row and stamps it with `pg_current_wal_insert_lsn()`, and
     /// `StagedChange::Truncate` requires one. Without it the truncate could
@@ -554,11 +554,11 @@ impl From<crate::error::Error> for ApplyError {
 
 /// Resolves `src_table` to the fully-qualified identity
 /// [`catalog::transforms_for_source`]/[`catalog::dependents_of`] now require
-/// (issue #74, ADR-0011: `schema_nodes` keys on qualified identity, so a
+/// (ADR-0011: `schema_nodes` keys on qualified identity, so a
 /// bare lookup there silently finds nothing rather than erroring).
 ///
 /// A no-op for the common case — `src_table` already contains a `.` — which
-/// covers every real CDC-staged or backfill-enumerated change (issue #76
+/// covers every real CDC-staged or backfill-enumerated change (the producer
 /// qualifies `change.src_table` unconditionally at the point it's staged).
 /// The one bare shape that still reaches it is a chained definition's own
 /// target, bare as [`crate::defs::ddl::neighbor_table_name`] always returns
@@ -568,14 +568,11 @@ impl From<crate::error::Error> for ApplyError {
 /// target that isn't on the `search_path`): the name can only be some other
 /// live definition's own target.
 ///
-/// Issue #267 turned this from an after-the-fact repair of an already-staged
-/// bare `src_table` into the canonicalization applied *before* staging: this
-/// function's output is now what those rows carry into the ring in the first
-/// place, so a bare `src_table` reaching `compute` is no longer something
-/// this module itself produces. The reading side still tolerates a bare
-/// name anyway:
-/// ring rows are durable, and this crate's integration-test fixtures stage
-/// bare names by hand.
+/// This is the canonicalization applied *before* staging: its output is what
+/// those rows carry into the ring in the first place, so a bare `src_table`
+/// reaching `compute` is not something this module itself produces. The
+/// reading side still tolerates a bare name anyway: ring rows are durable,
+/// and this crate's integration-test fixtures stage bare names by hand.
 async fn qualified_schema_node_key(pool: &Pool, src_table: &str) -> Result<String, ApplyError> {
     if src_table.contains('.') {
         return Ok(src_table.to_string());
@@ -592,7 +589,7 @@ async fn qualified_schema_node_key(pool: &Pool, src_table: &str) -> Result<Strin
 /// `MissingColumn` vs. plain `None` propagation). An empty image (`{}`)
 /// decodes to an empty [`Row`].
 ///
-/// Issue #327: one round trip per [`DECODE_CHUNK_IMAGES`] images (or
+/// One round trip per [`DECODE_CHUNK_IMAGES`] images (or
 /// [`DECODE_CHUNK_BYTES`] of image text, whichever fills first), not one
 /// per image. Each image still goes through the same `::jsonb` cast and
 /// `jsonb_each_text` a lone decode would, so the decoded text is
@@ -697,7 +694,7 @@ impl DecodedImages {
 /// Re-reads every one of `keys`' current rows from `source_table` live, in
 /// one round trip, for folded changes that carried no image at all (see
 /// [`compute`]'s doc comment on the three shapes) — the batched replacement
-/// for what used to be one `read_live_row` round trip per key (issue #13: a
+/// for one `read_live_row` round trip per key (a
 /// backfill's initial enumeration stages every pre-existing row as exactly
 /// this shape, so a naive per-key refetch made backfill throughput scale
 /// with source table size in network round trips, not rows).
@@ -710,7 +707,7 @@ impl DecodedImages {
 /// row is gone (already deleted, or never existed), which [`compute`]
 /// treats as a delete, matching `read_live_row`'s old `None` case exactly.
 ///
-/// `pk` may be a composite (multi-column) primary key (issue #126): `keys`
+/// `pk` may be a composite (multi-column) primary key: `keys`
 /// are each [`ddl::pk_key_sql_expr`]'s U+001F-joined text — the same shape
 /// every [`FoldedChange::key`] already carries for a composite-PK source,
 /// whether staged by a capture trigger or by this crate's own seam, so the
@@ -721,7 +718,7 @@ impl DecodedImages {
 /// single-column case (still the overwhelmingly common one) pays no extra
 /// cost.
 ///
-/// # NULL-keyed groups (issues #110, #446)
+/// # NULL-keyed groups
 ///
 /// A `NULL` component decodes off `keys` (via [`ddl::split_pk_key`]) as a
 /// real `Option::None`. A plain `t.<col> = u.<c>` never matches it (`NULL`
@@ -762,7 +759,7 @@ pub(super) struct LiveRowsQuery<'a> {
     sql: String,
     /// The same read before its `jsonb_each_text` split: one `(k, doc)` row
     /// per matched source row, `doc` its `row_columns` as a text-valued
-    /// `jsonb` (#623 D3's Re-derive read, `super::ledger`).
+    /// `jsonb` (the Re-derive read, `super::ledger`).
     pub(super) docs: String,
     arms: Vec<LiveRowsArm<'a>>,
 }
@@ -787,7 +784,7 @@ impl LiveRowsQuery<'_> {
 }
 
 /// Builds [`read_live_rows_batch`]'s statement: one `union all` arm per
-/// pattern of `NULL` key columns present among `keys` (issue #446), usually
+/// pattern of `NULL` key columns present among `keys`, usually
 /// just one. Each arm joins its keys' non-`NULL` parts as a keyset relation
 /// (one array per such column, so the bind count doesn't grow with the
 /// batch) and matches with [`live_rows_join_cond`], so every arm probes an
@@ -796,16 +793,16 @@ impl LiveRowsQuery<'_> {
 /// lateral jsonb_each_text` (so decoding costs no extra round trip).
 ///
 /// Matching a whole batch with `is not distinct from` on any column one of
-/// its keys binds a `NULL` for (the pre-#446 shape) is correct but not
+/// its keys binds a `NULL` for (the naive shape) is correct but not
 /// indexable: one `NULL`-keyed group in a batch turned the refetch into a
 /// nested loop over a sequential scan of the source. This is the same split
-/// `target_mutations::read_new_images` makes (issue #433).
+/// `target_mutations::read_new_images` makes.
 ///
 /// Every caller runs the statement under `super::ledger::ENTRY_PLAN_SETTINGS`
 /// (no sequential scan), and a single-column key's non-`NULL` arm also
 /// restricts the column to its array (`t.<col> = any(<array>)`), which the
 /// join already implies, so the source's side of whatever join the planner
-/// picks is read through the key's index and bounded by the batch (#778).
+/// picks is read through the key's index and bounded by the batch.
 /// It takes both while the source's statistics lag its size (analyzed while
 /// small, grown since), for a page's 5,000 keys:
 ///
@@ -847,7 +844,7 @@ pub(super) fn live_rows_query<'a>(
     }
 
     let k_expr = ddl::pk_key_sql_expr(pk, Some("t"));
-    // Issue #248: an explicit per-column `jsonb_build_object`, not
+    // An explicit per-column `jsonb_build_object`, not
     // `to_jsonb(t.*)` — see `row_as_text_jsonb_sql`'s doc comment for why.
     let doc_expr = row_as_text_jsonb_sql("t", row_columns);
     let source_ident = ddl::qualified_source_table(source_table);
@@ -903,8 +900,8 @@ pub(super) fn live_rows_query<'a>(
 /// [`read_live_rows_batch`]'s match for one [`live_rows_query`] arm: a
 /// conjunction over `pk` where column `i` is `t.<col> is null` if
 /// `pattern[i]` (every key in this arm is `NULL` there), else `t.<col> =
-/// u.c<i>`. Never `is not distinct from`: that is not indexable (issue
-/// #446), and within one arm it is never needed, since a column is either
+/// u.c<i>`. Never `is not distinct from`: that is not indexable,
+/// and within one arm it is never needed, since a column is either
 /// `NULL` for every key or for none.
 fn live_rows_join_cond(pk: &[PrimaryKeyColumn], pattern: &[bool]) -> String {
     pk.iter()
@@ -924,11 +921,11 @@ fn live_rows_join_cond(pk: &[PrimaryKeyColumn], pattern: &[bool]) -> String {
 
 /// The live, `attnum`-ordered column names of `table`, from a
 /// `to_regclass`-bound `pg_attribute` introspection. `table` is the unquoted
-/// `schema.table` identity, quoted for the lookup by [`ddl::regclass_arg`]
-/// (issue #561). An already-quoted name is quoted twice, finds nothing, and
+/// `schema.table` identity, quoted for the lookup by [`ddl::regclass_arg`].
+/// An already-quoted name is quoted twice, finds nothing, and
 /// yields an empty column list.
 ///
-/// Issue #248: every `to_jsonb(t.*)`-based row decode in this crate needs
+/// Every `to_jsonb(t.*)`-based row decode in this crate needs
 /// this to build an explicit per-column `jsonb_build_object` (see
 /// [`row_as_text_jsonb_sql`]) instead — `to_jsonb` renders a `timestamp`/
 /// `timestamptz` column with its own ISO-8601 writer rather than calling the
@@ -956,7 +953,7 @@ pub async fn live_row_columns(
     Ok(rows.into_iter().map(|row| row.get(0)).collect())
 }
 
-/// `to_jsonb(<alias>.*)`'s replacement (issue #248): an explicit
+/// `to_jsonb(<alias>.*)`'s replacement: an explicit
 /// `jsonb_build_object('<col>', <alias>."<col>"::text, ...)` over `columns`,
 /// so every value lands the same way an ordinary `<col>::text` cast would —
 /// including `timestamp`/`timestamptz`, where `to_jsonb`'s own writer
@@ -980,7 +977,7 @@ pub fn row_as_text_jsonb_sql(alias: &str, columns: &[String]) -> String {
 }
 
 /// Where a propagated change traces back to: its source commit's
-/// `src_changed` (issues #51/#52) and `origin_lsn` (issue #469), merged with
+/// `src_changed` and `origin_lsn`, merged with
 /// [`earliest_src_changed`] and [`earliest_origin`] respectively.
 type Provenance = (Option<std::time::SystemTime>, Option<PgLsn>);
 
@@ -988,7 +985,7 @@ type Provenance = (Option<std::time::SystemTime>, Option<PgLsn>);
 // Phase 2: compute
 // ---------------------------------------------------------------------
 
-/// Issue #51/ADR-0009 decision 5: buffers one applied change's per-transform
+/// ADR-0009 decision 5: buffers one applied change's per-transform
 /// hop latency/throughput observation, from data [`compute`]'s by-source
 /// grouping already has in hand — no new I/O, no new join. `transform` is
 /// the consuming definition's target table (this crate's one "transform
@@ -1001,11 +998,10 @@ type Provenance = (Option<std::time::SystemTime>, Option<PgLsn>);
 /// such a change still counts toward throughput, just not latency.
 /// Its [`FoldedChange::row_count`] is the number of staged ring rows the
 /// change folded: `trellis_changes_applied_total` counts staged
-/// rows (issue #409), while both latency histograms still observe once per
+/// rows, while both latency histograms still observe once per
 /// folded change.
 ///
-/// **Buffers, does not record** (the epic #49 cross-cutting review's fix,
-/// closing a gap in issues #51/#52): `compute` (Phase 2) has no transaction
+/// **Buffers, does not record**: `compute` (Phase 2) has no transaction
 /// and no locks, and [`drain_once`]/[`drain_many`]'s "reload, recompute,
 /// retry" loop calls it again, from scratch, on the very same `folded`
 /// input, for a version-fence miss or a rolled-back Phase 3 failure —
@@ -1032,7 +1028,7 @@ type Provenance = (Option<std::time::SystemTime>, Option<PgLsn>);
 /// of whether metrics are recorded, per the ADR's "effectively free"
 /// framing.
 ///
-/// Issue #52: every `Some(src_changed)` this function sees is also buffered
+/// Every `Some(src_changed)` this function sees is also buffered
 /// into `end_to_end_origins`, keyed by `transform` — one origin timestamp
 /// per applied change, same as the per-transform histogram observes. This
 /// is *not* itself gated on terminal-ness: at the point every call site
@@ -1066,7 +1062,7 @@ fn buffer_transform_apply_metrics(
 /// One applied folded change, as [`buffer_transform_apply_metrics`] buffers
 /// it for [`flush_apply_metrics`]: `src_changed` feeds one per-transform
 /// latency observation (when `Some`), and `row_count` is how much the change
-/// adds to `trellis_changes_applied_total` (issue #409: one per staged ring
+/// adds to `trellis_changes_applied_total` (one per staged ring
 /// row, not one per folded change).
 #[derive(Debug, Clone)]
 struct TransformObservation {
@@ -1087,7 +1083,7 @@ struct TransformObservation {
 /// `true`/`false`, text values verbatim) — matching this module's existing
 /// "text in, typed cast in SQL" convention for every other value it writes.
 ///
-/// `src_changed` (issues #51/#52's multi-hop gap) is the triggering
+/// `src_changed` is the triggering
 /// [`FoldedChange::src_changed`], carried forward the same way `hop_gen` is
 /// — so a downstream `Recompute` row this write's own propagation stages
 /// (see [`apply_and_mark_drained_many`]'s step 4) keeps a real origin
@@ -1098,7 +1094,7 @@ struct TargetWrite {
     values: Vec<Option<String>>,
     hop_gen: i32,
     src_changed: Option<std::time::SystemTime>,
-    /// The triggering [`FoldedChange::origin_lsn`] (issue #469), carried
+    /// The triggering [`FoldedChange::origin_lsn`], carried
     /// forward exactly as `src_changed` is.
     origin_lsn: Option<PgLsn>,
 }
@@ -1113,7 +1109,7 @@ struct TargetDelete {
     origin_lsn: Option<PgLsn>,
 }
 
-/// One folded change to a 1-1 target (#623 D6): an Apply of its last change,
+/// One folded change to a 1-1 target: an Apply of its last change,
 /// evaluated in Phase 2 from its image, or a Re-derive (`apply` `None`),
 /// which Phase 3 evaluates from the row it reads under the entry lock (see
 /// `super::one_to_one_ledger`).
@@ -1142,12 +1138,12 @@ struct TargetPlan {
     field_types: Vec<ValueType>,
     records: Vec<OneToOneRecord>,
     /// The persisted, fully-qualified `"schema.table"` identity of this
-    /// target (issue #73's `Definition::target_table`, ADR-0011) —
+    /// target (`Definition::target_table`, ADR-0011) —
     /// carried alongside the bare `def.def.target` this plan is keyed by
     /// (see [`ApplyPlan::targets`]'s doc comment on why the map key itself
     /// stays bare) so [`apply_target`] can bind the *right* physical table
     /// into its `INSERT`/`UPDATE`/`DELETE` SQL, rather than leaving a
-    /// target explicitly qualified into a non-default schema (issue #76) to
+    /// target explicitly qualified into a non-default schema to
     /// resolve against whatever `search_path` the executing session
     /// happens to carry.
     qualified_target: String,
@@ -1159,7 +1155,7 @@ struct TargetPlan {
     rederive: Arc<Rederive>,
 }
 
-/// How Phase 3 evaluates a 1-1 Re-derive's row (#623 D6).
+/// How Phase 3 evaluates a 1-1 Re-derive's row.
 struct Rederive {
     def: TransformDef,
     source_columns: HashMap<String, ValueType>,
@@ -1178,7 +1174,7 @@ impl std::fmt::Debug for Rederive {
 }
 
 /// One target table this batch must clear in full before its own keyed
-/// writes/deletes apply (issue #60: a truncate on `src_table` clears every
+/// writes/deletes apply (a truncate on `src_table` clears every
 /// row a 1-1 transform ever derived from it). `pk` is the target's primary
 /// key shape — reused, per [`compute`]'s existing convention, from the
 /// truncated source's own PK introspection (a 1-1 target's key column
@@ -1188,8 +1184,8 @@ impl std::fmt::Debug for Rederive {
 /// propagate downstream at `hop_gen + 1`, exactly like any other
 /// physically-changed key.
 ///
-/// `src_changed` is the triggering truncate sentinel's own `src_changed`
-/// (issues #51/#52's multi-hop gap), fan-in tie-broken by `min` across
+/// `src_changed` is the triggering truncate sentinel's own `src_changed`,
+/// fan-in tie-broken by `min` across
 /// however many truncated sources resolve to this same target — see
 /// [`earliest_src_changed`]'s doc comment for why `min`, not `max`, is the
 /// right merge here.
@@ -1203,7 +1199,7 @@ struct ClearPlan {
     qualified_target: String,
     src_changed: Option<std::time::SystemTime>,
     origin_lsn: Option<PgLsn>,
-    /// #623 D6: the latest truncating commit's ring `lsn` this batch
+    /// The latest truncating commit's ring `lsn` this batch
     /// carries, which the clear raises the target's truncate floor to as it
     /// empties the ledger.
     truncate_lsn: PgLsn,
@@ -1221,9 +1217,8 @@ struct AggregateClearPlan {
     hop_gen: i32,
     qualified_target: String,
     /// The aggregate target's own row identity — its `GROUP BY` columns, as
-    /// `ddl::identity_key_columns` reports them (ungated by key type, issue
-    /// #385) — so the clear can report each cleared group's key to the seam
-    /// (issue #315).
+    /// `ddl::identity_key_columns` reports them (ungated by key type)
+    /// — so the clear can report each cleared group's key to the seam.
     pk: Vec<PrimaryKeyColumn>,
     src_changed: Option<std::time::SystemTime>,
     origin_lsn: Option<PgLsn>,
@@ -1237,15 +1232,15 @@ struct AggregateClearPlan {
 /// Where an aggregate target keeps its ordering state ([`AggregateClearPlan`]).
 #[derive(Debug, Clone)]
 enum AggregateState {
-    /// #1102: the group basis's hidden table (`super::group_basis`), quoted
+    /// The group basis's hidden table (`super::group_basis`), quoted
     /// and qualified.
     GroupBasis { hidden: String },
     /// Neither: nothing to empty.
     Neither,
 }
 
-/// The fan-in tie-break for [`StagedChange::Recompute::src_changed`]
-/// (issues #51/#52's multi-hop gap): when more than one change in a batch
+/// The fan-in tie-break for [`StagedChange::Recompute::src_changed`]:
+/// when more than one change in a batch
 /// feeds the same propagated key (forward propagation's `changed` map), the
 /// **earliest** (`min`) of their origins wins — the oldest/earliest
 /// source-commit timestamp captures the slowest straggler in the group,
@@ -1300,7 +1295,7 @@ mod tests {
     use tokio_postgres::NoTls;
     use tokio_postgres::types::PgLsn;
 
-    /// Issue #327: the per-image decode [`decode_images`] replaced, kept
+    /// The per-image decode [`decode_images`] replaced, kept
     /// verbatim as the differential oracle.
     async fn decode_image_one_round_trip_each(pool: &Pool, image: &str) -> Row {
         let client = pool.get().await.expect("pool checkout");
@@ -1318,7 +1313,7 @@ mod tests {
         row
     }
 
-    /// Issue #327: the batched decode returns exactly what one
+    /// The batched decode returns exactly what one
     /// `jsonb_each_text` round trip per image did, over images of every
     /// column type in each shape the ring carries them in, NULLs, empty
     /// images, unicode and escapes, wherever the chunk boundaries fall.
@@ -1486,7 +1481,7 @@ mod tests {
         );
     }
 
-    /// Issue #344: a basis is compared to the source's current row as jsonb,
+    /// A basis is compared to the source's current row as jsonb,
     /// so it must be valid JSON whatever text a column holds, keep SQL NULL
     /// distinct from the text `"null"`, and come out the same for the same
     /// row regardless of map order.
@@ -1555,14 +1550,14 @@ mod tests {
             .map(|v| v as u64)
     }
 
-    /// Epic #49's final cross-cutting review found that [`compute`] (Phase
-    /// 2: no transaction, no locks) used to record straight into the global
-    /// metrics registry — but [`drain_once`]/[`drain_many`]'s "reload,
-    /// recompute, retry" loop calls `compute` again, unchanged, on a
-    /// version-fence miss or a rolled-back Phase 3 failure, so a change that
-    /// took more than one attempt to actually land got double-(or worse-)
-    /// counted into `trellis_changes_applied_total` and both latency
-    /// histograms. The fix: `compute` only *buffers* observations onto the
+    /// [`compute`] (Phase 2: no transaction, no locks) must not record
+    /// straight into the global metrics registry: [`drain_once`]/
+    /// [`drain_many`]'s "reload, recompute, retry" loop calls `compute`
+    /// again, unchanged, on a version-fence miss or a rolled-back Phase 3
+    /// failure, so a change that took more than one attempt to actually land
+    /// would be double-(or worse-) counted into
+    /// `trellis_changes_applied_total` and both latency histograms. So
+    /// `compute` only *buffers* observations onto the
     /// [`ApplyPlan`] it returns (`transform_observations`/`end_to_end_origins`),
     /// and only [`flush_apply_metrics`] — called by `drain_once`/`drain_many`
     /// right after their own `txn.commit().await?` succeeds — actually
@@ -1576,7 +1571,7 @@ mod tests {
     /// exactly one observation per metric — not two, even though `compute`
     /// itself ran twice.
     ///
-    /// Issue #409: the key is staged as three ring rows (an insert and two
+    /// The key is staged as three ring rows (an insert and two
     /// updates) that fold to one change. The counter reports the three
     /// staged rows, while each latency histogram's `_count` reports the one
     /// folded change.
@@ -1673,7 +1668,7 @@ mod tests {
         // histograms have something to observe, not just the throughput
         // counter — and so the fold has several rows to collapse.
         let image = r#"{"price":"10.00","tax":"1.50"}"#.to_string();
-        // Issue #512: ordered offsets above the real WAL insert position, as
+        // Ordered offsets above the real WAL insert position, as
         // three successive captured commits would carry.
         let base = u64::from(testkit::wal_insert_lsn(&client).await);
         for (op, lsn, old_image) in [
@@ -1809,7 +1804,7 @@ mod tests {
         );
     }
 
-    /// Issues #110/#446 regression pin: [`live_rows_join_cond`] matches a
+    /// Regression pin: [`live_rows_join_cond`] matches a
     /// column that is `NULL` in the arm's pattern with `is null` (so a
     /// `NULL`-keyed group's live row is found instead of being mistaken for
     /// "already deleted") and every other column with the indexable `=` —
@@ -1842,7 +1837,7 @@ mod tests {
         );
     }
 
-    /// Issue #446: a [`read_live_rows_batch`] batch that includes
+    /// A [`read_live_rows_batch`] batch that includes
     /// `NULL`-keyed groups (an aggregate target read as a source) still
     /// probes the table's `UNIQUE NULLS NOT DISTINCT` index, at a
     /// single-column and a composite key, and still finds every key's row.
@@ -1936,7 +1931,7 @@ mod tests {
             );
         }
 
-        // The pre-#446 shape over a single-column batch with one NULL key can
+        // The naive shape over a single-column batch with one NULL key can
         // only plan a sequential scan, so the difference above is real.
         let groups: Vec<Option<String>> = std::iter::once(None)
             .chain((1..500).map(|i| Some((i * 397).to_string())))
@@ -1955,11 +1950,11 @@ mod tests {
             .join("\n");
         assert!(
             plan.contains("Seq Scan"),
-            "the pre-#446 shape should not be able to probe the index, got:\n{plan}"
+            "the naive shape should not be able to probe the index, got:\n{plan}"
         );
     }
 
-    /// Issue #778: a [`live_rows_query`] batch, run as its callers run it
+    /// A [`live_rows_query`] batch, run as its callers run it
     /// (under `ENTRY_PLAN_SETTINGS`), reads only its keys' rows of a
     /// single-column key's source whose statistics lag its size: analyzed at
     /// 100 rows, then grown to 400k with autovacuum off. Left to the join
@@ -2083,7 +2078,7 @@ mod tests {
                  every row with every key, got:\n{plan}"
             );
             // What the scans actually read, not what the planner expected
-            // them to (#791).
+            // them to.
             let read = testkit::plan::rows_read(&plan, source);
             assert!(
                 read <= 2 * keys.len() as u64,
@@ -2092,7 +2087,7 @@ mod tests {
             );
             // The plan above is explained through `query_by_entry_key`; a 1-1
             // ledger page's Re-derive read must run the statement that way
-            // too (#791). Without the settings, a stale source is scanned.
+            // too. Without the settings, a stale source is scanned.
             let txn = client.transaction().await.expect("begin");
             // It reads the newest segment from Trellis's own schema too.
             txn.batch_execute(&format!(
@@ -2146,7 +2141,7 @@ mod tests {
         }
     }
 
-    /// Issue #790's review: a composite-key 1-1 target's pre-lock
+    /// A composite-key 1-1 target's pre-lock
     /// ([`lock_composite_keys`]) is matched to its keys without comparing
     /// every target row with every key, and without scanning the target.
     ///
@@ -2242,7 +2237,7 @@ mod tests {
                  every row with every key, got:\n{plan}"
             );
             // What the scans actually read, not what the planner expected
-            // them to (#791).
+            // them to.
             let read = testkit::plan::rows_read(&plan, &table["public.".len()..]);
             assert!(
                 read <= 2 * rows.len() as u64,
@@ -2281,7 +2276,7 @@ mod tests {
         }
     }
 
-    /// Issue #793: a single-column-key target's pre-lock
+    /// A single-column-key target's pre-lock
     /// ([`lock_single_keys`]) starts no sequential scan of the target while
     /// its statistics lag its size. PostgreSQL 16 priced the index scan for
     /// thousands of `= any` keys so high that it read a 400k-row target
@@ -2381,7 +2376,7 @@ mod tests {
         assert_eq!(locked, keys, "every key is locked, in key order");
     }
 
-    /// Issue #793's sibling: the single-column key's delete
+    /// The single-column key's delete
     /// ([`delete_single_keys`]) reads the same stale target by the same
     /// keys, so it starts no sequential scan of it either, and still deletes
     /// every key.
@@ -2465,7 +2460,7 @@ mod tests {
         assert_eq!(deleted, keys.into_iter().collect(), "every key is deleted");
     }
 
-    /// Issue #670 review: `classify` decides by the innermost `ApplyError`,
+    /// `classify` decides by the innermost `ApplyError`,
     /// which for a lost claim is `Isolate`, so `classify_and_retry`'s lost
     /// claim early return has to see through a wrapper too. Otherwise a
     /// wrapped `ClaimLost` would be isolated, and every key in the page
@@ -2514,7 +2509,7 @@ mod tests {
         );
     }
 
-    /// Issue #1314: a page takes its version fences in table-name order, the
+    /// A page takes its version fences in table-name order, the
     /// order a define, drop, resume or freeze bumps several in, so a page and
     /// a bump of the same fences never deadlock. A page of a `JOIN` target
     /// holds both its tables' fences, and a `JOIN` define bumps both: a page
@@ -2649,46 +2644,45 @@ mod tests {
 pub struct ApplyPlan {
     versions: BTreeMap<String, Option<i64>>,
     targets: BTreeMap<String, TargetPlan>,
-    /// The aggregate targets on the group basis (`super::group_basis`,
-    /// #1100), each with this page's ring rows for it,
-    /// keyed by the definition's bare target name, in target order.
+    /// The aggregate targets on the group basis (`super::group_basis`),
+    /// each with this page's ring rows for it, keyed by the definition's
+    /// bare target name, in target order.
     group_targets: BTreeMap<String, super::group_basis::GroupTargetPlan>,
-    /// The `JOIN` targets (`super::join`,
-    /// #1108), each with this page's ring rows of either table, keyed by the
+    /// The `JOIN` targets (`super::join`),
+    /// each with this page's ring rows of either table, keyed by the
     /// definition's bare target name, in target order.
     join_targets: BTreeMap<String, super::join::JoinTargetPlan>,
     /// Targets to clear in full at Phase 3, keyed by target table name —
-    /// issue #60's truncate propagation. See [`ClearPlan`].
+    /// the truncate propagation. See [`ClearPlan`].
     clears: HashMap<String, ClearPlan>,
     /// The aggregate-target counterpart to [`ApplyPlan::clears`]: a
     /// truncate on an aggregate definition's source clears every group.
     /// Applied by the same `clear_target` as a 1-1 clear, keyed by the
     /// target's `GROUP BY` columns, so each cleared group reaches the seam
-    /// and a transform chained off the aggregate target sees it (issue #315;
-    /// this used to be a documented propagation gap).
+    /// and a transform chained off the aggregate target sees it.
     aggregate_clears: HashMap<String, AggregateClearPlan>,
-    /// Issue #16: the (non-truncate) folded records whose `(src_table,
+    /// The (non-truncate) folded records whose `(src_table,
     /// key)` is poisoned for a definition that reads it, each paired with
     /// that definition's id — left out of that definition's plan only
-    /// (#799: every other reader applies it), and instead parked into
+    /// (every other reader applies it), and instead parked into
     /// `poison_held` for it by [`apply_and_mark_drained`], in the same
     /// Phase-3 transaction, before the drained mark. See
     /// `quarantine::park_batch_contribution`'s doc comment for why this must
     /// happen even when this batch didn't cause the key's eviction.
     poisoned_park: Vec<(i64, FoldedChange)>,
-    /// Issue #16: every non-truncate `(src_table, key)` this batch computed
+    /// Every non-truncate `(src_table, key)` this batch computed
     /// against for at least one definition — cleared from `key_deaths` by
     /// [`apply_and_mark_drained`] on a successful commit, per doc 06's "a
     /// clean drain clears the counters for the keys it just applied", for
-    /// every definition the key isn't poisoned for (#799).
+    /// every definition the key isn't poisoned for.
     applied_keys: Vec<(String, String)>,
-    /// How many of those keys were an automatic retry of a held key (#861),
+    /// How many of those keys were an automatic retry of a held key,
     /// set when the page clears their death counters
     /// ([`quarantine::clear_key_deaths`]) and counted by
     /// [`flush_apply_metrics`] once the page commits. Shared, so a clone of
     /// the plan sees the same count.
     retries_succeeded: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Epic #49 cross-cutting review fix (issues #51/#52): every
+    /// Every
     /// [`TransformObservation`] [`buffer_transform_apply_metrics`]
     /// buffered during this `compute` call, in place of recording each one
     /// immediately — drained by [`flush_apply_metrics`] into
@@ -2714,12 +2708,12 @@ pub struct ApplyPlan {
 /// no definition that isn't frozen reads the table, so `compute` skips them.
 ///
 /// A dropped source is [`ApplyError::SourceTableDropped`], reported under
-/// `qualified_source`, the ring's own spelling (issue #267): its consumers
+/// `qualified_source`, the ring's own spelling: its consumers
 /// (`quarantine::purge_dropped_table` and `drain_once`/`drain_many`'s
 /// `folded.retain`) match it against a ring row's `src_table` as an exact
 /// string.
 ///
-/// Issue #768: a key that no longer passes the key gate (a type off the
+/// A key that no longer passes the key gate (a type off the
 /// allowlist, or no key at all) halts the page while any definition that
 /// isn't frozen reads the table ([`catalog::has_unfrozen_reader`], under the
 /// canonical `source_key`): one that applies would key its rows wrongly or
@@ -2734,8 +2728,8 @@ pub struct ApplyPlan {
 /// reader it didn't see.
 ///
 /// The halt pauses every such reader and what is downstream of it
-/// (`super::halt`, #663, which is #703 R2's "pause the reader in the
-/// drain"), so the page's retry finds none and skips the table.
+/// (`super::halt`, which pauses the reader in the
+/// drain), so the page's retry finds none and skips the table.
 async fn source_key_for_apply(
     pool: &Pool,
     qualified_source: &str,
@@ -2788,7 +2782,7 @@ async fn has_unfrozen_reader(pool: &Pool, table: &str) -> Result<bool, ApplyErro
     Ok(catalog::has_unfrozen_reader(&**client, table).await?)
 }
 
-/// Each of `changes`' [`KeyExclusion`] (#799), or `None` when every one is
+/// Each of `changes`' [`KeyExclusion`], or `None` when every one is
 /// empty, the common case, which costs no allocation: `changes` are the folded
 /// changes to `source_key` (canonical), `defs` the definitions that apply
 /// it, and `poisoned` the batch's poison ([`quarantine::poisoned_keys_among`]).
@@ -2826,7 +2820,7 @@ fn key_exclusions(
 
 /// One definition's share of a source's `changes` and their decoded images
 /// (`rows`): every change but those `exclusions` leave out of
-/// `transform_id` (#799). Borrowed when it leaves out none, the common case.
+/// `transform_id`. Borrowed when it leaves out none, the common case.
 fn definition_share<'c, 'f>(
     transform_id: i64,
     changes: &'c [&'f FoldedChange],
@@ -2857,7 +2851,7 @@ fn definition_share<'c, 'f>(
 /// what makes [`drain_once`]'s retry-on-fence-miss loop "reload, recompute"
 /// rather than needing any separate invalidation path.
 ///
-/// Issue #56/ADR-0009 decision 3: this span is the "hop" half of the
+/// ADR-0009 decision 3: this span is the "hop" half of the
 /// source-commit → hop → hop → apply tree — one span per compute pass over
 /// a folded batch, with a per-source-table `tracing::debug!` event inside
 /// the loop below (not a nested span: the loop body's accumulators
@@ -2873,7 +2867,7 @@ pub async fn compute(pool: &Pool, folded: &[FoldedChange]) -> Result<ApplyPlan, 
     compute_page(pool, folded, None, false).await
 }
 
-/// One key an isolation probe (`quarantine::attribute`, #799) applies with
+/// One key an isolation probe (`quarantine::attribute`) applies with
 /// some of its work left out: the probe that tells which definition's apply
 /// a key fails in. `direct` picks the readers of its table that apply it.
 /// The key's poison stands as it is wherever the focus doesn't override it.
@@ -2889,7 +2883,7 @@ pub(super) struct ProbeFocus<'a> {
 pub(super) enum DirectFocus {
     /// That one alone.
     Only(i64),
-    /// Every one the key isn't poisoned for, but that one (#822's
+    /// Every one the key isn't poisoned for, but that one (the
     /// leave-one-out).
     AllBut(i64),
 }
@@ -2913,7 +2907,7 @@ impl ProbeFocus<'_> {
     }
 }
 
-/// Which readers a folded change's key is left out of (#799): the readers
+/// Which readers a folded change's key is left out of: the readers
 /// of its table it's poisoned for, in id order, which it is parked for.
 #[derive(Default)]
 struct KeyExclusion {
@@ -2929,7 +2923,7 @@ impl KeyExclusion {
 }
 
 /// [`compute`], with `focus` overriding one key's direct readers for an
-/// isolation probe, and with `skip_frozen` (issue #766) also skipping every
+/// isolation probe, and with `skip_frozen` also skipping every
 /// table no definition that isn't frozen reads, as [`source_key_for_apply`]
 /// skips one whose key can't be used ([`has_unfrozen_reader`], fenced the
 /// same way). [`drain_batch`] asks for it on the retry after Postgres
@@ -2952,14 +2946,14 @@ pub(super) async fn compute_page(
     focus: Option<&ProbeFocus<'_>>,
     skip_frozen: bool,
 ) -> Result<ApplyPlan, ApplyError> {
-    // Issue #16: find the already-poisoned keys before anything else touches
-    // them. Whole-key poison is per transform (#799): a poisoned key is left
+    // Find the already-poisoned keys before anything else touches
+    // them. Whole-key poison is per transform: a poisoned key is left
     // out of the apply of each definition it's poisoned for, decided per
     // source below, and every other reader applies it. Truncate sentinels
     // are never candidates: a truncate is whole-keyspace, not a key
     // quarantine can attribute anything to.
     //
-    // Issue #283: every quarantine table — `poison` included — is keyed on the
+    // Every quarantine table — `poison` included — is keyed on the
     // *canonical* (qualified, where resolvable) identity of a source table, not
     // the raw ring spelling, so each distinct `src_table` in this batch is
     // resolved once here and that canonical value is what this exclusion query,
@@ -2968,7 +2962,7 @@ pub(super) async fn compute_page(
     // already poisoned under the other spelling of its own table and
     // re-evaluate (then re-poison) it.
     //
-    // Issue #380: `by_source` and the version fence (`versions`) key on the
+    // `by_source` and the version fence (`versions`) key on the
     // same canonical identity, so truncates are resolved here too (their
     // fence entry needs it). Keying either on the bare table-name suffix
     // merged same-named tables in different schemas into one bucket and one
@@ -2996,7 +2990,7 @@ pub(super) async fn compute_page(
     tracing::Span::current().record("poisoned", poisoned.len());
 
     let mut by_source: HashMap<String, Vec<&FoldedChange>> = HashMap::new();
-    // Truncate sentinels (issue #60) never enter the keyed by-source
+    // Truncate sentinels never enter the keyed by-source
     // evaluation loop below — they carry no key of their own (see
     // `append::TRUNCATE_SENTINEL_KEY`) and produce no write/delete;
     // they're handled separately, right after that loop.
@@ -3008,10 +3002,10 @@ pub(super) async fn compute_page(
             truncated.push(change);
             continue;
         }
-        // Canonical, per this function's `poisoned` comment above (issue
-        // #283): the exclusion match, the parked row's own `src_table`
-        // (`poison_held` is keyed canonically, and issue #267 made the
-        // qualified spelling the ring invariant a release would replay it
+        // Canonical, per this function's `poisoned` comment above: the
+        // exclusion match, the parked row's own `src_table`
+        // (`poison_held` is keyed canonically, and the
+        // qualified spelling is the ring invariant a release would replay it
         // under anyway), and `applied_keys`, whose only consumer is
         // `clear_key_deaths` against the canonically-keyed `key_deaths`.
         by_source
@@ -3023,23 +3017,21 @@ pub(super) async fn compute_page(
 
     let mut versions: BTreeMap<String, Option<i64>> = BTreeMap::new();
     let mut targets: BTreeMap<String, TargetPlan> = BTreeMap::new();
-    // #1100: aggregate targets on the group basis, in target order too.
+    // Aggregate targets on the group basis, in target order too.
     let mut group_targets: BTreeMap<String, super::group_basis::GroupTargetPlan> = BTreeMap::new();
-    // #1108: `JOIN` targets, in target order too.
+    // `JOIN` targets, in target order too.
     let mut join_targets: BTreeMap<String, super::join::JoinTargetPlan> = BTreeMap::new();
-    // Issue #52: every `Some(src_changed)` origin timestamp
+    // Every `Some(src_changed)` origin timestamp
     // `buffer_transform_apply_metrics` sees below, buffered per consuming
     // target — filtered into `ApplyPlan::end_to_end_origins` only for
     // targets the `downstream_readers` computation at the end of this
     // function finds terminal (see that call site's comment). Not itself
     // part of `ApplyPlan` — only the terminal-filtered subset is.
     let mut end_to_end_origins: HashMap<String, Vec<std::time::SystemTime>> = HashMap::new();
-    // Epic #49 cross-cutting review fix (issues #51/#52): every
-    // observation `buffer_transform_apply_metrics` below
-    // would previously have recorded immediately — now buffered here and
-    // carried out on `ApplyPlan`, flushed post-commit by
+    // Every observation `buffer_transform_apply_metrics` below makes is
+    // buffered here and carried out on `ApplyPlan`, flushed post-commit by
     // [`flush_apply_metrics`]. See `buffer_transform_apply_metrics`'s doc
-    // comment for why eager recording here was the bug.
+    // comment for why eager recording here would be a bug.
     let mut transform_observations: Vec<TransformObservation> = Vec::new();
 
     for (source_key, mut changes) in by_source {
@@ -3051,11 +3043,11 @@ pub(super) async fn compute_page(
         let version = catalog::source_table_version(pool, &source_key).await?;
         versions.entry(source_key.clone()).or_insert(version);
 
-        // The source identity this batch's own CDC producer staged (issue
-        // #76, ADR-0011) — the ring's own spelling of `change.src_table`,
+        // The source identity this batch's own CDC producer staged
+        // (ADR-0011) — the ring's own spelling of `change.src_table`,
         // which `SourceTableDropped` below must echo back verbatim. Every
         // change in this bucket resolves to the same canonical `source_key`
-        // by construction (`by_source` grouped on it, issue #380), so any one
+        // by construction (`by_source` grouped on it), so any one
         // of them names the right physical table for the reads below.
         let qualified_source = changes[0].src_table.as_str();
 
@@ -3069,26 +3061,26 @@ pub(super) async fn compute_page(
         }
 
         // `source_key` alone determines the source table's primary key, not
-        // the individual definition (issue #69) — introspected once per
+        // the individual definition — introspected once per
         // source here and reused both below (every definition subscribed to
         // this source) and by the row decode below (every change, whichever
         // definition it's evaluated against). A dropped source is
-        // [`ApplyError::SourceTableDropped`] (issue #16's purge, #267's
-        // spelling); `None` is a key that can't be used on a table no
-        // definition applies (issue #768), whose changes are dropped with
+        // [`ApplyError::SourceTableDropped`] (carrying the
+        // ring's spelling); `None` is a key that can't be used on a table no
+        // definition applies, whose changes are dropped with
         // the page. See [`source_key_for_apply`].
         let Some(pk) = source_key_for_apply(pool, qualified_source, &source_key).await? else {
             continue;
         };
 
-        // Issue #344: the source column list a 1-1 target's Phase 3 check
+        // The source column list a 1-1 target's Phase 3 check
         // renders the current row with. Loaded at most once per source, and
         // only when some definition on it is 1-1.
         let mut source_row_columns: Option<Vec<String>> = None;
 
         // `qualified_source` (via `qualified_schema_node_key`):
-        // `schema_nodes`/`schema_edges` key on qualified identity (issue #74,
-        // ADR-0011), so `transforms_for_source` (a thin `dependents_of`
+        // `schema_nodes`/`schema_edges` key on qualified identity
+        // (ADR-0011), so `transforms_for_source` (a thin `dependents_of`
         // wrapper) needs an exact qualified match here. `qualified_source` is
         // usually already fully-qualified (real CDC/backfill), but a
         // downstream-propagation hop's `src_table` is a bare target name
@@ -3100,7 +3092,7 @@ pub(super) async fn compute_page(
         )
         .await?;
 
-        // #799: which readers each change is left out of (see
+        // Which readers each change is left out of (see
         // `KeyExclusion`). A change poisoned for a reader of this table is
         // left out of that reader's apply only, and parked for it. A change
         // left out of every reader is dropped here, before its image is
@@ -3140,23 +3132,23 @@ pub(super) async fn compute_page(
 
         // Decoded/re-read once per change here — not once per (definition,
         // change) — since every definition subscribed to this source
-        // evaluates the exact same row (issue #69): the image a change
+        // evaluates the exact same row: the image a change
         // carries, or the live re-read for an image-less recompute trigger,
         // doesn't depend on which definition is reading it. The `(None,
         // None)` shape — a bare recompute trigger with no image, the shape
         // every backfill enumeration produces — is collected instead of
         // re-read immediately, so every such key in this batch is fetched
         // in one [`read_live_rows_batch`] round trip rather than one
-        // round trip per key (issue #13). Every new image this source's
-        // changes need is decoded in one [`decode_images`] call (issue
-        // #327), not one round trip each.
+        // round trip per key. Every new image this source's
+        // changes need is decoded in one [`decode_images`] call,
+        // not one round trip each.
         //
-        // #1100: a definition on the group basis reads its changes' ring
+        // A definition on the group basis reads its changes' ring
         // rows in Phase 3 (`super::group_basis`), so it decodes and re-reads
         // nothing here.
         let mut group_shapes: Vec<Option<super::group_basis::GroupShape>> =
             Vec::with_capacity(defs.len());
-        // #1108: so does a `JOIN` (`super::join`).
+        // So does a `JOIN` (`super::join`).
         let mut joins: Vec<bool> = Vec::with_capacity(defs.len());
         for def in &defs {
             joins.push(matches!(def.def.key_space, KeySpace::Join(_)));
@@ -3166,7 +3158,7 @@ pub(super) async fn compute_page(
             .iter()
             .zip(&joins)
             .all(|(group, join)| group.is_some() || *join);
-        // #623 D6: so does a 1-1 definition's Re-derive, so a source read
+        // So does a 1-1 definition's Re-derive, so a source read
         // only by those re-reads nothing here either.
         let rederives_in_phase3 = defs.iter().zip(&group_shapes).all(|(def, group)| {
             group.is_some() || matches!(def.def.key_space, KeySpace::Join(_) | KeySpace::OneToOne)
@@ -3202,13 +3194,13 @@ pub(super) async fn compute_page(
         }
 
         for (def, group_shape) in defs.iter().zip(group_shapes) {
-            // #799: this definition's share, without the changes whose key
+            // This definition's share, without the changes whose key
             // is poisoned for it (parked above).
             let (changes, rows) = definition_share(def.id, &changes, &rows, &exclusions);
             if changes.is_empty() {
                 continue;
             }
-            // #1108: a `JOIN` takes each change's ring rows as they are,
+            // A `JOIN` takes each change's ring rows as they are,
             // routed to the side this source is; Phase 3 applies both sides'
             // (`super::join`).
             if matches!(def.def.key_space, KeySpace::Join(_)) {
@@ -3235,7 +3227,7 @@ pub(super) async fn compute_page(
                 }
                 continue;
             }
-            // #1100: an aggregate on the group basis takes each change's
+            // An aggregate on the group basis takes each change's
             // ring rows as they are; Phase 3 sums their sides
             // (`super::group_basis`).
             if let Some(shape) = group_shape {
@@ -3300,7 +3292,7 @@ pub(super) async fn compute_page(
                     .unzip()
             };
 
-            // Issue #121/#126: `pk` is this source's full (possibly
+            // `pk` is this source's full (possibly
             // composite) primary key — a `KeySpace::OneToOne` target's own primary
             // key now mirrors the source's in full, at whatever arity it
             // has, rather than narrowing to one column.
@@ -3315,7 +3307,7 @@ pub(super) async fn compute_page(
                 }
             };
 
-            // Reused across every change below (issue #68): `regexp_count`'s
+            // Reused across every change below: `regexp_count`'s
             // pattern is a validated string literal, so its compiled `Regex`
             // is the same for every row this definition evaluates, and
             // recompiling it per row would be wasted work at realistic row
@@ -3335,7 +3327,7 @@ pub(super) async fn compute_page(
                     field_names: field_names.clone(),
                     field_types: field_types.clone(),
                     records: Vec::new(),
-                    // The persisted, fully-qualified identity (issue #73)
+                    // The persisted, fully-qualified identity
                     // — not re-derived, since `def` (this source's own
                     // catalog `Definition`) already carries it. See
                     // `TargetPlan::qualified_target`'s doc comment.
@@ -3345,7 +3337,7 @@ pub(super) async fn compute_page(
                     rederive: Arc::clone(&rederive),
                 });
 
-            // #623 D6: an Apply evaluates its change's new image here —
+            // An Apply evaluates its change's new image here —
             // a delete when it has none. A Re-derive (a `recompute`, or a
             // change folded with one) is evaluated in Phase 3, from the
             // row it reads under the entry lock.
@@ -3389,7 +3381,7 @@ pub(super) async fn compute_page(
         );
     }
 
-    // Truncate clears (issue #60): for each truncated src_table, resolve its
+    // Truncate clears: for each truncated src_table, resolve its
     // targets via the catalog and record a full clear for each — the same
     // "resolve targets from the catalog" step the by-source loop above runs
     // per key, just once per truncated source instead of once per key.
@@ -3421,12 +3413,12 @@ pub(super) async fn compute_page(
         )
         .await?;
         for def in &defs {
-            // The floor the clear raises (#774, see the error's doc).
+            // The floor the clear raises (see the error's doc).
             let truncate_lsn = change.lsn.ok_or_else(|| ApplyError::TruncateWithoutLsn {
                 src_table: change.src_table.clone(),
             })?;
             match &def.def.key_space {
-                // #1110: a `JOIN` page clears what the truncate of its side
+                // A `JOIN` page clears what the truncate of its side
                 // empties, under its lock row (`super::join`).
                 KeySpace::Join(_) => {
                     let side = crate::defs::join::side_of_table(&def.def, &change.src_table)
@@ -3454,7 +3446,7 @@ pub(super) async fn compute_page(
                             earliest_origin(existing.origin_lsn, change.origin_lsn);
                         existing.truncate_lsn = existing.truncate_lsn.max(truncate_lsn);
                     } else {
-                        // Issue #385: the ungated `identity_key_columns`, not
+                        // The ungated `identity_key_columns`, not
                         // `source_primary_key`. The clear only renders this
                         // identity through `pk_key_sql_expr` (a `::text` of
                         // each column) to report cleared groups to the seam,
@@ -3462,8 +3454,8 @@ pub(super) async fn compute_page(
                         // `numeric` `GROUP BY` is still admitted, so the gate
                         // halted the instance on every such truncate. A
                         // chained reader can't depend on this key's text
-                        // being stable: #371 refuses to chain off an
-                        // aggregate whose identity fails the gate.
+                        // being stable: chaining off an aggregate whose
+                        // identity fails the gate is refused.
                         let pk = {
                             let client = pool.get().await?;
                             ddl::identity_key_columns(&**client, &def.target_table).await?
@@ -3474,7 +3466,7 @@ pub(super) async fn compute_page(
                             }
                             .into());
                         }
-                        // #1102: a group-basis target empties its hidden
+                        // A group-basis target empties its hidden
                         // table.
                         let state =
                             if super::group_basis::route(&def.def, &def.source_columns).is_some() {
@@ -3502,7 +3494,7 @@ pub(super) async fn compute_page(
                     }
                 }
                 KeySpace::OneToOne => {
-                    // Issue #121/#126: same full, un-narrowed primary key as
+                    // Same full, un-narrowed primary key as
                     // the by-source loop's identical `TargetPlan` construction
                     // above.
                     let target_pk = pk.clone();
@@ -3529,7 +3521,7 @@ pub(super) async fn compute_page(
             // A TRUNCATE is a genuine applied change to every direct
             // downstream target, same as a row-driven change — recorded
             // once per def per truncated source, mirroring the row-driven
-            // by_source loop above (issue #51/ADR-0009 decision 5).
+            // by_source loop above (ADR-0009 decision 5).
             buffer_transform_apply_metrics(
                 &def.def.target,
                 change,
@@ -3545,15 +3537,15 @@ pub(super) async fn compute_page(
     all_targets.extend(group_targets.keys());
     all_targets.extend(join_targets.keys());
     all_targets.extend(aggregate_clears.keys());
-    // Epic #49 cross-cutting review fix (issues #51/#52): only the
+    // Only the
     // terminal-filtered subset of `end_to_end_origins` survives into
     // `ApplyPlan` — flushed post-commit by `flush_apply_metrics`, not
     // recorded here.
     let mut terminal_end_to_end_origins: HashMap<String, Vec<std::time::SystemTime>> =
         HashMap::new();
     for target in all_targets {
-        // `target` is bare (`def.def.target`) — `schema_nodes` now keys on
-        // qualified identity (issue #74, ADR-0011), so a bare lookup here
+        // `target` is bare (`def.def.target`) — `schema_nodes` keys on
+        // qualified identity (ADR-0011), so a bare lookup here
         // would silently find nothing and permanently disable downstream
         // propagation for every chained transform.
         // `qualified_schema_node_key` resolves it the same way it resolves
@@ -3561,7 +3553,7 @@ pub(super) async fn compute_page(
         // that case, one step earlier: `target` is about to become such a
         // row's `src_table` the moment this loop's caller stages it).
         //
-        // Issue #267: that resolution is now *kept*, not discarded once the
+        // That resolution is now *kept*, not discarded once the
         // reader question is answered, and Phase 3 stages it verbatim as the
         // propagated row's `src_table`. Reusing the identity this lookup
         // already computed is what makes the emitted spelling agree, by
@@ -3589,7 +3581,7 @@ pub(super) async fn compute_page(
             .await?
             .is_empty();
         downstream_readers.insert(target.clone(), has_downstream.then_some(qualified_target));
-        // Issue #52/ADR-0009 decision 2: end-to-end latency is only ever
+        // ADR-0009 decision 2: end-to-end latency is only ever
         // recorded for a *terminal* transform — one with no downstream
         // reader of its own — reusing this exact "does anything read
         // `target`" lookup rather than a second one. An intermediate hop
@@ -3618,7 +3610,7 @@ pub(super) async fn compute_page(
     })
 }
 
-/// Epic #49 cross-cutting review fix (issues #51/#52): flushes `plan`'s
+/// Flushes `plan`'s
 /// buffered metrics observations — [`ApplyPlan::transform_observations`]
 /// into [`crate::metrics::record_transform_latency`]/
 /// [`crate::metrics::increment_changes_applied`], [`ApplyPlan::end_to_end_origins`]
@@ -3680,12 +3672,12 @@ const MAX_WRITE_PARAMS_PER_STATEMENT: usize = 60_000;
 /// Decodes one [`TargetWrite::pk_text`]/[`TargetDelete::pk_text`] (this
 /// crate's shared key-contract text, [`ddl::pk_key_sql_expr`]/
 /// [`ddl::join_pk_key`]) into the value of each of `pk`'s columns, via
-/// [`ddl::split_pk_key`] (issues #205 and #121), `None` for a `NULL` part.
+/// [`ddl::split_pk_key`], `None` for a `NULL` part.
 ///
 /// A `NULL` part is reachable only for a source keyed by a nullable unique
 /// index (an aggregate or `JOIN` target's `GROUP BY` columns), whose 1-1
-/// target is keyed `unique nulls not distinct` in turn (issue #1141,
-/// `ddl::target_table_ddl`): [`apply_target`] writes and matches it as a
+/// target is keyed `unique nulls not distinct` in turn
+/// (`ddl::target_table_ddl`): [`apply_target`] writes and matches it as a
 /// real SQL `NULL`, never as the sentinel text that encodes it.
 pub(super) fn decode_target_pk_parts(
     pk: &[PrimaryKeyColumn],
@@ -3710,9 +3702,9 @@ pub(super) fn pk_keyset_col(i: usize) -> String {
 /// how many keys it carries, well under Postgres's bind cap). The multi-
 /// column match [`apply_target`] needs once a composite (arity > 1) primary
 /// key means a plain `= any($1::text[]::cast[])` no longer identifies a row
-/// on its own (issue #121) — arity 1 keeps that simpler, pre-existing form
+/// on its own — arity 1 keeps that simpler, pre-existing form
 /// instead (see [`apply_target`]'s own arity branch). A column recompute
-/// used it at every arity (issue #377), since joining on the target's own
+/// used it at every arity, since joining on the target's own
 /// key columns is what lets its write-back use the index.
 pub(super) fn pk_keyset_unnest(pk: &[PrimaryKeyColumn], start: usize) -> String {
     let arrays: Vec<String> = pk
@@ -3739,7 +3731,7 @@ pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
 /// Whether a join of a keyset to a table keyed by `key` should also restrict
 /// the key's column to the keyset's own array (`t.<col> = any(<array>)`),
 /// which the join already implies: only when `key` is a single column. Every
-/// keyset join that takes such a bound asks here (#778, #790).
+/// keyset join that takes such a bound asks here.
 ///
 /// The bound caps the table's side of whatever join the planner picks at the
 /// keyset. Without it, a table analyzed while small and grown since is read
@@ -3769,7 +3761,7 @@ pub(super) fn pk_keyset_match(pk: &[PrimaryKeyColumn], alias: &str) -> String {
 /// settings always have an index to probe. Each composite statement
 /// among them has a plan test on a two-column key analyzed at 100 rows and
 /// grown to 400k or 1M, which counts the rows its scans actually read rather
-/// than the planner's estimates, and holds them to the batch (#791).
+/// than the planner's estimates, and holds them to the batch.
 /// [`apply_target`]'s composite delete runs without the settings: its
 /// `exists` probed the key's index once per key for 5,000 keys of a
 /// two-column key analyzed at 100 rows and grown to 1M or 3M, and of a
@@ -3806,8 +3798,8 @@ fn single_lock_statement(
 /// `super::ledger::ENTRY_PLAN_SETTINGS` (no sequential scan), and returns
 /// the locked rows in key order. While a target's statistics lag its size,
 /// PostgreSQL 16 prices an index scan for thousands of `= any` values so
-/// high that it read a 400k-row target in full and filtered it by the keys
-/// (#793); with the settings it probes the key's index. With fresh
+/// high that it read a 400k-row target in full and filtered it by the keys;
+/// with the settings it probes the key's index. With fresh
 /// statistics the planner already probes the index, and the settings leave
 /// that plan alone.
 async fn lock_single_keys(
@@ -3861,7 +3853,7 @@ async fn delete_single_keys(
     .await
 }
 
-/// [`apply_target`]'s pre-lock for a composite key (issue #121): the target
+/// [`apply_target`]'s pre-lock for a composite key: the target
 /// rows of a bound keyset relation ([`pk_keyset_unnest`] at `$1`), `select`ing
 /// `columns`, locked `for update of t` in key order. No one column's `=
 /// any(...)` test identifies a row of a composite key, so the pre-lock joins
@@ -3891,7 +3883,7 @@ fn composite_lock_statement(target_ident: &str, pk: &[PrimaryKeyColumn], columns
 /// alone hashed the keys against a sequential scan of the target: a
 /// two-column key at 1M rows analyzed at 100 took 133–167 ms on
 /// PostgreSQL 16 and 17, against 12–16 ms probing the key's index per key
-/// with the settings (#790). With fresh statistics the planner already
+/// with the settings. With fresh statistics the planner already
 /// probes per key, and the settings leave that plan alone.
 async fn lock_composite_keys(
     txn: &Transaction<'_>,
@@ -4092,8 +4084,8 @@ fn one_to_one_field_types(
         .collect())
 }
 
-/// A direct writer's Re-derive of 1-1 keys, outside a page (#623 D6): a
-/// field build's chunk over a 1-1 target (a column resume, #625 F8b,
+/// A direct writer's Re-derive of 1-1 keys, outside a page: a
+/// field build's chunk over a 1-1 target (a column resume,
 /// `staging::build`). Settled on the ledger as a page settles a Re-derive
 /// ([`settle_one_to_one_target`]). Built before the writer's transaction,
 /// since the source's key and columns are read through the pool.
@@ -4180,7 +4172,7 @@ impl DirectRederive {
 }
 
 /// Settles one 1-1 target's records on its ledger, in the page's
-/// transaction (#623 D6): locks the entries, reads and evaluates the
+/// transaction: locks the entries, reads and evaluates the
 /// Re-derives' rows, updates the entries, then writes the target rows of
 /// only the keys whose entry changed. See `super::one_to_one_ledger`.
 ///
@@ -4191,12 +4183,12 @@ impl DirectRederive {
 /// `first_seg` and `seg_seq` are the lowest and highest segments of the
 /// page's batches. A page whose first is at or below the target's
 /// `build_seg` re-derives every record instead of applying it, as a ledger
-/// target's page does (#733, `super::ledger::page_may_predate_build`): a
+/// target's page does (`super::ledger::page_may_predate_build`): a
 /// change committed before the target's Re-derive build started may have
 /// had a later change drained before the start, which never reached the
 /// target, and a key deleted that way has no source row for a chunk to
 /// find. A tombstone takes `seg_seq` as its `applied_seg`, or the
-/// Re-derive read's newest segment when that is newer (#742): the read is
+/// Re-derive read's newest segment when that is newer: the read is
 /// live, so it can see a later batch's delete, and a tombstone stamped below
 /// that batch could be collected while an older change in it is pending.
 async fn settle_one_to_one_target(
@@ -4242,7 +4234,7 @@ async fn settle_one_to_one_target(
     if by_key.is_empty() {
         return Ok((0, 0));
     }
-    // Planted bug (#557): #344/#392, apply every change without ADR-0002's
+    // Planted bug: apply every change without ADR-0002's
     // I2. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
     let predicate = !crate::plant::fires(
@@ -4280,7 +4272,7 @@ async fn settle_one_to_one_target(
         .map(|r| r.pk_text.as_str())
         .collect();
     // The entries' segment stamp: the page's latest segment, or the
-    // Re-derive read's when that is newer (#742, see `read_rows`).
+    // Re-derive read's when that is newer (see `read_rows`).
     let (mut read, snapshot, entry_seg) = if rederive_keys.is_empty() {
         (HashMap::new(), None, seg_seq)
     } else {
@@ -4345,7 +4337,7 @@ async fn settle_one_to_one_target(
     )
     .await?;
     changed.extend(inserted.applied);
-    // A placeholder nothing wrote doesn't outlive the page (#774).
+    // A placeholder nothing wrote doesn't outlive the page.
     let unwritten: Vec<&str> = inserted
         .keys
         .iter()
@@ -4388,17 +4380,17 @@ async fn settle_one_to_one_target(
 /// (as opposed to every key this batch merely *proposed* — the
 /// no-op-suppression `WHERE ... IS DISTINCT FROM ...` guard can mean a
 /// proposed write physically changes nothing) to `mutations`, with the
-/// key's prior image (issue #315, which subsumes #196's image-bearing
-/// delete). Returns only the counts.
+/// key's prior image (which covers an image-bearing delete). Returns only
+/// the counts.
 ///
 /// The pre-lock takes every key this call touches (write or delete) `FOR
 /// UPDATE`, ordered ascending, in one round trip — the deadlock-avoidance
 /// convention doc 05 calls for between concurrent workers writing
 /// overlapping target rows. At arity 1 it binds the whole key set as a
 /// single `text[]` parameter; a composite (arity > 1) key instead binds one
-/// typed array per column and joins the target to that bound keyset (issue
-/// #121). A key with a `NULL` part (a target over a nullable-keyed source,
-/// issue #1141) is locked and deleted by a statement per `NULL` pattern
+/// typed array per column and joins the target to that bound keyset.
+/// A key with a `NULL` part (a target over a nullable-keyed source)
+/// is locked and deleted by a statement per `NULL` pattern
 /// after the others ([`MatchKeys`]) —
 /// either way the parameter count is `O(pk.len())`, not `O(batch size)`, so
 /// — unlike the upsert below — it never approaches the bind-parameter cap
@@ -4408,10 +4400,10 @@ async fn settle_one_to_one_target(
 /// close: two transactions racing on overlapping keys still each take every
 /// lock, in the same ascending order, before either writes anything.
 ///
-/// Issue #56/ADR-0009 decision 3: the finest-grained span in the
+/// ADR-0009 decision 3: the finest-grained span in the
 /// propagation tree — one per consuming transform per batch, downstream of
 /// fold (`docs/observability.md`'s "Logs and traces" section), the exact
-/// same grouping #51's `buffer_transform_apply_metrics` observes its
+/// same grouping `buffer_transform_apply_metrics` observes its
 /// per-transform latency histogram from. `transform` (this target's own
 /// name — this crate's one "transform name," per
 /// `ApplyError::ColumnNotPaused`/`DefinitionNotLive`'s own `transform`
@@ -4444,15 +4436,15 @@ async fn apply_target(
     let arity = plan.pk.len();
     let pk_idents: Vec<String> = plan.pk.iter().map(|c| quote_ident(&c.name)).collect();
     let pk_col_list = pk_idents.join(", ");
-    // `plan.qualified_target` (issue #73's persisted identity), not a bare
+    // `plan.qualified_target` (the persisted identity), not a bare
     // `quote_ident(target)` — a target explicitly qualified into a
-    // non-default schema (issue #76) isn't necessarily on this connection's
+    // non-default schema isn't necessarily on this connection's
     // pinned `search_path`. See `TargetPlan::qualified_target`'s doc comment
     // and `ddl::qualified_target_table_ident`'s.
     let target_ident = ddl::qualified_target_table_ident(&plan.qualified_target);
     let field_idents: Vec<String> = plan.field_names.iter().map(|n| quote_ident(n)).collect();
 
-    // Issue #315: the pre-lock below doubles as the prior-image capture every
+    // The pre-lock below doubles as the prior-image capture every
     // changed key reports to `mutations` — see `staging::target_mutations`.
     // `None` (nothing reads this target) captures nothing.
     let prior_image_expr = mutations
@@ -4464,10 +4456,10 @@ async fn apply_target(
     };
     let lock_key_expr = ddl::pk_key_sql_expr(&plan.pk, Some("t"));
 
-    // Issue #205/#121: `write.pk_text`/`delete.pk_text` is this target's
+    // `write.pk_text`/`delete.pk_text` is this target's
     // shared key-contract text, not raw key values: decode each one through
     // `decode_target_pk_parts` before treating it as a key value (or a
-    // lock/match key) anywhere below. A `NULL` part (issue #1141) is a real
+    // lock/match key) anywhere below. A `NULL` part is a real
     // SQL `NULL` in the target's `unique nulls not distinct` key, written
     // as one and matched by `is null` (`MatchKeys`), never the sentinel text.
     let decoded_writes: Vec<Vec<Option<String>>> = plan_writes
@@ -4479,7 +4471,7 @@ async fn apply_target(
         .map(|d| decode_target_pk_parts(&plan.pk, target, &d.pk_text))
         .collect::<Result<_, _>>()?;
 
-    // Deduplicated lock keys (issue #205's decoded form, so a batch never
+    // Deduplicated lock keys (in their decoded form, so a batch never
     // locks the same physical row twice under two differently-encoded
     // spellings of the same key) — the actual lock *order* comes from each
     // branch's own `order by` below, not from this collection's order, so a
@@ -4502,7 +4494,7 @@ async fn apply_target(
         let keys: Vec<&str> = lock_keys.plain.iter().map(|p| p[0]).collect();
         lock_single_keys(txn, &target_ident, pk_ident, pk_cast, &lock_columns, &keys).await?
     } else {
-        // Issue #121: a composite key is matched against a bound keyset
+        // A composite key is matched against a bound keyset
         // relation instead; see `composite_lock_statement`.
         let arrays = transpose_pk_parts(arity, &lock_keys.plain);
         lock_composite_keys(txn, &target_ident, &plan.pk, &lock_columns, &arrays).await?
@@ -4592,7 +4584,7 @@ async fn apply_target(
             )
         };
 
-        // The composite key's own canonical identity text (issue #121) —
+        // The composite key's own canonical identity text —
         // what this statement's `RETURNING` reports as each written row's
         // key, matching `ddl::pk_key_sql_expr`'s row-identity encoding at any
         // arity (a bare `{col}::text` at arity 1, byte-identical to before
@@ -4642,7 +4634,7 @@ async fn apply_target(
     // that guarantee — the delete would now run against a snapshot that
     // already includes the write — so it's restored explicitly here
     // instead: never delete a key this same call just wrote. Compared as
-    // decoded keys (issue #205), encoded to one canonical text (issue #121)
+    // decoded keys, encoded to one canonical text
     // so a composite key compares as a whole tuple, not accidentally by its
     // first column alone, and a `NULL` part as itself.
     let write_keys: std::collections::HashSet<String> = writable
@@ -4656,7 +4648,7 @@ async fn apply_target(
             .iter()
             .filter(|k| !write_keys.contains(&ddl::encode_pk_key(&plan.pk, k))),
     );
-    // `t.`-qualified (issue #121: the composite branch's `exists (...)`
+    // `t.`-qualified (the composite branch's `exists (...)`
     // subquery below introduces a second relation into scope, so an
     // unqualified column reference would become ambiguous).
     let returning_pk_expr = ddl::pk_key_sql_expr(&plan.pk, Some("t"));
@@ -4675,7 +4667,7 @@ async fn apply_target(
             )
             .await?
         } else {
-            // Issue #121: a composite key has no single column an
+            // A composite key has no single column an
             // `= any(...)` array test could name, so the delete instead
             // matches any row whose full key tuple appears in a bound
             // keyset relation (a correlated `exists`, mirroring the
@@ -4711,7 +4703,7 @@ async fn apply_target(
         deleted.extend(rows.into_iter().map(|row| row.get::<_, String>(0)));
     }
 
-    // Issue #315: report every physically-changed key to the seam, with the
+    // Report every physically-changed key to the seam, with the
     // `hop_gen`/`src_changed` of the change that produced it and the prior
     // image the pre-lock captured (`None` for a key this call created). Keyed
     // by the key text the statements' `RETURNING` renders
@@ -4719,7 +4711,7 @@ async fn apply_target(
     // again (`ddl::encode_pk_key`), so it reaches the lookup in that one
     // canonical form whatever spelling it was staged in. A deleted row's
     // prior image is what lets a downstream aggregate find the group it left
-    // (issues #180/#196, now a recompute hint rather than a delta).
+    // (a recompute hint rather than a delta).
     let mut origin_of: HashMap<String, (i32, Provenance)> = HashMap::new();
     for (pk_text, hop_gen, src_changed, origin_lsn) in plan_writes
         .iter()
@@ -4756,13 +4748,13 @@ async fn apply_target(
     Ok((written.len(), deleted.len()))
 }
 
-/// A source `TRUNCATE`'s clear of one target (issue #60 for a 1-1 target,
+/// A source `TRUNCATE`'s clear of one target (every row of a 1-1 target,
 /// every group of an aggregate one): a plain `DELETE FROM <target>`, each
 /// removed row's key (in `pk`'s shared key-contract encoding,
 /// `ddl::pk_key_sql_expr` — for an aggregate target its `GROUP BY`
 /// columns) and, when something reads
-/// the target, its image reported to `mutations` as the key's prior image
-/// (issue #315). Returns how many rows it deleted.
+/// the target, its image reported to `mutations` as the key's prior image.
+/// Returns how many rows it deleted.
 pub(super) async fn clear_target(
     txn: &Transaction<'_>,
     qualified_target: &str,
@@ -4809,7 +4801,7 @@ pub(super) async fn clear_target(
 ///    at compute time. A mismatch means a definition changed mid-drain;
 ///    this returns [`ApplyError::VersionFenceMiss`] without writing
 ///    anything, for [`drain_once`] to retry against the reloaded catalog.
-/// 2. **Truncate clears** (issue #60), one plain `DELETE FROM <target>` per
+/// 2. **Truncate clears**, one plain `DELETE FROM <target>` per
 ///    [`ApplyPlan::clears`] entry, run *before* that target's own ordered
 ///    pre-lock + upsert/delete below: a truncate-bearing batch always seals
 ///    with `bucket_count = 1` (`seal::seal_phase2`) and is drained under
@@ -4820,12 +4812,12 @@ pub(super) async fn clear_target(
 ///    [`compute`]) survive, while anything the truncate is meant to erase
 ///    does not.
 /// 3. **The 1-1 targets on their ledgers** ([`settle_one_to_one_target`],
-///    #623 D6): the sorted entry lock, the Re-derive read, the entries'
+///    the sorted entry lock, the Re-derive read, the entries'
 ///    ADR-0002 I2 test, then the ordered pre-lock + upsert/delete of only
 ///    the keys it changed ([`apply_target`]).
 /// 4. **Downstream propagation**: every key a step above physically changed
 ///    (write or delete — no-op-suppressed writes don't count) was reported to
-///    a [`TargetMutations`] (issue #315); for every such target some `live`
+///    a [`TargetMutations`]; for every such target some `live`
 ///    definition reads, it stages an image-less `Recompute` at `hop_gen + 1`
 ///    carrying the key's prior image, enforcing [`MAX_HOP_GEN`] first. See
 ///    `staging::target_mutations` for why this seam, not CDC, is how a
@@ -4840,11 +4832,11 @@ pub(super) async fn clear_target(
 ///    means the claim was already gone — [`ApplyError::ClaimLost`].
 /// 6. A `pg_notify` on `wake_channel`, for anything awaiting convergence.
 ///
-/// A thin single-segment wrapper over [`apply_and_mark_drained_many`] (issue
-/// #63 Milestone 2) — every step below is shared verbatim with the
-/// multi-segment path; this function exists only to keep the pre-#63 public
-/// signature (and the every-`drain_once`-drains-exactly-one-segment
-/// contract every existing caller and test relies on) unchanged.
+/// A thin single-segment wrapper over [`apply_and_mark_drained_many`] —
+/// every step below is shared verbatim with the multi-segment path; this
+/// function exists only to keep the single-segment public signature (and
+/// the every-`drain_once`-drains-exactly-one-segment contract every
+/// existing caller and test relies on).
 pub async fn apply_and_mark_drained(
     txn: &Transaction<'_>,
     seg_seq: i64,
@@ -4862,8 +4854,8 @@ pub async fn apply_and_mark_drained(
     })
 }
 
-/// The [`apply_and_mark_drained`] steps generalized over `seg_seqs` — issue
-/// #63 Milestone 2's segment-coalescing seam. `plan` (Phase 2's output) was
+/// The [`apply_and_mark_drained`] steps generalized over `seg_seqs` — the
+/// segment-coalescing seam. `plan` (Phase 2's output) was
 /// computed once over every coalesced segment's *merged* folded changes
 /// ([`super::fold::merge_folded_changes`]), so steps 1-4 below (version
 /// fence, truncate clears, ordered writes, downstream propagation) already
@@ -4883,7 +4875,7 @@ pub async fn apply_and_mark_drained(
 /// etc. are shared across all of them, must never mix a truncate-bearing
 /// segment with any other (see [`next_claimable_segments`]'s barrier).
 ///
-/// Issue #56/ADR-0009 decision 3: the batch-level span in the propagation
+/// ADR-0009 decision 3: the batch-level span in the propagation
 /// tree's apply phase — parent of every [`apply_target`]/ledger apply span
 /// this call makes (one per
 /// consuming transform), since each of those runs inside this async fn's own
@@ -4905,7 +4897,7 @@ pub async fn apply_and_mark_drained_many(
     apply_page(txn, &steps, claimed_by, plan, wake_channel).await
 }
 
-/// How one segment's claim ends a Phase 3 transaction (issue #620 A2a).
+/// How one segment's claim ends a Phase 3 transaction.
 #[derive(Debug, Clone)]
 pub(crate) struct SegmentStep {
     pub(crate) seg_seq: i64,
@@ -4937,14 +4929,14 @@ pub(crate) struct PageClaim {
 /// [`ApplyError::VersionFenceMiss`] if any moved since the page read it.
 ///
 /// It takes them in table-name order (`versions` is ordered), the order a
-/// define, drop, resume or freeze bumps several fences in (issue #1314). A
+/// define, drop, resume or freeze bumps several fences in. A
 /// `JOIN` target's page holds both its tables' fences, and a `JOIN` define
 /// bumps both: a page that held the second while it queued on the first,
 /// behind a define that held the first, would close a cycle with it.
 ///
 /// `source_key` is the canonical (qualified, where resolvable) source
 /// identity `compute` keyed `versions` on, and
-/// `source_table_versions.source_table` is qualified (issue #72), so this
+/// `source_table_versions.source_table` is qualified, so this
 /// matches exactly — see `defs::source_table_version`, which reads the same
 /// row the same way.
 async fn hold_version_fences(
@@ -4973,8 +4965,8 @@ async fn hold_version_fences(
     Ok(())
 }
 
-/// [`apply_and_mark_drained_many`] with an explicit claim ending per segment
-/// (issue #620 A2a): a non-final page's transaction applies, checks the claim
+/// [`apply_and_mark_drained_many`] with an explicit claim ending per segment:
+/// a non-final page's transaction applies, checks the claim
 /// and advances the cursor; a final page's applies and completes. Everything
 /// before step 5 is the same either way.
 #[tracing::instrument(
@@ -4997,7 +4989,7 @@ pub(crate) async fn apply_page(
     // 1. Version fence.
     hold_version_fences(txn, &plan.versions).await?;
 
-    // 1b. Issue #16: park this batch's own folded contribution for every
+    // 1b. Park this batch's own folded contribution for every
     // already-poisoned key it's excluding, before the drained mark below —
     // "parked work is the source of truth" means every excluding batch must
     // do this itself, in the same transaction, not just the batch that
@@ -5012,7 +5004,7 @@ pub(crate) async fn apply_page(
 
     let mut keys_written = 0usize;
     let mut keys_deleted = 0usize;
-    // Issue #315: every target write below reports its physically-changed
+    // Every target write below reports its physically-changed
     // keys here, and step 4 turns them into downstream `Recompute` rows. See
     // `staging::target_mutations` — no writer hands its keys back to this
     // function, so none can skip propagation.
@@ -5037,10 +5029,10 @@ pub(crate) async fn apply_page(
 
     // 2b. Aggregate truncate clears: every group of an aggregate target
     // whose source was truncated, the same `clear_target` as step 2 over the
-    // target's `GROUP BY` key (issue #315: each cleared group reaches the
-    // seam, where it used to go unpropagated).
+    // target's `GROUP BY` key (each cleared group reaches the
+    // seam, so it propagates).
     for clear in plan.aggregate_clears.values() {
-        // #1102: a group-basis target's truncate empties its hidden table and
+        // A group-basis target's truncate empties its hidden table and
         // raises its truncate floor (the D split's Q6), then clears its
         // groups.
         match &clear.state {
@@ -5067,7 +5059,7 @@ pub(crate) async fn apply_page(
         .await?;
     }
 
-    // 3. The 1-1 targets on their ledgers (#623 D6), one at a time in
+    // 3. The 1-1 targets on their ledgers, one at a time in
     // target order, so every page and every direct writer takes their
     // entry locks in one order: see `settle_one_to_one_target`.
     let page_seg = steps.iter().map(|step| step.seg_seq).max().unwrap_or(0);
@@ -5086,7 +5078,7 @@ pub(crate) async fn apply_page(
         keys_deleted += deleted;
     }
 
-    // 3b. Aggregate targets on the group basis (#1100), in target order.
+    // 3b. Aggregate targets on the group basis, in target order.
     for group_plan in plan.group_targets.values() {
         let (written, deleted) =
             super::group_basis::apply_group_target(txn, group_plan, &mut mutations).await?;
@@ -5094,7 +5086,7 @@ pub(crate) async fn apply_page(
         keys_deleted += deleted;
     }
 
-    // 3c. `JOIN` targets (#1108), in target order.
+    // 3c. `JOIN` targets, in target order.
     for join_plan in plan.join_targets.values() {
         let (written, deleted) =
             super::join::apply_join_target(txn, join_plan, &mut mutations).await?;
@@ -5103,13 +5095,13 @@ pub(crate) async fn apply_page(
     }
 
     // 4. Downstream propagation, with the hop bound checked before staging
-    // anything. Issue #315: every key a write above physically changed, for
+    // anything. Every key a write above physically changed, for
     // every target some `live` definition reads, becomes one image-less
     // `Recompute` at `hop_gen + 1` carrying the key's prior image — see
     // `staging::target_mutations`. `lsn: None`, like every other row this
     // step stages: a propagated hop has no source LSN of its own. (A target
     // the seam feeds images for gets a CDC-shaped row with the write token
-    // as its `lsn` instead, issue #402.)
+    // as its `lsn` instead.)
     let propagation = mutations.into_staged(txn).await?;
     let recompute_changes = propagation.changes;
     let mut hop_bound_tables = propagation.hop_bound_tables;
@@ -5118,7 +5110,7 @@ pub(crate) async fn apply_page(
     if !hop_bound_tables.is_empty() {
         hop_bound_tables.sort();
         hop_bound_tables.dedup();
-        // Debug: the drain's halt (#663) logs the closure it pauses for it.
+        // Debug: the drain's halt logs the closure it pauses for it.
         crate::instance_log::debug!(
             hop_gen = worst_hop_gen,
             tables = ?hop_bound_tables,
@@ -5138,7 +5130,7 @@ pub(crate) async fn apply_page(
     }
     append::append(txn, &recompute_changes).await?;
 
-    // 4b. Issue #16: a clean drain clears the death counters for every key
+    // 4b. A clean drain clears the death counters for every key
     // it just applied (not the poisoned ones it parked above) — doc 06's
     // "clean drain clears counters for keys it applied."
     let retried = quarantine::clear_key_deaths(txn, &plan.applied_keys).await?;
@@ -5150,12 +5142,12 @@ pub(crate) async fn apply_page(
     // (each has its own `seg_claims` rows and `drained_mask`), unlike steps
     // 1-4 above, which already ran once for the whole coalesced batch.
     //
-    // Issue #620 A2a: a page that isn't its buckets' last instead checks the
+    // A page that isn't its buckets' last instead checks the
     // claim and advances their cursor. See `end_segment_step`.
     let mut segments_drained = Vec::with_capacity(steps.len());
     for step in steps {
         let batch_drained = end_segment_step(txn, step, claimed_by).await?;
-        // #817: the page commits, so its holdup goes with this transaction.
+        // The page commits, so its holdup goes with this transaction.
         super::holdup::clear(txn, step).await?;
         segments_drained.push((step.seg_seq, batch_drained));
     }
@@ -5164,7 +5156,7 @@ pub(crate) async fn apply_page(
     txn.execute("select pg_notify($1, '')", &[&wake_channel])
         .await?;
 
-    // Issue #166: every DML statement this Phase 3 pass will ever issue
+    // Every DML statement this Phase 3 pass will ever issue
     // against `txn` has now run (including the completion statement above,
     // which is what actually marks this claim's buckets drained, and the
     // `pg_notify` just above, whose payload Postgres won't actually deliver
@@ -5177,7 +5169,7 @@ pub(crate) async fn apply_page(
     // with `test-util` — see that function's doc comment.
     #[cfg(any(test, feature = "test-util"))]
     pause_before_commit_for_tests().await;
-    // Test-only pause point (#623 D1). See `super::interleave`.
+    // Test-only pause point. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     for target in plan
         .targets
@@ -5204,7 +5196,7 @@ pub(crate) async fn apply_page(
 /// Step 5 of [`apply_page`] for one segment: returns whether this
 /// transaction flipped the segment to `'drained'`.
 ///
-/// **A non-final page** (issue #620 A2a) runs the claim check, then advances
+/// **A non-final page** runs the claim check, then advances
 /// the cursor:
 ///
 /// - `update seg_claims set claimed_at = clock_timestamp() ... returning
@@ -5214,7 +5206,7 @@ pub(crate) async fn apply_page(
 ///   over an in-flight page, and the update doubles as a heartbeat. It stamps
 ///   the clock, not `now()`: `now()` is the transaction's start, so a page
 ///   whose apply ran for 20 s would commit a claim already 20 s old,
-///   overwriting the daemon's fresher refresh from mid-page (issue #654). A
+///   overwriting the daemon's fresher refresh from mid-page. A
 ///   reclaim that committed first deleted the row, so the update misses it; a
 ///   reclaim still in flight holds the row lock, so the update waits and then
 ///   misses it. Either way a stale claimant's page never commits, so no
@@ -5263,7 +5255,7 @@ async fn end_segment_step(
             return Err(claim_lost("a held bucket's claim is gone"));
         }
         if let Some(after) = &page.next {
-            // #856: a retry of a page whose `COMMIT` landed but whose reply
+            // A retry of a page whose `COMMIT` landed but whose reply
             // was lost. The claim update above waited for that commit, so
             // this statement sees its cursor.
             let at_this_page: i64 = txn
@@ -5306,7 +5298,7 @@ async fn end_segment_step(
     }
 
     // Lock the segment row before deleting any of its claims: the lock order
-    // `claim::claim` documents (issue #690). Deleting first, then waiting
+    // `claim::claim` documents. Deleting first, then waiting
     // here on a claim that holds the row, deadlocked with that claim's
     // insert waiting on this delete.
     let bucket_count: i16 = txn
@@ -5375,7 +5367,7 @@ async fn end_segment_step(
     ))
 }
 
-/// Issue #166 (a genuine `SIGKILL`-mid-drain test, not an in-process
+/// The hook for a genuine `SIGKILL`-mid-drain test (not an in-process
 /// simulation): a no-op unless the environment names a trigger file, in
 /// which case — only once that file actually exists — this blocks forever
 /// right after every write [`apply_and_mark_drained_many`]'s Phase 3 pass
@@ -5446,13 +5438,13 @@ pub struct ApplyOutcome {
     pub keys_written: usize,
     pub keys_deleted: usize,
     pub batch_drained: bool,
-    /// Issue #620: see [`ManyApplyOutcome::pages`].
+    /// See [`ManyApplyOutcome::pages`].
     pub pages: usize,
 }
 
 /// What one successful [`apply_and_mark_drained_many`] call did — the
-/// coalesced-segment counterpart to [`ApplyOutcome`] (issue #63 Milestone
-/// 2): the same physically-written/deleted key counts, now totalled across
+/// coalesced-segment counterpart to [`ApplyOutcome`]:
+/// the same physically-written/deleted key counts, now totalled across
 /// every segment this call drained from, plus each individual segment's own
 /// `(seg_seq, batch_drained)` completion result — a coalesced call can flip
 /// some of its segments to `'drained'` while leaving others still short a
@@ -5462,7 +5454,7 @@ pub struct ManyApplyOutcome {
     pub keys_written: usize,
     pub keys_deleted: usize,
     pub segments_drained: Vec<(i64, bool)>,
-    /// Issue #620: how many compute-and-apply transactions (pages) the drain
+    /// How many compute-and-apply transactions (pages) the drain
     /// committed. 1 when the share fit `drain_batch_cap`; at most
     /// ⌈share / cap⌉ when it didn't (a page can come out short, never over).
     /// One Phase 3 transaction is one page.
@@ -5479,7 +5471,7 @@ pub struct ManyApplyOutcome {
 /// definition churn), rather than retrying forever.
 const MAX_APPLY_ATTEMPTS: u32 = 5;
 
-/// How long one page keeps retrying lock timeouts (ADR-0002 I7, issue #621)
+/// How long one page keeps retrying lock timeouts
 /// before [`drain_batch`] surfaces the last one and the worker releases the
 /// claim. Each retry holds no transaction; the bound is on how long a worker
 /// sits on one page (and how long shutdown can wait for it), not on any
@@ -5494,7 +5486,7 @@ const LOCK_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
 /// failure.
 const TRANSIENT_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 
-/// [`drain_batch`]'s state for retrying transient failures (issue #621):
+/// [`drain_batch`]'s state for retrying transient failures:
 /// a backoff that doubles on each consecutive transient failure, and when
 /// the page's first lock timeout happened, for [`LOCK_RETRY_BUDGET`].
 #[derive(Debug, Default)]
@@ -5528,13 +5520,13 @@ impl TransientRetry {
 }
 
 /// [`crate::client::ClientOptions::drain_batch_cap`]'s default: the most
-/// folded records one drain batch holds at once (issue #620, ADR-0002). A
+/// folded records one drain batch holds at once (ADR-0002). A
 /// worker's peak memory is about this many changes' worth, whatever size the
 /// segment it drains grew to: ~0.8 GB across 8 workers at ~1 KB per
 /// image-less change, ~3.2 GB at ~4 KB per image-bearing one.
 pub const DEFAULT_DRAIN_BATCH_CAP: usize = 100_000;
 
-/// Test seams for [`drain_many_with_hooks`] (issue #620 A2a): the
+/// Test seams for [`drain_many_with_hooks`]: the
 /// exactly-once tests need a drainer stopped between two pages, and a
 /// drainer whose claim is taken away mid-page, without timing anything.
 /// Both default to off, which is what every production drain passes.
@@ -5555,7 +5547,7 @@ pub struct DrainHooks {
     /// Once page `n` (1-based) commits, end its session before the drain
     /// sees the commit succeed: a connection that drops after its COMMIT
     /// landed. The drain sees only the dropped connection, so it retries
-    /// the committed page (#856). Taken when it fires.
+    /// the committed page. Taken when it fires.
     pub lose_commit_reply_on_page: Option<usize>,
 }
 
@@ -5563,7 +5555,7 @@ pub struct DrainHooks {
 /// single-segment form of. Returns `Ok(None)` if this call's claim won (and
 /// already owned) nothing.
 ///
-/// Issue #56/ADR-0009 decision 3: the outermost span in the propagation
+/// ADR-0009 decision 3: the outermost span in the propagation
 /// tree's apply phase — parent, across however many retries and pages this
 /// call takes, of every [`compute`]/[`apply_and_mark_drained`] span (and,
 /// through those, every per-transform [`apply_target`] span). `attempt` is
@@ -5625,12 +5617,12 @@ pub async fn drain_many(
 }
 
 /// Claims this worker's share of `seg_seqs` and drains it, holding at most
-/// `drain_batch_cap` folded records at a time (issue #620 A2a).
+/// `drain_batch_cap` folded records at a time.
 ///
 /// **Phase 1, the claim**, is `CLAIM_SQL` per segment and a commit, nothing
 /// else. The fold used to share the claim's transaction, so every peer's
 /// `CLAIM_SQL` queued on the uncommitted `sealed -> draining` flip and
-/// `seg_claims` rows for the whole fold (#328). The fenced window is immutable
+/// `seg_claims` rows for the whole fold. The fenced window is immutable
 /// once fenced, so the fold needs no shared snapshot with the claim.
 ///
 /// **The direct path.** When no held bucket has a `drain_cursor` row and the
@@ -5657,7 +5649,7 @@ pub async fn drain_many(
 ///
 /// Returns `Ok(None)` if this call's claims won nothing at all.
 ///
-/// Issue #56/ADR-0009 decision 3: [`drain_once`]'s doc comment describes the
+/// ADR-0009 decision 3: [`drain_once`]'s doc comment describes the
 /// span this creates — same role, just parenting a coalesced batch's spans
 /// instead of a single segment's.
 #[tracing::instrument(
@@ -5809,7 +5801,7 @@ async fn drain_segments(
         return Ok(None);
     }
 
-    // #622 C6: a `schema_changed` marker pauses the definitions that read a
+    // A `schema_changed` marker pauses the definitions that read a
     // missing column before this drain computes anything they could apply.
     let held_seqs: Vec<i64> = held.iter().map(|share| share.seg_seq).collect();
     super::schema_change::pause_readers(pool, &held_seqs).await?;
@@ -6031,7 +6023,7 @@ async fn drain_batch(
     // choice for `poisoned_park`.
     let representative_seg_seq = steps[0].seg_seq;
 
-    // #703 R2: a primary key redefined since capture was installed pauses
+    // A primary key redefined since capture was installed pauses
     // the table's readers before this page computes anything for them.
     let tables: std::collections::BTreeSet<&str> =
         folded.iter().map(|c| c.src_table.as_str()).collect();
@@ -6047,7 +6039,7 @@ async fn drain_batch(
         let plan = match compute_page(pool, &folded, None, halt_retry.skip_frozen).await {
             Ok(plan) => plan,
             Err(ApplyError::SourceTableDropped { source_table }) => {
-                // Issue #16's one sanctioned exception to immutability: the
+                // The one sanctioned exception to immutability: the
                 // table this batch's folded rows name is gone, not any one
                 // row's fault, so no retry or per-key quarantine resolves
                 // it. Purge every ring/quarantine row naming it and retry
@@ -6093,7 +6085,7 @@ async fn drain_batch(
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
         let applied = match apply_page(&txn, steps, claimed_by, &plan, wake_channel).await {
-            // #856: COMMIT fails like any statement of the page does: a
+            // COMMIT fails like any statement of the page does: a
             // deferred constraint or constraint trigger an application put
             // on a target fires here, and a connection can drop here. Either
             // is classified like an `apply_page` failure, which isolation can
@@ -6136,7 +6128,7 @@ async fn drain_batch(
                 });
             }
             Ok(outcome) => {
-                // Epic #49 cross-cutting review fix (issues #51/#52): only
+                // Only
                 // flush `plan`'s buffered metrics now, once this attempt's
                 // transaction has actually committed — never from inside
                 // `compute` itself, which the loop above may have called
@@ -6145,7 +6137,7 @@ async fn drain_batch(
                 return Ok(outcome);
             }
             Err(err) => {
-                // Issue #670: isolation can run for many probes, each with
+                // Isolation can run for many probes, each with
                 // its own compute and pooled connection. Holding this page's
                 // plan and connection across it cost about 1.5x the page's
                 // plan in memory, and one pooled connection sitting idle for
@@ -6185,7 +6177,7 @@ async fn end_session(client: &impl GenericClient) -> ApplyError {
 
 /// Classifies `err` (per [`quarantine::classify`]) and either retries or
 /// propagates, shared by both [`drain_once`] and [`drain_many`]'s Phase 2
-/// and Phase 3 failure arms, the page's COMMIT included (#856), so a bad key
+/// and Phase 3 failure arms, the page's COMMIT included, so a bad key
 /// is attributed identically
 /// regardless of which phase — or which of the two orchestrators —
 /// first surfaced it.
@@ -6194,7 +6186,7 @@ async fn end_session(client: &impl GenericClient) -> ApplyError {
 /// transient failure, within [`MAX_APPLY_ATTEMPTS`]; a halt, see [`halt`];
 /// or an isolation that poisoned at least one key for the definition it
 /// fails in, which the retry's recompute leaves out of that definition's
-/// apply (#799).
+/// apply.
 /// `Err(_)` propagates `err` (or a probe's own halting error, once its halt
 /// paused nothing, see [`halt`]) unmodified, once retries are exhausted or
 /// the failure must never be retried at all —
@@ -6205,8 +6197,8 @@ async fn end_session(client: &impl GenericClient) -> ApplyError {
 /// "one charge per drain call").
 ///
 /// A failure surfaced while charging no key and pausing no definition is
-/// recorded as a drain holdup on `steps`' segments first (#817,
-/// [`super::holdup`]): a halt that paused nothing, isolation that reproduced
+/// recorded as a drain holdup on `steps`' segments first
+/// ([`super::holdup`]): a halt that paused nothing, isolation that reproduced
 /// nothing or hit its probe limit, and isolate-eligible retries exhausted.
 /// A transient failure, a lost claim, a fence miss and a below-threshold
 /// charge aren't.
@@ -6247,7 +6239,7 @@ async fn classify_and_retry(
 }
 
 /// How [`retry_or_surface`] surfaces a page's failure: whether it was
-/// charged to no one, and so is recorded as a drain holdup (#817).
+/// charged to no one, and so is recorded as a drain holdup.
 #[derive(Debug)]
 enum Surface {
     /// Surfaced as is: retries a transient failure or a fence miss ran out
@@ -6280,12 +6272,12 @@ async fn retry_or_surface(
     err: ApplyError,
 ) -> Result<(), Surface> {
     let attempt = *attempts;
-    // Issue #620 A2a: a lost claim is nobody's key's fault, and nothing in
+    // A lost claim is nobody's key's fault, and nothing in
     // this call can get it back. Isolating it would probe every record under
     // the same lost claim, reproduce `ClaimLost` for each, and charge every
     // key in the page a death. Surface it: the caller releases, and whoever
     // holds the buckets now resumes from the last committed cursor. Bare or
-    // wrapped (issue #670), as `classify` decides by the innermost error.
+    // wrapped, as `classify` decides by the innermost error.
     if quarantine::is_claim_lost(&err) {
         return Err(Surface::Plain(err));
     }
@@ -6310,7 +6302,7 @@ async fn retry_or_surface(
             }
             Ok(())
         }
-        // A lock wait that hit `lock_timeout` (ADR-0002 I7, issue #621):
+        // A lock wait that hit `lock_timeout`:
         // the page's transaction has rolled back, so it holds no snapshot
         // and no locks while it waits here. Back off and retry, keeping the
         // claim (the heartbeat daemon keeps it fresh), for up to
@@ -6343,7 +6335,7 @@ async fn retry_or_surface(
         }
         // Transient (serialization failure, deadlock, dropped connection,
         // statement timeout): retry, charge nothing, backing off on
-        // consecutive transient failures (issue #621) on a schedule of its
+        // consecutive transient failures on a schedule of its
         // own, so a fence miss between two doesn't reset it.
         quarantine::FailureClass::Transient => {
             if attempt >= MAX_APPLY_ATTEMPTS {
@@ -6369,11 +6361,11 @@ async fn retry_or_surface(
             Ok(())
         }
         // Halting schema diagnosis: never quarantine. Pause what it
-        // reaches and retry without it (#663).
+        // reaches and retry without it.
         quarantine::FailureClass::Halting => halt(pool, seg_seq, attempts, halt_retry, err).await,
         // Everything else: bisect the folded records down to the ones that
-        // fail alone to attribute the failure to specific key(s) (issue
-        // #655), evicting any past the death
+        // fail alone to attribute the failure to specific key(s),
+        // evicting any past the death
         // threshold and retrying without them. If nothing reproduces alone,
         // the error is surfaced, not blamed; if keys reproduce but none is
         // past the threshold yet, they are charged and the error is surfaced
@@ -6410,7 +6402,7 @@ async fn retry_or_surface(
                 Err(probe_err) => return Err(Surface::Plain(probe_err)),
             };
             match outcome {
-                // #799: the key is poisoned for the definition it fails in
+                // The key is poisoned for the definition it fails in
                 // only, so the retry recomputes the same records, and leaves
                 // the key out of that definition's apply alone.
                 quarantine::IsolationOutcome::Evicted { evicted, charged } => {
@@ -6469,7 +6461,7 @@ async fn retry_or_surface(
                     Err(Surface::Holdup(err))
                 }
                 // Warn: unlike `NothingReproduced`, part of the batch went
-                // unprobed, so a failing key may still be in it (issue #655).
+                // unprobed, so a failing key may still be in it.
                 quarantine::IsolationOutcome::ProbeLimitReached { probes } => {
                     crate::instance_log::warn!(
                         seg_seq,
@@ -6481,7 +6473,7 @@ async fn retry_or_surface(
                     Err(Surface::Holdup(err))
                 }
                 // Warn: a lock or deadlock storm stopped isolation before it
-                // could look at the batch (issue #670). Surfacing ends this
+                // could look at the batch. Surfacing ends this
                 // drain call, so the page is retried on a later drain rather
                 // than isolated again while the storm lasts. Retrying here
                 // instead would hold the claim through up to
@@ -6511,7 +6503,7 @@ async fn retry_or_surface(
     }
 }
 
-/// [`classify_and_retry`]'s halting arm (#663): pauses every definition the
+/// [`classify_and_retry`]'s halting arm: pauses every definition the
 /// halting failure `err` reaches ([`super::halt::halt_closure`]) and retries
 /// the page, whose recompute leaves them out. The retry is free, as for a
 /// dropped source: it runs without the failing input rather than repeating
@@ -6520,9 +6512,9 @@ async fn retry_or_surface(
 /// A halt that paused nothing (a peer paused the closure first, or the
 /// failure persists without one) retries once per [`drain_batch`] call, for
 /// the peer's case, then surfaces `err`, so the page can't spin. Nothing is
-/// charged, so it surfaces as a drain holdup (#817).
+/// charged, so it surfaces as a drain holdup.
 ///
-/// A refused read or write (`42501`, issue #766) also has every retry skip
+/// A refused read or write (`42501`) also has every retry skip
 /// the tables no unfrozen definition reads ([`HaltRetry::skip_frozen`]).
 async fn halt(
     pool: &Pool,
@@ -6556,17 +6548,17 @@ async fn halt(
         return Ok(());
     }
     // Paused nothing twice: a refused read or write the catalog pins on no
-    // table, say. Nothing is charged, so it is a holdup (#817).
+    // table, say. Nothing is charged, so it is a holdup.
     Err(Surface::Holdup(err))
 }
 
 /// What [`halt`] keeps across one [`drain_batch`] call's retries.
 #[derive(Debug, Default)]
 struct HaltRetry {
-    /// Whether this call has retried a halt that paused nothing (#663).
+    /// Whether this call has retried a halt that paused nothing.
     retried: bool,
-    /// Whether Postgres refused the drain a read or write (`42501`, issue
-    /// #766), so every later attempt skips the tables no unfrozen
+    /// Whether Postgres refused the drain a read or write (`42501`),
+    /// so every later attempt skips the tables no unfrozen
     /// definition reads ([`compute_page`]). The halt pauses the readers of
     /// the refused table, and the skip keeps the retry from reading it
     /// again.
@@ -6582,12 +6574,12 @@ struct HaltRetry {
 ///
 /// Only fenced segments come back. The seal decides a batch's
 /// `has_truncate`, `row_count` and `bucket_count` in the statement that
-/// publishes its fence (issue #598), so before that they are column defaults,
+/// publishes its fence, so before that they are column defaults,
 /// not the batch's. A segment returned here unfenced could be fenced by the
 /// time its caller claims it, with a truncate this query never saw, and be
 /// coalesced behind a predecessor the barrier says must drain first.
 ///
-/// The one exception is the truncate barrier (issue #60): a truncate is
+/// The one exception is the truncate barrier: a truncate is
 /// whole-keyspace, but drains are per-bucket, parallel, and — per the
 /// paragraph above — explicitly *not* ordered, so a truncate is a
 /// two-directional drain barrier. Predecessors must drain first (else an
@@ -6614,18 +6606,18 @@ pub async fn next_claimable_segment(
 }
 
 /// [`next_claimable_segment`] generalized to return several claimable
-/// segments at once (issue #63 Milestone 2), for [`drain_many`] to coalesce —
+/// segments at once, for [`drain_many`] to coalesce —
 /// the batch a burst of quickly-sealing segments needs so each one doesn't
 /// pay its own full compute-and-apply pass.
 ///
-/// Issue #620 A2a: bounded by `drain_batch_cap`, not a segment count. The
+/// Bounded by `drain_batch_cap`, not a segment count. The
 /// first segment always comes back, however large; the ones after it come
 /// back in ascending order while their `segments.row_count`s sum to at most
 /// the cap (an oversized first segment doesn't count against them: if peers
 /// hold all of it, this worker coalesces what follows instead of idling).
 /// [`drain_many`] then claims in order and stops at the first share that
 /// must page, so an oversized segment still drains alone. Row counts are
-/// ring rows over the whole fenced window (issue #598), never fewer than the
+/// ring rows over the whole fenced window, never fewer than the
 /// folded records they produce, so a coalesced batch's shares fit the cap by
 /// construction.
 ///

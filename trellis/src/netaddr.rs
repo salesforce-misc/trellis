@@ -1,7 +1,7 @@
 //! Postgres's **network-address** types — `inet`, `cidr`, `macaddr` and
-//! `macaddr8` (issue #116) — given the ordering, key/`GROUP BY`, and
+//! `macaddr8` — given the ordering, key/`GROUP BY`, and
 //! typed-literal roles `docs/type-support.md` marked in scope, on top of the
-//! passthrough classification issue #108 gave them.
+//! passthrough classification they already have.
 //!
 //! # Why there is no `ValueType::NetAddr`
 //!
@@ -11,8 +11,8 @@
 //!
 //! # The four families do *not* land the same way
 //!
-//! Checked against a live server per each of #111-#119's playbooks (never
-//! assumed from the type's name), the four diverge:
+//! Checked against a live server (never assumed from the type's name), the
+//! four diverge:
 //!
 //! ```text
 //!            join/PK/GROUP BY key
@@ -24,8 +24,7 @@
 //!
 //! ## `pg_cast`: `inet`/`cidr` share a second renderer; `macaddr`/`macaddr8` don't
 //!
-//! Per #119's playbook, the load-bearing check is `pg_cast`, not the type's
-//! name:
+//! The load-bearing check is `pg_cast`, not the type's name:
 //!
 //! ```sql
 //! select castsource::regtype, castfunc::regproc
@@ -43,8 +42,7 @@
 //! functions are already a bijection: every accepted input spelling
 //! (colon-, hyphen-, dot-grouped, or bare hex) normalizes to one canonical
 //! lowercase colon-separated form on output, verified live across all four
-//! input shapes. They join the allowlist exactly the way `bytea` did in
-//! #114.
+//! input shapes. They join the allowlist exactly the way `bytea` did.
 //!
 //! `inet` and `cidr` share **one** `pg_cast` row — `pg_catalog.text(inet)`,
 //! `prosrc = network_show` — reused for both source types because `cidr`'s
@@ -79,7 +77,7 @@
 //!   the same way `bytea`/`oid` did.
 //!
 //! `inet`'s `GROUP BY` key role is nonetheless admitted — the same split
-//! `boolean` got in #119, for the same mechanical reason: the group basis
+//! `boolean` got, for the same mechanical reason: the group basis
 //! (`staging::group_basis`) never compares a group key's text, it parses it
 //! into the column's native type, and `inet_in` is permissive enough to parse both
 //! spellings (`'192.168.1.5'` and `'192.168.1.5/32'`) back to the identical
@@ -100,17 +98,17 @@
 //! ```
 //!
 //! `to_jsonb` calls a value's own output function for every non-numeric,
-//! non-datetime scalar type (the same fact #114 established for `bytea`) —
+//! non-datetime scalar type (the same fact that holds for `bytea`) —
 //! it never goes through `pg_cast`'s `text(inet)` override, so for `inet` it
 //! *agrees with `inet_out`*, not with `<col>::text`. This is not a live
-//! hazard for Trellis today: issue #248's `staging::apply::row_as_text_jsonb_sql`
-//! replaced every bare `to_jsonb(t.*)` call site with an explicit per-column
-//! `<col>::text`, so nothing in the engine actually calls bare `to_jsonb`
+//! hazard for Trellis today: `staging::apply::row_as_text_jsonb_sql`
+//! renders every row with an explicit per-column
+//! `<col>::text` instead of a bare `to_jsonb(t.*)`, so nothing in the engine actually calls bare `to_jsonb`
 //! for a row body — the discrepancy above is bare-Postgres-`to_jsonb`
 //! trivia, not a second internal renderer to reconcile, the same conclusion
-//! #114 reached for `bytea`. It is recorded here because it is one more
+//! that holds for `bytea`. It is recorded here because it is one more
 //! confirmation that `inet_out` (⟵ CDC) and `<col>::text` (⟵ everything the
-//! engine itself renders, post-#248) are the two renderers actually in
+//! engine itself renders) are the two renderers actually in
 //! conflict, not `to_jsonb` and `<col>::text`.
 //!
 

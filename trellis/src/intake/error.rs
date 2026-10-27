@@ -31,7 +31,7 @@ pub enum IntakeError {
     DottedIdentifierComponent { component: String },
     /// A table the test harness enumerates has no identity key to stage its
     /// rows under: no primary key, and not an aggregate target with
-    /// grouping columns (issue #308).
+    /// grouping columns.
     NoIdentityKey { table: String },
     /// A `defs::catalog` lookup or build failed. Composed via `From` rather
     /// than flattened, matching

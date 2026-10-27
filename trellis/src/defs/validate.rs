@@ -1,4 +1,4 @@
-//! Validator for the 1-1 transform-definition subset (issue #23).
+//! Validator for the 1-1 transform-definition subset.
 //!
 //! Operates on the parsed [`TransformDef`] AST, independent of whether it
 //! came from [`super::parse`] or was hand-built (e.g. in tests), per the
@@ -10,7 +10,7 @@
 //! variant, so the exhaustive matches below are the "guard" — adding a
 //! variant to either enum without updating this module fails to compile.
 //! What genuinely needs runtime validation, because the AST *can* encode
-//! it, is column resolution, cycle detection, and (issue #63) type-checking.
+//! it, is column resolution, cycle detection, and type-checking.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -26,7 +26,7 @@ use crate::error_code::ErrorCode;
 use crate::integer::IntWidth;
 
 /// Which key a [`ValidationError::NondeterministicKeyCollation`] column
-/// belongs to (issue #638). Every one of them is matched by the engine as
+/// belongs to. Every one of them is matched by the engine as
 /// exact text: apply keys changes and target rows by the source's
 /// row-identity key, and an aggregate's group key is its `GROUP BY` values.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,15 +58,15 @@ pub enum ValidationError {
     /// (`super::ddl::MEMBERS_COLUMN`, an `AVG`'s `__{field}_sum`, a
     /// `SUM`'s `__{field}_count`). Without the reservation such a name could
     /// equal one of them, and install failed with a raw Postgres
-    /// duplicate-column error (issue #566).
+    /// duplicate-column error.
     ReservedFieldName { field: String },
     /// A `GROUP BY` key's target column name starts with
     /// `RESERVED_COLUMN_PREFIX` (see [`ValidationError::ReservedFieldName`]).
     /// `key` is the key as written, `column` the target column it would
     /// become.
     ReservedGroupByColumnName { key: String, column: String },
-    /// A 1-1 field is named after one of the source's primary key columns
-    /// (issue #566), whether it passes that column through (`id AS id`) or
+    /// A 1-1 field is named after one of the source's primary key columns,
+    /// whether it passes that column through (`id AS id`) or
     /// computes something else under its name. The target already carries
     /// every key column as its own key, so the field would declare the column
     /// a second time. Raised by `reject_primary_key_named_fields`, which the
@@ -83,8 +83,7 @@ pub enum ValidationError {
     FieldExpansionTooLarge,
     /// Adding a table-to-table dependency edge from a definition's source to
     /// its target would create a cycle in the two-level dependency graph
-    /// (issue #22 follow-up: cycle detection generalized from column-only,
-    /// within one `TransformDef`, to the whole graph of tables connected
+    /// (cycle detection runs over the whole graph of tables connected
     /// by `super::model::SchemaEdge`s — currently just `Source` edges, but
     /// checked generically over whatever edge kinds exist). Distinct
     /// from [`ValidationError::Cycle`], which names calculated *columns*
@@ -145,13 +144,13 @@ pub enum ValidationError {
     /// An aggregate in a deferred family (`MIN`/`MAX`, `bool_*`/`bit_*`,
     /// float or `interval` `SUM`/`AVG`, `array_agg`/`string_agg`/`jsonb_agg`).
     /// Only the aggregates the group basis keeps exact from signed deltas are
-    /// admitted (#1096 decision 1).
+    /// admitted.
     DeferredAggregate {
         function: String,
         family: &'static str,
     },
     /// `SUM`/`AVG` over an unconstrained `numeric` column, whose display
-    /// scale a running sum can't track (#1096 decision 2).
+    /// scale a running sum can't track.
     UnconstrainedNumericAggregate { function: String, column: String },
     /// `SUM`/`AVG` over a `numeric` column of a table Trellis creates (a
     /// target): Trellis creates its columns with no type modifier, so the
@@ -167,7 +166,7 @@ pub enum ValidationError {
     },
     /// The target's name ends with `suffix`, one of
     /// `super::ledger::RESERVED_TARGET_SUFFIXES`, which name the tables
-    /// Trellis keeps beside a target (a 1-1 target's ledger, #623 D2): this
+    /// Trellis keeps beside a target (a 1-1 target's ledger): this
     /// target would be one of another target's.
     ReservedTargetSuffix {
         target: String,
@@ -179,7 +178,7 @@ pub enum ValidationError {
     /// identifier limit and be silently truncated.
     TargetNameTooLong { target: String, max: usize },
     /// An operator was applied to an operand of the wrong `ValueType` —
-    /// e.g. `+` given a `Text` operand (issue #63: `+` stays Numeric-only,
+    /// e.g. `+` given a `Text` operand (`+` stays Numeric-only,
     /// no implicit string concatenation).
     TypeMismatch {
         field: String,
@@ -190,7 +189,7 @@ pub enum ValidationError {
     /// any width, or `numeric`) on the other. Postgres casts the exact side
     /// to `double precision`, so the comparison inherits float rounding;
     /// Trellis refuses the pair rather than admit a comparison that doesn't
-    /// compose (issue #1418).
+    /// compose.
     MixedFloatExactComparison {
         field: String,
         lhs: ValueType,
@@ -201,7 +200,7 @@ pub enum ValidationError {
     /// underflows to zero). Postgres raises `22003` for it at plan time.
     FloatComparisonLiteralOutOfRange { field: String, text: String },
     /// A function call's argument had the wrong `ValueType` for its
-    /// position (issue #64) — e.g. `octet_length(1)`. Distinct from
+    /// position — e.g. `octet_length(1)`. Distinct from
     /// [`ValidationError::TypeMismatch`] so the message can name the
     /// function and argument position; arity itself is a parser-time
     /// [`super::error::ParseError::FunctionArityMismatch`], since it needs
@@ -213,8 +212,7 @@ pub enum ValidationError {
         expected: ValueType,
         found: ValueType,
     },
-    /// `regexp_count`'s pattern argument was not a string literal (issue
-    /// #64/#65 follow-up). The pattern must be known at validate time so it
+    /// `regexp_count`'s pattern argument was not a string literal. The pattern must be known at validate time so it
     /// can be compiled and checked here, once, rather than re-parsed on
     /// every row at eval time — a column-sourced pattern is out of scope.
     NonLiteralRegexPattern { field: String },
@@ -225,7 +223,7 @@ pub enum ValidationError {
         pattern: String,
         error: String,
     },
-    /// A typed literal's text (issue #109) isn't in its family's **canonical**
+    /// A typed literal's text isn't in its family's **canonical**
     /// Postgres output spelling — `DATE '2024-1-5'`, `DATE 'today'`,
     /// `BYTEA '\xAB'`. See `super::typed_literal`'s module doc comment for
     /// why the bar is canonical form rather than "Postgres would parse it":
@@ -252,38 +250,36 @@ pub enum ValidationError {
     /// column that isn't a real source column.
     UnresolvedGroupByColumn { column: String },
     /// An `super::ast::KeySpace::Aggregate` definition's `GROUP BY` names a
-    /// column typed `ValueType::Other` (issue #108 review) — a Postgres
+    /// column typed `ValueType::Other` — a Postgres
     /// family the OID registry recognizes but that `docs/type-support.md`
     /// still lists as passthrough-only, with no key role.
     ///
     /// This is the `GROUP BY` twin of the check the two *other* key roles
     /// already make on the raw pg type name
     /// (`super::join_key_types::is_text_stable_join_key_type`, gating `JOIN`
-    /// keys and 1-1 primary keys, #107). A `GROUP BY` key is
+    /// keys and 1-1 primary keys). A `GROUP BY` key is
     /// matched by its `::text` rendering exactly like those are, so the same
     /// hazards apply and then some: `interval`'s native `=` holds
     /// `'1 day' = '24 hours'` while their renderings differ (two groups
     /// where Postgres's own `GROUP BY` has one), `money` renders under
     /// `lc_monetary`, and `json` has no `=` at all, so its key column can't
     /// even take the unique index the aggregate target needs. `bytea`
-    /// (issue #114) used to be another name on this list; it turned out not
+    /// used to be another name on this list; it turned out not
     /// to belong there — `byteaout` under the pinned `bytea_output = 'hex'`
     /// is a bijection with no session-GUC dependence at all, so it is
-    /// admitted below alongside `oid`, and `timestamptz` (issue #246) is a
+    /// admitted below alongside `oid`, and `timestamptz` is a
     /// second former name here now admitted the same way, once `TimeZone`
     /// was pinned identically on every connection Trellis opens rather than
     /// varying by session.
     ///
-    /// Nothing could reach this before #108 — an `Other`-typed column was
-    /// dropped from the validator's view entirely — so this gate only
-    /// narrows the surface that issue newly opened. The typed key index
+    /// The typed key index
     /// (`docs/type-support.md`'s "Cross-cutting concerns") is what lifts it
     /// per family.
     UnsupportedGroupByKeyType {
         column: String,
         value_type: ValueType,
     },
-    /// Two `GROUP BY` keys map to the same target column name (issue #519):
+    /// Two `GROUP BY` keys map to the same target column name:
     /// one key listed twice, or a `JOIN`'s `a.name` and `b.name`. A key's
     /// target column is named after its bare column, and the grammar has no
     /// `GROUP BY ... AS` alias yet, so the target DDL would declare that
@@ -308,15 +304,15 @@ pub enum ValidationError {
     /// another.
     AggregateOfAggregateField { field: String, reference: String },
     /// A field reads a bare name that is both a source column and another
-    /// field whose expression is not just that column (issue #830), outside
-    /// the one place #695 settled: an aggregate field's name inside another
+    /// field whose expression is not just that column, outside
+    /// the one place that reads the source column: an aggregate field's name inside another
     /// aggregate's argument, which reads the source column. A qualified
     /// `<table>.<column>` reads the source column; renaming the field is how
     /// to read the field.
     AmbiguousColumnReference(Box<AmbiguousColumnReference>),
     /// A qualified `<table>.<column>` or `<schema>.<table>.<column>`
-    /// reference names a table other than this definition's `FROM` table
-    /// (issue #830). `source` is the `FROM` table as the reference would
+    /// reference names a table other than this definition's `FROM` table.
+    /// `source` is the `FROM` table as the reference would
     /// have to spell it.
     QualifiedColumnNotFromSource {
         field: String,
@@ -338,31 +334,30 @@ pub enum ValidationError {
     /// matches the name of a real source column, but whose expression isn't a
     /// bare passthrough of that same column. Without this guard, a *different*
     /// field referencing that name would resolve it via `fields_by_name`
-    /// (issue #80's inter-field composition) and get the calculated value
+    /// (inter-field composition) and get the calculated value
     /// instead of the real column, with the alias unconditionally — and
     /// silently — shadowing the column. Mirrors
     /// [`ValidationError::GroupingColumnFieldMustBePassthrough`]'s guard for
     /// the `Aggregate` arm.
     CalculatedFieldShadowsSourceColumn { field: String },
     /// A column the engine matches as a key by its exact text has a
-    /// nondeterministic collation (issue #638): the source's row-identity key
+    /// nondeterministic collation: the source's row-identity key
     /// or a `GROUP BY` key. Such a collation's `=` (and so `GROUP BY` and a
     /// unique index) treats distinct strings as equal (`'A'` and `'a'` under a
     /// case-insensitive one), so Postgres would fold rows the engine keeps
     /// apart. The key-column twin of
     /// [`ValidationError::JoinNondeterministicCollation`], refused at define
-    /// time for the same reason (#590's decision: reject, never
-    /// reinterpret).
+    /// time for the same reason (reject, never reinterpret).
     NondeterministicKeyCollation(Box<NondeterministicKeyCollation>),
     /// A calculated field passes a column with a nondeterministic collation
-    /// to `STRPOS` or `REGEXP_COUNT` (issue #638's inline follow-up). Postgres
+    /// to `STRPOS` or `REGEXP_COUNT`. Postgres
     /// refuses both under such a collation (`0A000`: no substring search, no
     /// regular expressions), while the engine would compute a value from the
     /// exact text, so the engine and Postgres would disagree. Refused at
-    /// define time, as #590 decided for join and key columns.
+    /// define time, as for join and key columns.
     NondeterministicCollationTextFunction(Box<NondeterministicCollationTextFunction>),
     /// An explicitly-qualified `FROM <schema>.<table>` source reference
-    /// (issue #76, ADR-0011) named a schema that does not
+    /// (ADR-0011) named a schema that does not
     /// actually contain a table by that name, as introspected live against
     /// `information_schema.tables`
     /// (`super::catalog::confirm_qualified_source`). Distinct
@@ -374,7 +369,7 @@ pub enum ValidationError {
     QualifiedSourceTableNotFound { schema: String, table: String },
     /// The `TRANSFORM <target>` twin of
     /// [`ValidationError::QualifiedSourceTableNotFound`]: an explicitly-qualified
-    /// `TRANSFORM <schema>.<target>` reference (issue #76) named a schema
+    /// `TRANSFORM <schema>.<target>` reference named a schema
     /// that doesn't actually contain a table by that name. For the common
     /// `super::catalog::install_definition` path this schema is checked
     /// *after* the physical `CREATE TABLE` DDL already ran under the same
@@ -385,7 +380,7 @@ pub enum ValidationError {
     /// their caller already created the physical target table, this is the
     /// only check that a bogus explicit schema ever gets.
     QualifiedTargetTableNotFound { schema: String, table: String },
-    /// `STRING_AGG`'s separator is not a string literal (issue #293). The
+    /// `STRING_AGG`'s separator is not a string literal. The
     /// separator is fixed per definition so the ledger's contribution column
     /// is the value argument alone.
     StringAggSeparatorNotLiteral { field: String },
@@ -439,7 +434,7 @@ pub(crate) struct CollationRefusingRead {
 }
 
 /// Every column an argument of a `STRPOS`/`REGEXP_COUNT` call in `def`'s
-/// fields reads (issue #638's follow-up), for the catalog to check each
+/// fields reads, for the catalog to check each
 /// one's collation. In Postgres an argument's collation comes from the
 /// columns under it: directly, through `COALESCE`, or through another
 /// calculated field it references (whose expression Postgres would inline).
@@ -949,8 +944,8 @@ impl std::error::Error for ValidationError {}
 
 /// Validates `def` against the 1-1 subset. `source_columns` maps each
 /// column name known to exist on `def.source` to its [`ValueType`];
-/// resolving it against a real Postgres schema is out of scope here (see
-/// issue #23's report), so callers supply it explicitly.
+/// resolving it against a real Postgres schema is out of scope here, so
+/// callers supply it explicitly.
 pub fn validate(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
@@ -966,7 +961,7 @@ pub fn validate(
     validate_qualified_columns(def, source_columns, def.explicit_source_schema.as_deref())?;
 
     // Exhaustive matches: these are the "re-verify at this layer" guard for
-    // #22's already-enforced 1-1/TRUE-only constructs (see module docs).
+    // the already-enforced 1-1/TRUE-only constructs (see module docs).
     // `Aggregate` has real runtime checks (below), since — unlike the other
     // arm here — the AST can encode an invalid one.
     match &def.key_space {
@@ -974,7 +969,7 @@ pub fn validate(
         KeySpace::OneToOne => {
             for field in &def.fields {
                 // A calculated field aliased to a real source column's name
-                // must be a bare passthrough of it (issue #80) — the same
+                // must be a bare passthrough of it — the same
                 // shape the `Aggregate` arm below enforces for grouping
                 // columns. `is_self_passthrough`'s exemption in `infer_expr`/
                 // `eval_expr` only covers a field referencing its *own* name;
@@ -1005,7 +1000,7 @@ pub fn validate(
                     });
                 };
                 reject_unsupported_group_by_key_type(key, *value_type)?;
-                // Issue #519: each key becomes a target column named after
+                // Each key becomes a target column named after
                 // it, so a repeated key would reach the target DDL as a
                 // duplicate column. Checked after the key itself resolves,
                 // so an unknown column is reported as such rather than as a
@@ -1017,7 +1012,7 @@ pub fn validate(
                         column: key.clone(),
                     });
                 }
-                // Issue #566: a key's column sits beside the target's hidden
+                // A key's column sits beside the target's hidden
                 // `__`-prefixed columns, so it may not use their prefix.
                 if key.starts_with(RESERVED_COLUMN_PREFIX) {
                     return Err(ValidationError::ReservedGroupByColumnName {
@@ -1042,7 +1037,7 @@ pub fn validate(
                     });
                 }
             }
-            // Issue #830: ahead of the ungrouped-column check, which would
+            // Ahead of the ungrouped-column check, which would
             // otherwise report a bare read of a shadowing field as an
             // ungrouped source column.
             reject_ambiguous_names(def, source_columns)?;
@@ -1113,7 +1108,7 @@ pub fn validate(
             // `field_names.contains(&column)` would be true purely because
             // `column == field.name`, misclassifying an unresolvable column
             // as a self-dependency and producing a spurious cycle instead of
-            // `UnresolvedColumn` (issue #78).
+            // `UnresolvedColumn`.
             let is_a_different_calc_field = column != field.name && field_names.contains(&column);
             let is_calc_field = !is_self_passthrough && is_a_different_calc_field;
             if !is_source_column && !is_calc_field {
@@ -1153,7 +1148,7 @@ fn validate_target_names(def: &TransformDef) -> Result<(), ValidationError> {
         });
     }
 
-    // #623 D2: a 1-1 target has a ledger named `<target>__ledger` beside it.
+    // A 1-1 target has a ledger named `<target>__ledger` beside it.
     if let Some(suffix) = super::ledger::RESERVED_TARGET_SUFFIXES
         .into_iter()
         .find(|suffix| def.target.ends_with(suffix))
@@ -1170,7 +1165,7 @@ fn validate_target_names(def: &TransformDef) -> Result<(), ValidationError> {
         });
     }
 
-    // Issue #566: checked ahead of every per-key-space rule, so a reserved
+    // Checked ahead of every per-key-space rule, so a reserved
     // name is reported as such rather than as whatever shape error its
     // expression also happens to have.
     if let Some(field) = def
@@ -1255,7 +1250,7 @@ pub(crate) struct AggregateArg<'a> {
     pub trellis_target: bool,
 }
 
-/// The per-family refusal of #1096 decision 1: whether `function` (an
+/// The per-family refusal of aggregates outside the admitted set: whether `function` (an
 /// uppercased aggregate name) over `arg` is in the admitted set, `COUNT(*)`,
 /// `COUNT(col)`, and `SUM`/`AVG` over `smallint`/`integer`/`bigint`/
 /// `numeric(p,s)`, or else a named refusal. `arg` is `None` for `COUNT(*)`
@@ -1312,7 +1307,7 @@ pub(crate) fn check_aggregate_admitted(
 }
 
 /// Refuses a plain aggregate (`GROUP BY`) that calls
-/// an aggregate outside #1096 decision 1's admitted set, by family
+/// an aggregate outside the admitted set, by family
 /// ([`check_aggregate_admitted`]): the group basis keeps every aggregate
 /// definition, and has nothing for the rest. `columns` are the source's live
 /// columns, whose declared modifier tells a `numeric(p,s)` argument from an
@@ -1414,7 +1409,7 @@ fn written(column: &QualifiedColumn) -> String {
 /// and each field is a key passthrough or composes admitted aggregates
 /// (`COUNT(*)`, and `COUNT`/`SUM`/`AVG` of a column or an expression over
 /// one table's columns, per [`check_aggregate_admitted`]) with literals,
-/// operators and scalar functions (#1096 decision 1). An argument reading
+/// operators and scalar functions. An argument reading
 /// both tables is refused as [`ValidationError::JoinMixedSideArgument`].
 pub fn validate_join(
     def: &TransformDef,
@@ -1840,7 +1835,7 @@ pub(crate) fn join_field_value_type(
         .unwrap_or(ValueType::Numeric))
 }
 
-/// Checks every qualified [`Expr::SourceColumn`] in `def` (issue #830): it
+/// Checks every qualified [`Expr::SourceColumn`] in `def`: it
 /// names the `FROM` table, a schema that matches `source_schema` when one is
 /// known (written in the `FROM` clause, or resolved by the catalog), and a
 /// column the source has.
@@ -1902,8 +1897,8 @@ pub(crate) fn validate_qualified_columns(
         .try_for_each(|f| walk(&f.expr, &f.name, def, source_columns, source_schema))
 }
 
-/// Refuses a bare name that could mean either a source column or a field
-/// (issue #830): a name that is a source column and also a field whose
+/// Refuses a bare name that could mean either a source column or a field:
+/// a name that is a source column and also a field whose
 /// expression is not just that column (`(grp * 2) AS val` over a source with
 /// a `val` column), read by any other field.
 ///
@@ -1911,7 +1906,7 @@ pub(crate) fn validate_qualified_columns(
 /// * a field reading its own name reads the source column (`SUM(val) AS
 ///   val`), as it always has, since a field can't read itself;
 /// * an aggregate field's name inside another aggregate's argument is the
-///   source column (#695, [`aggregate_field_names`]).
+///   source column ([`aggregate_field_names`]).
 ///
 /// A field named after the column it passes through (`val AS val`) shadows
 /// nothing, so it is never the other meaning.
@@ -1983,11 +1978,11 @@ fn reject_ambiguous_names(
 }
 
 /// The name prefix reserved for the hidden columns Trellis keeps on a target
-/// table (issue #566). A user field or `GROUP BY` column may not start with it.
+/// table. A user field or `GROUP BY` column may not start with it.
 pub const RESERVED_COLUMN_PREFIX: &str = "__";
 
 /// Rejects any of a 1-1 definition's `fields` named after one of the
-/// source's `primary_key` columns (issue #566). The target already carries
+/// source's `primary_key` columns. The target already carries
 /// every key column as its own key, so such a field would be declared a second
 /// time, and install used to fail with a raw Postgres duplicate-column error.
 /// `id AS id` is refused too, not quietly treated as the key column: the
@@ -2040,7 +2035,7 @@ fn validate_aggregate_field_expr(
             }
             Ok(())
         }
-        // Issue #830: a qualified name is a source column even when a field
+        // A qualified name is a source column even when a field
         // has its name, so the same rule applies without the field lookup.
         Expr::SourceColumn { column, .. } => {
             let is_group_key = group_by.contains(column);
@@ -2098,7 +2093,7 @@ fn expr_is_group_by_key_passthrough(expr: &Expr, key: &str) -> bool {
 pub(super) fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
     match expr {
         Expr::Column(name) => out.push(name.clone()),
-        // Always a source column, never a read of a field (issue #830).
+        // Always a source column, never a read of a field.
         Expr::SourceColumn { .. } => {}
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
         Expr::BinaryOp { lhs, rhs, .. } => {
@@ -2200,7 +2195,7 @@ pub(crate) fn collect_reads(
             aggregate_args.push(name.clone());
         }
         Expr::Column(name) => fields.push(name.clone()),
-        // Always a source column, never a field (issue #830); `validate`
+        // Always a source column, never a field; `validate`
         // checks it names one through `validate_qualified_columns`.
         Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
@@ -2224,7 +2219,7 @@ pub(crate) fn collect_reads(
 /// operator's operands along the way. Reused by [`super::ddl`] to pick each
 /// target column's Postgres type, since a field's inferred type *is* its
 /// target column's declared type — this grammar has no separate "declare a
-/// target column's type" syntax (see issue #63's report).
+/// target column's type" syntax.
 ///
 /// Assumes `def`'s column references already resolved (this module's own
 /// [`validate`] checks that first) and that `def` is acyclic; a definition
@@ -2234,13 +2229,13 @@ pub(crate) fn collect_reads(
 /// Rejects an [`super::ast::KeySpace::Aggregate`] `GROUP BY` key whose
 /// column is typed [`ValueType::Other`] — see
 /// [`ValidationError::UnsupportedGroupByKeyType`] for why a key role needs
-/// more than #108's passthrough classification.
+/// more than the passthrough classification.
 pub(crate) fn reject_unsupported_group_by_key_type(
     column: &str,
     value_type: ValueType,
 ) -> Result<(), ValidationError> {
     match value_type {
-        // Issue #111: an exact integer's text rendering is canonical (no
+        // An exact integer's text rendering is canonical (no
         // leading zeros, no `+`, no whitespace), so it round-trips through
         // the still-text-keyed group-key path byte-for-byte — the same
         // property that already puts `smallint`/`integer`/`bigint` on
@@ -2249,11 +2244,11 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // `Numeric` is admitted here as it always has been, and that is
         // knowingly weaker: `1.0` and `1.00` are equal to Postgres but
         // distinct under `::text` matching, which is exactly why `numeric`
-        // is *rejected* as a `JOIN` key and as a primary key
-        // (#107). Tightening the `GROUP BY` gate to match belongs with the
-        // typed key index (#110), not here — see the note on issue #111.
+        // is *rejected* as a `JOIN` key and as a primary key.
+        // Tightening the `GROUP BY` gate to match belongs with the
+        // typed key index, not here.
         ValueType::Integer(_) | ValueType::Numeric | ValueType::Text | ValueType::Uuid => Ok(()),
-        // Issue #119: `boolean` was already admitted here (this arm
+        // `boolean` was already admitted here (this arm
         // predates the issue), and it is genuinely safe, but not for the
         // reason every other admission on this function is — this is the
         // one type where the *raw-text* premise the function's own error
@@ -2279,9 +2274,9 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // then matched natively, in SQL. Two renderings of one value always
         // resolve to the same group. `trellis/tests/defs_boolean.rs`'s
         // `a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two`
-        // pins it (issue #119).
+        // pins it.
         ValueType::Boolean => Ok(()),
-        // Issue #112: `real`/`double precision` are rejected outright, and
+        // `real`/`double precision` are rejected outright, and
         // this is a deliberate *tightening* — before the float split they
         // reached here as `ValueType::Numeric` and were waved through.
         //
@@ -2293,7 +2288,7 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // renderings, so a text-keyed `GROUP BY` would split one Postgres
         // group into two target rows, and the ADR-0013 self-check would
         // (correctly) report a divergence against a server-side `GROUP BY`.
-        // Admitting floats here is #110's typed key index to grant, by
+        // Admitting floats here is the typed key index's to grant, by
         // comparing decoded values through `crate::float::compare`; until
         // then, rejecting is the honest answer and `numeric` is the
         // steer-to. See `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`.
@@ -2301,13 +2296,13 @@ pub(crate) fn reject_unsupported_group_by_key_type(
             column: column.to_string(),
             value_type,
         }),
-        // `oid` is one `Other` family admitted as a key (issue #111):
+        // `oid` is one `Other` family admitted as a key:
         // Postgres renders it as canonical unsigned decimal, so it is
         // text-stable in exactly the way `interval` is not. It stays an
         // `Other` rather than joining `ValueType::Integer` because Postgres
         // gives it no arithmetic at all — see `pg_type::PgType::Oid`.
         ValueType::Other(PgType::Oid) => Ok(()),
-        // `bytea` is the other (issue #114), on the same "text-stability is
+        // `bytea` is the other, on the same "text-stability is
         // a property of the rendering, not the operator set" reasoning:
         // `byteaout` under the pinned `bytea_output = 'hex'` is a bijection
         // on every byte string, with no session-GUC dependence at all (see
@@ -2317,16 +2312,15 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // subset — so it is a plain admit rather than a call into a sibling
         // module.
         ValueType::Other(PgType::Bytea) => Ok(()),
-        // Issue #113: `date`, `timestamp`, `time`, `timetz` and (issue #246)
+        // `date`, `timestamp`, `time`, `timetz` and
         // `timestamptz` join `oid` on the same grounds, gated by
         // `crate::temporal`'s own per-family verdict rather than by a list
         // repeated here — see that module's doc comment for the live
         // evidence, and `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` for the
-        // join-key/PK half of the same decision. `timestamp` joined this
-        // arm for real once issue #248 fixed its render-consistency defect
-        // (it used to fall through to the reject arm below despite being
-        // named here); `timestamptz` needed both #248's fix *and* #246's —
-        // its rendering is `TimeZone`-dependent, so every renderer must pin
+        // join-key/PK half of the same decision. `timestamp` is admitted
+        // because its rendering is consistent across renderers;
+        // `timestamptz` additionally needs a pinned `TimeZone` — its
+        // rendering is `TimeZone`-dependent, so every renderer must pin
         // the same `TimeZone` (`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`,
         // pinned on the pool and in every capture function).
         //
@@ -2336,19 +2330,19 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // and render differently, so a text-matched `GROUP BY` would split
         // one Postgres group in two, exactly as a float `-0`/`0` key would.
         ValueType::Other(pg_type) if crate::temporal::is_text_stable(pg_type) => Ok(()),
-        // Issue #116: `cidr`/`macaddr`/`macaddr8` join `oid`/`bytea` above —
+        // `cidr`/`macaddr`/`macaddr8` join `oid`/`bytea` above —
         // each is on `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` (see that
         // constant's doc comment for the live `pg_cast`/renderer evidence),
         // and unlike the temporal families every value of each clears the
         // bar, not just a subset, so a plain admit is enough here too.
         ValueType::Other(PgType::Cidr | PgType::MacAddr | PgType::MacAddr8) => Ok(()),
         // `inet` is admitted here despite being deliberately *absent* from
-        // `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` — the same split issue #119
-        // gave `boolean`, for the same mechanical reason.
+        // `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` — the same split
+        // `boolean` has, for the same mechanical reason.
         //
         // `inet_out` (what a capture trigger's `format('%s', col)` writes
         // into the ring) and `network_show` (`<col>::text` — what this engine's
-        // own live reads use, post-#248) disagree on a bare-host `inet`
+        // own live reads use) disagree on a bare-host `inet`
         // value's spelling (`192.168.1.5` vs `192.168.1.5/32` — see
         // `crate::netaddr`'s module doc for the live grid), the identical
         // "one value, two renderers" shape that keeps `inet` off the
@@ -2359,7 +2353,7 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // back to the identical stored value (`'192.168.1.5'::inet =
         // '192.168.1.5/32'::inet` is `true`, verified live).
         ValueType::Other(PgType::Inet) => Ok(()),
-        // Issue #118: `bit varying` is safe here for a *different* reason
+        // `bit varying` is safe here for a *different* reason
         // than every arm above it — it isn't about `::text`-vs-native-`=`
         // rendering agreement at all. `bit`/`varbit` have no `pg_cast`
         // override the way `boolean` does (verified live; see
@@ -2402,7 +2396,7 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // escape hatch to reach for. `trellis/tests/defs_bit.rs` pins both
         // halves of this split live.
         ValueType::Other(PgType::VarBit) => Ok(()),
-        // Issue #115: `jsonb` falls through to the reject arm below like
+        // `jsonb` falls through to the reject arm below like
         // every other unlisted `Other` family, and — unlike `bit`/`oid`/
         // `bytea` — this is *not* a rendering-vs-key-order gap that turned
         // out to be already closed. `jsonb_out` genuinely does
@@ -2414,10 +2408,10 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // `double precision`'s `-0`/`0` and `interval`'s `'1 day'`/
         // `'24 hours'` have, discovered one type deeper. See
         // `crate::jsonb`'s module doc for the full live evidence. The
-        // unlock is #110's typed key index, same as `numeric`/`real`/
+        // unlock is the typed key index, same as `numeric`/`real`/
         // `double precision`/`timestamptz` above — not a jsonb-specific
         // mechanism.
-        // Issue #117: an enum type is safe here on *both* of this gate's two
+        // An enum type is safe here on *both* of this gate's two
         // independent hazard axes, unlike `bit`'s split above.
         //
         // Text-stability: `enumout` (what `<col>::text` calls — no `pg_cast`
@@ -2449,14 +2443,9 @@ pub(crate) fn reject_unsupported_group_by_key_type(
 /// [`GROUP_BY_KEY_TYPE_NAMES`] rendered for a user-facing error message, so
 /// the "supported GROUP BY key types are ..." list in
 /// [`ValidationError::UnsupportedGroupByKeyType`]'s `Display` cannot drift
-/// out of step with the allowlist it describes the way it did before issue
-/// #264 — the exact hand-maintained-second-copy failure mode issue #111
-/// already fixed for the join-key allowlist via
-/// [`super::join_key_types::supported_join_key_types`].
-///
-/// It had drifted: the message was missing `timestamp` (admitted since
-/// #248) and, after this week's #246/#254/#256/#258/#260/#261/#262 merges,
-/// `timestamptz`, `bytea`, `bit varying`, and the network-address types too.
+/// out of step with the allowlist it describes. A hand-maintained second copy
+/// of the list is the failure mode already avoided for the join-key allowlist
+/// via [`super::join_key_types::supported_join_key_types`].
 pub(crate) fn supported_group_by_key_types() -> String {
     GROUP_BY_KEY_TYPE_NAMES.join(", ")
 }
@@ -2471,19 +2460,19 @@ pub(crate) fn supported_group_by_key_types() -> String {
 /// checked against each other, deliberately, not assumed identical:
 ///
 /// * `numeric` and `boolean` are admitted *here* but refused as a
-///   `JOIN`/primary key (`numeric`: #107, its own text
-///   rendering isn't a `1.0`/`1.00` bijection; `boolean`: #119, a second
+///   `JOIN`/primary key (`numeric`: its own text
+///   rendering isn't a `1.0`/`1.00` bijection; `boolean`: a second
 ///   `pg_cast`-registered `::text` renderer disagrees with `boolout`). Both
 ///   are safe for this role for reasons specific to it — `boolean`'s
 ///   because the group basis (`staging::group_basis`) never does the raw-text
-///   comparison that trips it up elsewhere (issue #119).
+///   comparison that trips it up elsewhere.
 /// * `inet` is admitted here for the identical reason `boolean` is (its own
 ///   `network_show`-vs-`inet_out` split, closed the same way), but stays off
 ///   the join-key list.
 /// * Fixed-length `bit` is refused *here only*, for a DDL-only reason with
 ///   nothing to do with text-rendering: `ddl::create_aggregate_target_table`
 ///   would declare a brand-new `bit(1)` column from a bare `ValueType`,
-///   truncating any wider source column (issue #118's `VarBit` arm has the
+///   truncating any wider source column (the `VarBit` arm has the
 ///   live evidence). It is a perfectly good join/primary key, where the
 ///   role only ever reuses an already-existing column's own concrete type.
 ///
@@ -2538,8 +2527,8 @@ pub(crate) fn infer_field_types(
 
 /// The type of `expr`, a self-contained expression over the source row (no
 /// reference to another calculated field: a substituted field expression, or
-/// a part of one). The ledger types its contribution columns with it (#623
-/// D2): each is one aggregate call's argument.
+/// a part of one). The ledger types its contribution columns with it:
+/// each is one aggregate call's argument.
 pub(crate) fn infer_expr_type(
     expr: &Expr,
     source_columns: &HashMap<String, ValueType>,
@@ -2616,12 +2605,12 @@ fn infer_expr(
                 .copied()
                 .unwrap_or(ValueType::Numeric))
         }
-        // Issue #830: a qualified name is always the source column.
+        // A qualified name is always the source column.
         Expr::SourceColumn { column, .. } => Ok(source_columns
             .get(column)
             .copied()
             .unwrap_or(ValueType::Numeric)),
-        // Issue #111: an unadorned literal is typed exactly as Postgres's
+        // An unadorned literal is typed exactly as Postgres's
         // own lexer types it — `integer` if it fits, else `bigint`, else
         // (or if fractional) `numeric`. `eval::number_literal` is the
         // value-level twin of this rule and must agree with it.
@@ -2667,7 +2656,7 @@ fn infer_expr(
                 types,
                 in_progress,
             )?;
-            // Issue #111: operand admissibility *and* the result type both
+            // Operand admissibility *and* the result type both
             // come from `registry::operator_result_type`, which models
             // Postgres's family of `+`/`>` operators (`int4pl`,
             // `numeric_add`, and the implicit `int -> numeric` coercion
@@ -2742,7 +2731,7 @@ fn infer_expr(
                     in_progress,
                 )?;
                 if let Some(ct) = common_type {
-                    // Issue #111: `COALESCE`'s arguments used to have to be
+                    // `COALESCE`'s arguments used to have to be
                     // the identical `ValueType`. Splitting exact integers
                     // out of `Numeric` would otherwise have *newly rejected*
                     // `coalesce(int_col, numeric_col)` — and even
@@ -2779,7 +2768,7 @@ fn infer_expr(
             // just above.
             let aggregate_spec = super::registry::lookup_aggregate_function(name);
             let is_aggregate = aggregate_spec.is_some();
-            // An aggregate outside #1096 decision 1's admitted set is refused
+            // An aggregate outside the admitted set is refused
             // by family, before its argument is typed: the grammar parses
             // these names only to refuse them.
             if is_deferred_aggregate_name(name) {
@@ -2810,7 +2799,7 @@ fn infer_expr(
                 }
                 return Ok(ValueType::Numeric);
             };
-            // Issue #120: `COUNT` is special-cased ahead of the generic
+            // `COUNT` is special-cased ahead of the generic
             // per-argument loop below, for both its accepted shapes —
             // `COUNT(*)` (`args` empty) and `COUNT(<expr>)` (`args` one
             // element). `AGGREGATE_FUNCTION_SPECS`'s `COUNT` row declares
@@ -2849,7 +2838,7 @@ fn infer_expr(
                     types,
                     in_progress,
                 )?;
-                // Issue #111: a `Numeric`-declared *aggregate* argument now
+                // A `Numeric`-declared *aggregate* argument now
                 // means "any exact-numeric type" — `SUM`/`AVG`/`MIN`/`MAX`
                 // accept every exact-integer width as well as `numeric`, and
                 // the result type depends on which one
@@ -2857,11 +2846,11 @@ fn infer_expr(
                 // argument list stays an exact match: all four of those take
                 // `Text`, and Postgres would not coerce an integer into one.
                 let admissible = if is_aggregate && *expected == ValueType::Numeric {
-                    // Issues #111/#112: a `Numeric`-declared *aggregate*
+                    // A `Numeric`-declared *aggregate*
                     // argument means "any numeric type", floats included —
                     // Postgres has a `sum`/`avg`/`min`/`max` for `real` and
                     // `double precision` just as it does for the exact
-                    // types. Issue #113 widened it past the numeric family
+                    // types. It extends past the numeric family
                     // entirely (`MIN`/`MAX` over the temporal types,
                     // `SUM(interval)`), at which point "what does this
                     // aggregate accept?" and "what does it return?" are one
@@ -2871,7 +2860,7 @@ fn infer_expr(
                     // could teach one of the two and not the other.
                     super::registry::aggregate_result_type(name, arg_t).is_some()
                 } else if is_aggregate && matches!(name.as_str(), "BIT_AND" | "BIT_OR") {
-                    // Issue #118: `bit_and`/`bit_or` accept *two* distinct
+                    // `bit_and`/`bit_or` accept *two* distinct
                     // `ValueType::Other` families (`PgType::Bit` and
                     // `PgType::VarBit`) — Postgres genuinely has both
                     // `bit_and(bit)` and an implicit `bit varying -> bit`
@@ -2941,7 +2930,7 @@ fn number_literal_type(text: &str) -> ValueType {
 }
 
 /// The type two operands unify to, mirroring Postgres's own implicit
-/// coercions *within the exact-numeric family* (issue #111): two integers
+/// coercions *within the exact-numeric family*: two integers
 /// unify to the wider width, and any mix with `numeric` unifies to
 /// `numeric`. `None` for anything outside that family, or for two genuinely
 /// different types — this is deliberately not a general coercion lattice,
@@ -2955,7 +2944,7 @@ fn common_numeric_type(a: ValueType, b: ValueType) -> Option<ValueType> {
         return None;
     }
     Some(match (a, b) {
-        // Issue #112. `COALESCE` resolves through Postgres's
+        // `COALESCE` resolves through Postgres's
         // `select_common_type`, which is *not* the same algorithm operator
         // overload resolution uses, and the difference is visible: a live
         // server types `coalesce(1::real, 1::numeric)` (and
@@ -3138,7 +3127,7 @@ mod tests {
         // `x`'s only reference is to `x` itself, and `x` is not a source
         // column — the field's own name matching the referenced name is
         // coincidental (the bare-passthrough idiom), not evidence that this
-        // is "another calculated field" to depend on (issue #78): a field
+        // is "another calculated field" to depend on: a field
         // is never "another" calculated field relative to itself, so this
         // must resolve as an unknown column rather than a self-cycle.
         let d = def(vec![FieldDef {
@@ -3185,7 +3174,7 @@ mod tests {
 
     #[test]
     fn a_calc_field_named_after_a_real_column_must_be_a_bare_passthrough() {
-        // Issue #80's exact shape: `total_posted_words` is a calculated-field
+        // The exact shape: `total_posted_words` is a calculated-field
         // alias, but a real source column of the same name also exists. A
         // third field (not exercised here, since this alone is already
         // rejected) referencing that name would otherwise silently resolve
@@ -3210,7 +3199,7 @@ mod tests {
 
     #[test]
     fn a_calc_field_bare_passthrough_of_a_same_named_column_is_still_allowed() {
-        // The self-passthrough idiom (issue #36) must remain legal: a field
+        // The self-passthrough idiom must remain legal: a field
         // named after a real column, whose expression is exactly that
         // column, is unambiguous and carries no shadowing risk.
         let d = def(vec![FieldDef {
@@ -3304,7 +3293,7 @@ mod tests {
         assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
-    /// Issue #108 review: a `GROUP BY` key is matched by its `::text`
+    /// A `GROUP BY` key is matched by its `::text`
     /// rendering, so a `ValueType::Other` column — passthrough-only per
     /// `docs/type-support.md`, with no key role yet — must be rejected here
     /// rather than silently become a text-matched key. `interval` is the
@@ -3312,23 +3301,20 @@ mod tests {
     /// render differently, so a text-matched key would split one real group
     /// into two and diverge from the Postgres oracle.
     ///
-    /// Nothing could reach this before #108 (an `Other`-typed column never
-    /// made it into `source_columns` at all), so this only narrows that
-    /// issue's newly opened surface — the two other key roles already gate
-    /// on `join_key_types::is_text_stable_join_key_type`.
+    /// The two other key roles already gate on
+    /// `join_key_types::is_text_stable_join_key_type`.
     #[test]
     fn an_other_typed_column_is_rejected_as_an_aggregate_group_by_key() {
-        // Issue #118: `PgType::Bit` (fixed-length) is deliberately in this
+        // `PgType::Bit` (fixed-length) is deliberately in this
         // refusal list even though `PgType::VarBit` right next to it is
         // admitted — see this function's own `VarBit` arm for the DDL-only
         // reason (not a text-rendering one) the two split. `PgType::TimestampTz`
-        // used to be here too, until issue #246 pinned `TimeZone` everywhere
-        // `DateStyle` was already pinned — see `defs_temporal.rs`'s live
-        // coverage for its new admitted status.
+        // is admitted because `TimeZone` is pinned everywhere `DateStyle`
+        // is — see `defs_temporal.rs`'s live coverage.
         for pg_type in [
             PgType::Interval,
             PgType::Json,
-            // Issue #115: `jsonb` genuinely has canonical, sorted key
+            // `jsonb` genuinely has canonical, sorted key
             // order (unlike `interval`/`timestamptz`'s outright rendering
             // hazards), but an embedded number's scale is not
             // renormalized — see `crate::jsonb`'s module doc and
@@ -3367,12 +3353,9 @@ mod tests {
         }
     }
 
-    /// Issue #264: `UnsupportedGroupByKeyType`'s `Display` impl used to
-    /// name a second, hand-maintained copy of this gate's admission list
-    /// ("numeric, text, boolean, uuid, oid, date, time and timetz") that had
-    /// drifted stale — missing `timestamp` (admitted since #248) and, after
-    /// #246/#254/#256/#258/#260/#261/#262, `timestamptz`, `bytea`, `bit
-    /// varying`, and the network-address types too.
+    /// `UnsupportedGroupByKeyType`'s `Display` impl must not name a
+    /// second, hand-maintained copy of this gate's admission list that can
+    /// drift stale.
     ///
     /// This test drives [`reject_unsupported_group_by_key_type`] directly
     /// with one representative value per type family it actually
@@ -3382,7 +3365,7 @@ mod tests {
     /// checks that [`supported_group_by_key_types`]'s rendering names
     /// exactly the families that came back `Ok`. A future admission change to that
     /// function that isn't mirrored in [`GROUP_BY_KEY_TYPE_NAMES`] fails
-    /// here, the same drift guard #111 gave the sibling join-key message.
+    /// here, the same drift guard the sibling join-key message has.
     #[test]
     fn unsupported_group_by_key_type_message_matches_the_real_admission_list() {
         const DEMO_ENUM: PgType = PgType::Enum("enum:public.demo_enum");
@@ -3461,7 +3444,7 @@ mod tests {
                 GROUP_BY_KEY_TYPE_NAMES.contains(name),
                 "{name} is admitted by reject_unsupported_group_by_key_type but is missing \
                  from GROUP_BY_KEY_TYPE_NAMES, so UnsupportedGroupByKeyType's message would \
-                 no longer name every type it should — the exact drift issue #264 fixed"
+                 no longer name every type it should — the exact drift this test guards against"
             );
         }
         // Split on the join separator rather than a raw substring `contains`
@@ -3481,7 +3464,7 @@ mod tests {
     }
 
     /// The counterpart to the above: an `Other`-typed column is still a
-    /// perfectly good bare *passthrough* field (#108's actual scope) — only
+    /// perfectly good bare *passthrough* field — only
     /// the key role is gated.
     #[test]
     fn an_other_typed_column_passthrough_is_still_accepted() {
@@ -3779,7 +3762,7 @@ mod tests {
 
     #[test]
     fn greater_than_admits_a_bare_number_literal_against_a_float() {
-        // #1418: Postgres casts an untyped literal to `double precision`
+        // Postgres casts an untyped literal to `double precision`
         // when it meets a float (`explain verbose select r > 0.5` shows
         // `r > '0.5'::double precision`), so a *bare* literal is admitted in
         // either order and stays compared as a float. The same value in a
@@ -3887,8 +3870,8 @@ mod tests {
     #[test]
     fn boolean_target_field_from_greater_than_is_accepted() {
         // A calculated field whose final expression type is Boolean must be
-        // storable, not just intermediate — issue #65's "boolean target
-        // column" requirement.
+        // storable, not just intermediate (a "boolean target
+        // column").
         let d = def(vec![FieldDef {
             name: "is_positive".to_string(),
             expr: Expr::BinaryOp {
@@ -3982,7 +3965,7 @@ mod tests {
         assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
-    /// Issue #120: `COUNT(<column>)` in a `GROUP BY` definition — counting
+    /// `COUNT(<column>)` in a `GROUP BY` definition — counting
     /// non-null occurrences of a specific column, unlike `COUNT(*)` — parses
     /// and validates, typed `bigint` (`Integer(Int8)`), matching Postgres's
     /// own `count(x)`.
@@ -4190,7 +4173,7 @@ mod tests {
 
     #[test]
     fn a_field_named_like_an_aggregate_targets_hidden_columns_is_rejected() {
-        // Issue #566: each of these named one of the hidden columns the
+        // Each of these named one of the hidden columns the
         // aggregate target DDL adds (`__{field}_count`, `__{field}_sum`,
         // then `__trellis_members`), so validation passed and install then
         // failed with a raw `42701 column specified more than once`.
@@ -4223,7 +4206,7 @@ mod tests {
 
     #[test]
     fn a_target_named_like_a_ledger_or_too_long_for_one_is_rejected() {
-        // #623 D2: `t__ledger` is `t`'s ledger, and a name past 55 bytes gives
+        // `t__ledger` is `t`'s ledger, and a name past 55 bytes gives
         // a ledger name Postgres would truncate.
         let columns = numeric_columns(&["g", "x"]);
         let err = validate(
@@ -4308,7 +4291,7 @@ mod tests {
 
     #[test]
     fn a_field_named_after_a_primary_key_column_is_rejected() {
-        // Issue #566: the target already carries the key column, so a field of
+        // The target already carries the key column, so a field of
         // the same name, a bare passthrough or not, would declare it twice.
         for text in [
             "TRANSFORM t FROM s SELECT id AS id, amount AS amount",
@@ -4357,10 +4340,11 @@ mod tests {
         }
     }
 
-    /// Issue #638's follow-up: every column under a `STRPOS`/`REGEXP_COUNT`
+    /// Every column under a `STRPOS`/`REGEXP_COUNT`
     /// argument is reported, directly, through `COALESCE` and through another
-    /// field, each once and attributed to the field that makes the call. `CHAR_LENGTH`/`OCTET_LENGTH` don't depend
-    /// on collation and report nothing.
+    /// field, each once and attributed to the field that makes the call.
+    /// `CHAR_LENGTH`/`OCTET_LENGTH` don't depend on collation and report
+    /// nothing.
     #[test]
     fn collation_refusing_reads_follow_coalesce_and_fields() {
         let d = parsed(
@@ -4405,7 +4389,7 @@ mod tests {
         assert_eq!(collation_refusing_function_reads(&d), vec![]);
     }
 
-    /// Issue #695: inside an aggregate's argument, an aggregate field's name is
+    /// Inside an aggregate's argument, an aggregate field's name is
     /// the source column, so its collation is the one checked.
     #[test]
     fn collation_refusing_reads_in_an_aggregate_argument_name_the_source_column() {
@@ -4419,7 +4403,7 @@ mod tests {
         );
     }
 
-    /// Issue #695: inside an aggregate's argument, a field's name that matches
+    /// Inside an aggregate's argument, a field's name that matches
     /// a source column reads the source column, so the definition validates
     /// and `lo` has the source column's type, not the sum's.
     #[test]
@@ -4498,7 +4482,7 @@ mod tests {
         assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
-    // Issue #830: a bare name that is both a source column and a field whose
+    // A bare name that is both a source column and a field whose
     // expression is something else is refused at define; a qualified
     // `<table>.<column>` reads the source column.
 
@@ -4584,7 +4568,7 @@ mod tests {
         assert_eq!(validate(&d, &numeric_columns(&["id", "val"])), Ok(()));
     }
 
-    /// #695: an aggregate field's name inside another aggregate's argument is
+    /// An aggregate field's name inside another aggregate's argument is
     /// the source column, so it isn't ambiguous; nor is a field reading its
     /// own name (`SUM(val) AS val`).
     #[test]
@@ -4756,7 +4740,7 @@ mod tests {
         assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
-    /// A 1-1 field can't shadow a source column at all (issue #80), so a 1-1
+    /// A 1-1 field can't shadow a source column at all, so a 1-1
     /// field reading a shadowing alias is refused at the alias; the qualified
     /// name reads the column in a 1-1 definition too.
     #[test]
@@ -4773,7 +4757,7 @@ mod tests {
         assert_eq!(validate(&d, &source_columns), Ok(()));
     }
 
-    // ---- JOIN validation (#1106) ----
+    // ---- JOIN validation ----
 
     use crate::defs::parser::parse as parse_text;
 
@@ -4874,7 +4858,7 @@ mod tests {
 
     #[test]
     fn join_greater_than_refuses_a_float_against_an_exact_aggregate() {
-        // #1418: a JOIN's fields are typed by the same rule as a 1-1's. A
+        // A JOIN's fields are typed by the same rule as a 1-1's. A
         // float aggregate is refused there, even against a typed float literal.
         let err = check("orders.region AS region, SUM(items.qty) > DOUBLE PRECISION '1' AS x")
             .unwrap_err();
@@ -4951,7 +4935,7 @@ mod tests {
         );
     }
 
-    /// #1096 decision 1 on a plain aggregate: every deferred family is
+    /// A plain aggregate: every deferred family is
     /// refused by name and issue, `SUM`/`AVG` over an unconstrained `numeric`
     /// (a column, or any `numeric` expression) is refused with the "declare a
     /// scale" remedy, and the admitted set, expression arguments and
@@ -5181,7 +5165,7 @@ mod tests {
             ),
             (("bit varying(5)", 1562, 5), ("bit varying(8)", 1562, 8)),
             // Two lengths of `bit` never hold equal values, so they pair and
-            // match nothing (ADR-0020 rule 6 over #1261 rule 5).
+            // match nothing (ADR-0020 rule 6).
             (("bit(5)", 1560, 5), ("bit(8)", 1560, 8)),
             (("bit(5)", 1560, 5), ("\"bit\"", 1560, -1)),
         ] {

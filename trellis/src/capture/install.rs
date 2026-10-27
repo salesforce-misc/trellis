@@ -1,5 +1,5 @@
-//! Installs, widens, narrows and uninstalls one table's capture triggers
-//! (#622 C3), and reads back what is installed.
+//! Installs, widens, narrows and uninstalls one table's capture triggers,
+//! and reads back what is installed.
 //!
 //! The staging worker's reconcile pass ([`super::reconcile`], C5) computes
 //! each captured table's [`CaptureSpec`] from the catalog
@@ -39,7 +39,7 @@
 //! queues readers of the table for up to 50 ms. A late drop only costs
 //! capture writes nobody reads, so it retries the same way.
 //!
-//! # Waiting, never cancelling (#622 plan Q1)
+//! # Waiting, never cancelling
 //!
 //! Every lock holder is waited out, an autovacuum included: nothing here
 //! cancels or terminates a backend. (Postgres itself cancels an autovacuum
@@ -59,7 +59,7 @@
 //! its backend type; its lock mode; since when; and the start of its query).
 //! The reconcile pass retries on its next pass and records the report in
 //! `capture_holdups`, where `Trellis::status` reports it as a waiting
-//! definition's `capture_wait` (Q5, #687). Without a deadline an operation waits until it
+//! definition's `capture_wait`. Without a deadline an operation waits until it
 //! lands. While it retries, it logs the blockers at most every five seconds.
 //!
 //! `pg_stat_activity` shows another role's backend only to a superuser or a
@@ -139,7 +139,7 @@
 //!   evaluating them would be the cheaper wait, but apply had no
 //!   per-definition horizon, and every consumer path (1-1, aggregate,
 //!   `JOIN`) would need one.
-//!   That is D's ledger (#623), not C's.
+//!   That is D's ledger, not C's.
 //! - **A seal after the widen** would bound the pre-widen rows to the
 //!   batches up to the widen's, but a batch drained doesn't mean every row in
 //!   it did (`poison_held`, re-staged reverses), and a phase-gap straggler
@@ -149,7 +149,7 @@
 //!
 //! What the gate costs: a new definition waits for the table's pending
 //! changes to drain before its build starts, normally one seal and drain.
-//! A key held in `poison_held` doesn't hold the gate (#799): it is held for
+//! A key held in `poison_held` doesn't hold the gate: it is held for
 //! the definitions that hold it, never for the new one, and its release
 //! re-derives it from the live row rather than replaying its images.
 //!
@@ -212,9 +212,9 @@
 //!
 //! # What is installed
 //!
-//! The catalog is the only record (#622 plan Q9): the triggers in
+//! The catalog is the only record: the triggers in
 //! `pg_trigger`, and each function's spec in its `COMMENT ON FUNCTION`
-//! ([`sql::comment_text`]). `pg_dump` carries both (#644), and there is no
+//! ([`sql::comment_text`]). `pg_dump` carries both, and there is no
 //! Trellis table to disagree with them. [`installed`] reads them back, and
 //! also compares each function's source with what this build generates, so
 //! a function an older generator left behind is replaced.
@@ -222,10 +222,10 @@
 //! Nothing else this module writes is installed state. The capture gate is
 //! a row of its own ([`super::gate`]) that goes when no pending change holds
 //! it. A [`LockWait`] is returned;
-//! the reconcile pass records the latest one per table in `capture_holdups`
-//! (#687), which describes other sessions, not what is installed.
+//! the reconcile pass records the latest one per table in `capture_holdups`,
+//! which describes other sessions, not what is installed.
 //!
-//! # The Trellis role (#622 plan Q3)
+//! # The Trellis role
 //!
 //! One role does everything Trellis does: it owns the ring (and the
 //! instance schema, unless a DBA pre-created it, below), runs the migrations
@@ -234,7 +234,7 @@
 //!
 //! - **On each captured table, ownership or membership in the owning
 //!   role.** `CREATE TRIGGER` needs the `TRIGGER` privilege, but `ALTER TABLE
-//!   … ENABLE ALWAYS TRIGGER` needs ownership (#622 plan finding 3), and
+//!   … ENABLE ALWAYS TRIGGER` needs ownership, and
 //!   membership in the owner counts as ownership.
 //! - **No superuser.** Nothing here signals a backend, and reading the
 //!   blockers needs no privilege (`pg_read_all_stats` only makes other
@@ -250,7 +250,7 @@
 //! TO` in the same transaction, and a session that isn't a member fails
 //! there, loudly, instead of installing functions that can't write.
 //!
-//! The schema's owner is not a stand-in for the ring's (issue #701). A DBA
+//! The schema's owner is not a stand-in for the ring's. A DBA
 //! can pre-create the schema as one role and have a login role that is a
 //! member of it run the migrations: `create schema if not exists` keeps the
 //! DBA's role as the schema's owner, while the ring belongs to the login
@@ -1123,7 +1123,7 @@ async fn attempt(
         )
         .await?
         .get(0);
-    // The definitions an install rebuilds (#625 F7), for the build segment
+    // The definitions an install rebuilds, for the build segment
     // below.
     let mut rebuilt = Vec::new();
     // An install that only adds nodes new to a captured root's tree leaves the
@@ -1205,7 +1205,7 @@ async fn attempt(
             txn.batch_execute(&statement).await?;
         }
     }
-    // #703: the columns capture images from here on, as they are now.
+    // The columns capture images from here on, as they are now.
     match op {
         Op::Install {
             spec, scope, last, ..
@@ -1213,7 +1213,7 @@ async fn attempt(
             if last {
                 super::baseline::record(&txn, table, spec.columns()).await?;
             }
-            // #707, #1200: the triggers of the tables this install made them
+            // The triggers of the tables this install made them
             // on, as it made them, whether or not it is the last of several.
             let covers = match scope {
                 Scope::All => super::triggers::Covers::Whole,

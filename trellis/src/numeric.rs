@@ -1,5 +1,5 @@
 //! A minimal arbitrary-precision decimal sufficient to reproduce Postgres
-//! `numeric` addition exactly (issue #24).
+//! `numeric` addition exactly.
 //!
 //! Postgres `numeric` is base-10, arbitrary precision, with no binary-float
 //! equivalent in Rust `std` — `f64` would introduce rounding Postgres never
@@ -138,7 +138,7 @@ impl Numeric {
         }
     }
 
-    /// Postgres `numeric` comparison (issue #65's `>` needs it): aligns both
+    /// Postgres `numeric` comparison (the `>` operator needs it): aligns both
     /// operands to a common scale, the same way [`Self::add`] does, then
     /// compares magnitudes, accounting for sign.
     pub fn compare(&self, other: &Numeric) -> Ordering {

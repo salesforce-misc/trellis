@@ -1,4 +1,4 @@
-//! Quarantine (issue #16, stage 06's other half): isolate, evict, park,
+//! Quarantine (stage 06's other half): isolate, evict, park,
 //! release. See docs/staging-and-claiming/06-cleanup-and-reclaim.md's
 //! "Quarantine" section (the design this module implements) and
 //! docs/decisions/0003-quarantine-storage-and-api.md (storage shape,
@@ -17,7 +17,7 @@
 //! **Isolation and eviction** ([`isolate_and_evict`]) is what turns "a
 //! non-transient failure happened" into "this specific key is the cause, in
 //! this definition's apply" — never the other way around. Whole-key poison
-//! is per transform (#799): an evicted key is left out of the apply of the
+//! is per transform: an evicted key is left out of the apply of the
 //! definition it fails in, and every other definition reading it keeps
 //! applying it. **Parking** ([`park_batch_contribution`]) is what keeps a
 //! poisoned key's *later* changes held for that definition while it's
@@ -81,7 +81,7 @@ pub const DEFAULT_COLUMN_DEATH_THRESHOLD: i32 = DEFAULT_DEATH_THRESHOLD;
 /// tier"): another sibling of [`DEFAULT_DEATH_THRESHOLD`] and
 /// [`DEFAULT_COLUMN_DEATH_THRESHOLD`], same value, named separately for the
 /// same independent-tunability reason those two document. This one counts
-/// *distinct keys poisoned for one definition* (#799) — see
+/// *distinct keys poisoned for one definition* — see
 /// `quarantine_if_crossed` — rather than repeated attempts
 /// against one key or distinct poisoned rows for one `(transform, column)`
 /// pair.
@@ -100,7 +100,7 @@ pub enum FailureClass {
     /// Reload the schema and retry; back off on consecutive misses only.
     VersionFenceMiss,
     /// Never quarantine. The drain pauses every definition the failure
-    /// reaches, and the rest of the batch commits (`staging::halt`, #663).
+    /// reaches, and the rest of the batch commits (`staging::halt`).
     Halting,
     /// Everything else: isolate before blaming (see [`isolate_and_evict`]).
     Isolate,
@@ -123,7 +123,7 @@ pub enum FailureClass {
 /// loop — which is itself what "once every predecessor has drained" reduces
 /// to when there is no separate signal to wait on.
 ///
-/// **The innermost [`ApplyError`] decides (issue #670).** An `ApplyError`
+/// **The innermost [`ApplyError`] decides.** An `ApplyError`
 /// can nest another on its [`std::error::Error::source`] chain, as
 /// `ApplyError::Backfill(BackfillError::Propagation(Box<ApplyError>))` does
 /// when a backfill's downstream propagation fails. The wrapper says only
@@ -136,7 +136,7 @@ pub fn classify(err: &ApplyError) -> FailureClass {
         ApplyError::HopBoundExceeded { .. } | ApplyError::GroupBasisUnsupported { .. } => {
             FailureClass::Halting
         }
-        // A truncate the drain can't raise a floor for (#774) is no key's
+        // A truncate the drain can't raise a floor for is no key's
         // fault: every page holding it reproduces it.
         ApplyError::TruncateWithoutLsn { .. } => FailureClass::Halting,
         // Both of these mean "this definition can never work against this
@@ -146,17 +146,15 @@ pub fn classify(err: &ApplyError) -> FailureClass {
         // table is simply gone" (`drain_once` special-cases
         // `ApplyError::SourceTableDropped` before classification ever runs)
         // — what's left is a real primary key shape (no primary key at all)
-        // or type `ddl::source_primary_key` cannot use (issue #107), which
+        // or type `ddl::source_primary_key` cannot use, which
         // every key touching that source reproduces identically alone.
         // Isolating it would charge, and eventually evict, every such key
         // one at a time for a failure none of them individually caused. A
-        // composite (multi-column) primary key used to be a third such
-        // structural rejection here too, before issue #121 taught every 1-1
-        // consumer to key on the source's full primary key rather than
-        // narrowing it to one column.
+        // composite (multi-column) primary key is not one: every 1-1
+        // consumer keys on the source's full primary key.
         ApplyError::Ddl(DdlError::NoPrimaryKey { .. })
         | ApplyError::Ddl(DdlError::UnsupportedPrimaryKeyType { .. }) => FailureClass::Halting,
-        // Issue #766: Postgres refused the drain's role a read or write, for
+        // Postgres refused the drain's role a read or write, for
         // row-level security (every Trellis session runs with `row_security
         // = off`, so a statement the policies would filter raises instead)
         // or for a missing privilege. Either says something about the role
@@ -196,7 +194,7 @@ pub(super) fn is_claim_lost(err: &ApplyError) -> bool {
 }
 
 /// Whether `err` is a transient Postgres or pool failure, whichever
-/// [`ApplyError`] variant wraps it (issue #653). The drain reaches the same
+/// [`ApplyError`] variant wraps it. The drain reaches the same
 /// deadlock or dropped connection through `ApplyError::Db`, through a nested
 /// module's error (`StagingError::Db` from `append::append`,
 /// `CatalogError::Db`, `DdlError::Db`, ...), and through a pool checkout
@@ -212,7 +210,7 @@ pub(super) fn is_claim_lost(err: &ApplyError) -> bool {
 /// (waiting for a free connection, creating one, or recycling one) is
 /// transient too, since it is load or a briefly unreachable server, not
 /// anything a record did. So is [`ApplyError::LedgerEntryCollected`], a
-/// ledger entry lock that lost a key to the tombstone GC (#712), whose
+/// ledger entry lock that lost a key to the tombstone GC, whose
 /// retry finds the key gone and inserts it afresh.
 fn is_transient(err: &ApplyError) -> bool {
     is_transient_error(err)
@@ -220,7 +218,7 @@ fn is_transient(err: &ApplyError) -> bool {
 
 /// [`is_transient`] over any error's [`std::error::Error::source`] chain, for
 /// a caller whose error isn't an [`ApplyError`]: a backfill chunk's
-/// (`defs::chunk_queue::fail_chunk`, #616) is classified by the same rule.
+/// (`defs::chunk_queue::fail_chunk`) is classified by the same rule.
 pub(crate) fn is_transient_error(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(err) = link {
@@ -260,7 +258,7 @@ pub(crate) fn is_insufficient_privilege(err: &(dyn std::error::Error + 'static))
 
 /// The SQLSTATE of the first [`tokio_postgres::Error`] on `err`'s
 /// [`std::error::Error::source`] chain, if it has one: what `poison.sqlstate`
-/// records for a held key (#824), so [`release_retyped_keys`] can tell a
+/// records for a held key, so [`release_retyped_keys`] can tell a
 /// value that didn't fit a column (`22003`) from any other failure.
 pub(crate) fn sqlstate_of(err: &(dyn std::error::Error + 'static)) -> Option<String> {
     let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
@@ -279,7 +277,7 @@ pub(crate) fn sqlstate_of(err: &(dyn std::error::Error + 'static)) -> Option<Str
 /// a SQLSTATE at all), which is exactly the "dropped connection" case doc 05
 /// lists alongside the coded ones.
 ///
-/// Plus `53300` (too many connections, issue #670): the server refused a new
+/// Plus `53300`: the server refused a new
 /// connection because `max_connections`, or a role's or database's
 /// connection limit, is full. It arrives on a pool checkout
 /// (`PoolError::Backend`) or an unpooled page session's connect, and says
@@ -336,12 +334,12 @@ pub(super) async fn source_table_missing(
 /// Which definitions each of `candidates` (a folded batch's non-truncate
 /// `(src_table, key)` pairs) is poisoned for, per the `poison` marker table:
 /// the read [`super::apply::compute`] runs before evaluating anything. Whole-key
-/// poison is per transform (#799): a poisoned key is left out of the apply of
+/// poison is per transform: a poisoned key is left out of the apply of
 /// each definition it's poisoned for, and every other reader applies it as
 /// usual. A pair poisoned for no definition is absent from the map.
 ///
 /// **`candidates` must already carry the canonical `src_table` identity**
-/// (issue #283) — `poison` is keyed on it, so a raw bare spelling matches
+/// — `poison` is keyed on it, so a raw bare spelling matches
 /// nothing here and the key it names is re-evaluated (and re-poisoned) despite
 /// already being evicted. [`super::apply::compute`], the only caller, resolves
 /// each distinct source table through [`CanonicalSrcTables`] before building
@@ -375,8 +373,8 @@ pub(super) async fn poisoned_keys_among(
 }
 
 /// What a definition's parked changes for one held key tell [`release_key`]:
-/// the fields of one `poison_held` row it stages the key's `Recompute` from
-/// (#803). A definition holds one row per `(src_table, key)`, and each park
+/// the fields of one `poison_held` row it stages the key's `Recompute` from.
+/// A definition holds one row per `(src_table, key)`, and each park
 /// merges into it ([`HeldKey::merge`]) rather than adding a row per segment,
 /// so a key held for good costs one row however often it changes.
 ///
@@ -490,7 +488,7 @@ const MERGE_HELD_ROW: &str = "on conflict (transform_id, src_table, key) do upda
 
 /// Parks `changes` — a batch's own folded contribution for keys already
 /// poisoned for a definition, each paired with that definition's id — into
-/// `poison_held`. A definition holds one row per key (#803): the first park
+/// `poison_held`. A definition holds one row per key: the first park
 /// inserts it, and every later one merges into it ([`MERGE_HELD_ROW`],
 /// [`HeldKey::merge`]), keeping what [`release_key`] stages the key's
 /// `Recompute` from. Must run **inside the same Phase-3 transaction**
@@ -507,7 +505,7 @@ const MERGE_HELD_ROW: &str = "on conflict (transform_id, src_table, key) do upda
 ///
 /// **Parks only while the definition still holds the key.** `changes` were
 /// chosen from `poison` when the page was computed, outside this transaction.
-/// A resume (rule 5 of #799) or a release since then deleted the key's
+/// A resume or a release since then deleted the key's
 /// `poison` and `poison_held` rows, and a row parked after that would be held
 /// for a key nothing holds: no release would ever name it, and it would block
 /// every watermark token from then on (`converge`'s condition 4). The resume
@@ -560,10 +558,10 @@ pub(super) async fn park_batch_contribution(
                        where p.transform_id = $1 and p.src_table = $2 and p.key = $3) \
          {MERGE_HELD_ROW}"
     );
-    // #1102: a group-basis definition keeps the groups of every image the
+    // A group-basis definition keeps the groups of every image the
     // parked change's ring rows hold (`FoldedChange::group_sides`), as
-    // objects of its `GROUP BY` columns, for the release's recompute. #1110:
-    // a `JOIN` keeps the cells of the change's side, as objects of the
+    // objects of its `GROUP BY` columns, for the release's recompute.
+    // A `JOIN` keeps the cells of the change's side, as objects of the
     // side's cell columns.
     let mut definitions: HashMap<i64, Option<crate::defs::model::Definition>> = HashMap::new();
     for id in &ids {
@@ -580,7 +578,7 @@ pub(super) async fn park_batch_contribution(
     };
     for (transform_id, change) in ordered {
         let group_columns = cell_columns(*transform_id, &change.src_table);
-        // Issue #315: a recompute's prior-image hint rides in `old_image`,
+        // A recompute's prior-image hint rides in `old_image`,
         // exactly as it does in the ring, so `release_key` hands it on.
         let old_image = if change.old_image.is_none() && change.new_image.is_none() {
             &change.prior_image
@@ -612,12 +610,11 @@ pub(super) async fn park_batch_contribution(
 /// drain clears the counters for the keys it just applied, so a transient
 /// death does not accumulate toward a false eviction."
 ///
-/// Per transform (#799), a definition the key is poisoned for skipped it, so
+/// Per transform, a definition the key is poisoned for skipped it, so
 /// its counter is kept: only the definitions the key isn't poisoned for
 /// applied it.
 ///
-/// **`keys` must already carry the canonical `src_table` identity** (issue
-/// #283), for the same reason [`poisoned_keys_among`]'s candidates must:
+/// **`keys` must already carry the canonical `src_table` identity**, for the same reason [`poisoned_keys_among`]'s candidates must:
 /// [`record_key_death`] writes under it, so clearing by a raw bare spelling
 /// would delete nothing and leave a transient death accumulating toward a false
 /// eviction forever. `ApplyPlan::applied_keys` — this function's only source of
@@ -631,7 +628,7 @@ pub(super) async fn clear_key_deaths(
     }
     let src_tables: Vec<&str> = keys.iter().map(|(t, _)| t.as_str()).collect();
     let ks: Vec<&str> = keys.iter().map(|(_, k)| k.as_str()).collect();
-    // A cleared counter that carried a retry count (#861) is an automatic
+    // A cleared counter that carried a retry count is an automatic
     // retry of a held key that applied cleanly: the caller counts it once the
     // page commits.
     let retried = txn
@@ -658,10 +655,10 @@ pub(super) async fn clear_key_deaths(
 
 /// Increments `key_deaths` for `transform_id`'s `(src_table, key)` and
 /// returns the new count — an upsert, since the counter's row may not exist
-/// yet for a key's first attributed failure. Per transform (#799): each
+/// yet for a key's first attributed failure. Per transform: each
 /// definition a key fails for counts its own deaths toward its own eviction.
 ///
-/// `src_table` is the canonical identity, not the ring spelling (issue #283):
+/// `src_table` is the canonical identity, not the ring spelling:
 /// two spellings of one logical source used to maintain two independent
 /// row-level counters for the same physical row, so the row-level fuse took up
 /// to twice as many real failures to fire.
@@ -689,8 +686,8 @@ async fn record_key_death(
 }
 
 /// One key [`isolate_and_evict`]'s probe loop reproduced an
-/// [`FailureClass::Isolate`] failure for, attributed to one definition
-/// (#799), carrying **both** spellings of its source table (issue #283)
+/// [`FailureClass::Isolate`] failure for, attributed to one definition,
+/// carrying **both** spellings of its source table
 /// because the two halves of that function need different ones: quarantine's
 /// own counter/marker tables are keyed on `canonical_src_table`, while
 /// matching the key back to the ring row it came from (its parked
@@ -706,12 +703,12 @@ struct PoisonedProbe {
     /// The definition whose apply the failure is attributed to.
     culprit: Culprit,
     /// The SQLSTATE of the record's failure alone ([`sqlstate_of`]), which
-    /// the key's `poison` row keeps (#824).
+    /// the key's `poison` row keeps.
     sqlstate: Option<String>,
 }
 
 /// A definition [`attribute`] found a pinned key's failure in: the one its
-/// key is charged and, past the threshold, poisoned for (#799).
+/// key is charged and, past the threshold, poisoned for.
 #[derive(Clone)]
 struct Culprit {
     transform_id: i64,
@@ -767,13 +764,13 @@ async fn evict_key(
     )
     .await?;
     if let Some(change) = contribution {
-        // Issue #283: `poison_held` is keyed on the same canonical identity as
+        // `poison_held` is keyed on the same canonical identity as
         // the `poison` row just written, so the parked contribution is restaged
         // under `src_table` rather than the ring row's own spelling. Without
         // this, a bare-staged ring row's held work would be invisible to
         // `release_key`'s canonical delete — orphaned parked work that
         // `converge` gates on forever. Replaying it later under the qualified
-        // name is also what issue #267 made the ring invariant anyway.
+        // name is also the ring invariant anyway.
         let mut parked = change.clone();
         parked.src_table = probe.canonical_src_table.clone();
         park_batch_contribution(txn, seg_seq, &[(culprit.transform_id, parked)]).await?;
@@ -784,14 +781,14 @@ async fn evict_key(
 /// A key [`isolate_and_evict`] reproduced a failure for and charged a death,
 /// but that is still below the row-level death threshold — so it stays in the
 /// batch, un-evicted. Carried out of [`isolate_and_evict`] so the caller can
-/// name it in its log (issue #614): without it, "isolation pinned this key,
+/// name it in its log: without it, "isolation pinned this key,
 /// which is `deaths` of `threshold` from eviction" looked identical to
 /// "isolation reproduced nothing".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChargedKey {
-    /// The bare target of the definition the death was charged to (#799).
+    /// The bare target of the definition the death was charged to.
     pub transform: String,
-    /// Canonical identity (issue #283) — the one the `key_deaths` row is under.
+    /// Canonical identity — the one the `key_deaths` row is under.
     pub src_table: String,
     pub key: String,
     /// The key's death count *after* this charge.
@@ -806,18 +803,18 @@ pub enum IsolationOutcome {
     /// charged.
     FuseDisabled,
     /// No single key reproduced an isolate-eligible failure on its own that
-    /// could be attributed to a definition (#799): the failure is not
+    /// could be attributed to a definition: the failure is not
     /// attributable to a key, so nothing was charged.
     NothingReproduced,
     /// Isolation ran [`MAX_ISOLATION_PROBES`] probes without pinning the
-    /// failure on any key, and stopped with parts of the batch unprobed (issue
-    /// #655). Nothing was charged. Distinct from [`Self::NothingReproduced`],
+    /// failure on any key, and stopped with parts of the batch unprobed.
+    /// Nothing was charged. Distinct from [`Self::NothingReproduced`],
     /// which means every part of the batch that could hold a failing key was
     /// probed.
     ProbeLimitReached { probes: usize },
     /// Isolation stopped after [`MAX_CONSECUTIVE_TRANSIENT_PROBES`] probes in
-    /// a row hit a transient error, without pinning the failure on any key
-    /// (issue #670). Nothing was charged. A lock or deadlock storm says
+    /// a row hit a transient error, without pinning the failure on any key.
+    /// Nothing was charged. A lock or deadlock storm says
     /// nothing about the batch's records, and each probe in it can wait out a
     /// whole `lock_timeout`, so isolation stops rather than spending the rest
     /// of [`MAX_ISOLATION_PROBES`] on it; the page is retried on a later
@@ -829,8 +826,8 @@ pub enum IsolationOutcome {
     ChargedBelowThreshold { charged: Vec<ChargedKey> },
     /// At least one key crossed the threshold and was poisoned for the
     /// definition it fails in: [`super::apply::drain_once`] recomputes the
-    /// batch, which now leaves the key out of that definition's apply only
-    /// (#799), and reapplies it. `evicted` counts the `(definition, key)`
+    /// batch, which now leaves the key out of that definition's apply only,
+    /// and reapplies it. `evicted` counts the `(definition, key)`
     /// pairs poisoned. `charged` lists any *other* keys that reproduced the
     /// failure in the same probe pass but stayed below the threshold.
     Evicted {
@@ -872,7 +869,7 @@ pub(crate) fn describe_charged_keys(charged: &[ChargedKey], threshold: i32) -> S
 /// row-level `threshold`: the one place that decision is made. Both the
 /// partition of a page's charges ([`partition_by_threshold`]) and the
 /// eviction's re-check under the definition's row lock
-/// ([`still_charged_to_threshold`], #880) ask it. A retried key (#861) is
+/// ([`still_charged_to_threshold`]) ask it. A retried key is
 /// poisoned on its first failure without a different threshold: its retry's
 /// release wrote its `deaths` one below this one ([`release_key_as`]).
 fn crosses_threshold(_probe: &PoisonedProbe, deaths: i32, threshold: i32) -> bool {
@@ -881,7 +878,7 @@ fn crosses_threshold(_probe: &PoisonedProbe, deaths: i32, threshold: i32) -> boo
 
 /// Whether `probe`'s key is still charged to its threshold, read under the
 /// definition's row lock ([`evict_for`]) and so after every release that
-/// committed before it (#880). A [`release_key`] deletes the key's
+/// committed before it. A [`release_key`] deletes the key's
 /// `key_deaths` row, so an eviction whose isolation charged the key before
 /// the release finds the row gone, or counting only the deaths charged after
 /// it, and poisons nothing: the operator's release stands. A key that fails
@@ -889,7 +886,7 @@ fn crosses_threshold(_probe: &PoisonedProbe, deaths: i32, threshold: i32) -> boo
 /// again on its own deaths. A clean apply that clears the count
 /// ([`clear_key_deaths`]) in the same window skips the key the same way, as
 /// a cleared count means. The same canonical `src_table` as the charge and
-/// the release (#283).
+/// the release.
 async fn still_charged_to_threshold(
     txn: &Transaction<'_>,
     probe: &PoisonedProbe,
@@ -944,7 +941,7 @@ fn partition_by_threshold(
     (evict_now, below)
 }
 
-/// The most probes one [`isolate_and_evict`] call runs (issue #655).
+/// The most probes one [`isolate_and_evict`] call runs.
 ///
 /// Bisection finds one failing key in about `2 * log2(n)` probes, at most 34 for a
 /// page at the default `drain_batch_cap` of 100,000 records; this cap leaves
@@ -958,7 +955,7 @@ fn partition_by_threshold(
 pub const MAX_ISOLATION_PROBES: usize = 256;
 
 /// How many probes in a row may hit a transient error before one
-/// [`isolate_and_evict`] call stops (issue #670), ending
+/// [`isolate_and_evict`] call stops, ending
 /// [`IsolationOutcome::TransientStorm`] unless it already pinned a key.
 ///
 /// A probe that hits a lock timeout has waited a whole
@@ -979,7 +976,7 @@ pub const MAX_ISOLATION_PROBES: usize = 256;
 /// until the lock goes, however much of it isolation evicted.
 pub const MAX_CONSECUTIVE_TRANSIENT_PROBES: usize = 3;
 
-/// What one isolation probe of a run of records showed (issue #655).
+/// What one isolation probe of a run of records showed.
 #[derive(Debug)]
 enum ProbeVerdict<E> {
     /// The run computed and applied cleanly (and was rolled back).
@@ -994,7 +991,7 @@ enum ProbeVerdict<E> {
     Unknown,
     /// The run hit a transient error: handled exactly as [`Self::Unknown`],
     /// except that [`MAX_CONSECUTIVE_TRANSIENT_PROBES`] of these in a row stop
-    /// the search (issue #670).
+    /// the search.
     Transient,
 }
 
@@ -1038,7 +1035,7 @@ struct Split {
     clean_halves: u8,
 }
 
-/// Adaptive group testing over records `0..n` (issue #655): probes the two
+/// Adaptive group testing over records `0..n`: probes the two
 /// halves of the batch, and splits and probes again only the halves that fail,
 /// down to single records. A single record that fails is reported in
 /// [`Bisection::failing`]; nothing larger ever is, so the caller can only
@@ -1062,7 +1059,7 @@ struct Split {
 /// batch-mate in its own half: an aggregate group's sum, say, where one
 /// record's delta alone crosses a check and a batch-mate's negative delta
 /// cancels it. Bisection alone would miss that record on every drain, where
-/// probing each record alone found it (review of #655). So at a dead end each
+/// probing each record alone found it. So at a dead end each
 /// record of both halves is probed alone, within `max_probes`. A dead end
 /// high in a large batch has more records than the probe limit leaves room
 /// for, so those probes start at `dead_end_offset` into the dead end and wrap
@@ -1239,7 +1236,7 @@ fn random_dead_end_offset() -> usize {
 
 /// Computes and applies `records` inside a transaction that always rolls
 /// back (so it never commits the drained mark), checking its deferred
-/// constraints before the rollback as COMMIT would (#856), and returns the
+/// constraints before the rollback as COMMIT would, and returns the
 /// error it failed with, if any. `Err` only for failing to check out a connection or
 /// open the transaction. `focus`, and `at`'s `skip_frozen`, are
 /// [`apply::compute_page`]'s.
@@ -1258,7 +1255,7 @@ async fn probe_records(
     let outcome =
         apply::apply_and_mark_drained(&txn, at.seg_seq, at.claimed_by, &plan, at.wake_channel)
             .await;
-    // #856: a probe never commits, so a deferred constraint or constraint
+    // A probe never commits, so a deferred constraint or constraint
     // trigger an application put on a target would never fire in it, and a
     // page failing at COMMIT would reproduce on no key. Checking every
     // deferred constraint here, after the apply, as COMMIT would, reproduces
@@ -1282,7 +1279,7 @@ async fn probe_records(
 /// records inside a transaction that always rolls back (skipping the drained
 /// mark).
 ///
-/// **Bisection, not one probe per record (issue #655).** Probing each record
+/// **Bisection, not one probe per record.** Probing each record
 /// alone cost one compute and one rollback-only apply per record: minutes for
 /// a few thousand records, hours at the default `drain_batch_cap`, all while
 /// the worker held the page's buckets. [`Bisector`] probes the batch's two
@@ -1320,10 +1317,10 @@ async fn probe_records(
 /// charges nothing, as before. Probing smaller runs is also what gives a probe
 /// that hit lock contention or a statement timeout its best chance of an
 /// answer. A database that keeps failing transiently stops the search after
-/// [`MAX_CONSECUTIVE_TRANSIENT_PROBES`] such probes in a row (issue #670),
+/// [`MAX_CONSECUTIVE_TRANSIENT_PROBES`] such probes in a row,
 /// or propagates as `Err` once checking out a connection fails.
 ///
-/// **Logged at start and end (issue #670)**, with the batch's record count
+/// **Logged at start and end**, with the batch's record count
 /// and, at the end, the probes used, the outcome, how many keys it pinned,
 /// whether the search ran to completion, and the time it took. Isolation
 /// holds the page's buckets for as long as it runs, so its cost is worth
@@ -1331,7 +1328,7 @@ async fn probe_records(
 ///
 /// `folded`'s truncates are never probed.
 ///
-/// **Charged to a definition, not to the key (#799).** A record that fails
+/// **Charged to a definition, not to the key.** A record that fails
 /// alone is probed again to find which definition's apply it fails in
 /// (`attribute`), and its death,
 /// its eviction and the whole-transform fuse are those definitions' alone. A
@@ -1358,9 +1355,9 @@ async fn probe_records(
 ///   propagates immediately, unattributed to any key, per doc 06's "What
 ///   must never be quarantined" — discovered during isolation is no
 ///   different from discovered on the whole batch, so the caller halts on it
-///   the same way (`staging::halt`, #663). Likewise
-///   `Err(ApplyError::ClaimLost)` if a probe found the claim gone (issue
-///   #620), with nothing charged.
+///   the same way (`staging::halt`). Likewise
+///   `Err(ApplyError::ClaimLost)` if a probe found the claim gone, with
+///   nothing charged.
 ///
 /// **Accepted trade-off, not a bug — one charge per drain call**: when no key
 /// reaches `threshold`, `apply::classify_and_retry` surfaces the
@@ -1378,7 +1375,7 @@ async fn probe_records(
 /// real, observed attempts have failed for it, cleared by any clean drain
 /// that applies it.
 ///
-/// **`skip_frozen` (issue #766)** computes every probe as
+/// **`skip_frozen`** computes every probe as
 /// `apply::compute_page` does with it: a drain that Postgres refused a read
 /// or write probes the page as its own retries compute it, skipping the
 /// tables no unfrozen definition reads. Without that, a probe would read the
@@ -1445,7 +1442,7 @@ impl IsolationOutcome {
     }
 }
 
-/// [`isolate_and_evict`]'s end-of-call log line (issue #670). `records` is
+/// [`isolate_and_evict`]'s end-of-call log line. `records` is
 /// the batch's record count; `pinned` counts the keys it charged, evicted
 /// or not. `info`, or `warn` when the search stopped short or on an error:
 /// either leaves part of the batch unprobed.
@@ -1518,7 +1515,7 @@ async fn isolate_and_evict_probing(
     stats: &mut IsolationStats,
 ) -> Result<IsolationOutcome, ApplyError> {
     let seg_seq = at.seg_seq;
-    // Issue #283: every counter/marker write below lands under the *canonical*
+    // Every counter/marker write below lands under the *canonical*
     // (qualified, where resolvable) identity of the ring row's `src_table`,
     // never the raw spelling — resolved once per distinct source table here and
     // threaded through `attribute_column_failure`/`record_key_death`/
@@ -1546,7 +1543,7 @@ async fn isolate_and_evict_probing(
             bisector.record(run, ProbeVerdict::Clean);
             continue;
         };
-        // Issue #620: a probe that finds its claim gone reproduced the lost
+        // A probe that finds its claim gone reproduced the lost
         // claim, not this run's failure, and every later probe would
         // reproduce it too, charging every key in the page a death. Stop and
         // surface it, as `apply::classify_and_retry` does for a page's own
@@ -1557,7 +1554,7 @@ async fn isolate_and_evict_probing(
         }
         let verdict = match classify(&err) {
             // Unattributed to any key: `apply::classify_and_retry` halts
-            // on it as on the page's own (#663).
+            // on it as on the page's own.
             FailureClass::Halting => return Err(err),
             FailureClass::Isolate => {
                 if let [change] = records {
@@ -1601,7 +1598,7 @@ async fn isolate_and_evict_probing(
         None
     };
 
-    // #799: a record that fails alone is charged to the definition(s) it
+    // A record that fails alone is charged to the definition(s) it
     // fails in, never to the key across every reader of its table.
     let mut poisoned: Vec<PoisonedProbe> = Vec::with_capacity(bisection.failing.len());
     for (index, err) in bisection.failing {
@@ -1662,8 +1659,8 @@ async fn isolate_and_evict_probing(
     }
 
     // One definition at a time, in id order, so two concurrent evictions
-    // spanning the same definitions take their fuse gates (issue #159,
-    // `take_fuse_gate`) in one order. Each definition's gate is taken before
+    // spanning the same definitions take their fuse gates
+    // (`take_fuse_gate`) in one order. Each definition's gate is taken before
     // its definition row and its `poison` rows, so no transaction holding one
     // of those waits on a gate another transaction holding it waits on.
     let mut by_transform: std::collections::BTreeMap<i64, Vec<&PoisonedProbe>> =
@@ -1678,7 +1675,7 @@ async fn isolate_and_evict_probing(
     let txn = client.transaction().await?;
     let mut evicted = 0;
     for (transform_id, mut probes) in by_transform {
-        // Test-only pause point (#880). See `super::interleave`.
+        // Test-only pause point. See `super::interleave`.
         #[cfg(any(test, feature = "test-util"))]
         super::interleave::pause_at(
             &*txn,
@@ -1699,7 +1696,7 @@ async fn isolate_and_evict_probing(
             let contribution = folded.iter().find(|c| {
                 !c.is_truncate && c.src_table == probe.raw_src_table && c.key == probe.key
             });
-            // #880: a release that committed after isolation charged this
+            // A release that committed after isolation charged this
             // key, before `evict_for` locked the definition, deleted the
             // charge. Read it now, under the lock, or the poison written
             // below would undo the release.
@@ -1728,7 +1725,7 @@ async fn isolate_and_evict_probing(
 
 /// Where [`isolate_and_evict`]'s probes run: the page's segment and claim,
 /// and whether they skip the tables no unfrozen definition reads
-/// (`skip_frozen`, issue #766).
+/// (`skip_frozen`).
 #[derive(Clone, Copy)]
 struct ProbeSite<'a> {
     seg_seq: i64,
@@ -1738,7 +1735,7 @@ struct ProbeSite<'a> {
 }
 
 /// The definitions a record that fails alone (`change`, of canonical source
-/// `src_table`, with error `err`) fails in (#799), each probed on its own.
+/// `src_table`, with error `err`) fails in, each probed on its own.
 /// Its readers are those of its source that aren't already poisoned for its
 /// key:
 ///
@@ -1903,13 +1900,13 @@ impl Probe<'_> {
 }
 
 /// Takes `transform_id`'s fuse gate and its definition row, and says whether
-/// it may still be poisoned (#799): it isn't frozen, and no resume has
+/// it may still be poisoned: it isn't frozen, and no resume has
 /// stamped a new `fuse_rearmed_at` since attribution read `epoch`. A resume
 /// deletes the definition's poison and rebuilds it, so a key its old self
 /// failed on must not land after the resume and hold a key of the rebuilt
 /// one. The row lock (`for no key update`, the lock the fuse's own status
 /// write takes) holds off a resume until this transaction ends, and the gate
-/// comes first, as the fuse has always taken it (issue #159).
+/// comes first, as the fuse has always taken it.
 async fn evict_for(
     txn: &Transaction<'_>,
     transform_id: i64,
@@ -1936,20 +1933,19 @@ async fn evict_for(
 
 /// Resolves a ring row's raw `src_table` to the fully-qualified identity
 /// [`catalog::transforms_for_source`]/[`catalog::dependents_of`] require
-/// (issue #74, ADR-0011: `schema_nodes` keys on qualified identity, so a bare
+/// (ADR-0011: `schema_nodes` keys on qualified identity, so a bare
 /// lookup there silently finds *nothing* rather than erroring) — this
 /// module's counterpart to `super::apply`'s own `qualified_schema_node_key`,
 /// which every `apply.rs` call site already goes through.
 ///
-/// Issue #281: both of this module's `transforms_for_source` call sites
-/// ([`trip_transform_fuse_if_crossed`] and [`attribute_column_failure`]) used
-/// to pass the raw `src_table` straight through, so for any bare spelling the
-/// whole-transform fuse crossed its threshold and quarantined nothing, and
-/// column failures went unattributed — both entirely silently, since an
-/// unqualified argument is an empty result set, not an error. Issue #267
-/// stopped `apply.rs` *emitting* bare `src_table` going forward, but durable
-/// pre-#267 ring rows and the crate's own integration fixtures that stage
-/// bare `src_table` by hand still reach here.
+/// Both of this module's `transforms_for_source` call sites
+/// ([`trip_transform_fuse_if_crossed`] and [`attribute_column_failure`])
+/// resolve through it: passing a bare `src_table` straight through would mean
+/// the whole-transform fuse crossed its threshold and quarantined nothing,
+/// and column failures went unattributed — both entirely silently, since an
+/// unqualified argument is an empty result set, not an error. `apply.rs`
+/// never *emits* a bare `src_table`, but the crate's own integration fixtures
+/// that stage bare `src_table` by hand still reach here.
 ///
 /// **Unresolvable names fall through to the raw spelling rather than
 /// erroring**, which is the one deliberate difference from
@@ -1965,18 +1961,18 @@ async fn evict_for(
 /// source table that has since been dropped, which reaches
 /// `transforms_for_source` and finds nothing.
 ///
-/// **Issue #283: this is also the canonical key every quarantine counter and
-/// marker table is now written and read under** — `poison`, `poison_held`,
-/// `key_deaths`, `column_failures` and `transform_fuse_gate`. Before that, all
-/// five stored whatever spelling the ring row happened to carry, so one logical
-/// source staged both bare and qualified accumulated two independent sets of
-/// quarantine state that never combined: two half-threshold fuse budgets that
-/// never tripped, two row-level death counters for one physical row, a fold
-/// exclusion that missed a key poisoned under the other spelling, and a
+/// **This is also the canonical key every quarantine counter and
+/// marker table is written and read under** — `poison`, `poison_held`,
+/// `key_deaths`, `column_failures` and `transform_fuse_gate`. Were each to
+/// store whatever spelling the ring row happened to carry, one logical
+/// source staged both bare and qualified would accumulate two independent sets
+/// of quarantine state that never combined: two half-threshold fuse budgets
+/// that never tripped, two row-level death counters for one physical row, a
+/// fold exclusion that missed a key poisoned under the other spelling, and a
 /// per-spelling (so non-serializing) `take_fuse_gate` lock row. Every write and
-/// every read now goes through this one resolution. An unresolvable spelling is the
+/// every read goes through this one resolution. An unresolvable spelling is the
 /// deliberate exception: it keeps its raw key, which is self-consistent
-/// (nothing else can resolve it either) and exactly the pre-#283 behaviour.
+/// (nothing else can resolve it either).
 pub(super) async fn qualified_src_table(
     pool: &Pool,
     src_table: &str,
@@ -1993,15 +1989,15 @@ pub(super) async fn qualified_src_table(
 
 /// A memo over [`qualified_src_table`] for the two callers that resolve a whole
 /// folded batch's worth of `src_table`s at once ([`isolate_and_evict`] and
-/// [`super::apply::compute`], issue #283): a batch routinely carries many
+/// [`super::apply::compute`]): a batch routinely carries many
 /// changes per source table, and the resolution is a pure function of the
 /// catalog for the duration of one batch.
 ///
 /// Cheap by construction in the common case: an already-qualified spelling —
-/// which, since issue #267, is every `src_table` `apply.rs` emits — short
+/// which is every `src_table` `apply.rs` emits — short
 /// circuits inside [`qualified_src_table`] without touching the database at
-/// all, so this only ever spends a round trip on the durable bare rows and
-/// hand-staged fixtures that issue #281's doc comment enumerates, once each.
+/// all, so this only ever spends a round trip on hand-staged fixtures with a
+/// bare spelling, once each.
 #[derive(Default)]
 pub(super) struct CanonicalSrcTables {
     cache: HashMap<String, String>,
@@ -2030,7 +2026,7 @@ impl CanonicalSrcTables {
 }
 
 // ---------------------------------------------------------------------
-// Whole-transform fuse (ADR-0003's original, coarser tier — issue #105)
+// Whole-transform fuse (ADR-0003's original, coarser tier)
 // ---------------------------------------------------------------------
 //
 // ADR-0003: "if a failure isn't attributable to one column (e.g. a
@@ -2040,8 +2036,8 @@ impl CanonicalSrcTables {
 // survived a probe run *alone* and still wasn't attributable to a single
 // calculated field (whether or not [`attribute_column_failure`] separately
 // also charged a column fuse alongside it — the two tiers are independent,
-// see that function's own doc comment). Whole-key poison is per transform
-// (#799), so the `poison` rows of one definition *are* the distinct-evicted-key
+// see that function's own doc comment). Whole-key poison is per transform,
+// so the `poison` rows of one definition *are* the distinct-evicted-key
 // count its fuse needs — no counter table of its own, unlike
 // [`key_deaths`]/`column_deaths`'s incrementally-maintained counters, and a
 // definition is charged for its own evictions only, never for a sibling's on
@@ -2049,7 +2045,7 @@ impl CanonicalSrcTables {
 // ([`resume_transform`]), which is what re-arms its fuse.
 //
 // What `poison` cannot supply on its own is *serialization* between two
-// concurrent evictions for the same definition (issue #159): each counts
+// concurrent evictions for the same definition: each counts
 // inside its own transaction and cannot see the other's uncommitted insert,
 // so two workers landing the 4th and 5th eviction at once both counted 4 and
 // neither tripped. That is what `transform_fuse_gate`/[`take_fuse_gate`] adds
@@ -2057,8 +2053,8 @@ impl CanonicalSrcTables {
 // already uses for `key_deaths`, taken before any counting happens.
 
 /// Takes `transform_id`'s whole-transform-fuse gate on `txn` and holds it
-/// until that transaction ends: the serialization point issue #159 was
-/// missing. Every eviction transaction that is about to ask "has this
+/// until that transaction ends: the serialization point
+/// concurrent evictions need. Every eviction transaction that is about to ask "has this
 /// definition crossed [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`]?" passes through
 /// this one row first, so two of them for the same definition can never both
 /// answer from a snapshot taken before the other's `poison` insert landed.
@@ -2094,8 +2090,8 @@ async fn take_fuse_gate(txn: &Transaction<'_>, transform_id: i64) -> Result<(), 
 /// quarantines it if so, in `txn` — the transaction that just poisoned its
 /// key(s), so the count sees them before they commit.
 ///
-/// **Concurrent evictions for one definition are serialized first** (issue
-/// #159), by [`take_fuse_gate`], before the count runs. Reading `poison` from
+/// **Concurrent evictions for one definition are serialized first**
+/// by [`take_fuse_gate`], before the count runs. Reading `poison` from
 /// `txn` is what makes this call see *its own* new rows, but it is also
 /// exactly what made it blind to a *sibling* transaction's concurrent,
 /// not-yet-committed ones: two workers each poisoning a key (say the 4th and
@@ -2110,9 +2106,9 @@ async fn take_fuse_gate(txn: &Transaction<'_>, transform_id: i64) -> Result<(), 
 /// Never relabels a freeze: a definition already frozen
 /// ([`TransformStatus::Quarantined`] or [`TransformStatus::Paused`]) is left
 /// alone (no write, no log line), including when the freeze landed after the
-/// eviction read its candidates (issue #338, see [`quarantine_if_crossed`]).
+/// eviction read its candidates (see [`quarantine_if_crossed`]).
 ///
-/// `pub` rather than module-private only so the issue-#159 regression test
+/// `pub` rather than module-private only so the fuse-gate regression test
 /// (`tests/quarantine.rs`) can drive two genuinely overlapping eviction
 /// transactions through it directly: the race lives in the window between one
 /// transaction's `poison` insert and its commit, which two full
@@ -2132,7 +2128,7 @@ pub async fn trip_transform_fuse_if_crossed(
 
 /// A SQL predicate over a definition's row `t`: it isn't frozen. The states
 /// a drain's eviction may quarantine a definition from: an applying one,
-/// and one building (#799).
+/// and one building.
 fn not_frozen_sql() -> String {
     let frozen = [TransformStatus::Paused, TransformStatus::Quarantined]
         .map(|status| format!("'{}'", status.as_str()))
@@ -2150,8 +2146,8 @@ pub(crate) const BUILD_PARK_SEG_SEQ: i64 = i64::MAX;
 
 /// Quarantines `key` of `src_table` (canonical) for the building definition
 /// `transform_id`, because a backfill chunk narrowed its failure,
-/// `last_error` with SQLSTATE `sqlstate`, to that key alone (`defs::chunk_queue::fail_chunk`, #616),
-/// in the caller's transaction. It is the chunk-shaped counterpart of a
+/// `last_error` with SQLSTATE `sqlstate`, to that key alone
+/// (`defs::chunk_queue::fail_chunk`), in the caller's transaction. It is the chunk-shaped counterpart of a
 /// drain's eviction ([`isolate_and_evict`]):
 ///
 /// - a `poison` row, so the build's chunks leave the key out of their writes
@@ -2204,7 +2200,7 @@ pub(crate) async fn evict_build_key(
 /// [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`] keys is quarantined like a live
 /// definition whose drain does, so a failure that only looks like a data
 /// error (it narrows to whichever key a chunk tries alone) stops after that
-/// many keys. Only the building definition's own count is checked (#799):
+/// many keys. Only the building definition's own count is checked:
 /// its keys are poisoned for it alone. Returns whether it was quarantined.
 ///
 /// Separate from the eviction's transaction so the fuse's gate is never taken
@@ -2224,7 +2220,7 @@ pub(crate) async fn trip_build_fuse(pool: &Pool, definition_id: i64) -> Result<b
 ///
 /// The caller nominated `id` from an earlier, unlocked read, so by the time
 /// this runs the row may have moved on: an operator may have paused it, or
-/// paused and resumed it (issue #338). The verdict is one conditional
+/// paused and resumed it. The verdict is one conditional
 /// `UPDATE` that re-checks, against the row as it is when the write happens,
 /// both that the definition is still in a state the fuse may freeze and that
 /// its count crosses the threshold. Under READ COMMITTED a row changed by a
@@ -2234,7 +2230,7 @@ pub(crate) async fn trip_build_fuse(pool: &Pool, definition_id: i64) -> Result<b
 /// [`crate::defs::lifecycle::pause_transform`] leaves a quarantined one
 /// `quarantined`: both triggers are the same freeze, and the label records
 /// which one fired first. A resume deletes the definition's `poison` rows, so
-/// a resumed definition's count starts again from zero (#799).
+/// a resumed definition's count starts again from zero.
 ///
 /// `may_freeze` is a SQL predicate over the definition's row `t` saying
 /// which states it may be frozen from: any that isn't frozen
@@ -2338,7 +2334,7 @@ async fn attribute_column_failure(
     };
     let field = eval_err.field();
 
-    // Issue #281: qualify first — a bare `src_table` handed straight to
+    // Qualify first — a bare `src_table` handed straight to
     // `transforms_for_source` returns an empty candidate set, so every column
     // failure on it fell through unattributed. See [`qualified_src_table`].
     let qualified = qualified_src_table(pool, src_table).await?;
@@ -2360,7 +2356,7 @@ async fn attribute_column_failure(
     }
     let transform = def.def.target;
 
-    // Issue #283: `column_failures` is keyed on the canonical identity, not the
+    // `column_failures` is keyed on the canonical identity, not the
     // raw ring spelling — its primary key `(transform_table, column_name,
     // src_table, key)` is what makes `column_deaths` count *distinct* failing
     // rows, and a split key let one stubborn row charge that counter twice
@@ -2376,7 +2372,7 @@ async fn attribute_column_failure(
 /// Empty (the overwhelmingly common case) for a transform with nothing
 /// paused.
 ///
-/// Closed over `def`'s alias readers ([`AliasReaders::close`], issue #748):
+/// Closed over `def`'s alias readers ([`AliasReaders::close`]):
 /// a field reading a paused field by alias is held out too, so it keeps its
 /// value rather than being evaluated over the paused field's absence and
 /// written NULL. Its `column_status` row ([`cascade_pause`]) says the same
@@ -2442,7 +2438,7 @@ async fn charge_column_failure(
         // and the trip then failed, the count is still at or past it: the
         // trip resets it in the transaction that writes the pause, and that
         // transaction's first lock is a fence bump that can wait out the
-        // lock timeout behind a writer in flight (issue #903). Trip now,
+        // lock timeout behind a writer in flight. Trip now,
         // rather than wait for another row's failure.
         let deaths: Option<i32> = client
             .query_opt(
@@ -2480,8 +2476,7 @@ async fn charge_column_failure(
 /// Trips the column fuse for `(transform, column)`: pauses it
 /// (`column_status`, `local_fuse = true` — this pair's *own* fuse tripped,
 /// as opposed to a pause it only inherited via [`cascade_pause`]), resets
-/// its counter, and cascades the pause to every dependent reader
-/// (decision #5).
+/// its counter, and cascades the pause to every dependent reader.
 ///
 /// Deliberately does **not** clear `column_failures` here (unlike the
 /// row-level fuse's `key_deaths`, which the counter reset above otherwise
@@ -2554,7 +2549,7 @@ async fn pause_fence(pool: &Pool, transform: &str) -> Result<Option<String>, App
 /// Bumps `source`'s version fence (`super::build::bump_version_fence`), when
 /// there is one, in the transaction that writes a `column_status` pause:
 /// [`pause_column`], [`trip_column_fuse`] and each pair [`cascade_pause`]
-/// reaches (issue #903). The pause holds the column out of every write from
+/// reaches. The pause holds the column out of every write from
 /// its commit on, not just out of the writers that start after it:
 ///
 /// - A page reads the paused columns in Phase 2, after it reads the fence,
@@ -2568,7 +2563,7 @@ async fn pause_fence(pool: &Pool, transform: &str) -> Result<Option<String>, App
 ///   the pause or finds the fence moved and plans again.
 ///
 /// So `PAUSE` returns with no write of the column still to land. The bump is
-/// the transaction's first lock, as for a column resume (issue #744): it
+/// the transaction's first lock, as for a column resume: it
 /// waits for the writers in flight, and holding anything they might wait on
 /// meanwhile could close a cycle.
 async fn bump_pause_fence(
@@ -2582,10 +2577,10 @@ async fn bump_pause_fence(
 }
 
 /// Pauses every direct and transitive dependent of `(transform, column)`
-/// (decision #5: a transform reading a paused column's output must also
+/// (a transform reading a paused column's output must also
 /// pause, rather than silently consume a frozen/stale value with no
 /// signal), including a field of the same definition that reads it by
-/// alias (issue #748) — a breadth-first walk over
+/// alias — a breadth-first walk over
 /// [`crate::defs::catalog::column_dependents`], recorded into
 /// `column_pause_cascades` so [`resume_column`] can later tell a purely
 /// cascaded pause apart from one with its own independent (`local_fuse`)
@@ -2596,7 +2591,7 @@ async fn bump_pause_fence(
 ///
 /// Each dependent's edge and row commit together, fenced against its
 /// definition's writers in flight ([`bump_pause_fence`]), so a pair can wait
-/// out the lock timeout and fail the walk part-way (issue #912). The walk is
+/// out the lock timeout and fail the walk part-way. The walk is
 /// idempotent, so running it again finishes the job:
 ///
 /// - It walks every dependent's dependents, whether this walk paused it or
@@ -2614,7 +2609,7 @@ async fn bump_pause_fence(
 /// - The same read, under the same lock, checks the reader's definition
 ///   still has the field and the field still reads the upstream column, as
 ///   the walk listed it before any lock and an edit may have committed
-///   since (issue #955). A pair that fails it is skipped the same way.
+///   since. A pair that fails it is skipped the same way.
 ///
 /// A pause records the walk as owed (`column_status.cascade_pending`) in
 /// the transaction that writes its own row, and the walk clears it once it
@@ -2648,7 +2643,7 @@ async fn cascade_pause(
 
     while let Some((upstream_transform, upstream_column)) = queue.pop_front() {
         let deps = catalog::column_dependents(pool, &upstream_transform, &upstream_column).await?;
-        // Test-only pause point (#955). See `super::interleave`. The walk
+        // Test-only pause point. See `super::interleave`. The walk
         // holds nothing here, and nothing but the pair's own lock waits
         // keeps an edit of a reader it listed from committing.
         #[cfg(any(test, feature = "test-util"))]
@@ -2738,14 +2733,14 @@ async fn cascaded_already(
 /// exclusive ([`crate::locks::lock_column_pauses`]), as every write of a
 /// pause does, so a definition being defined or edited to read
 /// `downstream`'s column either reads this pause or commits before the walk
-/// goes on to read the graph (issue #914). False, with nothing written,
+/// goes on to read the graph. False, with nothing written,
 /// when `upstream` is no longer paused: the read of its row is made under
 /// the lock, so a [`resume_column`] deleting it has committed already, and
 /// one that comes later waits for this commit and then deletes the edge with
 /// the rest. Also false when `downstream` no longer reads `upstream`
 /// ([`catalog::reads_column`]): the walk listed it before it took any lock,
 /// and an `ALTER TRANSFORM` of its definition may have dropped the field or
-/// its read since (issue #955).
+/// its read since.
 async fn pause_dependent(
     pool: &Pool,
     (downstream_transform, downstream_column): (&str, &str),
@@ -2759,7 +2754,7 @@ async fn pause_dependent(
         crate::locks::set_local_lock_timeout(&*txn, timeout).await?;
     }
     bump_pause_fence(&*txn, fence.as_deref()).await?;
-    // Test-only pause point (#912). See `super::interleave`.
+    // Test-only pause point. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
         &*txn,
@@ -2783,7 +2778,7 @@ async fn pause_dependent(
         .await?
         .is_some();
     // The walk listed this reader before it took any lock, so an edit of
-    // the reader's definition may have committed since (#955). Every edit
+    // the reader's definition may have committed since. Every edit
     // holds the lock exclusive, so what is committed now stays so until this
     // pair commits.
     if !upstream_paused
@@ -2836,16 +2831,16 @@ async fn pause_dependent(
 }
 
 /// Finishes the cascade of every column pause still marked as owing one
-/// (`column_status.cascade_pending`, issue #912). A pause writes its own row
+/// (`column_status.cascade_pending`). A pause writes its own row
 /// and the mark in one transaction, then walks its dependents
 /// ([`cascade_pause`]), each pair in a transaction of its own whose fence
 /// bump can wait out the lock timeout behind a writer in flight. A walk that
 /// fails part-way, or whose process dies, leaves the mark, and a reader of
-/// the paused column unpaused (decision #5). An operator's `PAUSE` returns
+/// the paused column unpaused. An operator's `PAUSE` returns
 /// the error and can be re-run, but a column fuse trip has no caller to
 /// retry it, and its column, now paused, stops failing, so no new charge
 /// trips it again. An `ALTER TRANSFORM` that pauses a field at birth
-/// (issue #915) walks it once it commits ([`cascade_edit_pauses`]), but the
+/// walks it once it commits ([`cascade_edit_pauses`]), but the
 /// edit has already committed, so a walk that fails there leaves its mark
 /// to this.
 ///
@@ -2864,7 +2859,7 @@ pub async fn complete_pause_cascades(pool: &Pool) -> Result<usize, ApplyError> {
 
 /// Walks the cascade of each of `transform`'s column pauses marked as owing
 /// one (`column_status.cascade_pending`), right after an `ALTER TRANSFORM`
-/// of `transform` that marked them commits (issue #915), as [`pause_column`]
+/// of `transform` that marked them commits, as [`pause_column`]
 /// walks its own pause right after its commit. The edit's own transaction
 /// can't run the walk: it holds its definition's source fence, and each
 /// reader's pair bumps that reader's own ([`pause_dependent`]). So the walk
@@ -2933,8 +2928,7 @@ pub const CASCADE_COMPLETION_LOCK_TIMEOUT: std::time::Duration = std::time::Dura
 
 /// Pauses one calculated column deliberately — the operator-driven trigger
 /// for the same column-pause state [`trip_column_fuse`] reaches automatically,
-/// exposed through the grammar as `PAUSE TRANSFORM <target>.<column>` (issue
-/// #227; issue #228, decision 2).
+/// exposed through the grammar as `PAUSE TRANSFORM <target>.<column>`.
 ///
 /// ADR-0014's pause is one freeze with several triggers, and that is as true at
 /// column granularity as at whole-transform granularity: this writes the same
@@ -2944,7 +2938,7 @@ pub const CASCADE_COMPLETION_LOCK_TIMEOUT: std::time::Duration = std::time::Dura
 /// same [`resume_column`] (which re-derives it across every existing row).
 /// Nothing here is a second freezing mechanism.
 ///
-/// **Frozen from the moment it returns** (issue #903). The transaction that
+/// **Frozen from the moment it returns**. The transaction that
 /// writes the column's row bumps its definition's source's version fence
 /// first, and so does each pair [`cascade_pause`] reaches
 /// ([`bump_pause_fence`]). A page or build chunk that read the column as
@@ -2953,7 +2947,7 @@ pub const CASCADE_COMPLETION_LOCK_TIMEOUT: std::time::Duration = std::time::Dura
 /// column lands after the call returns, and the call waits for the writers
 /// in flight, as a column resume does.
 ///
-/// **A reader defined after it** (issue #914). Define and `ALTER TRANSFORM`
+/// **A reader defined after it**. Define and `ALTER TRANSFORM`
 /// pause a field that reads a column paused when they run, with the row and
 /// edge [`cascade_pause`] would write. The transaction that writes the
 /// column's row takes the column-pause lock exclusive after its fence bump
@@ -2961,7 +2955,7 @@ pub const CASCADE_COMPLETION_LOCK_TIMEOUT: std::time::Duration = std::time::Dura
 /// holds it shared to its commit. So a define either reads this pause, or
 /// commits before it and is in the graph [`cascade_pause`] walks. An edit
 /// that pauses a field which already has readers takes it exclusive too,
-/// and marks the field as owing its cascade (issue #915), which it walks
+/// and marks the field as owing its cascade, which it walks
 /// once it commits ([`cascade_edit_pauses`]).
 ///
 /// **`local_fuse` is set even though no fuse tripped.** That column records
@@ -3030,7 +3024,7 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
 
 /// Resumes a paused column: clears its counter and its `column_status` row
 /// and outgoing cascade edges, starts a field build that rewrites its value
-/// across every existing row (#625 F8b), then un-cascades every dependent
+/// across every existing row, then un-cascades every dependent
 /// this pause reached — but only a dependent with *no other* remaining
 /// reason to stay paused (no `local_fuse` of its own, and no other live
 /// `column_pause_cascades` edge into it — decision: careful not to un-pause
@@ -3038,7 +3032,7 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
 /// every `(transform, column)` pair actually resumed, `transform`/`column`
 /// itself first, in the order resumed.
 ///
-/// **Sibling readers** (issue #748). A field of the same definition that
+/// **Sibling readers**. A field of the same definition that
 /// reads a resumed field by alias was paused with it ([`cascade_pause`]).
 /// One with no other reason to stay paused is released in the same
 /// transaction, and the field build covers every such reader, so it is
@@ -3051,9 +3045,9 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
 /// unpause and its field build's registration commit together: the
 /// definition moves `live -> backfilling` (one already under a Re-derive
 /// build keeps building) and the drain workers rewrite the column in the
-/// background, so the call returns at once (#666) and the definition reads
+/// background, so the call returns at once and the definition reads
 /// `backfilling` until the column is rebuilt. The column applies from that
-/// commit, as a new definition does under the Re-derive build (#625 B1):
+/// commit, as a new definition does under the Re-derive build:
 /// every page after it writes the column from its change's image, and each
 /// chunk rewrites it under the keys' entry lock, so a row changed while the
 /// build runs needs no catch-up. An aggregate's column is never held out of
@@ -3063,12 +3057,12 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
 /// Errors with [`ApplyError::ColumnNotPaused`] if `(transform, column)`
 /// isn't currently paused — resuming a live column is caller error, not a
 /// silent no-op — and with [`ApplyError::ColumnAwaitingCapture`] if it is
-/// an `ALTER TRANSFORM` field still awaiting its capture widen (#687). A
+/// an `ALTER TRANSFORM` field still awaiting its capture widen. A
 /// dependent in that state reached through the cascade stays paused too,
 /// and so do its own readers, until its field build's start releases it and
-/// un-cascades from it (issue #918, `super::build::release_awaiting_capture`).
+/// un-cascades from it (`super::build::release_awaiting_capture`).
 /// A field that reads another field of its definition still paused, by
-/// alias, stays paused (issue #748): the resume drops only its own reason
+/// alias, stays paused: the resume drops only its own reason
 /// (`local_fuse`), leaves the cascade's, and resumes nothing. The resume of
 /// the field it reads releases and rebuilds it.
 ///
@@ -3083,7 +3077,7 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
 /// committed, so there is nothing left to roll back. A pair whose definition
 /// has not started building (`waiting_to_backfill`) is released by deleting
 /// its row: its build reads the paused set when its chunks run, so it writes
-/// the column without a field build (issue #916). One whose definition is
+/// the column without a field build. One whose definition is
 /// frozen can't be released, and the walk has
 /// deleted its edge: it is held as a pause of its own with a reason that says
 /// so ([`hold_orphaned_pause`]), for its `RESUME` once the definition
@@ -3115,7 +3109,7 @@ pub async fn resume_column(
                     column: column.to_string(),
                 });
             }
-            // #687: only the field build's release may unpause it.
+            // Only the field build's release may unpause it.
             Some(true) => {
                 return Err(ApplyError::ColumnAwaitingCapture {
                     transform: transform.to_string(),
@@ -3145,7 +3139,7 @@ pub async fn resume_column(
                     transform: transform.to_string(),
                 });
             }
-            // #708: the field rebuilds from the live schema, so it resumes
+            // The field rebuilds from the live schema, so it resumes
             // only while define would accept its definition.
             refuse_unless_valid(pool, transform, &def).await?;
         }
@@ -3164,7 +3158,7 @@ pub async fn resume_column(
             .await?;
 
         // Whether it stays paused with a sibling, read and acted on under
-        // the column-pause lock (#922): a resume of that sibling running at
+        // the column-pause lock: a resume of that sibling running at
         // the same time reads this column's `local_fuse` to decide whether
         // to release it. Without the lock, this could read the sibling
         // paused, that resume read `local_fuse` still set and keep this
@@ -3181,7 +3175,7 @@ pub async fn resume_column(
         )
         .await?;
         if reads_paused_sibling(&*txn, pool, transform, column).await? {
-            // Test-only pause point (#922). See `super::interleave`.
+            // Test-only pause point. See `super::interleave`.
             #[cfg(any(test, feature = "test-util"))]
             super::interleave::pause_at(
                 &*txn,
@@ -3221,7 +3215,7 @@ pub(crate) fn cascade_reason(upstream_transform: &str, upstream_column: &str) ->
 }
 
 /// Restates the reason `transform.column` gives for its pause once one of
-/// the edges into it is gone and others are left (issue #950): if its
+/// the edges into it is gone and others are left: if its
 /// `last_error` names an upstream column it no longer has an edge from, it
 /// names the first one it still has. A row with a reason of its own
 /// (`local_fuse`), one awaiting its capture, and one with no edge left are
@@ -3279,15 +3273,15 @@ pub(crate) struct Uncascaded {
 /// caller deleted their rows), in `txn`: deletes the edges that leave them,
 /// and releases each reader left with no reason to stay paused (no
 /// `local_fuse`, no other edge into it, and not awaiting its capture,
-/// which its own field build's start releases, #687). A reader in `target`
-/// is released in `txn` and walked from in turn (issue #748); one in
+/// which its own field build's start releases). A reader in `target`
+/// is released in `txn` and walked from in turn; one in
 /// another definition is returned in [`Uncascaded::dependents`]. A reader
 /// still paused through another edge has its reason restated
 /// ([`restate_cascade_reason`]).
 ///
 /// Two paths end a column's pause this way, and both must: a resume
 /// ([`resume_column`]), and the release of a field that awaited its capture
-/// (`super::build::release_awaiting_capture`, issue #918), which may have
+/// (`super::build::release_awaiting_capture`), which may have
 /// passed a pause on to readers after the resume that took its own edge
 /// away left it in place.
 pub(crate) async fn uncascade(
@@ -3323,7 +3317,7 @@ pub(crate) async fn uncascade(
                 continue;
             };
             let (local_fuse, awaiting_capture): (bool, bool) = (status.get(0), status.get(1));
-            // #687: a field awaiting its capture widen stays paused; with
+            // A field awaiting its capture widen stays paused; with
             // this cascade gone, its field build's start unpauses it.
             if local_fuse || awaiting_capture {
                 continue;
@@ -3367,7 +3361,7 @@ pub(crate) async fn uncascade(
 /// pair stays paused, as the walk goes on, when its definition can't take a
 /// field build (one that hasn't started building needs none, and is
 /// released) or no longer validates, judged on the definition read under
-/// the column-pause lock (#965); it is then held as a pause of its own
+/// the column-pause lock; it is then held as a pause of its own
 /// ([`hold_orphaned_pause`]). Returns the pairs resumed, in order.
 pub(crate) async fn resume_pairs(
     pool: &Pool,
@@ -3379,7 +3373,7 @@ pub(crate) async fn resume_pairs(
         let Some(def) = catalog::definition_by_target(pool, &t).await? else {
             continue;
         };
-        // Test-only pause point (#965). See `super::interleave`. The walk
+        // Test-only pause point. See `super::interleave`. The walk
         // holds nothing here: an edit of `t`'s definition can commit.
         #[cfg(any(test, feature = "test-util"))]
         {
@@ -3397,16 +3391,16 @@ pub(crate) async fn resume_pairs(
         }
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
-        // The unpause and the field build's registration commit together
-        // (#625 F8b): the column applies from this commit, and the build's
+        // The unpause and the field build's registration commit together:
+        // the column applies from this commit, and the build's
         // chunks rewrite it under the keys' entry lock, so nothing needs a
         // catch-up. See this function's doc comment. The version fence
         // keeps a page that read the column paused from applying after this
         // commit (`super::build::bump_version_fence`). The bump is this
         // transaction's first lock: it waits for the pages in flight, and
         // one of them can be waiting on a transaction that wants the
-        // definition row, so holding that row here would close a cycle
-        // (issue #744). A rollback below takes the bump back with it.
+        // definition row, so holding that row here would close a cycle.
+        // A rollback below takes the bump back with it.
         let one_to_one = matches!(def.def.key_space, KeySpace::OneToOne);
         if one_to_one {
             super::build::bump_version_fence(&*txn, &def.source_table).await?;
@@ -3445,7 +3439,7 @@ pub(crate) async fn resume_pairs(
         // column's pause held out: every build of it, the Re-derive build
         // and the old path alike, reads the paused set when its chunks run,
         // after this commit. Releasing the pair is deleting its row; there
-        // is no field build to start and none to wait for (issue #916).
+        // is no field build to start and none to wait for.
         let unbuilt = status == TransformStatus::WaitingToBackfill;
         if !unbuilt && !super::build::takes_field_build(status, build.as_deref()) {
             // Reached via cascade (the initial pair was already gated above
@@ -3502,7 +3496,7 @@ pub(crate) async fn resume_pairs(
                 column: c.to_string(),
             });
         }
-        // #708, #965: a dependent the cascade reaches is re-validated as the
+        // A dependent the cascade reaches is re-validated as the
         // resumed field's definition was at the gate in `resume_column`, on
         // the definition just read: an edit committed before the lock is
         // what the answer is about, and none can commit after it. One
@@ -3543,7 +3537,7 @@ pub(crate) async fn resume_pairs(
             &[&t, &c],
         )
         .await?;
-        // Test-only pause point (#917). See `super::interleave`.
+        // Test-only pause point. See `super::interleave`.
         #[cfg(any(test, feature = "test-util"))]
         super::interleave::pause_at(
             &*txn,
@@ -3551,8 +3545,8 @@ pub(crate) async fn resume_pairs(
             &t,
         )
         .await?;
-        // Un-cascade from `c`, and from each sibling this releases with it
-        // (issue #748): a field of this definition that reads a released
+        // Un-cascade from `c`, and from each sibling this releases with it:
+        // a field of this definition that reads a released
         // one by alias, and has no other reason to stay paused, is released
         // in this same transaction and rebuilt by the same field build. A
         // dependent in another definition goes on the queue.
@@ -3586,7 +3580,7 @@ pub(crate) async fn resume_pairs(
 
 /// Holds `(transform, column)` as a pause of its own when a walk that
 /// resumed its upstream column has deleted its last edge and then can't
-/// release it (issue #916): its definition can't take a field build, or no
+/// release it: its definition can't take a field build, or no
 /// longer validates. Its row is there, with no `local_fuse`, no edge and not
 /// awaiting a capture, and `last_error` still says it waits on the upstream,
 /// which no longer holds; nothing would release it, and its definition would
@@ -3640,7 +3634,7 @@ async fn hold_orphaned_pause(
 }
 
 /// Re-runs define-time validation for `definition` against the live schema
-/// ([`catalog::revalidate`], #708), on a transaction of its own that
+/// ([`catalog::revalidate`]), on a transaction of its own that
 /// changes nothing, as a field resume's gate: [`ApplyError::ResumeRefused`]
 /// for `transform` while define would refuse it.
 async fn refuse_unless_valid(
@@ -3674,7 +3668,7 @@ async fn refuse_unless_valid_in(
 }
 
 /// Whether `column` of `transform` reads another of its fields that is
-/// still paused, by alias, directly or through others (issue #748): Apply
+/// still paused, by alias, directly or through others: Apply
 /// holds it out with that field whatever its own row says
 /// ([`paused_columns_for`]).
 async fn reads_paused_sibling(
@@ -3705,7 +3699,7 @@ async fn reads_paused_sibling(
 /// tier (which additionally requires the owning definition to already be
 /// `live`; a frozen definition is, by construction, never that).
 ///
-/// **One resume for both of ADR-0014's pause triggers** (issue #142).
+/// **One resume for both of ADR-0014's pause triggers**.
 /// `target`'s current status must be either [`TransformStatus::Quarantined`]
 /// (the poison fuse tripped it) or [`TransformStatus::Paused`] (an operator
 /// froze it deliberately via `PAUSE TRANSFORM` — see [`crate::Trellis::apply`]) —
@@ -3720,36 +3714,36 @@ async fn reads_paused_sibling(
 ///
 /// This function itself only schedules that reconciliation. It drops the
 /// definition to [`TransformStatus::WaitingToBackfill`], unless a definition
-/// whose target it reads isn't `live` (#971): then it records a resume
+/// whose target it reads isn't `live`: then it records a resume
 /// request and returns, and the staging worker resumes it once every such
 /// upstream is ([`resume_locked`]'s step 0). The staging worker's next pass
-/// then starts a Re-derive build for it (`super::build::start_ready_builds`,
-/// #625 F3): a 1-1 build keeps the ledger (B4) and its sweep drops the keys
+/// then starts a Re-derive build for it (`super::build::start_ready_builds`):
+/// a 1-1 build keeps the ledger and its sweep drops the keys
 /// deleted while it was frozen, and an aggregate's or a `JOIN`'s plan job
 /// rewrites its groups in one absolute write. The target is left exactly as
 /// the freeze left it until then.
 ///
-/// Deletes the definition's unclaimed, undone `backfill_chunks` rows too
-/// (issue #332): the fresh backfill makes them redundant, and a pause only
+/// Deletes the definition's unclaimed, undone `backfill_chunks` rows too:
+/// the fresh backfill makes them redundant, and a pause only
 /// withheld them from dispatch. Chunks a worker still holds are left for that
 /// worker; however it gives one up, it is discarded rather than handed out
-/// again or used to complete the definition (issues #360/#397,
-/// `defs::chunk_queue::finish_chunk`/`release_chunk`/`reclaim_stale_chunks`).
+/// again or used to complete the definition
+/// (`defs::chunk_queue::finish_chunk`/`release_chunk`/`reclaim_stale_chunks`).
 ///
 /// **The trip half of this contract** lives in [`isolate_and_evict`]'s
 /// eviction (`quarantine_if_crossed`): when the count of keys poisoned for
 /// a definition crosses [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`], that
-/// definition is quarantined (issue #105; per definition since #799).
+/// definition is quarantined (the count is per definition).
 ///
-/// **Releases every key the definition holds** (#799): its own `poison`,
+/// **Releases every key the definition holds**: its own `poison`,
 /// `poison_held` and `key_deaths` rows are deleted in the same transaction,
 /// and the fresh build re-derives every key from the source, so the parked
 /// work is superseded rather than replayed. Every other definition's rows
 /// are untouched: whole-key poison is per transform, so a sibling on the same
 /// source keeps its own held keys. Deleting the rows is also what re-arms
-/// the fuse (issue #160): the resumed definition starts from a count of zero.
+/// the fuse: the resumed definition starts from a count of zero.
 /// `fuse_rearmed_at` is stamped too, as the resume's epoch: a backfill chunk
-/// of the old build is stale against it (issues #360/#397), and an eviction
+/// of the old build is stale against it, and an eviction
 /// whose attribution read the old one poisons nothing (`evict_for`).
 #[tracing::instrument(name = "quarantine.resume_transform", skip(pool), fields(transform = %target))]
 pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyError> {
@@ -3847,16 +3841,16 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
 /// fence, then locks the definition's row and reads its id and status.
 /// `None` if it's gone, or was dropped and defined again on another source.
 ///
-/// Issue #768: the drain skips a table whose key can't be used while every
+/// The drain skips a table whose key can't be used while every
 /// definition reading it is frozen, judged under the fence of each reader's
 /// source (`staging::apply::source_key_for_apply`). The bump makes a page
 /// that judged this definition frozen miss its fence if it reaches it after
 /// the resume commits, so it can't skip rows the rebuild needs. It is the
-/// transaction's first lock (issue #744): it waits for the pages holding the
+/// transaction's first lock: it waits for the pages holding the
 /// fence, and holding the definition row meanwhile could close a cycle
 /// through one queued on a transaction that wants it.
 ///
-/// A `JOIN` reads two tables, and a page of either may judge it (#1107), so
+/// A `JOIN` reads two tables, and a page of either may judge it, so
 /// its joined table's fence is bumped too, the two in table-name order.
 async fn lock_frozen(
     txn: &Transaction<'_>,
@@ -3923,8 +3917,8 @@ enum ResumeStep {
     Draining,
 }
 
-/// A definition in this instance whose target another definition reads
-/// (#971): as its source or a `JOIN`'s joined table.
+/// A definition in this instance whose target another definition reads:
+/// as its source or a `JOIN`'s joined table.
 #[derive(Debug)]
 struct Upstream {
     /// Its bare target, the name `RESUME TRANSFORM` takes.
@@ -3934,7 +3928,7 @@ struct Upstream {
 }
 
 /// The first upstream (by id) of definition `id` on `source_table`,
-/// that isn't `live`, if any (#971). A resume waits for every upstream to
+/// that isn't `live`, if any. A resume waits for every upstream to
 /// be `live`, so its rebuild reads whole upstream targets and each
 /// downstream rebuild starts only after its upstream's has finished.
 /// Definitions form no cycle (`catalog::reject_if_table_cycle`), so every
@@ -3961,12 +3955,12 @@ async fn upstream_not_live(
         )
         .await?;
     let live = TransformStatus::Live.as_str();
-    // `live` as the operator reads it (`catalog::reported_statuses`, #497):
+    // `live` as the operator reads it (`catalog::reported_statuses`):
     // an upstream stored `live` that reads one that isn't reports
     // `catching_up`, and its target may still change under a rebuild above
     // it. Derived only when every upstream is stored `live`. An upstream that
     // reports `catching_up` only for a paused column it reads keeps applying,
-    // so it doesn't hold the resume (#1208).
+    // so it doesn't hold the resume.
     let reported = if upstreams.iter().all(|row| row.get::<_, &str>(3) == live) {
         Some(catalog::reported_statuses_ignoring_column_pauses(client).await?)
     } else {
@@ -3985,7 +3979,7 @@ async fn upstream_not_live(
 }
 
 /// The `capture_failure` of a definition whose resume waits for `upstream`
-/// to be `live` (#971).
+/// to be `live`.
 fn waiting_failure(upstream: &Upstream) -> String {
     format!(
         "resuming: waiting for transform {name}, whose target {table} this definition reads, \
@@ -3997,8 +3991,8 @@ fn waiting_failure(upstream: &Upstream) -> String {
     )
 }
 
-/// Records that definition `id`'s resume waits for `upstream` to be `live`
-/// (#971): a resume request (`resume_requests`), which
+/// Records that definition `id`'s resume waits for `upstream` to be `live`:
+/// a resume request (`resume_requests`), which
 /// [`finish_requested_resumes`] completes once every upstream is, and the
 /// `capture_failure` that says so, which replaces whatever reason it was
 /// paused for, as [`request_retype`]'s does.
@@ -4026,7 +4020,7 @@ async fn request_wait(
 
 /// Whether definition `id` (on `source_table`) was paused for a relabelled
 /// enum value or a column re-typed to another enum
-/// (`capture_failures.relabel_lsn`, #1241, #1327) and a change at or
+/// (`capture_failures.relabel_lsn`) and a change at or
 /// below that position is still pending on its source or joined table
 /// ([`super::converge::table_rows_pending_through`]), an image-less
 /// `recompute` included. Such a change holds the old label as text, which
@@ -4068,7 +4062,7 @@ const DRAINING_FAILURE: &str = "resuming: waiting for the changes staged before 
      which stays paused until then";
 
 /// Records that definition `id`'s resume waits for the changes staged before
-/// an enum relabel or re-type to drain (#1241, #1327): a resume request, which
+/// an enum relabel or re-type to drain: a resume request, which
 /// [`finish_requested_resumes`] completes once none is pending, and the
 /// `capture_failure` that says so. The record's `relabel_lsn` stays, so the
 /// completion still rebuilds as a relabel's resume.
@@ -4094,7 +4088,7 @@ async fn request_drain(
 /// completion of one that had copies to re-type
 /// ([`finish_requested_resumes`]).
 ///
-/// 0. **It waits for its upstreams** (#971): if a definition whose target
+/// 0. **It waits for its upstreams**: if a definition whose target
 ///    it reads isn't `live` ([`upstream_not_live`]), the operator's resume
 ///    (and the capture pass's of a definition whose cause went live), with
 ///    `from_pass` false, records a resume request and a `capture_failure`
@@ -4104,18 +4098,18 @@ async fn request_drain(
 ///    here once every upstream is `live`. The worker's own call returns that
 ///    too, writing nothing, and its caller leaves the request.
 /// 1. **It re-validates the definition against the live schema**
-///    ([`catalog::revalidate`], #708, #760), before it changes anything, and
+///    ([`catalog::revalidate`]), before it changes anything, and
 ///    refuses with [`ApplyError::ResumeRefused`] while define would refuse
 ///    it: a key, join or `GROUP BY` column of a type or collation define
 ///    refuses, a `JOIN` whose `ON` columns no longer match, a redefined
 ///    source key. A whole-transform resume also refuses a
 ///    1-1 definition whose ledger table doesn't exist
-///    ([`catalog::check_ledger_table`], #986); a column resume doesn't make
+///    ([`catalog::check_ledger_table`]); a column resume doesn't make
 ///    that check.
 /// 2. **It compares each column Trellis created with a type from the
 ///    source (typed copies, and calculated, aggregate and contribution
 ///    columns) with the type define would give it now**
-///    ([`crate::defs::copies`], #767, #824). If any differ, the
+///    ([`crate::defs::copies`]). If any differ, the
 ///    copies are re-typed before the rebuild, by the staging worker, under
 ///    `ACCESS EXCLUSIVE` (a table rewrite for `integer` to `bigint`). So the
 ///    operator's resume, `from_pass` false, only records a resume request
@@ -4317,10 +4311,10 @@ async fn complete_resume(
         .map_or((false, None), |row| (row.get(0), row.get(1)));
     // `fuse_rearmed_at = now()` in the same statement, not a separate one:
     // it is this resume's epoch, part of the same atomic "this transform
-    // starts over" transition as the status drop (issue #160), and what a
+    // starts over" transition as the status drop, and what a
     // stale chunk or eviction checks against.
     //
-    // `build = null` too (#625 F2): a definition paused during a Re-derive
+    // `build = null` too: a definition paused during a Re-derive
     // build is no longer under one. The staging worker's next pass starts a
     // new one (`staging::build::start_ready_builds`).
     txn.execute(
@@ -4329,25 +4323,25 @@ async fn complete_resume(
         &[&TransformStatus::WaitingToBackfill.as_str(), &id],
     )
     .await?;
-    // #708, #767: the rebuild casts each source value through its live type,
+    // The rebuild casts each source value through its live type,
     // and the capture pass compares the key columns against what it builds
     // from.
     catalog::record_source_columns(txn, id, &revalidated.source_columns).await?;
     if let Some(sides) = &revalidated.join {
         catalog::record_join_columns(txn, id, &sides.joined_value_types()).await?;
     }
-    // #1242: after both, whose enum tokens it records the type OIDs of.
+    // After both, whose enum tokens it records the type OIDs of.
     let joined = revalidated.join.as_ref().map(|sides| sides.joined.as_str());
     crate::defs::key_types::record_definition(txn, id, &definition.def, source_table, joined, true)
         .await?;
-    // #1205: a definition paused by a logical restore starts over on this
+    // A definition paused by a logical restore starts over on this
     // database's own positions. The rebuild below keeps the ledger's
     // `__applied_lsn` (B4), which is right for an ordinary one and would skip
     // every later change to a key the dump held.
     if restored {
         reset_ordering_state(txn, schema, id, &definition.target_table).await?;
     }
-    // #1241, #1327: a definition paused for a relabelled enum value, or a
+    // A definition paused for a relabelled enum value, or a
     // column re-typed to another enum, rebuilds without casting any label it
     // stored; its copies were re-typed without a cast
     // ([`crate::defs::copies::CopyState::discards_values`]). Its resume
@@ -4366,15 +4360,15 @@ async fn complete_resume(
             empty_if_keyed_by_an_enum(txn, source_table, &definition.target_table).await?;
         }
     }
-    // #1107, #1096 decision 7: a JOIN's hidden tables are fully derived, so
+    // A JOIN's hidden tables are fully derived, so
     // the resume drops and recreates them, at the shape define would give
     // them now, rather than check them.
     if let Some(sides) = &revalidated.join {
         catalog::recreate_hidden_tables(txn, schema, id, &definition.def, sides).await?;
     }
 
-    // Discard the definition's leftover unclaimed backfill chunks (issue
-    // #332). The pause only withheld them from `claim_chunks`; unfrozen, they
+    // Discard the definition's leftover unclaimed backfill chunks.
+    // The pause only withheld them from `claim_chunks`; unfrozen, they
     // would be handed out again and re-run work the fresh backfill parked
     // below already does. In the same transaction as the status drop, so no
     // claim can see the definition dispatchable with them still present, and
@@ -4382,7 +4376,7 @@ async fn complete_resume(
     //
     // A chunk a worker still holds is left alone, as a pause leaves it: that
     // worker may still be writing its range. The `fuse_rearmed_at` stamp
-    // above marks it stale (issues #360/#397): however that worker gives it
+    // above marks it stale: however that worker gives it
     // up (finishing, failing or dying), the chunk queue deletes it rather
     // than completing the definition or freeing it for a rerun.
     txn.execute(
@@ -4393,7 +4387,7 @@ async fn complete_resume(
     .await?;
     // Waits out any write such a chunk still has in flight, which holds the
     // chunk's row `for key share` until it commits
-    // (`defs::chunk_queue::ClaimFence`, issue #434). Every write that chunk
+    // (`defs::chunk_queue::ClaimFence`). Every write that chunk
     // makes then commits before this resume does, while the definition is
     // frozen, and the rebuild overwrites it. One that starts later sees the
     // stamp above and writes nothing, so none can land after the rebuild has
@@ -4405,7 +4399,7 @@ async fn complete_resume(
     )
     .await?;
 
-    // #1101: a group-basis aggregate's partials are fully derived, so the
+    // A group-basis aggregate's partials are fully derived, so the
     // resume drops and recreates them at the shape define would give them
     // now (a re-typed `GROUP BY` column included), and its build writes
     // every group afresh. The visible target is kept: the build's absolute
@@ -4423,7 +4417,7 @@ async fn complete_resume(
     // runs over the ledger the freeze left (B4), and its sweep drops the keys
     // deleted meanwhile; a group-basis aggregate's or a `JOIN`'s plan job
     // rewrites its groups.
-    // #799: release every key this definition holds. The fresh build below
+    // Release every key this definition holds. The fresh build below
     // re-derives each from the source, so its parked work is superseded, not
     // replayed, and the key is applied again from the build's start on.
     // Only this definition's rows: a sibling on the same source keeps its
@@ -4436,7 +4430,7 @@ async fn complete_resume(
         )
         .await?;
     }
-    // #622 C6: a transform paused by a schema change stops being reported as
+    // A transform paused by a schema change stops being reported as
     // such the moment it is resumed. Its columns count for capture again from
     // here, so the next reconcile widens the source's capture to them before
     // the rebuild may start, or, if a column is still
@@ -4444,7 +4438,7 @@ async fn complete_resume(
     // (`staging::schema_change::pause_readers_of_missing`). A key column
     // changed again since the re-validation above is the next pass's to
     // pause (`pause_readers_of_retyped`), against the types just recorded.
-    // #707: the capture the definition was paused over is recorded afresh by
+    // The capture the definition was paused over is recorded afresh by
     // the next pass, which installs it again if the triggers were disrupted.
     txn.execute(
         "delete from capture_triggers where table_name in \
@@ -4452,7 +4446,7 @@ async fn complete_resume(
         &[&id],
     )
     .await?;
-    // #1200: a partitioned source whose root is no longer the one recorded
+    // A partitioned source whose root is no longer the one recorded
     // (dropped and created again, swapped in by renames, renamed away) is seen
     // as new by the next pass: its recorded tree and queued corrections name
     // the old root's nodes, and the resume's rebuild covers the new tree.
@@ -4493,7 +4487,7 @@ async fn complete_resume(
 }
 
 /// Deletes the ring rows of `tables` with an `origin_lsn` at or below `gate`
-/// that every definition has drained (#1241): their segment is `drained`
+/// that every definition has drained: their segment is `drained`
 /// and its fence saw them. They wait in their slot until a later segment
 /// reuses it, and a group-basis or JOIN rebuild names groups from the old
 /// images of every row there (`super::group_basis`), casting their text.
@@ -4526,7 +4520,7 @@ async fn discard_drained_changes(
 
 /// Empties the 1-1 target `target` (qualified) and its ledger when the
 /// row-identity key of `source_table` has a
-/// column of an enum type (#1241). Its ledger's `__from_key` is that key as
+/// column of an enum type. Its ledger's `__from_key` is that key as
 /// text, and after a relabel an entry may name a label that no longer
 /// exists, which the rebuild's sweep would cast to the key's type. Emptied,
 /// the target is rebuilt as define builds it: every key from the source,
@@ -4578,7 +4572,7 @@ async fn empty_if_keyed_by_an_enum(
 
 /// Resets the ordering state of definition `id` (target `target`, qualified)
 /// that a logical restore left holding the original database's WAL positions
-/// and transaction ids (#1205, ADR-0002 I2): the 1-1 ledger's and the group
+/// and transaction ids (ADR-0002 I2): the 1-1 ledger's and the group
 /// ledger's `__applied_lsn` and `__basis`, the truncate floors of the target
 /// and of the hidden tables. A group-basis aggregate's and a JOIN's hidden
 /// tables are recreated by the resume itself, with no basis or stamp. Entries keep their other
@@ -4624,25 +4618,26 @@ async fn reset_ordering_state(
 
 /// How long the staging worker waits for the lock on a table whose copies
 /// it re-types before it leaves the re-type for its next pass: a resume's,
-/// or one it makes in place (`staging::schema_change`, #824).
+/// or one it makes in place (`staging::schema_change`).
 pub(crate) const RETYPE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The staging worker's resume of every definition a resume's re-type of
-/// its upstream's target paused (#828, #970): run at the start of each
+/// its upstream's target paused: run at the start of each
 /// capture pass, before [`finish_requested_resumes`], so a re-type it
 /// requests is done in the same pass. One `RESUME` of the head of a chain
 /// carries the whole chain.
 ///
 /// A definition paused with a cause (`capture_failures.caused_by`,
 /// recorded by `staging::schema_change::pause_readers_of_retyped`) waits
-/// until that upstream definition is `live`: its rebuild has finished
-/// (#476), so the rebuild of this one reads a target that is whole, and each
+/// until that upstream definition is `live`: its rebuild has finished,
+/// so the rebuild of this one reads a target that is whole, and each
 /// downstream rebuild starts only after the one above it. Then it takes the
 /// path an operator's `RESUME` takes ([`lock_frozen`], [`resume_locked`]),
 /// in one transaction:
 ///
 /// - **No copy drifted:** the definition is resumed, `waiting_to_backfill`.
-/// - **Another upstream isn't `live`** (a `JOIN`'s joined table, #971): a resume request is recorded and the
+/// - **Another upstream isn't `live`** (a `JOIN`'s joined table): a resume
+///   request is recorded and the
 ///   cause cleared ([`request_wait`]), and [`finish_requested_resumes`]
 ///   completes it once every upstream is.
 /// - **Copies to re-type:** a resume request is recorded and the cause
@@ -4811,12 +4806,12 @@ async fn resume_caused_definition(
 }
 
 /// The staging worker's half of every resume [`resume_transform`] left
-/// waiting on re-typed copies (`resume_requests`, #767): run at the start of
+/// waiting on re-typed copies (`resume_requests`): run at the start of
 /// each capture pass, before it reads the catalog, so a resume it completes
 /// is `waiting_to_backfill` in that pass's snapshot.
 ///
 /// For each request, in id order, it first waits for the definition's
-/// upstreams (#971): while one isn't `live` ([`upstream_not_live`]) it
+/// upstreams: while one isn't `live` ([`upstream_not_live`]) it
 /// leaves the request, rewriting the `capture_failure` only when the
 /// upstream it names changes ([`rewrite_waiting`]). It leaves the request
 /// too while a change staged before the enum relabel or re-type the
@@ -4837,7 +4832,7 @@ async fn resume_caused_definition(
 ///   deadlock, a serialization failure, a cancelled statement, a lost
 ///   connection), which says nothing about whether its values convert. Each
 ///   such retry rewrites the `resuming: ...` text with the last error
-///   ([`record_transient_retry`], #894). A statement cancelled by a
+///   ([`record_transient_retry`]). A statement cancelled by a
 ///   `statement_timeout` (57014) is also counted, and the
 ///   [`RETYPE_TIMEOUT_CANCEL_LIMIT`]th ends the request
 ///   ([`retype_cancelled_error`]): Trellis honours the operator's timeout
@@ -4917,7 +4912,7 @@ async fn finish_requested_resume(
         let Some(definition) = catalog::definition_by_id_in(&txn, id).await? else {
             return Ok(());
         };
-        // #971: nothing is re-validated or re-typed until every upstream is
+        // Nothing is re-validated or re-typed until every upstream is
         // live: its re-type may change the types this definition's copies
         // take from it.
         if let Some(upstream) = upstream_not_live(&txn, id, &source_table).await? {
@@ -4935,7 +4930,7 @@ async fn finish_requested_resume(
             }
             return Ok(());
         }
-        // #1327: nor while the changes staged before an enum change still
+        // Nor while the changes staged before an enum change still
         // drain ([`relabel_changes_pending`]): a re-type to another enum
         // deletes a key's rows, which only the resume's rebuild writes back,
         // so the target keeps them until the resume goes on to it. The
@@ -5221,7 +5216,7 @@ async fn lock_column_readers(
 
 /// Pauses, in the re-type's own transaction, each definition that reads one
 /// of `columns` (re-typed by a definition's resume) and that define would
-/// now refuse (#1188), recording the refusal as its `capture_failure`. Their
+/// now refuse, recording the refusal as its `capture_failure`. Their
 /// rows are locked before the re-type ([`lock_column_readers`]). It
 /// has no cause: the resume of the definition that re-typed the column
 /// doesn't release it, and its own resume refuses until the operator
@@ -5302,7 +5297,7 @@ fn retype_failed_error(target: &str, labels: &[String], error: &str, retyped: &[
 }
 
 /// How many times one resume request's re-type may be cancelled by a
-/// `statement_timeout` (SQLSTATE 57014) before the request ends (#894).
+/// `statement_timeout` (SQLSTATE 57014) before the request ends.
 /// Trellis honours the operator's `statement_timeout` and sets none of its
 /// own, so a rewrite that outlasts it is cancelled and retried on the next
 /// capture pass, blocking the target's readers for up to the timeout each
@@ -5336,7 +5331,7 @@ struct TransientRetry<'a> {
     timeout_cancel: bool,
 }
 
-/// Records a transient failure of definition `id`'s re-type (#894), in one
+/// Records a transient failure of definition `id`'s re-type, in one
 /// transaction locked as [`end_request`] locks: the definition's
 /// `capture_failure` gets the last error, and, for a cancelled statement,
 /// the attempt count, with `resume_requests.timeout_cancels` counting it. The
@@ -5403,7 +5398,7 @@ async fn record_transient_retry(
 
 /// The `capture_failure` of a definition whose resume's re-type of
 /// `retry.labels` was cancelled [`RETYPE_TIMEOUT_CANCEL_LIMIT`] times by a
-/// `statement_timeout` (#894). The definition stays paused, the copies keep
+/// `statement_timeout`. The definition stays paused, the copies keep
 /// their types and the target its rows. Both remedies are named: raise the
 /// timeout, restart Trellis and resume again, or drop the definition and
 /// define it again, which isn't subject to the re-type rewrite.
@@ -5437,8 +5432,8 @@ fn retype_cancelled_error(retry: &TransientRetry<'_>) -> String {
 }
 
 /// Rewrites the `capture_failure` of definition `id`, whose resume request
-/// waits for an upstream, to `error`, naming the upstream it waits for now
-/// (#971), in a transaction of its own. Locked as [`end_request`] locks, and
+/// waits for an upstream, to `error`, naming the upstream it waits for now,
+/// in a transaction of its own. Locked as [`end_request`] locks, and
 /// does nothing if the request is gone by then: an operator's `PAUSE`
 /// withdrew it (`defs::lifecycle::pause_transform`), and its text stands.
 async fn rewrite_waiting(
@@ -5509,7 +5504,7 @@ async fn end_request(
 /// transaction: stages one image-less `Recompute` of `(src_table, key)` into
 /// the active batch, then deletes the key's `poison_held` row, its marker,
 /// and its death counter for the definition whose bare target is `transform`
-/// (#799: whole-key poison is per transform, and so is its release). Another
+/// (whole-key poison is per transform, and so is its release). Another
 /// definition holding the same key keeps holding it. If the key's cause is
 /// still there, the `Recompute` fails like the change before it did, and the
 /// key is poisoned again once it reaches [`DEFAULT_DEATH_THRESHOLD`].
@@ -5519,14 +5514,13 @@ async fn end_request(
 /// row, which is idempotent, and one that does parks it, as it parks every
 /// change to a key it holds.
 ///
-/// The parked changes are discarded, not replayed (#623 D3, the D split's
-/// finding 7). A replayed CDC row would carry the releaser's `row_txid`, not
+/// The parked changes are discarded, not replayed. A replayed CDC row would carry the releaser's `row_txid`, not
 /// its source transaction's, and a ledger target decides whether a change is
 /// already counted by that id (ADR-0002 I2), so a replay could regress an
 /// entry a later Re-derive already moved past. The `Recompute` re-derives
 /// the key from its current row instead, on every target that reads it. It
 /// carries what the parked changes told a reader beyond the current row,
-/// which every park merged into the key's one held row ([`HeldKey`], #803):
+/// which every park merged into the key's one held row ([`HeldKey`]):
 ///
 /// - the earliest parked change's pre-image (a recompute's own hint, or a
 ///   CDC change's old image) as its prior image, the state readers last saw;
@@ -5543,7 +5537,7 @@ async fn end_request(
 /// poisons one ([`isolate_and_evict`], a build chunk's [`evict_build_key`]),
 /// and a resume or drop deletes them all. The release serializes with each:
 ///
-/// - its first lock (#744) is a bump of the version fence of the key's
+/// - its first lock is a bump of the version fence of the key's
 ///   table, the canonical name the drain fences its pages on. It waits for
 ///   every page holding the fence, so a page that parked a change for the
 ///   key has committed, and the reads below see its row (ADR-0002 I1). A
@@ -5565,22 +5559,22 @@ async fn end_request(
 ///   ([`ApplyError::TransformNotFound`]). An eviction whose isolation
 ///   charged the key before the release but that locks the definition after
 ///   it re-reads the key's death counter, which the release deleted, and
-///   poisons nothing ([`still_charged_to_threshold`], #880). A key that
+///   poisons nothing ([`still_charged_to_threshold`]). A key that
 ///   fails again is charged from 1 again.
 ///
 /// Neither lock is held while a page waits on one of the release's, since a
 /// page takes its fences before any other lock: the release takes the
 /// fence, then the definition row, the order a page takes them in.
 ///
-/// `src_table` may be either spelling of the table (#283), and `key` is the
+/// `src_table` may be either spelling of the table, and `key` is the
 /// key text [`crate::app::Trellis::sample_quarantined`] reports. Errors with
 /// [`ApplyError::TransformNotFound`] for an unknown `transform`, and with
 /// [`ApplyError::KeyNotHeld`], changing nothing, when the transform holds no
 /// such key. A first lock that waits out the session's `lock_timeout` is
 /// [`ApplyError::ReleaseLockTimeout`], also changing nothing: retryable.
 /// Returns how many held rows it deleted: 1 for a key with parked changes,
-/// 0 for one only marked poisoned (#803; one more for a key also held
-/// under its other spelling, #283).
+/// 0 for one only marked poisoned (one more for a key also held
+/// under its other spelling).
 pub async fn release_key(
     pool: &Pool,
     transform: &str,
@@ -5601,8 +5595,8 @@ pub async fn release_key(
     release_key_as(pool, &bare, src_table, key, None).await
 }
 
-/// The automatic retry's release of one held key ([`retry_held_keys`],
-/// #861): [`release_key`], provided the key is still held under the
+/// The automatic retry's release of one held key ([`retry_held_keys`]):
+/// [`release_key`], provided the key is still held under the
 /// `poisoned_at` the pass judged it due by. A key poisoned again since
 /// (an operator released it and it failed back in, or another staging
 /// worker's pass retried it first) has a later `poisoned_at` and so a later
@@ -5624,7 +5618,7 @@ pub async fn retry_held_key(
 /// the key's attempt count through the release: it writes the key's death
 /// counter one below the death threshold, with the count plus one, so the
 /// key is poisoned again on its first failure ([`still_charged_to_threshold`]
-/// and [`partition_by_threshold`] read the counter, #880), and the new
+/// and [`partition_by_threshold`] read the counter), and the new
 /// `poison` row keeps the count ([`evict_key`]) for the longer backoff. An
 /// operator's release deletes the counter, count included.
 async fn release_key_as(
@@ -5634,7 +5628,7 @@ async fn release_key_as(
     key: &str,
     retry: Option<SystemTime>,
 ) -> Result<usize, ApplyError> {
-    // Issue #283: quarantine's tables are keyed canonically, but this is an
+    // Quarantine's tables are keyed canonically, but this is an
     // operator entry point that may be handed either spelling of a source.
     // Matching the set of both is what keeps a release total either way — a
     // partial release would leave orphaned parked work `converge` gates on
@@ -5645,12 +5639,12 @@ async fn release_key_as(
     let names = canonical_and_raw(pool, src_table).await?;
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
-    // The first lock (#744): see the doc comment's "Concurrency". `names[0]`
+    // The first lock: see the doc comment's "Concurrency". `names[0]`
     // is the canonical name, the one a page's fence read set keys the
     // table's changes on. A name that resolves to no table bumps a fence no
     // page reads, and the release then refuses and rolls it back.
     // A page that holds the fence past the lock timeout makes the release
-    // give up (#842): name that wait, retryable, rather than return a raw
+    // give up: name that wait, retryable, rather than return a raw
     // `55P03`. The bump never landed, and dropping `txn` rolls it back.
     if let Err(err) = super::build::bump_version_fence(&*txn, &names[0]).await {
         if crate::locks::is_lock_not_available(&err) {
@@ -5719,7 +5713,7 @@ async fn release_key_as(
             key: key.to_string(),
         });
     }
-    // One held row per spelling the key was parked under (#803), merged as
+    // One held row per spelling the key was parked under, merged as
     // a park would have merged them under one.
     let merged = held
         .iter()
@@ -5747,7 +5741,7 @@ async fn release_key_as(
     };
     append::append(&txn, std::slice::from_ref(&staged)).await?;
 
-    // #1102: on a group-basis aggregate the release recomputes every group
+    // On a group-basis aggregate the release recomputes every group
     // the key could owe: those its parked changes named, and its current
     // row's. The parked changes are discarded. The version fence above keeps
     // every page of the source out until this commits, and the groups are
@@ -5758,7 +5752,7 @@ async fn release_key_as(
             .iter()
             .flat_map(|row| row.get::<_, Option<Vec<String>>>(6).unwrap_or_default())
             .collect();
-        // #1110: on a `JOIN`, the cells of the key's side, carried into `T`
+        // On a `JOIN`, the cells of the key's side, carried into `T`
         // under the `J` locks.
         if !super::group_basis::release(&txn, pool.schema(), definition, &groups, key).await? {
             super::join::release(&txn, pool.schema(), definition, &names[0], &groups, key).await?;
@@ -5811,7 +5805,7 @@ async fn release_key_as(
 }
 
 /// Releases the keys the capture pass asked for when it followed a renamed
-/// type (`capture::baseline::follow_renamed_types`, #1204): for each
+/// type (`capture::baseline::follow_renamed_types`): for each
 /// `retype_releases` row, every key its definition holds whose failure had
 /// the row's SQLSTATE (`42704`, a cast by the type's old name), each
 /// through [`release_key`], so its parked work is applied again. A key held
@@ -5925,8 +5919,8 @@ pub(crate) const RETYPE_RELEASE_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(2 * crate::locks::LOCK_TIMEOUT.as_secs());
 
 /// Asks, in the transaction that completes a build of `upstream`'s target,
-/// for the release of every key each direct reader of that target holds
-/// (#1306): each definition whose source, or `JOIN` side, is the target
+/// for the release of every key each direct reader of that target holds:
+/// each definition whose source, or `JOIN` side, is the target
 /// (`upstream_releases`, released by [`release_upstream_rebuilt_keys`] after
 /// the next capture pass). A reader can hold a key for a failure the
 /// upstream caused while it was rebuilt (its copy held values of two widths
@@ -5956,7 +5950,7 @@ pub(crate) async fn request_upstream_releases(
 }
 
 /// Releases the keys the completion of an upstream build asked for
-/// ([`request_upstream_releases`], #1306): for each `upstream_releases` row,
+/// ([`request_upstream_releases`]): for each `upstream_releases` row,
 /// every key its definition holds, whatever the failure, each through the
 /// automatic retry's release ([`retry_held_key`]): the key's death counter
 /// is written one below the threshold, so a key whose failure persists is
@@ -6091,8 +6085,8 @@ pub(crate) async fn release_upstream_rebuilt_keys(pool: &Pool) -> Result<(), App
 /// build committed commits within it).
 pub(crate) const UPSTREAM_RELEASE_WINDOW: std::time::Duration = RETYPE_RELEASE_WINDOW;
 
-/// The opt-in automatic retry of held keys (#861,
-/// [`TrellisOptions::held_key_retry`](crate::TrellisOptions::held_key_retry)).
+/// The opt-in automatic retry of held keys
+/// ([`TrellisOptions::held_key_retry`](crate::TrellisOptions::held_key_retry)).
 ///
 /// The staging worker releases a held key on its own once it has been held
 /// for its backoff: `initial_backoff` after the key was poisoned, doubling
@@ -6181,7 +6175,7 @@ pub struct RetryPass {
     pub yielded: bool,
 }
 
-/// One pass of the automatic retry (#861): releases up to `policy.batch` of
+/// One pass of the automatic retry: releases up to `policy.batch` of
 /// the held keys that are due, the longest-held first, each through the same
 /// path as [`release_key`] (it bumps the key's table fence, locks the
 /// definition row and stages one `Recompute`) with the attempt count carried
@@ -6278,7 +6272,7 @@ pub async fn retry_held_keys(
     })
 }
 
-/// The keys one definition holds in quarantine (#759): its `poison` rows,
+/// The keys one definition holds in quarantine: its `poison` rows,
 /// each a source key whose changes the definition's apply leaves out until
 /// a release (`release_key`), a resume or a drop. `None` where a
 /// definition holds none. `status` reports it per definition, and
@@ -6357,12 +6351,12 @@ pub(crate) fn held_keys_from(
 /// database state.
 ///
 /// The quarantine deletes match both the canonical identity and the raw ring
-/// spelling (issue #283), for the same reason [`release_key`]'s do: a leftover
+/// spelling, for the same reason [`release_key`]'s do: a leftover
 /// `poison_held` row for a table that no longer exists can never be released or
 /// drained, so a partial purge re-wedges exactly what this call exists to
 /// unwedge. The *ring* deletes stay on the raw spelling alone — `src_table`
 /// there is the string the wedged rows literally hold, which is what
-/// `SourceTableDropped` reported (issue #267's final fix) and the only spelling
+/// `SourceTableDropped` reported and the only spelling
 /// that can be in the ring for this call to have happened at all. Note that a
 /// dropped table is precisely the case [`qualified_src_table`] cannot resolve,
 /// so for a bare wedged row the canonical name usually *is* the raw one here,
@@ -6375,9 +6369,9 @@ pub(crate) fn held_keys_from(
 /// suffix when handed an already-qualified spelling. A bare quarantine
 /// row for a table whose bare suffix is ambiguous across two schemas, or
 /// unresolvable, therefore still survives a purge keyed on the qualified ring spelling —
-/// exactly the pre-#283 behavior, since that delete was single-spelling too.
+/// exactly as before, since that delete is single-spelling too.
 /// Stripping to the bare suffix here would fix that only by reintroducing the
-/// ambiguity #74/ADR-0011 exists to prevent: a purge of `archive.orders` would
+/// ambiguity ADR-0011 exists to prevent: a purge of `archive.orders` would
 /// delete a bare `orders` row that may belong to `public.orders`. Tracked as its
 /// own question rather than guessed at.
 pub async fn purge_dropped_table(pool: &Pool, src_table: &str) -> Result<(), ApplyError> {
@@ -6412,8 +6406,8 @@ pub async fn purge_dropped_table(pool: &Pool, src_table: &str) -> Result<(), App
 }
 
 /// `src_table` plus its canonical identity, deduped — the match set the two
-/// whole-key/whole-source *deletes* above use instead of a single spelling
-/// (issue #283). Only for delete paths that must be total: counting and
+/// whole-key/whole-source *deletes* above use instead of a single spelling.
+/// Only for delete paths that must be total: counting and
 /// charging still key strictly on the canonical identity, which is the entire
 /// point of that issue (two spellings, one budget), and would be re-split by
 /// matching a set here.
@@ -6437,7 +6431,7 @@ async fn canonical_and_raw(pool: &Pool, src_table: &str) -> Result<Vec<String>, 
 /// rather than a Prometheus-style dependency this crate has none of today.
 ///
 /// Runs in the transaction that pauses the halt's closure
-/// (`staging::halt::halt_closure`, #663), and only when it paused one, so
+/// (`staging::halt::halt_closure`), and only when it paused one, so
 /// the count is of episodes, not of attempts.
 pub async fn record_halting_stop(txn: &Transaction<'_>, reason: &str) -> Result<(), ApplyError> {
     txn.execute(
@@ -6542,7 +6536,7 @@ mod unit_tests {
         found.failing.iter().map(|(index, ())| *index).collect()
     }
 
-    /// Issue #655: one poisoned record, the only failure in a page at the
+    /// One poisoned record, the only failure in a page at the
     /// default `drain_batch_cap`, is found in two probes per halving (34),
     /// not one probe per record (100,000), wherever it sits in the page.
     #[test]
@@ -6561,7 +6555,7 @@ mod unit_tests {
         }
     }
 
-    /// Issue #655: two poisoned records are both found, in at most two probes
+    /// Two poisoned records are both found, in at most two probes
     /// per halving each, whether their paths split at the top or share every
     /// halving but the last.
     #[test]
@@ -6624,7 +6618,7 @@ mod unit_tests {
         assert_eq!((found.failing.len(), found.probes), (0, 2));
     }
 
-    /// Review of #655: a dead end larger than the probe limit is probed from
+    /// A dead end larger than the probe limit is probed from
     /// `dead_end_offset` and wraps around, so a masked record out of reach of
     /// one call's window is reached by a call with another offset, and random
     /// offsets reach it within a bounded number of calls.
@@ -6682,7 +6676,7 @@ mod unit_tests {
         );
     }
 
-    /// Review of #655: a record that fails alone, masked inside its half by a
+    /// A record that fails alone, masked inside its half by a
     /// batch-mate (a run fails only if it holds `k` without `m`, or `k`, `m`
     /// and `r` together, as an aggregate sum crossing a check might). The
     /// failing run whose halves both come back clean is a dead end, and
@@ -6808,7 +6802,7 @@ mod unit_tests {
             .unwrap_or_else(|| panic!("no `{name}` field on {event:?}"))
     }
 
-    /// Issue #670: isolation logs its start, with the batch's record count,
+    /// Isolation logs its start, with the batch's record count,
     /// and its end, with the probes it used, its outcome, the keys it
     /// pinned, whether the search completed, and how long it took. It also
     /// shows the transient stop end to end: every probe's compute fails to
@@ -6879,7 +6873,7 @@ mod unit_tests {
             .expect("elapsed_ms is a number");
     }
 
-    /// Issue #670: the end-of-isolation line for a search that ran to
+    /// The end-of-isolation line for a search that ran to
     /// completion is `info` and counts every key it pinned, evicted or only
     /// charged; one that stopped on an error is `warn` with the error.
     #[test]
@@ -6971,7 +6965,7 @@ mod unit_tests {
         );
     }
 
-    /// Issue #670: a lock or deadlock storm used to split on every transient
+    /// A lock or deadlock storm used to split on every transient
     /// probe and run all [`MAX_ISOLATION_PROBES`], each able to wait out a
     /// whole `lock_timeout`. [`MAX_CONSECUTIVE_TRANSIENT_PROBES`] in a row
     /// stop the search, keeping what it already pinned.
@@ -7058,7 +7052,7 @@ mod unit_tests {
 
     #[test]
     fn partition_by_threshold_separates_evictions_from_below_threshold_charges() {
-        // Issue #614: the below-threshold keys must survive the partition as
+        // The below-threshold keys must survive the partition as
         // named `ChargedKey`s with their death count, rather than being dropped
         // (which left the caller unable to tell them from "nothing reproduced").
         let (evict, below) = partition_by_threshold(
@@ -7168,7 +7162,7 @@ mod unit_tests {
 
     #[test]
     fn classify_maps_unsupported_primary_key_type_to_halting() {
-        // Issue #107: a non-text-stable single-column primary key is exactly
+        // A non-text-stable single-column primary key is exactly
         // as structural as the composite-key and no-key cases above, so it
         // must halt too rather than isolate-and-evict every key touching
         // that source one at a time.
@@ -7217,7 +7211,7 @@ mod unit_tests {
 
     #[test]
     fn classify_finds_a_transient_pg_error_whichever_variant_wraps_it() {
-        // Issue #653: only `ApplyError::Db` used to be inspected, so the same
+        // Only `ApplyError::Db` used to be inspected, so the same
         // dropped connection surfaced through a nested module's error was
         // `Isolate`, and the drain probed the whole page one record at a time
         // for a failure no single record could reproduce.
@@ -7264,7 +7258,7 @@ mod unit_tests {
         }
     }
 
-    /// #712: an entry lock that lost a key to the tombstone GC is retried
+    /// An entry lock that lost a key to the tombstone GC is retried
     /// uncharged, bare or wrapped, by the drain (`classify`) and by a
     /// backfill chunk (`is_transient_error`).
     #[test]
@@ -7347,7 +7341,7 @@ mod unit_tests {
         assert_eq!(classify(&config), FailureClass::Isolate);
     }
 
-    /// Issue #670 review: a lost claim is recognised through any wrapper, the
+    /// A lost claim is recognised through any wrapper, the
     /// same innermost-error rule `classify` uses, via either type that nests
     /// an `ApplyError`.
     #[test]
@@ -7370,7 +7364,7 @@ mod unit_tests {
         assert!(!is_claim_lost(&ApplyError::Db(uncoded_pg_error())));
     }
 
-    /// Issue #670: a structural halting diagnosis is `Halting` however deeply
+    /// A structural halting diagnosis is `Halting` however deeply
     /// another `ApplyError` wraps it. A backfill's downstream propagation
     /// reports it as `Backfill(Propagation(Box<ApplyError>))`, which used to
     /// be `Isolate`: isolation would have charged, and eventually evicted,
@@ -7445,7 +7439,7 @@ mod unit_tests {
         }
     }
 
-    /// Issue #670: `53300` (too many connections) is the server refusing a
+    /// `53300` (too many connections) is the server refusing a
     /// connection, not anything a record did. It reaches the drain as a pool
     /// checkout's `PoolError::Backend`, and used to classify `Isolate`. This
     /// takes the real error from a real checkout, against a role whose
@@ -7493,7 +7487,7 @@ mod unit_tests {
         assert_eq!(classify(&err), FailureClass::Transient);
     }
 
-    /// Issue #766: a `42501`, row-level security under `row_security = off`
+    /// A `42501`, row-level security under `row_security = off`
     /// or a plain missing privilege, is halting however it's wrapped: it is
     /// about the role and a table, so isolating it would charge every key.
     #[tokio::test]
@@ -7706,7 +7700,7 @@ mod unit_tests {
         .await
         .expect("create definition");
         // The target and the ledger define creates, which a resume needs to
-        // exist (#986, #1201).
+        // exist.
         raw.batch_execute(
             "create table public.order_totals (id bigint primary key, total numeric)",
         )
@@ -7755,7 +7749,7 @@ mod unit_tests {
         tripped
     }
 
-    /// Issue #338: the fuse reads its candidates without a lock, then writes.
+    /// The fuse reads its candidates without a lock, then writes.
     /// An operator PAUSE that commits between the two stands; the fuse must
     /// not relabel the freeze as its own. The interleaving is the fuse's two
     /// halves called in order around the pause, not a race.
@@ -7785,7 +7779,7 @@ mod unit_tests {
         assert_eq!(status_of(&raw).await, "paused");
     }
 
-    /// Issue #338, the pause committing *while* the fuse's write waits on it:
+    /// The pause committing *while* the fuse's write waits on it:
     /// the pause's transaction holds the definition's row (as
     /// `pause_transform` does between its `for update` read and its commit)
     /// when the fuse's `UPDATE` reaches it. The fuse's write must re-check the
@@ -7863,9 +7857,9 @@ mod unit_tests {
         assert_eq!(status_of(&raw).await, "paused");
     }
 
-    /// Issue #338's wider window: a pause *and* resume both landing between
+    /// The wider window: a pause *and* resume both landing between
     /// the fuse's read and its write. The resume deleted the definition's
-    /// `poison` rows (#799) and handed it back for a fresh build, so the stale
+    /// `poison` rows and handed it back for a fresh build, so the stale
     /// read's verdict no longer applies to it: the write's own count finds
     /// none of the pre-resume rows. (The pin is against a fix that re-checks
     /// the status but trusts a count taken earlier.)
@@ -7898,7 +7892,7 @@ mod unit_tests {
         assert_eq!(status_of(&raw).await, "waiting_to_backfill");
     }
 
-    /// #971: a `PAUSE` of a frozen definition waiting to be resumed
+    /// A `PAUSE` of a frozen definition waiting to be resumed
     /// withdraws that resume, a request or an upstream cause, rewrites its
     /// `capture_failure` so it no longer says it resumes, and reports
     /// [`PauseOutcome::Withdrawn`], which a plain no-op
@@ -7954,7 +7948,7 @@ mod unit_tests {
         assert_eq!(pause().await, PauseOutcome::AlreadyFrozen(paused));
         assert_eq!(record().await.0, error);
 
-        // An upstream cause (#970): the reason stands, the sentence saying
+        // An upstream cause: the reason stands, the sentence saying
         // it resumes on its own is replaced.
         raw.batch_execute(
             "update capture_failures set caused_by = transform_id, \
@@ -7998,10 +7992,10 @@ mod unit_tests {
     }
 
     // -----------------------------------------------------------------
-    // #803: one held row per key
+    // One held row per key
     // -----------------------------------------------------------------
 
-    /// One park as the pre-#803 table stored it: one row per segment.
+    /// One park as a one-row-per-segment table would store it.
     #[derive(Debug, Clone, PartialEq)]
     struct ParkedRow {
         seg_seq: i64,
@@ -8055,7 +8049,7 @@ mod unit_tests {
         }
     }
 
-    /// The pre-#803 park and release, verbatim in what they computed: each
+    /// The one-row-per-segment park and release, verbatim in what they computed: each
     /// park inserted a row per segment, `on conflict do nothing` (so a second
     /// park of one segment was dropped), and the release sorted the rows by
     /// `(seg_seq, held_seq)` and folded them into its `Recompute`.
@@ -8127,7 +8121,7 @@ mod unit_tests {
         }
     }
 
-    /// #803: the release stages the same `Recompute` from the one merged row
+    /// The release stages the same `Recompute` from the one merged row
     /// as the old release folded from a row per segment, case by case, and
     /// whichever order the parks committed in.
     #[test]
@@ -8213,7 +8207,7 @@ mod unit_tests {
         }
     }
 
-    /// #803's equivalence over generated park sequences: segments out of
+    /// The one-row-per-key held row's equivalence over generated park sequences: segments out of
     /// order and parked more than once, null and known origins, source and
     /// hop changes, and build parks among page parks.
     /// Deterministic: a fixed-seed xorshift, no proptest dependency here.
@@ -8370,7 +8364,7 @@ mod unit_tests {
         (held, count)
     }
 
-    /// #803: parks of one key, page parks and a build chunk's alike, merge
+    /// Parks of one key, page parks and a build chunk's alike, merge
     /// into one `poison_held` row whose fields are [`HeldKey::merge`]'s,
     /// whatever order they commit in; and the release stages the merged
     /// row's `Recompute` and deletes the row.
@@ -8510,7 +8504,7 @@ mod unit_tests {
             .get(0)
     }
 
-    /// #803: a page parks its held rows in key order, whatever order its
+    /// A page parks its held rows in key order, whatever order its
     /// changes come in, so two pages parking overlapping keys queue on the
     /// first shared row rather than each holding a row the other waits on
     /// (ADR-0002 I5). A third session holds key `a`'s row: the page parking
@@ -8586,7 +8580,7 @@ mod unit_tests {
         }
     }
 
-    /// #803: `converge`'s condition 4 holds back on a held key's earliest
+    /// `converge`'s condition 4 holds back on a held key's earliest
     /// origin, which its one merged row keeps however its parks arrive, and
     /// on every token once a park's origin is unknown.
     #[tokio::test]
@@ -8722,7 +8716,7 @@ mod unit_tests {
         }
     }
 
-    /// #894 rules 3 and 5: each cancelled statement counts and rewrites the
+    /// Each cancelled statement counts and rewrites the
     /// `resuming:` message with the attempt number; the third ends the
     /// request, naming the timeout and both remedies, the definition still
     /// paused.
@@ -8781,7 +8775,7 @@ mod unit_tests {
         assert_eq!(status_of(&raw).await, "paused");
     }
 
-    /// #894 rule 2: a transient failure that isn't a cancelled statement is
+    /// A transient failure that isn't a cancelled statement is
     /// recorded with its error but never counted, however often it repeats.
     #[tokio::test]
     async fn a_transient_failure_that_is_not_a_cancel_is_recorded_but_never_counted() {
@@ -8808,7 +8802,7 @@ mod unit_tests {
         );
     }
 
-    /// #894 rule 5: a `RESUME` that completes between the re-type's failure
+    /// A `RESUME` that completes between the re-type's failure
     /// and the record's write has deleted the request and the definition's
     /// `capture_failure`; the record must neither bring the failure back nor
     /// count against a request that is gone. (A drop in between cascades the

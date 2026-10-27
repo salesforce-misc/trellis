@@ -1,5 +1,4 @@
-//! The correction engine for aggregates over a partitioned source (ADR-0017,
-//! P4a of epic #897).
+//! The correction engine for aggregates over a partitioned source (ADR-0017).
 //!
 //! Partition maintenance (`ATTACH`, `DETACH`, `DROP`, a new leaf written
 //! directly) changes a partitioned root's rows without a write any capture
@@ -11,14 +10,14 @@
 //! # What a correction does
 //!
 //! A correction **recomputes the groups that route to the node** (the
-//! `group` module, #1103): the target's, those of the ring's undrained
+//! `group` module): the target's, those of the ring's undrained
 //! images, and the node's current rows', in one transaction, with the
 //! recompute's snapshot as each group's basis. It never zeroes a group. A
 //! capture install that only adds new nodes to the tree rebuilds no
 //! aggregate (`crate::intake::catch_up::park_table_catch_ups`): the nodes'
 //! corrections cover them.
 //!
-//! A `JOIN` reading the source as either side (`super::join`, #1111) is
+//! A `JOIN` reading the source as either side (`super::join`) is
 //! corrected the same way, over that side's partial cells (`P` or `M`)
 //! instead of groups: each cell's key holds every partition-key column
 //! (ADR-0019), and its recompute runs through the `J`-locked writer, so the
@@ -333,7 +332,7 @@ fn route_of(correction: &PendingCorrection, recorded: Option<&Recorded>) -> Rout
 
 /// A leaf of a partitioned source's recorded tree and how its groups route
 /// to it, for a group-basis rebuild's structures
-/// ([`super::group_basis::RebuildScope`], #1101).
+/// ([`super::group_basis::RebuildScope`]).
 #[derive(Debug, Clone)]
 pub(crate) struct RebuildLeaf {
     /// The leaf's oid, which orders the structures and is the job's cursor.
@@ -425,7 +424,7 @@ pub(crate) fn remainder_scope(
 /// [`route_columns`] for the group columns `names`. A column is presented
 /// under the first recorded key on it: its type, and its type's own
 /// collation ([`Key::collation`]), which every level's text compares under
-/// unless it names its level's on the bound (#1084).
+/// unless it names its level's on the bound.
 fn route_columns_named(
     names: &[&str],
     recorded: Option<&Recorded>,
@@ -855,7 +854,7 @@ pub(crate) async fn run_chunk(
     );
     let fence = ClaimFence::new(chunk.id, claimed_by, reclaim_ttl);
     let group_shape = super::group_basis::route(&definition.def, &definition.source_columns);
-    // A `JOIN` reads the source as either side (#1111).
+    // A `JOIN` reads the source as either side.
     let join_side = super::join::applies(&definition.def)
         .then(|| crate::defs::join::side_of_table(&definition.def, &correction.table))
         .flatten();
@@ -1095,7 +1094,7 @@ async fn covered_by_parent(
     Ok(!alive)
 }
 
-/// What became of a new or truncated leaf's recorded ancestors (#1148).
+/// What became of a new or truncated leaf's recorded ancestors.
 #[derive(Debug, PartialEq, Eq)]
 enum Ancestry {
     /// Every recorded ancestor is there, or the correction is of another
@@ -1562,7 +1561,7 @@ mod tests {
     /// collations routes as Postgres does, whichever level's key
     /// [`route_columns_named`] presents it under, the column's own collation
     /// the same as either level's or as neither's, and a level under the
-    /// type's own collation, whose text names none (#1084).
+    /// type's own collation, whose text names none.
     #[tokio::test]
     async fn a_column_partitioned_under_two_collations_routes_as_postgres_does() {
         let cluster = testkit::TestCluster::start();

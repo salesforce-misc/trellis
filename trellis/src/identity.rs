@@ -31,7 +31,7 @@
 //!
 //! Before any of that, [`prepare_attach`] also refuses a catalog schema that
 //! belongs to, or collides with, *another* instance sharing the database
-//! (issue #877, epic #806) — see [`prepare_attach`] for the four rules. A
+//! (see [`prepare_attach`] for the four rules). A
 //! second client of the *same* instance is not "another instance": its
 //! marker matches, so it attaches as always. The whole attach (check, runner,
 //! marker write) runs under one database-wide [`AttachLock`], so the check
@@ -61,7 +61,7 @@ pub const INSTANCE_FORMAT_VERSION: i32 = 1;
 /// (see [`seed_marker`]), so no flag is needed here.
 ///
 /// Before anything is created, four rules keep one instance's catalog away
-/// from another's (issue #877). Each refusal is an
+/// from another's. Each refusal is an
 /// [`Error::IncompatibleInstance`] naming both schemas:
 ///
 /// 1. The catalog schema may not be `public`.

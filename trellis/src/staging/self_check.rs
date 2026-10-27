@@ -1,4 +1,4 @@
-//! `self_check`: a production recompute audit (issue #174, ADR-0013).
+//! `self_check`: a production recompute audit (ADR-0013).
 //!
 //! Trellis's one hard correctness promise is byte-identical convergence to a
 //! from-scratch recompute at any caught-up LSN. The failure mode this module
@@ -40,12 +40,12 @@
 //! ALWAYS` and calling their functions, the functions `SECURITY DEFINER` and
 //! owned by the Trellis role, that role still holding the privileges the
 //! functions use, and the table still outside any partition or inheritance
-//! hierarchy ([`super::capture_audit`], #622 C9). It also checks that no
+//! hierarchy ([`super::capture_audit`]). It also checks that no
 //! such table's row-level security applies to the Trellis role or the
-//! caller's (#745), which would filter the recompute's reads as well as the
+//! caller's, which would filter the recompute's reads as well as the
 //! engine's, that the target's doesn't apply to the caller's, standing in
-//! for the workers' that write it (#765), and that no logical-replication
-//! subscription replicates into a table it is computed from (#751), whose
+//! for the workers' that write it, and that no logical-replication
+//! subscription replicates into a table it is computed from, whose
 //! changes capture never sees. A fault there is reported as [`Divergence::Capture`], without a
 //! recompute comparison: the convergence wait can't see a broken capture (it
 //! is a predicate over ring rows, and the broken capture writes none), and
@@ -76,7 +76,7 @@
 //! race left to resolve), and is what a caller that can quiesce (e.g. the
 //! generative suite, after `ManualBackend::quiesce`) should reach for.
 //!
-//! # Only a `live` definition is compared (#625 F7)
+//! # Only a `live` definition is compared
 //!
 //! The convergence wait is a predicate over the staging ring
 //! ([`converge::await_converged`]); it never looks at a definition's status,
@@ -123,7 +123,7 @@
 //! This module compares one keyset page ([`SelfCheckScope`]) of a target:
 //! [`check_page`] and the audit under it. The public `self_check` is a
 //! background job built from those pages, one per pass of a worker task
-//! ([`super::self_check_job`], #1023, #599): it registers a row and
+//! ([`super::self_check_job`]): it registers a row and
 //! returns, a worker walks the target's keyspace page by page, and the
 //! caller polls the row. No page runs inside a public call.
 //!
@@ -194,7 +194,7 @@ pub enum SelfCheckMode {
     /// **An aggregate on the group basis or a `JOIN` target** compares
     /// against the source minus the ring rows the target hasn't applied yet,
     /// in the one statement that reads the target
-    /// (`super::self_check_ring`, #1140). Under one snapshot that is exactly
+    /// (`super::self_check_ring`). Under one snapshot that is exactly
     /// what the target has applied, however hot its groups are, so a
     /// divergence on such a page is reported from one pass. Only a
     /// divergence on a group the subtraction can't vouch for is re-checked:
@@ -209,7 +209,7 @@ pub enum SelfCheckMode {
     ///
     /// **A 1-1 target** compares each row of a page against what the target
     /// has applied of it, in the same statement that reads the target
-    /// (`super::self_check_ring`, #1176): the old image of the key's
+    /// (`super::self_check_ring`): the old image of the key's
     /// earliest unapplied change its page would apply (no row, for an
     /// insert), or the live source row when the ring holds no such change
     /// for the key. A divergence on
@@ -295,7 +295,7 @@ pub struct SelfCheckPage {
     pub next_after: Option<String>,
     pub outcome: SelfCheckOutcome,
     /// The keys the audited definition holds in quarantine when the audit
-    /// ends, `None` if it holds none (#759). Reported with every outcome,
+    /// ends, `None` if it holds none. Reported with every outcome,
     /// because a held key is one the audit can't vouch for: the definition
     /// leaves its changes out, so its target row stays as it was when the
     /// key was poisoned. It is a page's [`SelfCheckOutcome::Diverged`] row
@@ -306,7 +306,7 @@ pub struct SelfCheckPage {
     /// `Trellis::release_key`, or resume the definition.
     pub held_keys: Option<HeldKeys>,
     /// Every page the drain keeps failing on with nothing charged or paused,
-    /// oldest first (#817), whichever definitions read its tables: an
+    /// oldest first, whichever definitions read its tables: an
     /// instance-level finding, reported with every outcome. Each holds back
     /// the targets of the tables it holds changes to, and with them the
     /// convergence this audit waits on. Empty when there is none.
@@ -330,7 +330,7 @@ pub enum SelfCheckOutcome {
     /// A stable divergence — present, and (under [`SelfCheckMode::Standard`])
     /// still present after a fresh re-check.
     Diverged(Vec<Divergence>),
-    /// The definition isn't [`TransformStatus::Live`] (#625 F7): it is being
+    /// The definition isn't [`TransformStatus::Live`]: it is being
     /// built or rebuilt, catching up, paused or quarantined, with the
     /// carried status. Nothing was compared and nothing was awaited.
     /// **Not a verdict on correctness**, like
@@ -372,11 +372,11 @@ pub enum Divergence {
     /// installed: a trigger is missing, disabled or calls the wrong
     /// function, a capture function is missing or has the wrong owner, the
     /// role the functions run as lost a privilege, the table joined a
-    /// partition or inheritance hierarchy (#622 C9, see
+    /// partition or inheritance hierarchy (see
     /// `super::capture_audit`), its row-level security applies to the
-    /// Trellis role (#745), which would filter its reads, this audit's too
-    /// (or the target's does, which would filter its writes, #765),
-    /// or a logical-replication subscription replicates into it (#751). Its
+    /// Trellis role, which would filter its reads, this audit's too
+    /// (or the target's does, which would filter its writes),
+    /// or a logical-replication subscription replicates into it. Its
     /// changes may not be reaching the target at all, so `self_check` reports these before, and instead
     /// of, a recompute comparison.
     Capture(CaptureFault),
@@ -628,7 +628,7 @@ pub(crate) async fn comparable_definition(
             target: target_table.to_string(),
         });
     }
-    // #1167: a walk of a `GROUP BY` or `JOIN` target pages its source by an
+    // A walk of a `GROUP BY` or `JOIN` target pages its source by an
     // index, and without one scans it once per page. Refused unless the
     // definition opted out; nothing else about the definition changes.
     if !def.def.without_source_index {
@@ -652,8 +652,8 @@ pub(crate) async fn comparable_definition(
     Ok(def)
 }
 
-/// The group-basis shape of `def`, if it is an aggregate on the group basis
-/// (#1104): audited by [`super::self_check_groups`].
+/// The group-basis shape of `def`, if it is an aggregate on the group basis:
+/// audited by [`super::self_check_groups`].
 fn group_shape(def: &Definition) -> Option<super::group_basis::GroupShape> {
     super::group_basis::route(&def.def, &def.source_columns)
 }
@@ -693,7 +693,7 @@ pub(crate) async fn findings(pool: &Pool, def: &Definition) -> Result<Findings, 
 /// cursor's cast and the ring's encoding), each collation the target key
 /// column's. Define gives the target key the source's collation and nothing
 /// re-collates it afterwards, so the walk's order holds when the source key
-/// is re-collated between pages (#1203). The target's key columns are named
+/// is re-collated between pages. The target's key columns are named
 /// as the source's (`ddl::target_table_ddl`), so they pair by name; a source
 /// key column with no namesake there was renamed since define, which pauses
 /// the transform, and keeps its own collation meanwhile.
@@ -726,7 +726,7 @@ pub(crate) async fn audit(
         return Err(SelfCheckError::InvalidScope { limit: scope.limit });
     }
 
-    // #622 C9: a table whose capture is broken may not be feeding the target
+    // A table whose capture is broken may not be feeding the target
     // at all, so that is reported first, and alone. A recompute comparison
     // would only show the symptom, and the convergence wait before it would
     // pass, because convergence is a predicate over ring rows the broken
@@ -755,7 +755,7 @@ pub(crate) async fn audit(
         });
     }
 
-    // #625 F7: only a `live` definition is compared (see the module doc's
+    // Only a `live` definition is compared (see the module doc's
     // "Only a `live` definition is compared"). After the capture audit, a
     // fact about the catalog that holds whatever the status, and before the
     // wait and the comparison, which a definition that is being built would
@@ -774,7 +774,7 @@ pub(crate) async fn audit(
         });
     }
 
-    // Issue #121: this audit now keys on the source's full (possibly
+    // This audit now keys on the source's full (possibly
     // composite) primary key, through the shared key-contract text
     // (`ddl::pk_key_sql_expr`) rather than a single named column.
     // An aggregate on the group basis or a `JOIN` is keyed by its `GROUP BY`
@@ -826,7 +826,7 @@ pub(crate) async fn audit(
     // falls on a key the pass couldn't vouch for exactly: a group-basis or
     // `JOIN` page compares against the source minus the ring rows its target
     // hasn't applied yet (`super::self_check_ring`), so what it finds is the
-    // target's, not lag (#1140).
+    // target's, not lag.
     if !rechecks(mode, &divergences, &pass1.uncertain) {
         return Ok(SelfCheckPage {
             target: target_table.to_string(),
@@ -895,7 +895,7 @@ fn rechecks(
 /// One comparison of a page of `target_table`, with no convergence wait
 /// and no re-check: what [`check_page`]'s first pass finds, whatever the
 /// ring holds. For the tests of the comparison against the source minus
-/// the ring rows the target hasn't applied yet (#1140), which hold a page
+/// the ring rows the target hasn't applied yet, which hold a page
 /// undrained while they compare.
 #[cfg(any(test, feature = "internals"))]
 pub async fn compare_page(
@@ -1038,7 +1038,7 @@ async fn await_then_compare(
     let token = {
         let client = pool.get().await?;
         let token = converge::watermark_token(&**client).await?;
-        // #799: on the audited definition's own held keys only. A key a
+        // On the audited definition's own held keys only. A key a
         // sibling holds is applied here as usual.
         if !caught_up(converge::await_converged_for(&client, token, timeout, def.id).await)? {
             return Ok(AwaitOutcome::NotCaughtUp { attempted: token });
@@ -1053,7 +1053,7 @@ async fn await_then_compare(
 /// Reads [`converge::await_converged`]'s result: `Ok(true)` if the target
 /// caught up, `Ok(false)` only if the wait ran out of time
 /// ([`StagingError::ConvergenceTimeout`]), which is the one failure that
-/// means "not caught up yet" (issue #592). Any other error means the wait
+/// means "not caught up yet". Any other error means the wait
 /// itself couldn't run, say a lost connection or a failed query, so it
 /// propagates. Reporting it as [`SelfCheckOutcome::NotCaughtUp`] would tell a
 /// caller polling `self_check` to keep waiting on an audit that can't run.
@@ -1186,7 +1186,7 @@ fn page_sql(
     comparable: &[&FieldDef],
 ) -> Result<String, SelfCheckError> {
     // `pk_key_sql_expr` is the source/target's shared key-contract text at
-    // whatever arity the key has (issue #121): a bare `{col}::text` at arity
+    // whatever arity the key has: a bare `{col}::text` at arity
     // 1. It is the key's identity, the text a divergence is reported by; the
     // page is ordered and bounded by the raw columns.
     let key = ddl::pk_key_sql_expr(keyset.columns(), None);
@@ -1434,7 +1434,7 @@ fn diff_page(
 /// callers, and `defs::backfill::paused_columns_for` already duplicates it
 /// too, for the same layering reason: see that pair's own doc comments).
 ///
-/// Closed over `def`'s alias readers, as that original is (issue #748).
+/// Closed over `def`'s alias readers, as that original is.
 async fn paused_columns(
     pool: &Pool,
     def: &crate::defs::ast::TransformDef,
@@ -1713,7 +1713,7 @@ mod tests {
         assert_eq!(reproduced(&both, both.clone()), both);
     }
 
-    /// #1140: under `Standard`, a page re-checks only when a divergence falls
+    /// Under `Standard`, a page re-checks only when a divergence falls
     /// on a key it couldn't vouch for exactly; a divergence on any other key,
     /// or on the schema, is reported from the one pass. A page whose source has
     /// an unapplied op that touches every key vouches for none, and `Strict`
@@ -1768,7 +1768,7 @@ mod tests {
         assert!(caught_up(Ok(())).expect("a converged wait is not an error"));
     }
 
-    /// Issue #592: any other wait failure means the audit couldn't run, so it
+    /// Any other wait failure means the audit couldn't run, so it
     /// must come back as `Err`, with the wrapped error's own code, never as a
     /// benign "not caught up".
     #[test]

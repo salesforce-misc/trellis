@@ -1,4 +1,4 @@
-//! The scheduled build (#625; epic #556, ADR-0002 "A build is Re-derive over
+//! The scheduled build (ADR-0002 "A build is Re-derive over
 //! chunks, and applies from its first chunk"): a 1-1 target's build chunk
 //! ([`one_to_one::run_chunk`]) and its scheduling (F2). It builds the shapes
 //! it serves (see "Shapes"), a fresh definition's and a resumed one's alike:
@@ -15,7 +15,7 @@
 //!   folds its source's changes into its target, so nothing needs
 //!   a catch-up afterwards. The start also records `build_seg`, the segment active at
 //!   its commit, and a page re-derives rather than applies the keys of any
-//!   batch at or below it (#733, see `start`). A resume leaves the rebuild to
+//!   batch at or below it (see `start`). A resume leaves the rebuild to
 //!   this start (`super::quarantine::resume_transform`).
 //! - **Rebuild** (F3). A resumed 1-1 definition keeps its ledger, so its
 //!   build is a Re-derive over its existing entries, with no truncate. Its
@@ -40,7 +40,7 @@
 //!   An aggregate (`super::group_basis`) has no entries to re-derive, so its
 //!   rebuild is its sweep job alone, which recomputes
 //!   every group in place in one transaction
-//!   (`super::group_basis::rebuild`, #1101): its readers see the old values
+//!   (`super::group_basis::rebuild`): its readers see the old values
 //!   until that commits, then the new ones, never an empty or partial
 //!   target. Over a partitioned source it is one such transaction per leaf
 //!   of the recorded tree, then one for the groups that route to no leaf
@@ -50,13 +50,13 @@
 //!   (below). A `JOIN` (`super::join`) is rebuilt the same way, by the sweep
 //!   job alone, whichever of its two tables the request names
 //!   ([`rebuild_candidates`]): both structures and `T` in one transaction
-//!   ([`super::join::build`], #1109).
+//!   ([`super::join::build`]).
 //! - **Plan** ([`run_plan`]). For an aggregate or a `JOIN` the plan job is
 //!   the whole build ([`run_group_rebuild_held`]). Otherwise a drain worker walks the source's primary key
 //!   and enqueues `rederive` chunks of `ClientOptions::build_chunk_rows`
 //!   rows, [`PLAN_BATCH`] per transaction (Q13). The walk and every chunk
 //!   compare the key under the collations the walk started under, which the
-//!   rows record (`backfill_chunks.key_collations`, #769), so re-collating
+//!   rows record (`backfill_chunks.key_collations`), so re-collating
 //!   the key mid-build doesn't reorder it under the ranges.
 //! - **Work order** ([`work_once`], B6). A drain worker takes segments first,
 //!   then a plan job, then one chunk, and a chunk only under the ring's backlog bound ([`chunk_allowed`]). A chunk's
@@ -113,18 +113,18 @@
 //! scheduled build:
 //! the start, the plan job, the sweep on a rebuild and the strict flip. Its
 //! chunk writes the target rows themselves, ordered against pages by the
-//! keys' entries on the 1-1 slim ledger (#623 D6).
+//! keys' entries on the 1-1 slim ledger.
 //!
 //! **Field builds (F8b).** `ALTER TRANSFORM ... ADD`/`ALTER` and a column
 //! resume rebuild only the fields they change, in the background
 //! ([`start_field_build`]). The fields they change take in every field that
-//! reads one of them by alias, directly or through others (issue #748,
-//! `defs::eval::AliasReaders`), since its value moves with theirs; a column
+//! reads one of them by alias, directly or through others
+//! (`defs::eval::AliasReaders`), since its value moves with theirs; a column
 //! pause holds such a reader out of Apply with the field it reads, so the
 //! resume rebuilds both. Each chunk takes the readers in again from the
 //! definition as it stands when the chunk is planned, so a reader an edit
 //! added after the build was registered (of a field awaiting its capture,
-//! which this build releases) is written too. The call's own transaction (#666: `apply` only
+//! which this build releases) is written too. The call's own transaction (`apply` only
 //! registers) moves the definition `live -> backfilling` with `build =
 //! 'rederive'`, or leaves it `backfilling` when a build is already running,
 //! and enqueues a plan job whose `backfill_chunks.fields` names the fields.
@@ -144,7 +144,7 @@
 //!   aggregate's fields are never held out of Apply, so neither call builds
 //!   one.
 //! - **The capture gate.** A field that reads a source column the source's
-//!   capture may not image yet (#622) can't apply before capture images it:
+//!   capture may not image yet can't apply before capture images it:
 //!   a page would meet rows staged without the column and quarantine their
 //!   keys. `ALTER` holds such a field out of Apply with a `column_status`
 //!   row marked `awaiting_capture`, and the plan job starts by waiting
@@ -189,20 +189,20 @@ pub struct SweepOutcome {
     pub finished: bool,
 }
 
-/// How long a chunk waits for its entry lock before giving up (#625 Q4).
+/// How long a chunk waits for its entry lock before giving up.
 /// A drain page waits up to `locks::LOCK_TIMEOUT` for the same locks, so a
 /// page never queues for long behind a chunk, and a chunk never holds up a
 /// page that got there first. The caller retries the chunk later.
 pub const CHUNK_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------
-// The scheduled build (#625 F2)
+// The scheduled build
 // ---------------------------------------------------------------------
 
-/// Source rows per chunk unless the client says otherwise (#625 Q4).
+/// Source rows per chunk unless the client says otherwise.
 pub const DEFAULT_CHUNK_ROWS: i64 = 10_000;
 
-/// How many chunk boundaries the plan job commits per transaction (#625 Q13),
+/// How many chunk boundaries the plan job commits per transaction,
 /// so the first chunks run while the walk goes on.
 pub const PLAN_BATCH: usize = 100;
 
@@ -223,24 +223,24 @@ pub(crate) fn corrected_on_partitioned_source(definition: &Definition) -> bool {
     super::group_basis::route(&definition.def, &definition.source_columns).is_some()
 }
 
-/// Whether `definition` is on the group basis (`super::group_basis`, #1100),
-/// a `JOIN` (`super::join`, #1108) included. A plain aggregate's rebuild is its sweep job alone
+/// Whether `definition` is on the group basis (`super::group_basis`),
+/// a `JOIN` (`super::join`) included. A plain aggregate's rebuild is its sweep job alone
 /// ([`start_rebuilds`], [`run_group_rebuild`]), and its fresh build or resume
-/// is its plan job's one absolute write of the same kind ([`run_plan`],
-/// #1101), with no chunk, as is a `JOIN`'s (#1109, [`super::join::build`]).
+/// is its plan job's one absolute write of the same kind ([`run_plan`]),
+/// with no chunk, as is a `JOIN`'s ([`super::join::build`]).
 fn takes_group_basis(definition: &Definition) -> bool {
     super::group_basis::route(&definition.def, &definition.source_columns).is_some()
         || super::join::applies(&definition.def)
 }
 
 /// Starts a Re-derive build for every `waiting_to_backfill` definition in
-/// `ready` (#625 F2). `ready` is what the staging worker's capture pass found
+/// `ready`. `ready` is what the staging worker's capture pass found
 /// dispatchable (`capture::reconcile`). One whose source (or a `JOIN`'s
 /// joined table) has a capture gate a pending change still holds
 /// ([`crate::capture::gate`]) would meet rows imaged without a column it
 /// reads, so it is left `waiting_to_backfill` for a later pass, as is one
-/// whose start timed out waiting for the column-pause lock (#922) or failed
-/// transiently. A start that failed for good (#986), a failure that would
+/// whose start timed out waiting for the column-pause lock or failed
+/// transiently. A start that failed for good, a failure that would
 /// reproduce on every pass such as a dropped ledger table, pauses that
 /// definition and what is downstream of its target with the error as its
 /// `capture_failure` ([`super::halt::halt_failed_start`]), so it neither
@@ -260,8 +260,8 @@ pub async fn start_ready_builds(
         if definition.status != TransformStatus::WaitingToBackfill {
             continue;
         }
-        // A JOIN's plan job builds both structures (#1107, #1109,
-        // `super::join`), so both of its tables' gates hold it.
+        // A JOIN's plan job builds both structures
+        // (`super::join`), so both of its tables' gates hold it.
         let join = match &definition.def.key_space {
             crate::defs::ast::KeySpace::Join(_) => catalog::join_table_of(&*client, id).await?,
             _ => None,
@@ -289,11 +289,11 @@ pub async fn start_ready_builds(
         match start(client, pool.schema(), &definition).await {
             Ok(Some(dependents)) => {
                 // The build has started; readers elsewhere that the release
-                // left paused are resumed after it (issue #918).
+                // left paused are resumed after it.
                 resume_released_dependents(pool, &definition.def.target, dependents).await;
             }
             Ok(None) => {}
-            // A start waits for the column-pause lock (#922). One that
+            // A start waits for the column-pause lock. One that
             // times out wrote nothing; it stays `waiting_to_backfill` for
             // the next pass, as one held by its capture gate does. The rest
             // of the pass goes on.
@@ -316,7 +316,7 @@ pub async fn start_ready_builds(
                 );
             }
             // Anything else reproduces on every pass (a dropped ledger
-            // table, #986), and returning it would stop the pass before it
+            // table), and returning it would stop the pass before it
             // started the other definitions' builds. Pause this definition, and what is
             // downstream of its target, with the error as its
             // `capture_failure`, as a build that keeps failing does
@@ -400,11 +400,11 @@ async fn awaits_capture(
 /// Releases `target`'s `awaiting_capture` pauses in `txn` (see the module
 /// doc's "Field builds"), as only a build's start may: those the edit that
 /// made them still owns are deleted, and one an operator pause, a fuse trip
-/// or an upstream pause's cascade took over (issue #309) only stops
+/// or an upstream pause's cascade took over only stops
 /// waiting, and stays paused for its own resume. With `fields`, only those.
 ///
 /// A row it deletes is a pause that ends, so it un-cascades from it as a
-/// resume does ([`quarantine::uncascade`], issue #918): the field may have
+/// resume does ([`quarantine::uncascade`]): the field may have
 /// passed a pause on to its readers (a cascade through it, or one a sibling
 /// path gave it), and the resume that took its own edge away left the row,
 /// since it awaited its capture. The readers it releases in `target` come
@@ -461,7 +461,7 @@ async fn release_awaiting_capture(
 }
 
 /// Resumes the readers in other definitions that [`release_awaiting_capture`]
-/// left with no reason to stay paused (issue #918), as a resume of the
+/// left with no reason to stay paused, as a resume of the
 /// column would have: each is released and rebuilt by a field build of its
 /// definition. After the release's commit, which released the column-pause
 /// lock the resume takes.
@@ -495,7 +495,7 @@ pub(crate) async fn resume_released_dependents(
     }
 }
 
-/// Starts `definition`'s Re-derive build in one transaction (#625 F2, B1):
+/// Starts `definition`'s Re-derive build in one transaction:
 /// under its row lock, moves it `waiting_to_backfill -> backfilling` with
 /// `build = 'rederive'` and enqueues its plan job. From that commit it
 /// applies (`defs::model::APPLYING_SQL`): every page whose definition list
@@ -507,7 +507,7 @@ pub(crate) async fn resume_released_dependents(
 /// which the sweep's filter reads: every chunk's snapshot is taken after
 /// the start commits, so its `xmax` is past that id.
 ///
-/// **The start's segment (#733).** Pages drain batches out of order, so a
+/// **The start's segment.** Pages drain batches out of order, so a
 /// page that ran before the start can drain a key's later change while an
 /// older one waits in an earlier batch, which a page drains after the
 /// start. The later change never reaches the definition, and the older
@@ -534,7 +534,7 @@ async fn start(
     definition: &Definition,
 ) -> Result<Option<Vec<(String, String)>>, ApplyError> {
     let txn = client.transaction().await?;
-    // The column-pause lock, exclusive (#922): this start releases the
+    // The column-pause lock, exclusive: this start releases the
     // definition's `awaiting_capture` pauses ([`release_awaiting_capture`]),
     // which a pause, a resume and a define read and write. Before the
     // definition row, where every taker of the lock orders it
@@ -561,7 +561,7 @@ async fn start(
     let ledger = ddl::qualified_target_table_ident(&crate::defs::ledger::ledger_table_name(
         &definition.target_table,
     ));
-    // A group-basis definition has no ledger, and nothing to sweep (#1100).
+    // A group-basis definition has no ledger, and nothing to sweep.
     let empty: bool = takes_group_basis(definition)
         || txn
             .query_one(&format!("select not exists (select 1 from {ledger})"), &[])
@@ -576,7 +576,7 @@ async fn start(
         ],
     )
     .await?;
-    // The caller found any field awaiting capture ready (#625 F8b), so it
+    // The caller found any field awaiting capture ready, so it
     // applies from this commit, and the build's chunks write it.
     let dependents = release_awaiting_capture(&txn, &definition.def.target, None).await?;
     txn.execute(
@@ -595,7 +595,7 @@ async fn start(
         )
         .await?;
     }
-    // The start's segment (#733), last, so the share lock that keeps the
+    // The start's segment, last, so the share lock that keeps the
     // active segment from sealing until this commits is held only for the
     // commit. See this function's doc.
     txn.execute(
@@ -617,8 +617,8 @@ async fn start(
 }
 
 /// The definitions reading one of `tables` as their source, or a `JOIN`
-/// reading one as its joined table, that a rebuild could take (#625 F7,
-/// #1109): applying ones (`live`, and `backfilling` under a
+/// reading one as its joined table, that a rebuild could take:
+/// applying ones (`live`, and `backfilling` under a
 /// Re-derive build), in id order. A candidate only: [`rebuildable`] decides, under the row locks.
 pub(crate) async fn rebuild_candidates(
     client: &impl GenericClient,
@@ -643,7 +643,7 @@ pub(crate) async fn rebuild_candidates(
         .collect())
 }
 
-/// The definitions among `ids` that a rebuild takes (#625 F7): the ones that
+/// The definitions among `ids` that a rebuild takes: the ones that
 /// still apply (`live`, or `backfilling` under a Re-derive build). The caller
 /// holds their rows `for update` (`intake::catch_up`), so what this reads
 /// holds until it commits.
@@ -670,7 +670,7 @@ pub(crate) async fn rebuildable(
 }
 
 /// Rebuilds the definitions `ids` ([`rebuildable`]) in `txn`, the caller's
-/// transaction (#625 F7): moves a `live` one to `backfilling` with `build =
+/// transaction: moves a `live` one to `backfilling` with `build =
 /// 'rederive'` (one already building stays as it is), and enqueues a plan
 /// job and a sweep job for each, both whole-definition (`fields` null), as
 /// [`start`] does for a resumed definition: a rebuild re-derives the rows
@@ -685,7 +685,7 @@ pub(crate) async fn rebuildable(
 /// [`stamp_rebuild_seg`] as the last statement before it commits.
 ///
 /// From the commit the definition reads `backfilling`, so a caller that
-/// waits for `live` waits for the rebuild (#625 comment 2).
+/// waits for `live` waits for the rebuild.
 pub(crate) async fn start_rebuilds(
     txn: &impl GenericClient,
     ids: &[i64],
@@ -740,7 +740,7 @@ pub(crate) async fn start_rebuilds(
 }
 
 /// Records the segment active at the commit of the rebuild
-/// [`start_rebuilds`] enqueued for `ids` as their `build_seg` (#733), as
+/// [`start_rebuilds`] enqueued for `ids` as their `build_seg`, as
 /// [`start`] does for a build it starts. Last, so the share lock that keeps
 /// the active segment from sealing until the transaction commits is held
 /// only for the commit.
@@ -761,7 +761,7 @@ pub(crate) async fn stamp_rebuild_seg(
 }
 
 /// Whether a definition read as `status` with `build` can take a field
-/// build ([`start_field_build`], #625 F8b): one that applies. That is a
+/// build ([`start_field_build`]): one that applies. That is a
 /// `live` one, or a `backfilling` one under a Re-derive build, which the field
 /// build joins. A frozen definition doesn't apply.
 pub(crate) fn takes_field_build(status: TransformStatus, build: Option<&str>) -> bool {
@@ -840,13 +840,13 @@ const FIELD_CAPTURE_RETRY: Duration = Duration::from_millis(500);
 /// page to meet.
 ///
 /// A pause the edit no longer owns (an operator pause or a fuse trip
-/// upgraded it to `local_fuse`, or an upstream pause cascaded onto it,
-/// issue #309) only stops waiting: the field stays out of Apply and out of
+/// upgraded it to `local_fuse`, or an upstream pause cascaded onto it)
+/// only stops waiting: the field stays out of Apply and out of
 /// the build's chunks until its own resume.
 ///
 /// The release bumps the version fence ([`bump_version_fence`]) as its
 /// transaction's first lock, so its wait for the pages in flight holds
-/// nothing a page could be waiting on (issue #744). A look under the claim
+/// nothing a page could be waiting on. A look under the claim
 /// alone comes first, so a call that has nothing to release, or whose
 /// capture isn't ready, doesn't bump the fence; the release then looks again
 /// under its locks.
@@ -876,7 +876,7 @@ async fn field_build_ready(
     // stalled worker holds up every page of the source, not just its chunk.
     fence.arm(&*txn).await?;
     bump_version_fence(&*txn, &definition.source_table).await?;
-    // The column-pause lock, exclusive (#922), after the fence wait and
+    // The column-pause lock, exclusive, after the fence wait and
     // before the claim and the rows: the release below writes pause state
     // (`release_awaiting_capture`). See `crate::locks::lock_column_pauses`.
     // A wait that times out fails this job's attempt, which retries.
@@ -964,8 +964,8 @@ async fn capture_release(
 /// Bumps `source_table`'s version fence (`source_table_versions`) in `txn`,
 /// as `ALTER TRANSFORM` does, for a commit that releases a 1-1 field's
 /// `column_status` pause into a field build: a column resume, or the field
-/// build's capture release (#625 F8b). A column pause bumps it too, for the
-/// opposite direction (`quarantine::bump_pause_fence`, issue #903).
+/// build's capture release. A column pause bumps it too, for the
+/// opposite direction (`quarantine::bump_pause_fence`).
 ///
 /// A page reads the paused columns in Phase 2 and leaves them out of its
 /// writes. One that read them before the release must not apply after it:
@@ -979,7 +979,7 @@ async fn capture_release(
 /// again, with the field.
 ///
 /// Callers bump it as their transaction's first lock, as `ALTER TRANSFORM`
-/// does (issue #744). A page takes the fence before any other lock, so a
+/// does. A page takes the fence before any other lock, so a
 /// bump that holds nothing while it waits can't close a cycle; one that
 /// holds the definition row can, through a page queued on a third
 /// transaction that wants that row.
@@ -1058,7 +1058,7 @@ pub struct WorkerOptions {
     /// (`ClientOptions::build_chunk_rows`).
     pub chunk_rows: i64,
     /// `ClientOptions::drain_batch_cap`: a chunk is claimed only while the
-    /// sealed, undrained rows are under twice this (#625 Q4).
+    /// sealed, undrained rows are under twice this.
     pub drain_batch_cap: usize,
     /// How often a claimed plan job or chunk refreshes its claim.
     pub heartbeat_interval: Duration,
@@ -1071,7 +1071,7 @@ pub struct WorkerOptions {
 pub enum Step {
     /// No Re-derive build is running, or none had work for this worker.
     Idle,
-    /// The ring's backlog held the build's chunks back (#625 B6).
+    /// The ring's backlog held the build's chunks back.
     Backpressure,
     /// Ran (some of) a plan job.
     Planned,
@@ -1089,7 +1089,7 @@ impl Step {
 }
 
 /// One step of the Re-derive builds' work for a drain worker, which runs it
-/// after its segments (#625 B6): a plan job, else one chunk, a sweep batch
+/// after its segments: a plan job, else one chunk, a sweep batch
 /// run or a partition correction's turn (`super::partition_correction`) if the
 /// ring's backlog allows ([`chunk_allowed`]). A building definition with
 /// nothing left to do is moved to `live` ([`try_complete`]).
@@ -1242,7 +1242,7 @@ pub async fn work_probe(pool: &Pool) -> Result<WorkProbe, ChunkQueueError> {
     })
 }
 
-/// Whether a drain worker may claim a build chunk now (#625 B6, Q4): the
+/// Whether a drain worker may claim a build chunk now: the
 /// sealed, undrained rows are under twice `drain_batch_cap`, and the ring
 /// has a free slot for the next seal (the seal's own refusal predicate,
 /// `append::ring_slot_is_free`). A chunk claimed past either would compete
@@ -1272,7 +1272,7 @@ pub async fn chunk_allowed(
 
 /// Runs a claimed plan job or chunk ([`chunk_queue::claim_chunks_of`]), and
 /// gives it up through [`chunk_queue::fail_chunk`] if it fails, which
-/// records, logs and backs it off (#616). [`work_once`] claims and runs one;
+/// records, logs and backs it off. [`work_once`] claims and runs one;
 /// a test can claim one by hand and run it here.
 pub async fn run_claimed(
     pool: &Pool,
@@ -1328,7 +1328,7 @@ fn build_error(err: impl Into<ApplyError>) -> ChunkQueueError {
     ChunkQueueError::Build(Box::new(err.into()))
 }
 
-/// Runs one claimed Re-derive chunk (#625 F2): [`one_to_one::run_chunk`] and the chunk's
+/// Runs one claimed Re-derive chunk: [`one_to_one::run_chunk`] and the chunk's
 /// done mark in one `read committed` transaction (ADR-0002 I1: the chunk's
 /// snapshot must be its read statement's own), fenced by its claim
 /// ([`ClaimFence`]). The done mark commits with the entries it
@@ -1350,8 +1350,8 @@ async fn run_rederive(
         .ok_or(ChunkQueueError::DefinitionNotFound {
             definition_id: chunk.definition_id,
         })?;
-    // The range is read under the key collations its plan job walked under
-    // (issue #769), whatever the key's collation is now.
+    // The range is read under the key collations its plan job walked under,
+    // whatever the key's collation is now.
     let key_collations = chunk.key_collations.as_deref();
     let plan = match &chunk.fields {
         None => {
@@ -1444,14 +1444,14 @@ async fn run_rederive(
 enum ChunkPlan {
     /// A whole build's chunk.
     Whole(one_to_one::OneToOnePlan),
-    /// A field build's chunk (#625 F8b).
+    /// A field build's chunk.
     Field(FieldPlan),
 }
 
 /// The version fence of definition `id`'s source (`source_table_versions`),
 /// which a chunk or a sweep batch of a 1-1 target reads before it plans,
 /// and takes `for share` as its transaction's first lock
-/// ([`hold_plan_epoch`]) (#625 F8b). A chunk plans before its transaction
+/// ([`hold_plan_epoch`]). A chunk plans before its transaction
 /// (its fields, and for a [`FieldPlan::Direct`] its paused columns),
 /// so an edit can commit in between: `ALTER TRANSFORM`, a column pause or
 /// resume, or a field build's capture release, each of which bumps the
@@ -1459,7 +1459,7 @@ enum ChunkPlan {
 /// already have written keys the chunk had yet to lock, and the chunk would
 /// put its older plan's values over them, or stamp an entry's `basis` past
 /// a change whose page then can't write the new field; a chunk planned
-/// before a pause would write the paused column after it (issue #903). One
+/// before a pause would write the paused column after it. One
 /// that finds the fence moved rolls back and plans again. One that finds it
 /// unmoved holds it to its commit, so a bump that comes later waits for the
 /// chunk: the edit's build reaches its keys only after it commits, and a
@@ -1486,7 +1486,7 @@ async fn plan_epoch(
 /// transaction's first lock, before the claim's ([`ClaimFence::hold`]) and
 /// the keys' entries, as a page takes the fence before any other lock: a
 /// bump waits for the transactions holding the fence, and holds nothing
-/// while it does (issue #744), so a writer that holds no other lock when it
+/// while it does, so a writer that holds no other lock when it
 /// queues on a bump can't close a cycle through it. A resume, say, bumps
 /// the fence and then locks every chunk a worker holds.
 ///
@@ -1543,7 +1543,7 @@ impl FieldPlan {
         {
             plan.pin_key_collations(key_collations);
             // With every field that reads one of `fields` by alias in the
-            // definition as it is now (issue #748): a later edit can add a
+            // definition as it is now: a later edit can add a
             // reader of a field this build releases (one awaiting its
             // capture), which Apply holds out with that field and which no
             // other build writes once it is released. A chunk planned
@@ -1646,8 +1646,7 @@ const NULL_KEYS_PAGE: i64 = 10_000;
 /// `NULL` part, for a 1-1 target's build (F6). Only a source keyed by a
 /// nullable unique index has such keys: another aggregate's or `JOIN`'s
 /// target, whose `GROUP BY` columns may be `NULL`. A 1-1 target over such a
-/// source is keyed `unique nulls not distinct` so it holds their rows (issue
-/// #1141).
+/// source is keyed `unique nulls not distinct` so it holds their rows.
 /// No chunk reaches them. A chunk's range is a row comparison, which is
 /// `NULL` (so the row is out) wherever a `NULL` part decides it, and a
 /// plan's boundaries are keys without one.
@@ -1769,7 +1768,7 @@ async fn fence_settled(
     })
 }
 
-/// Runs a claimed plan job (#625 F2, Q13): walks the source's primary key
+/// Runs a claimed plan job: walks the source's primary key
 /// from the job's cursor, [`PLAN_BATCH`] boundaries at a time, each batch
 /// committed as `rederive` chunks together with the cursor's advance, so
 /// chunks run while the walk goes on and a job that dies resumes where its
@@ -1788,7 +1787,7 @@ async fn run_plan(
             definition_id: chunk.definition_id,
         })?;
     // The walk compares under the collations the job's first batch walked
-    // under, and every chunk records them (issue #769): an `alter column …
+    // under, and every chunk records them: an `alter column …
     // collate …` between two batches, or between a batch and a chunk, would
     // otherwise reorder the key under the boundaries already enqueued.
     let mut pk = ddl::source_primary_key(pool, &definition.source_table)
@@ -1803,7 +1802,7 @@ async fn run_plan(
         options.heartbeat_interval,
     );
     let fence = ClaimFence::new(chunk.id, claimed_by, options.reclaim_ttl);
-    // A field build starts once its fields apply (#625 F8b), and its walk,
+    // A field build starts once its fields apply, and its walk,
     // so every chunk, comes after that commit.
     if let Some(fields) = &chunk.fields
         && cursor.is_none()
@@ -1842,7 +1841,7 @@ async fn run_plan(
             }
         }
     }
-    // A `JOIN`'s fresh build or resume is its whole build (#1109, ADR-0019):
+    // A `JOIN`'s fresh build or resume is its whole build (ADR-0019):
     // both structures in one transaction, never a walk of the primary key.
     // It runs after the seam fence above, as a plain aggregate's does.
     if super::join::applies(&definition.def) {
@@ -1852,7 +1851,7 @@ async fn run_plan(
                 what: "a field build of a JOIN (ALTER TRANSFORM takes only a 1-1 target)",
             }));
         }
-        // Its commit parks its target's readers (#1287), once, in the
+        // Its commit parks its target's readers, once, in the
         // transaction that completes the build (the last step, if it has
         // several).
         return run_group_rebuild_held(
@@ -1868,12 +1867,12 @@ async fn run_plan(
     }
     // A plain group-basis aggregate's fresh build or resume is its whole
     // build: one absolute write of every group, as a rebuild of a live
-    // definition is (#1101, ADR-0002), run after the seam fence above so its
+    // definition is (ADR-0002), run after the seam fence above so its
     // `GROUP BY` reads a racing writer's row. Over a partitioned source it is
     // one transaction per leaf of the recorded tree, then one for the groups
     // that route to no leaf, the job's `lo` holding the last leaf done. It
     // never walks the primary key: a `rederive` chunk has no meaning without
-    // a ledger. Its commit parks its target's readers (#1287).
+    // a ledger. Its commit parks its target's readers.
     let mut client = pool.get().await?;
     let aggregate = chunk.fields.is_none() && takes_group_basis(&definition);
     let recorded = aggregate
@@ -1986,7 +1985,7 @@ async fn run_plan(
             // The keys no range reaches (F6), in the transaction that ends
             // the plan, so a plan that is done has staged them. A 1-1
             // target's field build stages them too: their rows hold the
-            // resumed fields as well (issue #1141).
+            // resumed fields as well.
             let one_to_one = matches!(
                 definition.def.key_space,
                 crate::defs::ast::KeySpace::OneToOne
@@ -2026,9 +2025,9 @@ async fn run_plan(
 }
 
 /// Runs a group-basis definition's claimed sweep job, which is its whole
-/// rebuild (#1101's decision; see the module doc's "Rebuild of an applying
+/// rebuild (see the module doc's "Rebuild of an applying
 /// definition"): [`super::group_basis::rebuild_definition`] (a `JOIN`'s,
-/// [`super::join::build`], #1109) and the job's
+/// [`super::join::build`]) and the job's
 /// done mark in one `read committed` transaction, fenced by the claim
 /// ([`ClaimFence`]), so a job that dies before its commit runs again whole
 /// and one that committed never does. The rebuild is idempotent: run again,
@@ -2082,7 +2081,7 @@ enum ReadersOnCommit {
     /// images.
     Keep,
     /// The readers are rebuilt
-    /// (`intake::catch_up::park_target_catchup_if_read`, #1287): the plan job
+    /// (`intake::catch_up::park_target_catchup_if_read`): the plan job
     /// of a fresh build or a resume. A resume starts from partials that are
     /// empty while its target holds the rows of the earlier life, so the
     /// seam rows a page or the build stages meanwhile can carry prior images
@@ -2264,7 +2263,7 @@ async fn reads_a_target(
 }
 
 /// The sides of a `JOIN` that are a partitioned root with rows, `FROM` side
-/// first: the sides whose build is per leaf (#1286). A partitioned side with
+/// first: the sides whose build is per leaf. A partitioned side with
 /// no rows builds as an unpartitioned one: there is nothing to bound.
 async fn join_partitioned_sides(
     client: &impl GenericClient,
@@ -2381,7 +2380,7 @@ struct SideTree {
     leaves: Vec<super::partition_correction::RebuildLeaf>,
 }
 
-/// A `JOIN` build with a partitioned side that has rows (#1286, ADR-0019): a
+/// A `JOIN` build with a partitioned side that has rows (ADR-0019): a
 /// sequence of bounded transactions, the job's cursor (`backfill_chunks.lo`,
 /// `side:oid`) written in each, so a job that dies resumes after its last
 /// committed step.
@@ -2761,8 +2760,8 @@ async fn run_group_structure(
         &definition.target_table,
     )
     .await?;
-    // The transaction that completes the whole build rebuilds its readers
-    // (#1287), once, not per leaf; the segment stamp is the last
+    // The transaction that completes the whole build rebuilds its readers,
+    // once, not per leaf; the segment stamp is the last
     // statement before the commit.
     let finished = !advances;
     let rebuilt = if finished && readers == ReadersOnCommit::Park {
@@ -2778,7 +2777,7 @@ async fn run_group_structure(
     Ok(Some((written, deleted)))
 }
 
-/// Runs a claimed sweep job (#625 F3; see the module doc): [`sweep_batch`]es
+/// Runs a claimed sweep job (see the module doc): [`sweep_batch`]es
 /// of [`WorkerOptions::chunk_rows`] entries from the job's cursor, each in
 /// its own `read committed` transaction with the cursor's advance, fenced by
 /// the claim ([`ClaimFence`]), so a job that dies resumes after its last
@@ -2878,7 +2877,7 @@ async fn run_sweep(
 }
 
 /// Moves definition `id` `backfilling -> live` once its Re-derive build is
-/// done (#625 B7, the strict flip): the plan job is done and no other chunk is
+/// done (the strict flip): the plan job is done and no other chunk is
 /// left undone (one held across a resume doesn't count, as for the old
 /// build). Returns whether it flipped.
 ///
@@ -2888,7 +2887,7 @@ async fn run_sweep(
 /// takes the definition row `for update` and checks again, so only a
 /// possibly-last caller takes the lock. The definition applied from its
 /// start. The flip deletes the definition's done
-/// rows (#966).
+/// rows.
 pub async fn try_complete(pool: &Pool, id: i64) -> Result<bool, ChunkQueueError> {
     let mut client = pool.get().await?;
     if !build_done(&**client, id).await? {
@@ -2908,7 +2907,7 @@ pub async fn try_complete(pool: &Pool, id: i64) -> Result<bool, ChunkQueueError>
     // done`, so nothing reads a done row, and the completion checks above
     // scan all of the definition's rows to find the undone ones. Deleting
     // them here keeps the table, and what those checks scan, to one build's
-    // rows however many builds the definition has had (#966). It takes the
+    // rows however many builds the definition has had. It takes the
     // done rows of a build a resume superseded too. An undone row left is a
     // [`chunk_queue::STALE`] one a worker still holds, which is discarded
     // when the worker gives it up.
@@ -2922,7 +2921,7 @@ pub async fn try_complete(pool: &Pool, id: i64) -> Result<bool, ChunkQueueError>
         &[&id, &TransformStatus::Live.as_str()],
     )
     .await?;
-    // #1306: the rebuild repaired what its readers may have held keys for
+    // The rebuild repaired what its readers may have held keys for
     // (a copy holding values of two widths while it ran, say); the staging
     // worker retries them once this commits.
     super::quarantine::request_upstream_releases(&*txn, id).await?;
@@ -2971,8 +2970,8 @@ async fn build_done(client: &impl GenericClient, id: i64) -> Result<bool, ChunkQ
 /// make no progress for a while (a chunk that keeps failing backs off): it
 /// is test harness.
 ///
-/// A field build whose plan job waits on its source's capture (#625 F8b,
-/// [`field_build_ready`]) can't go on until the staging worker's capture
+/// A field build whose plan job waits on its source's capture
+/// ([`field_build_ready`]) can't go on until the staging worker's capture
 /// pass, which this doesn't run: once that is all that is left, it returns
 /// with the build still running.
 #[cfg(any(test, feature = "internals"))]
@@ -3147,9 +3146,8 @@ mod tests {
         );
     }
 
-    /// #625 F-A5 for a 1-1 target's Re-derive chunk (F8a): #616's own
-    /// repro, a plain 1-1 `x + x` over a source of several chunks that
-    /// overflows on one row. The failing chunk splits until the key fails
+    /// A 1-1 target's Re-derive chunk: a plain 1-1 `x + x` over a source of
+    /// several chunks that overflows on one row. The failing chunk splits until the key fails
     /// alone, the key is quarantined, and the build goes `live` without it.
     #[tokio::test]
     async fn a_one_to_one_chunk_that_fails_on_its_data_quarantines_the_key() {

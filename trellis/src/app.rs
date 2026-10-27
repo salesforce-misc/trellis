@@ -20,7 +20,7 @@
 //!
 //! [`TrellisError::code`] reports a stable, coarse [`ErrorCode`] category
 //! for any failure this facade can return, on top of the existing `Display`
-//! message — settled ahead of issue #87's FFI embedding work so a host
+//! message — settled ahead of FFI embedding so a host
 //! language on the other side of that boundary has something stable to
 //! match on instead of every internal Rust error variant (`docs/decisions/0008-public-api-design.md`,
 //! decision 3).
@@ -28,8 +28,8 @@
 //! **Every definition-changing operation goes through one entrypoint.**
 //! [`Trellis::apply`] takes a single statement of Trellis's own grammar — the
 //! same grammar the CLI speaks — and the parse decides which operation runs:
-//! define a transform, alter, pause, resume, drop (issue #227;
-//! ADR-0012, ADR-0014). There is deliberately no typed method per operation,
+//! define a transform, alter, pause, resume, drop (ADR-0012,
+//! ADR-0014). There is deliberately no typed method per operation,
 //! so adding one is a grammar addition rather than new surface every
 //! host-language binding has to mirror. Read paths (status, `self_check`,
 //! quarantine sampling, convergence-await) are unaffected — they stay typed;
@@ -50,7 +50,7 @@
 //! anywhere, leaves the transform queued indefinitely) — then take a
 //! [`Trellis::watermark_token`] and [`Trellis::await_converged`] on it.
 //!
-//! Nor does an edit block on its rebuild (#666, #625 F8b): an `ALTER
+//! Nor does an edit block on its rebuild: an `ALTER
 //! TRANSFORM` that adds or changes fields, and a column `RESUME`, register a
 //! background field build and return, the definition reading
 //! [`TransformStatus::Backfilling`] until it is done. The statements that
@@ -142,8 +142,7 @@ pub struct TrellisOptions {
     /// should set this. When set, the staging worker installs capture
     /// triggers on whatever tables the registered definitions read, straight
     /// from the catalog, and picks up definitions registered later on its
-    /// next reconcile pass; none need be registered before it starts (issue
-    /// #427).
+    /// next reconcile pass; none need be registered before it starts.
     pub staging: bool,
     /// How many drain (application) worker threads this connection runs. Zero
     /// (the default) runs none.
@@ -173,7 +172,7 @@ pub struct TrellisOptions {
     /// default silently doubles the thread population with threads the host
     /// can't see, account for, or size around. Since the embedded runtime's
     /// own work is I/O, not compute-bound, a small explicit count (2, say)
-    /// is enough; see issue #141.
+    /// is enough.
     ///
     /// Must be at least 1 when set, since a runtime with no worker threads
     /// couldn't run anything: `Some(0)` fails a connect that builds a runtime,
@@ -188,7 +187,7 @@ pub struct TrellisOptions {
     /// out 30 seconds.
     #[doc(hidden)]
     pub call_deadline: Option<Duration>,
-    /// Retries held quarantine keys automatically (#861). `None` (the
+    /// Retries held quarantine keys automatically. `None` (the
     /// default) retries nothing: a key stays held until an operator releases
     /// it ([`Trellis::release_key`]) or the definition is resumed.
     ///
@@ -300,10 +299,10 @@ impl Trellis {
     /// The connection pool backing this instance. Exposed for callers that
     /// need to run their own queries against target tables; not needed for
     /// anything [`Trellis`]'s own methods already cover. Its connections run
-    /// with `row_security = off` (issue #766), so a query that row-level
+    /// with `row_security = off`, so a query that row-level
     /// security would filter for the login role fails instead: read through
     /// your own connection where you rely on policies to filter. They also
-    /// run with `jit = off` (issue #794).
+    /// run with `jit = off`.
     pub fn pool(&self) -> &Pool {
         &self.pool
     }
@@ -314,7 +313,7 @@ impl Trellis {
         &self.config
     }
 
-    /// A handle onto this process's in-process metrics registry (issue #53),
+    /// A handle onto this process's in-process metrics registry,
     /// for Prometheus exposition — see [`crate::metrics::Metrics::render_prometheus`]:
     ///
     /// ```no_run
@@ -345,8 +344,8 @@ impl Trellis {
     }
 
     /// **The** entrypoint for every definition-changing operation: parse one
-    /// statement of Trellis's own grammar and run whatever it says (issue
-    /// #227; ADR-0012, ADR-0014).
+    /// statement of Trellis's own grammar and run whatever it says (ADR-0012,
+    /// ADR-0014).
     ///
     /// Parsing decides the operation, so this signature does not change as
     /// operations are added — a new operation is a grammar addition and a new
@@ -424,7 +423,7 @@ impl Trellis {
     ///
     /// `DROP TRANSFORM <target>.<column>` is not a form: dropping one
     /// calculated field is an `ALTER TRANSFORM ... DROP <field>`, tracked
-    /// separately (issues #241/#242), not a `DROP`.
+    /// separately, not a `DROP`.
     pub async fn apply(&self, statement_text: &str) -> Result<Applied, TrellisError> {
         self.call(async {
             match defs::parse_statement(statement_text)? {
@@ -457,7 +456,7 @@ impl Trellis {
     }
 
     /// [`Statement::AlterTransform`](defs::Statement::AlterTransform)'s half
-    /// of [`apply`](Trellis::apply) (ADR-0015, issues #241/#242) — a thin
+    /// of [`apply`](Trellis::apply) — a thin
     /// facade wrapper over [`defs::alter_transform`], which does the actual
     /// work (idempotency, validation, DDL, registering the field build,
     /// version fencing); see that function's own doc comment for the full
@@ -597,7 +596,7 @@ impl Trellis {
 
     /// [`Statement::Drop`](defs::Statement::Drop)'s half of
     /// [`apply`](Trellis::apply). Only removes catalog rows: it never touches
-    /// a source table (issue #427, ADR-0002). The staging worker's next
+    /// a source table (ADR-0002). The staging worker's next
     /// reconcile pass uninstalls the capture triggers of a table nothing reads
     /// any more, so the process applying a `DROP` needs no privileges on the
     /// source tables.
@@ -678,9 +677,9 @@ impl Trellis {
 
     /// Every registered transform definition, oldest first. Each status is
     /// the one [`Trellis::status`] reports: a `live` definition reading an
-    /// upstream that isn't `live` shows [`TransformStatus::CatchingUp`]
-    /// (issue #497). Each also carries why its build keeps failing, if it
-    /// does, and why the drain halted on it, if it did (issue #663), so one
+    /// upstream that isn't `live` shows [`TransformStatus::CatchingUp`].
+    /// Each also carries why its build keeps failing, if it
+    /// does, and why the drain halted on it, if it did, so one
     /// listing shows every stuck definition: a health check that lists them
     /// and finds a [`DefinitionSummary::halt`] has a definition stopped until
     /// an operator fixes the cause and resumes it.
@@ -695,10 +694,10 @@ impl Trellis {
                 .read_only(true)
                 .start()
                 .await?;
-            // Issue #461: the same failing-chunk join `status` reads its
+            // The same failing-chunk join `status` reads its
             // `backfill_failure` from, in the one listing query (the chunk join
             // takes one chunk, so it adds at most one row per definition), and
-            // the definition's halt (#663; `capture_failures` is keyed by it).
+            // the definition's halt (`capture_failures` is keyed by it).
             let rows = txn
                 .query(
                     &format!(
@@ -736,7 +735,7 @@ impl Trellis {
     }
 
     /// SQL that loads this instance's definitions into a database built from
-    /// a schema-only dump (issue #644): `INSERT`s for the Trellis migration
+    /// a schema-only dump: `INSERT`s for the Trellis migration
     /// history, the instance marker and the transform
     /// definitions with the catalog rows they need, and for nothing else.
     /// Append it to a schema-only `pg_dump` of the Trellis schema and the
@@ -752,8 +751,8 @@ impl Trellis {
             .await
     }
 
-    /// One registered transform definition's current [`TransformStatus`]
-    /// (issue #55), by target table name — the read a host-language embedder
+    /// One registered transform definition's current [`TransformStatus`],
+    /// by target table name — the read a host-language embedder
     /// polls after [`apply`](Trellis::apply) registers a definition, per
     /// `docs/decisions/0008-public-api-design.md`'s decision 1 ("define, then poll status
     /// until live").
@@ -764,19 +763,19 @@ impl Trellis {
     /// [`Trellis::await_converged`] guarantees its target reflects that
     /// commit. A `live` 1-1 one rebuilding fields (an `ALTER
     /// TRANSFORM` that added or changed fields, a resumed column) reports
-    /// [`TransformStatus::Backfilling`] until they are built (#625 F8b), and so
+    /// [`TransformStatus::Backfilling`] until they are built, and so
     /// does an aggregate over a partitioned source while it is corrected for a
     /// partition that was attached, detached, dropped or truncated (ADR-0017),
     /// each listed in [`DefinitionStatus::correcting`]. A `live`
     /// one reading an upstream (another definition's target, as its source or
     /// as a `JOIN`'s joined table) that isn't `live` itself (paused,
     /// quarantined, rebuilding or catching up, down the whole chain) reports
-    /// [`TransformStatus::CatchingUp`] (issue #497): it keeps applying, but its
+    /// [`TransformStatus::CatchingUp`]: it keeps applying, but its
     /// target doesn't reflect the source yet. That status is derived from the
     /// upstream's status when read, never stored.
     ///
     /// Also reports why a definition isn't getting there, when the cause is a
-    /// failing build ([`DefinitionStatus::backfill_failure`], #616): a failing
+    /// failing build ([`DefinitionStatus::backfill_failure`]): a failing
     /// chunk of it. It is retried with backoff, so without this the only sign
     /// would be a warning in a worker's log.
     ///
@@ -855,9 +854,9 @@ impl Trellis {
                 paused_upstream_columns = causes;
                 correcting =
                     crate::staging::partition_correction::correcting(&*txn, row.get(1)).await?;
-                // #687: an edit whose new field awaits a widen is stuck on
+                // An edit whose new field awaits a widen is stuck on
                 // capture as much as a registration is. Not one a schema change
-                // paused (#705): capture stops widening for it, and its field
+                // paused: capture stops widening for it, and its field
                 // waits for the resume its `capture_failure` asks for, not on
                 // the table's lock or install failure.
                 let capture_failed = row.get::<_, Option<String>>("capture_table").is_some();
@@ -866,7 +865,7 @@ impl Trellis {
                 {
                     holdup = self.capture_holdup(&*txn, row.get(1), row.get(2)).await?;
                 }
-                // #817: a page the drain keeps failing on, charged to no one,
+                // A page the drain keeps failing on, charged to no one,
                 // holds back every definition still applying what it reads.
                 if !stored.is_frozen() {
                     drain_failure =
@@ -940,7 +939,7 @@ impl Trellis {
 
     /// Pauses, now, the readers of every captured table whose Trellis
     /// capture was changed outside Trellis or whose table is gone, and
-    /// returns those tables (#1181). The staging worker's reconcile pass does
+    /// returns those tables. The staging worker's reconcile pass does
     /// the same on its own cadence (`capture_failure` of kind
     /// [`CaptureFailureKind::Disruption`]); this is for a caller that has
     /// just done something that disrupts capture (a fixture or bulk load that
@@ -964,10 +963,10 @@ impl Trellis {
     }
 
     /// What holds up the capture a definition sourced from `source_table`
-    /// waits on (issue #622 C5, #687): the lock wait, then the other
+    /// waits on: the lock wait, then the other
     /// failure, that the staging worker's latest pass recorded in
-    /// `capture_holdups` for the source, or for a `JOIN`'s joined table
-    /// (#1107). The staging worker may run in any process.
+    /// `capture_holdups` for the source, or for a `JOIN`'s joined table.
+    /// The staging worker may run in any process.
     async fn capture_holdup(
         &self,
         client: &impl tokio_postgres::GenericClient,
@@ -1012,8 +1011,7 @@ impl Trellis {
         Ok((wait, failure))
     }
 
-    /// Rebuilds every applying definition that reads `source_table` (#522,
-    /// #625 F7): this call's own transaction moves each `live -> backfilling`
+    /// Rebuilds every applying definition that reads `source_table`: this call's own transaction moves each `live -> backfilling`
     /// and enqueues its plan and sweep jobs, one row each, so the call returns
     /// quickly and the status already reads `backfilling` when it does. The
     /// definition keeps applying. Its plan re-derives every row the table has,
@@ -1028,7 +1026,7 @@ impl Trellis {
     ///
     /// Only valid for a table the staging worker captures: one some
     /// registered definition reads, and that isn't one of this instance's own
-    /// targets (issue #622; the set its
+    /// targets (the set its
     /// reconcile pass installs capture triggers on). Any other table is
     /// refused ([`TrellisError::TableNotCaptured`]): nothing reads it, and a
     /// table's first reader backfills it in full anyway. The check is the
@@ -1043,7 +1041,7 @@ impl Trellis {
                     // Not captured. Tell a table that exists (nothing reads it)
                     // from one that doesn't. A bare name is looked up the way
                     // define resolves it; a table the role can't use is refused
-                    // as such rather than as not found (issue #933).
+                    // as such rather than as not found.
                     let (schema, table) = match source_table.split_once('.') {
                         Some((schema, table)) => (Some(schema), table),
                         None => (None, source_table),
@@ -1093,7 +1091,7 @@ impl Trellis {
 
     /// Poison-quarantine entries recorded since `watermark`, oldest first —
     /// the keys the apply path gave up on, each for the definition whose
-    /// apply failed (#799: every other definition reading the key keeps
+    /// apply failed (every other definition reading the key keeps
     /// applying it). A running client surfaces these so a whole-table
     /// failure (every row poisoned) doesn't sit silently.
     pub async fn poisoned_since(
@@ -1136,7 +1134,7 @@ impl Trellis {
             let client = self.pool.get().await?;
             let mut entries = Vec::new();
 
-            // Issue #73: read back the bare table-name suffix, not the persisted
+            // Read back the bare table-name suffix, not the persisted
             // fully-qualified `target_table` — `QuarantineTarget::Transform`
             // round-trips through
             // `docs/decisions/0003-quarantine-storage-and-api.md`'s
@@ -1203,7 +1201,7 @@ impl Trellis {
             let client = self.pool.get().await?;
             match &target {
                 QuarantineTarget::Transform(t) => {
-                    // Issue #73: `t` is the bare name `QuarantineTarget::parse`
+                    // `t` is the bare name `QuarantineTarget::parse`
                     // extracted from the caller's address — match against
                     // `target_table`'s bare table-name suffix, not the persisted
                     // qualified column (see `status`'s own call site for the
@@ -1220,7 +1218,7 @@ impl Trellis {
                     let stored = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
                     panic!("transform_definitions.status held unrecognized value '{status_text}'")
                 });
-                    // The status `Trellis::status` reports (issue #497).
+                    // The status `Trellis::status` reports.
                     let status = reported_status(&**client, row.get(1), stored).await?;
                     Ok(QuarantineEntry {
                         target,
@@ -1230,7 +1228,7 @@ impl Trellis {
                     })
                 }
                 QuarantineTarget::Column(t, c) => {
-                    // Issue #73: same bare-suffix match as the `Transform` arm
+                    // Same bare-suffix match as the `Transform` arm
                     // above — `t` is bare, `target_table` is qualified.
                     let transform_exists: bool = client
                         .query_one(
@@ -1318,9 +1316,9 @@ impl Trellis {
                     }
                 },
                 QuarantineTarget::Transform(t) => {
-                    // Issue #73: `t` is bare — same `split_part` match as
+                    // `t` is bare — same `split_part` match as
                     // `status`/`quarantine_status`. Whole-key poison is per
-                    // transform (#799), so the sample is this definition's own
+                    // transform, so the sample is this definition's own
                     // rows, whatever spelling of its source they carry.
                     let id: i64 = client
                         .query_opt(
@@ -1380,7 +1378,7 @@ impl Trellis {
     /// (`docs/decisions/0003-quarantine-storage-and-api.md`, "Releasing held
     /// keys"), once its cause is fixed: `source_table` and `key` as
     /// [`Trellis::sample_quarantined`] and [`Trellis::poisoned_since`] report
-    /// them, the table in either spelling, `schema.table` or bare (#283), and
+    /// them, the table in either spelling, `schema.table` or bare, and
     /// `transform` the target table, bare or qualified, as [`Trellis::status`] takes it.
     ///
     /// In one transaction, it deletes the key's quarantine rows for
@@ -1447,8 +1445,7 @@ impl Trellis {
 
     /// Whether at least one live drain worker (a connection running with
     /// `drain_threads > 0`) is registered anywhere in this fleet right now
-    /// (issue #144; `docs/decisions/0010-embeddable-clients.md`, decision 3
-    /// — the epic #140 hazard this closes). A single, cheap `exists(...)`
+    /// (`docs/decisions/0010-embeddable-clients.md`, decision 3). A single, cheap `exists(...)`
     /// query with no joins — meant to sit behind an application health check
     /// that runs on a timer, not just be called once at boot.
     ///
@@ -1462,7 +1459,7 @@ impl Trellis {
     /// a transform that never seems to finish backfilling. It counts drain
     /// workers only: a fleet missing its staging worker stalls the same way
     /// and passes this check, which is what
-    /// [`Trellis::has_live_staging_worker`] is for (issue #428). See
+    /// [`Trellis::has_live_staging_worker`] is for. See
     /// `docs/embedding.md`'s health-check section for a worked Phoenix/Rails
     /// example.
     ///
@@ -1489,8 +1486,8 @@ impl Trellis {
     }
 
     /// Whether this instance's staging worker (a connection running with
-    /// `staging: true`) is running anywhere in the fleet right now (issue
-    /// #428) — [`Trellis::has_live_drain_workers`]'s counterpart, and meant
+    /// `staging: true`) is running anywhere in the fleet right now —
+    /// [`Trellis::has_live_drain_workers`]'s counterpart, and meant
     /// to sit behind the same timer-driven health check.
     ///
     /// **What this detects.** The staging worker installs change capture on
@@ -1510,7 +1507,7 @@ impl Trellis {
     /// heartbeat: a crashed worker's connection closes and Postgres frees
     /// the lock with it. It also reads `false` for the tick or so the loop
     /// takes to reconnect after a failed step. Changes are captured by
-    /// triggers in the application's own transactions meanwhile (issue #622),
+    /// triggers in the application's own transactions meanwhile,
     /// but nothing seals or dispatches a backfill.
     pub async fn has_live_staging_worker(&self) -> Result<bool, TrellisError> {
         self.call(async {
@@ -1523,7 +1520,7 @@ impl Trellis {
         .await
     }
 
-    /// A read-your-writes watermark (issue #192): `pg_current_wal_insert_lsn()`,
+    /// A read-your-writes watermark: `pg_current_wal_insert_lsn()`,
     /// read on a freshly acquired pool connection — see
     /// `crate::staging::converge::watermark_token` for the exact
     /// semantics.
@@ -1539,7 +1536,7 @@ impl Trellis {
     /// `pg_current_wal_insert_lsn()` reports the server's current WAL insert
     /// position, not something scoped to one session, so it's guaranteed to
     /// be at or past the write's own commit record by the time this query
-    /// runs, even for a writer with `synchronous_commit = off` (issue #697).
+    /// runs, even for a writer with `synchronous_commit = off`.
     ///
     /// Pairs with [`Trellis::await_converged`]:
     ///
@@ -1578,11 +1575,11 @@ impl Trellis {
     /// failure, whose [`TrellisError::code`] is [`ErrorCode::Timeout`].
     /// `timeout` holds even while a poll is blocked, on a lock say: the
     /// server abandons the poll at the deadline, or 250ms into the poll if
-    /// that's later, since every poll gets at least that long (issue #596).
+    /// that's later, since every poll gets at least that long.
     /// So even a zero `timeout` makes one real check.
     ///
     /// Capture triggers write a change's ring rows in the writer's own
-    /// transaction (issue #622), so every commit at or below `token` is
+    /// transaction, so every commit at or below `token` is
     /// already in the ring when the token is read: this waits only for the
     /// ring rows at or below it to drain, and writes nothing.
     ///
@@ -1595,7 +1592,7 @@ impl Trellis {
     /// (ADR-0002, "What `live` promises"). That includes a repair that
     /// rebuilds a definition ([`Trellis::request_backfill`]): the definition
     /// reads `backfilling` from the call's return, so polling for `live`
-    /// first waits out the rebuild (#625 F7).
+    /// first waits out the rebuild.
     ///
     /// Like every call, this lasts at most the call's deadline (30 seconds,
     /// issue #599): a longer `timeout` is cut to what is left of it, and a
@@ -1625,10 +1622,10 @@ impl Trellis {
     }
 
     /// Starts a check of one target's persisted rows against an
-    /// independently-rendered Postgres recompute — issue #174, ADR-0013's
+    /// independently-rendered Postgres recompute — ADR-0013's
     /// production recompute audit — and returns the job at once. Read-only.
     ///
-    /// The comparison is a background job (#1023, #599): this call registers
+    /// The comparison is a background job: this call registers
     /// it and returns, and a process that runs drain workers
     /// (`drain_threads > 0`, any process of the fleet) walks the target a
     /// keyset page at a time on a task beside them, saving
@@ -1664,7 +1661,7 @@ impl Trellis {
     ///
     /// Only a `live` definition is compared: any other ends the job with
     /// [`crate::staging::self_check::SelfCheckOutcome::NotLive`] and its
-    /// status, and nothing is awaited or compared (#625 F7). A rebuild
+    /// status, and nothing is awaited or compared. A rebuild
     /// ([`Trellis::request_backfill`]) is `backfilling` from the call's
     /// return, so "poll `live`, then check" checks after the repair. A job
     /// whose target stops being live, or whose capture breaks, partway ends
@@ -1675,8 +1672,8 @@ impl Trellis {
     /// deliberately stale, so comparing it would report a false divergence.
     ///
     /// The report carries the keys the definition holds in quarantine
-    /// ([`SelfCheckReport::held_keys`](crate::SelfCheckReport::held_keys), #759), read when it is polled
-    /// whatever the outcome, so a held key isn't hidden behind a `Converged`
+    /// ([`SelfCheckReport::held_keys`](crate::SelfCheckReport::held_keys)), read when it is
+    /// polled whatever the outcome, so a held key isn't hidden behind a `Converged`
     /// job that didn't reach it or a `NotCaughtUp` its parked changes cause.
     ///
     /// The job ends when its transform is dropped (and a poll then finds
@@ -1724,10 +1721,10 @@ impl Trellis {
 
     /// Starts the background [`Client`] for a `staging`/`drain_threads`
     /// connection. The staging worker reads the tables to publish from the
-    /// catalog itself (issue #427), so an empty catalog is fine.
+    /// catalog itself, so an empty catalog is fine.
     fn start_client(config: &Config, options: &TrellisOptions) -> Result<Client, TrellisError> {
         let client_options = Self::client_options(options);
-        // Issue #234: `start_with_config`, not `start(config.dsn(), ..)` —
+        // `start_with_config`, not `start(config.dsn(), ..)` —
         // the latter threw this `Config`'s schema away and re-resolved one
         // from the process environment, so a `Trellis` explicitly configured
         // into a named schema ran its background client against the *default*
@@ -1739,23 +1736,14 @@ impl Trellis {
     /// validator, the same `information_schema` read
     /// [`defs::install_definition`] expects its caller to supply.
     ///
-    /// Broader sweep, reviewer follow-up to issue #74 (epic #78's own
-    /// whole-branch review): this used to query `information_schema.columns`
-    /// with a bare `table_name = $1 and table_schema = any(current_schemas(false))`
-    /// `search_path` walk — the same no-fallback shape every other fixed gap
-    /// in this round had — fed straight from [`defs::ast::TransformDef::source`],
-    /// which also completely ignored
-    /// [`defs::ast::TransformDef::explicit_source_schema`] (issue #76).
-    /// So *this*, the very first thing [`Trellis::apply`] does with a
-    /// parsed definition, rejected both an explicitly-qualified `FROM
-    /// <schema>.<table>` naming a table outside this connection's
-    /// `search_path`, and a bare `FROM <table>` chaining off another
-    /// definition's target explicitly qualified into a non-default schema
-    /// (issue #76) — before `install_definition`'s own, already-fixed
-    /// resolution (`resolve_source_for_install`) was ever reached: this call
-    /// happens first, in [`Trellis::apply`], and returns
-    /// [`TrellisError::SourceTableNotFound`] eagerly on an empty result, so
-    /// `install_definition` was never even called. Now resolves the source
+    /// This is the very first thing [`Trellis::apply`] does with a parsed
+    /// definition, and it returns [`TrellisError::SourceTableNotFound`]
+    /// eagerly on an empty result, so it must accept both an
+    /// explicitly-qualified `FROM <schema>.<table>` naming a table outside
+    /// this connection's `search_path` and a bare `FROM <table>` chaining off
+    /// another definition's target explicitly qualified into a non-default
+    /// schema, before `install_definition`'s own resolution
+    /// (`resolve_source_for_install`) is reached. It resolves the source
     /// the same way `resolve_source_for_install` does — an explicit schema
     /// names that exact relation directly, a bare name goes through
     /// [`defs::catalog::resolve_graph_identity`]'s two-step (physical
@@ -1768,7 +1756,7 @@ impl Trellis {
         source_table: &str,
         explicit_source_schema: Option<&str>,
     ) -> Result<HashMap<String, ValueType>, TrellisError> {
-        // Issue #933: a table the role can't use is refused as such, naming
+        // A table the role can't use is refused as such, naming
         // the missing privilege, rather than as not found (or, without
         // `USAGE` on a qualified name's schema, as Postgres's own refusal of
         // the column read below).
@@ -1827,7 +1815,7 @@ fn resolve_backfill_table(captured: &[String], name: &str) -> Result<Option<Stri
 }
 
 /// The status an operator reads for definition `id`, persisted as `stored`
-/// (issue #497, `defs::catalog::reported_statuses`). Only a `live` one can
+/// (`defs::catalog::reported_statuses`). Only a `live` one can
 /// differ, so any other skips the catalog read.
 async fn reported_status(
     client: &impl tokio_postgres::GenericClient,
@@ -1838,7 +1826,7 @@ async fn reported_status(
 }
 
 /// [`reported_status`] and the paused upstream columns behind a reported
-/// `catching_up` (#1208, [`DefinitionStatus::paused_upstream_columns`]).
+/// `catching_up` ([`DefinitionStatus::paused_upstream_columns`]).
 async fn reported_status_with_causes(
     client: &impl tokio_postgres::GenericClient,
     id: i64,
@@ -1856,12 +1844,12 @@ async fn reported_status_with_causes(
 }
 
 /// The columns [`backfill_failure`] reads a failing build chunk from, joined
-/// by [`CHUNK_FAILURE_JOIN`] (#616).
+/// by [`CHUNK_FAILURE_JOIN`].
 const CHUNK_FAILURE_COLUMNS: &str = "bcf.attempts as chunk_attempts, \
      bcf.last_error as chunk_last_error, bcf.next_attempt_at as chunk_next_attempt_at";
 
 /// The definition's current build chunk that has failed, if any, aliased
-/// `bcf` for [`CHUNK_FAILURE_COLUMNS`] (#616): the one that has failed most,
+/// `bcf` for [`CHUNK_FAILURE_COLUMNS`]: the one that has failed most,
 /// leaving out finished chunks and those of a build a resume superseded.
 const CHUNK_FAILURE_JOIN: &str = "left join lateral ( \
          select bc.attempts, bc.last_error, bc.next_attempt_at from backfill_chunks bc \
@@ -1872,7 +1860,7 @@ const CHUNK_FAILURE_JOIN: &str = "left join lateral ( \
 
 /// The [`BackfillFailure`] in a row of [`Trellis::status`]'s or
 /// [`Trellis::definitions`]' query: the definition's own failing build chunk
-/// ([`CHUNK_FAILURE_COLUMNS`], #616), with its `attempts`, `last_error` and
+/// ([`CHUNK_FAILURE_COLUMNS`]), with its `attempts`, `last_error` and
 /// `next_attempt_at` on the definition's `source_table`. `None` when no chunk
 /// is failing.
 fn backfill_failure(row: &tokio_postgres::Row) -> Option<BackfillFailure> {
@@ -1928,9 +1916,9 @@ fn capture_failure(row: &tokio_postgres::Row) -> Option<CaptureFailure> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DefinitionStatus {
-    /// Where the transform is in its lifecycle (issue #55).
+    /// Where the transform is in its lifecycle.
     pub status: TransformStatus,
-    /// Set while one of the definition's build chunks keeps failing (#616):
+    /// Set while one of the definition's build chunks keeps failing:
     /// it is waiting out a backoff before it is retried, or is being narrowed
     /// to the key it fails on. It clears once the chunk finishes. A key the
     /// narrowing quarantines is reported by [`Trellis::quarantined`] instead,
@@ -1941,45 +1929,45 @@ pub struct DefinitionStatus {
     pub backfill_failure: Option<BackfillFailure>,
     /// Set while the definition waits on capture, because the staging worker
     /// can't yet take the lock it needs to install or widen the capture
-    /// triggers on its source or a `JOIN`'s joined table (issue #622). It
+    /// triggers on its source or a `JOIN`'s joined table. It
     /// clears on its own once the lock holder lets go. A definition waits on capture while it is `waiting_to_backfill`,
     /// or while an `ALTER TRANSFORM` field it gained is paused until the
     /// capture images the column it reads (it is `backfilling` then, its
-    /// field build waiting to start, #687, #625 F8b).
+    /// field build waiting to start).
     /// One a schema change paused doesn't: it waits for the resume its
-    /// `capture_failure` asks for (#705). The staging worker's latest pass records it in the catalog
+    /// `capture_failure` asks for. The staging worker's latest pass records it in the catalog
     /// (`capture_holdups`), so every process reports it, wherever the worker
     /// runs.
     pub capture_wait: Option<CaptureWait>,
     /// Set while capture of a table the definition reads is broken, and
     /// only fixing the cause gets the definition going again. Either:
     ///
-    /// - a schema change paused it (issue #622 C6): a column it reads was
-    ///   renamed or dropped, or its source's primary key was redefined
-    ///   (#687). The application's writes go on succeeding, and the other
+    /// - a schema change paused it: a column it reads was
+    ///   renamed or dropped, or its source's primary key was redefined.
+    ///   The application's writes go on succeeding, and the other
     ///   definitions on the table keep applying. Recorded in the catalog
     ///   and cleared by resuming the definition, which rebuilds it;
     /// - or row-level security on a table it reads came to apply to the
-    ///   Trellis role after it was defined (issue #745): its policies would
+    ///   Trellis role after it was defined: its policies would
     ///   filter every read of the table. The staging worker's capture pass
     ///   pauses it, with no `columns`. Exempt the role and resume the
     ///   definition, which rebuilds it and clears this;
     /// - or row-level security on its own target came to apply to the role
-    ///   the workers write it as (issue #765): its policies would filter
+    ///   the workers write it as: its policies would filter
     ///   apply's writes. The staging worker's capture pass pauses it, with
     ///   no `columns` and the target as `source_table`. Exempt the role and
     ///   resume the definition, which rebuilds it and clears this;
     /// - or a logical-replication subscription came to replicate into a
-    ///   table it reads after it was defined (issue #751): capture never
+    ///   table it reads after it was defined: capture never
     ///   sees the subscription's changes. The staging worker's capture pass
     ///   pauses it, with no `columns`. Stop replicating into the table and
     ///   resume the definition, which rebuilds it and clears this;
     /// - or, while it waits on capture as for `capture_wait`, the staging
     ///   worker's install or widen fails for a reason other than a lock (no
-    ///   primary key, a statement that fails, #687). Every pass retries it,
+    ///   primary key, a statement that fails). Every pass retries it,
     ///   and it clears once one succeeds. Recorded like `capture_wait`;
     /// - or a column it keys by changed type or collation, or a column it
-    ///   keeps a typed copy of widened (issues #760, #767): define would now
+    ///   keeps a typed copy of widened: define would now
     ///   refuse the column, a `JOIN`'s `ON` columns no longer match,
     ///   the stored keys render differently, or a copy can't hold the new
     ///   type. The staging worker's capture pass pauses it, naming the
@@ -1989,21 +1977,21 @@ pub struct DefinitionStatus {
     ///   re-types the copies for a resume, it stays paused with a record
     ///   whose `error` starts `resuming:`; if a re-type fails, the record
     ///   says why;
-    /// - or the drain halted on it (issue #663), with
+    /// - or the drain halted on it, with
     ///   [`CaptureFailureKind::Halt`]: a failure no retry or quarantine gets
     ///   past (a key the drain can't use, a propagation wave past the hop
     ///   bound, an aggregate the group basis can't apply) reached it, so the drain paused
     ///   it, everything else reading what it reads, and everything
     ///   downstream of them, and drained the rest. Fix the cause and resume
     ///   the definition, which rebuilds it and clears this;
-    /// - or its Re-derive build couldn't start (issue #986), also with
+    /// - or its Re-derive build couldn't start, also with
     ///   [`CaptureFailureKind::Halt`]: a failure no retry gets past (its
     ///   ledger table was dropped, say), so it paused, with everything
     ///   downstream of its target. `source_table` names the target. Fix the
     ///   cause and resume it, which rebuilds it and clears this.
     ///
     /// - or Trellis's capture of a table it reads was changed outside
-    ///   Trellis, with [`CaptureFailureKind::Disruption`] (#707, #1181): a
+    ///   Trellis, with [`CaptureFailureKind::Disruption`]: a
     ///   capture trigger or function was altered, disabled (`ENABLE TRIGGER
     ///   ALL` after a bulk load leaves `ORIGIN`), recreated or replaced, or
     ///   the table is gone. Changes made meanwhile may be missing, so resume
@@ -2017,7 +2005,7 @@ pub struct DefinitionStatus {
     /// every other case [`CaptureFailureKind::Capture`]. A definition an
     /// operator paused has none until one of these is seen.
     pub capture_failure: Option<CaptureFailure>,
-    /// Set while the definition holds keys in quarantine (#759): source keys
+    /// Set while the definition holds keys in quarantine: source keys
     /// whose changes its apply leaves out, each because a change to it kept
     /// failing in this definition's apply, so their target rows stay as
     /// they were. Every other definition reading the same keys applies them
@@ -2028,7 +2016,7 @@ pub struct DefinitionStatus {
     pub held_keys: Option<HeldKeys>,
     /// Set while the drain keeps failing on a page holding changes to a
     /// table the definition reads, as its source or a `JOIN`'s joined table,
-    /// with nothing charged or paused (#817): a refused read or write the
+    /// with nothing charged or paused: a refused read or write the
     /// catalog can't pin on a table (a column grant, a function's
     /// `EXECUTE`, one of Trellis's own tables), records that fail only
     /// together, isolation stopped at its probe limit, or an
@@ -2039,8 +2027,8 @@ pub struct DefinitionStatus {
     /// first, and cleared when the page commits. Separate from
     /// `capture_failure`: it pauses nothing.
     pub drain_failure: Option<DrainFailure>,
-    /// The source indexes a `GROUP BY` or `JOIN` target needs and lacks now
-    /// (#1167): one entry per table and columns. Define and a resume refuse
+    /// The source indexes a `GROUP BY` or `JOIN` target needs and lacks now:
+    /// one entry per table and columns. Define and a resume refuse
     /// a definition without them, so an entry here is an index dropped or
     /// made invalid since, or one the definition opted out of with
     /// `WITHOUT SOURCE INDEX` ([`SourceIndexGap::opted_out`]). A warning:
@@ -2050,7 +2038,7 @@ pub struct DefinitionStatus {
     /// Trellis never creates one. Read live on each call. Empty for every
     /// other target, and when the indexes exist.
     pub source_index_gaps: Vec<SourceIndexGap>,
-    /// What a `JOIN` transform's hidden tables look like now (#1112): their
+    /// What a `JOIN` transform's hidden tables look like now: their
     /// sizes, a warning when `P` approaches the fact table's size, and the step
     /// its build runs while one is under way. `None` for a
     /// definition that isn't a `JOIN`. Read live on each call; a warning
@@ -2069,7 +2057,7 @@ pub struct DefinitionStatus {
     /// failing is reported in [`DefinitionStatus::backfill_failure`].
     pub correcting: Vec<CorrectingNode>,
     /// The paused columns of upstream 1-1 targets that make a `live`
-    /// definition report [`TransformStatus::CatchingUp`] (#1208), each
+    /// definition report [`TransformStatus::CatchingUp`], each
     /// `target.column` as [`Trellis::quarantine_status`] addresses it, sorted:
     /// the columns it reads, and those read by the definitions it reads
     /// (transitively). A column is paused when its fuse tripped or `PAUSE
@@ -2081,17 +2069,16 @@ pub struct DefinitionStatus {
     /// when no such column is read.
     pub paused_upstream_columns: Vec<String>,
     /// Set while the definition's Re-derive build waits on something other
-    /// than its own work (#625 F6): see [`BuildWait`]. Cleared once the
+    /// than its own work: see [`BuildWait`]. Cleared once the
     /// wait is over.
     pub build_wait: Option<BuildWait>,
 }
 
-/// Why capture of a table a definition reads is broken (issue #622 C6,
-/// #687); see [`DefinitionStatus::capture_failure`].
+/// Why capture of a table a definition reads is broken; see [`DefinitionStatus::capture_failure`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CaptureFailure {
-    /// Whether capture broke, or the drain halted on the definition (#663).
+    /// Whether capture broke, or the drain halted on the definition.
     pub kind: CaptureFailureKind,
     /// The qualified captured table. For a halt, the table (or tables,
     /// joined with `", "`) the halting failure named, or the target, for an
@@ -2111,7 +2098,7 @@ pub struct CaptureFailure {
     pub detected_at: SystemTime,
 }
 
-/// What a [`CaptureFailure`] is (issue #663): `capture_failures.kind`.
+/// What a [`CaptureFailure`] is: `capture_failures.kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CaptureFailureKind {
@@ -2127,13 +2114,13 @@ pub enum CaptureFailureKind {
     /// (`staging::halt`).
     Halt,
     /// Trellis's capture of a table the definition reads was changed outside
-    /// Trellis, or the table is gone (#707, #999, #1181): a capture trigger
+    /// Trellis, or the table is gone: a capture trigger
     /// or function was altered, disabled, recreated or replaced, or the
     /// table was dropped, renamed away or moved. Bulk loaders leave this
     /// (`ENABLE TRIGGER ALL` puts the triggers in `ORIGIN` mode). The
     /// definition waits for a resume, which re-validates, reinstalls
     /// capture and rebuilds it. Also every definition of a database restored
-    /// from a logical dump (#1205), whose resume first resets the ordering
+    /// from a logical dump, whose resume first resets the ordering
     /// state the dump brought. A test helper that resumes after a fixture
     /// load selects on this kind. A definition that was already frozen when
     /// the disruption was seen gets [`CaptureFailureKind::Capture`] instead.
@@ -2170,7 +2157,7 @@ impl CaptureFailureKind {
     }
 }
 
-/// What a definition's capture is waiting on (issue #622 C5): the staging
+/// What a definition's capture is waiting on: the staging
 /// worker's install or widen of the capture triggers on a table the
 /// definition reads couldn't take the table's lock, because another session
 /// holds or is queued for a conflicting one. Nothing cancels that session
@@ -2196,7 +2183,7 @@ pub struct CaptureWait {
 }
 
 /// The retry state of a definition's failing build (see
-/// [`DefinitionStatus::backfill_failure`]): one of its build chunks (#616),
+/// [`DefinitionStatus::backfill_failure`]): one of its build chunks,
 /// retried with capped exponential backoff. A chunk that fails on its data is
 /// narrowed to the key that causes it, which is quarantined; one that fails
 /// otherwise pauses the definition after a few charged attempts.
@@ -2222,15 +2209,14 @@ pub struct BackfillFailure {
 pub struct DefinitionSummary {
     /// The schema-qualified target table, which identifies the transform.
     pub target_table: String,
-    /// Where this transform is in its lifecycle (issue #55) — see
+    /// Where this transform is in its lifecycle — see
     /// [`TransformStatus`].
     pub status: TransformStatus,
     pub created_at: SystemTime,
     /// Why this definition's build keeps failing, if
-    /// it does: the same value [`DefinitionStatus::backfill_failure`] reports
-    /// (issue #461).
+    /// it does: the same value [`DefinitionStatus::backfill_failure`] reports.
     pub backfill_failure: Option<BackfillFailure>,
-    /// Set while the drain has halted on this definition (issue #663): the
+    /// Set while the drain has halted on this definition: the
     /// [`DefinitionStatus::capture_failure`] [`Trellis::status`] reports for
     /// it, always with [`CaptureFailureKind::Halt`]. The definition is
     /// `paused`. Listing every definition is the health read for halts: any
@@ -2239,7 +2225,7 @@ pub struct DefinitionSummary {
 }
 
 /// What [`Trellis::apply`] did — the one return type every
-/// definition-changing statement shares (issue #227).
+/// definition-changing statement shares.
 ///
 /// One variant per operation, carrying only what that operation has to report
 /// that the caller couldn't already know from the statement it wrote: the
@@ -2250,7 +2236,7 @@ pub struct DefinitionSummary {
 /// `#[non_exhaustive]`, for the same reason [`ErrorCode`] is: this is a type
 /// the caller is *meant* to match on from outside — eventually from outside
 /// Rust — while the set of operations behind `apply` keeps growing (`AMEND`
-/// next, once it has its own ADR — issue #228, decision 3). A match on it has
+/// next, once it has its own ADR). A match on it has
 /// to tolerate a variant it doesn't know rather than assume the set is closed.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -2275,7 +2261,7 @@ pub enum Applied {
     /// which ADR-0014 makes the same success.
     Dropped,
     /// An `ALTER TRANSFORM ...` statement edited its subject's calculated
-    /// fields (ADR-0015, issues #241/#242). `target_table` is the edited
+    /// fields. `target_table` is the edited
     /// transform's schema-qualified target table; `added`/`dropped`/`altered` name exactly the
     /// fields this call actually changed, excluding any clause that turned
     /// out to be an idempotent no-op (re-adding an existing field with the
@@ -2311,7 +2297,7 @@ impl Applied {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct PoisonEntry {
-    /// The bare target of the definition the key is held for (#799).
+    /// The bare target of the definition the key is held for.
     pub transform: String,
     pub src_table: String,
     pub key: String,
@@ -2390,7 +2376,7 @@ pub enum QuarantineState {
     WaitingToBackfill,
     Backfilling,
     /// Applied like a live transform, but reading an upstream that isn't
-    /// `live` (mirrors [`TransformStatus::CatchingUp`], issue #476).
+    /// `live` (mirrors [`TransformStatus::CatchingUp`]).
     CatchingUp,
     /// A whole transform's keyspace fuse has tripped (mirrors
     /// [`TransformStatus::Quarantined`]).
@@ -2398,13 +2384,13 @@ pub enum QuarantineState {
     /// Frozen without a whole-keyspace fuse having tripped.
     ///
     /// At **column** granularity: one column's own fuse has tripped, or it's
-    /// paused only because an upstream column it reads is (decision #5's
+    /// paused only because an upstream column it reads is (the
     /// cascade) — both look the same from this read; see
     /// [`Trellis::quarantine_status`] for whether a caller needs to
     /// distinguish them (today, [`QuarantineEntry::last_error`] is `None` for
     /// a purely cascaded pause, since it never itself failed).
     ///
-    /// At **whole-transform** granularity (issue #142): an operator
+    /// At **whole-transform** granularity: an operator
     /// deliberately froze it via `PAUSE TRANSFORM` ([`Trellis::apply`]), mirroring
     /// [`TransformStatus::Paused`] — the same freeze
     /// [`QuarantineState::Quarantined`] is, reached by the other of
@@ -2514,8 +2500,7 @@ pub enum TrellisError {
     /// A named source table doesn't resolve on the connection's search path.
     SourceTableNotFound(String),
     /// [`Trellis::request_backfill`] was asked to backfill a table no
-    /// registered definition reads, so the staging worker doesn't capture it
-    /// (issue #622).
+    /// registered definition reads, so the staging worker doesn't capture it.
     TableNotCaptured { table: String },
     /// [`Trellis::request_backfill`] was given a bare table name that more than
     /// one captured source table carries, one per entry of `tables`
@@ -2555,7 +2540,7 @@ pub enum TrellisError {
     /// doesn't exist in `transform_definitions` at all.
     TransformNotFound(String),
     /// A `PAUSE TRANSFORM <target>.<column>` statement named a column that
-    /// isn't one of `transform`'s declared calculated fields (issue #227) —
+    /// isn't one of `transform`'s declared calculated fields —
     /// most often a typo, or a `<schema>.<transform>` address written where
     /// this grammar reads `<transform>.<column>` (see [`Trellis::apply`]'s
     /// "Addressing"). `declared` lists the fields the definition does declare,
@@ -2810,7 +2795,7 @@ impl From<SelfCheckError> for TrellisError {
 mod client_options_tests {
     use super::*;
 
-    /// Issue #876: a connection's `worker_threads` reaches the background
+    /// A connection's `worker_threads` reaches the background
     /// client's runtime. It used to stop at the blocking wrapper, so the
     /// client thread built its own per-core runtime whatever the caller set.
     #[test]
@@ -2832,7 +2817,7 @@ mod client_options_tests {
         );
     }
 
-    /// Issue #876: the cap reaches the runtime the client thread actually
+    /// The cap reaches the runtime the client thread actually
     /// builds, not just the options struct. A zero cap fails that build
     /// before the client opens any connection, so this needs no database;
     /// a client thread that built its runtime any other way would get past
@@ -2990,7 +2975,7 @@ mod error_code_tests {
     }
 
     /// The same composition-through-nesting contract for
-    /// [`TrellisError::Staging`] (issue #192's new arm): it must delegate to
+    /// [`TrellisError::Staging`]: it must delegate to
     /// [`StagingError::code`] rather than hardcoding a category. Checked with
     /// a variant whose code is *not* [`ErrorCode::Internal`], so a hardcoded
     /// "staging failures are internal" would fail this test rather than
@@ -3011,7 +2996,7 @@ mod error_code_tests {
     /// branching on [`TrellisError::code`] shouldn't see it drift silently.
     /// It is [`ErrorCode::Timeout`], not [`ErrorCode::Internal`]: the
     /// caller's deadline expiring is expected and retryable, and a host maps
-    /// `internal` to "a Trellis bug" (issue #586).
+    /// `internal` to "a Trellis bug".
     #[test]
     fn a_convergence_timeout_surfaces_as_timeout_through_the_facade() {
         let err = TrellisError::Staging(StagingError::ConvergenceTimeout {

@@ -17,11 +17,11 @@
 //! value's text rendering depend on the value alone rather than on the
 //! session reading it (see [`DETERMINISTIC_TEXT_OUTPUT_GUCS`]), turns
 //! `row_security` off so a read row-level security would filter raises
-//! instead (see [`ROW_SECURITY_OFF`], issue #766), turns JIT compilation
-//! off (see [`JIT_OFF`], issue #794), starts every transaction at
-//! `READ COMMITTED` (see [`READ_COMMITTED`], issue #887), and turns on
+//! instead (see [`ROW_SECURITY_OFF`]), turns JIT compilation
+//! off (see [`JIT_OFF`]), starts every transaction at
+//! `READ COMMITTED` (see [`READ_COMMITTED`]), and turns on
 //! TCP keepalives at both ends so a partitioned connection's locks don't
-//! outlive it by hours (see [`tcp_keepalive_gucs`], issue #364). The
+//! outlive it by hours (see [`tcp_keepalive_gucs`]). The
 //! dedicated, non-pooled connections get the same through
 //! [`connect_dedicated`] and [`dedicated_session_setup`].
 
@@ -223,7 +223,7 @@ pub struct Pool {
     /// The connection settings the pool's connections are opened with,
     /// client keepalives included, kept so [`Pool::connect_unpooled`] can
     /// open one more the same way. `tokio_postgres::Config`'s `Debug`
-    /// redacts the password (issue #591).
+    /// redacts the password.
     pg_config: tokio_postgres::Config,
     /// The TLS connector the pool's connections use, kept for the same
     /// reason as `pg_config`.
@@ -250,7 +250,7 @@ impl Pool {
     /// connects lazily on first `get()`.
     ///
     /// Sized and timed out per `config.pool_max_size()`/
-    /// `config.pool_wait_timeout()` (issue #182) rather than deadpool's own
+    /// `config.pool_wait_timeout()` rather than deadpool's own
     /// defaults (`2 * num_cpus` connections, no wait timeout at all): with
     /// no cap and no timeout, a handful of concurrent callers each needing
     /// a *second* connection while their own transaction holds a first
@@ -310,7 +310,7 @@ impl Pool {
     /// capacity. Once that timeout elapses, returns
     /// `Err(Error::Pool(deadpool_postgres::PoolError::Timeout(_)))` — a
     /// clear, typed, loggable failure (categorized [`crate::ErrorCode::Connectivity`]
-    /// via [`Error::code`]) instead of hanging indefinitely (issue #182).
+    /// via [`Error::code`]) instead of hanging indefinitely.
     ///
     /// Inside a public call (issue #599, `crate::deadline`) it waits no
     /// longer than the call has left, and hands the connection out with its
@@ -345,7 +345,7 @@ impl Pool {
     /// `pool_max_size` or waits on it.
     ///
     /// For session state that must never reach a pooled connection: a paged
-    /// drain's `TEMP` table (issue #620, [`crate::staging::page`]) lives on
+    /// drain's `TEMP` table ([`crate::staging::page`]) lives on
     /// one of these, so however the drain ends (finished, failed, or its
     /// future dropped mid-page) the table goes with the session, and no later
     /// borrower of a pooled connection can inherit it.
@@ -384,8 +384,7 @@ impl Pool {
         &self.schema
     }
 
-    /// The [`Config::target_schema`] this pool was built with (issue #73,
-    /// ADR-0011) — the same value baked into every connection's own
+    /// The [`Config::target_schema`] this pool was built with (ADR-0011) — the same value baked into every connection's own
     /// `search_path` by [`session_bootstrap`] above, and the same value
     /// every real caller of [`crate::defs::install_definition`] already
     /// passes as its own `target_schema` argument (that argument and this
@@ -440,12 +439,12 @@ impl Pool {
 /// `('2024-01-01'::date)::text` renders `01/01/2024`, and nothing is
 /// actually wrong.
 ///
-/// The first four pinned here cover what issue #109's typed literals can
+/// The first four pinned here cover what typed literals can
 /// produce (`date`/`timestamp` under `DateStyle`, `bytea` under
-/// `bytea_output`), what issue #112's float split added (`real`/`double
-/// precision` under `extra_float_digits`), and what issue #113's temporal
+/// `bytea_output`), what the float split added (`real`/`double
+/// precision` under `extra_float_digits`), and what the temporal
 /// families added (`interval` under `IntervalStyle`). **Every future type
-/// family in epic #123 hits this same wall and should extend this one
+/// family hits this same wall and should extend this one
 /// constant** rather than pinning a GUC at its own call site. Keeping them
 /// in a single list is also what lets the non-pooled connect sites below,
 /// and every capture function's `SET` clauses
@@ -454,7 +453,7 @@ impl Pool {
 /// same text, so a GUC added here is pinned everywhere else too, with
 /// nothing to remember to update in a second place.
 ///
-/// # `TimeZone` (issue #246)
+/// # `TimeZone`
 ///
 /// `timestamptz_out` renders in the session's `TimeZone`, so pinning it to
 /// `'UTC'` gives `timestamptz` the same text-stability `DateStyle` gives
@@ -480,7 +479,7 @@ impl Pool {
 /// text to be in a spelling that parses to the same value under **any**
 /// `DateStyle` (leading-4-digit-year ISO is unambiguous), so a definition
 /// installed against one server stays correct if read on another.
-/// `IntervalStyle` joins them for issue #113 and is the clearest case of
+/// `IntervalStyle` joins them and is the clearest case of
 /// all: `interval_out` renders the *same* value as `1 year 2 mons 3 days
 /// 04:05:06` under `postgres`, `+1-2 +3 +4:05:06` under `sql_standard`,
 /// `@ 1 year 2 mons 3 days 4 hours 5 mins 6 secs` under `postgres_verbose`
@@ -489,20 +488,20 @@ impl Pool {
 /// specifically, which is both Postgres's default and what an interval
 /// `SUM` has to write back.
 ///
-/// `TimeZone` joined the other four for issue #246 (see the "`TimeZone`"
+/// `TimeZone` joined the other four (see the "`TimeZone`"
 /// section above): `timestamptz_out` renders in `'UTC'` everywhere Trellis
 /// renders a value, making it a bijection on the instant exactly the way
 /// `DateStyle` makes `date_out` a bijection on the day number.
 ///
-/// `lc_monetary` joined for issue #672. `cash_out` spells a `money` value
+/// `lc_monetary` joined too. `cash_out` spells a `money` value
 /// in the session's monetary locale: `1234.56::money` is `$1,234.56` under
 /// `C`, `£1,234.56` under `en_GB.UTF-8` and `kr.1.234,56` under
 /// `en_DK.UTF-8`, and `cash_in` reads input under the same locale. A
 /// `money` column is a passthrough value (`docs/type-support.md`), so an
 /// operator's `ALTER DATABASE ... SET lc_monetary` used to change its
 /// staged text. `'C'` is the value every libc has, and it renders the same
-/// `$1,234.56` a server initialized with `C.UTF-8` (the test clusters,
-/// issue #667) or `en_US.UTF-8` defaults to.
+/// `$1,234.56` a server initialized with `C.UTF-8` (the test clusters)
+/// or `en_US.UTF-8` defaults to.
 ///
 /// `money` stores an integer count of the monetary locale's smallest unit,
 /// scaled by its `frac_digits` at *input* time, so under a database whose
@@ -524,7 +523,7 @@ impl Pool {
 /// literal `'\x0102'` reads as a control character followed by `02`. `on`
 /// has been the server default since Postgres 9.1, but an operator's
 /// `ALTER DATABASE ... SET standard_conforming_strings = off` still reaches
-/// every session that doesn't set it. It sits in this constant (issue #672)
+/// every session that doesn't set it. It sits in this constant
 /// because this is the one list every Trellis session applies. A capture
 /// function pins it too, where it is harmless: its body's literals never
 /// contain a backslash.
@@ -538,13 +537,13 @@ impl Pool {
 /// value through `jsonb_populate_record` ([`crate::staging::group_basis`]),
 /// so an operator's `ALTER DATABASE ... SET xmloption = document` used to
 /// fail every page carrying one. `content` accepts everything `document`
-/// does, so it is pinned (found in #623 D3b's review). A capture function
+/// does, so it is pinned. A capture function
 /// pins it too, where it is harmless: `xml_out` ignores it.
 ///
 /// # Output settings deliberately *not* pinned
 ///
-/// The rest of Postgres's locale and formatting settings were audited for
-/// issue #672. None of them changes what a type's output function (the
+/// The rest of Postgres's locale and formatting settings were audited.
+/// None of them changes what a type's output function (the
 /// `::text` cast, capture's `format('%s', col)`, `to_jsonb`) prints:
 ///
 /// * `lc_numeric` and `lc_time` only feed `to_char`'s locale patterns (`D`,
@@ -555,7 +554,7 @@ impl Pool {
 ///   errors by SQLSTATE, never by message.
 /// * `lc_collate`/`lc_ctype` are fixed per database, not settable per
 ///   session. Ordering is handled with explicit `collate "C"` and the
-///   deterministic-collation checks on key columns (issues #590, #638).
+///   deterministic-collation checks on key columns.
 /// * `client_encoding` is fixed to `UTF8` by `tokio-postgres` itself.
 /// * `xmlbinary` and `timezone_abbreviations` change how *input* is parsed
 ///   (or, for `xmlbinary`, what the `xml*` constructor functions build),
@@ -569,7 +568,7 @@ pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str = "set datestyle to 'ISO, 
      set xmloption to 'content'";
 
 /// Makes a read or write that row-level security would filter **raise**
-/// instead (issue #766).
+/// instead.
 ///
 /// Under `row_security = off`, Postgres doesn't apply a table's policies to
 /// the session at all. When they would apply (the table has RLS enabled and
@@ -583,7 +582,7 @@ pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str = "set datestyle to 'ISO, 
 /// Trellis doesn't support policies that apply to the roles it reads or
 /// writes as (`docs/transforms.md`, "Supported sources and targets"), and
 /// checks the catalog for them at define, on every capture pass, and in
-/// `self_check` ([`crate::defs::row_security`], #745/#765). Those checks only
+/// `self_check` ([`crate::defs::row_security`]). Those checks only
 /// see the ring's owner and the role of the session running them, so a drain
 /// or build logged in as any other role would otherwise read past them and
 /// write a silently wrong target. This setting is the defense in depth behind them:
@@ -599,7 +598,7 @@ pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str = "set datestyle to 'ISO, 
 /// failed application write. The capture pass pauses those readers instead.
 pub(crate) const ROW_SECURITY_OFF: &str = "set row_security to off";
 
-/// Turns JIT compilation off (issue #794).
+/// Turns JIT compilation off.
 ///
 /// Postgres JIT-compiles a statement whose estimated cost is above
 /// `jit_above_cost`, and inlines and optimizes it above
@@ -634,7 +633,7 @@ pub(crate) const ROW_SECURITY_OFF: &str = "set row_security to off";
 /// server's, database's or role's default.
 pub(crate) const JIT_OFF: &str = "set jit to off";
 
-/// Starts every transaction at `READ COMMITTED` (issue #887).
+/// Starts every transaction at `READ COMMITTED`.
 ///
 /// ADR-0002's I1 (read after lock) depends on it: a statement that reads
 /// after the entry lock has to see what committed before it, including the
@@ -685,7 +684,7 @@ async fn session_bootstrap(
 }
 
 // ---------------------------------------------------------------------
-// Dead-peer detection: TCP keepalives on both ends (issue #364)
+// Dead-peer detection: TCP keepalives on both ends
 // ---------------------------------------------------------------------
 
 /// How long a connection sits with no traffic before the first keepalive
@@ -701,7 +700,7 @@ async fn session_bootstrap(
 /// up on it, which with Linux defaults (`tcp_keepalive_time` 7200s, then 9
 /// probes 75s apart) is about 2h11m.
 ///
-/// The producer session is where this hurt (issue #364): its backend holds the
+/// The producer session is where this hurt: its backend holds the
 /// instance's producer-singleton advisory lock
 /// ([`crate::staging::session::producer_singleton_lock_key`]), so a partitioned
 /// producer kept every restart refused with `ProducerAlreadyRunning` for the
@@ -878,7 +877,7 @@ pub(crate) fn with_client_keepalives(
 ///
 /// A DSN that doesn't parse is an [`Error::Config`] from
 /// [`crate::config::parse_dsn`], never a `tokio_postgres::Error`, whose
-/// `Debug` can quote part of the password (issue #608).
+/// `Debug` can quote part of the password.
 ///
 /// The TLS options in `dsn` apply as they do to the pool; the connector is
 /// rebuilt on each call, so a replaced certificate file is picked up.
@@ -929,7 +928,7 @@ pub(crate) fn quote_ident(ident: &str) -> String {
 /// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`] pins on every connection this crate
 /// opens, so a backslash needs no escaping).
 ///
-/// Issue #248: a column name can't be bound as an ordinary query parameter
+/// A column name can't be bound as an ordinary query parameter
 /// (it isn't a value), but it still needs to appear as a `jsonb_build_object`
 /// *key* — a text literal, not a bare identifier — when
 /// `staging::apply`/`staging::quarantine` build an explicit per-column
@@ -954,7 +953,7 @@ mod tests {
         assert_eq!(quote_ident("weird\"schema"), "\"weird\"\"schema\"");
     }
 
-    /// Issue #364: the client probes on the same schedule the server does,
+    /// The client probes on the same schedule the server does,
     /// with the user timeout only on dedicated connections. The server half
     /// is checked against a live TCP session in `tests/tcp_keepalives.rs`;
     /// `tokio_postgres` exposes no way to read the client's socket options
@@ -1047,7 +1046,7 @@ mod tests {
         }
     }
 
-    /// Issue #608: a DSN that doesn't parse gets a fixed message, not
+    /// A DSN that doesn't parse gets a fixed message, not
     /// tokio_postgres's error, which can name part of the password.
     #[test]
     fn unparsable_dsn_error_carries_no_password_fragment() {
@@ -1059,7 +1058,7 @@ mod tests {
         }
     }
 
-    /// Issue #608: the dedicated connections (producer session, maintenance
+    /// The dedicated connections (producer session, maintenance
     /// loop, wake listener, liveness daemon) parse the DSN themselves.
     #[tokio::test]
     async fn dedicated_connection_dsn_error_carries_no_password_fragment() {
@@ -1099,7 +1098,7 @@ mod tests {
         assert!(encrypted);
     }
 
-    /// Issue #672: `money` renders the same on every kind of session Trellis
+    /// `money` renders the same on every kind of session Trellis
     /// opens itself (pooled, unpooled, dedicated) even when the database's
     /// own `lc_monetary` default says otherwise.
     #[tokio::test]
@@ -1166,9 +1165,8 @@ mod tests {
     }
 
     /// Every kind of session Trellis opens itself (pooled, unpooled,
-    /// dedicated) runs with `row_security` (issue #766) and `jit` (issue
-    /// #794) off and starts its transactions at `read committed` (issue
-    /// #887), even when the database's defaults say otherwise: a read that
+    /// dedicated) runs with `row_security` and `jit` off
+    /// and starts its transactions at `read committed`, even when the database's defaults say otherwise: a read that
     /// row-level security would filter raises instead, no statement is
     /// JIT-compiled, and a read after a lock sees what committed before it.
     #[tokio::test]
@@ -1282,7 +1280,7 @@ mod tests {
         assert_eq!(settings(&mut dedicated).await, pinned, "dedicated");
     }
 
-    /// Issue #672 review: the SQL Trellis writes escapes a string literal by
+    /// The SQL Trellis writes escapes a string literal by
     /// doubling `'` only ([`quote_literal`],
     /// [`crate::defs::typed_literal::render_sql`]), which assumes
     /// `standard_conforming_strings = on`. A database default of `off` must
@@ -1373,7 +1371,7 @@ mod tests {
         assert_eq!(render(&dedicated, &full).await, expected, "dedicated");
     }
 
-    /// Issue #591: `Pool`'s derived `Debug` reaches the DSN only through
+    /// `Pool`'s derived `Debug` reaches the DSN only through
     /// `deadpool_postgres::Manager`'s `tokio_postgres::Config`, whose own
     /// Issue #599: a call connection whose reset never ran (its runtime shut
     /// down with the reset task still queued) is closed, not pooled with the

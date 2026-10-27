@@ -1,8 +1,8 @@
-//! Target-table DDL for a 1-1 [`TransformDef`] (issue #25).
+//! Target-table DDL for a 1-1 [`TransformDef`].
 //!
 //! **Neighbor-table convention**: the target table is created under the
 //! literal name `def.target`, in a separately-configurable *target schema*
-//! (`Config::target_schema`, issue #15) — deliberately decoupled from the
+//! (`Config::target_schema`) — deliberately decoupled from the
 //! Trellis-managed catalog schema (`Config::schema`) everything else
 //! `crate::pool` points `search_path` at, and defaulting to `public` (the
 //! same default any other bare `CREATE TABLE` would land in) rather than
@@ -25,37 +25,33 @@
 //! The target's primary key is inherited from the source table's own primary
 //! key (name and type, introspected live from `pg_catalog` — the one piece
 //! of schema introspection this issue needs, distinct from the general
-//! "introspect the whole source schema" question the catalog module (#23)
+//! "introspect the whole source schema" question the catalog module
 //! left open), at whatever arity the source declares it: a composite
 //! (multi-column) source primary key mirrors onto the target as a real,
-//! composite `primary key (...)` table constraint (issue #121), and a source
+//! composite `primary key (...)` table constraint, and a source
 //! keyed by a nullable unique index (an aggregate or `JOIN` target's `GROUP
 //! BY` columns) gives the target the same `unique nulls not distinct` key
-//! over its nullable columns (issue #1141) — every
+//! over its nullable columns — every
 //! consumer of a 1-1 target's own key (this DDL, the Re-derive build's
 //! key-range chunks, `staging::apply`'s live CDC apply,
 //! `staging::quarantine`'s recompute, `staging::self_check`'s divergence
 //! detector) renders and compares it through the shared, arity-generic
 //! key-contract text ([`pk_key_sql_expr`]/[`join_pk_key`]/[`split_pk_key`]),
-//! the same encoding an aggregate's `GROUP BY` key already used before this issue (issue #126
-//! first lifted [`source_primary_key`]'s own blanket single-column
-//! rejection; this issue finishes the job by removing the single-column
-//! narrowing every 1-1-specific consumer still layered on top of it).
+//! the same encoding an aggregate's `GROUP BY` key uses, at any arity
+//! ([`source_primary_key`] accepts a composite key, and no 1-1-specific
+//! consumer narrows it back to one column).
 //! Every key column's Postgres type must be
 //! [text-stable](super::join_key_types::is_text_stable_join_key_type) — the same
 //! allowlist a `JOIN` key is held to — since every
 //! consumer of this key compares it via `::text` casts just like a join key;
 //! an unsafe type (e.g. `numeric`, `interval`) is rejected at
 //! definition time rather than risking a silent missed/duplicated target row
-//! later (issue #107). `bytea` and `timestamptz` used to be other examples
-//! here; issue #114 found `bytea`'s `::text` rendering is in fact a
-//! bijection once `bytea_output` is pinned, and issue #246 pinned
-//! `timestamptz`'s `TimeZone` everywhere `DateStyle` was already pinned, so
-//! both are on the allowlist now rather than off it.
+//! later. `bytea` and `timestamptz` are on the allowlist: `bytea`'s `::text`
+//! rendering is a bijection once `bytea_output` is pinned, and
+//! `timestamptz`'s `TimeZone` is pinned everywhere `DateStyle` is.
 //!
 //! Every calculated field is typed per its inferred
-//! [`super::ast::ValueType`] (issue #63 widened this from a blanket
-//! `numeric` to `numeric`/`text`/`boolean`, reusing
+//! [`super::ast::ValueType`] (reusing
 //! [`super::validate::infer_field_types`] rather than a second type-inference
 //! implementation).
 
@@ -78,32 +74,32 @@ use super::validate::ValidationError;
 /// so the rest of the crate (the ledger's DDL, the backfill) renders the
 /// same casts without a second type-name table.
 ///
-/// Returns [`Cow`] rather than a bare `&'static str` since issue #117: every
-/// family but one renders a fixed keyword and stays `Cow::Borrowed`, exactly
-/// as before that issue: [`PgType::Enum`] is the one family whose rendering
+/// Returns [`Cow`] rather than a bare `&'static str`: every
+/// family but one renders a fixed keyword and stays `Cow::Borrowed`;
+/// [`PgType::Enum`] is the one family whose rendering
 /// is a function of *which* enum type a given column is — see
 /// [`PgType::sql_type_name`]'s own doc comment.
 pub(crate) fn pg_type_name(value_type: ValueType) -> Cow<'static, str> {
     match value_type {
         ValueType::Numeric => Cow::Borrowed("numeric"),
-        // Issue #111: a derived exact-integer column is declared with the
+        // A derived exact-integer column is declared with the
         // width Postgres would give the same expression, not the `numeric`
         // every integer used to collapse into.
         ValueType::Integer(width) => Cow::Borrowed(width.pg_name()),
-        // Issue #112: likewise a derived float column is declared `real` or
+        // Likewise a derived float column is declared `real` or
         // `double precision`, the type Postgres gives the same expression —
         // not the `numeric` both used to collapse into.
         ValueType::Float(width) => Cow::Borrowed(width.pg_name()),
         ValueType::Text => Cow::Borrowed("text"),
         ValueType::Boolean => Cow::Borrowed("boolean"),
         ValueType::Uuid => Cow::Borrowed("uuid"),
-        // Issue #108: a passthrough-only `Other` family still needs a real
+        // A passthrough-only `Other` family still needs a real
         // column type when it *is* rendered into DDL/cast SQL (e.g. a
         // `SELECT jsonb_col AS jsonb_col` passthrough field) —
         // `PgType::sql_type_name` is that keyword. Note it is deliberately
         // *not* `PgType::name` (the persisted token): `Unrecognized` has no
-        // real Postgres type keyword and renders as `text` here, matching
-        // the pre-#108 fallthrough. See that method's doc comment.
+        // real Postgres type keyword and renders as `text` here. See that
+        // method's doc comment.
         ValueType::Other(pg_type) => pg_type.sql_type_name(),
     }
 }
@@ -111,8 +107,8 @@ pub(crate) fn pg_type_name(value_type: ValueType) -> Cow<'static, str> {
 /// The source column a bare passthrough/rename field reads, if `field`'s
 /// expression is exactly a reference to one source column (`SELECT author AS
 /// author` or `SELECT author AS foo`) — the only shape whose target column
-/// type can be narrowed to the source column's *concrete* Postgres type
-/// (issue #45). Returns `None` for any other expression (arithmetic,
+/// type can be narrowed to the source column's *concrete* Postgres type.
+/// Returns `None` for any other expression (arithmetic,
 /// aggregates, function calls, literals), whose result genuinely can't be
 /// narrower than its inferred [`ValueType`], so those keep collapsing through
 /// [`pg_type_name`] exactly as before.
@@ -150,9 +146,8 @@ pub struct PrimaryKeyColumn {
     /// `UNIQUE` index [`source_primary_key`] also accepts. `true` only for
     /// a column of a `UNIQUE NULLS NOT DISTINCT` key: the grouping columns
     /// [`create_aggregate_target_table`] puts on an aggregate target, whose
-    /// `GROUP BY` columns are deliberately nullable (issue #110's whole
-    /// subject), and the same columns of a 1-1 target over such a source
-    /// ([`target_table_ddl`], issue #1141).
+    /// `GROUP BY` columns are deliberately nullable, and the same columns of
+    /// a 1-1 target over such a source ([`target_table_ddl`]).
     pub nullable: bool,
     /// The collation the key's index orders this column by, as a quoted,
     /// qualified name ready to interpolate after `collate`
@@ -160,7 +155,7 @@ pub struct PrimaryKeyColumn {
     /// with no collation (`integer`, `uuid`).
     ///
     /// Every `(lo, hi]` range a build compares this column against names it
-    /// explicitly ([`PrimaryKeyColumn::ordered`], issue #769). A build plans
+    /// explicitly ([`PrimaryKeyColumn::ordered`]). A build plans
     /// its ranges in one transaction and reads them in later ones, and an
     /// `alter column … type text collate …` between the two reorders the
     /// column under the ranges, so a build records the collations it
@@ -189,8 +184,8 @@ pub(crate) fn key_collations(pk: &[PrimaryKeyColumn]) -> Vec<Option<String>> {
 }
 
 /// Pins `pk`, the source's key as read now, to `recorded`, the collations
-/// its build planned its ranges under ([`PrimaryKeyColumn::collation`],
-/// issue #769), so a range planned before an `alter column … collate …`
+/// its build planned its ranges under ([`PrimaryKeyColumn::collation`]),
+/// so a range planned before an `alter column … collate …`
 /// still selects exactly the keys it did. A column only takes a recorded
 /// collation when it has one now as well: a column whose type changed to or
 /// from a collatable one orders by its type, which a collation can't pin.
@@ -232,7 +227,7 @@ pub enum DdlError {
     },
     /// The source table's (single-column) primary key resolved to a Postgres
     /// type outside `super::join_key_types::is_text_stable_join_key_type`'s
-    /// allowlist (issue #107). Every 1-1 apply/backfill path
+    /// allowlist. Every 1-1 apply/backfill path
     /// (`staging::apply`, `staging::backfill`) compares this primary key via
     /// `::text` casts, exactly like a `JOIN` key — so a
     /// non-text-stable type (`numeric`/`real`/`double precision`: `1.0` vs
@@ -394,12 +389,12 @@ impl From<super::backfill::BackfillError> for DdlError {
 /// Introspects `source_table`'s primary key from `pg_catalog`, via a bound
 /// `::regclass` cast (`to_regclass($1)`) rather than string-interpolating the
 /// table name into the query. `source_table` is the unquoted `schema.table`
-/// identity, quoted for the lookup by [`regclass_arg`] (issue #561), which
-/// `to_regclass` resolves exactly (issue #76, ADR-0011) — every real caller
-/// now passes one (`Definition::source_table`, or
+/// identity, quoted for the lookup by [`regclass_arg`], which
+/// `to_regclass` resolves exactly (ADR-0011) — every real caller
+/// passes one (`Definition::source_table`, or
 /// `catalog::resolve_source_for_install`'s equivalent at definition-acceptance
-/// time), so this no longer depends on the connection's `search_path`
-/// (`crate::pool`'s session bootstrap) the way it did before issue #72/#76. A
+/// time), so this does not depend on the connection's `search_path`
+/// (`crate::pool`'s session bootstrap). A
 /// bare table name still resolves via `search_path` exactly as before, for
 /// any caller that genuinely has nothing more specific. Rejects only a
 /// *zero*-column arity (no primary key, and no qualifying unique index
@@ -407,23 +402,20 @@ impl From<super::backfill::BackfillError> for DdlError {
 /// key is returned in full, in the key's own declared column order
 /// (`array_position(i.indkey, a.attnum)`, the same ordinal-position
 /// convention the capture trigger's key expression follows for the
-/// identical reason) — issue #126 lifted this function's own blanket
-/// rejection of an arity greater than one, and issue #121 removed the last
-/// caller (the 1-1 target-DDL slice) that still narrowed it back down to one
-/// column, so every consumer now takes the key at whatever arity it has.
+/// identical reason) — every consumer takes the key at whatever arity it has.
 /// Also gates every resolved column's *type*: only
 /// [`super::join_key_types::is_text_stable_join_key_type`]'s allowlist is accepted,
-/// returning [`DdlError::UnsupportedPrimaryKeyType`] otherwise (issue #107)
+/// returning [`DdlError::UnsupportedPrimaryKeyType`] otherwise
 /// — every caller of this function ultimately compares the returned key via
 /// `::text` casts, so an unsafe type here would risk the same silent
 /// divergence a `JOIN` key is already guarded against.
 /// Falls back to `source_table`'s own unique constraint when it has no
-/// `PRIMARY KEY` (issue #128). [`create_aggregate_target_table`] keys its
+/// `PRIMARY KEY`. [`create_aggregate_target_table`] keys its
 /// grouping columns with a `UNIQUE NULLS NOT DISTINCT` constraint rather than
 /// a `PRIMARY KEY`, precisely so a NULL grouping value is representable
 /// (`PRIMARY KEY` forbids `NULL` outright) — so an aggregate target chained
 /// into as another definition's source (`TRANSFORM x FROM some_aggregate`,
-/// #102's own worked example) has no `indisprimary` row at all. Without this
+/// for instance) has no `indisprimary` row at all. Without this
 /// fallback every such chain would regress from working to
 /// [`DdlError::NoPrimaryKey`]. Ties among multiple qualifying unique indexes
 /// break on `indexrelid` ascending (oldest first) for a deterministic choice;
@@ -441,8 +433,7 @@ pub async fn source_primary_key(
 
 /// [`source_primary_key`] against a caller-supplied client instead of a fresh
 /// pooled one — for callers already holding an open transaction
-/// (`catalog::create_definition_inner`'s create-time key gate, issues #177
-/// and #371). Two reasons that matters there rather than just calling
+/// (`catalog::create_definition_inner`'s create-time key gate). Two reasons that matters there rather than just calling
 /// [`source_primary_key`]: taking a *second* pooled connection while the
 /// first one is mid-transaction is the classic pool-exhaustion deadlock (N
 /// concurrent definition creations against a pool of N connections would each
@@ -462,7 +453,7 @@ pub(crate) async fn source_primary_key_in_txn(
         });
     }
     for column in &columns {
-        // Issue #117: a live enum type joins the static allowlist above via
+        // A live enum type joins the static allowlist above via
         // the same dynamic `to_regtype`-based check a `JOIN` key's gets — see
         // `join_key_types::is_enum_type_name`'s own doc comment for why admitting
         // it is safe.
@@ -494,11 +485,11 @@ pub(crate) async fn source_primary_key_in_txn(
 /// The catalog half of [`source_primary_key_in_txn`], with none of its
 /// definition-time policy: `table`'s row-identity key columns (its `PRIMARY
 /// KEY`, else the qualifying `UNIQUE` index — an aggregate target's `UNIQUE
-/// NULLS NOT DISTINCT` grouping columns, issue #128), in declared order, each
+/// NULLS NOT DISTINCT` grouping columns), in declared order, each
 /// with its nullability. Empty when `table` has no such index; no key-type
 /// gate. `table` is an unquoted `schema.table` identity ([`regclass_arg`]).
 ///
-/// Split out for `intake::harness::enumerate_and_append` (issue #308),
+/// Split out for `intake::harness::enumerate_and_append`,
 /// which must enumerate every table a fixture can name — aggregate targets
 /// included — under exactly the key [`pk_key_sql_expr`] renders for that
 /// table everywhere else. It has never type-gated the tables it enumerates.
@@ -575,14 +566,13 @@ pub(crate) async fn identity_key_columns(
 /// same U+001F choice — but, unlike that whole-key sentinel, a *component's own
 /// value* is not simply assumed never to contain it: Postgres `text`/`varchar`
 /// happily stores U+001F, so [`join_pk_key`]/[`pk_key_sql_expr`] escape a
-/// genuine occurrence in a *multi-column* key (issue #200) rather than assuming
+/// genuine occurrence in a *multi-column* key rather than assuming
 /// it away — a single-column key needs no escape and deliberately gets none,
 /// see [`push_escaped_composite_key_part`]'s "why arity 1 is exempt". See
 /// [`KEY_PART_ESCAPE`] for the escape itself, and [`split_pk_key`]'s doc
-/// comment for what happened pre-#200, when a real separator collided
-/// unescaped: a loud [`DdlError::MalformedCompositeKey`] arity mismatch, not
-/// silent corruption — still worth closing, just lower urgency than issue
-/// #110's silent-NULL-collision counterpart ([`NULL_KEY_SENTINEL`]). Reusing
+/// comment for what an unescaped real separator would do: a loud
+/// [`DdlError::MalformedCompositeKey`] arity mismatch, not silent corruption,
+/// unlike the silent-NULL-collision counterpart ([`NULL_KEY_SENTINEL`]). Reusing
 /// the identical separator here (not a second one) is what lets a from-side
 /// row's composite key, however it entered the ring — a capture trigger, or a
 /// synthetic [`crate::staging::append::StagedChange::Recompute`] — decode
@@ -597,12 +587,12 @@ pub(crate) async fn identity_key_columns(
 ///
 /// 1. **"Can this column be `NULL`?"** — decided per column from the
 ///    catalog ([`PrimaryKeyColumn::nullable`]). A nullable column's value
-///    goes through [`encode_key_part`]/[`null_key_escape_sql`] (issue #110),
+///    goes through [`encode_key_part`]/[`null_key_escape_sql`],
 ///    which only ever substitutes or doubles U+0001.
 /// 2. **"Does this key have a delimiter to protect?"** — decided by the
 ///    key's arity. At arity ≥ 2 every part (nullable or not) then goes
 ///    through [`push_escaped_composite_key_part`]/
-///    [`composite_key_escape_sql`] (issue #200), which only ever inspects
+///    [`composite_key_escape_sql`], which only ever inspects
 ///    and inserts U+001E/U+001F.
 ///
 /// Layer 1 is always the inner one, layer 2 always the outer one, on both
@@ -621,7 +611,7 @@ pub(crate) const COMPOSITE_KEY_SEPARATOR: char = '\u{1f}';
 /// real, in-value occurrence of [`COMPOSITE_KEY_SEPARATOR`] (or of this very
 /// character) in a *multi-column* key, so [`split_pk_key`] can tell a
 /// genuine field boundary apart from a column value that simply *contains*
-/// U+001F (issue #200; arity 1 is exempt — see
+/// U+001F (arity 1 is exempt — see
 /// [`push_escaped_composite_key_part`]). U+001E
 /// (INFORMATION SEPARATOR TWO) — Postgres `text` can hold this too, so, like
 /// [`COMPOSITE_KEY_SEPARATOR`], a real occurrence of *this* character is
@@ -631,7 +621,7 @@ pub(crate) const COMPOSITE_KEY_SEPARATOR: char = '\u{1f}';
 ///
 /// # Why not simply double a real [`COMPOSITE_KEY_SEPARATOR`] occurrence
 ///
-/// Issue #110's [`NULL_KEY_SENTINEL`] escape doubles a real sentinel
+/// The [`NULL_KEY_SENTINEL`] escape doubles a real sentinel
 /// occurrence and that is provably safe *there* because a
 /// [`NULL_KEY_SENTINEL`] part is checked as a whole token against exactly
 /// one already-delimited field (delimited by the *different* character
@@ -666,7 +656,7 @@ const KEY_PART_ESCAPE: char = '\u{1e}';
 /// producer of this crate's composite key text must: a real
 /// [`COMPOSITE_KEY_SEPARATOR`] or [`KEY_PART_ESCAPE`] character is prefixed
 /// with [`KEY_PART_ESCAPE`], everything else copied through unchanged. Used
-/// by [`join_pk_key`] for a *multi-part* key only (issue #200).
+/// by [`join_pk_key`] for a *multi-part* key only.
 ///
 /// This is the **outer** of the two escape layers described in
 /// [`COMPOSITE_KEY_SEPARATOR`]'s "how this composes with
@@ -695,22 +685,22 @@ const KEY_PART_ESCAPE: char = '\u{1e}';
 /// escaped one — two rows for one source row, and a delete that matches
 /// neither. That is exactly the silent-corruption failure mode
 /// [`encode_key_part`]'s own "[`PrimaryKeyColumn::nullable`] selects the
-/// encoding" section describes for issue #110's escape, and it would be
+/// encoding" section describes for the sentinel escape, and it would be
 /// *introduced*, not closed, by escaping here.
 ///
 /// It is also unnecessary: an arity-1 key has no delimiter to protect, and
 /// [`split_pk_key`] knows the target arity, so it returns a single-column
 /// key whole rather than splitting it. That, not escaping, is what closes
-/// issue #200's single-column half (a value containing U+001F used to reach
+/// the single-column half (a value containing U+001F would otherwise reach
 /// a loud [`DdlError::MalformedCompositeKey`] arity mismatch, even with no
 /// composite key involved at all). Escaping is only needed where a real
 /// delimiter is actually emitted — arity ≥ 2.
 ///
-/// Note this exemption is *only* about this separator/escape layer. Issue
-/// #110's [`NULL_KEY_SENTINEL`] layer has no arity exemption at all: a
+/// Note this exemption is *only* about this separator/escape layer. The
+/// [`NULL_KEY_SENTINEL`] layer has no arity exemption at all: a
 /// nullable arity-1 key (a single-column aggregate `GROUP BY`) still gets
 /// the full [`encode_key_part`] treatment. A 1-1 target keyed by such a
-/// column (issue #1141) never stores the encoded text: the write path
+/// column never stores the encoded text: the write path
 /// decodes it back to the value, `NULL` included ([`split_pk_key`]). The
 /// two decisions are independent — see [`COMPOSITE_KEY_SEPARATOR`]'s
 /// composition section.
@@ -746,8 +736,7 @@ fn push_escaped_composite_key_part(out: &mut String, part: &str) {
 /// nullable column of a multi-column key) leaves that inner layer's output
 /// recoverable exactly — and, because the inner `coalesce` has already
 /// turned a SQL `NULL` into a real `chr(1)` string, this wrapper never sees
-/// `NULL` and so can never re-introduce the `array_to_string` element-drop
-/// issue #110 closed.
+/// `NULL` and so can never re-introduce the `array_to_string` element drop.
 pub(crate) fn composite_key_escape_sql(col_text: &str) -> String {
     format!(
         "replace(replace({col_text}, chr(30), chr(30) || chr(30)), chr(31), chr(30) || chr(31))"
@@ -755,13 +744,13 @@ pub(crate) fn composite_key_escape_sql(col_text: &str) -> String {
 }
 
 /// The per-part text substituted for a `NULL` key/group component wherever
-/// this crate's shared key contract renders one — the fix for issue #110's
-/// NULL-lossiness axis: before this, a `NULL` component rendered as an empty
-/// string (`unwrap_or_default()`/a bare `col::text`, which is SQL `NULL` and
-/// gets dropped by `array_to_string`), indistinguishable from a genuine `''`
-/// value, so a `NULL`-keyed group's identity couldn't round-trip through a
-/// chained definition's live re-fetch (`staging::apply::read_live_rows_batch`)
-/// — it looked exactly like "no row," which is mistaken for a delete.
+/// this crate's shared key contract renders one. A `NULL` component can't
+/// render as an empty string (`unwrap_or_default()`/a bare `col::text`, which
+/// is SQL `NULL` and gets dropped by `array_to_string`), indistinguishable
+/// from a genuine `''` value: a `NULL`-keyed group's identity couldn't
+/// round-trip through a chained definition's live re-fetch
+/// (`staging::apply::read_live_rows_batch`), where it would look exactly
+/// like "no row," which is mistaken for a delete.
 ///
 /// U+0001 (SOH) is used — but, unlike
 /// `staging::append::TRUNCATE_SENTINEL_KEY`/[`COMPOSITE_KEY_SEPARATOR`],
@@ -845,7 +834,7 @@ pub(crate) fn null_key_escape_sql(col_text: &str) -> String {
 /// [`decode_key_part`] recovers `v` exactly. Without this escape a group
 /// whose key column genuinely held a lone U+0001 would silently share one
 /// encoded key with the `NULL` group — two distinct groups folded into one,
-/// a silent-corruption bug strictly worse than issue #110's own.
+/// a silent-corruption bug.
 ///
 /// # [`PrimaryKeyColumn::nullable`] selects the encoding
 ///
@@ -860,7 +849,7 @@ pub(crate) fn null_key_escape_sql(col_text: &str) -> String {
 ///
 /// That is not an optimization, it is a correctness requirement, and it is
 /// specifically *not* an arity-1 exemption (a single-column nullable `GROUP
-/// BY` is exactly issue #110's original bug and still gets the full
+/// BY` is exactly the case this encoding exists for and still gets the full
 /// treatment here). The reason is that a not-null primary key's encoded text
 /// does not stay internal to the ring: for a 1-1 definition,
 /// `staging::apply::apply_target` binds the staged key text *directly* as
@@ -911,7 +900,7 @@ pub(crate) fn decode_key_part(part: &str) -> Option<Cow<'_, str>> {
 /// *not-null* single column that makes it byte-identical to the bare
 /// `{pk}::text` form the write path binds as a real PK value, while a
 /// *nullable* single column still gets its [`null_key_escape_sql`] layer
-/// (issue #110 has no arity exemption). A multi-arity key renders
+/// (the `NULL` layer has no arity exemption). A multi-arity key renders
 /// `array_to_string(array[<escaped col0>, <escaped col1>, ...], chr(31))`,
 /// matching
 /// [`COMPOSITE_KEY_SEPARATOR`] via `chr(31)` (U+001F's code point) since SQL
@@ -923,7 +912,7 @@ pub(crate) fn decode_key_part(part: &str) -> Option<Cow<'_, str>> {
 /// query joins in a second relation, so an
 /// unqualified column name can't become ambiguous.
 ///
-/// # The declared-order convention (issue #163)
+/// # The declared-order convention
 ///
 /// "In the key's own declared order" above is the whole codebase's single
 /// convention for *which* order a composite key's parts appear in, and it is
@@ -947,7 +936,7 @@ pub(crate) fn decode_key_part(part: &str) -> Option<Cow<'_, str>> {
 /// (`capture::sql`, a producer that reads the key columns from the
 /// transition tables and so has to follow this order explicitly).
 pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> String {
-    // The *outer* escape layer (issue #200) runs only where a real delimiter
+    // The *outer* escape layer runs only where a real delimiter
     // is actually emitted. Decided once, from the key's arity, and applied
     // uniformly to every column — independently of each column's own
     // nullability, which decides the *inner* layer below. See
@@ -962,7 +951,7 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
                 None => format!("{ident}::text"),
             };
             // A NOT NULL key column (every real PRIMARY KEY) renders as its
-            // raw `col::text`, exactly as it did before issue #110 — it can
+            // raw `col::text`, with no encoding — it can
             // never produce the NULL component the encoding below exists
             // for, and its encoded text is not private to the ring: a 1-1
             // definition's `staging::apply::apply_target` binds it straight
@@ -979,7 +968,7 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
                     col_text
                 };
             }
-            // Issue #110: a NULL component is coalesced to `chr(1)`
+            // A NULL component is coalesced to `chr(1)`
             // (`NULL_KEY_SENTINEL`; deliberately not `chr(0)` — Postgres's
             // `chr()` itself refuses to construct a NUL byte, see that
             // constant's doc comment) rather than left as SQL `NULL`, so it
@@ -993,7 +982,7 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
             // of this same key (`join_pk_key`'s callers) must use so the two
             // sides render byte-identical text for the same value.
             //
-            // Issue #200's separator escape then wraps *around* that, never
+            // The separator escape then wraps *around* that, never
             // inside it: `composite_key_escape_sql` only touches
             // chr(30)/chr(31) and the `coalesce` has already replaced SQL
             // NULL with a real chr(1) string, so neither layer can disturb
@@ -1008,7 +997,7 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
         })
         .collect();
     match parts.len() {
-        // Arity 1: no separator, and no issue-#200 escape (already skipped
+        // Arity 1: no separator, and no separator escape (already skipped
         // above) — for a not-null column this is the bare `{pk}::text` whose
         // result doubles as a real primary-key *value* on the write side
         // (`staging::apply::apply_target` binds it into the target's own PK
@@ -1031,8 +1020,8 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
 ///
 /// The `parts` handed in are already whatever their own columns render —
 /// in particular, a nullable column's part must already have been through
-/// [`encode_key_part`] (issue #110) by the caller, since only the caller
-/// knows each column's nullability. This function applies issue #200's
+/// [`encode_key_part`] by the caller, since only the caller
+/// knows each column's nullability. This function applies the
 /// separator escape *on top of* that, the same nesting
 /// [`pk_key_sql_expr`] uses on the SQL side.
 ///
@@ -1041,9 +1030,9 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
 /// the capture trigger's key expression (`capture::sql`, built on
 /// [`composite_key_escape_sql`]) for a captured row, and the SQL form for
 /// everything computed in the database (an aggregate group's
-/// downstream-propagated identity among them, issue #171) — including
+/// downstream-propagated identity among them) — including
 /// `intake::harness::enumerate_and_append`'s enumeration, which selects its
-/// keys through [`pk_key_sql_expr`] (issue #308). Keeping them one
+/// keys through [`pk_key_sql_expr`]. Keeping them one
 /// function each — rather than a hand-rolled `join` per site — is what makes
 /// the "producers and consumers agree on one shape" claim in
 /// [`COMPOSITE_KEY_SEPARATOR`]'s doc comment checkable by grep.
@@ -1089,7 +1078,7 @@ pub(crate) fn encode_pk_key<S: AsRef<str>>(pk: &[PrimaryKeyColumn], parts: &[Opt
 /// misparse a field whose own value contains a real, escaped
 /// [`COMPOSITE_KEY_SEPARATOR`].
 ///
-/// What comes back is each column's *pre-issue-#200* text — i.e. still
+/// What comes back is each column's text before the separator escape — still
 /// [`encode_key_part`]-encoded for a nullable column. [`split_pk_key`] runs
 /// [`decode_key_part`] over these, undoing the two layers in the mirror of
 /// the order [`join_pk_key`]/[`pk_key_sql_expr`] applied them.
@@ -1145,11 +1134,11 @@ fn split_composite_key(key: &str) -> Vec<Cow<'_, str>> {
 /// [`DdlError::MalformedCompositeKey`] if `key` doesn't split into exactly
 /// `pk.len()` parts, rather than silently truncating/padding — "the same
 /// declared order" here is [`pk_key_sql_expr`]'s documented declared-order
-/// convention (issue #163), not the table's physical column order; see that
-/// variant's doc comment for when this can genuinely happen. Pre-issue-#200,
-/// a genuine, unescaped [`COMPOSITE_KEY_SEPARATOR`] inside one column's own
-/// value could *also* reach this arity mismatch, at any arity, including a
-/// single-column one. Both halves are closed here, by arity:
+/// convention, not the table's physical column order; see that
+/// variant's doc comment for when this can genuinely happen. A genuine,
+/// unescaped [`COMPOSITE_KEY_SEPARATOR`] inside one column's own
+/// value would *also* reach this arity mismatch, at any arity, including a
+/// single-column one. Both are avoided here, by arity:
 /// - **arity 1**: `key` *is* the column's own (possibly
 ///   [`encode_key_part`]-encoded) text, never separator-escaped (see
 ///   [`push_escaped_composite_key_part`]'s "why arity 1 is exempt"), so it
@@ -1158,7 +1147,7 @@ fn split_composite_key(key: &str) -> Vec<Cow<'_, str>> {
 ///   separator, and an escaped occurrence never contributes a field
 ///   boundary, so only a real join produces one.
 ///
-/// Each returned part is then run through [`decode_key_part`] (issue #110): a
+/// Each returned part is then run through [`decode_key_part`]: a
 /// part that is exactly [`NULL_KEY_SENTINEL`] decodes to `None` (a real
 /// `NULL` component), not the literal sentinel text, so a caller binding
 /// these back against the live columns (`staging::apply::read_live_rows_batch`)
@@ -1171,7 +1160,7 @@ pub(crate) fn split_pk_key<'a>(
     source_table: &str,
     key: &'a str,
 ) -> Result<Vec<Option<Cow<'a, str>>>, DdlError> {
-    // Arity 1 carries no separator and no issue-#200 escape, so the whole
+    // Arity 1 carries no separator and no separator escape, so the whole
     // key is that one column's encoded text — splitting it would misread a
     // separator the column genuinely contains.
     let parts: Vec<Cow<'a, str>> = if pk.len() == 1 {
@@ -1218,8 +1207,8 @@ pub(crate) fn split_pk_key<'a>(
 /// varying(255)`) — the same `pg_catalog` introspection [`source_primary_key`]
 /// does for the primary key, widened to every column. Used by
 /// [`create_target_table`] to give a bare source-column passthrough field its
-/// source column's exact type rather than collapsing it through [`ValueType`]
-/// (issue #45): a passthrough of an `integer` FK must stay `integer` on the
+/// source column's exact type rather than collapsing it through [`ValueType`]:
+/// a passthrough of an `integer` FK must stay `integer` on the
 /// target so it remains eligible as a `JOIN` key, instead of
 /// widening to `numeric` (which the join-key allowlist excludes). The rendered
 /// type is safe to interpolate into DDL for the same reason
@@ -1251,7 +1240,7 @@ async fn source_column_pg_types(
 /// The Postgres type each of `fields` is created with on a 1-1 target table,
 /// keyed by field name: the one rule `DEFINE TRANSFORM` ([`target_table_ddl`])
 /// and `ALTER TRANSFORM ... ADD` share. A bare source-column passthrough takes
-/// the source column's concrete type, typmod included (issue #45); every
+/// the source column's concrete type, typmod included; every
 /// other field takes its inferred [`ValueType`]'s keyword ([`pg_type_name`]).
 /// `def` is the definition the fields belong to (its field list decides
 /// whether a reference names a source column or a sibling field), and
@@ -1300,12 +1289,12 @@ pub(crate) async fn field_column_pg_types(
 /// The neighbor target table's name for `def` — see module docs for why this
 /// is simply `def.target` unchanged. Bare — `def.target` is always the
 /// unqualified table name, even for a definition whose `TRANSFORM` clause
-/// explicitly wrote a `schema.table` spelling (issue #76; see
+/// explicitly wrote a `schema.table` spelling (see
 /// [`super::ast::TransformDef`]'s own doc comment for why that dotted
 /// spelling never lands in this field), independent of which schema
 /// [`qualified_target_table`] actually creates it under. Note this is *not*
-/// the same string `transform_definitions.target_table` persists as of issue
-/// #73: the catalog's own identity column holds the fully-qualified
+/// the same string `transform_definitions.target_table` persists.
+/// The catalog's own identity column holds the fully-qualified
 /// `schema.table` form (built via `intake::qualify`, at
 /// definition-acceptance time — see `catalog::create_definition_inner`), not
 /// this bare name. Callers that need a live connection (whose `search_path`
@@ -1323,7 +1312,7 @@ pub fn neighbor_table_name(def: &TransformDef) -> &str {
 /// each component quoted independently via [`quote_ident`]. Built for direct
 /// interpolation into DDL text, not as a persisted-identity string: this
 /// quotes each component separately, whereas `transform_definitions.target_table`
-/// (issue #73) is the plain, unquoted `"schema.table"` form
+/// is the plain, unquoted `"schema.table"` form
 /// `intake::qualify` builds — the two are never byte-for-byte
 /// equal, so don't compare or persist this function's output as if it were
 /// that identity.
@@ -1335,8 +1324,8 @@ pub fn qualified_target_table(target_schema: &str, def: &TransformDef) -> String
     )
 }
 
-/// The read-side counterpart to [`qualified_target_table`] (issue #76,
-/// ADR-0011): quotes an already-qualified `"schema.table"` name — as read
+/// The read-side counterpart to [`qualified_target_table`]
+/// (ADR-0011): quotes an already-qualified `"schema.table"` name — as read
 /// back from [`super::model::Definition::source_table`]
 /// (`transform_definitions.source_table`), or freshly resolved by
 /// `catalog::resolve_source_for_install`/`create_definition_inner`'s own
@@ -1368,25 +1357,22 @@ pub(crate) fn qualified_source_table(qualified: &str) -> String {
 /// string, for a definition's *target* identity
 /// ([`super::model::Definition::target_table`]) rather than its source.
 ///
-/// Broader sweep, reviewer follow-up to issue #74 (epic #78's own
-/// whole-branch review): the live CDC-apply write path (`staging::apply`'s
-/// `apply_target`/truncate-clears loop, the aggregate target-write sites,
-/// `staging::quarantine`'s column recompute) never got
-/// this fix on the target side, even though issue #76 already let a
-/// `TRANSFORM` clause spell an explicit non-default target schema — every
-/// one of those sites was still binding `def.def.target` (bare) straight
-/// into `quote_ident`, which silently mis-resolved (or simply couldn't find)
-/// a target explicitly qualified outside the connection's pinned
-/// `search_path`. Every such site now reads
+/// The quoted form of a target's qualified name, for the live CDC-apply write
+/// path (`staging::apply`'s `apply_target`/truncate-clears loop, the aggregate
+/// target-write sites, `staging::quarantine`'s column recompute). A `TRANSFORM`
+/// clause can spell an explicit non-default target schema, so binding
+/// `def.def.target` (bare) straight into `quote_ident` would silently
+/// mis-resolve (or simply not find) a target explicitly qualified outside the
+/// connection's pinned `search_path`. Every such site reads
 /// [`super::model::Definition::target_table`] (or a plan field carrying it
-/// forward, mirroring how `source`/`qualified_source` already got threaded
-/// through in #76) through this function instead.
+/// forward, as `source`/`qualified_source` are threaded through) through this
+/// function instead.
 pub(crate) fn qualified_target_table_ident(qualified: &str) -> String {
     quote_qualified_ident(qualified)
 }
 
 /// The text to bind as `pg_catalog.to_regclass($1)`'s argument for `table`,
-/// a table's unquoted `schema.table` identity (issue #561).
+/// a table's unquoted `schema.table` identity.
 ///
 /// That unquoted identity is the one name every catalog lookup in this crate
 /// takes: it is what [`crate::intake::qualify`] builds, what
@@ -1423,7 +1409,7 @@ fn quote_qualified_ident(qualified: &str) -> String {
 /// Creates `def`'s neighbor target table keyed by `pk` (a `primary key`, or
 /// `unique nulls not distinct` when a column of `pk` is nullable, see
 /// [`target_table_ddl`]) and one column per calculated field — failing if a relation with that name
-/// already exists (issue #440: Trellis never adopts a table it didn't
+/// already exists (Trellis never adopts a table it didn't
 /// create). Renders the statement with [`target_table_ddl`] and runs it on
 /// its own connection; `catalog::install_definition` instead runs that
 /// rendered statement inside the transaction that records the definition,
@@ -1441,7 +1427,7 @@ fn quote_qualified_ident(qualified: &str) -> String {
 /// rather than relying on `search_path`.
 ///
 /// `source_table` is `def.source`'s fully-qualified `"schema.table"` identity
-/// (issue #76, ADR-0011) — the caller's own already-resolved
+/// (ADR-0011) — the caller's own already-resolved
 /// `catalog::resolve_source_for_install` result — used below (via
 /// [`qualified_source_table`]) to introspect a passthrough field's concrete
 /// source column type, rather than the bare `def.source` left to
@@ -1473,7 +1459,7 @@ pub(crate) async fn target_table_ddl(
 ) -> Result<String, DdlError> {
     let field_types = super::validate::infer_field_types(def, source_columns)?;
 
-    // Issue #45: a bare source-column passthrough keeps the source column's
+    // A bare source-column passthrough keeps the source column's
     // *concrete* Postgres type instead of collapsing through `ValueType` (so a
     // passthrough of an `integer` FK stays `integer`, not `numeric`, and can
     // still serve as a `JOIN` key). Only introspect the source
@@ -1505,14 +1491,14 @@ pub(crate) async fn target_table_ddl(
         "create table {} (",
         qualified_target_table(target_schema, def),
     );
-    // The key columns keep the source key's collation (issue #769), so the
+    // The key columns keep the source key's collation, so the
     // target orders its keys as its source does. A Re-derive build's chunk
     // reads the target by the same `(lo, hi]` range as the source
     // (`staging::build::one_to_one::chunk_pick`). That range names the
     // source key's collation explicitly, so it selects the same keys on
     // both sides whatever the target's collation is; the target's index
     // serves the chunk through its `= any(keys)` filter either way.
-    // The target's identity is the source's (issue #1141). A source key with
+    // The target's identity is the source's. A source key with
     // a nullable column (an aggregate or `JOIN` target's `GROUP BY` columns)
     // keys the target by `unique nulls not distinct`, so a group with a
     // `NULL` part has its row here too, each key column as nullable as it is
@@ -1546,7 +1532,7 @@ pub(crate) async fn target_table_ddl(
         sql.push_str(&format!(", {} {}", quote_ident(&field.name), pg_type));
     }
     // A table-level constraint, not an inline column-level one: it works
-    // uniformly for one column or several (issue #121).
+    // uniformly for one column or several.
     let pk_names: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
     let constraint = if nullable_key {
         "unique nulls not distinct"
@@ -1555,7 +1541,7 @@ pub(crate) async fn target_table_ddl(
     };
     sql.push_str(&format!(", {constraint} ({})", pk_names.join(", ")));
     sql.push(')');
-    // #623 D2: the target's ledger, created with it.
+    // The target's ledger, created with it.
     sql.push_str(&super::ledger::one_to_one_ledger_ddl(
         &super::ledger::qualified_ledger_table(target_schema, &def.target),
     ));
@@ -1571,7 +1557,7 @@ pub(crate) async fn target_table_ddl(
 /// source row to inherit a key from; the group itself is the key.
 ///
 /// The grouping columns are keyed with a `UNIQUE NULLS NOT DISTINCT`
-/// constraint rather than a bare `PRIMARY KEY` (issue #128): a source
+/// constraint rather than a bare `PRIMARY KEY`: a source
 /// grouping column can itself be `NULL` (Postgres's own `GROUP BY` folds all
 /// `NULL`s in a column into one group, same as any other value), and a
 /// `PRIMARY KEY` forbids `NULL` in any of its columns outright, which made a
@@ -1633,7 +1619,7 @@ pub(crate) fn aggregate_target_table_ddl(
         matches!(def.key_space, KeySpace::Aggregate { .. }),
         "aggregate_target_table_ddl called on a non-aggregate definition"
     );
-    // #1100: a target on the group basis is a plain table of its declared
+    // A target on the group basis is a plain table of its declared
     // columns; its partials live in a hidden table define creates once the
     // definition has an id.
     let shape = crate::staging::group_basis::route(def, source_columns).ok_or_else(|| {
@@ -1673,8 +1659,8 @@ mod tests {
     }
 
     /// The unsupported-key message lists the allowlist the gate actually
-    /// uses, not a hand-kept copy: it had drifted to the pre-#111 six types,
-    /// missing `oid` and the temporal families.
+    /// uses, not a hand-kept copy that could drift from it (including `oid`
+    /// and the temporal families).
     #[test]
     fn unsupported_primary_key_message_lists_the_live_allowlist() {
         let message = DdlError::UnsupportedPrimaryKeyType {
@@ -1699,7 +1685,7 @@ mod tests {
     }
 
     /// A **nullable** key — the aggregate-target (`UNIQUE NULLS NOT
-    /// DISTINCT`) shape every issue #110 encoding test here is about. Use
+    /// DISTINCT`) shape every `NULL`-encoding test here is about. Use
     /// [`not_null_pk`] for a real `PRIMARY KEY`.
     fn pk(columns: &[&str]) -> Vec<PrimaryKeyColumn> {
         columns
@@ -1726,7 +1712,7 @@ mod tests {
             .collect()
     }
 
-    /// Issue #110: every column reference `pk_key_sql_expr` renders is
+    /// Every column reference `pk_key_sql_expr` renders is
     /// [`null_key_escape_sql`]'s wrapper, not a bare `<col>::text` — the
     /// SQL-side half of the NULL-safe encoding, matching
     /// [`encode_key_part`]'s Rust-side substitution *and* its doubling
@@ -1743,7 +1729,7 @@ mod tests {
             pk_key_sql_expr(&pk(&["warehouse"]), Some("t")),
             "coalesce(replace(t.\"warehouse\"::text, chr(1), chr(1) || chr(1)), chr(1))"
         );
-        // At arity ≥ 2, issue #200's separator escape wraps *around* that —
+        // At arity ≥ 2, the separator escape wraps *around* that —
         // see `pk_key_sql_expr_nests_the_null_and_separator_escapes_per_column`.
         assert_eq!(
             pk_key_sql_expr(&pk(&["warehouse", "sku"]), Some("t")),
@@ -1755,8 +1741,8 @@ mod tests {
         );
     }
 
-    /// The other half of that contract, and the fix for the data-corruption
-    /// bug issue #110's own escape introduced: a **not-null** key column —
+    /// The other half of that contract, which guards against data corruption
+    /// from encoding a key that must stay raw: a **not-null** key column —
     /// every real `PRIMARY KEY` — renders as its bare `<col>::text`, with no
     /// `coalesce` and no `replace`, at either arity. It can never produce a
     /// `NULL` component to substitute, and its rendered text is not private
@@ -1764,8 +1750,8 @@ mod tests {
     /// straight in as a 1-1 target's own literal primary-key value, which
     /// `defs::backfill`/`staging::quarantine`/`defs::oracle` write and read
     /// raw. Deliberately *not* an arity-1 exemption — the arity-1 nullable
-    /// case above (a single-column nullable `GROUP BY`) is issue #110's
-    /// original bug and keeps the full encoding.
+    /// case above (a single-column nullable `GROUP BY`) keeps the full
+    /// encoding.
     #[test]
     fn pk_key_sql_expr_renders_a_not_null_key_column_raw() {
         assert_eq!(
@@ -1779,7 +1765,7 @@ mod tests {
                 composite_key_escape_sql("t.\"warehouse\"::text"),
                 composite_key_escape_sql("t.\"sku\"::text"),
             ),
-            "no `coalesce`/`chr(1)` anywhere — only issue #200's separator \
+            "no `coalesce`/`chr(1)` anywhere — only the separator \
              escape, which a composite key of any nullability gets"
         );
         assert_eq!(pk_key_sql_expr(&not_null_pk(&["id"]), None), "\"id\"::text");
@@ -1844,8 +1830,8 @@ mod tests {
     }
 
     /// [`join_pk_key`] and [`split_pk_key`] are exact inverses, and an
-    /// arity-1 key carries no separator at all — the property issue #103's
-    /// and issue #171's fixes both lean on (a group key of either arity is
+    /// arity-1 key carries no separator at all — a property the aggregate
+    /// path leans on (a group key of either arity is
     /// byte-identical to what [`pk_key_sql_expr`] renders for the aggregate
     /// target's own grouping-column identity, so a chained definition's live
     /// re-fetch decodes it as an ordinary source primary key).
@@ -1862,7 +1848,7 @@ mod tests {
             vec![Some("w1"), Some("a")]
         );
         // A genuine empty-string component still occupies its own part, so
-        // the arity check can't be fooled by it — and, issue #110, it must
+        // the arity check can't be fooled by it — and it must
         // decode as `Some("")`, distinct from a real `NULL` component below.
         assert_eq!(
             split_pk_key(&pk(&["warehouse", "sku"]), "t", &join_pk_key(["", "a"]))
@@ -1874,7 +1860,7 @@ mod tests {
         );
     }
 
-    /// Issue #110: a `NULL` key/group component, encoded via
+    /// A `NULL` key/group component, encoded via
     /// [`encode_key_part`] the way every real producer
     /// ([`pk_key_sql_expr`], its SQL-side twin) must, round-trips back to `None` — distinguishable
     /// from the genuine empty string [`join_pk_key_round_trips_through_split_pk_key`]
@@ -1911,11 +1897,11 @@ mod tests {
         assert_ne!(encode_key_part(None), encode_key_part(Some("")));
     }
 
-    /// Review follow-up to issue #110: [`NULL_KEY_SENTINEL`] is an ordinary
+    /// [`NULL_KEY_SENTINEL`] is an ordinary
     /// control character a `text` column can genuinely hold, so a value that
     /// *was* a lone U+0001 must not be readable back as a `NULL` component —
     /// that would fold two distinct groups onto one encoded key (silently,
-    /// and data-dependently, which is worse than the bug #110 fixes). The
+    /// and data-dependently). The
     /// doubling escape makes the two cases provably disjoint: an encoded
     /// non-`NULL` part's U+0001 runs are always even-length, and the `NULL`
     /// part is a run of one.
@@ -1976,10 +1962,9 @@ mod tests {
     }
 
     /// The length-prefixed encoding the old aggregate path used to emit for
-    /// a composite `GROUP BY` is exactly what issue #171's crash
-    /// was: one part where two were expected.
+    /// a composite `GROUP BY` is rejected: one part where two were expected.
     #[test]
-    fn split_pk_key_rejects_the_pre_171_length_prefixed_encoding() {
+    fn split_pk_key_rejects_a_length_prefixed_encoding() {
         match split_pk_key(&pk(&["warehouse", "sku"]), "stock_totals", "2:w11:a") {
             Err(DdlError::MalformedCompositeKey {
                 source_table,
@@ -1999,27 +1984,27 @@ mod tests {
     /// [`split_pk_key`] against a fixed table name, unwrapped — every test
     /// below is about the encoding round-tripping, not about the
     /// [`DdlError::MalformedCompositeKey`] path
-    /// `split_pk_key_rejects_the_pre_171_length_prefixed_encoding` covers.
+    /// `split_pk_key_rejects_a_length_prefixed_encoding` covers.
     fn split_ok<'a>(pk: &[PrimaryKeyColumn], key: &'a str) -> Vec<Option<Cow<'a, str>>> {
         split_pk_key(pk, "t", key).expect("decodes")
     }
 
-    /// Issue #200: a real, embedded [`COMPOSITE_KEY_SEPARATOR`] inside one
+    /// A real, embedded [`COMPOSITE_KEY_SEPARATOR`] inside one
     /// key component's own value must round-trip through
     /// [`join_pk_key`]/[`split_pk_key`] instead of being misread as a field
     /// boundary — the exact failure mode
-    /// `split_pk_key_rejects_the_pre_171_length_prefixed_encoding` above
+    /// `split_pk_key_rejects_a_length_prefixed_encoding` above
     /// shows the *error path* for (a genuine arity mismatch), except this
     /// one used to fire on perfectly valid data whenever a real column value
     /// happened to contain U+001F, at any arity, not only >1.
     #[test]
     fn a_real_separator_valued_component_survives_the_round_trip() {
-        // Arity 1: pre-#200, `split_pk_key` unconditionally split on
-        // `COMPOSITE_KEY_SEPARATOR` regardless of the target arity, so a
-        // single-column key whose own value was `"a\u{1f}b"` split into two
-        // parts against an arity-1 `pk` and failed loudly
+        // Arity 1: `split_pk_key` must not split on
+        // `COMPOSITE_KEY_SEPARATOR` regardless of the target arity, or a
+        // single-column key whose own value was `"a\u{1f}b"` would split into
+        // two parts against an arity-1 `pk` and fail loudly
         // (`MalformedCompositeKey { expected_arity: 1, actual_arity: 2 }`)
-        // even though there was no real composite key involved at all.
+        // even though there is no real composite key involved at all.
         let one_col = not_null_pk(&["sku"]);
         for value in ["a\u{1f}b", "\u{1f}", "\u{1f}\u{1f}", "\u{1f}a\u{1f}"] {
             let key = join_pk_key([value]);
@@ -2183,9 +2168,9 @@ mod tests {
     }
 
     /// The two escape layers are two independent, per-concern decisions —
-    /// "can this column be `NULL`?" (issue #110, per column, from the
-    /// catalog) and "does this key have a delimiter to protect?" (issue
-    /// #200, per key, from its arity) — nested, never merged. This pins all
+    /// "can this column be `NULL`?" (per column, from the
+    /// catalog) and "does this key have a delimiter to protect?"
+    /// (per key, from its arity) — nested, never merged. This pins all
     /// four combinations on the SQL side: [`null_key_escape_sql`] is always
     /// the *inner* layer and [`composite_key_escape_sql`] always the outer
     /// one, so the `coalesce` still sees SQL `NULL` as `NULL` and the outer
@@ -2297,8 +2282,8 @@ mod tests {
         }
 
         // Arity 1 for the nullable column on its own: the NULL layer still
-        // applies (issue #110 has no arity exemption) while the separator
-        // layer still does not (issue #200's arity-1 exemption), so a value
+        // applies (it has no arity exemption) while the separator
+        // layer still does not (arity 1 is exempt), so a value
         // carrying both a real sentinel and a real separator round-trips.
         let one_nullable = pk(&["sku"]);
         for value in ["\u{1}\u{1f}\u{1e}", "\u{1f}", "\u{1}"] {
@@ -2350,7 +2335,7 @@ mod tests {
             .collect()
     }
 
-    /// Issue #769: a build's key range compares under the collations its
+    /// A build's key range compares under the collations its
     /// ranges were planned under, and only where the column has one now.
     #[test]
     fn pinning_takes_the_recorded_collation_of_each_collatable_column() {

@@ -1,4 +1,4 @@
-//! The drain's side of a schema change (#622 C6).
+//! The drain's side of a schema change.
 //!
 //! When a column a capture function images is renamed or dropped, the
 //! function doesn't fail the application's statement. It appends a
@@ -59,7 +59,7 @@ struct Missing {
     columns: BTreeSet<String>,
     key_missing: bool,
     /// The installed capture's key and the table's primary key now, when the
-    /// key was redefined with its old columns still there (#687). Only the
+    /// key was redefined with its old columns still there. Only the
     /// capture pass sees this: the functions keep imaging the old key
     /// columns, so no write marks it.
     key_changed: Option<(Vec<String>, Vec<String>)>,
@@ -133,7 +133,7 @@ pub(crate) async fn pause_readers(pool: &Pool, seg_seqs: &[i64]) -> Result<(), A
     Ok(())
 }
 
-/// The drain's side of a redefined primary key (#703 R2): before a page
+/// The drain's side of a redefined primary key: before a page
 /// applies anything, compares the key each of `tables`' installed capture
 /// records with the table's primary key now. On a mismatch it runs the
 /// capture pass's pause for that table ([`pause_readers_of_missing`]), so the
@@ -281,7 +281,7 @@ fn missing_columns_error(table: &str, columns: &[String]) -> String {
 }
 
 /// The `capture_failure` sentence for a definition paused because `table`'s
-/// primary key changed from `old` to `new` (#687).
+/// primary key changed from `old` to `new`.
 fn key_changed_error(table: &str, old: &[String], new: &[String]) -> String {
     format!(
         "the primary key of {table} changed from ({}) to ({}), and this definition's rows \
@@ -322,7 +322,7 @@ fn quoted_list(columns: &[String]) -> String {
 ///   nothing on its status.
 ///
 /// It also pauses every definition on the table when its primary key was
-/// redefined while the old key columns stayed (#687): the installed
+/// redefined while the old key columns stayed: the installed
 /// functions still image them, so no write marks the change, and
 /// `capture_spec` would widen capture to the new key. The drain would then
 /// apply rows keyed by columns the definitions' targets aren't keyed by.
@@ -386,18 +386,18 @@ pub(crate) async fn pause_readers_of_missing(
 /// `capture_failures`, when
 ///
 /// - the table's row-level security policies now apply to the ring's owner
-///   or to this worker's own role, which read it (issue #745,
-///   [`crate::defs::row_security`]); only to this worker's own role for a
+///   or to this worker's own role, which read it
+///   ([`crate::defs::row_security`]); only to this worker's own role for a
 ///   table another definition targets, which no capture function reads
 ///   ([`crate::defs::row_security::Readers::Session`]). RLS can be enabled
 ///   or forced, or the table handed to another owner, after the definitions
 ///   were accepted; or
 /// - a logical-replication subscription now replicates into it, whose
-///   changes capture never sees (issue #751, [`crate::defs::subscription`]).
+///   changes capture never sees ([`crate::defs::subscription`]).
 ///   A subscription can be created, or refreshed to include the table,
 ///   after define.
 ///
-/// And (issue #765) it pauses the definition whose target `table` is, when
+/// And it pauses the definition whose target `table` is, when
 /// its policies now apply to this worker's own role, which writes it
 /// ([`crate::defs::row_security::Readers::Target`]): its applies' updates
 /// and deletes would skip the rows they hide, and its inserts would fail.
@@ -472,8 +472,8 @@ pub(crate) async fn pause_readers_of_unsupported(
 }
 
 /// The staging worker's capture pass's check for a captured table in a
-/// partition or inheritance hierarchy (issue #707,
-/// [`crate::defs::hierarchy`]): a partitioned table, a partition, or an
+/// partition or inheritance hierarchy
+/// ([`crate::defs::hierarchy`]): a partitioned table, a partition, or an
 /// inheritance parent or child, whose writes its statement triggers can't
 /// all see. Define refuses such a table, by the same check, but the table
 /// can join a hierarchy later (`ATTACH PARTITION`, `INHERIT`), or be dropped
@@ -518,16 +518,15 @@ pub(crate) async fn pause_readers_in_hierarchy(
 
 /// The staging worker's capture pass's check of the types and collations
 /// of `table`'s columns that a definition keys by, or that a column it
-/// created takes its type from (issues #760, #767 and #824,
-/// [`crate::defs::key_types`], [`crate::defs::copies`]). It pauses every
-/// definition that reads `table`
+/// created takes its type from ([`crate::defs::key_types`], [`crate::defs::copies`]). It pauses
+/// every definition that reads `table`
 /// and isn't paused for a capture failure yet when, on `table`,
 ///
 /// 1. one of its key columns has a type or collation define would refuse
 ///    for that use now ([`key_types::refusal`]): an `ALTER COLUMN ... TYPE
 ///    character(n)` on a join column, a nondeterministic `COLLATE` on a
 ///    `GROUP BY` column;
-/// 2. a `JOIN`'s `ON` pair no longer has one type and collation (#1107):
+/// 2. a `JOIN`'s `ON` pair no longer has one type and collation:
 ///    one join column re-typed and the other not (yet);
 /// 3. one of its key columns changed type, since the definition was
 ///    accepted or last resumed, in a way that renders the values Trellis
@@ -545,7 +544,7 @@ pub(crate) async fn pause_readers_in_hierarchy(
 ///
 /// The types the third check compares against are those recorded in
 /// `definition_key_types`; a key column with none recorded (one that joined
-/// the table's row-identity key after define, #687) gets the live one
+/// the table's row-identity key after define) gets the live one
 /// recorded here instead.
 ///
 /// The pause's `capture_failure` names every reason and what to do. When
@@ -555,7 +554,7 @@ pub(crate) async fn pause_readers_in_hierarchy(
 /// pause's cause (`capture_failures.caused_by`), unless the definition was
 /// already frozen for another reason or a resume would refuse it
 /// ([`Pause::cause`]). The pass resumes it once that definition is live
-/// (`staging::quarantine::resume_caused_definitions`, #970), or an operator's
+/// (`staging::quarantine::resume_caused_definitions`), or an operator's
 /// resume clears it first. A resume re-validates the
 /// definition as define would, and refuses while the first two hold;
 /// otherwise it re-records the key types, brings every column it created to
@@ -566,7 +565,7 @@ pub(crate) async fn pause_readers_in_hierarchy(
 ///
 /// The fourth check's comparison of a definition's columns with the live
 /// schema is skipped while every relation it reads is as it was when the last
-/// comparison found every column current (`drift`, [`drift_memo`], #858). The
+/// comparison found every column current (`drift`, [`drift_memo`]). The
 /// other checks read the key columns' types and run every pass.
 ///
 /// A key column the table no longer has is
@@ -674,7 +673,7 @@ pub(crate) async fn pause_readers_of_retyped(
             }
         }
 
-        // #1107: a JOIN's `ON` pairs, which define holds to one type
+        // A JOIN's `ON` pairs, which define holds to one type
         // (`text` and `varchar` are one) and collation each, never a
         // modifier (ADR-0020), after a retype of this table's side
         // (the side whose join column moved from its recorded type, so the
@@ -714,10 +713,10 @@ pub(crate) async fn pause_readers_of_retyped(
             }
         }
 
-        // #767, #824: the columns Trellis created for it typed from columns
+        // The columns Trellis created for it typed from columns
         // of this table, each with the type define would give it now.
         //
-        // #858: skipped while every relation it reads is as it was when its
+        // Skipped while every relation it reads is as it was when its
         // last comparison found every column current
         // ([`drift_memo`]).
         let stamp = drift.stamp(schema, reader);
@@ -882,7 +881,7 @@ pub(crate) async fn pause_readers_of_retyped(
             // can't change before the update. A frozen row the update skips
             // is locked here too: this transaction bumps no version fence
             // and locks rows in id order, and a resume holding the row has
-            // finished its fence wait (ADR-0002, #744).
+            // finished its fence wait.
             let frozen = txn
                 .query_opt(
                     "select status from transform_definitions where id = $1 for no key update",
@@ -914,7 +913,7 @@ pub(crate) async fn pause_readers_of_retyped(
 }
 
 /// The capture pass's check of the enum value identity each definition
-/// reads under (#1241, #1327, ADR-0020 "Stored value text is trusted only
+/// reads under (ADR-0020 "Stored value text is trusted only
 /// under the type's current value identity"). Trellis keeps an enum value as
 /// its label text: in ring images, held and parked keys, a 1-1 ledger's
 /// `__from_key`, and in the columns it creates of the type. Two changes fire
@@ -1101,7 +1100,7 @@ pub(crate) async fn pause_readers_of_relabelled(client: &mut Client) -> Result<b
 
 /// `(transform_id, tbl, col, kind, was, now)`, one row for each column a
 /// definition reads whose recorded type is one enum and whose live type is
-/// another (#1327): `kind` `source` or `join` for a column of its
+/// another: `kind` `source` or `join` for a column of its
 /// `source_columns` or `join_columns` whose token (`enum:schema.typname`)
 /// names another type than the column's, `key` for a key column whose
 /// `definition_key_types` OID is an enum's and isn't the column's. `was`
@@ -1337,15 +1336,15 @@ async fn retype_causes(
 
 /// The sentence of [`caused_error`] that says the definition resumes on its
 /// own, up to the upstream's name: an operator's `PAUSE` cuts the text there
-/// (`defs::lifecycle::pause_transform`, #971).
+/// (`defs::lifecycle::pause_transform`).
 pub(crate) const CAUSED_RESUMES_ON_ITS_OWN: &str = " This definition resumes on its own once ";
 
 /// The `capture_failure` of a definition `pause` that `cause`'s resume
 /// paused (#828), by re-typing columns of its target `table` the
 /// definition reads. It names that resume, not the columns as if the
 /// operator had altered them, and says the definition resumes on its own once
-/// the upstream is live again (`staging::quarantine::resume_caused_definitions`,
-/// #970): its rebuild reads the upstream's target.
+/// the upstream is live again (`staging::quarantine::resume_caused_definitions`):
+/// its rebuild reads the upstream's target.
 fn caused_error(table: &str, cause: &RetypeCause, pause: &Pause) -> String {
     let retyped: Vec<String> = cause
         .columns
@@ -1392,7 +1391,7 @@ struct Checked {
     columns: Vec<String>,
     reasons: Vec<String>,
     refused: bool,
-    /// Empty when the comparison of its copies was skipped (#858).
+    /// Empty when the comparison of its copies was skipped.
     states: Vec<copies::CopyState>,
 }
 
@@ -1505,7 +1504,7 @@ fn outgrown_reason(
 /// Whether the source columns `from` of `table`, definition `id`'s source
 /// (the caller checks: its record is of that table alone), are as it
 /// recorded them, so that `states`, the columns Trellis created typed from
-/// them, were re-typed outside Trellis (#1201) rather than outgrown by a
+/// them, were re-typed outside Trellis rather than outgrown by a
 /// source column that widened. Only a column whose type carries no modifier
 /// (an integer, a float, a `boolean`, a `uuid`) records its type exactly: a
 /// `varchar(50)` that became `text` records as `text` both times. So for any
@@ -1625,7 +1624,7 @@ mod tests {
     use crate::defs::copies::{CopyKind, CopyState, CopyType, TypedCopy};
     use crate::defs::key_types::ColumnType;
 
-    /// #1241: the reason names each relabel, then the remedy.
+    /// The reason names each relabel, then the remedy.
     #[test]
     fn a_relabel_reason_names_each_relabel_then_the_remedy() {
         assert_eq!(

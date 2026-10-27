@@ -1,5 +1,5 @@
-//! Evaluator for the 1-1 subset (issue #24), widened by issue #63 from
-//! numeric-only to [`Value`]'s three variants (`Numeric`/`Text`/`Boolean`).
+//! Evaluator for the 1-1 subset, over [`Value`]'s variants (`Numeric`,
+//! `Text`, `Boolean` and the others).
 //!
 //! Pure function: a source-row image plus a validated [`TransformDef`] in,
 //! the target row's calculated columns out. No database access here — the
@@ -14,11 +14,9 @@
 //! [`super::validate`]'s module docs describe for [`super::ast::KeySpace`]
 //! and [`super::ast::Predicate`].
 //!
-//! **Open question**: the interface this hands to apply (#11) — this
+//! **Open question**: the interface this hands to apply — this
 //! returns [`Value`]s; whether the SQL write path wants those, or their
-//! canonical text form, or something else, is undecided (called out in the
-//! issue #24 ticket, still open post-#63 since only `Numeric` values are
-//! wired into the staging apply path today).
+//! canonical text form, or something else, is undecided.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -40,10 +38,10 @@ use crate::error_code::ErrorCode;
 /// evaluator never touches Postgres.
 pub type Row = HashMap<String, Option<String>>;
 
-/// Memoizes `regexp_count`'s compiled [`Regex`] per pattern literal (issue
-/// #68), so a caller driving `evaluate` across many rows for the same
+/// Memoizes `regexp_count`'s compiled [`Regex`] per pattern literal,
+/// so a caller driving `evaluate` across many rows for the same
 /// [`TransformDef`] compiles each distinct pattern once rather than on every
-/// row. The validator (#64) already restricts `regexp_count`'s pattern
+/// row. The validator already restricts `regexp_count`'s pattern
 /// argument to a string literal, so the same pattern text always means the
 /// same compiled `Regex` — caching by that text is exact, not a heuristic.
 /// A fresh, empty cache is always safe to pass (just costs the first-row
@@ -52,24 +50,24 @@ pub type Row = HashMap<String, Option<String>>;
 pub type RegexCache = HashMap<String, Regex>;
 
 /// A calculated value the evaluator produces, per [`ValueType`]. `Uuid`
-/// (issue #79) carries its Postgres text rendering verbatim, the same way
+/// carries its Postgres text rendering verbatim, the same way
 /// `Text` does — there's no arithmetic to normalize it against, just
 /// passthrough and equality comparison.
 ///
-/// [`Value::Other`] (issue #108) is [`ValueType::Other`]'s value-level twin:
+/// [`Value::Other`] is [`ValueType::Other`]'s value-level twin:
 /// a [`PgType`]-tagged column's captured text, carried verbatim exactly
 /// like `Uuid`/`Text` — this is the "typed CDC round-trip" the issue asks
 /// for, a value now remembers its real Postgres type family all the way
 /// through [`parse_value`] instead of arriving pre-flattened to `Text`.
 ///
-/// [`Value::Integer`] (issue #111) is the exact-integer family's value-level
+/// [`Value::Integer`] is the exact-integer family's value-level
 /// twin, carrying its [`IntWidth`] alongside the value for the same reason
 /// [`ValueType::Integer`] does: the width *is* the overflow boundary, so no
 /// operation could reproduce Postgres's `22003` without it. It holds a real
 /// `i64` — not text, and not a [`Numeric`] — so arithmetic on it is checked
 /// rather than arbitrary-precision.
 ///
-/// [`Value::Float`] (issue #112) is the same shape for the binary floats,
+/// [`Value::Float`] is the same shape for the binary floats,
 /// holding a real `f64` (narrowed onto `real`'s grid when its width says so
 /// — see [`FloatWidth::round`]) rather than a decimal. It is why this enum
 /// hand-writes [`PartialEq`] instead of deriving it: `f64`'s `==` is IEEE's,
@@ -141,7 +139,7 @@ impl fmt::Display for Value {
             // join/primary-key/`GROUP BY` paths byte-for-byte — see
             // `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`.
             Value::Integer(_, n) => write!(f, "{n}"),
-            // Issue #112: `crate::float::render` reproduces `float4out`/
+            // `crate::float::render` reproduces `float4out`/
             // `float8out` under `extra_float_digits >= 1` exactly, so a
             // float value's text here is byte-identical to what Postgres
             // would have written for the same value — which is what lets it
@@ -173,7 +171,7 @@ pub enum EvalError {
     InvalidBoolean { field: String, text: String },
     /// An exact-integer (`smallint`/`integer`/`bigint`) operation left its
     /// result type's range, or a column's text didn't decode as a value of
-    /// its declared width (issue #111).
+    /// its declared width.
     ///
     /// **Unlike every other variant here, this one is not defense-in-depth.**
     /// It is a genuine, *data-dependent* runtime failure that a perfectly
@@ -189,7 +187,7 @@ pub enum EvalError {
     IntegerOutOfRange { field: String, source: IntegerError },
     /// A binary-float (`real`/`double precision`) operation overflowed its
     /// width's finite range, or a column's text didn't decode as a
-    /// canonical value of its declared width (issue #112).
+    /// canonical value of its declared width.
     ///
     /// [`EvalError::IntegerOutOfRange`]'s float twin, and not
     /// defense-in-depth for the same reason: `select 3.4e38::float4 +
@@ -200,9 +198,9 @@ pub enum EvalError {
     /// ordinary values in Postgres and stay ordinary values here.
     FloatOutOfRange { field: String, source: FloatError },
     /// A calculated field was re-entered while still being resolved on the
-    /// current recursion path. The validator (#23) is supposed to reject
+    /// current recursion path. The validator is supposed to reject
     /// cyclic definitions before they reach here, but `evaluate` is `pub`
-    /// and gets exercised standalone in tests and by future callers (#25),
+    /// and gets exercised standalone in tests and by future callers,
     /// so this is defense-in-depth against a stack overflow.
     Cycle(String),
 }
@@ -215,7 +213,7 @@ impl EvalError {
     /// type's own doc comment) — reaching one of those means something
     /// upstream didn't hold, not that the caller supplied bad input.
     ///
-    /// `IntegerOutOfRange` (issue #111) and `FloatOutOfRange` (issue #112)
+    /// `IntegerOutOfRange` and `FloatOutOfRange`
     /// are data-dependent rather than engine-invariant breaches, but still
     /// report [`ErrorCode::Internal`],
     /// which ADR-0008 decision 3 designates as the catch-all "anything
@@ -298,7 +296,7 @@ impl std::error::Error for EvalError {
 /// Evaluates every calculated field in `def` against `row`, returning the
 /// target row's calculated (non-key) columns. `row` must already resolve
 /// every source column the definition's fields reference — that's the
-/// validator's (#23) job against the source schema; a mismatch here (a
+/// validator's job against the source schema; a mismatch here (a
 /// column genuinely missing from the image) is an [`EvalError`], not a
 /// panic, since a staged image could in principle disagree with the
 /// definition it's evaluated against.
@@ -307,8 +305,8 @@ impl std::error::Error for EvalError {
 /// text value is parsed correctly (a `Text` column's text is passed through
 /// verbatim; a `Boolean` column's is parsed as a boolean; a `Numeric`
 /// column's as a decimal). A column absent from `source_columns` defaults to
-/// `Numeric`, preserving this evaluator's pre-#63 behavior for callers that
-/// don't yet declare column types.
+/// `Numeric`, for callers that
+/// don't declare column types.
 #[cfg(any(test, feature = "test-util"))]
 pub fn evaluate(
     def: &TransformDef,
@@ -335,8 +333,8 @@ pub fn evaluate(
 /// NULL." `excluded` is non-empty only when the caller has already looked up
 /// which of this definition's columns are currently paused (ADR-0003).
 ///
-/// `excluded` must be closed over alias readers ([`AliasReaders::close`],
-/// issue #748): a field left in that reads an excluded one by alias would
+/// `excluded` must be closed over alias readers ([`AliasReaders::close`]):
+/// a field left in that reads an excluded one by alias would
 /// read the `None` seeded here and be written NULL, where ADR-0003 freezes
 /// it. Every caller's paused set is read through that closure.
 pub fn evaluate_excluding(
@@ -386,7 +384,7 @@ pub fn evaluate_excluding(
     Ok(cache)
 }
 
-/// Which fields of one definition read which others by alias (issue #748):
+/// Which fields of one definition read which others by alias:
 /// for each field, the fields whose expressions name it directly.
 ///
 /// A field `f` reads sibling `g` when `f`'s expression names `g` and `g`
@@ -488,7 +486,7 @@ fn read_source_column(
 /// graph is acyclic before this runs, but `in_progress` — the set of field
 /// names currently being resolved on this recursion path — is a
 /// defense-in-depth guard against a cyclic definition that reaches here
-/// anyway (`evaluate` is `pub` and used standalone in tests/#25).
+/// anyway (`evaluate` is `pub` and used standalone in tests).
 #[allow(clippy::too_many_arguments)]
 fn eval_field(
     field: &FieldDef,
@@ -523,7 +521,7 @@ fn eval_field(
 
 // This recursive evaluator's params are each a distinct piece of per-call
 // state (the expression being reduced, the calc-field memoization cache and
-// its cycle guard, and now the regex cache added by #68) rather than a
+// its cycle guard, and the regex cache) rather than a
 // natural grouping — bundling them into a context struct wouldn't reduce
 // call-site complexity, just move it, so allow the count over grouping.
 #[allow(clippy::too_many_arguments)]
@@ -559,14 +557,14 @@ fn eval_expr(
             }
             read_source_column(field_name, name, row, source_columns)
         }
-        // Issue #830: a qualified name reads the source column even when a
+        // A qualified name reads the source column even when a
         // field has the same name.
         Expr::SourceColumn { column, .. } => {
             read_source_column(field_name, column, row, source_columns)
         }
         Expr::NumberLiteral(text) => number_literal(field_name, text).map(Some),
         Expr::StringLiteral(text) => Ok(Some(Value::Text(text.clone()))),
-        // Issue #109: a typed literal evaluates to its own family-tagged
+        // A typed literal evaluates to its own family-tagged
         // value, carrying the literal source text verbatim exactly as
         // `Value::Other` does for a captured column. That is only sound
         // because `validate` has already required the text to be in the
@@ -639,11 +637,11 @@ fn eval_expr(
 /// against one group's full row set — the aggregate counterpart to
 /// [`evaluate`]. `SUM`/`MIN`/`MAX`/`AVG` need every row in the group up
 /// front rather than one row image at a time, so there is no incremental
-/// per-row form of this (that's issue #11's job, blocked on this one).
+/// per-row form of this.
 ///
 /// A bare grouping-key column reference is read off any one row (every row
 /// in the group shares that value by definition); everything else the
-/// validator (#23) allows here is either another calculated field or an
+/// validator allows here is either another calculated field or an
 /// aggregate call, both handled by recursing through [`eval_aggregate_expr`].
 ///
 /// # Panics
@@ -741,7 +739,7 @@ fn eval_aggregate_expr(
             // representative.
             eval_row_scalar(name, field_name, &rows[0], source_columns)
         }
-        // Issue #830: outside an aggregate's argument, the validator only
+        // Outside an aggregate's argument, the validator only
         // lets a qualified name read a grouping key.
         Expr::SourceColumn { column, .. } => {
             eval_row_scalar(column, field_name, &rows[0], source_columns)
@@ -771,7 +769,7 @@ fn eval_aggregate_expr(
         }
         Expr::NumberLiteral(text) => number_literal(field_name, text).map(Some),
         Expr::StringLiteral(text) => Ok(Some(Value::Text(text.clone()))),
-        // Issue #109: a typed literal evaluates to its own family-tagged
+        // A typed literal evaluates to its own family-tagged
         // value, carrying the literal source text verbatim exactly as
         // `Value::Other` does for a captured column. That is only sound
         // because `validate` has already required the text to be in the
@@ -805,17 +803,17 @@ fn eval_aggregate_expr(
             apply_operator(*op, lhs, rhs, field_name)
         }
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
-            // `COUNT(*)` (issue #75): counts every row in the group,
+            // `COUNT(*)`: counts every row in the group,
             // unconditionally — unlike `SUM`/`MIN`/`MAX`/`AVG`'s
             // `fold_aggregate`, there is no per-row argument to evaluate or
             // skip-if-NULL, so `rows.len()` is the whole computation.
             //
-            // Issue #120: `bigint` (`Integer(Int8)`), matching Postgres's
+            // `bigint` (`Integer(Int8)`), matching Postgres's
             // own `pg_typeof(count(*))` — see `registry::AGGREGATE_FUNCTION_SPECS`'s
             // `COUNT` row doc comment.
             Ok(Some(Value::Integer(IntWidth::Int8, rows.len() as i64)))
         }
-        // Issue #120: `COUNT(<expr>)` — counts non-null occurrences of
+        // `COUNT(<expr>)` — counts non-null occurrences of
         // `<expr>` across the group, a different Postgres semantic from
         // `COUNT(*)` (which needs no per-row evaluation at all, above).
         // Deliberately **not** routed through `fold_aggregate`/
@@ -1084,14 +1082,14 @@ fn reduce_numeric_aggregate(
 
 /// `+` and `>` both take exact-numeric-family operands — [`Value::Numeric`]
 /// or [`Value::Integer`] (per ADR-0004, neither gains an implicit string
-/// form). An operand of any other type here would mean the validator (#23)
+/// form). An operand of any other type here would mean the validator
 /// let a type-mismatched definition through, so this falls back to `None`
 /// rather than a panic, matching this module's existing defense-in-depth
 /// posture toward validator bugs. Postgres's own `+`/`>` on these types are
 /// `STRICT` (any `NULL` operand yields `NULL`), matched by the same `None`
 /// fallback.
 ///
-/// # Mixed operands (issues #111, #112)
+/// # Mixed operands
 ///
 /// The dispatch mirrors [`super::registry::operator_result_type`] exactly,
 /// because it must: `Integer op Integer` runs Postgres's *bounded* integer
@@ -1111,7 +1109,7 @@ fn reduce_numeric_aggregate(
 /// the integer/`numeric` arms below. `>` admits only `Float > Float` among
 /// the floats, plus a float against a *bare number literal*, which Postgres
 /// casts to `double precision` (a `real` operand widens to it): any other
-/// float against an exact numeric is refused at define (#1418), so the
+/// float against an exact numeric is refused at define, so the
 /// evaluator can't tell a literal from a column here and doesn't need to.
 ///
 /// `>` on floats routes through [`crate::float::compare`], **not** `f64`'s
@@ -1160,7 +1158,7 @@ fn apply_operator(
                 float::compare(a, b) == std::cmp::Ordering::Greater,
             )),
             // A float against a bare number literal (the only mixed pair
-            // the validator admits, #1418): Postgres casts the literal to
+            // the validator admits): Postgres casts the literal to
             // `double precision` and widens a `real` operand to it, so the
             // comparison runs in `f64`. Never narrow the literal to `f32`.
             (Value::Float(_, a), rhs) => as_float(rhs)
@@ -1195,7 +1193,7 @@ fn as_numeric(value: Value) -> Option<Numeric> {
     }
 }
 
-/// [`as_numeric`]'s float twin (issue #112): a value as an `f64`, for the
+/// [`as_numeric`]'s float twin: a value as an `f64`, for the
 /// mixed-operand case Postgres resolves by casting **both** sides to
 /// `double precision`. `None` for any value outside the numeric family
 /// (defense-in-depth against a validator bug, as above).
@@ -1231,13 +1229,13 @@ fn float_add(
     Ok(Value::Float(width, sum))
 }
 
-/// Applies a registered function to its already-evaluated arguments (issue
-/// #64). Postgres's built-in functions are `STRICT` (return `NULL` given any
+/// Applies a registered function to its already-evaluated arguments.
+/// Postgres's built-in functions are `STRICT` (return `NULL` given any
 /// `NULL` argument) — matched here by short-circuiting to `None` before
 /// dispatching on `name` — so no per-function null handling is needed below.
 ///
 /// An `args` type mismatch or an unregistered `name` here would mean the
-/// validator (#23) let a bad definition through; as in [`apply_operator`],
+/// validator let a bad definition through; as in [`apply_operator`],
 /// this falls back to `None` rather than panicking, matching this module's
 /// defense-in-depth posture toward validator bugs.
 fn apply_function(
@@ -1260,7 +1258,7 @@ fn apply_function(
         ("REGEXP_COUNT", [text, pattern]) => regexp_count(text, pattern, regex_cache)?,
         _ => return None,
     };
-    // All four are `integer`-returning in Postgres (issue #111, see
+    // All four are `integer`-returning in Postgres (see
     // `registry::FUNCTIONS`), and all four are bounded by the length of a
     // `text` value, which Postgres itself caps at 1GB — so every result
     // here is at most ~2^30 and provably fits `int4` with no range check.
@@ -1295,7 +1293,7 @@ fn strpos(haystack: &str, needle: &str) -> usize {
 /// match keeps every search restart on a valid UTF-8 boundary.
 ///
 /// `pattern` is compiled at most once per distinct pattern text via
-/// `regex_cache` (issue #68) rather than on every call — the validator (#64)
+/// `regex_cache` rather than on every call — the validator
 /// already guarantees `pattern` is a string literal, so the same text always
 /// yields the same compiled `Regex`.
 fn regexp_count(text: &str, pattern: &str, regex_cache: &mut RegexCache) -> Option<usize> {
@@ -1327,9 +1325,8 @@ fn regexp_count(text: &str, pattern: &str, regex_cache: &mut RegexCache) -> Opti
 
 /// The [`Value`] an [`Expr::TypedLiteral`] evaluates to.
 ///
-/// Issue #109's allowlist held only passthrough families, so this was a
-/// one-liner producing [`Value::Other`]. Issue #112 added `real`/`double
-/// precision`, which are a real [`ValueType::Float`] and must decode to a
+/// Passthrough families produce [`Value::Other`]. `real`/`double
+/// precision` are a real [`ValueType::Float`] and must decode to a
 /// real `f64` — a `REAL '1.5'` carried as verbatim text would not have
 /// float arithmetic, float ordering, or a float target column.
 ///
@@ -1352,7 +1349,7 @@ fn typed_literal_value(
 fn parse_value(field_name: &str, value_type: ValueType, text: &str) -> Result<Value, EvalError> {
     match value_type {
         ValueType::Numeric => parse_number(field_name, text).map(Value::Numeric),
-        // Issue #111: an exact-integer column's text decodes to a real,
+        // An exact-integer column's text decodes to a real,
         // range-checked `i64` of the column's own width, not to unbounded
         // decimal digits. The range check is what turns a value that could
         // never have come out of a column of this type into a named error
@@ -1363,7 +1360,7 @@ fn parse_value(field_name: &str, value_type: ValueType, text: &str) -> Result<Va
                 field: field_name.to_string(),
                 source,
             }),
-        // Issue #112: likewise a float column's text decodes to a real
+        // Likewise a float column's text decodes to a real
         // `f64` on that width's grid. `float::parse` accepts exactly what
         // `float4out`/`float8out` emit — `NaN`/`Infinity`/`-Infinity`
         // included, since those are values a `real` column really holds —
@@ -1379,16 +1376,15 @@ fn parse_value(field_name: &str, value_type: ValueType, text: &str) -> Result<Va
         ValueType::Text => Ok(Value::Text(text.to_string())),
         ValueType::Boolean => parse_boolean(field_name, text).map(Value::Boolean),
         ValueType::Uuid => Ok(Value::Uuid(text.to_string())),
-        // Passthrough, like `Uuid`/`Text` above: the epic's per-family
-        // children (#111–#122) are what teach a `PgType` how to actually
-        // parse/validate its own text form; #108's job is only to carry it
-        // through tagged with its real type instead of mislabeling it.
+        // Passthrough, like `Uuid`/`Text` above: carried through tagged with
+        // its real type instead of mislabeled. A first-class family has its
+        // own `ValueType` variant that parses and validates its text form.
         ValueType::Other(pg_type) => Ok(Value::Other(pg_type, text.to_string())),
     }
 }
 
-/// Types an unadorned numeric literal the way Postgres's own lexer does
-/// (issue #111): a literal with no decimal point that fits `integer` *is*
+/// Types an unadorned numeric literal the way Postgres's own lexer does:
+/// a literal with no decimal point that fits `integer` *is*
 /// `integer`, one that only fits `bigint` is `bigint`, and anything else —
 /// a fractional literal, or an integral one too wide even for `bigint` — is
 /// `numeric`.
@@ -1503,7 +1499,7 @@ mod tests {
         out
     }
 
-    /// Issue #748: a field reading a paused one by alias, directly or
+    /// A field reading a paused one by alias, directly or
     /// through a chain, is closed into the paused set; a field naming
     /// itself reads its source column, not itself, and an unrelated field
     /// stays out.
@@ -1637,7 +1633,7 @@ mod tests {
 
     #[test]
     fn cyclic_definition_returns_error_instead_of_overflowing() {
-        // Bypasses the validator (#23), which is supposed to reject this,
+        // Bypasses the validator, which is supposed to reject this,
         // to exercise the evaluator's own defense-in-depth guard.
         let d = def(vec![
             FieldDef {
@@ -1709,12 +1705,12 @@ mod tests {
         );
     }
 
-    /// Issue #108's typed CDC round-trip: a column classified as
+    /// The typed CDC round-trip: a column classified as
     /// [`ValueType::Other`] (a recognized-but-not-first-class-yet PG type
     /// family, e.g. `jsonb`) still passes through `parse_value` tagged with
     /// its real [`PgType`], carrying the captured text verbatim exactly
     /// like [`Value::Uuid`]/[`Value::Text`] above — not silently
-    /// mislabeled/misrouted as `Text` the way it collapsed pre-#108.
+    /// mislabeled/misrouted as `Text`.
     #[test]
     fn other_typed_column_passes_through_tagged_with_its_real_pg_type() {
         let d = def(vec![FieldDef {
@@ -1766,8 +1762,8 @@ mod tests {
     }
 
     /// The text of an exact-numeric result, whichever of the two exact
-    /// value shapes it landed in. Issue #111 split `integer` out of
-    /// `Numeric`, and the four scalar functions below now return `integer`
+    /// value shapes it landed in. `integer` is separate from
+    /// `Numeric`, and the four scalar functions below return `integer`
     /// (as they do in Postgres) — these tests are about the *value* each
     /// computes, so they read it either way; the *type* is pinned
     /// separately by `scalar_functions_return_integer_like_postgres`.
@@ -1923,7 +1919,7 @@ mod tests {
 
     #[test]
     fn regexp_count_with_an_uncompilable_pattern_returns_null() {
-        // Bypasses the validator (#23/#64), which is supposed to reject
+        // Bypasses the validator, which is supposed to reject
         // this at validate time, to exercise the evaluator's own
         // defense-in-depth guard against a hand-built AST.
         let d = def(vec![FieldDef {
@@ -2052,7 +2048,7 @@ mod tests {
         }]);
         let r = row(&[("a", None), ("b", None)]);
         let result = eval(&d, &r, &numeric_types(&["a", "b"])).unwrap();
-        // The literal wins, and issue #111 types a bare `0` as `integer`
+        // The literal wins, and a bare `0` is typed as `integer`
         // (`select pg_typeof(0)`), the same as Postgres. The field's own
         // inferred type is still `numeric` — `validate::common_numeric_type`
         // unifies the `numeric` columns with the `integer` literal — and
@@ -2124,7 +2120,7 @@ mod tests {
         }
     }
 
-    /// Issue #830: `SUM(s.val)` folds the source column `val`, not the field
+    /// `SUM(s.val)` folds the source column `val`, not the field
     /// `val` that shadows it.
     #[test]
     fn a_qualified_name_in_an_aggregate_argument_folds_the_source_column() {
@@ -2156,7 +2152,7 @@ mod tests {
 
     #[test]
     fn coalesce_over_an_aggregate_replaces_the_empty_group_null() {
-        // The motivating case (PR #64): `SUM` over a group whose summed
+        // The motivating case: `SUM` over a group whose summed
         // column is entirely NULL yields NULL (Postgres empty-set SUM), and
         // `COALESCE(SUM(amount), 0)` turns that into 0 rather than letting the
         // NULL propagate. Exercises the aggregate-path COALESCE arm.
@@ -2191,7 +2187,7 @@ mod tests {
         )
         .unwrap();
         // `COALESCE(SUM(amount), 0)` over an all-NULL group falls through
-        // to the literal, which issue #111 types as `integer` (Postgres
+        // to the literal, which is typed as `integer` (Postgres
         // types a bare `0` the same way). The *field* is still `numeric` —
         // `validate`'s `common_numeric_type` unifies the two arms — and the
         // text written is identical either way, which is what the target
@@ -2199,7 +2195,7 @@ mod tests {
         assert_eq!(result["total"].as_ref().unwrap().to_string(), "0");
     }
 
-    // --- bool_and/bool_or (issue #119) ---
+    // --- bool_and/bool_or ---
 
     /// `id` stays `Numeric` (the group key), `flag` is `Boolean` — mirrors
     /// `numeric_types`, but for the one aggregate pair (`BOOL_AND`/
@@ -2213,7 +2209,7 @@ mod tests {
 
     #[test]
     fn parse_boolean_accepts_both_the_terse_and_sql_standard_spellings() {
-        // Issue #119's live finding: `boolout` (what capture images,
+        // `boolout` (what capture images,
         // and what a bare column fetch renders) spells a boolean `'t'`/`'f'`,
         // while `<col>::text` — a *different*, dedicated Postgres cast
         // function only `boolean` has — spells it `'true'`/`'false'`. The
@@ -2271,7 +2267,7 @@ mod tests {
         assert_eq!(result["any_true"], None);
     }
 
-    /// Issue #695: an aggregate's argument reads the source column when a
+    /// An aggregate's argument reads the source column when a
     /// field of the same name is itself an aggregate, so `AVG(val)` after
     /// `SUM(val) AS val` is the average of the rows, not of the sum.
     #[test]

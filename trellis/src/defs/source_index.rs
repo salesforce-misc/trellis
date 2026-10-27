@@ -1,4 +1,4 @@
-//! The source index a `GROUP BY` or `JOIN` target needs (#1167).
+//! The source index a `GROUP BY` or `JOIN` target needs.
 //!
 //! A `self_check` walk of a group-basis aggregate or a `JOIN` pages its
 //! source by the key's own columns, and a page is a range scan only when an
@@ -114,7 +114,7 @@ impl SourceIndex {
 }
 
 /// A source index a definition lacks now, as `DefinitionStatus::source_index_gaps`
-/// reports it (#1167).
+/// reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SourceIndexGap {

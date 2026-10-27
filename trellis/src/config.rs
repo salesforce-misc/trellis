@@ -16,12 +16,12 @@
 //! schema *transform target tables* are created under is a separate,
 //! independently configurable setting — resolved from `TRELLIS_TARGET_SCHEMA`,
 //! defaulting to [`DEFAULT_TARGET_SCHEMA`] (`public`) — deliberately decoupled
-//! from the Trellis-managed catalog schema above (issue #15): defaulting
+//! from the Trellis-managed catalog schema above: defaulting
 //! target tables into the same schema as the catalog made every new
 //! transform a potential name collision with Trellis's own future
 //! catalog/state objects.
 //!
-//! [`crate::Pool`]'s sizing/timeout (issue #182) is configured the same
+//! [`crate::Pool`]'s sizing/timeout is configured the same
 //! way: `TRELLIS_POOL_MAX_SIZE` (default [`DEFAULT_POOL_MAX_SIZE`]) caps how
 //! many physical connections the pool opens, and
 //! `TRELLIS_POOL_WAIT_TIMEOUT_SECS` (default [`DEFAULT_POOL_WAIT_TIMEOUT`])
@@ -49,11 +49,11 @@ pub const DEFAULT_SCHEMA: &str = "trellis";
 /// application data a user queries directly, not part of Trellis's own
 /// managed footprint, so defaulting them into the Trellis instance schema
 /// (as an earlier POC did) meant a high chance of future name conflicts as
-/// Trellis grows its own catalog/state tables in that schema (issue #15).
+/// Trellis grows its own catalog/state tables in that schema.
 pub const DEFAULT_TARGET_SCHEMA: &str = "public";
 
 /// The default cap on how many physical connections [`crate::Pool`] will
-/// ever open at once (issue #182).
+/// ever open at once.
 ///
 /// `deadpool_postgres`'s own default (`2 * num_cpus`, per `deadpool`'s
 /// `get_default_pool_max_size`) scales with the box this happens to run on,
@@ -75,14 +75,14 @@ pub const DEFAULT_TARGET_SCHEMA: &str = "public";
 ///
 /// It isn't every connection a client opens: Trellis's dedicated sessions
 /// (producer, maintenance loop, heartbeat daemon, wake listener) sit outside
-/// it, and so does each paged drain's `TEMP`-table session (issue #620, see
+/// it, and so does each paged drain's `TEMP`-table session (see
 /// `ClientOptions::drain_batch_cap`), up to one per drain thread while
 /// oversized shares page.
 pub const DEFAULT_POOL_MAX_SIZE: usize = 20;
 
 /// The default timeout [`crate::Pool::get`] waits for a free connection
 /// before failing with a typed [`crate::Error::Pool`] error, instead of
-/// deadpool's default of waiting forever (issue #182). Long enough that a
+/// deadpool's default of waiting forever. Long enough that a
 /// normal, brief load spike (a burst of concurrent evictions, a slow
 /// query holding a connection a bit longer than usual) doesn't spuriously
 /// fail, but bounded so a genuinely exhausted pool surfaces as a loud,
@@ -99,7 +99,7 @@ pub const DEFAULT_POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// `Debug` is written by hand rather than derived so a `{:?}` (a `tracing`
 /// field, a panic message, an embedder's log line) can't print the DSN's
-/// password (issue #591). It shows a password-free DSN as written and
+/// password. It shows a password-free DSN as written and
 /// replaces any other with `<redacted>`.
 #[derive(Clone)]
 pub struct Config {
@@ -193,8 +193,7 @@ impl Config {
         Ok(self)
     }
 
-    /// Returns `self` with its connection pool's `max_size` overridden (issue
-    /// #182) — see `DEFAULT_POOL_MAX_SIZE`. Rejects `0`: a pool that can
+    /// Returns `self` with its connection pool's `max_size` overridden — see `DEFAULT_POOL_MAX_SIZE`. Rejects `0`: a pool that can
     /// never open a single connection isn't a smaller pool, it's a broken
     /// one, and letting it through here would only surface as a confusing
     /// wait-timeout on every single [`crate::Pool::get`] call instead of a
@@ -210,7 +209,7 @@ impl Config {
     }
 
     /// Returns `self` with its connection pool's wait timeout overridden
-    /// (issue #182) — see `DEFAULT_POOL_WAIT_TIMEOUT`. Unlike
+    /// — see `DEFAULT_POOL_WAIT_TIMEOUT`. Unlike
     /// [`Config::with_pool_max_size`], every [`Duration`] (including
     /// [`Duration::ZERO`], which just makes [`crate::Pool::get`] fail
     /// immediately when no connection is already free — a legitimate, if
@@ -341,7 +340,7 @@ impl fmt::Debug for Config {
     }
 }
 
-/// `Debug`s a DSN without its password (issue #591).
+/// `Debug`s a DSN without its password.
 ///
 /// Rather than masking the password in place, which would mean
 /// re-implementing the connection-string grammar and getting every quoting
@@ -367,8 +366,8 @@ impl fmt::Debug for RedactedDsn<'_> {
 /// Parses `dsn` with [`tokio_postgres::Config`]'s parser. Every place
 /// Trellis parses a DSN goes through this.
 ///
-/// On failure it reports a fixed message and drops tokio_postgres's error
-/// (issue #608). That error's `Debug` and `source()` name the offending
+/// On failure it reports a fixed message and drops tokio_postgres's error.
+/// That error's `Debug` and `source()` name the offending
 /// option, so a password holding an unquoted space
 /// (`password=hunter2 xyzzy=1`) or a URL query value holding an unencoded
 /// `&` would print its tail as an "unknown option". Nothing in a DSN that
@@ -473,7 +472,7 @@ fn target_schema_from_env() -> String {
 }
 
 /// Resolves the pool's `max_size` from `TRELLIS_POOL_MAX_SIZE`, defaulting
-/// to [`DEFAULT_POOL_MAX_SIZE`] (issue #182) — the one place both
+/// to [`DEFAULT_POOL_MAX_SIZE`] — the one place both
 /// [`Config::resolve`] and [`Config::from_dsn`] read this env var, so they
 /// can't drift.
 fn pool_max_size_from_env() -> Result<usize, Error> {
@@ -488,8 +487,7 @@ fn pool_max_size_from_env() -> Result<usize, Error> {
 }
 
 /// Resolves the pool's wait timeout from `TRELLIS_POOL_WAIT_TIMEOUT_SECS`
-/// (whole seconds), defaulting to [`DEFAULT_POOL_WAIT_TIMEOUT`] (issue
-/// #182) — the one place both [`Config::resolve`] and [`Config::from_dsn`]
+/// (whole seconds), defaulting to [`DEFAULT_POOL_WAIT_TIMEOUT`] — the one place both [`Config::resolve`] and [`Config::from_dsn`]
 /// read this env var, so they can't drift.
 fn pool_wait_timeout_from_env() -> Result<Duration, Error> {
     match std::env::var("TRELLIS_POOL_WAIT_TIMEOUT_SECS") {
@@ -506,7 +504,7 @@ fn pool_wait_timeout_from_env() -> Result<Duration, Error> {
     }
 }
 
-/// Test fixtures for issue #608: DSNs that fail to parse and carry a
+/// Test fixtures: DSNs that fail to parse and carry a
 /// password whose tail tokio_postgres's parse error would name.
 #[cfg(test)]
 pub(crate) mod malformed_dsn_fixtures {
@@ -676,7 +674,7 @@ mod tests {
         );
     }
 
-    /// Issue #608: the fixed parse-failure message still says which form
+    /// The fixed parse-failure message still says which form
     /// the DSN looked like, so there's something to act on.
     #[test]
     fn unparsable_dsn_message_names_its_form() {
@@ -772,7 +770,7 @@ mod tests {
         assert_eq!(config.pool_wait_timeout(), Duration::from_millis(250));
     }
 
-    /// Issue #591: neither `{:?}` nor `{}` on a [`Config`] may print the
+    /// Neither `{:?}` nor `{}` on a [`Config`] may print the
     /// DSN's password, whichever form carries it.
     #[test]
     fn config_debug_and_display_never_print_the_password() {

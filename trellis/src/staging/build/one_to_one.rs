@@ -1,4 +1,4 @@
-//! The Re-derive build of a 1-1 target (#625 F8a; ADR-0002 "A build is
+//! The Re-derive build of a 1-1 target (ADR-0002 "A build is
 //! Re-derive over chunks, and applies from its first chunk").
 //!
 //! A plain 1-1 target, on a captured source or another definition's
@@ -12,11 +12,11 @@
 //! The chunk: a 1-1 target's rows are absolute, a target row is the
 //! evaluation of one source row, so a chunk writes the target rows
 //! themselves. What orders a chunk
-//! against a page is the key's entry on the 1-1 slim ledger (#623 D6,
-//! `super::super::one_to_one_ledger`), as it orders a page against a page:
+//! against a page is the key's entry on the 1-1 slim ledger
+//! (`super::super::one_to_one_ledger`), as it orders a page against a page:
 //!
 //! 1. read the keys in the range, leaving out the ones quarantined for the
-//!    definition (`poison`, #799) and any with a `NULL` part, which the
+//!    definition (`poison`) and any with a `NULL` part, which the
 //!    plan job stages into the ring instead (`super::stage_null_keys`);
 //! 2. lock their entries in key order (`one_to_one_ledger::lock_entries`:
 //!    an entry for each key with none, then the others `for update`), under
@@ -42,7 +42,7 @@
 //! chunk wrote. A key a page inserted after step 1 isn't locked, and its own
 //! change applies it. A page whose batch is at or
 //! below the start's segment re-derives its keys instead of applying them
-//! (#733, `super::start`): an older change drained after the start, whose
+//! (`super::start`): an older change drained after the start, whose
 //! key's later delete drained before it, would otherwise write a target row
 //! no chunk reaches.
 //!
@@ -50,7 +50,7 @@
 //! update, as the page and the old range build leave it. The chunk's caller
 //! holds the source's version fence from the start of its transaction, and
 //! a pause bumps it, so a pause that returns has no write of the column
-//! still to land (issue #903).
+//! still to land.
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -80,15 +80,14 @@ pub struct OneToOnePlan {
     /// columns, in definition order.
     fields: Vec<(String, String)>,
     /// Which fields read which others by alias, so a field reading a paused
-    /// one is left out with it (issue #748).
+    /// one is left out with it.
     alias_readers: crate::defs::eval::AliasReaders,
 }
 
-/// Whether `definition` is a 1-1 target the Re-derive build serves (#625
-/// F8a): a 1-1 key space, and fields whose aliases substitute to
+/// Whether `definition` is a 1-1 target the Re-derive build serves: a 1-1 key space, and fields whose aliases substitute to
 /// self-contained SQL, which define checks
 /// (`ValidationError::FieldExpansionTooLarge`). Its source may be captured or
-/// seam-fed (#625 F6).
+/// seam-fed.
 pub(crate) fn buildable(definition: &Definition) -> bool {
     matches!(
         definition.def.key_space,
@@ -98,7 +97,7 @@ pub(crate) fn buildable(definition: &Definition) -> bool {
 
 impl OneToOnePlan {
     /// Pins the source key's collations to the ones a build chunk's range
-    /// was planned under (`ddl::pin_key_collations`, issue #769). The
+    /// was planned under (`ddl::pin_key_collations`). The
     /// chunk reads the target by the same range, under the same collations.
     pub(super) fn pin_key_collations(&mut self, recorded: Option<&[Option<String>]>) {
         ddl::pin_key_collations(&mut self.pk, recorded);
@@ -180,7 +179,7 @@ pub async fn run_chunk(
     run_range(txn, plan, None, lo, hi).await
 }
 
-/// Runs one chunk of a field build (#625 F8b; see the parent module's
+/// Runs one chunk of a field build (see the parent module's
 /// "Field builds"), `(lo, hi]` of the target's source primary key, in `txn`,
 /// which must be `read committed`. The caller commits.
 ///
@@ -212,7 +211,7 @@ pub async fn run_chunk(
 /// directions. A page that read the field as paused can't come later: the
 /// edit, the column resume and the capture release that make the field
 /// apply bump the fence. Nor can a write of the field planned before a
-/// pause (issue #903): the pause bumps the fence too, so a page that read
+/// pause: the pause bumps the fence too, so a page that read
 /// the field as live misses it and computes again, and the caller holds the
 /// fence `for share` from the start of `txn` (`super::run_rederive`), so
 /// the pause waits for this chunk to commit, or the chunk, finding the fence
@@ -242,9 +241,9 @@ async fn run_range(
     let range_where = crate::defs::backfill::pk_range_where(&pk_idents, &plan.pk, &lo);
     let mut params = crate::defs::backfill::range_params(&lo, &hi);
 
-    // 1. The keys in the range, but for the quarantined ones (#616, #625
-    // F-A5) and any with a `NULL` part, as the old range build's write and
-    // `fail_chunk`'s narrowing count them: the plan stages those
+    // 1. The keys in the range, but for the quarantined ones
+    // and any with a `NULL` part, as `fail_chunk`'s narrowing counts them:
+    // the plan stages those
     // (`super::stage_null_keys`).
     let started = Instant::now();
     let source_param = format!("${}", params.len() + 1);
@@ -288,7 +287,7 @@ async fn run_range(
     params.push(&key_refs);
     let pick = chunk_pick(plan, &lo, &keys_param);
     let outcome = rederive(txn, plan, scope, &pick, &params, keys.len()).await?;
-    // Test-only pause point (#623 D1), directly after the chunk's one
+    // Test-only pause point, directly after the chunk's one
     // read-and-write statement. See `super::super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::super::interleave::pause_at(
@@ -403,7 +402,7 @@ async fn explain_range(
         .join("\n"))
 }
 
-/// One batch of a 1-1 rebuild's sweep (#625 F3's sweep, for a 1-1 target;
+/// One batch of a 1-1 rebuild's sweep (for a 1-1 target;
 /// see [`super::sweep_batch`]), in `txn`, which must be `read committed`.
 /// The caller commits.
 ///
@@ -464,7 +463,7 @@ pub async fn sweep_batch(
     let mut finished = scanned < scan;
     if finished {
         // The ledger is read to its end. Target rows with no live entry
-        // (added or re-keyed by hand, #1201) are in no ledger page: walk
+        // are in no ledger page: walk
         // them here, a batch at a time, until none is left. They're read
         // before any entry is locked and locked with the page's keys in one
         // ordered batch, so the batch holds no lock across the target scan
@@ -495,7 +494,7 @@ pub async fn sweep_batch(
 
 /// Up to `limit` keys of target rows that have no live ledger entry (no
 /// entry, or a tombstone) and aren't quarantined: rows nothing in the source
-/// backs, which someone added or re-keyed in the target (#1201), or whose
+/// backs, which someone added or re-keyed in the target, or whose
 /// source row exists but the ledger never learned. Every writer of a target
 /// row writes its entry in the same transaction, so a committed target row
 /// without a live entry is one nobody wrote through Trellis. A key
@@ -549,7 +548,7 @@ async fn rederive_keys(
     // The source and the target are read by their typed key columns, so
     // each is one index probe per key: `$1` is the keys' `text[]`, `$2..`
     // one `text[]` per key column. A key with a `NULL` part (a source keyed
-    // by a nullable unique index, issue #1141) is matched by `is null` on
+    // by a nullable unique index) is matched by `is null` on
     // that column, which the index serves where `is not distinct from`
     // can't, so the keys are re-derived a statement per `NULL` pattern
     // (`pattern[i]`: part `i` is `NULL`), each binding only its non-`NULL`
@@ -644,7 +643,7 @@ async fn lock_chunk_entries(
     plan: &OneToOnePlan,
     keys: &[&str],
 ) -> Result<(), ApplyError> {
-    // Planted bug (#625 F3): the chunk's read-and-write runs with no entry
+    // Planted bug: the chunk's read-and-write runs with no entry
     // lock on the keys that had an entry, so it reads an entry a page is
     // between reading and writing. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
@@ -694,8 +693,8 @@ struct Pick {
     keys: String,
 }
 
-/// The plan settings a 1-1 chunk's or sweep batch's statement runs under
-/// (#625 F8a), so its plan doesn't hang on row estimates or statistics: no
+/// The plan settings a 1-1 chunk's or sweep batch's statement runs under,
+/// so its plan doesn't hang on row estimates or statistics: no
 /// sequential scan, so the ledger, the target and the source are each
 /// reached through their key's index. Without it, the estimate of the
 /// locked keys joined to their source rows (a join on the encoded key,

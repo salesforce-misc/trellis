@@ -2,8 +2,7 @@
 //! `thiserror`/`anyhow`, matching [`crate::error::Error`]'s convention.
 //!
 //! Each variant names the specific unsupported construct rather than
-//! reporting a generic parse failure, per issue #22's requirement that
-//! rejections be actionable.
+//! reporting a generic parse failure, so that rejections are actionable.
 
 use std::fmt;
 
@@ -28,7 +27,7 @@ pub enum ParseError {
     /// A function call other than one in `super::registry::FUNCTIONS`.
     UnsupportedFunction { name: String },
     /// A registered function called with the wrong number of arguments
-    /// (issue #64) — a structural check the parser can make directly from
+    /// — a structural check the parser can make directly from
     /// `super::registry::FunctionSpec::arg_types`'s length, without
     /// needing argument type information (that's the validator's job).
     FunctionArityMismatch {
@@ -42,20 +41,20 @@ pub enum ParseError {
     UnsupportedPredicate { detail: String },
     /// `COALESCE` called with zero arguments.
     AtLeastOneArgumentRequired { name: String },
-    /// A `TRANSFORM`/`FROM` table reference (issue #76, ADR-0011 grammar
+    /// A `TRANSFORM`/`FROM` table reference (ADR-0011 grammar
     /// clause 4) had more than the two `<schema>.<table>` components this
     /// grammar accepts — e.g. `a.b.c`.
     TooManyQualifiedNameParts { reference: String },
     /// A column reference in an expression had more than the three
     /// `<schema>.<table>.<column>` components a qualified source column takes
-    /// (issue #830) — e.g. `a.b.c.d`.
+    /// — e.g. `a.b.c.d`.
     TooManyColumnNameParts { reference: String },
     /// A two-part `GROUP BY` key `<head>.<column>` of a non-`JOIN` aggregate
     /// whose head is not the `FROM` table. `source` is the `FROM` table's bare
     /// name. A key of another table is grouped by with a `JOIN`.
     GroupByKeyNotFromSource { reference: String, source: String },
     /// A `CAST(<expr> AS <type>)` whose operand is not a single-quoted
-    /// string literal (issue #109) — i.e. a request for a **general** cast
+    /// string literal — i.e. a request for a **general** cast
     /// rather than a typed literal. See `super::typed_literal` for why the
     /// coercion lattice a general cast implies is each type family's own
     /// epic child, not this grammar's.
@@ -64,11 +63,11 @@ pub enum ParseError {
     /// that isn't in `super::typed_literal::TYPED_LITERALS`'s allowlist.
     UnsupportedLiteralType { name: String },
     /// Postgres's `<expr>::<type>` cast sugar, which this grammar doesn't
-    /// accept (issue #109) — rejected by name so the message can point at
+    /// accept — rejected by name so the message can point at
     /// `CAST(...)`/`<type> '...'` instead of reporting an unexpected `:`.
     UnsupportedCastOperator,
     /// A `PAUSE`/`RESUME`/`DROP` address whose shape doesn't fit the statement
-    /// it was written in (issue #227/#228): too many `.`-separated parts, or a
+    /// it was written in: too many `.`-separated parts, or a
     /// `<transform>.<column>` address under `DROP TRANSFORM`, which is
     /// whole-definition only. `statement` names the statement form
     /// (`"DROP TRANSFORM"`), `address` is the address as written, and `detail`

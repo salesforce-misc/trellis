@@ -1,5 +1,5 @@
 //! The capture pass's memo of which definitions' typed copies it found
-//! current (issue #858).
+//! current.
 //!
 //! [`super::schema_change::pause_readers_of_retyped`] compares every column
 //! Trellis created from the source's types ([`crate::defs::copies`]) with the

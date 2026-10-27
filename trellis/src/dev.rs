@@ -70,7 +70,7 @@ pub mod defs {
     /// Function/operator/aggregate registries: the source of truth the oracle
     /// consults instead of hardcoding the engine's accepted spellings.
     pub use crate::defs::registry;
-    /// Issue #109's typed-literal allowlist and its shared SQL renderer. The
+    /// The typed-literal allowlist and its shared SQL renderer. The
     /// suite's own `render_expr` has to spell an `Expr::TypedLiteral` back
     /// out — both as definition source text and as oracle SQL — and must do
     /// it from the engine's table rather than a second, drifting copy, for
@@ -91,9 +91,9 @@ pub mod defs {
 pub mod staging {
     /// Read, never set: `benchmark`'s contention sampler tells a Re-derive
     /// build's statements from a drain page's by the `application_name`
-    /// their transactions set (#625 F2's profile).
+    /// their transactions set.
     pub use crate::staging::build::CHUNK_APPLICATION_NAME;
-    /// Read, never set: the concurrent tier's coverage report (issue #557)
+    /// Read, never set: the concurrent tier's coverage report
     /// counts bursts large enough to seal into a split batch, and must follow
     /// the threshold if it moves.
     pub use crate::staging::claim::MIN_ROWS_TO_SPLIT;
@@ -107,7 +107,7 @@ pub mod staging {
     /// retire what's retirable, then retry.
     /// `seal_if_active_nonempty` is the maintenance tick's own seal step, for
     /// a harness that runs with that tick disabled and seals on demand
-    /// instead (issue #453): it seals only when there is something to seal.
+    /// instead: it seals only when there is something to seal.
     /// `converged_through` is the single, non-waiting check behind
     /// `await_converged`, for a harness that must re-check the ring once
     /// without starting another wait.
@@ -120,13 +120,13 @@ pub mod staging {
     /// recompute and its rebuild), for plan-shape tests.
     #[cfg(any(test, feature = "internals"))]
     pub use crate::staging::group_basis::explain_whole_source_reads;
-    /// One page of a `self_check` walk, for `benchmark`'s `self-check-walk`
-    /// (#1198): it walks a JOIN target's `P` and `M` parts alone, from the
+    /// One page of a `self_check` walk, for `benchmark`'s `self-check-walk`:
+    /// it walks a JOIN target's `P` and `M` parts alone, from the
     /// cursor `p`, which the job (it walks `T` first) can't.
     pub use crate::staging::self_check::{SelfCheckScope, check_page as self_check_page};
     /// One pass of the `self_check` worker task, for a harness that runs no
     /// drain workers (so no such task) and hand-drives the job it started
-    /// through `Trellis::self_check` (#1023), the way `ManualBackend` drains
+    /// through `Trellis::self_check`, the way `ManualBackend` drains
     /// by hand.
     pub use crate::staging::self_check_job::{
         DEFAULT_PAGE_KEYS, WorkerOptions as SelfCheckWorkerOptions,
@@ -142,8 +142,8 @@ pub mod staging {
     };
 }
 
-/// Trigger capture (#622), for `benchmark`'s `write-tax` and
-/// `capture-ceiling` (#622 C4): the write-path benchmark installs the capture
+/// Trigger capture, for `benchmark`'s `write-tax` and
+/// `capture-ceiling`: the write-path benchmark installs the capture
 /// triggers through the real installer, with nothing draining, before C5
 /// wires the installer into the staging worker.
 pub mod capture {
@@ -153,7 +153,7 @@ pub mod capture {
     pub use crate::capture::sql::CaptureSpec;
 }
 
-/// Test-only pause points inside a drain page's transaction (#623 D1), for
+/// Test-only pause points inside a drain page's transaction, for
 /// a harness that freezes one worker between two steps. See
 /// `crate::staging::interleave`'s module doc.
 pub mod interleave {
@@ -168,7 +168,7 @@ pub mod build {
     pub use crate::staging::build::CHUNK_LOCK_TIMEOUT;
 }
 
-/// Planted ordering bugs (issue #557 part 3). A harness reads which plant
+/// Planted ordering bugs. A harness reads which plant
 /// this process runs with and how often it fired; it never arms one, since
 /// only [`plant::PLANT_ENV`] can. See `crate::plant`'s module doc.
 pub mod plant {

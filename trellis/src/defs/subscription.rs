@@ -1,4 +1,4 @@
-//! A table a logical-replication subscription replicates into (issue #751).
+//! A table a logical-replication subscription replicates into.
 //!
 //! Trellis doesn't support reading a table that a subscription in its
 //! database writes. Capture is statement-level triggers with transition

@@ -1,5 +1,5 @@
-//! Disruption of a captured table's capture that Trellis didn't make (#707,
-//! with #999's table-gone cases).
+//! Disruption of a captured table's capture that Trellis didn't make, and
+//! the cases where a captured table is gone.
 //!
 //! A statement trigger only captures what it sees. An operator who removes,
 //! swaps, disables or recreates Trellis's capture triggers, or replaces a
@@ -467,7 +467,7 @@ async fn pause_readers(
 /// exists at that name as a table (plain or partitioned), and, for a
 /// partitioned source the pass has recorded, is still the root it recorded.
 /// When it doesn't, pauses every definition that reads it and isn't paused
-/// yet (#999, #1200) and returns `true`, and the caller leaves the table
+/// yet and returns `true`, and the caller leaves the table
 /// alone: its capture can't be installed, and a table swapped in meanwhile is
 /// for a resume to re-validate. A view, materialized view or foreign table put
 /// at the name (a table renamed away behind a compatibility view, say) is no

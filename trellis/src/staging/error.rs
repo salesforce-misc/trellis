@@ -13,7 +13,7 @@ use tokio_postgres::types::PgLsn;
 
 use crate::error_code::{self, ErrorCode};
 
-/// Failure modes specific to the staging ring (issue #6): resolving the
+/// Failure modes specific to the staging ring: resolving the
 /// active ring slot, appending, and the producer singleton.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -58,7 +58,7 @@ pub enum StagingError {
     ConvergenceTimeout { token: PgLsn, waited: Duration },
     /// A `super::session::ProducerSession`'s DSN didn't parse. Carries
     /// the [`crate::error::Error::Config`] from `crate::config::parse_dsn`,
-    /// whose fixed message quotes none of the DSN (issue #608).
+    /// whose fixed message quotes none of the DSN.
     Config(crate::error::Error),
     /// A direct Postgres protocol/query error.
     Db(tokio_postgres::Error),
@@ -71,7 +71,7 @@ impl StagingError {
     /// lock already held) -> [`ErrorCode::Conflict`], and
     /// [`StagingError::ConvergenceTimeout`] is the caller's own deadline
     /// expiring -> [`ErrorCode::Timeout`], an expected, retryable outcome a
-    /// host must be able to tell apart from a bug (issue #586). Everything
+    /// host must be able to tell apart from a bug. Everything
     /// else here is either an internal ring-mechanics condition (a race
     /// lost, a full slot, a blocked seal gate, an unfenced segment, an
     /// invalid slot index) that a caller can't act on any differently than

@@ -1,4 +1,4 @@
-//! The staging ring (issue #6, stage 02 of
+//! The staging ring (stage 02 of
 //! docs/staging-and-claiming/README.md): the append-only substrate every
 //! producer writes into and every consumer (sealing, claiming — later
 //! stages) reads out of.
@@ -6,43 +6,43 @@
 //! - [`append`] is the blind append path plus the `RingFull` predicate.
 //! - [`session`] is the producer singleton the staging worker must hold.
 //! - [`state`] is the segment lifecycle's one legal-transition graph.
-//! - [`seal`] is stage 03 (issue #9): the fence, the two-phase seal, the
+//! - [`seal`] is stage 03: the fence, the two-phase seal, the
 //!   guards, seal-on-demand, and age-gated crash recovery.
-//! - [`fold`] is stage 04's claim-time fold (issue #10): collapsing a
+//! - [`fold`] is stage 04's claim-time fold: collapsing a
 //!   sealed batch's fenced window into one record per key.
-//! - [`claim`] is stage 04's bucket partitioning and multi-worker claims
-//!   (issue #14): deciding a batch's bucket count at seal, the drainer
+//! - [`claim`] is stage 04's bucket partitioning and multi-worker claims:
+//!   deciding a batch's bucket count at seal, the drainer
 //!   registry as the share denominator, and the one-statement claim + flip.
-//! - [`liveness`] is stage 04's claim-liveness half (issue #15): the
+//! - [`liveness`] is stage 04's claim-liveness half: the
 //!   out-of-band heartbeat daemon, release-on-error, reclaim-on-TTL, and
 //!   the consecutive-fence-miss backoff.
-//! - [`apply`] is stage 05's apply ∪ mark-drained (issue #11), 1-1/scalar
+//! - [`apply`] is stage 05's apply ∪ mark-drained, 1-1/scalar
 //!   subset only: the three-phase drain (claim, then fold, compute, apply ∪
 //!   mark-drained per page), the version fence, and downstream propagation.
-//! - [`page`] is where an oversized share's pages come from (issue #620):
+//! - [`page`] is where an oversized share's pages come from:
 //!   the page-source interface and the `drain_cursor` read-back.
 //! - [`schema_change`] is the drain's barrier for a capture function's
-//!   `schema_changed` marker (#622 C6): it pauses the definitions that read
+//!   `schema_changed` marker: it pauses the definitions that read
 //!   a renamed or dropped column before anything later applies to them.
-//! - [`halt`] is what a halting failure parks (#663): every definition it
+//! - [`halt`] is what a halting failure parks: every definition it
 //!   reaches, so the rest of the drain's page commits.
-//! - [`retire`] is stage 06's retirement half (issue #13/#58): freeing a
+//! - [`retire`] is stage 06's retirement half: freeing a
 //!   `drained` segment's ring slot once nobody can still need it.
-//! - [`quarantine`] is stage 06's other half (issue #16): isolate, evict,
+//! - [`quarantine`] is stage 06's other half: isolate, evict,
 //!   park, release — failure classification, per-key isolation and
 //!   eviction, parked work as the source of truth for an excluded key's
 //!   later healthy changes, operator-driven release, and the one sanctioned
 //!   exception to immutability (a dropped source table's purge).
-//! - [`worker_registry`] is issue #144's worker-level liveness registry:
+//! - [`worker_registry`] is the worker-level liveness registry:
 //!   one row per live drain worker, independent of whether it currently
 //!   holds a claim — the read behind `Trellis::has_live_drain_workers`.
-//! - [`self_check`] is issue #174's production recompute audit
+//! - [`self_check`] is the production recompute audit
 //!   (ADR-0013): a read-only, keyset-bounded comparison of a persisted 1-1
 //!   target against an independently-rendered Postgres recompute.
 //!   [`self_check_job`] is the background job around it that
-//!   [`crate::app::Trellis::self_check`] starts (#1023).
+//!   [`crate::app::Trellis::self_check`] starts.
 //!   [`capture_audit`] is the check of every captured table's triggers,
-//!   functions and privileges it runs first (#622 C9).
+//!   functions and privileges it runs first.
 //! - [`error`] is this module's error type.
 //!
 //! What this module does *not* do: delta arithmetic for aggregate

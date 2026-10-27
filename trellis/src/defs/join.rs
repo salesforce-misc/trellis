@@ -1,5 +1,5 @@
 //! A `JOIN` transform's two sides, and the tables Trellis keeps for one
-//! (#1107, ADR-0019).
+//! (ADR-0019).
 //!
 //! A `JOIN` definition reads two tables: its `FROM` table
 //! (`transform_definitions.source_table`) and its joined table
@@ -9,7 +9,7 @@
 //!
 //! **Hidden tables.** Each `JOIN` definition owns five tables in the
 //! instance's catalog schema, named by its definition id, never by its
-//! target ([#1096 decision 7](https://github.com/salesforce-misc/trellis/issues/1096)):
+//! target:
 //!
 //! - `P` ([`HiddenTable::FromPartials`]): the `FROM` side grouped by its
 //!   `GROUP BY` columns and its join key, with the row count and, per
@@ -340,7 +340,7 @@ fn zero_column(arguments: usize) -> String {
 /// `side`'s key columns in its hidden partials table, in the order of the
 /// table's cell identity: its join key columns, then its `GROUP BY` columns
 /// not already among them. The join key leads so the table's identity index
-/// serves both a `self_check` page's range scan (#1198) and the other
+/// serves both a `self_check` page's range scan and the other
 /// side's lookup of a key's cells.
 pub(crate) fn side_key_columns(def: &TransformDef, side: Side) -> Vec<String> {
     let mut columns = join_key(def, side);

@@ -1,11 +1,11 @@
-//! Convergence and the read-your-writes predicate (issue #12, stage 07). See
+//! Convergence and the read-your-writes predicate (stage 07). See
 //! docs/staging-and-claiming/07-convergence-and-await.md — this module
 //! implements the four-condition predicate, the cheap gate, the (never
 //! polled) observability count, and the caller-side await poll, in that
 //! order below.
 //!
 //! **Condition 4, the quarantine/poison band** (doc section "the one
-//! exclusion is parked quarantine work"): issue #16's `poison_held` table is
+//! exclusion is parked quarantine work"): the `poison_held` table is
 //! what this term reads — not `poison` (the marker; a poisoned key with
 //! nothing parked yet has nothing pending) and not `key_deaths` (a pure
 //! counter, no origin position of its own). A row parked in `poison_held`
@@ -15,10 +15,10 @@
 //! replays it back onto the active batch and it drains for real. This is
 //! what makes convergence never report "converged" across a parked key.
 //!
-//! **Deferred to #14/#15:** the doc's "a round did no work" classification
+//! **Not built here:** the doc's "a round did no work" classification
 //! table (refused-seal backpressure, peer-holds-batch) describes a
 //! *worker-side drain-to-convergence helper* that depends on
-//! claiming/sweeping (#14/#15) and cleanup (#13) machinery this crate
+//! claiming/sweeping and cleanup machinery this crate
 //! doesn't have yet. This module builds only the caller-side poll
 //! ([`await_converged`]) the doc's "Watermark tokens" section describes —
 //! not that helper.
@@ -68,7 +68,7 @@ pub(crate) fn per_ring_table(sep: &str, f: impl Fn(i16, &str) -> String) -> Stri
 /// doc's "The predicate" section for why splitting this into separate
 /// queries reintroduces the race it's built to close.
 ///
-/// - **No condition 1** (issue #622 C5). Trigger capture writes a change's
+/// - **No condition 1**. Trigger capture writes a change's
 ///   ring rows in the writer's own transaction, so every commit at or below
 ///   `token` already has its rows in the ring, with an `origin_lsn` below its
 ///   commit, and conditions 2–4 see them.
@@ -104,7 +104,7 @@ pub(crate) fn per_ring_table(sep: &str, f: impl Fn(i16, &str) -> String) -> Stri
 /// logic would otherwise let quietly vanish from a `WHERE` filter or an
 /// aggregate instead of gating the row.
 ///
-/// Which rows carry an origin (issue #469): a capture trigger stamps every row
+/// Which rows carry an origin: a capture trigger stamps every row
 /// it writes with `pg_current_wal_insert_lsn()`, and every row a drain derives
 /// for a downstream transform inherits the earliest origin of the changes that
 /// produced it (unknown if any was). Rows of genuinely unknown origin stay
@@ -131,8 +131,8 @@ pub async fn converged_through(
 /// as the SQL expression `token`: `$1` for the typed query above, or an
 /// inlined `pg_lsn` literal for [`await_converged`]'s simple-protocol poll.
 ///
-/// `held_by` scopes condition 4 to one definition's held keys (#799,
-/// [`await_converged_for`]); `None` counts every definition's.
+/// `held_by` scopes condition 4 to one definition's held keys
+/// ([`await_converged_for`]); `None` counts every definition's.
 fn converged_sql(token: &str, held_by: Option<i64>) -> String {
     // `origin_lsn` is nullable — a row of unknown origin (a build's `NULL`-key
     // `Recompute`, say) reads NULL here, not `'0/0'`. Both are "unknown", and the doc pins
@@ -152,7 +152,7 @@ fn converged_sql(token: &str, held_by: Option<i64>) -> String {
     // `min()` over zero rows is NULL too, and that must mean "nothing to
     // gate on", not "unknown, so block everything".
     // Conditions 2 and 3 read `segment_pointer`, not the `ring_slot_mirror`
-    // sequence ring writers resolve their slot from (issue #595). Between a
+    // sequence ring writers resolve their slot from. Between a
     // seal's phase 1 commit and its phase 2 mirror set, writers still land in
     // the slot the table already calls sealed; condition 3 gates those rows
     // like any other row in a sealed slot, so the table read is the right one
@@ -253,7 +253,7 @@ pub async fn has_pending(client: &impl GenericClient) -> Result<bool, StagingErr
              )"
         )
     });
-    // Issue #16: a parked `poison_held` row is pending too — it hasn't
+    // A parked `poison_held` row is pending too — it hasn't
     // drained, it's excluded from the active batch until release replays it.
     let sql = format!("select exists ({arms} union all select 1 from poison_held)");
     let row = client.query_one(&sql, &[]).await?;
@@ -276,7 +276,7 @@ pub async fn pending_count(client: &impl GenericClient) -> Result<i64, StagingEr
              )"
         )
     });
-    // Issue #16: every parked `poison_held` row counts as pending too.
+    // Every parked `poison_held` row counts as pending too.
     let sql = format!(
         "select coalesce(sum(c), 0)::bigint from \
          ({arms} union all select count(*) as c from poison_held) counts"
@@ -288,7 +288,7 @@ pub async fn pending_count(client: &impl GenericClient) -> Result<i64, StagingEr
 /// Whether some change to `table` that carries an image and whose origin is
 /// at or below `gate` hasn't drained yet: it sits in a ring slot a batch
 /// still has to claim. The capture gate a
-/// trigger install or widen records (`capture::gate`, issue #622) holds a
+/// trigger install or widen records (`capture::gate`) holds a
 /// definition's build while this is true, so no row staged by the replaced
 /// capture function reaches a definition that starts applying with it.
 ///
@@ -300,7 +300,7 @@ pub async fn pending_count(client: &impl GenericClient) -> Result<i64, StagingEr
 /// `schema_changed` rows carry no image a reader could miss a column of, so
 /// they don't hold the gate.
 ///
-/// A row held in `poison_held` doesn't count (#799). Its release stages an
+/// A row held in `poison_held` doesn't count. Its release stages an
 /// image-less `Recompute` (`quarantine::release_key`), so its images never
 /// reach a reader, and it is held for the definitions whose key it is, never
 /// for one whose build starts: a new definition holds no key, and a resume
@@ -325,7 +325,7 @@ pub async fn table_changes_pending_through(
 
 /// [`table_changes_pending_through`], counting every row of `table`, an
 /// image-less one included: a `recompute` names its key as text, which an
-/// enum relabel (#1241) can leave naming a label that no longer exists, so
+/// enum relabel can leave naming a label that no longer exists, so
 /// a relabel's resume waits for those too.
 pub(crate) async fn table_rows_pending_through(
     client: &impl GenericClient,
@@ -370,8 +370,8 @@ async fn pending_through(
 /// is actually reflected (docs/staging-and-claiming/07-convergence-and-await.md,
 /// "Watermark tokens").
 ///
-/// The *insert* position, not `pg_current_wal_lsn()`'s *write* position
-/// (issue #697): a writer with `synchronous_commit = off` gets its commit
+/// The *insert* position, not `pg_current_wal_lsn()`'s *write* position:
+/// a writer with `synchronous_commit = off` gets its commit
 /// back before its WAL is written, so the write position can still be below
 /// the `origin_lsn` its capture trigger stamped (itself an insert position),
 /// and a token taken from it would let the wait return before that change is
@@ -391,7 +391,7 @@ pub async fn watermark_token(client: &impl GenericClient) -> Result<PgLsn, Stagi
 /// token that takes a while.
 ///
 /// `timeout` bounds the whole call, including a poll that blocks (on a lock,
-/// say) rather than returning (issue #596): each poll runs under a
+/// say) rather than returning: each poll runs under a
 /// server-side `statement_timeout` of the remaining budget, but never less
 /// than [`MIN_POLL_BUDGET`]; see [`poll_within_deadline`]. So a call always
 /// makes at least one real check, even with a zero or spent `timeout`, and
@@ -408,7 +408,7 @@ pub async fn watermark_token(client: &impl GenericClient) -> Result<PgLsn, Stagi
 ///
 /// Cluster-wide: a key any definition holds in quarantine keeps blocking a
 /// token at or above its band (condition 4). [`await_converged_for`] waits
-/// on one definition's held keys only (#799).
+/// on one definition's held keys only.
 pub async fn await_converged(
     client: &Client,
     token: PgLsn,
@@ -418,7 +418,7 @@ pub async fn await_converged(
 }
 
 /// [`await_converged`], with condition 4 counting only the keys the
-/// definition `transform_id` holds in quarantine (#799). Whole-key poison is
+/// definition `transform_id` holds in quarantine. Whole-key poison is
 /// per transform, so a key another definition holds is applied by this one
 /// as usual and gives it nothing to wait for. Its own held keys still
 /// block, as they block every cluster-wide wait. The ring's pending rows
@@ -494,9 +494,9 @@ impl Deadline {
 }
 
 /// The least server time any one poll gets, however little of the budget is
-/// left. Before issue #596 every poll ran to completion, so a zero `timeout`
-/// meant "check once", and the poll the backoff times to land on the deadline
-/// was a real check. Callers lean on that: generative's `quiesce` passes
+/// left. A zero `timeout` still means "check once", and the poll the backoff
+/// times to land on the deadline is a real check. Callers lean on that:
+/// generative's `quiesce` passes
 /// what's left of its own budget, possibly nothing. A healthy poll takes a
 /// few milliseconds; the floor leaves room for that and for a brief lock
 /// wait (a segment retire's `TRUNCATE`, say), and bounds how far a poll
@@ -511,7 +511,7 @@ const SERVER_REPORT_GRACE: Duration = Duration::from_secs(1);
 
 /// Runs `statement` (one SQL statement, no parameters) under `wait`'s
 /// remaining budget, or [`MIN_POLL_BUDGET`] if that's longer, returning its
-/// rows (issue #596).
+/// rows.
 ///
 /// The budget is enforced by the server, not by dropping the future: the
 /// statement runs in the same simple-protocol message as a

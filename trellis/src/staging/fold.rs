@@ -1,4 +1,4 @@
-//! The claim-time fold (issue #10, stage 04): collapsing a sealed batch's
+//! The claim-time fold (stage 04): collapsing a sealed batch's
 //! fenced window into one record per `(src_table, key)`, entirely in SQL —
 //! ordered aggregates run in Postgres, not Rust-side aggregation. See
 //! docs/staging-and-claiming/04-claiming-and-the-fold.md, "The claim-time
@@ -6,7 +6,7 @@
 //!
 //! Scope: this module produces folded records. It does not claim buckets
 //! (that's `seg_claims`/`ON CONFLICT`, `super::claim`), does not compute
-//! deltas or apply them (#11), and does not evaluate `f()` (a later,
+//! deltas or apply them, and does not evaluate `f()` (a later,
 //! Rust-side concern). `BucketFilter` exists so the fold is
 //! bucket-parameterizable; `super::claim::HeldShare::filter` is what
 //! turns a real claim's buckets into one, but nothing in *this* module
@@ -38,7 +38,7 @@ const FOLD_WORK_MEM: &str = "SET LOCAL work_mem = '64MB'";
 /// SQL parameterization. [`BucketFilter::all`] selects the whole batch
 /// (`bucket_count = 1`, `buckets = [0]`), which is the only constructor this
 /// stage needs — the claim machinery that would populate real buckets is
-/// #14/#15, not here.
+/// not here.
 #[derive(Debug, Clone)]
 pub struct BucketFilter {
     bucket_count: i64,
@@ -88,7 +88,7 @@ pub struct FoldedChange {
     pub src_table: String,
     pub key: String,
     /// LAST image-bearing row's post-image, by `(lsn, change_id)` — highest.
-    /// A `delete` ranks here even without an image (issue #620): when one is
+    /// A `delete` ranks here even without an image: when one is
     /// the latest such row this is `None`, and [`Self::ends_in_delete`] says so.
     pub new_image: Option<String>,
     /// FIRST image-bearing row's pre-image, by `(lsn, change_id)` — lowest.
@@ -105,7 +105,7 @@ pub struct FoldedChange {
     /// the issue's field list.
     pub src_changed: Option<SystemTime>,
     /// LEAST `origin_lsn` over the group, or `None` (unknown) if any row's
-    /// is unknown (issue #469): see [`earliest_origin`].
+    /// is unknown: see [`earliest_origin`].
     pub origin_lsn: Option<PgLsn>,
     /// GREATEST `lsn` over *every* row in the group, image-less rows
     /// included, so the watermark still covers them.
@@ -119,20 +119,20 @@ pub struct FoldedChange {
     /// would under-report depth and could mask a wave that should have
     /// tripped the bound — MAX is the conservative choice that cannot
     /// itself cause a missed-detection of infinite propagation. FLAG:
-    /// confirm this against #11/the hop-bound check once it exists.
+    /// confirm this against the hop-bound check once it exists.
     pub hop_gen: i32,
     /// `min(appended_at)` per key — the end-to-end latency origin, per-row
     /// rather than the batch's creation timestamp (see doc: an idle active
     /// batch's age is unbounded).
     pub first_seen: SystemTime,
     /// Whether any row in this group is a truncate sentinel (`bool_or(op =
-    /// 'truncate')`) — issue #60. In practice only the sentinel-key group
+    /// 'truncate')`). In practice only the sentinel-key group
     /// (see `append::TRUNCATE_SENTINEL_KEY`) is ever `true`: no real key's
     /// rows ever carry `op = 'truncate'`. `compute` (`staging::apply`) uses
     /// this to find, per drain, which `src_table`s were truncated, without
     /// filtering `op` anywhere upstream of this one flag.
     pub is_truncate: bool,
-    /// Issue #315: the FIRST (lowest `(lsn, change_id)`) prior image any of
+    /// The FIRST (lowest `(lsn, change_id)`) prior image any of
     /// the group's `recompute` rows carried — see
     /// `StagedChange::Recompute::prior_image`. Kept apart from `old_image`/
     /// `new_image`: a hinted recompute is still image-less (the fold's
@@ -143,7 +143,7 @@ pub struct FoldedChange {
     /// batch's writes, which is the group a downstream aggregate must also
     /// re-derive.
     pub prior_image: Option<String>,
-    /// Issue #409: how many ring rows folded into this record — `count(*)`
+    /// How many ring rows folded into this record — `count(*)`
     /// over the group, after the truncate-void filter (a row a later
     /// truncate voided was never applied, so it isn't counted). This is the
     /// unit `trellis_changes_applied_total` counts in: one change per staged
@@ -153,7 +153,7 @@ pub struct FoldedChange {
     /// least 1 for a record [`fold`] returns; [`merge_folded_changes`] sums
     /// it across segments.
     pub row_count: u64,
-    /// Issue #392: whether any row in this group is a `recompute`
+    /// Whether any row in this group is a `recompute`
     /// (`bool_or(op = 'recompute')`). A `recompute` never wins an image
     /// arg-extreme, so when it folds with the key's CDC change the record
     /// carries that change's images and looks like a plain delta. This flag
@@ -161,7 +161,7 @@ pub struct FoldedChange {
     /// record names rather than applying the delta, which would land on
     /// whatever stale value the recompute was staged to repair.
     pub has_recompute: bool,
-    /// Issue #620 (ADR-0002's fold rule under I8): whether the key's latest
+    /// ADR-0002's fold rule under I8: whether the key's latest
     /// row that speaks to its state, by `(lsn, change_id)`, is a `delete`.
     /// An image-less `delete` is such a row: it is the key's final state
     /// whatever precedes it, so it wins the `new_image` arg-extreme with a
@@ -174,26 +174,26 @@ pub struct FoldedChange {
     /// recompute. This is what tells the two apart, so the delete still
     /// ends the key across segments.
     pub ends_in_delete: bool,
-    /// #623 D3: the identity of the change that won the `new_image`
+    /// The identity of the change that won the `new_image`
     /// arg-extreme above (the latest image-bearing row or delete, by `(lsn,
     /// change_id)`), which is the change a ledger target applies. `None` when
     /// the record has no such row (only `recompute` rows), or that row has no
     /// `lsn`. A ledger target re-derives such a record instead of applying
     /// it (`super::ledger`).
     pub last_change: Option<LastChange>,
-    /// #1100: every ring row of the key that is a change (`insert`,
+    /// Every ring row of the key that is a change (`insert`,
     /// `update`, `delete`, `recompute`), unfolded, as one JSON object each
     /// ([`super::group_basis`]'s sides): its `row_txid` (`t`), `lsn` (`l`),
     /// `op`, `old_image` (`o`), `new_image` (`n`) and, when the capture set
     /// it, `transition_images` (`x`). A group-basis aggregate sums `f(new) −
-    /// f(old)` per row and never folds per key (#1043 F2), so it needs every
+    /// f(old)` per row and never folds per key, so it needs every
     /// row, not the fold's endpoints. A union across rows:
     /// [`merge_folded_changes`] concatenates it.
     pub group_sides: Vec<String>,
 }
 
-/// The change a [`FoldedChange`] applies to a ledger target (#623 D3,
-/// ADR-0002 I2): its `lsn`, and the source transaction that committed it.
+/// The change a [`FoldedChange`] applies to a ledger target (ADR-0002
+/// I2): its `lsn`, and the source transaction that committed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LastChange {
     /// The ring row's `lsn`: the trigger's `pg_current_wal_insert_lsn()`.
@@ -209,7 +209,7 @@ pub struct LastChange {
 /// images cast to text at the source (this crate has no `serde_json`
 /// dependency — see `append.rs`). `route` rides along so the bucket filter
 /// can be applied to the union of both slots' rows, not to one slot alone.
-/// `op` rides along too — issue #60's truncate-void filter and `is_truncate`
+/// `op` rides along too — the truncate-void filter and `is_truncate`
 /// both need it, even though the fold otherwise deliberately never filters
 /// on `op` (see the discriminator comment below).
 const FOLD_COLUMNS: &str = "src_table, key, old_image::text as old_image, \
@@ -224,8 +224,8 @@ const FOLD_COLUMNS: &str = "src_table, key, old_image::text as old_image, \
 /// SQL encodes.
 ///
 /// Takes a `&Transaction` rather than any `GenericClient` so `SET LOCAL
-/// work_mem` can't silently evaporate on a bare autocommit `Client`. Since
-/// issue #620 the drain runs it in its own read transaction, after the claim
+/// work_mem` can't silently evaporate on a bare autocommit `Client`. The
+/// drain runs it in its own read transaction, after the claim
 /// has committed: the fenced window is immutable, so nothing depends on the
 /// fold sharing the claim's snapshot.
 ///
@@ -242,8 +242,8 @@ pub async fn fold(
     fold_scoped(txn, seg_seq, &bucket, None).await
 }
 
-/// [`fold`] with a `limit`: at most `limit` records, in no particular order
-/// (issue #620). The direct fold's guard: a drain whose share should fit the
+/// [`fold`] with a `limit`: at most `limit` records, in no particular order.
+/// The direct fold's guard: a drain whose share should fit the
 /// cap by the seal's row count folds with `limit cap + 1`, and a full result
 /// means the estimate was wrong (it assumes routes spread evenly across
 /// buckets, and a share's routes can bunch), so the drain pages instead.
@@ -256,7 +256,7 @@ pub(crate) async fn fold_limited(
     fold_scoped(txn, seg_seq, bucket, Some(limit)).await
 }
 
-/// Where one key sorts in a bucket's page order (issue #620, ADR-0002 I8):
+/// Where one key sorts in a bucket's page order (ADR-0002 I8):
 /// `(route, src_table, key)`, compared byte-wise (`collate "C"`). `route` is
 /// the ring row's stored hash, which already defines buckets, so the sort
 /// leads with an integer; `key` breaks ties between keys that hash alike.
@@ -306,8 +306,8 @@ fn push_after<'a>(
     )
 }
 
-/// The session `TEMP` table a paged drain folds its share into (issue #620
-/// A2b). Always named with its `pg_temp.` qualifier when dropped or read, so
+/// The session `TEMP` table a paged drain folds its share into.
+/// Always named with its `pg_temp.` qualifier when dropped or read, so
 /// a Trellis table that happened to share the name could never be touched.
 /// One per session: a new group's materialize replaces the last one.
 const PAGE_TABLE: &str = "trellis_drain_page";
@@ -320,8 +320,7 @@ const FOLDED_COLUMNS: &str = "src_table, key, new_image, old_image, src_changed,
 
 /// Folds `bucket`'s share of `seg_seq`, from strictly after `after` (the
 /// start when `None`), into this session's [`PAGE_TABLE`], indexed on its
-/// page key so [`read_page`] walks it by keyset (issue #620 A2b, the design's
-/// Q2 (c)). Returns how many folded records it holds.
+/// page key so [`read_page`] walks it by keyset. Returns how many folded records it holds.
 ///
 /// One fold, as the direct path runs it, so the cost is linear in the share:
 /// one statement and one snapshot (I7), with no ring index and no WAL for the
@@ -372,7 +371,7 @@ pub(crate) async fn materialize_share(
     Ok(records)
 }
 
-/// Reads the next page of this session's [`PAGE_TABLE`] (issue #620 A2b): at
+/// Reads the next page of this session's [`PAGE_TABLE`]: at
 /// most `cap` folded records, in page-key order, strictly after `after`.
 /// Returns the records and the last page key they cover when more follow, or
 /// `None` when this page reaches the end of the materialized share. An index
@@ -481,7 +480,7 @@ fn folded_from_row(row: &tokio_postgres::Row) -> FoldedChange {
 /// The fold statement over `window_sql` (the fenced window, binding
 /// `$1..=$fence_param_count`), with the bucket count and bucket list bound
 /// as the next two parameters. `range` is appended to the `filtered` rows'
-/// predicate (a resume's `after` bound, issue #620; empty for the whole
+/// predicate (a resume's `after` bound; empty for the whole
 /// share), `extra` to the select list after [`FOLDED_COLUMNS`] (the page
 /// key's route when materializing; empty otherwise) and `tail` to the
 /// statement (a `limit`, or empty).
@@ -504,7 +503,7 @@ fn fold_sql(
     // images NULL) never wins either extreme. `op` is deliberately not
     // filtered anywhere here as a row-level WHERE — the `truncate` sentinel
     // is image-less but load-bearing, and filtering `op` would fold it away.
-    // Issue #315: a `recompute` row is never image-bearing, even when its
+    // A `recompute` row is never image-bearing, even when its
     // `old_image` column holds a prior-image hint (`StagedChange::Recompute::prior_image`);
     // that hint is aggregated separately into `prior_image`.
     //
@@ -515,7 +514,7 @@ fn fold_sql(
     // highest/lowest-ordered row, not an independently-sorted value.
     //
     // The one exception to "never filter on `op`" is the truncate-void
-    // filter below (issue #60): a truncate is whole-keyspace, but the fold
+    // filter below: a truncate is whole-keyspace, but the fold
     // is per-key, so a key's image-bearing row landing *at or below* a
     // truncate for its own `src_table` in this fenced window is stale — the
     // truncate erased whatever it recorded — and must not survive into the
@@ -545,7 +544,7 @@ fn fold_sql(
     // truncate-bearing batch seals with `bucket_count = 1` (see
     // `seal::seal_phase2`), making that moot today.
     //
-    // Issue #492: the anti-join reads `truncates`, a `materialized` CTE of
+    // The anti-join reads `truncates`, a `materialized` CTE of
     // just the batch's truncate rows (almost always none, at most a few),
     // rather than `fenced` itself. Against `fenced` directly, the planner
     // picked a nested-loop anti-join that rescanned all of `fenced` for
@@ -559,16 +558,16 @@ fn fold_sql(
     // same rescan of `fenced`. Whatever join it picks now, its inner side is
     // the handful of truncate rows.
     //
-    // Issue #392's `has_recompute` is a plain `bool_or`, adding no sort or
+    // `has_recompute` is a plain `bool_or`, adding no sort or
     // pass.
     //
-    // #622 C6: a `schema_changed` marker is no change to any key. The drain
+    // A `schema_changed` marker is no change to any key. The drain
     // acts on it before the fold (`staging::schema_change`), so `filtered`
     // leaves it out and no folded change ever carries its key. Nor is a
     // `node_truncate` marker (ADR-0017 P5): the seal queued its node's
     // correction from it.
     //
-    // Issue #620 (ADR-0002's fold rule under I8): an image-less `delete` is
+    // ADR-0002's fold rule under I8: an image-less `delete` is
     // the key's final state within the window, whatever precedes it. So the
     // post-image arg-extreme (`last`) ranks image-bearing rows *and* every
     // `delete`, and an image-less delete that is latest wins it with a NULL
@@ -584,7 +583,7 @@ fn fold_sql(
                      filter (where (old_image is not null or new_image is not null \
                                     or op = 'delete') \
                                and op <> 'recompute'))";
-    // #1100: a group-basis aggregate's unfolded rows (`FoldedChange::group_sides`).
+    // A group-basis aggregate's unfolded rows (`FoldedChange::group_sides`).
     let group_sides = {
         "array_agg(json_build_object('t', row_txid::text, 'l', lsn::text, 'op', op, \
                                      'o', old_image::json, 'n', new_image::json, \
@@ -634,8 +633,8 @@ fn fold_sql(
     )
 }
 
-/// Merges several segments' already-folded change lists — issue #63
-/// Milestone 2's segment-coalescing seam. Each element of `per_segment` is
+/// Merges several segments' already-folded change lists — the
+/// segment-coalescing seam. Each element of `per_segment` is
 /// one segment's own [`fold`] output, already unique per `(src_table,
 /// key)`; `per_segment` itself must be ordered **ascending by seg_seq**
 /// (oldest segment first), since [`merge_pair`] assumes its `earlier`
@@ -692,7 +691,7 @@ pub fn merge_folded_changes(per_segment: Vec<Vec<FoldedChange>>) -> Vec<FoldedCh
 ///   and among two `Some`s the greater watermark/timestamp wins, matching
 ///   "OR across the group" and "GREATEST over every row" respectively.
 /// - `origin_lsn`: the lesser of the two, where a missing side is unknown
-///   and wins ([`earliest_origin`], issue #469).
+///   and wins ([`earliest_origin`]).
 /// - `hop_gen`: 0 if the merged `src_changed` is `Some` (a source change
 ///   resets propagation depth), else the greater of the two hop generations.
 /// - `first_seen`: the earlier of the two — first append into either
@@ -705,9 +704,8 @@ pub fn merge_folded_changes(per_segment: Vec<Vec<FoldedChange>>) -> Vec<FoldedCh
 ///   assumed away, so a future caller that breaks that invariant fails
 ///   toward "still marked as a truncate" rather than toward silently
 ///   dropping one.
-/// - `row_count`: the sum — [`fold`]'s `count(*)` over both segments' rows
-///   (issue #409).
-/// - `has_recompute`: OR, as [`fold`]'s `bool_or` (issue #392).
+/// - `row_count`: the sum — [`fold`]'s `count(*)` over both segments' rows.
+/// - `has_recompute`: OR, as [`fold`]'s `bool_or`.
 fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
     let src_changed = earlier.src_changed.max(later.src_changed);
     let hop_gen = if src_changed.is_some() {
@@ -720,7 +718,7 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
     // set) wins its half; a side with neither set contributed no image
     // information at all (a bare recompute trigger folded alone), so it
     // defers entirely to the other side rather than overwriting real
-    // evidence with `None`. An image-less delete (issue #620) speaks to the
+    // evidence with `None`. An image-less delete speaks to the
     // post-image without carrying one, so it wins that half too: `later`
     // then folds to `new_image = None`, the key's final state.
     let earlier_has_image = earlier.old_image.is_some() || earlier.new_image.is_some();
@@ -744,7 +742,7 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
     } else {
         earlier.ends_in_delete
     };
-    // #623 D3: the change that supplied the post-image, by the same rule.
+    // The change that supplied the post-image, by the same rule.
     let last_change = if later_speaks {
         later.last_change.clone()
     } else {
@@ -781,7 +779,7 @@ fn merge_pair(earlier: FoldedChange, later: FoldedChange) -> FoldedChange {
 
 /// Merges two folded `origin_lsn`s the way [`fold`]'s SQL does: the earlier
 /// origin, where a missing one is *unknown*, not absent. `converged_through`
-/// reads an unknown origin as older than any token (issue #469), so a key
+/// reads an unknown origin as older than any token, so a key
 /// that folded any row without an origin, such as a backfill `Recompute`,
 /// must keep gating every token, not only those past its other rows' origin.
 pub(crate) fn earliest_origin(a: Option<PgLsn>, b: Option<PgLsn>) -> Option<PgLsn> {
@@ -878,7 +876,7 @@ mod merge_tests {
         assert_eq!(merged[0].old_image, Some(r#"{"v":1}"#.to_string()));
     }
 
-    /// Issue #620: a later segment whose only row for the key is an
+    /// A later segment whose only row for the key is an
     /// image-less delete folds to a record with no image, like a bare
     /// recompute, but it is the key's final state. The merge must end the
     /// key rather than defer to the earlier segment's post-image, and a
@@ -967,7 +965,7 @@ mod merge_tests {
     }
 
     /// `origin_lsn` takes the lesser of two known sides, and an unknown
-    /// (missing) side wins outright (issue #469): the key still carries a
+    /// (missing) side wins outright: the key still carries a
     /// change of unknown age, which gates every convergence token.
     #[test]
     fn origin_lsn_takes_the_lesser_side_and_an_unknown_side_wins() {
@@ -983,7 +981,7 @@ mod merge_tests {
         assert_eq!(merged[0].origin_lsn, None);
     }
 
-    /// Issue #392: a recompute in either segment marks the merged record.
+    /// A recompute in either segment marks the merged record.
     #[test]
     fn has_recompute_is_an_or_across_segments() {
         let mut update = base("1");
@@ -1020,7 +1018,7 @@ mod merge_tests {
         assert_eq!(merged[0].lsn, Some(PgLsn::from(3)));
     }
 
-    /// Issue #409: a merged record's `row_count` is the sum of every
+    /// A merged record's `row_count` is the sum of every
     /// contributing segment's, so `trellis_changes_applied_total` counts the
     /// same staged rows whether they sealed into one segment or several.
     #[test]
@@ -1073,7 +1071,7 @@ mod plan_tests {
     use crate::config::DEFAULT_SCHEMA;
     use crate::staging::seal;
 
-    /// Issue #492: the fold reads the fenced window a fixed number of times,
+    /// The fold reads the fenced window a fixed number of times,
     /// however large the batch. The truncate-void filter used to be a `not
     /// exists` over the whole `fenced` CTE, which Postgres planned as a
     /// nested-loop anti-join rescanning `fenced` once per row, so the fold
@@ -1196,7 +1194,7 @@ mod plan_tests {
         }
     }
 
-    /// Issue #620 A2b: a materialized share reads back in page-key order,
+    /// A materialized share reads back in page-key order,
     /// truncate sentinel first, each record exactly once, in pages of at most
     /// the cap; and the `TEMP` table's index serves a page read in page-key
     /// order as an index range scan, with no sort, so paging stays linear in
@@ -1333,12 +1331,12 @@ mod plan_tests {
         );
     }
 
-    /// Issue #620 A2b: keys that share a `route` are ordered by `(src_table,
+    /// Keys that share a `route` are ordered by `(src_table,
     /// key)` byte-wise, and the resume's `after` bound (in the materialize,
     /// over ring rows), the page read's `after` bound and its `order by`
     /// must all agree on that order. Each pair here collides on `route`, and
     /// the database's default collation (ICU `en-US`, every test cluster's
-    /// default since #667) orders it the other way round from `"C"`:
+    /// default) orders it the other way round from `"C"`:
     /// `'B6445' < 'a11890'` byte-wise, `'a11890' < 'B6445'` under `en-US`.
     /// Walking the share one key per page and re-materializing from every
     /// cursor, as a reclaim before each page would, must still see every key
@@ -1439,7 +1437,7 @@ mod plan_tests {
         assert_eq!(sorted_seen, sorted_keys, "every key exactly once: {seen:?}");
     }
 
-    /// Issue #581: a ring slot refilled after reclaim still carries
+    /// A ring slot refilled after reclaim still carries
     /// statistics that describe it empty, so the planner estimates the
     /// fenced window at one row whatever it holds. A fold that joined a
     /// per-key aggregate back to `filtered` on `(src_table, key)` would plan
@@ -1450,7 +1448,7 @@ mod plan_tests {
     /// Asserts on the plan shape rather than timing: whatever the statistics
     /// say, the fold must contain no join over the keys. The one nested loop
     /// it may plan is the truncate-void anti-join, whose inner side is the
-    /// materialized handful of truncate rows (#492), besides those inside a
+    /// materialized handful of truncate rows, besides those inside a
     /// per-group subplan, which reads only its own group's aggregates.
     #[tokio::test]
     async fn a_refilled_slot_with_stale_statistics_plans_no_nested_loop_over_keys() {

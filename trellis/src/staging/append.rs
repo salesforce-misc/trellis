@@ -9,7 +9,7 @@
 //! `old_image`/`new_image`; [`StagedChange::Recompute`] — the shape the
 //! non-CDC producers use — carries neither, because it isn't a
 //! change, it's an instruction ("recompute this key") that the fold (stage
-//! 04) must not confuse with one. [`StagedChange::Truncate`] (issue #60) is
+//! 04) must not confuse with one. [`StagedChange::Truncate`] is
 //! a third, distinct shape: key-less and image-less, one row per truncated
 //! `src_table`, carrying only the commit position a whole-keyspace clear
 //! happened at.
@@ -21,8 +21,8 @@ use tokio_postgres::{GenericClient, Transaction};
 
 use super::error::StagingError;
 
-/// Number of ring slots. Fixed at 4 for now (issue #6 asks whether it should
-/// be operator-tunable); `seg_0..seg_3` are the only place the count is
+/// Number of ring slots. Fixed at 4 for now (not
+/// operator-tunable); `seg_0..seg_3` are the only place the count is
 /// spelled out.
 pub const RING_SIZE: i16 = 4;
 
@@ -59,12 +59,11 @@ impl CdcOp {
 /// encoding at all: it is one fixed literal, compared (and grouped by the fold)
 /// as an opaque whole string, not split back into parts.
 ///
-/// This is a *different* question from the one issue #200 closed in
-/// `defs::ddl` (a real, in-value U+001F no longer misparses as a field
-/// boundary, because a multi-column key now escapes one and a single-column
-/// key is never split at all). Neither half of that fix narrows this
-/// sentinel, which collides with any key whose text happens to *equal* this
-/// exact literal — two ways, both pre-existing and both unchanged by #200:
+/// This is a *different* question from a real, in-value U+001F misparsing as
+/// a field boundary (`defs::ddl` escapes one in a multi-column key, and a
+/// single-column key is never split at all). That escaping does not narrow
+/// this sentinel, which collides with any key whose text happens to *equal*
+/// this exact literal, in two ways:
 /// a single-column key whose own value literally spells
 /// `"\u{1f}trellis-truncate-sentinel"` (arity-1 keys are deliberately
 /// verbatim, see `defs::ddl::push_escaped_composite_key_part`'s "why arity 1
@@ -77,7 +76,7 @@ impl CdcOp {
 /// fixed, greppable literal, which is judged not worth it here.
 pub const TRUNCATE_SENTINEL_KEY: &str = "\u{1f}trellis-truncate-sentinel";
 
-/// The ring key of a capture function's `schema_changed` marker (#622 C6):
+/// The ring key of a capture function's `schema_changed` marker:
 /// a row a capture trigger writes, in place of or ahead of its images, when a
 /// column it images has been renamed or dropped. Key-less like
 /// [`TRUNCATE_SENTINEL_KEY`], and with the same collision caveat. Its
@@ -107,9 +106,9 @@ pub const NODE_TRUNCATE_SENTINEL_KEY: &str = "\u{1f}trellis-node-truncate";
 pub enum StagedChange {
     /// A capture trigger's shape: an image-bearing change. The
     /// target-mutation seam stages this shape too, for a target it feeds
-    /// images for (issue #402, `staging::target_mutations`): `lsn` is
+    /// images for (`staging::target_mutations`): `lsn` is
     /// then the writer's pre-commit write token, and `origin_lsn` is the
-    /// origin of the change that produced the write (issue #469; see
+    /// origin of the change that produced the write (see
     /// [`StagedChange::Recompute::origin_lsn`]). A capture trigger stamps
     /// both with `pg_current_wal_insert_lsn()`.
     Cdc {
@@ -128,7 +127,7 @@ pub enum StagedChange {
     /// trigger. It asserts nothing about the row's state — only "recompute
     /// this key."
     ///
-    /// `src_changed` (added for issues #51/#52's multi-hop gap) is the
+    /// `src_changed` (for multi-hop propagation) is the
     /// timestamp of the real source commit this recompute traces back to,
     /// when one is known — `Some` for forward propagation and quarantine
     /// replay (both of which inherit it from the triggering
@@ -137,15 +136,15 @@ pub enum StagedChange {
     /// automatically-propagated hop-to-hop chain (transform A's output
     /// feeding transform B as B's input, entirely through `Recompute` rows)
     /// would carry no origin at all past the first hop, leaving both the
-    /// per-transform latency histogram (#51) and the end-to-end latency
-    /// histogram (#52) unable to observe anything for it — exactly the gap
+    /// per-transform latency histogram and the end-to-end latency
+    /// histogram unable to observe anything for it — exactly the gap
     /// this field closes.
     Recompute {
         src_table: String,
         key: String,
         hop_gen: i32,
         src_changed: Option<SystemTime>,
-        /// Issue #315: the key's row image as it stood before the write that
+        /// The key's row image as it stood before the write that
         /// staged this recompute, when the producer knows it — only
         /// `staging::target_mutations` sets it, for a key it changed in a
         /// target table. It is a hint, not a delta: the recompute still
@@ -155,7 +154,7 @@ pub enum StagedChange {
         /// `old_image` column under `op = 'recompute'`, which the fold keeps
         /// apart from real images (`FoldedChange::prior_image`).
         prior_image: Option<String>,
-        /// The source commit this recompute traces back to (issue #469),
+        /// The source commit this recompute traces back to,
         /// carried forward from the triggering change exactly as
         /// `src_changed` is, so `converged_through` gates it only for tokens
         /// at or past that commit. `None` means unknown, which gates every
@@ -163,7 +162,7 @@ pub enum StagedChange {
         /// commit behind it.
         origin_lsn: Option<PgLsn>,
     },
-    /// A source `TRUNCATE` of `src_table` (issue #60): one row per truncated
+    /// A source `TRUNCATE` of `src_table`: one row per truncated
     /// relation, key-less (see [`TRUNCATE_SENTINEL_KEY`]) and image-less —
     /// it asserts nothing about any one row's state, only "every row this
     /// source ever produced is gone as of this position." A truncate always
@@ -173,7 +172,7 @@ pub enum StagedChange {
     ///
     /// `lsn` is required, as the trigger always stamps one: the truncate's
     /// drain raises its targets' truncate floor to it (ADR-0002 I2), and a
-    /// truncate with none would raise no floor (#774).
+    /// truncate with none would raise no floor.
     #[cfg(any(test, feature = "internals"))]
     Truncate {
         src_table: String,
@@ -275,8 +274,7 @@ pub(crate) fn ring_table_name(ring_slot: i16) -> Result<&'static str, StagingErr
     }
 }
 
-/// Resolves the ring slot a writer appends into (issue #595;
-/// docs/staging-and-claiming/03-sealing-and-the-fence.md, "The two-phase
+/// Resolves the ring slot a writer appends into (docs/staging-and-claiming/03-sealing-and-the-fence.md, "The two-phase
 /// seal"). Every ring writer resolves its slot here, never from
 /// `segment_pointer`. Two things make the read safe for the fence, and both
 /// are in this one statement:

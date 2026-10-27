@@ -1,4 +1,4 @@
-//! Bounded drain paging (issue #620, epic #556 milestone A2). See
+//! Bounded drain paging. See
 //! docs/staging-and-claiming/04-claiming-and-the-fold.md, "Paging a share
 //! larger than the cap".
 //!
@@ -31,7 +31,7 @@ pub(crate) struct Page {
     pub next: Option<PageKey>,
 }
 
-/// Where an oversized share's pages come from (issue #620 A2b): the share is
+/// Where an oversized share's pages come from: the share is
 /// folded once into a session `TEMP` table ([`fold::materialize_share`]),
 /// then read back a page at a time by keyset ([`fold::read_page`]). Linear in
 /// the share, where A2a's rescan pager re-scanned the fenced window for every
@@ -124,7 +124,7 @@ pub(crate) async fn read_cursors(
         .collect())
 }
 
-/// The ring rows a Phase 3 transaction applies itself (issue #762): every
+/// The ring rows a Phase 3 transaction applies itself: every
 /// row of its claimed buckets up to the page it is applying. They are
 /// committed with the transaction's own drain-state update, so to anyone
 /// reading after it they are applied, and to the transaction itself they
@@ -215,7 +215,7 @@ pub(crate) fn ring_slot_applied_sql(slot: i16) -> String {
     )
 }
 
-/// SQL, over ring row `r` of ring slot `slot` (issue #762): true while `r`'s
+/// SQL, over ring row `r` of ring slot `slot`: true while `r`'s
 /// change is still pending, that is, no committed drain has applied it, and
 /// `claim`, when given, is not applying it now.
 ///
@@ -338,7 +338,7 @@ mod tests {
         }
     }
 
-    /// Issue #762: a ring row is pending exactly until drain state says its
+    /// A ring row is pending exactly until drain state says its
     /// bucket applied it: its segment's `drained_mask` bit, or its bucket's
     /// cursor at or past its page key. A late writer's row belongs to the
     /// next segment, and the transaction applying a row counts it applied.

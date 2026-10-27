@@ -22,7 +22,7 @@ pub(super) fn apply_predicate() -> String {
 }
 
 /// The plan settings of a statement that reads or writes a ledger by its
-/// entries' keys (#778): no sequential scan, so the ledger is reached
+/// entries' keys: no sequential scan, so the ledger is reached
 /// through its key's index, and the statement costs the keys it is given
 /// rather than the ledger's size. [`ENTRY_PLAN_RESET`] puts them back after
 /// the statement. They pin the entry lock ([`lock_statement`]) and a 1-1
@@ -39,7 +39,7 @@ pub(super) fn apply_predicate() -> String {
 /// small: the lock as a sequential scan and a sort, and the entry update as
 /// a hash join of the page's records to a sequential scan of the ledger.
 /// The paged benchmark spent 200–345 ms a page on that scan, at up to
-/// 1.15M entries, until `autoanalyze` caught up (#775).
+/// 1.15M entries, until `autoanalyze` caught up.
 ///
 /// The setting alone isn't enough for a join. With sequential scans off,
 /// the planner hashed a scan of the ledger's whole key index instead. So
@@ -80,7 +80,7 @@ pub(super) fn lock_statement(ledger: &str) -> String {
 }
 
 /// Whether a page whose lowest segment is `first_seg` may hold a change
-/// committed before `target`'s Re-derive build started (#733): its batch
+/// committed before `target`'s Re-derive build started: its batch
 /// is at or below the target's `build_seg` (`super::build`'s start). Such a
 /// page re-derives every key it holds for the target rather than applying
 /// their changes (`super::apply`'s `settle_one_to_one_target`).

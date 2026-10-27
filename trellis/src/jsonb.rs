@@ -1,4 +1,4 @@
-//! Postgres's `jsonb` type (issue #115) — the typed-literal ("computed 1-1
+//! Postgres's `jsonb` type — the typed-literal ("computed 1-1
 //! target") canonical-form checker, and the shared evidence the `jsonb_agg`
 //! aggregate role and the join/primary/`GROUP BY` key roles are decided
 //! against.
@@ -7,12 +7,12 @@
 //!
 //! Same reasoning as [`crate::temporal`]/[`crate::netaddr`]'s module docs:
 //! every role this issue grants stays a function of the family alone, which
-//! [`PgType::Jsonb`] already carries (since issue #108), so it stays
+//! [`PgType::Jsonb`] already carries, so it stays
 //! `ValueType::Other(PgType::Jsonb)`.
 //!
 //! # `pg_cast`: no second renderer, unlike `boolean`/`inet`
 //!
-//! Per #119's playbook, checked live rather than assumed:
+//! Checked live rather than assumed:
 //!
 //! ```sql
 //! select castfunc::regproc from pg_cast
@@ -72,7 +72,7 @@
 //! and `jsonb_out` only does the first. This is why `jsonb` is **not**
 //! added to `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` or admitted by
 //! `validate::reject_unsupported_group_by_key_type` — the unlock is the
-//! same #110 typed key index every other numeric-bearing family
+//! same typed key index every other numeric-bearing family
 //! (`numeric`/`real`/`double precision`/`timestamptz`) is waiting on, not a
 //! new mechanism jsonb-specific.
 //!

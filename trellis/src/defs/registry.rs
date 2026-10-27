@@ -1,10 +1,10 @@
 //! The function/operator registry ADR-0004 requires: the grammar's accepted
 //! operators and functions must equal the evaluator's re-implemented set
-//! (issue #24 consumes this list too), so it lives as a plain, reusable
+//! (the evaluator consumes this list too), so it lives as a plain, reusable
 //! table rather than being baked into the parser's control flow.
 //!
-//! Issue #64 adds the first four functions (`strpos`, `octet_length`,
-//! `char_length`, `regexp_count`), each carrying its arity and argument/
+//! The text functions (`strpos`, `octet_length`, `char_length`,
+//! `regexp_count`) each carry their arity and argument/
 //! return [`ValueType`]s so the parser, validator, and evaluator all read
 //! the same source of truth rather than each hardcoding a function's shape.
 
@@ -21,7 +21,7 @@ pub struct OperatorSpec {
     /// The operator's **canonical** operand types — the signature named in a
     /// [`super::validate::ValidationError::TypeMismatch`].
     ///
-    /// Since issue #111 this is *not* the admissibility test: exact integers
+    /// This is *not* the admissibility test: exact integers
     /// have their own [`ValueType`], so each operator covers a family of
     /// Postgres operators rather than one signature, and
     /// [`operator_result_type`] is what decides both whether a pair of
@@ -56,7 +56,7 @@ pub mod precedence {
 
 /// The full set of operators this grammar/evaluator pairing supports.
 ///
-/// # Precedence table (issue #67)
+/// # Precedence table
 ///
 /// [`super::parser`] parses binary operators with a real precedence-climbing
 /// loop keyed off each [`OperatorSpec::precedence`] here, so `a OP1 b OP2 c`
@@ -113,7 +113,7 @@ pub fn operator_spec(operator: Operator) -> &'static OperatorSpec {
 /// The result type of `op` applied to operands of `lhs`/`rhs` type, or
 /// `None` if Postgres has no such operator — the **overload-resolution**
 /// replacement for the old "compare both operands to [`OperatorSpec::arg_types`]
-/// for exact equality" check (issue #111).
+/// for exact equality" check.
 ///
 /// Exact equality was sufficient while every arithmetic/comparison operand
 /// was the single [`ValueType::Numeric`] bucket. It stops being sufficient
@@ -146,7 +146,7 @@ pub fn operator_spec(operator: Operator) -> &'static OperatorSpec {
 /// to: if the two disagreed, the target column's declared type and the value
 /// written into it would disagree too.
 ///
-/// The float rows (issue #112) look asymmetric and are not: Postgres has
+/// The float rows look asymmetric and are not: Postgres has
 /// `float4pl`/`float8pl`/`float48pl`/`float84pl` and nothing else, so *any*
 /// mix of a float with a non-float resolves by casting **both** operands to
 /// `double precision`. Verified against a live server rather than reasoned
@@ -196,7 +196,7 @@ pub fn is_mixed_float_exact(lhs: ValueType, rhs: ValueType) -> bool {
 }
 
 /// One function the grammar accepts, and the arity/types the parser and
-/// validator check a call against (issue #64).
+/// validator check a call against.
 #[derive(Debug, Clone, Copy)]
 pub struct FunctionSpec {
     /// Canonical uppercased name, matched against the parser's uppercased
@@ -214,8 +214,7 @@ pub struct FunctionSpec {
 ///
 /// All four return Postgres `integer` (`int4`), not `numeric` — checked
 /// against `pg_proc.prorettype` for `strpos`/`octet_length`/`char_length`/
-/// `regexp_count`. They were declared `Numeric` only because, before issue
-/// #111, [`ValueType`] had no way to say "integer"; saying it now is what
+/// `regexp_count`. Declaring them as [`ValueType`] integers is what
 /// makes `char_length(t) + 1` type — and overflow — the way Postgres does,
 /// and what declares the derived column `integer` rather than `numeric`.
 pub const FUNCTIONS: &[FunctionSpec] = &[
@@ -267,7 +266,7 @@ pub const AGGREGATE_FUNCTIONS: &[&str] = &[
 /// The aggregate functions the grammar parses, each entry's `arg_types`
 /// length its arity, which [`super::parser`] enforces. `COUNT`, `SUM` and
 /// `AVG` are the ones an [`super::ast::KeySpace::Aggregate`] or `JOIN`
-/// definition keeps (#1096 decision 1); every other name is parsed only so
+/// definition keeps; every other name is parsed only so
 /// the validator can refuse it by family
 /// (`validate::check_aggregate_admitted`), and its declared types are a
 /// placeholder. Which argument types `SUM` and `AVG` accept, and what they
@@ -275,8 +274,8 @@ pub const AGGREGATE_FUNCTIONS: &[&str] = &[
 ///
 /// `COUNT` is the one entry whose arity isn't read from here. Its
 /// `arg_types` is empty, and [`super::parser`] special-cases both forms:
-/// `COUNT(*)` counts rows (issue #75) and `COUNT(<expr>)` counts non-null
-/// values of any argument type (issue #120). It is `bigint`, as Postgres
+/// `COUNT(*)` counts rows and `COUNT(<expr>)` counts non-null
+/// values of any argument type. It is `bigint`, as Postgres
 /// types `count(*)`.
 pub const AGGREGATE_FUNCTION_SPECS: &[FunctionSpec] = &[
     FunctionSpec {
@@ -350,7 +349,7 @@ pub fn lookup_aggregate_function(name: &str) -> Option<&'static FunctionSpec> {
 }
 
 /// The result type of aggregate `name` over an argument of type `arg` —
-/// [`operator_result_type`]'s aggregate twin (issue #111), and for the same
+/// [`operator_result_type`]'s aggregate twin, and for the same
 /// reason: once exact integers are their own type, an aggregate's result
 /// type is a *function of its argument's* type in Postgres, not a constant.
 /// `None` for an argument type the aggregate doesn't accept.
@@ -366,7 +365,7 @@ pub fn lookup_aggregate_function(name: &str) -> Option<&'static FunctionSpec> {
 /// * `avg(<any exact integer>)` returns `numeric`; the average of integers
 ///   is not an integer.
 ///
-/// Issue #112 adds the float rows, and they are *not* the integer rows'
+/// The float rows are *not* the integer rows'
 /// shape — Postgres does not widen a float sum, because a binary float's
 /// exponent range already covers what widening would buy:
 ///
@@ -385,9 +384,9 @@ pub fn lookup_aggregate_function(name: &str) -> Option<&'static FunctionSpec> {
 /// `COUNT(*)` row-counting in this grammar — type-agnostic by construction,
 /// which is why `docs/type-support.md` omits it from every per-type
 /// aggregate cell. Postgres types `count(*)` as `bigint`; aligning that is
-/// orthogonal to this issue's exact-integer split (it would change a derived
+/// orthogonal to the exact-integer split (it would change a derived
 /// column's type for definitions that reference no integer at all) and is
-/// left to #120.
+/// not done here.
 pub fn aggregate_result_type(name: &str, arg: ValueType) -> Option<ValueType> {
     // A float or `interval` sum is typed so a definition reaches its family
     // refusal (`validate::check_aggregate_admitted`, #1119) rather than a

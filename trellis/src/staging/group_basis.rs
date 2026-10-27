@@ -1,10 +1,10 @@
-//! Aggregate targets on the group basis (#1100 G2a, ADR-0002 "Aggregates: a
+//! Aggregate targets on the group basis (ADR-0002 "Aggregates: a
 //! basis per group, kept by deltas").
 //!
 //! # Which definitions take it
 //!
 //! The group basis keeps every aggregate definition: define refuses an
-//! aggregate outside #1096 decision 1's admitted set by family
+//! aggregate outside the admitted set by family
 //! (`defs::validate::validate_aggregate_admitted`), so [`route`] takes every
 //! aggregate define accepts. A definition [`route`] takes:
 //!
@@ -20,8 +20,8 @@
 //!   `run_group_rebuild`).
 //!
 //! Over a partitioned source, its partition maintenance is corrected by
-//! recomputing the groups that route to the node (#1103,
-//! [`recompute_routed`], `super::partition_correction`'s "On the group
+//! recomputing the groups that route to the node
+//! ([`recompute_routed`], `super::partition_correction`'s "On the group
 //! basis").
 //!
 //! # A source that is another definition's target
@@ -43,12 +43,12 @@
 //! build that is a fresh build or a resume parks it too, though it writes
 //! through the seam: a resume empties the partials and keeps the target, so
 //! the prior images of the seam rows it and its pages stage match no row the
-//! readers hold, and the readers' rebuilds overwrite what they did (#1287).
+//! readers hold, and the readers' rebuilds overwrite what they did.
 //!
 //! # Which definitions
 //!
-//! A plain aggregate (every `GROUP BY` key a source column) whose every value field composes the admitted aggregates of #1096
-//! decision 1 (`COUNT(*)`, `COUNT(x)`, and `SUM`/`AVG` over an integer
+//! A plain aggregate (every `GROUP BY` key a source column) whose every value field composes the admitted aggregates
+//! (`COUNT(*)`, `COUNT(x)`, and `SUM`/`AVG` over an integer
 //! argument or a `numeric` column) with literals, operators, functions and
 //! its `GROUP BY` keys. An argument may be an expression over the row
 //! (`SUM(a + b)`); a `numeric` one must be a column, whose declared scale
@@ -57,7 +57,7 @@
 //! # Where its state lives
 //!
 //! The visible target is a plain table holding exactly the declared columns
-//! and the `UNIQUE NULLS NOT DISTINCT` group identity (#1096 decision 7). The
+//! and the `UNIQUE NULLS NOT DISTINCT` group identity. The
 //! group's partials, its basis and its stamp live in a hidden table in the
 //! instance's catalog schema, named by definition id ([`hidden_table_name`],
 //! `agg_<id>`, beside a `JOIN`'s `join_<id>_*` tables): the row count
@@ -71,7 +71,7 @@
 //!
 //! A group whose partials are all zero (`__zero`, a stored generated
 //! column) has no visible row, but its hidden row can still matter (ADR-0002
-//! R4): an absolute write (a build's or a recompute's, #1101/#1102) sets
+//! R4): an absolute write (a build's or a recompute's) sets
 //! its basis, and a change that basis saw but a page hasn't drained yet must
 //! still be refused. A fresh row has no basis and would apply it twice. So
 //! the absolute write also sets the stamp, the newest segment holding a
@@ -110,7 +110,7 @@
 //! since, at zero. Nothing reads `T` to compute a delta, and `self_check`
 //! counts a group `T` lacks as zeros.
 //!
-//! Zero groups left in place aren't free: #1043's JOIN model ran 16x slower
+//! Zero groups left in place aren't free: a JOIN model measured 16x slower
 //! with thousands of them on a few hot keys, and a definition whose groups
 //! churn (a `GROUP BY` over a session id, say) would grow its hidden table
 //! without bound.
@@ -119,7 +119,7 @@
 //!
 //! 1. **Stage** (in [`lock_groups`]): one statement splits each ring row
 //!    into sides (its old image negated and its new image, or its
-//!    transition images, #1099), evaluates the group and each argument on
+//!    transition images), evaluates the group and each argument on
 //!    each, and sums them per (group, `row_txid`, statement) into a session
 //!    temporary table. It reads no basis, so this work, most of a page's,
 //!    happens before any group is locked.
@@ -144,7 +144,7 @@
 //!    so its cost under the groups' locks is the page's groups, not the
 //!    definition's.
 //!
-//! # Image-less changes, releases and truncates (#1102)
+//! # Image-less changes, releases and truncates
 //!
 //! An image-less change (a `Recompute`: a release of a key, or a marker's
 //! re-read) has no sides. The
@@ -166,7 +166,7 @@
 //! drain barrier orders that page after every page of earlier segments and
 //! before every page of later ones (R9).
 //!
-//! # A build or rebuild ([`rebuild`], #1101)
+//! # A build or rebuild ([`rebuild`])
 //!
 //! A build or rebuild recomputes every group in place, as one absolute write
 //! per source (a fresh build starts from an empty hidden table, and its
@@ -180,7 +180,7 @@
 //! rebuild is alone), and a fresh build's is its plan job, after the plan's
 //! fence for a source that is another definition's target.
 //!
-//! Sides are never folded per key (#1043 F2): the fold's first old and last
+//! Sides are never folded per key: the fold's first old and last
 //! new image are wrong when a group's basis falls between two of a key's
 //! changes. So each folded change carries its key's ring rows
 //! (`super::fold::FoldedChange::group_sides`).
@@ -377,7 +377,7 @@ pub(super) fn rewrite(
                         ValueType::Integer(IntWidth::Int8) => "numeric",
                         // A `numeric` argument only as a column, whose
                         // declared scale define checks: an expression's
-                        // `numeric` result has none (#1096 decision 2).
+                        // `numeric` result has none.
                         ValueType::Numeric => match arg {
                             Expr::Column(column) | Expr::SourceColumn { column, .. } => {
                                 if !shape.numeric_args.contains(column) {
@@ -822,7 +822,7 @@ impl GroupTargetPlan {
                 self.unsupported("a page folded without the unfolded ring rows its change needs")
             );
         }
-        // Planted bug (#1114): fold the key's ring rows into one side. See
+        // Planted bug: fold the key's ring rows into one side. See
         // `crate::plant`.
         #[cfg(any(test, feature = "test-util"))]
         if let Some(folded) = planted_fold(&change.group_sides)
@@ -972,7 +972,7 @@ impl GroupTargetPlan {
     /// equal, so it matches exactly the groups `GROUP BY` forms, and,
     /// unlike `is not distinct from`, it can be hashed or merged: a join of
     /// two group sets on it is a hash or merge join, not a nested loop
-    /// rescanning one set per row of the other (#1318). Both sides must hold
+    /// rescanning one set per row of the other. Both sides must hold
     /// each column at the same type (the hidden table's, as
     /// [`Self::group_values`] reads a source): unlike `is not distinct
     /// from`, array equality coerces no element type.
@@ -1424,7 +1424,7 @@ impl GroupTargetPlan {
         let matched = self.group_match("sg", "b");
         #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_mut))]
         let mut unseen = "not pg_visible_in_snapshot(sg.__txid, b.__basis)";
-        // Planted bug (#1114): order the change against the basis instead of
+        // Planted bug: order the change against the basis instead of
         // asking whether the basis saw it. See `crate::plant`.
         #[cfg(any(test, feature = "test-util"))]
         if crate::plant::armed() == Some(crate::plant::Plant::GbLsnNotVisibility) {
@@ -1677,8 +1677,8 @@ impl GroupTargetPlan {
         )
     }
 
-    /// A `JOIN` build's snapshot statement for one side ([`write_join_build_cells`],
-    /// #1097's rule 4): after every lock statement of the build, one `GROUP
+    /// A `JOIN` build's snapshot statement for one side ([`write_join_build_cells`]):
+    /// after every lock statement of the build, one `GROUP
     /// BY` of `node` (the side's table or leaf, quoted and qualified) into
     /// `grouped` (a session temp table, quoted and `pg_temp.`-qualified,
     /// dropped at commit), with one more row (`__meta`) holding the
@@ -1721,8 +1721,8 @@ impl GroupTargetPlan {
         )
     }
 
-    /// A `JOIN` build's write of one side's cells ([`write_join_build_cells`],
-    /// #1097's rules 5 and 6), after [`Self::join_group_sql`] filled
+    /// A `JOIN` build's write of one side's cells ([`write_join_build_cells`]),
+    /// after [`Self::join_group_sql`] filled
     /// `grouped`: over the cells of [`Self::recomputed`], whose keys the
     /// build holds under `J` and whose `NULL`-key cells it has locked, writes
     /// each cell's partials once from `grouped`: an update of a cell the
@@ -1745,7 +1745,7 @@ impl GroupTargetPlan {
     /// the guess, its anti-join's hash table split into as many batches as
     /// the guessed rows called for, and a build over a hidden table that
     /// already holds its cells (a rebuild, a resume) ran for minutes, or
-    /// hours at 100M rows, on the batches alone (#1346).
+    /// hours at 100M rows, on the batches alone.
     ///
     /// A keyed cell is held by `J`, not by a row lock, so the zero-cell
     /// collection (`super::retire`), which takes no `J` lock, may delete one
@@ -2463,7 +2463,7 @@ pub(crate) async fn lock_groups(
 ) -> Result<(), ApplyError> {
     stage_sides(txn, plan).await?;
     name_groups(txn, plan, &[], &plan.recompute_keys).await?;
-    // Planted bug (#1114): lock none of the groups that exist. See
+    // Planted bug: lock none of the groups that exist. See
     // `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
     if crate::plant::fires(
@@ -2541,7 +2541,7 @@ pub(crate) async fn apply_locked_groups(
     plan: &GroupTargetPlan,
     mutations: &mut TargetMutations,
 ) -> Result<(Vec<AppliedGroup>, usize, usize), ApplyError> {
-    // Planted bug (#1114): count the pages whose basis test the plant
+    // Planted bug: count the pages whose basis test the plant
     // changes. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
     if crate::plant::armed() == Some(crate::plant::Plant::GbLsnNotVisibility) {
@@ -2642,7 +2642,7 @@ pub(super) async fn restore_settings(
 /// commit), which becomes the plan's [`GroupTargetPlan::recomputed`]. A
 /// `create … as select`, so the read of the table runs in parallel where
 /// Postgres can. With a `scope` (one leaf of a partitioned side, or its
-/// remainder, #1286) only the cells the scope routes to the structure.
+/// remainder) only the cells the scope routes to the structure.
 /// Reads without a lock.
 pub(super) async fn enumerate_cells(
     txn: &Transaction<'_>,
@@ -2715,7 +2715,7 @@ pub(super) async fn apply_join_build_groups(
 /// so the recompute's snapshot sees them, and its basis refuses them from
 /// then on.
 ///
-/// A group-basis definition has no build chunks (#1101: its build is one
+/// A group-basis definition has no build chunks (its build is one
 /// absolute write), so the recompute counts every source row of its groups.
 pub(crate) async fn recompute_locked_groups(
     txn: &Transaction<'_>,
@@ -2816,7 +2816,7 @@ pub(super) async fn analyze(txn: &Transaction<'_>, tables: &[&str]) -> Result<()
     Ok(())
 }
 
-/// A release's recompute on a group-basis target (#1102 decision 1): every
+/// A release's recompute on a group-basis target: every
 /// group the held key could owe (R8), each named by an object of its group
 /// columns in `groups` (the held row's `agg_groups`: the groups of the old
 /// and new images of every change skipped while the key was held, the
@@ -2877,8 +2877,8 @@ async fn plan_of(
     )))
 }
 
-/// A partition correction's recompute on a group-basis target (#1103,
-/// `super::partition_correction`): every group of `groups` (objects of the
+/// A partition correction's recompute on a group-basis target
+/// (`super::partition_correction`): every group of `groups` (objects of the
 /// group columns: the groups that route to the node, `super::partition_correction`
 /// enumerates them) locked in one sorted statement and recomputed in the
 /// next from a `GROUP BY` of its source rows, with the statement's snapshot
@@ -2929,7 +2929,7 @@ pub(crate) async fn release(
     Ok(true)
 }
 
-/// One structure of a partitioned source's rebuild (#1101): a leaf of the
+/// One structure of a partitioned source's rebuild: a leaf of the
 /// recorded tree, or the remainder, the groups that route to no leaf. Every
 /// group key holds every partition-key column (ADR-0017), so a group routes
 /// to exactly one leaf and the structures cover disjoint sets of groups. The
@@ -2975,7 +2975,7 @@ enum RebuildRead {
 }
 
 /// A build or rebuild of a group-basis target (ADR-0002, "An aggregate's
-/// build is one absolute write per structure"; #1101's decision), in the
+/// build is one absolute write per structure"), in the
 /// caller's `READ COMMITTED` transaction, which
 /// commits it: one absolute write of every group, in three statements.
 ///
@@ -3017,7 +3017,7 @@ pub(crate) async fn rebuild(
     } else {
         None
     };
-    // Planted bug (#1114): read the source and take the basis before the
+    // Planted bug: read the source and take the basis before the
     // groups are locked. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
     let early = if crate::plant::fires(
@@ -3178,7 +3178,7 @@ pub(crate) async fn apply_group_target(
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
     lock_groups(txn, plan).await?;
-    // Test-only pause point (#623 D1): between the lock and the read of the
+    // Test-only pause point: between the lock and the read of the
     // bases. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
@@ -3294,8 +3294,8 @@ pub async fn explain_apply(pool: &crate::pool::Pool, target: &str) -> Result<Str
 /// rebuild) and [`GroupTargetPlan::rebuild_sql`]'s source read (a plain
 /// aggregate's), for `target`'s group-basis definition, each read from the
 /// whole source. Planned with nested loops disabled, so a nested loop that
-/// matches the groups shows only where the match can't be hashed or merged
-/// (#1318); the lateral lookups of the hidden rows stay nested loops. It
+/// matches the groups shows only where the match can't be hashed or merged;
+/// the lateral lookups of the hidden rows stay nested loops. It
 /// locks and writes nothing.
 #[cfg(any(test, feature = "internals"))]
 pub async fn explain_whole_source_reads(
@@ -3632,7 +3632,7 @@ mod tests {
     /// cells there are. A correlated subplan there rescans the update's rows
     /// once per cell, and a hash table sized for the match's guessed rows
     /// (Postgres has no statistics for its arrays) loops over its batches:
-    /// either way a 100M-row rebuild ran for hours (#1346).
+    /// either way a 100M-row rebuild ran for hours.
     #[tokio::test]
     async fn a_join_build_write_over_held_cells_hashes_every_match() {
         let cluster = testkit::TestCluster::start();
@@ -3718,7 +3718,7 @@ mod tests {
     /// staged group has no hidden row (a writer that skipped
     /// [`GroupTargetPlan::lock_sql`], which inserts the missing rows) fails
     /// with [`ApplyError::GroupLockGap`], and rolls nothing in; the same
-    /// writer after the lock applies (#1362).
+    /// writer after the lock applies.
     #[tokio::test]
     async fn a_join_t_write_of_a_group_with_no_hidden_row_is_an_error() {
         let cluster = testkit::TestCluster::start();
@@ -3830,7 +3830,7 @@ mod tests {
     /// shape (a counted-only argument next to a summed one), with one staged
     /// group locked and one not: the page's statement returns a written
     /// group's row and the sentinel together, so their columns must agree,
-    /// and the page still fails, counting only the unlocked group (#1362).
+    /// and the page still fails, counting only the unlocked group.
     #[tokio::test]
     async fn a_join_t_write_with_one_unlocked_group_fails_for_any_shape() {
         let cluster = testkit::TestCluster::start();

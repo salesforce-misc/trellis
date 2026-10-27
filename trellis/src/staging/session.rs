@@ -2,7 +2,7 @@
 //! staging worker **per Trellis instance** may run at a time, enforced by a
 //! session-scoped `pg_try_advisory_lock` that releases the instant the
 //! holding connection closes. "Per instance" — not per database — is
-//! load-bearing and was a real bug until issue #234; see
+//! load-bearing; see
 //! [`producer_singleton_lock_key`].
 //!
 //! [`ProducerSession`] owns a standalone `tokio_postgres` connection rather
@@ -39,7 +39,7 @@ pub(crate) fn fnv1a_64(text: &str) -> u64 {
 }
 
 /// The advisory lock key the producer singleton is acquired under, **derived
-/// from the instance schema** (issue #234).
+/// from the instance schema**.
 ///
 /// # Why this is per-schema and not a global constant
 ///
@@ -56,7 +56,7 @@ pub(crate) fn fnv1a_64(text: &str) -> u64 {
 /// second failed its staging setup with
 /// [`StagingError::ProducerAlreadyRunning`], reporting a conflict with a
 /// producer that was not its own and that it had no business seeing. Found by
-/// `generative/tests/two_instance_noise.rs` (issue #234's two-instance
+/// `generative/tests/two_instance_noise.rs` (its two-instance
 /// side-by-side property), which is also its regression coverage.
 ///
 /// Deriving the key from the schema restores the intended scope — one
@@ -116,8 +116,8 @@ impl ProducerSession {
     /// `schema` (this connection bypasses [`crate::pool::Pool`], so nothing
     /// else does), and takes the singleton lock.
     ///
-    /// TCP keepalives are on at both ends before the lock is taken (issue
-    /// #364), so a partitioned producer's lock frees in about 25s rather
+    /// TCP keepalives are on at both ends before the lock is taken,
+    /// so a partitioned producer's lock frees in about 25s rather
     /// than the ~2h the kernel defaults allow. See
     /// `crate::pool::TCP_KEEPALIVE_IDLE` for the numbers.
     pub async fn connect(dsn: &str, schema: &str) -> Result<Self, StagingError> {
@@ -130,7 +130,7 @@ impl ProducerSession {
             .batch_execute(&crate::pool::dedicated_session_setup(schema))
             .await?;
 
-        // Issue #234: scoped to this instance's own schema, not a global
+        // Scoped to this instance's own schema, not a global
         // constant — see `producer_singleton_lock_key`.
         acquire_singleton(&client, schema).await?;
 
@@ -174,7 +174,7 @@ impl ProducerSession {
 /// second producer should fail fast with a typed error, not hang waiting for
 /// a lock the long-lived first producer may never release.
 ///
-/// `schema` scopes the key to one Trellis instance (issue #234) — see
+/// `schema` scopes the key to one Trellis instance — see
 /// [`producer_singleton_lock_key`] for why a global constant was wrong.
 async fn acquire_singleton(client: &Client, schema: &str) -> Result<(), StagingError> {
     let row = client
@@ -190,7 +190,7 @@ async fn acquire_singleton(client: &Client, schema: &str) -> Result<(), StagingE
     Ok(())
 }
 
-/// Issue #428: whether some session holds `schema`'s producer singleton
+/// Whether some session holds `schema`'s producer singleton
 /// right now — that is, whether this instance's staging worker is running.
 /// The staging worker takes the lock in its setup, before
 /// [`crate::client::Client::start`] returns, and its maintenance loop holds
@@ -305,7 +305,7 @@ mod lock_probe_tests {
 mod tests {
     use super::producer_singleton_lock_key;
 
-    /// Issue #608: `ProducerSession::connect` is public and parses its own
+    /// `ProducerSession::connect` is public and parses its own
     /// DSN, so its parse failure must not echo part of the password either.
     #[tokio::test]
     async fn unparsable_dsn_error_carries_no_password_fragment() {
@@ -318,7 +318,7 @@ mod tests {
         }
     }
 
-    /// Issue #234: the whole point of the derivation — two instances in the
+    /// The whole point of the derivation — two instances in the
     /// same database must not contend for each other's singleton. Pure
     /// arithmetic, no database needed; the end-to-end proof that two
     /// instances can then actually both run lives in

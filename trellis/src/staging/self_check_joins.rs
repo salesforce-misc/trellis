@@ -1,4 +1,4 @@
-//! `self_check` of a `JOIN` target (#1112, ADR-0013 "Scope", ADR-0019).
+//! `self_check` of a `JOIN` target (ADR-0013 "Scope", ADR-0019).
 //!
 //! A `JOIN` target is audited in four parts, walked in this order, each a
 //! keyset walk of its own keys:
@@ -39,7 +39,7 @@
 //! walk (no cursor) starts the target's part, and the last part's end ends
 //! the walk.
 //!
-//! It reports, never repairs (ADR-0013, #1096 decision 3): the remedy is a
+//! It reports, never repairs: the remedy is a
 //! `request_backfill` or a `PAUSE`/`RESUME`. Like every page, it is read only
 //! after `super::self_check::audit`'s convergence wait. Each part reads its
 //! tables minus the ring rows not applied yet ([`super::self_check_ring`]):
@@ -983,7 +983,7 @@ impl Audit<'_> {
         // aggregate's does by its target's columns. A side's key is its
         // hidden identity's order, the join key first, so the hidden table's
         // index serves the hidden side and an index on the source's join
-        // columns serves the source side (#1198).
+        // columns serves the source side.
         let mut keyset = match part {
             Part::Target => Keyset::resolve(client, identity).await?,
             Part::From | Part::Joined | Part::Matches => {

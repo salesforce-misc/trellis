@@ -1,4 +1,4 @@
-//! A `JOIN` transform's apply step (#1108 J3, ADR-0019).
+//! A `JOIN` transform's apply step (ADR-0019).
 //!
 //! # When it runs
 //!
@@ -7,8 +7,8 @@
 //! one transaction ([`build`], "A build" below), and applies every captured
 //! change from the build's start on.
 //!
-//! Either table may be another definition's target (#1096 decision 5,
-//! ADR-0019). A target is never captured: its writers stage each changed key
+//! Either table may be another definition's target (ADR-0019).
+//! A target is never captured: its writers stage each changed key
 //! through the target-mutation seam as exact old and new images ordered by
 //! the write token (`super::target_mutations`, "The image feed"), and the side
 //! consumes them as it consumes captured images. A target is never truncated
@@ -18,7 +18,7 @@
 //! sources"). An upstream build that writes its target outside the seam
 //! rebuilds the `JOIN` (`intake::catch_up::park_target_catchup_if_read`).
 //!
-//! Either table may be a partitioned root (#1111, ADR-0019 "Either side may
+//! Either table may be a partitioned root (ADR-0019 "Either side may
 //! be partitioned"). A node operation (`DROP`, `DETACH`, `TRUNCATE`,
 //! `ATTACH`, a new leaf, a `DEFAULT` whose siblings changed, the complement
 //! sweep's hit) is corrected by `super::partition_correction`, which
@@ -34,7 +34,7 @@
 //!
 //! 1. **Stage.** Each side's ring rows are split into sides and summed per
 //!    (cell, transaction, statement) into a session table, before any lock,
-//!    by #1100's writer (`super::group_basis`): `P`'s cells are the `FROM`
+//!    by the group-basis writer (`super::group_basis`): `P`'s cells are the `FROM`
 //!    side's `GROUP BY` columns and join key, `M`'s the joined side's. A
 //!    joined row with a `NULL` in any join-key column joins nothing and is
 //!    never staged. An image-less change (a `Recompute`: a released key, a
@@ -50,7 +50,7 @@
 //!    and no lock. Then the `P` cells and the `M` cells, each in one sorted
 //!    statement. `FOR UPDATE` on both sides makes every key's lock mode the
 //!    page's one mode, so a mixed page never upgrades.
-//! 3. **Apply the sides.** #1100's writer applies the staged sides to `P`
+//! 3. **Apply the sides.** The group-basis writer applies the staged sides to `P`
 //!    and `M` (each cell's basis and its side's truncate floor filter them),
 //!    and records the change it applied per cell. Then each cell to
 //!    recompute is rewritten from a `GROUP BY` of its source rows, with the
@@ -65,7 +65,7 @@
 //!    key's `J.matches`.
 //! 5. **`T`.** The changed `T` groups are created and locked in one sorted
 //!    statement (a zero group the tombstone pass collected is created
-//!    afresh: `super::group_basis`'s "Zero groups"), then #1100's writer
+//!    afresh: `super::group_basis`'s "Zero groups"), then the group-basis writer
 //!    adds the deltas to `T`'s hidden partials and writes each visible row
 //!    whose value changed (only while its row count is above 0), through
 //!    the target-mutation seam.
@@ -97,7 +97,7 @@
 //! (which recreates the hidden tables and keeps the visible target) and a
 //! rebuild in place of a live `JOIN` (a
 //! `request_backfill` of either table, a re-installed capture) are one
-//! `READ COMMITTED` transaction over both structures, #1097's S1T: a page
+//! `READ COMMITTED` transaction over both structures: a page
 //! whose two sides both recompute every cell they enumerate from one `GROUP
 //! BY` of the whole table, through the same writer ([`write_locked`]).
 //!
@@ -107,7 +107,7 @@
 //!    temp table … as select`, which Postgres can run in parallel.
 //! 3. `J` `FOR UPDATE` on the union of both sides' keys, in one sorted
 //!    statement, then the `P` cells with a `NULL` key part, which take no `J`
-//!    row (#1097's rule 6: `J` holds every other cell). Pages of keys the
+//!    row (`J` holds every other cell). Pages of keys the
 //!    build holds wait for its commit; the other keys' pages run through.
 //! 4. Each side's snapshot statement, one `GROUP BY` of its table into a
 //!    temp table (parallel where Postgres can), whose snapshot is each cell's
@@ -137,7 +137,7 @@
 //!
 //! # A build with a partitioned side
 //!
-//! A side that is a partitioned root with rows (#1286) is built per side and
+//! A side that is a partitioned root with rows is built per side and
 //! per leaf, in transactions of their own ([`BuildWork`]): every unpartitioned
 //! side whole, then each partitioned side's leaves in oid order and its
 //! remainder, each step the shape of [`recompute_routed`] (steps 1 to 4 above
@@ -147,7 +147,7 @@
 //! names the last step committed (`super::build::run_join_steps`). Readers
 //! see progressive values until the final step commits.
 //!
-//! A `RESUME` build parks its readers' catch-up when it commits (#1287): its
+//! A `RESUME` build parks its readers' catch-up when it commits: its
 //! pages computed prior images from empty partials while the target kept the
 //! earlier rows, so a reader holds rows those images don't match, and its
 //! rebuild overwrites them. The park is in the last transaction, once.
@@ -185,7 +185,7 @@ pub(crate) fn applies(def: &TransformDef) -> bool {
 /// One side's part of a [`JoinTargetPlan`].
 #[derive(Debug, Clone)]
 struct SidePlan {
-    /// `P` or `M`, through #1100's writer.
+    /// `P` or `M`, through the group-basis writer.
     plan: GroupTargetPlan,
     /// The side's join-key columns, in `ON` order.
     join_cols: Vec<String>,
@@ -264,7 +264,7 @@ pub(crate) struct JoinTargetPlan {
     joined: SidePlan,
     /// `T`'s group columns, each with the side it is read from.
     t_groups: Vec<(Side, String)>,
-    /// `T`, through #1100's writer.
+    /// `T`, through the group-basis writer.
     t: GroupTargetPlan,
 }
 
@@ -898,7 +898,7 @@ impl JoinTargetPlan {
             let jk: Vec<String> = jc.iter().map(|c| format!("k.{c}")).collect();
             #[cfg_attr(not(any(test, feature = "test-util")), allow(unused_mut))]
             let mut matches_new = "j.__matches + coalesce(x.__d, 0)";
-            // Planted bug (#1114): a key's matches never cross zero. See
+            // Planted bug: a key's matches never cross zero. See
             // `crate::plant`.
             #[cfg(any(test, feature = "test-util"))]
             if crate::plant::armed() == Some(crate::plant::Plant::JoinDropFlip) {
@@ -1205,7 +1205,7 @@ async fn write_locked(
     if let Some(truncate) = &plan.truncate {
         deleted += clear(txn, plan, truncate, mutations).await?;
     }
-    // Planted bug (#1114): read both sides' partials before the `J` locks.
+    // Planted bug: read both sides' partials before the `J` locks.
     // See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
     let before_j =
@@ -1215,7 +1215,7 @@ async fn write_locked(
         txn.batch_execute(&plan.planted_copy_before_j_sql()).await?;
     }
     pause!(txn, BeforeJoinLock, &plan.target);
-    // Planted bug (#1114): insert the missing `J` rows and lock none. See
+    // Planted bug: insert the missing `J` rows and lock none. See
     // `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
     let skip_j_lock = crate::plant::fires(crate::plant::Plant::JoinNoJLock, !build);
@@ -1245,7 +1245,7 @@ async fn write_locked(
             let lock = match side.bulk_node(bulk) {
                 // A build's keyed cells are held by `J`; only those with a
                 // `NULL` key part, which take no `J` row, are locked as
-                // cells (#1097's rule 6).
+                // cells.
                 Some(_) => side.plan.lock_sql_where(&side.null_key_filter()),
                 None => side.plan.lock_sql(),
             };
@@ -1305,7 +1305,7 @@ async fn write_locked(
     } else {
         product
     };
-    // Planted bug (#1114): count the pages whose product the dropped flip
+    // Planted bug: count the pages whose product the dropped flip
     // changes. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
     if plan.left && crate::plant::armed() == Some(crate::plant::Plant::JoinDropFlip) {
@@ -1329,7 +1329,7 @@ async fn write_locked(
         group_basis::analyze(txn, &[plan.t.staged()]).await?;
     }
     pause!(txn, BeforeJoinTargetLock, &plan.target);
-    // Planted bug (#1114): insert the missing `T` groups and lock none. See
+    // Planted bug: insert the missing `T` groups and lock none. See
     // `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
     let t_lock = if crate::plant::fires(crate::plant::Plant::JoinTSkipLock, !build) {
@@ -1465,7 +1465,7 @@ pub(crate) async fn release(
 }
 
 /// A partition correction's recompute on `definition`, a `JOIN` that
-/// applies (#1111, ADR-0019 "Either side may be partitioned";
+/// applies (ADR-0019 "Either side may be partitioned";
 /// `super::partition_correction`): every cell of `side` named by `cells`
 /// (objects of the side's cell columns: the cells that route to the node,
 /// which the correction enumerates) is locked and rewritten from a
@@ -1502,9 +1502,8 @@ pub(crate) async fn recompute_routed(
     Ok(())
 }
 
-/// One transaction of a `JOIN`'s fresh build, `RESUME` or rebuild in place
-/// (#1109, #1097's decision), in the caller's `READ COMMITTED` transaction,
-/// which commits it. `work` is what it covers ([`BuildWork`]).
+/// One transaction of a `JOIN`'s fresh build, `RESUME` or rebuild in place,
+/// in the caller's `READ COMMITTED` transaction, which commits it. `work` is what it covers ([`BuildWork`]).
 ///
 /// [`BuildWork::Single`], both sides unpartitioned (or empty): both
 /// structures, `P` and `M`, and `T`, so readers see the old `T` and the old
@@ -1605,7 +1604,7 @@ pub(crate) enum BuildWork<'a> {
     /// The whole build: both sides unpartitioned (or empty), S1T.
     Single,
     /// One side's cells in a region, a step of the per-side, per-leaf build
-    /// of a `JOIN` with a partitioned side that has rows (#1286): the whole
+    /// of a `JOIN` with a partitioned side that has rows: the whole
     /// side (`scope` none), or the cells a leaf or the remainder of its
     /// recorded tree covers.
     Side {
@@ -1702,7 +1701,7 @@ mod tests {
     /// A re-typed or re-collated key column of a hidden table under the
     /// same definition id (as after a resume, which keeps the id and
     /// recreates the hidden tables) gives its working tables a new name, so
-    /// a pooled connection never reuses a temp table of the old shape (#1142).
+    /// a pooled connection never reuses a temp table of the old shape.
     #[tokio::test]
     async fn a_retyped_or_recollated_hidden_column_renames_the_working_tables() {
         let cluster = testkit::TestCluster::start();

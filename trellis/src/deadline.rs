@@ -17,7 +17,7 @@
 //!    timer per statement and the timer covers lock waits, so a statement
 //!    stuck on a lock is abandoned by the server and its transaction rolls
 //!    back. No `cancel_query`: a cancel request can land on the connection's
-//!    next query (#596, #599 rule 1).
+//!    next query.
 //! 2. **The pool wait is part of the budget.** A checkout waits no longer
 //!    than what is left of it.
 //! 3. **A client-side backstop.** [`bounded`] drops the call's future
@@ -47,7 +47,7 @@ pub const DEFAULT_CALL_BUDGET: Duration = Duration::from_secs(30);
 /// How far past the deadline [`bounded`] waits for the server to report the
 /// timeout itself before it gives up on the call client-side. Only a
 /// connection that has stopped delivering anything at all (a network stall)
-/// ever reaches it. The same grace as `staging::converge`'s #596 poll.
+/// ever reaches it. The same grace as `staging::converge`'s poll.
 pub const BACKSTOP_GRACE: Duration = Duration::from_secs(1);
 
 /// One public call's deadline, in scope for everything the call awaits.
@@ -81,7 +81,7 @@ impl CallDeadline {
     /// lasts for the session.
     ///
     /// The statement itself is [`crate::locks::cap_timeout_sql`], which reads
-    /// the setting in force with `current_setting`, not `pg_settings` (#1010);
+    /// the setting in force with `current_setting`, not `pg_settings`;
     /// this adds the time left, as [`timeout_ms`].
     pub(crate) fn set_statement_timeout_sql(&self, local: bool) -> String {
         crate::locks::cap_timeout_sql("statement_timeout", timeout_ms(self.remaining()), local)
@@ -192,7 +192,7 @@ pub(crate) async fn within<T>(
 /// `statement_timeout` (`57014`, `query_canceled`), a lock wait that outlasted
 /// its `lock_timeout` (`55P03`) at about the same moment, or a pool checkout
 /// that waited out what was left of the budget. Only ever consulted once the
-/// deadline has passed (like #596's poll): the budget's timer can't fire
+/// deadline has passed (like `staging::converge`'s poll): the budget's timer can't fire
 /// before it, so an earlier `57014` is someone else's (a shorter session
 /// `statement_timeout`, a `pg_cancel_backend`) and stays what it was.
 fn is_budget_error(err: &(dyn std::error::Error + 'static)) -> bool {

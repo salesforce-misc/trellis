@@ -157,7 +157,7 @@ pub(crate) mod tls;
 // not the ADR's sanctioned exception, and it is not API; see `dev` below for
 // the sibling crates' curated, equally uncommitted surface.
 //
-// `capture` (issue #622) generates the statement triggers that append
+// `capture` generates the statement triggers that append
 // source changes to the ring inside the writer's transaction (ADR-0002).
 #[cfg(not(feature = "internals"))]
 pub(crate) mod capture;
@@ -175,31 +175,31 @@ pub mod intake;
 pub(crate) mod staging;
 #[cfg(feature = "internals")]
 pub mod staging;
-// `locks` (issue #621) holds the lock discipline every tier-3 module shares
+// `locks` holds the lock discipline every tier-3 module shares
 // (ADR-0002 invariants I6 and I7): the session `lock_timeout` bound and the
 // user-table DDL retry loop.
 #[cfg(not(feature = "internals"))]
 pub(crate) mod locks;
 #[cfg(feature = "internals")]
 pub mod locks;
-// `temporal` (issue #113) sits with tier 3 rather than beside `float`/
+// `temporal` sits with tier 3 rather than beside `float`/
 // `integer` in tier 2 for one concrete reason: its public signatures name
 // `defs::pg_type::PgType`, which is itself crate-private above. The temporal
-// families never earned their own `ValueType` variant the way #111's
-// integers and #112's floats did (see that module's doc comment), so there
+// families have no `ValueType` variant of their own, unlike
+// integers and floats (see that module's doc comment), so there
 // is no tier-2-visible type to hang them off.
 #[cfg(not(feature = "internals"))]
 pub(crate) mod temporal;
 #[cfg(feature = "internals")]
 pub mod temporal;
-// `netaddr` (issue #116) sits here for the same reason `temporal` does: its
+// `netaddr` sits here for the same reason `temporal` does: its
 // public signatures name `defs::pg_type::PgType`, itself crate-private
 // above.
 #[cfg(not(feature = "internals"))]
 pub(crate) mod netaddr;
 #[cfg(feature = "internals")]
 pub mod netaddr;
-// `jsonb` (issue #115) sits here for the same reason `temporal`/`netaddr`
+// `jsonb` sits here for the same reason `temporal`/`netaddr`
 // do: its public signatures name `defs::pg_type::PgType`, itself
 // crate-private above.
 #[cfg(not(feature = "internals"))]
@@ -209,7 +209,7 @@ pub mod jsonb;
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod dev;
-// Issue #557 part 3: planted ordering bugs, armed per process by an env var.
+// Planted ordering bugs, armed per process by an env var.
 // Test-only, like `dev`; reached from other crates through `dev::plant`.
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) mod plant;
