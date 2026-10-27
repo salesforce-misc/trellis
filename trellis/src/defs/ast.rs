@@ -94,15 +94,14 @@ pub enum Statement {
     /// `DROP TRANSFORM <target>` — ADR-0014's terminal reap. Idempotent; refused if a still-registered dependent
     /// chains off the subject.
     Drop(DefinitionRef),
-    /// `ALTER TRANSFORM <target> <clause>[, <clause> ...]` (ADR-0015) — edits an already-registered transform's calculated
-    /// fields in place: `ADD`, `DROP`, and `ALTER` clauses, one calculated
-    /// field each. The key-space is not named and cannot change; a
-    /// granularity change is a new transform plus cutover, not an edit — the
-    /// grammar has no key-space clause here to write, rather than a
-    /// validator rejecting one. Idempotent per-clause, matching
-    /// pause/resume/drop's discipline: re-adding a field with the same
-    /// formula, re-altering to the formula it already has, and dropping an
-    /// already-absent field are all no-op successes.
+    /// `ALTER TRANSFORM <target> <clause>[, <clause> ...]` (ADR-0015) — edits an
+    /// already-registered transform's calculated fields in place: `ADD`, `DROP`, and
+    /// `ALTER` clauses, one calculated field each. The key-space is not named and
+    /// cannot change; a granularity change is a new transform plus cutover, not an edit
+    /// — the grammar has no key-space clause here to write, rather than a validator
+    /// rejecting one. Idempotent per-clause, matching pause/resume/drop's discipline:
+    /// re-adding a field with the same formula, re-altering to the formula it already
+    /// has, and dropping an already-absent field are all no-op successes.
     AlterTransform(AlterTransform),
 }
 

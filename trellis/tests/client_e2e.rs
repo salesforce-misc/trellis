@@ -1,8 +1,8 @@
-//! End-to-end tests for the [`trellis::Client`] runtime: drive the *whole* pipeline — capture-trigger setup, ring
-//! maintenance, and application workers — through the public `Client` API
-//! against a real, ephemeral Postgres instance (`testkit::TestCluster`),
-//! rather than staging changes into the ring by hand the way `apply.rs`
-//! does.
+//! End-to-end tests for the [`trellis::Client`] runtime: drive the *whole* pipeline
+//! — capture-trigger setup, ring maintenance, and application workers — through the
+//! public `Client` API against a real, ephemeral Postgres instance
+//! (`testkit::TestCluster`), rather than staging changes into the ring by hand the
+//! way `apply.rs` does.
 //!
 //! Two things this file exists to prove:
 //!
@@ -753,7 +753,7 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
         "install_definition must return before its build is even dispatched"
     );
     // No staging worker here (`staging_worker: false`): stand in for its
-    // capture pass, which starts the build. Check that it
+    // capture pass, which starts the build (ADR-0002). Check that it
     // did: a missing plan job would otherwise surface as the wait below
     // timing out.
     trellis::intake::harness::start_registered_builds(&db.pool)

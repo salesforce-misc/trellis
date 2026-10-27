@@ -198,11 +198,10 @@ pub(super) async fn create_source_indexes(
     Ok(())
 }
 
-/// Renders a generator-built [`Expr`] back to source text. Every operand of
-/// a `BinaryOp` is unconditionally parenthesized so a rendered expression always re-parses to the exact same
-/// tree regardless of operator precedence — see
-/// `tests::render_expr_parenthesizes_nested_binary_ops_so_they_round_trip`
-/// below.
+/// Renders a generator-built [`Expr`] back to source text. Every operand of a
+/// `BinaryOp` is unconditionally parenthesized so a rendered expression always
+/// re-parses to the exact same tree regardless of operator precedence — see
+/// `tests::render_expr_parenthesizes_nested_binary_ops_so_they_round_trip` below.
 pub(super) fn render_expr(expr: &Expr) -> String {
     match expr {
         Expr::Column(name) => name.clone(),

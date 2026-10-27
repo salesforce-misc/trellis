@@ -193,11 +193,11 @@ impl Config {
         Ok(self)
     }
 
-    /// Returns `self` with its connection pool's `max_size` overridden — see `DEFAULT_POOL_MAX_SIZE`. Rejects `0`: a pool that can
-    /// never open a single connection isn't a smaller pool, it's a broken
-    /// one, and letting it through here would only surface as a confusing
-    /// wait-timeout on every single [`crate::Pool::get`] call instead of a
-    /// clear configuration error now.
+    /// Returns `self` with its connection pool's `max_size` overridden — see
+    /// `DEFAULT_POOL_MAX_SIZE`. Rejects `0`: a pool that can never open a single
+    /// connection isn't a smaller pool, it's a broken one, and letting it through here
+    /// would only surface as a confusing wait-timeout on every single
+    /// [`crate::Pool::get`] call instead of a clear configuration error now.
     pub fn with_pool_max_size(mut self, pool_max_size: usize) -> Result<Self, Error> {
         if pool_max_size == 0 {
             return Err(Error::Config(
@@ -486,9 +486,10 @@ fn pool_max_size_from_env() -> Result<usize, Error> {
     }
 }
 
-/// Resolves the pool's wait timeout from `TRELLIS_POOL_WAIT_TIMEOUT_SECS`
-/// (whole seconds), defaulting to [`DEFAULT_POOL_WAIT_TIMEOUT`] — the one place both [`Config::resolve`] and [`Config::from_dsn`]
-/// read this env var, so they can't drift.
+/// Resolves the pool's wait timeout from `TRELLIS_POOL_WAIT_TIMEOUT_SECS` (whole
+/// seconds), defaulting to [`DEFAULT_POOL_WAIT_TIMEOUT`] — the one place both
+/// [`Config::resolve`] and [`Config::from_dsn`] read this env var, so they can't
+/// drift.
 fn pool_wait_timeout_from_env() -> Result<Duration, Error> {
     match std::env::var("TRELLIS_POOL_WAIT_TIMEOUT_SECS") {
         Ok(raw) => {

@@ -1502,8 +1502,9 @@ pub(crate) async fn recompute_routed(
     Ok(())
 }
 
-/// One transaction of a `JOIN`'s fresh build, `RESUME` or rebuild in place,
-/// in the caller's `READ COMMITTED` transaction, which commits it. `work` is what it covers ([`BuildWork`]).
+/// One transaction of a `JOIN`'s fresh build, `RESUME` or rebuild in place, in the
+/// caller's `READ COMMITTED` transaction, which commits it. `work` is what it
+/// covers ([`BuildWork`]).
 ///
 /// [`BuildWork::Single`], both sides unpartitioned (or empty): both
 /// structures, `P` and `M`, and `T`, so readers see the old `T` and the old

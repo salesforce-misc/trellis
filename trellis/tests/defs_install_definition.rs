@@ -1,6 +1,6 @@
 //! Integration tests for `defs::catalog::install_definition`:
 //! the front door that creates a definition's target table once, then
-//! records it `waiting_to_backfill` for the Re-derive
+//! records it `waiting_to_backfill` (ADR-0002) for the Re-derive
 //! build (`staging::build`): a plain 1-1 definition's `rederive` chunks, or an
 //! aggregate's one absolute write in its plan job.
 //!
@@ -1573,10 +1573,11 @@ async fn an_explicit_source_without_its_table_is_reported_missing_before_the_key
     );
 }
 
-/// Regression for DDL-before-validate ordering: if `install_definition`
-/// emitted the target table's DDL *before* running `validate()`, a definition
-/// rejected for any reason would still leave an orphan table behind. The failure here is plain `UngroupedColumnReference`,
-/// because the fix is about ordering for *every* key-space.
+/// Regression for DDL-before-validate ordering: if `install_definition` emitted the
+/// target table's DDL *before* running `validate()`, a definition rejected for any
+/// reason would still leave an orphan table behind. The failure here is plain
+/// `UngroupedColumnReference`, because the fix is about ordering for *every*
+/// key-space.
 #[tokio::test]
 async fn an_invalid_aggregate_definition_leaves_no_target_table() {
     let cluster = TestCluster::start();

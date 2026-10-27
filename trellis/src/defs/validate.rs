@@ -212,9 +212,9 @@ pub enum ValidationError {
         expected: ValueType,
         found: ValueType,
     },
-    /// `regexp_count`'s pattern argument was not a string literal. The pattern must be known at validate time so it
-    /// can be compiled and checked here, once, rather than re-parsed on
-    /// every row at eval time — a column-sourced pattern is out of scope.
+    /// `regexp_count`'s pattern argument was not a string literal. The pattern must be
+    /// known at validate time so it can be compiled and checked here, once, rather than
+    /// re-parsed on every row at eval time — a column-sourced pattern is out of scope.
     NonLiteralRegexPattern { field: String },
     /// `regexp_count`'s pattern literal does not compile as a regular
     /// expression, per the `regex` crate.

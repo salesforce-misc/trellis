@@ -1179,12 +1179,12 @@ struct MaintenanceConfig {
 /// sealing/recovery/reclaim/retirement/reconciliation are ring-wide
 /// operations that must not be duplicated across every client in a fleet.
 ///
-/// Holds one dedicated connection across ticks (reconnecting lazily on
-/// error) rather than opening a fresh one every tick. That connection is a
-/// [`ProducerSession`]: it holds the staging-worker singleton, and a reconnect takes it again. While another session holds it (this
-/// worker's previous backend, until the server notices it is gone, or another
-/// staging worker that took over), the reconnect fails and is retried every
-/// tick.
+/// Holds one dedicated connection across ticks (reconnecting lazily on error)
+/// rather than opening a fresh one every tick. That connection is a
+/// [`ProducerSession`]: it holds the staging-worker singleton, and a reconnect
+/// takes it again. While another session holds it (this worker's previous backend,
+/// until the server notices it is gone, or another staging worker that took over),
+/// the reconnect fails and is retried every tick.
 async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Receiver<bool>) {
     let MaintenanceConfig {
         dsn,

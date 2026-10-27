@@ -1118,9 +1118,10 @@ mod tests {
 }
 
 /// Grammar coverage for [`parse_statement`], the unified statement entry point
-/// [`crate::Trellis::apply`] dispatches on. Kept apart from the `tests` module above, which is about the
-/// expression/definition grammar `parse` covers, because what's under test
-/// here is *which statement* a text is — the dispatch decision itself.
+/// [`crate::Trellis::apply`] dispatches on. Kept apart from the `tests` module
+/// above, which is about the expression/definition grammar `parse` covers, because
+/// what's under test here is *which statement* a text is — the dispatch decision
+/// itself.
 #[cfg(test)]
 mod statement_grammar_tests {
     use super::*;

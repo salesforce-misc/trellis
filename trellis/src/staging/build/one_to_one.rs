@@ -84,10 +84,10 @@ pub struct OneToOnePlan {
     alias_readers: crate::defs::eval::AliasReaders,
 }
 
-/// Whether `definition` is a 1-1 target the Re-derive build serves: a 1-1 key space, and fields whose aliases substitute to
-/// self-contained SQL, which define checks
-/// (`ValidationError::FieldExpansionTooLarge`). Its source may be captured or
-/// seam-fed.
+/// Whether `definition` is a 1-1 target the Re-derive build serves: a 1-1 key
+/// space, and fields whose aliases substitute to self-contained SQL, which define
+/// checks (`ValidationError::FieldExpansionTooLarge`). Its source may be captured
+/// or seam-fed.
 pub(crate) fn buildable(definition: &Definition) -> bool {
     matches!(
         definition.def.key_space,

@@ -5471,7 +5471,7 @@ pub struct ManyApplyOutcome {
 /// definition churn), rather than retrying forever.
 const MAX_APPLY_ATTEMPTS: u32 = 5;
 
-/// How long one page keeps retrying lock timeouts
+/// How long one page keeps retrying lock timeouts (ADR-0002 I7)
 /// before [`drain_batch`] surfaces the last one and the worker releases the
 /// claim. Each retry holds no transaction; the bound is on how long a worker
 /// sits on one page (and how long shutdown can wait for it), not on any
@@ -6302,7 +6302,7 @@ async fn retry_or_surface(
             }
             Ok(())
         }
-        // A lock wait that hit `lock_timeout`:
+        // A lock wait that hit `lock_timeout` (ADR-0002 I7):
         // the page's transaction has rolled back, so it holds no snapshot
         // and no locks while it waits here. Back off and retry, keeping the
         // claim (the heartbeat daemon keeps it fresh), for up to

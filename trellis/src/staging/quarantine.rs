@@ -614,11 +614,12 @@ pub(super) async fn park_batch_contribution(
 /// its counter is kept: only the definitions the key isn't poisoned for
 /// applied it.
 ///
-/// **`keys` must already carry the canonical `src_table` identity**, for the same reason [`poisoned_keys_among`]'s candidates must:
-/// [`record_key_death`] writes under it, so clearing by a raw bare spelling
-/// would delete nothing and leave a transient death accumulating toward a false
-/// eviction forever. `ApplyPlan::applied_keys` — this function's only source of
-/// `keys` — is built canonically in [`super::apply::compute`] for that reason.
+/// **`keys` must already carry the canonical `src_table` identity**, for the same
+/// reason [`poisoned_keys_among`]'s candidates must: [`record_key_death`] writes
+/// under it, so clearing by a raw bare spelling would delete nothing and leave a
+/// transient death accumulating toward a false eviction forever.
+/// `ApplyPlan::applied_keys` — this function's only source of `keys` — is built
+/// canonically in [`super::apply::compute`] for that reason.
 pub(super) async fn clear_key_deaths(
     txn: &Transaction<'_>,
     keys: &[(String, String)],
@@ -2145,10 +2146,10 @@ fn not_frozen_sql() -> String {
 pub(crate) const BUILD_PARK_SEG_SEQ: i64 = i64::MAX;
 
 /// Quarantines `key` of `src_table` (canonical) for the building definition
-/// `transform_id`, because a backfill chunk narrowed its failure,
-/// `last_error` with SQLSTATE `sqlstate`, to that key alone
-/// (`defs::chunk_queue::fail_chunk`), in the caller's transaction. It is the chunk-shaped counterpart of a
-/// drain's eviction ([`isolate_and_evict`]):
+/// `transform_id`, because a backfill chunk narrowed its failure, `last_error` with
+/// SQLSTATE `sqlstate`, to that key alone (`defs::chunk_queue::fail_chunk`), in the
+/// caller's transaction. It is the chunk-shaped counterpart of a drain's eviction
+/// ([`isolate_and_evict`]):
 ///
 /// - a `poison` row, so the build's chunks leave the key out of their writes
 ///   and, once the definition applies, the drain leaves it out of the
@@ -5514,13 +5515,13 @@ async fn end_request(
 /// row, which is idempotent, and one that does parks it, as it parks every
 /// change to a key it holds.
 ///
-/// The parked changes are discarded, not replayed. A replayed CDC row would carry the releaser's `row_txid`, not
-/// its source transaction's, and a ledger target decides whether a change is
-/// already counted by that id (ADR-0002 I2), so a replay could regress an
-/// entry a later Re-derive already moved past. The `Recompute` re-derives
-/// the key from its current row instead, on every target that reads it. It
-/// carries what the parked changes told a reader beyond the current row,
-/// which every park merged into the key's one held row ([`HeldKey`]):
+/// The parked changes are discarded, not replayed. A replayed CDC row would carry
+/// the releaser's `row_txid`, not its source transaction's, and a ledger target
+/// decides whether a change is already counted by that id (ADR-0002 I2), so a
+/// replay could regress an entry a later Re-derive already moved past. The
+/// `Recompute` re-derives the key from its current row instead, on every target
+/// that reads it. It carries what the parked changes told a reader beyond the
+/// current row, which every park merged into the key's one held row ([`HeldKey`]):
 ///
 /// - the earliest parked change's pre-image (a recompute's own hint, or a
 ///   CDC change's old image) as its prior image, the state readers last saw;

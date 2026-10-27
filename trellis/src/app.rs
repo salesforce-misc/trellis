@@ -456,7 +456,7 @@ impl Trellis {
     }
 
     /// [`Statement::AlterTransform`](defs::Statement::AlterTransform)'s half
-    /// of [`apply`](Trellis::apply) — a thin
+    /// of [`apply`](Trellis::apply) (ADR-0015) — a thin
     /// facade wrapper over [`defs::alter_transform`], which does the actual
     /// work (idempotency, validation, DDL, registering the field build,
     /// version fencing); see that function's own doc comment for the full
@@ -1011,12 +1011,12 @@ impl Trellis {
         Ok((wait, failure))
     }
 
-    /// Rebuilds every applying definition that reads `source_table`: this call's own transaction moves each `live -> backfilling`
-    /// and enqueues its plan and sweep jobs, one row each, so the call returns
-    /// quickly and the status already reads `backfilling` when it does. The
-    /// definition keeps applying. Its plan re-derives every row the table has,
-    /// and its sweep deletes what the table no longer backs, and then it is
-    /// `live` again. A newly registered transform doesn't need this: the
+    /// Rebuilds every applying definition that reads `source_table`: this call's own
+    /// transaction moves each `live -> backfilling` and enqueues its plan and sweep
+    /// jobs, one row each, so the call returns quickly and the status already reads
+    /// `backfilling` when it does. The definition keeps applying. Its plan re-derives
+    /// every row the table has, and its sweep deletes what the table no longer backs,
+    /// and then it is `live` again. A newly registered transform doesn't need this: the
     /// staging worker starts its build itself.
     ///
     /// `source_table` is the captured table's `schema.table` name, matched
@@ -2261,7 +2261,7 @@ pub enum Applied {
     /// which ADR-0014 makes the same success.
     Dropped,
     /// An `ALTER TRANSFORM ...` statement edited its subject's calculated
-    /// fields. `target_table` is the edited
+    /// fields (ADR-0015). `target_table` is the edited
     /// transform's schema-qualified target table; `added`/`dropped`/`altered` name exactly the
     /// fields this call actually changed, excluding any clause that turned
     /// out to be an idempotent no-op (re-adding an existing field with the

@@ -13,10 +13,11 @@
 //!
 //! # The design decision: two schemas in one database, not two clusters
 //!
-//! The topology could be the same or independent clusters. This file puts both instances in the **same database of the same
-//! cluster**, separated only by `docs/instance-identity.md`'s named-schema
-//! mechanism (`Config::schema()`/`TRELLIS_SCHEMA`, `search_path` pinning,
-//! the `trellis_instance` marker). Three reasons, in order of weight:
+//! The topology could be the same or independent clusters. This file puts both
+//! instances in the **same database of the same cluster**, separated only by
+//! `docs/instance-identity.md`'s named-schema mechanism
+//! (`Config::schema()`/`TRELLIS_SCHEMA`, `search_path` pinning, the
+//! `trellis_instance` marker). Three reasons, in order of weight:
 //!
 //! 1. **It is the strongest test, because it shares the most.** The whole
 //!    point is to catch a resource one instance believes it owns privately

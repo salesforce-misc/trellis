@@ -384,20 +384,20 @@ impl Pool {
         &self.schema
     }
 
-    /// The [`Config::target_schema`] this pool was built with (ADR-0011) — the same value baked into every connection's own
-    /// `search_path` by [`session_bootstrap`] above, and the same value
-    /// every real caller of [`crate::defs::install_definition`] already
-    /// passes as its own `target_schema` argument (that argument and this
-    /// one are never meant to diverge; `install_definition` still takes its
-    /// own explicit parameter rather than reading this one, so its
-    /// target-table DDL and [`crate::defs::catalog::create_definition_inner`]'s
-    /// persisted qualification are threaded from one guaranteed-identical
-    /// value instead of two that merely happen to agree). Exposed so
-    /// [`crate::defs::catalog::create_definition`]/
-    /// [`crate::defs::catalog::create_definition_without_backfill`] — the
-    /// test-fixture entry points, which take no `target_schema` parameter of
-    /// their own — can qualify a definition's target table the same way,
-    /// without widening their public signature. Gated like its only callers.
+    /// The [`Config::target_schema`] this pool was built with (ADR-0011) — the same
+    /// value baked into every connection's own `search_path` by [`session_bootstrap`]
+    /// above, and the same value every real caller of
+    /// [`crate::defs::install_definition`] already passes as its own `target_schema`
+    /// argument (that argument and this one are never meant to diverge;
+    /// `install_definition` still takes its own explicit parameter rather than reading
+    /// this one, so its target-table DDL and
+    /// [`crate::defs::catalog::create_definition_inner`]'s persisted qualification are
+    /// threaded from one guaranteed-identical value instead of two that merely happen
+    /// to agree). Exposed so [`crate::defs::catalog::create_definition`]/
+    /// [`crate::defs::catalog::create_definition_without_backfill`] — the test-fixture
+    /// entry points, which take no `target_schema` parameter of their own — can qualify
+    /// a definition's target table the same way, without widening their public
+    /// signature. Gated like its only callers.
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn target_schema(&self) -> &str {
         &self.target_schema
@@ -1164,11 +1164,11 @@ mod tests {
         assert_eq!(render(&dedicated).await, expected, "dedicated");
     }
 
-    /// Every kind of session Trellis opens itself (pooled, unpooled,
-    /// dedicated) runs with `row_security` and `jit` off
-    /// and starts its transactions at `read committed`, even when the database's defaults say otherwise: a read that
-    /// row-level security would filter raises instead, no statement is
-    /// JIT-compiled, and a read after a lock sees what committed before it.
+    /// Every kind of session Trellis opens itself (pooled, unpooled, dedicated) runs
+    /// with `row_security` and `jit` off and starts its transactions at `read
+    /// committed`, even when the database's defaults say otherwise: a read that
+    /// row-level security would filter raises instead, no statement is JIT-compiled,
+    /// and a read after a lock sees what committed before it.
     #[tokio::test]
     async fn session_settings_are_pinned_on_every_session_kind() {
         /// Each setting, the database default this test sets, and the value

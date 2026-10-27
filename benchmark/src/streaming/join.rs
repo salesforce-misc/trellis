@@ -1,5 +1,5 @@
-//! `join`: the J2 scenario through the real engine. What a
-//! `JOIN … GROUP BY` transform costs to keep, next to a same-session
+//! `join`: the `JOIN` design research's experiment J2, through the real
+//! engine. What a `JOIN … GROUP BY` transform costs to keep, next to a same-session
 //! control that keeps one row per fact instead.
 //!
 //! # The data (J2's "Data", scaled by `--facts`)

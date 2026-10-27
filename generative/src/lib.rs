@@ -1,4 +1,5 @@
-//! Generative correctness test suite for the `trellis` crate. See `docs/generative-test-suite.md` for the architecture.
+//! Generative correctness test suite for the `trellis` crate. See
+//! `docs/generative-test-suite.md` for the architecture.
 //!
 //! Five strictly-separated modules (design doc §1):
 //!

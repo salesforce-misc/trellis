@@ -1542,13 +1542,13 @@ async fn a_new_leaf_costs_no_rebuild_and_no_source_wide_enumeration() {
     }
 }
 
-/// `--ignored`: what a leaf's correction costs on the group basis: a `RANGE` leaf of
-/// `TRELLIS_MEASURE_LEAF_ROWS` rows (1M by default) over 1,560 groups beside a leaf of a tenth as many over 1,000
-/// groups, the group key the partition key with an index leading on it (the
-/// primary key). The leaf is loaded outside capture and attached, then
-/// detached, attached again, truncated, and a second loaded leaf attached and
-/// dropped; each correction is timed with the WAL it wrote, and the target is
-/// checked against the oracle after each. Prints `MEASURE` lines.
+/// `--ignored`: what a leaf's correction costs on the group basis: a `RANGE` leaf
+/// of `TRELLIS_MEASURE_LEAF_ROWS` rows (1M by default) over 1,560 groups beside a
+/// leaf of a tenth as many over 1,000 groups, the group key the partition key with
+/// an index leading on it (the primary key). The leaf is loaded outside capture and
+/// attached, then detached, attached again, truncated, and a second loaded leaf
+/// attached and dropped; each correction is timed with the WAL it wrote, and the
+/// target is checked against the oracle after each. Prints `MEASURE` lines.
 #[tokio::test]
 #[ignore = "a measurement: run it alone, with a memory cap"]
 async fn measure_the_correction_of_a_large_leaf() {

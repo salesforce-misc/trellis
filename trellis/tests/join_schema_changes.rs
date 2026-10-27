@@ -177,7 +177,7 @@ async fn a_widened_varchar_of_either_table_is_applied_before_any_pass_on_a_live_
     assert_eq!(diverged(&d).await, Vec::<String>::new());
 }
 
-/// Rule 1 of the type-identity decision (ADR-0020), over the tables a `JOIN` and a group-basis
+/// ADR-0020's "Copies carry no type modifier", over the tables a `JOIN` and a group-basis
 /// aggregate create: a `JOIN` grouped by `varchar(n)` columns of both tables
 /// over a `varchar(n)` `ON` pair, another grouped by a `varchar(n)` key, and
 /// a group-basis aggregate grouped by two `varchar(n)` columns. None of

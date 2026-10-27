@@ -1,4 +1,5 @@
-//! Aggregate throughput by fold-in ratio — the **V-AGG** / target T3 (400k rows/sec at fold-in >= 10:1).
+//! Aggregate throughput by fold-in ratio — the **V-AGG** / target T3 (400k rows/sec
+//! at fold-in >= 10:1).
 //!
 //! Unlike a 1-1 chain, where every source row becomes exactly one target
 //! write, an aggregate's target write count is bounded by its *group* count:

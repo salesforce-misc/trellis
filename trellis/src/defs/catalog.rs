@@ -877,7 +877,7 @@ fn refuse_join_fixture(source_text: &str) {
 /// `DROP` would later drop it (ADR-0014). No build path creates the target
 /// itself.
 ///
-/// **Registration reads no source rows.** Every
+/// **Registration reads no source rows (ADR-0002).** Every
 /// definition is persisted [`TransformStatus::WaitingToBackfill`] and this
 /// returns, so its latency doesn't depend on the size of any table the
 /// definition reads. Its build runs in the background: the staging worker's
@@ -2815,8 +2815,8 @@ async fn target_column_type_via(
 
 /// Validates `source_text` and persists it as a definition in `status`, with
 /// its schema-graph nodes and edge and a `source_table_versions` bump, in one
-/// transaction. Reads the source's catalog shape (its key), never its rows:
-/// whoever builds the target does that later.
+/// transaction. Reads the source's catalog shape (its key), never its rows
+/// (ADR-0002): whoever builds the target does that later.
 ///
 /// `target_ddl` is [`install_definition`]'s rendered `create table` for the
 /// target, run in this same transaction after refusing a target name that
@@ -6117,8 +6117,8 @@ async fn column_dependents_via(
         if only_one_to_one && !matches!(def.key_space, KeySpace::OneToOne) {
             continue;
         }
-        // A `JOIN` names every column by its table. It reads the upstream column through whichever side
-        // is the upstream table: in a field, or in its `ON` or `GROUP BY`
+        // A `JOIN` names every column by its table. It reads the upstream column through
+        // whichever side is the upstream table: in a field, or in its `ON` or `GROUP BY`
         // (named by that column, which a `GROUP BY` key's target column is).
         if super::join::spec(&def).is_some() {
             for (side, table) in [

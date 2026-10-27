@@ -881,7 +881,7 @@ pub(crate) async fn pause_readers_of_retyped(
             // can't change before the update. A frozen row the update skips
             // is locked here too: this transaction bumps no version fence
             // and locks rows in id order, and a resume holding the row has
-            // finished its fence wait.
+            // finished its fence wait (ADR-0002).
             let frozen = txn
                 .query_opt(
                     "select status from transform_definitions where id = $1 for no key update",

@@ -17,11 +17,9 @@
 //!
 //! **Not built here:** the doc's "a round did no work" classification
 //! table (refused-seal backpressure, peer-holds-batch) describes a
-//! *worker-side drain-to-convergence helper* that depends on
-//! claiming/sweeping and cleanup machinery this crate
-//! doesn't have yet. This module builds only the caller-side poll
-//! ([`await_converged`]) the doc's "Watermark tokens" section describes —
-//! not that helper.
+//! *worker-side drain-to-convergence helper*, which Trellis doesn't have.
+//! This module builds only the caller-side poll ([`await_converged`]) the
+//! doc's "Watermark tokens" section describes.
 //!
 //! **The trap this module exists to avoid:** the design doc's per-batch
 //! summary band (`min_origin_lsn`/`max_lsn`, aggregated inside the seal's

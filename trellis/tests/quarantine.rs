@@ -2394,7 +2394,7 @@ async fn a_key_one_definition_fails_on_stays_live_in_every_other_reader() {
     assert_eq!(rows_for(&client, "poison_held", "order_totals").await, 0);
 }
 
-/// Rule 6: a wait scoped to a definition gates on its own held keys
+/// A wait scoped to a definition gates on its own held keys
 /// only. `order_prices` holds key 1, so a cluster-wide wait and a wait on
 /// `order_prices` don't converge, while one on `order_totals` does.
 #[tokio::test]
@@ -2619,7 +2619,7 @@ async fn a_halted_definitions_held_key_is_neither_parked_again_nor_left_after_it
 
 /// A page parks a change for the definition its key was held
 /// for when the page was computed, in its apply's own transaction. A release
-/// (or a resume, rule 5) that lands in between deletes the key's `poison`
+/// (or a resume) that lands in between deletes the key's `poison`
 /// and `poison_held` rows, and re-derives the key from its live row. The page
 /// must then park nothing: a held row for a key nothing holds is named by no
 /// release, and blocks every watermark token from then on. The release bumps
@@ -2900,7 +2900,7 @@ async fn an_eviction_after_a_release_does_not_poison_the_key_again() {
     assert!(!poison_marker_exists(&client, &orders, "7").await);
 }
 
-/// Rule 4: the re-check is "count at the threshold", not "row
+/// The re-check is "count at the threshold", not "row
 /// exists". A key charged again after its release, below the threshold, is
 /// not poisoned by the eviction that isolation's earlier charge started; and
 /// it is poisoned once it reaches the threshold again.

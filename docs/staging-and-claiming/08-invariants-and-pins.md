@@ -41,9 +41,9 @@ guarantee. Each item links to the document that argues for it.
       stamp, and a page adds a change only if its basis hasn't counted it.
       → [05](05-apply-and-exactly-once-deltas.md#the-ledger)
 - **No item may stay undrainable** — one would stop the whole instance. A
-      schema error pauses the definitions it reaches and drains without them;
-      write the halting-stop metric at the same time, so "halted" and "slow"
-      stay distinguishable.
+      schema error pauses the definitions it reaches and drains without them,
+      and `status()` names the halt (`capture_failure` of kind `halt`), so
+      "halted" and "slow" stay distinguishable.
       → [05](05-apply-and-exactly-once-deltas.md#failure-classification),
       [06](06-cleanup-and-reclaim.md)
 

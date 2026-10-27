@@ -57,14 +57,14 @@
 //!   role that ran the migrations, and need not own the schema: a DBA can
 //!   pre-create the schema as another role.
 //! - **The privileges a function's body uses, held by the role it runs
-//!   as** (its owner): `USAGE` on the instance schema, `INSERT` on every
-//!   ring segment, `USAGE` (or `UPDATE`) on `staging_change_id_seq`, which
-//!   the segments' `change_id` default draws from, `USAGE` (or `SELECT`) on
-//!   `ring_slot_mirror`, which `pg_sequence_last_value` reads, and `SELECT`
-//!   on the captured table, which the function re-reads when another write
-//!   to the table ran in the same statement. The ring's owner holds them all (the schema's `USAGE` through a grant
-//!   or membership in the schema's owner, if it isn't that role) unless
-//!   someone revokes them; a superuser always does.
+//!   as** (its owner): `USAGE` on the instance schema, `INSERT` on every ring
+//!   segment, `USAGE` (or `UPDATE`) on `staging_change_id_seq`, which the segments'
+//!   `change_id` default draws from, `USAGE` (or `SELECT`) on `ring_slot_mirror`,
+//!   which `pg_sequence_last_value` reads, and `SELECT` on the captured table, which
+//!   the function re-reads when another write to the table ran in the same statement.
+//!   The ring's owner holds them all (the schema's `USAGE` through a grant or
+//!   membership in the schema's owner, if it isn't that role) unless someone revokes
+//!   them; a superuser always does.
 //!
 //! # Which definitions and tables
 //!

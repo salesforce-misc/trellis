@@ -27,7 +27,7 @@
 //!
 //! **Engine log lines.** Some engine signals exist only as `tracing` events,
 //! not metrics: the drain's `drain page waited out its lock_timeout` warning
-//! is one. [`engine_log_counter`] is a `tracing` layer
+//! (ADR-0002 I7) is one. [`engine_log_counter`] is a `tracing` layer
 //! the benchmark binary always installs (`main.rs`), filtered to `WARN` and
 //! above, that counts those lines as they are emitted; [`lock_timeout_warnings`]
 //! reads the process-wide count, which a scenario diffs across its window like

@@ -179,15 +179,14 @@ const GATE_LOCK_KEY: i64 = 300;
 /// before the unlock is sent.
 const RELEASE_MARGIN: Duration = Duration::from_secs(1);
 
-/// public-api-design review gap: [`ManualBackend::quiesce`] used to only
-/// await CDC-ring convergence — it had no awareness of a still-`Backfilling`
-/// definition's build chunks at all (ADR-0002's "A build is Re-derive over
-/// chunks, and applies from its first chunk" puts that work entirely outside
-/// the ring). Every other test in this file only happened to pass because a
-/// large, unrelated convergence stall (a since-fixed keepalive throttle) gave
-/// a real running drain worker enough wall-clock time to finish a small
-/// backfill before `quiesce` returned and the test snapshotted state — not because `quiesce` actually
-/// waited for it.
+/// public-api-design review gap: [`ManualBackend::quiesce`] used to only await
+/// CDC-ring convergence — it had no awareness of a still-`Backfilling` definition's
+/// build chunks at all (ADR-0002's "A build is Re-derive over chunks, and applies
+/// from its first chunk" puts that work entirely outside the ring). Every other
+/// test in this file only happened to pass because a large, unrelated convergence
+/// stall (a since-fixed keepalive throttle) gave a real running drain worker enough
+/// wall-clock time to finish a small backfill before `quiesce` returned and the
+/// test snapshotted state — not because `quiesce` actually waited for it.
 ///
 /// This proves `quiesce` now really does wait, with no such coincidence to
 /// lean on and no manual chunk-queue driving of its own (this backend's

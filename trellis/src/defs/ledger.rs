@@ -1,4 +1,4 @@
-//! The 1-1 side ledger: one row per source key a 1-1
+//! The 1-1 side ledger (ADR-0002): one row per source key a 1-1
 //! target has applied, recording the ordering state (`applied_lsn`,
 //! `applied_seg`, `basis`, `tombstone`) that decides whether a later change
 //! for the key is applied or skipped. The target row holds the values.

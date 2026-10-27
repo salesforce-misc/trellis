@@ -1,4 +1,4 @@
-//! The type matrix: every type with a modifier, under every
+//! The type matrix (ADR-0020): every type with a modifier, under every
 //! kind of change to its source column, in every place Trellis keeps a copy
 //! of it, ends exact, or paused with a reason and exact after `RESUME`.
 //!
@@ -41,13 +41,13 @@
 //! or pauses. Every step is an explicit pass or drain; nothing polls for
 //! convergence.
 //!
-//! **Not in the matrix** (each is a later step of ADR-0020's type-identity work, or has its own test):
+//! **Not in the matrix** (each has its own test):
 //! - a Trellis copy against a source column in a `JOIN`'s `ON` has its own
 //!   tests: [`a_trellis_copy_pairs_with_a_source_column_of_any_modifier`] at
 //!   define, [`a_trellis_copy_joins_a_modified_source_column_end_to_end`] as
 //!   rows flow;
-//! - the rename row: a rename after define is `capture_type_rename.rs`'s, and
-//!   one before a baseline records it is step 3;
+//! - the rename row: `capture_type_rename.rs`, including a rename before a
+//!   baseline records the type (`a_rename_before_the_first_pass_is_followed`);
 //! - integer and float widths, the only changes that re-type a copy
 //!   (`capture_key_retype.rs`);
 
@@ -336,7 +336,7 @@ const TYPES: &[Ty] = &[
         narrow: None,
         relabel: None,
     },
-    // No modifier: its value identity is its labels.
+    // No modifier: its value identity is its labels (ADR-0020).
     Ty {
         label: "enum",
         value_type: ValueType::Other(PgType::Enum("enum:public.tone")),
@@ -882,7 +882,7 @@ async fn cell(place: Place, ty: &Ty, change: Change) {
         );
     }
     // A relabel pauses every reader of the type with its reason, whatever
-    // the place.
+    // the place (ADR-0020).
     if change == Change::Relabel {
         assert!(
             outcome
@@ -896,7 +896,7 @@ async fn cell(place: Place, ty: &Ty, change: Change) {
     // A re-type to another enum changes every value's identity: no stored
     // label is one of the new type's, so it pauses every reader of the
     // column, whatever the place, and `RESUME` rebuilds without casting
-    // one.
+    // one (ADR-0020).
     if enum_to_enum {
         assert!(
             !outcome.pauses.is_empty(),

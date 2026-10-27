@@ -274,10 +274,10 @@ pub(crate) fn ring_table_name(ring_slot: i16) -> Result<&'static str, StagingErr
     }
 }
 
-/// Resolves the ring slot a writer appends into (docs/staging-and-claiming/03-sealing-and-the-fence.md, "The two-phase
-/// seal"). Every ring writer resolves its slot here, never from
-/// `segment_pointer`. Two things make the read safe for the fence, and both
-/// are in this one statement:
+/// Resolves the ring slot a writer appends into
+/// (docs/staging-and-claiming/03-sealing-and-the-fence.md, "The two-phase seal").
+/// Every ring writer resolves its slot here, never from `segment_pointer`. Two
+/// things make the read safe for the fence, and both are in this one statement:
 ///
 /// - **It reads the mirror, not the table.** `ring_slot_mirror` is a
 ///   sequence, and `pg_sequence_last_value` is not transactional: it returns

@@ -1,5 +1,5 @@
 //! Define accepts the shape of a partitioned source and refuses every shape
-//! routing can't serve.
+//! routing can't serve (ADR-0017).
 //!
 //! A partitioned root of a servable shape defines; each accepted definition is
 //! dropped again so the next check can reuse its name. Nothing polls:

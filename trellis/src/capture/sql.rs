@@ -46,9 +46,10 @@
 //! - **It skips a statement that changed nothing.** An `UPDATE … WHERE false`
 //!   still fires a statement trigger. Returning early keeps it from
 //!   assigning an xid it doesn't need.
-//! - **It never fails the statement over a renamed or dropped column**. The same guard query counts the columns the function images; on a
-//!   miss it writes a [`SCHEMA_CHANGED_OP`] marker and images what's left
-//!   (see [`function_body`]).
+//! - **It never fails the statement over a renamed or dropped column.** The
+//!   same guard query counts the columns the function images; on a miss it
+//!   writes a [`SCHEMA_CHANGED_OP`] marker and images what's left (see
+//!   [`function_body`]).
 //! - **It stamps `lsn = origin_lsn = pg_current_wal_insert_lsn()`** and
 //!   `src_changed = clock_timestamp()`, both read once per statement.
 //!

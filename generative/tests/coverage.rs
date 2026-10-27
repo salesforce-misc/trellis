@@ -706,8 +706,8 @@ fn trivial_program_sometimes_draws_a_nested_expression() {
     );
 }
 
-/// The aggregate calls a `GROUP BY` definition can draw: the group basis's admitted set. Define refuses every
-/// other aggregate function on a plain aggregate.
+/// The aggregate calls a `GROUP BY` definition can draw: the group basis's admitted
+/// set. Define refuses every other aggregate function on a plain aggregate.
 const ADMITTED_AGGREGATE_CALLS: &[(&str, &str)] = &[
     ("COUNT", "*"),
     ("COUNT", "column"),

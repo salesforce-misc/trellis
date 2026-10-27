@@ -178,10 +178,10 @@ async fn converged_fixture(
     .await
     .expect("connect");
     trellis.apply(transform).await.expect("define");
-    // No staging worker runs here: stand in for its capture pass, which
-    // installs the source's capture triggers, and for its build, which
-    // takes a definition over an empty source straight to `live` (a plain 1-1 over a captured table is the Re-derive build's, whose plan
-    // job finds no rows).
+    // No staging worker runs here: stand in for its capture pass, which installs the
+    // source's capture triggers, and for its build, which takes a definition over an
+    // empty source straight to `live` (a plain 1-1 over a captured table is the
+    // Re-derive build's, whose plan job finds no rows).
     let src_table = format!("{DEFAULT_SCHEMA}.{source}");
     capture(&mut raw, &src_table).await;
     trellis::intake::harness::settle_builds(&db.pool).await;

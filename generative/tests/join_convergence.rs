@@ -60,26 +60,25 @@
 //! # Builds over rows
 //!
 //! Outside the `racing` shape, a definition is installed up front or part way
-//! through the stream, so most of those `JOIN`s build (per-side steps and the final `T` step) over tables
-//! that hold rows, or that the lanes are still writing. Later bursts pause
-//! and resume a definition (the resume rebuilds its target in place) and
-//! re-read `ja` or `jb` (`request_backfill`), while the lanes keep writing
-//! both tables. About a quarter of those cases first settle the up-front
-//! definitions over the empty tables, as the tier did before it drew builds.
-//! The oracle is the same per-burst comparison with the definition's own
-//! query, so a build that lost or doubled a row diverges at the burst it ran
-//! in, and a definition a build left paused, halted or quarantined fails the
-//! end check. The coverage report's `builds` lines count, per run, the
-//! installs, resumes and re-reads that fired over rows left by earlier
-//! bursts (more rows than their own burst can delete, so the build certainly
-//! read rows on both sides), the installs that fired in a burst whose own
-//! writes were still landing, and the cases that drew a build over rows; a
-//! run with none has drawn nothing worth reading. A last line reads the
-//! engine's build-rows counter (`trellis_build_rows_total`) around each
-//! passed case: the rows its builds wrote, the cases where they wrote any,
-//! and the cases with a build over rows in the model where the engine's
-//! builds wrote none (an `INNER` build with no matching key writes none, so
-//! that count is a prompt to look, not a failure).
+//! through the stream, so most of those `JOIN`s build (per-side steps and the final
+//! `T` step) over tables that hold rows, or that the lanes are still writing. Later
+//! bursts pause and resume a definition (the resume rebuilds its target in place)
+//! and re-read `ja` or `jb` (`request_backfill`), while the lanes keep writing both
+//! tables. About a quarter of those cases first settle the up-front definitions
+//! over the empty tables, as the tier did before it drew builds. The oracle is the
+//! same per-burst comparison with the definition's own query, so a build that lost
+//! or doubled a row diverges at the burst it ran in, and a definition a build left
+//! paused, halted or quarantined fails the end check. The coverage report's
+//! `builds` lines count, per run, the installs, resumes and re-reads that fired
+//! over rows left by earlier bursts (more rows than their own burst can delete, so
+//! the build certainly read rows on both sides), the installs that fired in a burst
+//! whose own writes were still landing, and the cases that drew a build over rows;
+//! a run with none has drawn nothing worth reading. A last line reads the engine's
+//! build-rows counter (`trellis_build_rows_total`) around each passed case: the
+//! rows its builds wrote, the cases where they wrote any, and the cases with a
+//! build over rows in the model where the engine's builds wrote none (an `INNER`
+//! build with no matching key writes none, so that count is a prompt to look, not a
+//! failure).
 //!
 //! Not drawn: partitioned sides, `DDL` between a build's steps, and
 //! definitions that read another's target.

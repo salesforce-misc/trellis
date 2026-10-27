@@ -286,7 +286,7 @@ mod tests {
         let entries = parse(
             "# a comment\n\
              \n\
-             cooling_key  3:1   #784  t3 rel_agg keeps a deleted parent\n",
+             cooling_key  3:1   #10  t3 keeps a stale row\n",
         )
         .expect("parses");
         assert_eq!(
@@ -295,17 +295,17 @@ mod tests {
                 tier: "cooling_key".into(),
                 seed: 3,
                 case: 1,
-                issue: 784,
-                note: "t3 rel_agg keeps a deleted parent".into(),
+                issue: 10,
+                note: "t3 keeps a stale row".into(),
             }]
         );
         for bad in [
-            "warm_key 3:1 #784 x",
-            "cooling_key 3 #784 x",
-            "cooling_key 0:1 #784 x",
-            "cooling_key 3:1 784 x",
-            "cooling_key 3:1 #784",
-            "cooling_key 3:1 #784 x\ncooling_key 3:1 #785 y",
+            "warm_key 3:1 #10 x",
+            "cooling_key 3 #10 x",
+            "cooling_key 0:1 #10 x",
+            "cooling_key 3:1 10 x",
+            "cooling_key 3:1 #10",
+            "cooling_key 3:1 #10 x\ncooling_key 3:1 #11 y",
         ] {
             assert!(parse(bad).is_err(), "{bad:?} parsed");
         }

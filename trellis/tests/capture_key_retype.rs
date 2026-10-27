@@ -2680,7 +2680,7 @@ async fn assert_widening_targets_match(raw: &Client) {
     }
 }
 
-/// One widening of a type modifier. The
+/// One widening of a type modifier (ADR-0020). The
 /// source's key columns are re-typed `key_to` (or kept, when `None`) and its
 /// value columns `value_to`. A copy has no modifier, so no column Trellis
 /// copied from them changes: a pass re-types nothing, rewrites nothing and

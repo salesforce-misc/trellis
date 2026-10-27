@@ -1,4 +1,4 @@
-//! Integration tests for `ALTER TRANSFORM` and
+//! Integration tests for `ALTER TRANSFORM` (ADR-0015) and
 //! its retrofit of `DROP TRANSFORM`'s dependency refusal to column
 //! granularity.
 //!

@@ -1,5 +1,5 @@
 //! Capture installs on every table of a partitioned source's tree, staging
-//! under the root's identity.
+//! under the root's identity (ADR-0017).
 //!
 //! A statement trigger fires only for the table a statement names, so the
 //! root, each middle and each leaf carries the five capture triggers, all

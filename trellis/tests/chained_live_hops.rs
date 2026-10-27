@@ -65,8 +65,8 @@ async fn install_chain(
     }
 }
 
-/// A 2-hop 1-1 passthrough chain and one insert, then an update and a delete of the same row, so every CDC op for
-/// the root reaches `h2` through the middle hop.
+/// A 2-hop 1-1 passthrough chain and one insert, then an update and a delete of the
+/// same row, so every CDC op for the root reaches `h2` through the middle hop.
 #[tokio::test]
 async fn a_two_hop_one_to_one_chain_converges_without_capturing_the_middle_hop() {
     let (cluster, db, raw) = trigger_pipeline::database().await;

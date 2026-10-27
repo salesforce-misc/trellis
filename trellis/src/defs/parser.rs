@@ -722,10 +722,10 @@ impl Parser {
         })
     }
 
-    /// Parses one `GROUP BY` key of a non-`JOIN` aggregate: a plain
-    /// `<column>`, or `<source>.<column>` naming the `FROM` table. A key is always a source column, never a field, so the
-    /// qualifier changes nothing and isn't kept. Any other head is refused
-    /// ([`ParseError::GroupByKeyNotFromSource`]).
+    /// Parses one `GROUP BY` key of a non-`JOIN` aggregate: a plain `<column>`, or
+    /// `<source>.<column>` naming the `FROM` table. A key is always a source column,
+    /// never a field, so the qualifier changes nothing and isn't kept. Any other head
+    /// is refused ([`ParseError::GroupByKeyNotFromSource`]).
     fn parse_group_by_key(&mut self) -> Result<String, ParseError> {
         let first = self.expect_ident()?;
         if self.peek_is_symbol('.') {

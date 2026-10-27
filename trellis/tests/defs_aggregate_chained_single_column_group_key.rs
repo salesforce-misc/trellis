@@ -459,16 +459,16 @@ async fn null_group_total(client: &Client, table: &str, column: &str) -> Option<
         .and_then(|row| row.get(0))
 }
 
-/// `ddl::NULL_KEY_SENTINEL` is U+0001, an
-/// ordinary control character a `text` column can genuinely hold — so the
-/// encoding has to *escape* a real one rather than merely assume it never
-/// occurs. Without the escape, a group whose `sku` is a lone U+0001 encodes
-/// to exactly the same key text as the `sku IS NULL` group, and the two are
-/// folded into one: the upstream aggregate loses the U+0001 group entirely
-/// and mis-attributes its `amount` to the NULL group, at both levels of the
-/// chain. That is a silent, data-dependent corruption of data that worked
-/// correctly without the NULL sentinel, which would make it strictly worse
-/// than the bug the sentinel fixes — hence this pin, alongside `ddl`'s own unit-level round-trip test.
+/// `ddl::NULL_KEY_SENTINEL` is U+0001, an ordinary control character a `text`
+/// column can genuinely hold — so the encoding has to *escape* a real one rather
+/// than merely assume it never occurs. Without the escape, a group whose `sku` is a
+/// lone U+0001 encodes to exactly the same key text as the `sku IS NULL` group, and
+/// the two are folded into one: the upstream aggregate loses the U+0001 group
+/// entirely and mis-attributes its `amount` to the NULL group, at both levels of
+/// the chain. That is a silent, data-dependent corruption of data that worked
+/// correctly without the NULL sentinel, which would make it strictly worse than the
+/// bug the sentinel fixes — hence this pin, alongside `ddl`'s own unit-level
+/// round-trip test.
 #[tokio::test]
 async fn a_real_sentinel_valued_group_key_stays_its_own_group() {
     let cluster = TestCluster::start();

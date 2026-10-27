@@ -246,9 +246,12 @@ objects an embedder creates, or use a separate pool.
 
 ## Configuration from the environment
 
-`Config::resolve` (what the CLI and the language clients call) reads the
-connection from an explicit connection string, then from the environment, with
-no config file. A value is read once, when the `Config` is built.
+`Config::resolve` (what the CLI calls) reads the connection from an explicit
+connection string, then from the environment, with no config file.
+`Config::from_dsn` takes the connection string and reads the other variables
+below. `Config::with_schema`, which the Ruby and Elixir clients call with their
+own options, reads no environment variable. A value is read once, when the
+`Config` is built.
 
 | Variable | Meaning | Default |
 |---|---|---|
@@ -262,8 +265,8 @@ no config file. A value is read once, when the `Config` is built.
 
 A value that does not parse (`TRELLIS_POOL_MAX_SIZE=many`), or a schema name
 that is empty, holds a NUL byte or is over 63 bytes, is a configuration error at startup; it is not
-ignored. With no connection string at all, startup fails and names the
-variables it looked for.
+ignored. An empty connection string, passed or in `TRELLIS_DATABASE_URL`, fails
+at startup naming the variables it looked for.
 
 ## TLS to Postgres
 

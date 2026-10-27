@@ -254,10 +254,9 @@ ordering state apply will judge a change against:
 
 - `__applied_lsn` and `__applied_seg`: the `lsn` and ring segment of the last
   change applied to the entry. A Re-derive leaves `__applied_lsn` alone.
-`__applied_seg` is the tombstone GC watermark. A
-  Re-derive's read is live, so it stamps at least the newest segment its
-  snapshot sees, not only the page's own: a tombstone must outlast every
-  change its `__basis` saw.
+  `__applied_seg` is the tombstone GC watermark. A Re-derive's read is live,
+  so it stamps at least the newest segment its snapshot sees, not only the
+  page's own: a tombstone must outlast every change its `__basis` saw.
 - `__basis`: the `pg_current_snapshot()` of the read that last wrote the entry,
   taken in the same statement as that read (I1). A change whose transaction is
   visible in it is already counted.
@@ -508,6 +507,8 @@ retried with backoff from outside any transaction.
   them) on disk, the longest page is 6.6 s, and no page waits out a 30 s or a
   10 s cap. The cap is the smallest of the two whose longest page stays under
   a third of it, so a slow checkpoint can't turn ordinary pages into retries.
+  Going lower waits for the measurements of
+  [#629](https://github.com/salesforce-misc/trellis/issues/629).
 - **A drain keeps its claim across the retry.** A page whose transaction
   times out is classified transient; the drain backs off (50 ms, doubling to
   1 s) and retries the page, recomputing it, while the heartbeat keeps its

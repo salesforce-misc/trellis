@@ -98,17 +98,16 @@
 //! ```
 //!
 //! `to_jsonb` calls a value's own output function for every non-numeric,
-//! non-datetime scalar type (the same fact that holds for `bytea`) —
-//! it never goes through `pg_cast`'s `text(inet)` override, so for `inet` it
-//! *agrees with `inet_out`*, not with `<col>::text`. This is not a live
-//! hazard for Trellis today: `staging::apply::row_as_text_jsonb_sql`
-//! renders every row with an explicit per-column
-//! `<col>::text` instead of a bare `to_jsonb(t.*)`, so nothing in the engine actually calls bare `to_jsonb`
-//! for a row body — the discrepancy above is bare-Postgres-`to_jsonb`
-//! trivia, not a second internal renderer to reconcile, the same conclusion
-//! that holds for `bytea`. It is recorded here because it is one more
-//! confirmation that `inet_out` (⟵ CDC) and `<col>::text` (⟵ everything the
-//! engine itself renders) are the two renderers actually in
+//! non-datetime scalar type (the same fact that holds for `bytea`) — it never goes
+//! through `pg_cast`'s `text(inet)` override, so for `inet` it *agrees with
+//! `inet_out`*, not with `<col>::text`. This is not a live hazard for Trellis
+//! today: `staging::apply::row_as_text_jsonb_sql` renders every row with an
+//! explicit per-column `<col>::text` instead of a bare `to_jsonb(t.*)`, so nothing
+//! in the engine actually calls bare `to_jsonb` for a row body — the discrepancy
+//! above is bare-Postgres-`to_jsonb` trivia, not a second internal renderer to
+//! reconcile, the same conclusion that holds for `bytea`. It is recorded here
+//! because it is one more confirmation that `inet_out` (⟵ CDC) and `<col>::text` (⟵
+//! everything the engine itself renders) are the two renderers actually in
 //! conflict, not `to_jsonb` and `<col>::text`.
 //!
 

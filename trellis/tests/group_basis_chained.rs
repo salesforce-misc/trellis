@@ -9,12 +9,12 @@
 //! capture once every definition is live, except where a test says it builds
 //! over rows.
 //!
-//! The first tests cover a chained aggregate over a single-column and a
-//! composite group key, and one whose upstream 1-1 target loses a row. The
-//! rest cover a row that moves group upstream, a rollup whose upstream group is emptied and refilled in one page, a
-//! reader defined while an upstream writer is in flight, and an upstream
-//! rebuild that rebuilds the reader. The last group is a reader's build over an
-//! upstream target whose keys have `NULL` parts, with writes and source
+//! The first tests cover a chained aggregate over a single-column and a composite
+//! group key, and one whose upstream 1-1 target loses a row. The rest cover a row
+//! that moves group upstream, a rollup whose upstream group is emptied and refilled
+//! in one page, a reader defined while an upstream writer is in flight, and an
+//! upstream rebuild that rebuilds the reader. The last group is a reader's build
+//! over an upstream target whose keys have `NULL` parts, with writes and source
 //! `TRUNCATE`s around it.
 
 #[path = "support/drain_driver.rs"]

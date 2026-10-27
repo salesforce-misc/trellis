@@ -320,7 +320,7 @@ it regenerates anything, it pauses the definition, with its
 The reason names each column, its old and new type, and each copy, and says
 what to do. Nothing clears it but a deliberate `RESUME`, or a drop.
 
-A modifier never makes the fourth check pause: every
+A modifier never makes the fourth check pause (ADR-0020): every
 column Trellis creates from a source column has the source column's type with
 no modifier, and its collation. It holds whatever the source column holds
 after any change of a modifier (a string bound, a `numeric` precision or

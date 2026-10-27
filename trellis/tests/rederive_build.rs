@@ -959,11 +959,11 @@ async fn a_one_to_one_build_leaves_a_quarantined_key_out() {
     );
 }
 
-/// A plain 1-1 whose source loses its primary key once captured: the start reads no key, so it isn't what fails; the plan job is
-/// what needs the key. That job fails, unnarrowable, and is charged and
-/// retried while status reports the error; its last charge pauses
-/// the definition with the error on status. The build never goes `live`
-/// and nothing is written to the target.
+/// A plain 1-1 whose source loses its primary key once captured: the start reads no
+/// key, so it isn't what fails; the plan job is what needs the key. That job fails,
+/// unnarrowable, and is charged and retried while status reports the error; its
+/// last charge pauses the definition with the error on status. The build never goes
+/// `live` and nothing is written to the target.
 #[tokio::test]
 async fn a_one_to_one_whose_source_lost_its_key_fails_through_its_plan_job() {
     // `chunk_queue::MAX_CHARGED_ATTEMPTS`, which is crate-private.

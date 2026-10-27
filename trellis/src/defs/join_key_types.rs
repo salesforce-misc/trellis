@@ -304,14 +304,13 @@ pub(crate) fn supported_join_key_types() -> String {
 }
 
 /// Whether `pg_type` (a `format_type` rendering, e.g. `integer`, `character
-/// varying(255)`) is in [`TEXT_STABLE_JOIN_KEY_TYPES`] — the single source of
-/// truth both [`super::validate::validate_join`] (`JOIN` keys) and
-/// [`super::ddl::source_primary_key`] (1-1 transform primary keys) gate on. Any modifier (`(255)`, `(10,2)`, `(3)`) is
-/// stripped by [`base_type_name`] before matching, so `varchar(255)` and
-/// `varchar(100)` are both recognized as `character varying` — and
-/// `timestamp(3) without time zone` as `timestamp without time zone` —
-/// rather than falling through to the catch-all rejection as distinct
-/// strings.
+/// varying(255)`) is in [`TEXT_STABLE_JOIN_KEY_TYPES`] — the single source of truth
+/// both [`super::validate::validate_join`] (`JOIN` keys) and
+/// [`super::ddl::source_primary_key`] (1-1 transform primary keys) gate on. Any
+/// modifier (`(255)`, `(10,2)`, `(3)`) is stripped by [`base_type_name`] before
+/// matching, so `varchar(255)` and `varchar(100)` are both recognized as `character
+/// varying` — and `timestamp(3) without time zone` as `timestamp without time zone`
+/// — rather than falling through to the catch-all rejection as distinct strings.
 pub(crate) fn is_text_stable_join_key_type(pg_type: &str) -> bool {
     let base = base_type_name(pg_type);
     // A copy renders `bit` as the quoted `"bit"` ([`super::copy_type`]).

@@ -47,12 +47,12 @@
 //!
 //! # Which definitions
 //!
-//! A plain aggregate (every `GROUP BY` key a source column) whose every value field composes the admitted aggregates
-//! (`COUNT(*)`, `COUNT(x)`, and `SUM`/`AVG` over an integer
-//! argument or a `numeric` column) with literals, operators, functions and
-//! its `GROUP BY` keys. An argument may be an expression over the row
-//! (`SUM(a + b)`); a `numeric` one must be a column, whose declared scale
-//! define checks. Define refuses any other aggregate by family.
+//! A plain aggregate (every `GROUP BY` key a source column) whose every value field
+//! composes the admitted aggregates (`COUNT(*)`, `COUNT(x)`, and `SUM`/`AVG` over
+//! an integer argument or a `numeric` column) with literals, operators, functions
+//! and its `GROUP BY` keys. An argument may be an expression over the row (`SUM(a +
+//! b)`); a `numeric` one must be a column, whose declared scale define checks.
+//! Define refuses any other aggregate by family.
 //!
 //! # Where its state lives
 //!

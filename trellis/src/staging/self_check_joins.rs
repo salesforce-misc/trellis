@@ -39,7 +39,7 @@
 //! walk (no cursor) starts the target's part, and the last part's end ends
 //! the walk.
 //!
-//! It reports, never repairs: the remedy is a
+//! It reports, never repairs (ADR-0013): the remedy is a
 //! `request_backfill` or a `PAUSE`/`RESUME`. Like every page, it is read only
 //! after `super::self_check::audit`'s convergence wait. Each part reads its
 //! tables minus the ring rows not applied yet ([`super::self_check_ring`]):

@@ -116,7 +116,7 @@ async fn insert_cdc_row(
 /// Runs any dispatched backfill chunks, then seals and drains repeatedly
 /// until nothing is pending anywhere in the ring — the same harness
 /// `defs_install_definition.rs` uses. A definition's build reads its source
-/// itself rather than staging it into the ring, so the
+/// itself rather than staging it into the ring (ADR-0002), so the
 /// builds run first.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     drain_backfill_chunks(pool).await;
@@ -152,7 +152,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 /// the one thing this test actually cares about — the target reaching live
 /// again — already happened.
 async fn drain_until_live(pool: &trellis::Pool, client: &mut Client, target: &str) {
-    // A chunked rebuild goes live from its last chunk.
+    // A chunked rebuild goes live from its last chunk (ADR-0002).
     drain_backfill_chunks(pool).await;
     if status_of(client, target).await == TransformStatus::Live {
         return;

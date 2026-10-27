@@ -101,8 +101,8 @@ pub struct Coverage {
     /// value), `"list_default"` (fewer leaves and a `DEFAULT`) and
     /// `"range"`. Zero everywhere means no case read a partitioned source.
     pub partition_strategies: HashMap<&'static str, usize>,
-    /// How many of each partitioned-source op the recorded programs drew,
-    /// by [`partition_op_name`]: partition
+    /// How many of each partitioned-source op the recorded programs drew
+    /// (ADR-0017), by [`partition_op_name`]: partition
     /// maintenance (`"detach"`, `"detach_concurrently"`, `"attach"`,
     /// `"drop"`, `"truncate_leaf"`, a new leaf `"create_empty"`,
     /// `"create_written"` or `"create_attached"`), writes named on a leaf

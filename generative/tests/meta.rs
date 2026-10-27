@@ -67,11 +67,12 @@ async fn a_backend_that_cannot_stand_up_is_reported_unusable() {
     );
 }
 
-/// Self-enforcing half of the fast/deep split: every proptest property is `#[ignore]`d, so a plain `cargo test
-/// --workspace` — the command every contributor and CI lane reaches for first —
-/// never deep-runs them by accident. Deep runs opt in with `-- --ignored` (just
-/// the properties) or `-- --include-ignored` (everything). Properties are also
-/// named with a `property_` prefix so they stay easy to spot and to filter
+/// Self-enforcing half of the fast/deep split: every proptest property is
+/// `#[ignore]`d, so a plain `cargo test --workspace` — the command every
+/// contributor and CI lane reaches for first — never deep-runs them by accident.
+/// Deep runs opt in with `-- --ignored` (just the properties) or
+/// `-- --include-ignored` (everything). Properties are also named with a
+/// `property_` prefix so they stay easy to spot and to filter
 /// (`cargo test -p generative -- --ignored property_convergence`).
 ///
 /// This scans every `generative/tests/*.rs` source file, finds each

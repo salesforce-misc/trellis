@@ -163,8 +163,8 @@ pub const FENCE_MISS_MAX_DELAY: Duration = Duration::from_secs(1);
 /// Pure, no-DB backoff state for a drain loop's own fence-miss retries
 /// (doc 04, "Two ways a claim comes back"). `0` on the first miss, then
 /// doubling from [`FENCE_MISS_INITIAL_DELAY`] up to [`FENCE_MISS_MAX_DELAY`],
-/// reset by any clean drain. The drain loop itself is a separate
-/// piece; this is just the piece of state it needs.
+/// reset by any clean drain. The drain's retry path (`staging::apply`)
+/// keeps one.
 #[derive(Debug, Clone)]
 pub struct FenceMissBackoff {
     /// The delay `next_delay` will return *after* the one it's about to
