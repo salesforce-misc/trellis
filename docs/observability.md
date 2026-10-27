@@ -135,6 +135,9 @@ below, and the histograms above, also carries the `trellis_instance` label
   snapshot are held. Its buckets are finer than the latency histograms': about
   25% apart from 1 ms to 125 s. `build_chunk_seconds_max` is a gauge of the
   longest such chunk the instance has committed.
+* `page_transaction_seconds` — the duration of each committed drain page's apply
+  transaction, from its begin to its commit: the span the page holds the entry and
+  target-row locks of its keys. It has `build_chunk_seconds`' buckets.
 * `build_rows_total` — source keys that Re-derive build chunks have re-derived.
 * `build_chunk_lock_timeouts_total` — build chunks that gave up on their entry
   lock's short timeout and were released for a retry. A nonzero rate means a

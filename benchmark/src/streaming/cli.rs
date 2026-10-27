@@ -12,7 +12,7 @@ use crate::streaming::tuning::EngineTuning;
 use crate::streaming::write_tax::{self, CellOptions, ProbeMode, Shape, Variant};
 use crate::streaming::{
     build_under_load, capture_ceiling, disk_tier, fold_in, generator_reach, hop_latency, idle_cost,
-    join, load, self_check_walk, ssi_tax, throughput,
+    join, load, one_to_one_apply, self_check_walk, ssi_tax, throughput,
 };
 
 /// Every scenario name this module handles, for `main.rs`'s usage message.
@@ -31,6 +31,7 @@ pub const SCENARIOS: &[&str] = &[
     "build-under-load",
     "join",
     "self-check-walk",
+    "one-to-one-apply",
 ];
 
 /// The latency ladder's defaults: a low offered rate (10
@@ -541,6 +542,30 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
                 eprintln!("APPLY AUDIT FAILURE: {audit_failed} audited statement(s) failed");
             }
             Some(result.oracle_ok && result.writes.errors == 0 && audit_failed == 0)
+        }
+
+        "one-to-one-apply" => {
+            let cfg = one_to_one_apply::OneToOneApply {
+                shapes: flag(args, "--shapes").map_or_else(
+                    || {
+                        one_to_one_apply::SHAPES
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect()
+                    },
+                    |raw| raw.split(',').map(str::to_string).collect(),
+                ),
+                rows: number(args, "--rows").map_or(1_000_000, |v| v as i64),
+                commit_rows: number(args, "--commit-rows").map_or(10_000, |v| v as i64),
+                timeout: secs(args, "--timeout-secs").unwrap_or(Duration::from_secs(600)),
+            };
+            let tuning = throughput_tuning(args);
+            let results = runtime().block_on(one_to_one_apply::run(&cfg, &tuning));
+            Some(
+                results
+                    .iter()
+                    .all(|r| r.drained && r.oracle_mismatches == 0),
+            )
         }
 
         // The JOIN scenario, with its per-fact control.

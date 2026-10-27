@@ -6083,6 +6083,7 @@ async fn drain_batch(
         };
 
         let mut client = pool.get().await?;
+        let began = std::time::Instant::now();
         let txn = client.transaction().await?;
         let applied = match apply_page(&txn, steps, claimed_by, &plan, wake_channel).await {
             // COMMIT fails like any statement of the page does: a
@@ -6128,6 +6129,7 @@ async fn drain_batch(
                 });
             }
             Ok(outcome) => {
+                crate::metrics::record_page_transaction(began.elapsed());
                 // Only
                 // flush `plan`'s buffered metrics now, once this attempt's
                 // transaction has actually committed — never from inside

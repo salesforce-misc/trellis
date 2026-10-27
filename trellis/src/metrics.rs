@@ -141,6 +141,10 @@ const BUILD_CHUNK_METRIC: &str = "trellis_build_chunk_seconds";
 /// The longest [`BUILD_CHUNK_METRIC`] this instance has recorded.
 const BUILD_CHUNK_MAX_METRIC: &str = "trellis_build_chunk_seconds_max";
 
+/// One drained page's apply transaction, from its begin to its commit:
+/// the span the page holds its entry and target-row locks.
+const PAGE_TRANSACTION_METRIC: &str = "trellis_page_transaction_seconds";
+
 /// Source keys a Re-derive build's chunks re-derived.
 const BUILD_ROWS_METRIC: &str = "trellis_build_rows_total";
 
@@ -288,6 +292,14 @@ pub fn record_build_chunk(elapsed: Duration, keys: u64) {
     metrics::counter!(BUILD_ROWS_METRIC, INSTANCE_LABEL => instance).increment(keys);
 }
 
+/// Records one committed page's apply transaction duration
+/// ([`PAGE_TRANSACTION_METRIC`]).
+pub fn record_page_transaction(elapsed: Duration) {
+    ensure_installed();
+    metrics::histogram!(PAGE_TRANSACTION_METRIC, INSTANCE_LABEL => instance())
+        .record(elapsed.as_secs_f64());
+}
+
 /// Counts a Re-derive build chunk that gave up on its entry lock.
 pub fn increment_build_chunk_lock_timeouts() {
     ensure_installed();
@@ -364,6 +376,11 @@ fn described_recorder(
             BUILD_CHUNK_BUCKETS,
         )
         .expect("BUILD_CHUNK_BUCKETS is non-empty and every boundary is finite")
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(PAGE_TRANSACTION_METRIC.to_string()),
+            BUILD_CHUNK_BUCKETS,
+        )
+        .expect("BUILD_CHUNK_BUCKETS is non-empty and every boundary is finite")
         .build_recorder();
     metrics::with_local_recorder(&recorder, describe_metrics);
     recorder
@@ -391,6 +408,11 @@ fn describe_metrics() {
         BUILD_CHUNK_METRIC,
         metrics::Unit::Seconds,
         "Duration of each committed Re-derive build chunk's transaction."
+    );
+    metrics::describe_histogram!(
+        PAGE_TRANSACTION_METRIC,
+        metrics::Unit::Seconds,
+        "Duration of each committed drain page's apply transaction, the span it holds its locks."
     );
     metrics::describe_gauge!(
         BUILD_CHUNK_MAX_METRIC,

@@ -63,6 +63,8 @@
 //!   storage, and a fixed-size commit-latency histogram.
 //! - [`process_memory`]: in-process `VmRSS` sampling (peak, per phase,
 //!   `VmHWM`, the cgroup's `memory.peak`).
+//! - [`one_to_one_apply`]: a 1-1 target's drain cost per row by field
+//!   shape: rows/s, Postgres CPU and page transaction durations.
 //! - [`server_cost`]: Postgres CPU, `deadlock detected` log lines, the
 //!   engine's lock-timeout warnings and ledger bytes over a window.
 
@@ -80,6 +82,7 @@ pub mod hop_latency;
 pub mod idle_cost;
 pub mod join;
 pub mod load;
+pub mod one_to_one_apply;
 pub mod process_memory;
 pub mod rate;
 pub mod scrape;
