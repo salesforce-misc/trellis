@@ -101,7 +101,7 @@ otlp = [
 #      timing luck.
 #   2. `src/dev.rs` — ADR-0012's one sanctioned exception: a curated
 #      re-export of the engine items the `generative` fuzz suite's
-#      independent, evaluator-driven cross-check leg and `benchmark`'s
+#      independent SQL oracle and `benchmark`'s
 #      scenario oracle need. ADR-0012 makes `defs`/`staging`/`intake`
 #      `pub(crate)`; `dev` is the only way across that line from another
 #      crate, and nothing reached through it carries a public-API or semver
