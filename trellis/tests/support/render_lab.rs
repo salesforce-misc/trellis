@@ -203,6 +203,16 @@ impl<'a> Lab<'a> {
     /// Inserts a row of `values` (column, text; `None` is SQL `NULL`) into
     /// the source, stages it as an insert and drains it once.
     pub async fn apply(&mut self, values: &[(&str, Option<&str>)]) -> Outcome {
+        self.apply_with(values, true).await
+    }
+
+    /// Like [`Self::apply`], but stages the image without inserting the row
+    /// into the source: for an image no source column could hold.
+    pub async fn apply_image_only(&mut self, values: &[(&str, Option<&str>)]) -> Outcome {
+        self.apply_with(values, false).await
+    }
+
+    async fn apply_with(&mut self, values: &[(&str, Option<&str>)], insert: bool) -> Outcome {
         self.next_key += 1;
         let id = self.next_key;
         let mut image = serde_json::Map::new();
@@ -216,7 +226,9 @@ impl<'a> Lab<'a> {
             );
         }
         let rows = vec![(id.to_string(), serde_json::Value::Object(image).to_string())];
-        insert_source(&self.client, "s", &rows).await;
+        if insert {
+            insert_source(&self.client, "s", &rows).await;
+        }
         let seg_seq = stage(&mut self.client, "s", &rows).await;
         match drain(self.db, seg_seq).await {
             Ok(_) => {}

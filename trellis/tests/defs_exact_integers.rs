@@ -16,21 +16,25 @@
 //!    expectations copied out of the documentation.
 //! 2. **Overflow.** `int4 + int4` raises `22003 numeric_value_out_of_range`
 //!    once the sum leaves `int4`; `int4 + numeric` never does. Checked by
-//!    running the same operands through Postgres and through the evaluator
-//!    and asserting the two agree about *whether* it fails, row by row.
+//!    running the same operands through Postgres directly and through the
+//!    real apply path and asserting the two agree about *whether* it fails,
+//!    row by row.
 //!
 //! Neither is provable by a unit test: a unit test asserting `int4 + int4 ->
 //! integer` is just the implementation restating itself. Per ADR-0013 the
 //! comparisons below are against independently-authored SQL — plain
-//! `pg_typeof`, plain `select ... group by ...` — never against
-//! `defs::oracle::recompute`, which would be the engine's own renderer
-//! grading the engine's own evaluator.
+//! `pg_typeof`, plain `select ... group by ...` — never against the engine's
+//! own renderer.
 //!
 //! Harness conventions (`install_definition` + drain the chunk queue, then
 //! introspect `information_schema`) follow `defs_typed_literals.rs`.
 
+#[path = "support/render_lab.rs"]
+mod render_lab;
 #[path = "support/wait_live.rs"]
 mod wait_live;
+
+use render_lab::{Lab, Outcome};
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -40,7 +44,6 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
-use trellis::defs::eval::{RegexCache, Row, Value, evaluate};
 use trellis::defs::{CatalogError, ValidationError, install_definition, parse, validate};
 use trellis::integer::IntWidth;
 use trellis::{Config, Trellis, TrellisOptions};
@@ -314,41 +317,31 @@ const BOUNDARY_CASES: &[(IntWidth, i64, i64)] = &[
     (IntWidth::Int8, i64::MIN, -1),
 ];
 
-fn add_def(lhs: &str, rhs: &str) -> TransformDef {
-    TransformDef {
-        target: "t".to_string(),
-        explicit_target_schema: None,
-        source: "s".to_string(),
-        explicit_source_schema: None,
-        key_space: KeySpace::OneToOne,
-        fields: vec![FieldDef {
-            name: "out".to_string(),
-            expr: Expr::BinaryOp {
-                op: Operator::Add,
-                lhs: Box::new(Expr::Column(lhs.to_string())),
-                rhs: Box::new(Expr::Column(rhs.to_string())),
-            },
-        }],
-        predicate: Predicate::True,
-        without_source_index: false,
-    }
+/// A `Lab` over `s (a, b)` of one exact integer width, computing `a + b`.
+async fn int_lab(db: &testkit::TestDatabase, width: IntWidth) -> Lab<'_> {
+    let pg_name = width.pg_name();
+    Lab::new(
+        db,
+        &format!("a {pg_name}, b {pg_name}"),
+        "TRANSFORM t FROM s SELECT a + b AS out",
+        &[
+            ("id", ValueType::Integer(IntWidth::Int4)),
+            ("a", ValueType::Integer(width)),
+            ("b", ValueType::Integer(width)),
+        ],
+    )
+    .await
 }
 
-fn row2(a: i64, b: i64) -> Row {
-    HashMap::from([
-        ("a".to_string(), Some(a.to_string())),
-        ("b".to_string(), Some(b.to_string())),
-    ])
-}
-
-/// Trellis raises exactly when Postgres raises, and produces exactly what
-/// Postgres produces otherwise.
+/// The real apply path raises exactly when Postgres raises, and produces
+/// exactly what Postgres produces otherwise.
 ///
 /// This is the behavioural half. Folding these through arbitrary-precision
 /// `numeric` would silently produce `32768` where a server-side
 /// `select a2 + b2` raises `22003 numeric_value_out_of_range` — so an
 /// incremental apply and a backfill of the *same definition* could disagree
-/// about whether it works at all.
+/// about whether it works at all. Postgres evaluates the sum in the upsert
+/// that writes the target, so the verdict is its own.
 ///
 /// The Postgres side is written independently (`select $1::<w> + $2::<w>`),
 /// with the operands bound as text and cast server-side, so neither side
@@ -356,65 +349,39 @@ fn row2(a: i64, b: i64) -> Row {
 #[tokio::test]
 async fn integer_addition_raises_exactly_where_postgres_raises() {
     let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    let def = add_def("a", "b");
-
-    for (width, lhs, rhs) in BOUNDARY_CASES {
+    for width in IntWidth::ALL {
+        let db = cluster.create_isolated_database().await;
+        let mut lab = int_lab(&db, width).await;
         let pg_name = width.pg_name();
-        let columns = HashMap::from([
-            ("a".to_string(), ValueType::Integer(*width)),
-            ("b".to_string(), ValueType::Integer(*width)),
-        ]);
-
-        let postgres = client
-            .query_one(
-                &format!("select ($1::text::{pg_name} + $2::text::{pg_name})::text"),
-                &[&lhs.to_string(), &rhs.to_string()],
-            )
-            .await;
-        let trellis = evaluate(&def, &row2(*lhs, *rhs), &columns, &mut RegexCache::new());
-
-        match (postgres, trellis) {
-            (Ok(pg_row), Ok(values)) => {
-                let expected: String = pg_row.get(0);
-                let got = values["out"].as_ref().expect("a non-NULL sum").to_string();
-                assert_eq!(
-                    got, expected,
-                    "{lhs} + {rhs} on {pg_name}: Postgres says {expected}, Trellis says {got}"
-                );
+        for (case_width, lhs, rhs) in BOUNDARY_CASES {
+            if *case_width != width {
+                continue;
             }
-            (Err(pg_err), Err(eval_err)) => {
-                let db_err = pg_err
-                    .as_db_error()
-                    .unwrap_or_else(|| panic!("{lhs} + {rhs} on {pg_name}: not a server error"));
-                assert_eq!(
-                    db_err.code(),
-                    &SqlState::NUMERIC_VALUE_OUT_OF_RANGE,
-                    "{lhs} + {rhs} on {pg_name}: unexpected SQLSTATE"
-                );
-                // Postgres's own wording, reproduced verbatim, so an
-                // operator reading a quarantine record sees the message
-                // they would have seen from the server.
-                assert!(
-                    eval_err
-                        .to_string()
-                        .contains(&format!("{pg_name} out of range")),
-                    "{lhs} + {rhs} on {pg_name}: expected Postgres's wording, got: {eval_err}"
-                );
-            }
-            (Ok(pg_row), Err(eval_err)) => {
-                let value: String = pg_row.get(0);
-                panic!(
-                    "{lhs} + {rhs} on {pg_name}: Postgres computed {value}, Trellis raised \
-                     {eval_err}"
-                );
-            }
-            (Err(pg_err), Ok(values)) => panic!(
-                "{lhs} + {rhs} on {pg_name}: Postgres raised {pg_err}, Trellis computed {:?}",
-                values["out"]
-            ),
+            let postgres = lab
+                .client()
+                .query_one(
+                    &format!("select ($1::text::{pg_name} + $2::text::{pg_name})::text"),
+                    &[&lhs.to_string(), &rhs.to_string()],
+                )
+                .await;
+            let expected = match postgres {
+                Ok(row) => Outcome::Values(vec![row.get(0)]),
+                Err(err) => {
+                    let db_err = err.as_db_error().expect("a server error");
+                    assert_eq!(db_err.code(), &SqlState::NUMERIC_VALUE_OUT_OF_RANGE);
+                    Outcome::Raised {
+                        code: db_err.code().code().to_string(),
+                        message: db_err.message().to_string(),
+                    }
+                }
+            };
+            let got = lab
+                .apply(&[
+                    ("a", Some(lhs.to_string().as_str())),
+                    ("b", Some(rhs.to_string().as_str())),
+                ])
+                .await;
+            assert_eq!(got, expected, "{lhs} + {rhs} on {pg_name}");
         }
     }
 }
@@ -426,15 +393,20 @@ async fn integer_addition_raises_exactly_where_postgres_raises() {
 async fn mixing_with_numeric_does_not_overflow_on_either_side() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
+    let mut lab = Lab::new(
+        &db,
+        "a integer, b numeric",
+        "TRANSFORM t FROM s SELECT a + b AS out",
+        &[
+            ("id", ValueType::Integer(IntWidth::Int4)),
+            ("a", ValueType::Integer(IntWidth::Int4)),
+            ("b", ValueType::Numeric),
+        ],
+    )
+    .await;
 
-    let def = add_def("a", "b");
-    let columns = HashMap::from([
-        ("a".to_string(), ValueType::Integer(IntWidth::Int4)),
-        ("b".to_string(), ValueType::Numeric),
-    ]);
-
-    let expected: String = client
+    let expected: String = lab
+        .client()
         .query_one(
             "select ($1::text::integer + $2::text::numeric)::text",
             &[&"2147483647".to_string(), &"1".to_string()],
@@ -443,28 +415,31 @@ async fn mixing_with_numeric_does_not_overflow_on_either_side() {
         .expect("postgres must not raise for int + numeric")
         .get(0);
 
-    let values = evaluate(&def, &row2(2147483647, 1), &columns, &mut RegexCache::new())
-        .expect("trellis must not raise for int + numeric either");
-    assert_eq!(values["out"].as_ref().unwrap().to_string(), expected);
+    assert_eq!(
+        lab.apply(&[("a", Some("2147483647")), ("b", Some("1"))])
+            .await,
+        Outcome::Values(vec![Some(expected.clone())])
+    );
     assert_eq!(expected, "2147483648");
 }
 
 /// A value that can't have come out of a column of its declared width is a
-/// named error, not a silently-too-wide integer. Defense-in-depth against a
+/// data exception, not a silently-too-wide integer: the rendered upsert casts
+/// the staged image's text to the column's type. Defense-in-depth against a
 /// corrupted or hand-written staged image.
-#[test]
-fn a_value_outside_its_columns_width_is_rejected_at_decode_time() {
-    let def = add_def("a", "b");
-    let columns = HashMap::from([
-        ("a".to_string(), ValueType::Integer(IntWidth::Int2)),
-        ("b".to_string(), ValueType::Integer(IntWidth::Int2)),
-    ]);
-    let err = evaluate(&def, &row2(40000, 1), &columns, &mut RegexCache::new())
-        .expect_err("40000 is not a smallint");
-    assert!(
-        err.to_string().contains("smallint out of range"),
-        "got: {err}"
-    );
+#[tokio::test]
+async fn a_value_outside_its_columns_width_raises_at_the_cast() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut lab = int_lab(&db, IntWidth::Int2).await;
+    let got = lab
+        .apply_image_only(&[("a", Some("40000")), ("b", Some("1"))])
+        .await;
+    let Outcome::Raised { code, message } = got else {
+        panic!("40000 is not a smallint, got {got:?}");
+    };
+    assert_eq!(code, "22003");
+    assert!(message.contains("smallint"), "got: {message}");
 }
 
 // ---------------------------------------------------------------------
@@ -636,42 +611,35 @@ fn an_oid_literal_must_be_in_canonical_form() {
 // 5. Values survive a round trip through a text-keyed path
 // ---------------------------------------------------------------------
 
-/// Every boundary value of every width renders to text and parses back to
-/// itself — byte-identically to Postgres's own rendering.
+/// Every boundary value of every width travels as staged-image text, is cast
+/// back by the rendered upsert and lands in the target as the text Postgres
+/// itself renders.
 ///
-/// This is the "exact key round-trip" claim stated directly. Integer keys
-/// work because `Value::Integer`'s `Display` *is* Postgres's
-/// `int4out`, which is what lets these types stay on
+/// This is the "exact key round-trip" claim stated directly: `int4out` is a
+/// canonical rendering, which is what lets these types stay on
 /// `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`.
 #[tokio::test]
 async fn integer_text_rendering_is_byte_identical_to_postgres() {
     let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
 
-    // Identity: `SELECT a AS out`, so the evaluated value is exactly the
-    // decoded column value.
-    let def = TransformDef {
-        target: "t".to_string(),
-        explicit_target_schema: None,
-        source: "s".to_string(),
-        explicit_source_schema: None,
-        key_space: KeySpace::OneToOne,
-        fields: vec![FieldDef {
-            name: "out".to_string(),
-            expr: Expr::Column("a".to_string()),
-        }],
-        predicate: Predicate::True,
-        without_source_index: false,
-    };
-
+    // Identity: `SELECT a AS out`, so the target holds exactly the column
+    // value read back from the staged image.
     for width in IntWidth::ALL {
+        let db = cluster.create_isolated_database().await;
+        let mut lab = Lab::new(
+            &db,
+            &format!("a {}", width.pg_name()),
+            "TRANSFORM t FROM s SELECT a AS out",
+            &[
+                ("id", ValueType::Integer(IntWidth::Int4)),
+                ("a", ValueType::Integer(width)),
+            ],
+        )
+        .await;
         let (min, max) = width.range();
         for value in [min, -1, 0, 1, max] {
-            let columns = HashMap::from([("a".to_string(), ValueType::Integer(width))]);
-            let row: Row = HashMap::from([("a".to_string(), Some(value.to_string()))]);
-
-            let expected: String = client
+            let expected: String = lab
+                .client()
                 .query_one(
                     &format!("select ($1::text::{})::text", width.pg_name()),
                     &[&value.to_string()],
@@ -679,18 +647,10 @@ async fn integer_text_rendering_is_byte_identical_to_postgres() {
                 .await
                 .unwrap_or_else(|e| panic!("{value} as {width}: {e}"))
                 .get(0);
-
-            let values = evaluate(&def, &row, &columns, &mut RegexCache::new())
-                .unwrap_or_else(|e| panic!("{value} as {width}: {e}"));
-            let got = values["out"].as_ref().expect("non-NULL");
-            assert!(
-                matches!(got, Value::Integer(w, v) if *w == width && *v == value),
-                "{value} as {width} decoded as {got:?}"
-            );
             assert_eq!(
-                got.to_string(),
-                expected,
-                "{value} as {width}: Trellis renders {got}, Postgres renders {expected}"
+                lab.apply(&[("a", Some(value.to_string().as_str()))]).await,
+                Outcome::Values(vec![Some(expected)]),
+                "{value} as {width}"
             );
         }
     }

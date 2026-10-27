@@ -12,9 +12,9 @@
 //! real server, and is checked against one:
 //!
 //! 1. **Comparison order.** `'NaN'::float8 = 'NaN'::float8` is **true**, and
-//!    `NaN` sorts above `Infinity`. `-0 = 0` is true. None of that is
-//!    assumed here — it is read back out of Postgres and compared against
-//!    `trellis::float::compare`.
+//!    `NaN` sorts above `Infinity`. `-0 = 0` is true. Postgres compares the
+//!    floats in the rendered SQL, so the engine implements no order of its
+//!    own; the bare-literal comparison test below checks the verdicts.
 //! 2. **Result types.** `real + real` is `real`, `real + integer` is
 //!    `double precision`, `sum(real)` is `real`, `avg(real)` is `double
 //!    precision`. Checked against `pg_typeof` on the equivalent expression.
@@ -24,7 +24,8 @@
 //!    fails.
 //! 4. **Text rendering.** `trellis::float::render` must be byte-identical to
 //!    `float4out`/`float8out`, over a grid spanning both notations, both
-//!    signs, the subnormal floor and the finite ceiling.
+//!    signs, the subnormal floor and the finite ceiling, and a float must
+//!    survive the staged image's text through the real apply path.
 //! 5. **Key roles.** `real`/`double precision` are rejected as `JOIN` `ON`
 //!    keys, primary keys and `GROUP BY` keys — and the reason is
 //!    demonstrated from the server, not asserted: `-0` and `0` are `=` but
@@ -33,20 +34,21 @@
 //!
 //! Per ADR-0013, every comparison is against independently-authored SQL —
 //! plain `pg_typeof`, plain `select ... group by ...`, plain `::text` —
-//! never against `defs::oracle::recompute`, which would be the engine's own
-//! renderer grading the engine's own evaluator.
+//! never against the engine's own renderer.
 //!
 //! Harness conventions follow `defs_exact_integers.rs`.
 
-use std::cmp::Ordering;
+#[path = "support/render_lab.rs"]
+mod render_lab;
+
 use std::collections::HashMap;
 
+use render_lab::{Lab, Outcome};
 use testkit::TestCluster;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
-use trellis::defs::eval::{RegexCache, Row, Value, evaluate};
+use trellis::defs::ast::{Expr, ValueType};
 use trellis::defs::{CatalogError, ValidationError, install_definition, parse, validate};
 use trellis::float::FloatWidth;
 use trellis::integer::IntWidth;
@@ -157,163 +159,6 @@ async fn seed_one_row(client: &Client) {
         .expect("seed row");
 }
 
-/// `SELECT <expr on column `a`> AS out` — the minimal definition shape the
-/// evaluator-level tests below drive.
-fn identity_def() -> TransformDef {
-    TransformDef {
-        target: "t".to_string(),
-        explicit_target_schema: None,
-        source: "s".to_string(),
-        explicit_source_schema: None,
-        key_space: KeySpace::OneToOne,
-        fields: vec![FieldDef {
-            name: "out".to_string(),
-            expr: Expr::Column("a".to_string()),
-        }],
-        predicate: Predicate::True,
-        without_source_index: false,
-    }
-}
-
-fn add_def() -> TransformDef {
-    TransformDef {
-        fields: vec![FieldDef {
-            name: "out".to_string(),
-            expr: Expr::BinaryOp {
-                op: Operator::Add,
-                lhs: Box::new(Expr::Column("a".to_string())),
-                rhs: Box::new(Expr::Column("b".to_string())),
-            },
-        }],
-        ..identity_def()
-    }
-}
-
-// ---------------------------------------------------------------------
-// 1. Postgres's comparison order — the decision the issue asks for
-// ---------------------------------------------------------------------
-
-/// The `NaN`/±0 decision, read out of the oracle and compared against
-/// [`trellis::float::compare`].
-///
-/// This is the central question for floats and it is **not** a free design choice.
-/// Postgres deliberately departs from IEEE 754 so floats have a total order
-/// and can be used in `ORDER BY`/`GROUP BY`/`DISTINCT`/btree at all:
-/// `'NaN' = 'NaN'` is true, and `NaN` sorts above every other value
-/// including `Infinity`. `-0 = 0` keeps IEEE's answer. Trellis's job is to
-/// match, so this test asks the server for each verdict and asserts
-/// `float::compare` agrees — nothing here is hardcoded from documentation.
-#[tokio::test]
-async fn nan_and_signed_zero_follow_postgres_not_ieee() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    // Every interesting pair, spelled the way Postgres spells them.
-    const VALUES: &[(&str, f64)] = &[
-        ("'-Infinity'", f64::NEG_INFINITY),
-        ("-1", -1.0),
-        ("'-0'", -0.0),
-        ("0", 0.0),
-        ("1", 1.0),
-        ("'Infinity'", f64::INFINITY),
-        ("'NaN'", f64::NAN),
-    ];
-
-    for width in FloatWidth::ALL {
-        let pg = width.pg_name();
-        for (a_sql, a) in VALUES {
-            for (b_sql, b) in VALUES {
-                let row = client
-                    .query_one(
-                        &format!(
-                            "select {a_sql}::{pg} = {b_sql}::{pg}, \
-                                    {a_sql}::{pg} < {b_sql}::{pg}, \
-                                    {a_sql}::{pg} > {b_sql}::{pg}"
-                        ),
-                        &[],
-                    )
-                    .await
-                    .unwrap_or_else(|e| panic!("{a_sql} vs {b_sql} as {pg}: {e}"));
-                let (eq, lt, gt): (bool, bool, bool) = (row.get(0), row.get(1), row.get(2));
-                let expected = match (eq, lt, gt) {
-                    (true, false, false) => Ordering::Equal,
-                    (false, true, false) => Ordering::Less,
-                    (false, false, true) => Ordering::Greater,
-                    other => panic!(
-                        "{a_sql} vs {b_sql} as {pg}: Postgres's own comparison is not a total \
-                         order? got {other:?}"
-                    ),
-                };
-                assert_eq!(
-                    trellis::float::compare(*a, *b),
-                    expected,
-                    "{a_sql} vs {b_sql} as {pg}"
-                );
-            }
-        }
-    }
-
-    // The two headline departures from IEEE, asserted explicitly so a
-    // reader of this test sees them rather than inferring them from the
-    // matrix above.
-    let (nan_eq, zero_eq, nan_above_inf): (bool, bool, bool) = {
-        let row = client
-            .query_one(
-                "select 'NaN'::float8 = 'NaN'::float8, \
-                        (-0.0::float8) = (0.0::float8), \
-                        'NaN'::float8 > 'Infinity'::float8",
-                &[],
-            )
-            .await
-            .expect("the three headline comparisons");
-        (row.get(0), row.get(1), row.get(2))
-    };
-    assert!(
-        nan_eq,
-        "Postgres must say NaN = NaN (IEEE says it does not)"
-    );
-    assert!(zero_eq, "Postgres must say -0 = 0");
-    assert!(nan_above_inf, "Postgres must sort NaN above Infinity");
-    assert!(trellis::float::equal(f64::NAN, f64::NAN));
-    assert!(trellis::float::equal(-0.0, 0.0));
-}
-
-/// `ORDER BY` over a float column puts `NaN` last, and Trellis's sort key
-/// ([`trellis::float::compare`]) reproduces that ordering exactly.
-#[tokio::test]
-async fn ordering_places_nan_last_on_both_sides() {
-    let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    let rendered: Vec<String> = client
-        .query(
-            // Aliased: a bare `order by v` would bind to the *output*
-            // column (`v::text`) and sort by collated text, not by the
-            // float order under test.
-            "select v::text as rendered from (values \
-                ('NaN'::float8), (1), ('Infinity'), ('-Infinity'), (0), (-1) \
-             ) t(v) order by t.v",
-            &[],
-        )
-        .await
-        .expect("order by")
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
-
-    let mut ours = vec![f64::NAN, 1.0, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0];
-    ours.sort_by(|a, b| trellis::float::compare(*a, *b));
-    let ours: Vec<String> = ours
-        .into_iter()
-        .map(|v| trellis::float::render(v, FloatWidth::Float8))
-        .collect();
-
-    assert_eq!(ours, rendered);
-    assert_eq!(rendered.last().map(String::as_str), Some("NaN"));
-}
-
 // ---------------------------------------------------------------------
 // 2. Result types
 // ---------------------------------------------------------------------
@@ -404,14 +249,31 @@ const BOUNDARY_CASES: &[(FloatWidth, &str, &str)] = &[
     (FloatWidth::Float8, "NaN", "Infinity"),
 ];
 
-/// Trellis raises exactly when Postgres raises, and produces exactly what
-/// Postgres produces otherwise.
+/// A `Lab` over `s (a, b)` of one float width, computing `a + b`.
+async fn float_lab(db: &testkit::TestDatabase, width: FloatWidth) -> Lab<'_> {
+    let pg_name = width.pg_name();
+    Lab::new(
+        db,
+        &format!("a {pg_name}, b {pg_name}"),
+        "TRANSFORM t FROM s SELECT a + b AS out",
+        &[
+            ("id", ValueType::Integer(IntWidth::Int4)),
+            ("a", ValueType::Float(width)),
+            ("b", ValueType::Float(width)),
+        ],
+    )
+    .await
+}
+
+/// The real apply path raises exactly when Postgres raises, and produces
+/// exactly what Postgres produces otherwise.
 ///
 /// The interesting half is the *non*-raising cases: `'Infinity' + 1e38` is
 /// `Infinity` (Postgres only errors when a finite pair overflows) and
-/// `'Infinity' + '-Infinity'` is `NaN`, a value, not an error. An
-/// implementation that treated every infinite result as `22003` would fail
-/// four of the rows below.
+/// `'Infinity' + '-Infinity'` is `NaN`, a value, not an error. Postgres
+/// evaluates the sum in the upsert that writes the target, so the verdict is
+/// its own; this pins that the staged image's float text survives the cast
+/// back and that a raise reaches the engine as a data exception.
 ///
 /// The Postgres side is written independently (`select $1::<w> + $2::<w>`),
 /// with the operands bound as text and cast server-side, so neither side
@@ -419,87 +281,53 @@ const BOUNDARY_CASES: &[(FloatWidth, &str, &str)] = &[
 #[tokio::test]
 async fn float_addition_raises_exactly_where_postgres_raises() {
     let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    let def = add_def();
-
-    for (width, lhs, rhs) in BOUNDARY_CASES {
+    for width in FloatWidth::ALL {
+        let db = cluster.create_isolated_database().await;
+        let mut lab = float_lab(&db, width).await;
         let pg_name = width.pg_name();
-        let columns = HashMap::from([
-            ("a".to_string(), ValueType::Float(*width)),
-            ("b".to_string(), ValueType::Float(*width)),
-        ]);
-
-        // The row image carries Postgres's *canonical* rendering of each
-        // operand, which is what a real CDC decode would deliver — obtained
-        // from the server rather than hand-spelled, so the decode step is
-        // exercised against genuine `float4out`/`float8out` text.
-        let (lhs_text, rhs_text): (String, String) = {
-            let row = client
+        for (case_width, lhs, rhs) in BOUNDARY_CASES {
+            if *case_width != width {
+                continue;
+            }
+            // The row image carries Postgres's *canonical* rendering of each
+            // operand, which is what a real CDC decode would deliver.
+            let (lhs_text, rhs_text): (String, String) = {
+                let row = lab
+                    .client()
+                    .query_one(
+                        &format!("select ($1::text::{pg_name})::text, ($2::text::{pg_name})::text"),
+                        &[&lhs.to_string(), &rhs.to_string()],
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("canonicalize {lhs}/{rhs} as {pg_name}: {e}"));
+                (row.get(0), row.get(1))
+            };
+            let postgres = lab
+                .client()
                 .query_one(
-                    &format!("select ($1::text::{pg_name})::text, ($2::text::{pg_name})::text"),
+                    &format!("select ($1::text::{pg_name} + $2::text::{pg_name})::text"),
                     &[&lhs.to_string(), &rhs.to_string()],
                 )
-                .await
-                .unwrap_or_else(|e| panic!("canonicalize {lhs}/{rhs} as {pg_name}: {e}"));
-            (row.get(0), row.get(1))
-        };
-        let row: Row = HashMap::from([
-            ("a".to_string(), Some(lhs_text)),
-            ("b".to_string(), Some(rhs_text)),
-        ]);
-
-        let postgres = client
-            .query_one(
-                &format!("select ($1::text::{pg_name} + $2::text::{pg_name})::text"),
-                &[&lhs.to_string(), &rhs.to_string()],
-            )
-            .await;
-        let trellis = evaluate(&def, &row, &columns, &mut RegexCache::new());
-
-        match (postgres, trellis) {
-            (Ok(pg_row), Ok(values)) => {
-                let expected: String = pg_row.get(0);
-                let got = values["out"].as_ref().expect("a non-NULL sum").to_string();
-                assert_eq!(
-                    got, expected,
-                    "{lhs} + {rhs} on {pg_name}: Postgres says {expected}, Trellis says {got}"
-                );
-            }
-            (Err(pg_err), Err(eval_err)) => {
-                let db_err = pg_err
-                    .as_db_error()
-                    .unwrap_or_else(|| panic!("{lhs} + {rhs} on {pg_name}: not a server error"));
-                assert_eq!(
-                    db_err.code(),
-                    &SqlState::NUMERIC_VALUE_OUT_OF_RANGE,
-                    "{lhs} + {rhs} on {pg_name}: unexpected SQLSTATE"
-                );
-                // Postgres's own wording, reproduced verbatim.
-                assert_eq!(
-                    db_err.message(),
-                    "value out of range: overflow",
-                    "{lhs} + {rhs} on {pg_name}: the oracle's wording changed"
-                );
-                assert!(
-                    eval_err
-                        .to_string()
-                        .contains("value out of range: overflow"),
-                    "{lhs} + {rhs} on {pg_name}: expected Postgres's wording, got: {eval_err}"
-                );
-            }
-            (Ok(pg_row), Err(eval_err)) => {
-                let value: String = pg_row.get(0);
-                panic!(
-                    "{lhs} + {rhs} on {pg_name}: Postgres computed {value}, Trellis raised \
-                     {eval_err}"
-                );
-            }
-            (Err(pg_err), Ok(values)) => panic!(
-                "{lhs} + {rhs} on {pg_name}: Postgres raised {pg_err}, Trellis computed {:?}",
-                values["out"]
-            ),
+                .await;
+            let expected = match postgres {
+                Ok(row) => Outcome::Values(vec![row.get(0)]),
+                Err(err) => {
+                    let db_err = err.as_db_error().expect("a server error");
+                    assert_eq!(db_err.code(), &SqlState::NUMERIC_VALUE_OUT_OF_RANGE);
+                    assert_eq!(db_err.message(), "value out of range: overflow");
+                    Outcome::Raised {
+                        code: db_err.code().code().to_string(),
+                        message: db_err.message().to_string(),
+                    }
+                }
+            };
+            let got = lab
+                .apply(&[
+                    ("a", Some(lhs_text.as_str())),
+                    ("b", Some(rhs_text.as_str())),
+                ])
+                .await;
+            assert_eq!(got, expected, "{lhs} + {rhs} on {pg_name}");
         }
     }
 }
@@ -588,21 +416,29 @@ async fn rendering_matches_postgres_over_a_value_grid() {
     }
 }
 
-/// A float column's value decodes, renders and round-trips byte-identically
-/// through the evaluator, exactly as the integer widths do — the claim that
-/// lets a computed float survive the text-carried staging ring.
+/// A float column's value travels as staged-image text, is cast back by the
+/// rendered upsert and lands in the target as the text Postgres itself
+/// renders: the claim that lets a float survive the text-carried staging
+/// ring, exactly as the integer widths do.
 #[tokio::test]
-async fn float_text_rendering_is_byte_identical_to_postgres_through_the_evaluator() {
+async fn float_text_rendering_is_byte_identical_to_postgres_through_the_apply_path() {
     let cluster = TestCluster::start();
-    let db = cluster.create_isolated_database().await;
-    let client = connect_raw(db.dsn()).await;
-
-    let def = identity_def();
-
     for width in FloatWidth::ALL {
+        let db = cluster.create_isolated_database().await;
         let pg_name = width.pg_name();
+        let mut lab = Lab::new(
+            &db,
+            &format!("a {pg_name}"),
+            "TRANSFORM t FROM s SELECT a AS out",
+            &[
+                ("id", ValueType::Integer(IntWidth::Int4)),
+                ("a", ValueType::Float(width)),
+            ],
+        )
+        .await;
         for spelling in ["0", "-0", "0.1", "1e15", "NaN", "Infinity", "-Infinity"] {
-            let expected: String = client
+            let expected: String = lab
+                .client()
                 .query_one(
                     &format!("select ($1::text::{pg_name})::text"),
                     &[&spelling.to_string()],
@@ -610,20 +446,10 @@ async fn float_text_rendering_is_byte_identical_to_postgres_through_the_evaluato
                 .await
                 .unwrap_or_else(|e| panic!("{spelling} as {pg_name}: {e}"))
                 .get(0);
-
-            let columns = HashMap::from([("a".to_string(), ValueType::Float(width))]);
-            let row: Row = HashMap::from([("a".to_string(), Some(expected.clone()))]);
-            let values = evaluate(&def, &row, &columns, &mut RegexCache::new())
-                .unwrap_or_else(|e| panic!("{spelling} as {pg_name}: {e}"));
-            let got = values["out"].as_ref().expect("non-NULL");
-            assert!(
-                matches!(got, Value::Float(w, _) if *w == width),
-                "{spelling} as {pg_name} decoded as {got:?}, not a Float of that width"
-            );
             assert_eq!(
-                got.to_string(),
-                expected,
-                "{spelling} as {pg_name}: Trellis renders {got}, Postgres renders {expected}"
+                lab.apply(&[("a", Some(expected.as_str()))]).await,
+                Outcome::Values(vec![Some(expected.clone())]),
+                "{spelling} as {pg_name}"
             );
         }
     }
@@ -689,6 +515,28 @@ async fn a_float_against_a_bare_literal_compares_in_double_precision_like_postgr
     exprs.push(format!("d > {}", subnormal("5")));
     exprs.push(format!("r > {}", subnormal("3")));
 
+    // One definition computes every expression as its own field.
+    for expr in &exprs {
+        let def = parse(&format!("TRANSFORM t FROM s SELECT {expr} AS out")).expect("parse");
+        assert_eq!(validate(&def, &columns), Ok(()), "{expr}");
+    }
+    let fields: Vec<String> = exprs
+        .iter()
+        .enumerate()
+        .map(|(i, expr)| format!("{expr} AS e{i}"))
+        .collect();
+    let mut lab = Lab::new(
+        &db,
+        "r real, d double precision",
+        &format!("TRANSFORM t FROM s SELECT {}", fields.join(", ")),
+        &[
+            ("id", ValueType::Integer(IntWidth::Int4)),
+            ("r", ValueType::Float(FloatWidth::Float4)),
+            ("d", ValueType::Float(FloatWidth::Float8)),
+        ],
+    )
+    .await;
+
     for (r, d) in [
         ("0.1", "0.1"),
         ("16777217", "0.30000000000000004"),
@@ -701,25 +549,24 @@ async fn a_float_against_a_bare_literal_compares_in_double_precision_like_postgr
             .query_one(&format!("select r::text, d::text from ({source}) t"), &[])
             .await
             .expect("row text");
-        let row: Row = HashMap::from([
-            ("r".to_string(), texts.get(0)),
-            ("d".to_string(), texts.get(1)),
-        ]);
+        let (r_text, d_text): (Option<String>, Option<String>) = (texts.get(0), texts.get(1));
+        let mut expected = Vec::new();
         for expr in &exprs {
-            let def = parse(&format!("TRANSFORM t FROM s SELECT {expr} AS out")).expect("parse");
-            assert_eq!(validate(&def, &columns), Ok(()), "{expr}");
             let oracle: Option<bool> = client
                 .query_one(&format!("select {expr} from ({source}) t"), &[])
                 .await
                 .unwrap_or_else(|e| panic!("{expr}: {e}"))
                 .get(0);
-            let values = evaluate(&def, &row, &columns, &mut RegexCache::new())
-                .unwrap_or_else(|e| panic!("{expr}: {e}"));
-            assert_eq!(
-                values["out"],
-                oracle.map(Value::Boolean),
-                "{expr} over r = {r}, d = {d}: Postgres says {oracle:?}"
-            );
+            expected.push(oracle.map(|b| b.to_string()));
+        }
+        let got = lab
+            .apply(&[("r", r_text.as_deref()), ("d", d_text.as_deref())])
+            .await;
+        let Outcome::Values(got) = got else {
+            panic!("over r = {r}, d = {d}: {got:?}");
+        };
+        for ((expr, got), expected) in exprs.iter().zip(&got).zip(&expected) {
+            assert_eq!(got, expected, "{expr} over r = {r}, d = {d}");
         }
     }
 
