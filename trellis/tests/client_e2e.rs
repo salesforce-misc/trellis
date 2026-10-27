@@ -9,14 +9,18 @@
 //! - The full pipeline, started with one `Client::start` call, converges a
 //!   real source table's inserts/updates/deletes into its target table, and
 //!   that target is byte-exact against an independent oracle
-//!   (`defs::oracle::recompute`) at every step.
+//!   (Postgres running the definition's `SELECT`) at every step.
 //! - `staging_worker` and `application_threads` are genuinely independent
 //!   knobs: a staging-only client (no app workers) stages and seals but
 //!   drains nothing, leaving the target empty.
 
+#[path = "support/sql_recompute.rs"]
+mod sql_recompute;
+
 use std::collections::HashMap;
 use std::time::Duration;
 
+use sql_recompute::recompute;
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::Pool;
@@ -24,7 +28,6 @@ use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
     TransformStatus, chunk_queue, create_definition, create_target_table, install_definition,
-    recompute,
 };
 use trellis::{Client as TrellisClient, ClientOptions};
 
@@ -146,18 +149,16 @@ async fn target_snapshot(client: &Client) -> HashMap<String, Option<String>> {
 }
 
 /// An independent, from-scratch recompute of `totals` from `orders`'s
-/// current contents (see `defs::oracle::recompute`'s own doc comment) — the
+/// current contents (`sql_recompute::recompute`: Postgres runs the definition's `SELECT`) — the
 /// authority every convergence check in this file compares the live target
 /// against.
 async fn oracle_snapshot(
     pool: &Pool,
     def: &TransformDef,
     pk_name: &str,
-    source_columns: &HashMap<String, ValueType>,
 ) -> HashMap<String, Option<String>> {
-    recompute(pool, def, pk_name, source_columns)
+    recompute(pool, def, pk_name)
         .await
-        .expect("oracle recompute")
         .into_iter()
         .map(|(id, fields)| {
             let total = fields
@@ -220,10 +221,7 @@ async fn the_full_pipeline_converges_inserts_updates_and_deletes_to_the_oracle()
         Duration::from_secs(20),
         Duration::from_millis(200),
         "target never converged with the oracle after the inserts",
-        async || {
-            target_snapshot(&raw).await
-                == oracle_snapshot(&db.pool, &def, "id", &numeric_columns(&["a", "b"])).await
-        },
+        async || target_snapshot(&raw).await == oracle_snapshot(&db.pool, &def, "id").await,
     )
     .await;
     assert_eq!(
@@ -240,10 +238,7 @@ async fn the_full_pipeline_converges_inserts_updates_and_deletes_to_the_oracle()
         Duration::from_secs(20),
         Duration::from_millis(200),
         "target never converged with the oracle after the update",
-        async || {
-            target_snapshot(&raw).await
-                == oracle_snapshot(&db.pool, &def, "id", &numeric_columns(&["a", "b"])).await
-        },
+        async || target_snapshot(&raw).await == oracle_snapshot(&db.pool, &def, "id").await,
     )
     .await;
     let total_after_update: Option<String> = raw
@@ -261,10 +256,7 @@ async fn the_full_pipeline_converges_inserts_updates_and_deletes_to_the_oracle()
         Duration::from_secs(20),
         Duration::from_millis(200),
         "target never converged with the oracle after the delete",
-        async || {
-            target_snapshot(&raw).await
-                == oracle_snapshot(&db.pool, &def, "id", &numeric_columns(&["a", "b"])).await
-        },
+        async || target_snapshot(&raw).await == oracle_snapshot(&db.pool, &def, "id").await,
     )
     .await;
     let remaining = target_snapshot(&raw).await;
@@ -313,10 +305,7 @@ async fn a_truncate_clears_the_target_then_post_truncate_inserts_converge_to_the
         Duration::from_secs(20),
         Duration::from_millis(200),
         "target never converged with the oracle after the inserts",
-        async || {
-            target_snapshot(&raw).await
-                == oracle_snapshot(&db.pool, &def, "id", &numeric_columns(&["a", "b"])).await
-        },
+        async || target_snapshot(&raw).await == oracle_snapshot(&db.pool, &def, "id").await,
     )
     .await;
     assert_eq!(target_snapshot(&raw).await.len(), 3);
@@ -344,10 +333,7 @@ async fn a_truncate_clears_the_target_then_post_truncate_inserts_converge_to_the
         Duration::from_secs(20),
         Duration::from_millis(200),
         "target never converged with the oracle after the truncate",
-        async || {
-            target_snapshot(&raw).await
-                == oracle_snapshot(&db.pool, &def, "id", &numeric_columns(&["a", "b"])).await
-        },
+        async || target_snapshot(&raw).await == oracle_snapshot(&db.pool, &def, "id").await,
     )
     .await;
 
@@ -470,7 +456,7 @@ async fn a_transform_registered_against_a_new_source_table_backfills_without_a_c
                 .into_iter()
                 .map(|row| (row.get(0), row.get(1)))
                 .collect();
-            target == oracle_snapshot(&db.pool, &def, "id", &comments_columns).await
+            target == oracle_snapshot(&db.pool, &def, "id").await
         },
     )
     .await;
@@ -601,7 +587,7 @@ async fn a_transform_registered_against_an_explicitly_qualified_non_default_sche
                 .into_iter()
                 .map(|row| (row.get(0), row.get(1)))
                 .collect();
-            target == oracle_snapshot(&db.pool, &def, "id", &comments_columns).await
+            target == oracle_snapshot(&db.pool, &def, "id").await
         },
     )
     .await;
@@ -627,7 +613,7 @@ async fn a_transform_registered_against_an_explicitly_qualified_non_default_sche
                 .into_iter()
                 .map(|row| (row.get(0), row.get(1)))
                 .collect();
-            target == oracle_snapshot(&db.pool, &def, "id", &comments_columns).await
+            target == oracle_snapshot(&db.pool, &def, "id").await
         },
     )
     .await;

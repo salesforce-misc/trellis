@@ -140,7 +140,6 @@ impl Numeric {
         digits.extend(std::iter::repeat_n(0, pad));
         digits
     }
-
 }
 
 impl fmt::Display for Numeric {

@@ -88,9 +88,7 @@ pub use ddl::{
     source_primary_key,
 };
 #[cfg(any(test, feature = "internals"))]
-pub use oracle::{
-    render_aggregate_select_sql, render_expr_sql,
-};
+pub use oracle::{render_aggregate_select_sql, render_expr_sql, render_one_to_one_select_sql};
 
 // Reached only by this crate's own `tests/*.rs`, through the `internals`
 // feature (ADR-0012; see `Cargo.toml`). Not part of `dev`.

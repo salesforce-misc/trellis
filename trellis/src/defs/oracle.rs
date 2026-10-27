@@ -40,6 +40,40 @@ fn quoted_source_from(def: &TransformDef) -> String {
     }
 }
 
+/// Renders a [`KeySpace::OneToOne`] `def` back to the Postgres `SELECT` that
+/// computes its whole target from the source's current contents: the primary
+/// key `pk_column` as text first, then each calculated field as text, in
+/// definition order. Tests compare a maintained target with the rows this
+/// returns. Every field is substituted first, as in
+/// [`render_aggregate_select_sql`].
+///
+/// # Panics
+///
+/// If `def.key_space` is not [`KeySpace::OneToOne`], or if substitution fails
+/// (see [`render_aggregate_select_sql`]).
+#[cfg(any(test, feature = "test-util"))]
+pub fn render_one_to_one_select_sql(def: &TransformDef, pk_column: &str) -> String {
+    assert!(
+        matches!(def.key_space, KeySpace::OneToOne),
+        "render_one_to_one_select_sql called on a non-1-1 definition"
+    );
+    let substituted = super::backfill::substituted_field_exprs(def)
+        .expect("1-1 oracle rendering requires a substitutable definition");
+    let mut select_list = vec![format!("{}::text", quote_ident(pk_column))];
+    select_list.extend(def.fields.iter().map(|field| {
+        format!(
+            "({})::text as {}",
+            render_expr_sql(&substituted[&field.name]),
+            quote_ident(&field.name)
+        )
+    }));
+    format!(
+        "select {} from {}",
+        select_list.join(", "),
+        quoted_source_from(def)
+    )
+}
+
 /// Renders an [`KeySpace::Aggregate`] `def` back to the equivalent Postgres
 /// `SELECT ... GROUP BY ...` (the correctness oracle):
 /// each calculated field renders via [`render_expr_sql`] exactly as the 1-1

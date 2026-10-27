@@ -13,10 +13,14 @@
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
+#[path = "support/sql_recompute.rs"]
+mod sql_recompute;
+
 use std::collections::HashMap;
 use std::time::Duration;
 
 use drain_driver::Driver;
+use sql_recompute::recompute;
 use trellis::defs::ValueType;
 use trellis::integer::IntWidth;
 use trellis::staging::build::{self, WorkerOptions};
@@ -365,16 +369,10 @@ async fn a_chain_of_aggregate_and_two_one_to_one_readers_keeps_the_null_group() 
         ["(,11)"]
     );
 
-    // The evaluator-driven oracle agrees, the NULL key included.
+    // A SELECT over the source agrees, the NULL key included.
     let def =
         trellis::defs::parse("TRANSFORM c FROM public.b SELECT dbl + 1 AS inc").expect("parse");
-    let columns: HashMap<String, ValueType> =
-        [("g".to_string(), int4()), ("dbl".to_string(), int8())]
-            .into_iter()
-            .collect();
-    let recomputed = trellis::defs::oracle::recompute(d.pool(), &def, "g", &columns)
-        .await
-        .expect("recompute");
+    let recomputed = recompute(d.pool(), &def, "g").await;
     let null_key = recomputed
         .get("\u{1}")
         .expect("the oracle has the NULL key, under the key sentinel");

@@ -493,7 +493,7 @@ mod tests {
                 let back = parse(&text, width)
                     .unwrap_or_else(|e| panic!("{text:?} at {width} did not re-parse: {e}"));
                 assert!(
-                    equal(back, value),
+                    back == value || (back.is_nan() && value.is_nan()),
                     "{text:?} at {width} round-tripped to a different value"
                 );
             }

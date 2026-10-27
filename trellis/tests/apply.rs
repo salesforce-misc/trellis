@@ -9,15 +9,17 @@
 //! into the ring (mirroring `claims.rs`/`fold.rs`'s convention), rather than
 //! going through capture — capture is out of scope here.
 
+#[path = "support/sql_recompute.rs"]
+mod sql_recompute;
+
 use std::collections::HashMap;
 
+use sql_recompute::recompute;
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
-use trellis::defs::{
-    PgType, create_definition, create_target_table, recompute, source_primary_key,
-};
+use trellis::defs::{PgType, create_definition, create_target_table, source_primary_key};
 use trellis::staging::apply::{self, ApplyError};
 use trellis::staging::{SegmentState, TRUNCATE_SENTINEL_KEY, claim, fold};
 
@@ -262,9 +264,7 @@ async fn drain_matches_the_oracle_across_an_insert_update_and_delete() {
     assert_eq!(outcome.keys_written, 2, "orders 1 and 2 must be written");
     assert_eq!(outcome.keys_deleted, 1, "order 3 must be deleted");
 
-    let oracle = recompute(&db.pool, &def, &pk[0].name, &source_columns)
-        .await
-        .expect("oracle recompute");
+    let oracle = recompute(&db.pool, &def, &pk[0].name).await;
     let target_rows = client
         .query("select id::text, total::text from order_totals", &[])
         .await
@@ -2050,9 +2050,7 @@ async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batc
         refetch_queries[0]
     );
 
-    let oracle = recompute(&db.pool, &def, &pk[0].name, &source_columns)
-        .await
-        .expect("oracle recompute");
+    let oracle = recompute(&db.pool, &def, &pk[0].name).await;
     let target_rows = client
         .query("select id::text, total::text from order_totals", &[])
         .await
@@ -2136,9 +2134,7 @@ async fn a_write_batch_past_the_bind_parameter_cap_chunks_and_still_drains() {
         .get(0);
     assert_eq!(target_count, N);
 
-    let oracle = recompute(&db.pool, &def, &pk[0].name, &source_columns)
-        .await
-        .expect("oracle recompute");
+    let oracle = recompute(&db.pool, &def, &pk[0].name).await;
     let target_rows = client
         .query("select id::text, total::text from order_totals", &[])
         .await
@@ -2316,9 +2312,7 @@ async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch
         refetch_queries[0]
     );
 
-    let oracle = recompute(&db.pool, &def, &pk[0].name, &source_columns)
-        .await
-        .expect("oracle recompute");
+    let oracle = recompute(&db.pool, &def, &pk[0].name).await;
     let target_rows = client
         .query("select id::text, total::text from order_totals", &[])
         .await
@@ -2444,9 +2438,7 @@ async fn drain_many_coalesces_two_sealed_segments_into_one_apply_pass() {
         assert_eq!(segment_state(&client, seg_seq).await, SegmentState::Drained);
     }
 
-    let oracle = recompute(&db.pool, &def, &pk[0].name, &source_columns)
-        .await
-        .expect("oracle recompute");
+    let oracle = recompute(&db.pool, &def, &pk[0].name).await;
     let target_rows = client
         .query("select id::text, total::text from order_totals", &[])
         .await

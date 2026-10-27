@@ -7,132 +7,25 @@
 //! does, and drives it with `drain_once`: deterministic, with no
 //! convergence polling.
 
+#[path = "support/render_lab.rs"]
+mod render_lab;
+
 use std::collections::HashMap;
 
+use render_lab::{connect_raw, define, drain, insert_source, is_data_exception, stage};
 use testkit::{TestCluster, TestDatabase};
-use tokio_postgres::{Client, NoTls};
-use trellis::config::DEFAULT_SCHEMA;
+use tokio_postgres::Client;
 use trellis::defs::ast::ValueType;
-use trellis::defs::{create_definition, create_target_table, parse, source_primary_key};
+use trellis::defs::create_definition;
 use trellis::float::FloatWidth;
 use trellis::integer::IntWidth;
-use trellis::staging::apply::{self, ApplyError};
+use trellis::staging::apply::ApplyError;
 use trellis::staging::quarantine::{
     DEFAULT_COLUMN_DEATH_THRESHOLD, DEFAULT_DEATH_THRESHOLD, FailureClass, classify,
 };
 
 /// Clean records in each poison test's page, around its poisoned one.
 const PAGE: i32 = 10_000;
-
-async fn connect_raw(dsn: &str) -> Client {
-    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-        .batch_execute(&format!(
-            "set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; \
-             set extra_float_digits to 3"
-        ))
-        .await
-        .expect("set search_path");
-    client
-}
-
-async fn seal_active_segment(client: &mut Client) -> i64 {
-    use trellis::staging::seal;
-    let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
-    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
-        .await
-        .expect("seal phase 2");
-    outcome.sealed_seg_seq
-}
-
-/// Creates `public.<table>` with `ddl`'s columns, the 1-1 definition `text`
-/// over it and its target, with `columns` the source's types.
-async fn define(
-    db: &TestDatabase,
-    client: &Client,
-    table: &str,
-    ddl: &str,
-    text: &str,
-    columns: &[(&str, ValueType)],
-) {
-    client
-        .batch_execute(&format!("create table public.{table} ({ddl})"))
-        .await
-        .expect("create the source");
-    let columns: HashMap<String, ValueType> = columns
-        .iter()
-        .map(|(name, t)| (name.to_string(), *t))
-        .collect();
-    create_definition(&db.pool, text, &columns)
-        .await
-        .expect("create the definition");
-    let def = parse(text).expect("parse");
-    let pk = source_primary_key(&db.pool, &def.source)
-        .await
-        .expect("the source's key");
-    create_target_table(&db.pool, &def, "public", &pk, &columns, &def.source)
-        .await
-        .expect("create the target");
-}
-
-/// Stages an insert of every `(key, image)` of `rows` from `public.<table>`
-/// into the ring, in one statement, and seals them into one batch. Each image
-/// is a jsonb object of the row's columns as text, as capture writes it.
-async fn stage(client: &mut Client, table: &str, rows: &[(String, String)]) -> i64 {
-    let (keys, images): (Vec<&str>, Vec<&str>) = rows
-        .iter()
-        .map(|(key, image)| (key.as_str(), image.as_str()))
-        .unzip();
-    client
-        .execute(
-            "insert into seg_0 (src_table, key, op, lsn, old_image, new_image, hop_gen) \
-             select $1, k, 'insert', pg_current_wal_insert_lsn(), null, i::jsonb, 0 \
-             from unnest($2::text[], $3::text[]) as u(k, i)",
-            &[&format!("public.{table}"), &keys, &images],
-        )
-        .await
-        .expect("stage the page");
-    seal_active_segment(client).await
-}
-
-/// Inserts `rows` into the source too, so a recompute of the target from
-/// its source agrees with what was staged.
-async fn insert_source(client: &Client, table: &str, rows: &[(String, String)]) {
-    let images: Vec<&str> = rows.iter().map(|(_, image)| image.as_str()).collect();
-    client
-        .execute(
-            &format!(
-                "insert into public.{table} \
-                 select (jsonb_populate_record(null::public.{table}, i::jsonb)).* \
-                 from unnest($1::text[]) as u(i)"
-            ),
-            &[&images],
-        )
-        .await
-        .expect("insert the source rows");
-}
-
-async fn drain(db: &TestDatabase, seg_seq: i64) -> Result<Option<apply::ApplyOutcome>, ApplyError> {
-    apply::drain_once(
-        &db.pool,
-        seg_seq,
-        "worker",
-        1,
-        "trellis_one_to_one_render_test",
-    )
-    .await
-}
-
-/// Whether `err` is a data exception (SQLSTATE class 22).
-fn is_data_exception(err: &ApplyError) -> bool {
-    match err {
-        ApplyError::Db(err) => err.code().is_some_and(|code| code.code().starts_with("22")),
-        _ => false,
-    }
-}
 
 /// Drains `seg_seq` until it applies, at most `attempts` times, and returns
 /// how many drains failed with a data exception first. Any other failure

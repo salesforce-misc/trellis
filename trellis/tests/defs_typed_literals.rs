@@ -28,16 +28,20 @@
 //! `drain_once`) are copied from `apply.rs`; the backfill leg's
 //! chunk-draining helper is copied from `defs_install_definition.rs`.
 
+#[path = "support/sql_recompute.rs"]
+mod sql_recompute;
+
 use std::collections::HashMap;
 
+use sql_recompute::recompute;
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::Pool;
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ast::{Expr, ValueType};
 use trellis::defs::{
-    PgType, create_definition, create_target_table, install_definition, parse, recompute,
-    render_expr_sql, source_primary_key, validate,
+    PgType, create_definition, create_target_table, install_definition, parse, render_expr_sql,
+    source_primary_key, validate,
 };
 use trellis::staging::apply;
 
@@ -502,9 +506,7 @@ async fn a_cdc_apply_writes_typed_literal_values_matching_the_evaluator() {
         assert_eq!(&column_pg_type(&client, "t", name).await, expected_pg_type);
     }
 
-    let oracle = recompute(&db.pool, &def, &pk[0].name, &cols)
-        .await
-        .expect("oracle recompute");
+    let oracle = recompute(&db.pool, &def, &pk[0].name).await;
     let select_list = CASES
         .iter()
         .map(|(name, _, _, _)| format!("{name}::text"))
