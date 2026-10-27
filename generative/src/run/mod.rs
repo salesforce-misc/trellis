@@ -589,8 +589,8 @@ fn bursts(program: &Program, burst_size: usize) -> Vec<&[Op]> {
 /// the divergence — proving it tells green from red (design doc §6/§7).
 ///
 /// A thin wrapper around [`check_defs`] for `program.defs` in full — every
-/// caller whose definitions all install up front wants exactly that. [`run_convergence`] itself calls
-/// [`check_defs`] directly with only the definitions installed *so far*,
+/// caller whose definitions all install up front wants exactly that. [`run_convergence`] itself
+/// calls [`check_defs`] directly with only the definitions installed *so far*,
 /// since a deferred definition must not be checked — or even
 /// looked up in the snapshot — before its own install point is reached.
 pub async fn check_program(

@@ -703,8 +703,8 @@ impl ManualBackend {
         Ok(rows.iter().map(|row| row.get(0)).collect())
     }
 
-    /// Diagnostic-only: the largest `bucket_count` across every segment sealed so far, straight from
-    /// the engine's own `staging::claim` partition decision (`segments.bucket_count`,
+    /// Diagnostic-only: the largest `bucket_count` across every segment sealed so far, straight
+    /// from the engine's own `staging::claim` partition decision (`segments.bucket_count`,
     /// fixed at seal time from row count alone — see
     /// `staging::claim::MIN_ROWS_TO_SPLIT`/`SEG_BUCKETS`). `0` if no
     /// segment has sealed yet.
@@ -1484,7 +1484,8 @@ impl super::ConcurrentBackend for ManualBackend {
                             self.strict_audits_converged += 1;
                         }
                         // Not a verdict on correctness: a definition an
-                        // operator action left paused is checked by the
+                        // operator action left paused, or one reading it
+                        // (reported `catching_up`), is checked by the
                         // run's end-of-run `live` check.
                         trellis::SelfCheckOutcome::NotLive(_) => {}
                         _ => failures.push(format!("{target}: {report:#?}")),

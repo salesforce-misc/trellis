@@ -45,9 +45,9 @@ pub struct Coverage {
     /// Which function names (the [`Expr::FunctionCall`] `name` field, one of
     /// `trellis::dev::defs::registry::FUNCTIONS`/`AGGREGATE_FUNCTION_SPECS`'s
     /// canonical uppercased names) appear across every `FieldDef.expr` on
-    /// every def, walked recursively alongside `expr_shapes`. An unrecognized function name is tallied as `"Other"` rather
-    /// than panicking — this accumulator has no failure mode of its own, it
-    /// just can't name what it's never been told about.
+    /// every def, walked recursively alongside `expr_shapes`. An unrecognized function name is
+    /// tallied as `"Other"` rather than panicking — this accumulator has no failure mode of its
+    /// own, it just can't name what it's never been told about.
     pub functions: HashSet<&'static str>,
     /// Which [`ValueType`] names appear on any column of any table.
     pub types_exercised: HashSet<&'static str>,
@@ -64,9 +64,10 @@ pub struct Coverage {
     pub max_expr_depth: usize,
     /// Number of definitions, across every recorded program, whose
     /// [`Program::def_install_after_op`] entry is nonzero — i.e. actually
-    /// deferred mid-stream rather than installed up front. A floor test over [`crate::generate::program_with_mid_stream_def_install`]
-    /// asserts this is nonzero across enough samples: a coverage bit for "a
-    /// mid-stream install was actually drawn", not just "the strategy exists".
+    /// deferred mid-stream rather than installed up front. A floor test over
+    /// [`crate::generate::program_with_mid_stream_def_install`] asserts this is nonzero across
+    /// enough samples: a coverage bit for "a mid-stream install was actually drawn", not just "the
+    /// strategy exists".
     pub mid_stream_def_installs: usize,
     /// Total [`Program::restart_after_ops`] entries across every recorded
     /// program — how many scheduled client

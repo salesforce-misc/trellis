@@ -39,8 +39,7 @@
 //!   hits zero rows) — included below anyway (cheap, and "the same delete
 //!   run twice" is a slightly different scenario than "a delete that always
 //!   targeted a dead pk") but not the interesting case.
-//! - **Update twice** is the only genuinely non-trivial case (as the
-//!   research pass that rescoped this task found): each of the two
+//! - **Update twice** is the only genuinely non-trivial case: each of the two
 //!   `apply()` calls is a real, valid delta (the row is live both times), so
 //!   the target must reflect the net result of *both* having actually run —
 //!   not double-count anything the way a naive incremental-`SUM`-style
@@ -55,13 +54,13 @@
 //!   updates)`, not `f(row after only the first)`, so a dropped second delta
 //!   (or a stale-image read that folds two deltas using the first's
 //!   captured row rather than the current one) shows up as a divergence.
-//!   Every definition this branch's generator draws is `KeySpace::OneToOne`
-//!   (a full recompute from the current source row, not an incremental
-//!   delta fold), so this doesn't yet reach the `Aggregate`-specific
+//!   `build_program`'s definition is `KeySpace::OneToOne` (a full
+//!   recompute from the current source row, not an incremental delta
+//!   fold), so this doesn't reach the `Aggregate`-specific
 //!   double-counting risk — but it's still real, valuable coverage of "the
 //!   pipeline handles two back-to-back real transactions against the same
-//!   row without dropping or double-applying either one," which is the
-//!   actual, honest scope of this task.
+//!   row without dropping or double-applying either one," which is this
+//!   test's scope.
 
 use generative::backend::{Backend, ManualBackend};
 use generative::generate::{Mutate, build_program};

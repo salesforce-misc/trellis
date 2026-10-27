@@ -179,10 +179,10 @@ pub enum Op {
         pk: String,
         expect: OpOutcome,
     },
-    /// Clears every row of `table` in one statement. Rendered by [`crate::backend::ManualBackend::apply`] as a plain
-    /// `TRUNCATE TABLE`, **not** trusted for its own affected-row count:
-    /// Postgres's `TRUNCATE` command tag always reports `0` regardless of how
-    /// many rows existed, so the backend synthesizes a real count itself (a
+    /// Clears every row of `table` in one statement. Rendered by
+    /// [`crate::backend::ManualBackend::apply`] as a plain `TRUNCATE TABLE`, **not** trusted for
+    /// its own affected-row count: Postgres's `TRUNCATE` command tag always reports `0` regardless
+    /// of how many rows existed, so the backend synthesizes a real count itself (a
     /// `SELECT count(*)` in the same transaction, before issuing the
     /// `TRUNCATE`) rather than letting `tokio_postgres::Client::execute`'s
     /// raw return value flow into `run_convergence`'s
@@ -300,10 +300,9 @@ pub struct Program {
     pub defs: Vec<TransformDef>,
     /// `def_install_after_op[i]` is how many of `ops` must already have been
     /// applied before `defs[i]` is installed:
-    /// `0` means "install up front, alongside every table, before
-    /// any op runs" (the default, and [`crate::run::run_convergence`]'s
-    /// behavior for most strategies). A nonzero value `N` means "install this definition only once
-    /// `ops[0..N]` have already been applied" — real rows can already exist
+    /// `0` (the default) means "install up front, alongside every table,
+    /// before any op runs". A nonzero value `N` means "install this
+    /// definition only once `ops[0..N]` have already been applied" — real rows can already exist
     /// in `defs[i].source` by then, exercising the build
     /// over pre-existing rows (the same path
     /// `generative/tests/backfill.rs` exercises by hand, now reachable from
@@ -356,7 +355,7 @@ pub enum NoiseAction {
     Delete {
         pk: i64,
     },
-    /// `ALTER TABLE ... ADD COLUMN` — DDL noise, not just DML; the noise includes DDL as well as DML.
+    /// `ALTER TABLE ... ADD COLUMN`: DDL noise, alongside the DML noise.
     AddColumn {
         name: String,
         value_type: ValueType,
@@ -390,8 +389,8 @@ pub struct NoiseEvent {
     pub kind: NoiseEventKind,
 }
 
-/// A full noise/administration schedule for one program run: an optional untracked table to create once at install
-/// time (`None` for an administration-only schedule, e.g. a `CHECKPOINT`-only
+/// A full noise/administration schedule for one program run: an optional untracked table to create
+/// once at install time (`None` for an administration-only schedule, e.g. a `CHECKPOINT`-only
 /// plan that needs no table at all), plus the [`NoiseEvent`]s to
 /// fire against it (or standalone) as the real op stream plays out.
 ///

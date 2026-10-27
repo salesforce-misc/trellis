@@ -4,8 +4,8 @@
 //! polled) observability count, and the caller-side await poll, in that
 //! order below.
 //!
-//! **Condition 4, the quarantine/poison band** (doc section "the one
-//! exclusion is parked quarantine work"): the `poison_held` table is
+//! **Condition 4, the quarantine/poison band** (doc section "What the
+//! await waits for", "Parked quarantine work is counted"): the `poison_held` table is
 //! what this term reads — not `poison` (the marker; a poisoned key with
 //! nothing parked yet has nothing pending) and not `key_deaths` (a pure
 //! counter, no origin position of its own). A row parked in `poison_held`
@@ -15,17 +15,16 @@
 //! replays it back onto the active batch and it drains for real. This is
 //! what makes convergence never report "converged" across a parked key.
 //!
-//! **The trap this module exists to avoid:** the design doc's per-batch
-//! summary band (`min_origin_lsn`/`max_lsn`, aggregated inside the seal's
-//! phase-1 flip transaction) is the obvious optimization for condition 3 —
+//! **The trap this module exists to avoid:** a per-batch summary band
+//! (`min_origin_lsn`/`max_lsn`, aggregated inside the seal's phase-1 flip
+//! transaction) is the obvious optimization for condition 3 —
 //! one indexed comparison per batch instead of a scan — and it is wrong: a
 //! band aggregated inside the flip describes what that transaction could
 //! see, not the slot, so a straddler or a phase-gap writer
 //! (docs/staging-and-claiming/03-sealing-and-the-fence.md) can each land in
-//! the slot outside it and produce a false `converged`. Nothing in
-//! `segments` even carries those two columns
-//! today — they are vestigial in the doc, not a real surface to restore a
-//! reader for. Condition 3 below asks the slot directly instead.
+//! the slot outside it and produce a false `converged`. `segments` carries
+//! no such band (the doc's "The trap: no per-batch summary band"), and
+//! condition 3 below asks the slot directly instead.
 
 use std::time::{Duration, Instant};
 

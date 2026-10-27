@@ -51,8 +51,8 @@ pub enum StagingError {
     /// `super::converge::await_converged` exhausted its timeout budget
     /// without `converged_through(token)` ever returning true. Named rather
     /// than a generic "values not stabilizing" message
-    /// (docs/staging-and-claiming/07-convergence-and-await.md, "A round did
-    /// no work"): that framing implies a schema cycle, which is not what
+    /// (docs/staging-and-claiming/07-convergence-and-await.md, "What the
+    /// await waits for"): that framing implies a schema cycle, which is not what
     /// this is — it just means the token hasn't cleared yet, and the caller
     /// should widen its budget or investigate the drain, not the schema.
     ConvergenceTimeout { token: PgLsn, waited: Duration },

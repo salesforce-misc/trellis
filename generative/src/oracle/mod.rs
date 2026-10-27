@@ -350,9 +350,9 @@ fn quote_ident(ident: &str) -> String {
 /// classes like `[[:alpha:]]`), and `COALESCE` does no comparison at all (it
 /// just returns its first non-`NULL` argument). `SUM`/`COUNT`/`AVG`/`MIN`/
 /// `MAX` are likewise all numeric aggregation, and `BOOL_AND`/`BOOL_OR`
-/// boolean aggregation, with no text/collation involvement. So unlike a text *ordering* comparison (the load-bearing
-/// collation risk), nothing here needs the oracle and the engine's underlying Postgres session
-/// pinned to the same collation — there is no ordering comparison in this
+/// boolean aggregation, with no text/collation involvement. So unlike a text *ordering* comparison
+/// (the load-bearing collation risk), nothing here needs the oracle and the engine's underlying
+/// Postgres session pinned to the same collation — there is no ordering comparison in this
 /// grammar for the two to disagree about.
 fn render_expr(expr: &Expr) -> String {
     match expr {

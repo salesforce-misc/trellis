@@ -188,7 +188,7 @@ pub const MAX_DEFS: usize = 3;
 /// `0..=GRAIN_MAX` is the grain column's non-NULL
 /// value space — kept at `2` (three possible non-`NULL` values; see
 /// [`grain_value`]'s doc comment for the fourth, `NULL`, value) so it stays
-/// "tiny, heavily-repeating" (the plan's own words): with `MAX_SEED_ROWS` (4)
+/// tiny and heavily repeating: with `MAX_SEED_ROWS` (4)
 /// rows drawn from a 3-value domain, a real collision (two seed rows landing
 /// in the same group) is the common case, not a rare one, and a handful of
 /// `Delete` mutates has real odds of emptying a group entirely — see the
@@ -358,8 +358,8 @@ pub enum Mutate {
         c1: Option<i64>,
         c2: Option<i64>,
     },
-    /// Clears every row of this table in one statement. Renders to [`Op::Truncate`]. Whether this "affects rows" tracks
-    /// the table's *current* liveness set exactly like every other variant
+    /// Clears every row of this table in one statement. Renders to [`Op::Truncate`]. Whether this
+    /// "affects rows" tracks the table's *current* liveness set exactly like every other variant
     /// here (`OpOutcome::Succeeds` if any pk is still live, `AffectsNoRows`
     /// if the table happens to already be empty) — but unlike
     /// `Update`/`Delete`, which touch one pk, this clears every remaining
@@ -378,7 +378,8 @@ pub enum Mutate {
 }
 
 /// Which of a source table's two aggregated columns (`c1`/`c2`) a generated
-/// `SUM`/`AVG`/`COUNT(<col>)` field aggregates over `COUNT(*)` has no column argument at all (see [`AggregateFn::Count`]).
+/// `SUM`/`AVG`/`COUNT(<col>)` field aggregates over. `COUNT(*)` has no column
+/// argument at all (see [`AggregateFn::Count`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateColumn {
     C1,
@@ -705,7 +706,7 @@ pub fn build_program(seed_values: &[(Option<i64>, Option<i64>)], mutates: &[Muta
 /// scoped to. Every definition sourced from a table gets the same field
 /// list: `total = c1 + c2`, plus an identity-passthrough field for each of
 /// that table's `Text`/`Boolean`/`Uuid` columns — this function
-/// widens *how many* tables/defs a program has and, also *how many
+/// widens *how many* tables/defs a program has and *how many
 /// scalar types* each table/def touches; it does not draw operators,
 /// functions, or comparisons over those types (see
 /// [`build_program_multi_with_shapes_and_derived`]).
@@ -727,9 +728,9 @@ pub fn build_program(seed_values: &[(Option<i64>, Option<i64>)], mutates: &[Muta
 /// `OneToOne`) kept at its original `&[usize]` signature rather than folded
 /// away — the same "don't touch two dozen call sites for an orthogonal
 /// widening" reasoning [`build_program`]'s own doc comment gives for staying
-/// at its two-argument shape (the shape widening is *which shapes*
-/// a def can take, not how many tables/defs a program has, which is what
-/// this signature already expresses).
+/// at its two-argument shape ([`build_program_multi_with_shapes`] widens
+/// *which shapes* a def can take, not how many tables/defs a program has,
+/// which is what this signature already expresses).
 pub fn build_program_multi(tables: &[TableSpec], def_sources: &[usize]) -> Program {
     let defs: Vec<(usize, DefShape)> = def_sources
         .iter()
@@ -998,8 +999,8 @@ pub fn build_program_multi_with_shapes(
     }
 }
 
-/// Builds one [`FieldDef`] for a drawn [`AggregateFn`]: the field name encodes both the function and its aggregated column
-/// (`sum_c1`, `avg_c2`, `count_c1`, ...) so distinct `(function, column)`
+/// Builds one [`FieldDef`] for a drawn [`AggregateFn`]: the field name encodes both the function
+/// and its aggregated column (`sum_c1`, `avg_c2`, `count_c1`, ...) so distinct `(function, column)`
 /// draws — even two functions sharing the same column, e.g. `SUM(c1)` and
 /// `AVG(c1)` — never collide; `COUNT(*)` has no column and always takes the
 /// fixed name `cnt`. `c1`/`c2` are the source table's own rendered column
@@ -1086,7 +1087,7 @@ fn aggregate_field_def(func: AggregateFn, c1: &str, c2: &str) -> FieldDef {
 /// by a column that can be zero, ...), this is the comment to update and the
 /// decision to revisit.
 ///
-/// **Scoped to `OneToOne` defs only (a design note).** Every
+/// **Scoped to `OneToOne` defs only.** Every
 /// `DerivedShape` variant references `c1`/`c2`/the text column *bare*
 /// (`Expr::Column`), never wrapped in an aggregate function — that's exactly
 /// what makes a `OneToOne` field a legal `SELECT` projection. On an
@@ -2167,7 +2168,7 @@ fn op_table(op: &Op) -> &str {
 /// carry that column (a generator bug: every [`Op::Insert`] this crate
 /// builds always carries the pk column, non-`NULL`, and `Update`/`Delete`
 /// carry it directly as `pk`), or if `op` inherently touches more than one
-/// pk at once (the `Op::Truncate`/`Op::BulkInsert` —
+/// pk at once (`Op::Truncate`/`Op::BulkInsert` —
 /// `None` here is the same "conservative, may conflict with anything on this
 /// table" signal [`ops_commute`] already treats an unresolved pk as, which is
 /// exactly right for a whole-table clear or a multi-row insert).
@@ -2380,8 +2381,8 @@ pub fn reordered_by_commute_groups(program: &Program) -> Program {
     }
 }
 
-/// A noise table's fixed shape (untracked-object noise): a `Numeric` primary key column plus one extra
-/// column of `extra_type`. Kept to exactly two columns (pk + one extra) —
+/// A noise table's fixed shape (untracked-object noise): a `Numeric` primary key column plus one
+/// extra column of `extra_type`. Kept to exactly two columns (pk + one extra) —
 /// noise doesn't need [`Table`]'s full multi-type-column richness, just
 /// enough shape for DML (`Insert`/`Update`/`Delete`) and DDL
 /// (`AddColumn`/`DropColumn`) noise to have somewhere to land. Never routed
@@ -2476,9 +2477,9 @@ mod strategy {
         "[a-zA-Z0-9 ]{0,8}".boxed()
     }
 
-    /// One specific awkward *text* value (design doc §3): the empty string; the literal four-character text `"NULL"`
-    /// (distinct from SQL `NULL`, i.e. `None` — that's [`value`]'s job, this
-    /// is the string that spells the word); a string containing the U+001F
+    /// One specific awkward *text* value (design doc §3): the empty string; the literal
+    /// four-character text `"NULL"` (distinct from SQL `NULL`, i.e. `None` — that's [`value`]'s
+    /// job, this is the string that spells the word); a string containing the U+001F
     /// unit-separator (`defs::ddl::join_pk_key`'s composite-key
     /// delimiter — see the module doc comment's "Scope" section on why this
     /// doesn't reach that risk); and a string containing a
@@ -2576,8 +2577,7 @@ mod strategy {
     /// occasionally `None` (SQL `NULL`). Deliberately **never** a malformed
     /// UUID string (see the module doc comment's "Scope" section): a bad UUID
     /// would fail the `INSERT`/`UPDATE` statement's own `$n::text::uuid`
-    /// cast — real, separate future coverage (a new `OpOutcome::Fails`
-    /// case), not this task.
+    /// cast, which would be a separate `OpOutcome::Fails` case.
     fn uuid_value(awkward_values: bool) -> BoxedStrategy<Option<String>> {
         if awkward_values {
             prop_oneof![
@@ -2645,36 +2645,18 @@ mod strategy {
         ]
     }
 
-    /// A single grain column value: `0..=GRAIN_MAX`
-    /// most of the time, occasionally `None` (SQL `NULL`) — the "0, 1, 2, plus
-    /// NULL" domain the improvement plan originally asked for. This was
-    /// deliberately cut down to the three non-`NULL` values for a while:
-    /// a `NULL` grouping value is real, standard SQL (Postgres's
-    /// `GROUP BY` puts every `NULL` into one group, like any other value),
-    /// but `defs::ddl::create_aggregate_target_table` used to declare
-    /// the `group_by` columns as the target's `PRIMARY KEY`, and Postgres
-    /// primary-key columns are `NOT NULL` unconditionally — so a source row
-    /// whose grouping column was `NULL` made every write to that group's
-    /// target row fail with a real Postgres `null value in column ...
-    /// violates not-null constraint` error. The failure itself was never a
-    /// liveness wedge on its own (`staging::quarantine`'s isolate-before-blaming
-    /// machinery parks the offending row alone after a few deaths and lets
-    /// the rest of the batch drain), but the parked row's contribution was
-    /// then permanently and silently excluded from its aggregate group with
-    /// no automatic recovery, and `staging::converge::converged_through`'s
-    /// condition 4 — which deliberately treats any live `poison_held` row as
-    /// "not converged" until an operator releases it — meant a token at or
-    /// past that row's LSN never converged, observed directly as this
-    /// suite's own `quiesce` hanging past its 30s `QUIESCE_TIMEOUT`.
-    ///
-    /// The root cause is fixed: `create_aggregate_target_table` now
-    /// keys the grouping columns with a `UNIQUE NULLS NOT DISTINCT`
-    /// constraint instead of a bare `PRIMARY KEY`, `defs::backfill`'s direct
-    /// aggregate build no longer drops a NULL-keyed group, and
+    /// A single grain column value: `0..=GRAIN_MAX` most of the time,
+    /// occasionally `None` (SQL `NULL`). A `NULL` grouping value is standard
+    /// SQL (Postgres's `GROUP BY` puts every `NULL` into one group, like any
+    /// other value), and it is a sharp edge for the target: a `PRIMARY KEY`
+    /// over the grouping columns would be `NOT NULL` and refuse that group's
+    /// row, parking it in quarantine and holding convergence. So
+    /// `defs::ddl::create_aggregate_target_table` keys the grouping columns
+    /// with a `UNIQUE NULLS NOT DISTINCT` constraint instead,
+    /// `defs::backfill`'s direct aggregate build keeps a NULL-keyed group, and
     /// `ddl::source_primary_key` falls back to a unique constraint so
-    /// chaining off an aggregate target still works. A `NULL` grouping value
-    /// no longer hits the not-null violation, so it's never quarantined and
-    /// never blocks convergence — safe to draw again.
+    /// chaining off an aggregate target works; drawing `NULL` here keeps all
+    /// three honest.
     ///
     /// Not gated by `awkward_values` (see [`trivial_program_with`]'s doc
     /// comment) — `NULL` here is a structural grouping-domain dimension, the
@@ -3994,7 +3976,7 @@ mod strategy {
     ///
     /// **Scoped to `KeySpace::OneToOne` definitions, not
     /// [`trivial_program_with`]'s full mix — a deliberate, documented scope
-    /// cut, discovered *while building this task*, mirroring
+    /// cut, mirroring
     /// [`grain_value`]'s own history of a found-but-then-out-of-scope engine
     /// bug (since fixed).** Restarting the primary client
     /// mid-stream originally reproduced a real engine bug in the replication

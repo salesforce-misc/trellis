@@ -44,15 +44,14 @@ fn sorted_value_types(types: impl IntoIterator<Item = ValueType>) -> Vec<&'stati
 /// Every **value** column's scalar type appears both as a plain column and
 /// via a derivation.
 ///
-/// Widened the generator's whole type surface past
-/// Numeric-only (design doc §3): every table now also gets one `Text`, one
-/// `Boolean`, and one `Uuid` column, each with its own identity-passthrough
+/// The generator's type surface goes past Numeric-only (design doc §3):
+/// every table also gets one `Text`, one `Boolean`, and one `Uuid` column, each with its own identity-passthrough
 /// field (`SELECT <col> AS <col>`) on every def sourced from that table — see
 /// `generate::build_program_multi`'s doc comment. This test's whole point is
 /// to fail loudly the day a scalar type is added to the generated schema
 /// without a matching derivation landing alongside it — exactly the
 /// "coverage that silently drops out" the design doc warns about — so its
-/// expected-surface assertion is widened here, not weakened or dropped.
+/// expected surface grows with the schema, never weakened or dropped.
 ///
 /// The **primary-key** column is excluded, and that exclusion is the
 /// assertion's shape, not a hole in it: the pk exists to be a *key*, and its
@@ -130,12 +129,11 @@ fn collect_column_types(expr: &Expr, source: &Table, out: &mut Vec<ValueType>) {
 }
 
 /// `build_program`'s fixed `total = c1 + c2` field (unaffected by
-/// the new "derived" field — see
+/// the "derived" field — see
 /// `generate::build_program_multi_with_derived`'s doc comment, which layers
 /// on top of `build_program_multi` rather than changing its output) still
-/// draws exactly `Operator::Add` over `Numeric, Numeric`, unchanged from
-/// before the derived field existed. `Operator::GreaterThan` is drawn too now, but only by the
-/// proptest strategy's independent `derived` field — see
+/// draws exactly `Operator::Add` over `Numeric, Numeric`.
+/// `Operator::GreaterThan` is drawn too, but only by the proptest strategy's independent `derived` field — see
 /// `trivial_program_sometimes_draws_greater_than` below for that floor.
 #[test]
 fn every_supported_operator_appears_over_every_supported_argument_type() {
@@ -539,8 +537,8 @@ fn a_real_run_of_the_default_strategy_meets_its_coverage_floors() {
 /// `awkward_values_on_sometimes_draws_null`/
 /// `trivial_program_sometimes_draws_a_duplicate_pk_insert` above. A single-table
 /// generator could never draw this; this is the coverage meta-test that would
-/// catch the multi-table widening silently regressing back to always-one (design doc §3 "coverage that
-/// silently drops out").
+/// catch the multi-table widening silently regressing back to always-one (design doc §3 "coverage
+/// that silently drops out").
 #[test]
 fn trivial_program_sometimes_draws_more_than_one_table() {
     let mut runner = TestRunner::default();
@@ -898,9 +896,8 @@ fn noise_plan_for_sometimes_draws_at_least_one_event() {
 /// samples, matching this suite's own "every shape reachable across a
 /// bounded number of samples" convention (e.g.
 /// `trivial_program_draws_every_scalar_function_at_least_once` above). If
-/// `AddColumn`/`DropColumn` silently stopped being drawn, the DDL half of
-/// E1's "ideally also some DDL" ask would quietly regress to DML-only noise
-/// without any test noticing.
+/// `AddColumn`/`DropColumn` silently stopped being drawn, the noise would
+/// quietly regress to DML-only without any test noticing.
 #[test]
 fn noise_plan_for_draws_every_action_variant_across_enough_samples() {
     let mut runner = TestRunner::default();
