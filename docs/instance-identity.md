@@ -128,10 +128,10 @@ would both run the migration runner on the same new schema.
 The named schema is necessary but not sufficient. Anything an instance treats
 as privately its own has to be scoped by that schema too, or two instances in
 one database will collide on it even though every table they own is separate.
-Issue #234's two-instance generative property
+The two-instance generative property
 (`generative/tests/two_instance_noise.rs`) runs two instances side by side in
 one database to keep this honest; it found two real gaps, both since closed.
-The column-pause lock (#978) was the same trap again, found by review:
+The column-pause lock was the same trap again, found by review:
 
 * **The producer singleton is keyed by schema.** Postgres advisory locks are
   keyed by `(database, key)` — a session's `search_path` is not part of the
@@ -154,8 +154,8 @@ The column-pause lock (#978) was the same trap again, found by review:
   fine for a one-instance process, wrong for anything holding a `Config` (like
   `Trellis`) and impossible for two instances in one process.
 
-The same test file also runs the shapes a multi-instance deployment uses
-(issue #879): two instances that define transforms over one source table, an
+The same test file also runs the shapes a multi-instance deployment uses:
+two instances that define transforms over one source table, an
 instance that reads another's one-to-one target (including the other dropping
 the transform that builds it), and two instances in two databases of one
 cluster, each in the default catalog schema. The Elixir client's `two_handles_test.exs`
@@ -240,7 +240,7 @@ that target's readers in the writing transaction, without capture triggers.
 That internal path stops at the instance boundary. The reading instance's only
 view of the table is its own capture triggers, and they have no primary key
 to identify a change by, so `CREATE TRANSFORM` rejects the definition with
-`SourceNotChangeKeyed` (issue #376). To chain off an aggregate target, or a 1-1 target over one, define
+`SourceNotChangeKeyed`. To chain off an aggregate target, or a 1-1 target over one, define
 the downstream transform in the instance that owns it.
 
 ## Convergence waits

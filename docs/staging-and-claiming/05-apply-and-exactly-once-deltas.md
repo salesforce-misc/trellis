@@ -54,7 +54,7 @@ folded whole; a larger one is walked in pages of at most the cap, each its own
 fold, compute and Phase 3 transaction (see
 [04](04-claiming-and-the-fold.md#paging-a-share-larger-than-the-cap)). The claim
 commits on its own before any fold, so a peer's claim never waits on this
-worker's fold (#328).
+worker's fold.
 
 **Phase 2 holds no locks and no transaction.** Deliberate: compute can be
 arbitrarily expensive without blocking a writer, another worker, or — by holding a
@@ -185,17 +185,17 @@ A 1-1 write is an absolute value: "set this key's row to `f(row)`". Two such wri
 for one key in two batches don't commute. If the batch computed from the older
 source state reaches Phase 3 last, its value overwrites the newer one, and nothing
 is left staged to correct it. That is the same **permanent staleness** the version
-fence exists for, caused by ordinary data changes instead of a definition change
-(issues #344, #392). It needs no crash or retry to happen. It only needs one
+fence exists for, caused by ordinary data changes instead of a definition change.
+It needs no crash or retry to happen. It only needs one
 worker to stall between Phase 2 and Phase 3, e.g. over a large batch.
 
-So a 1-1 target is on its ledger (`staging::one_to_one_ledger`, #623 D6),
+So a 1-1 target is on its ledger (`staging::one_to_one_ledger`),
 whose entry for a key holds only the ordering state ([below](#the-ledger)); the
 target row holds the values. A change is an **Apply** when it carries the
 image of the commit it came from (its `lsn` and source `txid`), and a
 **Re-derive** when it was staged as a `recompute` or folded with one. Every
 record of a page whose oldest batch is at or below the target's `build_seg`,
-the segment its Re-derive build started in, is a Re-derive too (#733): such a
+the segment its Re-derive build started in, is a Re-derive too: such a
 batch may hold a change committed before the start whose later change drained
 before it, unapplied, so its image is stale. Phase 2
 evaluates an Apply's image; Phase 3 settles each 1-1 target's records in one
@@ -208,20 +208,19 @@ pass:
    the key's target row holds the entry, so every Phase 3 for a key runs one
    at a time. It can't be the target row's `FOR UPDATE`: a stale insert
    racing a delete has no row to lock. A key whose tombstone the GC collects
-   between the two statements fails the page transiently and it is retried
-   (#712).
+   between the two statements fails the page transiently and it is retried.
 2. **The Re-derive read (I1).** The Re-derived keys' source rows and
    `pg_current_snapshot()`, in one statement, after the lock. A key with no
    row is a delete.
 3. **The entries (I2).** A Re-derive sets the entry's `__basis` to the read's
-   snapshot and leaves `__applied_lsn` alone (#623 Q1). An Apply applies only
+   snapshot and leaves `__applied_lsn` alone. An Apply applies only
    if the I2 test above passes; it
    then sets `__applied_lsn`. Either raises `__applied_seg` and marks a
    tombstone when the key has no row after it. The statement returns the keys
    it changed. A placeholder step 1 inserted that neither step wrote (an
    Apply at or below the truncate floor, or a Re-derive skipped as failing
    to evaluate)
-   is deleted in the same transaction (#774): it holds no ordering state, so
+   is deleted in the same transaction: it holds no ordering state, so
    I2 treats it as no entry, and the tombstone GC collects only tombstones.
 4. **The target rows** of exactly those keys are upserted or deleted.
 
@@ -238,7 +237,7 @@ position, so a key whose source changes faster than a batch drains still
 gets each batch's newest image.
 
 `ALTER TRANSFORM`'s field rebuild and a column resume are field builds
-(`staging::build`, #625 F8b): background chunks that lock a range of keys'
+(`staging::build`): background chunks that lock a range of keys'
 entries as a page does and rewrite just the changed columns of their target
 rows from one snapshot, leaving the entries as they are.
 
@@ -254,11 +253,11 @@ one entry per source key (`__from_key`, in the ring's `key` encoding) with the
 ordering state apply will judge a change against:
 
 - `__applied_lsn` and `__applied_seg`: the `lsn` and ring segment of the last
-  change applied to the entry. A Re-derive leaves `__applied_lsn` alone
-  (#623 Q1). `__applied_seg` is the tombstone GC watermark (#623 Q7). A
+  change applied to the entry. A Re-derive leaves `__applied_lsn` alone.
+`__applied_seg` is the tombstone GC watermark. A
   Re-derive's read is live, so it stamps at least the newest segment its
   snapshot sees, not only the page's own: a tombstone must outlast every
-  change its `__basis` saw (#742).
+  change its `__basis` saw.
 - `__basis`: the `pg_current_snapshot()` of the read that last wrote the entry,
   taken in the same statement as that read (I1). A change whose transaction is
   visible in it is already counted.
@@ -268,8 +267,8 @@ A 1-1 target's ledger holds only the key and the ordering state, because the
 target row holds the values. It is keyed by `__from_key` and indexes its
 tombstones by `__applied_seg` (the tombstone GC's index, below).
 
-A 1-1 target is built one of two ways. The Re-derive build (`staging::build`,
-#625) serves a 1-1 target on a captured source or on another definition's
+A 1-1 target is built one of two ways. The Re-derive build (`staging::build`)
+serves a 1-1 target on a captured source or on another definition's
 target: it applies from its start and re-derives the source in chunks, each
 inserting the entries its keys don't have yet and locking the others as a page
 does, and stamping them as a Re-derive does (below). Every other 1-1 target
@@ -326,7 +325,7 @@ group only once the contiguous drained prefix reaches its stamp
 
 **Truncate.** A source `TRUNCATE` empties a 1-1 target's ledger, or an
 aggregate's hidden table, clears the target's rows, and raises the target's
-truncate floor (`ledger_truncate_floor`) to the truncate's `lsn` (#623 Q6). `TRUNCATE` takes
+truncate floor (`ledger_truncate_floor`) to the truncate's `lsn`. `TRUNCATE` takes
 `ACCESS EXCLUSIVE`, so every earlier writer's trigger ran below that `lsn` and
 every later writer's above it; a write later in the truncating transaction
 itself is above it too, since the truncate's own ring row moves the WAL insert
@@ -355,13 +354,13 @@ recomputes the groups it names the same way, under the page's group locks.
 segment (`staging::retire::collect_tombstones`). An earlier change to the same
 key committed before the delete's trigger ran, so it is in the delete's batch
 or an earlier one, and at or below the prefix it has been applied or refused.
-A Re-derive stamps at least the newest segment its snapshot sees (#742), so a
+A Re-derive stamps at least the newest segment its snapshot sees, so a
 tombstone it wrote outlives every change its `__basis` would refuse. A later
 change to a collected key finds no entry and gets a fresh one, where I2
 reduces to the truncate floor.
 
 The GC skips the ledger of a definition under a build: one that is
-`backfilling`, or whose Re-derive build a pause or quarantine froze (#723).
+`backfilling`, or whose Re-derive build a pause or quarantine froze.
 A build chunk inserts a new key's entry from a snapshot taken before the
 insert, so a tombstone written after that snapshot must still be there when
 the insert looks for the key. A GC batch checks the definition and holds its
@@ -371,11 +370,11 @@ and skips. The tombstones of deletes applied during a build therefore wait
 for it to finish, which bounds them by the write rate times the build's
 length.
 
-Only a tombstone carries `__applied_seg` (#775). A write that leaves an entry
+Only a tombstone carries `__applied_seg`. A write that leaves an entry
 a tombstone raises it to `greatest(old, its segment)`; one that leaves the
 entry live leaves it alone. The ledger indexes its tombstones by it
 (`(__applied_seg) where __tombstone`), so a GC batch seeks the collectable
-ones under a pinned index-scan plan (#738), however many tombstones wait
+ones under a pinned index-scan plan, however many tombstones wait
 above the drained prefix, and an Apply or Re-derive that leaves an entry live
 changes no indexed column and can be HOT. A live entry's stale
 stamp never has to protect anything: a delete's Apply applies only a change
@@ -487,9 +486,8 @@ queued behind a lock holds its transaction, and with it its snapshot, its
 transaction id and every lock it took before, for as long as the holder
 does. Vacuum can't pass it, and the sealer's gate, which waits out every
 transaction running when the last fence was taken, refuses every seal
-meanwhile. In #617 a drain batch's ledger insert waited 1 h 50 min behind
-chunk transactions, and the sealer was refused for the whole wait
-([#617 final](https://github.com/salesforce-misc/trellis/issues/617#issuecomment-5859141160)).
+meanwhile. In a benchmark run a drain batch's ledger insert waited 1 h 50 min behind
+chunk transactions, and the sealer was refused for the whole wait.
 
 **The rule.** Every lock wait in a Trellis transaction is bounded by
 `lock_timeout`, and on `55P03` the transaction rolls back and the work is
@@ -501,19 +499,15 @@ retried with backoff from outside any transaction.
   lock statements (the 1-1 ledger's entry locks above, `FOR SHARE` on the version fence,
   advisory stripe locks, DDL) and the implicit waits nobody writes down: an
   `INSERT ... ON CONFLICT` waiting on another transaction's uncommitted key
-  (#617's wait), an `UPDATE` of a row another transaction holds. A setting
+  (the wait above), an `UPDATE` of a row another transaction holds. A setting
   per transaction would cover only the transactions someone remembered.
 - **The cap is 30 seconds.** The invariant is that the wait is bounded, not
-  that it is short. The cap was two minutes while the aggregate group
-  pre-lock queued drain pages that touch the same groups one behind
-  another: in `bench fold-in-ratio` at ratio 10 (40k groups, every page
-  touching most of them) the longest page transaction, its wait included,
-  was 89 s, and a 5 s cap fired 75 times. #623 D5 removed the pre-lock, and
-  D9 re-measured the same run on disk: the longest page is now 6.6 s, and no
-  page waits out a 30 s or a 10 s cap. The cap is the smallest of the two
-  whose longest page stays under a third of it, so a slow checkpoint can't
-  turn ordinary pages into retries. Going lower waits for #629's
-  measurements.
+  that it is short. Aggregate drain pages take no group pre-lock, so pages
+  that touch the same groups don't queue one behind another: in
+  `bench fold-in-ratio` at ratio 10 (40k groups, every page touching most of
+  them) on disk, the longest page is 6.6 s, and no page waits out a 30 s or a
+  10 s cap. The cap is the smallest of the two whose longest page stays under
+  a third of it, so a slow checkpoint can't turn ordinary pages into retries.
 - **A drain keeps its claim across the retry.** A page whose transaction
   times out is classified transient; the drain backs off (50 ms, doubling to
   1 s) and retries the page, recomputing it, while the heartbeat keeps its
@@ -530,15 +524,14 @@ retried with backoff from outside any transaction.
 A DDL statement waiting for a lock on a user table sits in that table's lock
 queue, and every later lock request that conflicts with it queues behind it.
 For a lock that conflicts with `ROW EXCLUSIVE` (`CREATE TRIGGER`'s `SHARE ROW
-EXCLUSIVE`, #622) that is every application writer, for as long as whatever
-the DDL waits on stays open. In #565 E7 a bare `CREATE TRIGGER` stalled
+EXCLUSIVE`) that is every application writer, for as long as whatever
+the DDL waits on stays open. In a benchmark run a bare `CREATE TRIGGER` stalled
 every writer for 25 s behind one open transaction; with a 50 ms
-`lock_timeout` retried every 200 ms the worst writer wait was 52 ms
-([E7](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119)).
+`lock_timeout` retried every 200 ms the worst writer wait was 52 ms.
 
-**The rule.** DDL on a user table (`CREATE`/`DROP TRIGGER`, #622) runs in a
+**The rule.** DDL on a user table (`CREATE`/`DROP TRIGGER`) runs in a
 retry loop (`locks::DdlRetry`), each attempt its own transaction under
-`locks::USER_TABLE_DDL_LOCK_TIMEOUT` (50 ms), E7's shape, one attempt per
+`locks::USER_TABLE_DDL_LOCK_TIMEOUT` (50 ms), one attempt per
 `locks::USER_TABLE_DDL_RETRY_INTERVAL` (200 ms). The staging worker's
 reconcile pass leaves a table whose lock stays held to the next pass
 ([01](01-capture-by-triggers.md#installing-widening-narrowing-and-uninstalling)).
@@ -548,7 +541,7 @@ The retire path's `TRUNCATE` is the older precedent: it takes its lock
 An autovacuum holding the table blocks the DDL the same way. Postgres cancels
 one only when a waiter runs its deadlock check, after `deadlock_timeout`,
 which a 50 ms attempt never reaches, so a join on a table under a long
-autovacuum waits the vacuum out (#622 plan Q1).
+autovacuum waits the vacuum out.
 
 ## Downstream propagation, and why it terminates
 
@@ -603,7 +596,7 @@ key, or a schema error into a silently parked one. The classification:
 | **Everything else** | a genuinely poisonous change | isolate and charge — see [06](06-cleanup-and-reclaim.md) |
 
 The halting class deserves emphasis: **failing that way pauses the definitions
-the failure reaches, not the instance** (#663). Every key reproduces it, so the
+the failure reaches, not the instance**. Every key reproduces it, so the
 page can never drain as it stands; instead the drain pauses a closure and retries
 the page without it:
 
@@ -613,12 +606,12 @@ the page without it:
   through — not the definition that wrote it; inside a cycle, every member;
 - for an aggregate the group basis can't apply, the definition that writes that
   target;
-- for a refused read or write (#766), found from the catalog as the drain's
+- for a refused read or write, found from the catalog as the drain's
   own role, since Postgres's message names no key and only a bare table: the
   readers of each table they read that the role can't (`SELECT`, or policies
   that apply to it), and the writer of each target it can't write. The
   page's retries, and the isolation probes they run, then skip every table no
-  unfrozen definition reads, as for a table whose key can't be used (#768);
+  unfrozen definition reads, as for a table whose key can't be used;
 - and, in every case, everything downstream of those, so no hop target goes
   quietly stale.
 
@@ -634,10 +627,10 @@ episode, and a closure's members can be resumed in any order. A halt that pauses
 nothing because a peer already paused the closure retries the page once. One
 that still pauses nothing (a refused read or write the catalog can't pin on a
 table, [observability — A halting failure](../observability.md#a-halting-failure))
-surfaces the error and records the page as a drain holdup (#817, ADR-0003's
+surfaces the error and records the page as a drain holdup (ADR-0003's
 retry policy), which `status` reports as `drain_failure` on the definitions
 reading its tables, and the worker re-claims the page at the poll interval
-under a collapsed warning (#660).
+under a collapsed warning.
 
 ## Invariants
 

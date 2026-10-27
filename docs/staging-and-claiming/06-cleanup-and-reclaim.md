@@ -151,7 +151,7 @@ for that transform when that batch retired. Therefore **every batch that leaves 
 poisoned key out of a transform parks its own folded contribution for that
 transform before it marks drained, in the same transaction**. The transform holds
 one row per key, keyed `(transform, table, key)`, and each batch merges its
-contribution into it (#803), so a key held for good doesn't gain a row per batch:
+contribution into it, so a key held for good doesn't gain a row per batch:
 
 ```sql
 -- inside the Phase-3 transaction, before the drained mark, in key order
@@ -212,13 +212,13 @@ caused by the *declared schema*, not the data — a source key the drain can't u
 (`NoPrimaryKey`, `UnsupportedPrimaryKeyType`), a tripped hop bound (a real value
 cycle), an aggregate the group basis can't apply (`GroupBasisUnsupported`), and Postgres
 refusing the drain's role a read or write (`42501`, row-level security or a
-missing privilege, #766). Every key
+missing privilege). Every key
 reproduces them, so quarantining would blame one key for nobody's fault and turn
 a loud, actionable error into a key that blocks reads forever. Instead the drain
 pauses the closure the failure reaches — left `paused` with a `capture_failures`
 row of `kind` `halt` — and drains the batch without it, so the ring keeps
 retiring and every other definition keeps converging
-([05](05-apply-and-exactly-once-deltas.md#failure-classification), #663).
+([05](05-apply-and-exactly-once-deltas.md#failure-classification)).
 
 ## The one sanctioned exception to immutability
 

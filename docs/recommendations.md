@@ -19,11 +19,11 @@ more often checkpoints run, the more of the WAL is full-page images.
 
 The share depends on the target's shape. A build that inserts into an index
 at random positions logs a full page for almost every insert once the index
-outgrows what a checkpoint interval leaves clean: in #723, a per-row ledger
+outgrows what a checkpoint interval leaves clean: a per-row ledger in a benchmark
 with a `GROUP BY` index wrote 25 million full-page images over 100M rows,
 against 0.18 million for a ledger without the index.
 
-The #723 benchmark runs set `checkpoint_timeout=1min` and `max_wal_size=4GB`
+The benchmark runs set `checkpoint_timeout=1min` and `max_wal_size=4GB`
 to stress a build, giving a requested checkpoint about every 10 seconds. There,
 a 100M-row, 1M-group build with the index wrote 3,370 B of WAL per built row,
 2.6 times the 1,290 B of a 10M-row, 100k-group build.
@@ -36,7 +36,7 @@ restart.
 
 On the 100M-row build above, `lz4` alone cut WAL from 3,370 to 1,918 B per
 built row and define-to-`live` from 1,446 to 1,090 seconds, and the writers
-rose from 1,269 to 1,751 writes per second (#723). The gain is largest for a
+rose from 1,269 to 1,751 writes per second. The gain is largest for a
 build that inserts into such an index; the same build without the index wrote
 1,036 B per row and reached `live` in 396 seconds.
 
@@ -48,18 +48,18 @@ not seconds.
 * `checkpoint_timeout`: raise it from the default 5 minutes to 15 or 30.
 * `max_wal_size`: PostgreSQL forces a checkpoint at about `max_wal_size`
   divided by (1 + `checkpoint_completion_target`), roughly half. Set it to
-  about twice the WAL written in one `checkpoint_timeout`. In the #723 runs a
+  about twice the WAL written in one `checkpoint_timeout`. In those runs a
   checkpoint covered about 2.2 GB at `max_wal_size=4GB`.
 * Take the WAL rate from your own database: read `pg_stat_wal.wal_bytes`
   before and after a build, or at two points of steady load, and divide by the
   seconds between. A 100M-row invertible aggregate wrote about 260 MB per
-  second (#723), so a 15-minute interval writes about 235 GB and wants a
+  second, so a 15-minute interval writes about 235 GB and wants a
   `max_wal_size` near 450 GB.
 * Size `max_wal_size` for steady load, not for builds. If the disk under
   `pg_wal` can't hold more, let a rare large build force a checkpoint every
   few minutes; `wal_compression` offsets the extra full-page images.
 * `pg_wal` holds about `max_wal_size` plus one checkpoint's worth of WAL (the
-  #723 runs peaked at 4,192 and 4,576 MiB at a 4,096 MiB setting). It grows
+  benchmark runs peaked at 4,192 and 4,576 MiB at a 4,096 MiB setting). It grows
   without bound while WAL archiving fails or another consumer's replication
   slot lags (Trellis has none), so alert on both.
 
@@ -82,11 +82,9 @@ To watch a build's progress, see
 
 Captured changes wait in the staging ring, which lives in your application's
 database, until the drain applies them. The ring grows whenever capture
-outruns the drain, which it can by about 20 times
-([#808](https://github.com/salesforce-misc/trellis/issues/808)), and whenever
+outruns the drain, which it can by about 20 times, and whenever
 no Trellis process is running. Each undrained change takes about 188 B for a
-narrow row
-([#565, E6](https://github.com/salesforce-misc/trellis/issues/565#issuecomment-5844307119));
+narrow row;
 a ring row carries the primary key and the columns definitions read, so wider
 rows take more, and an update carries both its old and new image.
 
@@ -111,8 +109,7 @@ At 10,000 changes per second, a one-hour outage needs about 6.8 GB.
 * To see the ring's size on disk, sum `pg_total_relation_size` over the ring
   tables `seg_0` to `seg_3` in Trellis's schema.
 * The ring's gauges and its soft and hard bounds are designed but not built
-  ([#808](https://github.com/salesforce-misc/trellis/issues/808),
-  [ADR-0002 — Consequences](decisions/0002-async-data-flow.md#consequences-and-costs)).
+  ([ADR-0002 — Consequences](decisions/0002-async-data-flow.md#consequences-and-costs)).
 
 ## `statement_timeout`
 
@@ -178,9 +175,7 @@ commits, so its lock window, its hold on `xmin` and the stall in retiring ring
 segments grow with the source. On a `JOIN` over an unpartitioned
 100-million-row fact table, a fresh build held `xmin` for 23 seconds grouped by
 a dimension attribute, and for 932 seconds, writing 15.9 GB of WAL, grouped by
-day and attribute
-([#1346](https://github.com/salesforce-misc/trellis/issues/1346) tracks the
-second). For that
+day and attribute. For that
 whole window the source's drain waits on the groups the build holds, and on a
 `JOIN` so do the other side's pages on the same keys. No ring segment retires
 until the build commits, so once the ring's slots fill, every source's drain

@@ -13,7 +13,7 @@ leaves this page when Trellis repairs it, or starts reporting it.
 
 An aggregate keeps each group's partials (its row count and running sums) and
 applies each captured change to them as a delta, and a `JOIN` does the same for
-each table's partials ([epic #1091](https://github.com/salesforce-misc/trellis/issues/1091)).
+each table's partials.
 A delta is computed from the change's own images, so a group that missed a
 change stays wrong until it's rebuilt: `request_backfill` of the source, or
 `PAUSE`/`RESUME`. A later write to the same rows doesn't repair it.
@@ -32,7 +32,7 @@ wrong rows, on the targets it compares
 | **Writes capture never sees** | | |
 | [Capture disrupted and restored between two passes](#capture-disrupted-and-restored-between-two-passes) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study), otherwise documented |
 | [An unlogged source emptied by a crash or failover](#an-unlogged-source-emptied-by-a-crash-or-failover) | `self_check` | documented |
-| [A `MERGE` that moves a row to another partition](#a-merge-that-moves-a-row-to-another-partition) | `self_check` | a Postgres fix ([#942](https://github.com/salesforce-misc/trellis/issues/942)) |
+| [A `MERGE` that moves a row to another partition](#a-merge-that-moves-a-row-to-another-partition) | `self_check` | a Postgres fix |
 | [The source renamed or re-parented and back within one pass](#the-source-renamed-or-re-parented-and-back-within-one-pass) | `self_check` | [#1210](https://github.com/salesforce-misc/trellis/issues/1210) |
 | [A short-lived leaf beside a `DEFAULT` partition](#a-short-lived-leaf-beside-a-default-partition) | `self_check` | documented |
 | [A leaf detached and attached again around a `pg_upgrade`](#a-leaf-detached-and-attached-again-around-a-pg_upgrade) | `self_check` | [#1210](https://github.com/salesforce-misc/trellis/issues/1210) |
@@ -237,8 +237,7 @@ capture reads:
 `request_backfill` it. To avoid it, change a partition key with `UPDATE`, or
 with `DELETE` and `INSERT`.
 
-**Ends with:** a Postgres fix; it's reported upstream
-([#942](https://github.com/salesforce-misc/trellis/issues/942)).
+**Ends with:** a Postgres fix; it's reported upstream.
 
 ### The source renamed or re-parented and back within one pass
 
@@ -277,7 +276,7 @@ partition for the sweep to find.
 `request_backfill` it. To avoid it, delete a short-lived leaf's rows through
 the parent before removing it, or keep it until a pass has run.
 
-**Ends with:** documented; accepted in epic #897's design.
+**Ends with:** documented; accepted in the design.
 
 ### A leaf detached and attached again around a `pg_upgrade`
 

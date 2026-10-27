@@ -164,7 +164,7 @@ newer than the entry's
 record with only `recompute` rows has no `last_change`. Across segments,
 `last_change` comes from whichever side supplied `new_image`.
 
-`change_id` (issue #31) is store-assigned from a shared `nextval` sequence,
+`change_id` is store-assigned from a shared `nextval` sequence,
 monotonic across the ring. It records the one order commit `lsn` can't: every row
 of a transaction shares its commit `lsn`, so ordering an INSERT before a later
 UPDATE of the same key needs an intra-commit order. `lsn` stays primary;
@@ -235,13 +235,13 @@ same key must therefore pick one. The target-mutation seam does: it stages
 the changed keys of a target on its image feed (one a group-basis aggregate
 or a `JOIN` reads) as image-bearing CDC-shaped rows and every other target's
 as image-less `Recompute`s, never both for one target
-(`staging::target_mutations`, #402/#403).
+(`staging::target_mutations`).
 
 One fact the arg-extremes erase is kept on the side: **a recompute folded with
 a change.** A `recompute` never wins an image, so when it folds with the same
 key's CDC change the record carries that change's images and looks like a plain
 change. The recompute was staged to re-derive the key from live state, and
-applying the change's image instead would skip that (issue #392). The fold
+applying the change's image instead would skip that. The fold
 carries `has_recompute = bool_or(op = 'recompute')`, and a 1-1 target
 re-derives such a key rather than applying its last change.
 
@@ -256,7 +256,7 @@ segment merge concatenates them.
 A key born and died in the batch (an insert then a delete) folds to both images
 NULL, the same as a bare trigger. That needs nothing kept on the side: the
 key's ring rows carry both images, so a group that counted the insert (in its
-basis) also sees the delete, and the sides cancel ([05](05-apply-and-exactly-once-deltas.md), issue #486).
+basis) also sees the delete, and the sides cancel ([05](05-apply-and-exactly-once-deltas.md)).
 
 One field is deliberately **not** filtered: `op`, because the only load-bearing op
 is the `truncate` sentinel, and that sentinel is itself image-less. Filtering `op`
