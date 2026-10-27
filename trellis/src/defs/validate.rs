@@ -199,6 +199,15 @@ pub enum ValidationError {
     /// `double precision`'s range (overflow, or a nonzero value that
     /// underflows to zero). Postgres raises `22003` for it at plan time.
     FloatComparisonLiteralOutOfRange { field: String, text: String },
+    /// A bare number literal in a `COALESCE` whose result is a float lies
+    /// outside that float type's range (overflow, or a nonzero value that
+    /// underflows to zero). Postgres casts the literal to the float type and
+    /// raises `22003` for it at plan time, for every row.
+    CoalesceLiteralOutOfRange {
+        field: String,
+        text: String,
+        target: ValueType,
+    },
     /// A function call's argument had the wrong `ValueType` for its
     /// position — e.g. `octet_length(1)`. Distinct from
     /// [`ValidationError::TypeMismatch`] so the message can name the
@@ -751,6 +760,17 @@ impl fmt::Display for ValidationError {
                 f,
                 "calculated field '{field}' compares a float with the literal {text}, which is \
                  out of range for double precision"
+            ),
+            ValidationError::CoalesceLiteralOutOfRange {
+                field,
+                text,
+                target,
+            } => write!(
+                f,
+                "calculated field '{field}' has a COALESCE fallback literal {text} that is out \
+                 of range for {target}, the type of the COALESCE's other arguments; Postgres \
+                 cannot cast it. Use a literal within {target}'s range, or a column as the \
+                 fallback (see \"Supported sources and targets\" in docs/transforms.md)"
             ),
             ValidationError::MixedFloatExactComparison { field, lhs, rhs } => write!(
                 f,
@@ -2756,7 +2776,26 @@ fn infer_expr(
                     common_type = Some(arg_t);
                 }
             }
-            Ok(common_type.unwrap())
+            let common_type = common_type.unwrap();
+            // A bare number literal is an untyped constant that Postgres
+            // casts to the COALESCE's resolved type. For an exact result the
+            // literal's own type already unifies upward (an integer literal
+            // too wide for `integer` is `bigint`, then `numeric`), so only a
+            // float result can leave it out of range.
+            if let ValueType::Float(width) = common_type {
+                for arg in args {
+                    if let Expr::NumberLiteral(text) = arg
+                        && crate::float::literal_to_width(text, width).is_err()
+                    {
+                        return Err(ValidationError::CoalesceLiteralOutOfRange {
+                            field: field_name.to_string(),
+                            text: text.clone(),
+                            target: common_type,
+                        });
+                    }
+                }
+            }
+            Ok(common_type)
         }
         Expr::FunctionCall { name, args } => {
             // The parser only ever builds a `FunctionCall` node for a name
@@ -3846,6 +3885,76 @@ mod tests {
         assert_eq!(validate(&d, &source_columns), Ok(()));
         let d = parsed("TRANSFORM t FROM s SELECT f > 0.0000 AS out");
         assert_eq!(validate(&d, &source_columns), Ok(()));
+    }
+
+    #[test]
+    fn a_coalesce_literal_outside_the_floats_range_is_refused_at_define() {
+        let source_columns = HashMap::from([
+            ("r".to_string(), ValueType::Float(FloatWidth::Float4)),
+            ("d".to_string(), ValueType::Float(FloatWidth::Float8)),
+            ("n".to_string(), ValueType::Numeric),
+            ("i".to_string(), ValueType::Integer(IntWidth::Int4)),
+        ]);
+        let beyond_real = format!("1{}", "0".repeat(39));
+        let beyond_double = "9".repeat(310);
+        let underflow_real = format!("0.{}1", "0".repeat(50));
+        let fractional = format!("{beyond_real}.0");
+        for (expr, text, target) in [
+            (
+                format!("COALESCE(r, {beyond_real})"),
+                &beyond_real,
+                FloatWidth::Float4,
+            ),
+            (
+                format!("COALESCE({beyond_real}, r)"),
+                &beyond_real,
+                FloatWidth::Float4,
+            ),
+            (
+                format!("COALESCE(r, n, {beyond_real})"),
+                &beyond_real,
+                FloatWidth::Float4,
+            ),
+            (
+                format!("COALESCE(i, r, {fractional})"),
+                &fractional,
+                FloatWidth::Float4,
+            ),
+            (
+                format!("COALESCE(r, {underflow_real})"),
+                &underflow_real,
+                FloatWidth::Float4,
+            ),
+            (
+                format!("COALESCE(d, {beyond_double})"),
+                &beyond_double,
+                FloatWidth::Float8,
+            ),
+        ] {
+            let d = parsed(&format!("TRANSFORM t FROM s SELECT {expr} AS out"));
+            assert_eq!(
+                validate(&d, &source_columns),
+                Err(ValidationError::CoalesceLiteralOutOfRange {
+                    field: "out".to_string(),
+                    text: text.clone(),
+                    target: ValueType::Float(target),
+                }),
+                "{expr}"
+            );
+        }
+        // In range for the float, an exact result (the literal unifies
+        // upward instead of being cast), or a column fallback.
+        for expr in [
+            format!("COALESCE(d, {beyond_real})"),
+            format!("COALESCE(r, 34{})", "0".repeat(37)),
+            "COALESCE(r, 0)".to_string(),
+            "COALESCE(r, n)".to_string(),
+            format!("COALESCE(i, {beyond_real})"),
+            format!("COALESCE(n, {beyond_real})"),
+        ] {
+            let d = parsed(&format!("TRANSFORM t FROM s SELECT {expr} AS out"));
+            assert_eq!(validate(&d, &source_columns), Ok(()), "{expr}");
+        }
     }
 
     #[test]

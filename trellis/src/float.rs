@@ -341,6 +341,19 @@ pub fn literal_to_f64(text: &str) -> Result<f64, FloatError> {
     Ok(value)
 }
 
+/// [`literal_to_f64`] narrowed to `width`: the constant Postgres casts a bare
+/// number literal to when the other `COALESCE` argument is that float type.
+/// For `real` it errors where `float4in` does: a value past `real`'s finite
+/// range, or a nonzero one that underflows to zero.
+pub fn literal_to_width(text: &str, width: FloatWidth) -> Result<f64, FloatError> {
+    let wide = literal_to_f64(text)?;
+    let narrowed = width.round(wide);
+    if narrowed.is_infinite() || (narrowed == 0.0 && wide != 0.0) {
+        return Err(FloatError::OutOfRange { width });
+    }
+    Ok(narrowed)
+}
+
 /// Renders a float exactly as Postgres's `float4out`/`float8out` do under
 /// `extra_float_digits >= 1` — the shortest decimal that round-trips,
 /// formatted with Postgres's own fixed-vs-scientific rule.

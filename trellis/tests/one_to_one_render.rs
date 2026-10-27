@@ -534,41 +534,45 @@ async fn coalesce_over_a_real_computes_what_postgres_computes() {
     );
 }
 
-/// A fallback literal outside `real`'s range is admitted at define, and
-/// Postgres raises `22003` for it when it plans the write, whatever the row:
-/// every record fails, so the column pauses at its fuse's threshold.
+/// A `COALESCE` fallback literal outside the range of the float it is cast to
+/// is refused at define, because Postgres would raise `22003` for it at plan
+/// time for every row. An in-range literal and a column fallback define.
 #[tokio::test]
-async fn a_fallback_literal_out_of_reals_range_pauses_its_column() {
+async fn a_coalesce_literal_out_of_reals_range_is_refused_at_define() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let mut client = connect_raw(db.dsn()).await;
-    define(
-        &db,
-        &client,
-        "wide",
-        "id integer primary key, r real",
-        "TRANSFORM wide_out FROM public.wide SELECT COALESCE(r, 1000000000000000000000000000000000000000.0) AS v, (id + 1) AS next",
-        &[
-            ("id", ValueType::Integer(IntWidth::Int4)),
-            ("r", ValueType::Float(FloatWidth::Float4)),
-        ],
+    let client = connect_raw(db.dsn()).await;
+    client
+        .batch_execute("create table public.wide (id integer primary key, r real, n numeric)")
+        .await
+        .expect("create the source");
+    let columns: HashMap<String, ValueType> = HashMap::from([
+        ("id".to_string(), ValueType::Integer(IntWidth::Int4)),
+        ("r".to_string(), ValueType::Float(FloatWidth::Float4)),
+        ("n".to_string(), ValueType::Numeric),
+    ]);
+    let beyond_real = format!("1{}", "0".repeat(39));
+    let refused = create_definition(
+        &db.pool,
+        &format!("TRANSFORM wide_out FROM public.wide SELECT COALESCE(r, {beyond_real}) AS v"),
+        &columns,
     )
-    .await;
-    let rows: Vec<(String, String)> = (1..=50)
-        .map(|id| (id.to_string(), format!(r#"{{"id":"{id}","r":"1.5"}}"#)))
-        .collect();
-    let seg_seq = stage(&mut client, "wide", &rows).await;
-
-    drain_until_applied(&db, seg_seq, 8).await;
-    assert!(column_paused(&client, "wide_out", "v").await);
-    assert_eq!(
-        count(
-            &client,
-            "select count(*) from public.wide_out where next = id + 1"
-        )
-        .await,
-        50
+    .await
+    .expect_err("an out-of-range fallback literal is refused");
+    let message = refused.to_string();
+    assert!(
+        message.contains("out of range for real") && message.contains(&beyond_real),
+        "{message}"
     );
+    for (i, fallback) in ["3", "n"].into_iter().enumerate() {
+        create_definition(
+            &db.pool,
+            &format!("TRANSFORM ok{i}_out FROM public.wide SELECT COALESCE(r, {fallback}) AS v"),
+            &columns,
+        )
+        .await
+        .expect("an in-range literal and a column fallback define");
+    }
 }
 
 /// A lock timeout (`55P03`) is transient: it is retried, never isolated and
