@@ -510,6 +510,7 @@ fn keys_remaining(keys_total: Option<i64>, keys_done: i64) -> Option<u64> {
 /// A node a definition is being corrected for: one entry of
 /// [`crate::DefinitionStatus::correcting`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CorrectingNode {
     /// The schema-qualified node the correction is for: the leaf or middle
     /// partition that was attached, detached, dropped or truncated, or, for

@@ -70,6 +70,7 @@ pub const MAX_HOP_GEN: i32 = 32;
 /// [`StagingError`]/[`CatalogError`]/[`DdlError`]/`EvalError`'s own
 /// convention.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ApplyError {
     /// A failure from the staging ring (claim, fold, append).
     Staging(StagingError),

@@ -79,6 +79,7 @@ impl From<&SelfCheckJob> for PlainSelfCheckJob {
             mode: match job.mode {
                 SelfCheckMode::Standard => "standard",
                 SelfCheckMode::Strict => "strict",
+                _ => "unknown",
             },
             state: match job.state {
                 SelfCheckJobState::Queued => "queued",
@@ -86,6 +87,7 @@ impl From<&SelfCheckJob> for PlainSelfCheckJob {
                 SelfCheckJobState::Done => "done",
                 SelfCheckJobState::Failed => "failed",
                 SelfCheckJobState::Cancelled => "cancelled",
+                _ => "unknown",
             },
             rows_compared: job.rows_compared,
             report: job.report.as_ref().map(PlainSelfCheckReport::from),
@@ -158,6 +160,7 @@ impl From<&SelfCheckReport> for PlainSelfCheckReport {
                 "diverged",
                 divergences.iter().map(PlainDivergence::from).collect(),
             ),
+            _ => ("unknown", Vec::new()),
         };
         let status = match &report.outcome {
             SelfCheckOutcome::NotLive(status) => Some(transform_status(*status)),
@@ -223,6 +226,10 @@ impl From<&Divergence> for PlainDivergence {
                 detail: Some(fault.to_string()),
                 ..PlainDivergence::default()
             },
+            _ => PlainDivergence {
+                kind: "unknown",
+                ..PlainDivergence::default()
+            },
         }
     }
 }
@@ -235,7 +242,7 @@ mod tests {
     use crate::decode_watermark;
 
     fn report(outcome: SelfCheckOutcome) -> SelfCheckReport {
-        SelfCheckReport {
+        trellis::fixture!(SelfCheckReport {
             target: "order_totals".to_string(),
             checked_through: PgLsn::from(0x1_016B_3748),
             rows_compared: 42,
@@ -243,7 +250,7 @@ mod tests {
             outcome,
             held_keys: None,
             drain_failures: Vec::new(),
-        }
+        })
     }
 
     #[test]
@@ -274,13 +281,13 @@ mod tests {
     #[test]
     fn held_keys_cross_with_any_outcome() {
         let mut held = report(SelfCheckOutcome::NotCaughtUp);
-        held.held_keys = Some(trellis::HeldKeys {
+        held.held_keys = Some(trellis::fixture!(HeldKeys {
             count: 2,
             oldest_poisoned_at: std::time::UNIX_EPOCH
                 + std::time::Duration::from_micros(1_727_222_400_000_001),
             max_retry_attempts: 0,
             next_retry_at: None,
-        });
+        }));
         assert_eq!(
             PlainSelfCheckReport::from(&held).held_keys,
             Some(PlainHeldKeys {
@@ -295,7 +302,7 @@ mod tests {
         let at = |micros| std::time::UNIX_EPOCH + std::time::Duration::from_micros(micros);
         let mut held_up = report(SelfCheckOutcome::Converged);
         held_up.drain_failures = vec![
-            trellis::DrainFailure {
+            trellis::fixture!(DrainFailure {
                 seg_seq: 3,
                 tables: vec!["public.orders".to_string()],
                 error: "permission denied for column note".to_string(),
@@ -303,8 +310,8 @@ mod tests {
                 since: at(1_727_222_400_000_001),
                 last_seen: at(1_727_222_400_000_002),
                 attempts: 4,
-            },
-            trellis::DrainFailure {
+            }),
+            trellis::fixture!(DrainFailure {
                 seg_seq: 9,
                 tables: vec!["public.lines".to_string()],
                 error: "records fail only together".to_string(),
@@ -312,7 +319,7 @@ mod tests {
                 since: at(1_727_222_400_000_003),
                 last_seen: at(1_727_222_400_000_004),
                 attempts: 1,
-            },
+            }),
         ];
 
         assert_eq!(
@@ -450,14 +457,16 @@ mod tests {
 
     #[test]
     fn a_job_crosses_with_its_state_word_and_its_report_only_when_done() {
-        let job = |state, report: Option<SelfCheckReport>, error: Option<&str>| SelfCheckJob {
-            id: 7,
-            target: "order_totals".to_string(),
-            mode: SelfCheckMode::Strict,
-            state,
-            rows_compared: 42,
-            report,
-            error: error.map(str::to_string),
+        let job = |state, report: Option<SelfCheckReport>, error: Option<&str>| {
+            trellis::fixture!(SelfCheckJob {
+                id: 7,
+                target: "order_totals".to_string(),
+                mode: SelfCheckMode::Strict,
+                state,
+                rows_compared: 42,
+                report,
+                error: error.map(str::to_string),
+            })
         };
 
         let queued = PlainSelfCheckJob::from(&job(SelfCheckJobState::Queued, None, None));

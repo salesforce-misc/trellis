@@ -2499,11 +2499,11 @@ async fn status_lists_the_node_under_correction_until_it_commits() {
     assert_eq!(status.status, trellis::TransformStatus::Backfilling);
     assert_eq!(
         status.correcting,
-        vec![trellis::CorrectingNode {
+        vec![trellis::fixture!(CorrectingNode {
             node: "public.items_p1".to_string(),
             since: queued_at,
             keys_remaining: None,
-        }],
+        })],
         "listed from the pass that queued it"
     );
 

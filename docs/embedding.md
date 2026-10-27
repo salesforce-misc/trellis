@@ -232,6 +232,18 @@ building blocks beneath them, and `Error`, `ErrorCode` and the error and status
 types the facade returns are exported alongside. The engine's modules are private. `.github/public-api.txt` lists
 every public item.
 
+Public enums and the status and report structs (`DefinitionStatus`,
+`SelfCheckReport` and the like) are `#[non_exhaustive]`: match an enum with a
+wildcard arm, and read a struct's fields rather than building or destructuring
+it exhaustively. The options structs (`TrellisOptions`, `ClientOptions`) are
+built with a struct literal and `..Default::default()`, so they are not.
+
+`Trellis::pool()` is meant for queries against your own tables and the target
+tables. Its connections run with `search_path` set to the instance schema, then
+the target schema, then `public`, so an unqualified `create table` through it
+lands in the instance schema, next to Trellis's own tables. Schema-qualify the
+objects an embedder creates, or use a separate pool.
+
 ## TLS to Postgres
 
 Every connection Trellis opens to Postgres (both pools, the `LISTEN`

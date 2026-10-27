@@ -302,13 +302,13 @@ mod tests {
 
     #[test]
     fn a_summary_crosses_with_its_creation_time_in_microseconds() {
-        let summary = DefinitionSummary {
+        let summary = trellis::fixture!(DefinitionSummary {
             target_table: "public.order_totals".to_string(),
             status: TransformStatus::Live,
             created_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_123_456),
             backfill_failure: None,
             halt: None,
-        };
+        });
 
         let plain = PlainDefinitionSummary::from(&summary);
 
@@ -326,18 +326,18 @@ mod tests {
 
     #[test]
     fn a_summary_carries_its_backfill_failure() {
-        let summary = DefinitionSummary {
+        let summary = trellis::fixture!(DefinitionSummary {
             target_table: "public.order_totals".to_string(),
             status: TransformStatus::WaitingToBackfill,
             created_at: UNIX_EPOCH,
-            backfill_failure: Some(BackfillFailure {
+            backfill_failure: Some(trellis::fixture!(BackfillFailure {
                 source_table: "public.orders".to_string(),
                 attempts: 2,
                 last_error: "permission denied for table orders".to_string(),
                 next_attempt_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_654_321),
-            }),
+            })),
             halt: None,
-        };
+        });
 
         assert_eq!(
             PlainDefinitionSummary::from(&summary).backfill_failure,
@@ -352,19 +352,19 @@ mod tests {
 
     #[test]
     fn a_summary_carries_its_halt_with_its_kind_word() {
-        let summary = DefinitionSummary {
+        let summary = trellis::fixture!(DefinitionSummary {
             target_table: "public.order_totals".to_string(),
             status: TransformStatus::Paused,
             created_at: UNIX_EPOCH,
             backfill_failure: None,
-            halt: Some(CaptureFailure {
+            halt: Some(trellis::fixture!(CaptureFailure {
                 kind: CaptureFailureKind::Halt,
                 source_table: "public.orders".to_string(),
                 columns: Vec::new(),
                 error: "the drain halted".to_string(),
                 detected_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_000_004),
-            }),
-        };
+            })),
+        });
 
         assert_eq!(
             PlainDefinitionSummary::from(&summary).halt,
@@ -389,7 +389,7 @@ mod tests {
 
     #[test]
     fn a_healthy_status_crosses_as_its_word_with_no_failure() {
-        let status = DefinitionStatus {
+        let status = trellis::fixture!(DefinitionStatus {
             join: None,
             status: TransformStatus::Live,
             backfill_failure: None,
@@ -401,7 +401,7 @@ mod tests {
             paused_upstream_columns: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
-        };
+        });
 
         assert_eq!(
             PlainDefinitionStatus::from(&status),
@@ -421,24 +421,24 @@ mod tests {
 
     #[test]
     fn held_keys_cross_with_their_oldest_poison_time_in_microseconds() {
-        let status = DefinitionStatus {
+        let status = trellis::fixture!(DefinitionStatus {
             join: None,
             status: TransformStatus::Live,
             backfill_failure: None,
             capture_wait: None,
             capture_failure: None,
-            held_keys: Some(trellis::HeldKeys {
+            held_keys: Some(trellis::fixture!(HeldKeys {
                 count: 3,
                 oldest_poisoned_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_654_321),
                 max_retry_attempts: 0,
                 next_retry_at: None,
-            }),
+            })),
             drain_failure: None,
             source_index_gaps: Vec::new(),
             paused_upstream_columns: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
-        };
+        });
 
         assert_eq!(
             PlainDefinitionStatus::from(&status).held_keys,
@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn paused_upstream_columns_cross_as_plain_strings() {
-        let status = DefinitionStatus {
+        let status = trellis::fixture!(DefinitionStatus {
             join: None,
             status: TransformStatus::CatchingUp,
             backfill_failure: None,
@@ -463,7 +463,7 @@ mod tests {
             correcting: Vec::new(),
             paused_upstream_columns: vec!["t.total".to_string()],
             build_wait: None,
-        };
+        });
         let plain = PlainDefinitionStatus::from(&status);
         assert_eq!(plain.status, "catching_up");
         assert_eq!(plain.paused_upstream_columns, ["t.total"]);
@@ -471,12 +471,12 @@ mod tests {
 
     #[test]
     fn a_source_index_gap_crosses_with_its_role_and_fix() {
-        let gap = SourceIndexGap {
+        let gap = trellis::fixture!(SourceIndexGap {
             table: "public.regions".to_string(),
             columns: vec!["id".to_string()],
             role: trellis::IndexRole::JoinJoined,
             opted_out: false,
-        };
+        });
         assert_eq!(
             PlainSourceIndexGap::from(&gap),
             PlainSourceIndexGap {
@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn a_correcting_node_crosses_with_its_queue_time_in_microseconds() {
-        let status = DefinitionStatus {
+        let status = trellis::fixture!(DefinitionStatus {
             join: None,
             status: TransformStatus::Backfilling,
             backfill_failure: None,
@@ -504,19 +504,19 @@ mod tests {
             source_index_gaps: Vec::new(),
             paused_upstream_columns: Vec::new(),
             correcting: vec![
-                CorrectingNode {
+                trellis::fixture!(CorrectingNode {
                     node: "public.items_p1".to_string(),
                     since: UNIX_EPOCH + Duration::from_micros(1_727_222_400_123_456),
                     keys_remaining: Some(5),
-                },
-                CorrectingNode {
+                }),
+                trellis::fixture!(CorrectingNode {
                     node: "public.items_p2".to_string(),
                     since: UNIX_EPOCH + Duration::from_micros(1_727_222_400_654_321),
                     keys_remaining: None,
-                },
+                }),
             ],
             build_wait: None,
-        };
+        });
 
         let plain = PlainDefinitionStatus::from(&status);
 
@@ -541,14 +541,14 @@ mod tests {
     #[test]
     fn a_drain_failure_crosses_with_its_times_in_microseconds() {
         let at = |micros| UNIX_EPOCH + Duration::from_micros(micros);
-        let status = DefinitionStatus {
+        let status = trellis::fixture!(DefinitionStatus {
             join: None,
             status: TransformStatus::Live,
             backfill_failure: None,
             capture_wait: None,
             capture_failure: None,
             held_keys: None,
-            drain_failure: Some(DrainFailure {
+            drain_failure: Some(trellis::fixture!(DrainFailure {
                 seg_seq: 17,
                 tables: vec!["public.lines".to_string(), "public.orders".to_string()],
                 error: "permission denied for function audit_hook".to_string(),
@@ -556,12 +556,12 @@ mod tests {
                 since: at(1_727_222_400_000_001),
                 last_seen: at(1_727_222_400_654_321),
                 attempts: 5,
-            }),
+            })),
             source_index_gaps: Vec::new(),
             paused_upstream_columns: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
-        };
+        });
 
         assert_eq!(
             PlainDefinitionStatus::from(&status).drain_failure,
@@ -579,15 +579,15 @@ mod tests {
 
     #[test]
     fn a_backfill_failure_crosses_with_its_retry_time_in_microseconds() {
-        let status = DefinitionStatus {
+        let status = trellis::fixture!(DefinitionStatus {
             join: None,
             status: TransformStatus::WaitingToBackfill,
-            backfill_failure: Some(BackfillFailure {
+            backfill_failure: Some(trellis::fixture!(BackfillFailure {
                 source_table: "public.orders".to_string(),
                 attempts: 4,
                 last_error: "permission denied for table orders".to_string(),
                 next_attempt_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_654_321),
-            }),
+            })),
             capture_wait: None,
             capture_failure: None,
             held_keys: None,
@@ -596,7 +596,7 @@ mod tests {
             paused_upstream_columns: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
-        };
+        });
 
         assert_eq!(
             PlainDefinitionStatus::from(&status),
@@ -622,32 +622,32 @@ mod tests {
     #[test]
     fn a_capture_wait_and_failure_cross_with_their_times_in_microseconds() {
         let at = |micros| UNIX_EPOCH + Duration::from_micros(micros);
-        let status = DefinitionStatus {
+        let status = trellis::fixture!(DefinitionStatus {
             join: None,
             status: TransformStatus::CatchingUp,
             backfill_failure: None,
-            capture_wait: Some(CaptureWait {
+            capture_wait: Some(trellis::fixture!(CaptureWait {
                 table: "public.orders".to_string(),
                 operation: "widen".to_string(),
                 lock_mode: "ShareRowExclusiveLock".to_string(),
                 waiting_since: at(1_727_222_400_000_001),
                 observed_at: at(1_727_222_400_000_002),
                 blockers: vec!["pid 42 (client backend) holds RowExclusiveLock".to_string()],
-            }),
-            capture_failure: Some(CaptureFailure {
+            })),
+            capture_failure: Some(trellis::fixture!(CaptureFailure {
                 kind: CaptureFailureKind::Capture,
                 source_table: "public.lines".to_string(),
                 columns: vec!["qty".to_string()],
                 error: "capture of public.lines needs column \"qty\"".to_string(),
                 detected_at: at(1_727_222_400_000_003),
-            }),
+            })),
             held_keys: None,
             drain_failure: None,
             source_index_gaps: Vec::new(),
             paused_upstream_columns: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
-        };
+        });
 
         let plain = PlainDefinitionStatus::from(&status);
 

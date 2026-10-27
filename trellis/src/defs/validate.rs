@@ -49,6 +49,7 @@ impl fmt::Display for KeyColumnRole {
 
 /// Why a `TransformDef` was rejected by the validator.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ValidationError {
     /// Two calculated fields on the same target share a name.
     DuplicateFieldName { name: String },

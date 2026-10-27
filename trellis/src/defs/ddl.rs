@@ -212,6 +212,7 @@ pub(crate) fn pin_key_collations(pk: &mut [PrimaryKeyColumn], recorded: Option<&
 
 /// Why target-table DDL could not be generated or executed.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum DdlError {
     /// The source table has no primary key at all.
     NoPrimaryKey { source_table: String },

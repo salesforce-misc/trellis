@@ -16,6 +16,7 @@ use crate::error_code::{self, ErrorCode};
 /// Failure modes specific to the staging ring (issue #6): resolving the
 /// active ring slot, appending, and the producer singleton.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum StagingError {
     /// `segment_pointer` or its `ring_slot_mirror` sequence named a
     /// `ring_slot` outside `0..RING_SIZE` (`-1`: the mirror read NULL).

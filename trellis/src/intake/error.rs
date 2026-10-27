@@ -12,6 +12,7 @@ use crate::staging::StagingError;
 
 /// Failure modes of the intake helpers.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum IntakeError {
     /// The staging ring's append, or the transaction it runs in,
     /// failed. Composes [`StagingError`] via `From` rather than

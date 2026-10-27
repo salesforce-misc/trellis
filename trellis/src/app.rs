@@ -1926,6 +1926,7 @@ fn capture_failure(row: &tokio_postgres::Row) -> Option<CaptureFailure> {
 /// One registered transform definition's status, as [`Trellis::status`]
 /// reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DefinitionStatus {
     /// Where the transform is in its lifecycle (issue #55).
     pub status: TransformStatus,
@@ -2088,6 +2089,7 @@ pub struct DefinitionStatus {
 /// Why capture of a table a definition reads is broken (issue #622 C6,
 /// #687); see [`DefinitionStatus::capture_failure`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CaptureFailure {
     /// Whether capture broke, or the drain halted on the definition (#663).
     pub kind: CaptureFailureKind,
@@ -2111,6 +2113,7 @@ pub struct CaptureFailure {
 
 /// What a [`CaptureFailure`] is (issue #663): `capture_failures.kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CaptureFailureKind {
     /// Capture of a table the definition reads is broken: a schema change,
     /// row-level security, a subscription, or a failing install or widen.
@@ -2174,6 +2177,7 @@ impl CaptureFailureKind {
 /// (an autovacuum included), so the definition waits until it lets go; this
 /// names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CaptureWait {
     /// The qualified table whose lock the capture operation waits for.
     pub table: String,
@@ -2197,6 +2201,7 @@ pub struct CaptureWait {
 /// narrowed to the key that causes it, which is quarantined; one that fails
 /// otherwise pauses the definition after a few charged attempts.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BackfillFailure {
     /// The qualified source table the build reads.
     pub source_table: String,
@@ -2213,6 +2218,7 @@ pub struct BackfillFailure {
 /// One registered transform definition, as [`Trellis::definitions`] reports
 /// it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DefinitionSummary {
     /// The schema-qualified target table, which identifies the transform.
     pub target_table: String,
@@ -2303,6 +2309,7 @@ impl Applied {
 
 /// One poison-quarantine entry, as [`Trellis::poisoned_since`] reports it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PoisonEntry {
     /// The bare target of the definition the key is held for (#799).
     pub transform: String,
@@ -2319,6 +2326,7 @@ pub struct PoisonEntry {
 /// has elsewhere for qualified column references, rather than inventing a
 /// new addressing idiom.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum QuarantineTarget {
     /// The whole transform, named by its target table.
     Transform(String),
@@ -2376,6 +2384,7 @@ impl fmt::Display for QuarantineTarget {
 /// has no equivalent of, since column pausing doesn't touch a transform's
 /// overall lifecycle status at all).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum QuarantineState {
     Live,
     WaitingToBackfill,
@@ -2451,6 +2460,7 @@ impl From<TransformStatus> for QuarantineState {
 /// whole list) and [`Trellis::quarantine_status`] (one target) both report
 /// it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct QuarantineEntry {
     pub target: QuarantineTarget,
     pub state: QuarantineState,
@@ -2467,6 +2477,7 @@ pub struct QuarantineEntry {
 /// One sampled quarantined row, as [`Trellis::sample_quarantined`] reports
 /// it — the ADR's `(src_table, key, error_message)` triple.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PoisonSample {
     pub src_table: String,
     pub key: String,
@@ -2487,6 +2498,7 @@ pub struct PoisonSample {
 /// category for this error alongside its `Display` message — see
 /// `docs/decisions/0008-public-api-design.md`, decision 3.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum TrellisError {
     /// A definition failed to parse before it could be registered.
     Parse(ParseError),

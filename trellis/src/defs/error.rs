@@ -10,6 +10,7 @@ use std::fmt;
 use crate::error_code::ErrorCode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ParseError {
     /// The lexer found a character it doesn't know how to tokenize.
     UnexpectedChar { found: char },

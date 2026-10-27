@@ -95,6 +95,7 @@ pub fn applying_sql(alias: &str) -> String {
 /// is the one gate the claim-time fold has ever honored (the status
 /// predicate in `super::catalog::dependents_of`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TransformStatus {
     WaitingToBackfill,
     Backfilling,

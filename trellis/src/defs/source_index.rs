@@ -45,6 +45,7 @@ use crate::pool::quote_ident;
 /// sides sit on the same table with the same columns, and the role is what
 /// tells their two requirements apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IndexRole {
     /// A group-basis aggregate's `GROUP BY` columns.
     GroupBy,
@@ -115,6 +116,7 @@ impl SourceIndex {
 /// A source index a definition lacks now, as `DefinitionStatus::source_index_gaps`
 /// reports it (#1167).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SourceIndexGap {
     /// The table the index is missing on, qualified.
     pub table: String,

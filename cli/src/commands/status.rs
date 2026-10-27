@@ -314,6 +314,7 @@ fn format_join_step(step: &JoinBuildStep) -> String {
             let side = match side {
                 JoinSide::From => "FROM side",
                 JoinSide::Joined => "JOIN side",
+                _ => "side",
             };
             match part {
                 JoinSidePart::Whole => format!("{side} whole"),
@@ -322,8 +323,10 @@ fn format_join_step(step: &JoinBuildStep) -> String {
                 JoinSidePart::Unroutable => {
                     format!("{side}: its partition tree can't be routed (see the backfill failure)")
                 }
+                _ => format!("{side}: an unrecognized part"),
             }
         }
+        _ => "an unrecognized step".to_string(),
     }
 }
 
@@ -410,11 +413,11 @@ mod tests {
 
     #[test]
     fn a_join_build_step_is_printed_only_while_building() {
-        let mut join = JoinStatus {
+        let mut join = trellis::fixture!(JoinStatus {
             hidden_tables: Vec::new(),
             partials_warning: None,
             building: None,
-        };
+        });
         assert_eq!(format_join(&join), "");
         join.building = Some(JoinBuildStep::Side {
             side: JoinSide::From,
@@ -466,13 +469,13 @@ mod tests {
 
     #[test]
     fn a_definition_is_formatted_with_its_fields() {
-        let def = DefinitionSummary {
+        let def = trellis::fixture!(DefinitionSummary {
             target_table: "order_totals".to_string(),
             status: trellis::TransformStatus::Live,
             created_at: UNIX_EPOCH,
             backfill_failure: None,
             halt: None,
-        };
+        });
         let formatted = format_definitions(&[(def, StatusWarnings::default())]);
         assert!(formatted.contains("target=order_totals"));
         assert!(formatted.contains("status=live"));
@@ -481,13 +484,13 @@ mod tests {
 
     #[test]
     fn a_healthy_definition_is_one_line() {
-        let def = DefinitionSummary {
+        let def = trellis::fixture!(DefinitionSummary {
             target_table: "order_totals".to_string(),
             status: trellis::TransformStatus::Live,
             created_at: UNIX_EPOCH,
             backfill_failure: None,
             halt: None,
-        };
+        });
         let formatted = format_definitions(&[(def, StatusWarnings::default())]);
         assert_eq!(formatted.lines().count(), 1, "got {formatted:?}");
         assert!(!formatted.contains("backfill"), "got {formatted:?}");
@@ -497,18 +500,18 @@ mod tests {
     fn a_failing_backfill_is_shown_under_its_definition() {
         // `date -u -d "2024-01-01 00:00:00" +%s` => 1704067200
         let next_attempt_at = UNIX_EPOCH + Duration::from_secs(1_704_067_200);
-        let def = DefinitionSummary {
+        let def = trellis::fixture!(DefinitionSummary {
             target_table: "public.order_totals".to_string(),
             status: trellis::TransformStatus::WaitingToBackfill,
             created_at: UNIX_EPOCH,
-            backfill_failure: Some(trellis::BackfillFailure {
+            backfill_failure: Some(trellis::fixture!(BackfillFailure {
                 source_table: "public.orders".to_string(),
                 attempts: 3,
                 last_error: "table \"public.orders\" has no primary key".to_string(),
                 next_attempt_at,
-            }),
+            })),
             halt: None,
-        };
+        });
         let formatted = format_definitions(&[(def, StatusWarnings::default())]);
         assert_eq!(
             formatted,
@@ -524,19 +527,19 @@ mod tests {
     fn a_halt_is_shown_under_its_definition() {
         // `date -u -d "2024-01-01 00:00:00" +%s` => 1704067200
         let detected_at = UNIX_EPOCH + Duration::from_secs(1_704_067_200);
-        let def = DefinitionSummary {
+        let def = trellis::fixture!(DefinitionSummary {
             target_table: "public.order_totals".to_string(),
             status: trellis::TransformStatus::Paused,
             created_at: UNIX_EPOCH,
             backfill_failure: None,
-            halt: Some(trellis::CaptureFailure {
+            halt: Some(trellis::fixture!(CaptureFailure {
                 kind: trellis::CaptureFailureKind::Halt,
                 source_table: "public.orders".to_string(),
                 columns: Vec::new(),
                 error: "the drain halted: no primary key".to_string(),
                 detected_at,
-            }),
-        };
+            })),
+        });
         let formatted = format_definitions(&[(def, StatusWarnings::default())]);
         assert_eq!(
             formatted,
@@ -551,14 +554,14 @@ mod tests {
     fn a_drain_failure_is_shown_under_its_definition() {
         // `date -u -d "2024-01-01 00:00:00" +%s` => 1704067200
         let since = UNIX_EPOCH + Duration::from_secs(1_704_067_200);
-        let def = DefinitionSummary {
+        let def = trellis::fixture!(DefinitionSummary {
             target_table: "public.order_totals".to_string(),
             status: trellis::TransformStatus::Live,
             created_at: UNIX_EPOCH,
             backfill_failure: None,
             halt: None,
-        };
-        let failure = DrainFailure {
+        });
+        let failure = trellis::fixture!(DrainFailure {
             seg_seq: 17,
             tables: vec!["public.lines".to_string(), "public.orders".to_string()],
             error: "permission denied for function audit_hook".to_string(),
@@ -566,7 +569,7 @@ mod tests {
             since,
             last_seen: since + Duration::from_secs(90),
             attempts: 5,
-        };
+        });
         let formatted = format_definitions(&[(
             def,
             StatusWarnings {
@@ -586,20 +589,22 @@ mod tests {
 
     #[test]
     fn a_missing_source_index_is_shown_with_its_fix_and_whether_it_opted_out() {
-        let def = || DefinitionSummary {
-            target_table: "public.order_totals".to_string(),
-            status: trellis::TransformStatus::Live,
-            created_at: UNIX_EPOCH,
-            backfill_failure: None,
-            halt: None,
+        let def = || {
+            trellis::fixture!(DefinitionSummary {
+                target_table: "public.order_totals".to_string(),
+                status: trellis::TransformStatus::Live,
+                created_at: UNIX_EPOCH,
+                backfill_failure: None,
+                halt: None,
+            })
         };
         let gap = |opted_out| StatusWarnings {
-            source_index_gaps: vec![SourceIndexGap {
+            source_index_gaps: vec![trellis::fixture!(SourceIndexGap {
                 table: "public.orders".to_string(),
                 columns: vec!["customer_id".to_string()],
                 role: trellis::IndexRole::JoinJoined,
                 opted_out,
-            }],
+            })],
             ..StatusWarnings::default()
         };
         let head = "  target=public.order_totals status=live created_at=1970-01-01 00:00:00 UTC\n";
@@ -625,12 +630,12 @@ mod tests {
     #[test]
     fn a_missing_source_index_names_its_role() {
         let gap = |role| {
-            format_source_index_gap(&SourceIndexGap {
+            format_source_index_gap(&trellis::fixture!(SourceIndexGap {
                 table: "public.t".to_string(),
                 columns: vec!["a".to_string()],
                 role,
                 opted_out: false,
-            })
+            }))
         };
         assert!(gap(trellis::IndexRole::GroupBy).contains(" for the GROUP BY columns is missing"));
         assert!(
@@ -641,25 +646,25 @@ mod tests {
 
     #[test]
     fn each_node_under_correction_is_shown_under_its_definition() {
-        let def = DefinitionSummary {
+        let def = trellis::fixture!(DefinitionSummary {
             target_table: "public.order_totals".to_string(),
             status: trellis::TransformStatus::Backfilling,
             created_at: UNIX_EPOCH,
             backfill_failure: None,
             halt: None,
-        };
+        });
         let warnings = StatusWarnings {
             correcting: vec![
-                CorrectingNode {
+                trellis::fixture!(CorrectingNode {
                     node: "public.orders_2026".to_string(),
                     since: UNIX_EPOCH + Duration::from_secs(60),
                     keys_remaining: Some(1200),
-                },
-                CorrectingNode {
+                }),
+                trellis::fixture!(CorrectingNode {
                     node: "public.orders_2027".to_string(),
                     since: UNIX_EPOCH + Duration::from_secs(90),
                     keys_remaining: None,
-                },
+                }),
             ],
             ..StatusWarnings::default()
         };
@@ -674,13 +679,13 @@ mod tests {
 
     #[test]
     fn a_paused_upstream_column_is_named_under_the_catching_up_reader() {
-        let def = DefinitionSummary {
+        let def = trellis::fixture!(DefinitionSummary {
             target_table: "public.order_totals".to_string(),
             status: trellis::TransformStatus::CatchingUp,
             created_at: UNIX_EPOCH,
             backfill_failure: None,
             halt: None,
-        };
+        });
         let warnings = StatusWarnings {
             paused_upstream_columns: vec!["t.a".to_string(), "t.b".to_string()],
             ..StatusWarnings::default()
@@ -695,7 +700,7 @@ mod tests {
 
     #[test]
     fn a_drain_failure_without_a_sqlstate_leaves_it_out() {
-        let failure = DrainFailure {
+        let failure = trellis::fixture!(DrainFailure {
             seg_seq: 3,
             tables: vec!["public.orders".to_string()],
             error: "records fail only together\nDETAIL: twice".to_string(),
@@ -703,7 +708,7 @@ mod tests {
             since: UNIX_EPOCH,
             last_seen: UNIX_EPOCH,
             attempts: 1,
-        };
+        });
         let formatted = format_drain_failure(&failure);
         assert_eq!(formatted.lines().count(), 1, "got {formatted:?}");
         assert!(!formatted.contains("sqlstate"), "got {formatted:?}");
@@ -715,20 +720,20 @@ mod tests {
 
     #[test]
     fn a_multi_line_backfill_error_stays_on_its_line() {
-        let def = DefinitionSummary {
+        let def = trellis::fixture!(DefinitionSummary {
             target_table: "public.order_totals".to_string(),
             status: trellis::TransformStatus::WaitingToBackfill,
             created_at: UNIX_EPOCH,
-            backfill_failure: Some(trellis::BackfillFailure {
+            backfill_failure: Some(trellis::fixture!(BackfillFailure {
                 source_table: "public.orders".to_string(),
                 attempts: 1,
                 last_error: "db error: ERROR: permission denied for table orders\n\
                              DETAIL: role lacks SELECT\nHINT: grant it"
                     .to_string(),
                 next_attempt_at: UNIX_EPOCH,
-            }),
+            })),
             halt: None,
-        };
+        });
         let formatted = format_definitions(&[(def, StatusWarnings::default())]);
         assert_eq!(formatted.lines().count(), 2, "got {formatted:?}");
         assert!(
@@ -744,15 +749,13 @@ mod tests {
 
     #[test]
     fn a_poisoned_entry_is_formatted_with_its_fields() {
-        use trellis::PoisonEntry;
-
-        let entry = PoisonEntry {
+        let entry = trellis::fixture!(PoisonEntry {
             transform: "order_totals".to_string(),
             src_table: "orders".to_string(),
             key: "42".to_string(),
             last_error: "division by zero".to_string(),
             poisoned_at: UNIX_EPOCH,
-        };
+        });
         let formatted = format_poisoned(std::slice::from_ref(&entry));
         assert!(formatted.contains("Quarantined source rows: 1"));
         assert!(formatted.contains("transform=order_totals"));
@@ -797,13 +800,13 @@ mod tests {
     }
 
     fn held(transform: &str, src_table: &str, key: &str) -> trellis::PoisonEntry {
-        trellis::PoisonEntry {
+        trellis::fixture!(PoisonEntry {
             transform: transform.to_string(),
             src_table: src_table.to_string(),
             key: key.to_string(),
             last_error: "division by zero".to_string(),
             poisoned_at: UNIX_EPOCH,
-        }
+        })
     }
 
     /// A held key that needs quoting round-trips from `status`'s listing to

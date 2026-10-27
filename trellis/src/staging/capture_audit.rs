@@ -115,6 +115,7 @@ use crate::staging::append::RING_SIZE;
 /// [`CaptureFault::MissingPrivilege`], which is about the instance, not one
 /// table.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum CaptureFault {
     /// None of the table's capture triggers or functions exist.
     NotInstalled { table: String },

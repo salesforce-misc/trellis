@@ -49,6 +49,7 @@ use super::quarantine::CanonicalSrcTables;
 /// (`DefinitionStatus::drain_failure`) and `self_check` reports every one
 /// (`SelfCheckReport::drain_failures`).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DrainFailure {
     /// The segment whose page fails.
     pub seg_seq: i64,

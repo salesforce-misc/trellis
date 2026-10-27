@@ -181,12 +181,12 @@ mod tests {
 
     #[test]
     fn a_paused_column_entry_crosses_with_its_address_and_pause_time() {
-        let entry = QuarantineEntry {
+        let entry = trellis::fixture!(QuarantineEntry {
             target: QuarantineTarget::Column("order_totals".to_string(), "total".to_string()),
             state: QuarantineState::Paused,
             paused_at: Some(UNIX_EPOCH + Duration::from_micros(1_727_222_400_123_456)),
             last_error: Some("integer out of range".to_string()),
-        };
+        });
 
         assert_eq!(
             PlainQuarantineEntry::from(&entry),
@@ -201,12 +201,12 @@ mod tests {
 
     #[test]
     fn a_quarantined_transform_entry_has_no_pause_detail() {
-        let entry = QuarantineEntry {
+        let entry = trellis::fixture!(QuarantineEntry {
             target: QuarantineTarget::Transform("order_totals".to_string()),
             state: QuarantineState::Quarantined,
             paused_at: None,
             last_error: None,
-        };
+        });
 
         assert_eq!(
             PlainQuarantineEntry::from(&entry),
@@ -221,13 +221,13 @@ mod tests {
 
     #[test]
     fn a_poison_entry_crosses_with_its_time_in_microseconds() {
-        let entry = PoisonEntry {
+        let entry = trellis::fixture!(PoisonEntry {
             transform: "order_totals".to_string(),
             src_table: "public.orders".to_string(),
             key: "42".to_string(),
             last_error: "new row violates check constraint".to_string(),
             poisoned_at: UNIX_EPOCH + Duration::from_micros(1_727_222_400_654_321),
-        };
+        });
 
         assert_eq!(
             PlainPoisonEntry::from(&entry),
@@ -242,13 +242,13 @@ mod tests {
     }
 
     fn sample(key: &str) -> PoisonSample {
-        PoisonSample {
+        trellis::fixture!(PoisonSample {
             src_table: "public.orders".to_string(),
             key: key.to_string(),
             error_message: "integer out of range".to_string(),
             retry_attempts: 0,
             next_retry_at: None,
-        }
+        })
     }
 
     #[test]

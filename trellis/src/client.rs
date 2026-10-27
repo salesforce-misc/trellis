@@ -344,6 +344,7 @@ fn validate_options(options: &ClientOptions) -> Result<(), ClientError> {
 /// coarse [`ErrorCode`] category for this error alongside its `Display`
 /// message — see `docs/decisions/0008-public-api-design.md`, decision 3.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ClientError {
     /// `heartbeat.interval` is more than half of `reclaim_ttl`. Claims
     /// would go stale between two refreshes of a live worker and be

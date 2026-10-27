@@ -114,6 +114,7 @@ use super::validate::{
 /// reports a stable, coarse [`ErrorCode`] category for this error alongside
 /// its `Display` message — see `docs/decisions/0008-public-api-design.md`, decision 3.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum CatalogError {
     /// The source text failed to parse (issue #22's grammar).
     Parse(ParseError),

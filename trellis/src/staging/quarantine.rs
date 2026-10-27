@@ -6285,6 +6285,7 @@ pub async fn retry_held_keys(
 /// `self_check` with every report, so a definition that reads `live` can't
 /// hide a held key. The keys themselves are paged by `sample_quarantined`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HeldKeys {
     /// How many keys the definition holds.
     pub count: u64,

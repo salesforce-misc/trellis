@@ -185,6 +185,7 @@ pub struct SelfCheckScope {
 /// Standard (default) vs. strict auditing — see the module doc comment's
 /// "Quiescence" section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SelfCheckMode {
     /// A divergence the comparison can't vouch for is provisional until it
     /// survives a re-check after a fresh await — sound under live load, at
@@ -316,6 +317,7 @@ pub struct SelfCheckPage {
 /// section for why [`SelfCheckOutcome::NotCaughtUp`] is a distinct outcome
 /// from [`SelfCheckOutcome::Diverged`] rather than folded into it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SelfCheckOutcome {
     /// No divergence — every comparable cell, row, and column matched (under
     /// [`SelfCheckMode::Standard`], this also covers a divergence that
@@ -343,6 +345,7 @@ pub enum SelfCheckOutcome {
 /// One divergence `self_check` found: ADR-0013's four kinds, plus a
 /// broken capture.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum Divergence {
     /// A row exists on both sides, but `column`'s value differs.
     Cell {
@@ -383,6 +386,7 @@ pub enum Divergence {
 /// [`SelfCheckOutcome::Diverged`], which is a successful audit that found a
 /// problem, not a failure of the audit itself).
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SelfCheckError {
     /// No transform is registered under this target table name.
     TargetNotFound(String),

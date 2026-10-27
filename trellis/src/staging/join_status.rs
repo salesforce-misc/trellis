@@ -33,6 +33,7 @@ pub(crate) const PARTIALS_WARNING_MIN_FACT_ROWS: i64 = 1000;
 
 /// One hidden table of a `JOIN` definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HiddenTableSize {
     /// Which table: `P` (the `FROM` side's partials), `M` (the joined
     /// side's), `J` (the matches per join key) or `T` (the target's
@@ -48,6 +49,7 @@ pub struct HiddenTableSize {
 
 /// `P` has grown close to the fact table's size; see [`JoinStatus::partials_warning`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PartialsWarning {
     /// `P`'s estimated rows.
     pub partials_rows: i64,
@@ -58,6 +60,7 @@ pub struct PartialsWarning {
 /// A `JOIN` definition's hidden tables; see
 /// `DefinitionStatus::join`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct JoinStatus {
     /// `P`, `M`, `J` and `T`, in that order. A table that doesn't exist is
     /// left out.
@@ -73,6 +76,7 @@ pub struct JoinStatus {
 
 /// A side of a `JOIN`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum JoinSide {
     /// The `FROM` table, whose partials are `P`.
     From,
@@ -82,6 +86,7 @@ pub enum JoinSide {
 
 /// The step of a `JOIN` build; see [`JoinStatus::building`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum JoinBuildStep {
     /// The whole build in one transaction: neither side is a partitioned
     /// table with rows, so the build has no steps.
@@ -96,6 +101,7 @@ pub enum JoinBuildStep {
 
 /// What a [`JoinBuildStep::Side`] step builds of its side.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum JoinSidePart {
     /// The whole side: it isn't a partitioned table with rows.
     Whole,

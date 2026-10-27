@@ -14,6 +14,7 @@ use crate::error_code::{self, ErrorCode};
 /// Errors that can occur while resolving configuration, connecting to
 /// Postgres, or running migrations.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// The engine's own configuration (DSN, schema name, ...) was invalid.
     Config(String),
