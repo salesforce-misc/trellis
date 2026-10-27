@@ -84,7 +84,7 @@ defmodule Trellis.Parity do
   too.
 
   `dump_definitions_sql` is here until the Ruby binding has its counterpart:
-then it becomes a fixture operation and leaves this list.
+  then it becomes a fixture operation and leaves this list.
   `structure_dump_test.exs` covers it meanwhile.
   """
   def not_operations do
