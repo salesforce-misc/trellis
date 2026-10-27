@@ -317,6 +317,75 @@ async fn a_value_out_of_a_casts_range_quarantines_only_its_record() {
     );
 }
 
+/// A row image without a column a field reads (one staged before a capture
+/// widen, which the capture gate otherwise keeps from the reader) fails
+/// its record with a data exception: it is isolated, charged to the field
+/// and held, and never written as if the column were `NULL`. A column
+/// present with a `NULL` value reads `NULL`.
+#[tokio::test]
+async fn a_row_without_a_column_a_field_reads_is_isolated_not_read_as_null() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    define(
+        &db,
+        &client,
+        "partial",
+        "id integer primary key, a integer",
+        "TRANSFORM partial_out FROM public.partial SELECT COALESCE(a, 0) + 1 AS b",
+        &[
+            ("id", ValueType::Integer(IntWidth::Int4)),
+            ("a", ValueType::Integer(IntWidth::Int4)),
+        ],
+    )
+    .await;
+    let (missing, null) = (7, 8);
+    let rows: Vec<(String, String)> = (1..=50)
+        .map(|id| {
+            let image = match id {
+                _ if id == missing => format!(r#"{{"id":"{id}"}}"#),
+                _ if id == null => format!(r#"{{"id":"{id}","a":null}}"#),
+                _ => format!(r#"{{"id":"{id}","a":"{id}"}}"#),
+            };
+            (id.to_string(), image)
+        })
+        .collect();
+    let seg_seq = stage(&mut client, "partial", &rows).await;
+
+    let failed = drain_until_applied(&db, seg_seq, DEFAULT_DEATH_THRESHOLD as usize + 1).await;
+    assert_eq!(failed, DEFAULT_DEATH_THRESHOLD as usize - 1);
+    assert_eq!(poisoned_keys(&client).await, vec![missing.to_string()]);
+    assert_eq!(
+        column_failure_keys(&client, "partial_out", "b").await,
+        vec![missing.to_string()]
+    );
+    assert_eq!(
+        count(
+            &client,
+            &format!("select count(*) from public.partial_out where id = {missing}")
+        )
+        .await,
+        0,
+        "the row without the column is not written"
+    );
+    assert_eq!(
+        count(
+            &client,
+            &format!("select count(*) from public.partial_out where id = {null} and b = 1")
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &client,
+            "select count(*) from public.partial_out where b = id + 1"
+        )
+        .await,
+        48
+    );
+}
+
 /// A pattern Rust's `regex` accepts at define and Postgres refuses
 /// (`2201B`) fails every record. Each one isolation pins is a distinct
 /// failing row of the column, so the column fuse trips at its threshold,

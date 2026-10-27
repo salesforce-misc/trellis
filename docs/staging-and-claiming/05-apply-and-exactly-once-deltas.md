@@ -70,8 +70,9 @@ statement under `lock_timeout`
 holds its locks is `trellis_page_transaction_seconds`
 ([observability](../observability.md)). Evaluating in Postgres costs the
 transaction less than binding Rust's computed values did: in the
-`one-to-one-apply` benchmark a 1-1 page's transaction averaged 140–181 ms
-instead of 236–296 ms, at 26.5 µs of Postgres CPU per row instead of 33–36.
+`one-to-one-apply` benchmark (a backlog of inserts) a 1-1 page's transaction
+averaged 140–181 ms instead of 236–296 ms, at about 26 µs of Postgres CPU per
+row instead of 33–36.
 Phase 2's world can move under it, which the version fence and the immutable
 batch exist to handle.
 

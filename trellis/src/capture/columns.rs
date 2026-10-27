@@ -1,9 +1,10 @@
 //! Which columns a table's capture triggers image.
 //!
 //! A trigger images the primary key plus every column some consumer of the
-//! table's ring rows reads. Imaging less poisons rows with
-//! `EvalError::MissingColumn`, or worse, silently reads a missing value as
-//! `NULL`. Imaging more costs the writer (every column of a table
+//! table's ring rows reads. Imaging less poisons rows that lack a column
+//! a reader needs (a 1-1 field fails on it,
+//! `staging::one_to_one_render`), or worse, silently reads a missing value
+//! as `NULL`. Imaging more costs the writer (every column of a table
 //! with a 100 KB column cost 40x a narrow image). The set, for table `T`:
 //!
 //! 1. **`T`'s primary key.**

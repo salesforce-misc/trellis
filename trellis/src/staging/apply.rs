@@ -195,7 +195,7 @@ pub enum ApplyError {
     /// TRANSFORM` field that is paused until its source's capture images the
     /// column it reads (`column_status.awaiting_capture`). Unpausing it
     /// before then would let a row the narrower capture function staged,
-    /// which lacks that column, reach it and fail with `MissingColumn`. The
+    /// which lacks that column, reach it and fail for want of it. The
     /// field build's start unpauses it once the widened capture lands
     /// (`staging::build`'s "Field builds"); the definition's `capture_wait`
     /// or `capture_failure` status says what holds that up.

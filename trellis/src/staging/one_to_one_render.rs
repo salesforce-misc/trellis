@@ -111,7 +111,15 @@ impl OneToOneRender {
 
     /// A lateral subquery `s` with the columns the fields read, cast from
     /// `image`, SQL for a jsonb row of text values in scope (`v.__img`).
-    /// A column the row lacks reads `NULL`.
+    ///
+    /// A column the row lacks fails the statement with a data exception
+    /// (`22P02`, naming the column), so the record is isolated and its
+    /// fields charged like any other value a field can't be computed from.
+    /// Reading it as `NULL` would write a wrong value silently. The capture
+    /// gate (`crate::capture::install`) keeps a row imaged before a widen
+    /// away from a reader of the new column; this is the defense behind it.
+    /// The failing arm reads the row, so the planner can't fold it into an
+    /// error for every row.
     pub(crate) fn row_sql(&self, image: &str) -> String {
         if self.columns.is_empty() {
             return "(select 1 as __none) s".to_string();
@@ -125,9 +133,12 @@ impl OneToOneRender {
                     .as_ref()
                     .map(|name| format!(" collate {name}"))
                     .unwrap_or_default();
+                let name = quote_literal(&c.name);
+                let missing = quote_literal(&format!("the row has no column {}", c.name));
                 format!(
-                    "({image} ->> {})::{}{collate} as {}",
-                    quote_literal(&c.name),
+                    "(case when {image} operator(pg_catalog.?) {name} then {image} ->> {name} \
+                     else ({missing} || pg_catalog.left({image}::text, 0))::integer::text end)\
+                     ::{}{collate} as {}",
                     c.type_sql,
                     quote_ident(&c.name)
                 )
@@ -166,9 +177,9 @@ pub(crate) fn is_data_exception(err: &(dyn std::error::Error + 'static)) -> bool
 
 /// The per-field probe: evaluates each of `render`'s fields alone over
 /// `image` (a text-valued jsonb row), cast to its target column's type in
-/// `target_columns` as the upsert's assignment casts it (an out-of-range
-/// constant fails there, not in the bare expression), and returns the ones that fail with a
-/// data exception, each with its error, in definition order. Each probe is its own
+/// `target_columns` as the upsert's assignment casts it (a no-op while
+/// define types a field as Postgres does), and returns the ones that fail
+/// with a data exception, each with its error, in definition order. Each probe is its own
 /// statement on `client` outside any transaction, and takes no lock. Any other
 /// failure propagates. The row comes from a set-returning function, as the
 /// upsert's does, so the planner can't fold the fields over a constant row:

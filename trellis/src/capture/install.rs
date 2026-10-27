@@ -92,7 +92,7 @@
 //! 2. **Rows the old body staged that haven't drained yet.** A definition
 //!    applies every ring row drained after its build starts, and a
 //!    row staged before the widen lacks the new column: the reader fails it
-//!    with `EvalError::MissingColumn` and the key is quarantined. The rows
+//!    for want of the column and the key is quarantined. The rows
 //!    can be in the ring. A row held in `poison_held` never reaches
 //!    a reader with its images: its release re-stages an image-less
 //!    `Recompute` that re-derives the key from its live row.
