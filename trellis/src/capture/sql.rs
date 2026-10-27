@@ -1,10 +1,10 @@
-//! Generates one table's capture functions and triggers (#622 C2).
+//! Generates one table's capture functions and triggers.
 //!
 //! Each captured table gets one function per event (insert, update, delete,
 //! truncate) and one `AFTER … FOR EACH STATEMENT` trigger per function, plus
 //! a `BEFORE INSERT OR UPDATE OR DELETE … FOR EACH STATEMENT` begin trigger
-//! and function that only mark where a statement's span starts (#623 D8a). The
-//! statement shape follows the #565 spike's `capture_sql.py`: one `INSERT …
+//! and function that only mark where a statement's span starts. The
+//! statement shape is one `INSERT …
 //! SELECT` from the transition table into the active ring slot, chosen by a
 //! `CASE` over the four static `seg_N` inserts so every arm keeps a cached
 //! plan.
@@ -14,7 +14,7 @@
 //! - **It runs as its owner.** Each function is `SECURITY DEFINER`, so the
 //!   application's role needs no privilege on Trellis's schema. Its owner is
 //!   the one Trellis role, which owns the ring and does every other Trellis
-//!   operation too (#622 plan Q3; see [`super::install`]'s "The Trellis
+//!   operation too (see [`super::install`]'s "The Trellis
 //!   role").
 //! - **It doesn't trust the writer's session.** `search_path` is pinned to
 //!   `pg_catalog, pg_temp`, and every ring and mirror reference is
@@ -22,8 +22,8 @@
 //!   ([`crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`]) are `SET` clauses on
 //!   the function, parsed from that constant so there is one list. Without
 //!   them an image would depend on the application session's `DateStyle`,
-//!   `TimeZone`, `bytea_output`, `IntervalStyle` and `extra_float_digits`
-//!   (#565 E3). Literals in the body never contain a backslash, so
+//!   `TimeZone`, `bytea_output`, `IntervalStyle` and `extra_float_digits`.
+//!   Literals in the body never contain a backslash, so
 //!   `standard_conforming_strings` can't change their meaning either.
 //! - **It renders a value with the type's output function.** That is what
 //!   `format('%s', col)` calls, and what the rest of Trellis compares a
@@ -31,11 +31,11 @@
 //!   fixture. `::text` is not the same: for example,
 //!   it strips `char(n)` padding. A `NULL` stays a JSON `null`, because
 //!   `format('%s', NULL)` is an empty string.
-//! - **It reads the active slot the way every ring writer must** (#597): from
+//! - **It reads the active slot the way every ring writer must**: from
 //!   `ring_slot_mirror` with `pg_sequence_last_value`, in the same expression
 //!   that assigns the writer's xid. See `staging::append::active_ring_slot`
 //!   for why both halves matter at every isolation level.
-//! - **It images the live row** (#623 D8a): when another write to the table
+//! - **It images the live row**: when another write to the table
 //!   ran in the statement's span, every row the statement wrote is re-read
 //!   by primary key, so a nested write to the same key leaves the later ring
 //!   row carrying the final values (see [`ring_select`]). Otherwise the
@@ -46,8 +46,7 @@
 //! - **It skips a statement that changed nothing.** An `UPDATE … WHERE false`
 //!   still fires a statement trigger. Returning early keeps it from
 //!   assigning an xid it doesn't need.
-//! - **It never fails the statement over a renamed or dropped column** (#622
-//!   C6). The same guard query counts the columns the function images; on a
+//! - **It never fails the statement over a renamed or dropped column**. The same guard query counts the columns the function images; on a
 //!   miss it writes a [`SCHEMA_CHANGED_OP`] marker and images what's left
 //!   (see [`function_body`]).
 //! - **It stamps `lsn = origin_lsn = pg_current_wal_insert_lsn()`** and
@@ -55,7 +54,7 @@
 //!
 //! The function records its column set in `COMMENT ON FUNCTION`, as JSON
 //! ([`comment_text`]). C3 reads the installed state back from the catalog
-//! that way, and `pg_dump` carries it (#644).
+//! that way, and `pg_dump` carries it.
 //!
 //! # Names
 //!
@@ -76,7 +75,7 @@ use crate::staging::append::{
 use super::CaptureError;
 
 /// The ring `op` of the marker a capture function writes when a column it
-/// images has been renamed or dropped (#622 C6), keyed by
+/// images has been renamed or dropped, keyed by
 /// [`SCHEMA_CHANGED_SENTINEL_KEY`]. Its `new_image` is `{"missing": [<column
 /// names, sorted>], "key_missing": <bool>}`, and it has no `old_image`.
 pub const SCHEMA_CHANGED_OP: &str = "schema_changed";
@@ -260,7 +259,7 @@ pub fn pinned_output_settings() -> Vec<&'static str> {
 }
 
 /// Planner settings every capture function runs (and so plans) under, as
-/// `SET` clauses (#623 D8a).
+/// `SET` clauses.
 ///
 /// PL/pgSQL plans each statement once per session, often on the first
 /// write to a table that is still empty or that a `VACUUM` last saw empty.
@@ -396,8 +395,7 @@ pub fn uninstall_statements(
 
 /// `ALTER FUNCTION … OWNER TO` `owner` for each of `table`'s capture
 /// functions: the functions run as their owner (`SECURITY DEFINER`), which
-/// #622's plan (Q3) makes the role that owns the ring, whoever installs them
-/// (issue #701).
+/// is the role that owns the ring, whoever installs them.
 pub fn owner_statements(
     schema: &str,
     table: &str,
@@ -480,7 +478,7 @@ pub fn comment_ddl(
 /// reads the spec back to decide whether the installed functions match the
 /// spec the catalog now asks for; the capture pass compares the hash with
 /// the live source to tell a function an older generator left behind (its
-/// source still is what was recorded) from one replaced by hand (#707).
+/// source still is what was recorded) from one replaced by hand.
 pub fn comment_text(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> String {
     let list = |names: &[String]| {
         let items: Vec<String> = names
@@ -584,15 +582,14 @@ pub(crate) fn function_source(schema: &str, spec: &CaptureSpec, event: CaptureEv
 /// pins the resolution to the variables. Every column reference in the body
 /// is qualified by its alias, so nothing needs the other resolution.
 ///
-/// # A renamed or dropped column never fails the write (#622 C6)
+/// # A renamed or dropped column never fails the write
 ///
 /// The static ring inserts name every imaged column. Once one of them is
 /// renamed or dropped, planning them fails, and with them the application's
 /// statement. So the insert, update and delete functions first count, in
 /// one `pg_attribute` probe, how many of their imaged columns the table
 /// still has. The probe rides in the empty-statement guard's query, which
-/// the function runs anyway (#622 plan Q2(c); C4's
-/// `trigger+column-check-guard` measured it at +3.4–5 µs per single-row
+/// the function runs anyway (measured at +3.4–5 µs per single-row
 /// statement). On a miss the function takes [`schema_changed_branch`]
 /// instead of the static inserts. PL/pgSQL plans a statement only when it
 /// first runs it, so the stale inserts are never planned.
@@ -618,7 +615,7 @@ pub(crate) fn function_source(schema: &str, spec: &CaptureSpec, event: CaptureEv
 /// returns the outer root, so the source's own writes stage nothing and the
 /// rebuild on resume repairs them. A plain table's functions have no check.
 ///
-/// # The live re-read is conditional (#623 D8a)
+/// # The live re-read is conditional
 ///
 /// The live re-read ([`ring_select`]) is an index probe of the source table
 /// inside the application's write, and under `SERIALIZABLE` every probe takes
@@ -676,7 +673,7 @@ pub(crate) fn function_source(schema: &str, spec: &CaptureSpec, event: CaptureEv
 /// update can also move it onto a key the second then updates (a
 /// self-referencing `ON UPDATE CASCADE` of a row that references itself), so
 /// a key can occur twice among the new rows only, and pairing by key would
-/// image one old row twice (#1099). So the update function also re-reads
+/// image one old row twice. So the update function also re-reads
 /// whenever a key occurs twice on either side (`capture_ssi.rs` pins it), and
 /// the re-read pairs one to one (see "Every transition row counts once" on
 /// [`ring_select`]). An `ON DELETE CASCADE` merges the same way, harmlessly: a
@@ -692,7 +689,7 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
     if event == CaptureEvent::Begin {
         return format!(
             "declare\n    st bigint[];\nbegin\n    \
-             -- #623 D8a: the statement-span state (see capture::sql's function_body).\n    \
+             -- The statement-span state (see capture::sql's function_body).\n    \
              st := {span_state};\n    \
              if st[2] > 0 then\n        st[2] := st[2] + 1;\n    \
              else\n        st := array[st[1], 1, st[1]];\n    end if;\n    \
@@ -732,11 +729,11 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
     }
     if let Some(rows) = rows {
         body.push_str(&format!(
-            "    -- #622 C6: how many imaged columns the table still has, or -1 for a\n    \
+            "    -- How many imaged columns the table still has, or -1 for a\n    \
              -- statement that changed nothing.\n    \
              present := case when exists (select 1 from {rows})\n        \
              then {} else -1 end;\n    \
-             -- #623 D8a: re-read only if another capture of this table staged rows\n    \
+             -- Re-read only if another capture of this table staged rows\n    \
              -- since this statement's span started.\n    \
              st := {span_state};\n    \
              reread := st[3] <> st[1];\n    \
@@ -748,7 +745,7 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
         ));
     }
     body.push_str(&format!(
-        "    -- #597: the xid is assigned in the same expression that reads the mirror.\n    \
+        "    -- The xid is assigned in the same expression that reads the mirror.\n    \
          slot := case when pg_current_xact_id() is not null\n        \
          then pg_sequence_last_value(({mirror})::regclass)::smallint end;\n    \
          l := pg_current_wal_insert_lsn();\n    \
@@ -760,7 +757,7 @@ fn function_body(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> Strin
     if event == CaptureEvent::Update {
         // After the schema-changed branch, which handles a renamed key.
         body.push_str(&format!(
-            "    -- #623 D8a, #1099: an FK action's update shares these transition tables,\n    \
+            "    -- An FK action's update shares these transition tables,\n    \
              -- and a row updated twice leaves two versions of one key on a side.\n    \
              if not reread then\n        \
              reread := exists (select 1 from {OLD_ROWS} o\n            \
@@ -912,7 +909,7 @@ fn column_probe(select: &str, columns: &[String]) -> String {
     )
 }
 
-/// The miss path of [`function_body`]'s column probe (#622 C6), taken when
+/// The miss path of [`function_body`]'s column probe, taken when
 /// some column the function images is gone. It never fails the statement:
 ///
 /// 1. It appends one [`SCHEMA_CHANGED_OP`] marker for the table, whose
@@ -929,7 +926,7 @@ fn column_probe(select: &str, columns: &[String]) -> String {
 ///    keyed wrongly, and every definition on the table pauses.
 ///
 /// Neither statement is in an `EXCEPTION` block, so the path takes no
-/// subtransaction (#622 plan Q2).
+/// subtransaction.
 fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> String {
     let all: Vec<String> = spec.columns.iter().map(|c| text_expr(c)).collect();
     let key: Vec<String> = spec.key.iter().map(|c| text_expr(c)).collect();
@@ -1002,7 +999,7 @@ fn schema_changed_branch(schema: &str, spec: &CaptureSpec, event: CaptureEvent) 
     };
     format!(
         "    if present <> {count} then\n        \
-         -- #622 C6: an imaged column was renamed or dropped.\n        \
+         -- An imaged column was renamed or dropped.\n        \
          have := array{names};\n        \
          execute pg_catalog.format({marker_sql}, {ring})\n            \
          using {src}, {marker_key}, l, {marker}, ts;\n        \
@@ -1123,7 +1120,7 @@ impl Render {
 /// The rows a capture insert writes: a `SELECT` over the event's transition
 /// tables (a `VALUES` row for truncate), in [`RING_COLUMNS`] order.
 ///
-/// # The image is the live row (#623 D8a, D's Q8)
+/// # The image is the live row
 ///
 /// With `live` (see "The live re-read is conditional" on [`function_body`]
 /// for when), every row a statement wrote is re-read from the live table `t`
@@ -1133,16 +1130,16 @@ impl Render {
 /// wrote runs its nested statement, and that statement's capture, before
 /// this statement's capture; the transition table still holds the outer
 /// statement's version, so imaging it would put the older values at the
-/// higher `lsn` (#680). The live row is the one the transaction ends the
+/// higher `lsn`. The live row is the one the transaction ends the
 /// statement with. If it is gone, a nested write deleted or re-keyed it, and
 /// the row staged is a delete of the key, imaging the transition row as its
 /// `old_image`. A delete's key is re-read too: a nested write that put the
 /// key back stages it as an update to the live row.
 ///
-/// # Every transition row counts once (#1099)
+/// # Every transition row counts once
 ///
-/// A reader that sums each ring row's `f(new) − f(old)` (the group basis,
-/// #1043 R3) needs the images to chain: summed over a transaction, they must
+/// A reader that sums each ring row's `f(new) − f(old)` (the group basis)
+/// needs the images to chain: summed over a transaction, they must
 /// telescope to the final row minus the first. The live `new_image` breaks
 /// that. An `AFTER ROW` trigger that rewrites `a → b` to `c` stages `(b, c)`
 /// from the nested capture and then `(a, c)` from the outer one, which sums
@@ -1184,7 +1181,7 @@ impl Render {
 ///   `REPEATABLE READ` and `SERIALIZABLE` the snapshot predates the
 ///   statement, so a version of the key that another transaction deleted or
 ///   re-keyed after the snapshot, and that this statement then re-created,
-///   is still visible beside this transaction's own (#623 D8a review). `age`
+///   is still visible beside this transaction's own. `age`
 ///   measures against the transaction's own xid, or the next xid as of its
 ///   first call in the transaction, so it is `<= 0` for every version this
 ///   transaction or its subtransactions wrote, and positive for one
@@ -1461,9 +1458,9 @@ fn typed_key(spec: &CaptureSpec, alias: &str) -> String {
 }
 
 /// `alias`'s ring key. A single-column key is the column's text verbatim; a
-/// composite key joins its parts, each with #200's separator escape, on
+/// composite key joins its parts, each with a separator escape, on
 /// U+001F in declared order ([`crate::defs::ddl::join_pk_key`]). Primary-key
-/// columns are never `NULL`, so #110's null encoding never applies.
+/// columns are never `NULL`, so the null encoding never applies.
 fn key_expr(spec: &CaptureSpec, alias: &str) -> String {
     let parts: Vec<String> = spec
         .key
@@ -1757,8 +1754,8 @@ mod tests {
     #[test]
     fn the_set_clauses_come_from_the_pools_pinned_settings() {
         let clauses = pinned_output_settings();
-        // At least the five pinned before #672; the exact list grows with the pool's, and every
-        // clause is checked below, so the count must not pin a merge order with #672.
+        // At least five; the exact list grows with the pool's, and every
+        // clause is checked below, so the count must not pin a merge order.
         assert!(clauses.len() >= 5, "{clauses:?}");
         let sql = ddl(&spec(), CaptureEvent::Insert);
         for clause in clauses {
@@ -1783,7 +1780,7 @@ mod tests {
             } else {
                 2
             };
-            // A re-read and a transition-only insert per slot (#623 D8a).
+            // A re-read and a transition-only insert per slot.
             let per_slot = if event == CaptureEvent::Truncate {
                 1
             } else {
@@ -1844,7 +1841,7 @@ mod tests {
         assert!(!ddl(&spec(), CaptureEvent::Truncate).contains("present"));
     }
 
-    /// #622 C6: the guard's query counts the imaged columns the table still
+    /// The guard's query counts the imaged columns the table still
     /// has, and a miss takes the schema-changed branch before any static
     /// insert: the marker first, then (only with the key intact) the images
     /// over the columns left, by `EXECUTE`, with no `EXCEPTION` block.
@@ -1894,7 +1891,7 @@ mod tests {
         }
     }
 
-    /// #623 D8a: each slot has a re-read insert and a transition-only one,
+    /// Each slot has a re-read insert and a transition-only one,
     /// chosen by `reread`, which is read from the span state before this
     /// call counts itself; the transition insert reads no relation.
     #[test]
@@ -1945,13 +1942,13 @@ mod tests {
         assert!(!ddl(&spec(), CaptureEvent::Truncate).contains("reread"));
 
         // An update also re-reads when a key repeats among its old rows or
-        // its new rows (an FK action's merged update, #1099), checked after
+        // its new rows (an FK action's merged update), checked after
         // the schema-changed branch.
         let update = ddl(&spec(), CaptureEvent::Update);
         let repeated = update
             .find("reread := exists (select 1 from trellis_old o")
             .expect("the repeated-key check");
-        assert!(update.find("-- #622 C6: an imaged column").expect("branch") < repeated);
+        assert!(update.find("-- An imaged column").expect("branch") < repeated);
         let case = update.find("    case slot\n").expect("case");
         assert!(repeated < case);
         assert!(
@@ -2066,7 +2063,7 @@ mod tests {
         );
     }
 
-    /// #623 D8a: every event re-reads the rows it wrote from the live table
+    /// Every event re-reads the rows it wrote from the live table
     /// by the primary key's typed equality, keeps only a version this
     /// transaction wrote whose key renders as the row's own, and images the
     /// live row.
@@ -2114,7 +2111,7 @@ mod tests {
         );
     }
 
-    /// #623 D8a: an update row whose imaged columns are all unchanged,
+    /// An update row whose imaged columns are all unchanged,
     /// compared by binary image over the typed values, stages nothing. A key
     /// move always stages.
     #[test]
