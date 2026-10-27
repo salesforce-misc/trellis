@@ -236,25 +236,26 @@ Physically, a batch boundary is cut by *sealing* the active segment
 is the **claim-time fold** — grouping a sealed batch's raw changes to one record
 per key ([stage 04](staging-and-claiming/04-claiming-and-the-fold.md)).
 
-## Evaluation and dependency order
+## Computing fields and dependency order
 
-Within a batch, calculated columns are evaluated in **dependency order** over the
+Within a batch, calculated columns are computed in **dependency order** over the
 dependency graph (see
 [transforms — Chaining and cycle detection](transforms.md#chaining-and-cycle-detection)).
 Cycles are rejected at definition time, so a valid ordering always exists.
 
-Because formulas use only **immutable** functions, re-evaluating one on unchanged
+Because formulas use only **immutable** functions, recomputing one on unchanged
 inputs always yields the same result — the property the
 [correctness oracle](#correctness) relies on.
 
-Trellis **evaluates formulas in its own execution layer**, not by issuing SQL to
-Postgres per batch (modeled on Postgres's own implementation, see
-[0004-transform-definition-grammar](decisions/0004-transform-definition-grammar.md)).
-It computes each target from the collapsed batch as the **minimal write** — for
-an aggregate, a small atomic delta against the group's existing value rather than
-a full recompute; for 1-1 and cross-join, only the target rows the batch touched.
-This keeps incremental maintenance cheaper than re-running the definition while
-landing on the same result.
+**Postgres computes every field.** Trellis renders each formula into the SQL
+statement that writes the target and computes no value itself (see
+[0004-transform-definition-grammar](decisions/0004-transform-definition-grammar.md)
+and [0002-async-data-flow](decisions/0002-async-data-flow.md)). Each statement
+is the **minimal write** for the collapsed batch — for an aggregate, a small
+atomic delta against the group's existing value rather than a full recompute;
+for 1-1 and cross-join, only the target rows the batch touched. This keeps
+incremental maintenance cheaper than re-running the definition while landing on
+the same result.
 
 How that delta is applied **exactly once** — never twice, never zero times — with
 apply and mark-complete in a single transaction, is
@@ -262,7 +263,7 @@ apply and mark-complete in a single transaction, is
 
 ## Writing to calculated tables and chaining
 
-Evaluated results are written to the calculated tables. Those writes are
+Computed results are written to the calculated tables. Those writes are
 themselves changes, so any **chained** transform receives the just-written rows
 as input to a subsequent batch, walking the dependency graph across tables: each
 layer's output feeds the staging area as the next layer's input, so transitive

@@ -118,27 +118,16 @@ source, run it in the same cluster, and assert the persisted target equals it.
 - **1-1:** `SELECT pk, (price + tax) AS total FROM orders` → compare row-by-row.
 - **Aggregate:** `SELECT grain, sum(measure) FROM src GROUP BY grain` → compare.
 - **Join aggregate:** the definition's own `SELECT keys, aggregates FROM a [LEFT]
-  JOIN b ON … GROUP BY keys` over the two tables → compare byte for byte. The
-  evaluator recompute has no join, so this one has no second leg.
+  JOIN b ON … GROUP BY keys` over the two tables → compare byte for byte.
 
-This oracle shares **no evaluation code** with the engine — only the parser AST
-and a small AST→`SELECT` printer. It catches every class of bug, including one in
-the engine's own evaluator (the thing the "Rust layer that mirrors Postgres"
-thesis rests on), and is fast at volume. It can't outgrow the oracle: the grammar
+Postgres evaluates every field of the engine's targets (ADR-0002), so a
+divergence is a pipeline / fold / exactly-once-apply / ordering / convergence
+bug, or a rendering bug in the engine's compiler. This oracle shares **no
+rendering code** with the engine — only the parser AST and a small AST→`SELECT`
+printer — so a rendering bug in the engine cannot agree with it. It catches
+every class of bug and is fast at volume. It can't outgrow the oracle: the grammar
 is *committed* to a Postgres subset, so a construct with no Postgres equivalent is
 out of scope by definition.
-
-### The evaluator recompute is a secondary cross-check
-
-`trellis::defs::oracle::recompute` (evaluator-driven) is retained as a parity
-check on the mirror-Postgres claim. Per op we compare:
-
-- persisted target **vs. Postgres-SQL oracle** — correctness (a mismatch is a
-  pipeline / fold / exactly-once-apply / ordering / convergence bug);
-- engine evaluator **vs. Postgres-SQL oracle** — the ADR-0004 claim itself (a
-  mismatch localizes an eval-layer drift bug).
-
-A divergence therefore localizes cleanly to *which* layer is wrong.
 
 ### Refuse to guess on unmodeled shapes
 

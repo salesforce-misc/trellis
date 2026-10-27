@@ -4,7 +4,7 @@ Which PostgreSQL data types Trellis supports, in which role, and why the
 roles that are refused are refused. The candidacy constraint is
 [ADR-0004](decisions/0004-transform-definition-grammar.md): an operator,
 function or type role is admitted only with semantics identical to stable
-PostgreSQL, immutable, and with a re-implemented evaluator.
+PostgreSQL, immutable, and one the renderer emits as the Postgres operator or function of that name.
 
 A type is never simply "supported". It has a verdict in each of five roles,
 ordered floor to ceiling:
@@ -22,7 +22,8 @@ ordered floor to ceiling:
    covers every table whose rows Trellis keys, both tables of a `JOIN`
    included.
 4. **Computed 1-1 target** — a scalar calculated field produces this type.
-   Needs an immutable evaluator arm and, for a constant, a typed literal.
+   Needs an immutable operator or function in the registry and, for a
+   constant, a typed literal.
 5. **Aggregate target** — an aggregate calculated field has this type: `COUNT`,
    and `SUM` or `AVG` over an integer or `numeric(p,s)` column.
 
@@ -386,7 +387,7 @@ date)`. The accepted keywords are `DATE`, `TIMESTAMP`, `TIME`, `TIMETZ`,
 `BYTEA`, `OID`, `REAL`, `DOUBLE PRECISION`, `INET`, `CIDR`, `MACADDR`,
 `MACADDR8`, `VARBIT` and `JSONB` (`defs::typed_literal::TYPED_LITERALS`). The
 literal's text must be in the type's canonical Postgres output spelling, which
-also makes the Rust evaluator's text agree with Postgres's byte for byte. A
+also makes the literal's spelling agree with Postgres's rendering byte for byte. A
 general `CAST(<expr> AS <type>)` over a non-literal is refused by name. See
 [ADR-0004](decisions/0004-transform-definition-grammar.md#typed-literals-spell-constants-in-canonical-postgres-form).
 

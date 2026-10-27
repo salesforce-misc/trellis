@@ -115,9 +115,8 @@ program.** This is the `generative` crate; full architecture lives in
   committed (ADR-0004) to an immutable subset of PostgreSQL operators/functions, the
   oracle renders each definition back to a `SELECT` (per-row projection for 1-1,
   `GROUP BY` for aggregates), runs it in the same cluster, and asserts the persisted
-  target equals it. It shares no evaluation code with the engine, so it catches even
-  a bug in the engine's own evaluator. The evaluator-driven `recompute` is retained
-  as a secondary parity check.
+  target equals it. It shares no rendering code with the engine, so it catches even
+  a bug in the engine's own SQL compiler.
 - **Reproducibility:** at the *program* level via shrinking; seeds replay the
   program, and findings terminate as hand-minimized pins in tiers 3–4.
 - **Properties it lights up as engine stages land:** per-op convergence,

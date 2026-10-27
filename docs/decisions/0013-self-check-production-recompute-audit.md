@@ -124,12 +124,11 @@ there with what it had found.
 ### Postgres is the oracle; the comparison is two-way
 
 `self_check` compares the persisted target against an equivalent recompute *query*
-executed by Postgres. It does not run the engine's Rust evaluator as part of the
-comparison. Re-running the
-evaluator would check the engine against itself; the authority is Postgres computing
-the answer from source rows independently. This also matches the failure class the
+executed by Postgres. The engine computes no value itself, so there is no second
+engine-side computation to compare with; the authority is Postgres computing the
+answer from source rows independently. This also matches the failure class the
 audit exists to catch: a stale target diverges as persisted-vs-recompute, where an
-independent query is exactly the detector and the evaluator adds nothing.
+independent query is exactly the detector.
 
 ### Comparison semantics: exact text for 1-1, equal values for aggregates and JOINs
 
@@ -375,7 +374,7 @@ on exactly the targets an operator is most likely to be inspecting.
 
 `self_check`'s renderer and the generative suite's SQL oracle are independently
 authored; neither imports the other, and neither shares `SELECT`-assembly logic with
-the engine's evaluator. The generative suite runs both renderers over the same
+the engine's write path. The generative suite runs both renderers over the same
 definitions and asserts they agree, on every run. This keeps the two implementations
 from drifting and turns the deliberate duplication into a live guarantee rather than a
 standing cost.
@@ -395,5 +394,5 @@ standing cost.
 - Trellis gains a shipped, public answer to "is this target correct right now,"
   usable by operators, by a thin CLI wrapper, and as a shared end-of-test
   assertion that turns integration tests into correctness tests.
-- The engine's evaluator stays internal to the engine and the test suite; the
-  public audit path is the independently-rendered query in `self_check`.
+- The public audit path is the independently-rendered query in `self_check`; the
+  engine has no evaluator of its own to audit against.

@@ -277,7 +277,7 @@ of small named steps (a `margin` column defined in terms of `revenue` and `cost`
 Transforms also chain: a target table may itself be a source for another —
 aggregated or joined. Trellis builds a
 dependency graph spanning columns within a table and tables across chained
-transforms, and evaluates in dependency order.
+transforms, and computes in dependency order.
 
 A transform can only chain off a target once that target's own transform is
 `live`. Defining it while the upstream is still building (for example, a plain
@@ -290,7 +290,7 @@ It does not cross into another instance.
 
 **Cycles are rejected at definition time across the whole graph.** A definition
 that would introduce a cycle, directly or transitively, is invalid and rejected
-before it runs, keeping evaluation order well-defined.
+before it runs, keeping the computation order well-defined.
 
 ## Partial data
 

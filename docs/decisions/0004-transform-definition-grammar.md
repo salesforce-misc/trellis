@@ -19,9 +19,10 @@ starting from stable operations common to **PostgreSQL 15+**.
 
 The *statement* shape (`TRANSFORM / FROM / SELECT / WHERE`, later `GROUP BY` /
 `JOIN`) is ours; the *expression semantics* are an **immutable subset of
-Postgres's**. That subset lets Postgres serve as the primary correctness oracle,
-with our re-implemented evaluator as a secondary cross-check (see the
-[generative test suite](../generative-test-suite.md)).
+Postgres's**. That subset lets Postgres serve as the correctness oracle (see the
+[generative test suite](../generative-test-suite.md)), because Postgres
+evaluates every expression: the engine renders a definition into the
+statements that write the target and computes no value itself.
 
 ## The grammar is split by concern
 
@@ -43,15 +44,16 @@ context:
 ## Why our own grammar, not the Postgres parser
 
 The obvious alternative is Postgres's real grammar (`libpg_query`
-through its Rust bindings, or the pure-Rust `sqlparser-rs`). We reject both because we
-execute formulas ourselves rather than issuing SQL to Postgres per batch: we
-re-implement evaluation in our own layer so we can do things Postgres-as-executor
-can't — notably small **atomic delta adjustments** to aggregated `numeric`
-values, the basis of cheap incremental maintenance (see [data-flow](../data-flow.md)).
+through its Rust bindings, or the pure-Rust `sqlparser-rs`). We reject both
+because the engine must know exactly what a definition means: it infers each
+field's type to declare the target column, decides which aggregates can be
+maintained by small **atomic delta adjustments** (the basis of cheap
+incremental maintenance, see [data-flow](../data-flow.md)), and checks
+constants and literals at define time.
 
-So the grammar's function set and the evaluator's function set are the **same
-list**: we accept only what we've re-implemented, and every addition is a paired
-grammar-plus-evaluator change. Adopting a full SQL parser would invert this —
+So the grammar's function set and the renderer's function set are the **same
+list**: we accept only what we render, and every addition is a paired
+grammar-plus-renderer change. Adopting a full SQL parser would invert this —
 we'd inherit its entire surface and forbid it piece by piece — and we parse
 fragments, not whole statements. We want the accepted language to *be* the spec.
 
@@ -88,8 +90,7 @@ CAST('2024-01-01' AS date)
 
 Both are valid, unambiguous Postgres, and Postgres folds them to the *same*
 constant (`EXPLAIN (VERBOSE)` prints `'2024-01-01'::date` for each), so the
-SQL-rendering oracle can render our node back to text that means exactly what
-we evaluated. Accepted types are an allowlist of type families (`date`,
+renderer can write our node back as text that means exactly what we parsed. Accepted types are an allowlist of type families (`date`,
 `timestamp`, `bytea` and `jsonb` among them), each admitted by the rules below.
 
 Deliberately out:
@@ -98,8 +99,8 @@ Deliberately out:
   parser whose precedence table this ADR already flags as delicate. It buys
   nothing over `CAST`. Rejected by name, pointing at the two spellings above.
 * **General `CAST(<expr> AS <type>)`** — a coercion lattice, not a literal.
-  Every (source, target) pair needs its own volatility verdict and evaluator
-  arm, and most interesting pairs aren't immutable (`timestamptz` → `date`
+  Every (source, target) pair needs its own volatility verdict and rendering
+  rule, and most interesting pairs aren't immutable (`timestamptz` → `date`
   reads `TimeZone`). Each type family decides its own pairs when it is
   admitted; rejected here by name.
 
@@ -113,10 +114,11 @@ of the ADR's bar drive it:
   them *are* immutable. The reason is the relative spellings they accept
   (`DATE 'today'`, `TIMESTAMP 'now'`). Admitting only absolute ISO-8601
   removes exactly that surface.
-* **Cross-check agreement.** A computed value travels as text, and the
-  generative suite compares the Rust evaluator's text against Postgres's
-  rendering byte-for-byte. Requiring canonical form makes the two renderers
-  agree by construction instead of needing a per-family normalizer.
+* **Round-trip identity.** A value travels as text, and the generative suite
+  compares a target's text against Postgres's rendering byte-for-byte.
+  Requiring canonical form makes the literal's spelling and Postgres's
+  rendering agree by construction instead of needing a per-family
+  normalizer.
 
 `jsonb` is the family this second rule costs most: `jsonb_out` re-sorts object
 keys by length then bytes, collapses duplicates, and renormalizes numbers. The
@@ -127,8 +129,9 @@ refused, so no `jsonb` value model is needed.
 `COALESCE(<expr>, ...)` is accepted — first non-`NULL` argument, or
 `NULL` if all are. It's immutable, but *variadic*, so it isn't a registry
 function: the parser special-cases it (at least one argument, as Postgres does)
-and the evaluator short-circuits. It is a **safe subset** of Postgres's
-`COALESCE`; the accepted-language-is-the-spec goal makes the gaps worth naming:
+and the renderer emits Postgres's `COALESCE`. It is a **safe subset** of
+Postgres's `COALESCE`; the accepted-language-is-the-spec goal makes the gaps
+worth naming:
 
 * Numeric arguments resolve to a common type as Postgres's `COALESCE` does
   (`integer` and `numeric` give `numeric`; a float wins over every exact type).
@@ -188,7 +191,7 @@ shape:
 We ship the stable core first and add operators and functions incrementally,
 driven by community feedback. The bar for admitting one: (a) **semantics
 identical to a stable PostgreSQL 15+ operator/function**; (b) **immutable** per
-[transforms](../transforms.md#calculated-fields); (c) a re-implemented evaluator.
+[transforms](../transforms.md#calculated-fields); (c) the renderer emits it as the Postgres function of that name.
 Anything volatile, session- or collation-dependent stays out.
 
 Binary operators parse by precedence climbing over a per-operator precedence table
@@ -197,8 +200,8 @@ tier there.
 
 ## Consequences
 
-* Every operator or function a user can write is one we re-implemented: each
-  addition is a paired grammar-plus-evaluator change, and a Postgres function
+* Every operator or function a user can write is one the renderer emits: each
+  addition is a paired grammar-plus-renderer change, and a Postgres function
   outside the list is refused until then.
 * The accepted language is narrower than Postgres's in places a SQL user will
   notice: a typed literal must use its type's canonical spelling, `::` casts and

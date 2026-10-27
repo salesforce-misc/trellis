@@ -99,20 +99,18 @@ boundary as any embedder — with one narrow, sanctioned exception (below).
   constructing engine ASTs directly.
 - **Postgres is the oracle.** Correctness is verified by comparing a persisted target
   against an equivalent, independently-authored SQL query — for an aggregate target,
-  the corresponding `GROUP BY` — executed by Postgres, not by re-running the engine's
-  own evaluator over the same data. The comparison is byte-identical for almost every
+  the corresponding `GROUP BY` — executed by Postgres. The comparison is byte-identical for almost every
   value, and up to the type's own `=` for an aggregate value, where byte-identity
   would be stricter than correctness. `Trellis::self_check` (see
   [ADR-0013](0013-self-check-production-recompute-audit.md), *Comparison semantics*)
   is the shipped form of this check and the public API the suites use for it.
 
-### One sanctioned exception: the fuzz suite's independent cross-check leg
+### One sanctioned exception: the fuzz suite's independent SQL oracle
 
-The generative suite keeps a second, evaluator-driven recompute leg whose sole
-purpose is to catch divergence between the engine's Rust evaluator and Postgres
-semantics. By design it must stay independent of both the shipped `self_check` and
-the suite's own SQL oracle, so it cannot become a public method. It — and the small
-set of type and registry lookups its correctness assertions need — is reachable only
+The generative suite's SQL oracle renders each definition back to a `SELECT` and
+compares the persisted target with it. By design it must stay independent of the
+shipped `self_check`, so it cannot become a public method. It needs a small set of
+type and registry lookups for its correctness assertions, which are reachable only
 through a curated, dev-only re-export at the crate root, gated behind a cargo feature
 enabled only from test and benchmark targets and never on a production dependency
 edge. The gate carries no public-API or semver commitment: anything reached through
@@ -123,7 +121,7 @@ it may change without notice.
 - The crate root's public surface is exactly the tier-1 facade, the tier-2 primitives,
   and the wrapped error types. Everything else is crate-private.
 - The dev-only gated surface is small and specific — the fuzz suite's independent
-  verification legs — rather than a re-export of the engine. Adding to it is a
+  SQL oracle — rather than a re-export of the engine. Adding to it is a
   deliberate, visible act.
 - Because the sibling crates drive the facade and verify against Postgres, they test
   the same paths users take, and a regression in a user-reachable path cannot hide
