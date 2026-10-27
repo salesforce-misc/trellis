@@ -210,6 +210,18 @@ pub enum ValidationError {
         text: String,
         target: ValueType,
     },
+    /// A `+` whose operands are constants Postgres folds at plan time and
+    /// whose value is out of range for the type it is computed or cast in:
+    /// the sum of two integer constants past `integer`/`bigint`
+    /// (`2147483647 + 1`), a float sum past the float's range, or an exact
+    /// constant past `double precision` beside a float. Postgres raises
+    /// `22003` at plan time, for every row. `text` is the offending
+    /// expression as written and `target` the type it does not fit.
+    ConstantOutOfRange {
+        field: String,
+        text: String,
+        target: ValueType,
+    },
     /// A function call's argument had the wrong `ValueType` for its
     /// position — e.g. `octet_length(1)`. Distinct from
     /// [`ValidationError::TypeMismatch`] so the message can name the
@@ -773,6 +785,17 @@ impl fmt::Display for ValidationError {
                  range for {target}, the type the COALESCE resolves to; Postgres cannot cast \
                  it. Use a constant within {target}'s range, or a column (see \"Supported \
                  sources and targets\" in docs/transforms.md)"
+            ),
+            ValidationError::ConstantOutOfRange {
+                field,
+                text,
+                target,
+            } => write!(
+                f,
+                "calculated field '{field}' has the constant {text}, which is out of range for \
+                 {target}; Postgres folds it at plan time and raises an out-of-range error for \
+                 every row. Use values that fit, or a column (see \"Supported sources and \
+                 targets\" in docs/transforms.md)"
             ),
             ValidationError::MixedFloatExactComparison { field, lhs, rhs } => write!(
                 f,
@@ -2594,32 +2617,71 @@ fn infer_field(
     Ok(t)
 }
 
-/// The value of `expr` when it is an exact constant Postgres folds at plan
-/// time: a number literal, a `+` of two constants, a `COALESCE` whose first
-/// argument is one (the grammar has no `NULL`, so it is the result), or a
-/// calculated field whose expression is one, resolved as [`infer_expr`]
-/// resolves a name. `None` for anything that reads a column.
-fn exact_constant(
+/// A constant Postgres folds at plan time: an exact value, or a float with
+/// the width it is computed in.
+enum Constant {
+    Exact(crate::numeric::Numeric),
+    Float(f64, crate::float::FloatWidth),
+}
+
+impl Constant {
+    /// The value as the float an operand beside a float is cast to (`double
+    /// precision` for an exact one), `None` where Postgres's cast raises.
+    fn as_float(&self) -> Option<(f64, crate::float::FloatWidth)> {
+        match self {
+            Constant::Exact(n) => crate::float::literal_to_f64(&n.to_string())
+                .ok()
+                .map(|v| (v, crate::float::FloatWidth::Float8)),
+            Constant::Float(v, w) => Some((*v, *w)),
+        }
+    }
+}
+
+/// The value of `expr` when it is a constant Postgres folds at plan time: a
+/// number literal, a float typed literal, a `+` of two constants, a
+/// `COALESCE` whose first argument is one (the grammar has no `NULL`, so it
+/// is the result), or a calculated field whose expression is one, resolved
+/// as [`infer_expr`] resolves a name. `None` for anything that reads a
+/// column, and for a sum whose value Postgres could not compute (which
+/// [`check_constant_sum`] has refused).
+fn fold_constant(
     expr: &Expr,
     field_name: &str,
     source_columns: &HashMap<String, ValueType>,
     fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
     depth: usize,
-) -> Option<crate::numeric::Numeric> {
+) -> Option<Constant> {
     // Inference has already refused a cycle; this bounds a hand-built one.
     if depth > fields_by_name.len() + 64 {
         return None;
     }
     let recurse = |expr: &Expr, field_name: &str| {
-        exact_constant(expr, field_name, source_columns, fields_by_name, depth + 1)
+        fold_constant(expr, field_name, source_columns, fields_by_name, depth + 1)
     };
     match expr {
-        Expr::NumberLiteral(text) => crate::numeric::Numeric::parse(text).ok(),
+        Expr::NumberLiteral(text) => crate::numeric::Numeric::parse(text)
+            .ok()
+            .map(Constant::Exact),
+        Expr::TypedLiteral {
+            value_type: ValueType::Float(width),
+            text,
+        } => crate::float::parse(text, *width)
+            .ok()
+            .map(|v| Constant::Float(v, *width)),
         Expr::BinaryOp {
             op: super::ast::Operator::Add,
             lhs,
             rhs,
-        } => Some(recurse(lhs, field_name)?.add(&recurse(rhs, field_name)?)),
+        } => match (recurse(lhs, field_name)?, recurse(rhs, field_name)?) {
+            (Constant::Exact(a), Constant::Exact(b)) => Some(Constant::Exact(a.add(&b))),
+            (a, b) => {
+                let (a, a_width) = a.as_float()?;
+                let (b, b_width) = b.as_float()?;
+                crate::float::checked_add(a, a_width, b, b_width)
+                    .ok()
+                    .map(|(sum, width)| Constant::Float(sum, width))
+            }
+        },
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
             recurse(args.first()?, field_name)
         }
@@ -2632,6 +2694,79 @@ fn exact_constant(
         }
         _ => None,
     }
+}
+
+/// [`fold_constant`] restricted to an exact value.
+fn exact_constant(
+    expr: &Expr,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
+    depth: usize,
+) -> Option<crate::numeric::Numeric> {
+    match fold_constant(expr, field_name, source_columns, fields_by_name, depth)? {
+        Constant::Exact(n) => Some(n),
+        Constant::Float(..) => None,
+    }
+}
+
+/// Refuses a `+` Postgres cannot compute at plan time, whatever the row:
+/// two integer constants whose sum does not fit the result width, two float
+/// constants whose sum overflows the float, or an exact constant beside a
+/// float that does not fit `double precision` (Postgres casts it to the
+/// float's type when it plans the `+`). An operand that reads a column is
+/// not a constant, so `col + 2147483647` still defines and fails only for
+/// the rows it overflows. Each nested `+` is checked as it is inferred, so
+/// the innermost offender is the one reported.
+fn check_constant_sum(
+    expr: &Expr,
+    (lhs, rhs): (&Expr, &Expr),
+    result: ValueType,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
+) -> Result<(), ValidationError> {
+    let out_of_range = |arg: &Expr, target: ValueType| ValidationError::ConstantOutOfRange {
+        field: field_name.to_string(),
+        text: super::ast::render_field_expr(arg),
+        target,
+    };
+    let fold = |e: &Expr| fold_constant(e, field_name, source_columns, fields_by_name, 0);
+    let (l, r) = (fold(lhs), fold(rhs));
+    match result {
+        ValueType::Integer(width) => {
+            if let (Some(Constant::Exact(a)), Some(Constant::Exact(b))) = (&l, &r) {
+                let fits = a
+                    .add(b)
+                    .to_string()
+                    .parse::<i64>()
+                    .is_ok_and(|v| width.fits(v));
+                if !fits {
+                    return Err(out_of_range(expr, result));
+                }
+            }
+        }
+        ValueType::Float(_) => {
+            for (arg, constant) in [(lhs, &l), (rhs, &r)] {
+                if let Some(c @ Constant::Exact(_)) = constant
+                    && c.as_float().is_none()
+                {
+                    return Err(out_of_range(
+                        arg,
+                        ValueType::Float(crate::float::FloatWidth::Float8),
+                    ));
+                }
+            }
+            if let (Some(a), Some(b)) = (&l, &r)
+                && let (Some((a, a_width)), Some((b, b_width))) = (a.as_float(), b.as_float())
+                && crate::float::checked_add(a, a_width, b, b_width).is_err()
+            {
+                return Err(out_of_range(expr, result));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn infer_expr(
@@ -2726,6 +2861,16 @@ fn infer_expr(
             // to compare against. `OperatorSpec::arg_types` survives only as
             // the canonical shape a `TypeMismatch` names.
             if let Some(result) = super::registry::operator_result_type(*op, lhs_t, rhs_t) {
+                if matches!(op, super::ast::Operator::Add) {
+                    check_constant_sum(
+                        expr,
+                        (lhs, rhs),
+                        result,
+                        field_name,
+                        source_columns,
+                        fields_by_name,
+                    )?;
+                }
                 return Ok(result);
             }
             if matches!(op, super::ast::Operator::GreaterThan)
@@ -4040,6 +4185,159 @@ mod tests {
     }
 
     #[test]
+    fn a_constant_sum_postgres_cannot_compute_is_refused_at_define() {
+        let source_columns = HashMap::from([
+            ("r".to_string(), ValueType::Float(FloatWidth::Float4)),
+            ("d".to_string(), ValueType::Float(FloatWidth::Float8)),
+            ("n".to_string(), ValueType::Numeric),
+            ("i".to_string(), ValueType::Integer(IntWidth::Int4)),
+            ("g".to_string(), ValueType::Integer(IntWidth::Int4)),
+        ]);
+        let int4 = ValueType::Integer(IntWidth::Int4);
+        let int8 = ValueType::Integer(IntWidth::Int8);
+        let double = ValueType::Float(FloatWidth::Float8);
+        let real = ValueType::Float(FloatWidth::Float4);
+        let beyond_double = "9".repeat(310);
+        let tiny = format!("0.{}1", "0".repeat(400));
+        let max8 = "9223372036854775807";
+        for (fields, text, target) in [
+            // Integer overflow, at either width.
+            (
+                "2147483647 + 1 AS out".to_string(),
+                "(2147483647 + 1)".to_string(),
+                int4,
+            ),
+            (
+                format!("{max8} + 1 AS out"),
+                format!("({max8} + 1)"),
+                int8,
+            ),
+            (
+                format!("{max8} + 2147483647 AS out"),
+                format!("({max8} + 2147483647)"),
+                int8,
+            ),
+            // Nested: the innermost sum that overflows is the one named.
+            (
+                "(2147483647 + 1) + 5000000000 AS out".to_string(),
+                "(2147483647 + 1)".to_string(),
+                int4,
+            ),
+            // Folded constants: a COALESCE whose first argument is one, and
+            // a calculated field holding one.
+            (
+                "COALESCE(2147483647, 5) + 1 AS out".to_string(),
+                "(COALESCE(2147483647, 5) + 1)".to_string(),
+                int4,
+            ),
+            (
+                "2147483647 AS big, big + 1 AS out".to_string(),
+                "(big + 1)".to_string(),
+                int4,
+            ),
+            // A constant sub-expression beside a column, in a COALESCE
+            // argument.
+            (
+                "COALESCE(i, 2147483647 + 1) AS out".to_string(),
+                "(2147483647 + 1)".to_string(),
+                int4,
+            ),
+            (
+                "i + (2147483647 + 1) AS out".to_string(),
+                "(2147483647 + 1)".to_string(),
+                int4,
+            ),
+            // Float constants past the float's range.
+            (
+                "REAL '3e+38' + REAL '3e+38' AS out".to_string(),
+                "(CAST('3e+38' AS REAL) + CAST('3e+38' AS REAL))".to_string(),
+                real,
+            ),
+            (
+                "DOUBLE PRECISION '1e+308' + DOUBLE PRECISION '1e+308' AS out".to_string(),
+                "(CAST('1e+308' AS DOUBLE PRECISION) + CAST('1e+308' AS DOUBLE PRECISION))".to_string(),
+                double,
+            ),
+            // An exact constant beside a float is cast to double precision,
+            // whether or not the other operand reads a column.
+            (
+                format!("r + {beyond_double} AS out"),
+                beyond_double.clone(),
+                double,
+            ),
+            (
+                format!("d + {tiny} AS out"),
+                tiny.clone(),
+                double,
+            ),
+            (
+                format!("{beyond_double} AS big, r + big AS out"),
+                "big".to_string(),
+                double,
+            ),
+            (
+                format!("r + ({beyond_double} + 1) AS out"),
+                format!("({beyond_double} + 1)"),
+                double,
+            ),
+        ] {
+            let d = parsed(&format!("TRANSFORM t FROM s SELECT {fields}"));
+            assert_eq!(
+                validate(&d, &source_columns),
+                Err(ValidationError::ConstantOutOfRange {
+                    field: "out".to_string(),
+                    text,
+                    target,
+                }),
+                "{fields}"
+            );
+        }
+        // What Postgres computes: sums that fit, the wider type absorbing an
+        // integer, numeric (which never overflows here), a float constant
+        // sum inside its range, and any sum that reads a column.
+        for fields in [
+            "2147483646 + 1 AS out".to_string(),
+            "2147483647 + 3000000000 AS out".to_string(),
+            "(2147483647 + 5000000000) + 1 AS out".to_string(),
+            "COALESCE(2147483647, 5000000000) + 1 AS out".to_string(),
+            format!("{max8} + 0 AS out"),
+            format!("{max8}0 + 1 AS out"),
+            "2147483647 + 1.5 AS out".to_string(),
+            "2147483647 + n AS out".to_string(),
+            "i + 2147483647 AS out".to_string(),
+            "i + 2147483647 + 2147483647 AS out".to_string(),
+            "COALESCE(i, 2147483646 + 1) AS out".to_string(),
+            "REAL '2e+38' + REAL '1e+38' AS out".to_string(),
+            "REAL '3e+38' + 1 AS out".to_string(),
+            "r + 3000000000 AS out".to_string(),
+            format!("r + {} AS out", "9".repeat(308)),
+            "d + 0.5 AS out".to_string(),
+            "REAL '3e+38' + DOUBLE PRECISION '3e+38' AS out".to_string(),
+        ] {
+            let d = parsed(&format!("TRANSFORM t FROM s SELECT {fields}"));
+            assert_eq!(validate(&d, &source_columns), Ok(()), "{fields}");
+        }
+        // The same SQL runs for an aggregate's argument.
+        let d = parsed(
+            "TRANSFORM t FROM s GROUP BY g WITHOUT SOURCE INDEX \
+             SELECT g AS g, SUM(2147483647 + 1) AS out",
+        );
+        assert_eq!(
+            validate(&d, &source_columns),
+            Err(ValidationError::ConstantOutOfRange {
+                field: "out".to_string(),
+                text: "(2147483647 + 1)".to_string(),
+                target: int4,
+            })
+        );
+        let d = parsed(
+            "TRANSFORM t FROM s GROUP BY g WITHOUT SOURCE INDEX \
+             SELECT g AS g, SUM(i + 2147483647) AS out",
+        );
+        assert_eq!(validate(&d, &source_columns), Ok(()));
+    }
+
+    #[test]
     fn function_call_composed_with_greater_than_type_checks_as_boolean() {
         let d = def(vec![FieldDef {
             name: "has_foo".to_string(),
@@ -5045,6 +5343,24 @@ mod tests {
              items.qty = orders.id GROUP BY orders.region SELECT COUNT(*) AS n",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn join_refuses_a_constant_sum_postgres_cannot_compute() {
+        // A JOIN's fields are typed by the same rule as a 1-1's, so a
+        // constant overflow inside an aggregate argument is refused too, and
+        // a sum that reads a column is not.
+        for select in [
+            "orders.region AS region, SUM(items.qty + (2147483647 + 1)) AS s",
+            "orders.region AS region, SUM(COALESCE(items.qty, 2147483647 + 1)) AS s",
+        ] {
+            assert!(
+                matches!(check(select), Err(ValidationError::ConstantOutOfRange { .. })),
+                "{:?}: {select}",
+                check(select)
+            );
+        }
+        check("orders.region AS region, SUM(items.qty + 2147483647) AS s").unwrap();
     }
 
     #[test]

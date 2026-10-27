@@ -564,6 +564,19 @@ async fn a_coalesce_literal_out_of_reals_range_is_refused_at_define() {
         message.contains("out of range for real") && message.contains(&beyond_real),
         "{message}"
     );
+    // A constant sum Postgres cannot compute fails for every row, so define
+    // refuses it too.
+    let overflow = create_definition(
+        &db.pool,
+        "TRANSFORM sum_out FROM public.wide SELECT 2147483647 + 1 AS v",
+        &columns,
+    )
+    .await
+    .expect_err("an overflowing constant sum is refused");
+    assert!(
+        overflow.to_string().contains("out of range for integer"),
+        "{overflow}"
+    );
     for (i, fallback) in ["3", "n"].into_iter().enumerate() {
         create_definition(
             &db.pool,
