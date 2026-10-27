@@ -185,6 +185,7 @@ impl fmt::Display for IntWidth {
 /// comparison, which is the exact hazard that allowlist exists to rule out.
 /// (An *input* literal written in a definition's text is a different thing,
 /// and is typed by the parser, not by this function.)
+#[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
 pub fn parse(text: &str, width: IntWidth) -> Result<i64, IntegerError> {
     let invalid = || IntegerError::Invalid {
         text: text.to_string(),
@@ -215,6 +216,7 @@ pub fn parse(text: &str, width: IntWidth) -> Result<i64, IntegerError> {
 /// range raises rather than widening (Postgres's `int2pl`/`int4pl`/`int8pl`
 /// and the mixed-width family all `ereport(ERROR, errcode(22003))` on
 /// overflow — they do not promote).
+#[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
 pub fn checked_add(
     a: i64,
     a_width: IntWidth,

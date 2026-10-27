@@ -14,9 +14,13 @@
 //! [`super::validate`]'s module docs describe for [`super::ast::KeySpace`]
 //! and [`super::ast::Predicate`].
 //!
-//! **Open question**: the interface this hands to apply — this
-//! returns [`Value`]s; whether the SQL write path wants those, or their
-//! canonical text form, or something else, is undecided.
+//! Nothing in the engine evaluates with it: Postgres evaluates every field
+//! in the statement that writes it (`staging::one_to_one_render`). The
+//! evaluation is compiled only for tests and `test-util`, where the
+//! generative suite cross-checks against it, so a new runtime caller fails
+//! to compile in a release build.
+
+#![cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -337,6 +341,7 @@ pub fn evaluate(
 /// a field left in that reads an excluded one by alias would
 /// read the `None` seeded here and be written NULL, where ADR-0003 freezes
 /// it. Every caller's paused set is read through that closure.
+#[cfg(any(test, feature = "test-util"))]
 pub fn evaluate_excluding(
     def: &TransformDef,
     row: &Row,

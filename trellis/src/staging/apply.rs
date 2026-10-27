@@ -32,11 +32,11 @@ use std::time::Duration;
 use tokio_postgres::types::{PgLsn, ToSql};
 use tokio_postgres::{GenericClient, Transaction};
 
-use crate::defs::ast::{KeySpace, TransformDef, ValueType};
+use crate::defs::ast::KeySpace;
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
-use crate::defs::eval::{self, EvalError, Row};
-use crate::defs::validate::{self, ValidationError};
+use crate::defs::eval::EvalError;
+use crate::defs::validate::ValidationError;
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident, quote_literal};
 
@@ -580,191 +580,46 @@ async fn qualified_schema_node_key(pool: &Pool, src_table: &str) -> Result<Strin
     Ok(catalog::resolve_graph_identity(pool, src_table).await?)
 }
 
-/// Decodes staged jsonb images (each bound as text: this crate has no
-/// `serde_json` dependency, matching `append.rs`/`fold.rs`'s convention)
-/// into [`Row`]s via `jsonb_each_text`, so the evaluator never has to parse
-/// JSON itself. The result is in `images`' order, one [`Row`] per image. A
-/// JSON `null` value decodes to `None`, matching `Row`'s "absent column" vs.
-/// "present but NULL" distinction the evaluator depends on (`eval.rs`'s
-/// `MissingColumn` vs. plain `None` propagation). An empty image (`{}`)
-/// decodes to an empty [`Row`].
-///
-/// One round trip per [`DECODE_CHUNK_IMAGES`] images (or
-/// [`DECODE_CHUNK_BYTES`] of image text, whichever fills first), not one
-/// per image. Each image still goes through the same `::jsonb` cast and
-/// `jsonb_each_text` a lone decode would, so the decoded text is
-/// byte-for-byte what a per-image query returns; `with ordinality` only
-/// says which image a pair came from. The chunk bounds keep one statement's
-/// bind message and buffered result to a few megabytes however many images
-/// a batch carries.
-async fn decode_images(pool: &Pool, images: &[&str]) -> Result<Vec<Row>, ApplyError> {
-    decode_images_in_chunks(pool, images, DECODE_CHUNK_IMAGES, DECODE_CHUNK_BYTES).await
-}
-
-/// [`decode_images`] with its chunk bounds as parameters, so a test can put
-/// chunk boundaries anywhere in a small corpus.
-async fn decode_images_in_chunks(
+/// The row `change` is written from, as a [`TargetWrite::image`]: an
+/// Apply's new image, or a Re-derive's current source row, read live.
+/// `None` for a delete, or a key whose row is gone. For the per-field probe
+/// of a record that fails alone (`quarantine`'s column attribution).
+pub(super) async fn record_row_image(
     pool: &Pool,
-    images: &[&str],
-    max_images: usize,
-    max_bytes: usize,
-) -> Result<Vec<Row>, ApplyError> {
-    let mut rows: Vec<Row> = vec![Row::new(); images.len()];
-    if images.is_empty() {
-        return Ok(rows);
+    change: &FoldedChange,
+) -> Result<Option<String>, ApplyError> {
+    if change.last_change.is_some() && !change.has_recompute {
+        return Ok(change.new_image.clone());
     }
+    let pk = ddl::source_primary_key(pool, &change.src_table).await?;
     let client = pool.get().await?;
-    let mut start = 0;
-    while start < images.len() {
-        let mut end = start;
-        let mut bytes = 0;
-        // Always at least one image, however large, so a chunk is never empty.
-        while end < images.len()
-            && (end == start
-                || (end - start < max_images && bytes + images[end].len() <= max_bytes))
-        {
-            bytes += images[end].len();
-            end += 1;
-        }
-        let chunk = &images[start..end];
-        let pairs = client
-            .query(
-                "select i.ord, e.key, e.value \
-                 from unnest($1::text[]) with ordinality as i(image, ord) \
-                 cross join lateral jsonb_each_text(i.image::jsonb) as e",
-                &[&chunk],
-            )
-            .await?;
-        for pair in pairs {
-            let ord: i64 = pair.get(0);
-            let key: String = pair.get(1);
-            let value: Option<String> = pair.get(2);
-            rows[start + ord as usize - 1].insert(key, value);
-        }
-        start = end;
-    }
-    Ok(rows)
+    let columns = live_row_columns(&**client, &change.src_table).await?;
+    let query = live_rows_query(&change.src_table, &pk, &columns, &[change.key.as_str()])?;
+    let rows = client
+        .query(
+            &format!("select m.doc::text from ({}) m", query.docs),
+            &query.params(),
+        )
+        .await?;
+    Ok(rows.first().map(|row| row.get(0)))
 }
 
-/// At most this many images per [`decode_images`] round trip.
-const DECODE_CHUNK_IMAGES: usize = 4096;
-
-/// At most this much image text per [`decode_images`] round trip, unless a
-/// single image is larger on its own.
-const DECODE_CHUNK_BYTES: usize = 4 << 20;
-
-/// Collects the images one [`compute`] step needs decoded, so they all go
-/// through a single [`decode_images`] call, then hands each caller back its
-/// own [`Row`] by the slot [`ImageBatch::push`] returned.
-#[derive(Default)]
-struct ImageBatch<'a> {
-    images: Vec<&'a str>,
-}
-
-impl<'a> ImageBatch<'a> {
-    /// Queues `image` for decoding, returning the slot its [`Row`] lands in.
-    fn push(&mut self, image: &'a str) -> usize {
-        self.images.push(image);
-        self.images.len() - 1
-    }
-
-    /// [`ImageBatch::push`], passing a missing image through as `None`.
-    fn push_opt(&mut self, image: Option<&'a String>) -> Option<usize> {
-        image.map(|image| self.push(image))
-    }
-
-    async fn decode(self, pool: &Pool) -> Result<DecodedImages, ApplyError> {
-        Ok(DecodedImages(decode_images(pool, &self.images).await?))
-    }
-}
-
-/// [`ImageBatch::decode`]'s result: each slot's [`Row`], taken exactly once.
-struct DecodedImages(Vec<Row>);
-
-impl DecodedImages {
-    fn take(&mut self, slot: usize) -> Row {
-        std::mem::take(&mut self.0[slot])
-    }
-
-    fn take_opt(&mut self, slot: Option<usize>) -> Option<Row> {
-        slot.map(|slot| self.take(slot))
-    }
-}
-
-/// Re-reads every one of `keys`' current rows from `source_table` live, in
-/// one round trip, for folded changes that carried no image at all (see
-/// [`compute`]'s doc comment on the three shapes) — the batched replacement
-/// for one `read_live_row` round trip per key (a
-/// backfill's initial enumeration stages every pre-existing row as exactly
-/// this shape, so a naive per-key refetch made backfill throughput scale
-/// with source table size in network round trips, not rows).
-///
-/// The `jsonb_each_text` unnest happens in the same query as the `any($1)`
-/// row lookup — a `cross join lateral`, one column per matched row — so
-/// decoding costs no extra round trip either; [`decode_images`] is only
-/// paid for images that arrive already staged (`new_image`), never for a
-/// live refetch. A key absent from the returned map means its
-/// row is gone (already deleted, or never existed), which [`compute`]
-/// treats as a delete, matching `read_live_row`'s old `None` case exactly.
-///
-/// `pk` may be a composite (multi-column) primary key: `keys`
-/// are each [`ddl::pk_key_sql_expr`]'s U+001F-joined text — the same shape
-/// every [`FoldedChange::key`] already carries for a composite-PK source,
-/// whether staged by a capture trigger or by this crate's own seam, so the
-/// two agree on one row identity regardless of which produced it.
-/// The batch match itself is a keyset join, one bind-parameter array per
-/// `pk` column, rather than a single `= any($1)` — `pk.len() == 1`
-/// degenerates to exactly that single-array-parameter shape, so the
-/// single-column case (still the overwhelmingly common one) pays no extra
-/// cost.
-///
-/// # NULL-keyed groups
-///
-/// A `NULL` component decodes off `keys` (via [`ddl::split_pk_key`]) as a
-/// real `Option::None`. A plain `t.<col> = u.<c>` never matches it (`NULL`
-/// is never `=` anything, including another `NULL`), which is how a
-/// `NULL`-keyed aggregate group's live row used to be mistaken for "already
-/// deleted" by every downstream consumer of this function. See
-/// [`live_rows_query`] for how such keys are matched without giving up the
-/// index.
-async fn read_live_rows_batch(
-    pool: &Pool,
-    source_table: &str,
-    pk: &[PrimaryKeyColumn],
-    keys: &[&str],
-) -> Result<HashMap<String, Row>, ApplyError> {
-    if keys.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let mut client = pool.get().await?;
-    let row_columns = live_row_columns(&**client, source_table).await?;
-    let query = live_rows_query(source_table, pk, &row_columns, keys)?;
-    // A transaction only for `query_by_entry_key`'s `set local`.
-    let txn = client.transaction().await?;
-    let db_rows = super::ledger::query_by_entry_key(&txn, &query.sql, &query.params()).await?;
-    txn.commit().await?;
-    let mut rows: HashMap<String, Row> = HashMap::new();
-    for db_row in db_rows {
-        let key: String = db_row.get(0);
-        let field: String = db_row.get(1);
-        let value: Option<String> = db_row.get(2);
-        rows.entry(key).or_default().insert(field, value);
-    }
-    Ok(rows)
-}
-
-/// [`read_live_rows_batch`]'s statement and the arrays it binds: one
-/// [`LiveRowsArm`] per pattern of `NULL` key columns among the batch's keys.
+/// The live read of a batch of keys' source rows and the arrays it binds:
+/// one [`LiveRowsArm`] per pattern of `NULL` key columns among the batch's
+/// keys.
 pub(super) struct LiveRowsQuery<'a> {
+    /// The read split by `jsonb_each_text` into `(k, column, value)` rows,
+    /// for the tests of the read's plan.
+    #[cfg(test)]
     sql: String,
-    /// The same read before its `jsonb_each_text` split: one `(k, doc)` row
-    /// per matched source row, `doc` its `row_columns` as a text-valued
-    /// `jsonb` (the Re-derive read, `super::ledger`).
+    /// One `(k, doc)` row per matched source row, `doc` its `row_columns`
+    /// as a text-valued `jsonb` (the Re-derive read,
+    /// `super::one_to_one_ledger::read_rows`).
     pub(super) docs: String,
     arms: Vec<LiveRowsArm<'a>>,
 }
 
-/// The keys of one [`read_live_rows_batch`] call whose `pk` is `NULL` in
+/// The keys of one [`live_rows_query`] whose `pk` is `NULL` in
 /// exactly the same columns, bound as one `union all` arm.
 struct LiveRowsArm<'a> {
     /// One array per `pk` column that is not `NULL` in this pattern, in
@@ -783,7 +638,7 @@ impl LiveRowsQuery<'_> {
     }
 }
 
-/// Builds [`read_live_rows_batch`]'s statement: one `union all` arm per
+/// Builds the live read of a batch of keys: one `union all` arm per
 /// pattern of `NULL` key columns present among `keys`, usually
 /// just one. Each arm joins its keys' non-`NULL` parts as a keyset relation
 /// (one array per such column, so the bind count doesn't grow with the
@@ -888,6 +743,7 @@ pub(super) fn live_rows_query<'a>(
         .collect();
     let docs = selects.join(" union all ");
     Ok(LiveRowsQuery {
+        #[cfg(test)]
         sql: format!(
             "select m.k, e.key, e.value from ({docs}) m \
              cross join lateral jsonb_each_text(m.doc) e"
@@ -897,7 +753,7 @@ pub(super) fn live_rows_query<'a>(
     })
 }
 
-/// [`read_live_rows_batch`]'s match for one [`live_rows_query`] arm: a
+/// The match for one [`live_rows_query`] arm: a
 /// conjunction over `pk` where column `i` is `t.<col> is null` if
 /// `pattern[i]` (every key in this arm is `NULL` there), else `t.<col> =
 /// u.c<i>`. Never `is not distinct from`: that is not indexable,
@@ -1071,17 +927,11 @@ struct TransformObservation {
     row_count: u64,
 }
 
-/// One key's write into a target table: the evaluated calculated-field
-/// values, rendered to their canonical text form (aligned with the owning
-/// [`TargetPlan::field_names`]/[`TargetPlan::field_types`]) plus the
-/// `hop_gen` it carries forward if this write propagates downstream.
-///
-/// Kept as text rather than [`eval::Value`] so [`apply_target`] can bind it
-/// straight into a parameterized query — every one of [`ValueType`]'s three
-/// variants renders to a plain text form Postgres's own `::text::<type>`
-/// cast round-trips exactly (numeric's decimal text, `Display for bool`'s
-/// `true`/`false`, text values verbatim) — matching this module's existing
-/// "text in, typed cast in SQL" convention for every other value it writes.
+/// One key's write into a target table: the source row it is written from,
+/// as a text-valued jsonb object (a staged image, or the Re-derive read's
+/// row), which [`apply_target`]'s upsert evaluates the fields over
+/// ([`TargetPlan::fields`]), plus the `hop_gen` it carries forward if this
+/// write propagates downstream.
 ///
 /// `src_changed` is the triggering
 /// [`FoldedChange::src_changed`], carried forward the same way `hop_gen` is
@@ -1091,7 +941,7 @@ struct TransformObservation {
 #[derive(Debug, Clone)]
 struct TargetWrite {
     pk_text: String,
-    values: Vec<Option<String>>,
+    image: String,
     hop_gen: i32,
     src_changed: Option<std::time::SystemTime>,
     /// The triggering [`FoldedChange::origin_lsn`], carried
@@ -1109,10 +959,9 @@ struct TargetDelete {
     origin_lsn: Option<PgLsn>,
 }
 
-/// One folded change to a 1-1 target: an Apply of its last change,
-/// evaluated in Phase 2 from its image, or a Re-derive (`apply` `None`),
-/// which Phase 3 evaluates from the row it reads under the entry lock (see
-/// `super::one_to_one_ledger`).
+/// One folded change to a 1-1 target: an Apply of its last change, written
+/// from its image, or a Re-derive (`apply` `None`), written from the row
+/// Phase 3 reads under the entry lock (see `super::one_to_one_ledger`).
 #[derive(Debug, Clone)]
 struct OneToOneRecord {
     pk_text: String,
@@ -1122,20 +971,19 @@ struct OneToOneRecord {
     origin_lsn: Option<PgLsn>,
 }
 
-/// A 1-1 Apply's `(lsn, txid)` and its values, `None` for a delete.
-type OneToOneApply = (PgLsn, String, Option<Vec<Option<String>>>);
+/// A 1-1 Apply's `(lsn, txid)` and its new image, `None` for a delete.
+type OneToOneApply = (PgLsn, String, Option<String>);
 
 /// Everything Phase 3 needs to settle one 1-1 target: its primary key shape
-/// (for the pre-lock/upsert/delete SQL), the calculated-field column names
-/// and their inferred [`ValueType`]s (both aligned with every
-/// [`TargetWrite::values`], so [`apply_target`] knows which Postgres type
-/// each column casts to), this page's records for it, and how to Re-derive
-/// a key.
+/// (for the pre-lock/upsert/delete SQL), its fields rendered to SQL over the
+/// source row, this page's records for it, and how to read a Re-derive's
+/// row.
 #[derive(Debug, Clone)]
 struct TargetPlan {
     pk: Vec<PrimaryKeyColumn>,
-    field_names: Vec<String>,
-    field_types: Vec<ValueType>,
+    /// The fields Apply writes (every one but the paused), as their names
+    /// and their SQL over the source row `s` ([`OneToOneRender`]).
+    render: Arc<super::one_to_one_render::OneToOneRender>,
     records: Vec<OneToOneRecord>,
     /// The persisted, fully-qualified `"schema.table"` identity of this
     /// target (`Definition::target_table`, ADR-0011) —
@@ -1152,25 +1000,6 @@ struct TargetPlan {
     qualified_source: String,
     /// Every column of the source, which the Re-derive read renders.
     row_columns: Vec<String>,
-    rederive: Arc<Rederive>,
-}
-
-/// How Phase 3 evaluates a 1-1 Re-derive's row.
-struct Rederive {
-    def: TransformDef,
-    source_columns: HashMap<String, ValueType>,
-    paused: std::collections::HashSet<String>,
-    /// A direct writer's: a row that fails to evaluate is left as it is.
-    skip_failing: bool,
-}
-
-impl std::fmt::Debug for Rederive {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Rederive")
-            .field("def", &self.def.target)
-            .field("paused", &self.paused)
-            .finish()
-    }
 }
 
 /// One target table this batch must clear in full before its own keyed
@@ -1269,235 +1098,13 @@ pub(super) fn earliest_src_changed(
     }
 }
 
-/// A [`Row`] as a JSON object of column text (`null` for SQL NULL), the
-/// shape capture writes an image in. Hand-built, since this crate has no
-/// JSON dependency.
-#[cfg(test)]
-fn row_to_json_text(row: &Row) -> String {
-    let mut fields: Vec<String> = row
-        .iter()
-        .map(|(name, value)| {
-            let value = match value {
-                Some(text) => crate::intake::json_string(text),
-                None => "null".to_string(),
-            };
-            format!("{}:{value}", crate::intake::json_string(name))
-        })
-        .collect();
-    fields.sort_unstable();
-    format!("{{{}}}", fields.join(","))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::defs::ast::ValueType;
     use std::time::{Duration, SystemTime};
     use tokio_postgres::NoTls;
     use tokio_postgres::types::PgLsn;
-
-    /// The per-image decode [`decode_images`] replaced, kept
-    /// verbatim as the differential oracle.
-    async fn decode_image_one_round_trip_each(pool: &Pool, image: &str) -> Row {
-        let client = pool.get().await.expect("pool checkout");
-        let rows = client
-            .query(
-                "select key, value from jsonb_each_text($1::text::jsonb)",
-                &[&image],
-            )
-            .await
-            .expect("decode one image");
-        let mut row = Row::with_capacity(rows.len());
-        for r in rows {
-            row.insert(r.get(0), r.get(1));
-        }
-        row
-    }
-
-    /// The batched decode returns exactly what one
-    /// `jsonb_each_text` round trip per image did, over images of every
-    /// column type in each shape the ring carries them in, NULLs, empty
-    /// images, unicode and escapes, wherever the chunk boundaries fall.
-    #[tokio::test]
-    async fn batched_image_decode_matches_one_round_trip_per_image() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        // A same-crate pool: see
-        // `compute_only_buffers_metrics_and_a_single_flush_records_them_exactly_once`.
-        let pool = crate::pool::Pool::new(
-            &crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
-        )
-        .expect("build a same-crate pool");
-        let client = pool.get().await.expect("pool checkout");
-        client
-            .batch_execute(
-                r#"create type mood as enum ('sad', 'ok', 'happy');
-                create table corpus (
-                    id integer primary key, i2 smallint, i8 bigint, num numeric,
-                    r4 real, f8 double precision, t text, vc varchar(20), ch char(3),
-                    b boolean, u uuid, d date, tm time, tmz timetz, ts timestamp,
-                    tsz timestamptz, iv interval, by bytea, j json, jb jsonb, ip inet,
-                    cidr_ cidr, mac macaddr, mac8 macaddr8, bt bit(4), vb varbit,
-                    m money, x xml, tv tsvector, tq tsquery, o oid, e mood,
-                    ia integer[], ta text[]);
-                insert into corpus values
-                (1, 7, 9007199254740993, 1.50, 1.5, 0.1, 'plain', 'v', 'ab', true,
-                 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-02-29', '13:45:00.5',
-                 '13:45:00+05:30', '2024-02-29 13:45:00.123456',
-                 '2024-02-29 13:45:00+00', '1 year 2 mons 3 days 04:05:06',
-                 '\x00ff10', '{"b": [1, 2.50, "x"], "a": {"n": null}}',
-                 '{"b": 1e3, "a": "é", "c": [true, null]}', '10.0.0.1/8', '10.0.0.0/8',
-                 '08:00:2b:01:02:03', '08:00:2b:01:02:03:04:05', B'1010', B'10101',
-                 12.34, '<a>x</a>', 'a fat cat', 'fat & rat', 42, 'happy',
-                 '{1,NULL,3}', '{"a b",NULL,"c\"d","e\\f",""}'),
-                (2, -32768, -9223372036854775808, 'NaN', 'Infinity', '-0',
-                 E'quote " backslash \\ newline \n tab \t bell \x07 é 值 🎉', '', '   ',
-                 false, '00000000-0000-0000-0000-000000000000', 'infinity', '00:00',
-                 '00:00-12', '-infinity', 'infinity', '-1 days -00:00:01', '\x', '[]',
-                 '{}', '::1', '::/0', '00:00:00:00:00:00', '00:00:00:00:00:00:00:00',
-                 B'0000', B'', -0.01, '', '', 'a', 0, 'sad', '{}', '{}'),
-                (3, null, null, 123456789012345678901234567890.000000000000000000001,
-                 '-Infinity', 1e308, E'ключ 😀 \u200b', null, null, null, null, null,
-                 null, null, null, null, null, null, 'null', 'null', null, null, null,
-                 null, null, null, null, null, null, null, null, null, null, null),
-                (4, null, null, null, null, null, null, null, null, null, null, null,
-                 null, null, null, null, null, null, null, null, null, null, null,
-                 null, null, null, null, null, null, null, null, null, null, null);"#,
-            )
-            .await
-            .expect("seed the corpus table");
-        let columns: Vec<String> = client
-            .query(
-                "select attname::text from pg_attribute \
-                 where attrelid = 'corpus'::regclass and attnum > 0 and not attisdropped \
-                 order by attnum",
-                &[],
-            )
-            .await
-            .expect("read corpus columns")
-            .iter()
-            .map(|r| r.get(0))
-            .collect();
-        let mut corpus: Vec<String> = Vec::new();
-        // The shape a live-row-derived image (a recompute's prior image)
-        // carries: every value as its text, NULL as JSON null.
-        let text_sql = format!(
-            "select ({})::text from corpus t order by id",
-            row_as_text_jsonb_sql("t", &columns)
-        );
-        for r in client.query(&text_sql, &[]).await.expect("text images") {
-            corpus.push(r.get(0));
-        }
-        // Native JSON values: numbers, booleans, nested objects and arrays.
-        for r in client
-            .query("select to_jsonb(t.*)::text from corpus t order by id", &[])
-            .await
-            .expect("to_jsonb images")
-        {
-            corpus.push(r.get(0));
-        }
-        // The CDC shape, hand-encoded by `crate::intake::json_string`.
-        let values_sql = format!(
-            "select {} from corpus t order by id",
-            columns
-                .iter()
-                .map(|c| format!("t.{}::text", quote_ident(c)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        for r in client.query(&values_sql, &[]).await.expect("cdc values") {
-            let row: Row = columns
-                .iter()
-                .enumerate()
-                .map(|(i, c)| (c.clone(), r.get::<_, Option<String>>(i)))
-                .collect();
-            corpus.push(row_to_json_text(&row));
-        }
-        for image in [
-            "{}",
-            " { } ",
-            r#"{"a":null}"#,
-            r#"{"":""}"#,
-            r#"{"a":"1","a":"2"}"#,
-            r#"{"b":"2","a":"1","c":null}"#,
-            r#"{"\u00e9t\u00e9":"\ud83c\udf89","ключ":"值 🎉","esc":"\"\\\/\b\f\n\r\t\u0001"}"#,
-            r#"{"n1":1.50,"n2":1e3,"n3":-0,"n4":0.000001,"n5":12345678901234567890,"n6":-1.5E-7}"#,
-            r#"{"t":true,"f":false,"z":null,"arr":[1,"a",null,{"y":2,"x":1}],"obj":{"b":{},"a":[]}}"#,
-            "{\n  \"spaced\" :\t\"out\" ,\r\n \"k\": [ 1 , 2 ] }",
-            r#"{"line\nbreak key":"v","tab\tkey":null}"#,
-        ] {
-            corpus.push(image.to_string());
-        }
-        let images: Vec<&str> = corpus.iter().map(String::as_str).collect();
-        let mut expected = Vec::with_capacity(images.len());
-        for image in &images {
-            expected.push(decode_image_one_round_trip_each(&pool, image).await);
-        }
-        assert!(
-            expected.iter().any(Row::is_empty)
-                && expected.iter().any(|row| row.values().any(Option::is_none))
-                && expected.iter().any(|row| row.len() == columns.len()),
-            "the corpus covers empty images, NULLs and every column"
-        );
-
-        for (max_images, max_bytes) in [
-            (DECODE_CHUNK_IMAGES, DECODE_CHUNK_BYTES),
-            (1, usize::MAX),
-            (2, usize::MAX),
-            (5, usize::MAX),
-            (usize::MAX, 1),
-            (usize::MAX, 200),
-            (0, 0),
-        ] {
-            let decoded = decode_images_in_chunks(&pool, &images, max_images, max_bytes)
-                .await
-                .expect("batched decode");
-            assert_eq!(
-                decoded, expected,
-                "chunks of at most {max_images} images / {max_bytes} bytes"
-            );
-        }
-
-        // Many chunks at the production bounds, with empty images at the
-        // edges and between chunks.
-        let mut many: Vec<&str> = vec!["{}"];
-        let mut many_expected: Vec<Row> = vec![Row::new()];
-        for i in 0..(2 * DECODE_CHUNK_IMAGES + 3) {
-            many.push(images[i % images.len()]);
-            many_expected.push(expected[i % images.len()].clone());
-        }
-        many.push("{}");
-        many_expected.push(Row::new());
-        assert_eq!(
-            decode_images(&pool, &many).await.expect("batched decode"),
-            many_expected
-        );
-        assert_eq!(
-            decode_images(&pool, &[]).await.expect("empty batch"),
-            Vec::<Row>::new()
-        );
-        assert!(
-            decode_images(&pool, &["{}", "not json"]).await.is_err(),
-            "an undecodable image fails the batch, as it failed its own decode"
-        );
-    }
-
-    /// A basis is compared to the source's current row as jsonb,
-    /// so it must be valid JSON whatever text a column holds, keep SQL NULL
-    /// distinct from the text `"null"`, and come out the same for the same
-    /// row regardless of map order.
-    #[test]
-    fn a_row_basis_is_valid_escaped_json_with_nulls_kept_distinct() {
-        let row: Row = HashMap::from([
-            ("id".to_string(), Some("1".to_string())),
-            ("note".to_string(), Some("say \"hi\"\n\\".to_string())),
-            ("gone".to_string(), None),
-            ("literal".to_string(), Some("null".to_string())),
-        ]);
-        assert_eq!(
-            row_to_json_text(&row),
-            r#"{"gone":null,"id":"1","literal":"null","note":"say \"hi\"\n\\"}"#
-        );
-    }
 
     #[test]
     fn earliest_src_changed_picks_the_lesser_of_two_known_origins() {
@@ -2818,27 +2425,25 @@ fn key_exclusions(
     (!exclusions.iter().all(KeyExclusion::is_empty)).then_some(exclusions)
 }
 
-/// One definition's share of a source's `changes` and their decoded images
-/// (`rows`): every change but those `exclusions` leave out of
+/// One definition's share of a source's `changes`: every change but those
+/// `exclusions` leave out of
 /// `transform_id`. Borrowed when it leaves out none, the common case.
 fn definition_share<'c, 'f>(
     transform_id: i64,
     changes: &'c [&'f FoldedChange],
-    rows: &'c [Option<Row>],
     exclusions: &Option<Vec<KeyExclusion>>,
-) -> (Cow<'c, [&'f FoldedChange]>, Cow<'c, [Option<Row>]>) {
+) -> Cow<'c, [&'f FoldedChange]> {
     let Some(exclusions) = exclusions
         .as_ref()
         .filter(|exclusions| exclusions.iter().any(|e| e.defs.contains(&transform_id)))
     else {
-        return (Cow::Borrowed(changes), Cow::Borrowed(rows));
+        return Cow::Borrowed(changes);
     };
-    let keep: Vec<usize> = (0..changes.len())
-        .filter(|&i| !exclusions[i].defs.contains(&transform_id))
-        .collect();
-    (
-        Cow::Owned(keep.iter().map(|&i| changes[i]).collect()),
-        Cow::Owned(keep.iter().map(|&i| rows[i].clone()).collect()),
+    Cow::Owned(
+        (0..changes.len())
+            .filter(|&i| !exclusions[i].defs.contains(&transform_id))
+            .map(|i| changes[i])
+            .collect(),
     )
 }
 
@@ -3076,7 +2681,10 @@ pub(super) async fn compute_page(
         // The source column list a 1-1 target's Phase 3 check
         // renders the current row with. Loaded at most once per source, and
         // only when some definition on it is 1-1.
-        let mut source_row_columns: Option<Vec<String>> = None;
+        let mut source_row_columns: Option<(
+            Vec<String>,
+            Vec<super::one_to_one_render::ImageColumn>,
+        )> = None;
 
         // `qualified_source` (via `qualified_schema_node_key`):
         // `schema_nodes`/`schema_edges` key on qualified identity
@@ -3130,73 +2738,21 @@ pub(super) async fn compute_page(
             continue;
         }
 
-        // Decoded/re-read once per change here — not once per (definition,
-        // change) — since every definition subscribed to this source
-        // evaluates the exact same row: the image a change
-        // carries, or the live re-read for an image-less recompute trigger,
-        // doesn't depend on which definition is reading it. The `(None,
-        // None)` shape — a bare recompute trigger with no image, the shape
-        // every backfill enumeration produces — is collected instead of
-        // re-read immediately, so every such key in this batch is fetched
-        // in one [`read_live_rows_batch`] round trip rather than one
-        // round trip per key. Every new image this source's
-        // changes need is decoded in one [`decode_images`] call,
-        // not one round trip each.
-        //
-        // A definition on the group basis reads its changes' ring
-        // rows in Phase 3 (`super::group_basis`), so it decodes and re-reads
-        // nothing here.
+        // A definition on the group basis reads its changes' ring rows in
+        // Phase 3 (`super::group_basis`), so does a `JOIN` (`super::join`),
+        // and a 1-1 definition's fields are evaluated over each change's
+        // image in Phase 3's upsert (`super::one_to_one_render`): nothing is
+        // decoded or re-read here.
         let mut group_shapes: Vec<Option<super::group_basis::GroupShape>> =
             Vec::with_capacity(defs.len());
-        // So does a `JOIN` (`super::join`).
-        let mut joins: Vec<bool> = Vec::with_capacity(defs.len());
         for def in &defs {
-            joins.push(matches!(def.def.key_space, KeySpace::Join(_)));
             group_shapes.push(super::group_basis::route(&def.def, &def.source_columns));
-        }
-        let phase3_only = group_shapes
-            .iter()
-            .zip(&joins)
-            .all(|(group, join)| group.is_some() || *join);
-        // So does a 1-1 definition's Re-derive, so a source read
-        // only by those re-reads nothing here either.
-        let rederives_in_phase3 = defs.iter().zip(&group_shapes).all(|(def, group)| {
-            group.is_some() || matches!(def.def.key_space, KeySpace::Join(_) | KeySpace::OneToOne)
-        });
-        let mut batch = ImageBatch::default();
-        let mut slots: Vec<Option<usize>> = Vec::with_capacity(changes.len());
-        let mut live_refetch_indices: Vec<usize> = Vec::new();
-        for (i, change) in changes.iter().enumerate() {
-            if phase3_only {
-                slots.push(None);
-                continue;
-            }
-            if change.new_image.is_none() && change.old_image.is_none() && !rederives_in_phase3 {
-                live_refetch_indices.push(i);
-            }
-            slots.push(batch.push_opt(change.new_image.as_ref()));
-        }
-        let mut decoded = batch.decode(pool).await?;
-        let mut rows: Vec<Option<Row>> = slots
-            .into_iter()
-            .map(|slot| decoded.take_opt(slot))
-            .collect();
-        if !live_refetch_indices.is_empty() {
-            let live_keys: Vec<&str> = live_refetch_indices
-                .iter()
-                .map(|&i| changes[i].key.as_str())
-                .collect();
-            let mut live_rows =
-                read_live_rows_batch(pool, qualified_source, &pk, &live_keys).await?;
-            for &i in &live_refetch_indices {
-                rows[i] = live_rows.remove(changes[i].key.as_str());
-            }
         }
 
         for (def, group_shape) in defs.iter().zip(group_shapes) {
             // This definition's share, without the changes whose key
             // is poisoned for it (parked above).
-            let (changes, rows) = definition_share(def.id, &changes, &rows, &exclusions);
+            let changes = definition_share(def.id, &changes, &exclusions);
             if changes.is_empty() {
                 continue;
             }
@@ -3267,65 +2823,43 @@ pub(super) async fn compute_page(
                     what: "an aggregate the group basis doesn't take",
                 });
             }
-            let field_names: Vec<String> = def.def.fields.iter().map(|f| f.name.clone()).collect();
-            let field_types = one_to_one_field_types(&def.def, &def.source_columns, &field_names)?;
-
             // ADR-0003 (column-level quarantine): a column
-            // the fuse has paused is excluded from both this plan's
-            // column list (so `apply_target`'s generated SQL never
-            // mentions it at all — decision: freeze at the last
-            // successfully computed value, don't null it out or keep
-            // reattempting a formula that's already fused off) and from
-            // evaluation itself below (so a still-broken paused formula
-            // doesn't keep reproducing the same failure on every batch).
-            // Empty for every definition with nothing currently paused —
-            // the overwhelmingly common case — so this is a cheap,
-            // indexed no-op read then.
+            // the fuse has paused is left out of this plan's rendered fields,
+            // so `apply_target`'s generated SQL never mentions it at all —
+            // decision: freeze at the last successfully computed value, don't
+            // null it out or keep reattempting a formula that's already fused
+            // off. Empty for every definition with nothing currently paused —
+            // the overwhelmingly common case — so this is a cheap, indexed
+            // no-op read then.
             let paused = quarantine::paused_columns_for(pool, &def.def).await?;
-            let (field_names, field_types): (Vec<String>, Vec<ValueType>) = if paused.is_empty() {
-                (field_names, field_types)
-            } else {
-                field_names
-                    .into_iter()
-                    .zip(field_types)
-                    .filter(|(name, _)| !paused.contains(name))
-                    .unzip()
-            };
 
             // `pk` is this source's full (possibly
             // composite) primary key — a `KeySpace::OneToOne` target's own primary
             // key now mirrors the source's in full, at whatever arity it
             // has, rather than narrowing to one column.
             let target_pk = pk.clone();
-            let columns = match &source_row_columns {
+            let (columns, image_columns) = match &source_row_columns {
                 Some(columns) => columns.clone(),
                 None => {
                     let client = pool.get().await?;
                     let columns = live_row_columns(&**client, qualified_source).await?;
-                    source_row_columns = Some(columns.clone());
-                    columns
+                    let image_columns =
+                        super::one_to_one_render::image_columns(&**client, qualified_source)
+                            .await?;
+                    source_row_columns = Some((columns.clone(), image_columns.clone()));
+                    (columns, image_columns)
                 }
             };
-
-            // Reused across every change below: `regexp_count`'s
-            // pattern is a validated string literal, so its compiled `Regex`
-            // is the same for every row this definition evaluates, and
-            // recompiling it per row would be wasted work at realistic row
-            // volumes.
-            let mut regex_cache = eval::RegexCache::new();
-
-            let rederive = Arc::new(Rederive {
-                def: def.def.clone(),
-                source_columns: def.source_columns.clone(),
-                paused: paused.clone(),
-                skip_failing: false,
-            });
+            let render = Arc::new(super::one_to_one_render::OneToOneRender::new(
+                &def.def,
+                &image_columns,
+                &paused,
+            )?);
             let plan = targets
                 .entry(def.def.target.clone())
                 .or_insert_with(|| TargetPlan {
                     pk: target_pk,
-                    field_names: field_names.clone(),
-                    field_types: field_types.clone(),
+                    render: Arc::clone(&render),
                     records: Vec::new(),
                     // The persisted, fully-qualified identity
                     // — not re-derived, since `def` (this source's own
@@ -3334,25 +2868,16 @@ pub(super) async fn compute_page(
                     qualified_target: def.target_table.clone(),
                     qualified_source: qualified_source.to_string(),
                     row_columns: columns,
-                    rederive: Arc::clone(&rederive),
                 });
 
-            // An Apply evaluates its change's new image here —
+            // An Apply is written from its change's new image —
             // a delete when it has none. A Re-derive (a `recompute`, or a
-            // change folded with one) is evaluated in Phase 3, from the
-            // row it reads under the entry lock.
-            for (change, row) in changes.iter().zip(rows.iter()) {
+            // change folded with one) is written from the row Phase 3 reads
+            // under the entry lock.
+            for change in changes.iter() {
                 let apply = match &change.last_change {
                     Some(last) if !change.has_recompute => {
-                        let values = match (&change.new_image, row) {
-                            (Some(_), Some(row)) => {
-                                let mut evaluated =
-                                    evaluate_one_to_one(&rederive, row, &mut regex_cache)?;
-                                Some(evaluated_values(&field_names, &mut evaluated))
-                            }
-                            _ => None,
-                        };
-                        Some((last.lsn, last.row_txid.clone(), values))
+                        Some((last.lsn, last.row_txid.clone(), change.new_image.clone()))
                     }
                     _ => None,
                 };
@@ -3660,14 +3185,12 @@ fn flush_apply_metrics(plan: &ApplyPlan) {
 // Phase 3: apply ∪ mark-drained
 // ---------------------------------------------------------------------
 
-/// Postgres's wire protocol caps one statement's total bound parameters at
-/// `i16::MAX` (65535) — the same limit `append::append`'s `MAX_ROWS_PER_STATEMENT`
-/// exists to respect. A write row's parameter count scales with its target's
-/// field count, so unlike `append::append` (whose row shape is fixed) this
-/// is a parameter budget, not a row count: [`apply_target`] divides it by
-/// `cols_per_row` to get the actual chunk size. 60000 leaves headroom below
-/// 65535 regardless of column count.
-const MAX_WRITE_PARAMS_PER_STATEMENT: usize = 60_000;
+/// At most this many rows per [`apply_target`] upsert statement.
+const WRITE_CHUNK_ROWS: usize = 4096;
+
+/// At most this much row text per [`apply_target`] upsert statement, unless
+/// one row is larger on its own.
+const WRITE_CHUNK_BYTES: usize = 4 << 20;
 
 /// Decodes one [`TargetWrite::pk_text`]/[`TargetDelete::pk_text`] (this
 /// crate's shared key-contract text, [`ddl::pk_key_sql_expr`]/
@@ -4038,143 +3561,10 @@ fn pattern_params<'a>(columns: &'a [Vec<&'a str>]) -> Vec<&'a (dyn ToSql + Sync)
 /// [`TargetMutations`]).
 type AppliedTarget = (usize, usize);
 
-/// One evaluated row's values in `field_names` order, rendered to the text
-/// [`TargetWrite::values`] carries — shared by [`compute`]'s Applies and
-/// [`settle_one_to_one_target`]'s Re-derives so the two can't drift.
-fn evaluated_values(
-    field_names: &[String],
-    evaluated: &mut HashMap<String, Option<eval::Value>>,
-) -> Vec<Option<String>> {
-    field_names
-        .iter()
-        .map(|name| match evaluated.remove(name) {
-            Some(Some(value)) => Some(value.to_string()),
-            Some(None) | None => None,
-        })
-        .collect()
-}
-
-/// Evaluates a 1-1 definition over one source row, without its paused
-/// columns: an Apply's image in Phase 2, or a Re-derive's row in Phase 3.
-fn evaluate_one_to_one(
-    rederive: &Rederive,
-    row: &Row,
-    regex_cache: &mut eval::RegexCache,
-) -> Result<HashMap<String, Option<eval::Value>>, ApplyError> {
-    Ok(eval::evaluate_excluding(
-        &rederive.def,
-        row,
-        &rederive.source_columns,
-        regex_cache,
-        &rederive.paused,
-    )?)
-}
-
-/// A 1-1 definition's `field_names`' types, inferred from its source's
-/// column types.
-fn one_to_one_field_types(
-    def: &TransformDef,
-    source_columns: &HashMap<String, ValueType>,
-    field_names: &[String],
-) -> Result<Vec<ValueType>, ApplyError> {
-    let types = validate::infer_field_types(def, source_columns)?;
-    Ok(field_names
-        .iter()
-        .map(|name| types.get(name).copied().unwrap_or(ValueType::Numeric))
-        .collect())
-}
-
-/// A direct writer's Re-derive of 1-1 keys, outside a page: a
-/// field build's chunk over a 1-1 target (a column resume,
-/// `staging::build`). Settled on the ledger as a page settles a Re-derive
-/// ([`settle_one_to_one_target`]). Built before the writer's transaction,
-/// since the source's key and columns are read through the pool.
-pub(crate) struct DirectRederive {
-    target: String,
-    plan: TargetPlan,
-}
-
-impl DirectRederive {
-    /// A Re-derive of source keys `keys` that writes every field but
-    /// `excluded`, which it leaves as they are. With `skip_failing`, a row
-    /// that fails to evaluate is left as it is, instead of failing the call.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn new(
-        pool: &Pool,
-        def: &TransformDef,
-        source_table: &str,
-        target_table: &str,
-        source_columns: &HashMap<String, ValueType>,
-        excluded: std::collections::HashSet<String>,
-        skip_failing: bool,
-        keys: &[String],
-    ) -> Result<Self, ApplyError> {
-        let pk = ddl::source_primary_key(pool, source_table).await?;
-        let field_names: Vec<String> = def
-            .fields
-            .iter()
-            .map(|f| f.name.clone())
-            .filter(|name| !excluded.contains(name))
-            .collect();
-        let field_types = one_to_one_field_types(def, source_columns, &field_names)?;
-        let row_columns = {
-            let client = pool.get().await?;
-            live_row_columns(&**client, source_table).await?
-        };
-        let records = keys
-            .iter()
-            .map(|key| OneToOneRecord {
-                pk_text: key.clone(),
-                apply: None,
-                hop_gen: 0,
-                src_changed: None,
-                origin_lsn: None,
-            })
-            .collect();
-        Ok(Self {
-            target: def.target.clone(),
-            plan: TargetPlan {
-                pk,
-                field_names,
-                field_types,
-                records,
-                qualified_target: target_table.to_string(),
-                qualified_source: source_table.to_string(),
-                row_columns,
-                rederive: Arc::new(Rederive {
-                    def: def.clone(),
-                    source_columns: source_columns.clone(),
-                    paused: excluded,
-                    skip_failing,
-                }),
-            },
-        })
-    }
-
-    /// Settles the Re-derive in `txn`, reporting every changed key to
-    /// `mutations`. A tombstone this writes is stamped with the latest
-    /// segment there is, so it is collected once everything staged so far
-    /// has drained.
-    pub(crate) async fn settle(
-        &self,
-        txn: &Transaction<'_>,
-        mutations: &mut TargetMutations,
-    ) -> Result<(), ApplyError> {
-        let seg: i64 = txn
-            .query_one("select coalesce(max(seg_seq), 0) from segments", &[])
-            .await?
-            .get(0);
-        // Every record is a Re-derive already, so the first segment
-        // changes nothing.
-        settle_one_to_one_target(txn, &self.target, &self.plan, seg, seg, mutations).await?;
-        Ok(())
-    }
-}
-
 /// Settles one 1-1 target's records on its ledger, in the page's
-/// transaction: locks the entries, reads and evaluates the
-/// Re-derives' rows, updates the entries, then writes the target rows of
-/// only the keys whose entry changed. See `super::one_to_one_ledger`.
+/// transaction: locks the entries, reads the Re-derives' rows, updates the
+/// entries, then writes the target rows of only the keys whose entry changed,
+/// evaluating their fields in the upsert. See `super::one_to_one_ledger`.
 ///
 /// A key carried by more than one record settles once, from the record that
 /// reflects the latest state: a Re-derive, which reads it, or else the
@@ -4287,23 +3677,11 @@ async fn settle_one_to_one_target(
         .await?;
         (read.rows, Some(read.snapshot), seg_seq.max(read.seg))
     };
-    let mut regex_cache = eval::RegexCache::new();
-    let mut rederived: HashMap<&str, Option<Vec<Option<String>>>> = HashMap::new();
-    for key in rederive_keys {
-        let values = match read.remove(key) {
-            None => None,
-            Some(row) => {
-                let mut evaluated =
-                    match evaluate_one_to_one(&plan.rederive, &row, &mut regex_cache) {
-                        Ok(evaluated) => evaluated,
-                        Err(_) if plan.rederive.skip_failing => continue,
-                        Err(err) => return Err(err),
-                    };
-                Some(evaluated_values(&plan.field_names, &mut evaluated))
-            }
-        };
-        rederived.insert(key, values);
-    }
+    // A Re-derive's row, `None` for a key with no row.
+    let rederived: HashMap<&str, Option<String>> = rederive_keys
+        .into_iter()
+        .map(|key| (key, read.remove(key)))
+        .collect();
 
     let mut changes: Vec<one_to_one_ledger::EntryChange<'_>> = Vec::with_capacity(by_key.len());
     for record in by_key.values() {
@@ -4352,14 +3730,14 @@ async fn settle_one_to_one_target(
         if !changed.contains(&record.pk_text) {
             continue;
         }
-        let values = match &record.apply {
-            Some((_, _, values)) => values.clone(),
-            None => rederived.remove(record.pk_text.as_str()).flatten(),
+        let image = match &record.apply {
+            Some((_, _, image)) => image.clone(),
+            None => rederived.get(record.pk_text.as_str()).cloned().flatten(),
         };
-        match values {
-            Some(values) => writes.push(TargetWrite {
+        match image {
+            Some(image) => writes.push(TargetWrite {
                 pk_text: record.pk_text.clone(),
-                values,
+                image,
                 hop_gen: record.hop_gen,
                 src_changed: record.src_changed,
                 origin_lsn: record.origin_lsn,
@@ -4442,7 +3820,12 @@ async fn apply_target(
     // pinned `search_path`. See `TargetPlan::qualified_target`'s doc comment
     // and `ddl::qualified_target_table_ident`'s.
     let target_ident = ddl::qualified_target_table_ident(&plan.qualified_target);
-    let field_idents: Vec<String> = plan.field_names.iter().map(|n| quote_ident(n)).collect();
+    let field_idents: Vec<String> = plan
+        .render
+        .fields
+        .iter()
+        .map(|(n, _)| quote_ident(n))
+        .collect();
 
     // The pre-lock below doubles as the prior-image capture every
     // changed key reports to `mutations` — see `staging::target_mutations`.
@@ -4522,12 +3905,6 @@ async fn apply_target(
         HashMap::new()
     };
 
-    let field_pg_types: Vec<Cow<'static, str>> = plan
-        .field_types
-        .iter()
-        .map(|t| ddl::pg_type_name(*t))
-        .collect();
-
     let col_list = pk_idents
         .iter()
         .cloned()
@@ -4540,9 +3917,6 @@ async fn apply_target(
 
     let mut written = Vec::new();
     if !writable.is_empty() {
-        let cols_per_row = arity + plan.field_names.len();
-        let rows_per_chunk = (MAX_WRITE_PARAMS_PER_STATEMENT / cols_per_row).max(1);
-
         // Every one of this target's calculated columns can be paused at
         // once (ADR-0003) — a single-field definition whose lone
         // column's fuse has tripped is the simplest such case. There is then
@@ -4592,33 +3966,69 @@ async fn apply_target(
         // parses it back the same way.
         let returning_pk_expr = ddl::pk_key_sql_expr(&plan.pk, None);
 
-        for chunk in writable.chunks(rows_per_chunk) {
-            let mut rows_sql = Vec::with_capacity(chunk.len());
-            let mut params: Vec<&(dyn ToSql + Sync)> =
-                Vec::with_capacity(chunk.len() * cols_per_row);
-            for (i, (write, pk_parts)) in chunk.iter().enumerate() {
-                let base = i * cols_per_row;
-                let mut row_parts = Vec::with_capacity(cols_per_row);
-                for (j, c) in plan.pk.iter().enumerate() {
-                    row_parts.push(format!("${}::text::{}", base + j + 1, c.data_type));
-                    params.push(&pk_parts[j]);
+        // The fields are evaluated here, over each key's row
+        // (`super::one_to_one_render`): one statement per chunk, binding one
+        // `text[]` per key column and one of rows, so the parameter count is
+        // `O(pk.len())`.
+        let mut select_cols: Vec<String> = plan
+            .pk
+            .iter()
+            .enumerate()
+            .map(|(j, c)| format!("v.__p{j}::{}", c.data_type))
+            .collect();
+        select_cols.extend(plan.render.fields.iter().map(|(_, sql)| sql.clone()));
+        let unnest_args: Vec<String> = (0..=arity)
+            .map(|j| {
+                if j == arity {
+                    format!("${}::text[]::jsonb[]", j + 1)
+                } else {
+                    format!("${}::text[]", j + 1)
                 }
-                for (j, pg_type) in field_pg_types.iter().enumerate() {
-                    row_parts.push(format!("${}::text::{pg_type}", base + arity + j + 1));
-                    params.push(&write.values[j]);
-                }
-                rows_sql.push(format!("({})", row_parts.join(", ")));
+            })
+            .collect();
+        let unnest_cols: Vec<String> = (0..arity)
+            .map(|j| format!("__p{j}"))
+            .chain(std::iter::once("__img".to_string()))
+            .collect();
+        let sql = format!(
+            "insert into {target_ident} ({col_list}) \
+             select {} from unnest({}) as v({}) cross join {} \
+             {on_conflict} \
+             returning {returning_pk_expr} as pk",
+            select_cols.join(", "),
+            unnest_args.join(", "),
+            unnest_cols.join(", "),
+            plan.render.row_sql("v.__img"),
+        );
+        let mut start = 0;
+        while start < writable.len() {
+            let mut end = start;
+            let mut bytes = 0;
+            while end < writable.len()
+                && (end == start
+                    || (end - start < WRITE_CHUNK_ROWS
+                        && bytes + writable[end].0.image.len() <= WRITE_CHUNK_BYTES))
+            {
+                bytes += writable[end].0.image.len();
+                end += 1;
             }
-
-            let sql = format!(
-                "insert into {target_ident} ({col_list}) \
-                 select * from (values {}) as v({col_list}) \
-                 {on_conflict} \
-                 returning {returning_pk_expr} as pk",
-                rows_sql.join(", "),
-            );
+            let chunk = &writable[start..end];
+            let mut columns: Vec<Vec<Option<&str>>> = vec![Vec::with_capacity(chunk.len()); arity];
+            let mut images: Vec<&str> = Vec::with_capacity(chunk.len());
+            for (write, pk_parts) in chunk {
+                for (j, part) in pk_parts.iter().enumerate() {
+                    columns[j].push(part.as_deref());
+                }
+                images.push(&write.image);
+            }
+            let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(arity + 1);
+            for column in &columns {
+                params.push(column);
+            }
+            params.push(&images);
             let rows = txn.query(&sql, &params).await?;
             written.extend(rows.into_iter().map(|row| row.get::<_, String>(0)));
+            start = end;
         }
     }
 

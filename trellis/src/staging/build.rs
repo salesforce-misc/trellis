@@ -167,7 +167,6 @@ use crate::pool::{Pool, quote_ident};
 
 use super::apply::ApplyError;
 use super::quarantine;
-use super::target_mutations::TargetMutations;
 
 pub mod one_to_one;
 
@@ -1359,9 +1358,7 @@ async fn run_rederive(
             plan.pin_key_collations(key_collations);
             ChunkPlan::Whole(plan)
         }
-        Some(fields) => {
-            FieldPlan::for_chunk(pool, &definition, fields, lo, hi, key_collations).await?
-        }
+        Some(fields) => FieldPlan::for_chunk(pool, &definition, fields, key_collations).await?,
     };
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
@@ -1415,16 +1412,6 @@ async fn run_rederive(
                 .map_err(build_error)?;
             outcome.keys
         }
-        ChunkPlan::Field(FieldPlan::Direct(rederive, keys)) => {
-            let mut mutations = TargetMutations::new();
-            rederive
-                .settle(&txn, &mut mutations)
-                .await
-                .map_err(build_error)?;
-            mutations.flush(&txn).await.map_err(build_error)?;
-            *keys
-        }
-        ChunkPlan::Field(FieldPlan::Empty) => 0,
     };
     let commit_started = Instant::now();
     txn.execute(
@@ -1452,7 +1439,7 @@ enum ChunkPlan {
 /// which a chunk or a sweep batch of a 1-1 target reads before it plans,
 /// and takes `for share` as its transaction's first lock
 /// ([`hold_plan_epoch`]). A chunk plans before its transaction
-/// (its fields, and for a [`FieldPlan::Direct`] its paused columns),
+/// (its fields and its paused columns),
 /// so an edit can commit in between: `ALTER TRANSFORM`, a column pause or
 /// resume, or a field build's capture release, each of which bumps the
 /// fence. If the chunk then went on, the edit's own field build could
@@ -1516,16 +1503,10 @@ enum FieldPlan {
     /// A plain 1-1 target's: [`one_to_one::run_field_chunk`] over the
     /// fields.
     OneToOne(one_to_one::OneToOnePlan, Vec<String>),
-    /// A 1-1 target the Re-derive build's SQL can't render: a page's
-    /// whole-row Re-derive of the range's keys, built before the chunk's
-    /// transaction, and how many keys it re-derives.
-    Direct(Box<super::apply::DirectRederive>, usize),
-    /// A range with no key to re-derive.
-    Empty,
 }
 
 impl FieldPlan {
-    /// The chunk `(lo, hi]` of `definition`'s field build over `fields`.
+    /// The plan of a chunk of `definition`'s field build over `fields`.
     /// Only a 1-1 target holds a field out of Apply, so only a 1-1 target
     /// has a field build; anything else is
     /// [`BackfillError::Unsupported`](crate::defs::backfill::BackfillError::Unsupported).
@@ -1533,8 +1514,6 @@ impl FieldPlan {
         pool: &Pool,
         definition: &Definition,
         fields: &[String],
-        lo: Option<&str>,
-        hi: &str,
         key_collations: Option<&[Option<String>]>,
     ) -> Result<ChunkPlan, ChunkQueueError> {
         if let Some(mut plan) = one_to_one::OneToOnePlan::for_definition(pool, definition)
@@ -1559,62 +1538,13 @@ impl FieldPlan {
                 .collect();
             return Ok(ChunkPlan::Field(FieldPlan::OneToOne(plan, fields)));
         }
-        if !matches!(
-            definition.def.key_space,
-            crate::defs::ast::KeySpace::OneToOne
-        ) {
-            return Err(build_error(
-                crate::defs::backfill::BackfillError::Unsupported(
-                    "only a 1-1 target has a field build".to_string(),
-                ),
-            ));
-        }
-        let mut pk = ddl::source_primary_key(pool, &definition.source_table)
-            .await
-            .map_err(build_error)?;
-        ddl::pin_key_collations(&mut pk, key_collations);
-        let decode = |text: &str| -> Result<Vec<String>, ChunkQueueError> {
-            Ok(ddl::split_pk_key(&pk, &definition.source_table, text)
-                .map_err(build_error)?
-                .into_iter()
-                .map(|part| part.map(|c| c.into_owned()).unwrap_or_default())
-                .collect())
-        };
-        let (lo, hi) = (lo.map(decode).transpose()?, decode(hi)?);
-        let keys = {
-            let client = pool.get().await?;
-            crate::defs::backfill::range_keys(
-                &**client,
-                &definition.source_table,
-                &definition.def.target,
-                &pk,
-                &lo,
-                &hi,
-            )
-            .await?
-        };
-        if keys.is_empty() {
-            return Ok(ChunkPlan::Field(FieldPlan::Empty));
-        }
-        let excluded = super::quarantine::paused_columns_for(pool, &definition.def)
-            .await
-            .map_err(build_error)?;
-        let rederive = super::apply::DirectRederive::new(
-            pool,
-            &definition.def,
-            &definition.source_table,
-            &definition.target_table,
-            &definition.source_columns,
-            excluded,
-            false,
-            &keys,
-        )
-        .await
-        .map_err(build_error)?;
-        Ok(ChunkPlan::Field(FieldPlan::Direct(
-            Box::new(rederive),
-            keys.len(),
-        )))
+        // Every 1-1 definition define accepts renders
+        // (`one_to_one::buildable`), so this is any other key space.
+        Err(build_error(
+            crate::defs::backfill::BackfillError::Unsupported(
+                "only a 1-1 target has a field build".to_string(),
+            ),
+        ))
     }
 }
 

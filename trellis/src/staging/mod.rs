@@ -73,6 +73,7 @@ pub(crate) mod join_status;
 pub(crate) mod ledger;
 pub mod liveness;
 pub(crate) mod one_to_one_ledger;
+pub(crate) mod one_to_one_render;
 pub(crate) mod page;
 pub mod partition_correction;
 pub mod quarantine;

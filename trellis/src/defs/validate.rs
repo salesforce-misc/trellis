@@ -2920,7 +2920,7 @@ fn infer_expr(
 /// The type-level twin of [`super::eval`]'s `number_literal`; the two must
 /// agree, or the validator and the evaluator would disagree about a field's
 /// target column type.
-fn number_literal_type(text: &str) -> ValueType {
+pub(crate) fn number_literal_type(text: &str) -> ValueType {
     if !text.contains('.')
         && let Ok(value) = text.parse::<i64>()
     {

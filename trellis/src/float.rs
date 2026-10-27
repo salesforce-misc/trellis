@@ -217,6 +217,7 @@ impl fmt::Display for FloatWidth {
 ///
 /// Every one of those is verified against a live server in
 /// `trellis/tests/defs_floats.rs` rather than taken from this comment.
+#[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
 pub fn compare(a: f64, b: f64) -> Ordering {
     // Ordinary (non-NaN) comparison first, exactly as Postgres does — this
     // arm is also what makes `-0 == 0`, since IEEE `==` already says so.
@@ -241,6 +242,7 @@ pub fn compare(a: f64, b: f64) -> Ordering {
 
 /// Postgres's float equality — [`compare`] reduced to a bool, so
 /// `NaN = NaN` is true and `-0 = 0` is true.
+#[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
 pub fn equal(a: f64, b: f64) -> bool {
     compare(a, b) == Ordering::Equal
 }
@@ -256,6 +258,7 @@ pub fn equal(a: f64, b: f64) -> bool {
 /// operand was already infinite (`select 'Infinity'::float4 + 1e38::float4`
 /// is `Infinity`, `select 3.4e38::float4 + 3.4e38::float4` raises). `NaN`
 /// propagates silently — it is a value, not an error.
+#[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
 pub fn checked_add(
     a: f64,
     a_width: FloatWidth,

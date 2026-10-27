@@ -14,6 +14,8 @@
 //! rules addition doesn't need), and a real decimal crate should be
 //! reconsidered at that point rather than growing this by hand indefinitely.
 
+#![cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
+
 use std::cmp::Ordering;
 use std::fmt;
 

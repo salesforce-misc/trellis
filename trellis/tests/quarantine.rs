@@ -29,6 +29,15 @@ use trellis::staging::apply::{self, ApplyError, MAX_HOP_GEN};
 use trellis::staging::converge;
 use trellis::staging::{ChargedKey, FoldedChange, IsolationOutcome, LastChange, isolate_and_evict};
 
+/// Whether `err` is a data exception (SQLSTATE class 22), what a field
+/// Postgres can't compute from a row fails with.
+fn is_data_exception(err: &ApplyError) -> bool {
+    match err {
+        ApplyError::Db(err) => err.code().is_some_and(|code| code.code().starts_with("22")),
+        _ => false,
+    }
+}
+
 /// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
 /// `apply.rs`/`converge.rs`'s convention.
 async fn connect_raw(dsn: &str) -> Client {
@@ -335,7 +344,7 @@ async fn an_innocent_batch_mate_is_not_charged_and_the_error_surfaces_unattribut
         .expect("seed orders rows");
 
     // Key "1" carries a malformed numeric field — fails `eval::evaluate`
-    // (`EvalError::InvalidNumber`), an isolate-eligible failure. Key "2" is
+    // (`22P02`, a data exception), an isolate-eligible failure. Key "2" is
     // healthy.
     let orders = qualify_fixture_table("orders");
     insert_cdc_row(
@@ -362,8 +371,8 @@ async fn an_innocent_batch_mate_is_not_charged_and_the_error_surfaces_unattribut
     let seg_seq = seal_active_segment(&mut client).await;
     let result = apply::drain_once(&db.pool, seg_seq, "worker", 1, "trellis_quarantine_test").await;
     match result {
-        Err(ApplyError::Eval(_)) => {}
-        other => panic!("expected an Eval error to surface, got {other:?}"),
+        Err(err) if is_data_exception(&err) => {}
+        other => panic!("expected a data exception to surface, got {other:?}"),
     }
 
     assert_eq!(
@@ -1996,8 +2005,8 @@ async fn isolation_bisects_a_large_page_to_its_one_poisoned_key() {
         started.elapsed()
     );
     match result {
-        Err(ApplyError::Eval(_)) => {}
-        other => panic!("expected the poisoned key's Eval error to surface, got {other:?}"),
+        Err(err) if is_data_exception(&err) => {}
+        other => panic!("expected the poisoned key's data exception to surface, got {other:?}"),
     }
     assert_eq!(
         charged_keys(&client, &orders).await,
@@ -2017,8 +2026,8 @@ async fn isolation_bisects_a_large_page_to_both_poisoned_keys() {
 
     let (orders, seg_seq) = stage_large_page_with_poisoned(&mut client, &[17, 3900]).await;
     match drain_result(&db.pool, seg_seq).await {
-        Err(ApplyError::Eval(_)) => {}
-        other => panic!("expected a poisoned key's Eval error to surface, got {other:?}"),
+        Err(err) if is_data_exception(&err) => {}
+        other => panic!("expected a poisoned key's data exception to surface, got {other:?}"),
     }
     assert_eq!(
         charged_keys(&client, &orders).await,

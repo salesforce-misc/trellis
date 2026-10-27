@@ -1560,28 +1560,21 @@ async fn isolate_and_evict_probing(
             FailureClass::Isolate => {
                 if let [change] = records {
                     // ADR-0003, layered alongside (not instead
-                    // of) the row-level charge below: a probe failure that's
-                    // specifically an evaluator error names the calculated
-                    // field it broke on
-                    // ([`crate::defs::eval::EvalError::field`]), which this
-                    // attributes to a `(transform, column)` pair and charges
-                    // toward that pair's own, independent fuse. See
+                    // of) the row-level charge below: a record that fails
+                    // alone with a data exception is probed field by field
+                    // (`one_to_one_render::failing_fields`), and each field
+                    // that fails is charged toward its `(transform, column)`
+                    // pair's own, independent fuse. See
                     // [`attribute_column_failure`]'s doc comment for why this
                     // never changes what gets returned from *this* function
                     // — the row-level fuse below is completely unmodified by
-                    // this call. Also see that same doc comment's "Ambiguous
-                    // match -> no attribution, deliberately": if the failing
-                    // field name matches more than one sibling transform on
-                    // this source, this call intentionally attributes nothing
-                    // rather than guess, and the row-level fuse below is
-                    // exactly what still protects against the failure going
-                    // otherwise unhandled. Only a single record's failure is
+                    // this call. Only a single record's failure is
                     // attributed, since a run's names no one key; and it is
                     // attributed as each key is pinned, so a column fuse that
                     // trips mid-isolation pauses the column for the probes
                     // after it.
                     let canonical = canonical_srcs.get(pool, &change.src_table).await?;
-                    attribute_column_failure(pool, &canonical, &change.key, &err).await?;
+                    attribute_column_failure(pool, &canonical, change, &err).await?;
                 }
                 ProbeVerdict::Failed(err)
             }
@@ -1743,9 +1736,12 @@ struct ProbeSite<'a> {
 /// 1. With one reader, it's that one.
 /// 2. Otherwise each reader is probed alone, the others left out, and every
 ///    one that fails is charged.
-/// 3. If none fails alone, the record fails only when several of them apply
-///    it together. With two, it's both of them. With three or more, each is
-///    left out in turn, the others applying the record, and every one whose
+/// 3. If none fails alone and the failure is a data exception, the record
+///    is applied again with all of them: if that is clean too, its failure is
+///    gone (a column fuse tripped since bisection pinned it) and nobody is
+///    charged. Otherwise it fails only
+///    when several of them apply it together. With two, it's both of them.
+///    With three or more, each is left out in turn, the others applying the record, and every one whose
 ///    absence makes the failure go away is charged: it is in every failing
 ///    combination. One that is in none of them (two separate failing pairs,
 ///    say) leaves nobody charged, as bisection charges nobody for a failure
@@ -1827,8 +1823,19 @@ async fn attribute(
         return Ok(culprits);
     }
 
-    // 3. Only together. With two, leaving either out is the other's probe
-    // alone, which step 2 ran: it's both.
+    // 3. Only together — unless it no longer fails at all: a column
+    // fuse that tripped since bisection pinned the record (its own
+    // attribution, or a batch-mate's) leaves it nothing to fail on, and
+    // every reader would be charged for a failure that is gone. Only a data
+    // exception is attributed to a column, so only one is probed again.
+    if super::one_to_one_render::is_data_exception(err) {
+        match probe.run_whole(pool, stats).await? {
+            Probed::Failed(_) => {}
+            Probed::Clean | Probed::Unsettled | Probed::OutOfProbes => return Ok(Vec::new()),
+        }
+    }
+    // With two, leaving either out is the other's probe alone, which step 2
+    // ran: it's both.
     if direct.len() == 2 {
         return Ok(direct
             .iter()
@@ -1875,18 +1882,36 @@ impl Probe<'_> {
         direct: DirectFocus,
         stats: &mut IsolationStats,
     ) -> Result<Probed, ApplyError> {
-        if stats.probes >= MAX_ISOLATION_PROBES {
-            stats.stopped.get_or_insert(IsolationStop::ProbeLimit);
-            return Ok(Probed::OutOfProbes);
-        }
-        stats.probes += 1;
         let focus = apply::ProbeFocus {
             src_table: self.src_table,
             key: &self.change.key,
             direct,
         };
+        self.run_focused(pool, Some(&focus), stats).await
+    }
+
+    /// Applies the record with every reader its poison leaves in.
+    async fn run_whole(
+        &self,
+        pool: &Pool,
+        stats: &mut IsolationStats,
+    ) -> Result<Probed, ApplyError> {
+        self.run_focused(pool, None, stats).await
+    }
+
+    async fn run_focused(
+        &self,
+        pool: &Pool,
+        focus: Option<&apply::ProbeFocus<'_>>,
+        stats: &mut IsolationStats,
+    ) -> Result<Probed, ApplyError> {
+        if stats.probes >= MAX_ISOLATION_PROBES {
+            stats.stopped.get_or_insert(IsolationStop::ProbeLimit);
+            return Ok(Probed::OutOfProbes);
+        }
+        stats.probes += 1;
         let records = std::slice::from_ref(self.change);
-        let Some(err) = probe_records(pool, self.at, records, Some(&focus)).await? else {
+        let Some(err) = probe_records(pool, self.at, records, focus).await? else {
             return Ok(Probed::Clean);
         };
         if is_claim_lost(&err) {
@@ -2295,74 +2320,85 @@ async fn quarantine_if_crossed(
 // status (the existing whole-transform fuse) is completely unaffected by
 // this scope cut.
 
-/// Attributes `err` to a `(transform, column)` pair and charges it toward
-/// that pair's fuse, if `err` is specifically
-/// [`crate::defs::eval::EvalError`] (a calculated-field failure — the only
-/// kind [`crate::defs::eval::EvalError::field`] can name) coming from a
-/// [`crate::defs::ast::KeySpace::OneToOne`] definition. Anything else (a DDL/
-/// key-shape failure, a plain database error) is left entirely to the
-/// existing row-level fuse — this function is a no-op for it.
+/// Attributes `err`, the failure of `change` (of canonical source
+/// `src_table`) applied alone, to the `(transform, column)` pairs it fails
+/// in and charges each toward that pair's fuse, if `err` is a data exception
+/// (SQLSTATE class 22, `one_to_one_render::is_data_exception`). Anything
+/// else (a DDL/key-shape failure, a constraint on the target) is left
+/// entirely to the existing row-level fuse — this function is a no-op for
+/// it.
 ///
-/// Attribution is by field-name match against every definition
-/// [`crate::defs::catalog::transforms_for_source`] returns for `src_table`
-/// — [`super::apply::compute`] evaluates one definition's fields inside one
-/// `eval::evaluate*` call and doesn't itself thread transform identity
-/// through [`crate::defs::eval::EvalError`] (which would mean widening that
-/// error type's public shape, and every existing construction site/test of
-/// it, just for this one caller).
-///
-/// **Ambiguous match -> no attribution, deliberately.** If more than one
-/// sibling `KeySpace::OneToOne` definition on `src_table` declares a field
-/// named [`crate::defs::eval::EvalError::field`], there is no reliable way
-/// to tell here which one actually produced `err` (only one may even be the
-/// one that's broken). Guessing — e.g. "lowest id wins" — would be a
-/// *deterministic misattribution*: every failure would land on the same
-/// (possibly perfectly healthy) column every time, potentially freezing it
-/// while the actually-broken sibling never accumulates a `column_status`
-/// entry at all. That's worse than doing nothing, so this falls through to
-/// the existing whole-row/transform-wide fuse (the row-level charge
-/// [`isolate_and_evict`] already runs alongside this call, unaffected by
-/// this function's return value either way) instead of attempting a fancier
-/// disambiguation heuristic.
+/// The per-field probe names the pairs: each
+/// [`crate::defs::ast::KeySpace::OneToOne`] definition reading `src_table`
+/// evaluates each of its fields alone over the record's row
+/// (`one_to_one_render::failing_fields`): an Apply's new image, or a
+/// Re-derive's live source row. A field is charged unless a field it reads
+/// by alias fails too, since then its failure is that field's
+/// ([`AliasReaders`]): pausing that field pauses its readers with it.
 async fn attribute_column_failure(
     pool: &Pool,
     src_table: &str,
-    key: &str,
+    change: &FoldedChange,
     err: &ApplyError,
 ) -> Result<(), ApplyError> {
-    let ApplyError::Eval(eval_err) = err else {
+    if !super::one_to_one_render::is_data_exception(err) {
         return Ok(());
-    };
-    let field = eval_err.field();
-
+    }
     // Qualify first — a bare `src_table` handed straight to
     // `transforms_for_source` returns an empty candidate set, so every column
     // failure on it fell through unattributed. See [`qualified_src_table`].
     let qualified = qualified_src_table(pool, src_table).await?;
-    let candidates = catalog::transforms_for_source(pool, &qualified).await?;
-    let mut matches = candidates.into_iter().filter(|def| {
-        matches!(def.def.key_space, KeySpace::OneToOne)
-            && def.def.fields.iter().any(|f| f.name == field)
-    });
-    let Some(def) = matches.next() else {
-        return Ok(());
-    };
-    // See this function's doc comment ("Ambiguous match -> no attribution,
-    // deliberately"): a second sibling definition matching the same field
-    // name means attribution would be a guess, not a fact, so fall back to
-    // the pre-existing row-level fuse rather than risk freezing the wrong
-    // column.
-    if matches.next().is_some() {
+    let candidates: Vec<_> = catalog::transforms_for_source(pool, &qualified)
+        .await?
+        .into_iter()
+        .filter(|def| matches!(def.def.key_space, KeySpace::OneToOne))
+        .collect();
+    if candidates.is_empty() {
         return Ok(());
     }
-    let transform = def.def.target;
-
-    // `column_failures` is keyed on the canonical identity, not the
-    // raw ring spelling — its primary key `(transform_table, column_name,
-    // src_table, key)` is what makes `column_deaths` count *distinct* failing
-    // rows, and a split key let one stubborn row charge that counter twice
-    // (the one place the dual spelling over-counted rather than under-counted).
-    charge_column_failure(pool, &transform, field, &qualified, key, &err.to_string()).await
+    let Some(image) = super::apply::record_row_image(pool, change).await? else {
+        return Ok(());
+    };
+    let columns = {
+        let client = pool.get().await?;
+        super::one_to_one_render::image_columns(&**client, &change.src_table).await?
+    };
+    for def in candidates {
+        let paused = paused_columns_for(pool, &def.def).await?;
+        let render = super::one_to_one_render::OneToOneRender::new(&def.def, &columns, &paused)?;
+        let failing = {
+            let client = pool.get().await?;
+            super::one_to_one_render::failing_fields(&**client, &render, &image).await?
+        };
+        let readers = AliasReaders::of(&def.def);
+        let mut explained: HashSet<String> = HashSet::new();
+        for (field, _) in &failing {
+            let mut closure = HashSet::from([field.clone()]);
+            readers.close(&mut closure);
+            closure.remove(field);
+            explained.extend(closure);
+        }
+        // `column_failures` is keyed on the canonical identity, not the
+        // raw ring spelling — its primary key `(transform_table, column_name,
+        // src_table, key)` is what makes `column_deaths` count *distinct*
+        // failing rows, and a split key let one stubborn row charge that
+        // counter twice.
+        for (field, error) in failing {
+            if explained.contains(&field) {
+                continue;
+            }
+            charge_column_failure(
+                pool,
+                &def.def.target,
+                &field,
+                &qualified,
+                &change.key,
+                &error,
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Every column [`super::apply::compute`] must currently exclude from

@@ -30,6 +30,15 @@ use trellis::staging::apply::{self, ApplyError};
 use trellis::staging::quarantine::{self, DEFAULT_COLUMN_DEATH_THRESHOLD};
 use trellis::{BlockingTrellis, Config, Trellis, TrellisOptions};
 
+/// Whether `err` is a data exception (SQLSTATE class 22), what a field
+/// Postgres can't compute from a row fails with.
+fn is_data_exception(err: &ApplyError) -> bool {
+    match err {
+        ApplyError::Db(err) => err.code().is_some_and(|code| code.code().starts_with("22")),
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------
 // Shared scaffolding (mirrors `tests/quarantine.rs`)
 // ---------------------------------------------------------------------
@@ -230,8 +239,8 @@ async fn stage_bad_orders(client: &mut Client, pool: &trellis::Pool, ids: &[i64]
     let result =
         apply::drain_once(pool, seg_seq, "worker", 1, "trellis_column_quarantine_test").await;
     assert!(
-        matches!(result, Err(ApplyError::Eval(_))),
-        "a malformed numeric field must still surface as an evaluator failure, got {result:?}"
+        result.as_ref().is_err_and(is_data_exception),
+        "a malformed numeric field must still surface as a data exception, got {result:?}"
     );
 }
 
@@ -408,7 +417,7 @@ async fn a_column_fuse_trip_that_waits_out_the_lock_timeout_trips_on_the_next_fa
     )
     .await;
     assert!(
-        !matches!(result, Err(ApplyError::Eval(_)) | Ok(_)),
+        !(result.is_ok() || result.as_ref().is_err_and(is_data_exception)),
         "the trip's bump must wait out the lock timeout, got {result:?}"
     );
     assert_eq!(
@@ -434,7 +443,7 @@ async fn a_column_fuse_trip_that_waits_out_the_lock_timeout_trips_on_the_next_fa
     )
     .await;
     assert!(
-        matches!(result, Err(ApplyError::Eval(_))),
+        result.as_ref().is_err_and(is_data_exception),
         "the row still fails, got {result:?}"
     );
     let status = column_status_row(&client, "order_totals", "total")
@@ -1899,24 +1908,19 @@ async fn resume_recomputes_every_row_of_a_composite_key_target_across_chunks() {
 }
 
 // ---------------------------------------------------------------------
-// (j) Regression: ambiguous field-name attribution must fall back to no
-//     column-level attribution (should-fix 4).
+// (j) Two siblings with the same field name: the per-field probe charges
+//     only the one whose field fails.
 // ---------------------------------------------------------------------
 
 /// Two sibling `KeySpace::OneToOne` transforms on the same source table,
 /// both declaring a field named `total` — only `sib_b`'s formula is
 /// actually broken (it reads `qty`, staged as unparseable below; `sib_a`
-/// only reads `price`/`tax`, both fine). `attribute_column_failure` used to
-/// resolve the ambiguity by picking whichever candidate
-/// `transforms_for_source` happened to return first (lowest id), a
-/// deterministic misattribution: it could freeze `sib_a`'s perfectly
-/// healthy `total` while `sib_b`'s actually-broken one never accumulates a
-/// `column_status` entry at all. Proves the fix: neither sibling gets a
-/// column-level attribution, while the pre-existing row-level/transform-wide
-/// fuse still evicts the stubborn key exactly as it did before this
-/// feature.
+/// only reads `price`/`tax`, both fine). The per-field probe evaluates each
+/// definition's own fields, so the shared name is no ambiguity: `sib_b`'s
+/// `total` is charged and pauses at the threshold, `sib_a`'s never, and the
+/// row-level fuse still charges each stubborn key.
 #[tokio::test]
-async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribution() {
+async fn a_shared_field_name_charges_only_the_sibling_whose_field_fails() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
@@ -2036,8 +2040,8 @@ async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribut
     )
     .await;
     assert!(
-        matches!(result, Err(ApplyError::Eval(_))),
-        "the malformed qty must still surface as an evaluator failure, got {result:?}"
+        result.as_ref().is_err_and(is_data_exception),
+        "the malformed qty must still surface as a data exception, got {result:?}"
     );
 
     assert_eq!(
@@ -2046,17 +2050,15 @@ async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribut
         "the healthy sibling must never be attributed to, even though its field name matches \
          the actually-broken sibling's"
     );
-    assert_eq!(
-        column_status_row(&client, "sib_b", "total").await,
-        None,
-        "the actually-broken sibling must also get no column-level attribution — ambiguous \
-         attribution must fall back to no attribution at all, not a guess"
+    assert!(
+        column_status_row(&client, "sib_b", "total").await.is_some(),
+        "the broken sibling's column pauses once its distinct failing rows reach the threshold"
     );
 
-    // The pre-existing row-level fuse's own bookkeeping must be completely
-    // unaffected by the ambiguity fallback: every distinct bad row is still
-    // charged toward its own key-level counter exactly as it would be
-    // without this feature (`tests/quarantine.rs`'s own fuse, untouched).
+    // The column fuse trips while isolation pins the fifth row, before
+    // isolation attributes the pinned rows to a definition: by then `sib_b`
+    // writes nothing for them, so they apply, and neither sibling is
+    // charged for them.
     let shared_src = qualify_fixture_table("shared_src");
     for id in &bad_ids {
         let deaths: Option<i32> = client
@@ -2068,10 +2070,8 @@ async fn ambiguous_field_name_attribution_falls_back_to_no_column_level_attribut
             .expect("read key_deaths")
             .map(|row| row.get(0));
         assert_eq!(
-            deaths,
-            Some(1),
-            "row-level key_deaths bookkeeping for id {id} must proceed normally, unaffected by \
-             the ambiguity fallback"
+            deaths, None,
+            "id {id} applies once its failing column is paused"
         );
     }
 }
@@ -2368,8 +2368,8 @@ async fn stage_bad_orders_bare(client: &mut Client, pool: &trellis::Pool, ids: &
     let result =
         apply::drain_once(pool, seg_seq, "worker", 1, "trellis_column_quarantine_test").await;
     assert!(
-        matches!(result, Err(ApplyError::Eval(_))),
-        "a malformed numeric field must still surface as an evaluator failure for a bare \
+        result.as_ref().is_err_and(is_data_exception),
+        "a malformed numeric field must still surface as a data exception for a bare \
          src_table (`apply::compute` resolves it via `qualified_schema_node_key`), got \
          {result:?}"
     );
@@ -2387,7 +2387,7 @@ async fn stage_bad_orders_bare(client: &mut Client, pool: &trellis::Pool, ids: &
 /// deliberate ambiguous-match fallback, and with no log line either.
 ///
 /// Note `apply::compute` itself handles the same bare row fine (hence the
-/// `ApplyError::Eval` this fixture asserts on): it routes every
+/// data exception this fixture asserts on): it routes every
 /// `transforms_for_source` call through its own `qualified_schema_node_key`.
 /// The gap was quarantine's two call sites alone. Pre-fix both assertions
 /// below see `None`; post-fix the column is charged and, at the threshold,

@@ -14,7 +14,7 @@
 //!    the GC collects between the two fails the page transiently.
 //! 2. **Re-derive read** ([`read_rows`], I1): the Re-derived keys' source
 //!    rows, `pg_current_snapshot()` and the newest segment in one statement,
-//!    after the lock. The rows are evaluated in Rust, as Phase 2 evaluates
+//!    after the lock, each row as a text-valued jsonb object, the shape of
 //!    an Apply's image.
 //! 3. **The entries** ([`update_entries`], I2): a Re-derive sets `basis` to
 //!    the read's snapshot and leaves `applied_lsn` alone (the D split's Q1);
@@ -29,8 +29,9 @@
 //!    neither step wrote (an Apply at or below the floor, or a Re-derive the
 //!    page skipped) is deleted ([`drop_placeholders`]): the tombstone
 //!    GC collects only tombstones.
-//! 4. The target rows of exactly those keys are upserted or deleted, as
-//!    before (`super::apply::apply_target`).
+//! 4. The target rows of exactly those keys are upserted or deleted
+//!    (`super::apply::apply_target`), the upsert evaluating the fields over
+//!    each key's image or read row (`super::one_to_one_render`).
 //!
 //! An Apply the predicate refuses was already reflected by a Re-derive whose
 //! snapshot saw it, or overtaken by a later change: writing it would put an
@@ -50,7 +51,6 @@ use tokio_postgres::Transaction;
 use tokio_postgres::types::PgLsn;
 
 use crate::defs::ddl::{self, PrimaryKeyColumn};
-use crate::defs::eval::Row;
 use crate::defs::ledger as schema;
 use crate::pool::quote_ident;
 
@@ -177,13 +177,13 @@ pub(crate) async fn lock_entries(
 /// What [`read_rows`] read: the rows, by key text, the snapshot, and the
 /// newest segment the snapshot sees.
 pub(crate) struct ReadRows {
-    pub rows: HashMap<String, Row>,
+    pub rows: HashMap<String, String>,
     pub snapshot: String,
     pub seg: i64,
 }
 
-/// The Re-derive read: the current source rows of `keys` (each `columns`
-/// as text, keyed by the row's key text), `pg_current_snapshot()` and the
+/// The Re-derive read: the current source rows of `keys` (each a jsonb
+/// object of its `columns` as text, as text, keyed by the row's key text), `pg_current_snapshot()` and the
 /// newest segment (`max(seg_seq)`), in one statement. A key with no row is
 /// absent from the map. `keys` must not be empty.
 ///
@@ -210,11 +210,10 @@ pub(crate) async fn read_rows(
     let sql = format!(
         "select null::text, (select coalesce(max(seg_seq), 0) from segments)::text, \
                 pg_catalog.pg_current_snapshot()::text \
-         union all select m.k, e.key, e.value from ({}) m \
-         cross join lateral jsonb_each_text(m.doc) e",
+         union all select m.k, m.doc::text, null from ({}) m",
         query.docs
     );
-    let mut rows: HashMap<String, Row> = HashMap::new();
+    let mut rows: HashMap<String, String> = HashMap::new();
     let mut snapshot = String::new();
     let mut seg = 0;
     for row in super::ledger::query_by_entry_key(txn, &sql, &query.params()).await? {
@@ -227,7 +226,7 @@ pub(crate) async fn read_rows(
                 snapshot = row.get(2);
             }
             Some(key) => {
-                rows.entry(key).or_default().insert(row.get(1), row.get(2));
+                rows.insert(key, row.get(1));
             }
         }
     }

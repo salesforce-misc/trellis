@@ -19,12 +19,13 @@ use std::fmt;
 use crate::pool::Pool;
 use crate::pool::quote_ident;
 
-use super::ast::{Expr, Operator, TransformDef};
 #[cfg(any(test, feature = "test-util"))]
-use super::ast::{KeySpace, ValueType};
+use super::ast::KeySpace;
+use super::ast::{Expr, Operator, TransformDef, ValueType};
 #[cfg(any(test, feature = "test-util"))]
 use super::eval::{EvalError, RegexCache, Row, Value, evaluate, evaluate_aggregate};
 use super::typed_literal;
+use crate::integer::IntWidth;
 
 /// Why a from-scratch recompute failed.
 #[derive(Debug)]
@@ -421,7 +422,7 @@ fn collect_columns(
 pub fn render_expr_sql(expr: &Expr) -> String {
     match expr {
         Expr::Column(name) | Expr::SourceColumn { column: name, .. } => quote_ident(name),
-        Expr::NumberLiteral(text) => format!("{text}::numeric"),
+        Expr::NumberLiteral(text) => number_literal_sql(text),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
@@ -450,6 +451,21 @@ pub fn render_expr_sql(expr: &Expr) -> String {
     }
 }
 
+/// An unadorned number literal, cast to the type `validate` infers for it
+/// (`integer` if it fits, else `bigint`, else `numeric`), which is the type
+/// Postgres's own lexer gives the bare literal. Overflow, and the result
+/// type an operator over it has, are then the ones the definition's
+/// declared column types were inferred with: `int4_col + 1` is `integer`
+/// and overflows where an `integer` does.
+fn number_literal_sql(text: &str) -> String {
+    let pg_type = match super::validate::number_literal_type(text) {
+        ValueType::Integer(IntWidth::Int4) => "integer",
+        ValueType::Integer(IntWidth::Int8) => "bigint",
+        _ => "numeric",
+    };
+    format!("{text}::{pg_type}")
+}
+
 /// [`render_expr_sql`] with every source column qualified by `source_sql`
 /// (already-quoted SQL text — a quoted table name, or a query alias such as
 /// `s`), for SQL that reads the source under an alias: the group-basis and
@@ -459,7 +475,7 @@ pub(crate) fn render_qualified_expr_sql(expr: &Expr, source_sql: &str) -> String
         Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {
             format!("{source_sql}.{}", quote_ident(name))
         }
-        Expr::NumberLiteral(text) => format!("{text}::numeric"),
+        Expr::NumberLiteral(text) => number_literal_sql(text),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
