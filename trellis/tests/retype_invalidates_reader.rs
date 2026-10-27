@@ -579,6 +579,55 @@ async fn a_source_retype_to_a_float_pauses_its_sum_reader_and_the_resume_refuses
     trellis.shutdown().await.expect("shutdown");
 }
 
+/// A `COALESCE` constant outside `real`'s range is refused by an `ALTER
+/// TRANSFORM` as by define. Over a `double precision` column it is in range,
+/// so it defines; re-typing the column to `real` pauses the transform on the
+/// capture pass, and the resume refuses as define would.
+#[tokio::test]
+async fn a_coalesce_constant_out_of_range_after_a_retype_to_real_pauses_and_the_resume_refuses() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.src (id int primary key, x double precision, r real); \
+         insert into public.src values (1, 1.5, 2.5)",
+    )
+    .await
+    .expect("table");
+    let trellis = definer(db.dsn()).await;
+    let beyond_real = format!("1{}", "0".repeat(39));
+    trellis
+        .apply(&format!(
+            "TRANSFORM one FROM public.src SELECT COALESCE(x, {beyond_real}) AS v"
+        ))
+        .await
+        .expect("define one");
+    bring_live(&mut raw, &db.pool, &["one"]).await;
+
+    match trellis
+        .apply(&format!(
+            "ALTER TRANSFORM one ADD COALESCE(r, {beyond_real}) AS w"
+        ))
+        .await
+    {
+        Err(err) => assert!(err.to_string().contains("out of range for real"), "{err}"),
+        Ok(applied) => panic!("the alter should be refused: {applied:?}"),
+    }
+
+    raw.batch_execute("alter table public.src alter column x type real")
+        .await
+        .expect("retype x");
+    full_pass(&mut raw, &db.pool).await;
+    let reported = trellis.status("one").await.expect("status").expect("one");
+    assert_eq!(reported.status, TransformStatus::Paused, "{reported:?}");
+
+    match trellis.apply("RESUME TRANSFORM one").await {
+        Err(err) => assert!(err.to_string().contains("out of range for real"), "{err}"),
+        Ok(applied) => panic!("the resume should be refused: {applied:?}"),
+    }
+    trellis.shutdown().await.expect("shutdown");
+}
+
 /// Rules 1 and 4: an alter that changes a column's type within the string
 /// family leaves a `JOIN` key pair `t.k = o.k` valid (Trellis's copy of a
 /// `varchar(n)` column is unbounded, and `varchar` and `text` pair),

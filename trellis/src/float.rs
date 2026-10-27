@@ -344,14 +344,25 @@ pub fn literal_to_f64(text: &str) -> Result<f64, FloatError> {
 /// [`literal_to_f64`] narrowed to `width`: the constant Postgres casts a bare
 /// number literal to when the other `COALESCE` argument is that float type.
 /// For `real` it errors where `float4in` does: a value past `real`'s finite
-/// range, or a nonzero one that underflows to zero.
+/// range, or a nonzero one that underflows to zero. The text is rounded to
+/// `real` once, as `float4in`'s `strtof` rounds it: rounding to `double
+/// precision` first would round twice, and a literal just inside `real`'s
+/// limits could land on a halfway point and round out of range.
 pub fn literal_to_width(text: &str, width: FloatWidth) -> Result<f64, FloatError> {
-    let wide = literal_to_f64(text)?;
-    let narrowed = width.round(wide);
-    if narrowed.is_infinite() || (narrowed == 0.0 && wide != 0.0) {
-        return Err(FloatError::OutOfRange { width });
+    match width {
+        FloatWidth::Float8 => literal_to_f64(text),
+        FloatWidth::Float4 => {
+            let value: f32 = text.parse().map_err(|_| FloatError::Invalid {
+                width,
+                text: text.to_string(),
+            })?;
+            let nonzero_digits = text.bytes().any(|b| (b'1'..=b'9').contains(&b));
+            if !value.is_finite() || (value == 0.0 && nonzero_digits) {
+                return Err(FloatError::OutOfRange { width });
+            }
+            Ok(f64::from(value))
+        }
     }
-    Ok(narrowed)
 }
 
 /// Renders a float exactly as Postgres's `float4out`/`float8out` do under
@@ -440,6 +451,34 @@ pub fn render(value: f64, width: FloatWidth) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each case's verdict is what Postgres 17 gives for
+    /// `COALESCE(real_col, <literal>)`. The first and last two lie within a
+    /// `double precision` step of a halfway point at `real`'s limits, where
+    /// rounding through `double precision` would round them out of range.
+    #[test]
+    fn a_literal_narrows_to_real_as_float4in_rounds_it() {
+        let half_ulp_of_the_smallest_subnormal = format!(
+            "0.{}70064923216240853546186479164495806564013097093825788587853414194489554134293031",
+            "0".repeat(45)
+        );
+        for (text, in_range) in [
+            ("340282356779733661637539395458142568447", true),
+            ("340282346638528859811704183484516925440", true),
+            ("340282356779733661637539395458142568448", false),
+            ("1000000000000000000000000000000000000000", false),
+            (half_ulp_of_the_smallest_subnormal.as_str(), true),
+            ("0.0000000000000000000000000000000000000000000007006", false),
+            ("0.000000000000000000000000000000000000000000001", true),
+            ("0.0", true),
+        ] {
+            assert_eq!(
+                literal_to_width(text, FloatWidth::Float4).is_ok(),
+                in_range,
+                "{text}"
+            );
+        }
+    }
 
     #[test]
     fn pg_names_round_trip() {

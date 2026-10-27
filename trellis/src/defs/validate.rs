@@ -199,10 +199,12 @@ pub enum ValidationError {
     /// `double precision`'s range (overflow, or a nonzero value that
     /// underflows to zero). Postgres raises `22003` for it at plan time.
     FloatComparisonLiteralOutOfRange { field: String, text: String },
-    /// A bare number literal in a `COALESCE` whose result is a float lies
-    /// outside that float type's range (overflow, or a nonzero value that
-    /// underflows to zero). Postgres casts the literal to the float type and
-    /// raises `22003` for it at plan time, for every row.
+    /// A constant argument of a `COALESCE` whose result is a float (a number
+    /// literal, or a sum, `COALESCE` or calculated field made only of
+    /// literals) lies outside that float type's range (overflow, or a nonzero
+    /// value that underflows to zero). Postgres folds the constant, casts it
+    /// to the float type and raises `22003` at plan time, for every row.
+    /// `text` is the argument as written.
     CoalesceLiteralOutOfRange {
         field: String,
         text: String,
@@ -767,10 +769,10 @@ impl fmt::Display for ValidationError {
                 target,
             } => write!(
                 f,
-                "calculated field '{field}' has a COALESCE fallback literal {text} that is out \
-                 of range for {target}, the type of the COALESCE's other arguments; Postgres \
-                 cannot cast it. Use a literal within {target}'s range, or a column as the \
-                 fallback (see \"Supported sources and targets\" in docs/transforms.md)"
+                "calculated field '{field}' has a COALESCE argument {text}, a constant out of \
+                 range for {target}, the type the COALESCE resolves to; Postgres cannot cast \
+                 it. Use a constant within {target}'s range, or a column (see \"Supported \
+                 sources and targets\" in docs/transforms.md)"
             ),
             ValidationError::MixedFloatExactComparison { field, lhs, rhs } => write!(
                 f,
@@ -2592,6 +2594,46 @@ fn infer_field(
     Ok(t)
 }
 
+/// The value of `expr` when it is an exact constant Postgres folds at plan
+/// time: a number literal, a `+` of two constants, a `COALESCE` whose first
+/// argument is one (the grammar has no `NULL`, so it is the result), or a
+/// calculated field whose expression is one, resolved as [`infer_expr`]
+/// resolves a name. `None` for anything that reads a column.
+fn exact_constant(
+    expr: &Expr,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
+    depth: usize,
+) -> Option<crate::numeric::Numeric> {
+    // Inference has already refused a cycle; this bounds a hand-built one.
+    if depth > fields_by_name.len() + 64 {
+        return None;
+    }
+    let recurse = |expr: &Expr, field_name: &str| {
+        exact_constant(expr, field_name, source_columns, fields_by_name, depth + 1)
+    };
+    match expr {
+        Expr::NumberLiteral(text) => crate::numeric::Numeric::parse(text).ok(),
+        Expr::BinaryOp {
+            op: super::ast::Operator::Add,
+            lhs,
+            rhs,
+        } => Some(recurse(lhs, field_name)?.add(&recurse(rhs, field_name)?)),
+        Expr::FunctionCall { name, args } if name == "COALESCE" => {
+            recurse(args.first()?, field_name)
+        }
+        Expr::Column(name) => {
+            let is_self_passthrough = name == field_name && source_columns.contains_key(name);
+            let calc_field = fields_by_name
+                .get(name.as_str())
+                .filter(|_| !is_self_passthrough)?;
+            recurse(&calc_field.expr, &calc_field.name)
+        }
+        _ => None,
+    }
+}
+
 fn infer_expr(
     expr: &Expr,
     field_name: &str,
@@ -2777,19 +2819,21 @@ fn infer_expr(
                 }
             }
             let common_type = common_type.unwrap();
-            // A bare number literal is an untyped constant that Postgres
-            // casts to the COALESCE's resolved type. For an exact result the
-            // literal's own type already unifies upward (an integer literal
-            // too wide for `integer` is `bigint`, then `numeric`), so only a
-            // float result can leave it out of range.
+            // Postgres casts each argument to the COALESCE's resolved type,
+            // and folds a constant one (a number literal, or a sum, COALESCE
+            // or calculated field made only of them) at plan time. For an
+            // exact result the constant's own type already unifies upward
+            // (an integer literal too wide for `integer` is `bigint`, then
+            // `numeric`), so only a float result can leave it out of range.
             if let ValueType::Float(width) = common_type {
                 for arg in args {
-                    if let Expr::NumberLiteral(text) = arg
-                        && crate::float::literal_to_width(text, width).is_err()
+                    if let Some(value) =
+                        exact_constant(arg, field_name, source_columns, fields_by_name, 0)
+                        && crate::float::literal_to_width(&value.to_string(), width).is_err()
                     {
                         return Err(ValidationError::CoalesceLiteralOutOfRange {
                             field: field_name.to_string(),
-                            text: text.clone(),
+                            text: super::ast::render_field_expr(arg),
                             target: common_type,
                         });
                     }
@@ -3954,6 +3998,44 @@ mod tests {
         ] {
             let d = parsed(&format!("TRANSFORM t FROM s SELECT {expr} AS out"));
             assert_eq!(validate(&d, &source_columns), Ok(()), "{expr}");
+        }
+        // Postgres folds a constant argument made of literals too, so the
+        // cast fails for every row the same way: a sum, a COALESCE whose
+        // first argument is the literal, and a calculated field holding it.
+        for (fields, text) in [
+            (
+                format!("COALESCE(r, {beyond_real} + 1) AS out"),
+                format!("({beyond_real} + 1)"),
+            ),
+            (
+                format!("COALESCE(r, COALESCE({beyond_real}, i)) AS out"),
+                format!("COALESCE({beyond_real}, i)"),
+            ),
+            (
+                format!("{beyond_real} AS big, COALESCE(r, big) AS out"),
+                "big".to_string(),
+            ),
+        ] {
+            let d = parsed(&format!("TRANSFORM t FROM s SELECT {fields}"));
+            assert_eq!(
+                validate(&d, &source_columns),
+                Err(ValidationError::CoalesceLiteralOutOfRange {
+                    field: "out".to_string(),
+                    text,
+                    target: ValueType::Float(FloatWidth::Float4),
+                }),
+                "{fields}"
+            );
+        }
+        // An argument that reads a column is not a constant: the cast fails
+        // only for the rows whose value is out of range.
+        for fields in [
+            format!("COALESCE(r, i + {beyond_real}) AS out"),
+            format!("COALESCE(r, COALESCE(i, {beyond_real})) AS out"),
+            format!("{beyond_real} + i AS big, COALESCE(r, big) AS out"),
+        ] {
+            let d = parsed(&format!("TRANSFORM t FROM s SELECT {fields}"));
+            assert_eq!(validate(&d, &source_columns), Ok(()), "{fields}");
         }
     }
 
