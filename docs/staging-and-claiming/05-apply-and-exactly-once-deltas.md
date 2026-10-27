@@ -29,9 +29,9 @@ sequenceDiagram
     end
 
     rect rgb(160,160,160,0.12)
-    Note over W,DB: Phase 2 — compute (NO transaction, NO locks held)
-    W->>DB: read source rows, prefetch related rows
-    W->>W: evaluate derivations in dependency order
+    Note over W,DB: Phase 2 — plan (NO transaction, NO locks held)
+    W->>DB: read the catalog, the poisoned keys and the paused columns
+    W->>W: render each 1-1 definition's fields to SQL
     W->>DB: heartbeat the claim, per source table
     end
 
@@ -39,7 +39,7 @@ sequenceDiagram
     Note over W,DB: Phase 3 — apply ∪ mark (ONE transaction)
     W->>DB: BEGIN
     W->>DB: 1. version fence (FOR SHARE on each computed source)
-    W->>DB: 2. derived writes, gone-key deletes, truncate handling<br/>(1-1: sorted entry lock + I2 test)
+    W->>DB: 2. derived writes, gone-key deletes, truncate handling<br/>(1-1: sorted entry lock + I2 test, fields evaluated in the upsert)
     W->>DB: 3. aggregate groups (sorted group lock, basis test, partial increments)
     W->>DB: 4. downstream staging — into the ACTIVE batch
     W->>DB: 5. last page: mark this claim's buckets drained<br/>earlier page: check the claim, advance the cursor
@@ -56,10 +56,24 @@ fold, compute and Phase 3 transaction (see
 commits on its own before any fold, so a peer's claim never waits on this
 worker's fold.
 
-**Phase 2 holds no locks and no transaction.** Deliberate: compute can be
-arbitrarily expensive without blocking a writer, another worker, or — by holding a
-snapshot open — the seal gate and cleanup pass. The price is that the world can
-move under you, which the version fence and the immutable batch exist to handle.
+**Phase 2 holds no locks and no transaction**, and computes no values. It
+reads what a page's plan needs (the definitions reading each source, the keys
+poisoned for them, their paused columns, the source's key and columns) and
+renders each 1-1 definition's fields to SQL. Postgres evaluates the fields in
+Phase 3, in the upsert that writes the target rows
+([ADR-0002](../decisions/0002-async-data-flow.md#the-1-1-ledger-one-target-owned-entry-per-source-row)),
+so evaluation runs inside the transaction that holds the page's entry and
+target-row locks. What bounds that is the page: at most `drain_batch_cap`
+records, one upsert statement per few thousand rows of a target, every lock
+statement under `lock_timeout`
+([below](#no-lock-wait-holds-a-snapshot-open-adr-0002-i7)). How long a page
+holds its locks is `trellis_page_transaction_seconds`
+([observability](../observability.md)). Evaluating in Postgres costs the
+transaction less than binding Rust's computed values did: in the
+`one-to-one-apply` benchmark a 1-1 page's transaction averaged 140–181 ms
+instead of 236–296 ms, at 26.5 µs of Postgres CPU per row instead of 33–36.
+Phase 2's world can move under it, which the version fence and the immutable
+batch exist to handle.
 
 ## The exactly-once argument
 
@@ -197,9 +211,8 @@ image of the commit it came from (its `lsn` and source `txid`), and a
 record of a page whose oldest batch is at or below the target's `build_seg`,
 the segment its Re-derive build started in, is a Re-derive too: such a
 batch may hold a change committed before the start whose later change drained
-before it, unapplied, so its image is stale. Phase 2
-evaluates an Apply's image; Phase 3 settles each 1-1 target's records in one
-pass:
+before it, unapplied, so its image is stale. An Apply is written from its
+image; Phase 3 settles each 1-1 target's records in one pass:
 
 1. **The entry lock (I5).** Insert an entry for every key with none, then
    lock every other entry `for update`, sorted by key. A new key's Apply is
@@ -209,7 +222,8 @@ pass:
    at a time. It can't be the target row's `FOR UPDATE`: a stale insert
    racing a delete has no row to lock. A key whose tombstone the GC collects
    between the two statements fails the page transiently and it is retried.
-2. **The Re-derive read (I1).** The Re-derived keys' source rows and
+2. **The Re-derive read (I1).** The Re-derived keys' source rows, each a
+   jsonb object of its columns' text as an image is, and
    `pg_current_snapshot()`, in one statement, after the lock. A key with no
    row is a delete.
 3. **The entries (I2).** A Re-derive sets the entry's `__basis` to the read's
@@ -218,11 +232,15 @@ pass:
    then sets `__applied_lsn`. Either raises `__applied_seg` and marks a
    tombstone when the key has no row after it. The statement returns the keys
    it changed. A placeholder step 1 inserted that neither step wrote (an
-   Apply at or below the truncate floor, or a Re-derive skipped as failing
-   to evaluate)
+   Apply at or below the truncate floor)
    is deleted in the same transaction: it holds no ordering state, so
    I2 treats it as no entry, and the tombstone GC collects only tombstones.
-4. **The target rows** of exactly those keys are upserted or deleted.
+4. **The target rows** of exactly those keys are upserted or deleted. The
+   upsert evaluates the fields over each key's image or read row, cast back
+   to the source columns' types and collations
+   (`staging::one_to_one_render`), so a value that fails a field (a data
+   exception, SQLSTATE class 22) fails the page, which isolation bisects
+   ([06](06-cleanup-and-reclaim.md#quarantine-when-a-change-deterministically-kills-its-worker)).
 
 Why that converges: an Apply the test refuses is already reflected by a
 Re-derive whose snapshot saw its commit, or older than the change last

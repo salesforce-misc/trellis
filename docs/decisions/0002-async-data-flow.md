@@ -333,9 +333,10 @@ state that orders its writes. A 1-1 target owns it per source row.
 - **Must:** exactly two operations exist, and every producer is one of them.
   - **Re-derive(r).** Lock r's entry (inserting a placeholder if absent;
     a build chunk instead inserts an absent entry from its read, I1).
-    In one statement: take the snapshot, read r's source row, compute the
-    target row, write it, and replace the entry's basis with the new
-    snapshot, leaving `applied_lsn` as it was. If r no longer exists in its
+    In one statement: take the snapshot and read r's source row. Then write
+    the target row, the fields evaluated over that row in the statement that
+    writes it, and replace the entry's basis with the new snapshot, leaving
+    `applied_lsn` as it was. If r no longer exists in its
     source, the target row is deleted and the entry becomes a tombstone. It
     does not store the read's position as `applied_lsn`: a ring row's
     position is the writer's pre-commit insert position, so a change whose
@@ -349,10 +350,29 @@ state that orders its writes. A 1-1 target owns it per source row.
     own, which a test of chunked keyspace reads checks.
   - **Apply(r, C, image).** Lock r's entry. If C is visible in the entry's
     basis, or C's position is at or below `applied_lsn`, stop (I2).
-    Otherwise write the target row from C's new image and set the entry's
+    Otherwise write the target row from C's new image, the fields evaluated
+    over it in the statement that writes it, and set the entry's
     `applied_lsn` to C's position, basis unchanged. A delete removes the
     target row and the entry becomes a tombstone. A row with no entry is an
     insert of NEW, which the lock's own insert writes as the entry.
+
+- **Must:** Postgres evaluates every field, and Rust computes no values.
+  Each field is rendered to SQL over the source row
+  (`staging::one_to_one_render`): a field reading another by alias reads it
+  through its substituted expression, a number literal carries the type
+  define inferred for it, and a paused field is left out. The row an Apply or
+  a Re-derive writes from is a jsonb object of the source columns' `::text`
+  renderings, and the statement casts each column the fields read back to
+  the source column's own type, with its own collation. Postgres reads back
+  what it wrote under the same pinned output settings, so the value is the
+  source's by construction, and a field means over the row what it means
+  over the source table: the same result type, the same overflow, the same
+  regex dialect and the same collation. *Evidence:* the `one-to-one-apply`
+  benchmark (a 1M-row backlog into one 1-1 target, disk-backed, against the
+  Rust evaluator as a control, two interleaved runs) ran 14–27% more rows/s
+  at 26.5 µs of Postgres CPU per row instead of 33–36, and a page's
+  transaction, which holds its locks, averaged 140–181 ms instead of
+  236–296.
 
   | Producer | Operation |
   |---|---|

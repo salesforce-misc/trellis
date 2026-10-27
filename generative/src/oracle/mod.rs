@@ -1278,7 +1278,7 @@ mod tests {
         );
         assert_eq!(
             render_join_select(&def),
-            r#"select "ja"."ga"::text, "jb"."gb"::text, (count(*))::text as "n", (sum("jb"."y"))::text as "sy", (coalesce(sum("jb"."y"), 0::numeric))::text as "sy0" from "ja" left join "jb" on "ja"."t" = "jb"."t" and "ja"."k" = "jb"."k" group by "ja"."ga", "jb"."gb""#
+            r#"select "ja"."ga"::text, "jb"."gb"::text, (count(*))::text as "n", (sum("jb"."y"))::text as "sy", (coalesce(sum("jb"."y"), 0::integer))::text as "sy0" from "ja" left join "jb" on "ja"."t" = "jb"."t" and "ja"."k" = "jb"."k" group by "ja"."ga", "jb"."gb""#
         );
     }
 

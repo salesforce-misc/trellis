@@ -81,7 +81,7 @@
 //! but not sufficient: it only helps if **every path that turns a column
 //! into text renders it the same way.** A whole-row render such as
 //! `to_jsonb(t.*)` followed by `jsonb_each_text` would not (this is what the
-//! live-row reads in `staging::apply`'s `read_live_rows_batch`, in
+//! live-row reads in `staging::apply`'s `live_rows_query`, in
 //! `staging::quarantine`'s column sweep, and the old-image captures in
 //! `staging::apply` must avoid).
 //! `to_jsonb` does not call the type's output function for datetimes; it uses
@@ -191,7 +191,7 @@ const fn is_bijective_under_text(pg_type: PgType) -> bool {
 /// Trellis must not have **two** internal renderers. Most paths use
 /// `<col>::text`; a live-row read that built a whole row body at once with
 /// `to_jsonb(t.*)` plus `jsonb_each_text` (as `staging::apply`'s
-/// `read_live_rows_batch`, `staging::quarantine`'s column sweep, and the
+/// `live_rows_query`, `staging::quarantine`'s column sweep, and the
 /// old-image captures could) would add a second.
 /// `to_jsonb` renders a `timestamp` through `jsonb`'s own ISO-8601 datetime
 /// writer, not through `timestamp_out`, and the two disagree (read

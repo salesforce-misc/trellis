@@ -851,7 +851,7 @@ mod tests {
         let out = substitute_all_fields(&def).expect("no cycle");
         let sql: Vec<String> = out.iter().map(render_expr_sql).collect();
         assert_eq!(sql[2], r#"min("val")"#);
-        assert_eq!(sql[3], r#"(max("val") + 1::numeric)"#);
+        assert_eq!(sql[3], r#"(max("val") + 1::integer)"#);
         assert_eq!(
             sql[4], r#"(sum("val") + count(*))"#,
             "a name outside an aggregate's argument still inlines the field"
@@ -871,7 +871,7 @@ mod tests {
         assert_eq!(out[2], call_sum(Expr::Column("val".to_string())));
         assert_eq!(
             render_expr_sql(&out[3]),
-            r#"("grp" + ("grp" + 1::numeric))"#,
+            r#"("grp" + ("grp" + 1::integer))"#,
             "the bare name still inlines the field"
         );
 
@@ -898,7 +898,7 @@ mod tests {
             ),
         ]);
         let out = substitute_all_fields(&def).expect("no cycle");
-        assert_eq!(render_expr_sql(&out[1]), r#"sum(("a" + 1::numeric))"#);
+        assert_eq!(render_expr_sql(&out[1]), r#"sum(("a" + 1::integer))"#);
     }
 
     /// A cyclic alias chain (`a = b + 1, b = a + 1`) must fall back to the ring

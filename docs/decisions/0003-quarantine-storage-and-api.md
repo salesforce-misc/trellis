@@ -118,6 +118,10 @@ needs pausing, as the per-column tier does.
 * **Isolation names the transform.** A record that fails alone is probed again
   with the transforms reading its table left out but one, to find the one(s)
   whose apply it fails in. Every probe runs on the failure path only.
+  * A record that fails with a data exception and with no reader alone is
+    applied once more with all of them first. A column fuse that tripped
+    while isolation ran can leave it nothing to fail on, and then it is
+    charged to nobody.
   * A record that fails with no reader alone fails only when several
     apply it together. With two, both are charged. With three or more, each
     is left out in turn, and every one whose absence lets the record apply is
@@ -193,6 +197,28 @@ row-level tracking stops (its `column_failures` rows are retained as evidence
 until resume) and the column is marked `paused`. Resuming re-runs the backfill
 for just that column's formula, without touching other columns or the
 transform's lifecycle status.
+
+**What the column fuse counts.** Postgres evaluates every field in the
+statement that writes it ([ADR-0002](0002-async-data-flow.md#the-1-1-ledger-one-target-owned-entry-per-source-row)),
+so a value one field can't be computed from fails the page's whole statement.
+Such a failure is a data exception, SQLSTATE class 22: an overflow, an invalid
+regex, an out-of-range or invalid cast. It takes the isolation path: the page
+rolls back and is bisected with rolled-back probes, each half applied on its
+own and only a failing half split again, down to the records that fail alone
+([cleanup — quarantine](../staging-and-claiming/06-cleanup-and-reclaim.md#quarantine-when-a-change-deterministically-kills-its-worker)).
+A page holds every key whole, so a half page is a valid page, and no probe
+holds a lock past its rollback. A lock timeout, a serialization failure or a
+lost connection is retried and never bisected. When a record fails alone, a
+per-field probe evaluates each field of each 1-1 transform reading its table
+alone over the record's row (its new image, or for a Re-derive its live
+source row), each in its own statement outside any transaction and taking no
+lock. Every field that fails is one `column_failures` row for its
+`(transform, column)`, unless a field it reads by alias fails too: that
+field's pause pauses it with it. A poisoned record costs about `2·log2(n)`
+failed probes of a page of `n` records, about 34 at the default
+`drain_batch_cap` of 10^5, plus one probe per field, and the column fuse bounds
+how often that recurs. A field is never wrapped to turn an error into `NULL`,
+which would change what the definition computes relative to the source query.
 
 The **transform-wide fuse** trips when the keys poisoned for one transform
 reach the threshold, moving that transform to `quarantined`. It counts the

@@ -542,7 +542,7 @@ async fn an_inet_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
     )
     .await;
     // Row 2: a bare recompute trigger — no image at all — forcing
-    // `read_live_rows_batch`'s live refetch to decode `grp` via
+    // `live_rows_query`'s live refetch to decode `grp` via
     // `row_as_text_jsonb_sql`'s `<col>::text` cast, which spells the very
     // same value `192.168.1.5/32`.
     stage_bare_recompute(&client, "seg_0", "2").await;

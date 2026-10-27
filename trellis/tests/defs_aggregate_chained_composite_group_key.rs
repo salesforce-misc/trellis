@@ -14,7 +14,7 @@
 //! interesting: when a group's row changes, `apply_and_mark_drained_many`'s
 //! downstream-propagation step stages a `Recompute` against `stock_totals`
 //! keyed by its encoded group-key text (`ddl::join_pk_key`), and
-//! `stock_totals_v2`'s own live re-fetch (`apply::read_live_rows_batch` →
+//! `stock_totals_v2`'s own live re-fetch (`apply::live_rows_query` →
 //! `ddl::split_pk_key`) decodes it as `stock_totals`' real (composite)
 //! primary key. If those two encodings disagreed (say the group-key encoder
 //! emitted a length-prefixed form, `"2:w1" + "1:a"`, while the decoder split
@@ -296,7 +296,7 @@ async fn a_live_update_propagates_through_a_composite_group_key_into_a_chained_a
 /// the escape to agree against a real Postgres: `ddl::join_pk_key`
 /// encodes the downstream `Recompute`'s key in Rust,
 /// while `stock_totals_v2`'s live re-fetch re-derives that same key *in
-/// SQL* (`read_live_rows_batch`'s `ddl::pk_key_sql_expr`, whose multi-column
+/// SQL* (`live_rows_query`'s `ddl::pk_key_sql_expr`, whose multi-column
 /// arm wraps every column in `ddl::composite_key_escape_sql`) and then
 /// decodes it back with `ddl::split_pk_key`. A disagreement anywhere in that
 /// triangle either fails the drain outright with

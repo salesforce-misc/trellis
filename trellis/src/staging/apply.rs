@@ -12,8 +12,9 @@
 //!   commits, in its own read transaction: [`super::fold::fold_limited`] for
 //!   a share that fits `drain_batch_cap`, pages from [`super::page`]
 //!   otherwise.
-//! - Phase 2 (compute: evaluate `f()` against every folded change, no
-//!   transaction, no locks) is [`compute`].
+//! - Phase 2 (compute: read the live rows and build each change's target
+//!   write, no transaction, no locks; Postgres evaluates the fields in
+//!   Phase 3's upsert) is [`compute`].
 //! - Phase 3 (apply ∪ mark-drained, one transaction) is
 //!   [`apply_and_mark_drained`].
 //!
@@ -1444,7 +1445,7 @@ mod tests {
         );
     }
 
-    /// A [`read_live_rows_batch`] batch that includes
+    /// A [`live_rows_query`] batch that includes
     /// `NULL`-keyed groups (an aggregate target read as a source) still
     /// probes the table's `UNIQUE NULLS NOT DISTINCT` index, at a
     /// single-column and a composite key, and still finds every key's row.
@@ -1452,7 +1453,7 @@ mod tests {
     /// that column to `is not distinct from`, which can't use the index, so
     /// the plan was a nested loop over a sequential scan.
     #[tokio::test]
-    async fn read_live_rows_batch_probes_the_index_when_a_batch_binds_a_null() {
+    async fn live_rows_query_probes_the_index_when_a_batch_binds_a_null() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
@@ -2447,9 +2448,9 @@ fn definition_share<'c, 'f>(
     )
 }
 
-/// Phase 2 (design doc: "no transaction, no locks"): evaluates every
-/// folded change's `f()` against the transform currently reading its
-/// source table, grouped by (unqualified) `src_table` so each source's
+/// Phase 2 (design doc: "no transaction, no locks"): builds the write of
+/// every folded change against the transform currently reading its
+/// source table (the fields are evaluated by Phase 3's upsert), grouped by (unqualified) `src_table` so each source's
 /// catalog version is loaded — and fenced against — exactly once.
 ///
 /// Reloads the catalog fresh on every call, including retries: this is

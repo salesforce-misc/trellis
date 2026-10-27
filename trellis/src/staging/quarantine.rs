@@ -2368,7 +2368,10 @@ async fn attribute_column_failure(
         let render = super::one_to_one_render::OneToOneRender::new(&def.def, &columns, &paused)?;
         let failing = {
             let client = pool.get().await?;
-            super::one_to_one_render::failing_fields(&**client, &render, &image).await?
+            let target_columns =
+                super::one_to_one_render::image_columns(&**client, &def.def.target).await?;
+            super::one_to_one_render::failing_fields(&**client, &render, &target_columns, &image)
+                .await?
         };
         let readers = AliasReaders::of(&def.def);
         let mut explained: HashSet<String> = HashSet::new();

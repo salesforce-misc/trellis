@@ -39,8 +39,6 @@ wrong rows, on the targets it compares
 | **Changes made outside Trellis to what it owns** | | |
 | [Rows written into a target, a hidden table or Trellis's schema](#rows-written-into-a-target-a-hidden-table-or-trelliss-schema) | `self_check`, except Trellis's schema | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
 | [Part of the database restored from another point in time](#part-of-the-database-restored-from-another-point-in-time) | `self_check` | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
-| **Values computed differently from the definition** | | |
-| [Text functions in a 1-1 field](#text-functions-in-a-1-1-field) | `self_check` | [#575](https://github.com/salesforce-misc/trellis/issues/575) |
 
 ## Preconditions
 
@@ -376,38 +374,6 @@ ring held.
 TRANSFORM` and define each affected transform again.
 
 **Ends with:** [#1209](https://github.com/salesforce-misc/trellis/issues/1209).
-
-## Values computed differently from the definition
-
-### Text functions in a 1-1 field
-
-**When:** a 1-1 transform's field calls `REGEXP_COUNT` with a pattern that
-uses any regex syntax beyond plain characters, or a column read by `STRPOS`
-or `REGEXP_COUNT` is given a nondeterministic collation after define. Define
-refuses such a collation, because Postgres refuses both functions under one,
-and nothing checks it afterwards.
-
-**What goes wrong:** the drain evaluates the pattern with Rust's `regex`
-engine, which differs from Postgres's even on ordinary patterns:
-`regexp_count('aab', 'a|aa')` is 1 in Postgres and 2 in Trellis, `.` matches
-a newline only in Postgres, and `\w` and `\d` disagree on non-ASCII text and
-under `"C"` collation. A build evaluates in Postgres, so the target holds
-Postgres's value on rows a build wrote and Rust's on rows the drain wrote
-since. The drain's evaluator has no collation to consult, so under a
-nondeterministic one it keeps writing values Postgres would refuse to
-compute. An aggregate transform's arguments evaluate in Postgres and aren't
-affected. A pattern Rust's engine rejects (back-references, `\m`, embedded
-options) is refused at define.
-
-**Detected by:** `self_check`. Under a nondeterministic collation, its
-recompute fails with Postgres's error, as a rebuild does.
-
-**Repair:** use patterns of plain characters. `PAUSE`/`RESUME` rewrites
-every row with Postgres's value, until each row's next write.
-
-**Ends with:** [#643](https://github.com/salesforce-misc/trellis/issues/643),
-which closes when [#575](https://github.com/salesforce-misc/trellis/issues/575)
-moves 1-1 evaluation into Postgres.
 
 ## What `self_check` can't see
 

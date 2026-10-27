@@ -137,10 +137,7 @@
 //!
 //! - **The chunk** of a plain 1-1 target ([`one_to_one::run_field_chunk`])
 //!   takes the keys' entry lock and then rewrites just the fields of their
-//!   existing target rows from one snapshot, leaving the entries alone. A
-//!   1-1 target whose fields the Re-derive build's SQL can't render takes a
-//!   page's whole-row Re-derive of the range's keys instead
-//!   (`apply::DirectRederive`). An
+//!   existing target rows from one snapshot, leaving the entries alone. An
 //!   aggregate's fields are never held out of Apply, so neither call builds
 //!   one.
 //! - **The capture gate.** A field that reads a source column the source's

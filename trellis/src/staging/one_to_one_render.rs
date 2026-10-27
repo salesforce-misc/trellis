@@ -33,9 +33,10 @@ use crate::pool::{quote_ident, quote_literal};
 
 use super::apply::ApplyError;
 
-/// One source column as a row reads it back: its name, its type as
-/// `format_type` spells it (with its modifier), and its collation when it
-/// differs from its type's.
+/// One source column as a row reads it back: its name, its type as a copy
+/// casts to it (`defs::copy_type::type_sql`: qualified, no modifier, so a
+/// value never rounds or truncates on the cast, ADR-0020), and its
+/// collation unless it is the database default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImageColumn {
     pub name: String,
@@ -48,22 +49,16 @@ pub(crate) async fn image_columns(
     client: &impl GenericClient,
     table: &str,
 ) -> Result<Vec<ImageColumn>, ApplyError> {
-    let rows = client
-        .query(
-            "select a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod), \
-                    case when a.attcollation <> 0 and a.attcollation <> t.typcollation \
-                         then pg_catalog.quote_ident(n.nspname) || '.' \
-                              || pg_catalog.quote_ident(c.collname) end \
-             from pg_catalog.pg_attribute a \
-             join pg_catalog.pg_type t on t.oid = a.atttypid \
-             left join pg_catalog.pg_collation c on c.oid = a.attcollation \
-             left join pg_catalog.pg_namespace n on n.oid = c.collnamespace \
-             where a.attrelid = pg_catalog.to_regclass($1) \
-               and a.attnum > 0 and not a.attisdropped \
-             order by a.attnum",
-            &[&ddl::regclass_arg(table)],
-        )
-        .await?;
+    let sql = format!(
+        "select a.attname::text, {}, {} \
+         from pg_catalog.pg_attribute a \
+         where a.attrelid = pg_catalog.to_regclass($1) \
+           and a.attnum > 0 and not a.attisdropped \
+         order by a.attnum",
+        crate::defs::copy_type::type_sql("a.atttypid"),
+        crate::defs::copy_type::collation_sql("a.attcollation"),
+    );
+    let rows = client.query(&sql, &[&ddl::regclass_arg(table)]).await?;
     Ok(rows
         .into_iter()
         .map(|row| ImageColumn {
@@ -170,20 +165,30 @@ pub(crate) fn is_data_exception(err: &(dyn std::error::Error + 'static)) -> bool
 }
 
 /// The per-field probe: evaluates each of `render`'s fields alone over
-/// `image` (a text-valued jsonb row), and returns the ones that fail with a
+/// `image` (a text-valued jsonb row), cast to its target column's type in
+/// `target_columns` as the upsert's assignment casts it (an out-of-range
+/// constant fails there, not in the bare expression), and returns the ones that fail with a
 /// data exception, each with its error, in definition order. Each probe is its own
 /// statement on `client` outside any transaction, and takes no lock. Any other
-/// failure propagates.
+/// failure propagates. The row comes from a set-returning function, as the
+/// upsert's does, so the planner can't fold the fields over a constant row:
+/// a fallback arm that a non-`NULL` column hides must fail here as it does
+/// there.
 pub(crate) async fn failing_fields(
     client: &impl GenericClient,
     render: &OneToOneRender,
+    target_columns: &[ImageColumn],
     image: &str,
 ) -> Result<Vec<(String, String)>, ApplyError> {
     let row = render.row_sql("v.__img");
     let mut failing = Vec::new();
     for (name, sql) in &render.fields {
+        let cast = target_columns
+            .iter()
+            .find(|c| &c.name == name)
+            .map_or_else(String::new, |c| format!("::{}", c.type_sql));
         let probe = format!(
-            "select ({sql})::text from (select $1::text::jsonb as __img) v cross join {row}"
+            "select (({sql}){cast})::text from unnest(array[$1::text]::text[]::jsonb[]) as v(__img) cross join {row}"
         );
         match client.query(&probe, &[&image]).await {
             Ok(_) => {}

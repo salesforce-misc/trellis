@@ -1,0 +1,548 @@
+//! A 1-1 target's fields are evaluated by Postgres, in the upsert that
+//! writes them (ADR-0002, `staging::one_to_one_render`), and a value a field
+//! can't be computed from is isolated to its record and its column
+//! (ADR-0003, "What the column fuse counts").
+//!
+//! Every test stages its page into the ring by hand, as `quarantine.rs`
+//! does, and drives it with `drain_once`: deterministic, with no
+//! convergence polling.
+
+use std::collections::HashMap;
+
+use testkit::{TestCluster, TestDatabase};
+use tokio_postgres::{Client, NoTls};
+use trellis::config::DEFAULT_SCHEMA;
+use trellis::defs::ast::ValueType;
+use trellis::defs::{create_definition, create_target_table, parse, source_primary_key};
+use trellis::float::FloatWidth;
+use trellis::integer::IntWidth;
+use trellis::staging::apply::{self, ApplyError};
+use trellis::staging::quarantine::{
+    DEFAULT_COLUMN_DEATH_THRESHOLD, DEFAULT_DEATH_THRESHOLD, FailureClass, classify,
+};
+
+/// Clean records in each poison test's page, around its poisoned one.
+const PAGE: i32 = 10_000;
+
+async fn connect_raw(dsn: &str) -> Client {
+    let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(&format!(
+            "set search_path to {DEFAULT_SCHEMA}, public; set datestyle to 'ISO, YMD'; \
+             set extra_float_digits to 3"
+        ))
+        .await
+        .expect("set search_path");
+    client
+}
+
+async fn seal_active_segment(client: &mut Client) -> i64 {
+    use trellis::staging::seal;
+    let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
+        .await
+        .expect("seal phase 2");
+    outcome.sealed_seg_seq
+}
+
+/// Creates `public.<table>` with `ddl`'s columns, the 1-1 definition `text`
+/// over it and its target, with `columns` the source's types.
+async fn define(
+    db: &TestDatabase,
+    client: &Client,
+    table: &str,
+    ddl: &str,
+    text: &str,
+    columns: &[(&str, ValueType)],
+) {
+    client
+        .batch_execute(&format!("create table public.{table} ({ddl})"))
+        .await
+        .expect("create the source");
+    let columns: HashMap<String, ValueType> = columns
+        .iter()
+        .map(|(name, t)| (name.to_string(), *t))
+        .collect();
+    create_definition(&db.pool, text, &columns)
+        .await
+        .expect("create the definition");
+    let def = parse(text).expect("parse");
+    let pk = source_primary_key(&db.pool, &def.source)
+        .await
+        .expect("the source's key");
+    create_target_table(&db.pool, &def, "public", &pk, &columns, &def.source)
+        .await
+        .expect("create the target");
+}
+
+/// Stages an insert of every `(key, image)` of `rows` from `public.<table>`
+/// into the ring, in one statement, and seals them into one batch. Each image
+/// is a jsonb object of the row's columns as text, as capture writes it.
+async fn stage(client: &mut Client, table: &str, rows: &[(String, String)]) -> i64 {
+    let (keys, images): (Vec<&str>, Vec<&str>) = rows
+        .iter()
+        .map(|(key, image)| (key.as_str(), image.as_str()))
+        .unzip();
+    client
+        .execute(
+            "insert into seg_0 (src_table, key, op, lsn, old_image, new_image, hop_gen) \
+             select $1, k, 'insert', pg_current_wal_insert_lsn(), null, i::jsonb, 0 \
+             from unnest($2::text[], $3::text[]) as u(k, i)",
+            &[&format!("public.{table}"), &keys, &images],
+        )
+        .await
+        .expect("stage the page");
+    seal_active_segment(client).await
+}
+
+/// Inserts `rows` into the source too, so a recompute of the target from
+/// its source agrees with what was staged.
+async fn insert_source(client: &Client, table: &str, rows: &[(String, String)]) {
+    let images: Vec<&str> = rows.iter().map(|(_, image)| image.as_str()).collect();
+    client
+        .execute(
+            &format!(
+                "insert into public.{table} \
+                 select (jsonb_populate_record(null::public.{table}, i::jsonb)).* \
+                 from unnest($1::text[]) as u(i)"
+            ),
+            &[&images],
+        )
+        .await
+        .expect("insert the source rows");
+}
+
+async fn drain(db: &TestDatabase, seg_seq: i64) -> Result<Option<apply::ApplyOutcome>, ApplyError> {
+    apply::drain_once(
+        &db.pool,
+        seg_seq,
+        "worker",
+        1,
+        "trellis_one_to_one_render_test",
+    )
+    .await
+}
+
+/// Whether `err` is a data exception (SQLSTATE class 22).
+fn is_data_exception(err: &ApplyError) -> bool {
+    match err {
+        ApplyError::Db(err) => err.code().is_some_and(|code| code.code().starts_with("22")),
+        _ => false,
+    }
+}
+
+/// Drains `seg_seq` until it applies, at most `attempts` times, and returns
+/// how many drains failed with a data exception first. Any other failure
+/// fails the test.
+async fn drain_until_applied(db: &TestDatabase, seg_seq: i64, attempts: usize) -> usize {
+    for failed in 0..attempts {
+        match drain(db, seg_seq).await {
+            Ok(_) => return failed,
+            Err(err) if is_data_exception(&err) => {}
+            Err(err) => panic!("drain {failed} failed with something else: {err:?}"),
+        }
+    }
+    panic!("the page didn't apply in {attempts} drains");
+}
+
+async fn count(client: &Client, sql: &str) -> i64 {
+    client
+        .query_one(sql, &[])
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .get(0)
+}
+
+async fn poisoned_keys(client: &Client) -> Vec<String> {
+    client
+        .query("select key from poison order by key", &[])
+        .await
+        .expect("read poison")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+async fn column_failure_keys(client: &Client, transform: &str, column: &str) -> Vec<String> {
+    client
+        .query(
+            "select key from column_failures \
+             where transform_table = $1 and column_name = $2 order by key",
+            &[&transform, &column],
+        )
+        .await
+        .expect("read column_failures")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+async fn column_paused(client: &Client, transform: &str, column: &str) -> bool {
+    client
+        .query_opt(
+            "select 1 from column_status where transform_table = $1 and column_name = $2",
+            &[&transform, &column],
+        )
+        .await
+        .expect("read column_status")
+        .is_some()
+}
+
+/// `int4_col + 1` is `integer`, as Postgres types it and as define
+/// declared the target column: it overflows at `integer`'s bound. In a
+/// page of 10,000 records, the one at the bound is isolated, charged to its
+/// column and, at the death threshold, held; every other record applies,
+/// one below the bound included.
+#[tokio::test]
+async fn an_integer_overflow_quarantines_only_its_record() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    define(
+        &db,
+        &client,
+        "nums",
+        "id integer primary key, a integer",
+        "TRANSFORM nums_next FROM public.nums SELECT a + 1 AS b",
+        &[
+            ("id", ValueType::Integer(IntWidth::Int4)),
+            ("a", ValueType::Integer(IntWidth::Int4)),
+        ],
+    )
+    .await;
+    let poisoned = PAGE / 2;
+    let rows: Vec<(String, String)> = (1..=PAGE)
+        .map(|id| {
+            let a = match id {
+                _ if id == poisoned => i32::MAX as i64,
+                1 => i32::MAX as i64 - 1,
+                _ => id as i64,
+            };
+            (id.to_string(), format!(r#"{{"id":"{id}","a":"{a}"}}"#))
+        })
+        .collect();
+    let seg_seq = stage(&mut client, "nums", &rows).await;
+
+    let failed = drain_until_applied(&db, seg_seq, DEFAULT_DEATH_THRESHOLD as usize + 1).await;
+    assert_eq!(
+        failed,
+        DEFAULT_DEATH_THRESHOLD as usize - 1,
+        "each drain charges the record once; the drain that reaches the threshold holds it \
+         and applies the rest, so it doesn't fail"
+    );
+    assert_eq!(poisoned_keys(&client).await, vec![poisoned.to_string()]);
+    assert_eq!(
+        column_failure_keys(&client, "nums_next", "b").await,
+        vec![poisoned.to_string()],
+        "the per-field probe names the failing column"
+    );
+    assert!(!column_paused(&client, "nums_next", "b").await);
+    assert_eq!(
+        count(&client, "select count(*) from public.nums_next").await,
+        PAGE as i64 - 1
+    );
+    let one_below: i32 = client
+        .query_one(
+            "select b from public.nums_next where id = 1 and pg_typeof(b) = 'integer'::regtype",
+            &[],
+        )
+        .await
+        .expect("read the row one below the bound")
+        .get(0);
+    assert_eq!(
+        one_below,
+        i32::MAX,
+        "one below the bound is the bound, in an integer column"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "select count(*) from public.nums_next where id <> 1 and b is distinct from id + 1"
+        )
+        .await,
+        0
+    );
+}
+
+/// `COALESCE(r, n)` casts `n` to `real` where `r` is `NULL`, which raises
+/// `22003` for an `n` outside `real`'s range, per row. Only that row's
+/// record is isolated; its batch-mates, `n` in range, apply.
+#[tokio::test]
+async fn a_value_out_of_a_casts_range_quarantines_only_its_record() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    define(
+        &db,
+        &client,
+        "fallbacks",
+        "id integer primary key, r real, n numeric",
+        "TRANSFORM fallbacks_out FROM public.fallbacks SELECT COALESCE(r, n) AS v",
+        &[
+            ("id", ValueType::Integer(IntWidth::Int4)),
+            ("r", ValueType::Float(FloatWidth::Float4)),
+            ("n", ValueType::Numeric),
+        ],
+    )
+    .await;
+    let poisoned = 7;
+    let rows: Vec<(String, String)> = (1..=PAGE)
+        .map(|id| {
+            let n = if id == poisoned { "1e39" } else { "2.5" };
+            (
+                id.to_string(),
+                format!(r#"{{"id":"{id}","r":null,"n":"{n}"}}"#),
+            )
+        })
+        .collect();
+    let seg_seq = stage(&mut client, "fallbacks", &rows).await;
+
+    let failed = drain_until_applied(&db, seg_seq, DEFAULT_DEATH_THRESHOLD as usize + 1).await;
+    assert_eq!(failed, DEFAULT_DEATH_THRESHOLD as usize - 1);
+    assert_eq!(poisoned_keys(&client).await, vec![poisoned.to_string()]);
+    assert_eq!(
+        column_failure_keys(&client, "fallbacks_out", "v").await,
+        vec![poisoned.to_string()]
+    );
+    assert_eq!(
+        count(
+            &client,
+            "select count(*) from public.fallbacks_out where v = 2.5::real"
+        )
+        .await,
+        PAGE as i64 - 1
+    );
+}
+
+/// A pattern Rust's `regex` accepts at define and Postgres refuses
+/// (`2201B`) fails every record. Each one isolation pins is a distinct
+/// failing row of the column, so the column fuse trips at its threshold,
+/// the column pauses, and the page applies without it: the healthy field is
+/// written for every record and no key is held.
+#[tokio::test]
+async fn an_invalid_regex_trips_its_column_fuse_and_the_rest_applies() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    define(
+        &db,
+        &client,
+        "notes",
+        "id integer primary key, t text",
+        "TRANSFORM notes_out FROM public.notes \
+         SELECT REGEXP_COUNT(t, '(?P<n>a)') AS named, CHAR_LENGTH(t) AS len",
+        &[
+            ("id", ValueType::Integer(IntWidth::Int4)),
+            ("t", ValueType::Text),
+        ],
+    )
+    .await;
+    let rows: Vec<(String, String)> = (1..=200)
+        .map(|id| (id.to_string(), format!(r#"{{"id":"{id}","t":"abc{id}"}}"#)))
+        .collect();
+    let seg_seq = stage(&mut client, "notes", &rows).await;
+
+    drain_until_applied(&db, seg_seq, 3).await;
+    assert!(column_paused(&client, "notes_out", "named").await);
+    assert!(!column_paused(&client, "notes_out", "len").await);
+    assert_eq!(
+        column_failure_keys(&client, "notes_out", "named")
+            .await
+            .len(),
+        DEFAULT_COLUMN_DEATH_THRESHOLD as usize,
+        "isolation pins the threshold's worth of distinct rows, and the pause ends it"
+    );
+    assert!(poisoned_keys(&client).await.is_empty());
+    assert_eq!(
+        count(&client, "select count(*) from key_deaths").await,
+        0,
+        "once the column pauses, no record fails, so none is charged"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "select count(*) from public.notes_out where len = char_length('abc' || id)"
+        )
+        .await,
+        200
+    );
+}
+
+/// `REGEXP_COUNT` runs under the column's own collation, as over the source
+/// table (#643): `\w` matches `é` under `"C.utf8"` and not under `"C"`.
+#[tokio::test]
+async fn regexp_count_runs_under_the_columns_collation() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    define(
+        &db,
+        &client,
+        "words",
+        r#"id integer primary key, tc text collate "C", tu text collate "C.utf8""#,
+        r"TRANSFORM words_out FROM public.words SELECT REGEXP_COUNT(tc, '\w') AS wc, REGEXP_COUNT(tu, '\w') AS wu",
+        &[
+            ("id", ValueType::Integer(IntWidth::Int4)),
+            ("tc", ValueType::Text),
+            ("tu", ValueType::Text),
+        ],
+    )
+    .await;
+    let rows = vec![(
+        "1".to_string(),
+        r#"{"id":"1","tc":"é","tu":"é"}"#.to_string(),
+    )];
+    insert_source(&client, "words", &rows).await;
+    let seg_seq = stage(&mut client, "words", &rows).await;
+    drain(&db, seg_seq).await.expect("drain");
+
+    let row = client
+        .query_one("select wc, wu from public.words_out where id = 1", &[])
+        .await
+        .expect("read the target");
+    assert_eq!((row.get::<_, i32>(0), row.get::<_, i32>(1)), (0, 1));
+    assert_eq!(
+        count(
+            &client,
+            r"select count(*) from public.words s join public.words_out t using (id)
+              where t.wc = regexp_count(s.tc, '\w') and t.wu = regexp_count(s.tu, '\w')"
+        )
+        .await,
+        1,
+        "the target holds what Postgres computes over the source"
+    );
+}
+
+/// `COALESCE` over a `real` takes Postgres's result type, so its value is
+/// Postgres's (#1418's review): over a `NULL` `r`, `COALESCE(r, 0.1) > 0.1`
+/// compares the `real` 0.1 in double precision, and the sums are `double
+/// precision` of a `real` fallback.
+#[tokio::test]
+async fn coalesce_over_a_real_computes_what_postgres_computes() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    define(
+        &db,
+        &client,
+        "reals",
+        "id integer primary key, r real",
+        "TRANSFORM reals_out FROM public.reals SELECT \
+         (COALESCE(r, 0.1) > 0.1) AS gt, (COALESCE(r, 0.1) + 0) AS p, \
+         (COALESCE(r, 16777217) + 0) AS q",
+        &[
+            ("id", ValueType::Integer(IntWidth::Int4)),
+            ("r", ValueType::Float(FloatWidth::Float4)),
+        ],
+    )
+    .await;
+    let rows = vec![("1".to_string(), r#"{"id":"1","r":null}"#.to_string())];
+    insert_source(&client, "reals", &rows).await;
+    let seg_seq = stage(&mut client, "reals", &rows).await;
+    drain(&db, seg_seq).await.expect("drain");
+
+    let row = client
+        .query_one(
+            "select gt, p::text, q::text from public.reals_out where id = 1",
+            &[],
+        )
+        .await
+        .expect("read the target");
+    assert_eq!(
+        (
+            row.get::<_, bool>(0),
+            row.get::<_, String>(1),
+            row.get::<_, String>(2)
+        ),
+        (
+            true,
+            "0.10000000149011612".to_string(),
+            "16777216".to_string()
+        )
+    );
+}
+
+/// A fallback literal outside `real`'s range is admitted at define, and
+/// Postgres raises `22003` for it when it plans the write, whatever the row:
+/// every record fails, so the column pauses at its fuse's threshold.
+#[tokio::test]
+async fn a_fallback_literal_out_of_reals_range_pauses_its_column() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    define(
+        &db,
+        &client,
+        "wide",
+        "id integer primary key, r real",
+        "TRANSFORM wide_out FROM public.wide SELECT COALESCE(r, 1000000000000000000000000000000000000000.0) AS v, (id + 1) AS next",
+        &[
+            ("id", ValueType::Integer(IntWidth::Int4)),
+            ("r", ValueType::Float(FloatWidth::Float4)),
+        ],
+    )
+    .await;
+    let rows: Vec<(String, String)> = (1..=50)
+        .map(|id| (id.to_string(), format!(r#"{{"id":"{id}","r":"1.5"}}"#)))
+        .collect();
+    let seg_seq = stage(&mut client, "wide", &rows).await;
+
+    drain_until_applied(&db, seg_seq, 8).await;
+    assert!(column_paused(&client, "wide_out", "v").await);
+    assert_eq!(
+        count(
+            &client,
+            "select count(*) from public.wide_out where next = id + 1"
+        )
+        .await,
+        50
+    );
+}
+
+/// A lock timeout (`55P03`) is transient: it is retried, never isolated and
+/// never charged to a record or a column, while a data exception (`22003`)
+/// from the same kind of statement is isolated. Both errors are real ones,
+/// from Postgres.
+#[tokio::test]
+async fn a_lock_timeout_is_never_bisected_and_a_data_exception_is() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let holder = connect_raw(db.dsn()).await;
+    let waiter = connect_raw(db.dsn()).await;
+    holder
+        .batch_execute("create table public.locked (id integer primary key)")
+        .await
+        .expect("create the table");
+    holder
+        .batch_execute("begin; lock table public.locked")
+        .await
+        .expect("hold the lock");
+    waiter
+        .batch_execute("set lock_timeout = '10ms'")
+        .await
+        .expect("set the timeout");
+    let timed_out = ApplyError::Db(
+        waiter
+            .batch_execute("begin; lock table public.locked")
+            .await
+            .expect_err("the lock wait times out"),
+    );
+    assert!(!is_data_exception(&timed_out));
+    assert!(matches!(classify(&timed_out), FailureClass::Transient));
+
+    waiter
+        .batch_execute("rollback")
+        .await
+        .expect("leave the aborted transaction");
+    let overflow = ApplyError::Db(
+        waiter
+            .query_one("select (2147483647 + $1::integer)", &[&1_i32])
+            .await
+            .expect_err("the sum overflows"),
+    );
+    assert!(is_data_exception(&overflow));
+    assert!(matches!(classify(&overflow), FailureClass::Isolate));
+}

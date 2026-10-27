@@ -85,7 +85,7 @@ async fn drained_mask(client: &Client, seg_seq: i64) -> i64 {
 /// so a hand-staged ring row's `src_table` matches what a real CDC producer
 /// would actually stage (always fully-qualified) and what
 /// `schema_nodes`/`schema_edges` key on. The physical read paths
-/// (`ddl::source_primary_key`/`read_live_rows_batch`) would tolerate a bare
+/// (`ddl::source_primary_key`/`live_rows_query`) would tolerate a bare
 /// name via their own connection's `search_path` (Postgres resolves it
 /// live), so only the catalog-keyed paths need the qualified form.
 /// Already-qualified input
@@ -287,7 +287,7 @@ async fn drain_matches_the_oracle_across_an_insert_update_and_delete() {
 /// `rederive_build_reads_the_explicitly_qualified_source_not_a_same_named_decoy`
 /// covers the build layer): a definition created with an
 /// explicit `FROM custom.orders` must have its *live* source reads —
-/// [`read_live_rows_batch`], reached whenever a folded change carries no
+/// [`live_rows_query`], reached whenever a folded change carries no
 /// image, e.g. every `Recompute` marker `create_definition`'s own initial
 /// ring-backfill enumeration stages for a pre-existing row — actually read
 /// `custom.orders`, not a same-named `orders` sitting in one of this pool's
@@ -334,7 +334,7 @@ async fn explicitly_qualified_source_reads_the_right_table_on_a_live_refetch() {
     // `create_definition` enumerates every one of `custom.orders`'s 3
     // pre-existing rows into the active segment as image-less `Recompute`
     // markers — exactly the shape that forces `compute`'s live-refetch path
-    // (`read_live_rows_batch`) once drained below.
+    // (`live_rows_query`) once drained below.
     create_definition(
         &db.pool,
         "TRANSFORM order_totals FROM custom.orders SELECT price AS total",
@@ -2045,7 +2045,7 @@ async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batc
     assert!(
         refetch_queries[0].contains("::text[]::"),
         "the one refetch query must batch every key via one bound array parameter \
-         (`read_live_rows_batch`'s `join unnest($1::text[]::<type>[])`, which generalizes to an \
+         (`live_rows_query`'s `join unnest($1::text[]::<type>[])`, which generalizes to an \
          arbitrary-arity primary key), not a single-key `= $1`:\n{}",
         refetch_queries[0]
     );
@@ -2159,7 +2159,7 @@ async fn a_write_batch_past_the_bind_parameter_cap_chunks_and_still_drains() {
 /// A single bucket mixing all three shapes `compute()` dispatches on (see
 /// its own doc comment): a staged `new_image` (decoded inline, no refetch),
 /// a genuine CDC delete (`old_image` only, no refetch either), and bare
-/// recompute triggers (the only shape needing [`read_live_rows_batch`]).
+/// recompute triggers (the only shape needing [`live_rows_query`]).
 /// Guards against a fix that only handles a homogeneous, all-recompute
 /// bucket: the batched refetch must cover exactly the recompute keys, the
 /// other two shapes must still resolve correctly without ever touching it,
@@ -2312,7 +2312,7 @@ async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch
     assert!(
         refetch_queries[0].contains("::text[]::"),
         "the one refetch query must batch its keys via one bound array parameter \
-         (`read_live_rows_batch`'s `join unnest($1::text[]::<type>[])`):\n{}",
+         (`live_rows_query`'s `join unnest($1::text[]::<type>[])`):\n{}",
         refetch_queries[0]
     );
 

@@ -625,7 +625,7 @@ mod tests {
         };
         assert_eq!(
             render_expr_sql(&expr),
-            "(strpos(\"name\", 'foo'::text) > 0::numeric)"
+            "(strpos(\"name\", 'foo'::text) > 0::integer)"
         );
     }
 
@@ -641,7 +641,7 @@ mod tests {
                 Expr::NumberLiteral("0".to_string()),
             ],
         };
-        assert_eq!(render_expr_sql(&expr), "coalesce(\"amount\", 0::numeric)");
+        assert_eq!(render_expr_sql(&expr), "coalesce(\"amount\", 0::integer)");
     }
 
     #[test]

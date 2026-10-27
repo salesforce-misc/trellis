@@ -383,7 +383,7 @@ async fn a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two
     // not the SQL cast's `'true'`.
     stage_image(&client, "seg_0", "1", r#"{"grp":"t","amount":"10"}"#).await;
     // Row 2: a bare recompute trigger — no image at all — forcing
-    // `read_live_rows_batch`'s live refetch to decode `grp` via
+    // `live_rows_query`'s live refetch to decode `grp` via
     // `row_as_text_jsonb_sql`'s `<col>::text` cast, which spells the very
     // same value `'true'`.
     stage_bare_recompute(&client, "seg_0", "2").await;

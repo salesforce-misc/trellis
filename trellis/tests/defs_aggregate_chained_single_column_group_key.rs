@@ -312,13 +312,13 @@ async fn an_extinct_single_column_group_reduces_the_chained_downstream_aggregate
 /// The `NULL`-keyed group, a `NULL` grouping component in the shared key
 /// contract: a group-key encoder that encoded a `NULL` component as an empty
 /// part would be indistinguishable from `''`, and the chained definition's
-/// own live re-read (`read_live_rows_batch`'s keyset join, a plain
+/// own live re-read (`live_rows_query`'s keyset join, a plain
 /// `t.col = u.c0`) could never match a `NULL` column anyway. So a `NULL`
 /// component encodes as `ddl::NULL_KEY_SENTINEL` (a control character
 /// that no genuine value can encode to, since `ddl::encode_key_part` escapes
 /// a real one by doubling it — see
 /// `a_real_sentinel_valued_group_key_stays_its_own_group` below), and
-/// `read_live_rows_batch` uses `is not distinct from`
+/// `live_rows_query` uses `is not distinct from`
 /// for any key component a batch's keys carry a `NULL` for.
 ///
 /// This test asserts, end to end: a `NULL`-keyed upstream group's **creation**, a later

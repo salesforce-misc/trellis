@@ -577,7 +577,7 @@ pub(crate) async fn identity_key_columns(
 /// row's composite key, however it entered the ring — a capture trigger, or a
 /// synthetic [`crate::staging::append::StagedChange::Recompute`] — decode
 /// identically wherever it's
-/// later read back (`staging::apply::read_live_rows_batch`'s live re-fetch,
+/// later read back (`staging::apply::live_rows_query`'s live re-fetch,
 /// most notably): both producers, and every consumer, agree on one shape.
 ///
 /// # How this composes with [`NULL_KEY_SENTINEL`]
@@ -749,7 +749,7 @@ pub(crate) fn composite_key_escape_sql(col_text: &str) -> String {
 /// is SQL `NULL` and gets dropped by `array_to_string`), indistinguishable
 /// from a genuine `''` value: a `NULL`-keyed group's identity couldn't
 /// round-trip through a chained definition's live re-fetch
-/// (`staging::apply::read_live_rows_batch`), where it would look exactly
+/// (`staging::apply::live_rows_query`), where it would look exactly
 /// like "no row," which is mistaken for a delete.
 ///
 /// U+0001 (SOH) is used — but, unlike
@@ -1130,7 +1130,7 @@ fn split_composite_key(key: &str) -> Vec<Cow<'_, str>> {
 /// captured row) back into its per-column parts, in the same
 /// declared order — the read-side counterpart used once a set of already-
 /// identified rows' keys need to be matched back against `pk`'s live
-/// columns (`staging::apply::read_live_rows_batch`). Returns
+/// columns (`staging::apply::live_rows_query`). Returns
 /// [`DdlError::MalformedCompositeKey`] if `key` doesn't split into exactly
 /// `pk.len()` parts, rather than silently truncating/padding — "the same
 /// declared order" here is [`pk_key_sql_expr`]'s documented declared-order
@@ -1150,7 +1150,7 @@ fn split_composite_key(key: &str) -> Vec<Cow<'_, str>> {
 /// Each returned part is then run through [`decode_key_part`]: a
 /// part that is exactly [`NULL_KEY_SENTINEL`] decodes to `None` (a real
 /// `NULL` component), not the literal sentinel text, so a caller binding
-/// these back against the live columns (`staging::apply::read_live_rows_batch`)
+/// these back against the live columns (`staging::apply::live_rows_query`)
 /// can bind a genuine SQL `NULL` — and, critically, tell that column apart
 /// from one that merely holds an empty string. That decode is the *inner*
 /// layer, undone after [`split_composite_key`]'s outer one — see

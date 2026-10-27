@@ -36,7 +36,7 @@
 //!    one Postgres `GROUP BY` group, one target row, seeded partly through
 //!    an image-bearing change and partly through a bare, image-less
 //!    recompute trigger (the shape that used to force
-//!    `staging::apply::read_live_rows_batch`'s now-fixed live refetch).
+//!    `staging::apply::live_rows_query`'s now-fixed live refetch).
 //!
 //! Per ADR-0013 every comparison is against independently-authored SQL —
 //! plain `pg_typeof`, plain `select ... group by ...`, plain `::text` —
@@ -481,7 +481,7 @@ async fn datestyle_moves_date_and_timestamp_but_not_time() {
 /// as a key must render *identically* under both of the engine's two
 /// renderers — the per-column `<col>::text` most paths use, and the
 /// whole-row `to_jsonb(t.*)`/`jsonb_each_text` the live-row reads use
-/// (`staging::apply`'s `read_live_rows_batch`; `staging::quarantine`'s
+/// (`staging::apply`'s `live_rows_query`; `staging::quarantine`'s
 /// sweep).
 ///
 /// A type that disagrees is one value with two spellings, and a key seeded
@@ -658,7 +658,7 @@ async fn the_engine_s_own_row_renderer_agrees_with_text_for_every_temporal_famil
         .await
         .expect("seed sweep row");
 
-    // The exact call shape `read_live_rows_batch`/`fetch_to_side_rows`/etc.
+    // The exact call shape `live_rows_query`/`fetch_to_side_rows`/etc.
     // now use: introspect the live column list, then build the explicit
     // `jsonb_build_object` from it.
     let row_columns = apply::live_row_columns(&client, "engine_renderer_sweep")
@@ -997,7 +997,7 @@ async fn interval_in_reads_intervalstyle_which_is_why_there_is_no_interval_liter
 /// the engine through *different* row-decode paths must still fold into
 /// **one** target row, not two.
 ///
-/// Were `staging::apply::read_live_rows_batch` to decode a
+/// Were `staging::apply::live_rows_query` to decode a
 /// live-refetched row via `to_jsonb(t.*)`, it would spell a `timestamp`
 /// `2024-06-15T12:34:56` — a `T` where `::text` (and a real CDC image) renders
 /// a space. A group touched once
@@ -1015,7 +1015,7 @@ async fn interval_in_reads_intervalstyle_which_is_why_there_is_no_interval_liter
 ///   propagation/definition-re-derive all use, per `append.rs`'s own doc
 ///   comment). `compute()` has no image to decode for it, so it lands in
 ///   `live_refetch_indices` and is decoded via
-///   `staging::apply::read_live_rows_batch` — the exact call site
+///   `staging::apply::live_rows_query` — the exact call site
 ///   fixed.
 ///
 /// Both rows share the identical `grp` instant. If the two decode paths ever
@@ -1130,7 +1130,7 @@ async fn a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_
     )
     .await;
     // Row 2: a bare recompute trigger — no image at all — forcing
-    // `read_live_rows_batch`'s live refetch to decode `grp` straight off
+    // `live_rows_query`'s live refetch to decode `grp` straight off
     // Postgres.
     stage_bare_recompute(&client, "seg_0", "2").await;
 
