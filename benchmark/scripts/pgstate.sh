@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Samples a running benchmark cluster's Postgres-side state every INTERVAL seconds until the
-# cluster goes away, for diagnosing a long run (#617, #629) without touching the harness:
+# cluster goes away, for diagnosing a long run without touching the harness:
 # pg_wal size, the definitions' status and build chunks, the
 # ring's segments, and the oldest client transactions with what they wait on.
 #

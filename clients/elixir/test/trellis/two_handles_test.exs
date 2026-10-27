@@ -1,7 +1,7 @@
 defmodule Trellis.TwoHandlesTest do
   # Two supervised handles in one BEAM, each registered under its own `:name`
   # and each an instance of its own (its own catalog schema and target
-  # schema) in the suite's one database (epic #806, issue #879). Every call
+  # schema) in the suite's one database. Every call
   # goes through a name, so the two never share a handle.
   #
   # Both shapes planned for production use are here: the instances define

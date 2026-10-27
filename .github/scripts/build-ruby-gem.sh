@@ -56,7 +56,7 @@ trap clean EXIT
 # - The repository's rust-toolchain.toml pins the Rust version, which rustup
 #   installs on first use; the target's standard library comes separately.
 # - The gem ships without the `trellis` crate's `otlp` feature and its
-#   OpenTelemetry and gRPC dependency tree (issue #154). Nothing turns it on
+#   OpenTelemetry and gRPC dependency tree. Nothing turns it on
 #   today; fail loudly if a dependency change ever does.
 # - The bundle's test group has pg, which needs libpq to build.
 #

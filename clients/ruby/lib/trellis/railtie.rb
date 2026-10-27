@@ -49,7 +49,7 @@ module Trellis
   # - config.trellis.connect_on_boot = false, for a server that forks with
   #   no hook to shut the handle down first (see below).
   #
-  # A handle doesn't survive fork (issue #600). A preforking server that
+  # A handle doesn't survive fork. A preforking server that
   # loads the app before forking (Puma's preload_app!, on by default with
   # more than one worker) must shut the boot handle down before it forks,
   # and connect one in each worker:

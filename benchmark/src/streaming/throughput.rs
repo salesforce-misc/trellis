@@ -1,13 +1,13 @@
-//! Single-hop throughput scenarios: the ramp (#266's B2, epic #269's
-//! **V-THRU** / target T2) and the transaction-shape sweep (#266's B4, #269's
-//! **V-SHAPE**). Both go through the same [`run_probe`] — the ramp fixes the
+//! Single-hop throughput scenarios: the ramp
+//! (**V-THRU** / target T2) and the transaction-shape sweep
+//! (**V-SHAPE**). Both go through the same [`run_probe`] — the ramp fixes the
 //! commit cadence and derives `rows_per_commit` from the target rate, the
 //! shape sweep fixes `rows_per_commit` (the axis it's sweeping) and derives
 //! the cadence instead.
 //!
 //! ## What `kept_target_rate` means here, and what it doesn't
 //!
-//! T2 (#266) defines sustained as "held for >= 10 minutes with ring depth and
+//! T2 defines sustained as "held for >= 10 minutes with ring depth and
 //! replication lag both flat". A ramp searching several candidate rates at 10
 //! minutes each is a multi-hour run before it has found anything. Each probe
 //! here instead offers load for a short window and passes
@@ -20,7 +20,7 @@
 //! * the backlog the window left (`rows offered - rows landed`) drained
 //!   within a bounded grace period (`drained`).
 //!
-//! Before issue #319 a probe passed on `drained` alone, which a pipeline
+//! A probe once passed on `drained` alone, which a pipeline
 //! running at a fraction of the target also passes: at half the target a 20s
 //! window's backlog is 10s of work, well inside a 30s grace. That put the
 //! reported knee at roughly 2.5x what the engine could actually hold.
@@ -57,7 +57,7 @@ use crate::streaming::scrape::{
 use crate::streaming::tuning::EngineTuning;
 
 /// Drain parallelism for the throughput scenarios: more than the latency
-/// ladder's, because #266's H4 expects `SEG_BUCKETS = 8` worth of useful
+/// ladder's, because `SEG_BUCKETS = 8` worth of useful
 /// claim parallelism per batch and these scenarios are measuring throughput,
 /// not per-hop latency.
 pub const THROUGHPUT_APPLICATION_THREADS: usize = 8;
@@ -67,7 +67,7 @@ pub const THROUGHPUT_APPLICATION_THREADS: usize = 8;
 /// rate — transaction shape is the *other* scenario's axis.
 pub const RAMP_COMMITS_PER_SEC: f64 = 50.0;
 
-/// The three commit shapes #266's B4 names.
+/// The three commit shapes.
 pub const DEFAULT_SHAPES: &[usize] = &[1, 100, 10_000];
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -83,13 +83,13 @@ pub struct ThroughputProbe {
     pub offered_duration_secs: f64,
     /// How long the generator waited, after the offer window closed, for the
     /// commits it issued inside it ([`LoadSummary::commit_tail`]). Not part of
-    /// `offered_duration_secs` or the achieved rate (issue #541).
+    /// `offered_duration_secs` or the achieved rate.
     pub commit_tail_secs: f64,
     pub rows_issued: u64,
     /// What the generator actually managed — compare against
     /// `target_rows_per_sec` before reading anything else here.
     pub achieved_rows_per_sec: f64,
-    /// Issue #276's self-check: the generator undershot the target and the
+    /// Self-check: the generator undershot the target and the
     /// engine kept up with everything it did get (`kept_target_rate`, which
     /// judges against the achieved rate when that is lower), so this probe
     /// measured the generator. Its verdict says nothing about the engine at
@@ -98,7 +98,7 @@ pub struct ThroughputProbe {
     pub changes_applied: u64,
     pub backlog_after_grace: i64,
     /// The backlog fully landed within the grace period. Not a throughput
-    /// verdict on its own (issue #319) — `kept_target_rate` is.
+    /// verdict on its own — `kept_target_rate` is.
     pub drained: bool,
     /// The rate the terminal hop applied rows at while load was arriving, and
     /// the tolerance it is judged with: the least-squares slope of its
@@ -228,7 +228,7 @@ pub async fn run_probe(
     // Its one weakness — a mid-window re-stage pushing it past rows committed
     // — can only matter to a probe that drained (the verdict needs one), and
     // then the extra rows show in the final count, which `report_probes`'
-    // #423 cross-check fails the probe on.
+    // counter cross-check fails the probe on.
     let load_cfg = ParallelLoad {
         connections: offer.connections,
         rows_per_commit,
@@ -263,11 +263,11 @@ pub async fn run_probe(
     //
     // Neither signal works alone here:
     //
-    // * `trellis_changes_applied_total` counts staged rows (#409), which
+    // * `trellis_changes_applied_total` counts staged rows, which
     //   matches rows committed only while nothing stages a source row a second
     //   time. If something did mid-window, the counter would reach
     //   `rows_issued` with rows still in flight and end the grace period
-    //   early. Issue #423 measured that with a re-read that staged every
+    //   early. A past run measured that with a re-read that staged every
     //   source row: at 20k rows/sec in 10,000-row commits the counter read
     //   500,001 against 400,000 committed rows.
     // * a `count(*)` every poll is exact but, at the millions-of-rows end of
@@ -351,7 +351,7 @@ pub async fn run_probe(
     }
 }
 
-/// The #266 metric cross-check: a drained probe landed every committed row,
+/// The metric cross-check: a drained probe landed every committed row,
 /// so the counter must have counted every one. A shortfall means the counter,
 /// and with it the in-window rate fitted from it, missed rows.
 pub fn counter_short_of_drain(drained: bool, changes_applied: u64, rows_issued: u64) -> bool {
@@ -370,7 +370,7 @@ pub fn counter_disagrees(drained: bool, changes_applied: u64, rows_issued: u64) 
 /// the in-window rate is fitted from disagrees with the rows committed
 /// ([`counter_disagrees`]). That fails the run, and a probe whose JSON said
 /// `kept_target_rate: true` under a failed exit status would be read as a
-/// pass by anything consuming the JSON alone (#509).
+/// pass by anything consuming the JSON alone.
 pub fn probe_kept_target_rate(
     drained: bool,
     in_window_applied: Option<InWindowRate>,

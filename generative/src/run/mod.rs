@@ -66,8 +66,7 @@ pub enum Outcome {
     /// path in this crate currently produces this variant. It is kept so
     /// the classifier stays exhaustive/complete if an external-cluster mode
     /// (point the suite at an existing database instead of a disposable
-    /// one) is ever added — see the design doc §6 and issue #4's open
-    /// question.
+    /// one) is ever added — see the design doc §6.
     #[allow(dead_code)]
     Unavailable { reason: String },
     /// The backend was provisioned but could not stand up (e.g. the engine
@@ -120,7 +119,7 @@ pub struct Divergence {
     /// Boxed so [`RunError`] stays small enough to return by value.
     pub report: Box<ThreeWayReport>,
     /// Every other definition whose target diverged at the same check, in
-    /// definition order (#671): a sweep attributing a failure to a planted
+    /// definition order: a sweep attributing a failure to a planted
     /// bug needs every diverging target, not just the first, or an unplanted
     /// divergence earlier in definition order hides the plant's own.
     pub also_diverged: Vec<(String, ThreeWayReport)>,
@@ -186,14 +185,14 @@ pub enum RunError {
     Restart(String),
     /// A scheduled [`Backend::scale_out`] (improvement-plan task E3) failed.
     ScaleOut(String),
-    /// Issue #236: carrying out a database-administration action failed
+    /// Carrying out a database-administration action failed
     /// (the harness's side of it: restarting the server and reconnecting).
     DbAdmin {
         op_index: usize,
         action: DbAdminAction,
         error: String,
     },
-    /// Issue #236: carrying out a backup or restore failed (the harness's
+    /// Carrying out a backup or restore failed (the harness's
     /// side of it: reconnecting after the backup's stop, stopping the
     /// original engine, starting one on the restored database). `step`
     /// names which.
@@ -202,7 +201,7 @@ pub enum RunError {
         step: &'static str,
         error: String,
     },
-    /// Issue #236: the restored database's source tables are not what the
+    /// The restored database's source tables are not what the
     /// original's were after the backup op `op_index`, so the restore itself
     /// lost or kept something it shouldn't have. Only the source tables:
     /// the targets are judged by the oracle.
@@ -211,15 +210,14 @@ pub enum RunError {
         at_backup: Snapshot,
         restored: Snapshot,
     },
-    /// Issue #236: after a cold-copy restore these `(target, status)`
+    /// After a cold-copy restore these `(target, status)`
     /// definitions were `paused` once the engine caught up with `op_index`.
-    /// Nothing about the restore warrants a pause (the 2026-09-24 decision on
-    /// #236).
+    /// Nothing about the restore warrants a pause.
     PausedAfterRestore {
         op_index: usize,
         paused: Vec<(String, String)>,
     },
-    /// Issue #557 part 2: the engine refused, or the harness failed to
+    /// The engine refused, or the harness failed to
     /// carry out, a mid-burst operator action in burst `burst`. The plan
     /// only draws actions that apply (`crate::generate::add_burst_actions`),
     /// so this is a generator, harness or engine bug.
@@ -228,7 +226,7 @@ pub enum RunError {
         action: BurstAction,
         error: String,
     },
-    /// Issue #1388: the oracle agreed with every target after burst
+    /// The oracle agreed with every target after burst
     /// `burst`, but a `Strict` `self_check` of a target found a divergence
     /// (a hidden `P`/`M`/`J`/`T` table off) or could not finish.
     Audit {
@@ -471,7 +469,7 @@ async fn quiesce_snapshot_and_check<B: Backend>(
 /// generated order, one at a time, each one's actual outcome still checked
 /// against [`Op::expect`] via [`apply_and_check_outcome`] — this is **not**
 /// the harness racing ops against each other; [`run_convergence_concurrent`]
-/// does that (issue #557). It is only a change to *when* `quiesce()` is
+/// does that. It is only a change to *when* `quiesce()` is
 /// called, nothing about *what* is applied or in what order.
 ///
 /// **Divergence localization is coarser than `run_convergence`'s.** A
@@ -609,7 +607,7 @@ pub async fn check_program(
 /// of `program.defs` — see [`run_convergence`]'s use of this for a partially-
 /// installed program) against `snapshot`, returning every `(target, report)`
 /// that diverged, in definition order — empty if all converged. It checks
-/// every definition rather than stopping at the first divergence (#671), so a
+/// every definition rather than stopping at the first divergence, so a
 /// caller attributing a failure sees each target that went wrong. `program`
 /// is still needed for its `tables` (to resolve each definition's source
 /// schema).
@@ -682,7 +680,7 @@ mod tests {
         program
     }
 
-    /// Issue #1320: beside a possible `DEFAULT`, a detach or drop of a leaf
+    /// Beside a possible `DEFAULT`, a detach or drop of a leaf
     /// created or attached earlier in the same burst starts a new burst (the
     /// short-lived-leaf gap); every other partition operation shares a burst,
     /// and without a `DEFAULT` nothing splits but `burst_size`.
@@ -750,7 +748,7 @@ mod tests {
         assert_eq!(sizes(without, 4), vec![4, 4, 2]);
     }
 
-    /// Design doc §6 / issue #4: only `Ran` passes. Fast, no database —
+    /// Design doc §6: only `Ran` passes. Fast, no database —
     /// this is the classifier logic itself, not the harness sanity check
     /// (that meta-test lives in `tests/meta.rs` and needs a real cluster).
     #[test]

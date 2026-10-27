@@ -2,7 +2,7 @@
 
 require_relative "lib/trellis/version"
 
-# The `trellis-pg` gem (issue #154): `trellis` is taken on RubyGems. It is
+# The `trellis-pg` gem: `trellis` is taken on RubyGems. It is
 # required as "trellis/pg", which Bundler.require finds by itself for a gem
 # with a hyphenated name; the module stays `Trellis`.
 #

@@ -59,7 +59,7 @@ impl Chain {
 /// Split out from [`install_chain_hops`] so a caller can create the table,
 /// start the client, and only then install the chain — see
 /// [`install_chain_hops`]. The staging worker starts capturing the table once
-/// the first hop reads it (issue #427).
+/// the first hop reads it.
 pub async fn create_chain_source_table(raw: &RawClient, prefix: &str) -> String {
     let source = format!("{prefix}_src");
     raw.batch_execute(&format!(
@@ -81,8 +81,8 @@ pub async fn create_chain_source_table(raw: &RawClient, prefix: &str) -> String 
 /// worker to claim and finish that plan job.
 ///
 /// Waits for each hop to go live before registering the next one on top of
-/// it (#471): registration returns with a definition `waiting_to_backfill`
-/// (#418), and a transform can't be defined on another's target until that
+/// it: registration returns with a definition `waiting_to_backfill`,
+/// and a transform can't be defined on another's target until that
 /// one's build has finished. Each hop's build starts at the staging worker's
 /// next reconcile pass, so registering the next hop waits for one.
 pub async fn install_chain_hops(pool: &Pool, source: &str, depth: usize) -> Chain {
@@ -187,7 +187,7 @@ async fn wait_for_row(raw: &RawClient, predicate_sql: &str, what: &str, deadline
 /// counted. A warm-up that returned on the row alone could let the scrape
 /// that opens the measurement window land in that gap, and the warm-up row's
 /// count would then fall inside the window, one more than the rows committed
-/// in it, which `report_probes` rejects as a re-stage (#423).
+/// in it, which `report_probes` rejects as a re-stage.
 async fn wait_for_counted(transform: &str, baseline: u64, what: &str, deadline: Instant) {
     while counter_value(&scrape(), CHANGES_APPLIED_METRIC, transform) <= baseline {
         assert!(
@@ -264,7 +264,7 @@ pub async fn warm_up_aggregate(
 }
 
 /// The independent oracle verdict for a 1-1 chain (every scenario carries
-/// one, per #266: "an oracle check per run so a fast-but-wrong result
+/// one: "an oracle check per run so a fast-but-wrong result
 /// fails").
 #[derive(Debug, Clone, Copy)]
 pub struct ChainOracle {

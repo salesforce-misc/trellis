@@ -1,4 +1,4 @@
-//! `join`'s build-from-seed mode (#1113 slice B1): seed the tables server-side,
+//! `join`'s build-from-seed mode: seed the tables server-side,
 //! then time what it costs to *build* each target over them, rather than
 //! measuring only the pages that follow.
 //!
@@ -8,7 +8,7 @@
 //! and secondary indexes, and fills them with set-based `INSERT ... SELECT`
 //! statements over `generate_series` id ranges on `--loaders` connections:
 //! nothing is captured and nothing enters the ring, so the load costs the
-//! server's insert rate and not the engine's drain rate (#1155 R4: a 20M load
+//! server's insert rate and not the engine's drain rate (a 20M load
 //! through capture did not converge in 1,800 s). Then the keys and indexes are
 //! built (one connection per index), the tables are `VACUUM (ANALYZE)`d and
 //! the cluster checkpointed: J2's recipe, so a build starts from settled

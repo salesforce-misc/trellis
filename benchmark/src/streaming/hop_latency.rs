@@ -1,4 +1,4 @@
-//! The hop-depth latency ladder — issue #266's B1, epic #269's **V-LAT**.
+//! The hop-depth latency ladder (**V-LAT**).
 //!
 //! Depths 1/2/3/5/10 of plain 1-1 transforms at a low offered rate, reporting
 //! T1's boundary-fraction evaluation per depth plus `per_hop_mean_ms` for
@@ -23,7 +23,7 @@ use crate::streaming::scrape::{
 };
 use crate::streaming::tuning::EngineTuning;
 
-/// The depths #266's ladder and #269's V-LAT both name.
+/// The depths the V-LAT ladder measures.
 pub const DEFAULT_DEPTHS: &[usize] = &[1, 2, 3, 5, 10];
 
 /// How long a hop's chain gets to reach `live` and to prove it's flowing
@@ -47,12 +47,12 @@ pub struct HopLatencyResult {
     pub actual_elapsed_secs: f64,
     /// `trellis_changes_applied_total` for the terminal hop over the window.
     pub changes_applied_terminal: u64,
-    /// The #266 metric sanity check: did the terminal transform apply at
+    /// The metric sanity check: did the terminal transform apply at
     /// least as many changes as the generator committed rows? A latency
     /// number that looks fast because most changes were never observed fails
     /// here rather than passing quietly.
     pub changes_match_committed: bool,
-    /// Issue #276's self-check ([`generator_bound`]): the single-connection
+    /// The generator self-check ([`generator_bound`]): the single-connection
     /// generator undershot `offered_commits_per_sec` while the chain still
     /// converged. At the ladder's low default rate this should never fire; if
     /// it does, the depth was measured at a lower rate than it claims.
@@ -65,11 +65,11 @@ pub struct HopLatencyResult {
     pub t1_p99_pass: bool,
     pub t1_all_pass: bool,
     /// Exact mean latency (ms), cumulative from source commit, for *every*
-    /// hop — not just the terminal one (#268). `None` for a hop with no
+    /// hop — not just the terminal one. `None` for a hop with no
     /// samples. Index 0 is hop 1.
     pub per_hop_mean_ms: Vec<Option<f64>>,
     /// The mean per-hop *increment*: `(hop N mean - hop 1 mean) / (N - 1)`.
-    /// This is the number #268 reports as "per-hop mean" and the one #270's
+    /// This is the number reported as "per-hop mean", and the one the
     /// expected bracket (300-315 ms at the stock tick) is stated against.
     /// `None` for depth 1, or if either endpoint has no samples.
     pub per_hop_increment_ms: Option<f64>,
@@ -123,8 +123,8 @@ impl HopLatencyResult {
     }
 }
 
-/// `(hop N mean - hop 1 mean) / (N - 1)` — the per-hop increment #268
-/// reports. Uses the first and last hop with samples, so a run where an
+/// `(hop N mean - hop 1 mean) / (N - 1)` — the reported per-hop
+/// increment. Uses the first and last hop with samples, so a run where an
 /// intermediate hop happened to observe nothing still yields a number rather
 /// than `None`.
 fn increment_ms(per_hop: &[Option<f64>]) -> Option<f64> {

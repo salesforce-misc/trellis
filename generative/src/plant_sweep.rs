@@ -1,4 +1,4 @@
-//! The planted-bug sweep (#557 part 3, #627, #1114): runs a tier's seeded
+//! The planted-bug sweep: runs a tier's seeded
 //! cases once with no plant, as the baseline, then once per planted bug
 //! (`trellis::dev::plant::Plant`), and judges whether the tier catches each.
 //! Shared by the concurrent tier (`tests/concurrent_convergence.rs`,
@@ -90,8 +90,8 @@ pub enum PlantPath {
 /// The path `plant` breaks.
 pub fn plant_path(plant: Plant) -> PlantPath {
     match plant {
-        // The tombstone GC (#623 D7) collects a 1-1 target's ledger, and a
-        // plain 1-1 target takes the Re-derive build's chunks (#625 F8a).
+        // The tombstone GC collects a 1-1 target's ledger, and a
+        // plain 1-1 target takes the Re-derive build's chunks.
         Plant::StaleOneToOneWrite | Plant::EarlyTombstoneGc | Plant::ChunkWithoutEntryLock => {
             PlantPath::OneToOne
         }
@@ -125,8 +125,8 @@ pub fn plant_reaches(plant: &str, key_space: &KeySpace) -> bool {
 
 /// Whether `plant` can have caused a failure that diverged in targets with
 /// these key spaces (`None` for a target the program doesn't define, which is
-/// given the benefit of the doubt): any one of them it writes is enough
-/// (#671). A failure with no diverging target at all (an error or a quiesce
+/// given the benefit of the doubt): any one of them it writes is enough.
+/// A failure with no diverging target at all (an error or a quiesce
 /// timeout) is reachable too.
 pub fn divergence_reachable<'a>(
     plant: &str,

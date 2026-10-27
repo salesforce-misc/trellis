@@ -5,10 +5,9 @@
 //! measures `main` as it is, and deliberately carries no knob the engine
 //! doesn't already have.
 //!
-//! ## Extension point (epic #269)
+//! ## Extension point
 //!
-//! Later children of #269 add engine options of their own (a seal mode,
-//! say). Wiring one up is meant to be three edits and
+//! A new engine option (a seal mode, say) is wired up in three edits and
 //! no new plumbing:
 //!
 //! 1. add the field to [`EngineTuning`] (with its stock value in
@@ -34,7 +33,7 @@ pub const STOCK_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// [`ClientOptions::maintenance_interval`]'s own stock default (300 ms) — the
 /// seal cadence, and the only place a sealed (claimable) batch is ever
-/// created. Issue #266's H1.
+/// created.
 pub const STOCK_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(300);
 
 /// [`ClientOptions::reconcile_interval`]'s own stock default (5 s), and what
@@ -52,7 +51,7 @@ pub const STOCK_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 pub struct EngineTuning {
     /// Whether the client also owns capture
     /// ([`ClientOptions::staging_worker`]). Stock for these scenarios is
-    /// `true`; `false` measures a drain-only fleet (issue #350's split of the
+    /// `true`; `false` measures a drain-only fleet (splitting the
     /// idle cost into its staging and drain halves).
     pub staging_worker: bool,
     /// How many drain workers the client runs
@@ -67,7 +66,7 @@ pub struct EngineTuning {
     /// [`STOCK_RECONCILE_INTERVAL`] for why this is a knob at all.
     pub reconcile_interval: Duration,
     /// The most folded records one drain batch holds
-    /// ([`ClientOptions::drain_batch_cap`], issue #620). A small value forces
+    /// ([`ClientOptions::drain_batch_cap`]). A small value forces
     /// paging on a scenario whose segments would otherwise drain whole.
     pub drain_batch_cap: usize,
     /// Source rows per Re-derive build chunk
@@ -99,21 +98,18 @@ impl Default for EngineTuning {
 impl EngineTuning {
     /// The multi-hop latency ladder's defaults: stock in every field.
     ///
-    /// The ladder used to run with an hour-long reconcile interval, so the
-    /// reconcile pass never fired and intermediate hop tables were never
-    /// captured, where each of their writes would have been staged twice
-    /// (once by apply's in-transaction `Recompute`, again by capture). #315
-    /// keeps every definition's target out of the captured set, so that
-    /// reason is gone (#471). And the reconcile pass is what starts a newly
-    /// registered hop's build, so an hour-long interval kept every hop after
-    /// the first `waiting_to_backfill` for an hour.
+    /// Every definition's target is kept out of the captured set, so the
+    /// reconcile interval need not be stretched to avoid staging an
+    /// intermediate hop's writes twice. And the reconcile pass is what starts
+    /// a newly registered hop's build, so a long interval would keep every
+    /// hop after the first `waiting_to_backfill` for that long.
     pub fn multi_hop() -> Self {
         Self::default()
     }
 
     /// This tuning as [`ClientOptions`], for a staging-worker client. The
-    /// worker captures whatever the registered definitions read (issue
-    /// #427), so there is no table list to pass.
+    /// worker captures whatever the registered definitions read, so
+    /// there is no table list to pass.
     pub fn client_options(&self) -> ClientOptions {
         ClientOptions {
             staging_worker: self.staging_worker,

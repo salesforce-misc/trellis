@@ -20,13 +20,13 @@
 //! live cluster leaks its temp dir *and* the SysV shared-memory segment
 //! Postgres holds as a startup interlock. Because that segment table is tiny
 //! on macOS (`kern.sysv.shmmni` defaults to 32), a few killed runs exhaust it
-//! and `initdb` starts failing for everyone (see issue #43). Since no handler
+//! and `initdb` starts failing for everyone. Since no handler
 //! can trap SIGKILL, teardown can't be the only defense: [`TestCluster::start`]
 //! first runs a self-healing reaper ([`reap_orphans_in`]) that sweeps orphaned
 //! `trellis-testkit-*` dirs from dead prior runs, freeing each one's leaked
 //! segment before allocating a new one. A killed run's postmaster doesn't die
 //! with it either; it's reparented and keeps running, so the reaper also stops
-//! a postmaster whose owning test process is gone (#576).
+//! a postmaster whose owning test process is gone.
 //!
 //! **Template.** `initdb` and the migrations run once per engine build, not
 //! once per test: the `template` module keeps a migrated data directory under
@@ -93,15 +93,14 @@ fn unique_suffix() -> String {
 /// [`TestCluster::from_backup`] takes from [`RESTORED_CLUSTERS`]. A restore
 /// is the one place a test starts a second cluster while it still holds its
 /// first, and with a single pool, `MAX_LIVE_CLUSTERS` tests each holding
-/// one and waiting in `from_backup` for another would wait forever (issue
-/// #569). With two, a restore only ever waits on other restores, which
-/// wait on nothing unless they restore again, so one level of nesting
-/// can't deadlock.
+/// one and waiting in `from_backup` for another would wait forever. With two, a restore only ever
+/// waits on other restores, which wait on nothing unless they restore again, so one level of
+/// nesting can't deadlock.
 ///
 /// Linux has no such limit worth a cap (SysV segments are bounded by memory
 /// there), so it allows 16, the width of the box `verify` runs on: a test
 /// binary at 16 threads with 4 clusters spends most of its time waiting for a
-/// permit (#1246).
+/// permit.
 #[cfg(target_os = "linux")]
 const MAX_LIVE_CLUSTERS: usize = 16;
 #[cfg(not(target_os = "linux"))]
@@ -287,7 +286,7 @@ impl TestCluster {
     /// a database from. A [`TestDatabase`] on it drops its database when it
     /// goes, so the cases do not pile up. On a cluster not so marked the drop
     /// is skipped: the cluster is deleted with the test, and `DROP
-    /// DATABASE`'s checkpoint costs ~110 ms per test (#1246).
+    /// DATABASE`'s checkpoint costs ~110 ms per test.
     pub fn long_lived(mut self) -> Self {
         self.long_lived = true;
         self
@@ -297,7 +296,7 @@ impl TestCluster {
     /// that [`TestCluster::tcp_database_dsn`] reaches. For the few tests that
     /// need a TCP session rather than a unix-socket one: Postgres ignores
     /// the `tcp_keepalives_*`/`tcp_user_timeout` settings on a unix socket
-    /// and always reads them back as `0` there (issue #364).
+    /// and always reads them back as `0` there.
     ///
     /// The port comes from binding `127.0.0.1:0` and letting it go just
     /// before the server starts, so another process could in principle take
@@ -1020,7 +1019,7 @@ fn spawn_server(
         .arg("-c")
         .arg("dynamic_shared_memory_type=mmap")
         // Postgres's default of 0 refuses `PREPARE TRANSACTION`. Trigger
-        // capture (#622) must stage a prepared transaction's rows into the
+        // capture must stage a prepared transaction's rows into the
         // batch that claims it once `COMMIT PREPARED` lands, and
         // `trellis/tests/capture_install.rs` checks that. A few slots cost
         // a few kilobytes of shared memory.
@@ -1092,10 +1091,10 @@ fn reap_orphans_once() {
 /// `postmaster.pid`) and removing the directory. A dir whose recorded
 /// postmaster is still alive is left untouched unless
 /// [`stop_orphaned_postmaster`] confirms the test process that started it is
-/// gone and stops the server first (#576); one whose postmaster is dead (or has no
+/// gone and stops the server first; one whose postmaster is dead (or has no
 /// `postmaster.pid` at all) is only a genuine orphan if its *owning* process
 /// (see [`owning_pid`]) is also confirmed dead — a live owner can be
-/// mid-`initdb`/mid-startup (no pidfile yet) or, per #206, mid-teardown of a
+/// mid-`initdb`/mid-startup (no pidfile yet) or mid-teardown of a
 /// postgres it just had to SIGKILL and may still be depending on that
 /// directory for (e.g. a retry) — so a live owner is left alone either way.
 ///
@@ -1118,7 +1117,7 @@ fn reap_orphans_in(tmp: &Path) {
             // First line of `postmaster.pid` is the postmaster PID. If it's
             // still alive, the cluster is either in use by a running test
             // process (possibly a parallel test binary) or orphaned by one
-            // that was killed without running `Drop` (#576). Only
+            // that was killed without running `Drop`. Only
             // `stop_orphaned_postmaster` may tell those apart; unless it
             // stops the server, the directory is left entirely alone.
             Ok(contents) => {
@@ -1141,12 +1140,12 @@ fn reap_orphans_in(tmp: &Path) {
                 // doesn't make the *directory* an orphan: testkit's own
                 // teardown (`TestCluster::drop`) SIGKILLs a wedged postgres
                 // as a fallback while its owning harness process is still
-                // alive and using this directory (#206) — so, exactly like
+                // alive and using this directory — so, exactly like
                 // the no-pidfile case below, only reap once the owning
                 // process is confirmed dead too. A name that doesn't match
                 // the `<owning-pid>-<counter>` shape (so `owning_pid`
-                // returns `None`) falls back to the pre-#206 behavior of
-                // reaping on the postmaster PID alone, since there's no
+                // returns `None`) falls back to reaping on the
+                // postmaster PID alone, since there's no
                 // owner to check.
                 match owning_pid(&name) {
                     Some(pid) if process_alive(pid) => continue,
@@ -1159,10 +1158,9 @@ fn reap_orphans_in(tmp: &Path) {
             // No `postmaster.pid`: either a run was killed mid-`initdb` (no
             // server, no segment — safe to drop) or a cluster in *another*,
             // still-live process whose postgres hasn't written its pidfile
-            // yet (still mid-`initdb`, possibly for a while under load — see
-            // #198). The directory name itself encodes the answer: it's
-            // `trellis-testkit-<owning-pid>-<counter>` (see [`unique_suffix`]),
-            // so check that PID directly rather than guessing from age. A
+            // yet (still mid-`initdb`, possibly for a while under load). The directory name itself
+            // encodes the answer: it's `trellis-testkit-<owning-pid>-<counter>` (see
+            // [`unique_suffix`]), so check that PID directly rather than guessing from age. A
             // dir whose owning process is still alive is left alone no
             // matter how long setup takes; one whose owner is confirmed dead
             // is a genuine orphan and reaped immediately.
@@ -1198,7 +1196,7 @@ fn owning_pid(dir_name: &str) -> Option<i32> {
 }
 
 /// Stops `postmaster`, a live process named by the `postmaster.pid` in
-/// `data_dir`, if the test process that started it is gone (#576). Returns
+/// `data_dir`, if the test process that started it is gone. Returns
 /// whether the server is now stopped; on `false` the caller must leave the
 /// directory alone.
 ///
@@ -1375,7 +1373,7 @@ enum DataDirSource {
 /// The `initdb` every test (and benchmark) cluster is made with.
 ///
 /// The collation is pinned rather than taken from `LANG`, so a test database
-/// orders text the same on every machine (issue #665). Unpinned, this box's
+/// orders text the same on every machine. Unpinned, this box's
 /// `en_US.UTF-8` gave linguistic ordering while GitHub's ubuntu runners
 /// (`C.UTF-8`) gave bytewise ordering, and a test could pass here and fail on
 /// CI.
@@ -1591,7 +1589,7 @@ mod tests {
 
     #[test]
     fn keeps_dir_with_no_pidfile_whose_owning_process_is_alive() {
-        // This is the #198 regression case: a cluster whose owning process
+        // Regression case: a cluster whose owning process
         // is still alive and mid-`initdb` (no postmaster.pid yet) must never
         // be reaped, no matter how long setup takes. Backdate it well past
         // the old 60s age guard to prove it's the owning-pid check — not
@@ -1630,7 +1628,7 @@ mod tests {
         let _ = fs::remove_dir_all(&sandbox);
     }
 
-    /// Regression test for #198: two independent OS processes concurrently
+    /// Regression test: two independent OS processes concurrently
     /// running `reap_orphans_in` against the same shared temp root must
     /// never reap a directory that belongs to the *other*, still-live
     /// process — even though that directory has no `postmaster.pid` yet
@@ -1681,14 +1679,14 @@ mod tests {
         let _ = fs::remove_dir_all(&sandbox);
     }
 
-    /// Regression test for #206: the `Ok(contents)` (pidfile-present) branch
-    /// must respect the same owning-process liveness check #198 gave the
+    /// Regression test: the `Ok(contents)` (pidfile-present) branch
+    /// must respect the same owning-process liveness check as the
     /// `Err(_)` (no-pidfile) branch. A `postmaster.pid` naming a dead
     /// postgres PID does not by itself mean the *directory* is an orphan —
     /// its owning process (the harness that called `TestCluster::start`,
     /// per the directory name) can still be alive and depending on that
     /// directory, e.g. immediately after SIGKILLing a wedged postgres as
-    /// part of its own teardown. As in #198's own regression test, a real
+    /// part of its own teardown. As in the no-pidfile regression test, a real
     /// child process stands in for that independent owner so this exercises
     /// `owning_pid` + `process_alive` for real, not a simulation that would
     /// all share this process's own PID.
@@ -1697,7 +1695,7 @@ mod tests {
         let sandbox = fresh_sandbox("stale-pidfile-owner-alive");
 
         // Stand-in for another live `TestCluster` owner in a different
-        // process, analogous to #198's `does_not_reap_concurrent_processes_in_flight_cluster`.
+        // process, analogous to `does_not_reap_concurrent_processes_in_flight_cluster`.
         let mut other_process = Command::new("sleep")
             .arg("30")
             .spawn()
@@ -1830,7 +1828,7 @@ mod tests {
         }
     }
 
-    /// Issue #576: a test binary killed without unwinding leaves its
+    /// A test binary killed without unwinding leaves its
     /// postmaster running. The reaper stops it once the owner in the
     /// directory name is dead, and removes the directory.
     #[test]
@@ -1849,7 +1847,7 @@ mod tests {
         );
     }
 
-    /// Issue #576: a running cluster whose owner is alive (here, this very
+    /// A running cluster whose owner is alive (here, this very
     /// test process, the postmaster's parent) is never touched.
     #[test]
     fn leaves_a_live_postmaster_whose_owner_is_alive() {
@@ -1871,7 +1869,7 @@ mod tests {
         );
     }
 
-    /// Issue #576: if the owner's PID has been reused, the process now
+    /// If the owner's PID has been reused, the process now
     /// holding it is alive but isn't the postmaster's parent. That still
     /// counts as the owner being gone.
     #[test]
@@ -1898,7 +1896,7 @@ mod tests {
         let _ = reused.wait();
     }
 
-    /// Issue #576: a pidfile whose PID now belongs to something other than
+    /// A pidfile whose PID now belongs to something other than
     /// this cluster's postgres is never signalled, even with the owner dead.
     #[test]
     fn never_signals_a_live_pid_that_is_not_the_clusters_postgres() {
@@ -1960,10 +1958,10 @@ mod tests {
         let _ = fs::remove_dir_all(&sandbox);
     }
 
-    /// Issue #569: a restore started while every regular cluster permit is
+    /// A restore started while every regular cluster permit is
     /// held, the caller's own among them, comes up instead of waiting for a
-    /// permit no one will release. Before #569, `from_backup` drew from the
-    /// same pool and blocked here forever; the restore runs on its own
+    /// permit no one will release. If `from_backup` drew from the
+    /// same pool it would block here forever; the restore runs on its own
     /// thread so that regression fails this test instead of hanging it.
     #[test]
     fn a_restore_comes_up_while_every_cluster_permit_is_held() {
@@ -1983,7 +1981,7 @@ mod tests {
             .expect("from_backup blocked on the full cluster pool");
         assert_ne!(restored.root(), source.root());
 
-        // Issue #576: the orphan reaper counts a live owner that isn't its
+        // The orphan reaper counts a live owner that isn't its
         // postmaster's parent as gone, and stops the server. That is only
         // safe while every postmaster is a direct child of the process named
         // in its directory, however it was started and whichever thread
@@ -2008,7 +2006,7 @@ mod tests {
         }
     }
 
-    /// Issue #569: a wait on a pool where nothing is ever released panics,
+    /// A wait on a pool where nothing is ever released panics,
     /// with a message naming the likely cause, instead of hanging.
     #[test]
     #[should_panic(

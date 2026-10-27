@@ -1,6 +1,6 @@
 //! `build-under-load --one-to-one --apply-latency`: how long each statement
 //! `Trellis::apply` accepts takes to return on the loaded source while the
-//! writers run (#666, #625 F8b; the user's Q8 bar is < 1 s each on the 100M
+//! writers run (the bar is < 1 s each on the 100M
 //! source), and how long an `ALTER TRANSFORM` and a column resume take until
 //! their field is built.
 //!
@@ -61,7 +61,7 @@ impl ApplyAudit {
     }
 
     /// How many statements failed. A failed statement is a measurement that
-    /// did not happen, so the scenario fails on any (#1022).
+    /// did not happen, so the scenario fails on any.
     pub fn failed(&self) -> usize {
         self.statements.iter().filter(|t| t.error.is_some()).count()
     }

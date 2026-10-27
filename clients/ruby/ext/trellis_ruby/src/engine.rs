@@ -1,4 +1,4 @@
-//! Knowing whether a forked child may connect (issue #600).
+//! Knowing whether a forked child may connect.
 //!
 //! `fork()` copies the whole address space but only the calling thread. The
 //! engine keeps process-wide state behind locks (the enum type-name

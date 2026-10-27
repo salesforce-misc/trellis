@@ -1,4 +1,4 @@
-//! Disk-tier columns (from issue #558 experiment 5, #617): what a measured window cost
+//! Disk-tier columns: what a measured window cost
 //! the cluster's storage, so a number taken with the cluster on a real disk
 //! (`bench --disk`) carries its own I/O context rather than just a rate.
 //!

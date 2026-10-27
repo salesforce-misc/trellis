@@ -1,5 +1,4 @@
-//! Generative correctness test suite for the `trellis` crate (issue #3,
-//! epic #2). See `docs/generative-test-suite.md` for the architecture.
+//! Generative correctness test suite for the `trellis` crate. See `docs/generative-test-suite.md` for the architecture.
 //!
 //! Five strictly-separated modules (design doc §1):
 //!
@@ -14,7 +13,7 @@
 //! - [`run`] — drives a program through a backend, asserts the properties.
 //!
 //! [`baseline_quarantine`] sits beside them: the planted-bug sweep's baseline
-//! bar and its checked-in list of known, filed failures (#786).
+//! bar and its checked-in list of known, filed failures.
 //!
 //! `generate`/`oracle`/`run` are skeletons today; [`model`] and [`backend`]
 //! are this issue's substance.

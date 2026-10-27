@@ -1,6 +1,6 @@
 //! What a measured window cost the Postgres side, beyond storage
 //! ([`disk_tier`](super::disk_tier)): server CPU, error lines, and the size of
-//! any ledger tables (#623 D1). Everything here is read from the cluster or
+//! any ledger tables. Everything here is read from the cluster or
 //! its processes, not from the engine, so the columns mean the same thing
 //! before and after the engine's apply path is rewritten.
 //!
@@ -11,7 +11,7 @@
 //!   That includes the load generator's own backends. They cost the same
 //!   per row before and after a change to the drain, so a before/after delta
 //!   across one is the drain's. Not across a change to capture: trigger
-//!   capture (#622 C5 on) runs inside the generator's backends, and D8's
+//!   capture runs inside the generator's backends, and D8's
 //!   NEW-only images change what it costs there. Resolution is one clock
 //!   tick (10 ms) per process.
 //! - **`deadlock detected` lines** in the cluster's `postgres.log` written
@@ -22,10 +22,10 @@
 //!   drain's `drain page waited out its lock_timeout` line, counted in-process.
 //! - **Ledger bytes** ([`ledger_bytes`]): `pg_total_relation_size` summed over
 //!   every table named `%__ledger`, read at the window's end. `0` until the
-//!   engine creates ledger tables (#623 D2).
+//!   engine creates ledger tables.
 //! - **Ledger updates** ([`ledger_updates`]): `pg_stat_user_tables`'
 //!   `n_tup_upd` and `n_tup_hot_upd` summed over the same tables, read at the
-//!   window's end (#775). They count from the ledger's creation, not from the
+//!   window's end. They count from the ledger's creation, not from the
 //!   window's start, and miss what a backend has not yet flushed to the
 //!   cumulative statistics (up to a second or so), so only their ratio is
 //!   meaningful: the share of ledger updates that were HOT.

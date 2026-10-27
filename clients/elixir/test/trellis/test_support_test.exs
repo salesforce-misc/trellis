@@ -1,5 +1,5 @@
 defmodule Trellis.TestSupportTest do
-  # Trellis.TestSupport (issue #1181): a fixture load that disables the
+  # Trellis.TestSupport: a fixture load that disables the
   # triggers, the way Rails' disable_referential_integrity does, pauses the
   # readers of the table (a capture failure of kind :disruption), and the
   # helper resumes them and waits for exact targets. Mirrors the Ruby

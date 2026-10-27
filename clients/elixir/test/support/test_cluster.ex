@@ -31,7 +31,7 @@ defmodule Trellis.TestCluster do
   itself dies, the port closing tears it down just the same.
 
   For a test whose leftovers would disturb the shared cluster, such as a
-  poisoned key, which holds back every later `await_converged` (#588).
+  poisoned key, which holds back every later `await_converged`.
   """
   def private! do
     # Not linked: the test process exits before its `on_exit` callbacks run,

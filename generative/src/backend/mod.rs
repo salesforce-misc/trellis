@@ -7,7 +7,7 @@
 //! doc, so a second backend can be added without touching either. Two
 //! backends exist today: [`ManualBackend`] (a concurrent-runtime-capable, but
 //! always in-process, [`trellis::Client`]) and [`SubprocessBackend`] (issue
-//! #166: a real OS subprocess `testkit::CrashGuard` can `SIGKILL`, for tests
+//! A real OS subprocess `testkit::CrashGuard` can `SIGKILL`, for tests
 //! that need a genuine crash rather than an in-process simulation). Both
 //! share [`sql`]'s DDL/DML/read-back rendering — see that module's doc
 //! comment.
@@ -75,13 +75,13 @@ pub trait Backend {
     /// no stuck or lost work, no duplicate processing. Each implementation
     /// picks its own faithful stand-in for "the process died": [`ManualBackend`]
     /// (in-process) replaces its `trellis::Client`, awaiting the outgoing
-    /// one's graceful `shutdown()` first (issue #251) rather than just
+    /// one's graceful `shutdown()` first rather than just
     /// dropping it — `Drop`'s shutdown signal is best-effort and doesn't
     /// join the background thread, so a bare drop-then-restart could race
     /// the old producer's advisory-lock release against the new producer's
     /// acquire and spuriously fail with `ProducerAlreadyRunning`; no
     /// subprocess/`SIGKILL` machinery is needed there either way.
-    /// [`SubprocessBackend`] (issue #166) does the real thing: `SIGKILL`s the
+    /// [`SubprocessBackend`] does the real thing: `SIGKILL`s the
     /// actual OS process, *waits for it to actually exit* and then for
     /// Postgres to free its singleton before spawning a fresh one — the same
     /// "don't just drop, wait for the teardown to really finish" discipline,
@@ -96,7 +96,7 @@ pub trait Backend {
     fn scale_out(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-/// Applies ops on a connection of its own (issue #557), so the concurrent
+/// Applies ops on a connection of its own, so the concurrent
 /// tier can issue several lanes of a burst at once, each from its own task.
 /// Same contract as [`Backend::apply`]: raw source DML, the affected row
 /// count on success, `Err` when the statement itself was rejected.
@@ -106,7 +106,7 @@ pub trait OpApplier: Send + 'static {
     fn apply(&mut self, op: &Op) -> impl Future<Output = Result<u64, Self::Error>> + Send;
 }
 
-/// A [`Backend`] the concurrent tier can drive (issue #557): it hands out
+/// A [`Backend`] the concurrent tier can drive: it hands out
 /// independent [`OpApplier`]s, and it can say how its engine actually sealed
 /// and claimed the batches a run produced ([`DrainAudit`]).
 pub trait ConcurrentBackend: Backend {
@@ -127,8 +127,8 @@ pub trait ConcurrentBackend: Backend {
     /// What the recording has seen so far.
     fn drain_audit(&mut self) -> impl Future<Output = Result<DrainAudit, Self::Error>> + Send;
 
-    /// Takes one operator action while a burst's lanes run (issue #557 part
-    /// 2), through the public API an operator would use: see each
+    /// Takes one operator action while a burst's lanes run, through the
+    /// public API an operator would use: see each
     /// [`BurstAction`] for the call. `program` supplies an
     /// [`BurstAction::Install`]'s definition, which from then on is part of
     /// what [`Backend::quiesce`] waits for and [`Backend::snapshot`] reads.
@@ -157,7 +157,7 @@ pub trait ConcurrentBackend: Backend {
 /// module doc comment); `crate::run::Coverage` reads it.
 pub const SPLIT_THRESHOLD_ROWS: usize = trellis::dev::staging::MIN_ROWS_TO_SPLIT as usize;
 
-/// How the engine sealed and claimed one run's batches (issue #557), read
+/// How the engine sealed and claimed one run's batches, read
 /// from triggers on its own `segments` and `seg_claims` rows. This is the
 /// evidence that a run really split batches across workers, as opposed to
 /// merely issuing many ops. Plain counts, so runs add up
@@ -192,8 +192,8 @@ impl DrainAudit {
     }
 }
 
-/// Control over the Postgres server itself, as opposed to a database on it
-/// (issue #236): what a [`crate::model::DbAdminAction::RestartPostgres`]
+/// Control over the Postgres server itself, as opposed to a database on it:
+/// what a [`crate::model::DbAdminAction::RestartPostgres`]
 /// needs. A trait rather than a `testkit` type so `run` names no cluster
 /// type (its module doc comment), and so a harness that drives some other
 /// server can supply its own.
@@ -212,9 +212,9 @@ impl ClusterControl for testkit::TestCluster {
     }
 }
 
-/// Backing a Postgres server up and restoring it into a fresh one (issue
-/// #236): what `crate::run::run_convergence_with_restore` needs. A trait for
-/// the same reason as [`ClusterControl`].
+/// Backing a Postgres server up and restoring it into a fresh one: what
+/// `crate::run::run_convergence_with_restore` needs. A trait for the same
+/// reason as [`ClusterControl`].
 pub trait BackupRestore: Sized {
     /// A backup, kept until it has been restored from.
     type Backup;

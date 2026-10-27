@@ -1,5 +1,4 @@
-//! The build's profile columns for `build-under-load` (#625 F2, the plan's
-//! §4 "The profile").
+//! The build's profile columns for `build-under-load`.
 //!
 //! Most come from the engine's own metrics (`trellis::metrics`), diffed
 //! across the window like every other scrape here ([`super::scrape`]):
@@ -320,7 +319,7 @@ trellis_build_rows_total 20100
 trellis_seal_refused_total 2
 ";
 
-    /// The engine labels every series with its instance (#873); the profile
+    /// The engine labels every series with its instance; the profile
     /// reads them by name and its own labels.
     #[test]
     fn the_instance_label_is_not_part_of_a_series_key() {

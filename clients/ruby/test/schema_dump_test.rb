@@ -7,7 +7,7 @@ require "test_helper"
 require_relative "support/rails_app"
 require "trellis/schema_dump"
 
-# Trellis::SchemaDump (issue #644): `structure.sql` carries Trellis's
+# Trellis::SchemaDump: `structure.sql` carries Trellis's
 # definitions. The round trip runs Rails' own dump and load, in-process, over
 # two databases of the test cluster: define in one, dump with
 # DatabaseTasks.dump_schema, load the file into a fresh one with

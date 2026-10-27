@@ -24,7 +24,7 @@
 //!   and raises `Trellis::ForkedHandleError`, and a forked copy is never
 //!   dropped either (see [`Handle`]'s `Drop`).
 //! - **A process forked while its parent had an engine running can't
-//!   connect one of its own** (issue #600): it may have inherited a lock one
+//!   connect one of its own**: it may have inherited a lock one
 //!   of the parent's engine threads held, which nothing in it can release.
 //!   [`connect`] raises `Trellis::ForkedHandleError` instead of risking the
 //!   hang. See the [`engine`] module.
@@ -331,7 +331,7 @@ impl Handle {
     }
 
     /// Pauses now the readers of every table whose capture was changed
-    /// outside Trellis (#1181), and returns the tables.
+    /// outside Trellis, and returns the tables.
     fn detect_capture_disruptions(ruby: &Ruby, rb_self: &Self) -> Result<Vec<String>, Error> {
         rb_self.call(ruby, BlockingTrellis::start_detect_capture_disruptions)
     }
@@ -432,7 +432,7 @@ impl Handle {
 /// `lib/trellis/pg.rb`'s to document, and nothing falls back to the environment.
 ///
 /// Raises `Trellis::ForkedHandleError`, before starting anything, in a
-/// process forked while its parent had an engine running (issue #600).
+/// process forked while its parent had an engine running.
 fn connect(
     ruby: &Ruby,
     url: String,

@@ -1,4 +1,4 @@
-//! The load generator's own reach (issue #276): [`run_parallel_load`] at
+//! The load generator's own reach: [`run_parallel_load`] at
 //! [`Pace::Max`] against a plain source table with **no engine running** —
 //! no client, no capture triggers, nothing draining the staging ring.
 //!
@@ -29,7 +29,7 @@ pub struct GeneratorReachResult {
     pub offered_duration_secs: f64,
     /// How long the generator waited, after the offer window closed, for the
     /// commits it issued inside it ([`LoadSummary::commit_tail`]). Not part of
-    /// `offered_duration_secs` or the achieved rate (issue #541).
+    /// `offered_duration_secs` or the achieved rate.
     pub commit_tail_secs: f64,
     pub commits_issued: u64,
     pub rows_issued: u64,

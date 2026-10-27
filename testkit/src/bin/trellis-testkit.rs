@@ -1,5 +1,5 @@
 //! `trellis-testkit`: a throwaway Postgres for test suites that aren't
-//! written in Rust (the Elixir and Ruby bindings, epic #140).
+//! written in Rust (the Elixir and Ruby bindings).
 //!
 //! It starts a [`TestCluster`], the same cluster the engine's own tests run
 //! against (same `initdb` flags, same `postgres -c` settings, unix socket

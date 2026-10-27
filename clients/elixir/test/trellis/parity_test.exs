@@ -1,5 +1,5 @@
 defmodule Trellis.ParityTest do
-  # The cross-language parity suite (issue #155): `clients/parity/cases.json`,
+  # The cross-language parity suite: `clients/parity/cases.json`,
   # a script of (operation, input, expected shape) steps that the Ruby suite
   # runs too. Neither suite owns it; both are checked against it, so a field
   # name, a nil, an atom, a time or a page that one binding shapes
@@ -16,7 +16,7 @@ defmodule Trellis.ParityTest do
   alias Trellis.{Parity, TestCluster}
 
   # The script, top to bottom. It runs the staging worker and ends by
-  # poisoning a key, which would disturb the shared cluster (#588).
+  # poisoning a key, which would disturb the shared cluster.
   @tag timeout: 300_000
   test "every live step returns its expected shape" do
     run_live(:handle)
@@ -249,7 +249,7 @@ defmodule Trellis.ParityTest do
 
   # Calls the operation until its result matches the step's `until` shape,
   # for at most `Trellis.Eventually`'s bound, then fails naming what it
-  # waited for and the last result it saw (#297).
+  # waited for and the last result it saw.
   defp poll(step, saved, what, call) do
     eventually("#{step["waiting_for"]} (#{what})", fn ->
       result = call.()

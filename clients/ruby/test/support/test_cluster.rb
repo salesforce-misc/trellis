@@ -33,7 +33,7 @@ module TestCluster
     # it returns. Shut down any handle connected to it inside the block.
     #
     # For a test whose leftovers would disturb the shared cluster, such as a
-    # poisoned key, which holds back every later await_converged (#588).
+    # poisoned key, which holds back every later await_converged.
     def private_cluster
       testkit, info = open
       yield info

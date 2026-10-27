@@ -1,7 +1,7 @@
 //! Readers for [`trellis::Metrics::render_prometheus`] output.
 //!
 //! No bucket-boundary changes, no raw-sample recording, no new histograms:
-//! issue #266 states its latency targets at exactly
+//! the latency targets are stated at exactly
 //! [`trellis::metrics::LATENCY_BUCKETS`]' existing boundaries, so a
 //! cumulative-bucket-fraction read off a scrape answers them with no
 //! interpolation and no estimator. The `bucket_count`/`total_count` shape
@@ -27,7 +27,7 @@
 //!
 //! **Engine log lines.** Some engine signals exist only as `tracing` events,
 //! not metrics: the drain's `drain page waited out its lock_timeout` warning
-//! (ADR-0002 I7, #621) is one. [`engine_log_counter`] is a `tracing` layer
+//! is one. [`engine_log_counter`] is a `tracing` layer
 //! the benchmark binary always installs (`main.rs`), filtered to `WARN` and
 //! above, that counts those lines as they are emitted; [`lock_timeout_warnings`]
 //! reads the process-wide count, which a scenario diffs across its window like
@@ -130,8 +130,8 @@ impl HistogramSnapshot {
 /// has ever been observed legitimately has no line at all, which is not an
 /// error.
 ///
-/// Summed, not the first match: every series carries `trellis_instance`
-/// (#873), and each probe of a ramp runs against a fresh database, so the
+/// Summed, not the first match: every series carries `trellis_instance`,
+/// and each probe of a ramp runs against a fresh database, so the
 /// process holds one series of the same transform per probe, rendered in no
 /// fixed order. Their sum is the cumulative count a scenario diffs across its
 /// window, as the single series was before the label.
@@ -186,7 +186,7 @@ pub fn counter_value(rendered: &str, metric: &str, transform: &str) -> u64 {
 ///
 /// Both are cumulative Prometheus counters, so a post-minus-pre subtraction
 /// over a measurement window is exact. This is what makes `per_hop_mean_ms`
-/// legible (#268): `trellis_transform_latency_seconds` already fires per
+/// legible: `trellis_transform_latency_seconds` already fires per
 /// transform, so every hop's mean is sitting in a scrape the harness was
 /// already taking — no new instrumentation, and none of T1's bucket
 /// coarseness.
@@ -228,7 +228,7 @@ impl SumCountSnapshot {
 }
 
 /// Exact per-hop mean latency (ms) for every `transform` in `hops`, over the
-/// window between `baseline` and `rendered_after` (#268's `per_hop_mean_ms`).
+/// window between `baseline` and `rendered_after`.
 /// `None` for a hop with no samples in the window. Index 0 is hop 1.
 pub fn per_hop_mean_ms(
     rendered_after: &str,
@@ -266,7 +266,7 @@ pub fn per_hop_json(per_hop_mean_ms: &[Option<f64>]) -> String {
         .join(",")
 }
 
-/// T1's three targets (#266) as cumulative-bucket-fraction pass/fail against
+/// T1's three targets as cumulative-bucket-fraction pass/fail against
 /// one histogram window. Deliberately reports fractions, not an interpolated
 /// percentile — the issue's own words: "'p99 <= 500 ms' is answerable; 'our
 /// p99 is 380 ms' is not."
@@ -406,7 +406,7 @@ trellis_changes_applied_total{transform=\"t\"} 10\n";
         assert_eq!(counter_value(SAMPLE, CHANGES_APPLIED_METRIC, "t"), 10);
     }
 
-    /// #873: an earlier probe's instance keeps its series of the same
+    /// An earlier probe's instance keeps its series of the same
     /// transform, and the exporter renders the two in either order. The
     /// window is the same whichever comes first.
     #[test]

@@ -66,8 +66,7 @@ enum Comparison {
     /// [`trellis::numeric::Numeric`] rather than hand-rolled parsing.
     DecimalByValue,
     /// Combined absolute+relative tolerance for `real`/`double precision`
-    /// (issue #112, which added [`ValueType::Float`] and so made this arm
-    /// constructible for the first time).
+    /// (this arm exists because of [`ValueType::Float`]).
     ///
     /// Tolerance rather than [`Comparison::Exact`] even though
     /// `trellis::float::render` reproduces `float4out`/`float8out`
@@ -91,7 +90,7 @@ impl Comparison {
     fn for_type(value_type: ValueType) -> Comparison {
         match value_type {
             ValueType::Numeric => Comparison::DecimalByValue,
-            // Issue #111: an exact integer has exactly one text rendering
+            // An exact integer has exactly one text rendering
             // per value on both sides — Postgres's `int4out` and Rust's
             // `i64` `Display` agree character for character — so byte-exact
             // comparison is both correct *and* strictly stronger than
@@ -99,9 +98,9 @@ impl Comparison {
             // difference that a by-value decimal compare would forgive, and
             // for this type any such difference is a real bug.
             ValueType::Integer(_) => Comparison::Exact,
-            // Issue #112: see `Comparison::FloatTolerance`.
+            // See `Comparison::FloatTolerance`.
             ValueType::Float(_) => Comparison::FloatTolerance,
-            // Issue #108: `Other` is passthrough-only (no arithmetic, no
+            // `Other` is passthrough-only (no arithmetic, no
             // scale-insensitive semantics defined for it yet), same footing
             // as `Text`/`Boolean`/`Uuid` — byte-exact text equality is the
             // right default until a family's own epic child teaches it
@@ -257,7 +256,7 @@ pub struct ThreeWayReport {
     /// `evaluator ≠ SQL oracle` — an eval-layer drift bug (ADR-0004's
     /// "immutable subset of Postgres's" semantics, tested directly).
     pub evaluator_vs_sql: Vec<Divergence>,
-    /// Whether the evaluator leg ran at all. `false` for a `JOIN` (#1113),
+    /// Whether the evaluator leg ran at all. `false` for a `JOIN`,
     /// where the engine's evaluator-driven recompute has nothing to compare
     /// against — see [`check`]. An empty `evaluator_vs_sql` means
     /// "agreed" when this is `true` and "never asked" when it is `false`,
@@ -325,15 +324,14 @@ fn quote_ident(ident: &str) -> String {
 /// choose the same idiomatic rendering — quoted identifiers, an explicit cast
 /// on every literal, `name(args)` for a function call — independently, not by
 /// sharing an implementation). Improvement-plan task B2 widened this past the
-/// original numeric-`+` slice (issue #5) to `Operator::GreaterThan`,
+/// original numeric-`+` slice to `Operator::GreaterThan`,
 /// `Expr::StringLiteral`, and the five scalar functions
 /// (`STRPOS`/`OCTET_LENGTH`/`CHAR_LENGTH`/`REGEXP_COUNT`/`COALESCE`) the
 /// generator now draws (see `crate::generate::DerivedShape`); task B4 widens
 /// it again to the `KeySpace::Aggregate` functions
-/// (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`, plus `BOOL_AND`/`BOOL_OR` since issue
-/// #255, see `crate::generate::AggregateFn`).
-/// Every one of those renders as the same generic `name(args)` Postgres call
-/// syntax (the fallthrough `FunctionCall` arm below) except `COUNT`'s
+/// (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`, plus `BOOL_AND`/`BOOL_OR`, see
+/// `crate::generate::AggregateFn`). Every one of those renders as the same generic `name(args)`
+/// Postgres call syntax (the fallthrough `FunctionCall` arm below) except `COUNT`'s
 /// argument-less `COUNT(*)`, which the grammar's AST carries with an empty
 /// `args` list — special-cased so it doesn't fall through to the generic arm
 /// and emit the invalid `count()`. Anything still beyond that (a path into
@@ -737,7 +735,7 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
                 )
             })
         }
-        // Issue #111: Postgres's own literal-typing rule — a bare integral
+        // Postgres's own literal-typing rule — a bare integral
         // literal is `integer` if it fits, else `bigint`; anything else is
         // `numeric`.
         Expr::NumberLiteral(text) => match text.contains('.') {
@@ -749,7 +747,7 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
         },
         Expr::StringLiteral(_) => ValueType::Text,
         Expr::TypedLiteral { value_type, .. } => *value_type,
-        // Issue #111: `+`'s result type depends on its operands (`int4 +
+        // `+`'s result type depends on its operands (`int4 +
         // int4` is `integer`, `int4 + numeric` is `numeric`), so it has to
         // be resolved rather than read off a constant.
         Expr::BinaryOp { op, lhs, rhs } => {
@@ -766,13 +764,12 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
             field_value_type(&args[0], source_columns)
         }
-        // Issue #111: likewise for the aggregates — `sum(int4)` is `bigint`,
+        // Likewise for the aggregates — `sum(int4)` is `bigint`,
         // `sum(numeric)` is `numeric`. `COUNT` is excluded on purpose:
         // `registry::aggregate_result_type` deliberately has no row for it
         // (both `COUNT(*)` and `COUNT(<expr>)` are type-agnostic — Postgres
         // accepts any argument type and always returns `bigint`), so its
-        // constant `FunctionSpec` return type (below, `Integer(Int8)` as of
-        // issue #120's registry alignment — `numeric` before it) is the
+        // constant `FunctionSpec` return type (below, `Integer(Int8)`) is the
         // right answer regardless of which shape reaches here. Its
         // one-argument form (`COUNT(<col>)`) is why this needs naming rather
         // than falling out of the `args.is_empty()` guard.
@@ -805,7 +802,7 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
 }
 
 /// The type of each of `def`'s fields, in field order: the types of the
-/// columns of the target table the engine builds for it (issue #879). A
+/// columns of the target table the engine builds for it. A
 /// second instance that reads that target as a source needs them to model it
 /// as a [`Table`].
 ///
@@ -825,7 +822,7 @@ pub fn field_types(
         .collect()
 }
 
-/// The SQL oracle of a `JOIN` definition (#1113): the definition's own
+/// The SQL oracle of a `JOIN` definition: the definition's own
 /// `select … from a [left] join b on … group by …`, each column as text,
 /// group columns first in `GROUP BY` order, then every other field.
 ///
@@ -957,7 +954,7 @@ pub async fn check(
     source_columns: &HashMap<String, ValueType>,
     target: &Rows,
 ) -> Result<ThreeWayReport, OracleError> {
-    // #1113: a `JOIN`'s oracle is its own `JOIN … GROUP BY` query over the
+    // A `JOIN`'s oracle is its own `JOIN … GROUP BY` query over the
     // two tables, compared byte for byte; there is no evaluator leg.
     if matches!(def.key_space, KeySpace::Join(_)) {
         let sql = join_sql_oracle(pool, def).await?;
@@ -986,7 +983,7 @@ pub async fn check(
 mod tests {
     use super::*;
 
-    /// Issue #830: the SQL oracle reads a qualified name inside an aggregate
+    /// The SQL oracle reads a qualified name inside an aggregate
     /// as the source column it names.
     #[test]
     fn render_expr_reads_a_qualified_source_column_as_the_column() {
@@ -1234,7 +1231,7 @@ mod tests {
     /// agree that every aggregate function a definition keeps (`SUM`,
     /// `COUNT`, `AVG`) produces the type Postgres itself would: `Numeric` for
     /// `SUM`/`AVG` over
-    /// a `Numeric` column, and — since issue #120's registry alignment —
+    /// a `Numeric` column, and
     /// `Integer(Int8)` (`bigint`) for `COUNT`, matching
     /// `pg_typeof(count(*))`/`pg_typeof(count(x))`, which selects
     /// `Comparison::Exact` rather than `Comparison::DecimalByValue` for the
@@ -1264,7 +1261,7 @@ mod tests {
         }
     }
 
-    /// #1113: a `JOIN`'s oracle is its own query: group columns first, read
+    /// A `JOIN`'s oracle is its own query: group columns first, read
     /// through their tables, then each other field, a joined-side column
     /// read through the joined table.
     #[test]
@@ -1379,9 +1376,8 @@ mod tests {
     }
 
     /// Every one of the four scalar functions type-checks to its registered
-    /// return type via [`field_value_type`] — `integer` since issue #111,
-    /// which gave them the return type `pg_proc.prorettype` actually
-    /// reports instead of the `Numeric` they collapsed into — and
+    /// return type via [`field_value_type`] — `integer`, the return type
+    /// `pg_proc.prorettype` actually reports — and
     /// `COALESCE` specifically types as its first argument's type rather
     /// than a fixed registry entry.
     #[test]

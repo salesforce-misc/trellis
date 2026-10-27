@@ -1,4 +1,4 @@
-# The baseline quarantine list (#786). A planted-bug sweep's unplanted
+# The baseline quarantine list. A planted-bug sweep's unplanted
 # baseline passes only with no failure outside this list; see
 # docs/generative-test-suite.md, "The baseline bar".
 #

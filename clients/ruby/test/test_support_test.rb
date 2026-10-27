@@ -4,7 +4,7 @@ require "test_helper"
 require "trellis/test_support"
 require_relative "support/rails_app"
 
-# Trellis::TestSupport (issue #1181): a fixture load that disables the
+# Trellis::TestSupport: a fixture load that disables the
 # triggers, the way ActiveRecord's disable_referential_integrity does for
 # Rails fixtures, pauses the readers of the table (a capture failure of kind
 # :disruption), and the helper resumes them and waits for exact targets.

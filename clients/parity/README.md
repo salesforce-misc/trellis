@@ -1,7 +1,7 @@
 # Binding parity fixture
 
 `cases.json` is the one description of what the Elixir and Ruby bindings
-return, shared by both (issue #155). Each host's test suite runs it against a
+return, shared by both. Each host's test suite runs it against a
 Trellis it connects itself, and checks every result against the shape written
 here:
 
@@ -25,8 +25,8 @@ test`, `mix test`), so they run in the `ruby` and `elixir` CI jobs.
   suite also checks that this list is exactly its own value types, field for
   field.
 - `live`: a script of steps, run top to bottom on a private testkit cluster
-  (it runs the staging worker, and it ends by poisoning a key and releasing it,
-  #588). A step is
+  (it runs the staging worker, and it ends by poisoning a key and releasing it).
+  A step is
   `{"op", "args", "opts", "expect" | "until" + "waiting_for", "save",
   "covers", "about"}`.
   - `op` is one of the binding's calls (`connect`, `apply`, `status`, ...), or
@@ -37,7 +37,7 @@ test`, `mix test`), so they run in the `ruby` and `elixir` CI jobs.
     a keyword list, except `await_converged`, where `timeout_ms` is
     positional.
   - `until` polls the call until its result matches, for at most 30 seconds,
-    then fails naming `waiting_for` and the last result (#297).
+    then fails naming `waiting_for` and the last result.
   - `save` keeps the host's result for a later `{"$ref": "name.field"}`.
   - `covers.statement_kind` marks the step that applies each
     `trellis::StatementKind`.
@@ -105,7 +105,7 @@ comparison.
 
 The word sets come from `trellis-embed` through each binding's native
 module, and are never written out in either suite. So a status the engine
-adds or drops (`catching_up`, #625) changes what `word_in` accepts, and the
+adds or drops (`catching_up`) changes what `word_in` accepts, and the
 fixture is left alone. Only a step that names a specific word has to change.
 
 ## Coverage
@@ -166,4 +166,4 @@ Definitions may share a source. The
 source of its own, and the overflowing `parity_ledger` rows are fixed before
 the column resume re-reads them. Name a specific status word only where the
 step is about it: the phase-one steps take any `transform_status`, since how
-a new definition starts is #556's to change.
+a new definition starts can change.

@@ -81,8 +81,8 @@ pub struct Coverage {
     /// How many recorded programs (cases, not fields) contain each aggregate
     /// call shape, keyed `(key_space, function, argument)` — e.g.
     /// `("Aggregate", "COUNT", "column")` for `COUNT(<col>)` inside a
-    /// `GROUP BY` def (issue #294), or `("Aggregate", "SUM", "column")`
-    /// (issue #255). `functions` above only says a name appeared somewhere;
+    /// `GROUP BY` def, or `("Aggregate", "SUM", "column")`.
+    /// `functions` above only says a name appeared somewhere;
     /// this says how often each *shape* was actually driven, which is what a
     /// deep run needs to report to show a newly-drawn shape got real
     /// exercise. Only calls to `registry::AGGREGATE_FUNCTIONS` names are
@@ -101,8 +101,8 @@ pub struct Coverage {
     /// value), `"list_default"` (fewer leaves and a `DEFAULT`) and
     /// `"range"`. Zero everywhere means no case read a partitioned source.
     pub partition_strategies: HashMap<&'static str, usize>,
-    /// How many of each partitioned-source op the recorded programs drew
-    /// (ADR-0017, issue #1320), by [`partition_op_name`]: partition
+    /// How many of each partitioned-source op the recorded programs drew,
+    /// by [`partition_op_name`]: partition
     /// maintenance (`"detach"`, `"detach_concurrently"`, `"attach"`,
     /// `"drop"`, `"truncate_leaf"`, a new leaf `"create_empty"`,
     /// `"create_written"` or `"create_attached"`), writes named on a leaf
@@ -110,25 +110,25 @@ pub struct Coverage {
     /// partition-key updates through the root that move a row
     /// (`"key_update"`) or are refused (`"key_update_refused"`).
     pub partition_ops: HashMap<&'static str, usize>,
-    /// Bursts recorded by [`Coverage::record_concurrent_plan`] (issue #557).
+    /// Bursts recorded by [`Coverage::record_concurrent_plan`].
     pub concurrent_bursts: usize,
     /// How many recorded concurrent-tier cases contain at least one burst of
-    /// each [`ConcurrentShape`], keyed by its name (issue #557). Worked out
+    /// each [`ConcurrentShape`], keyed by its name. Worked out
     /// from the program and its plan alone, in program order: the lanes of a
     /// burst race, so the engine sees some interleaving of it, but which
     /// keys, groups and row counts a burst carries doesn't depend on that.
     pub concurrent_shape_cases: HashMap<&'static str, usize>,
     /// How many of each mid-burst operator action the recorded concurrent
-    /// plans take, keyed by [`BurstAction::name`] (issue #557 part 2).
+    /// plans take, keyed by [`BurstAction::name`].
     pub concurrent_actions: HashMap<&'static str, usize>,
-    /// Every [`DrainAudit`] recorded by [`Coverage::record_drain`], added up
-    /// (issue #557): what the engine actually sealed and claimed, where
+    /// Every [`DrainAudit`] recorded by [`Coverage::record_drain`], added up:
+    /// what the engine actually sealed and claimed, where
     /// `concurrent_shape_cases` is only what the program offered it.
     pub drain: DrainAudit,
     /// How many recorded runs' drain audits show each of: a split batch
     /// (`"split"`), a split batch claimed by two or more workers
     /// (`"split_across_workers"`), and a key sealed into several batches
-    /// within one burst (`"key_in_several_batches"`) (issue #557).
+    /// within one burst (`"key_in_several_batches"`).
     pub drain_cases: HashMap<&'static str, usize>,
 }
 
@@ -194,7 +194,7 @@ impl Coverage {
             }
         }
 
-        // Issues #255/#294: per-case aggregate call shapes.
+        // Per-case aggregate call shapes.
         let mut aggregate_calls = HashSet::new();
         for def in &program.defs {
             let key_space = key_space_name(&def.key_space);
@@ -209,7 +209,7 @@ impl Coverage {
 
     /// Tallies one concurrent-tier case's [`ConcurrentShape`]s into
     /// [`Self::concurrent_shape_cases`], and its bursts into
-    /// [`Self::concurrent_bursts`] (issue #557). Separate from
+    /// [`Self::concurrent_bursts`]. Separate from
     /// [`Self::record_program`], which the harness calls as well.
     pub fn record_concurrent_plan(&mut self, program: &Program, plan: &ConcurrentPlan) {
         self.concurrent_bursts += plan.bursts.len();
@@ -225,7 +225,7 @@ impl Coverage {
     }
 
     /// Adds one run's [`DrainAudit`] into [`Self::drain`] and
-    /// [`Self::drain_cases`] (issue #557).
+    /// [`Self::drain_cases`].
     pub fn record_drain(&mut self, audit: &DrainAudit) {
         self.drain.add(audit);
         for (name, reached) in [
@@ -382,7 +382,7 @@ fn op_table_name(op: &Op) -> &str {
     op.table()
 }
 
-/// A burst shape the concurrent tier exists to reach (issue #557). A case
+/// A burst shape the concurrent tier exists to reach. A case
 /// has a shape when at least one of its bursts does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConcurrentShape {
@@ -404,7 +404,7 @@ pub enum ConcurrentShape {
     /// A group loses its last member and gains one again within the burst.
     GroupRefill,
     /// A `request_backfill` fires mid-burst on a table the burst writes
-    /// both before and after it (issue #557 part 2): the re-read overlaps
+    /// both before and after it: the re-read overlaps
     /// in-flight CDC for the same keys. This and the three shapes below
     /// place an action by the burst's program order; the lanes race, so the
     /// engine sees roughly that.
@@ -416,11 +416,11 @@ pub enum ConcurrentShape {
     /// both before and after it.
     MidBurstColumnResume,
     /// A definition installs on a source the burst writes both before and
-    /// after the install, so its build overlaps CDC (#625's shape).
+    /// after the install, so its build overlaps CDC.
     MidBurstInstall,
     /// A row a 1-1 definition reads is written twice or more in a burst
     /// that also has a hot key, and its last write in the whole program
-    /// falls in the burst's middle fifth to four fifths (#557 part 3b): a
+    /// falls in the burst's middle fifth to four fifths: a
     /// key that goes quiet while the rest of the burst still writes, so an
     /// out-of-order 1-1 write to it is never healed by a later change.
     CoolingKey,
@@ -445,7 +445,7 @@ impl ConcurrentShape {
         ConcurrentShape::CoolingKey,
     ];
 
-    /// The shapes part 1 of #557 added, which every hot-key case offers.
+    /// The hot-key shapes, which every hot-key case offers.
     /// The rest come from mid-burst actions and cooling keys, which only
     /// some cases draw.
     pub const HOT_KEY: [ConcurrentShape; 6] = [
@@ -481,7 +481,7 @@ impl ConcurrentShape {
 type Group<'a> = (&'a str, &'a str, Option<String>);
 
 /// Replays `program.ops` burst by burst, in program order, and returns every
-/// [`ConcurrentShape`] some burst reaches (issue #557). Groups are those of
+/// [`ConcurrentShape`] some burst reaches. Groups are those of
 /// every `GROUP BY` definition's single-column key.
 fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<ConcurrentShape> {
     let mut out = HashSet::new();
@@ -668,8 +668,8 @@ fn concurrent_shapes(program: &Program, plan: &ConcurrentPlan) -> HashSet<Concur
     out
 }
 
-/// The mid-burst action shapes one burst reaches (issue #557
-/// part 2). `ops` is the burst's op indices in program order; an action
+/// The mid-burst action shapes one burst reaches.
+/// `ops` is the burst's op indices in program order; an action
 /// `after` `k` ops fires between `ops[k - 1]` and `ops[k]`.
 fn burst_action_shapes(
     program: &Program,
@@ -966,7 +966,7 @@ mod tests {
     };
     use crate::model::Burst;
 
-    /// Issue #557: four rows grouped by grain (`0`, `0`, `1`, `1`) under a
+    /// Four rows grouped by grain (`0`, `0`, `1`, `1`) under a
     /// `COUNT(*)` `GROUP BY`. After the seeds, one burst moves both rows of
     /// group `0` into the never-used group `5` and one back (group `0`
     /// empties and refills), then writes group `1`'s rows twelve times,

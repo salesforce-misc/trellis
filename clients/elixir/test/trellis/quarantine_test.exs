@@ -46,7 +46,7 @@ defmodule Trellis.QuarantineTest do
     # row's batch fails alone on each drain cycle, and the row-level fuse
     # (also five) evicts the key before the column fuse can trip: a
     # poisoned key, which wedges convergence for every test after this one
-    # until it's released (#588).
+    # until it's released.
     ids = Enum.to_list(1..@column_death_threshold)
 
     Postgrex.query!(
@@ -75,7 +75,7 @@ defmodule Trellis.QuarantineTest do
     # The pause is visible while the batch that tripped it can still be in
     # flight, and a resume that lands before that batch settles sees it
     # retried against its original row images, which pauses the column
-    # again (#585). Wait for everything written so far to drain first, the
+    # again. Wait for everything written so far to drain first, the
     # way an operator resuming a column has to until that's fixed.
     assert :ok = Trellis.await_converged(trellis, Trellis.watermark_token!(trellis), 30_000)
 
@@ -132,7 +132,7 @@ defmodule Trellis.QuarantineTest do
   # `status/2` counts. Fixed, `release_key/4` releases it.
   #
   # A held key stops `await_converged/3` converging past it until it's
-  # released (#588), so this runs on a cluster of its own rather than risk
+  # released, so this runs on a cluster of its own rather than risk
   # wedging the shared one.
   test "a poisoned key is reported, sampled, counted and released" do
     cluster = TestCluster.private!()
@@ -210,7 +210,7 @@ defmodule Trellis.QuarantineTest do
     # the table's version fence. One that waits past the session's lock
     # timeout (100 ms here, behind the `for share` hold a drain page takes,
     # from another connection) is a `:timeout` error, which says to retry it,
-    # and changes nothing (#842).
+    # and changes nothing.
     waiter = Trellis.connect!(url: dsn <> " options='-c lock_timeout=100'")
 
     {:error, :rolled_back} =

@@ -1,4 +1,4 @@
-//! The concurrent tier's runner (issue #557): a [`ConcurrentPlan`]'s lanes
+//! The concurrent tier's runner: a [`ConcurrentPlan`]'s lanes
 //! issued from separate tasks, each on its own connection, against a
 //! multi-worker engine.
 
@@ -30,7 +30,7 @@ pub struct ConcurrentRun {
 /// installed so far is checked against the oracle, once per burst.
 ///
 /// While the lanes run, this task takes the burst's operator actions
-/// ([`crate::model::Burst::actions`], issue #557 part 2) in order, each once
+/// ([`crate::model::Burst::actions`]) in order, each once
 /// its [`crate::model::TimedAction::after`] count of the burst's ops has been
 /// applied, through [`ConcurrentBackend::act`]. A definition deferred by
 /// [`Program::def_install_after_op`] is installed by the plan's

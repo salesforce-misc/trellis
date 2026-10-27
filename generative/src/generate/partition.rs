@@ -1,6 +1,6 @@
 //! ADR-0017: the partitioned tier's model of a partitioned source, and the
 //! partition maintenance, partition-key updates and leaf-named writes it
-//! draws (issue #1320).
+//! draws.
 //!
 //! [`super::partition_table`] makes a program's table a partitioned source
 //! keyed by `(pk, grain)` and routed by the grain. Once rows can move between
@@ -812,7 +812,7 @@ mod tests {
         }
     }
 
-    /// Issue #1320: a revival of a row moved to another partition no longer
+    /// A revival of a row moved to another partition no longer
     /// collides with it (the primary key holds the grain), and a second
     /// partition-key update of that pk then hits both rows and fails.
     #[test]

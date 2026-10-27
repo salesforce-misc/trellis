@@ -2,7 +2,7 @@
 //! observably hostile to Trellis's pinned output GUCs.
 //!
 //! `trellis::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` pins `lc_monetary` to
-//! `'C'` (issue #672), which renders `money` as `$1,234.56`. `lc_monetary`
+//! `'C'`, which renders `money` as `$1,234.56`. `lc_monetary`
 //! only accepts a locale the server's C library actually has, and which ones
 //! exist varies by box: `C`/`POSIX`/`C.UTF-8` are universal, but they, and
 //! `en_US.UTF-8`, all render `$1,234.56` too, so none of them proves a pin

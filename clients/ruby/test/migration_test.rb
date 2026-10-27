@@ -6,7 +6,7 @@ require "tmpdir"
 require "test_helper"
 require_relative "support/rails_app"
 
-# Trellis::Migration (issue #153), run the way `rails db:migrate` runs it:
+# Trellis::Migration, run the way `rails db:migrate` runs it:
 # migration files in a directory, through ActiveRecord's MigrationContext,
 # with ActiveRecord connected to the test cluster. Mirrors the Elixir
 # suite's migration_test.exs.
@@ -250,7 +250,7 @@ class MigrationTest < Minitest::Test
 
   # A shutdown that fails after the block has raised mustn't replace the
   # block's error, which is the one that says what went wrong: it's
-  # raised, and the shutdown's failure is a warning (issue #645).
+  # raised, and the shutdown's failure is a warning.
   def test_a_failing_shutdown_does_not_mask_the_blocks_error
     failing_shutdown do
       _, err = capture_io do

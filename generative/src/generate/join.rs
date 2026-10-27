@@ -1,4 +1,4 @@
-//! The JOIN tier's programs (#1113): two tables, [`FROM_TABLE`] and
+//! The JOIN tier's programs: two tables, [`FROM_TABLE`] and
 //! [`JOINED_TABLE`], one to three `JOIN … GROUP BY` definitions over them,
 //! and an op stream that writes both tables.
 //!
@@ -12,7 +12,7 @@
 //!
 //! Each definition ([`JoinDefSpec`]) is `LEFT` or `INNER`, joins on `k`
 //! alone or on the pair `(t, k)` ([`JoinKey`]), and groups by `jb.gb`
-//! (#1091 J2's S1), by `ja.ga, jb.gb` (S2) or by `ja.ga` alone
+//! (S1), by `ja.ga, jb.gb` (S2) or by `ja.ga` alone
 //! ([`JoinGroups`]). Its fields are `COUNT(*)` and a draw of [`JoinField`]s,
 //! including composed and expression-argument ones. The oracle is the
 //! definition's own `JOIN … GROUP BY` query
@@ -20,7 +20,7 @@
 //!
 //! The op stream ([`build_join_program`]) inserts, updates and deletes rows
 //! of both tables, and now and then truncates one of them (ADR-0019's
-//! per-side `TRUNCATE`, #1110), one statement per op, with values `NULL` now
+//! per-side `TRUNCATE`), one statement per op, with values `NULL` now
 //! and then
 //! (a `NULL` join key joins nothing). Its [`KeyShape`] decides how the join
 //! keys spread: over a dozen keys, mostly onto one hot key, over three keys
@@ -35,7 +35,7 @@
 //!
 //! **Builds over rows.** A definition is installed up front or part way
 //! through the stream ([`JoinBuildDraws::installs`]), so most `JOIN`s build
-//! (#1109's per-side steps and `T` step) over tables that already hold rows,
+//! (the per-side steps and `T` step) over tables that already hold rows,
 //! or that both lanes are still writing. Later bursts pause and resume a
 //! definition (a `RESUME` rebuilds it in place) and re-read one side
 //! ([`BurstAction::RequestBackfill`] on `ja` or `jb`), each while the lanes
@@ -101,7 +101,7 @@ pub enum JoinKey {
 /// What a definition groups by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinGroups {
-    /// `jb.gb`: #1091 J2's S1, every group fed through the join.
+    /// `jb.gb`: S1, every group fed through the join.
     Joined,
     /// `ja.ga, jb.gb`: J2's S2, a group column on each side.
     Both,

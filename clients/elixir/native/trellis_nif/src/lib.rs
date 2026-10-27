@@ -26,7 +26,7 @@
 //!   included, so there is no rule to remember about which ones are "cheap".
 //!   Plus `connect` and `shutdown`, the handle's lifecycle, which wait on a
 //!   connection and on the runtime's threads. Three exceptions, none of which
-//!   touches the database (issue #149):
+//!   touches the database:
 //!   - `render_prometheus` runs on a **dirty CPU** scheduler. It never waits
 //!     on IO, which is why ADR-0010 singles it out, but its cost isn't
 //!     bounded either: it formats every series in the process-wide registry
@@ -850,7 +850,7 @@ fn has_live_staging_worker<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> Nif
 }
 
 /// Pauses now the readers of every table whose capture was changed outside
-/// Trellis (#1181), and returns the tables.
+/// Trellis, and returns the tables.
 #[rustler::nif]
 fn detect_capture_disruptions<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifReply<Term<'a>> {
     handle.submit(

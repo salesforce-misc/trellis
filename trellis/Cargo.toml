@@ -21,9 +21,9 @@ categories = ["database"]
 deadpool-postgres = "0.14.1"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
-# `MetricKindMask`, for the exporter's gauge idle timeout (issue #873).
+# `MetricKindMask`, for the exporter's gauge idle timeout.
 metrics-util = { version = "0.20.4", default-features = false }
-# Issue #56/ADR-0009 decision 3: the `tracing` facade every span/event in
+# ADR-0009 decision 3: the `tracing` facade every span/event in
 # this crate goes through. Unconditional (unlike the four crates below) —
 # emitting spans/events costs nothing when no subscriber is installed (a
 # `tracing` core design goal), so this crate always compiles them in; only
@@ -32,7 +32,7 @@ metrics-util = { version = "0.20.4", default-features = false }
 # the embedder's job, same "library, not a binary" principle `src/metrics.rs`
 # follows for the `metrics` facade.
 tracing = "0.1"
-# Issue #56/ADR-0009 decision 1's OTLP export layer, feature-gated behind
+# ADR-0009 decision 1's OTLP export layer, feature-gated behind
 # `otlp` (off by default — see `src/otel.rs`). `optional = true` means none
 # of these four compile at all (not just "unused") when the feature is off;
 # `cargo build -p trellis --no-default-features` vs.
@@ -55,11 +55,11 @@ tracing-opentelemetry = { version = "0.33", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = [
     "registry",
 ] }
-# Issue #756: the random part of each `Client`'s worker id
+# The random part of each `Client`'s worker id
 # (`client::new_worker_id`). Already in the tree, through `tokio-postgres`'s
 # SCRAM auth, so this adds no crate.
 getrandom = "0.4"
-# #1023: a `self_check` job keeps the divergences it has found as JSON in its
+# A `self_check` job keeps the divergences it has found as JSON in its
 # catalog row (`staging::self_check_job`). Both are in the tree already, through
 # `tracing` and `metrics`' dependencies.
 serde = { version = "1", features = ["derive"] }
@@ -74,13 +74,13 @@ tokio-postgres = "0.7.13"
 # OpenSSL.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-postgres-rustls = "0.13"
-# Issue #874: the OS user `tokio-postgres` connects as when a DSN names no
+# The OS user `tokio-postgres` connects as when a DSN names no
 # user, whose name is then the database's (`instance_log::name_of`). Already
 # in the tree through `tokio-postgres`, so this adds no crate.
 whoami = "2"
 
 [features]
-# Issue #56/ADR-0009 decision 1's optional OTLP export layer. Off by default
+# ADR-0009 decision 1's optional OTLP export layer. Off by default
 # — `cargo build -p trellis` (no flags) compiles none of the four
 # OTLP-related dependencies above at all, so an embedder who never enables
 # this feature pays nothing, not even at compile time. See `src/otel.rs`.
@@ -91,10 +91,10 @@ otlp = [
     "dep:tracing-opentelemetry",
     "dep:tracing-subscriber",
 ]
-# Issue #166 and ADR-0012. Compiles in this crate's dev-only, uncommitted
+# ADR-0012. Compiles in this crate's dev-only, uncommitted
 # surface, which is two things:
 #
-#   1. A small number of test-only pause hooks (issue #166 — today, just
+#   1. A small number of test-only pause hooks (today, just
 #      `staging::apply`'s pre-commit Phase 3 pause; see that module for the
 #      mechanism) that let an external harness land a `SIGKILL` at a
 #      deterministic point in the engine's drain path instead of relying on

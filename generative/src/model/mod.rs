@@ -24,8 +24,8 @@ pub struct Table {
     pub name: String,
     pub pk_col: String,
     pub columns: Vec<Column>,
-    /// Names of columns that carry a single-column `UNIQUE` constraint
-    /// (issue #34). Every entry must also appear in `columns`; the primary
+    /// Names of columns that carry a single-column `UNIQUE` constraint.
+    /// Every entry must also appear in `columns`; the primary
     /// key is *not* listed here (it's already unique by virtue of being the
     /// primary key — see `pk_col`). The generator's tables leave it empty;
     /// a hand-built pin sets it to give a source a unique column.
@@ -64,20 +64,15 @@ pub enum PartitionStrategy {
 ///
 /// The generator seeds primary keys as consecutive integers
 /// (`1..=seed_count`, see `crate::generate::build_program_multi_with_shapes`),
-/// and since issue #111 [`ValueType`] can finally *say* that: `bigint`.
+/// and [`ValueType`] can *say* that: `bigint`.
 ///
-/// This used to be a bare `PRIMARY_KEY_PG_TYPE: &str = "bigint"` constant
-/// that every DDL and cast site had to special-case, precisely because the
-/// `ValueType` on the PK's own [`Column`] could not name the type the column
-/// was declared with. The only numeric variant mapped to Postgres `numeric`,
-/// which the engine rejects as a primary key outright
-/// (`defs::ddl::DdlError::UnsupportedPrimaryKeyType`, issue #107: `::text`
-/// key matching is not sound for `numeric`, since `1.0::text != 1.00::text`
-/// though the two are numerically equal) — so declaring the PK from its
-/// `ValueType` made *every* generated program fail to install. Recording the
-/// real type removes the special case and, as a bonus, gives the whole
-/// generative suite continuous end-to-end coverage of an exact-integer
-/// primary key against the Postgres oracle.
+/// Recording the real type on the PK's own [`Column`] means no DDL or cast
+/// site special-cases it. A `numeric` primary key is not an option: the
+/// engine rejects it outright (`defs::ddl::DdlError::UnsupportedPrimaryKeyType`:
+/// `::text` key matching is not sound for `numeric`, since
+/// `1.0::text != 1.00::text` though the two are numerically equal). It also
+/// gives the whole generative suite continuous end-to-end coverage of an
+/// exact-integer primary key against the Postgres oracle.
 pub const PRIMARY_KEY_VALUE_TYPE: ValueType = ValueType::Integer(IntWidth::Int8);
 
 impl Table {
@@ -86,9 +81,9 @@ impl Table {
     /// step can strand a definition that references it (design doc §1).
     ///
     /// The PK column's [`ValueType`] is [`PRIMARY_KEY_VALUE_TYPE`], and
-    /// since issue #111 that is an honest `bigint` rather than a
-    /// `ValueType::Numeric` placeholder the DDL and cast sites had to
-    /// override — see that constant.
+    /// that is an honest `bigint` rather than a `ValueType::Numeric`
+    /// placeholder the DDL and cast sites would have to override — see that
+    /// constant.
     pub fn new(pool: &mut NamePool, column_types: &[ValueType]) -> Table {
         let name = pool.next_table_name();
         let pk_col = pool.next_column_name();
@@ -426,7 +421,7 @@ impl NoisePlan {
     }
 }
 
-/// How the concurrent tier (issue #557) issues a [`Program`]'s ops: a
+/// How the concurrent tier issues a [`Program`]'s ops: a
 /// sequence of [`Burst`]s, run one after another. Every burst is checked
 /// against the oracle once, after all of its lanes have finished and the
 /// engine has quiesced; nothing is checked mid-burst.
@@ -437,23 +432,23 @@ impl NoisePlan {
 pub struct ConcurrentPlan {
     pub bursts: Vec<Burst>,
     /// A steady load the whole run is issued under, or `None` to issue every
-    /// burst flat out (#720, #725).
+    /// burst flat out.
     pub steady_load: Option<SteadyLoad>,
     /// Whether the run waits, after installing, for every definition to
-    /// settle before the first burst's first op. The JOIN tier (#1113) draws
+    /// settle before the first burst's first op. The JOIN tier draws
     /// it for some cases, so their up-front definitions build over empty
     /// tables; the others race the first burst. Every other tier leaves it
     /// off.
     pub settle_after_install: bool,
     /// The longest stall each page takes between its last write and its
     /// commit, for the whole run (`trellis::dev::interleave::set_commit_stall`),
-    /// or `None`. The JOIN tier (#1114) draws it for some cases, so a page
+    /// or `None`. The JOIN tier draws it for some cases, so a page
     /// that skipped a lock reads another's uncommitted write now and then.
     pub commit_stall: Option<std::time::Duration>,
 }
 
-/// A steady load on the engine, for a whole [`ConcurrentPlan`] (#720,
-/// #725). Flat out, a burst's lanes issue every op in tens of milliseconds:
+/// A steady load on the engine, for a whole [`ConcurrentPlan`].
+/// Flat out, a burst's lanes issue every op in tens of milliseconds:
 /// a build an action starts runs its chunks after the writes are over, and
 /// a page is never slow next to another, so segments drain in order. Two
 /// races the tier exists to catch then never get a window: a build chunk
@@ -470,7 +465,7 @@ pub struct SteadyLoad {
     /// source's do, while the build runs.
     pub pace: std::time::Duration,
     /// Whether the pace holds from every burst's start, rather than only
-    /// once an action starts a build. The cooling-backfill tier (#734) paces
+    /// once an action starts a build. The cooling-backfill tier paces
     /// its whole run, so a `request_backfill`'s rebuild runs among the
     /// writes of the keys going quiet around it rather than after a burst
     /// written flat out in tens of milliseconds.
@@ -487,8 +482,8 @@ pub struct SteadyLoad {
 /// order at all, so Postgres commits their ops in whatever order the tasks
 /// happen to reach it.
 ///
-/// `actions` are operator actions the harness takes while the lanes run
-/// (issue #557 part 2), in order of [`TimedAction::after`]: each fires once
+/// `actions` are operator actions the harness takes while the lanes run,
+/// in order of [`TimedAction::after`]: each fires once
 /// that many of the burst's ops have been applied, by whichever lanes, so
 /// the work it starts overlaps the burst's CDC rather than landing at a
 /// quiescent point.
@@ -498,7 +493,7 @@ pub struct Burst {
     pub actions: Vec<TimedAction>,
 }
 
-/// A [`BurstAction`] and when in its burst it fires (issue #557 part 2).
+/// A [`BurstAction`] and when in its burst it fires.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimedAction {
     /// How many of the burst's ops must have been applied, across all its
@@ -509,8 +504,8 @@ pub struct TimedAction {
     pub action: BurstAction,
 }
 
-/// An operator action the concurrent tier takes mid-burst (issue #557 part
-/// 2). Each is named after the public API call an operator makes, not the
+/// An operator action the concurrent tier takes mid-burst.
+/// Each is named after the public API call an operator makes, not the
 /// engine mechanism behind it. None of them changes what the converged
 /// targets should hold, so the oracle is unchanged: the burst is
 /// checked once it settles, like any other.
@@ -537,7 +532,7 @@ pub enum BurstAction {
     },
     /// `DEFINE TRANSFORM` for `program.defs[def]`, whose
     /// [`Program::def_install_after_op`] falls in this burst: its build runs
-    /// while the burst still writes the source (the shape #625's
+    /// while the burst still writes the source (the shape a
     /// build-under-load divergence needs).
     Install { def: usize },
 }
@@ -587,7 +582,7 @@ impl Burst {
 }
 
 /// How a [`DbAdminAction::RestartPostgres`] stops the server before starting
-/// it again (issue #236).
+/// it again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartMode {
     /// An orderly shutdown: open transactions roll back, clients are
@@ -598,7 +593,7 @@ pub enum RestartMode {
     Immediate,
 }
 
-/// A database-administration action (issue #236, layer-3 bucket 5 in
+/// A database-administration action (layer-3 bucket 5 in
 /// `docs/generative-test-suite.md` §7). Each one leaves the correct
 /// converged state unchanged, so the oracle needs no changes: the run
 /// quiesces after the op the action is anchored to and compares as usual.
@@ -626,28 +621,27 @@ pub struct DbAdminEvent {
     pub action: DbAdminAction,
 }
 
-/// The database-administration schedule for one program run (issue #236),
+/// The database-administration schedule for one program run,
 /// interleaved with its ops by `crate::run::run_convergence_with_db_admin`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DbAdminPlan {
     pub events: Vec<DbAdminEvent>,
 }
 
-/// How a [`RestorePlan`] backs the source cluster up (issue #236). Trellis's
+/// How a [`RestorePlan`] backs the source cluster up. Trellis's
 /// catalog, ring, capture triggers and targets all live in the backed-up
-/// database, so a restore rolls them all back together (the 2026-09-24
-/// decision on issue #236).
+/// database, so a restore rolls them all back together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackupKind {
     /// A file-level copy of the whole data directory, taken while the
     /// server is stopped. Capture carries on from the restored point with no
     /// pause.
     ColdCopy,
-    // TODO(#558): `BaseBackup`, a `pg_basebackup` restore. Capture state
-    // lives in ordinary tables (#622), so it should behave like `ColdCopy`.
+    // TODO: `BaseBackup`, a `pg_basebackup` restore. Capture state
+    // lives in ordinary tables, so it should behave like `ColdCopy`.
 }
 
-/// A backup-and-restore schedule for one program run (issue #236), driven by
+/// A backup-and-restore schedule for one program run, driven by
 /// `crate::run::run_convergence_with_restore`: back the cluster up right
 /// after `ops[backup_op]` is applied, run the program to its end, restore
 /// the backup into a fresh cluster, then replay `ops[backup_op + 1..]`
@@ -750,7 +744,7 @@ mod tests {
         let table = Table::new(&mut pool, &[]);
         assert_eq!(table.columns.len(), 1);
         assert_eq!(table.columns[0].name, table.pk_col);
-        // Issue #111: an honest `bigint`, not the `Numeric` placeholder the
+        // An honest `bigint`, not the `Numeric` placeholder the
         // DDL and cast sites used to have to override — see
         // [`PRIMARY_KEY_VALUE_TYPE`].
         assert_eq!(table.columns[0].value_type, PRIMARY_KEY_VALUE_TYPE);

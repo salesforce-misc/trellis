@@ -1,4 +1,4 @@
-//! `self_check` starts a background job (#1023), and the job crosses as a
+//! `self_check` starts a background job, and the job crosses as a
 //! [`PlainSelfCheckJob`]: its id, its state as a word, how many keys it has
 //! compared, and, once it is done, its report. The report is a
 //! [`PlainSelfCheckReport`]: its outcome as a word and its divergences as a

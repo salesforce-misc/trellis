@@ -4,11 +4,11 @@
 //! - [`run_controlled_load`]: **one connection, precisely paced.** The
 //!   latency ladder's generator, where the offered rate is an independent
 //!   variable held low and steady, not the thing being measured. Its
-//!   behaviour is frozen (issue #276: "existing paced scenarios —
-//!   byte-identical behaviour"), because the latency battery's numbers are
+//!   behaviour is frozen (existing paced scenarios keep
+//!   byte-identical behaviour), because the latency battery's numbers are
 //!   only comparable across runs while the instrument doesn't move.
 //! - [`run_parallel_load`]: **N connections, paced on a shared schedule or
-//!   unpaced** ([`Pace`]). The throughput generator (issue #276): able to
+//!   unpaced** ([`Pace`]). The throughput generator: able to
 //!   offer more than the engine can absorb, so a throughput scenario measures
 //!   the engine's ceiling rather than one connection's. Each commit is one
 //!   prepared `INSERT ... SELECT FROM generate_series(..)` whose rows Postgres
@@ -34,10 +34,10 @@ use crate::scenario::connect_raw;
 
 /// How far `achieved_rows_per_sec` may fall below the target before
 /// [`generator_bound`] calls it a material undershoot: the same 2% the
-/// scenarios' prose warnings used before issue #276 made it a verdict.
+/// scenarios' prose warnings use.
 pub const GENERATOR_UNDERSHOOT_TOLERANCE: f64 = 0.02;
 
-/// Issue #276's self-check: whether a result measured the *generator* rather
+/// Self-check: whether a result measured the *generator* rather
 /// than the engine.
 ///
 /// True when the generator materially undershot the offered target
@@ -117,7 +117,7 @@ impl LoadSummary {
     /// The rate the generator offered: rows issued over the offer
     /// [`window`](Self::window).
     ///
-    /// Not over `elapsed` (issue #541): that includes the commit tail, the
+    /// Not over `elapsed`: that includes the commit tail, the
     /// time the last in-flight commits took to return after the window closed.
     /// The tail says nothing about what was offered. Counting it made a paced
     /// run that issued its whole schedule read as an undershoot whenever its
@@ -233,7 +233,7 @@ pub async fn run_controlled_load(
 ///
 /// Measured with `generator-reach` (no engine running) on the 16-core dev
 /// box: 8 connections offer ~470k commits/sec at 1 row/commit and ~4.5M
-/// rows/sec at 1,000 rows/commit — past both of issue #276's reach gates
+/// rows/sec at 1,000 rows/commit — past both reach gates
 /// (200k and 1M) with margin — and adding more barely moves the 1-row number
 /// (16: ~490k, 32: ~520k) while taking more cores from the engine the
 /// generator shares the box with.
@@ -442,7 +442,7 @@ mod tests {
 
     #[test]
     fn a_slow_commit_tail_does_not_make_a_full_offer_generator_bound() {
-        // Issue #541's run: every commit due in the window issued, the last
+        // A run where every commit due in the window issued, the last
         // ones slow to return. Its offered rate is its target.
         let summary = paced_summary(20_000, Duration::from_millis(274));
         assert_eq!(summary.achieved_rows_per_sec(), 20_000.0);
@@ -557,7 +557,7 @@ mod tests {
     fn a_paced_parallel_run_lands_gapless_ids_within_its_schedule() {
         // 20k rows/sec in 100-row commits from 4 connections for 1s. How many
         // of the 200 commits due get issued before the deadline depends on how
-        // loaded the box is (issue #541), so this checks only what holds on
+        // loaded the box is, so this checks only what holds on
         // any box: every issued row landed, the ids are gapless, and the
         // schedule is never overrun. The rate and verdict are pure functions
         // of the summary, tested above.

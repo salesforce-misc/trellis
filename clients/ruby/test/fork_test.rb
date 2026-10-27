@@ -90,7 +90,7 @@ class ForkTest < Minitest::Test
   # The whole life of a forking server's workers, in a script of its own so
   # every process exits normally, running its at_exit hooks and freeing its
   # handles. A child forked while the parent's handle runs can't use it or
-  # connect its own (issue #600); a worker forked after the parent shut down
+  # connect its own; a worker forked after the parent shut down
   # connects its own, uses it, and exits; the parent connects again.
   def test_a_child_connects_only_if_its_parent_shut_down_before_forking
     script = File.expand_path("support/fork_worker.rb", __dir__)
@@ -117,7 +117,7 @@ class ForkTest < Minitest::Test
     out_r&.close
   end
 
-  # Issue #600: an engine still connecting on another thread has threads,
+  # An engine still connecting on another thread has threads,
   # and may hold a process-wide lock, before `Trellis` holds any handle. A
   # child forked then can't connect; one forked once that connect has
   # finished (here, failed) can.

@@ -1,4 +1,4 @@
-//! Issue #234 (layer-3 bucket 1 remainder, epic #238): drive **two Trellis
+//! Drive **two Trellis
 //! instances side by side**, each running its own independent program, each
 //! converging against its **own** oracle.
 //!
@@ -200,7 +200,7 @@ impl<B: Backend> InstanceRun<'_, B> {
 /// because a single instance's `quiesce()` almost always returns as soon as
 /// its own commit has drained. The bounded number of checks here was sized
 /// when a co-tenant instance's writes made every quiesce wait out a
-/// replication keepalive (~10s). Trigger capture (#622) has no such wait,
+/// replication keepalive (~10s). Trigger capture has no such wait,
 /// and the bound stays until someone decides per-op localization is worth
 /// the extra quiesces.
 ///
@@ -248,8 +248,7 @@ pub async fn run_two_instance_convergence<A: Backend, B: Backend>(
     // first point a shared-resource collision can surface at all: if the two
     // instances contend for something neither is supposed to own globally
     // (a trigger name, an advisory lock), B's install is where
-    // that shows up — and in fact is exactly where both of the bugs #234
-    // found did show up.
+    // that shows up.
     a.backend
         .install(a.program)
         .await
@@ -315,7 +314,7 @@ fn reject_unsupported_schedule<B: Backend>(
 }
 
 // ---------------------------------------------------------------------------
-// The shapes planned for production use (issue #879, epic #806)
+// The shapes planned for production use
 // ---------------------------------------------------------------------------
 //
 // [`run_two_instance_convergence`] already holds two programs side by side and
@@ -370,7 +369,7 @@ pub fn share_source(program: &Program) -> (Program, Program) {
 /// one-to-one targets as its source tables and has nothing of its own to
 /// write. `None` when the first program defines no one-to-one transform. An
 /// aggregate target can't be read by another instance (it has no primary key
-/// to capture by, issue #376), so those are left out.
+/// to capture by), so those are left out.
 ///
 /// Each source table is modelled from the definition that builds it: the
 /// source's primary key column, then one column per field, typed as the

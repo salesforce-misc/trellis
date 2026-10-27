@@ -1,6 +1,6 @@
 defmodule Trellis.Parity do
   @moduledoc false
-  # The Elixir half of the cross-language parity suite (issue #155): runs
+  # The Elixir half of the cross-language parity suite: runs
   # `clients/parity/cases.json`, which the Ruby suite runs too, against this
   # binding. The shape language and the canonical form are described in
   # `clients/parity/README.md`; the Ruby suite's `test/support/parity.rb` is
@@ -83,15 +83,15 @@ defmodule Trellis.Parity do
   these, and the fixture's operations run through a supervised handle there
   too.
 
-  `dump_definitions_sql` is here until the Ruby binding has its counterpart
-  (#644 part ii): then it becomes a fixture operation and leaves this list.
+  `dump_definitions_sql` is here until the Ruby binding has its counterpart:
+then it becomes a fixture operation and leaves this list.
   `structure_dump_test.exs` covers it meanwhile.
   """
   def not_operations do
     %{
       "child_spec" => "`{Trellis, options}` in a supervision tree",
       "start_link" => "`{Trellis, options}` in a supervision tree",
-      "dump_definitions_sql" => "Ruby's counterpart is #644 part (ii)"
+      "dump_definitions_sql" => "Ruby's counterpart is its schema dump"
     }
   end
 

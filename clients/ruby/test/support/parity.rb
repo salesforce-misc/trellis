@@ -2,7 +2,7 @@
 
 require "json"
 
-# The Ruby half of the cross-language parity suite (issue #155): runs
+# The Ruby half of the cross-language parity suite: runs
 # clients/parity/cases.json, which the Elixir suite runs too, against this
 # binding. The shape language and the canonical form are described in
 # clients/parity/README.md; test/trellis/parity_test.exs is the Elixir
@@ -81,7 +81,7 @@ module Parity
   # The fixture's own steps, which drive the test rather than the binding.
   HARNESS_OPS = %w[sql now].freeze
 
-  # How long an `until` step polls before failing (#297).
+  # How long an `until` step polls before failing.
   UNTIL_SECONDS = 30
 
   def self.fixture

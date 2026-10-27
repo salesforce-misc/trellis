@@ -1,7 +1,6 @@
 //! `build-under-load`: an aggregate's build over a large source while a
-//! write load runs throughout. Built for issue #558 experiment 5 (#617) and
-//! ported to main as the harness every #556 milestone measures itself with
-//! (#620 part A3, #629).
+//! write load runs throughout. It is the harness the build-path work
+//! measures itself with.
 //!
 //! `agg_src(id bigint primary key, grp integer, amt bigint)` is loaded with
 //! `--rows` rows by streamed `COPY ... FROM STDIN` (text format, one
@@ -46,12 +45,12 @@
 //!   and per phase (`load`: COPY + index; `build`: client start, the
 //!   `--pre-define-secs` of writes, then define -> `live`; `converge`:
 //!   `live` -> converged or the grace deadline), plus `VmHWM` and the enclosing
-//!   cgroup's `memory.peak`. #617 found a drain holding a bucket's whole
+//!   cgroup's `memory.peak`. A drain was once found holding a bucket's whole
 //!   share of a segment in memory (about 650 B per staged row, killed at
-//!   13.8 GB for 20M rows); the `converge` peak is the number #620's batch
+//!   13.8 GB for 20M rows); the `converge` peak is the number the batch
 //!   cap has to bound.
 //!
-//! - the Re-derive build's profile (#625 F2)
+//! - the Re-derive build's profile
 //!   ([`build_profile`]): worker-seconds per build statement class, chunk
 //!   transaction p50/p99/max, delta rows appended and merged and the delta
 //!   table's peak, chunks that gave up on their entry lock, seal refusals,
@@ -109,9 +108,9 @@ fn source_columns() -> HashMap<String, trellis::dev::defs::ValueType> {
 ///
 /// `--apply-latency` declares the table's own ([`source_columns`]): its
 /// `ALTER TRANSFORM ... ADD amt + 1` validates the merged definition against
-/// the live source columns, and since #980 refuses a field over a column whose
+/// the live source columns, and `ALTER TRANSFORM` refuses a field over a column whose
 /// live type differs from the recorded one, so an `amt` recorded as `numeric`
-/// over a `bigint` column failed it and the three statements after it (#1022).
+/// over a `bigint` column failed it and the three statements after it.
 ///
 /// Every other mode keeps declaring all three `numeric`, as it always has, so
 /// its numbers stay comparable with the ones already recorded: the declared
@@ -153,12 +152,12 @@ pub struct BuildUnderLoad {
     /// How often the run prints its RSS progress line (`None`: never).
     pub progress: Option<Duration>,
     /// `--one-to-one`: the definition is the 1-1 `SELECT grp AS grp, amt +
-    /// amt AS dbl` instead of the aggregate (#625 F8a), and the oracle
+    /// amt AS dbl` instead of the aggregate, and the oracle
     /// compares it row by row.
     pub one_to_one: bool,
     /// `--apply-latency` (with `--one-to-one`): once the target is `live`,
     /// time every statement `apply` accepts with the writers running
-    /// ([`apply_latency`](super::apply_latency), #666, #625 F8b).
+    /// ([`apply_latency`](super::apply_latency)).
     pub apply_latency: bool,
 }
 
@@ -245,7 +244,7 @@ pub struct BuildUnderLoadResult {
     /// `--apply-latency`'s audit.
     pub apply: Option<super::apply_latency::ApplyAudit>,
     pub application_threads: usize,
-    /// The engine's `build_chunk_rows` (#625 F2).
+    /// The engine's `build_chunk_rows`.
     pub build_chunk_rows: i64,
     /// The Re-derive build's profile columns ([`build_profile`]), over the
     /// same window as `disk`.
@@ -258,7 +257,7 @@ pub struct BuildUnderLoadResult {
     pub first_claim_secs: Option<f64>,
     pub first_chunk_secs: Option<f64>,
     /// `backfill_chunks` rows the build had (the most seen at once, before
-    /// the flip to `live` deleted them, #966).
+    /// the flip to `live` deleted them).
     pub chunks: i64,
     /// define -> the definition left `waiting_to_backfill`/`backfilling`.
     pub build_secs: f64,
@@ -775,7 +774,7 @@ async fn monitor_build(
             match status.as_str() {
                 "waiting_to_backfill" | "backfilling" => {}
                 "live" => {
-                    // The flip deleted the build's rows (#966): a build that
+                    // The flip deleted the build's rows: a build that
                     // ran its chunks and flipped between two polls was
                     // claimed and done by this one.
                     p.first_claim.get_or_insert(now);
@@ -1188,7 +1187,7 @@ mod tests {
 
     /// The definition is installed against the types the table has: a column
     /// declared differently is recorded as that type, and `ALTER TRANSFORM`
-    /// refuses an edit over it once the live type disagrees (#1022).
+    /// refuses an edit over it once the live type disagrees.
     #[test]
     fn declared_source_types_match_the_tables() {
         use trellis::dev::defs::IntWidth::{Int4, Int8};

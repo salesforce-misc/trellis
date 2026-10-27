@@ -3,7 +3,7 @@
 require "rbconfig"
 require "test_helper"
 
-# Trellis::Instance (issue #878, epic #806): one process holding several
+# Trellis::Instance: one process holding several
 # handles, each on a catalog schema of its own, in one database.
 class InstanceTest < Minitest::Test
   include TrellisTestCase

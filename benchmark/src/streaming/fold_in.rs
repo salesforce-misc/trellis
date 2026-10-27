@@ -1,5 +1,4 @@
-//! Aggregate throughput by fold-in ratio — issue #266's B3, epic #269's
-//! **V-AGG** / target T3 (400k rows/sec at fold-in >= 10:1).
+//! Aggregate throughput by fold-in ratio — the **V-AGG** / target T3 (400k rows/sec at fold-in >= 10:1).
 //!
 //! Unlike a 1-1 chain, where every source row becomes exactly one target
 //! write, an aggregate's target write count is bounded by its *group* count:
@@ -14,12 +13,12 @@
 //! groups each taking ~1,000 rows/sec.
 //!
 //! Load comes from the multi-connection generator, paced at the target
-//! ([`run_parallel_load`]): before issue #276 a single connection offered
-//! this scenario's 400k rows/sec target, undershot it at every ratio, and
-//! still reported `sustained: true` — a verdict on the generator that read
-//! like one on T3. `generator_bound` now flags exactly that combination.
+//! ([`run_parallel_load`]): a single connection could not offer
+//! this scenario's 400k rows/sec target, would undershoot it at every ratio, and
+//! still report `sustained: true` — a verdict on the generator that reads
+//! like one on T3. `generator_bound` flags exactly that combination.
 //!
-//! The same probe backs issue #277's `group-contention` scenario, which takes
+//! The same probe backs the `group-contention` scenario, which takes
 //! the group count directly (`--groups`) and crosses it with the drain-worker
 //! count (`--threads`). Every probe also samples where the engine's backends
 //! spent the window ([`contention`]), so a slow row can be attributed —
@@ -28,7 +27,7 @@
 //!
 //! Offer above the ceiling when characterizing: `in_window_folded_rows_per_sec`
 //! of a pipeline that can't keep up *is* its capacity at that shape, which is
-//! the number #277's curves are made of.
+//! the number the `group-contention` curves are made of.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -62,7 +61,7 @@ const SOURCE_TABLE: &str = "agg_src";
 const GROUP_COLUMN: &str = "grp";
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The ratios #266 names.
+/// The default fold-in ratios swept.
 pub const DEFAULT_RATIOS: &[usize] = &[10, 100, 1000];
 
 #[derive(Debug)]
@@ -71,19 +70,19 @@ pub struct FoldInResult {
     pub fold_in_ratio: f64,
     pub groups: usize,
     pub target_rows_per_sec: f64,
-    /// Drain workers ([`EngineTuning::application_threads`]) — issue #277's
-    /// second axis.
+    /// Drain workers ([`EngineTuning::application_threads`]) — the
+    /// `group-contention` scenario's second axis.
     pub application_threads: usize,
     /// Generator writer connections.
     pub connections: usize,
     pub offered_duration_secs: f64,
     /// How long the generator waited, after the offer window closed, for the
     /// commits it issued inside it ([`LoadSummary::commit_tail`]). Not part of
-    /// `offered_duration_secs` or the achieved rate (issue #541).
+    /// `offered_duration_secs` or the achieved rate.
     pub commit_tail_secs: f64,
     pub rows_issued: u64,
     pub achieved_rows_per_sec: f64,
-    /// Issue #276's self-check: the generator undershot the target and the
+    /// Self-check: the generator undershot the target and the
     /// aggregate kept up with everything it got (`kept_target_rate`, which
     /// judges against the achieved rate when that is lower), so this probe
     /// says nothing about T3 at `target_rows_per_sec`.
@@ -117,7 +116,7 @@ pub struct FoldInResult {
     /// T3's yes-or-no at this ratio ([`kept_target_rate`]): the target
     /// drained **and** `in_window_folded` kept up with the offered rate
     /// within its tolerance, **and** no source row was staged twice in the
-    /// window ([`rate::restaged_in_window`], which fails the run too, #509).
+    /// window ([`rate::restaged_in_window`], which fails the run too).
     /// `drained` alone can't answer T3: it only says the backlog drained
     /// within `grace`, and a long grace lets a pipeline running at a fraction
     /// of the target pass. Only meaningful when `generator_bound` is false.
@@ -133,10 +132,10 @@ pub struct FoldInResult {
     /// the comparison ran.
     pub oracle_groups: i64,
     /// Groups where the target disagrees with the oracle, or `None` when the
-    /// comparison was skipped (issue #335): `0` would read as "checked, all
+    /// comparison was skipped: `0` would read as "checked, all
     /// correct" for a run whose correctness was never checked.
     pub oracle_mismatched_groups: Option<i64>,
-    /// Issue #277: where the engine's backends spent the offer window, over
+    /// Where the engine's backends spent the offer window, over
     /// the same span the in-window fold rate is fitted to — see
     /// [`contention`].
     pub contention: ContentionSummary,
@@ -148,8 +147,8 @@ pub struct FoldInResult {
     /// [`disk_tier`] columns from the offer window opening until the target
     /// drained (or the grace deadline): WAL bytes (source and engine writes
     /// together, also per source row issued), fsyncs/s, checkpoint buffers
-    /// and the cluster's storage, so a `bench --disk` before/after (#620,
-    /// #629) carries its own I/O context.
+    /// and the cluster's storage, so a `bench --disk` before/after
+    /// carries its own I/O context.
     pub disk: disk_tier::DiskTier,
     pub wal_bytes_per_row: f64,
     /// Source rows the target folded in over the same window as `disk` and
@@ -159,7 +158,7 @@ pub struct FoldInResult {
     /// [`server_cost`] columns over the same window as `disk`: Postgres CPU
     /// (JSON `pg_cpu_us_per_folded_row`), `deadlock detected` log lines, the
     /// engine's lock-timeout warnings, ledger bytes per source row. The lock
-    /// hold/wait columns come from `contention` (#623 D1).
+    /// hold/wait columns come from `contention`.
     pub server: ServerCost,
 }
 
@@ -232,7 +231,7 @@ impl FoldInResult {
 /// every group would "mismatch" for a reason that is not a correctness
 /// failure. `drained` is therefore passed in, and a non-drained run reports
 /// `None` for both the verdict and the mismatch count, rather than a
-/// misleading `false` or a `0` that reads as a pass (#335).
+/// misleading `false` or a `0` that reads as a pass.
 async fn check_aggregate_oracle(
     raw: &RawClient,
     terminal: &str,
@@ -289,14 +288,14 @@ async fn folded_rows(raw: &RawClient, terminal: &str) -> i64 {
 }
 
 /// One probe: installs a single `COUNT` aggregate with `aggregate` (`SUM`, or
-/// `MAX` for #698's recomputed-field path) of `val` over a fresh source
+/// `MAX` for the recomputed-field path) of `val` over a fresh source
 /// table, offers `target_rows_per_sec` for `offer.duration` from
 /// `offer.connections` writers, spread across `groups` group keys, then waits
 /// up to `offer.grace` for the target to fold in every row.
 ///
 /// "Caught up" is the target's own `sum(row_count)` reaching the committed
 /// row count (see the comment at the drain loop below), not
-/// `changes_applied`. That counter counts staged source rows too (#409), but
+/// `changes_applied`. That counter counts staged source rows too, but
 /// it's an in-process tally recorded after each apply commits, not the
 /// target's own state, so the target is the authoritative signal.
 pub async fn run_probe(
@@ -311,7 +310,7 @@ pub async fn run_probe(
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
-    // Issue #277's sampler gets its own connection: `raw` is busy sampling
+    // The contention sampler gets its own connection: `raw` is busy sampling
     // the fold rate over the same window.
     let sampler = connect_raw(db.dsn()).await;
 
@@ -467,7 +466,7 @@ pub async fn run_probe(
 
 /// A fold-in probe's verdict: [`kept_target_rate`], unless a source row was
 /// staged twice inside the window ([`rate::restaged_in_window`]). That fails
-/// the run, so the probe's JSON must not report a pass (#509).
+/// the run, so the probe's JSON must not report a pass.
 pub fn fold_in_kept_target_rate(
     drained: bool,
     in_window_folded: Option<InWindowRate>,

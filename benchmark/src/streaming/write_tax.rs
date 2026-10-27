@@ -1,4 +1,4 @@
-//! The write-path tax (#565's E1, rebuilt for #622 C4): what capturing a
+//! The write-path tax: what capturing a
 //! table costs the application writing to it.
 //!
 //! Every cell starts a fresh cluster (on `$TMPDIR`, so `bench --disk` moves
@@ -14,16 +14,12 @@
 //!   btree, or ADR-0002 A7's comparator, an expression index on
 //!   `regexp_count(val::text, '[13579]')`. They put the capture numbers next to
 //!   costs application engineers already accept.
-//! - The logical-replication path before #622 C5 (`slot`) is gone with
-//!   intake (C7).
 //! - `trigger`: the capture triggers, installed through the real installer
 //!   ([`trellis::dev::capture::install`]), with the capture spec computed
 //!   from the catalog the way the staging worker's reconcile does.
-//!   Since #622 C6 every insert, update and delete function counts its
-//!   columns in the empty-statement guard's query (Q2(c)), so this is C4's
-//!   `trigger+column-check-guard`. C4's benchmark-only Q2 variants
-//!   (`trigger+exception`, `trigger+column-check`, `-guard`, `-txn`) went
-//!   with the decision.
+//!   Every insert, update and delete function counts its
+//!   columns in the empty-statement guard's query, so this is the
+//!   `trigger+column-check-guard` variant.
 //!
 //! Shapes ([`Shape::parse`]):
 //!
@@ -33,13 +29,13 @@
 //!   transaction, one round trip each: what an ORM saving objects one at a
 //!   time sends. It was added to show C4's `trigger+exception` variant
 //!   overflowing the backend's subtransaction cache past 64 captured
-//!   statements per transaction (#622 plan finding 8). That variant is gone,
+//!   statements per transaction. That variant is gone,
 //!   and the shape now checks the chosen `trigger` stays clear of it.
 //! - `upd<r>x<w>`: `w` writers, each committing one
 //!   `UPDATE … SET val = val + 1` of `r` rows per transaction, cycling
 //!   through [`UPDATE_BAND_ROWS`] rows preloaded per writer before capture
 //!   is installed. The update capture's common path, which checks for
-//!   repeated keys on both sides (#1099).
+//!   repeated keys on both sides.
 //! - `ups<r>x<w>`: one `INSERT … ON CONFLICT DO UPDATE` of `r` rows per
 //!   transaction, half of them the writer's previous statement's keys
 //!   (updated) and half new (inserted). Its two events capture in one
@@ -47,7 +43,7 @@
 //! - `nest<r>x<w>`: `<r>x<w>` on a table with an application `AFTER INSERT`
 //!   row trigger that rewrites the row it fired for, in every variant. The
 //!   nested write makes capture re-read and stage transition images (the
-//!   gated path, #1099).
+//!   gated path).
 //! - `copy`: one `COPY … FROM STDIN` of `--copy-rows` rows, one transaction.
 //! - A `+hold` suffix holds a transaction with an xid open on another
 //!   connection for the whole window: the long-running transaction under
@@ -343,9 +339,9 @@ impl Shape {
     }
 }
 
-/// E1's shapes plus the ORM shape (#622 plan, C4), and the ORM shape again at
+/// The bulk shapes plus the ORM shape, and the ORM shape again at
 /// 16 writers and under a held `xmin`, for the subtransaction effect; then
-/// #1099's updates (single-row and bulk, the update capture's common path),
+/// updates (single-row and bulk, the update capture's common path),
 /// a mixed upsert and an application trigger rewriting its row (both the
 /// gated path, where capture re-reads).
 pub const DEFAULT_SHAPES: &[&str] = &[

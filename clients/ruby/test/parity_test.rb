@@ -4,7 +4,7 @@ require "test_helper"
 require_relative "support/parity"
 require_relative "support/rails_app"
 
-# The cross-language parity suite (issue #155): clients/parity/cases.json,
+# The cross-language parity suite: clients/parity/cases.json,
 # a script of (operation, input, expected shape) steps that the Elixir suite
 # runs too. Neither suite owns it; both are checked against it, so a field
 # name, a nil, a symbol, a time or a page that one binding shapes
@@ -15,7 +15,7 @@ class ParityTest < Minitest::Test
 
   # The script, top to bottom, on a cluster of its own: it runs the staging
   # worker and ends by poisoning a key, which would disturb the shared
-  # cluster's other tests (#588).
+  # cluster's other tests.
   def test_every_live_step_returns_its_expected_shape
     TestCluster.private_cluster do |cluster|
       pg = TestCluster.pg(cluster)
@@ -140,7 +140,7 @@ class ParityTest < Minitest::Test
   end
 
   # Calls the operation until its result matches the step's `until` shape,
-  # for at most UNTIL_SECONDS, then fails naming what it waited for (#297).
+  # for at most UNTIL_SECONDS, then fails naming what it waited for.
   def poll(step, saved, what)
     waiting_for = step.fetch("waiting_for")
     eventually_value("#{waiting_for} (#{what})",

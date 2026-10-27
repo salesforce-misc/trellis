@@ -5,7 +5,7 @@ require "tempfile"
 require "rbconfig"
 require "test_helper"
 
-# The Rails integration's boot half (issue #153): Trellis::Railtie, in a
+# The Rails integration's boot half: Trellis::Railtie, in a
 # minimal app booted in a process of its own per scenario
 # (support/rails_boot_app.rb), and the promise that without Rails the gem
 # requires nothing at all.
@@ -63,7 +63,7 @@ class RailsTest < Minitest::Test
   end
 
   # Trellis.migrate needs no ActiveRecord, so neither does the task: it
-  # mustn't load the migration helpers, which do (issue #645).
+  # mustn't load the migration helpers, which do.
   def test_trellis_migrate_runs_in_an_app_without_active_record
     assert_equal({ "connected" => false, "connected_after_migrate" => false, "active_record" => false },
                  boot("rake_without_active_record"))
@@ -135,7 +135,7 @@ class RailsTest < Minitest::Test
     JSON.parse(out.lines.last)
   end
 
-  # Runs a Ruby process to completion, bounded (#297), and returns its
+  # Runs a Ruby process to completion, bounded, and returns its
   # stdout, failing with its stderr if it doesn't exit 0.
   def run_ruby(what, env, *args)
     Tempfile.create("out") do |out|

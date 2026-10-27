@@ -10,7 +10,7 @@ module Trellis
   # appends the `INSERT`s that describe how the schema came to be. A database
   # built from the file (`db:schema:load`, `db:prepare`, the test database
   # `maintain_test_schema!` loads) then has every transform defined, with no
-  # Trellis step to run: Trellis's worker finds the definitions unbuilt and builds them (issue #644, ADR-0010).
+  # Trellis step to run: Trellis's worker finds the definitions unbuilt and builds them (ADR-0010).
   #
   # Needs `config.active_record.schema_format = :sql`: a `schema.rb` can't
   # carry another schema's tables or triggers. With `:ruby`, the dump raises
@@ -156,7 +156,7 @@ module Trellis
 
       # The keywords of a libpq connection string or URI. A failure names
       # what was being read and never the string or libpq's message, which
-      # can quote part of a password (as Trellis's own parse does, #608).
+      # can quote part of a password (as Trellis's own parse does).
       def conninfo(url, what)
         PG::Connection.conninfo_parse(url.to_s).to_h { |entry| [entry[:keyword], entry[:val]] }
       rescue PG::Error

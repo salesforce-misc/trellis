@@ -1,10 +1,10 @@
-//! Issue #236's backup-and-restore action (`docs/generative-test-suite.md`
+//! The backup-and-restore action (`docs/generative-test-suite.md`
 //! §7, layer-3 bucket 5): back the cluster up at op *k*, run the program to
 //! its end, restore the backup into a fresh cluster, replay ops *k+1..n*
 //! against the restored database, and converge.
 //!
-//! What this checks is the assumption the 2026-09-24 decision on issue #236
-//! rests on: Trellis keeps its catalog, staging ring, capture triggers and
+//! What this checks is the assumption that restoring needs no special
+//! handling: Trellis keeps its catalog, staging ring, capture triggers and
 //! targets in the database it reads from, so a restore rolls all of them
 //! back to the same point and what comes back is consistent with
 //! itself. Trellis has no restore-specific handling, and needs none.
@@ -12,8 +12,7 @@
 //! The one thing a stop carries over is a claim a worker took just before
 //! it, whose worker is gone after the restore. The stale-claim sweep frees
 //! it once it is a reclaim TTL old, so this run gives the engine
-//! [`SERVER_STOP_RECLAIM_TTL`] to keep that inside the quiesce's budget
-//! (issue #752).
+//! [`SERVER_STOP_RECLAIM_TTL`] to keep that inside the quiesce's budget.
 //!
 //! The oracle is "cloned" at *k* for free: it recomputes from the source
 //! tables, and those are in the backup. So the restored database is held to
@@ -50,7 +49,7 @@ use super::{
 /// The status a cold-copy restore must never leave a transform in.
 const PAUSED: &str = "paused";
 
-/// Issue #236's check that a cold-copy restore carried on without a pause.
+/// The check that a cold-copy restore carried on without a pause.
 /// `statuses` is every installed definition's `(target, status)` on the
 /// restored database, read after the engine caught up with `op_index`.
 ///
@@ -90,7 +89,7 @@ fn source_tables(program: &Program, snapshot: &Snapshot) -> Snapshot {
 }
 
 /// [`super::run_convergence`] with a backup at `plan.backup_op` and a restore
-/// after the last op (issue #236); see the module doc comment.
+/// after the last op; see the module doc comment.
 ///
 /// `backend` and `pool` are the original database's backend and oracle
 /// handle, and `database` its name, the same on the restored cluster.
@@ -118,7 +117,7 @@ pub async fn run_convergence_with_restore<C: BackupRestore>(
     }
 
     // The backup stops the server under the running engine, which can
-    // strand a claim on both sides of the restore (issue #752; see
+    // strand a claim on both sides of the restore (see
     // `SERVER_STOP_RECLAIM_TTL`). `connect_to_restore` carries the TTL over.
     backend.set_reclaim_ttl(SERVER_STOP_RECLAIM_TTL);
 

@@ -1,4 +1,4 @@
-//! The serialization-failure tax (#623 D8a): how often capture makes a
+//! The serialization-failure tax: how often capture makes a
 //! `SERIALIZABLE` application write fail with `40001` that would have
 //! committed without it.
 //!
@@ -28,7 +28,7 @@
 //!   preloaded id;
 //! - `nested1`: `serial1` on a table with an application `AFTER INSERT` row
 //!   trigger that updates the row it was fired for (in every variant). The
-//!   nested write is what makes capture re-read (#623 D8a's gate), so this
+//!   nested write is what makes capture re-read, so this
 //!   is the case where capture still reads the table; the trigger's own
 //!   `UPDATE … WHERE id = …` reads it too, which is its no-capture rate.
 //!

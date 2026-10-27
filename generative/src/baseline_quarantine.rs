@@ -1,4 +1,4 @@
-//! The planted-bug sweep's baseline bar (#786): an unplanted baseline passes
+//! The planted-bug sweep's baseline bar: an unplanted baseline passes
 //! only with **no failure outside the checked-in quarantine list**,
 //! `generative/baseline-quarantine.txt`. See `docs/generative-test-suite.md`,
 //! "The baseline bar", for the rule and why it replaced a failure-rate bar.

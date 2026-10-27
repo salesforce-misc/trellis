@@ -1,9 +1,9 @@
-//! The benchmark process's own memory, sampled in-process (issue #620 A3).
+//! The benchmark process's own memory, sampled in-process.
 //!
 //! Every streaming scenario runs the engine inside this process (a
 //! [`trellis::Client`]), so `VmRSS` here is the engine's memory plus the
-//! harness's (a few counters and fixed-size histograms). #617 sampled it with
-//! a side script; [`RssSampler`] does the same from a plain OS thread, so a
+//! harness's (a few counters and fixed-size histograms). [`RssSampler`]
+//! samples it from a plain OS thread (rather than a side script), so a
 //! runtime starved by the engine's own work can't stretch the sampling
 //! interval, and reports:
 //!
@@ -36,7 +36,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// The default sampling interval: fine enough to see a drain batch's step
-/// (#617 saw 2.5-3 GB per batch over seconds), cheap enough to be free.
+/// (a drain batch can swing 2.5-3 GB over seconds), cheap enough to be free.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_millis(250);
 
 /// One `key: <n> kB` field of a `/proc/<pid>/status` text, in bytes.

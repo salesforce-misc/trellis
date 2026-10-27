@@ -33,8 +33,8 @@ pub const SCENARIOS: &[&str] = &[
     "self-check-walk",
 ];
 
-/// The latency ladder's defaults. #266: "low offered rate (e.g. 10
-/// commits/s)". 60 s at 10 commits/sec gives ~600 end-to-end observations per
+/// The latency ladder's defaults: a low offered rate (10
+/// commits/s). 60 s at 10 commits/sec gives ~600 end-to-end observations per
 /// depth — enough for the p99 bucket-fraction check to mean something (a single
 /// miss out of 600 is already inside the 1% tolerance).
 const LADDER_DEFAULT_RATE: f64 = 10.0;
@@ -56,10 +56,10 @@ const SHAPE_DEFAULT_TARGET_RATE: f64 = 20_000.0;
 const SHAPE_DEFAULT_DURATION: Duration = Duration::from_secs(20);
 const SHAPE_DEFAULT_GRACE: Duration = Duration::from_secs(30);
 
-/// The fold-in sweep's defaults: #266's own ratio list at T3's 400k rows/sec.
+/// The fold-in sweep's defaults: the ratio list at T3's 400k rows/sec.
 const FOLD_IN_DEFAULT_TARGET_RATE: f64 = 400_000.0;
 const FOLD_IN_DEFAULT_DURATION: Duration = Duration::from_secs(20);
-/// Longer than every other scenario's 30s grace (issue #270 review): at
+/// Longer than every other scenario's 30s grace: at
 /// 400k rows/sec every ratio starts the grace window already backlogged, and a low fold-in ratio's target
 /// write count is close to the row count — near the same write load as a 1-1
 /// chain, whose own knee sits at ~210-230k rows/sec. Measured directly: ratio
@@ -73,16 +73,16 @@ const FOLD_IN_DEFAULT_DURATION: Duration = Duration::from_secs(20);
 /// rather than lowering the default target rate.
 const FOLD_IN_DEFAULT_GRACE: Duration = Duration::from_secs(120);
 
-/// Issue #277's group-count axis: the five points it names, bracketing
-/// #268's 1000:1 (400 groups at 400k rows/sec) by two decades either side.
+/// The group-count axis: five points bracketing
+/// a 1000:1 (400 groups at 400k rows/sec) by two decades either side.
 const CONTENTION_DEFAULT_GROUPS: &[usize] = &[10, 100, 400, 4_000, 40_000];
 
 /// Repetitions per cell for `write-tax` and `capture-ceiling`: the plan asks
-/// for at least three, interleaved (#622 C4).
+/// for at least three, interleaved.
 const WRITE_TAX_DEFAULT_REPS: usize = 3;
 
-/// Idle cost's defaults: 8 drain threads (#269's own "staging worker + 8 drain
-/// threads" wording), a 10 s warmup so start-of-day work never pollutes the
+/// Idle cost's defaults: 8 drain threads ("staging worker + 8 drain
+/// threads"), a 10 s warmup so start-of-day work never pollutes the
 /// steady-state sample, then a 60 s window — long enough that a few hundred
 /// transactions/sec is measured over tens of thousands of transactions rather
 /// than a handful.
@@ -93,7 +93,7 @@ const REACH_DEFAULT_ROWS_PER_COMMIT: usize = 1000;
 const REACH_DEFAULT_DURATION: Duration = Duration::from_secs(10);
 
 /// `build-under-load`'s knobs (see [`build_under_load`]'s module doc for the
-/// scenario), over #617's defaults:
+/// scenario), over these defaults:
 ///
 /// - `--rows <n>` (10,000,000) COPY-loaded into `agg_src`, `grp` uniform over
 ///   `--groups <n>` (100,000), by `--loaders <n>` (4) connections;
@@ -108,17 +108,17 @@ const REACH_DEFAULT_DURATION: Duration = Duration::from_secs(10);
 /// - `--progress-secs` (30; 0 turns it off): how often stderr gets an RSS
 ///   progress line;
 /// - `--one-to-one`: the definition is a 1-1 target, `SELECT grp AS grp,
-///   amt + amt AS dbl`, instead of the aggregate (#625 F8a);
+///   amt + amt AS dbl`, instead of the aggregate;
 /// - `--apply-latency` (with `--one-to-one`): once it is `live`, time every
 ///   statement `apply` accepts while the writers run, and each field
-///   rebuild to `live` (`apply_latency`, #666, #625 F8b).
+///   rebuild to `live` (`apply_latency`).
 ///
 /// Plus the engine flags every throughput scenario takes (`--application-threads`,
 /// 8 by default; `--poll-interval-ms`, `--maintenance-interval-ms`,
-/// `--reconcile-interval-ms`, `--drain-batch-cap`), and #625 F2's
+/// `--reconcile-interval-ms`, `--drain-batch-cap`), and
 /// `--build-chunk-rows <n>` (the Re-derive build's chunk size, 10,000). Postgres settings for a disk
 /// run go through testkit's `TRELLIS_TESTKIT_PG_OPTIONS`, e.g.
-/// `'shared_buffers=1GB checkpoint_timeout=1min max_wal_size=4GB'` (#617's).
+/// `'shared_buffers=1GB checkpoint_timeout=1min max_wal_size=4GB'`.
 fn build_under_load_config(args: &[String]) -> build_under_load::BuildUnderLoad {
     let positive = |name: &str, default: f64| {
         let v = number(args, name).unwrap_or(default);
@@ -360,8 +360,8 @@ fn writer_runtime() -> tokio::runtime::Runtime {
 /// scenario, so `main.rs` can carry on to the backfill ones.
 ///
 /// Note what does **not** make this return `false`: missing a T1 target, or a
-/// rate failing to sustain. Those are the measurements, and #269 is explicit
-/// that a red number is a finding to report rather than something to tune
+/// rate failing to sustain. Those are the measurements:
+/// a red number is a finding to report rather than something to tune
 /// until it passes. Only a harness- or correctness-level failure is an error.
 pub fn run(name: &str, args: &[String]) -> Option<bool> {
     let runtime = || tokio::runtime::Runtime::new().expect("build tokio runtime");
@@ -522,7 +522,7 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
             Some(ok)
         }
 
-        // #617's large aggregate build under write load (#620, #629).
+        // A large aggregate build under write load.
         "build-under-load" => {
             let cfg = build_under_load_config(args);
             let tuning = throughput_tuning(args);
@@ -543,7 +543,7 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
             Some(result.oracle_ok && result.writes.errors == 0 && audit_failed == 0)
         }
 
-        // #1113 J8: #1091 J2's JOIN scenario, with its per-fact control.
+        // The JOIN scenario, with its per-fact control.
         "join" => {
             let cfg = join_config(args);
             let tuning = join_tuning(args);
@@ -599,7 +599,7 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
             Some(results.iter().all(|r| r.ring_ok))
         }
 
-        // #623 D8a: `--workloads serial1,serial-batch,random1,update1`,
+        // `--workloads serial1,serial-batch,random1,update1`,
         // `--writers 1,4,8,16`, `--variants none,trigger`,
         // `--isolation serializable[,read-committed]`, `--batch 10`,
         // `--secs 8`, `--reps`.
@@ -657,7 +657,7 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
             Some(true)
         }
 
-        // #1178: one `self_check` walk's cost as the table grows.
+        // One `self_check` walk's cost as the table grows.
         "self-check-walk" => {
             let cfg = self_check_walk::Config {
                 rows: number(args, "--rows").map_or(1_000_000, |n| n as i64),
@@ -695,7 +695,7 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
     }
 }
 
-/// Issue #277's one-line reading of a probe's [`contention`] sample.
+/// A one-line reading of a probe's [`contention`] sample.
 fn report_contention(result: &fold_in::FoldInResult) {
     let c = &result.contention;
     if c.samples == 0 {
@@ -768,14 +768,14 @@ fn report_fold_in(results: &[fold_in::FoldInResult], scenario: &str) -> bool {
                 ok = false;
             }
             // Not a failure — a partially drained aggregate legitimately
-            // holds partial sums — but not a pass either (#335).
+            // holds partial sums — but not a pass either.
             None => eprintln!(
                 "oracle SKIPPED: {} groups — the target never folded in every row within the \
                  grace period, so this probe's correctness was not checked",
                 result.groups
             ),
         }
-        // Same cross-check as `report_probes` (#423): the counter counts
+        // Same cross-check as `report_probes`: the counter counts
         // staged source rows, one per committed row, so any excess is a
         // mid-window re-stage the probe measured on top of its offer.
         if restaged_in_window(result.changes_applied, result.rows_issued) {
@@ -829,7 +829,7 @@ fn probe_outcome(probe: &throughput::ThroughputProbe) -> String {
             probe.backlog_after_grace
         )
     };
-    // A rate that reads as kept would otherwise sit next to a NO (#509).
+    // A rate that reads as kept would otherwise sit next to a NO.
     if probe.counter_disagrees() {
         format!("void, the applied-changes counter disagrees with the rows committed; {outcome}")
     } else {
@@ -856,7 +856,7 @@ fn report_probes(probes: &[throughput::ThroughputProbe], scenario: &str) -> bool
         }
         // A drained probe landed its whole backlog, so every committed row
         // must have been applied *and* counted: a shortfall there is the
-        // #266 metric cross-check failing, not a slow pipeline.
+        // metric cross-check failing, not a slow pipeline.
         if throughput::counter_short_of_drain(
             probe.drained,
             probe.changes_applied,
@@ -869,7 +869,7 @@ fn report_probes(probes: &[throughput::ThroughputProbe], scenario: &str) -> bool
             );
             ok = false;
         }
-        // The other direction (#423): the counter counts staged rows, so it
+        // The other direction: the counter counts staged rows, so it
         // can only pass rows committed if something staged a source row a
         // second time inside the window, and then the probe measured more
         // work than it offered.
@@ -1116,7 +1116,7 @@ mod tests {
             drained: true,
             in_window_applied: Some(fit(20_000.0)),
             // The scenario's own verdict, so the fixture can't disagree with
-            // what `report_probes` makes of its counter (#509).
+            // what `report_probes` makes of its counter.
             kept_target_rate: throughput::probe_kept_target_rate(
                 true,
                 Some(fit(20_000.0)),
@@ -1179,8 +1179,8 @@ mod tests {
         }
     }
 
-    /// Issue #423: a counter ahead of the rows committed means something
-    /// re-staged source rows inside the window (#423 measured 297,601 for
+    /// A counter ahead of the rows committed means something
+    /// re-staged source rows inside the window (a past run counted 297,601 for
     /// 200,000), so the probe fails even though it drained and
     /// its oracle agrees.
     #[test]
@@ -1208,7 +1208,7 @@ mod tests {
         ));
     }
 
-    /// Issue #509: a counter that fails the run (#423's re-stage, or #266's
+    /// A counter that fails the run (a re-stage, or the
     /// drained-but-short cross-check) must fail the probe's JSON verdict too,
     /// or anything reading the JSON alone sees `kept_target_rate: true` from a
     /// run that exited non-zero. Every other check passes in these fixtures,
@@ -1239,7 +1239,7 @@ mod tests {
         }
     }
 
-    /// Issue #509: a probe voided by its counter reads as failed, but it
+    /// A probe voided by its counter reads as failed, but it
     /// measured nothing, so the ramp steps past it and finds the knee above
     /// it instead of reporting the rate below it.
     #[test]
@@ -1262,9 +1262,9 @@ mod tests {
         };
         let probes = [
             at(50_000.0, 50_000.0, 500_000, 500_000),
-            // #423: re-staged mid-window, so the counter ran past the rows.
+            // Re-staged mid-window, so the counter ran past the rows.
             at(100_000.0, 100_000.0, 1_000_000, 1_400_000),
-            // #266: drained, but the counter missed rows.
+            // Drained, but the counter missed rows.
             at(125_000.0, 125_000.0, 1_250_000, 1_200_000),
             at(150_000.0, 150_000.0, 1_500_000, 1_500_000),
             // Genuinely slow: half its target while offered.
@@ -1285,7 +1285,7 @@ mod tests {
         assert_eq!(knee.target_rows_per_sec, 150_000.0);
     }
 
-    /// Issue #319: a probe applying at half its target drains a short
+    /// A probe applying at half its target drains a short
     /// window's backlog inside the grace period. That used to be the knee;
     /// the in-window rate now keeps it out.
     #[test]
@@ -1316,7 +1316,7 @@ mod tests {
         assert!(probe_outcome(&probes[1]).contains("drained within grace"));
     }
 
-    /// Issue #335: an oracle that never ran reads as skipped — `null`, not a
+    /// An oracle that never ran reads as skipped — `null`, not a
     /// `0`-mismatch pass — and isn't reported as a correctness failure either.
     #[test]
     fn a_skipped_aggregate_oracle_reads_as_skipped() {

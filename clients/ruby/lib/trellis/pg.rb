@@ -71,7 +71,7 @@ require_relative "instance"
 # calls on a handle it inherited raise Trellis::ForkedHandleError, except
 # Trellis.shutdown, which leaves the parent's handle alone and does nothing.
 # So does Trellis.connect in a child forked while its parent's handle was
-# running (issue #600).
+# running.
 module Trellis
   @default = nil
   @lock = Mutex.new

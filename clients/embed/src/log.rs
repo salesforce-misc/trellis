@@ -1,5 +1,5 @@
 //! The engine's `tracing` events, queued as plain records for the host's
-//! logger (issue #149).
+//! logger.
 //!
 //! The `trellis` crate emits through the `tracing` facade and never installs
 //! a subscriber (ADR-0009 decision 3): that is the embedder's job, and for an
@@ -374,7 +374,7 @@ mod tests {
         );
     }
 
-    /// The engine's `trellis_instance` field (issue #874) is a displayed
+    /// The engine's `trellis_instance` field is a displayed
     /// value, so it crosses as plain `name=value` text, with no quotes.
     #[test]
     fn the_engines_instance_field_crosses_as_plain_text() {

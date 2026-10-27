@@ -1,6 +1,6 @@
 //! Whether one session was stuck behind another's lock, read from the
 //! server's lock table rather than from how long the session's statements
-//! took (issue #893).
+//! took.
 //!
 //! The user-table DDL tests (ADR-0002 I6) hold a lock the DDL needs for a
 //! few seconds while a writer writes the table throughout. A DDL attempt that
@@ -22,8 +22,8 @@
 //! the hold.
 //!
 //! Short attempts alone aren't enough: attempts retried back to back would
-//! each be brief and still keep the writer queued nearly all the time
-//! (issue #911). So a test also bounds [`BlockedWatch::blocked_fraction`],
+//! each be brief and still keep the writer queued nearly all the time.
+//! So a test also bounds [`BlockedWatch::blocked_fraction`],
 //! the share of samples that found the writer blocked, below half. With the
 //! real retry interval that share is about a fifth (a 50 ms `lock_timeout`
 //! per 250 ms cycle); with no interval it is two thirds or more.

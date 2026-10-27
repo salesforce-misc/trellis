@@ -2,7 +2,7 @@
 
 # Polling for the tests that wait on the engine's background workers. Every
 # wait is bounded, and a timeout names what it waited for and the last value
-# it saw (#297).
+# it saw.
 module Eventually
   CONVERGE_SECONDS = 30
 

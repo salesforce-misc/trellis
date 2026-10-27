@@ -1,7 +1,7 @@
-//! Idle cost — epic #269's **V-IDLE** (issue #268's X6): what a fully idle
+//! Idle cost (**V-IDLE**): what a fully idle
 //! install costs the database. A staging worker plus N drain workers, a
 //! captured source table that is never written to, the one 1-1 transform
-//! that makes the staging worker capture it (issue #427), and nothing else —
+//! that makes the staging worker capture it, and nothing else —
 //! sampled for transactions/sec, WAL bytes/sec and seals/sec.
 //!
 //! All three come **from Postgres directly**, not from new engine metrics:
@@ -16,7 +16,7 @@
 //! itself in background load: if a change improves latency but this gets
 //! worse, that's a trade and should be reported as one.
 //!
-//! **On "queries/sec"**: #268's prediction is phrased in queries/sec, but
+//! **On "queries/sec"**: the original prediction is phrased in queries/sec, but
 //! there is no query counter without `pg_stat_statements`, which this
 //! harness's ephemeral cluster doesn't preload unless asked to (see
 //! "Per-statement attribution" below). In this regime almost every
@@ -27,7 +27,7 @@
 //! reports `xact_commit_per_sec` and nothing that pretends to be a second,
 //! independently measured number.
 //!
-//! ## Per-statement attribution (issue #350)
+//! ## Per-statement attribution
 //!
 //! `--statements` turns the window into an attribution run: it creates
 //! `pg_stat_statements`, resets it right before the window and reads every

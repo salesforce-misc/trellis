@@ -1,4 +1,4 @@
-//! Issue #236 (layer-3 bucket 5, `docs/generative-test-suite.md` §7):
+//! Layer-3 bucket 5 (`docs/generative-test-suite.md` §7):
 //! database-administration actions interleaved with a program's ops.
 //!
 //! Every action is an oracle identity: none of them changes the correct
@@ -24,7 +24,7 @@ use crate::model::{DbAdminAction, DbAdminPlan, Program};
 use super::{Outcome, RunError, apply_and_check_outcome, quiesce_snapshot_and_check};
 
 /// [`super::run_convergence`] with `plan`'s database-administration actions
-/// interleaved (issue #236). `cluster` restarts the server `backend` and
+/// interleaved. `cluster` restarts the server `backend` and
 /// `pool` point at. `pool` is the oracle's handle; it is waited on after a
 /// restart the same way the backend's own pool is.
 pub async fn run_convergence_with_db_admin<C: ClusterControl>(
@@ -43,7 +43,7 @@ pub async fn run_convergence_with_db_admin<C: ClusterControl>(
     }
 
     // A restart can strand a claim the engine then waits a reclaim TTL to
-    // free (issue #752; see `SERVER_STOP_RECLAIM_TTL`).
+    // free (see `SERVER_STOP_RECLAIM_TTL`).
     backend.set_reclaim_ttl(SERVER_STOP_RECLAIM_TTL);
     backend
         .install(program)

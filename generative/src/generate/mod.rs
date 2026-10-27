@@ -3,7 +3,7 @@
 //! this crate enforces is that only [`crate::backend`] drives the engine's
 //! pipeline.
 //!
-//! Today's scope is the *trivial* generator (issue #6): every source table is
+//! Today's scope is the *trivial* generator: every source table is
 //! shaped `(numeric pk, numeric c1, numeric c2)` and every definition is a 1-1
 //! numeric-`+`, each with a seed-before-mutate op stream. Improvement-plan task
 //! **B3** widened this from *exactly* one table/one definition to **1-3 tables
@@ -46,7 +46,7 @@
 //! either the existing `total = c1 + c2` [`KeySpace::OneToOne`] shape, or a
 //! new [`KeySpace::Aggregate`] shape grouped by that table's grain column,
 //! with 2–4 fields drawn from the group basis's admitted set (`COUNT(*)`,
-//! and `COUNT`/`SUM`/`AVG` over `c1`/`c2`, issue #1100; see [`DefShape`],
+//! and `COUNT`/`SUM`/`AVG` over `c1`/`c2`; see [`DefShape`],
 //! [`AggregateFn`], and the `aggregate_functions`/`def_shape` strategies
 //! below). The grain column is deliberately **not**
 //! `c1`/`c2` (which keep their existing wider `0..=VALUE_MAX` range and
@@ -59,7 +59,7 @@
 //! maintenance in the engine); improvement-plan task B4.
 //!
 //! **The domain *is* now "0, 1, 2, plus `NULL`"**, matching the improvement
-//! plan's original text (issue #128). It wasn't always: a `NULL` grouping
+//! plan's original text. It wasn't always: a `NULL` grouping
 //! value was implemented and drawn early in task B4's development, and
 //! immediately found a real engine bug — `defs::ddl::create_aggregate_target_table`
 //! declared the `GROUP BY` columns as the target's Postgres `PRIMARY KEY`,
@@ -83,7 +83,7 @@
 //! converged — observed directly as this suite's own `quiesce` hanging past
 //! its 30-second `QUIESCE_TIMEOUT`.
 //!
-//! Issue #128 fixed the root cause: `create_aggregate_target_table` now keys
+//! The root cause is fixed: `create_aggregate_target_table` now keys
 //! the `GROUP BY` columns with a `UNIQUE NULLS NOT DISTINCT` constraint
 //! instead of a bare `PRIMARY KEY`, so a NULL-keyed group is representable
 //! and still deduplicated correctly, `defs::backfill`'s direct aggregate
@@ -116,7 +116,7 @@
 //! a group changing membership via delete/insert of whole rows is already
 //! the sharpest edge; *migrating* a live row from one group to another via
 //! `Update` is real, separate coverage `trellis/tests/group_basis_interleavings.rs`
-//! exercises by hand, not drawn by `trivial_program`; issue #557's
+//! exercises by hand, not drawn by `trivial_program`; the
 //! concurrent tier draws it as [`Mutate::MoveGroup`]). `KeySpace::Aggregate.group_by`
 //! is always exactly one column (never a composite/multi-column group-by,
 //! which the engine grammar supports but this generator does not draw).
@@ -133,7 +133,7 @@
 //! - The new columns are seeded once at `INSERT` time and never touched by
 //!   [`Mutate::Update`]/[`Mutate::Delete`]/[`Mutate::DuplicateInsert`], which
 //!   continue to read/write only `c1`/`c2` exactly as before. (The one later
-//!   exception is the `Boolean` column, which issue #255's
+//!   exception is the `Boolean` column, which
 //!   [`Mutate::UpdateFlag`] rewrites in place.) This fully
 //!   covers "every column scalar type appears via a derivation"
 //!   (`generative/tests/coverage.rs`'s
@@ -175,7 +175,7 @@
 //!   binding, `::text` casts, this harness's own snapshot diffing) — just not
 //!   of that specific key-encoding risk, which remains open.
 //!
-//! Issue **#505** interleaves the tables' op streams. The builders emit one
+//! The generator interleaves the tables' op streams. The builders emit one
 //! table's whole op stream before the next, so on their own a program's
 //! writes to different tables would never interleave. `trivial_program_with`
 //! therefore draws one interleaving of the per-table streams
@@ -184,7 +184,7 @@
 //! purpose, so a `COUNT(<col>)` or `SUM` fold starts or stops counting the
 //! row.
 //!
-//! # Awkward values (issue #7, design doc §3)
+//! # Awkward values (design doc §3)
 //!
 //! Of the four awkward-value classes the design doc calls out:
 //!
@@ -270,7 +270,7 @@ pub const MAX_DEFS: usize = 3;
 /// module doc comment's B4 section.
 pub const GRAIN_MAX: i64 = 2;
 
-/// The concurrent tier's hot-key shape (issue #557): the range of rows its
+/// The concurrent tier's hot-key shape: the range of rows its
 /// hot table seeds. Small next to [`HOT_MUTATES`], so every key takes many
 /// writes per burst, but large enough that the rows spread across all of a
 /// split batch's buckets (a row's bucket is a hash of its key).
@@ -288,7 +288,7 @@ pub const HOT_MUTATES: std::ops::RangeInclusive<usize> = 1_000..=2_400;
 /// The width of the group window [`Mutate::MoveGroup`] draws from: a drawn
 /// grain is `0..=HOT_GRAIN_MAX` above the window's current bottom. Seeds
 /// only use `0..=GRAIN_MAX`, so the groups above it don't exist until a row
-/// moves into one mid-run: the new-group bursts of #389 and #539.
+/// moves into one mid-run: the new-group bursts.
 pub const HOT_GRAIN_MAX: i64 = 7;
 
 /// Every this many mutates, the hot-key shape's group window slides up by
@@ -318,7 +318,7 @@ pub const HOT_WORKERS: std::ops::RangeInclusive<usize> = 4..=8;
 /// its long end fewer that clear the split threshold.
 pub const HOT_SEAL_INTERVAL_MS: std::ops::RangeInclusive<u64> = 20..=200;
 
-/// The cooling-key shape's key count (issue #557 part 3b): how many keys its
+/// The cooling-key shape's key count: how many keys its
 /// cooling table takes, each written a few times and then never again.
 /// Hundreds, so every burst holds many keys going quiet at once.
 pub const COOLING_KEYS: std::ops::RangeInclusive<usize> = 150..=400;
@@ -340,10 +340,9 @@ pub const COOLING_GAP: std::ops::RangeInclusive<u16> = 30..=200;
 
 /// The range of drain workers the cooling-key shape runs the engine with.
 /// Fewer than [`HOT_WORKERS`]: in tmpfs probes, 4 to 8 workers caught a
-/// stale 1-1 write in about 1 case in 15, 2 to 6 in about 1 in 4 (#557 part
-/// 3b's PR). The likely reason is that a busier pool lets sealed batches
-/// queue, so one worker's drain of a coalesced backlog overlaps another's
-/// drain of a fresh, short batch, and the newer batch can commit first.
+/// stale 1-1 write in about 1 case in 15, 2 to 6 in about 1 in 4. The likely reason is that a
+/// busier pool lets sealed batches queue, so one worker's drain of a coalesced backlog overlaps
+/// another's drain of a fresh, short batch, and the newer batch can commit first.
 pub const COOLING_WORKERS: std::ops::RangeInclusive<usize> = 3..=6;
 
 /// The cooling-key shape's seal cadences, in milliseconds. Shorter than
@@ -381,13 +380,13 @@ pub enum Mutate {
         c2: Option<i64>,
     },
     /// Set row `pk`'s `Boolean` column to `flag` (`"true"`/`"false"`, or
-    /// `None` for SQL `NULL`), and nothing else (issue #255). The one
+    /// `None` for SQL `NULL`), and nothing else. The one
     /// exception to the "non-numeric columns are seeded once, never mutated"
     /// scope cut (see the module doc comment): it changes a passthrough
     /// column in place. A `pk` naming no live row is a source no-op, exactly
     /// like `Update`.
     UpdateFlag { pk: i64, flag: Option<String> },
-    /// Move row `pk`'s `c1` across `NULL` (issue #505): to `NULL` if it is
+    /// Move row `pk`'s `c1` across `NULL`: to `NULL` if it is
     /// currently non-`NULL`, otherwise to `value`. Renders to an `UPDATE` of
     /// `c1` alone. A plain [`Mutate::Update`] draws `c1` independently of
     /// what the row holds, so it crosses `NULL` only about a third of the
@@ -402,11 +401,10 @@ pub enum Mutate {
     /// a source no-op: the source table's primary key is a real Postgres
     /// `primary key` constraint, so this statement is rejected with a
     /// unique-violation error and the source is left unchanged (a single
-    /// `INSERT` is atomic — it cannot partially apply). Closes the issue #6
-    /// gap where every generated op used to succeed, so "an op that errors
-    /// changed nothing" (design doc §4) was never exercised against a *real*
-    /// rejection (a missing-pk update/delete comes back as `Ok(0 rows)`, not
-    /// an `Err`).
+    /// `INSERT` is atomic — it cannot partially apply). Without it every
+    /// generated op would succeed, and "an op that errors changed nothing"
+    /// (design doc §4) would never be exercised against a *real* rejection (a missing-pk
+    /// update/delete comes back as `Ok(0 rows)`, not an `Err`).
     ///
     /// If an earlier mutate in the same stream already deleted this pk, it
     /// is no longer live: this "duplicate" insert is then an ordinary
@@ -424,9 +422,9 @@ pub enum Mutate {
     /// *seed* flag, not the updated one — just an ordinary insert value, since
     /// the SQL oracle reads whatever Postgres holds.) This matters well beyond
     /// legibility for the grain column specifically — see the
-    /// `grain_value` proptest strategy's doc comment for issue #128, the
-    /// engine bug a `NULL` grain value used to hit and which grain_value's
-    /// own occasional `NULL` draw now exercises deliberately; a revival that
+    /// `grain_value` proptest strategy's doc comment, the
+    /// engine hazard a `NULL` grain value poses and which grain_value's
+    /// own occasional `NULL` draw exercises deliberately; a revival that
     /// carelessly *reset* the grain column to some other value (`NULL` or
     /// otherwise) instead of preserving whatever it originally was would
     /// silently change which group the revived row belongs to.
@@ -445,11 +443,11 @@ pub enum Mutate {
     /// every mutate after a `Truncate` sees an empty table exactly as real
     /// Postgres would.
     Truncate,
-    /// Moves row `pk` into group `grain` by setting its grain column (issue
-    /// #557), and nothing else. The one exception to the B4 scope cut that
+    /// Moves row `pk` into group `grain` by setting its grain column,
+    /// and nothing else. The one exception to the B4 scope cut that
     /// the grain column is seeded once and never updated: only the
     /// concurrent tier's hot-key strategy draws it (see [`HOT_GRAIN_MAX`]),
-    /// so a group can lose and regain members mid-burst (#389, #539) and a
+    /// so a group can lose and regain members mid-burst and a
     /// group nobody seeded can appear. `trivial_program` never draws it. A
     /// `pk` naming no live row is a source no-op, exactly like `Update`.
     MoveGroup { pk: i64, grain: Option<i64> },
@@ -469,7 +467,7 @@ pub enum AggregateColumn {
 /// Kept as a small enum — rather than a bare `(name, column)` pair — so
 /// [`aggregate_field_def`]'s match stays exhaustive.
 ///
-/// The variants are exactly the group basis's admitted set (issue #1100):
+/// The variants are exactly the group basis's admitted set:
 /// `COUNT(*)`, `COUNT(<col>)`, and `SUM`/`AVG` over a `numeric(p,s)` column
 /// (every generated `Numeric` column is declared `numeric(14,2)`; see
 /// `backend::sql::column_ddl_type`). Define refuses every other aggregate
@@ -546,13 +544,13 @@ pub struct TableSpec {
     pub uuid_values: Vec<Option<String>>,
     /// `grain_values[i]` is the rendered value (`"0"`/`"1"`/`"2"`, see
     /// [`GRAIN_MAX`], or `None` for a `NULL` group — see [`grain_value`]'s
-    /// doc comment for issue #128) for seeded primary key `i + 1`'s grain
+    /// doc comment) for seeded primary key `i + 1`'s grain
     /// column (improvement-plan task B4). Stays `Option<String>` — the same
     /// shape every other seeded column here uses — so a hand-built pin can
     /// construct a `None` (SQL `NULL`) grain value directly for a targeted
     /// regression pin, same as the `grain_value` proptest strategy itself now
     /// draws one on its own. Same length contract as `text_values`. Only
-    /// [`Mutate::MoveGroup`] (issue #557's concurrent tier) touches it — see
+    /// [`Mutate::MoveGroup`] (the concurrent tier) touches it — see
     /// the module doc comment's B4 scope cuts.
     pub grain_values: Vec<Option<String>>,
     /// Mutates appended after this table's seed inserts (seed-before-mutate,
@@ -796,7 +794,7 @@ pub fn build_program(seed_values: &[(Option<i64>, Option<i64>)], mutates: &[Muta
 /// together) and is not a claim that real traffic interleaves tables that
 /// way — nothing about the model or the backend assumes any particular
 /// interleaving. The drawn strategies interleave the tables afterward with
-/// [`interleave_tables`] (issue #505).
+/// [`interleave_tables`].
 ///
 /// Panics if `tables` or `def_sources` is empty, or if a `def_sources` entry
 /// is out of range for `tables` — both are generator bugs (every strategy
@@ -840,7 +838,7 @@ pub fn build_program_multi(tables: &[TableSpec], def_sources: &[usize]) -> Progr
 /// together) and is not a claim that real traffic interleaves tables that
 /// way — nothing about the model or the backend assumes any particular
 /// interleaving. The drawn strategies interleave the tables afterward with
-/// [`interleave_tables`] (issue #505).
+/// [`interleave_tables`].
 ///
 /// Panics if `tables` or `defs` is empty, or if a `defs` entry's table index
 /// is out of range for `tables` — both are generator bugs (every strategy
@@ -941,7 +939,7 @@ pub fn build_program_multi_with_shapes(
                     (c1.clone(), render(*a)),
                     (c2.clone(), render(*b)),
                     // Task B1: seeded once, here, and never touched again
-                    // (except the Boolean column, which issue #255's
+                    // (except the Boolean column, which
                     // [`Mutate::UpdateFlag`] rewrites) — see [`Mutate`]/the
                     // module doc comment's scope cut.
                     (text_col.clone(), spec.text_values[i].clone()),
@@ -1375,7 +1373,7 @@ pub fn build_program_multi_with_shapes_and_derived(
 }
 
 // ---------------------------------------------------------------------
-// Issue #505: interleaving the per-table op streams.
+// Interleaving the per-table op streams.
 //
 // The builders above emit each table's whole stream before the next
 // table's, so in a table-ordered program no two tables' writes ever
@@ -1390,14 +1388,14 @@ pub fn build_program_multi_with_shapes_and_derived(
 // says: ops on different tables always commute at the source.
 //
 // So a program is a set of per-table streams ([`table_streams`]) plus one
-// linearization of them ([`interleave_tables`]). The concurrent tier (#557)
+// linearization of them ([`interleave_tables`]). The concurrent tier
 // can take the same streams and issue each from its own task, since the
 // streams are exactly the ordering constraints; the serial tiers draw one
 // linearization per case.
 // ---------------------------------------------------------------------
 
 /// `program.ops`' indices split into one stream per `program.tables` entry,
-/// in table order, each stream in its original op order (issue #505). The
+/// in table order, each stream in its original op order. The
 /// only ordering constraints a generated program carries are within a
 /// stream; see the section comment above.
 ///
@@ -1431,7 +1429,7 @@ const _: () =
     assert!(INTERLEAVE_PICK_RANGE.is_multiple_of(2) && INTERLEAVE_PICK_RANGE.is_multiple_of(3));
 
 /// Reorders `program.ops` into one interleaving of its per-table streams
-/// ([`table_streams`]), keeping every table's own ops in order (issue #505).
+/// ([`table_streams`]), keeping every table's own ops in order.
 ///
 /// Step `i` emits the next op of one of the tables that still has ops left:
 /// `schedule[i] % remaining` picks among those tables in table order, and a
@@ -1551,8 +1549,8 @@ fn reorder_ops(program: &mut Program, order: Vec<usize>) {
 }
 
 /// Of the streams with ops left to emit, the one furthest behind its own
-/// share: the smallest fraction `emitted[t] / totals[t]`, the first on a tie
-/// (issue #557). `None` once every stream is done.
+/// share: the smallest fraction `emitted[t] / totals[t]`, the first on a tie.
+/// `None` once every stream is done.
 fn furthest_behind(totals: &[usize], emitted: &[usize]) -> Option<usize> {
     // Smallest fraction emitted, compared without division.
     (0..totals.len())
@@ -1561,11 +1559,11 @@ fn furthest_behind(totals: &[usize], emitted: &[usize]) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------
-// Issue #557 part 3b: cooling keys.
+// Cooling keys.
 //
 // The hot-key tier's keys keep changing until their burst ends, so a batch
 // holding a key's change is nearly always followed by a later batch that
-// rewrites the key. A 1-1 write that lands out of order (#344's bug) is then
+// rewrites the key. A 1-1 write that lands out of order is then
 // healed before the burst is checked. What a stale write needs to survive
 // is a key that goes quiet mid-burst: its last change sits in one batch, an
 // older change in another, both drain while hot traffic keeps the workers
@@ -1578,7 +1576,7 @@ fn furthest_behind(totals: &[usize], emitted: &[usize]) -> Option<usize> {
 // of the program (the hot table, and any other) evenly around them.
 // ---------------------------------------------------------------------
 
-/// Where one cooling key's writes go (issue #557 part 3b). Plain numbers,
+/// Where one cooling key's writes go. Plain numbers,
 /// resolved against the program by [`place_cooling_keys`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoolingPlace {
@@ -1593,7 +1591,7 @@ pub struct CoolingPlace {
 }
 
 /// Orders `program.ops` so every key of table `cooling_table` has its writes
-/// where `places` says (issue #557 part 3b), one [`CoolingPlace`] per key in
+/// where `places` says, one [`CoolingPlace`] per key in
 /// order of the key's first op. The other tables' ops are spread evenly
 /// through the rest of the program, as the hot-key tier spreads them, each
 /// table keeping its own order.
@@ -1697,9 +1695,9 @@ pub fn place_cooling_keys(
 }
 
 // ---------------------------------------------------------------------
-// Issue #557: the concurrent tier's lanes.
+// The concurrent tier's lanes.
 //
-// #505 made each table's op stream the only ordering constraint a program
+// Each table's op stream is the only ordering constraint a program
 // carries across tables. The concurrent tier goes one step further and
 // issues a burst's ops from several harness tasks at once, each on its own
 // connection, so Postgres commits them in no order the harness chooses.
@@ -1722,20 +1720,20 @@ pub fn place_cooling_keys(
 // `table_streams`' streams, so each table's own order is kept too.
 // ---------------------------------------------------------------------
 
-/// The most harness tasks one burst is split across (issue #557).
+/// The most harness tasks one burst is split across.
 pub const MAX_LANES: usize = 4;
 
 /// Splits `program.ops` into bursts of `burst_size` consecutive ops, and
 /// each burst into at most `lanes` lanes that the concurrent tier issues
-/// from separate tasks (issue #557; see the section comment above for which
+/// from separate tasks (see the section comment above for which
 /// ops may be split apart). Within a burst, every op on one row (or on one
 /// table, if the program ever truncates or bulk-inserts it) lands in the
 /// same lane, in program order. Distinct keys are dealt to lanes round-robin
 /// in order of first appearance, so the lanes stay balanced and the plan is
 /// a pure function of its arguments: a shrunk case replays the same plan.
 ///
-/// A deferred install (`program.def_install_after_op[i] == n`, issue #557
-/// part 2) becomes a [`BurstAction::Install`] in the burst holding op `n`,
+/// A deferred install (`program.def_install_after_op[i] == n`)
+/// becomes a [`BurstAction::Install`] in the burst holding op `n`,
 /// firing once the burst ops before `n` have been applied. The lanes race,
 /// so "before op `n`" becomes "after that many of the burst's ops": the
 /// build runs while the rest of the burst still writes the source.
@@ -1820,9 +1818,8 @@ fn sort_actions(plan: &mut ConcurrentPlan) {
     }
 }
 
-/// Which mid-burst operator action an [`ActionDraw`] asks for (issue #557
-/// part 2). Mid-burst installs aren't drawn here: they come from
-/// [`Program::def_install_after_op`] through [`concurrent_plan`].
+/// Which mid-burst operator action an [`ActionDraw`] asks for. Mid-burst installs aren't drawn
+/// here: they come from [`Program::def_install_after_op`] through [`concurrent_plan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
     /// [`BurstAction::RequestBackfill`] on a table an installed definition
@@ -1854,8 +1851,8 @@ pub struct ActionDraw {
     pub span: u16,
 }
 
-/// Resolves `draws` against `program` and adds them to `plan`'s bursts
-/// (issue #557 part 2). Every action lands in a burst after the first: by
+/// Resolves `draws` against `program` and adds them to `plan`'s bursts.
+/// Every action lands in a burst after the first: by
 /// then the previous burst has quiesced, so every definition installed up
 /// front is `live` and its tables are captured, which `request_backfill`
 /// and a column resume both require. Only definitions installed up front
@@ -1951,7 +1948,7 @@ pub fn add_burst_actions(
     plan
 }
 
-/// One concurrent-tier case (issue #557): the program, how it is issued,
+/// One concurrent-tier case: the program, how it is issued,
 /// and the engine shape it is drained by.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConcurrentCase {
@@ -2539,7 +2536,7 @@ mod strategy {
     /// "awkward values" note).
     ///
     /// When `awkward_values` is unset this is *exactly* the strategy the
-    /// generator used before issue #7 (a bare `0..=VALUE_MAX` draw, just
+    /// generator used before awkward values (a bare `0..=VALUE_MAX` draw, just
     /// wrapped in `Some` outside the strategy), so a coverage meta-test can
     /// assert the flag-off path draws unchanged (design doc §3 "coverage
     /// meta-tests").
@@ -2740,8 +2737,8 @@ mod strategy {
     /// A single grain column value (improvement-plan task B4): `0..=GRAIN_MAX`
     /// most of the time, occasionally `None` (SQL `NULL`) — the "0, 1, 2, plus
     /// NULL" domain the improvement plan originally asked for. This was
-    /// deliberately cut down to the three non-`NULL` values for a while
-    /// (issue #128): a `NULL` grouping value is real, standard SQL (Postgres's
+    /// deliberately cut down to the three non-`NULL` values for a while:
+    /// a `NULL` grouping value is real, standard SQL (Postgres's
     /// `GROUP BY` puts every `NULL` into one group, like any other value),
     /// but `defs::ddl::create_aggregate_target_table` used to declare
     /// the `group_by` columns as the target's `PRIMARY KEY`, and Postgres
@@ -2759,7 +2756,7 @@ mod strategy {
     /// past that row's LSN never converged, observed directly as this
     /// suite's own `quiesce` hanging past its 30s `QUIESCE_TIMEOUT`.
     ///
-    /// Issue #128 fixed the root cause: `create_aggregate_target_table` now
+    /// The root cause is fixed: `create_aggregate_target_table` now
     /// keys the grouping columns with a `UNIQUE NULLS NOT DISTINCT`
     /// constraint instead of a bare `PRIMARY KEY`, `defs::backfill`'s direct
     /// aggregate build no longer drops a NULL-keyed group, and
@@ -2905,8 +2902,8 @@ mod strategy {
     /// it ([`build_program`] simulates this to expect the right outcome
     /// either way, see [`Mutate::DuplicateInsert`]); most of the time it is
     /// still live, so this is the generator's main source of genuine
-    /// primary-key-violation `apply()` errors (issue #6's gap).
-    /// `UpdateFlag` (issue #255) draws its pk exactly like `Update`, at
+    /// primary-key-violation `apply()` errors.
+    /// `UpdateFlag` draws its pk exactly like `Update`, at
     /// weight `2`: it only matters to a def reading the `Boolean` column, so
     /// it shouldn't crowd out the `c1`/`c2` writes every other def reads.
     /// `Truncate` (improvement-plan task E6) is weighted at `1` against the
@@ -2919,7 +2916,7 @@ mod strategy {
     /// rare-but-reliable balance [`NULL_WEIGHT`]/[`AWKWARD_TEXT_WEIGHT`]
     /// strike for their own awkward values.
     ///
-    /// `ToggleNull` (issue #505) draws its pk like `Update`, at weight `2`
+    /// `ToggleNull` draws its pk like `Update`, at weight `2`
     /// and only with awkward values on (it writes `NULL`). It thins the other
     /// variants by about an eighth; see [`Mutate::ToggleNull`] for what it
     /// buys.
@@ -2935,7 +2932,7 @@ mod strategy {
         let delete = pk.prop_map(|pk| Mutate::Delete { pk });
         let duplicate_insert = (dup_pk, value(awkward_values), value(awkward_values))
             .prop_map(|(pk, c1, c2)| Mutate::DuplicateInsert { pk, c1, c2 });
-        // Issue #505: `ToggleNull` only with awkward values on, since it
+        // `ToggleNull` only with awkward values on, since it
         // writes `NULL`. It is left out of the union rather than weighted
         // `0`, because a `prop_oneof!` shrinks toward its earlier arms
         // whatever their weight: a weight-`0` arm would still be reached by
@@ -2962,7 +2959,7 @@ mod strategy {
         }
     }
 
-    /// [`Mutate::ToggleNull`]'s weight in [`mutate`] (issue #505), next to
+    /// [`Mutate::ToggleNull`]'s weight in [`mutate`], next to
     /// `Update`'s `3` and `UpdateFlag`'s `2`.
     const TOGGLE_NULL_WEIGHT: u32 = 2;
 
@@ -3025,15 +3022,15 @@ mod strategy {
     /// `awkward_values` gates every other column's `NULL` draw (see
     /// [`value`], [`text_value`], [`bool_value`], [`uuid_value`]); it does
     /// not gate [`grain_value`] (which draws its own occasional `NULL`
-    /// unconditionally — see its own doc comment for issue #128, the engine
-    /// bug that used to force a scope cut here), nor does it affect
+    /// unconditionally — see its own doc comment for the engine
+    /// hazard it guards), nor does it affect
     /// [`Mutate::DuplicateInsert`], [`def_shape`] (which of a def's fields
     /// are `SUM`/`COUNT`/`AVG` over), or
     /// [`DerivedShape`] (every `OneToOne` def always gets one `derived`
     /// field) — all distinct, structural widenings, always available
     /// regardless of the flag.
     ///
-    /// Issue #505: the built program's per-table op streams are then
+    /// The built program's per-table op streams are then
     /// interleaved by a drawn schedule ([`interleave_schedule`],
     /// [`interleave_tables`]), so the tables' ops mix. The schedule shrinks toward the table-by-table order.
     pub fn trivial_program_with(awkward_values: bool) -> impl Strategy<Value = Program> {
@@ -3090,7 +3087,7 @@ mod strategy {
     /// transform over a partitioned source is refused at define. The other
     /// tables draw as usual.
     ///
-    /// Issue #1320: on top of its seeds and mutates, the partitioned table
+    /// On top of its seeds and mutates, the partitioned table
     /// draws up to [`MAX_PARTITION_DRAWS`] [`partition::PartitionDraw`]s
     /// ([`partition::add_partition_maintenance`]): partition maintenance
     /// (a leaf detached, also `CONCURRENTLY`, attached again with its rows,
@@ -3189,10 +3186,9 @@ mod strategy {
         ]
     }
 
-    /// The [`interleave_tables`] schedule `trivial_program_with` draws (issue
-    /// #505): one uniform pick per op slot. Each entry shrinks toward `0`,
-    /// and an all-zero schedule is the table-by-table order, so a shrunk
-    /// counterexample keeps only the interleaving it needs to fail.
+    /// The [`interleave_tables`] schedule `trivial_program_with` draws: one uniform pick per op
+    /// slot. Each entry shrinks toward `0`, and an all-zero schedule is the table-by-table order,
+    /// so a shrunk counterexample keeps only the interleaving it needs to fail.
     ///
     /// Proptest caps shrinking at `4 * cases` iterations, and each op the
     /// flat-map's outer shrink removes redraws this schedule at random, so
@@ -3210,7 +3206,7 @@ mod strategy {
         trivial_program_with(true)
     }
 
-    /// One hot-key mutate against `seed_count` seeded rows (issue #557):
+    /// One hot-key mutate against `seed_count` seeded rows:
     /// half the draws pick a pk from the first [`HOT_CORE_KEYS`], so a few
     /// keys are much hotter than the rest. Mostly value updates, with enough
     /// [`Mutate::MoveGroup`]s, deletes and revivals that groups gain, lose
@@ -3243,8 +3239,8 @@ mod strategy {
     }
 
     /// Slides every [`Mutate::MoveGroup`]'s drawn grain up by
-    /// [`HOT_GROUP_SLIDE`] per [`HOT_GROUP_EPOCH`] mutates before it (issue
-    /// #557), so the group window moves through the run.
+    /// [`HOT_GROUP_SLIDE`] per [`HOT_GROUP_EPOCH`] mutates before it,
+    /// so the group window moves through the run.
     fn slide_group_window(mut mutates: Vec<Mutate>) -> Vec<Mutate> {
         for (index, mutate) in mutates.iter_mut().enumerate() {
             if let Mutate::MoveGroup {
@@ -3257,8 +3253,7 @@ mod strategy {
         mutates
     }
 
-    /// [`table_spec`] with the hot-key shape's ranges and [`hot_mutate`]
-    /// (issue #557).
+    /// [`table_spec`] with the hot-key shape's ranges and [`hot_mutate`].
     fn hot_table_spec(
         seeds: std::ops::RangeInclusive<usize>,
         mutates: std::ops::RangeInclusive<usize>,
@@ -3292,7 +3287,7 @@ mod strategy {
     /// is written now and then while the hot table churns, not hot itself.
     const HOT_SECOND_MUTATES: usize = 60;
 
-    /// The concurrent tier's hot-key case (issue #557): a hot table of
+    /// The concurrent tier's hot-key case: a hot table of
     /// [`HOT_KEYS`] rows taking [`HOT_MUTATES`] writes, always read by a
     /// `GROUP BY` definition over its grain column, plus up to two more
     /// drawn definitions. Half the cases add a small second table that
@@ -3306,26 +3301,26 @@ mod strategy {
         hot_key_case_with(Just(CaseExtras::None).boxed())
     }
 
-    /// The concurrent tier's mid-burst case (issue #557 part 2): a
+    /// The concurrent tier's mid-burst case: a
     /// [`hot_key_case`] whose bursts also stage re-reads while CDC for the
     /// same keys is in flight.
     ///
     /// - Three cases in four install one more `GROUP BY` definition over
     ///   the hot table mid-burst (always with `COUNT(*)`), so its build runs
-    ///   while the hot table takes writes: #625's build-under-load shape.
+    ///   while the hot table takes writes (a build under load).
     ///   Half of those are invertible-only ([`install_functions`]), so the
-    ///   Re-derive build runs it (#625 F3).
+    ///   Re-derive build runs it.
     /// - One to [`MAX_ACTION_DRAWS`] operator actions ([`ActionDraw`]),
     ///   placed by [`add_burst_actions`]: `request_backfill`, a pause and
     ///   resume, or a column pause and resume.
     /// - Three cases in four that have a second table also truncate it once,
     ///   somewhere in its op stream, while the hot table keeps changing. The
-    ///   second table's ops are spread through the hot table's (#505).
+    ///   second table's ops are spread through the hot table's.
     pub fn mid_burst_case() -> impl Strategy<Value = ConcurrentCase> {
         hot_key_case_with(mid_burst_draws().prop_map(CaseExtras::MidBurst).boxed())
     }
 
-    /// The concurrent tier's steady-load case (#720, #725): a
+    /// The concurrent tier's steady-load case: a
     /// [`mid_burst_case`] run under a steady load ([`SteadyLoad`]).
     ///
     /// - Each lane waits a drawn [`LOAD_PACE_MICROS`] after every op, from
@@ -3348,7 +3343,7 @@ mod strategy {
         hot_key_case_with(extras.boxed())
     }
 
-    /// The concurrent tier's cooling-key case (issue #557 part 3b): a
+    /// The concurrent tier's cooling-key case: a
     /// [`hot_key_case`] plus a cooling table read by a 1-1 definition.
     ///
     /// The cooling table has [`COOLING_KEYS`] keys. Each is inserted, then
@@ -3358,13 +3353,13 @@ mod strategy {
     /// taking writes all around them. The engine seals every
     /// [`COOLING_SEAL_INTERVAL_MS`], so a key's writes seal into different
     /// batches that drain alongside each other: the shape where a 1-1 write
-    /// applied out of order (#344) survives to the end of the burst,
+    /// applied out of order survives to the end of the burst,
     /// because no later change to the key heals it.
     pub fn cooling_key_case() -> impl Strategy<Value = ConcurrentCase> {
         hot_key_case_with(cooling_draws().prop_map(CaseExtras::Cooling).boxed())
     }
 
-    /// The concurrent tier's cooling-backfill case (#734): a
+    /// The concurrent tier's cooling-backfill case: a
     /// [`cooling_key_case`] whose cooling table a `GROUP BY` definition
     /// reads instead of a 1-1 one, re-read by `request_backfill` while its
     /// keys go quiet, under a steady load paced from each burst's start.
@@ -3482,7 +3477,7 @@ mod strategy {
 
     /// Moves each cooling key of a [`cooling_backfill_case`] into a burst
     /// after the first, the ones that take a `request_backfill`, with its
-    /// last write its lag after the request (#734). `ops` is the program's
+    /// last write its lag after the request. `ops` is the program's
     /// op count, which cuts its bursts as [`place_cooling_keys`] does.
     fn places_after_backfills(
         draws: &CoolingBackfillDraws,
@@ -3511,7 +3506,7 @@ mod strategy {
     }
 
     /// Adds a `request_backfill` of `table` to every burst of `plan` after
-    /// the first, at `at[i % len]` thousandths of burst `i`'s ops (#734).
+    /// the first, at `at[i % len]` thousandths of burst `i`'s ops.
     /// By the second burst the first has quiesced, so the table's reader is
     /// `live`, which `request_backfill` requires.
     fn add_backfills(mut plan: ConcurrentPlan, table: &str, at: &[u16]) -> ConcurrentPlan {
@@ -3653,7 +3648,7 @@ mod strategy {
         load: Option<LoadDraws>,
     }
 
-    /// The steady load a [`steady_load_case`] runs under (#720, #725).
+    /// The steady load a [`steady_load_case`] runs under.
     #[derive(Debug, Clone, Copy)]
     struct LoadDraws {
         /// [`ConcurrentCase::build_chunk_rows`]: a few rows, so a build over
@@ -3681,10 +3676,9 @@ mod strategy {
     /// lock for over two seal intervals can still be waiting when a later
     /// segment has sealed and drained and the maintenance tick after that
     /// collects tombstones: the shape `early_tombstone_gc` needs. From 3
-    /// rather than 2 (#733) for the margin: at 2 to 4 the plant was caught
+    /// rather than 2 for the margin: at 2 to 4 the plant was caught
     /// in as few as 1 case in 48. The wider stalls also drain more older
-    /// segments after newer ones across a build's start, the race #733
-    /// fixed.
+    /// segments after newer ones across a build's start.
     pub const LOAD_STALL_SEALS: std::ops::RangeInclusive<u32> = 3..=6;
 
     fn load_draws() -> impl Strategy<Value = LoadDraws> {
@@ -3880,7 +3874,7 @@ mod strategy {
 
     /// An [`interleave_tables`] schedule that spreads every table's ops
     /// evenly through the program: each step emits from the table furthest
-    /// behind its own share (issue #557). The hot-key shape uses it rather
+    /// behind its own share. The hot-key shape uses it rather
     /// than drawing a schedule, because a drawn one over ~1,000 ops is slow
     /// to shrink and a burst is issued concurrently anyway.
     fn spread_schedule(program: &Program) -> Vec<usize> {
@@ -3976,7 +3970,7 @@ mod strategy {
         })
     }
 
-    /// Issue #236: one [`DbAdminAction`], weighted toward the cheap ones.
+    /// One [`DbAdminAction`], weighted toward the cheap ones.
     fn db_admin_action() -> impl Strategy<Value = DbAdminAction> {
         prop_oneof![
             2 => Just(DbAdminAction::Checkpoint),
@@ -3985,7 +3979,7 @@ mod strategy {
         ]
     }
 
-    /// Issue #236: a database-administration plan for `program`, 0-3 events
+    /// A database-administration plan for `program`, 0-3 events
     /// anchored anywhere in its ops.
     ///
     /// At most three, so a short program isn't dominated by restarts.
@@ -3996,9 +3990,9 @@ mod strategy {
         prop::collection::vec(event, 0..=3).prop_map(|events| DbAdminPlan { events })
     }
 
-    /// Issue #236: a backup-and-restore plan for `program`, backing up after
+    /// A backup-and-restore plan for `program`, backing up after
     /// any of its ops. Every plan is a [`BackupKind::ColdCopy`] today; the
-    /// `pg_basebackup` kind is held for #558 (see [`BackupKind`]).
+    /// `pg_basebackup` kind is held for #1422 (see [`BackupKind`]).
     pub fn restore_plan_for(program: &Program) -> impl Strategy<Value = RestorePlan> + use<> {
         (0..program.ops.len()).prop_map(|backup_op| RestorePlan {
             backup_op,
@@ -4062,7 +4056,7 @@ mod strategy {
     /// doc comment for why a restart-carrying program is scoped away from
     /// `Aggregate` definitions specifically) and reused, `pub`, by
     /// `generative/tests/self_check_cross_check.rs`'s swept
-    /// out-of-band-tampering property (issue #237): `self_check`
+    /// out-of-band-tampering property: `self_check`
     /// (`trellis/src/staging/self_check.rs`) only audits a `OneToOne` target
     /// this issue (`SelfCheckError::UnsupportedKeySpace`), so that property
     /// needs the same `Aggregate`-free restriction this strategy already
@@ -4091,9 +4085,9 @@ mod strategy {
     /// [`trivial_program_with`]'s full mix — a deliberate, documented scope
     /// cut, discovered *while building this task*, mirroring
     /// [`grain_value`]'s own history of a found-but-then-out-of-scope engine
-    /// bug (issue #128, since fixed).** Restarting the primary client
+    /// bug (since fixed).** Restarting the primary client
     /// mid-stream originally reproduced a real engine bug in the replication
-    /// intake Trellis ran before #622: a fresh connection resumed from the
+    /// intake Trellis once ran: a fresh connection resumed from the
     /// slot's server-tracked position rather than the durably persisted
     /// watermark, so Postgres redelivered already-applied transactions,
     /// silently double-counting an `Aggregate` target's `SUM`/`COUNT`. Fixed
@@ -4357,7 +4351,7 @@ mod tests {
 
     /// A `None` seed value must render as SQL `NULL` (no bound text), not the
     /// literal string `"None"` or `"NULL"` — the awkward-value machinery
-    /// (issue #7) reuses the same `Option<String>` = `NULL` convention
+    /// reuses the same `Option<String>` = `NULL` convention
     /// [`crate::model::Op`] already documents.
     #[test]
     fn a_null_seed_value_renders_as_sql_null_not_a_string() {
@@ -4371,7 +4365,7 @@ mod tests {
 
     /// [`Mutate::DuplicateInsert`] renders to a second `Op::Insert` at a
     /// pk that already exists in the seed — the shape that gives `apply()` a
-    /// real primary-key violation to fail on (issue #6's gap).
+    /// real primary-key violation to fail on.
     #[test]
     fn duplicate_insert_renders_a_second_insert_at_the_same_pk() {
         let program = build_program(
@@ -4390,7 +4384,7 @@ mod tests {
         assert_eq!(pk.1.as_deref(), Some("1"));
     }
 
-    /// Issue #255: an `UpdateFlag` writes only the `Boolean` column, and
+    /// An `UpdateFlag` writes only the `Boolean` column, and
     /// tracks pk liveness exactly like `Update` (a deleted pk affects no
     /// rows).
     #[test]
@@ -4474,7 +4468,7 @@ mod tests {
     /// *multiple* mutates in the same stream, not just whether it was
     /// originally seeded — these are fast, DB-free pins for sequences the
     /// slow DB-backed proptest property only exercises when it happens to
-    /// draw them (issue #4/A1: an op's expected outcome must always match
+    /// draw them (an op's expected outcome must always match
     /// what real Postgres would do).
     mod pk_liveness {
         use super::*;
@@ -4849,7 +4843,7 @@ mod tests {
         }
     }
 
-    /// Issue #505: `ToggleNull` and the table interleaving.
+    /// `ToggleNull` and the table interleaving.
     mod reverse_path {
         use super::*;
 
@@ -4974,7 +4968,7 @@ mod tests {
         }
     }
 
-    /// Issue #557: the concurrent tier's lanes and the hot-key shape's
+    /// The concurrent tier's lanes and the hot-key shape's
     /// group window.
     mod concurrent_lanes {
         use super::*;
@@ -5056,7 +5050,7 @@ mod tests {
             concurrent_plan(&schedule_restart(program, 1), 1, 1);
         }
 
-        /// Issue #557 part 2: a deferred install becomes an install action
+        /// A deferred install becomes an install action
         /// in the burst holding its op, firing after the burst's ops before
         /// it.
         #[test]
@@ -5237,7 +5231,7 @@ mod tests {
         }
 
         #[cfg(feature = "proptest")]
-        /// The drawn steady-load cases (#720, #725, #786): each has small
+        /// The drawn steady-load cases: each has small
         /// build chunks, a reconcile pass at its seal cadence and a stall of
         /// a few seal intervals; and the mid-burst tier's cases stay flat
         /// out, at the engine's defaults.
@@ -5273,7 +5267,7 @@ mod tests {
         }
 
         #[cfg(feature = "proptest")]
-        /// The drawn cooling-key cases (#557 part 3b): every op is in one
+        /// The drawn cooling-key cases: every op is in one
         /// lane, a 1-1 definition reads the cooling table, and each cooling
         /// key's writes stay in order, inside one burst, with the last of
         /// them in the burst's middle rather than its tail.

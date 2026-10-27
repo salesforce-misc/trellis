@@ -1,13 +1,11 @@
-//! Steady-state streaming benchmark harness (issue #270, ported from the
-//! throwaway `performance-investigation` branch that issues #266/#268 were
-//! measured on).
+//! Steady-state streaming benchmark harness.
 //!
 //! Everything here drives the real, product-facing streaming path: a live [`trellis::Client`] doing trigger
 //! capture into the ring -> seal -> claim -> fold -> apply, fed by a
 //! controlled-rate load generator, measured through the Prometheus
 //! histograms that already exist
-//! ([`trellis::Metrics::render_prometheus`]). No new instrumentation: issue
-//! #266 states the latency targets at exactly
+//! ([`trellis::Metrics::render_prometheus`]). No new instrumentation: the
+//! latency targets are stated at exactly
 //! [`trellis::metrics::LATENCY_BUCKETS`]' own boundaries so a
 //! cumulative-bucket-fraction read off a scrape answers them with no
 //! interpolation and no estimator.
@@ -31,43 +29,42 @@
 //! - [`cli`]: flag parsing and dispatch for the scenarios below.
 //! - [`tuning`]: the engine knobs a scenario varies ([`tuning::EngineTuning`]),
 //!   and the single place they're mapped onto [`trellis::ClientOptions`].
-//!   This is the documented extension point for epic #269's later children.
+//!   This is the documented extension point for later scenarios.
 //! - [`chain`]: the N-hop 1-1 chain builder, plus liveness/warm-up/oracle.
 //! - [`load`]: the single-connection paced generator, the multi-connection
-//!   paced-or-max-rate one, and the generator-bound self-check (#276).
+//!   paced-or-max-rate one, and the generator-bound self-check.
 //! - [`generator_reach`]: the multi-connection generator alone, no engine —
 //!   how much load the instrument itself can offer.
 //! - [`scrape`]: `render_prometheus()` readers — T1's bucket-fraction
 //!   convention, exact per-hop means, plain counters.
 //! - [`rate`]: the in-window rate fit and the `kept_target_rate` verdict the
-//!   throughput and fold-in scenarios share (#276, #319).
+//!   throughput and fold-in scenarios share.
 //! - [`hop_latency`]: the hop-depth latency ladder (V-LAT / T1).
 //! - [`throughput`]: the single-hop probe, the throughput ramp (V-THRU / T2)
 //!   and the transaction-shape sweep (V-SHAPE).
-//! - [`fold_in`]: the aggregate fold-in-ratio sweep (V-AGG / T3), and issue
-//!   #277's group-count x drain-worker contention grid over the same probe.
+//! - [`fold_in`]: the aggregate fold-in-ratio sweep (V-AGG / T3), and a
+//!   group-count x drain-worker contention grid over the same probe.
 //! - [`contention`]: `pg_stat_activity` sampling that attributes engine
-//!   backend time to row-lock waits vs everything else (#277), and per-episode
-//!   lock wait and page lock hold times by statement class (#623 D1).
+//!   backend time to row-lock waits vs everything else, and per-episode
+//!   lock wait and page lock hold times by statement class.
 //! - [`write_tax`]: what capturing a table costs the application writing to
-//!   it, per capture variant and transaction shape (#565 E1, #622 C4).
+//!   it, per capture variant and transaction shape.
 //! - [`capture_ceiling`]: rows/s reaching the ring as writers are added,
-//!   with nothing draining (#565 E2, #622 C4). It replaced `intake-ceiling`.
+//!   with nothing draining. It replaced `intake-ceiling`.
 //! - [`ssi_tax`]: the `40001` rate capture adds to concurrent
-//!   `SERIALIZABLE` writers, against the same table with no capture (#623 D8a).
-//! - [`join`]: #1091 J2's `JOIN … GROUP BY` scenario (D1/D2 x S1/S2,
-//!   a-side and b-side pages, hot keys) against a per-fact control (#1113).
+//!   `SERIALIZABLE` writers, against the same table with no capture.
+//! - [`join`]: the `JOIN … GROUP BY` scenario (D1/D2 x S1/S2,
+//!   a-side and b-side pages, hot keys) against a per-fact control.
 //! - [`idle_cost`]: a zero-traffic install's transactions/sec, WAL bytes/sec
 //!   and seals/sec (V-IDLE).
 //! - [`build_under_load`]: a large aggregate build under a paced mixed write
-//!   load, checked against a SQL oracle, with peak RSS per phase (#617's
-//!   experiment 5 harness; #620, #629).
+//!   load, checked against a SQL oracle, with peak RSS per phase.
 //! - [`disk_tier`]: WAL/fsync/checkpoint deltas over a window, the cluster's
 //!   storage, and a fixed-size commit-latency histogram.
 //! - [`process_memory`]: in-process `VmRSS` sampling (peak, per phase,
 //!   `VmHWM`, the cgroup's `memory.peak`).
 //! - [`server_cost`]: Postgres CPU, `deadlock detected` log lines, the
-//!   engine's lock-timeout warnings and ledger bytes over a window (#623 D1).
+//!   engine's lock-timeout warnings and ledger bytes over a window.
 
 pub mod apply_latency;
 pub mod build_profile;

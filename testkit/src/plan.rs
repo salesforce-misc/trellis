@@ -1,6 +1,5 @@
 //! Reads what an `explain (analyze)` plan says a statement did, so a plan
-//! test can assert on the work done rather than on the planner's estimates
-//! (#791).
+//! test can assert on the work done rather than on the planner's estimates.
 
 /// How many rows of `relation` the scans in `plan` read, from an `explain
 /// (analyze)` of the statement in text format, with costs on or off: every

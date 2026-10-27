@@ -1,9 +1,9 @@
-//! Shared DDL/DML/read-back plumbing (issue #166): every piece of
+//! Shared DDL/DML/read-back plumbing: every piece of
 //! [`ManualBackend`](super::ManualBackend)'s rendering and raw-SQL logic
 //! that has nothing to do with *how* the engine itself is run — only with
 //! turning a [`Program`]/[`Op`]/[`Snapshot`] into concrete SQL text and back
 //! — lives here instead, so [`SubprocessBackend`](super::SubprocessBackend)
-//! (issue #166's subprocess-supervised backend) can reuse it verbatim rather
+//! (the subprocess-supervised backend) can reuse it verbatim rather
 //! than re-deriving the same DDL/DML shapes a second time. Split out of
 //! `manual.rs` when `SubprocessBackend` was added; every function here was
 //! previously a private `ManualBackend` method or free function, unchanged
@@ -37,8 +37,8 @@ pub(super) fn quote_ident(ident: &str) -> String {
 
 /// The Postgres type name a [`ValueType`] casts to.
 ///
-/// Returns [`std::borrow::Cow`] rather than a bare `&'static str` since
-/// issue #117, mirroring `defs::ddl::pg_type_name`'s own signature change:
+/// Returns [`std::borrow::Cow`] rather than a bare `&'static str`,
+/// mirroring `defs::ddl::pg_type_name`'s own signature:
 /// every family but [`trellis::dev::defs::PgType::Enum`] still
 /// renders a fixed keyword and stays `Cow::Borrowed` — the generator itself
 /// never emits an `Other`-typed column at all (see `generate::Column`'s doc
@@ -48,15 +48,15 @@ pub(super) fn quote_ident(ident: &str) -> String {
 pub(super) fn pg_type_name(value_type: ValueType) -> std::borrow::Cow<'static, str> {
     match value_type {
         ValueType::Numeric => "numeric".into(),
-        // Issue #111: an exact integer renders as its own Postgres width,
+        // An exact integer renders as its own Postgres width,
         // mirroring `defs::ddl::pg_type_name`.
         ValueType::Integer(width) => width.pg_name().into(),
-        // Issue #112: likewise `real`/`double precision`.
+        // Likewise `real`/`double precision`.
         ValueType::Float(width) => width.pg_name().into(),
         ValueType::Text => "text".into(),
         ValueType::Boolean => "boolean".into(),
         ValueType::Uuid => "uuid".into(),
-        // Issue #108: the generator itself never emits an `Other`-typed
+        // The generator itself never emits an `Other`-typed
         // column (see `generate::Column`'s doc comment), but this mirrors
         // `defs::ddl::pg_type_name` for exhaustiveness/parity.
         ValueType::Other(pg_type) => pg_type.sql_type_name(),
@@ -69,7 +69,7 @@ pub(super) const NUMERIC_COLUMN_TYPE: &str = "numeric(14,2)";
 /// The type a generated source column is declared with: [`pg_type_name`],
 /// except that a [`ValueType::Numeric`] column is declared
 /// [`NUMERIC_COLUMN_TYPE`]. The group basis admits `SUM`/`AVG` only over a
-/// `numeric` with a declared scale (issue #1100), and every aggregate this
+/// `numeric` with a declared scale, and every aggregate this
 /// generator draws reads such a column. The drawn values are small integers
 /// (`generate::VALUE_MAX`, `GRAIN_MAX`), which `numeric(14,2)` stores
 /// exactly; casts and typed literals keep the bare `numeric` of
@@ -93,7 +93,7 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
         .collect();
     debug_assert_eq!(def.predicate, Predicate::True);
     let key_space_clause = match &def.key_space {
-        // The JOIN tier (#1113): `FROM a [LEFT|INNER] JOIN b ON … GROUP BY …`.
+        // The JOIN tier: `FROM a [LEFT|INNER] JOIN b ON … GROUP BY …`.
         KeySpace::Join(join) => {
             let qualified = |c: &QualifiedColumn| format!("{}.{}", c.table, c.column);
             format!(
@@ -138,7 +138,7 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
     )
 }
 
-/// The source indexes `def` needs (#1167), as `(table, leading columns)`: an
+/// The source indexes `def` needs, as `(table, leading columns)`: an
 /// aggregate's `GROUP BY` columns on its source, and a `JOIN` side's `ON`
 /// columns, in `ON` order, on each side. Asked of every definition, whether or
 /// not the engine requires it: the index serves a `self_check` walk either way.
@@ -199,8 +199,7 @@ pub(super) async fn create_source_indexes(
 }
 
 /// Renders a generator-built [`Expr`] back to source text. Every operand of
-/// a `BinaryOp` is unconditionally parenthesized (issue #67's reviewer
-/// follow-up) so a rendered expression always re-parses to the exact same
+/// a `BinaryOp` is unconditionally parenthesized so a rendered expression always re-parses to the exact same
 /// tree regardless of operator precedence — see
 /// `tests::render_expr_parenthesizes_nested_binary_ops_so_they_round_trip`
 /// below.
@@ -217,7 +216,7 @@ pub(super) fn render_expr(expr: &Expr) -> String {
         },
         Expr::NumberLiteral(text) => text.clone(),
         Expr::StringLiteral(text) => format!("'{}'", text.replace('\'', "''")),
-        // Issue #109's typed literal, rendered in the `<type> '<text>'`
+        // A typed literal, rendered in the `<type> '<text>'`
         // spelling rather than `CAST(... AS ...)`. Both re-parse to this
         // same node, so either would round-trip; the typed-literal form is
         // the shorter one and keeps the generated definition text closer to
@@ -274,10 +273,8 @@ pub(super) struct Assignment {
 /// [`create_source_table`] — the single source of truth every
 /// `$n::text::<type>` cast renders from.
 ///
-/// Since issue #111 this is just [`pg_type_name`] of the column's own
-/// [`ValueType`], including for the primary key: `ValueType` can now name
-/// `bigint`, so the PK no longer needs the override it carried while its
-/// recorded type was a `Numeric` placeholder (see
+/// This is just [`pg_type_name`] of the column's own [`ValueType`],
+/// including for the primary key: `ValueType` can name `bigint` (see
 /// `crate::model::PRIMARY_KEY_VALUE_TYPE`).
 pub(super) fn column_pg_type(
     tables: &HashMap<String, Table>,
@@ -877,7 +874,7 @@ async fn unsettled_definitions(
             panic!("transform_definitions.status held unrecognized value '{status_text}'")
         });
         // `Paused` joins the terminal set for the same reason `Quarantined`
-        // is in it (issue #142): a frozen definition never progresses on its
+        // is in it: a frozen definition never progresses on its
         // own, so waiting for it to settle any further is waiting forever.
         // The suite doesn't pause anything today — this is here so that if it
         // ever does, the wait fails its assertion rather than hanging.
@@ -964,7 +961,7 @@ where
 const SETTLE_POLL: Duration = Duration::from_millis(20);
 
 /// Waits, within one `timeout` budget, until the engine has no work left
-/// that could still change a target (issue #432). Shared by both backends'
+/// that could still change a target. Shared by both backends'
 /// `Backend::quiesce`.
 ///
 /// A two-way check, the same one an operator makes (ADR-0002, "What `live`
@@ -984,7 +981,7 @@ const SETTLE_POLL: Duration = Duration::from_millis(20);
 ///   what this check waits on.
 /// - **Caught up to the token.** [`await_converged`] against a token taken
 ///   after the mutations of interest: the public read-your-writes path, so
-///   every quiesce in the suite exercises it (issue #452).
+///   every quiesce in the suite exercises it.
 ///
 /// - **Partition maintenance corrected** (ADR-0017). An attach, detach,
 ///   drop or new leaf reaches a target only through the correction the next
@@ -1049,7 +1046,7 @@ pub(super) async fn quiesce(
 }
 
 /// One pass of [`quiesce`]'s two checks, in its order, without waiting on
-/// either (issue #453): every definition settled, then the ring converged
+/// either: every definition settled, then the ring converged
 /// through a token taken after that. A caller that has to act between
 /// checks (seal by hand, say) polls this and then confirms with [`quiesce`].
 pub(super) async fn settled(
@@ -1125,11 +1122,9 @@ mod tests {
         );
     }
 
-    /// The reviewer-flagged follow-up to issue #67 (real operator
-    /// precedence): a nested, mixed-operator `Expr` must round-trip through
-    /// `render_expr` and back through the real parser to the exact same
-    /// tree, not a reflowed one. See the pre-#166 `manual.rs` history for
-    /// the original, more detailed version of this doc comment.
+    /// Real operator precedence: a nested, mixed-operator `Expr` must
+    /// round-trip through `render_expr` and back through the real parser to
+    /// the exact same tree, not a reflowed one.
     #[test]
     fn render_expr_parenthesizes_nested_binary_ops_so_they_round_trip() {
         let expr = Expr::BinaryOp {
@@ -1154,7 +1149,7 @@ mod tests {
         );
     }
 
-    /// Issue #830: a qualified source column inside an aggregate renders
+    /// A qualified source column inside an aggregate renders
     /// back to the same qualified spelling, so a generated definition that
     /// carries one re-parses to the same tree.
     #[test]
@@ -1176,7 +1171,7 @@ mod tests {
         }
     }
 
-    /// #1113: every `JOIN` shape the JOIN tier draws renders back to text
+    /// Every `JOIN` shape the JOIN tier draws renders back to text
     /// that parses to the same definition.
     #[test]
     fn render_definition_round_trips_a_join() {
@@ -1224,7 +1219,7 @@ mod tests {
         assert_eq!(def.fields[0].expr, expr);
     }
 
-    // --- `quiesce` (issue #432) ---
+    // --- `quiesce` ---
     //
     // No engine runs in these tests. Each stands the engine's side up by hand
     // on a second session, in the order the engine itself commits it, so the
@@ -1420,7 +1415,7 @@ mod tests {
         txn.commit().await.expect("commit");
     }
 
-    /// Issue #1320: the partition model's `HASH` routing table is the one
+    /// The partition model's `HASH` routing table is the one
     /// Postgres computes, for every modulus and grain it covers.
     #[tokio::test]
     async fn the_hash_remainders_are_postgres_own() {
@@ -1452,7 +1447,7 @@ mod tests {
         }
     }
 
-    /// Issue #1320: a partitioned source is unsettled while its tree differs
+    /// A partitioned source is unsettled while its tree differs
     /// from the one recorded (here: a leaf attached since), and while a
     /// correction is queued for it.
     #[tokio::test]

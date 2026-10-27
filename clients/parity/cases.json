@@ -1,5 +1,5 @@
 {
-  "about": "The cross-language parity fixture (issue #155). Both host suites run every step below against a Trellis they connect themselves, and check each result against the same expected shape; neither suite owns this file. See README.md for the shape language and what each host maps onto it.",
+  "about": "The cross-language parity fixture. Both host suites run every step below against a Trellis they connect themselves, and check each result against the same expected shape; neither suite owns this file. See README.md for the shape language and what each host maps onto it.",
   "records": {
     "DefinitionSummary": {
       "target_table": "string",
@@ -133,7 +133,7 @@
   },
   "live": [
     {
-      "about": "Source tables, and a role that can log in but not create a schema (for the internal error below). parity_scratch shares parity_items with parity_prices: its ALTER and RESUME rebuild it alone, visible in its status, so they don't rewrite the other target under a later step (#625). parity_doubled and parity_gizmo_prices have sources of their own because their steps poison keys.",
+      "about": "Source tables, and a role that can log in but not create a schema (for the internal error below). parity_scratch shares parity_items with parity_prices: its ALTER and RESUME rebuild it alone, visible in its status, so they don't rewrite the other target under a later step. parity_doubled and parity_gizmo_prices have sources of their own because their steps poison keys.",
       "op": "sql",
       "args": [
         "create table parity_items (id integer primary key, owner_id integer, price integer)",
@@ -193,14 +193,14 @@
     {"op": "status", "args": ["parity_prices"], "expect": {"record": "Status", "fields": {"backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null}}},
     {"about": "A column that isn't paused is live, with no pause time or error.", "op": "quarantine_status", "args": ["parity_prices.price"], "expect": {"record": "QuarantineEntry", "fields": {"target": {"eq": "parity_prices.price"}, "state": {"word": "live"}, "paused_at": null, "last_error": null}}},
     {"about": "A whole transform reports its lifecycle status as its state.", "op": "quarantine_status", "args": ["parity_prices"], "expect": {"record": "QuarantineEntry", "fields": {"target": {"eq": "parity_prices"}, "state": {"word_in": "transform_status"}, "paused_at": null, "last_error": null}}},
-    {"about": "status(define(...)) round-trips: the qualified name define returned is accepted, and a wrong schema matches nothing (#1168).", "op": "status", "args": ["public.parity_prices"], "expect": {"record": "Status", "fields": {"backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null}}},
+    {"about": "status(define(...)) round-trips: the qualified name define returned is accepted, and a wrong schema matches nothing.", "op": "status", "args": ["public.parity_prices"], "expect": {"record": "Status", "fields": {"backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null}}},
     {"op": "status", "args": ["no_such_schema.parity_prices"], "expect": null},
     {"about": "The quarantine reads take the qualified name too; it names the whole transform, reported by its bare name.", "op": "quarantine_status", "args": ["public.parity_prices"], "expect": {"record": "QuarantineEntry", "fields": {"target": {"eq": "parity_prices"}, "state": {"word_in": "transform_status"}, "paused_at": null, "last_error": null}}},
     {"op": "quarantine_status", "args": ["no_such_schema.parity_prices"], "expect": {"error": "not_found"}},
     {"about": "An empty first page has no cursor.", "op": "sample_quarantined", "args": ["parity_prices.price"], "expect": {"record": "SamplePage", "fields": {"samples": {"list": []}, "next_cursor": null}}},
 
     {
-      "about": "A JOIN's source index (#1167): define is refused without an index leading with each side's ON columns, status reports an index dropped later, and WITHOUT SOURCE INDEX opts out. Nothing converges (all catalog reads), so these are plain expects.",
+      "about": "A JOIN's source index: define is refused without an index leading with each side's ON columns, status reports an index dropped later, and WITHOUT SOURCE INDEX opts out. Nothing converges (all catalog reads), so these are plain expects.",
       "op": "sql",
       "args": [
         "create table parity_regions (id integer primary key, name text)",
@@ -226,7 +226,7 @@
     {"about": "A staging worker with no drain workers. connect returns once the worker's first capture pass has installed capture on every defined source, so the write below is captured, and nothing drains it.", "op": "connect", "opts": {"url": {"$dsn": {}}, "staging": true, "drain_threads": 0}, "expect": null},
     {"op": "has_live_staging_worker", "until": {"eq": true}, "waiting_for": "a live staging worker"},
     {"op": "has_live_drain_workers", "expect": {"eq": false}},
-    {"about": "A captured write to a defined source: the token below has work outstanding (#556).", "op": "sql", "args": ["update parity_items set price = 51 where id = 5"]},
+    {"about": "A captured write to a defined source: the token below has work outstanding.", "op": "sql", "args": ["update parity_items set price = 51 where id = 5"]},
     {"op": "watermark_token", "save": "idle_token", "expect": "string"},
     {"about": "Nothing drains the write, so the token can't converge.", "op": "await_converged", "args": [{"$ref": "idle_token"}], "opts": {"timeout_ms": 0}, "expect": {"error": "timeout"}},
     {"op": "shutdown", "expect": null},
@@ -300,7 +300,7 @@
 
     {"about": "Doubling 2e9 overflows integer, so each row fails the column; five trip its pause.", "op": "sql", "args": ["insert into parity_ledger (id, n) values (1, 2000000000), (2, 2000000000), (3, 2000000000), (4, 2000000000), (5, 2000000000)"]},
     {"op": "quarantine_status", "args": ["parity_doubled.doubled"], "until": {"record": "QuarantineEntry", "fields": {"state": {"word": "paused"}}}, "waiting_for": "parity_doubled.doubled to pause", "save": "paused"},
-    {"about": "Every write so far drained, so the sample below is complete (#585).", "op": "watermark_token", "save": "ledger_token", "expect": "string"},
+    {"about": "Every write so far drained, so the sample below is complete.", "op": "watermark_token", "save": "ledger_token", "expect": "string"},
     {"op": "await_converged", "args": [{"$ref": "ledger_token"}], "opts": {"timeout_ms": 30000}, "expect": null},
     {"op": "quarantine_status", "args": ["parity_doubled.doubled"], "expect": {"record": "QuarantineEntry", "fields": {"target": {"eq": "parity_doubled.doubled"}, "state": {"word": "paused"}, "paused_at": "time", "last_error": "string"}}},
     {"op": "quarantined", "expect": {"list": [{"ref": "paused"}]}},
@@ -325,7 +325,7 @@
     {"about": "Returns once the re-read is queued (a rebuild of the live readers); nothing after this reads parity_items's targets.", "op": "request_backfill", "args": ["parity_items"], "expect": null},
     {"about": "The rebuild ends with the definition live again.", "op": "status", "args": ["parity_prices"], "until": {"record": "Status", "fields": {"status": {"word": "live"}}}, "waiting_for": "parity_prices's rebuild to finish"},
 
-    {"about": "A write the target's own constraint refuses poisons its key. Last, because a poisoned key holds await_converged back (#588).", "op": "sql", "args": ["alter table parity_gizmo_prices add constraint parity_cheap check (price < 100)"]},
+    {"about": "A write the target's own constraint refuses poisons its key. Last, because a poisoned key holds await_converged back.", "op": "sql", "args": ["alter table parity_gizmo_prices add constraint parity_cheap check (price < 100)"]},
     {"op": "now", "save": "before_poison"},
     {"op": "sql", "args": ["insert into parity_gizmos (id, price) values (1, 5), (2, 500)"]},
     {"op": "poisoned_since", "args": [{"$ref": "before_poison"}], "until": {"list": [{"record": "PoisonEntry", "fields": {"transform": {"eq": "parity_gizmo_prices"}, "src_table": {"eq": "public.parity_gizmos"}, "key": {"eq": "2"}}}]}, "waiting_for": "parity_gizmos key 2 to be poisoned", "save": "poisoned"},
@@ -356,13 +356,13 @@
       "expect": {"record": "Status", "fields": {"status": {"word": "waiting_to_backfill"}, "backfill_failure": {"record": "BackfillFailure", "fields": {"source_table": {"eq": "public.orders"}, "attempts": {"eq": 3}, "next_attempt_at": {"time_micros": 1727222400123456}}}, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null}}
     },
     {
-      "about": "A capture lock wait, a capture failure (#687) and held keys (#759), which need a held lock, a broken source table or a refused write, so a live run can't produce them all cheaply: their times are rehydrated from epoch microseconds exactly.",
+      "about": "A capture lock wait, a capture failure and held keys, which need a held lock, a broken source table or a refused write, so a live run can't produce them all cheaply: their times are rehydrated from epoch microseconds exactly.",
       "type": "Status",
       "native": {"status": {"$word": "catching_up"}, "backfill_failure": null, "capture_wait": {"table": "public.orders", "operation": "widen", "lock_mode": "ShareRowExclusiveLock", "waiting_since_micros": 1727222400123456, "observed_at_micros": 1727222400123457, "blockers": ["pid 42 (client backend) holds RowExclusiveLock"]}, "capture_failure": {"kind": {"$word": "capture"}, "source_table": "public.lines", "columns": ["qty"], "error": "capture of public.lines needs column \"qty\", which the table doesn't have", "detected_at_micros": 1727222400123458}, "held_keys": {"count": 2, "oldest_poisoned_at_micros": 1727222400123459}, "drain_failure": null, "source_index_gaps": [], "paused_upstream_columns": [], "correcting": []},
       "expect": {"record": "Status", "fields": {"status": {"word": "catching_up"}, "backfill_failure": null, "capture_wait": {"record": "CaptureWait", "fields": {"table": {"eq": "public.orders"}, "operation": {"eq": "widen"}, "waiting_since": {"time_micros": 1727222400123456}, "observed_at": {"time_micros": 1727222400123457}, "blockers": {"list": [{"eq": "pid 42 (client backend) holds RowExclusiveLock"}]}}}, "capture_failure": {"record": "CaptureFailure", "fields": {"kind": {"word": "capture"}, "source_table": {"eq": "public.lines"}, "columns": {"list": [{"eq": "qty"}]}, "detected_at": {"time_micros": 1727222400123458}}}, "held_keys": {"record": "HeldKeys", "fields": {"count": {"eq": 2}, "oldest_poisoned_at": {"time_micros": 1727222400123459}}}, "drain_failure": null}}
     },
     {
-      "about": "A drain failure (#817), which needs a page the drain keeps failing on with nothing charged or paused, so a live run can't produce it cheaply: its tables and SQLSTATE cross as they are, and its times are rehydrated from epoch microseconds exactly.",
+      "about": "A drain failure, which needs a page the drain keeps failing on with nothing charged or paused, so a live run can't produce it cheaply: its tables and SQLSTATE cross as they are, and its times are rehydrated from epoch microseconds exactly.",
       "type": "Status",
       "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": {"seg_seq": 17, "tables": ["public.lines", "public.orders"], "error": "permission denied for function audit_hook", "sqlstate": "42501", "since_micros": 1727222400123456, "last_seen_micros": 1727222400123457, "attempts": 5}, "source_index_gaps": [], "paused_upstream_columns": [], "correcting": []},
       "expect": {"record": "Status", "fields": {"status": {"word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": {"record": "DrainFailure", "fields": {"seg_seq": {"eq": 17}, "tables": {"list": [{"eq": "public.lines"}, {"eq": "public.orders"}]}, "error": {"eq": "permission denied for function audit_hook"}, "sqlstate": {"eq": "42501"}, "since": {"time_micros": 1727222400123456}, "last_seen": {"time_micros": 1727222400123457}, "attempts": {"eq": 5}}}}}
@@ -386,19 +386,19 @@
       "expect": {"record": "SelfCheckReport", "fields": {"outcome": {"word": "not_live"}, "status": {"word": "backfilling"}, "rows_compared": {"eq": 0}, "divergences": {"list": []}}}
     },
     {
-      "about": "A source index gap (#1167) in a status: the entry crosses with its columns, its role, whether it opted out, and its create index statement.",
+      "about": "A source index gap in a status: the entry crosses with its columns, its role, whether it opted out, and its create index statement.",
       "type": "Status",
       "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [{"table": "public.orders", "columns": ["customer_id", "region"], "role": {"$word": "join_from"}, "opted_out": true, "fix": "create index on \"public\".\"orders\" (\"customer_id\", \"region\")"}], "paused_upstream_columns": [], "correcting": []},
       "expect": {"record": "Status", "fields": {"source_index_gaps": {"list": [{"record": "SourceIndexGap", "fields": {"table": {"eq": "public.orders"}, "columns": {"list": [{"eq": "customer_id"}, {"eq": "region"}]}, "role": {"word": "join_from"}, "opted_out": {"eq": true}, "fix": {"eq": "create index on \"public\".\"orders\" (\"customer_id\", \"region\")"}}}]}}}
     },
     {
-      "about": "Two source index gaps on the same table and columns cross as two entries, in order, told apart only by their roles (the Decision on #1347: a self-join's two sides each report their own gap). The grammar refuses a self-join, so this is a decode-only fixture.",
+      "about": "Two source index gaps on the same table and columns cross as two entries, in order, told apart only by their roles (a self-join's two sides each report their own gap). The grammar refuses a self-join, so this is a decode-only fixture.",
       "type": "Status",
       "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [{"table": "public.orders", "columns": ["id"], "role": {"$word": "join_from"}, "opted_out": false, "fix": "create index on \"public\".\"orders\" (\"id\")"}, {"table": "public.orders", "columns": ["id"], "role": {"$word": "join_joined"}, "opted_out": false, "fix": "create index on \"public\".\"orders\" (\"id\")"}], "paused_upstream_columns": [], "correcting": []},
       "expect": {"record": "Status", "fields": {"source_index_gaps": {"list": [{"record": "SourceIndexGap", "fields": {"table": {"eq": "public.orders"}, "columns": {"list": [{"eq": "id"}]}, "role": {"word": "join_from"}, "opted_out": {"eq": false}, "fix": {"eq": "create index on \"public\".\"orders\" (\"id\")"}}}, {"record": "SourceIndexGap", "fields": {"table": {"eq": "public.orders"}, "columns": {"list": [{"eq": "id"}]}, "role": {"word": "join_joined"}, "opted_out": {"eq": false}, "fix": {"eq": "create index on \"public\".\"orders\" (\"id\")"}}}]}}}
     },
     {
-      "about": "A reader of a paused upstream column (#1208) in a status: it reports catching_up and names the column, target then column.",
+      "about": "A reader of a paused upstream column in a status: it reports catching_up and names the column, target then column.",
       "type": "Status",
       "native": {"status": {"$word": "catching_up"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [], "paused_upstream_columns": ["t.total", "u.qty"], "correcting": []},
       "expect": {"record": "Status", "fields": {"status": {"word": "catching_up"}, "paused_upstream_columns": {"list": [{"eq": "t.total"}, {"eq": "u.qty"}]}}}
@@ -416,7 +416,7 @@
       "expect": {"record": "DefinitionSummary", "fields": {"target_table": {"eq": "public.t"}, "created_at": {"time_micros": -1}, "backfill_failure": null, "halt": null}}
     },
     {
-      "about": "A definition the drain halted on (#663), which needs a source whose key the drain can't use, so a live run can't produce it cheaply: the halt is a CaptureFailure of kind halt, and its time is rehydrated from epoch microseconds exactly.",
+      "about": "A definition the drain halted on, which needs a source whose key the drain can't use, so a live run can't produce it cheaply: the halt is a CaptureFailure of kind halt, and its time is rehydrated from epoch microseconds exactly.",
       "type": "DefinitionSummary",
       "native": {"target_table": "public.t", "status": {"$word": "paused"}, "created_at_micros": 1727222400123456, "backfill_failure": null, "halt": {"kind": {"$word": "halt"}, "source_table": "public.s", "columns": [], "error": "the drain halted: source table 'public.s' has no primary key; fix the cause, then resume the definition to rebuild it, or drop the definition", "detected_at_micros": 1727222400123459}},
       "expect": {"record": "DefinitionSummary", "fields": {"status": {"word": "paused"}, "backfill_failure": null, "halt": {"record": "CaptureFailure", "fields": {"kind": {"word": "halt"}, "source_table": {"eq": "public.s"}, "columns": {"list": []}, "detected_at": {"time_micros": 1727222400123459}}}}}

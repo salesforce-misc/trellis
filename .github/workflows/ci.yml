@@ -73,7 +73,7 @@ jobs:
       - name: Clippy
         # `--all-features` alone makes code whose only caller is feature-gated
         # look live, so dead code and unused imports in narrower builds slip
-        # through (issue #473). The extra runs cover the feature sets that
+        # through. The extra runs cover the feature sets that
         # actually get built: the production default, and trellis with
         # `test-util` but not `internals` (benchmark, generative's
         # engine_subprocess). They share the build cache with the first.
@@ -177,7 +177,7 @@ jobs:
           echo "$pg_bin" >> "$GITHUB_PATH"
 
       - name: Generate a non-default locale
-        # The lc_monetary pinning tests (issue #672) need a locale whose
+        # The lc_monetary pinning tests need a locale whose
         # `money` rendering differs from `C`'s; see testkit/src/locale.rs.
         # The ubuntu-24.04 image ships the `locales` package but none of the
         # locales it generates does (C.utf8 and en_US.utf8 both render
@@ -212,7 +212,7 @@ jobs:
         # `benchmark/engine-access` because the benchmark binary carries
         # `required-features` for it, so a plain `--workspace` skips its unit
         # tests without a word, and those are the verdict logic performance
-        # work is judged by (issue #509). The test build already has
+        # work is judged by. The test build already has
         # `trellis/test-util` on through generative's self dev-dependency, so
         # naming it here adds only the benchmark crate to the build.
         # generative's `engine_subprocess` binary needs no flag: the same
@@ -220,7 +220,7 @@ jobs:
         #
         # `--no-fail-fast` so one failing test binary doesn't stop the rest
         # from running, and one run shows every failure, as `verify` does
-        # locally (issue #665).
+        # locally.
         #
         # The throwaway clusters run with `jit=off`. The runner's Postgres
         # (pgdg 16, built --with-llvm) may JIT-compile the large generate_series
@@ -250,7 +250,7 @@ jobs:
           [ "$LINT" = success ] && [ "$TEST" = success ]
 
   elixir:
-    # The Elixir binding (clients/elixir, issue #146). Its NIF crate is a
+    # The Elixir binding. Its NIF crate is a
     # workspace member, so the `lint` job already formats, lints and builds it
     # (Rustler needs no Erlang install to compile); this job loads it into a
     # BEAM and runs the ExUnit suite against a `trellis-testkit` cluster.
@@ -333,7 +333,7 @@ jobs:
           mix test
 
   ruby:
-    # The Ruby binding (clients/ruby, issue #151). Its extension crate is a
+    # The Ruby binding. Its extension crate is a
     # workspace member, but everything in it is behind the `ruby` feature,
     # because rb-sys needs a Ruby install to build (see its Cargo.toml): the
     # `lint` and `test` jobs only format it and build it empty. This job lints it with

@@ -1,5 +1,4 @@
-//! `self-check-walk`: what one `self_check` walk costs as the table grows
-//! (#1178).
+//! `self-check-walk`: what one `self_check` walk costs as the table grows.
 //!
 //! Seeds a `bigint`-keyed source of `--rows` rows, defines either a 1-1
 //! transform (`--kind one-to-one`) or a group-basis aggregate over
@@ -9,7 +8,7 @@
 //! the source and the target (`pg_stat_user_tables.seq_tup_read` deltas), so
 //! rows read per page is `seq_tup_read / pages`.
 //!
-//! `--kind join` (#1198) instead walks the `P` and `M` parts of a JOIN target
+//! `--kind join` instead walks the `P` and `M` parts of a JOIN target
 //! (`FROM a JOIN b ON a.bid = b.id GROUP BY a.cat, b.region`, `a` indexed on
 //! `bid`, `--rows` rows of `a`, a tenth as many of `b`) with `Standard`
 //! pages of 10 000 keys, each part timed apart, and reports the rows read
@@ -42,7 +41,7 @@ const PAGE_KEYS: i64 = 10_000;
 pub struct Config {
     pub rows: i64,
     pub aggregate: bool,
-    /// `--kind join` (#1198): walk a JOIN target's `P` and `M` parts.
+    /// `--kind join`: walk a JOIN target's `P` and `M` parts.
     pub join: bool,
     pub groups: i64,
     pub probe_pages: usize,
@@ -52,7 +51,7 @@ pub struct Config {
     pub index: bool,
     pub build_timeout: Duration,
     pub walk_timeout: Duration,
-    /// `--write-rate N` (`--kind join` only, #1219): update N rows of `a` a
+    /// `--write-rate N` (`--kind join` only): update N rows of `a` a
     /// second, spread over ten statements, while the parts are walked.
     pub write_rate: i64,
 }
@@ -69,7 +68,7 @@ async fn seq_tup_read(raw: &RawClient, table: &str) -> i64 {
     .get(0)
 }
 
-/// Rows the ring slot tables have served so far (#1219): sequential tuples
+/// Rows the ring slot tables have served so far: sequential tuples
 /// and index fetches of every `seg_N`.
 async fn ring_tup_read(raw: &RawClient) -> i64 {
     tokio::time::sleep(Duration::from_millis(2500)).await;
@@ -583,7 +582,7 @@ async fn run_join(cfg: Config, tuning: &EngineTuning) {
 }
 
 /// Prints the ring's segments and the rows each slot table holds, so a walk's
-/// ring reads can be read against what the ring held (#1219).
+/// ring reads can be read against what the ring held.
 async fn report_ring(raw: &RawClient) {
     for row in raw
         .query(

@@ -1,5 +1,5 @@
 //! The migrated template data directory every ordinary [`TestCluster`] starts
-//! from (#1246).
+//! from.
 //!
 //! `initdb` (~220 ms) and the migrations (~70 ms) run once, not once per
 //! test: a throwaway cluster is initialised and migrated into a database

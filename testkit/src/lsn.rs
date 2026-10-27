@@ -1,9 +1,9 @@
-//! The LSN a test stages a CDC ring row at (issue #512).
+//! The LSN a test stages a CDC ring row at.
 //!
 //! A capture trigger stages each change at the WAL insert position it reads
 //! as the statement runs, which is below the position read after the commit
 //! and above any position read before the statement. Aggregate apply compares that LSN with a group's
-//! recompute horizon (issue #321's `delta_may_be_absorbed`, the extinct
+//! recompute horizon (the aggregate's absorb check, the extinct
 //! horizon, a build's stamped horizon): at or below, the group is re-derived
 //! from the source; above, the delta applies. A test that stages at a made-up
 //! LSN like `0/1` sits below every horizon, so it only ever exercises the

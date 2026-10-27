@@ -31,7 +31,7 @@ class QuarantineTest < Minitest::Test
     # row's batch fails alone on each drain cycle, and the row-level fuse
     # (also five) evicts the key before the column fuse can trip: a
     # poisoned key, which wedges convergence for every test after this one
-    # until it's released (#588).
+    # until it's released.
     ids = (1..COLUMN_DEATH_THRESHOLD).to_a
     pg.exec_params("insert into ledger (id, n) select id, 2000000000 from generate_series(1, $1::int) id",
                    [COLUMN_DEATH_THRESHOLD])
@@ -49,8 +49,8 @@ class QuarantineTest < Minitest::Test
 
     # The pause is visible while the batch that tripped it can still be in
     # flight, and a resume that lands before that batch settles sees it
-    # retried against its original row images, which pauses the column again
-    # (#585). Wait for everything written so far to drain first, the way an
+    # retried against its original row images, which pauses the column again.
+    # Wait for everything written so far to drain first, the way an
     # operator resuming a column has to until that's fixed.
     Trellis.await_converged(Trellis.watermark_token, timeout_ms: 30_000)
 
@@ -106,8 +106,8 @@ class QuarantineTest < Minitest::Test
   # which poisoned_since reports, the transform's own address samples, and
   # status counts. Fixed, release_key releases it.
   #
-  # A held key stops await_converged converging past it until it's released
-  # (#588), so this runs on a cluster of its own rather than risk wedging the
+  # A held key stops await_converged converging past it until it's released,
+  # so this runs on a cluster of its own rather than risk wedging the
   # shared one.
   def test_a_poisoned_key_is_reported_sampled_counted_and_released
     TestCluster.private_cluster do |cluster|
@@ -169,7 +169,7 @@ class QuarantineTest < Minitest::Test
         # behind the table's version fence. One that waits past the session's
         # lock timeout (100 ms here, behind the `for share` hold a drain page
         # takes, from another connection) raises TimeoutError, which says to
-        # retry it, and changes nothing (#842). Trellis is one connection per
+        # retry it, and changes nothing. Trellis is one connection per
         # process, so this reconnects with the shorter timeout, and back.
         Trellis.shutdown
         Trellis.connect(url: "#{dsn} options='-c lock_timeout=100'")

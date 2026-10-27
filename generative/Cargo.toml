@@ -5,7 +5,7 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-# Plain and featureless, deliberately. `trellis/test-util` (issue #166) is
+# Plain and featureless, deliberately. `trellis/test-util` is
 # turned on only through this crate's own `subprocess-backend` feature
 # below, never unconditionally here. Cargo unifies features across a whole
 # workspace build, and this is a *normal* (not dev-) dependency, so a
@@ -17,10 +17,10 @@ publish = false
 trellis = { path = "../trellis" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tokio-postgres = "0.7.13"
-# Issue #166: `backend::subprocess::SubprocessBackend` spawns/supervises the
+# `backend::subprocess::SubprocessBackend` spawns/supervises the
 # engine as a real child process via `testkit::crash::CrashGuard`, so this
-# needs to be a normal dependency now, not (as before #166) only a
-# dev-dependency every integration test pulled in separately. `testkit`
+# needs to be a normal dependency now, not only a
+# dev-dependency. `testkit`
 # stays dev-only scaffolding itself (see its own doc comment) — it has no
 # production-facing dependents either.
 testkit = { path = "../testkit" }
@@ -44,7 +44,7 @@ proptest = ["dep:proptest"]
 # turned on for this crate's own tests by the self dev-dependency below,
 # exactly like `proptest`.
 engine-access = ["trellis/test-util"]
-# Issue #166. Turns on `trellis/test-util`, which compiles in
+# Turns on `trellis/test-util`, which compiles in
 # `trellis::staging::apply`'s test-only pre-commit pause hook (see that
 # module for the mechanism) — the thing `backend::subprocess::
 # SubprocessBackend` needs in order to land a `SIGKILL` deterministically

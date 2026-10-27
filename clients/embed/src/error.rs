@@ -181,7 +181,7 @@ mod tests {
         assert_eq!(plain.message, message);
     }
 
-    /// Issue #586: `await_converged` running out of time crosses as
+    /// `await_converged` running out of time crosses as
     /// `timeout`, so a host can retry it instead of reading `internal` ("a
     /// Trellis bug").
     #[test]

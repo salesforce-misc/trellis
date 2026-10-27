@@ -1,4 +1,4 @@
-//! `engine_subprocess` — issue #166's real, `SIGKILL`-able engine process.
+//! `engine_subprocess` — the real, `SIGKILL`-able engine process.
 //!
 //! Not a general-purpose operator entrypoint (that's `cli`'s `trellis run` —
 //! see `cli/src/commands/run.rs`): this is test-only infrastructure, built
@@ -17,7 +17,7 @@
 //! `"false"`), `TRELLIS_APPLICATION_THREADS` (a `usize`),
 //! `TRELLIS_MAINTENANCE_INTERVAL_MS` (a `u64`), `TRELLIS_READY_MARKER` (a
 //! path). There is no source-table list: the staging worker captures what
-//! the catalog's definitions read (issue #427). Two more env vars are read directly by `staging::apply`'s
+//! the catalog's definitions read. Two more env vars are read directly by `staging::apply`'s
 //! own test-only pause hook, never by this binary — see
 //! `SubprocessBackend::spawn_engine`'s doc comment for why they only need to
 //! be present in this process's environment, not parsed here:

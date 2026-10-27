@@ -1,4 +1,4 @@
-//! The capture ceiling (#565's E2, rebuilt for #622 C4; it replaces
+//! The capture ceiling (it replaces
 //! `intake-ceiling`): how many rows/s reach the ring as writers are added,
 //! at 1,000 rows per commit, with nothing draining.
 //!

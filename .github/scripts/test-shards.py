@@ -39,8 +39,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 WEIGHTS = os.path.join(ROOT, ".github", "test-shards.txt")
 WORKFLOW = os.path.join(ROOT, ".github", "workflows", "ci.yml")
 # What the old single `Test` step ran: `--features benchmark/engine-access`
-# because the benchmark binary has `required-features` (issue #509);
-# `--no-fail-fast` so one run shows every failure (issue #665).
+# because the benchmark binary has `required-features`;
+# `--no-fail-fast` so one run shows every failure.
 CARGO_FLAGS = ["--workspace", "--features", "benchmark/engine-access", "--no-fail-fast"]
 DOC_DEFAULT_SECONDS = 15.0
 

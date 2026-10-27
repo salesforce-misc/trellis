@@ -24,7 +24,7 @@
 //! `generative/tests/concurrent_convergence.rs` for the new, separate
 //! property/test file this constructor is meant to be driven from.
 //!
-//! **Issue #166 update**: that same DDL/DML/read-back rendering logic
+//! **Update**: that same DDL/DML/read-back rendering logic
 //! (`render_definition`/`render_expr`/`create_source_table`/`apply_op`/
 //! `read_table`/`read_aggregate_table`, none of which cares whether the
 //! engine driving the ring is in-process or a real subprocess) has since
@@ -68,7 +68,7 @@ const QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The reclaim TTL a run that stops Postgres under a running engine gives
 /// its engine clients ([`ManualBackend::set_reclaim_ttl`]).
 ///
-/// A server stop can strand a claim (issue #752). A worker that claimed a
+/// A server stop can strand a claim. A worker that claimed a
 /// build job or a segment just before the stop loses its connection before
 /// it can run the work or give the claim back, so the claim stays in the
 /// catalog under a worker that isn't running it. The engine's stale-claim
@@ -87,7 +87,7 @@ const _: () = assert!(SERVER_STOP_RECLAIM_TTL.as_secs() * 3 <= QUIESCE_TIMEOUT.a
 /// A maintenance interval ([`ManualBackend::connect_with_options`]) for a
 /// pin that does all sealing itself, with
 /// [`ManualBackend::force_seal_active_segment`] and
-/// [`ManualBackend::quiesce_forcing_seals`] (issue #453). The engine's
+/// [`ManualBackend::quiesce_forcing_seals`]. The engine's
 /// start-up capture pass, and the loop's first tick right after it, still
 /// run when the engine client starts, so the definitions
 /// [`Backend::install`](super::Backend::install) registered before starting
@@ -105,7 +105,7 @@ const _: () = assert!(SERVER_STOP_RECLAIM_TTL.as_secs() * 3 <= QUIESCE_TIMEOUT.a
 /// needs any of those keeps a real interval.
 pub const SEAL_ON_DEMAND_INTERVAL: Duration = Duration::from_secs(3600);
 
-/// [`ManualBackend::restart`]'s bounded retry budget (issue #251) for the
+/// [`ManualBackend::restart`]'s bounded retry budget for the
 /// residual `ProducerAlreadyRunning` window `trellis::Client::shutdown`
 /// alone doesn't close: up to this many *retries* (so up to
 /// `RESTART_PRODUCER_RETRY_ATTEMPTS + 1` total attempts to start the
@@ -130,7 +130,7 @@ const RESTART_PRODUCER_RETRY_MAX_DELAY: Duration = Duration::from_millis(320);
 
 /// Whether `err` is the producer-singleton-lock conflict
 /// (`trellis::StagingError::ProducerAlreadyRunning`) [`ManualBackend::restart`]'s
-/// bounded retry (issue #251) specifically targets — recognized in both
+/// bounded retry specifically targets — recognized in both
 /// shape it reaches a fresh [`EngineClient::start_with_config`] call
 /// through: `setup_staging`'s producer session, inside
 /// `ClientError::Staging`. Every other `ClientError` variant is a real
@@ -142,7 +142,7 @@ fn is_producer_already_running(err: &ClientError) -> bool {
     )
 }
 
-/// [`ManualBackend::restart`]'s layer-2 fix (issue #251): starts a fresh
+/// [`ManualBackend::restart`]'s layer-2 fix: starts a fresh
 /// `EngineClient`, retrying with a short bounded backoff
 /// ([`RESTART_PRODUCER_RETRY_ATTEMPTS`]/[`RESTART_PRODUCER_RETRY_BASE_DELAY`]/
 /// [`RESTART_PRODUCER_RETRY_MAX_DELAY`]) specifically when
@@ -226,7 +226,7 @@ pub enum ManualBackendError {
         unsettled: Vec<String>,
         waited: Duration,
     },
-    /// Issue #236: a statement sent through the `Trellis` facade (the
+    /// A statement sent through the `Trellis` facade (the
     /// operator's `RESUME TRANSFORM`) failed.
     Facade(trellis::TrellisError),
     Config(trellis::Error),
@@ -357,7 +357,7 @@ fn noise_sql_literal(value: &Option<String>) -> String {
 }
 
 /// Where a [`ManualBackend`] keeps the source tables of the programs it
-/// installs (issue #879).
+/// installs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SourceTables {
     /// In the instance's own catalog schema, which is first on the backend's
@@ -429,7 +429,7 @@ pub struct ManualBackend {
     /// [`ManualBackend::set_reclaim_ttl`]; the engine's default otherwise.
     reclaim_ttl: Option<Duration>,
     /// The schema this backend's transform *target* tables are created
-    /// under (`trellis::Config::target_schema`; issue #234,
+    /// under (`trellis::Config::target_schema`,
     /// `docs/instance-identity.md`): two instances sharing one
     /// database must not both write their targets into `public`, where two
     /// independently-generated programs' identically-named target tables
@@ -440,7 +440,7 @@ pub struct ManualBackend {
     source_tables: SourceTables,
     /// The resolved [`Config`] this backend's [`Pool`] and every
     /// [`EngineClient`] it starts are built from — carrying
-    /// the instance schema and [`Self::target_schema`] (issue #234). Kept whole
+    /// the instance schema and [`Self::target_schema`]. Kept whole
     /// rather than rebuilt at each use so the engine client, the oracle's
     /// pool, and this backend's own raw connection provably share one
     /// instance identity.
@@ -512,7 +512,7 @@ impl ManualBackend {
         // Resolved through the engine's own `Config::from_dsn` — i.e. from
         // `TRELLIS_SCHEMA`/`TRELLIS_TARGET_SCHEMA`, defaulting to
         // `DEFAULT_SCHEMA`/`DEFAULT_TARGET_SCHEMA` — so this constructor
-        // keeps its exact pre-#234 behavior rather than hardcoding the
+        // follows the environment rather than hardcoding the
         // defaults and quietly ignoring an environment a caller set.
         let resolved = Config::from_dsn(dsn.clone())?;
         let (schema, target_schema) = (
@@ -529,13 +529,13 @@ impl ManualBackend {
         .await
     }
 
-    /// [`ManualBackend::connect_with_options`]'s instance-aware general form
-    /// (issue #234): the same backend, but pinned to an explicitly-named
+    /// [`ManualBackend::connect_with_options`]'s instance-aware general form:
+    /// the same backend, but pinned to an explicitly-named
     /// Trellis **instance schema** and transform **target schema** rather
     /// than whatever `Config::from_dsn` resolves from the process's
     /// `TRELLIS_SCHEMA`/`TRELLIS_TARGET_SCHEMA` environment.
     ///
-    /// This exists because #234 runs *two* Trellis instances side by side
+    /// This exists because the two-instance tests run *two* Trellis instances side by side
     /// inside one test process (see
     /// `generative/tests/two_instance_noise.rs`), and process-global
     /// environment variables structurally cannot give two in-process
@@ -599,7 +599,7 @@ impl ManualBackend {
     /// [`Backend::install`](super::Backend::install), which starts the
     /// client. The concurrent tier draws a few rows so that a build over its
     /// small hot table runs as many chunks, spread through the burst, the
-    /// way a build over a large table does at the default size (#720).
+    /// way a build over a large table does at the default size.
     pub fn set_build_chunk_rows(&mut self, rows: i64) {
         self.build_chunk_rows = Some(rows);
     }
@@ -638,15 +638,15 @@ impl ManualBackend {
         self.reclaim_ttl = Some(ttl);
     }
 
-    /// Chooses where [`Backend::install`] puts the source tables (issue
-    /// #879). Call before installing. [`SourceTables::Own`] by default.
+    /// Chooses where [`Backend::install`] puts the source tables.
+    /// Call before installing. [`SourceTables::Own`] by default.
     pub fn set_source_tables(&mut self, source_tables: SourceTables) {
         self.source_tables = source_tables;
     }
 
     /// Stops reading `table`, which the database no longer has: a later
     /// [`Backend::snapshot`] leaves it out, and [`Backend::apply`] refuses an
-    /// op naming it (issue #879: another instance dropped the transform whose
+    /// op naming it (another instance dropped the transform whose
     /// target this instance read as a source).
     pub fn forget_table(&mut self, table: &str) {
         self.tables.remove(table);
@@ -656,8 +656,8 @@ impl ManualBackend {
     /// statement refuses a transform that isn't paused), through the public
     /// `Trellis` facade an operator would use, and forgets the definition
     /// here, so a later
-    /// [`Backend::quiesce`] or [`Backend::snapshot`] no longer expects it
-    /// (issue #879). The facade removes the target table with it.
+    /// [`Backend::quiesce`] or [`Backend::snapshot`] no longer expects it.
+    /// The facade removes the target table with it.
     pub async fn drop_transform(&mut self, target: &str) -> Result<(), ManualBackendError> {
         let facade =
             trellis::Trellis::connect(self.config.clone(), trellis::TrellisOptions::default())
@@ -670,7 +670,7 @@ impl ManualBackend {
     }
 
     /// The highest `seg_seq` the drain audit has seen sealed, or `0` before
-    /// any seal (issue #453): a baseline for
+    /// any seal: a baseline for
     /// [`ManualBackend::audited_capture_segments`]. Needs
     /// [`super::ConcurrentBackend::start_drain_audit`] first.
     pub async fn latest_audited_seal(&self) -> Result<i64, ManualBackendError> {
@@ -686,7 +686,7 @@ impl ManualBackend {
 
     /// The segments sealed after `after_seg` whose slot held, when its fence
     /// was published, a change captured from `table`: a source write's ring
-    /// row, not a drain's `Recompute` (issue #453). The drain audit's seal
+    /// row, not a drain's `Recompute`. The drain audit's seal
     /// trigger records them, so this reads where a change actually landed
     /// rather than which seal a caller forced, even once the segment has
     /// drained and retired. `table` is named as the backend's own connection
@@ -734,7 +734,7 @@ impl ManualBackend {
     }
 
     /// How many group-basis hidden tables (`<instance schema>.agg_<id>`, one
-    /// per definition maintained on the group basis, issue #1100) the
+    /// per definition maintained on the group basis) the
     /// instance has. A coverage floor compares this with the aggregate
     /// definitions it installed, so "every aggregate runs on the group basis"
     /// is checked against the catalog rather than assumed.
@@ -751,14 +751,14 @@ impl ManualBackend {
     }
 
     /// Whether anything committed so far is still sitting in the ring,
-    /// un-drained (issue #138): a thin wrapper around
+    /// un-drained: a thin wrapper around
     /// `trellis::dev::staging::has_pending`, exposed so a pin that seals by
     /// hand can confirm "the op I just committed is in the ring" before
     /// calling
     /// [`ManualBackend::force_seal_active_segment`] — sealing an empty (or
     /// stale) active segment would silently defeat the deterministic
     /// seal-boundary reproduction the caller is trying to build. A capture
-    /// trigger stages a change in the writer's own transaction (#622), so it
+    /// trigger stages a change in the writer's own transaction, so it
     /// is there at commit.
     ///
     /// Not a substitute for [`ManualBackend::quiesce`]: this only reports
@@ -768,8 +768,8 @@ impl ManualBackend {
         Ok(staging_has_pending(&self.raw).await?)
     }
 
-    /// Forces whatever is currently active in the ring to seal immediately
-    /// (issue #138), returning the sealed segment's `seg_seq`: a direct
+    /// Forces whatever is currently active in the ring to seal immediately,
+    /// returning the sealed segment's `seg_seq`: a direct
     /// wrapper around `trellis::dev::staging::seal_phase1`/`seal_phase2`, the
     /// same two-phase seal the engine's own maintenance loop performs on its
     /// normal cadence. Sealing one change into its own segment, then a later
@@ -831,8 +831,8 @@ impl ManualBackend {
     }
 
     /// [`Backend::quiesce`](super::Backend::quiesce) that seals what the
-    /// maintenance tick would have, instead of waiting for the tick (issue
-    /// #453): for a backend whose tick is off ([`SEAL_ON_DEMAND_INTERVAL`])
+    /// maintenance tick would have, instead of waiting for the tick:
+    /// for a backend whose tick is off ([`SEAL_ON_DEMAND_INTERVAL`])
     /// or widened. Draining can stage more rows into the active segment, and
     /// only a seal makes them drainable.
     ///
@@ -871,7 +871,7 @@ impl ManualBackend {
         Ok(sql::quiesce(&self.raw, &self.defs, remaining).await?)
     }
 
-    /// The channel a seal notifies (issue #271: `seal_phase2` `pg_notify`s it
+    /// The channel a seal notifies (`seal_phase2` `pg_notify`s it
     /// the instant it publishes the fence). This backend never overrides the
     /// wake channel, so it is the schema's default channel (what an engine
     /// client started with these options listens on) when no engine client has
@@ -904,7 +904,7 @@ impl ManualBackend {
             .clone();
         let source_columns = sql::source_columns(&source_table);
 
-        // #1167: the engine refuses a GROUP BY or JOIN definition whose
+        // The engine refuses a GROUP BY or JOIN definition whose
         // source lacks the index its self_check walk pages by.
         let schema = match self.source_tables {
             SourceTables::Own => None,
@@ -914,17 +914,17 @@ impl ManualBackend {
 
         let text = sql::render_definition(def);
 
-        // Issue #63 C1: `install_definition` is the same front door real
+        // `install_definition` is the same front door real
         // callers use. It creates the target table and records the
         // definition `waiting_to_backfill`; the staging worker's capture
         // pass starts its build in the background (ADR-0002). Routing the fuzz
         // harness through it, instead of hand-rolling the same
         // create-table/persist sequence, keeps this backend exercising the
         // exact path production traffic takes.
-        // Issue #234: `self.target_schema`, not a hardcoded `"public"` — see
+        // `self.target_schema`, not a hardcoded `"public"` — see
         // that field's doc comment. `connect`/`connect_with_workers`/
         // `connect_with_options` all still resolve it to exactly what a
-        // literal `"public"` used to mean, so no pre-#234 caller changes.
+        // literal `"public"` would mean.
         install_definition(&self.pool, &text, &source_columns, &self.target_schema).await?;
         Ok(())
     }
@@ -934,7 +934,7 @@ impl ManualBackend {
     /// indistinguishable from a real one at the DDL level, but never
     /// registers it in `self.tables`, and no definition reads it, so the
     /// engine never captures it (the engine captures exactly the tables
-    /// registered definitions read, issue #427). Those are the only ways a table is "tracked" by this backend
+    /// registered definitions read). Those are the only ways a table is "tracked" by this backend
     /// or watched by the engine (see [`ManualBackend::install`]/
     /// [`ManualBackend::snapshot`]), and `run::check_program`'s oracle never
     /// looks at "every table in the schema" either — it only ever resolves a
@@ -990,7 +990,7 @@ impl ManualBackend {
 const POOL_USABLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Blocks until `pool` hands out a connection that can run a query, after a
-/// Postgres restart severed every connection it held (issue #236).
+/// Postgres restart severed every connection it held.
 ///
 /// A pooled connection is recycled only once its driver task has noticed the
 /// server closed it. One the pool hasn't caught up on yet looks healthy and
@@ -1016,7 +1016,7 @@ pub async fn await_pool_usable(pool: &Pool) -> Result<(), ManualBackendError> {
     }
 }
 
-/// Issue #236: the database-administration actions
+/// The database-administration actions
 /// (`crate::model::DbAdminAction`). The harness side of each one lives here,
 /// because it has to reach the engine client and the backend's own
 /// connections. Restarting the server itself is the cluster's job
@@ -1055,7 +1055,7 @@ impl ManualBackend {
     }
 
     /// A second backend over a restored copy of this backend's database at
-    /// `dsn` (issue #236), with this one's engine client already started on
+    /// `dsn`, with this one's engine client already started on
     /// it. Nothing is installed: the restored database already holds the
     /// program's tables, catalog, ring and targets as of the backup, so this
     /// only carries over what the harness itself remembers (the tables and
@@ -1104,7 +1104,7 @@ impl ManualBackend {
         Ok(statuses)
     }
 
-    /// The operator's half of issue #310's recovery: `RESUME TRANSFORM` on
+    /// The operator's recovery step: `RESUME TRANSFORM` on
     /// every installed definition, through the public `Trellis` facade an
     /// operator would use. Each resume is a fresh backfill from current
     /// source data; [`Backend::quiesce`] waits for them to finish.
@@ -1138,7 +1138,7 @@ impl super::Backend for ManualBackend {
         }
 
         // The staging worker captures whatever the definitions just
-        // registered read, straight from the catalog (issue #427).
+        // registered read, straight from the catalog.
         if !program.tables.is_empty() && self.engine_client.is_none() {
             let mut options = ClientOptions {
                 staging_worker: true,
@@ -1183,18 +1183,17 @@ impl super::Backend for ManualBackend {
 
     async fn quiesce(&mut self) -> Result<(), ManualBackendError> {
         // Improvement-plan workstream C, task C1: opt-in per-call timing
-        // around the whole quiesce (since #432, the settle and partition
+        // around the whole quiesce (the settle and partition
         // waits as well as the watermark -> converge round trip), to test the
         // hypothesis that the convergence property's wall-clock variance came
-        // from a ~10s pipeline stall. It did: issue #452's keepalive
-        // throttle, first blamed on the seal age gate. Silent and free unless
+        // from a ~10s pipeline stall. Silent and free unless
         // `GENERATIVE_QUIESCE_TIMING` is set: the env lookup happens once per
         // call so the default (unset) path pays exactly one `var_os` check
         // and no clock reads.
         let timing_enabled = std::env::var_os("GENERATIVE_QUIESCE_TIMING").is_some();
         let start = timing_enabled.then(std::time::Instant::now);
 
-        // Issue #432: partition maintenance, definition status and the ring,
+        // Partition maintenance, definition status and the ring,
         // in that order — see `sql::quiesce` for why the order matters.
         let result = sql::quiesce(&self.raw, &self.defs, QUIESCE_TIMEOUT).await;
 
@@ -1219,11 +1218,11 @@ impl super::Backend for ManualBackend {
         }
 
         for def in &self.defs {
-            // Issue #234: `self.target_schema`, not a hardcoded `"public"` —
+            // `self.target_schema`, not a hardcoded `"public"` —
             // see `install_definition` above and that field's doc comment.
             let qualified = qualified_target_table(&self.target_schema, def);
             let rows = match &def.key_space {
-                // The JOIN tier (#1113): a `JOIN` target's group columns
+                // The JOIN tier: a `JOIN` target's group columns
                 // are named after the columns its `GROUP BY` keys name.
                 KeySpace::Join(join) => {
                     let group_by_names: Vec<String> =
@@ -1233,12 +1232,11 @@ impl super::Backend for ManualBackend {
                 }
                 KeySpace::OneToOne => {
                     // `source_primary_key` accepts an arbitrary-arity source
-                    // primary key (issue #126), and — since issue #121 — the
+                    // primary key, and the
                     // engine's own 1-1 target DDL mirrors a composite key in
                     // full rather than narrowing it to one column. This
                     // generative suite, though, never itself constructs a
-                    // composite-PK 1-1 definition (out of this issue's
-                    // scope), and `sql::read_table`'s snapshot reader below
+                    // composite-PK 1-1 definition, and `sql::read_table`'s snapshot reader below
                     // only takes one `pk_col` name — narrowed to the first
                     // (and, for every definition this suite actually
                     // generates, only) column.
@@ -1276,7 +1274,7 @@ impl super::Backend for ManualBackend {
     /// state untouched by any of this, so the new client resumes exactly
     /// where the old one left off.
     ///
-    /// Issue #251, two layers of fix:
+    /// Two layers of fix:
     ///
     /// 1. This used to just drop the old `Option<Client>` and rely on
     ///    `Client`'s `Drop` impl (a best-effort shutdown signal with no
@@ -1285,7 +1283,7 @@ impl super::Backend for ManualBackend {
     ///    producer's `pg_try_advisory_lock`-held session could still be open
     ///    when the very next line's producer tried to acquire that same
     ///    lock — a real, sporadic `ProducerAlreadyRunning` race (see the CI
-    ///    failure this issue links). Awaiting `trellis::Client::shutdown` on
+    ///    observed CI failure). Awaiting `trellis::Client::shutdown` on
     ///    the outgoing client first — which sends the same signal *and*
     ///    joins the thread — makes the old lock's release happen-before the
     ///    new client's *thread* fully exiting, closing the client-side half
@@ -1314,7 +1312,7 @@ impl super::Backend for ManualBackend {
     /// `kill`-then-`wait` (never just letting its `CrashGuard` drop) for the
     /// identical layer-1 reason. The process's exit doesn't close layer 2's
     /// gap either: the killed engine's backend still has to be scheduled to
-    /// read the EOF (issue #870). `SubprocessBackend` waits for the singleton
+    /// read the EOF. `SubprocessBackend` waits for the singleton
     /// to read free in `pg_locks` before spawning instead of retrying, since
     /// a failed start there is a dead subprocess, not a typed error.
     async fn restart(&mut self) -> Result<(), ManualBackendError> {
@@ -1325,7 +1323,7 @@ impl super::Backend for ManualBackend {
         // Take the old client and await its graceful shutdown — not just
         // drop it — before starting the replacement, so the old producer's
         // advisory lock is released (from this process's point of view)
-        // before the new one tries to acquire it (issue #251, layer 1).
+        // before the new one tries to acquire it (layer 1 of `restart`'s fix).
         if let Some(old_client) = self.engine_client.take() {
             old_client.shutdown().await?;
         }
@@ -1355,7 +1353,7 @@ impl super::Backend for ManualBackend {
     }
 }
 
-/// A [`ManualBackend`]'s [`super::OpApplier`] (issue #557): its own raw
+/// A [`ManualBackend`]'s [`super::OpApplier`]: its own raw
 /// session, set up exactly like the backend's, and a copy of the installed
 /// tables to render ops against.
 pub struct ManualApplier {
@@ -1379,7 +1377,7 @@ impl super::OpApplier for ManualApplier {
     }
 }
 
-/// The drain audit's tables, triggers and trigger functions (issue #557),
+/// The drain audit's tables, triggers and trigger functions,
 /// created in the instance schema `schema` (already quoted). Two
 /// `AFTER` row triggers on the engine's own staging registry: one on a
 /// segment's fence being published, which records the batch's bucket count
@@ -1387,7 +1385,7 @@ impl super::OpApplier for ManualApplier {
 /// `seg_claims` insert, which records which worker claimed which bucket. A
 /// retired segment's registry rows are deleted, so the audit keeps its own
 /// copy. The seal decides the bucket count and row count in the statement
-/// that publishes the fence (issue #598), so the trigger records the
+/// that publishes the fence, so the trigger records the
 /// registry's own values.
 ///
 /// Each seal is tagged with the burst the harness last announced

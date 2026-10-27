@@ -1,4 +1,4 @@
-//! The subprocess-supervised backend (issue #166): [`ManualBackend`]'s
+//! The subprocess-supervised backend: [`ManualBackend`]'s
 //! sibling `Backend` impl, differing *only* in how the engine that drains
 //! the ring is started, stopped, and restarted. Every DDL/DML/read-back
 //! concern (installing tables/definitions, applying raw
@@ -21,7 +21,7 @@
 //! comment for how a caller can confirm the kill was real (not a clean
 //! exit).
 //!
-//! **The deterministic pause point (issue #166, item 2)**: a blind
+//! **The deterministic pause point**: a blind
 //! "apply an op, sleep a bit, `SIGKILL`" test would only *sometimes* land
 //! inside Phase 3's open transaction — this suite's programs are tiny, and a
 //! drain of them can complete in well under a millisecond. Instead,
@@ -330,7 +330,7 @@ impl SubprocessBackend {
     }
 
     /// Arms `staging::apply`'s test-only pre-commit pause hook
-    /// (issue #166; see that module's `pause_before_commit_for_tests` doc
+    /// (see that module's `pause_before_commit_for_tests` doc
     /// comment for the full mechanism): creates the trigger file the hook
     /// polls for, so the *next* Phase 3 commit the primary engine
     /// subprocess attempts pauses indefinitely, right after every write and
@@ -406,7 +406,7 @@ impl SubprocessBackend {
         sql::create_source_indexes(&self.raw, None, def).await?;
         let text = sql::render_definition(def);
         // Same front door real callers and `ManualBackend` use — see
-        // `ManualBackend::install_definition`'s doc comment (issue #63 C1).
+        // `ManualBackend::install_definition`'s doc comment.
         install_definition(&self.pool, &text, &source_columns, "public").await?;
         Ok(())
     }
@@ -447,7 +447,7 @@ impl SubprocessBackend {
                 self.maintenance_interval.as_millis().to_string(),
             )
             .env("TRELLIS_READY_MARKER", &self.ready_marker_path)
-            // Issue #166's pause hook — see this module's doc comment. Set
+            // The pause hook — see this module's doc comment. Set
             // unconditionally (every spawned subprocess, primary or
             // scale-out): a no-op unless `arm_pause_before_commit` later
             // creates the trigger file, per `pause_before_commit_for_tests`'s
@@ -490,7 +490,7 @@ impl SubprocessBackend {
     /// the EOF. Under CPU contention that can trail the process's exit by
     /// several milliseconds, and a fresh engine that asks for the singleton
     /// first fails its start with `ProducerAlreadyRunning`. That's the race
-    /// `ManualBackend::restart` retries around (issue #251); waiting here
+    /// `ManualBackend::restart` retries around; waiting here
     /// instead makes the release happen before the fresh engine's acquire.
     async fn wait_for_producer_release(&self) -> Result<(), SubprocessBackendError> {
         let trellis = trellis::Trellis::connect(
@@ -535,7 +535,7 @@ impl super::Backend for SubprocessBackend {
         }
 
         // The staging worker captures whatever the definitions just
-        // registered read, straight from the catalog (issue #427).
+        // registered read, straight from the catalog.
         if !program.tables.is_empty() && self.child.is_none() {
             self.spawn_engine(true).await?;
         }
@@ -549,7 +549,7 @@ impl super::Backend for SubprocessBackend {
     }
 
     async fn quiesce(&mut self) -> Result<(), SubprocessBackendError> {
-        // Issue #432: the same composed wait `ManualBackend::quiesce` runs.
+        // The same composed wait `ManualBackend::quiesce` runs.
         Ok(sql::quiesce(&self.raw, &self.defs, QUIESCE_TIMEOUT).await?)
     }
 
@@ -579,7 +579,7 @@ impl super::Backend for SubprocessBackend {
                     // This generative suite never itself constructs a
                     // composite-PK 1-1 definition, even though `source_primary_key`
                     // and the engine's own 1-1 target DDL both support one in
-                    // full since issue #121 — narrowed to the first (and,
+                    // full — narrowed to the first (and,
                     // for every definition this suite actually generates,
                     // only) column, matching `sql::read_table`'s single
                     // `pk_col` contract.
@@ -608,15 +608,15 @@ impl super::Backend for SubprocessBackend {
         Ok(snapshot)
     }
 
-    /// The real thing (issue #166), unlike `ManualBackend::restart`'s
+    /// The real thing, unlike `ManualBackend::restart`'s
     /// in-process simulation: `SIGKILL`s the currently running primary
     /// subprocess (via [`CrashGuard::kill`]), waits for it to actually exit
     /// (recording the exit status — see [`SubprocessBackend::last_kill_status`]),
     /// waits for Postgres to free the staging-worker singleton it held (see
     /// [`SubprocessBackend::wait_for_producer_release`]),
     /// then spawns a fresh one against the exact same dsn `install`
-    /// originally used (it reads the tables to capture from the catalog,
-    /// issue #427). The ring is durable
+    /// originally used (it reads the tables to capture from the catalog).
+    /// The ring is durable
     /// Postgres state untouched by any of this, so the fresh subprocess is
     /// expected to redrive exactly whatever the killed one left mid-flight —
     /// including, if [`SubprocessBackend::arm_pause_before_commit`] paused it

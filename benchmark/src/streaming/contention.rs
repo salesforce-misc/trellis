@@ -1,5 +1,5 @@
 //! Where the engine's backends spend their time while an aggregate is under
-//! load — issue #277's lock-wait attribution.
+//! load: lock-wait attribution.
 //!
 //! [`sample`] polls `pg_stat_activity` on its own connection every
 //! [`SAMPLE_INTERVAL`] for the length of a probe's offer window and sorts
@@ -10,7 +10,7 @@
 //! workers blocked on another transaction's row lock is contention, whatever
 //! the throughput number says.
 //!
-//! Two splits matter for #277's hypothesis:
+//! Two splits matter for the lock-contention hypothesis:
 //!
 //! * **Generator vs engine.** The load generator's own backends share the
 //!   database, and one waiting on a lock would say nothing about Trellis. A
@@ -36,10 +36,10 @@
 //! *time*, which Postgres doesn't account for without `log_lock_waits` or an
 //! extension this harness's ephemeral cluster doesn't have.
 //!
-//! **Lock waits and holds by statement class (#623 D1).** Each engine
+//! **Lock waits and holds by statement class.** Each engine
 //! statement is put in a [`StatementClass`] by its text: the claim, the
 //! aggregate pre-lock, a ledger lock (any statement naming a `__ledger`
-//! table; none exist before #623 D2), a group upsert (any other write naming
+//! table; none exist unless a ledger table does), a group upsert (any other write naming
 //! the scenario's target), or other. The same samples then give two
 //! per-episode distributions, both from Postgres's own timestamps so they
 //! don't depend on how the engine is built:
@@ -96,11 +96,11 @@ const GROUP_LOCK_MARKER: &str = "do update set __n = excluded.__n where false";
 /// buckets with this.
 const CLAIM_MARKER: &str = "insert into seg_claims";
 
-/// The claim's first statement (`staging::claim`'s `LOCK_SEGMENT_SQL`, #690),
+/// The claim's first statement (`staging::claim`'s `LOCK_SEGMENT_SQL`),
 /// where a claim now waits for the segment's other claims and completions.
 const CLAIM_LOCK_MARKER: &str = "select 1 from segments where seg_seq = $1 for no key update";
 
-/// Every ledger table's name ends in this (#623 D2).
+/// Every ledger table's name ends in this.
 const LEDGER_MARKER: &str = "__ledger";
 
 /// What an engine statement is, for lock-wait attribution (see the module
@@ -178,7 +178,7 @@ pub fn statement_class(query: &str, target: &str) -> StatementClass {
     }
 }
 
-/// A Re-derive build's statement classes (#625 F2), told apart by the
+/// A Re-derive build's statement classes, told apart by the
 /// `application_name` its transactions set (`trellis::dev::staging`'s
 /// `CHUNK_APPLICATION_NAME`): a chunk's entry lock
 /// shares its text with a drain page's.

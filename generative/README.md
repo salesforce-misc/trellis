@@ -1,7 +1,7 @@
 # `generative`
 
 The generative correctness test suite (design doc:
-`docs/generative-test-suite.md`, epic #2). See that doc for architecture,
+`docs/generative-test-suite.md`). See that doc for architecture,
 oracle design, and the property list; this file is the crate-local
 operational notes.
 
@@ -22,32 +22,16 @@ wall-clock heuristic is backed by `run::Coverage`'s floor assertions
 (`tests/coverage.rs`) for the fast, DB-free half of "did it actually run" —
 this note stays as a smell to notice, not the only check.
 
-## Current cost profile, and the CI split that exists today
+## Cost profile and the CI split
 
-At the design doc's default case count (16), a full `cargo test -p generative
---test convergence` run takes **~130–290s**, and that variance is understood,
-not mysterious: per-op timing instrumentation (`GENERATIVE_QUIESCE_TIMING=1`,
-`ManualBackend::quiesce`) across 10 runs (894 samples) found a clean bimodal
-distribution — ~77% of quiesce calls resolve under 2s, and a distinct ~22%
-cluster lands at 8.2–10.2s. A second pass (`GENERATIVE_COST_TIMING=1`,
-covering cluster startup, per-case database provisioning, install, apply,
-snapshot, and the oracle's recompute) found those phases collectively
-account for **under 3% of wall-clock** — so the suite's cost was, almost
-entirely, that stall, not test-harness overhead; see the git history for
-`generative/src/backend/manual.rs` (`ManualBackend::quiesce`) for the full
-measurement writeup.
-
-That stall was an engine bug, issue #452, not the seal age gate
-(`SealConfig::age_gate`) that an earlier diagnosis suspected: a convergence
-wait whose token landed past the last decoded change waited for the
-then-replication intake's keepalive-driven persist,
-throttled to once per 10s. Fixing that dropped the fast-lane binaries'
-serial time from 385s to 174s (fifteen binaries, measured 2026-09-24), and
-trigger capture (#622) removed the wait altogether. The figures above
-predate both.
-What's left of a quiesce's floor is mostly the staging worker's
+The suite's cost is dominated by waiting for the engine to converge, not by
+harness overhead: cluster startup, per-case database provisioning, install,
+apply, snapshot and the oracle's recompute together are a small fraction of
+wall-clock. A quiesce's floor is mostly the staging worker's
 `reconcile_interval` (5s), which a new registration waits out before its
-build starts.
+build starts. Set `GENERATIVE_QUIESCE_TIMING=1` for per-op quiesce timing
+(`ManualBackend::quiesce`) and `GENERATIVE_COST_TIMING=1` for the cost split
+by phase.
 
 Because paying that cost for every property on every push/PR would be
 expensive — and because a contributor's (or agent's) first reflex is a plain
@@ -80,9 +64,9 @@ wired into two workflows:
 `FileFailurePersistence::SourceParallel` config writes a failing case's seed
 to `generative/tests/<file>.proptest-regressions` and replays it first on the
 next local run. Those files are git-ignored. A seed is only an RNG state, so
-it names the same program only while the strategy keeps its shape: after
-#505 changed the generator, every checked-in seed replayed into an unrelated
-program and guarded nothing, and they were deleted. A failure worth keeping
+it names the same program only while the strategy keeps its shape: a
+change to the generator makes every checked-in seed replay an unrelated
+program that guards nothing, so none are checked in. A failure worth keeping
 is transcribed from its printed `Program` into a hand-built pin, which the
 fast lane runs on every push and no generator change can invalidate (see
 `tests/concurrent_convergence.rs`'s shrink-trust convention).

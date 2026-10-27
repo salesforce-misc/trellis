@@ -1,5 +1,4 @@
-//! The in-window rate check every throughput verdict rests on (issues #276,
-//! #319).
+//! The in-window rate check every throughput verdict rests on.
 //!
 //! A probe offers load for a window, then waits up to a grace period for the
 //! pipeline to catch up. "Caught up within grace" alone is not a throughput
@@ -22,7 +21,7 @@
 //! Progress is a staircase, not a line: rows arrive a commit at a time and
 //! become visible a sealed segment at a time. A least-squares slope through a
 //! sampled staircase that exactly keeps up still misses the offered rate, in
-//! two ways that a fixed 2% tolerance does not absorb (issue #319's review):
+//! two ways that a fixed 2% tolerance does not absorb:
 //!
 //! * **Aliasing.** Sampled at a fixed period close to the step period (a 200ms
 //!   sampler against a 200-300ms seal/poll cadence), the sampler sees the
@@ -195,11 +194,11 @@ pub fn kept_target_rate(
     drained && in_window.is_some_and(|fit| fit.rows_per_sec >= offered * (1.0 - fit.tolerance))
 }
 
-/// Issue #423's cross-check: `trellis_changes_applied_total` counts staged
+/// Cross-check:`trellis_changes_applied_total` counts staged
 /// source rows, one per committed row, so it can only pass the rows committed
 /// if something staged a source row a second time inside the window. The probe
 /// then measured more work than it offered. The run fails on it, so the
-/// probe's own verdict must not claim a pass either (#509).
+/// probe's own verdict must not claim a pass either.
 pub fn restaged_in_window(changes_applied: u64, rows_issued: u64) -> bool {
     changes_applied > rows_issued
 }
@@ -385,8 +384,8 @@ mod tests {
         }
     }
 
-    /// The 10,000-row shape at 20k rows/sec over an 8s window (issue #319's
-    /// smoke read 19,622 against a 19,600 bar): the partial steps at the
+    /// The 10,000-row shape at 20k rows/sec over an 8s window (a
+    /// smoke run read 19,622 against a 19,600 bar): the partial steps at the
     /// span's ends alone push some exact-keep-up phases past a flat 2%, which
     /// the step-size allowance absorbs.
     #[test]
@@ -480,7 +479,7 @@ mod tests {
         assert!(!kept_target_rate(true, Some(fit), 400_000.0, 400_000.0));
     }
 
-    /// Issue #319's false green: at half the target, a 20s window's backlog
+    /// A false green: at half the target, a 20s window's backlog
     /// (10s of rows) drains well inside a 30s grace, so "drained" alone read
     /// as sustained. The in-window rate says otherwise.
     #[test]

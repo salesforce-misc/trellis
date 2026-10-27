@@ -98,7 +98,7 @@ module Trellis
   # forked child's calls on an instance it inherited raise
   # Trellis::ForkedHandleError, and its shutdown leaves the parent's handle
   # alone and does nothing. So does Instance.connect in a child forked while
-  # any instance of its parent was running (issue #600).
+  # any instance of its parent was running.
   class Instance
     extend Checks
     include Checks
@@ -111,7 +111,7 @@ module Trellis
       # Connects a new instance and returns it. Raises ForkedHandleError in
       # a process forked while its parent had an instance running
       # (connected, connecting, or not yet fully shut down): it may have
-      # inherited a lock one of that instance's threads held (issue #600).
+      # inherited a lock one of that instance's threads held.
       #
       # - url: where the database is, as a libpq connection string
       #   ("host=... dbname=...") or URL. Nothing is read from the environment.

@@ -82,7 +82,7 @@ module Trellis
   #
   # Also Trellis.connect's error in a process forked while its parent had a
   # handle running, which may have inherited a lock that handle's threads
-  # held (issue #600): shut down before forking (Puma's before_fork).
+  # held: shut down before forking (Puma's before_fork).
   class ForkedHandleError < ValidationError
   end
 

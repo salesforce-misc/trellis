@@ -12,7 +12,7 @@ dsn = ARGV.fetch(0)
 Trellis.connect(url: dsn)
 
 # Forked while the parent's handle is running: the child can neither use the
-# handle it inherited nor connect its own (issue #600). It exits holding the
+# handle it inherited nor connect its own. It exits holding the
 # inherited handle, which is left alone.
 child = fork do
   begin

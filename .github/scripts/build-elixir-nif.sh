@@ -43,7 +43,7 @@ if [ -z "$crate_version" ] || [ "$crate_version" != "$mix_version" ]; then
 fi
 
 # The precompiled NIF ships without the crate's `otlp` feature and its gRPC
-# dependency tree (issue #150). Nothing turns it on today; fail loudly if a
+# dependency tree. Nothing turns it on today; fail loudly if a
 # dependency change ever does.
 deps="$(cd "$crate_dir" && cargo tree --locked --target "$target" -e normal --prefix none)"
 if grep -Eq '^(opentelemetry|tonic)' <<<"$deps"; then
