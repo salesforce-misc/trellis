@@ -4207,11 +4207,7 @@ mod tests {
                 "(2147483647 + 1)".to_string(),
                 int4,
             ),
-            (
-                format!("{max8} + 1 AS out"),
-                format!("({max8} + 1)"),
-                int8,
-            ),
+            (format!("{max8} + 1 AS out"), format!("({max8} + 1)"), int8),
             (
                 format!("{max8} + 2147483647 AS out"),
                 format!("({max8} + 2147483647)"),
@@ -4255,7 +4251,8 @@ mod tests {
             ),
             (
                 "DOUBLE PRECISION '1e+308' + DOUBLE PRECISION '1e+308' AS out".to_string(),
-                "(CAST('1e+308' AS DOUBLE PRECISION) + CAST('1e+308' AS DOUBLE PRECISION))".to_string(),
+                "(CAST('1e+308' AS DOUBLE PRECISION) + CAST('1e+308' AS DOUBLE PRECISION))"
+                    .to_string(),
                 double,
             ),
             // An exact constant beside a float is cast to double precision,
@@ -4265,11 +4262,7 @@ mod tests {
                 beyond_double.clone(),
                 double,
             ),
-            (
-                format!("d + {tiny} AS out"),
-                tiny.clone(),
-                double,
-            ),
+            (format!("d + {tiny} AS out"), tiny.clone(), double),
             (
                 format!("{beyond_double} AS big, r + big AS out"),
                 "big".to_string(),
@@ -5355,7 +5348,10 @@ mod tests {
             "orders.region AS region, SUM(COALESCE(items.qty, 2147483647 + 1)) AS s",
         ] {
             assert!(
-                matches!(check(select), Err(ValidationError::ConstantOutOfRange { .. })),
+                matches!(
+                    check(select),
+                    Err(ValidationError::ConstantOutOfRange { .. })
+                ),
                 "{:?}: {select}",
                 check(select)
             );
