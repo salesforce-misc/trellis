@@ -1,5 +1,5 @@
 //! Row-level security that applies to the Trellis role isn't supported, and
-//! is detected (issue #745, `trellis::defs::row_security`).
+//! is detected (`trellis::defs::row_security`).
 //!
 //! The first two tests check the catalog predicate against Postgres itself:
 //! for every combination of table setting and role, the check must agree
@@ -9,7 +9,7 @@
 //! apply, and the staging worker's capture pass pauses the readers of one
 //! whose policies apply after define, which `self_check` reports too.
 //!
-//! Nothing polls for convergence (#297): every pass is stepped by hand.
+//! Nothing polls for convergence: every pass is stepped by hand.
 
 use std::time::{Duration, Instant};
 
@@ -113,8 +113,7 @@ async fn the_check_matches_postgres_for_every_role_and_table_setting() {
             let found = applying(&client, SCHEMA, "public.t", Readers::RingAndSession)
                 .await
                 .expect("check RLS");
-            // No ring here, so all three check the session's role alone
-            // (#765).
+            // No ring here, so all three check the session's role alone.
             assert_eq!(
                 applying(&client, SCHEMA, "public.t", Readers::Session)
                     .await
@@ -168,13 +167,13 @@ async fn the_check_matches_postgres_for_every_role_and_table_setting() {
 }
 
 /// The capture functions run as the role that owns the ring, and re-read
-/// the captured table (#623 D8a), so the policies applying to that role
+/// the captured table, so the policies applying to that role
 /// count even when the session's role is exempt. When both are subject, the
 /// session's role is the one reported. [`Readers::Ring`], define's check,
 /// asks about the ring's owner alone: the session's role may be a process's
 /// that only defines transforms and never reads the table.
 /// [`Readers::Session`] and [`Readers::Target`] ask about the session's role
-/// alone, which reads a seam-fed table and writes a target (#765).
+/// alone, which reads a seam-fed table and writes a target.
 #[tokio::test]
 async fn the_ring_owner_is_checked_as_well_as_the_session_role() {
     let cluster = TestCluster::start();
@@ -231,7 +230,7 @@ async fn the_ring_owner_is_checked_as_well_as_the_session_role() {
                 .expect("check RLS")
                 .is_none(),
             "{readers:?} asks about the session's role alone: a seam-fed table's \
-             reader, or a target's writer (#765)"
+             reader, or a target's writer"
         );
     }
     assert!(
@@ -582,7 +581,7 @@ async fn the_capture_pass_pauses_a_reader_once_the_policies_apply_and_self_check
 /// seam feeds it), but its readers read it as the Trellis role all the same,
 /// so the capture pass checks it too: RLS forced on an upstream target pauses
 /// the definition sourced from it, for its reads. It pauses the upstream as
-/// well, for its writes to the target (#765).
+/// well, for its writes to the target.
 #[tokio::test]
 async fn the_capture_pass_pauses_a_reader_of_a_seam_fed_table() {
     let cluster = TestCluster::start();
@@ -626,7 +625,7 @@ async fn the_capture_pass_pauses_a_reader_of_a_seam_fed_table() {
         failure.error.contains("Trellis's reads of it"),
         "{failure:?}"
     );
-    // #765: the upstream writes the forced target as the same role, so it
+    // The upstream writes the forced target as the same role, so it
     // pauses too, for its writes.
     let upstream = status(&it.trellis, "c_copy").await;
     assert_eq!(upstream.status, TransformStatus::Paused);
@@ -685,8 +684,8 @@ async fn poison_rows(admin: &Client) -> i64 {
         .get(0)
 }
 
-/// Which role writes a target (#765), and what happens when row-level
-/// security applies to a role the catalog checks never look at (#766).
+/// Which role writes a target, and what happens when row-level
+/// security applies to a role the catalog checks never look at.
 ///
 /// Apply's writes are plain SQL on the draining connection, so they run as
 /// that connection's login role, not as the ring's owner (no `SECURITY
@@ -793,7 +792,7 @@ async fn a_drain_as_an_unchecked_role_pauses_the_writer_instead_of_skipping_rows
     it.trellis.shutdown().await.expect("shutdown");
 }
 
-/// A refused read beside a key failure (#766 with #799). The page holds a
+/// A refused read beside a key failure. The page holds a
 /// change to `p`, whose policies apply to the drain's role and which the
 /// drain reads for `p`'s reader, `p_copy`, and a change to key 1 of `c` that
 /// one of `c`'s two readers, `c_cheap`, fails to write (its target refuses
@@ -918,7 +917,7 @@ async fn a_refused_read_halts_while_a_key_failure_beside_it_is_held_for_its_defi
 
 /// defining refuses a target only when DDL around its creation makes the
 /// policies apply to that role: here an event trigger that enables and
-/// forces RLS on each new table (#765). One that only enables it, a common
+/// forces RLS on each new table. One that only enables it, a common
 /// "RLS on every table" setup, leaves the owner exempt and refuses nothing.
 #[tokio::test]
 async fn defining_refuses_a_target_whose_policies_apply_to_the_session_once_created() {
@@ -998,7 +997,7 @@ async fn defining_refuses_a_target_whose_policies_apply_to_the_session_once_crea
     it.trellis.shutdown().await.expect("shutdown");
 }
 
-/// RLS on a live definition's target after define (#765). Enabling it on a
+/// RLS on a live definition's target after define. Enabling it on a
 /// target the worker's role owns, for the application's readers, changes
 /// nothing. Forcing it makes `self_check` report it, and so does handing the
 /// table to another owner; the next capture pass pauses the definition that
@@ -1124,7 +1123,7 @@ async fn the_capture_pass_pauses_the_writer_of_a_target_its_policies_apply_to() 
 /// a member of the ring's owner and define as that member too, the ring's
 /// owner owns nothing of the target, so enabling RLS on it (for the
 /// application's readers) applies the policies to the ring's owner. That
-/// isn't a writer, so nothing fires (#765): the capture pass, run as the
+/// isn't a writer, so nothing fires: the capture pass, run as the
 /// member, leaves the definition `live`, and `self_check` converges.
 #[tokio::test]
 async fn a_target_its_writer_owns_is_not_checked_for_the_ring_owner() {
@@ -1381,7 +1380,7 @@ async fn source_and_targets(admin: &Client) -> [Vec<String>; 4] {
     out
 }
 
-/// Capture's conditional live re-read (#623 D8a) runs as the ring's owner
+/// Capture's conditional live re-read runs as the ring's owner
 /// under the writing session's `row_security`. Defines a 1-1 copy and an
 /// aggregate of `c`, forces a policy hiding every row of `c` from the
 /// ring's owner, then writes as the superuser (exempt, `row_security` on)

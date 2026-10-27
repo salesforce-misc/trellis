@@ -1,9 +1,9 @@
-//! Integration tests for the worker registry (issue #144; ADR-0010 decision
+//! Integration tests for the worker registry (ADR-0010 decision
 //! 3): `staging::worker_registry`'s register/deregister/liveness primitives,
 //! `Client::start`'s wiring of them, and the `Trellis::has_live_drain_workers`
 //! health check they back (plus its staging-side counterpart,
-//! `Trellis::has_live_staging_worker`, issue #428) — all run against a real, ephemeral Postgres
-//! instance via the shared harness (`testkit::TestCluster`).
+//! `Trellis::has_live_staging_worker`) — all run against a real, ephemeral
+//! Postgres instance via the shared harness (`testkit::TestCluster`).
 //!
 //! `staleness_is_read_time_and_needs_no_reclaim_pass` is the one test that
 //! goes straight at `staging::worker_registry` rather than through `Trellis`:
@@ -110,7 +110,7 @@ async fn has_live_drain_workers_tracks_a_real_drain_connection_starting_and_stop
         .expect("shutdown health-check handle");
 }
 
-/// Issue #428: a fleet with drain workers but no staging worker passes
+/// A fleet with drain workers but no staging worker passes
 /// `has_live_drain_workers` while nothing captures changes or dispatches a
 /// new transform's backfill. `has_live_staging_worker` is the check that
 /// catches it: `false` with only drain workers running, `true` once a
@@ -167,7 +167,7 @@ async fn has_live_staging_worker_needs_a_staging_connection_not_just_drain_worke
             .has_live_staging_worker()
             .await
             .expect("has_live_staging_worker with only drain workers"),
-        "drain workers alone must not pass as a staging worker (issue #428)"
+        "drain workers alone must not pass as a staging worker"
     );
 
     // `Trellis::connect` returns only after the staging worker has started,
@@ -249,14 +249,14 @@ async fn has_live_drain_workers_is_false_for_a_staging_only_connection() {
             .await
             .expect("has_live_drain_workers under a staging-only connection"),
         "staging + ring maintenance with zero drain threads must not register as a \
-         live drain worker — this is exactly the misconfiguration issue #144 exists \
+         live drain worker — this is exactly the misconfiguration the registry exists \
          to make detectable"
     );
 
     staging_only.shutdown().await.expect("clean shutdown");
 }
 
-/// Issue #144's explicit instruction: the registry reuses the reclaim TTL's
+/// The registry reuses the reclaim TTL's
 /// own notion of liveness rather than inventing a second one, and
 /// [`worker_registry::has_live_workers`] must observe staleness as a
 /// straight read-time comparison — correct the instant `ttl` has elapsed,
@@ -434,7 +434,7 @@ fn worker_process() {
         .expect("clean shutdown");
 }
 
-/// Issue #756: two processes, each starting the same drain `Client` from the
+/// Two processes, each starting the same drain `Client` from the
 /// same code path, register two rows under distinct ids, and one's clean
 /// shutdown removes only its own row. The id used to be the starting thread's
 /// `ThreadId`, which numbers threads within one process only, so both came

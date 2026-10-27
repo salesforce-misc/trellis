@@ -1,5 +1,5 @@
 //! Capture triggers or functions changed outside Trellis, and a read table
-//! that is gone (#707, #999): the capture pass pauses every reader of the
+//! that is gone: the capture pass pauses every reader of the
 //! table with a `capture_failure` naming what it found, nothing reinstalls
 //! or rebuilds by itself, and routine maintenance and Trellis's own installs
 //! pause nothing.
@@ -7,7 +7,7 @@
 //! Each case runs on a table of its own with two readers: `r_<case>`, a 1-1
 //! passthrough, and `s_<case>`, `SUM(b)` by `g`. The case's windows run
 //! between calls of the capture pass, which is called directly. Nothing
-//! polls for convergence (#297).
+//! polls for convergence.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -271,7 +271,7 @@ async fn run_cases(cases: &[Case]) {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// Every case of #707 rule 2 pauses on the first pass that sees it.
+/// Every disruptive operation pauses on the first pass that sees it.
 #[tokio::test]
 async fn disruption_of_capture_pauses_the_readers_with_the_cause() {
     let recreate_by_hand = recreate_triggers("{t}");
@@ -358,7 +358,7 @@ async fn disruption_of_capture_pauses_the_readers_with_the_cause() {
     .await;
 }
 
-/// The routine operations of #999's matrix, and a change to the table that
+/// The routine operations of the false-positive matrix, and a change to the table that
 /// leaves Trellis's triggers and functions untouched, pause nothing.
 #[tokio::test]
 async fn routine_maintenance_and_migrations_pause_nothing() {
@@ -783,7 +783,7 @@ async fn a_real_dump_and_restore_pauses_everything() {
     }
 }
 
-/// `detect_capture_disruptions` (#1181) pauses the readers of a disrupted
+/// `detect_capture_disruptions` pauses the readers of a disrupted
 /// table at once, on the caller's connection, with no staging-worker pass,
 /// and names the table. A healthy instance finds nothing.
 #[tokio::test]
@@ -847,7 +847,7 @@ async fn detect_capture_disruptions_pauses_readers_without_a_pass() {
 }
 
 /// A disruption while every reader is paused by the operator is recorded on
-/// them with kind `capture`, not `disruption` (#1181), and the operator's
+/// them with kind `capture`, not `disruption`, and the operator's
 /// `RESUME` repairs it in one go: it forgets the table's recorded capture, so
 /// the next pass reinstalls it rather than finding the disruption again and
 /// pausing the resumed readers.
@@ -906,7 +906,7 @@ async fn an_operator_resume_repairs_a_disruption_seen_while_paused() {
 /// A `PAUSE` that commits while a disruption is being recorded is seen: the
 /// recording waits for the definition's row lock and reads its status after
 /// the pause, so the operator's pause is recorded with kind `capture`, never
-/// as a `disruption` a helper would resume (#1181).
+/// as a `disruption` a helper would resume.
 #[tokio::test]
 async fn a_pause_committing_meanwhile_is_never_recorded_as_a_disruption() {
     let cluster = TestCluster::start();
@@ -984,7 +984,7 @@ async fn a_pause_committing_meanwhile_is_never_recorded_as_a_disruption() {
     );
 }
 
-// ---- #1217: a table's capture records go with its last reader ----
+// ---- A table's capture records go with its last reader ----
 
 const T_SQL: &str = "create table public.t_fg (id int primary key, g int not null, a int, b int, u int); \
      insert into public.t_fg select i, i % 3, i, i, i from generate_series(1, 30) i";
@@ -1012,7 +1012,7 @@ async fn record_counts(raw: &Client, table: &str) -> (i64, i64, i64) {
     )
 }
 
-/// The #1217 repro on a plain table: the last definition goes, the table is
+/// The last-reader repro on a plain table: the last definition goes, the table is
 /// dropped and created again, a definition is made, all before a pass. The
 /// new definition never read the old table, so nothing was missed: it is not
 /// paused, capture is installed afresh and it goes live with the right rows.
@@ -1095,7 +1095,7 @@ async fn a_paused_reader_keeps_the_record_so_a_replaced_table_still_pauses() {
     assert_eq!(failure.kind, trellis::CaptureFailureKind::Disruption);
 }
 
-/// #1217: the last reader goes and a definition is made again on the same,
+/// The last reader goes and a definition is made again on the same,
 /// untouched table before a pass, with its orphaned triggers disabled in
 /// between. The new definition never relied on them: the pass reinstalls and
 /// records capture afresh, pauses nothing, and it goes live with the right

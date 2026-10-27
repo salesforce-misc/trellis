@@ -1,7 +1,7 @@
 //! A column re-typed from one enum to another (`ALTER COLUMN ... TYPE
 //! other_enum USING ...`) pauses every definition that reads it, and
 //! `RESUME` rebuilds it from the source without casting any label it stored
-//! (#1327, ADR-0020 "Stored value text is trusted only under the type's
+//! (ADR-0020 "Stored value text is trusted only under the type's
 //! current value identity").
 //!
 //! No value of one enum is a value of another, so the labels Trellis keeps
@@ -14,7 +14,7 @@
 //! without a cast (a key's rows are deleted first) and rebuilds. The type
 //! matrix (`type_matrix.rs`) holds the same change in every place; this
 //! holds the pass's record, and changes staged across the re-type. Every
-//! step is explicit; nothing polls (#297).
+//! step is explicit; nothing polls.
 
 #[path = "support/relabel.rs"]
 mod relabel;

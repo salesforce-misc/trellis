@@ -1,4 +1,4 @@
-//! Integration tests for the claim-time fold (issue #10, stage 04), run
+//! Integration tests for the claim-time fold (stage 04), run
 //! against a real, ephemeral Postgres instance via the shared harness
 //! (`testkit::TestCluster`).
 //!
@@ -202,7 +202,7 @@ async fn fold_matches_a_from_scratch_oracle_across_mixed_ops() {
     assert_eq!(updated.old_image, Some(r#"{"v": "a"}"#.to_string()));
     assert_eq!(updated.lsn, Some(PgLsn::from(20)));
     assert_eq!(updated.origin_lsn, Some(PgLsn::from(10)));
-    // Issue #409: two staged rows fold to one record that still counts both.
+    // Two staged rows fold to one record that still counts both.
     assert_eq!(updated.row_count, 2);
     assert_eq!(inserted.row_count, 1);
 
@@ -224,7 +224,7 @@ async fn fold_matches_a_from_scratch_oracle_across_mixed_ops() {
 
 /// A key born inside the batch: an insert immediately followed by an update
 /// of the *same key in the same source transaction*, so both rows share one
-/// `lsn` and are ordered only by `change_id` — the tie-break #31 exists for.
+/// `lsn` and are ordered only by `change_id` — the tie-break.
 #[tokio::test]
 async fn a_key_born_in_the_batch_folds_old_image_to_null_via_the_change_id_tie_break() {
     let cluster = TestCluster::start();
@@ -544,7 +544,7 @@ async fn bucket_filter_partitions_the_batch_disjointly_and_completely() {
     assert_eq!(whole.len(), 20);
 }
 
-/// The truncate-void filter (issue #60): an image-bearing row at or below a
+/// The truncate-void filter: an image-bearing row at or below a
 /// truncate sentinel for its own `src_table`, in the same fenced window,
 /// must be voided out of the fold entirely — not merely stripped of its
 /// images, but absent from the output altogether, since the truncate erased
@@ -616,7 +616,7 @@ async fn a_truncate_voids_stale_rows_but_not_post_truncate_writes_or_recomputes(
 
     // "reinserted": written on both sides of the truncate. Only the
     // post-truncate row survives into its group, so only it counts toward
-    // `row_count` (issue #409).
+    // `row_count`.
     for (lsn, image) in [(12, r#"{"v":"gone"}"#), (32, r#"{"v":"back"}"#)] {
         insert_row(
             &client,
@@ -668,7 +668,7 @@ async fn a_truncate_voids_stale_rows_but_not_post_truncate_writes_or_recomputes(
     assert_eq!(reinserted.new_image, Some(r#"{"v": "back"}"#.to_string()));
     assert_eq!(reinserted.old_image, None);
 
-    // Issue #409: a truncate sentinel counts as one staged row, and a row
+    // A truncate sentinel counts as one staged row, and a row
     // the truncate voided was never applied, so it isn't counted anywhere:
     // not in a group of its own ("stale" has none), and not in a group that
     // survives through a post-truncate write ("reinserted" counts only that
@@ -761,7 +761,7 @@ async fn a_same_transaction_truncate_is_ordered_by_change_id_not_lsn() {
     assert_eq!(post.new_image, Some(r#"{"v": "post"}"#.to_string()));
 }
 
-/// Issue #492 moved the truncate-void filter onto a pre-filtered set of just
+/// The truncate-void filter runs over a pre-filtered set of just
 /// the batch's truncate rows. That set can hold more than one truncate, and
 /// truncates of more than one table: each row is voided only by a later
 /// truncate of its own `src_table`, and the latest such truncate is what
@@ -822,7 +822,7 @@ async fn several_truncates_each_void_only_earlier_rows_of_their_own_table() {
     );
 }
 
-/// Issue #392: a `recompute` folded with the key's CDC change leaves the
+/// A `recompute` folded with the key's CDC change leaves the
 /// record carrying the change's images, as before, and `has_recompute` keeps
 /// the recompute's intent. A key with no `recompute` row doesn't get it.
 #[tokio::test]
@@ -860,12 +860,11 @@ async fn has_recompute_survives_a_fold_with_the_keys_cdc_change() {
     assert!(find(&folded, "bare").has_recompute);
 }
 
-/// Issue #620 (ADR-0002's fold rule under I8): an image-less `delete` is the
+/// ADR-0002's fold rule under I8: an image-less `delete` is the
 /// key's final state within a fold window, whatever precedes it. Under
-/// NEW-only capture a delete carries no image, and the old "latest row with
-/// any image" rule skipped it for the earlier write's post-image, so the
-/// fold reported a live row for a key its source had deleted (#617 step 4:
-/// 11–12 groups wrong at 1M).
+/// NEW-only capture a delete carries no image, and a "latest row with
+/// any image" rule would skip it for the earlier write's post-image, so the
+/// fold would report a live row for a key its source had deleted.
 #[tokio::test]
 async fn an_image_less_delete_after_an_image_is_the_keys_final_state() {
     let cluster = TestCluster::start();
@@ -929,7 +928,7 @@ async fn an_image_less_delete_after_an_image_is_the_keys_final_state() {
     )
     .await;
     // Born and died in the window: no image survives, but the insert's
-    // post-image still names the group it was born into (#486).
+    // post-image still names the group it was born into.
     insert_row(
         &client,
         "seg_0",

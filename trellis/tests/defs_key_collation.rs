@@ -1,4 +1,4 @@
-//! Issue #638: every column the engine matches as a key by its exact text
+//! Every column the engine matches as a key by its exact text
 //! needs a deterministic collation. A nondeterministic one's `=` (and so its
 //! `GROUP BY` and unique indexes) treats `'A'` and `'a'` as equal, so Postgres
 //! would fold rows the engine keeps apart. Refused at define time, one test
@@ -17,7 +17,7 @@ use trellis::defs::{
 };
 
 /// Only ICU provides nondeterministic collations. Every test cluster's
-/// default collation is ICU `en-US` (#665), so a server without ICU can't run
+/// default collation is ICU `en-US`, so a server without ICU can't run
 /// these tests at all; a refusal here is a real failure, not a skip.
 async fn create_case_insensitive_collation(pool: &trellis::pool::Pool) {
     pool.get()
@@ -215,7 +215,7 @@ fn assert_text_function_refused(
     );
 }
 
-/// Issue #638's follow-up: Postgres refuses `strpos` and `regexp_count` under
+/// Postgres refuses `strpos` and `regexp_count` under
 /// a nondeterministic collation (`0A000`), while the engine would compute
 /// them from the exact text, so a field that calls either on such a column
 /// is refused: directly, and through `COALESCE` and another field.

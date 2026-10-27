@@ -1,5 +1,5 @@
 //! Integration tests for convergence and the read-your-writes predicate
-//! (issue #12, stage 07), run against a real, ephemeral Postgres instance
+//! (stage 07), run against a real, ephemeral Postgres instance
 //! via the shared harness (`testkit::TestCluster`).
 //!
 //! See docs/staging-and-claiming/07-convergence-and-await.md for the design
@@ -11,8 +11,8 @@
 //!
 //! Deliberately out of scope: the doc's "a round did no work" classification
 //! (refused-seal backpressure, peer-holds-claim) is a worker-side
-//! drain-to-convergence helper that depends on claiming/sweeping
-//! (#14/#15), which aren't built yet — not tested here.
+//! drain-to-convergence helper that depends on claiming/sweeping,
+//! which aren't built yet — not tested here.
 
 use std::time::Duration;
 
@@ -109,7 +109,7 @@ async fn never_false_converged_until_active_and_sealed_all_clear() {
     );
 }
 
-/// Issue #622 C5: trigger capture writes a change's ring rows in the
+/// Trigger capture writes a change's ring rows in the
 /// writer's own transaction, so there is no intake progress to wait for. An
 /// empty ring converges with no intake progress recorded anywhere.
 #[tokio::test]
@@ -205,7 +205,7 @@ async fn a_drained_slots_unfenced_straggler_still_gates_convergence() {
         "a freshly-sealed (not yet drained) slot must still gate on its own straggler"
     );
 
-    // Stand in for #14/#15's real apply-and-mark: segment 1 has finished
+    // Stand in for the real apply-and-mark: segment 1 has finished
     // applying everything *it* could see and reports `'drained'` — but the
     // straggler was never visible in S_1, so nothing has actually applied
     // it yet.
@@ -446,14 +446,14 @@ async fn poison_held_waiters(observer: &Client) -> i64 {
         .get(0)
 }
 
-/// Issue #596: `await_converged`'s deadline must hold while a poll is
+/// `await_converged`'s deadline must hold while a poll is
 /// blocked. Before the fix it checked the deadline only between polls, so a
 /// poll queued behind a lock waited out any timeout (here: until the lock is
 /// released, which this test only does after the call returns).
 ///
 /// Three things are pinned: the wait ends in exactly
 /// [`StagingError::ConvergenceTimeout`] (`self_check` reads only that
-/// variant as "not caught up", #592) and does so promptly; the server-side
+/// variant as "not caught up") and does so promptly; the server-side
 /// query is gone once it returns (no backend still queued on the lock); and
 /// the same connection serves a later wait normally.
 #[tokio::test]
@@ -511,7 +511,7 @@ async fn await_converged_times_out_while_a_poll_blocks_on_a_lock() {
         .expect("the connection must serve a later wait once the lock is released");
 }
 
-/// Issue #596's other half: a `statement_timeout` the session set itself,
+/// A `statement_timeout` the session set itself,
 /// shorter than the wait's budget, fires well before the wait's deadline.
 /// That's the caller's own setting cancelling a query, not the wait running
 /// out of time, so it must surface as the database error it is rather than
@@ -553,7 +553,7 @@ async fn await_converged_reports_a_session_statement_timeout_as_a_db_error() {
         .expect("release lock");
 }
 
-/// The poll's `statement_timeout` is transaction-local (#1010 review): once a
+/// The poll's `statement_timeout` is transaction-local: once a
 /// wait returns, the session's own setting is back, both none (`0`) and one
 /// longer than the poll's budget. A session-level one would outlive the poll
 /// and cancel the connection's later statements.
@@ -583,13 +583,12 @@ async fn a_poll_leaves_the_session_statement_timeout_as_it_was() {
     }
 }
 
-/// Review of issue #596: a spent budget still gets one real check. Before
-/// #596 a zero `timeout` meant "check once", and callers lean on that:
-/// generative's `quiesce` passes whatever is left of its own budget
-/// (`saturating_sub`), possibly nothing, and expects the wait to confirm an
-/// already-converged ring rather than fail on it. With the server timeout
-/// set to the bare remaining budget, that check got a 1ms `statement_timeout`
-/// and could never finish.
+/// A spent budget still gets one real check. A zero `timeout` means "check
+/// once", and callers lean on that: generative's `quiesce` passes whatever is
+/// left of its own budget (`saturating_sub`), possibly nothing, and expects
+/// the wait to confirm an already-converged ring rather than fail on it. With
+/// the server timeout set to the bare remaining budget, that check would get
+/// a 1ms `statement_timeout` and could never finish.
 #[tokio::test]
 async fn await_converged_with_a_spent_budget_still_checks_once() {
     let cluster = TestCluster::start();

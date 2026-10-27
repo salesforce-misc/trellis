@@ -1,4 +1,4 @@
-//! Integration tests for the staging ring (issue #6, stage 02), run against
+//! Integration tests for the staging ring (stage 02), run against
 //! a real, ephemeral Postgres instance via the shared harness
 //! (`testkit::TestCluster`).
 //!
@@ -205,13 +205,12 @@ async fn row_txid_is_the_writers_real_top_level_xid() {
     );
 }
 
-/// The gap issue #31 closes: `lsn`/`row_txid`/`appended_at` are all constant
+/// The gap `change_id` closes: `lsn`/`row_txid`/`appended_at` are all constant
 /// across every row of one source transaction, so nothing but `change_id`
 /// can tell an INSERT from a later UPDATE of the same key committed in that
 /// transaction. Appends an insert then an update for the same key via a
 /// single `append` call (mirroring how capture stages one statement's rows
 /// in one shot) and checks `change_id` alone records that order.
-/// Fails on the pre-#31 schema, which has no `change_id` column at all.
 #[tokio::test]
 async fn change_id_records_intra_transaction_append_order() {
     let cluster = TestCluster::start();
@@ -405,7 +404,7 @@ async fn a_released_producer_session_frees_the_singleton_immediately() {
     }
 }
 
-/// Issue #234, the direct engine-level counterpart of
+/// The direct engine-level counterpart of
 /// `a_second_producer_cannot_acquire_the_singleton_while_the_first_holds_it`:
 /// the singleton is scoped to one **Trellis instance**, not to the database.
 ///

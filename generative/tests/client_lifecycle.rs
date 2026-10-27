@@ -8,7 +8,7 @@
 //! in-process `trellis::Client`, a faithful, free stand-in for "the process
 //! died" (see `Backend::restart`'s doc comment) — plus "scale out": starting
 //! an additional application-worker-only client alongside the existing one,
-//! against the same source tables. Issue #251: that teardown now awaits
+//! against the same source tables. That teardown awaits
 //! `trellis::Client::shutdown` rather than just dropping the old client —
 //! `Drop`'s own shutdown signal is best-effort and doesn't join the
 //! background thread, which raced the old producer's advisory-lock release
@@ -19,7 +19,7 @@
 //! from `tests/convergence.rs`.
 //!
 //! **This file's restart property found a real engine bug, and fixed the
-//! majority of it.** The replication intake Trellis ran before #622 resumed
+//! majority of it.** The replication intake Trellis once ran resumed
 //! a fresh connection from its slot's server-tracked position
 //! rather than its own durably persisted watermark, so Postgres redelivered
 //! already-applied transactions, silently double-counting an `Aggregate`
@@ -164,7 +164,7 @@ proptest! {
     ///
     /// **Formerly `#[ignore]`d for a known engine bug — root-caused and
     /// fixed.** This property is exactly what surfaced the bug, in two
-    /// layers: first the pre-#622 intake's resume position (fixed, and
+    /// layers: first the old intake's resume position (fixed, and
     /// since deleted with intake), then a second, deeper one this
     /// property (and [`a_restart_and_a_scale_out_interleaved_mid_stream_still_converge`]
     /// below) kept reproducing even after that fix — a genuine `MissingRow`
@@ -205,7 +205,7 @@ proptest! {
     /// confirmed root cause and fix (a seal/append race, unrelated to
     /// restart or scale-out specifically — both simply perturb timing enough
     /// to make it common). Re-enabled. The hand-built pins below guard the
-    /// fix; the seeds this property once persisted were deleted once #505's
+    /// fix; the seeds this property once persisted were deleted once a
     /// generator change made them replay into unrelated programs.
     #[test]
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
@@ -345,7 +345,7 @@ async fn restart_then_scale_out_are_independently_usable_against_a_live_backend(
     );
 }
 
-/// Regression coverage for issue #251: `ManualBackend::restart` used to just
+/// Regression coverage: `ManualBackend::restart` used to just
 /// drop the outgoing primary `trellis::Client` and immediately start a
 /// replacement, relying on `Client`'s `Drop` impl — a fire-and-forget
 /// shutdown *signal*, not a join (see its own doc comment) — to have already
@@ -410,7 +410,7 @@ async fn restarting_the_primary_client_back_to_back_never_races_the_advisory_loc
 
     // No delay between restarts, deliberately: this is exactly the timing
     // shape that raced the old producer's advisory-lock release against the
-    // new one's acquire pre-fix (issue #251).
+    // new one's acquire pre-fix.
     for i in 0..25 {
         backend.restart().await.unwrap_or_else(|e| {
             panic!("restart #{i} raced the old producer's advisory-lock release: {e:?}")

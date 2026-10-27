@@ -7,7 +7,7 @@
 //! Every test acts and then reads what the listening session was told. A
 //! notification is delivered before the listener's next command completes, so
 //! `Listener::heard` runs `select 1` and then reads what arrived: no sleeping,
-//! no polling until something converges (#297).
+//! no polling until something converges.
 
 use std::time::Duration;
 
@@ -230,7 +230,7 @@ async fn a_definition_entering_a_build_state_announces_itself() {
     assert_eq!(f.listener.heard().await, 1, "build changed");
     // Every status a chunk is handed out in announces entering it (a resume
     // or an unfreeze makes the definition's existing chunks claimable
-    // without touching a chunk row, #1047); a frozen status is no edge.
+    // without touching a chunk row); a frozen status is no edge.
     for status in trellis::defs::TransformStatus::ALL {
         f.sql("update transform_definitions set status = 'paused'")
             .await;
@@ -258,7 +258,7 @@ async fn a_definition_entering_a_build_state_announces_itself() {
 }
 
 /// Resuming a paused definition holding an undone chunk: the probe is false
-/// while paused and true after, and the resume sent the wake (#1047).
+/// while paused and true after, and the resume sent the wake.
 #[tokio::test]
 async fn resuming_a_paused_definition_with_a_chunk_wakes_workers() {
     let mut f = Fixture::new().await;

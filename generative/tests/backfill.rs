@@ -14,7 +14,7 @@
 //! **Why the target can only come from the build.** Phase 1's `install`
 //! starts the engine client, but no definition reads the source yet, so the
 //! staging worker doesn't capture it (it captures exactly what registered
-//! definitions read, issue #427): the seed inserts are never staged, and no
+//! definitions read): the seed inserts are never staged, and no
 //! CDC fold can stand in for the build. The table is captured only once
 //! phase 2's definition registers, and the capture pass then starts its
 //! build. So the build is the *only* thing that can populate the target:
@@ -184,9 +184,9 @@ const RELEASE_MARGIN: Duration = Duration::from_secs(1);
 /// definition's build chunks at all (ADR-0002's "A build is Re-derive over
 /// chunks, and applies from its first chunk" puts that work entirely outside
 /// the ring). Every other test in this file only happened to pass because a
-/// large, unrelated convergence stall (issue #452's keepalive throttle, since
-/// fixed) gave a real running drain worker enough wall-clock time to finish a small backfill before `quiesce`
-/// returned and the test snapshotted state — not because `quiesce` actually
+/// large, unrelated convergence stall (a since-fixed keepalive throttle) gave
+/// a real running drain worker enough wall-clock time to finish a small
+/// backfill before `quiesce` returned and the test snapshotted state — not because `quiesce` actually
 /// waited for it.
 ///
 /// This proves `quiesce` now really does wait, with no such coincidence to
@@ -201,13 +201,13 @@ const RELEASE_MARGIN: Duration = Duration::from_secs(1);
 ///
 /// **Why an event gate, not a fixed `pg_sleep`.** The ring-convergence half
 /// of `quiesce` alone used to stall for ~10s on this exact scenario (measured
-/// with `GENERATIVE_QUIESCE_TIMING=1`; issue #452's keepalive throttle, not
+/// with `GENERATIVE_QUIESCE_TIMING=1`; a keepalive throttle, not
 /// the seal age gate it was first blamed on), independent of how slow the
 /// chunk write is. Any fixed sleep races the wait it stands in for, and one
 /// shorter than that stall lets a
 /// `quiesce` that only waits on ring convergence pass by the very
-/// coincidence this test exists to rule out. Issue #300 proposed shrinking
-/// the old `pg_sleep(13.0)` to 1-2s, but a 1.5s sleep was measured to pass
+/// coincidence this test exists to rule out. Shrinking the old
+/// `pg_sleep(13.0)` to 1-2s was proposed, but a 1.5s sleep was measured to pass
 /// even with the definition-status wait deleted from `quiesce`. So the gate is
 /// released on an *event*, not a clock: a helper task waits for the ring to
 /// converge on its own connection, lets [`RELEASE_MARGIN`] pass, and only

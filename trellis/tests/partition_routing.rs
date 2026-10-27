@@ -1,4 +1,4 @@
-//! ADR-0017 P4a (issue #1062): a correction routes a group to a partition
+//! ADR-0017 P4a: a correction routes a group to a partition
 //! node by evaluating the node's recorded `pg_get_partition_constraintdef`
 //! text over the group, each column cast to the source key column's type and
 //! collation, under pinned settings.
@@ -690,7 +690,7 @@ async fn wrong_over_leaves(client: &mut Client, table: &str, keys: &[(&str, &str
     wrong
 }
 
-/// Review of #1062: the cases the type matrix leaves out. `NULL` keys (a
+/// The cases the type matrix leaves out. `NULL` keys (a
 /// `DEFAULT` takes them under `RANGE`, a `NULL` list value or a `DEFAULT`
 /// under `LIST`, and `HASH` places them by remainder), multi-column `RANGE`
 /// and `HASH` keys, infinite and BC `timestamptz` and `date` values, numerics

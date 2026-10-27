@@ -1,7 +1,6 @@
-//! Front-door integration test for issue #196, the sibling gap #180
-//! deliberately scoped out: a **1-1 (non-aggregate) target row**'s deletion
+//! Front-door integration test: a **1-1 (non-aggregate) target row**'s deletion
 //! must reduce a chained downstream aggregate, exactly like an extinct
-//! upstream aggregate group's deletion does (issue #180).
+//! upstream aggregate group's deletion does.
 //!
 //! ```text
 //! TRANSFORM order_view      FROM orders      SELECT customer AS customer, amount AS amt
@@ -10,20 +9,18 @@
 //!
 //! `order_view` is a plain [`KeySpace::OneToOne`] mirror of `orders` (no
 //! `GROUP BY` at all) — one target row per source row, keyed by `orders`'
-//! own primary key. Before issue #196's fix, `apply_and_mark_drained_many`'s
-//! step 3 (`apply_target`'s ordinary delete) staged a deleted `order_view`
-//! row's downstream propagation as an image-less `StagedChange::Recompute`.
-//! `customer_totals` would then live-refetch that
+//! own primary key. If `apply_and_mark_drained_many`'s step 3
+//! (`apply_target`'s ordinary delete) staged a deleted `order_view`
+//! row's downstream propagation as an image-less `StagedChange::Recompute`,
+//! `customer_totals` would live-refetch that
 //! key, find nothing (the row is genuinely gone), and silently drop the
-//! change instead of subtracting the deleted row's contribution — the exact
-//! same failure shape issue #180 fixed for an *aggregate* group's own
-//! extinction, just one producer earlier in the chain.
+//! change instead of subtracting the deleted row's contribution — the same
+//! failure shape as an *aggregate* group's own extinction, just one producer
+//! earlier in the chain.
 //!
-//! The fix: `apply_target`'s own delete statement now captures each deleted
+//! So `apply_target`'s own delete statement captures each deleted
 //! row's pre-delete image (`RETURNING ...`, an explicit per-column
-//! `jsonb_build_object('<col>', <col>::text, ...)::text` since issue #248 —
-//! `to_jsonb(t.*)::text` before it — the same shape
-//! the old aggregate path's issue #180 fix used), threaded
+//! `jsonb_build_object('<col>', <col>::text, ...)::text`), threaded
 //! through the same `ChangedKey` slot so step 4 stages a real image-bearing
 //! delete for it.
 //!
@@ -46,7 +43,7 @@ use trellis::staging::{has_pending, retire_drained_segments};
 /// its plan job) need this. Mirrors `defs_install_definition.rs`'s helper of
 /// the same name.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the staging
+    // ADR-0002: registration only records a definition; the staging
     // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
         .await
@@ -230,7 +227,7 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
     );
 }
 
-/// Issue #196's exact repro: deleting one `orders` row deletes its mirrored
+/// The exact repro: deleting one `orders` row deletes its mirrored
 /// `order_view` row (a plain 1-1 target delete, no `GROUP BY` anywhere
 /// upstream of it), and that deletion must propagate into `customer_totals`
 /// — whether it only *reduces* a surviving group (customer `a`, which keeps
@@ -317,7 +314,7 @@ async fn a_deleted_oneone_target_row_reduces_the_chained_downstream_aggregate() 
             ("c".to_string(), Some("14".to_string())),
             ("d".to_string(), Some("9".to_string())),
         ]),
-        "issue #196: customer 'a' must reduce to 5 (order 2's deletion \
+        "customer 'a' must reduce to 5 (order 2's deletion \
          subtracted, not dropped), customer 'b' must go fully extinct (not \
          left stale at total = 2), while the ordinary update ('c') and the \
          brand-new group ('d') still propagate normally"

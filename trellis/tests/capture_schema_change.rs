@@ -1,5 +1,4 @@
-//! A schema change never fails the application's write (#622 C6, acceptance
-//! A4).
+//! A schema change never fails the application's write.
 //!
 //! Renaming or dropping a column a capture function images used to make
 //! every write to the table fail, because the function's static inserts no
@@ -13,7 +12,7 @@
 //!
 //! Every test is stepped by hand: writes from a separate session, then
 //! explicit seal/drain rounds and staging-worker passes. Nothing polls for
-//! convergence (#297).
+//! convergence.
 
 use std::time::{Duration, Instant};
 
@@ -227,7 +226,7 @@ async fn rows(raw: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
 /// aggregate over `b`, all live.
 ///
 /// - `ta` reads `a`, `tb` reads `b`, `tc` reads `c`;
-/// - `tsum` sums `b` per `g` (the ledger path, #623 D3a).
+/// - `tsum` sums `b` per `g`.
 async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
     raw.batch_execute(
         "create table public.u (id int primary key, g int, a int, b int, c int, spare int); \
@@ -340,11 +339,7 @@ async fn renaming_a_read_column_pauses_its_reader_and_never_fails_a_write() {
         .expect("ta is registered");
     assert_eq!(reported.status, TransformStatus::Paused);
     let failure = reported.capture_failure.expect("the reason is reported");
-    assert_eq!(
-        failure.kind,
-        CaptureFailureKind::Capture,
-        "not a halt (#663)"
-    );
+    assert_eq!(failure.kind, CaptureFailureKind::Capture, "not a halt");
     assert_eq!(failure.source_table, "public.u");
     assert_eq!(failure.columns, vec!["a".to_string()]);
     assert!(
@@ -572,7 +567,7 @@ async fn renaming_a_key_column_pauses_every_reader_and_never_fails_a_write() {
     );
     let since = high_water(&raw).await;
     // A delete: capture now images `uid` alone, and an update of an unimaged
-    // column stages nothing (#623 D8a).
+    // column stages nothing.
     app.batch_execute("delete from public.u where uid = 2")
         .await
         .expect("a write after the regeneration");
@@ -586,7 +581,7 @@ type ImageRow = (String, String, Option<String>, Option<String>);
 /// The images a function writes on its schema-changed branch, built at run
 /// time and run with `EXECUTE`, are byte-identical to the static inserts'
 /// over the columns that are left, from an application session whose output
-/// settings differ from Trellis's (#622 A1's harness, in miniature).
+/// settings differ from Trellis's.
 #[tokio::test]
 async fn the_partial_images_match_the_static_ones_for_the_columns_left() {
     let cluster = TestCluster::start();
@@ -740,14 +735,14 @@ async fn a_key_rename_the_capture_pass_sees_first_pauses_every_reader() {
     );
 }
 
-/// A primary key redefined without a rename, its old column still there
-/// (#687). The installed functions go on imaging the old key, so no write
+/// A primary key redefined without a rename, its old column still there.
+/// The installed functions go on imaging the old key, so no write
 /// marks the change, and without a check the capture pass would regenerate
 /// them keyed by the new one, silently. The pass pauses every reader
 /// instead, with the old and new key on its status, and leaves the functions
 /// for the next pass. A row the old functions staged then drains without
 /// reaching a paused reader, and no write fails. (A drain page that runs
-/// before the pass pauses them itself: #703 R2, below.)
+/// before the pass pauses them itself: see the false-positive rows below.)
 #[tokio::test]
 async fn a_primary_key_redefined_without_a_rename_pauses_every_reader() {
     let cluster = TestCluster::start();
@@ -796,7 +791,7 @@ async fn a_primary_key_redefined_without_a_rename_pauses_every_reader() {
     );
 }
 
-/// #703 R2: a drain page that runs between a primary key's redefinition and
+/// A drain page that runs between a primary key's redefinition and
 /// the capture pass. The old functions still stage rows keyed by the old
 /// key, which the page would read by the new one. The page compares the
 /// installed capture's key with the table's before it applies anything,
@@ -870,7 +865,7 @@ async fn a_drain_page_before_the_pass_pauses_on_a_key_swapped_for_another_column
     .await;
 }
 
-/// #703 R2's false-positive rows: a key rebuilt on the same columns, by
+/// The false-positive rows: a key rebuilt on the same columns, by
 /// `ADD PRIMARY KEY USING INDEX`, renamed, or joined by new indexes and
 /// constraints, pauses nothing when a page drains before the pass.
 #[tokio::test]
@@ -914,7 +909,7 @@ async fn a_drain_page_pauses_nothing_for_a_key_rebuilt_on_the_same_columns() {
 }
 
 /// Resuming a definition while the column it reads is still missing: the
-/// resume re-validates it as define would and refuses (#708), so it stays
+/// resume re-validates it as define would and refuses, so it stays
 /// paused with its reason, rather than waiting to backfill with the
 /// table's capture failing every pass. The other readers of the table keep
 /// applying.
@@ -1037,10 +1032,10 @@ async fn the_partial_images_keep_odd_identifiers() {
 }
 
 /// A definition paused for a missing column holds up no other definition on
-/// its table (#705). `ta` is edited to read `spare`, a column nothing imaged
+/// its table. `ta` is edited to read `spare`, a column nothing imaged
 /// yet, so its new field waits for a capture imaging `spare`
 /// (`column_status.awaiting_capture`) and its field build waits until one
-/// does (#625 F8b). Before any pass widens capture, `a` (which only `ta`
+/// does. Before any pass widens capture, `a` (which only `ta`
 /// reads) is renamed, so the drain pauses `ta` with a capture failure and
 /// capture stops imaging for it: `a` is gone and `spare` is read by no one
 /// else, so capture can never image them. `tb`'s own edit then starts a
@@ -1146,7 +1141,7 @@ async fn a_definition_paused_for_a_missing_column_does_not_hold_the_tables_catch
     assert_eq!(left, 0, "spare2 no longer waits");
 }
 
-/// Issue #748: an edit adding a field that reads, by alias, a field still
+/// An edit adding a field that reads, by alias, a field still
 /// awaiting its capture. Apply holds the reader out with that field, and
 /// the reader's own field build runs (and skips it) before the capture is
 /// ready, so the build that releases the awaited field must write the
@@ -1192,9 +1187,9 @@ async fn the_release_of_a_field_awaiting_capture_builds_a_reader_added_after_it(
 /// `public.users`, keyed by `handle`; `users_copy` reads it directly,
 /// `posts_named` reads it as the joined side of a `JOIN` from `posts` on
 /// `posts.author = users.handle`, and `named_copy` is a downstream hop target
-/// reading `users_copy` (#663): the closure a halt on `users` reaches.
+/// reading `users_copy`: the closure a halt on `users` reaches.
 /// `posts_plain` reads only `posts`, and `public.o` is an unrelated table
-/// whose `o_copy` shares the drain's pages with them (#768). All live.
+/// whose `o_copy` shares the drain's pages with them. All live.
 async fn halt_closure_setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
     raw.batch_execute(
         "create table public.users (handle varchar(16) primary key, name text); \
@@ -1255,7 +1250,7 @@ async fn halt_record(raw: &Client, target: &str) -> Option<(String, String)> {
     .map(|row| (row.get(0), row.get(1)))
 }
 
-/// The targets [`Trellis::definitions`] reports a halt on (#663), each
+/// The targets [`Trellis::definitions`] reports a halt on, each
 /// checked to be a halt, in id order.
 async fn halted_targets(trellis: &Trellis) -> Vec<String> {
     let mut halted = Vec::new();
@@ -1325,7 +1320,7 @@ mod error_log {
     }
 }
 
-/// Issue #663: a page holding a write to a table whose key the drain can't
+/// A page holding a write to a table whose key the drain can't
 /// use, beside an unrelated table's write. The drain used to fail the page
 /// every poll, forever, logging and counting a stop each time. Now it
 /// pauses the halt's closure (`users_copy` reads `users`, `posts_named`
@@ -1490,7 +1485,7 @@ async fn a_halting_key_pauses_its_closure_once_and_the_rest_of_the_page_drains()
     );
 }
 
-/// Issue #663 with #708: a member of a halted closure that reads the key
+/// A member of a halted closure that reads the key
 /// define would refuse can't be resumed before the key is fixed. The resume
 /// re-validates it as define would and refuses, naming the type, and it
 /// stays paused with its halt record: the halt and the resume's validation
@@ -1573,7 +1568,7 @@ async fn resuming_a_halted_closure_before_the_key_is_fixed_is_refused() {
     }
 }
 
-/// Issue #663: two workers draining different buckets of one page both meet
+/// Two workers draining different buckets of one page both meet
 /// the halt. Whichever pauses the closure first records the stop; the other
 /// finds it frozen, records none, and drains its share too. And a halt on a
 /// closure already paused pauses and records nothing.

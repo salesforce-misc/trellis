@@ -1,4 +1,4 @@
-//! Integration tests for stage 06's retirement pass (issue #13/#58), run
+//! Integration tests for stage 06's retirement pass, run
 //! against a real, ephemeral Postgres instance via the shared harness
 //! (`testkit::TestCluster`).
 //!
@@ -379,7 +379,7 @@ async fn two_concurrent_retirement_passes_never_double_retire() {
 }
 
 /// The liveness unblock: after three isolated seals wedge the ring
-/// (issue #58's exact repro), a fully drained oldest segment lets the
+/// (the exact repro), a fully drained oldest segment lets the
 /// stuck fourth seal succeed via `seal_if_active_nonempty`'s one retry.
 #[tokio::test]
 async fn ring_full_self_heals_once_the_oldest_segment_is_retirable() {
@@ -411,7 +411,7 @@ async fn ring_full_self_heals_once_the_oldest_segment_is_retirable() {
     assert_eq!(outcome.next_ring_slot, 0);
 }
 
-// -------------------------------------------------- tombstone GC (#623 D7)
+// -------------------------------------------------- tombstone GC
 
 /// `collect_tombstones`' `LEDGER_TABLES_SQL` finds a ledger by
 /// `split_part`ting `transform_definitions.target_table` on `.` and joining
@@ -475,7 +475,7 @@ async fn collect_tombstones_finds_a_mixed_case_spaced_ledger() {
 /// A ledger without its tombstone index is left for a later pass: an
 /// aggregate build drops the ledger's indexes for its load and adds them
 /// back in a later transaction, and between the two the GC's only plan
-/// would be a sequential scan of the whole ledger (#722, #738). Once the
+/// would be a sequential scan of the whole ledger. Once the
 /// index is back, the GC collects as usual.
 #[tokio::test]
 async fn collect_tombstones_skips_a_ledger_without_its_tombstone_index() {
@@ -524,7 +524,7 @@ async fn collect_tombstones_skips_a_ledger_without_its_tombstone_index() {
     assert_eq!(collected, 1, "k1's tombstone goes once the index is back");
 }
 
-/// The GC skips the ledger of a definition under a build (#723): one that
+/// The GC skips the ledger of a definition under a build: one that
 /// is `backfilling`, or whose Re-derive build a pause froze (`build` still
 /// set), and one whose row another transaction holds `for update`, as a
 /// build's start does. A build's chunk inserts the entry of a key with no

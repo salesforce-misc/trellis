@@ -1,4 +1,4 @@
-//! A copy of a `varchar(n)` column is an unbounded `varchar` (#1207).
+//! A copy of a `varchar(n)` column is an unbounded `varchar`.
 //!
 //! Postgres truncates a value whose characters past `n` are all spaces,
 //! silently, when it assigns it to a `varchar(n)` column. So after the source
@@ -10,7 +10,7 @@
 //! Trellis creates for a 1-1 target holds a bounded `varchar`
 //! (`join_schema_changes.rs` checks the `JOIN` and group-basis tables). The pipeline and the
 //! pass are stepped by hand (`support/drain_driver.rs`), and nothing polls for
-//! convergence (#297).
+//! convergence.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -216,7 +216,7 @@ async fn a_varchar_text_change_of_the_source_reports_no_drift() {
     assert_eq!(after, before, "the target was not rewritten");
 }
 
-/// Rule 1 of #1207's decision, over the tables Trellis creates for these
+/// No length on a copy, over the tables Trellis creates for these
 /// shapes: a 1-1 target keyed by a `varchar(n)` with a passthrough, and a
 /// group-basis aggregate grouped by `varchar(n)` columns (target and
 /// partials). None of their columns has a length. `join_schema_changes.rs`

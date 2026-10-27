@@ -1,7 +1,7 @@
-//! Issue #677's review: an `UPDATE` that leaves an out-of-line TOASTed
+//! An `UPDATE` that leaves an out-of-line TOASTed
 //! column unchanged, through capture.
 //!
-//! The change stream Trellis consumed before #622 didn't resend such a
+//! The replication change stream Trellis once consumed didn't resend such a
 //! column in the new tuple, so a new image could lack a column a definition
 //! reads. Here that column is a `JOIN`'s group key on the joined table, and a
 //! `JOIN`'s key on both of its sides.
@@ -171,7 +171,7 @@ async fn an_unchanged_toasted_column_is_read_from_the_old_image() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Issue #677's note for #622 C5: the case intake could never fix. A plain
+/// The case the old intake could never fix. A plain
 /// 1:1 source whose definition reads a TOASTed column: the old change stream
 /// left the unchanged column out of an `UPDATE`'s new tuple and carried no
 /// old tuple to fill it from, so the key was poisoned.

@@ -164,7 +164,7 @@ async fn reading_without_quiesce_can_observe_state_that_has_not_caught_up_yet() 
     );
 }
 
-/// Read-your-own-writes across a `JOIN` (#1113).
+/// Read-your-own-writes across a `JOIN`.
 ///
 /// The positive half of the property, on the shape that makes it hardest:
 /// the write lands on the *joined* table, not on the definition's `FROM`

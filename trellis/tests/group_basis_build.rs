@@ -1,5 +1,5 @@
 //! A fresh build of a group-basis aggregate over a source that already has
-//! rows (#1101's decision, ADR-0002 "An aggregate's build is one absolute
+//! rows (ADR-0002 "An aggregate's build is one absolute
 //! write per structure"): the plan job, after its seam fence,
 //! runs one absolute write of every group the enumeration union names (R8)
 //! in key order, from one snapshot taken after the locks, while pages apply
@@ -9,7 +9,7 @@
 //! the aggregate is defined over it, so its build starts over rows. Every
 //! test runs the plan job by hand through `support/drain_driver.rs`, frozen at its
 //! pause points where the scenario needs it. None sleeps or polls for
-//! convergence (#297): the one wait is for a page to queue on a lock the
+//! convergence: the one wait is for a page to queue on a lock the
 //! frozen build holds, which the test has forced.
 
 #[path = "support/drain_driver.rs"]
@@ -801,7 +801,7 @@ async fn a_partitioned_source_with_rows_is_refused() {
 /// side's node-form recompute and a plain aggregate's rebuild) match its
 /// groups to the locked ones by a hash or merge join, never by a nested loop
 /// that rescans the `GROUP BY`'s result once per group: on a two-column
-/// group with hundreds of thousands of cells that loop is quadratic (#1318).
+/// group with hundreds of thousands of cells that loop is quadratic.
 /// Planned with nested loops disabled, so a nested-loop match (a `Join
 /// Filter` tested on every pair) shows only where its condition can't be
 /// hashed or merged, whatever the table sizes; the lateral index probes of
@@ -882,7 +882,7 @@ async fn a_build_that_keeps_failing_on_its_data_pauses_its_definition() {
     );
 }
 
-/// Issue #77 / ADR-0011's same-named decoy, on the group basis: an aggregate
+/// ADR-0011's same-named decoy, on the group basis: an aggregate
 /// that names `custom.order_items` and a `custom` target reads and writes
 /// those, never the `public` tables of the same names on the engine's pinned
 /// `search_path`. Its build, a page, an image-less recompute (which reads

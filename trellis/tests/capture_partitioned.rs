@@ -1,10 +1,10 @@
 //! Capture installs on every table of a partitioned source's tree, staging
-//! under the root's identity (ADR-0017 P2a, issue #1059).
+//! under the root's identity.
 //!
 //! A statement trigger fires only for the table a statement names, so the
 //! root, each middle and each leaf carries the five capture triggers, all
-//! calling the root's one function set. Nothing here waits for convergence
-//! (#297): a writer held open stands in for contention, and the install's
+//! calling the root's one function set. Nothing here waits for convergence:
+//! a writer held open stands in for contention, and the install's
 //! deadline stops it.
 
 use std::time::{Duration, Instant};
@@ -613,7 +613,7 @@ async fn measure_writer_stall_during_a_one_hundred_table_install() {
 }
 
 /// A source root attached under another table (its readers pause, and its
-/// capture is left as it is, #707) keeps its nodes out of the installed
+/// capture is left as it is) keeps its nodes out of the installed
 /// tables: they're still the captured root's, not orphans to uninstall.
 #[tokio::test]
 async fn the_nodes_of_a_root_attached_under_another_table_are_not_installed_tables() {

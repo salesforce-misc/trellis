@@ -1,11 +1,11 @@
-//! A hand-driven drain for the interleaving tests (#623 D1).
+//! A hand-driven drain for the interleaving tests.
 //!
 //! Source writes go through trigger capture, installed by hand with
-//! `capture::install` (#622 C3), since the client doesn't install it yet
+//! `capture::install`, since the client doesn't install it yet
 //! (C5). The driver seals both phases itself, and drains one batch at a time
 //! with `drain_once` on a worker name the test picks, optionally frozen at a
 //! [`PausePoint`] (`trellis::staging::interleave`). Nothing here waits for
-//! convergence (#297). The one wait, [`Driver::wait_blocked_behind`], waits
+//! convergence. The one wait, [`Driver::wait_blocked_behind`], waits
 //! for a backend to queue on a lock a frozen worker holds, which the test has
 //! forced; it is not a race.
 
@@ -259,8 +259,8 @@ impl Driver {
         self.stage_recomputes_with_prior(src_table, &keys).await;
     }
 
-    /// As [`Self::stage_recomputes`], each carrying a prior image (the
-    /// CDC text-format row image the old go-live enumeration attached, #392).
+    /// As [`Self::stage_recomputes`], each carrying a prior image (a CDC
+    /// text-format row image).
     pub async fn stage_recomputes_with_prior(
         &self,
         src_table: &str,
@@ -460,7 +460,7 @@ impl Driver {
             .expect("retire drained segments");
     }
 
-    /// Collects the tombstones the drained prefix no longer needs (#623 D7),
+    /// Collects the tombstones the drained prefix no longer needs,
     /// returning how many went.
     pub async fn collect_tombstones(&mut self) -> u64 {
         collect_tombstones(&mut self.ctl)

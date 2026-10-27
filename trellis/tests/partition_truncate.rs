@@ -1,11 +1,11 @@
-//! ADR-0017 P5 (issue #1064): a leaf or middle `TRUNCATE` queues that
+//! ADR-0017 P5: a leaf or middle `TRUNCATE` queues that
 //! node's correction, and a root `TRUNCATE` clears the target once.
 //!
 //! Each test builds a partitioned `public.items` and an aggregate over it,
 //! kept live by the hand-driven pipeline (`support/drain_driver.rs`),
 //! truncates part of the tree, drains the ring (whose seal queues the
 //! correction) and runs the correction engine. The oracle is a from-scratch
-//! `GROUP BY` over the source. Nothing waits for convergence (#297): the
+//! `GROUP BY` over the source. Nothing waits for convergence: the
 //! pass, the drain and the engine are called by hand.
 
 #[path = "support/drain_driver.rs"]

@@ -1,4 +1,4 @@
-//! Issue #236 (layer-3 bucket 5, `docs/generative-test-suite.md` §7):
+//! Layer-3 bucket 5 (`docs/generative-test-suite.md` §7):
 //! database-administration actions interleaved with a program's ops —
 //! `CHECKPOINT`, and a Postgres restart (fast, and immediate so the next
 //! start runs crash recovery). Each is an oracle identity, so every op is

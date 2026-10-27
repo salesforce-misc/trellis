@@ -88,9 +88,9 @@ fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
 /// `create table` in this file's own fixtures actually lands, since
 /// `connect_raw` pins `search_path` to `trellis, public` and never qualifies
 /// its own DDL. Matches `tests/quarantine.rs`'s (and `tests/apply.rs`'s) own
-/// `qualify_fixture_table` (issue #74, ADR-0011): a CDC-staged `src_table`
-/// must be fully qualified to match what a real CDC producer stages (issue
-/// #76) and what the dependency graph now keys on (issue #74), or
+/// `qualify_fixture_table` (ADR-0011): a CDC-staged `src_table`
+/// must be fully qualified to match what a real CDC producer stages
+/// and what the dependency graph keys on, or
 /// `catalog::transforms_for_source` silently finds nothing and this whole
 /// file's column-fuse machinery never even gets exercised. Already-qualified
 /// input (containing a `.`) passes through unchanged.
@@ -352,7 +352,7 @@ async fn column_fuse_trips_only_once_the_threshold_is_crossed() {
 }
 
 /// A column fuse trip bumps its source's version fence as the first lock of
-/// the transaction that writes the pause (issue #903), so it can wait out the
+/// the transaction that writes the pause, so it can wait out the
 /// lock timeout behind a writer holding the fence. The charge that reached
 /// the threshold has committed by then and the trip has not, so the count is
 /// left at the threshold with the column live. The next failure of a row
@@ -461,7 +461,7 @@ async fn paused_column_freezes_instead_of_going_null_or_being_overwritten() {
     seed_order_totals(&db, &client).await;
 
     // A healthy row, computed successfully before anything pauses. The
-    // source row exists too: Phase 3 checks each write against it (#344).
+    // source row exists too: Phase 3 checks each write against it.
     client
         .execute(
             "insert into orders (id, price, tax) values (100, 10.00, 1.50)",
@@ -671,7 +671,7 @@ async fn cascade_pending(client: &Client, transform: &str, column: &str) -> Opti
         .map(|row| row.get(0))
 }
 
-/// Issue #912: each pair of a column pause's cascade bumps its own source's
+/// Each pair of a column pause's cascade bumps its own source's
 /// fence in its own transaction, so a writer holding a grandchild's fence
 /// fails the walk after the child has paused. The child was paused by the
 /// first attempt, and a retried `PAUSE` still walks on through it to the
@@ -746,7 +746,7 @@ async fn a_retried_pause_completes_a_cascade_that_failed_at_a_grandchild() {
     assert_eq!(resumed.len(), 3, "resumed {resumed:?}");
 }
 
-/// Issue #912: a column fuse trip commits its pause and then cascades. A
+/// A column fuse trip commits its pause and then cascades. A
 /// cascade that fails at the grandchild has no caller to retry it, and the
 /// paused column stops failing, so nothing trips the fuse again. The trip
 /// leaves its pause marked as owing the cascade, and the capture pass's
@@ -873,7 +873,7 @@ async fn release_gate(gate: &Client, key: i64) {
         .expect("release the pause lock");
 }
 
-/// Issue #912: a cascade pair checks, after its fence bump, that its
+/// A cascade pair checks, after its fence bump, that its
 /// upstream column is still paused. A walk frozen between the bump and that
 /// check while the upstream column's `RESUME` commits (the two bump
 /// different fences: the reader's definition reads the paused column's
@@ -936,7 +936,7 @@ async fn a_cascade_pair_that_loses_the_race_to_its_upstreams_resume_pauses_nothi
     );
 }
 
-/// Issue #912: a walk clears its pause's `cascade_pending` mark only if the
+/// A walk clears its pause's `cascade_pending` mark only if the
 /// row is as the walk found it. Here a second `PAUSE` of the same column
 /// commits while the first walk is frozen at the grandchild, and its own
 /// walk fails there. The first walk then finishes, and leaves the second
@@ -1103,7 +1103,7 @@ async fn resume_recomputes_and_does_not_un_pause_a_dependent_with_its_own_reason
         "the dependent must NOT be auto-resumed — it has its own independent reason"
     );
 
-    // #625 F8b: the resume registers a field build of the column, so the
+    // The resume registers a field build of the column, so the
     // transform reports `backfilling` (it keeps applying) until the build's
     // chunks, driven here as the drain workers would, take it back to
     // `live`. Nothing is parked for a catch-up.
@@ -1166,11 +1166,10 @@ async fn resume_recomputes_and_does_not_un_pause_a_dependent_with_its_own_reason
     }
 }
 
-/// Reviewer follow-up to issue #74 (epic #78's own whole-branch review): the
-/// quarantine-recompute counterpart to `apply.rs`'s
+/// The quarantine-recompute counterpart to `apply.rs`'s
 /// `explicitly_qualified_target_receives_a_live_cdc_write` — a
-/// definition installed with an explicit non-default *target* schema (issue
-/// #76's grammar) used to fail `resume_column`'s recompute outright:
+/// definition installed with an explicit non-default *target* schema
+/// used to fail `resume_column`'s recompute outright:
 /// `recompute_column`'s own `UPDATE` (`staging::quarantine`) bound
 /// `def.def.target` — always bare — straight into `quote_ident`, instead of
 /// `Definition::target_table`'s qualified identity, so the write tried
@@ -1358,11 +1357,10 @@ async fn trellis_exposes_the_read_and_resume_methods() {
         .expect("quarantine_status after resume");
     assert_eq!(status_after.state, trellis::app::QuarantineState::Live);
 
-    // Issue #227 replaced `resume_column`'s "a bare address is caller error"
-    // rejection with a grammar that makes the two spellings *different
+    // The grammar makes the two spellings *different
     // statements*: `RESUME TRANSFORM <t>.<c>` resumes one column (above),
     // while `RESUME TRANSFORM <t>` is the whole-transform rebuild. So the bare
-    // form is no longer an addressing error at all — it is the other
+    // form is not an addressing error at all — it is the other
     // operation, judged against that operation's own precondition, which this
     // still-live transform doesn't meet (only a frozen definition can be
     // resumed).
@@ -1665,7 +1663,7 @@ async fn resume_recomputes_correctly_even_when_a_sibling_column_still_throws() {
     // `busted`'s formula overflows (`22003`, as Postgres's `tax + tax` would)
     // on every row, for every recompute attempt, indefinitely. The
     // definition is one define accepts, so the resume's re-validation
-    // (#708) passes; only the data makes the sibling throw.
+    // passes; only the data makes the sibling throw.
     client
         .batch_execute(
             "create table calc_src (id integer primary key, price numeric, tax integer); \
@@ -1794,13 +1792,13 @@ async fn resume_recomputes_correctly_even_when_a_sibling_column_still_throws() {
     }
 }
 
-/// Issue #377: `recompute_column`'s write-back matches each chunk of keys
+/// `recompute_column`'s write-back matches each chunk of keys
 /// against the target's own primary-key columns (an indexed keyset join)
 /// rather than against the computed key-contract text. Resuming over a
 /// composite key, across more than one write-back chunk, with key parts that
 /// hold the key contract's own separator and escape characters, must still
 /// land every recomputed value on exactly its own row. A resume is a field
-/// build (#625 F8b): it rewrites the column of the rows the target has, and
+/// build: it rewrites the column of the rows the target has, and
 /// writes no row the target lacks (Apply and a rebuild own a row's
 /// existence).
 #[tokio::test]
@@ -2120,7 +2118,7 @@ async fn resume_column_refuses_a_column_on_a_not_yet_live_definition() {
     // Nothing in this test starts the definition's build, so it stays
     // `waiting_to_backfill`: it doesn't apply yet. (A plain 1-1 under its
     // Re-derive build does apply, and a column resume joins its build
-    // instead, #625 F8b.)
+    // instead.)
     let def = install_definition(
         &db.pool,
         "TRANSFORM stuck FROM stuck_src SELECT a + a AS doubled",
@@ -2304,7 +2302,7 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
         None,
         "the resumed upstream column itself must no longer be paused"
     );
-    // Issue #916: the walk deleted its edge into the reader, and the reader
+    // The walk deleted its edge into the reader, and the reader
     // is frozen, so it can't be released. It stays paused as a pause of its own, with a reason that
     // is true and the way out, not as a row with no edge that says it waits
     // on an upstream that has resumed.
@@ -2338,15 +2336,15 @@ async fn resume_column_leaves_a_cascaded_not_yet_live_dependent_paused_without_e
 }
 
 // ---------------------------------------------------------------------
-// Issue #281: column attribution must resolve a *bare* `src_table` before
+// Column attribution must resolve a *bare* `src_table` before
 // asking the catalog which transforms read that source.
 // ---------------------------------------------------------------------
 
 /// Stages one malformed CDC insert per id under the **bare** `orders`
 /// spelling — `insert_cdc_row`'s deliberate opposite (it qualifies every
 /// `src_table` through `qualify_fixture_table`, precisely so this whole
-/// file's machinery is exercised at all). This is what a durable pre-#267
-/// ring row looks like, and what several of this crate's other integration
+/// file's machinery is exercised at all). This is what a durable ring row staged
+/// under the bare spelling looks like, and what several of this crate's other integration
 /// fixtures still stage by hand.
 async fn stage_bad_orders_bare(client: &mut Client, pool: &trellis::Pool, ids: &[i64]) {
     let table = active_segment_table(client).await;
@@ -2382,7 +2380,7 @@ async fn stage_bad_orders_bare(client: &mut Client, pool: &trellis::Pool, ids: &
 ///
 /// `attribute_column_failure` used to pass its raw `src_table` straight to
 /// `catalog::transforms_for_source`, which requires an already-qualified name
-/// (issue #74, ADR-0011) and answers a bare one with an *empty* candidate set
+/// (ADR-0011) and answers a bare one with an *empty* candidate set
 /// rather than an error. The lookup therefore matched no definition, the
 /// function fell out through its "no candidate" arm, and the failure went
 /// completely unattributed — indistinguishable, from the outside, from the
@@ -2413,7 +2411,7 @@ async fn a_bare_src_table_failure_is_still_attributed_to_its_column() {
         .await
         .expect(
             "a threshold's worth of evaluator failures on a bare `src_table` must pause the \
-             column, not go unattributed (issue #281)",
+             column, not go unattributed",
         );
     assert!(status.0, "a threshold trip is a local fuse, not a cascade");
     assert!(status.1.is_some(), "the tripping error must be recorded");
@@ -2425,7 +2423,7 @@ async fn a_bare_src_table_failure_is_still_attributed_to_its_column() {
 }
 
 // ---------------------------------------------------------------------
-// (g) The operator-driven half of a column pause — issue #227, ADR-0014's
+// (g) The operator-driven half of a column pause — ADR-0014's
 //     one freeze with several triggers, at column granularity, reached through the
 //     unified `PAUSE TRANSFORM <target>.<column>` grammar rather than by a
 //     fuse tripping.
@@ -2525,7 +2523,7 @@ async fn pausing_a_column_by_statement_reaches_the_fuse_s_own_state_and_cascades
         None
     );
 
-    // #625 F8b: each resumed column is a field build, so both read
+    // Each resumed column is a field build, so both read
     // `backfilling` until its chunks have run.
     assert_eq!(status_named(&client, "order_totals").await, "backfilling");
     assert_eq!(
@@ -2537,8 +2535,8 @@ async fn pausing_a_column_by_statement_reaches_the_fuse_s_own_state_and_cascades
     assert_eq!(status_named(&client, "order_summaries").await, "live");
 }
 
-/// Issue #228's decision-5 clause about "addressing something that doesn't
-/// exist": a column address is validated against the definition's own declared
+/// Addressing something that doesn't
+/// exist: a column address is validated against the definition's own declared
 /// fields before anything is written, because `column_status` has no foreign
 /// key that would catch it — an unchecked pause would park a row naming
 /// nothing and only surface on a later resume.
@@ -2583,7 +2581,7 @@ async fn pausing_a_column_that_does_not_exist_is_refused_before_anything_is_writ
     assert!(err.to_string().contains("no_such_transform"), "got {err}");
 }
 
-/// Issue #305, restated for #625 F8b: a row changed while a resumed
+/// A row changed while a resumed
 /// column's field build runs needs no catch-up. The resume unpauses the
 /// column in the transaction that registers its build, so the column
 /// applies from there: Apply writes it for every later change, and the
@@ -2679,7 +2677,7 @@ async fn a_row_changed_after_a_column_resume_needs_no_catch_up() {
 }
 
 // ---------------------------------------------------------------------
-// Issue #748: a field that reads a paused field by alias is paused with it.
+// A field that reads a paused field by alias is paused with it.
 // ---------------------------------------------------------------------
 
 /// Creates source `items (id, price, tax, bonus)` and the 1-1 transform
@@ -3189,7 +3187,7 @@ async fn a_definition_reading_a_frozen_sibling_is_paused_and_resumed_through_it(
 }
 
 // ---------------------------------------------------------------------
-// Issue #914: a field defined or added while a column it reads is paused is
+// A field defined or added while a column it reads is paused is
 // paused at birth, as the cascade pauses a reader that existed before.
 // ---------------------------------------------------------------------
 
@@ -3301,7 +3299,7 @@ async fn a_definition_reading_a_paused_column_is_paused_at_birth_until_that_colu
     );
 }
 
-/// Issue #916: the column's resume that comes before the new definition's
+/// The column's resume that comes before the new definition's
 /// registration settles. `sib_sum` is `waiting_to_backfill`, so it can't
 /// take a field build, but it has built nothing either: the resume releases
 /// its born-paused fields by deleting their rows, and its own build, which
@@ -3366,8 +3364,8 @@ async fn a_resume_before_the_readers_registration_settles_releases_its_born_paus
     );
 }
 
-/// Issue #916, the other pair a column's resume can't release: a reader
-/// whose definition no longer validates (#708). The walk deleted its edge,
+/// The other pair a column's resume can't release: a reader
+/// whose definition no longer validates. The walk deleted its edge,
 /// so the reader is held as a pause of its own, with a reason that says
 /// why, and its sibling keeps the edge from it. An operator `RESUME` of the
 /// held field is refused while define would refuse the definition, and
@@ -3707,7 +3705,7 @@ async fn a_cascade_pair_waits_for_a_define_reading_its_column_that_read_no_pause
 }
 
 // ---------------------------------------------------------------------
-// Issue #915: an `ALTER TRANSFORM` that pauses a field that already existed
+// An `ALTER TRANSFORM` that pauses a field that already existed
 // at birth owes the cascade to that field's readers, as any other pause.
 // ---------------------------------------------------------------------
 
@@ -3778,7 +3776,7 @@ async fn an_alter_pausing_an_existing_field_at_birth_cascades_to_its_readers() {
     );
 }
 
-/// The same through issue #748's sibling path: editing `sib.cost` to read
+/// The same through the sibling path: editing `sib.cost` to read
 /// the paused `sib.total` by alias pauses `cost` with it, and the edit's
 /// walk pauses `sib_sum.c1`, which already read `cost`, and its reader.
 #[tokio::test]
@@ -3984,7 +3982,7 @@ async fn an_alter_pausing_a_field_awaiting_its_capture_on_a_paused_sibling_casca
     assert_eq!(d1.as_deref(), Some("17"));
 }
 
-/// The ALTER of #918's routes: `cost` reads `bonus`, which `sib` didn't
+/// The ALTER of the routes below: `cost` reads `bonus`, which `sib` didn't
 /// read, so it waits for its capture widen, and `total`, by alias.
 const ALTER_COST_AWAITING_CAPTURE: &str = "ALTER TRANSFORM sib ALTER cost AS total + bonus";
 
@@ -4014,7 +4012,7 @@ async fn assert_cost_readers_released(client: &mut Client, db: &TestDatabase) {
     assert_eq!(d1.as_deref(), Some("17"));
 }
 
-/// Issue #918, route 2. `cost` waits for its capture and has passed `total`'s
+/// Route 2. `cost` waits for its capture and has passed `total`'s
 /// pause on to `sib_sum.c1` and `sib_down.d1`. `total`'s resume deletes the
 /// edge into `cost` and leaves the row, which is awaiting its capture. The
 /// capture release then deletes that row; it has to release `cost`'s
@@ -4047,7 +4045,7 @@ async fn the_capture_release_of_a_field_that_passed_a_pause_on_releases_its_read
     assert_cost_readers_released(&mut client, &db).await;
 }
 
-/// Issue #918, route 3: `total` is resumed before the edit's cascade walk
+/// Route 3: `total` is resumed before the edit's cascade walk
 /// runs, so the walk starts from a row that only awaits its capture.
 #[tokio::test]
 async fn a_resume_before_the_cascade_walk_leaves_no_reader_paused_by_the_capture_release() {
@@ -4069,7 +4067,7 @@ async fn a_resume_before_the_cascade_walk_leaves_no_reader_paused_by_the_capture
     assert_cost_readers_released(&mut client, &db).await;
 }
 
-/// Issue #918, route 1: the edit comes first, and `total`'s pause then
+/// Route 1: the edit comes first, and `total`'s pause then
 /// cascades through the field that awaits its capture.
 #[tokio::test]
 async fn a_pause_cascading_through_a_field_awaiting_its_capture_is_released_with_it() {
@@ -4097,7 +4095,7 @@ async fn a_pause_cascading_through_a_field_awaiting_its_capture_is_released_with
     assert_cost_readers_released(&mut client, &db).await;
 }
 
-/// Issue #918 through the other release: the definition is frozen and
+/// Through the other release: the definition is frozen and
 /// resumed (`RESUME TRANSFORM`) while `cost` still awaits its capture, so the
 /// resume discards the field build that would have released it, and the
 /// rebuild's start releases it instead.
@@ -4132,7 +4130,7 @@ async fn a_rebuilds_release_of_a_field_that_passed_a_pause_on_releases_its_reade
     assert_cost_readers_released(&mut client, &db).await;
 }
 
-/// Issue #918's release, one sibling deeper: the edit also adds `z`, which
+/// The release, one sibling deeper: the edit also adds `z`, which
 /// reads `cost` by alias and `bonus`, so it awaits its capture too, and
 /// `total`'s pause reaches it through `cost`. The release's first delete
 /// can't take `z` (the edge from `cost` is still there); the un-cascade from
@@ -4207,7 +4205,7 @@ async fn an_alter_whose_cascade_walk_fails_leaves_it_to_the_capture_pass() {
 }
 
 // ---------------------------------------------------------------------
-// Issue #950: an `ALTER TRANSFORM` that stops a paused reader reading the
+// An `ALTER TRANSFORM` that stops a paused reader reading the
 // column it was paused through ends that pause.
 // ---------------------------------------------------------------------
 
@@ -4567,7 +4565,7 @@ async fn an_alter_that_stops_a_paused_field_reading_its_upstream_holds_it_for_it
 }
 
 // ---------------------------------------------------------------------
-// Issue #917: a define reading a paused target's rows is ordered against a
+// A define reading a paused target's rows is ordered against a
 // resume of one of its columns that releases a sibling.
 // ---------------------------------------------------------------------
 
@@ -4610,7 +4608,7 @@ async fn blocked_behind(client: &Client, pid: i32) -> i32 {
 /// and waits for `total`'s, and the resume's delete of `cost` closes the
 /// cycle (`deadlock detected`). The resume's column-pause lock makes the
 /// define wait for the whole resume instead, so both commit, and the define
-/// finds nothing paused. With the one column-pause lock (#922) the define
+/// finds nothing paused. With the one column-pause lock the define
 /// waits for the resume at the lock, before it reads any row.
 #[tokio::test]
 async fn a_define_reading_a_target_waits_for_a_resume_releasing_a_sibling_that_sorts_first() {
@@ -4669,8 +4667,8 @@ async fn a_define_reading_a_target_waits_for_a_resume_releasing_a_sibling_that_s
 }
 
 // ---------------------------------------------------------------------
-// Issue #922: one column-pause lock per instance. Lock order, DROP vs RESUME
-// (#921), the timeout, and a define holding the lock for its catalog
+// One column-pause lock per instance. Lock order, DROP vs RESUME,
+// the timeout, and a define holding the lock for its catalog
 // transaction only.
 // ---------------------------------------------------------------------
 
@@ -4759,7 +4757,7 @@ async fn hold_definition_row<'a>(
 
 /// A pause waits out its source's fence before it takes the column-pause
 /// lock, so a pause stuck behind busy writers (up to the lock timeout)
-/// never holds the lock against everything else. Rule 3 of #922: the fence
+/// never holds the lock against everything else. The fence
 /// comes first.
 #[tokio::test]
 async fn a_pause_waits_out_its_fence_without_holding_the_column_pause_lock() {
@@ -4887,7 +4885,7 @@ async fn an_alter_takes_the_fence_then_the_column_pause_lock_then_the_definition
 }
 
 /// `DROP TRANSFORM` has no fence: the column-pause lock is its first lock,
-/// before the definition row (#921).
+/// before the definition row.
 #[tokio::test]
 async fn a_drop_takes_the_column_pause_lock_before_the_definition_row() {
     let cluster = TestCluster::start();
@@ -4910,7 +4908,7 @@ async fn a_drop_takes_the_column_pause_lock_before_the_definition_row() {
     drop.await.expect("drop task").expect("the drop commits");
 }
 
-/// Issue #921: a `DROP TRANSFORM` of a paused reader races a `RESUME` of the
+/// A `DROP TRANSFORM` of a paused reader races a `RESUME` of the
 /// upstream column it reads, and both delete the same cascade edges, in
 /// different orders. Frozen after the resume has deleted its column's row,
 /// the resume holds the column-pause lock; the drop must wait for the whole
@@ -5038,7 +5036,7 @@ async fn a_define_does_not_hold_the_column_pause_lock_across_its_build() {
     .expect("a second define takes the lock at once");
 }
 
-/// Issue #922 rule 5: a held column-pause lock makes a pause fail with the
+/// A held column-pause lock makes a pause fail with the
 /// named, retryable error (code `Timeout`) after the transaction's
 /// `lock_timeout`, writing nothing; the same call succeeds once it is free.
 #[tokio::test]
@@ -5078,7 +5076,7 @@ async fn a_pause_behind_a_held_column_pause_lock_times_out_retryably() {
     assert!(column_status_row(&client, "sib", "total").await.is_some());
 }
 
-/// Issue #922: a resume of a column that stays paused with a sibling it reads
+/// A resume of a column that stays paused with a sibling it reads
 /// clears the column's own reason (`local_fuse`) under the column-pause lock.
 /// A resume of that sibling decides whether to release the column from that
 /// same `local_fuse`, so the two serialize: here the column's resume holds
@@ -5145,10 +5143,10 @@ async fn a_resume_held_by_a_paused_sibling_serializes_with_that_siblings_resume(
     assert_eq!(column_status_row(&client, "sib", "cost").await, None);
 }
 
-/// Issue #922: an `ALTER TRANSFORM` that only drops a field deletes that
+/// An `ALTER TRANSFORM` that only drops a field deletes that
 /// field's pause row and the cascade edges into it, which a resume of the
 /// column it reads deletes too, so it takes the column-pause lock, as `DROP
-/// TRANSFORM` does (#921): it waits for a resume frozen holding it. The
+/// TRANSFORM` does: it waits for a resume frozen holding it. The
 /// resume reads the reader's definition again under the lock, so the
 /// dropped field, which its cascade queued before the edit committed, is
 /// skipped rather than resumed, and the reader's other field is resumed.
@@ -5225,7 +5223,7 @@ async fn a_drop_only_alter_waits_for_a_resume_holding_the_column_pause_lock() {
     assert_eq!(column_status_row(&client, "sib_sum", "t2").await, None);
 }
 
-/// Issue #922 rule 5, for the capture pass: a Re-derive build's start takes
+/// For the capture pass: a Re-derive build's start takes
 /// the column-pause lock. Behind a held lock it times out with nothing
 /// written, and the pass goes on rather than failing: the definition stays
 /// `waiting_to_backfill`, held back as a start held by its capture gate is,
@@ -5287,7 +5285,7 @@ async fn a_build_start_behind_a_held_column_pause_lock_waits_for_the_next_pass()
     assert_eq!(definition_status(&client, defined.id).await, "backfilling");
 }
 
-/// #978: the column-pause lock is one per instance. Instance A (the
+/// The column-pause lock is one per instance. Instance A (the
 /// database's default instance) holds its lock exclusive in an open
 /// transaction while instance B, in the same database, defines, pauses and
 /// resumes a field and drops its transform, through a pool whose sessions
@@ -5376,7 +5374,7 @@ async fn another_instances_held_column_pause_lock_does_not_hold_up_this_ones() {
 }
 
 // ---------------------------------------------------------------------
-// Issue #955: a cascade pair re-checks, under the column-pause lock, that
+// A cascade pair re-checks, under the column-pause lock, that
 // its reader still reads the paused column.
 // ---------------------------------------------------------------------
 
@@ -5421,7 +5419,7 @@ async fn pause_cost_frozen_after_dependents_read(
 /// The race's first outcome: `c1` is edited to read `total` instead of
 /// `cost` after the walk listed it as `cost`'s reader and before its pair.
 /// The pair writes nothing: `c1` isn't paused on a column it doesn't read,
-/// and has no edge for a later `DROP cost` to strand it on (#950).
+/// and has no edge for a later `DROP cost` to strand it on.
 #[tokio::test]
 async fn a_cascade_pair_skips_a_reader_edited_to_stop_reading_the_column_after_the_walk_listed_it()
 {
@@ -5453,7 +5451,7 @@ async fn a_cascade_pair_skips_a_reader_edited_to_stop_reading_the_column_after_t
 /// The race's second outcome: `c1` is dropped after the walk listed it and
 /// before its pair. The pair writes no `column_status` row and no edge for
 /// a field that no longer exists, so a field of the same name added later
-/// isn't born paused (#309).
+/// isn't born paused.
 #[tokio::test]
 async fn a_cascade_pair_skips_a_reader_dropped_after_the_walk_listed_it() {
     let cluster = TestCluster::start();
@@ -5512,7 +5510,7 @@ async fn a_cascade_pair_still_pauses_a_reader_when_an_edit_of_a_sibling_field_ra
 }
 
 // ---------------------------------------------------------------------
-// Issue #965: a resume's walk validates a reader's definition under the
+// A resume's walk validates a reader's definition under the
 // column-pause lock, not before it.
 // ---------------------------------------------------------------------
 
@@ -5634,7 +5632,7 @@ async fn a_resume_holds_a_reader_whose_source_changed_after_the_walk_read_its_de
 }
 
 // ---------------------------------------------------------------------
-// Issue #1208: a reader of a paused upstream column reports catching_up.
+// A reader of a paused upstream column reports catching_up.
 // ---------------------------------------------------------------------
 
 /// `sib (total, cost)` over a `bigint` `items` (a `SUM` over a target's
@@ -5798,7 +5796,7 @@ async fn a_reader_of_a_column_paused_by_the_fuse_s_api_reports_catching_up() {
     );
 }
 
-/// A resume waits for an upstream that is rebuilding (#971), but not for
+/// A resume waits for an upstream that is rebuilding, but not for
 /// one that reports `catching_up` only because it reads a paused column: that
 /// upstream keeps applying, so a reader rebuilt over it is as current as a
 /// `live` one, and the column may stay paused for good.

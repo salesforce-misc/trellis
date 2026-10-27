@@ -1,15 +1,15 @@
-//! Issues #312 and #315: a write to a chain's intermediate hop must reach a
+//! A write to a chain's intermediate hop must reach a
 //! downstream aggregate exactly once, and must leave both the group a row
 //! left and the group it joined correct.
 //!
 //! `h1` below is the target of `src -> h1` and the source of the aggregate
-//! `h1 -> h3`. Since issue #315 a target table is never captured: the drain
+//! `h1 -> h3`. A target table is never captured: the drain
 //! that writes `h1` stages its own downstream `Recompute` for `h3` inside the
 //! writing transaction (`staging::target_mutations`), and that is the only
-//! copy. Before, `h1` was captured too, and intake decoded the same write a
+//! copy. Were `h1` captured too, intake would decode the same write a
 //! second time; when the two copies landed in different batches the
-//! aggregate re-derived the group from live state (which already held the
-//! write) and then added the CDC delta on top of it.
+//! aggregate would re-derive the group from live state (which already held the
+//! write) and then add the CDC delta on top of it.
 //!
 //! The tests install capture and drive the drain by hand
 //! (`support/trigger_pipeline.rs`) so every hop lands in its own batch,
@@ -58,7 +58,7 @@ async fn start() -> Pipeline {
     .expect("install h1");
     trellis::intake::harness::settle_builds(&db.pool).await;
     // An aggregate over a target never reads its capture: the
-    // target-mutation seam feeds it (#315).
+    // target-mutation seam feeds it.
     install_definition(
         &db.pool,
         "TRANSFORM h3 FROM public.h1 GROUP BY val WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
@@ -108,7 +108,7 @@ async fn an_aggregate_counts_an_intermediate_hops_write_once() {
     );
 }
 
-/// Issue #315's grain migration: `h3` groups by `h1.val`, a non-key column
+/// Grain migration: `h3` groups by `h1.val`, a non-key column
 /// of an upstream target. Moving a row from group 7 to group 8 must leave
 /// group 7 correct as well as group 8. The recompute `h1`'s write stages is
 /// image-less (re-read live), so on its own it only names group 8; the prior

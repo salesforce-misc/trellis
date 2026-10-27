@@ -1,7 +1,7 @@
-//! Issue #644: `dump_definitions_sql` appends a schema-only `pg_dump` with the
+//! `dump_definitions_sql` appends a schema-only `pg_dump` with the
 //! rows that say what is defined, the way Rails appends `schema_migrations`.
 //!
-//! The round trip is hand-driven and deterministic (#297): no live pipeline,
+//! The round trip is hand-driven and deterministic: no live pipeline,
 //! and the one build step the loaded database needs is run through the same
 //! engine functions the drain worker calls.
 //!
@@ -285,10 +285,10 @@ async fn a_dump_loads_as_defined_not_built() {
         "select to_jsonb(t) - 'created_at' from schema_nodes t order by id",
         "select to_jsonb(t) - 'created_at' from schema_edges t order by id",
         "select to_jsonb(t) from source_table_versions t order by source_table",
-        // #1242: a type's OID is the database's own; the name beside it loads.
+        // A type's OID is the database's own; the name beside it loads.
         "select to_jsonb(t) - 'type_oid' from definition_key_types t order by transform_id, table_name, column_name",
         "select to_jsonb(t) - 'type_oid' from definition_types t order by transform_id, type_name",
-        // #1241: an enum value's OID too; its label loads.
+        // An enum value's OID too; its label loads.
         "select to_jsonb(t) - 'type_oid' - 'value_oid' from definition_enum_values t \
          order by transform_id, label",
         "select to_jsonb(t) from trellis_instance t",
@@ -317,7 +317,7 @@ async fn a_dump_loads_as_defined_not_built() {
         count(&after, "select count(*) from definition_types").await,
         3
     );
-    // #1241: each recorded value resolves to the loaded database's value of
+    // Each recorded value resolves to the loaded database's value of
     // the same label, so a relabel there is found by OID.
     assert_eq!(
         count(

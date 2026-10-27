@@ -1,16 +1,16 @@
-//! `RESUME` of a group-basis aggregate (#1101's decision, #1287): the resume
+//! `RESUME` of a group-basis aggregate: the resume
 //! drops and recreates the hidden partials table at the shape define would
 //! give it now and keeps the visible target; the build that follows is the
 //! plan job's one absolute write of every group, which replaces the rows of
 //! the groups the source still has and removes the others. Its commit parks
-//! the target's readers (#1287): the seam rows a page stages between the
+//! the target's readers: the seam rows a page stages between the
 //! resume and that commit compute their prior images from the empty
 //! partials, not from the rows the target holds, so a group-basis reader is
 //! rebuilt and any other reader is caught up.
 //!
 //! Every test drives the pipeline by hand through `support/drain_driver.rs`, frozen at
 //! pause points where the scenario needs it. None sleeps or polls for
-//! convergence (#297).
+//! convergence.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -331,7 +331,7 @@ async fn changes_written_while_paused_are_built_in() {
     assert_eq!(d.rows(&status(TARGET)).await, ["(live,)"]);
 }
 
-/// A dropped `agg_<id>` is recreated by the resume (it used to refuse, #1222).
+/// A dropped `agg_<id>` is recreated by the resume.
 #[tokio::test]
 async fn a_dropped_partials_table_is_recreated() {
     let mut d = start("(1, 1, 10), (2, 2, 7)").await;
@@ -416,7 +416,7 @@ async fn a_retyped_group_column_resumes_over_correctly_typed_partials() {
     );
 }
 
-// -------------------------------------------------------- the readers (#1287)
+// -------------------------------------------------------- the readers
 
 /// A page applied to a held group between the resume and the build's lock
 /// statement computes its prior image from the empty partials, so the seam

@@ -1,4 +1,4 @@
-//! #1099 (G1 of #1091, #1043 F1): every transition row counts once.
+//! Every transition row counts once.
 //!
 //! A reader that sums each ring row's `f(new) − f(old)` (the group basis)
 //! needs a transaction's ring rows to telescope: summed as signed multisets
@@ -7,14 +7,14 @@
 //! one nested-write shape and checks exactly that, where a row's sides are
 //! its `transition_images` when set (JSON `null` meaning none) and its
 //! `old_image`/`new_image` otherwise (`capture::sql`, "Every transition row
-//! counts once"). The six shapes of #1043 E1's `H1.*` each have a test named
+//! counts once"). The six `H1.*` shapes each have a test named
 //! after them; the rest cover the other ways a statement's rows reach one
 //! capture call twice.
 //!
 //! Each test also checks what a 1-1 reader sees: every key's last ring row
-//! carries the row the transaction ended with (the #680 live re-read).
+//! carries the row the transaction ended with (the live re-read).
 //! `capture_reread.rs` pins the re-read itself. Capture is installed by hand
-//! and the ring is read directly; nothing waits for convergence (#297).
+//! and the ring is read directly; nothing waits for convergence.
 
 use std::collections::BTreeMap;
 
@@ -237,7 +237,7 @@ async fn assert_chains(client: &Client, table: &str, columns: &[&str], sql: &str
 }
 
 /// `public.src (id int primary key, g int, v int)` holding `(1, 1, 2)`,
-/// `(2, 1, 4)`, imaging `g` and `v`: #1043 E1's `m.src`.
+/// `(2, 1, 4)`, imaging `g` and `v`.
 async fn src_table(dsn: &str) -> Client {
     let mut client = connect(dsn).await;
     client
@@ -270,7 +270,7 @@ async fn app_trigger(client: &Client, events: &str, body: &str) {
         .expect("create the application trigger");
 }
 
-/// `H1.nested-update`, #1043 F1's motivating case: an `AFTER ROW` trigger
+/// `H1.nested-update`: an `AFTER ROW` trigger
 /// rewrites the row its own statement wrote (`a → b`, then `b → c`). The
 /// nested capture stages `(b, c)` and the outer one `(a, c)` with the live
 /// row, which alone sum to `2c − a − b`.
@@ -421,7 +421,7 @@ async fn fk_table(dsn: &str, rows: &str) -> Client {
 
 const FK: &[&str] = &["g", "v", "o", "trellis_pair"];
 
-/// `H1.fk-cascade-self`, the other failure E1 observed and #1043 F1's engine
+/// `H1.fk-cascade-self`, the other engine
 /// case: row 1 is its own parent, so moving its key cascades into the same
 /// row. The cascade's update joins the outer update's transition tables:
 /// the old keys are distinct (1, then 100) but the new key 100 occurs twice,
@@ -601,7 +601,7 @@ async fn sibling_events_of_one_statement_sum_once() {
     .await;
 }
 
-/// The schema-changed path (#622 C6) always re-reads and builds its
+/// The schema-changed path always re-reads and builds its
 /// statement at run time; it stages transition images too.
 #[tokio::test]
 async fn the_schema_changed_path_sums_once() {

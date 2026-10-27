@@ -1,5 +1,5 @@
 //! Integration tests for the persisted cross-table dependency graph and
-//! edge-typed resolver (issue #21), run against a real, ephemeral Postgres
+//! edge-typed resolver, run against a real, ephemeral Postgres
 //! instance via `testkit::TestCluster`.
 
 use std::collections::HashMap;
@@ -12,21 +12,20 @@ use trellis::defs::{
 };
 
 /// Creates a minimal backing relation for a definition's source table
-/// (issue #23's backfill enumerates it for real, via a live `regclass`/
+/// (the backfill enumerates it for real, via a live `regclass`/
 /// catalog lookup) — a bare PK column is enough, since `validate()` checks
 /// column references against the passed-in `source_columns` map, not the
 /// live schema.
 ///
-/// Explicitly under `public` (issue #74, ADR-0011) — not left to land
+/// Explicitly under `public` (ADR-0011) — not left to land
 /// wherever the pool's ambient `search_path` happens to put a bare `CREATE
-/// TABLE` (`trellis`, per `pool::session_bootstrap`), as before #74. Several
+/// TABLE` (`trellis`, per `pool::session_bootstrap`). Several
 /// tests below reuse the same bare name both as a real source table here and
 /// later as a chained definition's bare `TRANSFORM <name> ...` target; a
 /// target always resolves against `Config::target_schema` (`public` by
-/// default — a config-time decision, never a `search_path` walk), so this table needs to actually live there too or
-/// the two roles now resolve to two different qualified nodes instead of one
-/// — before #74's qualified `schema_nodes` keying, the bare graph couldn't
-/// tell the difference either way.
+/// default — a config-time decision, never a `search_path` walk), so this
+/// table needs to actually live there too or
+/// the two roles resolve to two different qualified nodes instead of one.
 async fn create_bare_source_table(pool: &trellis::pool::Pool, name: &str) {
     let client = pool.get().await.expect("get connection");
     client
@@ -41,9 +40,9 @@ async fn create_bare_source_table(pool: &trellis::pool::Pool, name: &str) {
 /// what a real chained definition always does before anything downstream can
 /// name it as a `FROM` source). A handful of tests below chain a second
 /// definition off of a target that was only ever registered in the catalog
-/// via `create_definition`, never backfilled with a real table — issue #23
-/// made that chained definition's own backfill actually enumerate its
-/// source, so the source now has to be a real, queryable relation in
+/// via `create_definition`, never backfilled with a real table — that
+/// chained definition's own backfill enumerates its
+/// source, so the source has to be a real, queryable relation in
 /// whichever schema `create_definition`'s `is_target` check resolves it to
 /// (`public`, same as [`create_target_table`]'s own hardcoded schema), not
 /// just a name in `schema_nodes`.
@@ -262,8 +261,8 @@ async fn persisting_the_same_edge_twice_does_not_duplicate_the_row() {
 }
 
 /// A direct table-level cycle — A -> B already exists, then B -> A is
-/// declared — is rejected at definition time (issue #22, generalized from
-/// column-only to the two-level graph), not just persisted as a second edge.
+/// declared — is rejected at definition time (checked on the two-level
+/// graph, not only on columns), not just persisted as a second edge.
 #[tokio::test]
 async fn a_direct_table_cycle_is_rejected() {
     let cluster = TestCluster::start();
@@ -440,12 +439,12 @@ async fn a_shortcut_edge_across_an_existing_path_is_not_a_cycle() {
     .expect("a -> c is a shortcut across an existing path, not a cycle");
 }
 
-/// The actual point of issue #74 (ADR-0011): `public.posts` and
+/// The actual point of ADR-0011: `public.posts` and
 /// `archive.posts` — the same bare table name, in two different schemas —
 /// must resolve to two independent `schema_nodes` rows with two
 /// independent sets of dependent edges, not collide into one node the way
 /// the bare-keyed graph did before this issue. Both sources are named via
-/// the explicit `schema.table` grammar (issue #76) so this test doesn't
+/// the explicit `schema.table` grammar so this test doesn't
 /// depend on `search_path` ordering to pick one or the other.
 #[tokio::test]
 async fn same_named_tables_in_different_schemas_are_distinct_nodes_with_independent_edges() {
@@ -479,8 +478,7 @@ async fn same_named_tables_in_different_schemas_are_distinct_nodes_with_independ
     .expect("archive.posts definition should be stored");
 
     // Distinct nodes, each correctly reporting its own qualified identity —
-    // before issue #74 both `FROM` clauses would have resolved to the same
-    // bare "posts" node.
+    // the two `FROM` clauses must not resolve to the same bare "posts" node.
     let public_node = node_for_table(&db.pool, "public.posts")
         .await
         .expect("query public.posts node")

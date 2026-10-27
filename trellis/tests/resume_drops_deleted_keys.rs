@@ -1,4 +1,4 @@
-//! Issue #330, #888: `RESUME TRANSFORM` rebuilds a frozen target with a
+//! `RESUME TRANSFORM` rebuilds a frozen target with a
 //! Re-derive build (`staging::build`), whose sweep deletes every target row
 //! no source row backs any more and tombstones its ledger entry
 //! (`staging::build::one_to_one::sweep_batch`), reporting each deletion
@@ -47,7 +47,7 @@ async fn define_only(dsn: &str) -> Trellis {
 }
 
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the staging
+    // ADR-0002: registration only records a definition; the staging
     // worker's pass starts its build.
     trellis::intake::harness::start_registered_builds(pool)
         .await
@@ -141,7 +141,7 @@ async fn resume_drops_an_aggregate_group_whose_rows_were_all_deleted_while_pause
     )
     .await
     .expect("install the aggregate");
-    // Registration only records the aggregate (#419): run its build.
+    // Registration only records the aggregate: run its build.
     drain_backfill_chunks(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;
     assert_eq!(status(&client, "order_rollup").await, "live");
@@ -262,7 +262,7 @@ async fn resume_drops_a_one_to_one_row_whose_source_row_was_deleted_while_paused
         "the rebuild picked up id 7 and dropped ids 2, 4 and 6, whose source rows were \
          deleted while the transform was paused"
     );
-    // #888: the rebuild's sweep tombstones the ledger entries of the keys it
+    // The rebuild's sweep tombstones the ledger entries of the keys it
     // deleted, so `retire::collect_tombstones` can collect them. A live entry
     // with no row behind it would leak.
     let entries: Vec<(String, bool)> = client

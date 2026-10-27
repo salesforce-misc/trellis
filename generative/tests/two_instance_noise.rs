@@ -1,7 +1,7 @@
-//! Issue #234 (epic #238, layer-3 bucket 1 remainder; design doc §8/§9):
+//! Layer-3 bucket 1 remainder (design doc §8/§9):
 //! **two Trellis instances side by side, each converging against its own
-//! oracle** — the sub-requirement #11 called out and the one shape of bug a
-//! single-instance suite structurally cannot see.
+//! oracle** — the one shape of bug a single-instance suite structurally
+//! cannot see.
 //!
 //! Everything about *why* this is an interaction test and not just two
 //! unrelated runs (both engines live for the whole run, op streams
@@ -13,8 +13,7 @@
 //!
 //! # The design decision: two schemas in one database, not two clusters
 //!
-//! Issue #234 leaves the topology open ("the same or independent clusters").
-//! This file puts both instances in the **same database of the same
+//! The topology could be the same or independent clusters. This file puts both instances in the **same database of the same
 //! cluster**, separated only by `docs/instance-identity.md`'s named-schema
 //! mechanism (`Config::schema()`/`TRELLIS_SCHEMA`, `search_path` pinning,
 //! the `trellis_instance` marker). Three reasons, in order of weight:
@@ -86,16 +85,16 @@
 //!
 //! Every `quiesce()` in a two-instance run used to cost ~10 seconds, against
 //! ~0.1s for the identical single-instance run: the replication intake Trellis
-//! ran before #622 confirmed WAL its co-tenant wrote only on a throttled
-//! keepalive. Trigger capture has no such wait. [`MAX_CHECKS_PER_RUN`] was
+//! ran before trigger capture confirmed WAL its co-tenant wrote only on a
+//! throttled keepalive. Trigger capture has no such wait. [`MAX_CHECKS_PER_RUN`] was
 //! sized for the old cost.
 //!
-//! # The shapes planned for production use (issue #879, epic #806)
+//! # The shapes planned for production use
 //!
 //! Everything above runs two instances that share a database but nothing
-//! else: each has its own source tables, in its own catalog schema. Epic #806
-//! plans three shapes with more in common than that, and each has a property
-//! and a hand-built pin below:
+//! else: each has its own source tables, in its own catalog schema. Three
+//! planned production shapes have more in common than that, and each has a
+//! property and a hand-built pin below:
 //!
 //! 1. **One source table, two instances** ([`share_source`]). The source lives
 //!    in `public`. Instance A creates and writes it and defines the first half
@@ -178,7 +177,7 @@ fn proptest_config() -> ProptestConfig {
 /// interleaved steps. Chosen when every `quiesce()` in a two-instance run
 /// cost ~10 seconds (see `generative::run::run_two_instance_convergence`'s
 /// doc comment, and for the coarser divergence localization this implies).
-/// Issue #452 removed that cost, so more checkpoints, up to one per step,
+/// That cost is gone, so more checkpoints, up to one per step,
 /// are now affordable; four still gives a failure several distinct windows
 /// to be localized to rather than one all-or-nothing check at the end.
 const MAX_CHECKS_PER_RUN: usize = 4;
@@ -216,7 +215,7 @@ async fn stand_up(db: &TestDatabase, label: InstanceLabel, tag: &str) -> Instanc
 }
 
 /// [`stand_up`] with the instance schema, the target schema and the place
-/// the instance's source tables live all chosen by the caller (issue #879).
+/// the instance's source tables live all chosen by the caller.
 async fn stand_up_in(
     db: &TestDatabase,
     label: InstanceLabel,
@@ -435,7 +434,7 @@ proptest! {
         run_one(&program_a, &program_b)?;
     }
 
-    /// Shape 1 (issue #879): two instances define transforms over the same
+    /// Shape 1: two instances define transforms over the same
     /// source tables, and each matches the oracle over them while one program
     /// churns them. The instances are separated by their schemas alone, as
     /// above, but now they capture the same tables as well.
@@ -447,7 +446,7 @@ proptest! {
         run_sharing_a_source(&program)?;
     }
 
-    /// Shape 2 (issue #879): instance B defines transforms over instance A's
+    /// Shape 2: instance B defines transforms over instance A's
     /// one-to-one targets, and matches the oracle over A's targets while A's
     /// program churns its own sources. A program with no one-to-one
     /// definition has nothing for B to read and is discarded.
@@ -461,7 +460,7 @@ proptest! {
         run_chain(&program, &chained.expect("assumed above"))?;
     }
 
-    /// Shape 3 (issue #879): two instances in two databases of one cluster,
+    /// Shape 3: two instances in two databases of one cluster,
     /// in the same catalog schema, each match their own oracle.
     #[test]
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
@@ -868,7 +867,7 @@ async fn a_dropped_transform_in_one_instance_does_not_wedge_the_instance_reading
     // batch it happened to fold (`quarantine::purge_dropped_table`). A drained
     // segment keeps its rows until it is recycled, so without the purge some
     // would still be here. This holds while B's transform over the dropped
-    // table stays `live` (#999), so the drain reads its rows rather than
+    // table stays `live`, so the drain reads its rows rather than
     // skipping them as a paused reader's.
     assert_eq!(
         b.backend
@@ -879,7 +878,7 @@ async fn a_dropped_transform_in_one_instance_does_not_wedge_the_instance_reading
         "B's ring should hold no rows naming {dropped} once it has drained"
     );
     // B's transform over it is still `live`, with nothing to say its source is
-    // gone (#999), so the operator drops it.
+    // gone, so the operator drops it.
     let lost_source = chained.defs[0].target.clone();
     b.backend
         .drop_transform(&lost_source)

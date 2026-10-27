@@ -1,4 +1,4 @@
-//! Integration tests for quarantine (issue #16, stage 06's other half):
+//! Integration tests for quarantine:
 //! isolate, evict, park, release, run against a real, ephemeral Postgres
 //! instance via the shared harness (`testkit::TestCluster`).
 //!
@@ -72,11 +72,11 @@ fn numeric_columns(names: &[&str]) -> HashMap<String, ValueType> {
 /// `create table` in this file's own fixtures actually lands, since
 /// `connect_raw` pins `search_path` to `{DEFAULT_SCHEMA}, public` and never
 /// qualifies its own DDL. Matches `apply.rs`'s own `qualify_fixture_table`
-/// (issue #74, ADR-0011): a CDC-staged `src_table`, and everything keyed off
+/// (ADR-0011): a CDC-staged `src_table`, and everything keyed off
 /// it downstream (`poison`/`poison_held`/`key_deaths`, and `schema_nodes`'s
 /// own lookups via `transforms_for_source`), must be fully qualified to
-/// match what a real CDC producer stages (issue #76) and what the
-/// dependency graph now keys on (issue #74). Already-qualified input
+/// match what a real CDC producer stages and what the
+/// dependency graph now keys on. Already-qualified input
 /// (containing a `.`) passes through unchanged.
 fn qualify_fixture_table(name: &str) -> String {
     if name.contains('.') {
@@ -174,7 +174,7 @@ async fn seed_order_totals(db: &TestDatabase, client: &Client) -> TransformDef {
 }
 
 /// The id of the definition whose bare target is `target`: whole-key poison
-/// is keyed by it (#799).
+/// is keyed by it.
 async fn transform_id(client: &Client, target: &str) -> i64 {
     client
         .query_one(
@@ -199,7 +199,7 @@ async fn insert_poison_marker(client: &Client, transform: &str, src_table: &str,
         .expect("insert poison marker");
 }
 
-/// Holds `key` for `transform` with one `poison_held` row (#803: one per
+/// Holds `key` for `transform` with one `poison_held` row (one per
 /// held key), as parked changes leave it: their earliest segment, pre-image
 /// and origin.
 async fn insert_poison_held(
@@ -253,7 +253,7 @@ async fn poison_marker_exists(client: &Client, src_table: &str, key: &str) -> bo
 }
 
 async fn drain(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
-    // Issue #132: a throwaway, always-caught-up watermark — no live
+    // A throwaway, always-caught-up watermark — no live
     // capture runs in this test file, and it isn't exercising guard (a).
     apply::drain_once(pool, seg_seq, claimed_by, 1, "trellis_quarantine_test")
         .await
@@ -405,11 +405,11 @@ async fn a_clean_drain_clears_death_counters() {
     // directly rather than re-deriving it through a whole failing batch.
     //
     // Seeded under the *qualified* spelling while the ring row below stays
-    // bare — issue #283: `key_deaths` is keyed on the canonical identity of a
+    // bare: `key_deaths` is keyed on the canonical identity of a
     // source table, so `clear_key_deaths` resolves the drained batch's raw
     // `src_table` before clearing. That makes this the sharper version of this
     // scenario: the counter is found and cleared across a spelling difference,
-    // where before the fix the two spellings were two unrelated counters and a
+    // where two spellings could otherwise be two unrelated counters and a
     // bare-staged drain could only ever clear a bare-keyed row.
     let orders = qualify_fixture_table("orders");
     client
@@ -559,10 +559,9 @@ async fn seed_order_summary(db: &TestDatabase, def: &TransformDef) {
 }
 
 /// Scenario: a halting schema diagnosis (the hop bound) must never be
-/// quarantined, regardless of how few or many keys it touches. Issue #663:
-/// it pauses the definitions the runaway wave reaches (`order_summary`,
-/// which reads the table it ran away through), records why and counts one
-/// halting stop, and the rest of the page commits without them.
+/// quarantined, regardless of how few or many keys it touches: it pauses the definitions the
+/// runaway wave reaches (`order_summary`, which reads the table it ran away through), records why
+/// and counts one halting stop, and the rest of the page commits without them.
 #[tokio::test]
 async fn a_halting_schema_error_is_never_quarantined_and_pauses_what_it_reaches() {
     let cluster = TestCluster::start();
@@ -661,7 +660,7 @@ async fn a_halting_schema_error_is_never_quarantined_and_pauses_what_it_reaches(
     );
 }
 
-/// Issue #663: a halting failure only an isolation probe meets is halted on
+/// A halting failure only an isolation probe meets is halted on
 /// like the page's own. The page fails on key 2, whose total breaks a check
 /// on `order_totals` before propagation runs, so isolation probes it. The
 /// probe of key 1 alone writes, then runs past the hop bound: that pauses
@@ -754,14 +753,12 @@ async fn a_halting_failure_an_isolation_probe_meets_pauses_what_it_reaches() {
     assert_eq!(written, 1, "key 1 applied once its reader paused");
 }
 
-/// Scenario: a composite source primary key used to be exactly as structural
-/// a rejection as the hop bound below (`DdlError::CompositePrimaryKeyUnsupported`,
-/// pre-issue-#121) — "this definition can never work against this source's
-/// real schema," not "this row's data is bad." Issue #121 lifted that
-/// rejection: a `OneToOne` transform against a composite-PK source is now
-/// accepted at create time and drains through the ring exactly like any
-/// other 1-1 definition, so this test's own scenario no longer has anything
-/// to reject — it instead pins the positive replacement: `create_definition`
+/// Scenario: a composite source primary key is not a structural rejection
+/// like the hop bound below ("this definition can never work against this
+/// source's real schema," not "this row's data is bad"): a `OneToOne`
+/// transform against a composite-PK source is accepted at create time and
+/// drains through the ring exactly like any other 1-1 definition, so there
+/// is nothing to reject. This test pins that: `create_definition`
 /// against a composite-PK source succeeds, a live CDC insert drains cleanly
 /// through the same `staging::apply` path this quarantine-focused test file
 /// exercises for every other scenario, and neither `halting_stop_stats` nor
@@ -770,8 +767,8 @@ async fn a_halting_failure_an_isolation_probe_meets_pauses_what_it_reaches() {
 /// `a_one_to_one_transform_against_a_composite_primary_key_source_is_accepted`
 /// and `one_to_one_composite_primary_key.rs`'s insert/update/delete coverage
 /// are the more direct pins of this behavior; this test's own value
-/// is narrower — confirming the old halt/quarantine path this file is about
-/// genuinely never engages for this shape any more.
+/// is narrower — confirming the halt/quarantine path this file is about
+/// never engages for this shape.
 #[tokio::test]
 async fn a_composite_primary_key_source_drains_cleanly_with_no_quarantine_or_halt() {
     let cluster = TestCluster::start();
@@ -806,7 +803,7 @@ async fn a_composite_primary_key_source_drains_cleanly_with_no_quarantine_or_hal
     let transform_text = "TRANSFORM line_totals FROM order_lines SELECT price AS total";
     create_definition(&db.pool, transform_text, &source_columns)
         .await
-        .expect("issue #121: a composite-PK source is accepted, not rejected");
+        .expect("a composite-PK source is accepted, not rejected");
     // `create_definition` is the ring-path entry point (deliberately, not
     // `install_definition`) — it never runs target-table DDL itself, so the
     // caller builds the physical target here, matching `seed_order_totals`'s
@@ -856,30 +853,21 @@ async fn a_composite_primary_key_source_drains_cleanly_with_no_quarantine_or_hal
 }
 
 /// Scenario: a single-column primary key of an unsafe, non-text-stable type
-/// (`DdlError::UnsupportedPrimaryKeyType`, issue #107) used to be exactly as
-/// structural as the composite-key case above — "this definition can never
-/// work against this source's real schema" — so it used to halt the
-/// instance rather than get isolated and evicted key by key, for the exact
-/// same reason the composite-key case did: `create_definition` never ran
-/// `ddl::source_primary_key`/`require_single_column_pk` at all, so the
-/// rejection only ever surfaced later, deep inside `staging::apply`.
-///
-/// Issue #177's fix closes this gap too, not just the composite-arity one
-/// (which issue #121 later removed the rejection for — see this test's
-/// sibling immediately above): `create_definition_inner`'s create-time key
-/// check (every key-space since issue #371, see the aggregate sibling below)
+/// (`DdlError::UnsupportedPrimaryKeyType`) is structural — "this definition
+/// can never work against this source's real schema" — so it must be
+/// rejected up front, not halt the instance or get isolated and evicted key
+/// by key. `create_definition_inner`'s create-time key
+/// check (every key-space, see the aggregate sibling below)
 /// calls `ddl::source_primary_key` itself (the same call
-/// `install_definition` already made), and that function's own type check
+/// `install_definition` makes), and that function's own type check
 /// (`is_text_stable_join_key_type`) runs unconditionally as part of fetching
 /// the primary key — there's no way to ask it for "just the columns, skip
 /// the type check" — so this scenario is still rejected up front. This test
-/// pins the *absence* of the old halt, the same shape its sibling above
-/// pins for the (now-accepted) composite-arity case.
+/// pins the *absence* of a halt, the same shape its sibling above
+/// pins for the (accepted) composite-arity case.
 ///
-/// `numeric` is the unsafe type here — `timestamptz` used to be this test's
-/// example, but issue #246 (pinning `TimeZone` on the walsender the same way
-/// `DateStyle` was already pinned on the pool) made it a text-stable primary
-/// key type, so it no longer demonstrates this rejection.
+/// `numeric` is the unsafe type here; `timestamptz` is a text-stable primary
+/// key type, so it would not demonstrate this rejection.
 #[tokio::test]
 async fn an_unsupported_primary_key_type_source_is_rejected_at_create_time_not_quarantined_or_halted()
  {
@@ -929,7 +917,7 @@ async fn an_unsupported_primary_key_type_source_is_rejected_at_create_time_not_q
     );
 }
 
-/// Issue #371: the aggregate sibling of the test above. Live apply reads
+/// The aggregate sibling of the test above. Live apply reads
 /// every source's primary key through `ddl::source_primary_key` whatever the
 /// reading definition's key-space, and `quarantine::classify` halts the
 /// instance on `UnsupportedPrimaryKeyType`. The create-time key check used to
@@ -1064,7 +1052,7 @@ async fn an_aggregate_over_an_unsupported_primary_key_type_source_is_rejected_at
 }
 
 /// Scenario: `poison_held` holds one row per `(transform_id, src_table,
-/// key)` (#803), whichever batch parked into it: a second row for a key
+/// key)`, whichever batch parked into it: a second row for a key
 /// already held, from another batch, is refused, since a park merges into the
 /// first one instead (`staging::quarantine::park_batch_contribution`).
 #[tokio::test]
@@ -1149,8 +1137,8 @@ async fn dropped_table_purge_lets_a_wedged_batch_drain() {
     );
 }
 
-/// Scenario: a key held across several batches has one merged held row
-/// (#803), and its release re-derives the key from the live source row, so
+/// Scenario: a key held across several batches has one merged held row,
+/// and its release re-derives the key from the live source row, so
 /// it reaches the oracle's final state, not any batch's parked value.
 #[tokio::test]
 async fn release_of_a_key_held_across_batches_re_derives_it_to_the_oracle() {
@@ -1515,7 +1503,7 @@ async fn zero_threshold_disables_eviction_even_past_the_default_threshold() {
 
 /// `target`'s persisted `transform_definitions.status`, matched on the bare
 /// target-table suffix the same way `quarantine::resume_transform` does
-/// (issue #73: the column itself is fully qualified).
+/// (the column itself is fully qualified).
 async fn transform_status(client: &Client, target: &str) -> String {
     client
         .query_one(
@@ -1548,7 +1536,7 @@ async fn poison_in_txn(
 }
 
 /// How many backends on this cluster are currently parked waiting for a lock
-/// — the signal the issue-#159 test below uses to observe worker B's fuse
+/// — the signal the test below uses to observe worker B's fuse
 /// check actually blocking on the fuse gate, rather than guessing with a
 /// sleep. Read from a third, uninvolved connection.
 async fn backends_waiting_on_a_lock(client: &Client) -> i64 {
@@ -1562,7 +1550,7 @@ async fn backends_waiting_on_a_lock(client: &Client) -> i64 {
         .get(0)
 }
 
-/// Regression pin for issue #159: two **concurrent** eviction transactions
+/// Regression pin: two **concurrent** eviction transactions
 /// for the same source table, neither of which crosses
 /// `DEFAULT_TRANSFORM_DEATH_THRESHOLD` on the evidence it can see alone, must
 /// still trip the whole-transform fuse once their evictions combine to cross
@@ -1688,12 +1676,12 @@ async fn concurrent_evictions_for_one_source_still_trip_the_whole_transform_fuse
         transform_status(&client, "order_totals").await,
         "quarantined",
         "a threshold's worth of poisoned keys reached by two concurrent evictions must trip the \
-         whole-transform fuse just as promptly as one worker reaching it alone (issue #159)"
+         whole-transform fuse just as promptly as one worker reaching it alone"
     );
 }
 
 // ---------------------------------------------------------------------
-// Issue #283: quarantine's counter/marker tables key on one *canonical*
+// Quarantine's counter/marker tables key on one *canonical*
 // identity per logical source table, not on the raw ring spelling.
 // ---------------------------------------------------------------------
 
@@ -1718,7 +1706,7 @@ fn unevaluable_change(src_table: &str, key: &str) -> FoldedChange {
         row_count: 1,
         has_recompute: false,
         ends_in_delete: false,
-        // #623 D6: an Apply (its image is the change), not a Re-derive.
+        // An Apply (its image is the change), not a Re-derive.
         last_change: Some(LastChange {
             lsn: PgLsn::from(1),
             row_txid: "1".to_string(),
@@ -1738,13 +1726,13 @@ async fn poison_rows_for(client: &Client, src_table: &str) -> i64 {
         .get(0)
 }
 
-/// The headline property of issue #283: a threshold's worth of evictions spread
+/// The headline property: a threshold's worth of evictions spread
 /// across **two spellings of one logical source table** charges **one** combined
 /// whole-transform fuse budget, and trips it.
 ///
 /// Every quarantine counter/marker table used to store and match whatever
 /// `src_table` spelling the ring row being diagnosed happened to carry. A source
-/// staged both bare (`orders` — pre-#267 durable ring rows, hand-staging
+/// staged both bare (`orders` — hand-staging
 /// fixtures) and qualified (`public.orders`) therefore ran two entirely
 /// independent sets of quarantine state: here, five real evictions for five
 /// distinct keys of one physical table split into a 3-row budget and a 2-row
@@ -1800,7 +1788,7 @@ async fn two_spellings_of_one_source_charge_one_combined_fuse_budget() {
         poison_rows_for(&client, bare).await,
         0,
         "no quarantine row may be written under the raw bare spelling any more — the canonical \
-         identity is the key (issue #283)"
+         identity is the key"
     );
     assert_eq!(
         poison_rows_for(&client, &qualified).await,
@@ -1812,11 +1800,11 @@ async fn two_spellings_of_one_source_charge_one_combined_fuse_budget() {
         transform_status(&client, "order_totals").await,
         "quarantined",
         "a threshold's worth of evictions for one logical source must trip the whole-transform \
-         fuse even when they arrive under two different spellings of it (issue #283)"
+         fuse even when they arrive under two different spellings of it"
     );
 }
 
-/// Issue #614: a key that reproduces the failure alone but is still below the
+/// A key that reproduces the failure alone but is still below the
 /// death threshold must come back as `ChargedBelowThreshold`, naming the key and
 /// its death count — not as the same "nothing reproduced" answer a batch with no
 /// attributable key gets. Pre-fix both returned `Ok(None)`, so
@@ -1911,7 +1899,7 @@ async fn two_spellings_of_one_row_charge_one_death_counter() {
     assert_eq!(
         key_deaths_count(&client, "orders", "1").await,
         None,
-        "nothing may be counted under the raw bare spelling (issue #283)"
+        "nothing may be counted under the raw bare spelling"
     );
     assert_eq!(
         key_deaths_count(&client, &qualified, "1").await,
@@ -1921,17 +1909,17 @@ async fn two_spellings_of_one_row_charge_one_death_counter() {
     assert!(
         poison_marker_exists(&client, &qualified, "1").await,
         "the combined counter must reach the threshold and evict the key — pre-fix the two split \
-         counters reached 2 and 1 and it never did (issue #283)"
+         counters reached 2 and 1 and it never did"
     );
 }
 
 // ---------------------------------------------------------------------
-// Issue #655: isolation bisects a failed page instead of probing it one
+// Isolation bisects a failed page instead of probing it one
 // record at a time.
 // ---------------------------------------------------------------------
 
 /// How many records the large-page isolation tests stage: big enough that
-/// probing every record alone (the pre-#655 isolation) runs for minutes, small
+/// probing every record alone (isolating by probing each record alone) runs for minutes, small
 /// enough that the bisection's two probes per level stay quick.
 const LARGE_PAGE: i32 = 4096;
 
@@ -1989,10 +1977,10 @@ async fn charged_keys(client: &Client, src_table: &str) -> Vec<(String, i32)> {
         .collect()
 }
 
-/// Issue #655: one poisoned key, the only failure in a large page, is found and
-/// charged alone, and nothing else in the page is charged. Before #655 this
-/// probed all 4,096 records one at a time (a compute plus a rollback-only apply
-/// each); bisection gets there in about two probes per halving.
+/// One poisoned key, the only failure in a large page, is found and
+/// charged alone, and nothing else in the page is charged. Probing all 4,096
+/// records one at a time would cost a compute plus a rollback-only apply
+/// each; bisection gets there in about two probes per halving.
 #[tokio::test]
 async fn isolation_bisects_a_large_page_to_its_one_poisoned_key() {
     let cluster = TestCluster::start();
@@ -2018,7 +2006,7 @@ async fn isolation_bisects_a_large_page_to_its_one_poisoned_key() {
     assert!(!segment_state_is_drained(&client, seg_seq).await);
 }
 
-/// Issue #655: two poisoned keys in one large page are both found and charged,
+/// Two poisoned keys in one large page are both found and charged,
 /// each once, and no batch-mate is.
 #[tokio::test]
 async fn isolation_bisects_a_large_page_to_both_poisoned_keys() {
@@ -2038,7 +2026,7 @@ async fn isolation_bisects_a_large_page_to_both_poisoned_keys() {
     );
 }
 
-/// Issue #655: the same, for a failure only the apply hits (a check constraint
+/// The same, for a failure only the apply hits (a check constraint
 /// on the target), so every probe of a half page computes and applies that
 /// half before rolling back.
 #[tokio::test]
@@ -2080,14 +2068,14 @@ async fn isolation_bisects_a_large_page_to_a_key_that_fails_on_apply() {
     );
 }
 
-/// Issue #655 review: a key that fails alone can be masked inside a run by a
+/// A key that fails alone can be masked inside a run by a
 /// batch-mate. Here three keys share one brand-new aggregate group under a
 /// `total <= 8` check: key 1 adds 10 (fails alone), key 2 subtracts 5 and
 /// key 3 adds 5, and key 4 is in another group. The page fails (10), but
 /// its halves `{1, 2}` (5) and `{3, 4}` (5 and 1) both pass: the failure
 /// needs records from both halves, and key 2 masks key 1 inside its half.
 /// Isolation must still pin key 1, which fails alone, as probing every
-/// record alone did before #655, or nothing is ever charged and the page
+/// record alone would, or nothing is ever charged and the page
 /// stays wedged. Evicting key 1 is what lets the page drain.
 #[tokio::test]
 async fn isolation_pins_a_key_masked_by_a_batch_mate_in_its_half() {
@@ -2193,7 +2181,7 @@ async fn isolation_pins_a_key_masked_by_a_batch_mate_in_its_half() {
 }
 
 // ---------------------------------------------------------------------
-// Issue #799: whole-key poison is per transform. One definition's key
+// Whole-key poison is per transform. One definition's key
 // failure holds the key for that definition only; every other reader of
 // the source keeps applying it.
 // ---------------------------------------------------------------------
@@ -2333,7 +2321,7 @@ async fn rows_for(client: &Client, table: &str, target: &str) -> i64 {
         .get(0)
 }
 
-/// The blast radius (#799): `order_prices`' write of key 1 fails (its target
+/// The blast radius: `order_prices`' write of key 1 fails (its target
 /// refuses the price), so isolation charges the key to `order_prices` alone
 /// and, at the death threshold, holds it there. `order_totals` keeps applying
 /// key 1, both the change that failed and a later one, while `order_prices`
@@ -2406,7 +2394,7 @@ async fn a_key_one_definition_fails_on_stays_live_in_every_other_reader() {
     assert_eq!(rows_for(&client, "poison_held", "order_totals").await, 0);
 }
 
-/// Rule 6 (#799): a wait scoped to a definition gates on its own held keys
+/// Rule 6: a wait scoped to a definition gates on its own held keys
 /// only. `order_prices` holds key 1, so a cluster-wide wait and a wait on
 /// `order_prices` don't converge, while one on `order_totals` does.
 #[tokio::test]
@@ -2440,7 +2428,7 @@ async fn a_held_key_gates_its_own_definitions_wait_and_not_a_siblings() {
     );
 }
 
-/// Resume (#799 rule 5): resuming `order_prices` deletes its own `poison`,
+/// Resume: resuming `order_prices` deletes its own `poison`,
 /// `poison_held` and `key_deaths` rows before its fresh build, and leaves the
 /// key `order_totals` holds exactly as it was.
 #[tokio::test]
@@ -2492,7 +2480,7 @@ async fn resuming_a_definition_releases_its_own_held_keys_only() {
     assert_eq!(rows_for(&client, "poison_held", "order_totals").await, 1);
 }
 
-/// Release (#799 rule 4): releasing `order_prices`' key 1, once its cause is
+/// Release: releasing `order_prices`' key 1, once its cause is
 /// gone, stages a `Recompute` that re-derives the key for `order_prices` from
 /// the live row. It reaches `order_totals` too, as an idempotent re-derive,
 /// which leaves its row as it was.
@@ -2530,7 +2518,7 @@ async fn releasing_a_key_re_derives_it_for_its_definition_and_leaves_a_sibling_u
     );
 }
 
-/// The whole-transform fuse (#799 rule 1) counts a definition's own held
+/// The whole-transform fuse counts a definition's own held
 /// keys: `order_totals` holding four keys and `order_prices` four more trips
 /// neither, though the source has eight held keys, and `order_prices`' fifth
 /// eviction trips it alone.
@@ -2582,7 +2570,7 @@ async fn a_definitions_fuse_trips_on_its_own_evictions_only() {
     );
 }
 
-/// #799 with #663: a definition that holds a key and is then paused by a
+/// A definition that holds a key and is then paused by a
 /// halt is frozen, so the drain no longer reads its poison at all. A later
 /// change to the key is neither applied nor parked for it (its resume
 /// rebuilds it), and the sibling keeps applying the key. The resume clears
@@ -2629,13 +2617,13 @@ async fn a_halted_definitions_held_key_is_neither_parked_again_nor_left_after_it
     }
 }
 
-/// Review of #799: a page parks a change for the definition its key was held
+/// A page parks a change for the definition its key was held
 /// for when the page was computed, in its apply's own transaction. A release
 /// (or a resume, rule 5) that lands in between deletes the key's `poison`
 /// and `poison_held` rows, and re-derives the key from its live row. The page
 /// must then park nothing: a held row for a key nothing holds is named by no
 /// release, and blocks every watermark token from then on. The release bumps
-/// the key's table's version fence (#759), so the page computed before it
+/// the key's table's version fence, so the page computed before it
 /// misses its fence, and the page computed again finds the key released.
 #[tokio::test]
 async fn a_page_parks_nothing_for_a_key_released_after_it_was_computed() {
@@ -2711,7 +2699,7 @@ async fn a_page_parks_nothing_for_a_key_released_after_it_was_computed() {
         .expect("nothing is left holding the band");
 }
 
-/// #759: a page reads the poisoned keys before it reads its fence, so a
+/// A page reads the poisoned keys before it reads its fence, so a
 /// release can commit between the two reads. The page then leaves the key
 /// out for the definition but holds the fence the release bumped, so it
 /// doesn't miss it. Its park must still find the key no longer held and park
@@ -2776,7 +2764,7 @@ async fn a_page_whose_fence_matches_parks_nothing_for_a_key_released_after_its_p
     );
 }
 
-/// #799: a key held in `poison_held` doesn't hold a capture gate
+/// A key held in `poison_held` doesn't hold a capture gate
 /// (`converge::table_changes_pending_through`). Its release re-derives the key
 /// from the live row rather than replaying its images, and it is held for the
 /// definitions that hold it, never for the new definition a gate waits for.
@@ -2805,7 +2793,7 @@ async fn a_held_key_does_not_hold_its_tables_capture_gate() {
 }
 
 // ---------------------------------------------------------------------
-// An eviction that commits after a release (#880)
+// An eviction that commits after a release
 // ---------------------------------------------------------------------
 
 /// The advisory lock the interleaving tests below freeze the eviction on.
@@ -2862,7 +2850,7 @@ async fn unfreeze(gate: &Client) {
         .expect("release the pause lock");
 }
 
-/// Issue #880: isolation charges a key, a `release_key` commits, then the
+/// Isolation charges a key, a `release_key` commits, then the
 /// eviction commits. The eviction re-reads the key's deaths under the
 /// definition's row lock, finds the release deleted them and poisons
 /// nothing, so the release stands and the `Recompute` it staged drains
@@ -2912,7 +2900,7 @@ async fn an_eviction_after_a_release_does_not_poison_the_key_again() {
     assert!(!poison_marker_exists(&client, &orders, "7").await);
 }
 
-/// Issue #880 rule 4: the re-check is "count at the threshold", not "row
+/// Rule 4: the re-check is "count at the threshold", not "row
 /// exists". A key charged again after its release, below the threshold, is
 /// not poisoned by the eviction that isolation's earlier charge started; and
 /// it is poisoned once it reaches the threshold again.
@@ -2976,7 +2964,7 @@ async fn a_key_that_fails_again_after_its_release_is_poisoned_at_the_threshold()
     assert!(poison_marker_exists(&client, &orders, "7").await);
 }
 
-/// Issue #880 with #799: a release of the key for one definition does not
+/// A release of the key for one definition does not
 /// stop the eviction of the same key for the other definition its failure
 /// was charged to.
 #[tokio::test]

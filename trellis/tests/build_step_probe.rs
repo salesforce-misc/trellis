@@ -3,8 +3,7 @@
 //! chunk and then listing the Re-derive builds on every idle wake. A `false`
 //! must never hide a step the old probes would have found.
 //!
-//! Every test steps the engine by hand and nothing waits for convergence
-//! (#297).
+//! Every test steps the engine by hand and nothing waits for convergence.
 
 use std::time::Duration;
 
@@ -178,7 +177,7 @@ async fn the_probe_ignores_claimed_backing_off_and_done_chunks() {
 }
 
 /// The probe gates a chunk on its definition's status with the claim's own
-/// allowlist (#1047): a frozen definition's undone, unclaimed, due chunk
+/// allowlist: a frozen definition's undone, unclaimed, due chunk
 /// hands out nothing, so it must not keep an idle worker awake; every
 /// dispatchable status does. The claim is asked too, so the probe cannot
 /// drift from it.

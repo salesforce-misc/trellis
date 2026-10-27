@@ -1,7 +1,7 @@
-//! A harness for the enum relabel tests (#1241): a database with
+//! A harness for the enum relabel tests: a database with
 //! `public.tone` (`'brisk'`, `'calm'`), definitions brought live, and each
 //! step of the staging worker driven by hand: a capture pass, build chunks,
-//! seal and drain. Nothing polls for convergence (#297).
+//! seal and drain. Nothing polls for convergence.
 
 #![allow(dead_code)]
 

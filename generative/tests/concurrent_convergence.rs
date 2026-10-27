@@ -21,7 +21,7 @@
 //! knob below). Its programs never come near the engine's split threshold.
 //!
 //! [`property_hot_keys_converge_under_concurrent_drains`] is the hot-key
-//! tier (issue #557, part 1). It draws `generate::hot_key_case`: a hot table
+//! tier. It draws `generate::hot_key_case`: a hot table
 //! of 8 to 24 rows taking 1,000 to 2,400 writes, always read by a `GROUP BY`
 //! definition, with rows moving between groups (`Mutate::MoveGroup`) over a
 //! group window that slides up through the run, so groups nobody has used
@@ -48,7 +48,7 @@
 //! engine the chance.
 //!
 //! [`property_mid_burst_rereads_converge_under_concurrent_drains`] is the
-//! mid-burst tier (issue #557, part 2). It draws `generate::mid_burst_case`:
+//! mid-burst tier. It draws `generate::mid_burst_case`:
 //! a hot-key case whose bursts also stage re-reads while CDC for the same
 //! keys is in flight, instead of only at quiescent points. The harness takes
 //! each action from its own task while the lanes run, once a drawn share of
@@ -59,7 +59,7 @@
 //!   one column of a 1-1 definition (the column resume is the same call that
 //!   recovers a column after its poison fuse trips);
 //! - installing a `GROUP BY` definition over the hot table mid-burst, so its
-//!   build overlaps CDC on its source (#625's build-under-load shape);
+//!   build overlaps CDC on its source (a build under load);
 //! - a `TRUNCATE` of the case's second table while the hot table churns.
 //!
 //! The actions are named after the public API an operator calls, not the
@@ -68,7 +68,7 @@
 //! (`concurrent_actions`).
 //!
 //! [`property_cooling_keys_converge_under_concurrent_drains`] is the
-//! cooling-key tier (issue #557 part 3b). It draws
+//! cooling-key tier. It draws
 //! `generate::cooling_key_case`: a hot-key case plus a cooling table of 150
 //! to 400 keys read by a 1-1 definition. Each cooling key is inserted and
 //! written one to three more times close together, then never again, with
@@ -77,11 +77,11 @@
 //! drain workers and seals every 5 to 20ms, several times per burst, so a
 //! key's writes seal into different batches that drain side by side. It is
 //! the shape where a 1-1 write applied out of order survives to the end of
-//! the burst, because no later change to the key heals it (#344), which
+//! the burst, because no later change to the key heals it, which
 //! the hot-key tier's keys, busy until the burst ends, almost never offer.
 //! The coverage report counts it as `cooling_key`.
 //!
-//! The steady-load tier (#720, #725) draws `generate::steady_load_case`: a
+//! The steady-load tier draws `generate::steady_load_case`: a
 //! mid-burst case run under a steady load
 //! (`model::SteadyLoad`). Once an action starts a build, each lane waits a
 //! drawn 0.5 to 2ms after every op for the rest of the burst, so its writes
@@ -97,7 +97,7 @@
 //! whose page hasn't taken its entry lock yet, so that a tombstone the older
 //! change needs can be collected (`early_tombstone_gc`).
 //!
-//! The cooling-backfill tier (#734) draws `generate::cooling_backfill_case`: a
+//! The cooling-backfill tier draws `generate::cooling_backfill_case`: a
 //! cooling-key case whose cooling table a `GROUP BY` definition reads rather
 //! than a 1-1 one, with a `request_backfill` of that table in every burst
 //! after the first, at 25 to 65% of its ops, among the cooling keys' last
@@ -114,10 +114,9 @@
 //!
 //! # Planted ordering bugs
 //!
-//! [`planted_bugs_are_caught`] is the tier's check on itself (issue #557
-//! part 3). The engine carries a few known ordering bugs behind test-only
-//! hooks (`trellis::dev::plant::Plant`, `trellis/src/plant.rs`). None is
-//! compiled into a production build, and none is armed unless the process
+//! [`planted_bugs_are_caught`] is the tier's check on itself. The engine carries a few known
+//! ordering bugs behind test-only hooks (`trellis::dev::plant::Plant`, `trellis/src/plant.rs`).
+//! None is compiled into a production build, and none is armed unless the process
 //! starts with `TRELLIS_TEST_PLANT=<name>`. The sweep runs the same seeded
 //! cases unplanted and then once per plant, each in its own process, and
 //! reports each plant's catch rate and each seed's cases-to-first-catch.
@@ -135,7 +134,7 @@
 //! # A disk-backed cluster
 //!
 //! This binary's shared cluster normally lives in the system temp dir, a
-//! tmpfs on the nightly box, where fsync and WAL writes cost nothing. #625's
+//! tmpfs on the nightly box, where fsync and WAL writes cost nothing. A
 //! build-under-load divergence reproduced 5 times in 6 on disk and never on
 //! tmpfs, so commit timing matters. Set `GENERATIVE_CLUSTER_DIR` to a
 //! directory on a real disk to put the cluster there (the run refuses a
@@ -150,10 +149,10 @@
 //!
 //! On disk both concurrent-tier properties find a `GROUP BY` divergence
 //! within a few cases, where the tmpfs cluster converges. It needs neither
-//! the mid-burst actions nor concurrency. It is #494's shape (a key passing
-//! through a group inside one folded batch), which disk commit timing makes
-//! common. The old aggregate path diverged on it; [`group_moves_converge_on_disk`]
-//! is its regression pin.
+//! the mid-burst actions nor concurrency. It is the shape of a key passing
+//! through a group inside one folded batch, which disk commit timing makes
+//! common. The old aggregate path diverged on it;
+//! [`group_moves_converge_on_disk`] is its regression pin.
 //!
 //! # Pinned cases
 //!
@@ -161,8 +160,7 @@
 //! proptest seed: a seed replays into a different program as soon as the
 //! strategy changes shape. [`hot_key_case_3_11_converges`] is the first, the
 //! hot-key case that fails on tmpfs with no plant armed. Its ops and plan
-//! live in `tests/pins/hot_key_3_11.ops`. It was #623's exit check, and it
-//! stays a regression pin.
+//! live in `tests/pins/hot_key_3_11.ops`. It stays a regression pin.
 //!
 //! # The burst-batching knob
 //!
@@ -275,14 +273,14 @@ struct Harness {
     runtime: tokio::runtime::Runtime,
     cluster: TestCluster,
     coverage: std::cell::RefCell<generative::run::Coverage>,
-    /// The hot-key property's own report (issue #557), kept apart from
+    /// The hot-key property's own report, kept apart from
     /// `coverage` so each property's numbers read on their own.
     hot_key_coverage: std::cell::RefCell<generative::run::Coverage>,
-    /// The mid-burst property's own report (issue #557 part 2).
+    /// The mid-burst property's own report.
     mid_burst_coverage: std::cell::RefCell<generative::run::Coverage>,
-    /// The cooling-key property's own report (issue #557 part 3b).
+    /// The cooling-key property's own report.
     cooling_coverage: std::cell::RefCell<generative::run::Coverage>,
-    /// A planted-bug sweep's report (issue #557 part 3), printed by each
+    /// A planted-bug sweep's report, printed by each
     /// sweep process for the cases it ran.
     plant_coverage: std::cell::RefCell<generative::run::Coverage>,
 }
@@ -450,7 +448,7 @@ fn run_one(program: &generative::model::Program, burst_size: usize) -> Result<()
 /// Why a concurrent-tier case failed.
 #[derive(Debug)]
 struct CaseFailure {
-    /// Every target that diverged from the oracle (#671: all of them, not
+    /// Every target that diverged from the oracle (all of them, not
     /// just the first, so the sweep can attribute a failure to a plant even
     /// when an unplanted divergence shows up in the same check). Empty when
     /// the case failed by erroring rather than by diverging.
@@ -472,7 +470,7 @@ impl From<CaseFailure> for TestCaseError {
     }
 }
 
-/// Runs one concurrent-tier case (issue #557) against a fresh isolated
+/// Runs one concurrent-tier case against a fresh isolated
 /// database: the case's own worker count and seal cadence, its plan's lanes
 /// issued from separate tasks, its mid-burst actions taken while they run.
 /// Records the case's shapes and the engine's drain audit into `coverage`.
@@ -584,7 +582,7 @@ proptest! {
         run_one(&program, burst_size)?;
     }
 
-    /// Issue #557: the hot-key tier. See the module doc comment's
+    /// The hot-key tier. See the module doc comment's
     /// "The hot-key tier" section.
     #[test]
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
@@ -592,14 +590,14 @@ proptest! {
         run_concurrent_case(&case, |h| &h.hot_key_coverage)?;
     }
 
-    /// Issue #557 part 2: the mid-burst tier. See the module doc comment.
+    /// The mid-burst tier. See the module doc comment.
     #[test]
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_mid_burst_rereads_converge_under_concurrent_drains(case in mid_burst_case()) {
         run_concurrent_case(&case, |h| &h.mid_burst_coverage)?;
     }
 
-    /// Issue #557 part 3b: the cooling-key tier. See the module doc
+    /// The cooling-key tier. See the module doc
     /// comment.
     #[test]
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
@@ -673,7 +671,7 @@ async fn a_hand_built_program_converges_under_the_concurrent_backend() {
 /// harness does. If 1,000 sequential raw-DML round trips straddled a tick,
 /// the rows would split across two (or more) smaller sealed batches, each
 /// possibly below the split threshold. So the engine runs with
-/// [`SEAL_ON_DEMAND_INTERVAL`] (no tick after its first, issue #453), and the
+/// [`SEAL_ON_DEMAND_INTERVAL`], and the
 /// pin brackets the inserts between two forced seals of its own. The two
 /// sealed segments must be consecutive: no other seal (the first tick's, say)
 /// landed between them, so every insert, committed after the first and
@@ -699,7 +697,7 @@ async fn a_batch_that_exceeds_the_split_threshold_converges_across_workers() {
             .await
             .expect("connect concurrent backend that seals only on demand");
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
-    // Issue #557: the drain audit the hot-key tier reports through, checked
+    // The drain audit the hot-key tier reports through, checked
     // here against a batch whose split is deterministic.
     backend
         .start_drain_audit()
@@ -836,7 +834,7 @@ async fn a_restart_and_a_scale_out_interleaved_still_converge_under_the_concurre
     assert!(outcome.as_pass(), "run did not pass: {outcome}");
 }
 
-/// Issue #557 part 2: every kind of mid-burst action goes through the
+/// Every kind of mid-burst action goes through the
 /// concurrent runner and the backend's public-API calls while its burst's
 /// lanes still write the source, and the burst still converges. The
 /// property draws these actions; this pin is what exercises them in the
@@ -937,7 +935,7 @@ async fn every_mid_burst_action_runs_while_its_burst_writes_the_source() {
     .await
     .expect("connect concurrent backend");
     // `request_backfill` has to find the table among the ones this backend
-    // captures (#641).
+    // captures.
     let pool = Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
     let run = run_convergence_concurrent(&mut backend, &pool, &program, &plan)
         .await
@@ -989,7 +987,7 @@ fn group_moves() -> generative::model::Program {
     )
 }
 
-/// Found by #557 part 2's disk-backed cluster: on a real disk, plain group
+/// Found by the disk-backed cluster: on a real disk, plain group
 /// moves leave a `GROUP BY` target wrong for good. A group every row has
 /// left keeps its target row, or a group's `COUNT(*)` is one to three too
 /// high. It needs no concurrency: one lane issues every op in program order
@@ -998,8 +996,9 @@ fn group_moves() -> generative::model::Program {
 /// `live` before the first op), but it does need group moves: inserts and
 /// deletes alone converge. On the tmpfs test cluster the same run converges.
 ///
-/// It is #494's shape, and this is its regression pin. On the old aggregate
-/// path (before #623 D5) a batch's forced re-derive
+/// It is the shape of a key passing through a group inside one folded batch,
+/// and this is its regression pin. On the old aggregate
+/// path a batch's forced re-derive
 /// read the source live, so it counted a key that a later, still-undrained
 /// commit moved into group `z`, and stamped the group's recompute horizon
 /// above that commit. The key then left `z` above the horizon, and both
@@ -1086,7 +1085,7 @@ async fn group_moves_converge_on_disk() {
 }
 
 // ---------------------------------------------------------------------
-// Pinned hot-key case 3:11: a regression pin, and a re-check for #624.
+// Pinned hot-key case 3:11: a regression pin.
 // ---------------------------------------------------------------------
 
 /// How many attempts [`hot_key_case_3_11_converges`] makes. Unset, it
@@ -1226,13 +1225,13 @@ fn pin_ops_rejects_malformed_lines() {
     }
 }
 
-/// Hot-key case 3:11, the one case #557 part 3a's planted-bug sweep saw
+/// Hot-key case 3:11, the one case the planted-bug sweep saw
 /// fail on tmpfs with no plant armed (`GENERATIVE_PLANT_ONLY=3:11`), cut down
 /// by hand and written out op for op in `tests/pins/hot_key_3_11.ops`, so no
 /// generator change can move it.
 ///
 /// `t2`, `t3` and `t4` all group `t0` by `c6`, on the group basis, which
-/// admits only `COUNT`/`SUM`/`AVG` (#1100): each drawn `MIN(x)` is now
+/// admits only `COUNT`/`SUM`/`AVG`: each drawn `MIN(x)` is now
 /// `COUNT(x)`, each `MAX(x)` `SUM(x)`, and each `BOOL_AND(c4)`/`BOOL_OR(c4)`
 /// `COUNT(c4)`. `t2` has two SUMs, `COUNT(*)`, AVG and two COUNTs, `t3`
 /// AVG, `COUNT(c1)` and `SUM(c2)`, `t4` two SUMs, AVG and two COUNTs. The ops
@@ -1325,11 +1324,9 @@ fn hot_key_case_3_11_loads() {
 /// (`t2[1:0].sum_c2: expected=68`, with `got` anywhere from 4 to 148), or
 /// the run never converges
 /// (`ConvergenceTimeout`). The input is identical every time; only the drain
-/// workers' timing differs. It was the exit check of #556's milestone D
-/// (#623) and is a regression pin since; milestone E (#624) re-runs it as
-/// its own check. Either check needs the same box to show it failing on the
-/// unfixed engine first: a pass means little unless the unfixed engine
-/// fails the same run.
+/// workers' timing differs. It is a regression pin. The check needs the
+/// same box to show it failing on an unfixed engine first: a pass means
+/// little unless the unfixed engine fails the same run.
 ///
 /// What the failure needs, from cutting the drawn case down on tmpfs with
 /// four processes at once, 160 to 200 runs per row:
@@ -1348,13 +1345,7 @@ fn hot_key_case_3_11_loads() {
 /// over the hot table, or at least the apply load a second one adds: the
 /// table can't tell those apart. It doesn't need the fields that read `t1`
 /// (it still diverges without them) or the `t1` updates (without them it
-/// fails more often, not less). Both
-/// remaining suspects are #623's scope. Group moves under `MIN`/`MAX`
-/// recomputes are #494's shape: a key passing through a group inside one
-/// folded batch, under a recompute horizon. And #649's review saw up to 22
-/// `deadlock detected` per run between the three definitions' aggregate
-/// pre-locks (#326's group pre-lock). #623 D5 removed both the horizons and
-/// the pre-lock.
+/// fails more often, not less).
 ///
 /// Runs the case `GENERATIVE_PIN_ATTEMPTS` times, each on a fresh database
 /// with 8 drain workers and a 112ms seal, and fails if any attempt diverged
@@ -1432,15 +1423,15 @@ async fn hot_key_case_3_11_converges() {
 }
 
 // ---------------------------------------------------------------------
-// Issue #557 part 3: planted ordering bugs.
+// Planted ordering bugs.
 // ---------------------------------------------------------------------
 
-/// Why the hot-key-based tiers miss `stale_one_to_one_write` (#344): the
+/// Why the hot-key-based tiers miss `stale_one_to_one_write`: the
 /// plant fires in a third to a half of their cases, but a stale 1-1 value
 /// only survives when the batch holding a key's *last* change commits before
 /// an older batch for that key. Their hot keys keep changing until the burst
 /// ends, so a later batch nearly always rewrites the key. It was caught once
-/// in about 390 cases (#557 part 3a's PR). The cooling-key tier is the shape
+/// in about 390 cases. The cooling-key tier is the shape
 /// that catches it.
 const STALE_ONE_TO_ONE_MISS: &str = "stale_one_to_one_write";
 
@@ -1457,7 +1448,7 @@ const MID_BURST_NOT_GATED: &[(&str, &str)] = &[];
 
 /// The cooling-backfill tier's programs are the hot table and the cooling
 /// table, each read by a `GROUP BY` definition, and install or resume
-/// nothing mid-burst (#734). It gates the plants a `request_backfill` under
+/// nothing mid-burst. It gates the plants a `request_backfill` under
 /// load reaches, and not the 1-1 or build plants.
 const COOLING_BACKFILL_NOT_GATED: &[(&str, &str)] = &[(
     "stale_one_to_one_write",
@@ -1491,7 +1482,7 @@ const ONE_TO_ONE_PINNED: &[(&str, &str)] = &[
 const NO_JOIN: &str = "the concurrent tier draws no `JOIN`; the JOIN tier \
                        (join_convergence.rs, join_planted_bugs_are_caught) gates it";
 
-/// Measured catch rates of the group-basis plants (#1114, 4 seeds x 12
+/// Measured catch rates of the group-basis plants (4 seeds x 12
 /// cases per tier, logbook `20261024T051124-a-sweep`): `gb_skip_group_lock`
 /// 24 to 44 of 48 in every tier; `gb_fold_sides_per_key` 48 of 48 in the
 /// steady-load, mid-burst and cooling-backfill tiers; `gb_lsn_not_visibility`
@@ -1528,7 +1519,7 @@ const NO_ABSOLUTE_WRITE_UNDER_LOAD: &[(&str, &str)] = &[
     ),
 ];
 
-/// Why no tier catches `gb_early_zero_gc` yet (#1114): it needs the GC pass
+/// Why no tier catches `gb_early_zero_gc` yet: it needs the GC pass
 /// to meet a zero group whose stamp is past the drained prefix (an absolute
 /// write's zero group with a change it saw still undrained) and then a page
 /// of that change to land on the fresh row; the plant changed the GC's
@@ -1593,8 +1584,7 @@ fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'st
 /// The tier a sweep draws from, by [`PLANT_TIER_ENV`].
 ///
 /// Every tier's baseline is held to the same bar: no failure outside
-/// `generative/baseline-quarantine.txt` (`generative::baseline_quarantine`,
-/// #786).
+/// `generative/baseline-quarantine.txt` (`generative::baseline_quarantine`).
 fn sweep_tier() -> (SweepTier, BoxedStrategy<ConcurrentCase>) {
     let name = std::env::var(PLANT_TIER_ENV);
     sweep_tier_named(name.as_deref().unwrap_or("cooling_key")).unwrap_or_else(|| {
@@ -1702,7 +1692,7 @@ fn every_tier_lists_real_plants() {
     }
 }
 
-/// Issue #557 part 3: shows the concurrent tier catches each planted ordering
+/// Shows the concurrent tier catches each planted ordering
 /// bug (`trellis::dev::plant::Plant`), and how often.
 ///
 /// Draws the same seeded cases ([`plant_sweep::PLANT_SEEDS_ENV`] seeds of

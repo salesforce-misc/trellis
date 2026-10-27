@@ -1,4 +1,4 @@
-//! Integration tests for the first-class schema-node model (issue #20), run
+//! Integration tests for the first-class schema-node model, run
 //! against a real, ephemeral Postgres instance via `testkit::TestCluster`.
 
 use std::collections::HashMap;
@@ -7,12 +7,12 @@ use testkit::TestCluster;
 use trellis::defs::{NodeKind, ValueType, create_definition, node_for_table, resolve_node};
 
 /// Creates a minimal backing relation for a definition's source table
-/// (issue #23's backfill enumerates it for real, via a live `regclass`/
+/// (the backfill enumerates it for real, via a live `regclass`/
 /// catalog lookup) — a bare PK column is enough, since `validate()` checks
 /// column references against the passed-in `source_columns` map, not the
 /// live schema.
 ///
-/// Explicitly under `public` (issue #74, ADR-0011), not wherever a bare
+/// Explicitly under `public` (ADR-0011), not wherever a bare
 /// `CREATE TABLE` would land via the pool's ambient `search_path` —
 /// `a_definitions_target_matching_an_existing_source_node_merges_roles`
 /// below reuses "orders" both as a real source table here and as a later

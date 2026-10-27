@@ -1,4 +1,4 @@
-//! Issue #476: `live` means steady state (ADR-0002, "What `live` promises").
+//! `live` means steady state (ADR-0002, "What `live` promises").
 //!
 //! Once a definition reports `live`, a watermark token taken after a commit
 //! and awaited with `Trellis::await_converged` guarantees the target reflects
@@ -135,7 +135,7 @@ async fn seed_sales(raw: &Client) {
     .expect("create and seed sales");
 }
 
-/// #625 F8a, the Re-derive build of a plain 1-1 target: there is no
+/// The Re-derive build of a plain 1-1 target: there is no
 /// `catching_up`. The definition applies from its start, so a row inserted
 /// while the build's chunk is held before its write is applied while it is
 /// still `backfilling`; once the chunk commits it goes straight to `live`,

@@ -1,4 +1,4 @@
-//! The type matrix (ADR-0020, #1289): every type with a modifier, under every
+//! The type matrix: every type with a modifier, under every
 //! kind of change to its source column, in every place Trellis keeps a copy
 //! of it, ends exact, or paused with a reason and exact after `RESUME`.
 //!
@@ -9,18 +9,18 @@
 //! reaches every copy exactly: Postgres rounds silently on plain assignment
 //! into `numeric(p,s)`, `timestamp(p)`, `timestamptz(p)`, `time(p)`,
 //! `timetz(p)` and `interval` columns, so only an unmodified column protects
-//! one (#1288, from the research of #1224).
+//! one.
 //!
 //! **Axes.**
 //! - The type ([`TYPES`]): `varchar`, `bpchar`, `bit`, `varbit`, `numeric`,
 //!   `time`, `timetz`, `timestamp`, `timestamptz`, `interval` and an array
 //!   (refused in every place), `char(n)` moved to `text`, and an enum, whose
-//!   value identity is its labels, relabelled or re-typed to another enum
-//!   (#1327), which pauses every reader in every place.
+//!   value identity is its labels, relabelled or re-typed to another enum,
+//!   which pauses every reader in every place.
 //! - The change ([`Change`]): a catalog-only widening, a widening or `USING`
 //!   rewrite that re-renders the stored values, a narrowing, and an enum
 //!   relabel (`RENAME VALUE`), which pauses every reader of the type in every
-//!   place (#1241).
+//!   place.
 //! - The place ([`Place`]): a 1-1 primary key and passthrough, a group-basis
 //!   `GROUP BY` key, a `JOIN`'s `ON` columns and its `GROUP BY` key. The two
 //!   `JOIN` places keep their columns in the hidden tables `P`, `M`, `J` and
@@ -39,9 +39,9 @@
 //! converged: nothing may be left diverged, and a pause must carry a reason,
 //! after which `RESUME` rebuilds exactly. A passthrough never fails a write
 //! or pauses. Every step is an explicit pass or drain; nothing polls for
-//! convergence (#297).
+//! convergence.
 //!
-//! **Not in the matrix** (each is a later step of #1289, or has its own test):
+//! **Not in the matrix** (each is a later step of ADR-0020's type-identity work, or has its own test):
 //! - a Trellis copy against a source column in a `JOIN`'s `ON` has its own
 //!   tests: [`a_trellis_copy_pairs_with_a_source_column_of_any_modifier`] at
 //!   define, [`a_trellis_copy_joins_a_modified_source_column_end_to_end`] as
@@ -78,7 +78,7 @@ enum Change {
     Narrow,
     /// An enum value relabelled (`ALTER TYPE ... RENAME VALUE`): no column
     /// changes, but the label text Trellis stored names a value that no
-    /// longer exists (#1241). It pauses every reader of the type, and
+    /// longer exists. It pauses every reader of the type, and
     /// `RESUME` rebuilds.
     Relabel,
 }
@@ -191,7 +191,7 @@ const TYPES: &[Ty] = &[
         ),
         relabel: None,
     },
-    // Not a modifier change: `char(n)` to `text` is #1238's other shape.
+    // Not a modifier change: `char(n)` to `text` is a different shape.
     Ty {
         label: "bpchar to text",
         value_type: ValueType::Text,
@@ -336,7 +336,7 @@ const TYPES: &[Ty] = &[
         narrow: None,
         relabel: None,
     },
-    // No modifier: its value identity is its labels (ADR-0020, #1241).
+    // No modifier: its value identity is its labels.
     Ty {
         label: "enum",
         value_type: ValueType::Other(PgType::Enum("enum:public.tone")),
@@ -352,7 +352,7 @@ const TYPES: &[Ty] = &[
             "calm",
         ),
     },
-    // A re-type from one enum to another (#1327): a value-identity change
+    // A re-type from one enum to another: a value-identity change
     // like a relabel. The new type shares no label with the old one, so no
     // stored label casts to it; the source's own `USING` maps the values.
     Ty {
@@ -490,7 +490,7 @@ async fn diverged(d: &Driver, target_sql: &str, source_sql: &str) -> Vec<String>
 /// Seals and drains eight times, tolerating a drain that fails because a
 /// copy refuses a value: each failure charges the key a death, so the page
 /// commits once the key is held. A fixed number of rounds with no sleep and
-/// no exit on a condition, so it is not a wait for convergence (#297).
+/// no exit on a condition, so it is not a wait for convergence.
 /// Returns how many attempts failed.
 async fn settle_tolerant(d: &mut Driver) -> usize {
     let mut failures = 0;
@@ -729,8 +729,7 @@ async fn run(place: Place, ty: &Ty, change: Change, row: &Row) -> Outcome {
     write(&d, &scn.seed_sql).await;
     d.settle().await;
     // The seed is a captured write before any change: the apply's cast of
-    // it to the copy's type must keep it whole (a bare `bit` is `bit(1)`,
-    // #1262).
+    // it to the copy's type must keep it whole (a bare `bit` is `bit(1)`).
     assert_eq!(
         diverged(&d, &scn.target_sql, &scn.oracle_sql).await,
         Vec::<String>::new(),
@@ -874,7 +873,7 @@ async fn cell(place: Place, ty: &Ty, change: Change) {
         );
     }
     // A passthrough copy has no modifier, so no change of one fails a write
-    // or pauses it: a rewrite rebuilds it on its own (#1238, #1261).
+    // or pauses it: a rewrite rebuilds it on its own.
     if place == Place::Passthrough && change != Change::Relabel && !enum_to_enum {
         assert_eq!(
             (outcome.drain_failures, outcome.pauses.as_slice()),
@@ -883,7 +882,7 @@ async fn cell(place: Place, ty: &Ty, change: Change) {
         );
     }
     // A relabel pauses every reader of the type with its reason, whatever
-    // the place (ADR-0020, #1241).
+    // the place.
     if change == Change::Relabel {
         assert!(
             outcome
@@ -897,7 +896,7 @@ async fn cell(place: Place, ty: &Ty, change: Change) {
     // A re-type to another enum changes every value's identity: no stored
     // label is one of the new type's, so it pauses every reader of the
     // column, whatever the place, and `RESUME` rebuilds without casting
-    // one (ADR-0020, #1327).
+    // one.
     if enum_to_enum {
         assert!(
             !outcome.pauses.is_empty(),

@@ -1,16 +1,16 @@
-//! Drain holdups (#817): a page the drain keeps failing on while charging no
+//! Drain holdups: a page the drain keeps failing on while charging no
 //! key and pausing no definition is recorded in `drain_holdups`, reported by
 //! `status` on every unfrozen definition reading a table on the page and by
 //! `self_check` for the instance, and cleared by the transaction that
 //! commits the page. A page that fails at COMMIT, on a deferred constraint an
-//! application put on a target (#856), is classified like any other: retried,
+//! application put on a target, is classified like any other: retried,
 //! charged to its key, or held up.
 //!
 //! Trellis runs as a non-superuser login role, `holdup_trellis`, owning the
 //! application's tables, and the drain as a second one, `holdup_worker`,
 //! granted what it uses, so a column grant on a target can be taken away
 //! from the drain alone.
-//! Nothing polls for convergence (#297): every seal, capture pass and drain
+//! Nothing polls for convergence: every seal, capture pass and drain
 //! is stepped by hand, one drain call at a time.
 
 use std::time::{Duration, Instant, SystemTime};
@@ -472,7 +472,7 @@ async fn status_reports_a_holdup_on_each_unfrozen_reader_of_its_tables() {
 }
 
 /// A `JOIN` definition reads its joined table too, so a page holding only
-/// that table is a holdup `status` reports on it (#1363).
+/// that table is a holdup `status` reports on it.
 #[tokio::test]
 async fn status_reports_a_holdup_on_a_page_holding_only_a_joined_table() {
     let cluster = TestCluster::start();
@@ -597,8 +597,8 @@ async fn copied_amount(admin: &Client, id: i32) -> i32 {
         .get(0)
 }
 
-/// A deferred constraint an application put on a target fails at COMMIT
-/// (#856). A deferrable foreign key from `c_copy.amount` to `q.id`, and a
+/// A deferred constraint an application put on a target fails at COMMIT.
+/// A deferrable foreign key from `c_copy.amount` to `q.id`, and a
 /// page with two keys of `c`: key 3 names no `q`, key 4 names one. The
 /// drain classifies the COMMIT's failure like any other, and isolation, whose
 /// probes check deferred constraints before rolling back, charges key 3 alone
@@ -649,7 +649,7 @@ async fn a_deferred_constraint_failing_at_commit_is_charged_to_its_key() {
     it.trellis.shutdown().await.expect("shutdown");
 }
 
-/// Records failing only together at COMMIT (#856): two keys of `c` set to one
+/// Records failing only together at COMMIT: two keys of `c` set to one
 /// amount, which a deferrable unique constraint on `c_copy` refuses when the
 /// page commits. Each key passes alone, deferred check included, so
 /// isolation charges nothing and the drain records a holdup.
@@ -684,7 +684,7 @@ async fn records_failing_only_together_at_commit_are_a_holdup() {
     it.trellis.shutdown().await.expect("shutdown");
 }
 
-/// A transient failure at COMMIT is retried (#856): a deferred constraint
+/// A transient failure at COMMIT is retried: a deferred constraint
 /// trigger on `c_copy` raises a serialization failure the first time it
 /// fires, counted by a sequence, which a rollback doesn't take back. One
 /// drain call retries the page, and it commits.

@@ -1,6 +1,6 @@
 //! A key column re-typed after define, or a column Trellis keeps a typed
 //! copy of widened, pauses the definitions it concerns, and a resume
-//! re-validates and rebuilds them (issues #760, #767, #708).
+//! re-validates and rebuilds them.
 //!
 //! Define refuses a key, join or `GROUP BY` column whose type or collation
 //! Trellis can't match by. An `ALTER COLUMN ... TYPE` or `COLLATE` after
@@ -12,7 +12,7 @@
 //! copies (through the staging worker) and rebuilds.
 //!
 //! Every test is stepped by hand: writes, then explicit capture passes,
-//! drains and backfill runs. Nothing polls for convergence (#297).
+//! drains and backfill runs. Nothing polls for convergence.
 
 use std::time::{Duration, Instant};
 
@@ -357,8 +357,8 @@ async fn changes_no_key_copy_or_pairing_depends_on_pause_nothing() {
     .expect("writes");
     full_pass(&mut raw, &db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
-    // `per_price` keeps the rendering each group was first written with
-    // (#110), so its groups are compared as numbers.
+    // `per_price` keeps the rendering each group was first written with,
+    // so its groups are compared as numbers.
     for (target, column) in [
         ("per_kind", "kind"),
         ("per_at", "at"),
@@ -393,7 +393,7 @@ async fn changes_no_key_copy_or_pairing_depends_on_pause_nothing() {
 
 /// `public.items`, keyed by an `integer`, with a 1-1 definition whose
 /// target copies the key and passes `name` (`varchar(10)`, an unbounded
-/// `varchar` on the target, #1207) and `amount` (`numeric(5,2)`) through,
+/// `varchar` on the target) and `amount` (`numeric(5,2)`) through,
 /// live.
 async fn items(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
     raw.batch_execute(
@@ -487,13 +487,13 @@ async fn widening_a_one_to_one_key_pauses_and_resume_widens_the_target_key() {
     assert_eq!(status(&raw, "item_names").await, TransformStatus::Live);
 }
 
-/// A passthrough of a `varchar` is an unbounded `varchar` (#1207): the
+/// A passthrough of a `varchar` is an unbounded `varchar`: the
 /// source column's widening changes nothing there, so only the key's
 /// `integer` to `bigint`, which rewrites, outgrows a copy. The pass pauses
 /// the definition, naming the key alone, and a resume re-types it and
 /// rebuilds, so a longer value lands. A narrowing of the passthrough pauses
 /// nothing and re-types nothing: every value still fits. It rebuilds the
-/// definition (#703 R1): the narrowing may have dropped trailing spaces.
+/// definition: the narrowing may have dropped trailing spaces.
 #[tokio::test]
 async fn a_table_that_also_needs_a_rewrite_pauses_and_resume_re_types_all_of_it() {
     let cluster = TestCluster::start();
@@ -866,11 +866,11 @@ async fn a_type_change_that_re_renders_the_keys_pauses_and_resume_rebuilds_it() 
     );
 }
 /// A nondeterministic collation given to a `GROUP BY` column after define,
-/// which define refuses (#638), pauses the aggregate. The `JOIN`, which
+/// which define refuses, pauses the aggregate. The `JOIN`, which
 /// doesn't key by the column, keeps applying.
 ///
 /// Only ICU provides nondeterministic collations; every test cluster's
-/// default collation is ICU (#665).
+/// default collation is ICU.
 #[tokio::test]
 async fn a_nondeterministic_collation_on_a_group_by_column_pauses_its_reader() {
     let cluster = TestCluster::start();
@@ -998,7 +998,7 @@ async fn a_wider_numeric_scale_on_a_group_by_key_keeps_its_groups_and_a_narrower
     groups_match(&raw).await;
 }
 
-/// #708: a resume re-runs define-time validation against the live schema,
+/// A resume re-runs define-time validation against the live schema,
 /// whatever paused the definition. Paused by its operator, then a column
 /// one of its fields sums made `text`, the definition is one define would
 /// refuse (`SUM` over text): the resume refuses with define's error, and
@@ -1033,8 +1033,8 @@ async fn resume_refuses_a_definition_define_would_refuse_now() {
     assert_item_names_match(&raw).await;
 }
 
-/// #708: a 1-1 definition whose source key was redefined is paused by the
-/// capture pass (#687), and its resume refuses with the remedy: the target
+/// A 1-1 definition whose source key was redefined is paused by the
+/// capture pass, and its resume refuses with the remedy: the target
 /// is keyed by the old key, so only restoring it, or a drop and redefine,
 /// gets it going again.
 #[tokio::test]
@@ -1060,12 +1060,12 @@ async fn resume_refuses_a_redefined_source_key() {
             && refused.contains("`DROP TRANSFORM` and define it again"),
         "{refused}"
     );
-    // Define would accept this definition: only a resume refuses it (#967).
+    // Define would accept this definition: only a resume refuses it.
     assert!(!refused.contains("define would refuse"), "{refused}");
     assert_eq!(status(&raw, "item_names").await, TransformStatus::Paused);
 }
 
-/// #708: a field resume re-validates its definition too, and refuses while
+/// A field resume re-validates its definition too, and refuses while
 /// define would refuse it.
 #[tokio::test]
 async fn a_field_resume_refuses_a_definition_define_would_refuse_now() {
@@ -1100,7 +1100,7 @@ async fn a_field_resume_refuses_a_definition_define_would_refuse_now() {
     assert_eq!(still_paused, 1);
 }
 
-/// #760 rule 8: re-typing a copy in place can fail. A 1-1 key re-typed
+/// Re-typing a copy in place can fail. A 1-1 key re-typed
 /// `text` to `uuid` with a `USING` that isn't a plain cast leaves the
 /// target's copy holding text no `uuid` cast accepts. The resume's re-type
 /// fails: the request ends, the definition stays paused with the Postgres
@@ -1177,7 +1177,7 @@ async fn a_re_type_that_fails_leaves_the_definition_paused_with_the_error_and_it
     }
 }
 
-/// The group basis's #824: widening a column an aggregate sums (`integer`
+/// The group basis: widening a column an aggregate sums (`integer`
 /// to `bigint`) outgrows the target's `SUM` column, which define now gives
 /// `numeric` (`sum(bigint)`'s type) rather than `bigint`. The pass pauses the
 /// aggregate; a resume re-types the column, recreates the partials and
@@ -1265,7 +1265,7 @@ async fn widening_a_summed_column_on_the_group_basis_pauses_and_resume_re_types_
     assert_eq!(status(&raw, "per_shop").await, TransformStatus::Live);
 }
 
-/// #986: the staging worker checks the ledger too before it re-types
+/// The staging worker checks the ledger too before it re-types
 /// anything. The operator's resume is accepted (a widened column is waiting
 /// to be re-typed), then the ledger is dropped: the worker's pass refuses the
 /// resume, names the table and `DROP TRANSFORM`, and leaves the column as it
@@ -1325,7 +1325,7 @@ async fn the_worker_refuses_a_requested_resume_whose_ledger_was_dropped_first() 
     }
 }
 
-/// #986: a 1-1 definition has a ledger (a group-basis aggregate keeps none),
+/// A 1-1 definition has a ledger (a group-basis aggregate keeps none),
 /// so a resume refuses one whose ledger an operator dropped: the build's
 /// `start` reads it, and a resume that passed would fail every staging-worker
 /// pass after it. The message names the table and `DROP TRANSFORM`, and the
@@ -1378,7 +1378,7 @@ async fn a_resume_refuses_a_definition_whose_ledger_table_is_missing() {
     }
 }
 
-/// #857 negative control: a retype that keeps every field admitted (`SUM`
+/// Negative control: a retype that keeps every field admitted (`SUM`
 /// over `integer` moved to `bigint`) leaves the definition as define would
 /// create it, so the resume goes ahead.
 #[tokio::test]
@@ -1415,7 +1415,7 @@ async fn a_resume_goes_ahead_when_a_sum_argument_retype_keeps_the_delta_table_s_
         .expect("the resume isn't refused");
 }
 
-/// #824: widening a column a 1-1 calculated field reads (`qty + 1`, with
+/// Widening a column a 1-1 calculated field reads (`qty + 1`, with
 /// `qty` `integer` to `bigint`) outgrows the field's column: the pass
 /// pauses the definition, and a resume re-types that column, leaving the
 /// key and the passthrough as they are, then rebuilds.
@@ -1500,14 +1500,14 @@ async fn failure_detected_at(raw: &Client, target: &str) -> String {
 }
 
 /// Whether `target` isn't paused and has no pause record. A reader of a
-/// target being rebuilt reports `catching_up` (#497).
+/// target being rebuilt reports `catching_up`.
 async fn assert_unpaused(trellis: &Trellis, target: &str) {
     let reported = trellis.status(target).await.expect("status").expect(target);
     assert!(!reported.status.is_frozen(), "{target}: {reported:?}");
     assert!(reported.capture_failure.is_none(), "{target}: {reported:?}");
 }
 
-/// Asserts `target` waits on `upstream`'s rebuild (#828, #970): it is
+/// Asserts `target` waits on `upstream`'s rebuild: it is
 /// paused with `upstream` as its cause, has no resume request, and its
 /// rebuild hasn't started (no backfill chunk, no build).
 async fn assert_waiting_on(trellis: &Trellis, raw: &Client, target: &str, upstream: &str) {
@@ -1625,7 +1625,7 @@ async fn assert_chain_converges(trellis: &Trellis, raw: &mut Client, pool: &trel
     );
 }
 
-/// #828, #970: a resume that re-types a target's key (`integer` to
+/// A resume that re-types a target's key (`integer` to
 /// `bigint`) pauses the definition chained off that target, whose own key
 /// copy is still `integer`. Its pause records the upstream resume as its
 /// cause and its message names that resume, not a column the operator
@@ -1692,7 +1692,7 @@ async fn one_resume_carries_a_chain_of_definitions_each_rebuilt_after_its_upstre
     assert_chain_converges(&trellis, &mut raw, &db.pool).await;
 }
 
-/// #970: the durable queue is `caused_by` plus `resume_requests`: dropping
+/// The durable queue is `caused_by` plus `resume_requests`: dropping
 /// every handle after A's rebuild, and running the next pass from fresh
 /// ones, resumes B, and then C.
 #[tokio::test]
@@ -1731,7 +1731,7 @@ async fn a_restart_after_the_upstream_rebuild_resumes_the_chain_from_where_it_st
     assert_chain_converges(&trellis, &mut raw, &db.pool).await;
 }
 
-/// #970: the automatic resume of B comes back with copies to re-type, so
+/// The automatic resume of B comes back with copies to re-type, so
 /// it takes the request path an operator's resume does: the same pass
 /// records the request, re-types and completes it, and the cause is gone
 /// once the request is recorded. A crash between the request and the
@@ -1772,7 +1772,7 @@ async fn a_crash_after_the_automatic_resume_requests_the_re_type_leaves_the_requ
     assert_chain_converges(&trellis, &mut raw, &db.pool).await;
 }
 
-/// #970: B is refused at its automatic resume: the schema changed after
+/// B is refused at its automatic resume: the schema changed after
 /// the pause, so define would refuse it. The refusal is recorded on its
 /// `capture_failure`, the cause is cleared, and the next pass doesn't try
 /// again (its `detected_at` stands). C is untouched: B's target was never
@@ -1843,7 +1843,7 @@ async fn a_definition_refused_at_its_automatic_resume_stays_paused_with_the_refu
     assert_eq!(status(&raw, "c_owners").await, TransformStatus::Live);
 }
 
-/// #971: a `RESUME` by hand of a definition waiting on its upstream's
+/// A `RESUME` by hand of a definition waiting on its upstream's
 /// chained resume (A not live) is accepted, and the definition keeps
 /// waiting, now on a request naming A instead of a cause. It follows A: the
 /// first pass after A is live re-types its target and resumes it, and
@@ -1907,7 +1907,7 @@ async fn requested(raw: &Client, target: &str) -> bool {
     .get(0)
 }
 
-/// Asserts `target`'s resume waits for `upstream` to be live (#971): it is
+/// Asserts `target`'s resume waits for `upstream` to be live: it is
 /// paused with a resume request and no cause, its `capture_failure` names
 /// `upstream` and its target, and its rebuild hasn't started (no backfill
 /// chunk, no build).
@@ -1975,7 +1975,7 @@ async fn step_until_live_requested(
     panic!("{upstream} did not go live within 12 rounds of steps");
 }
 
-/// #971: an operator can resume a whole stack at once, in any order, and it
+/// An operator can resume a whole stack at once, in any order, and it
 /// comes up in dependency order. A -> B -> C, all paused by the operator,
 /// resumed C, then B, then A: C and B are accepted and wait, naming their
 /// upstream; no build starts early. Once A is live the next pass rebuilds B,
@@ -2054,7 +2054,7 @@ async fn a_stack_resumed_in_any_order_comes_up_in_dependency_order() {
     );
 }
 
-/// #971: an upstream is `live` as the operator reads it (#497): one stored
+/// An upstream is `live` as the operator reads it: one stored
 /// `live` that reads a definition that isn't reports `catching_up`, and a
 /// resume below it waits for it. A -> B -> C, with A and C paused by the
 /// operator and B left running: after `RESUME A; RESUME C`, C waits on B
@@ -2119,7 +2119,7 @@ async fn a_resume_waits_for_an_upstream_that_reports_catching_up() {
     );
 }
 
-/// #971 rule 7: a resume waits on every definition whose target it reads,
+/// A resume waits on every definition whose target it reads,
 /// through its source or a `JOIN`'s joined table, so those waits end only if
 /// no definition can come to read its own target through them. Define
 /// refuses such a loop: here one closed by a `JOIN`'s joined table.
@@ -2153,7 +2153,7 @@ async fn no_chain_of_upstreams_a_resume_waits_on_can_loop() {
     .await;
 }
 
-/// #971: a downstream whose upstream nobody resumes keeps waiting across
+/// A downstream whose upstream nobody resumes keeps waiting across
 /// passes, its record as it was, and an operator `PAUSE` withdraws its
 /// request: it then stays paused, with no request, after the upstream is
 /// resumed and live.
@@ -2201,7 +2201,7 @@ async fn a_downstream_waits_on_a_paused_upstream_until_a_pause_withdraws_it() {
     assert_unpaused(&trellis, "c_names").await;
 }
 
-/// #971: a waiting request whose re-validation fails when its upstream is
+/// A waiting request whose re-validation fails when its upstream is
 /// live ends with the refusal on its `capture_failure`, once: later passes
 /// don't try again.
 #[tokio::test]
@@ -2263,7 +2263,7 @@ async fn a_waiting_resume_refused_once_its_upstream_is_live_is_not_retried() {
     assert_eq!(detected_at, failure_detected_at(&raw, "b_owners").await);
 }
 
-/// #971 item 1: an operator `PAUSE` of B while it waits on A's chained
+/// An operator `PAUSE` of B while it waits on A's chained
 /// resume (with A as its cause) takes it out of the chain: the cause is
 /// cleared, its message keeps the reason and no longer says it resumes on
 /// its own, and passes after A is live leave it paused, and C untouched.
@@ -2304,7 +2304,7 @@ async fn a_pause_of_a_definition_waiting_on_its_cause_takes_it_out_of_the_chain(
     assert_eq!(status(&raw, "c_names").await, TransformStatus::Live);
 }
 
-/// #971 item 1: C, paused by the operator before the chain's resume, stays
+/// C, paused by the operator before the chain's resume, stays
 /// paused with no cause after A and B are live, through further passes.
 #[tokio::test]
 async fn a_definition_paused_by_the_operator_before_the_chain_stays_paused() {
@@ -2329,7 +2329,7 @@ async fn a_definition_paused_by_the_operator_before_the_chain_stays_paused() {
     assert_eq!(column_type(&raw, "public.c_names", "id").await, "integer");
 }
 
-/// #971 item 3: B's chained resume requests a re-type that fails for a
+/// B's chained resume requests a re-type that fails for a
 /// reason no retry gets past (a view on B's target key column, `0A000`).
 /// The request ends: B stays paused with the re-type error and no cause,
 /// its target keeps its type, so C is never paused. A later pass doesn't
@@ -2446,7 +2446,7 @@ async fn a_definition_the_re_type_leaves_refused_keeps_its_own_error() {
         "{error}"
     );
     assert_eq!(caused_by(&raw, "name_totals").await, None);
-    // A resume waits for item_names to be live (#971), then refuses.
+    // A resume waits for item_names to be live, then refuses.
     bring_live(&mut raw, &db.pool, &["item_names"]).await;
     resume_refused(&trellis, "name_totals").await;
 }
@@ -2495,12 +2495,12 @@ async fn a_definition_refused_on_the_re_typed_target_keeps_its_own_error() {
         caused_by(&raw, "b_names").await.as_deref(),
         Some("item_names")
     );
-    // A resume waits for item_names to be live (#971), then refuses.
+    // A resume waits for item_names to be live, then refuses.
     bring_live(&mut raw, &db.pool, &["item_names"]).await;
     resume_refused(&trellis, "id_totals").await;
 }
 
-/// #824: a source change whose columns Trellis created from it hold every
+/// A source change whose columns Trellis created from it hold every
 /// value of the types define would give them now pauses nothing: a
 /// widening under an expression typed by its family (`CHAR_LENGTH(name)`,
 /// `qty + 2.5`, `COUNT(name)`, `SUM(price)` over a `numeric(10,2)`), and a
@@ -2554,7 +2554,7 @@ async fn changes_no_created_column_outgrows_pause_nothing() {
             assert_eq!(status(&raw, target).await, TransformStatus::Live, "{alter}");
         }
     }
-    // A narrowing isn't a pure widening (#703 R1): it rebuilds the readers,
+    // A narrowing isn't a pure widening: it rebuilds the readers,
     // and still pauses nothing.
     raw.batch_execute("alter table public.lines alter column qty type integer")
         .await
@@ -2611,7 +2611,7 @@ async fn changes_no_created_column_outgrows_pause_nothing() {
     );
 }
 
-/// The columns #824's in-place re-type reaches, over `public.users` and
+/// The columns an in-place re-type reaches, over `public.users` and
 /// `public.posts` (`posts.author` joined to `users.handle`):
 ///
 /// - `user_labels`, a 1-1 definition: its target's key copies
@@ -2680,7 +2680,7 @@ async fn assert_widening_targets_match(raw: &Client) {
     }
 }
 
-/// One widening of a type modifier (ADR-0020, #824, #1207, #1288). The
+/// One widening of a type modifier. The
 /// source's key columns are re-typed `key_to` (or kept, when `None`) and its
 /// value columns `value_to`. A copy has no modifier, so no column Trellis
 /// copied from them changes: a pass re-types nothing, rewrites nothing and
@@ -2729,7 +2729,7 @@ async fn a_modifier_widening_re_types_no_copy(
         .expect("a post by it");
     };
     if written_before_the_pass {
-        // #1207: the copies of a string column are unbounded, so the drain
+        // The copies of a string column are unbounded, so the drain
         // applies these with no pass in between.
         write_long(&raw).await;
         drain_to_quiescence(&db.pool, &mut raw).await;
@@ -2794,7 +2794,7 @@ async fn a_modifier_widening_re_types_no_copy(
     assert_widening_targets_match(&raw).await;
 }
 
-/// #1207: a copy of a `varchar(n)` column is an unbounded `varchar`, so a
+/// A copy of a `varchar(n)` column is an unbounded `varchar`, so a
 /// source column's change of bound, or to `text`, re-types no copy: the
 /// pass leaves every column and file as it is and pauses nothing, and a key
 /// and a value past the old bound apply before it.
@@ -2989,7 +2989,7 @@ async fn a_value_the_old_modifier_couldnt_hold_applies_with_no_pass_and_no_hold(
 /// length) and a `text` column made `varchar(n)` (binary-coercible, but a
 /// narrowing) re-type no copy and pause nothing: every value still fits a
 /// passthrough of either. Neither is a pure widening, so the definition
-/// rebuilds (#703 R1).
+/// rebuilds.
 #[tokio::test]
 async fn character_and_text_to_varchar_changes_re_type_no_copy() {
     let cluster = TestCluster::start();
@@ -3114,7 +3114,7 @@ async fn a_resume_re_type_that_fails_transiently_keeps_the_request() {
     assert_item_names_match(&raw).await;
 }
 
-/// #824, #1207: a 1-1 key's copy of a `varchar(10)` source key is an
+/// A 1-1 key's copy of a `varchar(10)` source key is an
 /// unbounded `varchar` with the source key's collation and its index, and a
 /// widening to `varchar(40)` leaves both as they are. The source key is
 /// recorded at its new type, as a resume records it. Its target stores
@@ -3187,7 +3187,7 @@ async fn a_key_re_typed_in_place_is_measured_from_its_new_type() {
     );
 }
 
-// ---- #894: a re-type cancelled by a statement_timeout ends the request ----
+// ---- A re-type cancelled by a statement_timeout ends the request ----
 
 /// Gives `public.item_names` an expression index whose function reads
 /// `public.retype_gate`: while its `mode` is `cancel`, rebuilding the index
@@ -3255,7 +3255,7 @@ async fn gated_resume(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trel
     trellis
 }
 
-/// #894: a re-type cancelled by a `statement_timeout` is retried on the
+/// A re-type cancelled by a `statement_timeout` is retried on the
 /// next pass, each time telling the operator why in the `resuming:` message;
 /// the third cancellation ends the request, naming the timeout and both
 /// remedies. The definition stays paused, the copy keeps its type and the
@@ -3351,7 +3351,7 @@ async fn a_re_type_cancelled_three_times_ends_the_request_and_a_resume_once_the_
     assert_eq!(timeout_cancels(&raw, "item_names").await, None);
 }
 
-/// #894: the other remedy the ending message names. `DROP TRANSFORM` and
+/// The other remedy the ending message names. `DROP TRANSFORM` and
 /// define again works after a request ended this way, and builds the target
 /// with the widened key.
 #[tokio::test]
@@ -3387,7 +3387,7 @@ async fn drop_transform_and_define_again_works_after_a_re_type_request_ended_on_
     assert_item_names_match(&raw).await;
 }
 
-/// #894 rule 2: a lock timeout never held the lock, so it isn't counted: the
+/// A lock timeout never held the lock, so it isn't counted: the
 /// request stays however many passes fail on it, and the message carries the
 /// last error without an attempt number. Here a reader of the target holds
 /// `ACCESS SHARE`, so the re-type's `ACCESS EXCLUSIVE` times out after
@@ -3422,7 +3422,7 @@ async fn a_lock_timeout_on_the_re_type_is_retried_without_counting() {
     );
 }
 
-/// #894: the cancel is the operator's own `statement_timeout`, not only a
+/// The cancel is the operator's own `statement_timeout`, not only a
 /// cancel by request: a re-type that outlasts it is counted the same way.
 #[tokio::test]
 async fn a_re_type_outlasting_the_statement_timeout_is_counted() {
@@ -3451,7 +3451,7 @@ async fn a_re_type_outlasting_the_statement_timeout_is_counted() {
 }
 
 // ---------------------------------------------------------------------
-// #858: the capture pass skips a definition's typed-copy comparison while
+// The capture pass skips a definition's typed-copy comparison while
 // nothing it reads has changed (`staging::drift_memo`).
 // ---------------------------------------------------------------------
 
@@ -3544,7 +3544,7 @@ async fn a_widening_after_clean_passes_is_caught_on_the_next_pass() {
 
 /// A widening of a `varchar` `ON` pair of a `JOIN`, after clean passes, is
 /// compared again by the next pass, both sides alike, and finds the
-/// unbounded copies current (#1207).
+/// unbounded copies current.
 #[tokio::test]
 async fn a_varchar_widening_after_clean_passes_is_compared_again_and_re_types_nothing() {
     let cluster = TestCluster::start();
@@ -3581,7 +3581,7 @@ async fn a_varchar_widening_after_clean_passes_is_compared_again_and_re_types_no
 /// but is not the column the last comparison saw: the next pass compares
 /// again. The fingerprint carries each row's `xmin` for this. The two
 /// rewrites read as a same-type rewrite of the column, so the table's
-/// readers rebuild (#703 R3b's documented false positive), and nothing
+/// readers rebuild (a documented false positive), and nothing
 /// pauses.
 #[tokio::test]
 async fn a_column_re_typed_and_back_between_passes_is_compared_again() {
@@ -3709,7 +3709,7 @@ async fn a_column_added_by_alter_transform_is_compared_after_clean_passes() {
     assert!(error.contains("public.post_titles.k"), "{error}");
 }
 
-/// #1201: a target column someone re-typed by hand, with its source column
+/// A target column someone re-typed by hand, with its source column
 /// untouched, is reported as re-typed outside Trellis, not as a source
 /// column that widened.
 #[tokio::test]

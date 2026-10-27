@@ -1,18 +1,18 @@
-//! End-to-end tests for issue #119's `boolean` support as a join/`GROUP BY`
+//! End-to-end tests for `boolean` support as a join/`GROUP BY`
 //! key. The `bool_and`/`bool_or` aggregates are refused at define
 //! (`ValidationError::DeferredAggregate`).
 //!
 //! # Why these run against a live server
 //!
-//! Issue #119's own scope note treats `boolean` as the obvious easy case:
+//! `boolean` looks like the obvious easy case:
 //! `boolout` renders exactly two values (`'t'`/`'f'`), a textbook
-//! bijection, so on the pattern #111/#113/#114 established ("text-stability
+//! bijection, so on the pattern the other type families follow ("text-stability
 //! is a property of the rendering, not the operator set") it reads like a
-//! straight allowlist addition, the simplest of the epic's type families so
-//! far. Asked of a real server rather than assumed, that turns out to be
-//! wrong in a genuinely new way — not "no typed index needed" (#111/#113/
-//! #114's finding) and not "needs one" (#112's), but a *third* shape none
-//! of the previous four type-family issues had reason to find:
+//! straight allowlist addition, the simplest of the type families.
+//! Asked of a real server rather than assumed, that turns out to be
+//! wrong in a genuinely new way — not "no typed index needed" and not
+//! "needs one", but a *third* shape none
+//! of the other type families had reason to find:
 //!
 //! 1. **`boolean` has two independent, disagreeing output paths**, and nothing
 //!    about the value's own equality is at issue. `boolout` (what a capture
@@ -33,7 +33,7 @@
 //!    here — seeing this test file, this is a deliberate, documented
 //!    non-change, not an oversight. See `catalog.rs`'s own doc comment on
 //!    that constant for the full account, including which call sites are
-//!    and are not exposed (issue #125's `key_array_filter` already sidesteps
+//!    and are not exposed (`key_array_filter` already sidesteps
 //!    it for its own bulk lookups).
 //! 3. **The `GROUP BY` key role's *final SQL* half was already safe despite
 //!    the same divergence**, because the old aggregate path's keyset
@@ -50,7 +50,7 @@
 //!    `'true'` spelling used to land in *two* separate groups that
 //!    both independently wrote to the one row the SQL layer correctly
 //!    resolved them to — silently corrupting its value rather than visibly
-//!    splitting it into two rows the way #248's pre-fix `timestamp` did.
+//!    splitting it into two rows the way a `timestamp` key once did.
 //!    Canonicalizing a `Boolean` key part closed that gap;
 //!    `a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two`
 //!    below reproduces the corruption end-to-end and pins the fix.
@@ -255,7 +255,7 @@ async fn boolean_is_refused_as_a_join_key_and_primary_key() {
 }
 
 /// The `GROUP BY` key gate (`validate::reject_unsupported_group_by_key_type`)
-/// admits `boolean` — pre-existing behavior (this arm predates issue #119),
+/// admits `boolean` — long-standing behavior,
 /// pinned here so a future edit can't accidentally tighten it without a
 /// test noticing, the same convention `defs_bytea.rs`'s
 /// `bytea_group_by_key_is_admitted` and `defs_temporal.rs`'s
@@ -271,7 +271,7 @@ fn boolean_group_by_key_is_admitted() {
 }
 
 // ---------------------------------------------------------------------
-// 3. The #113/#248 regression shape, reproduced for a boolean GROUP BY key
+// 3. The two-spellings regression shape, reproduced for a boolean GROUP BY key
 // ---------------------------------------------------------------------
 
 /// A `boolean` `GROUP BY` group touched once through an ordinary

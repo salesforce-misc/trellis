@@ -1,24 +1,24 @@
-//! End-to-end tests for issue #117's user-defined enum type support — as
+//! End-to-end tests for user-defined enum type support — as
 //! join/primary-key and `GROUP BY` key roles, and the `MIN`/`MAX` result
 //! type, honoring the type's *creation-order* comparison rather than an
 //! alphabetical one.
 //!
 //! # Why these run against a live server
 //!
-//! Per #111-#119's playbook: check `pg_cast` for a second `::text` renderer
+//! Per the type-support playbook: check `pg_cast` for a second `::text` renderer
 //! rather than assume `enumout` is the whole story, check `to_jsonb`
 //! agreement, check that `min`/`max` actually exist and keep their argument's
 //! own concrete type.
 //!
 //! **Text-stability.** `select castfunc from pg_cast where castsource =
 //! 'an enum type'::regtype and casttarget = 'text'::regtype` returns no rows
-//! on a live Postgres 17 (verified below) — unlike `boolean` (#119), an enum
+//! on a live Postgres 17 (verified below) — unlike `boolean`, an enum
 //! type has no second, dedicated `::text` cast function. `enumout` is what
 //! `<col>::text` calls, and it renders each value as its own label text
 //! verbatim: an enum value's identity *is* that label (a `pg_enum` row keyed
 //! by OID), so there is no deeper representation for two distinct values to
 //! collide under — a bijection by construction, the same conclusion `bit`/
-//! `bit varying` reached (#118) for a structurally different reason (a
+//! `bit varying` reached for a structurally different reason (a
 //! fixed alphabet rather than a fixed label set).
 //!
 //! **Key roles.** Both land cleanly: the `JOIN` key/primary-key role gains
@@ -33,7 +33,7 @@
 //! **`MIN`/`MAX`.** `anyenum` has a full btree opclass ordered by
 //! `pg_enum.enumsortorder` (creation position, not alphabetical), and
 //! `pg_typeof(min(v))` keeps the argument's own concrete enum type — the same
-//! "own family, own terms" shape `inet`'s `MIN`/`MAX` landed under (#116).
+//! "own family, own terms" shape `inet`'s `MIN`/`MAX` landed under.
 //!
 //! The one place this type family is *not* like every earlier one: it is the
 //! first whose ordering is not a fixed, universal property of the family
@@ -118,8 +118,8 @@ async fn define_join_on(
 // 1. Text-stability: no second renderer
 // ---------------------------------------------------------------------
 
-/// An enum type has no dedicated `::text` cast function — unlike `boolean`
-/// (#119), `::text` is `enumout` directly. Contrasted with `boolean` as the
+/// An enum type has no dedicated `::text` cast function — unlike `boolean`,
+/// `::text` is `enumout` directly. Contrasted with `boolean` as the
 /// control, so the probe itself is confirmed discriminating.
 #[tokio::test]
 async fn enum_has_no_dedicated_text_cast_function() {
@@ -153,11 +153,11 @@ async fn enum_has_no_dedicated_text_cast_function() {
         .await
         .expect("pg_cast probe for boolean");
     let n: i64 = row.get(0);
-    assert_eq!(n, 1, "boolean must still have its own ::text cast (#119)");
+    assert_eq!(n, 1, "boolean must still have its own ::text cast");
 }
 
 /// `to_jsonb` and `::text` must agree — the render-agreement half of the
-/// #113/#248 defect shape. An enum is not a datetime family (the only
+/// datetime-render defect shape. An enum is not a datetime family (the only
 /// families `to_jsonb` special-cases), so this is expected to hold, but is
 /// checked live rather than assumed.
 #[tokio::test]

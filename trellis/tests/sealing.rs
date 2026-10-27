@@ -1,4 +1,4 @@
-//! Integration tests for sealing and the fence (issue #9, stage 03), run
+//! Integration tests for sealing and the fence (stage 03), run
 //! against a real, ephemeral Postgres instance via the shared harness
 //! (`testkit::TestCluster`).
 //!
@@ -236,7 +236,7 @@ async fn an_empty_active_segment_still_seals_to_catch_a_stranded_straggler() {
     let straddler = connect_raw(db.dsn()).await;
     insert_recompute(&straddler, "seg_0", "stranded").await;
 
-    // Stand in for #14/#15's real apply-and-mark: everything segment 1
+    // Stand in for the real apply-and-mark: everything segment 1
     // *could* see has already drained, so it reports `'drained'` — exactly
     // like the real bug, where a tiny batch drains almost instantly. The
     // straddler landed in its slot regardless, and segment 1's own fence
@@ -398,7 +398,7 @@ async fn burst_sealed_and_drained(sealer: &mut Client, keys: &[&str]) {
     mark_drained(sealer, 1).await;
 }
 
-/// The idle seal (#1253): once a burst's segment drains and no more writes
+/// The idle seal: once a burst's segment drains and no more writes
 /// arrive, one seal step seals the empty active segment, so the drained
 /// batch can retire and its slot is freed instead of staying resident (and
 /// read whole by every check that asks the slot) for as long as the ring is
@@ -587,7 +587,7 @@ async fn seal_both_phases(sealer: &mut Client) -> i64 {
     outcome.sealed_seg_seq
 }
 
-/// Issue #595: a writer at a snapshot isolation level takes its snapshot
+/// A writer at a snapshot isolation level takes its snapshot
 /// with a first `SELECT`, two seals flip the pointer past it, and only then
 /// does it append. Read from `segment_pointer`, the active slot comes out of
 /// its snapshot — segment 1's slot, two flips stale — and the row lands in
@@ -665,7 +665,7 @@ async fn append_committed(client: &mut Client, key: &str) {
     txn.commit().await.expect("commit append");
 }
 
-/// Issue #595's crash case: the sealer dies after phase 1's flip commits and
+/// The crash case: the sealer dies after phase 1's flip commits and
 /// before phase 2 moves the mirror, so writers keep resolving the sealed
 /// slot. Recovery's reconstruction runs through `seal_phase2`, which sets
 /// the mirror before its xid bump, so a writer still open in the sealed slot
@@ -734,7 +734,7 @@ async fn a_crash_between_the_flip_and_the_mirror_set_is_recovered_and_the_writer
 /// recovery age gate runs after recovery published `S_1` and after segment 2
 /// sealed and moved the mirror to slot 2. Setting the mirror back to slot 1
 /// would send writers into a sealed slot with xids above `xmax(S_2)`, which
-/// is issue #595's loss again. The stalled call must leave the mirror alone.
+/// would lose those writes. The stalled call must leave the mirror alone.
 #[tokio::test]
 async fn a_phase_two_that_stalls_past_recovery_does_not_move_the_mirror_backwards() {
     let cluster = TestCluster::start();
@@ -1054,7 +1054,7 @@ async fn ring_full_runs_retirement_then_retries_once() {
     }
 
     // Simulate stage 05's apply ∪ mark-drained having fully drained segments
-    // 1 and 2 (issue #11 isn't wired into this test's own drain path, so
+    // 1 and 2 (the real apply isn't wired into this test's own drain path, so
     // this stands in for it): both flip to 'drained' and their slots empty
     // out. Segment 2 must be drained too — retirement's condition 3 needs
     // segment 1's *successor* to be drained, not merely segment 1 itself.
@@ -1177,7 +1177,7 @@ async fn age_gated_recovery_unwedges_a_crashed_seal_without_stomping_a_fresh_one
     );
 }
 
-/// The truncate barrier's seal-time half (issue #60): a batch containing a
+/// The truncate barrier's seal-time half: a batch containing a
 /// truncate sentinel must seal single-bucket regardless of its row count —
 /// the whole-keyspace clear and any same-batch post-truncate writes need to
 /// run as one atomic Phase-3 transaction, never split across workers — and
@@ -1287,7 +1287,7 @@ async fn seal_decisions(client: &Client, seg_seq: i64) -> (i16, bool, i64) {
     (row.get(0), row.get(1), row.get(2))
 }
 
-/// Issue #598, first case: a writer resolves segment 1's slot, phase 1
+/// First case: a writer resolves segment 1's slot, phase 1
 /// flips the pointer, and only then does the writer append a truncate and
 /// commit, before phase 2 captures `S_1`. The truncate is visible in `S_1`,
 /// so it is in batch 1. The truncate barrier must see it: batch 1 carries
@@ -1336,7 +1336,7 @@ async fn a_truncate_committed_between_the_flip_and_the_fence_reaches_the_barrier
     );
 }
 
-/// Issue #598, second case: the writer is still open when phase 2 captures
+/// Second case: the writer is still open when phase 2 captures
 /// `S_1`, so its truncate in slot 0 is invisible in `S_1` and batch 2 claims
 /// it through its predecessor half. Batch 2's own slot holds enough rows to
 /// split and no truncate of its own; the barrier must still see the
@@ -1392,7 +1392,7 @@ async fn a_truncate_claimed_through_the_predecessor_half_reaches_the_barrier() {
     );
 }
 
-/// Issue #271: a seal actually completing is the one transition that makes
+/// A seal actually completing is the one transition that makes
 /// a segment claimable, so `seal_phase2` now `pg_notify`s `wake_channel` the
 /// instant it publishes the fence. The property is "notify must not precede
 /// the fact it announces": a dedicated `LISTEN` connection must never observe
@@ -1529,7 +1529,7 @@ async fn seal_notify_does_not_fire_on_a_raced_no_op_seal_phase2() {
     );
 }
 
-/// Issue #598: a segment's `has_truncate`, `row_count` and `bucket_count`
+/// A segment's `has_truncate`, `row_count` and `bucket_count`
 /// are column defaults until phase 2 publishes its fence, so
 /// `next_claimable_segments` must not hand out a segment before then.
 /// Here segment 2 holds a truncate that phase 1 flipped past. Returned

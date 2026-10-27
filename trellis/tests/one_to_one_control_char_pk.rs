@@ -2,7 +2,7 @@
 //! primary-key text, byte-for-byte — never the staging ring's encoded key
 //! text.
 //!
-//! No live `Client` (issue #301): each source change is mirrored by the CDC
+//! No live `Client`: each source change is mirrored by the CDC
 //! row capture would stage for it, staged by hand and drained through the
 //! engine's own apply path, so nothing here waits on a pipeline under a
 //! wall-clock budget. The staged key is the raw key text, which is what

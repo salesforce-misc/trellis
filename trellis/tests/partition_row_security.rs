@@ -1,4 +1,4 @@
-//! #958 (X12-7f): row-level security on a partitioned source.
+//! Row-level security on a partitioned source.
 //!
 //! Trellis runs as a non-superuser login role that owns the tree (a superuser
 //! bypasses RLS). Postgres applies a table's own policies only when the table
@@ -12,13 +12,13 @@
 //!   go through the root;
 //! - the correction engine enumerates a node's own keys by reading the node
 //!   (it must read a detached or truncated one), and those reads run with
-//!   `row_security = off` (#766): a leaf policy that applies makes the
+//!   `row_security = off`: a leaf policy that applies makes the
 //!   leaf's own correction fail loudly instead of skipping the hidden keys,
 //!   the failure is recorded, and the correction completes once the role is
 //!   exempt. Nothing ever counts a hidden row as gone.
 //!
 //! Every aggregate here is on the group basis (the dev knob), seeded through
-//! capture. Nothing polls for convergence (#297).
+//! capture. Nothing polls for convergence.
 
 use std::time::{Duration, Instant};
 
@@ -338,7 +338,7 @@ async fn a_policy_on_a_leaf_alone_hides_nothing_from_the_row_flow() {
 }
 
 /// The same leaf policy, and the leaf truncated: the correction enumerates
-/// the leaf's own keys, and its read raises (`row_security = off`, #766)
+/// the leaf's own keys, and its read raises (`row_security = off`)
 /// where it would otherwise have skipped the hidden keys and left their
 /// groups counted. The failure is recorded, the groups stay as they were,
 /// and once the role is exempt the retry corrects them.

@@ -1,5 +1,5 @@
-//! Front-door integration test for issue #211:
-//! `staging::quarantine::recompute_column` panics on a NULL-keyed group when
+//! Front-door integration test that
+//! `staging::quarantine::recompute_column` handles a NULL-keyed group when
 //! its source is a nullable-group-key aggregate target.
 //!
 //! ```text
@@ -7,10 +7,10 @@
 //! TRANSFORM sku_totals_echo FROM sku_totals              SELECT total AS echo_total
 //! ```
 //!
-//! Same fixture shape as issue #205's own regression test
+//! Same fixture shape as the regression test for the apply path
 //! (`one_to_one_chained_off_nullable_aggregate_group_key.rs`): `sku_totals`'
 //! own primary key is its `sku` grouping column, genuinely nullable (`UNIQUE
-//! NULLS NOT DISTINCT`, issue #128), unlike a real `PRIMARY KEY`. #205 closed
+//! NULLS NOT DISTINCT`), unlike a real `PRIMARY KEY`. That test covers
 //! one producer/consumer of that fact — `staging::apply::apply_target`
 //! binding a still-encoded staged key straight in as a literal PK. This is a
 //! *different* producer/consumer of the very same fact: `recompute_column`'s
@@ -23,17 +23,17 @@
 //! does a raw, unencoded `{pk_ident}::text` cast directly against the source
 //! table's column — nothing here ever goes through
 //! `ddl::pk_key_sql_expr`/`NULL_KEY_SENTINEL`'s escape treatment at all, so
-//! there's no encoding to `split_pk_key`-decode the way #205's fix did.
+//! there's no encoding to `split_pk_key`-decode the way the apply path does.
 //! Instead, for the NULL-keyed group's row this is simply a genuine SQL
 //! `NULL`, and the old `let pk_text: String = db_row.get(0);` panics —
 //! `tokio-postgres` refuses to convert a `NULL` into a `String`.
 //!
 //! The fix reads `pk_text` as `Option<String>`. A column resume is now a
-//! field build (#625 F8b), whose chunks' `(lo, hi]` ranges never reach a
+//! field build, whose chunks' `(lo, hi]` ranges never reach a
 //! `NULL`-keyed group either, so its plan stages that group's key into the
 //! ring and the drain re-derives its row: `sku_totals_echo` is keyed `UNIQUE
-//! NULLS NOT DISTINCT` like `sku_totals`, so it holds the `NULL` group's row
-//! (issue #1141), and the resumed column is restored there too.
+//! NULLS NOT DISTINCT` like `sku_totals`, so it holds the `NULL` group's row,
+//! and the resumed column is restored there too.
 
 use std::collections::HashMap;
 
@@ -112,8 +112,8 @@ const SKU_TOTALS: &str =
 const SKU_TOTALS_ECHO: &str =
     "TRANSFORM sku_totals_echo FROM sku_totals SELECT total AS echo_total";
 
-/// `sales`, seeded with a NULL-`sku` row from the very start (unlike #205's
-/// own test, which deliberately introduced the NULL group later as a live
+/// `sales`, seeded with a NULL-`sku` row from the very start (unlike the apply-path
+/// test, which deliberately introduced the NULL group later as a live
 /// delta to exercise `apply_target`'s write path): this test exercises
 /// `recompute_column`'s own direct read of the *already-built* `sku_totals`
 /// table, not any live-CDC path, so the NULL group just needs to already
@@ -154,13 +154,13 @@ async fn sku_totals_echo(client: &Client) -> HashMap<Option<String>, Option<Stri
         .collect()
 }
 
-/// Issue #211's exact repro: pausing (reached past the mechanism, the same
+/// The exact repro: pausing (reached past the mechanism, the same
 /// "insert directly into `column_status`" convention
 /// `tests/column_quarantine.rs` uses throughout) and then resuming
 /// `sku_totals_echo.echo_total` re-derives the column over every current row
 /// of `sku_totals` (the source), the NULL-keyed group's included. It must
 /// not panic, and must restore the column on every row, the NULL-keyed
-/// one's too (issue #1141).
+/// one's too.
 #[tokio::test]
 async fn resuming_a_column_restores_a_null_keyed_upstream_group_without_panicking() {
     let cluster = TestCluster::start();
@@ -181,7 +181,7 @@ async fn resuming_a_column_restores_a_null_keyed_upstream_group_without_panickin
     drain_to_quiescence(&db.pool, &mut client).await;
 
     // Sanity checks: the upstream aggregate holds the NULL group, and so
-    // does the chained 1-1 target (issue #1141).
+    // does the chained 1-1 target.
     assert_eq!(
         sku_totals(&client).await.get(&None).cloned(),
         Some(Some("6".to_string())),
@@ -198,13 +198,13 @@ async fn resuming_a_column_restores_a_null_keyed_upstream_group_without_panickin
         "sanity check: the build writes the NULL group's row too"
     );
 
-    // Pause `echo_total` directly, then resume it — this is issue #211's
+    // Pause `echo_total` directly, then resume it — this is the
     // exact panic site: `recompute_column`'s own query reads every row of
     // `sku_totals`, including the NULL-keyed group's.
     client
         .execute(
             "insert into column_status (transform_table, column_name, last_error, local_fuse) \
-             values ('sku_totals_echo', 'echo_total', 'synthetic pause for issue #211 test', \
+             values ('sku_totals_echo', 'echo_total', 'synthetic pause for test', \
              true)",
             &[],
         )
@@ -231,7 +231,7 @@ async fn resuming_a_column_restores_a_null_keyed_upstream_group_without_panickin
         vec![("sku_totals_echo".to_string(), "echo_total".to_string())],
         "only the resumed column itself"
     );
-    // #625 F8b: the resume registers the column's field build; run it, then
+    // The resume registers the column's field build; run it, then
     // drain the NULL-keyed key its plan staged.
     trellis::staging::build::settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut client).await;

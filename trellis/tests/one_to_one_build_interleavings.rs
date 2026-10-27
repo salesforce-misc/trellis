@@ -1,7 +1,7 @@
 //! Deterministic interleavings of a 1-1 target's Re-derive build chunk
-//! (#625 F8a; `trellis::staging::build::one_to_one`) with Apply pages, on
+//! (`trellis::staging::build::one_to_one`) with Apply pages, on
 //! the real engine, driven by hand through `support/drain_driver.rs`. No
-//! test sleeps or polls for convergence (#297).
+//! test sleeps or polls for convergence.
 //!
 //! Each test makes the state a build starts from by hand, as
 //! `build_interleavings.rs` does for an aggregate: the definition is
@@ -358,7 +358,7 @@ async fn a_chunk_leaves_a_quarantined_key_out() {
 }
 
 /// The chunk statement reaches the ledger, the target and the source each
-/// through its key's index, whatever their statistics say (#625 F8a). At
+/// through its key's index, whatever their statistics say. At
 /// 10M source rows the planner estimated the locked keys joined to their
 /// rows at millions, and the entry rewrite hashed the whole ledger, so each
 /// chunk cost grew with the ledger. Here the tables are tiny, where a
@@ -614,7 +614,7 @@ async fn a_chunk_feeds_a_reader_of_its_target_through_the_seam() {
 
 // ------------------------------------------- a field build's chunk (F8b)
 //
-// `ALTER TRANSFORM one ADD v + 1 AS w` registers a field build (#625 F8b):
+// `ALTER TRANSFORM one ADD v + 1 AS w` registers a field build:
 // `w` applies from the edit's commit, and each chunk of the build rewrites
 // just `w` of its keys' existing rows from one snapshot, under their entry
 // lock, leaving the entries alone. Each test makes that state from a live
@@ -977,7 +977,7 @@ async fn the_field_chunk_statement_reads_every_table_by_its_key() {
 // ------------------------------- a column resume against a page before it
 
 /// A column resume releases its pause and registers the field build in one
-/// commit (#625 F8b), and the column applies from there. A page that read
+/// commit, and the column applies from there. A page that read
 /// the paused columns before that commit leaves the column out of its
 /// writes, so it must not apply after it. Otherwise this happens: the build
 /// writes `dbl` of key 1; the page of an older change to key 1, computed
@@ -1051,13 +1051,13 @@ async fn a_page_computed_before_a_column_resume_does_not_apply_after_it() {
     assert_oracle(&mut d).await;
 }
 
-// ------------------------------- a column pause against a page in flight (#903)
+// ------------------------------- a column pause against a page in flight
 
 /// `public.one`'s `id, dbl`, the column the pause tests below pause.
 const DBL: &str = "select id, dbl from public.one order by id";
 
-/// A column pause holds the column out of Apply from the moment it returns
-/// (issue #903). Here a page computed key 1's change with `dbl` live, holds
+/// A column pause holds the column out of Apply from the moment it returns.
+/// Here a page computed key 1's change with `dbl` live, holds
 /// the version fence `for share`, and stops before its entry lock. The pause
 /// bumps the source's fence, so it waits for that page, and the page's write
 /// of `dbl` lands before the pause returns. Had the pause not waited, the
@@ -1119,7 +1119,7 @@ async fn a_column_pause_waits_for_a_page_that_computed_the_column() {
     );
 }
 
-/// The other side of the same fence (issue #903): a page computed key 1's
+/// The other side of the same fence: a page computed key 1's
 /// change with `dbl` live, and the pause commits before the page's Phase 3
 /// takes the fence. The pause bumped the fence, so the page misses it and
 /// computes again, with `dbl` paused. Had it applied what it computed, it
@@ -1168,7 +1168,7 @@ async fn a_page_computed_before_a_column_pause_does_not_apply_after_it() {
     assert_eq!(d.rows(DBL).await, at_pause);
 }
 
-// ------------------ an edit waiting on a page at the fence holds nothing (#744)
+// ------------------ an edit waiting on a page at the fence holds nothing
 
 /// The edits that bump the version fence of a live 1-1 definition's source
 /// and lock its definition row.
@@ -1187,7 +1187,7 @@ enum FenceEdit {
 /// transaction holds. The edit then waits on the page at the fence. Had it
 /// locked the definition row first, the third transaction's lock on that
 /// row would close the cycle: third on edit, edit on page, page on third,
-/// and Postgres would abort one of them with `40P01`. In issue #744 the
+/// and Postgres would abort one of them with `40P01`. The
 /// third was the catch-up discharge: its orphan sweep held target rows a
 /// page queued on, and it then locked its `catching_up` readers'
 /// definition rows (`catalog::catching_up_readers`). The edit bumps the
@@ -1259,8 +1259,8 @@ async fn an_edit_waiting_on_a_page_at_the_fence(edit: FenceEdit) {
         }
     });
     d.wait_blocked_behind(frozen.backend_pid).await;
-    // The third now wants the definition row. Before #744's fix the cycle
-    // closed here, and whichever of the three ran its deadlock check first
+    // The third now wants the definition row. Without the fence bump the cycle
+    // closes here, and whichever of the three ran its deadlock check first
     // was aborted: usually the page, which retries, so only the log shows it.
     let locked = third
         .execute(
@@ -1374,10 +1374,10 @@ async fn a_chunk_planned_before_an_edit_doesnt_write_after_it() {
     );
 }
 
-// ----------------------------- a column pause against a chunk in flight (#903)
+// ----------------------------- a column pause against a chunk in flight
 
 /// A column pause holds the column out of its build's chunks from the
-/// moment it returns (issue #903). Here the field build's chunk has run its
+/// moment it returns. Here the field build's chunk has run its
 /// statement, writing `w` from its snapshot, and stops before it commits.
 /// The chunk holds its source's version fence `for share` from the start of
 /// its transaction, and the pause bumps that fence, so the pause waits for
@@ -1434,9 +1434,9 @@ async fn a_column_pause_waits_for_a_field_chunk_that_wrote_the_column() {
     );
 }
 
-// ------------- a page Re-derive under a repeatable read default (#887)
+// ------------- a page Re-derive under a repeatable read default
 
-/// Issue #887: a read after the entry lock sees what committed before it
+/// A read after the entry lock sees what committed before it
 /// only at `read committed`. A page re-deriving key 1 takes its first
 /// statement's snapshot and stops before its entry lock; key 1's own row
 /// then changes. When the page goes on, its Re-derive reads the row after
@@ -1513,9 +1513,9 @@ async fn apply_computed_page(d: &Driver, batch: i64, worker: &str, plan: &apply:
     txn.commit().await.expect("commit phase 3");
 }
 
-// ------------------------------ the column-pause lock against a build (#922)
+// ------------------------------ the column-pause lock against a build
 
-/// Issue #922 rule 4: a define holds the column-pause lock (shared) for its
+/// A define holds the column-pause lock (shared) for its
 /// catalog transaction only, and the build it starts takes none while it
 /// writes. Here a second definition is registered and its Re-derive build
 /// started, and its chunk stops mid-statement, holding its fence and entry

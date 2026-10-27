@@ -1,4 +1,4 @@
-//! Front-door integration test for issue #180: an **extinct** upstream
+//! Front-door integration test: an **extinct** upstream
 //! aggregate group must reduce (or, when it was the group's sole
 //! contributor, remove) a chained downstream aggregate — reproduced here
 //! with the *plainest* possible shape, a single-column `GROUP BY` at every
@@ -9,19 +9,18 @@
 //! TRANSFORM sku_totals_v2 FROM sku_totals  GROUP BY sku WITHOUT SOURCE INDEX SELECT sum(total)  AS total2
 //! ```
 //!
-//! The issue's own writeup is explicit that this bug is encoding-independent
-//! — it reproduces identically for a plain single-column `GROUP BY` chain,
-//! unaffected by the #171/#163 composite-key encoding fix
+//! This bug is encoding-independent — it reproduces identically for a plain
+//! single-column `GROUP BY` chain, unaffected by the composite-key encoding
 //! (`defs_aggregate_chained_composite_group_key.rs`'s own front door). This
 //! file is that single-column pin: `sku_totals`' identity is a bare,
-//! unencoded primary key (issue #103's shape, not #171's U+001F-joined
-//! composite one), so it exercises a different `ddl::join_pk_key`/
+//! unencoded primary key (not a U+001F-joined composite one), so it
+//! exercises a different `ddl::join_pk_key`/
 //! `ddl::split_pk_key` code path than the composite test while hitting the
-//! exact same root cause — before issue #180, deleting a group's only row
-//! removed it upstream (`sku_totals`) but the downstream `Recompute` that
-//! propagated it carried no image, so `sku_totals_v2`'s live re-fetch found
-//! the row already gone and silently dropped the change instead of
-//! subtracting its last-known contribution.
+//! exact same root cause — if deleting a group's only row removed it
+//! upstream (`sku_totals`) but the downstream `Recompute` that propagated it
+//! carried no image, `sku_totals_v2`'s live re-fetch would find the row
+//! already gone and silently drop the change instead of subtracting its
+//! last-known contribution.
 //!
 //! `sku_totals_v2` deliberately groups by the exact same column
 //! `sku_totals` does (an identity re-aggregation, not a coarser fan-in): a
@@ -233,7 +232,7 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
     );
 }
 
-/// Issue #180's exact repro, single-column-keyed: deleting `sku = 'b'`'s only
+/// The exact repro, single-column-keyed: deleting `sku = 'b'`'s only
 /// row makes that group extinct upstream (`sku_totals`), and the deletion
 /// must propagate all the way through to `sku_totals_v2` — removing its own
 /// `b` entry — rather than leaving `sku_totals_v2`'s stale `b: 2` forever.
@@ -304,30 +303,25 @@ async fn an_extinct_single_column_group_reduces_the_chained_downstream_aggregate
             ("c".to_string(), Some("11".to_string())),
             ("d".to_string(), Some("9".to_string())),
         ]),
-        "issue #180: the extinct 'b' group's downstream counterpart must be \
+        "the extinct 'b' group's downstream counterpart must be \
          removed too (not left stale at total2 = 2), while the ordinary \
          update and the brand-new group still propagate normally"
     );
 }
 
-/// The `NULL`-keyed group, which issue #180's own writeup calls out by name
-/// ("a `NULL` grouping component ... same underlying gap, same failure
-/// family") — and which issue #180's fix deliberately did **not** close,
-/// because the gap was upstream of it, in the shared key contract itself:
-/// the old path's group-key encoder used to encode a `NULL` component as an empty part
-/// (indistinguishable from `''`), and the chained definition's own live
-/// re-read (`read_live_rows_batch`'s keyset join, a plain `t.col = u.c0`)
-/// could never match a `NULL` column anyway. Issue #110 closes it: a `NULL`
-/// component now encodes as `ddl::NULL_KEY_SENTINEL` (a control character
+/// The `NULL`-keyed group, a `NULL` grouping component in the shared key
+/// contract: a group-key encoder that encoded a `NULL` component as an empty
+/// part would be indistinguishable from `''`, and the chained definition's
+/// own live re-read (`read_live_rows_batch`'s keyset join, a plain
+/// `t.col = u.c0`) could never match a `NULL` column anyway. So a `NULL`
+/// component encodes as `ddl::NULL_KEY_SENTINEL` (a control character
 /// that no genuine value can encode to, since `ddl::encode_key_part` escapes
 /// a real one by doubling it — see
 /// `a_real_sentinel_valued_group_key_stays_its_own_group` below), and
 /// `read_live_rows_batch` uses `is not distinct from`
 /// for any key component a batch's keys carry a `NULL` for.
 ///
-/// This test (formerly `a_null_keyed_group_never_reaches_the_chained_downstream_aggregate`,
-/// issue #195's pin of the gap) now asserts the behaviour we actually want,
-/// end to end: a `NULL`-keyed upstream group's **creation**, a later
+/// This test asserts, end to end: a `NULL`-keyed upstream group's **creation**, a later
 /// **update** that keeps it `NULL`-keyed, and its eventual **extinction**
 /// must all reach the chained downstream aggregate, exactly like any other
 /// group.
@@ -362,7 +356,7 @@ async fn a_null_keyed_group_reaches_the_chained_downstream_aggregate() {
     assert_eq!(
         null_group_total(&client, "sku_totals_v2", "total2").await,
         Some("6".to_string()),
-        "issue #110: the NULL-keyed group's creation now propagates into \
+        "the NULL-keyed group's creation propagates into \
          the chained aggregate"
     );
 
@@ -390,7 +384,7 @@ async fn a_null_keyed_group_reaches_the_chained_downstream_aggregate() {
     assert_eq!(
         null_group_total(&client, "sku_totals_v2", "total2").await,
         Some("10".to_string()),
-        "issue #110: the NULL-keyed group's update also propagates downstream"
+        "the NULL-keyed group's update also propagates downstream"
     );
 
     // Partial reduction: deleting one of the two rows leaves the group alive
@@ -417,11 +411,11 @@ async fn a_null_keyed_group_reaches_the_chained_downstream_aggregate() {
     assert_eq!(
         null_group_total(&client, "sku_totals_v2", "total2").await,
         Some("4".to_string()),
-        "issue #110: the reduction (not yet an extinction) propagates too"
+        "the reduction (not yet an extinction) propagates too"
     );
 
     // Extinction: deleting the group's last row must remove it both upstream
-    // and (issue #180's image-threading, exercised here for a NULL key
+    // and (the image-threading, exercised here for a NULL key
     // specifically) downstream.
     client
         .batch_execute("delete from sales where id = 8")
@@ -446,7 +440,7 @@ async fn a_null_keyed_group_reaches_the_chained_downstream_aggregate() {
     assert_eq!(
         null_group_total(&client, "sku_totals_v2", "total2").await,
         None,
-        "issue #110 + #180: the NULL-keyed group's extinction propagates \
+        "the NULL-keyed group's extinction propagates \
          downstream too, instead of leaving a stale total2 = 4 forever"
     );
 }
@@ -465,7 +459,7 @@ async fn null_group_total(client: &Client, table: &str, column: &str) -> Option<
         .and_then(|row| row.get(0))
 }
 
-/// Review follow-up to issue #110: `ddl::NULL_KEY_SENTINEL` is U+0001, an
+/// `ddl::NULL_KEY_SENTINEL` is U+0001, an
 /// ordinary control character a `text` column can genuinely hold — so the
 /// encoding has to *escape* a real one rather than merely assume it never
 /// occurs. Without the escape, a group whose `sku` is a lone U+0001 encodes
@@ -473,8 +467,8 @@ async fn null_group_total(client: &Client, table: &str, column: &str) -> Option<
 /// folded into one: the upstream aggregate loses the U+0001 group entirely
 /// and mis-attributes its `amount` to the NULL group, at both levels of the
 /// chain. That is a silent, data-dependent corruption of data that worked
-/// correctly *before* #110, which makes it strictly worse than the bug #110
-/// fixes — hence this pin, alongside `ddl`'s own unit-level round-trip test.
+/// correctly without the NULL sentinel, which would make it strictly worse
+/// than the bug the sentinel fixes — hence this pin, alongside `ddl`'s own unit-level round-trip test.
 #[tokio::test]
 async fn a_real_sentinel_valued_group_key_stays_its_own_group() {
     let cluster = TestCluster::start();

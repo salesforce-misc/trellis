@@ -1,5 +1,5 @@
 //! A source that joins a partition or inheritance hierarchy after its
-//! definitions were accepted pauses them (issue #707, case 3).
+//! definitions were accepted pauses them.
 //!
 //! Define refuses a table in a hierarchy (`trellis::defs::hierarchy`): a
 //! statement trigger fires only for the table a statement names, so capture
@@ -9,7 +9,7 @@
 //! pass checks every table it captures, pauses the definitions that read
 //! one, and leaves its capture alone.
 //!
-//! Nothing polls for convergence (#297): every pass is stepped by hand.
+//! Nothing polls for convergence: every pass is stepped by hand.
 
 use std::time::{Duration, Instant};
 

@@ -1,9 +1,9 @@
-//! A live `JOIN` whose joined table is swapped for a copy (#1177): the
-//! staging worker's pass reinstalls capture on the recreated table. Since
-//! #707 the swap is first a disruption of capture that pauses the `JOIN`: the
+//! A live `JOIN` whose joined table is swapped for a copy: the
+//! staging worker's pass reinstalls capture on the recreated table. The
+//! swap is first a disruption of capture that pauses the `JOIN`: the
 //! test resumes it and steps the passes after, neither of which may fail.
 //!
-//! The pass is stepped by hand and nothing polls (#297).
+//! The pass is stepped by hand and nothing polls.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -52,10 +52,10 @@ async fn a_swapped_joined_table_does_not_panic_the_pass() {
         .expect("swap");
 
     let pool = d.pool().clone();
-    // The swap is a disruption of Trellis's capture (#707): the first pass
+    // The swap is a disruption of Trellis's capture: the first pass
     // pauses the `JOIN` and installs nothing. A resume re-validates it
     // against the table now at the name, and the passes after it reinstall
-    // capture on the recreated table (#1177).
+    // capture on the recreated table.
     trellis::client::reconcile_pass(&mut d.ctl, &pool, DEFAULT_SCHEMA)
         .await
         .expect("reconcile pass");

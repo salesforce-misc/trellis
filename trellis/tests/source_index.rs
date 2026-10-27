@@ -1,9 +1,9 @@
-//! #1167: a `GROUP BY` (on the group basis) or `JOIN` target needs, on its
+//! A `GROUP BY` (on the group basis) or `JOIN` target needs, on its
 //! source, an index its `self_check` walk pages by. Define and a
 //! whole-transform `RESUME` refuse without it unless the definition says
 //! `WITHOUT SOURCE INDEX`; later `status` warns and `self_check` refuses,
 //! and nothing pauses. Every test is stepped by hand: no staging worker runs
-//! and nothing polls (#297).
+//! and nothing polls.
 
 use std::time::Duration;
 
@@ -312,7 +312,7 @@ async fn the_index_must_lead_with_the_group_columns_in_group_by_order() {
 /// A page orders each group column ascending, `NULL` last: an index whose
 /// leading columns run that way, or all the other way (read backward), counts;
 /// one mixing directions, or with `NULL` first ascending, leaves each page to
-/// sort and doesn't (#1223).
+/// sort and doesn't.
 #[tokio::test]
 async fn the_index_must_run_in_the_page_order_forward_or_backward() {
     let (_cluster, _db, raw, trellis) = setup("").await;

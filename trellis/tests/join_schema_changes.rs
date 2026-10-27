@@ -1,11 +1,10 @@
-//! A live `JOIN` target across a schema change of either table (#1110 J5,
-//! ADR-0019): its copies of a `varchar(n)` column are unbounded (#1207), so a
-//! widening needs no re-type and no value waits for the staging worker's
-//! pass. No table a `JOIN` or a group-basis aggregate creates holds a bounded
+//! A live `JOIN` target across a schema change of either table (ADR-0019): its copies of a
+//! `varchar(n)` column are unbounded, so a widening needs no re-type and no value waits for the
+//! staging worker's pass. No table a `JOIN` or a group-basis aggregate creates holds a bounded
 //! `varchar`.
 //!
 //! The pipeline and the pass are stepped by hand
-//! (`support/drain_driver.rs`), and nothing polls for convergence (#297).
+//! (`support/drain_driver.rs`), and nothing polls for convergence.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -79,7 +78,7 @@ async fn pass(d: &mut Driver) {
 }
 
 /// Both `GROUP BY` columns and the `ON` pair widen from `varchar(5)` to
-/// `varchar(20)` (#1207). The target and the hidden `P`, `M`, `J` and `T`
+/// `varchar(20)`. The target and the hidden `P`, `M`, `J` and `T`
 /// hold their copies of these columns as unbounded `varchar`, so a value
 /// the old type couldn't hold, and a value of only trailing spaces past it
 /// (which a `varchar(5)` copy would truncate into the group `'g1'`), is
@@ -178,7 +177,7 @@ async fn a_widened_varchar_of_either_table_is_applied_before_any_pass_on_a_live_
     assert_eq!(diverged(&d).await, Vec::<String>::new());
 }
 
-/// Rule 1 of #1207's decision, over the tables a `JOIN` and a group-basis
+/// Rule 1 of the type-identity decision (ADR-0020), over the tables a `JOIN` and a group-basis
 /// aggregate create: a `JOIN` grouped by `varchar(n)` columns of both tables
 /// over a `varchar(n)` `ON` pair, another grouped by a `varchar(n)` key, and
 /// a group-basis aggregate grouped by two `varchar(n)` columns. None of

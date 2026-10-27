@@ -3,28 +3,27 @@
 //!
 //! A chain's intermediate hop (`h1` in `src -> h1 -> h2`) is two things at
 //! once: the *target* of the upstream definition and a *source* of the
-//! downstream one. Issue #267 found that, while `h1` was itself captured, a
-//! write to it was staged twice under two spellings of the
-//! table — once by the applying transaction's own downstream propagation and
-//! once by intake — which live-locked the downstream apply. Issue #315 then
-//! took intermediate hops out of the captured set altogether: every write to
-//! a target reaches its readers only through the target-mutation seam
-//! (`staging::target_mutations`), inside the writing transaction, so there is
-//! one staging and one spelling by construction. That also fixed an
-//! aggregate target feeding another transform, whose CDC could not be
-//! decoded at all (issue #315's original report: intake died on the first
-//! change).
+//! downstream one. Were `h1` itself captured, a write to it would be staged
+//! twice under two spellings of the table — once by the applying
+//! transaction's own downstream propagation and once by intake — which
+//! live-locks the downstream apply. So intermediate hops are not in the
+//! captured set at all: every write to a target reaches its readers only
+//! through the target-mutation seam (`staging::target_mutations`), inside the
+//! writing transaction, so there is one staging and one spelling by
+//! construction. That also covers an aggregate target feeding another
+//! transform, whose CDC could not be decoded at all (intake would die on the
+//! first change).
 //!
 //! The root source's capture is real here: the tests install the capture
 //! triggers with the staging worker's own reconcile pass, then seal and drain
 //! by hand (`support/trigger_pipeline.rs`). Hand-staging the root's ring row
-//! instead would write capture's half of #267's spelling disagreement into
-//! the test (#369). Driving every step by hand makes each test
+//! instead would write capture's half of a spelling disagreement into
+//! the test. Driving every step by hand makes each test
 //! deterministic: no background worker, no reconcile loop, no polling for
-//! convergence (#297).
+//! convergence.
 //! A drain that fails panics with its error, and a ring that never quiesces
-//! panics with its stuck `(src_table, key)` pairs, where #267 would once
-//! have retried a `draining` segment forever.
+//! panics with its stuck `(src_table, key)` pairs, rather than
+//! retrying a `draining` segment forever.
 
 use std::collections::HashMap;
 
@@ -52,7 +51,7 @@ fn rows(pairs: &[(&str, &str)]) -> HashMap<String, Option<String>> {
 
 /// Installs each `TRANSFORM` in order against `columns`, taking each live
 /// (its build's start, then its chunks) before the next: that is what lets the
-/// next hop chain off it at all (`reject_non_live_upstream`, issue #315).
+/// next hop chain off it at all (`reject_non_live_upstream`).
 async fn install_chain(
     db: &testkit::TestDatabase,
     texts: &[&str],
@@ -66,8 +65,7 @@ async fn install_chain(
     }
 }
 
-/// Issue #267's repro, in shape: a 2-hop 1-1 passthrough chain and one
-/// insert, then an update and a delete of the same row, so every CDC op for
+/// A 2-hop 1-1 passthrough chain and one insert, then an update and a delete of the same row, so every CDC op for
 /// the root reaches `h2` through the middle hop.
 #[tokio::test]
 async fn a_two_hop_one_to_one_chain_converges_without_capturing_the_middle_hop() {
@@ -96,7 +94,7 @@ async fn a_two_hop_one_to_one_chain_converges_without_capturing_the_middle_hop()
     assert_eq!(
         chain.rows(H2).await,
         rows(&[("1", "1")]),
-        "h2 must converge through the 2-hop chain (issue #267)"
+        "h2 must converge through the 2-hop chain"
     );
 
     chain
@@ -116,7 +114,7 @@ async fn a_two_hop_one_to_one_chain_converges_without_capturing_the_middle_hop()
     assert_eq!(chain.rows(H2).await, rows(&[]));
 }
 
-/// Issue #267 follow-up (the issue's repro is 1-1 only, 2 hops only): `h2`
+/// Beyond the 1-1, 2-hop case: `h2`
 /// here is a *deeper* intermediate hop, and `h3` an aggregate reading it.
 #[tokio::test]
 async fn a_three_hop_chain_ending_in_an_aggregate_converges() {
@@ -125,7 +123,7 @@ async fn a_three_hop_chain_ending_in_an_aggregate_converges() {
         .await
         .expect("create src");
     // An aggregate over a target never reads that target's capture: the
-    // target-mutation seam feeds it (issue #315).
+    // target-mutation seam feeds it.
     install_chain(
         &db,
         &[
@@ -151,7 +149,7 @@ async fn a_three_hop_chain_ending_in_an_aggregate_converges() {
     assert_eq!(
         chain.rows(H3).await,
         rows(&[("7", "2")]),
-        "h3 must converge through the 3-hop chain ending in an aggregate (issue #267)"
+        "h3 must converge through the 3-hop chain ending in an aggregate"
     );
 
     // A group move two hops down: only `h2`'s prior image names group 7.
@@ -164,7 +162,7 @@ async fn a_three_hop_chain_ending_in_an_aggregate_converges() {
     assert_eq!(chain.rows(H3).await, rows(&[("7", "1"), ("8", "1")]));
 }
 
-/// Issue #315's original report: an aggregate target feeding another
+/// An aggregate target feeding another
 /// transform. While the aggregate target was captured, its first CDC change
 /// killed intake (no primary key to decode a key from), so nothing
 /// downstream ever converged again. `hist` counts `agg`'s groups by their

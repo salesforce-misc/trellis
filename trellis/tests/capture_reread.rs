@@ -1,4 +1,4 @@
-//! #623 D8a: capture images the live row, re-read by primary key, and an
+//! Capture images the live row, re-read by primary key, and an
 //! update that changed no imaged column stages nothing.
 //!
 //! - **No leak (the user's gate on D's Q8).** The re-read joins only rows the
@@ -24,7 +24,7 @@
 //! nested-write tests run with the gate on.
 //!
 //! Capture is installed by hand and the ring is read directly; nothing waits
-//! for convergence (#297).
+//! for convergence.
 
 use std::time::Duration;
 
@@ -61,7 +61,7 @@ async fn install_spec(client: &mut Client, spec: &CaptureSpec) {
 
 /// Makes every capture of `table` re-read the live row: with its begin
 /// trigger disabled no statement marks a span start, and the gate falls back
-/// to the re-read (#623 D8a).
+/// to the re-read.
 async fn always_reread(client: &Client, table: &str) {
     client
         .batch_execute(&format!(
@@ -389,7 +389,7 @@ async fn an_upsert_over_another_sessions_commit_images_its_own_result() {
 /// its own insert of that key writes. The re-read images the writer's row,
 /// never the other session's deleted one, and when a nested write deletes
 /// the writer's row, it stages a delete rather than imaging the stale
-/// version (#623 D8a review).
+/// version.
 #[tokio::test]
 async fn a_version_another_session_removed_after_the_snapshot_is_never_imaged() {
     for level in [IsolationLevel::RepeatableRead, IsolationLevel::Serializable] {
@@ -453,7 +453,7 @@ async fn a_version_another_session_removed_after_the_snapshot_is_never_imaged() 
 /// A key move between two values its type's `=` calls equal but that render
 /// differently (`numeric` `1.0` to `1.00`) is a delete of the old key text
 /// and an insert of the new one: the ring keys by the text, so the re-read
-/// of the old key must not find the moved row (#623 D8a review).
+/// of the old key must not find the moved row.
 #[tokio::test]
 async fn a_key_move_its_types_equality_calls_a_no_op_deletes_the_old_key() {
     let cluster = TestCluster::start();
@@ -833,7 +833,7 @@ async fn scan_counts(client: &Client, table: &str) -> (i64, i64) {
 /// primary key's index build, say) leaves a scan pending in the `raw`
 /// session that reaches the shared counters only once that session has been
 /// idle for a second, which is by timing, so under load it lands between any
-/// two reads (#1233). The test therefore flushes every session, reads the
+/// two reads. The test therefore flushes every session, reads the
 /// counters as a baseline before the writes, and asserts on the delta.
 #[tokio::test]
 async fn the_reread_never_scans_the_table_after_planning_against_it_empty() {

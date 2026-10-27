@@ -1,10 +1,10 @@
 //! `self_check` of a 1-1 target compares it against its source minus the ring
-//! rows the target hasn't applied yet (#1176, ADR-0013 "Quiescence"): a key
+//! rows the target hasn't applied yet (ADR-0013 "Quiescence"): a key
 //! with an unapplied change is expected as that change's old image (no row
 //! for an insert), any other key as its live row.
 //!
 //! Every test drives the pipeline by hand through `support/drain_driver.rs`
-//! and never polls for convergence (#297): a page is compared while a sealed
+//! and never polls for convergence: a page is compared while a sealed
 //! segment nobody drained, or the active segment, still holds changes.
 
 #[path = "support/drain_driver.rs"]
@@ -201,7 +201,7 @@ async fn a_pending_truncate_leaves_every_key_uncertain() {
 }
 
 /// A 1-1 page reads the ring through the helper the group and `JOIN` pages
-/// share, so it skips a drained slot (#1219): a slot whose segment is drained
+/// share, so it skips a drained slot: a slot whose segment is drained
 /// is never scanned, the one holding the active segment is.
 #[tokio::test]
 async fn a_one_to_one_page_never_scans_a_drained_ring_slot() {
@@ -286,7 +286,7 @@ async fn a_change_below_the_truncate_floor_is_not_expected() {
 }
 
 /// The ring's keys and old images are matched to source rows by key value,
-/// never by order, so a source key re-collated after define (#1203) changes
+/// never by order, so a source key re-collated after define changes
 /// nothing: pages follow the target key's collation (`en-US`: `k01 < K02 <
 /// k03`; `"C"` puts every `K…` first), and a pending update, delete and insert
 /// are each subtracted once, at every page size. A planted error is still

@@ -1,13 +1,11 @@
-//! Issue #166: the settled-state model's Phase 3 (apply ∪ mark-drained)
+//! The settled-state model's Phase 3 (apply ∪ mark-drained)
 //! atomicity claim, proven across a **real** crash — a genuine `SIGKILL` of
 //! a real OS process, not `ManualBackend::restart`'s in-process simulation
 //! (see that method's own doc comment for exactly why it can't stand in for
-//! this). This is the last unmet piece of issue #138's original scope (a
-//! SIGKILL during Phase 3, so the re-drain must redo the batch), deliberately
-//! deferred out of #138 rather than faked, and filed as its own issue for
-//! exactly this reason.
+//! this). A SIGKILL during Phase 3, so the re-drain must redo the batch, is
+//! exactly the case that needs a real process rather than a faked one.
 //!
-//! Uses `generative::backend::SubprocessBackend` (issue #166) against a
+//! Uses `generative::backend::SubprocessBackend` against a
 //! small 1-1 program ([`critical_pair_program`]) whose last two ops, updates
 //! to two different rows, land back-to-back with no intervening
 //! `quiesce()`, so whichever Phase 3 pass drains them writes both target
@@ -58,7 +56,7 @@ fn critical_pair_program() -> Program {
     )
 }
 
-/// The regression test issue #166 exists for: `SIGKILL` a real engine
+/// The regression test for a real crash: `SIGKILL` a real engine
 /// subprocess while it is sitting inside Phase 3's still-open transaction —
 /// every write already issued against it, nothing yet committed — then
 /// confirm a freshly spawned subprocess redrives the same batch and the
@@ -153,7 +151,7 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
 
     // The claims the paused primary holds, read before the restart: the
     // fresh subprocess is already draining when `restart` returns, so its
-    // own claims must not be aged below (issue #756). A plain `SELECT`
+    // own claims must not be aged below. A plain `SELECT`
     // doesn't block on the paused transaction, as above.
     let killed_claimants: Vec<String> = pool
         .get()
@@ -199,7 +197,7 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
     }
 
     // The killed process's claims on the batch outlive it: the fresh
-    // subprocess has an id of its own (issue #756), so it takes them back
+    // subprocess has an id of its own, so it takes them back
     // only once the reclaim sweep finds them past `reclaim_ttl` (30 s, as
     // long as `quiesce` waits). Age them past it instead of waiting it out;
     // the fresh subprocess's next maintenance tick reclaims them. Only the
@@ -243,7 +241,7 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
 /// only once Postgres schedules that backend to read the EOF, which under CPU
 /// contention can trail the kill by milliseconds; a fresh engine that asked
 /// first failed its start with `ProducerAlreadyRunning`, and the restart above
-/// timed out waiting for a readiness marker that never came (PR #859's CI).
+/// timed out waiting for a readiness marker that never came (seen in CI).
 ///
 /// The stand-in for that slow backend is a session of this test's own,
 /// queued on the singleton behind the running primary: Postgres hands it the

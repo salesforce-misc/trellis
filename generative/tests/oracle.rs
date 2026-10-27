@@ -1,5 +1,5 @@
 //! Proves the Postgres-SQL oracle and the three-way comparison
-//! (`generative::oracle`, issue #5): render a 1-1 numeric-`+` definition back
+//! (`generative::oracle`): render a 1-1 numeric-`+` definition back
 //! to a `SELECT`, run it against the same `testkit` cluster the program ran
 //! in, and confirm the comparison localizes a divergence to the right layer
 //! (`target ≠ SQL` vs `evaluator ≠ SQL`). Comparator/report unit tests live

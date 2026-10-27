@@ -1,5 +1,5 @@
 //! A database-level `xmloption = document` doesn't fail an aggregate's page
-//! over an `xml` fragment (found in #623 D3b's review).
+//! over an `xml` fragment.
 //!
 //! The group basis casts an image's text into the source's columns through
 //! `jsonb_populate_record` (`staging::group_basis`), so an `xml` argument
@@ -10,7 +10,7 @@
 //! `xmloption` to `content`, which accepts both.
 //!
 //! Stepped by hand: the writes come from a separate session, then explicit
-//! staging-worker passes and seal/drain rounds. Nothing polls (#297).
+//! staging-worker passes and seal/drain rounds. Nothing polls.
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};

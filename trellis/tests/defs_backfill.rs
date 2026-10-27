@@ -1,4 +1,4 @@
-//! Integration test for issue #23: creating a definition backfills its
+//! Integration test: creating a definition backfills its
 //! source exactly once, regardless of how many calculated fields the
 //! definition declares — "N columns, one backfill", not once per column.
 //! Run against a real, ephemeral Postgres instance via `testkit::TestCluster`.

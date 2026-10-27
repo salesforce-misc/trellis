@@ -1,5 +1,5 @@
 //! A rebuild of a `live` group-basis aggregate whose target already has
-//! groups (#1101's decision, ADR-0002 "An aggregate's build is one absolute
+//! groups (ADR-0002 "An aggregate's build is one absolute
 //! write per structure"): one absolute write that locks
 //! every group the enumeration union names (R8) in key order, runs the
 //! source's `GROUP BY` from one snapshot, and replaces each group's partials
@@ -8,7 +8,7 @@
 //! Every test requests the rebuild through `Trellis::request_backfill`, and runs the
 //! rebuild's job by hand through `support/drain_driver.rs`, frozen at its
 //! pause points where the scenario needs it. None sleeps or polls for
-//! convergence (#297): the one wait is for a page to queue on a lock the
+//! convergence: the one wait is for a page to queue on a lock the
 //! frozen rebuild holds, which the test has forced.
 
 #[path = "support/drain_driver.rs"]
@@ -246,7 +246,7 @@ async fn changes_before_during_and_after_a_rebuild() {
     assert_oracle(&mut d).await;
 }
 
-/// #1097 rule 4: the rebuild takes its snapshot after its lock statement. A
+/// The rebuild takes its snapshot after its lock statement. A
 /// page that applies a change to a group the rebuild has enumerated, and
 /// commits before the rebuild locks it, is in the snapshot, so the absolute
 /// write keeps the change. A snapshot taken before the locks (planted bug
@@ -476,7 +476,7 @@ async fn pause(d: &Driver) {
         .expect("pause");
 }
 
-/// A whole-transform `RESUME` of a group-basis aggregate is accepted (#1222):
+/// A whole-transform `RESUME` of a group-basis aggregate is accepted:
 /// it keeps no ledger, so the owned-table check a 1-1 resume runs has
 /// nothing to find missing. Its hidden partials table is recreated
 /// (`group_basis_resume.rs`).

@@ -1,4 +1,4 @@
-//! The scenarios of `upstream_build_releases.rs` (#1306): a reader of a
+//! The scenarios of `upstream_build_releases.rs`: a reader of a
 //! Trellis target holding a key, and the upstream build whose completion
 //! releases it.
 
@@ -43,7 +43,7 @@ pub async fn status_of(trellis: &Trellis, target: &str) -> String {
 
 /// Seals and drains eight times, tolerating a drain that fails on a held
 /// key's value: each failure charges the key a death, so the page commits
-/// once the key is held. A fixed number of rounds, not a wait (#297).
+/// once the key is held. A fixed number of rounds, not a wait.
 /// Returns how many attempts failed.
 pub async fn settle_tolerant(d: &mut Driver) -> usize {
     let mut failures = 0;

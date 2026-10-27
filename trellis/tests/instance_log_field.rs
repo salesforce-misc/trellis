@@ -1,4 +1,4 @@
-//! Issue #874 (epic #806): every engine log event names the instance that
+//! Every engine log event names the instance that
 //! emitted it, in a `trellis_instance` field.
 //!
 //! Two instances share one process and one database, each with its own

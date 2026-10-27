@@ -1,4 +1,4 @@
-//! ADR-0017 P7 (issue #1066): every reconcile pass sweeps a partitioned
+//! ADR-0017 P7: every reconcile pass sweeps a partitioned
 //! source for target groups that route to no current leaf, by the bounds'
 //! complement, and queues their correction.
 //!
@@ -6,7 +6,7 @@
 //! live by the hand-driven pipeline (`support/drain_driver.rs`), and drives
 //! the pass, the ring and the correction engine by hand. The
 //! oracle is a from-scratch `GROUP BY` over the source. Nothing waits for
-//! convergence (#297): the race test freezes the pass at a pause point.
+//! convergence: the race test freezes the pass at a pause point.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -841,7 +841,7 @@ async fn a_complement_whose_hash_middle_is_dropped_completes_and_converges() {
 }
 
 // ---------------------------------------------------------------------------
-// #1129: real ways to reach a recorded node that is gone with an unusable
+// Real ways to reach a recorded node that is gone with an unusable
 // text, and the shapes that could let an unchanged leaf absorb its region.
 // Each drives real DDL against the real pass, freezing it between the tree
 // read and the text fetch where the window needs widening.
@@ -1516,8 +1516,8 @@ async fn a_hash_middle_dropped_under_a_queued_correction_converges() {
         }
         fx.d.settle().await;
         // A new leaf's text embeds the dropped middle's oid; the leaf went
-        // with its middle, so its correction is complete without work
-        // (#1148), and the middle's `gone_node` corrects the region.
+        // with its middle, so its correction is complete without work,
+        // and the middle's `gone_node` corrects the region.
         partition_correction::run_pending(fx.d.pool(), &Options::default())
             .await
             .expect("run the pending corrections");
@@ -1609,7 +1609,7 @@ async fn a_detach_committed_during_the_text_fetch_converges() {
         holder.batch_execute("commit").await.expect("commit");
         // The fetch takes the node's lock once the DDL commits and finds it
         // no longer a partition (`XX000`): it defers the check and records
-        // nothing (#1149). Past the fetch's lock timeout it retries and reads
+        // nothing. Past the fetch's lock timeout it retries and reads
         // no text; past its last retry it defers too (a slow runner can
         // commit that late). Each way the pass fails nothing, and the next
         // pass reads the tree afresh.

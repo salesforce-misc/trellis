@@ -1,7 +1,7 @@
-//! Tests of the harness itself (issue #21): that it spins up and tears down
+//! Tests of the harness itself: that it spins up and tears down
 //! cleanly, that isolated databases don't bleed into each other, that a
 //! restart keeps the data while severing every connection, and that a cold
-//! backup restores into an independent cluster (issue #236).
+//! backup restores into an independent cluster.
 
 use std::process::{Command, Stdio};
 use testkit::{StopMode, TestCluster, fixtures};
@@ -62,7 +62,7 @@ async fn harness_starts_runs_a_query_and_tears_down_cleanly() {
     assert!(!root.exists(), "temp dir should be removed on teardown");
 
     // Teardown stops the server with `pg_ctl stop -m immediate`, which must
-    // still free the SysV segment (issue #43: leaked segments break every
+    // still free the SysV segment (leaked segments break every
     // later `initdb`).
     #[cfg(target_os = "linux")]
     assert!(
@@ -128,7 +128,7 @@ async fn isolated_databases_do_not_bleed_into_each_other() {
     assert_eq!(rows_b, vec![(1, "from-b".to_string())]);
 }
 
-/// Issue #665: every test database collates the same on every machine,
+/// Every test database collates the same on every machine,
 /// whatever `LANG` the test runs under. Unpinned, this box's `en_US.UTF-8`
 /// leaked in while CI got `C.UTF-8`, and a test's `ORDER BY` could pass here
 /// and fail on CI. The default is ICU `en-US`, so a query that needs bytewise
@@ -175,7 +175,7 @@ async fn test_databases_default_to_the_icu_en_us_collation() {
     assert_eq!(order, ["a", "B"]);
 }
 
-/// Issue #236: `restart` in either mode brings the same cluster back — a new
+/// `restart` in either mode brings the same cluster back — a new
 /// server process, every existing connection severed, and the data intact.
 ///
 /// Multi-threaded so each pooled connection's driver task observes the
@@ -221,7 +221,7 @@ async fn restart_severs_connections_and_keeps_data() {
     );
 }
 
-/// Issue #236: a cold backup restores into an independent cluster holding
+/// A cold backup restores into an independent cluster holding
 /// the data exactly as it was at the backup,
 /// and later writes to either cluster don't reach the other. Both the
 /// backup's and the restored cluster's temp directories go on drop.

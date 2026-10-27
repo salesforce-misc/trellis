@@ -1,4 +1,4 @@
-//! Integration tests for the from-scratch correctness oracle (issue #25),
+//! Integration tests for the from-scratch correctness oracle,
 //! run against a real, ephemeral Postgres instance via `testkit::TestCluster`.
 
 use std::collections::HashMap;
@@ -49,7 +49,7 @@ fn order_totals_def() -> TransformDef {
 }
 
 /// The oracle's recompute over the whole source table must equal evaluating
-/// each source row directly with #24's evaluator — the self-consistency
+/// each source row directly with the evaluator — the self-consistency
 /// property that follows from the oracle being evaluator-driven rather than
 /// a second, independently-written SQL expression.
 #[tokio::test]
@@ -105,7 +105,7 @@ async fn oracle_recompute_equals_per_row_evaluation_over_the_source() {
 }
 
 /// Cross-checks `strpos(name, 'foo') > 0` (a function call composed with the
-/// `>` comparison operator, issue #65) against real Postgres, by rendering
+/// `>` comparison operator) against real Postgres, by rendering
 /// the expression back to SQL via [`render_expr_sql`] and comparing its
 /// result to the evaluator's — the same "our grammar is a subset of Postgres
 /// semantics" check ADR-0004 calls for, exercised for the composed
@@ -168,9 +168,9 @@ async fn function_call_composed_with_greater_than_matches_postgres() {
 
 /// A hand-staged apply of a 1-1 change converges to the oracle's recompute:
 /// this simulates (by hand, in the test) the step the real apply stage
-/// (#11, not yet built) will one day perform automatically — pre-populating
-/// the target directly stands in for backfill-on-create (#6), which is
-/// explicitly out of scope for this issue.
+/// performs automatically — pre-populating
+/// the target directly stands in for backfill-on-create, which is
+/// out of scope for this test.
 #[tokio::test]
 async fn hand_staged_apply_of_a_source_change_converges_to_the_oracle() {
     let cluster = TestCluster::start();
@@ -200,8 +200,8 @@ async fn hand_staged_apply_of_a_source_change_converges_to_the_oracle() {
     .await
     .expect("create target table");
 
-    // Pre-populate the target directly, standing in for backfill-on-create
-    // (#6), which this issue defers.
+    // Pre-populate the target directly, standing in for backfill-on-create,
+    // which this issue defers.
     for id in [1i32, 2] {
         let row = client
             .query_one(
@@ -527,15 +527,13 @@ async fn aggregate_recompute_matches_postgres_group_by_exactly() {
 
 /// A `GROUP BY` field referencing another calculated field by name
 /// (`double_total = total + total`, where `total = SUM(amount)`) — the
-/// Aggregate-key-space counterpart of issue #83's 1-1 cross-field-alias
-/// substitution fix, which was never extended to this oracle's rendering
-/// (`render_aggregate_select_sql` used to render `double_total`'s raw
-/// `Expr::Column("total")` as a bare SQL identifier, which Postgres rejects
-/// since `total` names neither a source column nor a same-SELECT-list-visible
-/// name — so this oracle never actually ran as working ground truth for this
-/// shape; both the real target and the oracle would have hit the identical
-/// "column does not exist" error). Confirms the oracle now renders valid SQL
-/// that agrees with the evaluator-driven [`recompute_aggregate`].
+/// Aggregate-key-space counterpart of the 1-1 cross-field-alias
+/// substitution (`render_aggregate_select_sql` must not render
+/// `double_total`'s raw `Expr::Column("total")` as a bare SQL identifier,
+/// which Postgres rejects since `total` names neither a source column nor a
+/// same-SELECT-list-visible name; both the real target and the oracle would
+/// hit the identical "column does not exist" error). Confirms the oracle
+/// renders valid SQL that agrees with the evaluator-driven [`recompute_aggregate`].
 #[tokio::test]
 async fn aggregate_recompute_matches_postgres_group_by_for_a_cross_field_alias() {
     let cluster = TestCluster::start();

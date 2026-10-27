@@ -1,4 +1,4 @@
-//! Integration tests for issue #227 — the unified, grammar-driven
+//! Integration tests for the unified, grammar-driven
 //! [`trellis::Trellis::apply`] entrypoint every definition-changing operation
 //! now goes through.
 //!
@@ -208,7 +208,7 @@ async fn statements_outside_the_grammar_are_parse_errors_that_change_nothing() {
 }
 
 /// `RELATIONSHIP`, `DROP RELATIONSHIP` and `PAUSE`/`RESUME RELATIONSHIP` are
-/// not statements (#1115):
+/// not statements:
 /// `apply` refuses each as text it can't parse, before registering anything,
 /// and `statement_kind` gives the same answer without a database.
 #[tokio::test]

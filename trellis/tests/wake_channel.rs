@@ -1,4 +1,4 @@
-//! Issue #875 (epic #806): two instances in one database wake only their own
+//! Two instances in one database wake only their own
 //! workers. `LISTEN/NOTIFY` channels are per database, so the default wake
 //! channel is derived from the catalog schema.
 //!

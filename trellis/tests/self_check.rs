@@ -1,4 +1,4 @@
-//! Integration tests for `Trellis::self_check` (issue #174, ADR-0013's
+//! Integration tests for `Trellis::self_check` (ADR-0013's
 //! production recompute audit).
 //!
 //! A real, ephemeral Postgres instance per test (`testkit::TestCluster`).
@@ -9,10 +9,10 @@
 //! the first place. [`converged_fixture`] installs the source's capture
 //! triggers, lets them stage the rows it writes, and drains them through the
 //! engine's own apply path instead of running a live `Client` and waiting
-//! for it to converge (issue #299). See that helper for why the wait was
+//! for it to converge. See that helper for why the wait was
 //! the expensive part.
 //!
-//! The capture-audit tests at the end (#622 C9) break a converged target's
+//! The capture-audit tests at the end break a converged target's
 //! capture from the catalog side: a disabled or dropped trigger, a function
 //! handed to another owner, a revoked privilege, a partition or inheritance
 //! hierarchy. No staging worker runs to repair any of it, so each report is
@@ -28,7 +28,7 @@
 //! (`trellis/src/staging/self_check.rs`). These tests cover what needs
 //! Postgres: that the rendered recompute SQL runs and agrees with what the
 //! engine persisted, the keyset paging and its page alignment (under the
-//! key's collation, #782), and the paused-column read.
+//! key's collation), and the paused-column read.
 //!
 //! **A deliberately out-of-scope race** (judgment call, flagged rather than
 //! silently skipped): ADR-0013's re-check-on-divergence design also guards
@@ -82,10 +82,10 @@ async fn connect_raw(dsn: &str) -> Client {
 /// actually spent. It is a ceiling, not a wait.
 const GENEROUS_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The convergence deadline for the #592 test that blocks the wait on a
+/// The convergence deadline for the test that blocks the wait on a
 /// lock and terminates it. Never spent: the test terminates the wait within
 /// its 30s lookup bound. It only has to outlast that bound, so the wait is
-/// still running when the terminate lands, since #596 enforces the deadline
+/// still running when the terminate lands, since the deadline is enforced
 /// mid-poll.
 const LOCKED_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -180,8 +180,7 @@ async fn converged_fixture(
     trellis.apply(transform).await.expect("define");
     // No staging worker runs here: stand in for its capture pass, which
     // installs the source's capture triggers, and for its build, which
-    // takes a definition over an empty source straight to `live` (#625 F8a:
-    // a plain 1-1 over a captured table is the Re-derive build's, whose plan
+    // takes a definition over an empty source straight to `live` (a plain 1-1 over a captured table is the Re-derive build's, whose plan
     // job finds no rows).
     let src_table = format!("{DEFAULT_SCHEMA}.{source}");
     capture(&mut raw, &src_table).await;
@@ -261,7 +260,7 @@ async fn converged_target_reports_no_divergence() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// A definition that isn't `live` isn't compared (#625 F7, comment 2): a
+/// A definition that isn't `live` isn't compared: a
 /// rebuild a repair starts is visible from the call's return, so the audit
 /// says so rather than comparing a target the rebuild is about to change, and
 /// once the rebuild is done the same audit compares and converges. Nothing is
@@ -368,7 +367,7 @@ async fn self_check_reports_a_paused_definition_as_not_live() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Issue #109's typed literals, through the production audit path.
+/// Typed literals, through the production audit path.
 ///
 /// `self_check` is the one place a *production* SQL renderer
 /// (`staging::self_check::render_leaf`) turns a calculated-field expression
@@ -555,7 +554,7 @@ async fn self_check_reports_not_caught_up_rather_than_a_false_divergence_for_a_l
     definer.shutdown().await.expect("shutdown definer");
     // The definition goes `live` over the empty source before the staging
     // worker starts: with no drain workers it could never run a build, and a
-    // definition that isn't `live` is not compared (#625 F7).
+    // definition that isn't `live` is not compared.
     let mut setup = connect_raw(db.dsn()).await;
     capture(&mut setup, &format!("{DEFAULT_SCHEMA}.widgets")).await;
     trellis::intake::harness::settle_builds(&db.pool).await;
@@ -605,7 +604,7 @@ async fn self_check_reports_not_caught_up_rather_than_a_false_divergence_for_a_l
     running.shutdown().await.expect("shutdown running");
 }
 
-/// Issue #592: a database failure during `self_check`'s convergence wait
+/// A database failure during `self_check`'s convergence wait
 /// must come back as `Err`, not as the benign
 /// [`SelfCheckOutcome::NotCaughtUp`]. Otherwise a caller polling `self_check`
 /// keeps seeing "not caught up" while the audit can't run at all.
@@ -617,7 +616,7 @@ async fn self_check_reports_not_caught_up_rather_than_a_false_divergence_for_a_l
 /// poisoned key). The test finds the blocked backend in `pg_locks`, terminates
 /// it, and only then releases the lock.
 ///
-/// `await_converged` bounds each poll by the remaining deadline (issue #596),
+/// `await_converged` bounds each poll by the remaining deadline,
 /// so a blocked wait that outlives it ends in `ConvergenceTimeout`, which
 /// this test would read as `NotCaughtUp`. So the wait's deadline,
 /// [`LOCKED_WAIT_TIMEOUT`], is far longer than the lookup loop's own 30s
@@ -909,7 +908,7 @@ async fn self_check_refuses_a_non_positive_limit_rather_than_vacuously_convergin
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// #622 C9: [`converged_fixture`]'s `widget_totals` over `widgets`, with its
+/// [`converged_fixture`]'s `widget_totals` over `widgets`, with its
 /// capture installed and nothing diverged.
 async fn widgets_fixture(db: &TestDatabase) -> (Trellis, Client) {
     converged_fixture(
@@ -958,7 +957,7 @@ fn capture_faults(report: &trellis::staging::self_check::SelfCheckPage) -> Vec<C
 
 const WIDGETS: &str = "trellis.widgets";
 
-/// #622 C9 (acceptance A5): a capture trigger an operator disabled by name
+/// A capture trigger an operator disabled by name
 /// is reported, and so is one set to plain `ENABLE`, which stops firing in
 /// a `session_replication_role = replica` session. The target row is
 /// corrupted as well, to show the comparison that would find it never runs.
@@ -998,7 +997,7 @@ async fn a_disabled_capture_trigger_is_reported_before_any_comparison() {
                 trigger: "trellis_capture_delete".to_string(),
                 enabled: "O".to_string(),
             },
-            // #623 D8a: without it every capture re-reads.
+            // Without it every capture re-reads.
             CaptureFault::TriggerNotAlways {
                 table: WIDGETS.to_string(),
                 trigger: "trellis_capture_begin".to_string(),
@@ -1010,7 +1009,7 @@ async fn a_disabled_capture_trigger_is_reported_before_any_comparison() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// #622 C9: a dropped capture trigger is reported.
+/// A dropped capture trigger is reported.
 #[tokio::test]
 async fn a_dropped_capture_trigger_is_reported() {
     let cluster = TestCluster::start();
@@ -1032,17 +1031,17 @@ async fn a_dropped_capture_trigger_is_reported() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// #622 C9 (acceptance A5): the Trellis role losing a privilege the capture
+/// The Trellis role losing a privilege the capture
 /// functions use is reported.
 ///
 /// The test cluster's Trellis role is a superuser, which holds every
 /// privilege whatever is revoked, so the test hands the ring to an ordinary
 /// role first. The functions still belong to the superuser then, which is
-/// reported as mis-owned: they belong to the ring's owner (issue #701), and
+/// reported as mis-owned: they belong to the ring's owner, and
 /// the schema's owner doesn't count. Once they belong to the new role too,
 /// and it holds exactly the grants the audit expects, the target converges;
 /// revoking `INSERT` on one ring segment, or `SELECT` on the source, which
-/// the functions re-read (#623 D8a), is then reported.
+/// the functions re-read, is then reported.
 #[tokio::test]
 async fn a_revoked_capture_privilege_and_a_mis_owned_function_are_reported() {
     let cluster = TestCluster::start();
@@ -1130,7 +1129,7 @@ async fn a_revoked_capture_privilege_and_a_mis_owned_function_are_reported() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// #622 C9: a source attached as a partition after its definition was
+/// A source attached as a partition after its definition was
 /// accepted is reported. A write through the partitioned parent fires the
 /// parent's statement triggers, not the source's.
 #[tokio::test]
@@ -1159,7 +1158,7 @@ async fn a_source_attached_as_a_partition_is_reported() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// #622 C9: a source that joined an inheritance hierarchy after its
+/// A source that joined an inheritance hierarchy after its
 /// definition was accepted is reported, as a child and as a parent.
 #[tokio::test]
 async fn a_source_in_an_inheritance_hierarchy_is_reported() {
@@ -1198,7 +1197,7 @@ async fn a_source_in_an_inheritance_hierarchy_is_reported() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// #622 C9 review: a capture trigger re-pointed at some other function, and
+/// A capture trigger re-pointed at some other function, and
 /// a capture function switched to `SECURITY INVOKER`, are reported. The
 /// re-pointed trigger is set back to `ENABLE ALWAYS`, so the only thing wrong
 /// with it is the function it calls.
@@ -1245,7 +1244,7 @@ async fn a_repointed_capture_trigger_and_an_invoker_capture_function_are_reporte
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// #622 C9 review: which definitions and tables the audit looks at. A
+/// Which definitions and tables the audit looks at. A
 /// definition sourced from this instance's own target is fed by the
 /// target-mutation seam, which installs no triggers, so its source isn't
 /// audited. A paused definition is frozen and reads nothing, so it isn't
@@ -1313,7 +1312,7 @@ async fn a_seam_fed_source_and_a_paused_definition_are_not_audited() {
 }
 
 // ---------------------------------------------------------------------------
-// Paging under the key's collation (issue #782)
+// Paging under the key's collation
 // ---------------------------------------------------------------------------
 
 /// Twelve source rows keyed `k01`, `K02`, `k03`, … (lower case for an odd
@@ -1505,8 +1504,8 @@ async fn an_extra_target_row_just_past_a_page_boundary_is_reported_under_the_key
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// The source key is re-collated to `"C"` between page 1 and page 2 of a walk
-/// (#1203). Page 1 (`en-US`: `k01 < K02 < k03`) saves the cursor `k03`; under
+/// The source key is re-collated to `"C"` between page 1 and page 2 of a walk.
+/// Page 1 (`en-US`: `k01 < K02 < k03`) saves the cursor `k03`; under
 /// `"C"` every `K…` sorts before it, so a walk that followed the source's new
 /// collation would skip `K04`, `K06`, … and never see the planted missing
 /// `K06`. The walk pages under the target key's collation, which the
@@ -1550,11 +1549,11 @@ async fn a_re_collation_between_pages_skips_no_key_and_reports_a_missing_row() {
 }
 
 /// A source key re-collated after define to a *nondeterministic* collation
-/// (case-insensitive here; define refuses one, #638, but a later `alter`
+/// (case-insensitive here; define refuses one, but a later `alter`
 /// isn't refused). Under it, `k03` and an extra target row `K03` compare
 /// equal, so paging by it would let a page's `limit` cut between the two and
 /// the next page's `> k03` skip whichever was cut. A 1-1 walk pages under
-/// the target key's collation (#1203), which the `alter` didn't touch, so the
+/// the target key's collation, which the `alter` didn't touch, so the
 /// two never tie: the extra row is reported and `k03` isn't. The `"C"`
 /// fallback for a nondeterministic walk collation is tested on
 /// `staging::self_check_keyset`'s own walk.
@@ -1660,7 +1659,7 @@ async fn a_page_reads_both_sides_by_their_key_index() {
 }
 
 /// After the source key is re-collated, the page is still compared under
-/// the target key's collation (#1203): the target is read by its key index
+/// the target key's collation: the target is read by its key index
 /// and the source, whose index now orders otherwise, by a scan.
 #[tokio::test]
 async fn a_page_after_a_re_collation_reads_the_target_by_its_key_index() {
@@ -1692,7 +1691,7 @@ async fn a_page_after_a_re_collation_reads_the_target_by_its_key_index() {
 }
 
 // ---------------------------------------------------------------------------
-// `Trellis::self_check` as a background job (#1023, #599)
+// `Trellis::self_check` as a background job
 //
 // A job is registered by the call and run by a drain worker, a keyset page per
 // pass. These tests hand-drive the worker (`work_once`) the way
@@ -1793,7 +1792,7 @@ async fn self_check_returns_a_queued_job_and_the_result_is_readable_once_a_worke
 
 /// An idle `self_check` worker waits out its poll floor (here 30 s, with the
 /// cap above it), so a job queued meanwhile is run by the wake the database
-/// sends when the row is inserted (#1075), not by the clock.
+/// sends when the row is inserted, not by the clock.
 /// The only wait is for the worker's `LISTEN` to be in place, which the test
 /// reads from the server, and then for the job it queued.
 #[tokio::test]
@@ -2329,7 +2328,7 @@ async fn a_job_over_a_paused_definition_ends_not_live() {
 }
 
 /// The report of a job reads what an operator needs to act on live, when it
-/// is polled: here a held key (#759) that appears after the job finished.
+/// is polled: here a held key that appears after the job finished.
 #[tokio::test]
 async fn a_finished_jobs_report_reads_the_findings_live() {
     let cluster = TestCluster::start();
@@ -2663,7 +2662,7 @@ async fn a_shutdown_stops_the_worker_mid_page_and_cancels_its_job() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-// ---- Typed keyset paging (#1178) ----
+// ---- Typed keyset paging ----
 
 /// The `next_after` of each page of a walk of `target`, `limit` keys a page,
 /// and every divergence any page reported.

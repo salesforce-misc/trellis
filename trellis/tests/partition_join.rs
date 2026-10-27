@@ -1,4 +1,4 @@
-//! #1111 (J6): partition maintenance under a `JOIN` transform whose fact
+//! Partition maintenance under a `JOIN` transform whose fact
 //! side (`FROM`) or dimension side (the joined table) is a partitioned root
 //! (ADR-0017, ADR-0019 "Either side may be partitioned when its partial key
 //! holds every partition-key column").
@@ -13,12 +13,12 @@
 //! definition goes `live` with empty hidden tables and the seed arrives
 //! through capture (the per-leaf build of a partitioned side with rows is
 //! `join_interleavings.rs`'s). The pass,
-//! the seal, the drain and the correction engine are called by hand; nothing waits for convergence
-//! (#297). The oracle is each definition's own `JOIN … GROUP BY`, and the
+//! the seal, the drain and the correction engine are called by hand; nothing waits for convergence.
+//! The oracle is each definition's own `JOIN … GROUP BY`, and the
 //! hidden `P`, `M`, `J` and `T` against `GROUP BY`s of the tables.
 //!
-//! The cases are #1043 E1's variant-L scenarios (`P.*`) with a `JOIN` side
-//! operated on, and #958's lifecycle cells (X12-7a two-level trees, X12-7b a
+//! The cases are the variant-L scenarios (`P.*`) with a `JOIN` side
+//! operated on, and the lifecycle cells (X12-7a two-level trees, X12-7b a
 //! `DEFAULT` operated on, X12-7c a `HASH` re-split, X12-7e writes into the
 //! node while it is corrected).
 
@@ -468,7 +468,7 @@ impl Fx {
     }
 }
 
-// --- Leaf and middle operations (#1043 E1 variant L, `P.*`) ---------------
+// --- Leaf and middle operations (variant L, `P.*`) ---------------------
 
 /// `P.drop` / `P.detach`: a leaf of either side dropped or detached with
 /// changes to it still undrained in the ring. The recompute's basis sees
@@ -857,7 +857,7 @@ async fn a_detach_pending_leaf_waits_for_the_detach_to_finalize() {
     }
 }
 
-// --- Two-level trees, DEFAULTs and HASH re-splits (#958) ------------------
+// --- Two-level trees, DEFAULTs and HASH re-splits ------------------
 
 /// `RANGE` then `HASH`: the root's ranges 0-7 and 8-15, the second a `HASH`
 /// middle of four leaves.
@@ -880,7 +880,7 @@ fn two_level(part: Part) -> String {
 /// Declares one `#[tokio::test]` per (operation, root) pair, each running
 /// `$case(part, index)` on its own fixture. The cases used to be one test
 /// looping over sixteen fixtures, a ~25 s tail no other test could overlap;
-/// as separate tests the harness runs them in parallel (#1226).
+/// as separate tests the harness runs them in parallel.
 macro_rules! case_tests {
     ($case:ident: $($index:literal => $fact:ident, $dim:ident;)+) => {
         $(

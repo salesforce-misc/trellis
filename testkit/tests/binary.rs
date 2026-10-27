@@ -1,4 +1,4 @@
-//! Tests of the `trellis-testkit` binary (issue #143), driven the way a host
+//! Tests of the `trellis-testkit` binary, driven the way a host
 //! test suite drives it: spawn it, read its JSON line, connect, then end it
 //! and check it took the cluster with it.
 

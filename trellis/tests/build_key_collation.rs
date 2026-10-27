@@ -1,5 +1,5 @@
 //! A chunked build over a text-keyed source whose key column is re-collated
-//! while the build runs (issue #769).
+//! while the build runs.
 //!
 //! A build's chunks are `(lo, hi]` ranges of the source's primary key, stored
 //! as text in `backfill_chunks.lo/hi` and compared against the key column by
@@ -11,7 +11,7 @@
 //! every `K…` before every `k…`.
 //!
 //! Every test steps the engine by hand, as `rederive_build.rs` does: no
-//! background worker runs and nothing waits for convergence (#297).
+//! background worker runs and nothing waits for convergence.
 
 use std::time::Duration;
 

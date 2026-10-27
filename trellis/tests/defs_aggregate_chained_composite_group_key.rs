@@ -1,4 +1,4 @@
-//! Front-door integration tests for issue #171: a **live incremental**
+//! Front-door integration tests for a **live incremental**
 //! change that propagates downstream into a chained aggregate whose upstream
 //! aggregate has a **multi-column `GROUP BY`**.
 //!
@@ -16,14 +16,13 @@
 //! keyed by its encoded group-key text (`ddl::join_pk_key`), and
 //! `stock_totals_v2`'s own live re-fetch (`apply::read_live_rows_batch` →
 //! `ddl::split_pk_key`) decodes it as `stock_totals`' real (composite)
-//! primary key. Before the fix those two encodings disagreed —
-//! the old path's group-key encoder emitted a locally-invented length-prefixed form
-//! (`"2:w1" + "1:a"`), the decoder split on U+001F — so the drain failed
-//! outright with `DdlError::MalformedCompositeKey { key: "2:w11:a",
+//! primary key. If those two encodings disagreed (say the group-key encoder
+//! emitted a length-prefixed form, `"2:w1" + "1:a"`, while the decoder split
+//! on U+001F), the drain would fail outright with
+//! `DdlError::MalformedCompositeKey { key: "2:w11:a",
 //! expected_arity: 2, actual_arity: 1 }`, taking the whole batch with it.
-//! Issue #103 had already fixed the single-column twin of this bug (a
-//! one-column `GROUP BY` emits its bare value, matching a single-column PK);
-//! #171 is the same treatment for the composite case.
+//! A one-column `GROUP BY` emits its bare value, matching a single-column PK;
+//! the composite case encodes the same way the primary key does.
 //!
 //! Backfilling both definitions from scratch was never broken (a direct
 //! table scan builds no per-row key text at all), so every test here
@@ -107,7 +106,7 @@ async fn stage_cdc(
 /// Seals and drains repeatedly until nothing is pending anywhere in the ring.
 ///
 /// The `expect("drain_once")` here is this file's actual regression pin for
-/// issue #171: the pre-fix failure mode is a hard `ApplyError` (a
+/// The pre-fix failure mode is a hard `ApplyError` (a
 /// `DdlError::MalformedCompositeKey` raised while decoding the downstream
 /// `Recompute`'s key), so a regression panics right here rather than merely
 /// producing a wrong number further down.
@@ -176,7 +175,7 @@ async fn create_schema(client: &Client) {
                (4, 'w2', 'a', 11)",
         )
         .await
-        .expect("create + seed issue #171's schema");
+        .expect("create + seed the schema");
 }
 
 /// `(warehouse, sku) -> total_qty`.
@@ -242,7 +241,7 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
     );
 }
 
-/// Issue #171's exact repro: a live `UPDATE` on `inventory` that changes one
+/// The exact repro: a live `UPDATE` on `inventory` that changes one
 /// `stock_totals` group's total must propagate all the way through to
 /// `stock_totals_v2` — instead of failing the drain with
 /// `DdlError::MalformedCompositeKey { source_table: "stock_totals", key:
@@ -283,11 +282,11 @@ async fn a_live_update_propagates_through_a_composite_group_key_into_a_chained_a
             ("w2".to_string(), Some("11".to_string())),
         ]),
         "the live change must propagate downstream through the composite \
-         group key (issue #171)"
+         group key"
     );
 }
 
-/// Issue #200, end to end: the same chain, but one grouping component's own
+/// End to end: the same chain, but one grouping component's own
 /// text genuinely contains U+001F — `ddl::COMPOSITE_KEY_SEPARATOR` itself —
 /// and U+001E (`ddl::KEY_PART_ESCAPE`), adjacent to each other so an
 /// off-by-one in either direction of the escape shows up rather than
@@ -301,8 +300,8 @@ async fn a_live_update_propagates_through_a_composite_group_key_into_a_chained_a
 /// arm wraps every column in `ddl::composite_key_escape_sql`) and then
 /// decodes it back with `ddl::split_pk_key`. A disagreement anywhere in that
 /// triangle either fails the drain outright with
-/// `DdlError::MalformedCompositeKey` (what happened before #200: the raw
-/// U+001F split into a third phantom part) or silently resolves the group's
+/// `DdlError::MalformedCompositeKey` (the raw
+/// U+001F would split into a third phantom part) or silently resolves the group's
 /// row to "missing", which shows up here as a wrong `stock_totals_v2` total.
 #[tokio::test]
 async fn a_live_separator_valued_group_component_propagates_downstream() {
@@ -350,7 +349,7 @@ async fn a_live_separator_valued_group_component_propagates_downstream() {
             ("w2".to_string(), Some("11".to_string())),
         ]),
         "a group component containing the key separator must still propagate \
-         downstream (issue #200)"
+         downstream"
     );
 }
 
@@ -360,21 +359,20 @@ async fn a_live_separator_valued_group_component_propagates_downstream() {
 /// stages a *deleted* group key — the other half of
 /// what the downstream-propagation step encodes).
 ///
-/// Both now propagate. Before issue #180, the extinct one did **not**: a
-/// downstream `Recompute` carried no image, so `stock_totals_v2` re-read the
-/// key live, found the row already gone, and had no way to know which of
-/// *its* groups that vanished row used to contribute to, so the change was
-/// dropped. That gap was entirely independent of issue #171's key *encoding*
-/// (it reproduced identically for a single-column `GROUP BY` chain, whose
-/// encoding #103 already fixed — see
-/// `defs_aggregate_chained_single_column_group_key.rs`) and closing it
-/// needed the deleted group's old values threaded through the propagation
-/// step, not a different key format: the old aggregate path (deleted in
-/// #623 D5) captured the extinct group's pre-delete row and staged it as a
-/// real image-bearing delete instead of an image-less `Recompute`. #171's own narrower fix is still exercised here
+/// Both propagate. An image-less downstream `Recompute` would not carry the
+/// extinct one: `stock_totals_v2` would re-read the key live, find the row
+/// already gone, and have no way to know which of *its* groups that vanished
+/// row used to contribute to, so the change would be dropped. That is
+/// independent of the key *encoding* (it would reproduce identically for a
+/// single-column `GROUP BY` chain — see
+/// `defs_aggregate_chained_single_column_group_key.rs`) and is avoided by
+/// threading the deleted group's old values through the propagation step: the
+/// extinct group's pre-delete row is captured and staged as a
+/// real image-bearing delete instead of an image-less `Recompute`. The key
+/// encoding is exercised here
 /// too: the extinct group's key still needs to *decode* correctly (rather
 /// than failing the whole batch with `MalformedCompositeKey`) for either the
-/// old gap or this fix to be reachable at all — which is why the sibling
+/// image threading or the encoding to be reachable at all — which is why the sibling
 /// `(w2, c)` insert in this same batch lands regardless.
 #[tokio::test]
 async fn a_live_insert_and_an_extinct_composite_group_both_propagate_downstream() {
@@ -425,22 +423,22 @@ async fn a_live_insert_and_an_extinct_composite_group_both_propagate_downstream(
     assert_eq!(
         stock_totals_v2(&client).await,
         HashMap::from([
-            // Issue #180: extinct (w1, b)'s 2 is now subtracted from `w1`
+            // Extinct (w1, b)'s 2 is now subtracted from `w1`
             // (14 - 2 = 12) instead of surviving forever.
             ("w1".to_string(), Some("12".to_string())),
             // The new `(w2, c)` group did propagate: 11 + 4.
             ("w2".to_string(), Some("15".to_string())),
         ]),
-        "a brand-new composite-key group must propagate downstream (issue \
-         #171) and an extinct one must now reduce the downstream aggregate \
-         too (issue #180)"
+        "a brand-new composite-key group must propagate downstream \
+         and an extinct one must now reduce the downstream aggregate \
+         too"
     );
 }
 
 /// A grain migration on the *upstream* composite key — row 1 moves from
 /// `(w1, a)` to `(w1, b)`, changing one of the two `GROUP BY` columns — must
 /// propagate both the old and the new group key downstream. Both keys are
-/// encoded the same way, so both go through issue #171's encoding on the way
+/// encoded the same way, so both go through the composite encoding on the way
 /// out; `stock_totals_v2`'s own key (`warehouse`) is unchanged by this move,
 /// which is precisely why its total must still be recomputed correctly from
 /// two separate upstream keys rather than one.
@@ -501,7 +499,7 @@ async fn null_sku_total(client: &Client, warehouse: &str) -> Option<String> {
         .and_then(|row| row.get(0))
 }
 
-/// Issue #110's composite-key case: one component of a composite `GROUP BY`
+/// The composite-key `NULL` case: one component of a composite `GROUP BY`
 /// key (`sku`) is `NULL` while the other (`warehouse`) is not — exercising
 /// the `array_to_string`/`coalesce(..., chr(1))` composite encoding path
 /// (`ddl::pk_key_sql_expr`/`ddl::join_pk_key`), as opposed to
@@ -546,12 +544,12 @@ async fn a_composite_group_with_a_null_component_propagates_downstream() {
             ("w1".to_string(), Some("17".to_string())),
             ("w2".to_string(), Some("11".to_string())),
         ]),
-        "issue #110: a composite group with a NULL component propagates its \
+        "a composite group with a NULL component propagates its \
          creation into the chained aggregate"
     );
 
     // Extinction: deleting the (w1, NULL) group's only row must remove its
-    // contribution downstream too (issue #110 + #180's image threading).
+    // contribution downstream too (via the image threading).
     client
         .batch_execute("delete from inventory where id = 6")
         .await
@@ -578,12 +576,13 @@ async fn a_composite_group_with_a_null_component_propagates_downstream() {
             ("w1".to_string(), Some("14".to_string())),
             ("w2".to_string(), Some("11".to_string())),
         ]),
-        "issue #110 + #180: the (w1, NULL) group's extinction propagates \
+        "the (w1, NULL) group's extinction propagates \
          downstream too, back to w1's original 14"
     );
 }
 
-/// Issues #110 and #200 *in the same composite group key*, end to end: one
+/// A `NULL` component and a separator-valued component *in the same composite
+/// group key*, end to end: one
 /// component (`warehouse`) genuinely holds both reserved characters of the
 /// separator scheme (U+001F and U+001E, adjacent), while the other (`sku`)
 /// is a genuine SQL `NULL`. The encoded key therefore carries
@@ -596,7 +595,7 @@ async fn a_composite_group_with_a_null_component_propagates_downstream() {
 /// `MalformedCompositeKey` or silently resolves the group to "missing".
 #[tokio::test]
 async fn a_null_component_and_a_separator_valued_component_propagate_together() {
-    // A warehouse name carrying both control characters the #200 escape
+    // A warehouse name carrying both control characters the escape
     // reserves, adjacent so an off-by-one in either direction shows up.
     const AWKWARD_WAREHOUSE: &str = "w\u{1f}\u{1e}3";
 
@@ -638,7 +637,7 @@ async fn a_null_component_and_a_separator_valued_component_propagate_together() 
             ("w2".to_string(), Some("11".to_string())),
             (AWKWARD_WAREHOUSE.to_string(), Some("6".to_string())),
         ]),
-        "issues #110 and #200 together: a group key carrying both a NULL \
+        "a group key carrying both a NULL \
          component and a separator/escape-valued one must propagate downstream"
     );
 

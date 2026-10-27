@@ -1,4 +1,4 @@
-//! Issue #695: a field named after a source column (`SUM(val) AS val`) used to
+//! A field named after a source column (`SUM(val) AS val`) used to
 //! be substituted into a later field's aggregate argument, so
 //! `MIN(val) AS lo` read as `MIN(SUM(val))`. Define accepted it and every
 //! build attempt failed. An aggregate's argument now reads the source column,
@@ -172,7 +172,7 @@ async fn an_aggregate_of_another_aggregate_field_is_refused_at_define() {
     );
 }
 
-/// #1096 decision 1: a plain aggregate outside the admitted set is refused at
+/// A plain aggregate outside the admitted set is refused at
 /// define by family, with nothing left behind: no target, no hidden table, no
 /// definition row. The float and unconstrained-`numeric` refusals read the
 /// live column, so they come from define's transaction, not the text.

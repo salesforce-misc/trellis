@@ -1,4 +1,4 @@
-//! Meta-tests for the harness itself (issue #4, design doc §6): a green
+//! Meta-tests for the harness itself (design doc §6): a green
 //! generative run must prove it ran. These are deliberately not about any
 //! generated program or oracle comparison — they check that the harness's
 //! own plumbing (standing up a cluster, classifying a backend that can't
@@ -67,7 +67,7 @@ async fn a_backend_that_cannot_stand_up_is_reported_unusable() {
     );
 }
 
-/// Self-enforcing half of the fast/deep split (issue #172): every proptest property is `#[ignore]`d, so a plain `cargo test
+/// Self-enforcing half of the fast/deep split: every proptest property is `#[ignore]`d, so a plain `cargo test
 /// --workspace` — the command every contributor and CI lane reaches for first —
 /// never deep-runs them by accident. Deep runs opt in with `-- --ignored` (just
 /// the properties) or `-- --include-ignored` (everything). Properties are also

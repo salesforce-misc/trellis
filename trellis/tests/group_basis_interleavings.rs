@@ -1,17 +1,17 @@
 //! Deterministic interleavings of the drain on a group-basis aggregate
-//! (#1100 G2a, ADR-0002 "Aggregates: a basis per group, kept by deltas").
+//! (ADR-0002 "Aggregates: a basis per group, kept by deltas").
 //!
 //! Each test drives one interleaving by hand through `support/drain_driver.rs`, and none
-//! sleeps or polls for convergence (#297). Every source starts empty and is
+//! sleeps or polls for convergence. Every source starts empty and is
 //! seeded through capture.
 //!
-//! The scenarios are #1043 E1's, at group granularity: R1 (a page reads a
+//! The scenarios are at group granularity: R1 (a page reads a
 //! group's basis after locking it), R2 (each side is checked against its own
 //! group's basis, per transaction), F2 (sides are never folded per key), R3
-//! (nested writes stage exact transition images, #1099), R7 (pages lock
+//! (nested writes stage exact transition images), R7 (pages lock
 //! groups in one sorted statement and never deadlock), and decision 4's
 //! transient states (a group is visible only while its row count is above
-//! 0). An absolute write, which only the build and recompute (#1101, #1102)
+//! 0). An absolute write, which only the build and recompute
 //! make, is planted by [`recompute`]: the model's locked group recompute.
 
 #[path = "support/drain_driver.rs"]
@@ -118,8 +118,8 @@ async fn partials(d: &Driver, g: i32) -> Vec<String> {
     .await
 }
 
-/// A locked group recompute of `groups`, the absolute write #1102 will
-/// make: lock the groups in one sorted statement, then one statement takes
+/// A locked group recompute of `groups`, the absolute write the build and
+/// recompute make: lock the groups in one sorted statement, then one statement takes
 /// the snapshot, `GROUP BY`s the source and writes the partials, the basis,
 /// the stamp (the newest segment there is, read with the snapshot: R5) and
 /// the visible rows. Runs on its own connection and is left open; the
@@ -205,7 +205,7 @@ async fn a_page_that_changes_nothing_writes_nothing() {
     assert_oracle(&mut d).await;
 }
 
-/// #1096 decision 7: a page that changes a group's partials but no visible
+/// A page that changes a group's partials but no visible
 /// value writes the hidden row and leaves the visible row alone. A `NULL`
 /// `v` changes the row count, which no field shows.
 #[tokio::test]
@@ -229,7 +229,7 @@ async fn a_page_that_changes_only_hidden_partials_leaves_the_visible_row() {
     );
 }
 
-/// #1096 decision 1: composed fields and expression arguments, without
+/// Composed fields and expression arguments, without
 /// `MIN`/`MAX` (the ledger's
 /// `composed_fields_and_expression_arguments_equal_postgres`).
 #[tokio::test]
@@ -266,8 +266,8 @@ async fn composed_fields_and_expression_arguments_equal_postgres() {
     }
 }
 
-/// `numeric(p,s)` sums and averages carry Postgres's scale (#1096 decision
-/// 2), through values leaving the group.
+/// `numeric(p,s)` sums and averages carry Postgres's scale,
+/// through values leaving the group.
 #[tokio::test]
 async fn numeric_sums_and_averages_keep_the_declared_scale() {
     let mut d = start_with(
@@ -459,7 +459,7 @@ async fn r2_one_page_applies_only_the_transactions_its_groups_basis_missed() {
     assert_oracle(&mut d).await;
 }
 
-/// R2 by visibility, not position (#558 exp 2's scenario 10): a writer's
+/// R2 by visibility, not position: a writer's
 /// change is in flight when a recompute of its group takes its snapshot, so
 /// the basis doesn't see it, though the writer's transaction id is below the
 /// snapshot's `xmax` (a later transaction completed first). The page applies
@@ -557,7 +557,7 @@ async fn f2_a_key_through_three_groups_on_one_page() {
 
 // ----------------------------------------------------------------------- R3
 
-/// R3 (#1099): nested writes stage exact transition images, so each
+/// R3: nested writes stage exact transition images, so each
 /// statement's sides sum to its rows' net change: an `AFTER ROW` trigger
 /// that rewrites the row it fires on, one that deletes an insert, and one
 /// that updates it.
@@ -628,7 +628,7 @@ async fn hidden_rows(d: &Driver) -> i64 {
 }
 
 /// R4: groups that churn (each filled and emptied again, the shape that made
-/// #1043's JOIN model 16x slower with the zero rows left in place) leave
+/// a JOIN model 16x slower with the zero rows left in place) leave
 /// zero groups with no basis, and the GC collects every one, so the hidden
 /// table holds only the groups with rows however many have come and gone.
 #[tokio::test]
@@ -654,7 +654,7 @@ async fn r4_the_gc_bounds_a_hidden_table_whose_groups_churn() {
     assert_oracle(&mut d).await;
 }
 
-/// R4, #1043's `RV.gc-n0`: pages applied out of order leave group 1 at
+/// R4, the `gc-n0` shape: pages applied out of order leave group 1 at
 /// `n = 0` with its sum still owed (`-2`). A GC that tests `n = 0` alone
 /// would delete it, and the late page would then leave `sum = 2` behind.
 /// Only a group whose every partial is zero is collected.
@@ -676,7 +676,7 @@ async fn r4_a_group_with_a_nonzero_partial_stays() {
     assert_oracle(&mut d).await;
 }
 
-/// R4 with a basis (#1043's `R.recreate-gc-race`): a recompute empties
+/// R4 with a basis (the recreate/GC race): a recompute empties
 /// group 5 after the delete C1 is sealed but before it drains, so the zero
 /// group's basis already counts C1. The GC keeps it while C1's segment is
 /// undrained, though a later segment has drained, and C1's page is then
@@ -788,7 +788,7 @@ async fn r4_a_page_meeting_a_group_the_gc_is_deleting_inserts_it_afresh() {
 /// The page's apply statement fetches the hidden rows it updates by TID and
 /// probes both tables' group identity indexes, `NULL` groups included:
 /// nothing in it scans either table whole while the page holds its groups'
-/// locks (#1100 G2b). The hidden rows' TID scan is over the array of the
+/// locks. The hidden rows' TID scan is over the array of the
 /// page's `ctid`s, not a probe per row from a nested loop: on this test's
 /// tiny tables `enable_seqscan = off` alone makes the planner pick that
 /// probe (a disabled nested loop), but on a large hidden table with real
@@ -853,7 +853,7 @@ async fn r7_concurrent_pages_over_shared_groups_never_deadlock() {
             }
             // The writers overlap on the rows they update, and an update
             // walks them in heap order: two writers could take row locks in
-            // opposite orders and deadlock each other (#1258). Locking the
+            // opposite orders and deadlock each other. Locking the
             // rows in id order first makes the writers deadlock-free, so a
             // logged deadlock below can only be between Trellis's pages.
             let sql = format!(
@@ -1300,7 +1300,7 @@ async fn the_evicting_changes_groups_are_held_and_released() {
 // ------------------------------------------------------------------ refusals
 
 /// Define refuses `SUM` over a `numeric` with no declared scale on the group
-/// basis (#1096 decision 2).
+/// basis.
 #[tokio::test]
 async fn define_refuses_an_unconstrained_numeric_sum() {
     let cluster = testkit::TestCluster::start();

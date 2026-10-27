@@ -1,13 +1,13 @@
-//! End-to-end tests for issue #115's `jsonb` support: the passthrough gap
+//! End-to-end tests for `jsonb` support: the passthrough gap
 //! check, the join/primary/`GROUP BY` key refusal, the typed-literal
 //! ("computed 1-1 target") role (covered by `defs_typed_literals.rs`'s
-//! shared `CASES` table, which this issue added a `JSONB` row to). The
+//! shared `CASES` table, which has a `JSONB` row). The
 //! `jsonb_agg` aggregate is refused at define
 //! (`ValidationError::DeferredAggregate`).
 //!
 //! # Why these run against a live server
 //!
-//! Per #111-#119's playbook: check `pg_cast` rather than assume `::text` is
+//! Per the type-family playbook: check `pg_cast` rather than assume `::text` is
 //! a type's own output function, check `pg_proc`/`pg_aggregate` rather than
 //! assume an aggregate exists or is safe, and check equality/rendering
 //! agreement live rather than reason about it from the type's name. Three
@@ -97,7 +97,7 @@ async fn define_join_on(
 // ---------------------------------------------------------------------
 
 /// `jsonb`'s `::text` is `jsonb_out` directly — no `pg_cast` override, the
-/// same "easy" shape `bit`/`bit varying` (#118) had, contrasted with
+/// same "easy" shape `bit`/`bit varying` had, contrasted with
 /// `boolean`, which does have one.
 #[tokio::test]
 async fn jsonb_has_no_dedicated_text_cast_function() {
@@ -160,9 +160,8 @@ async fn jsonb_in_and_out_are_immutable() {
 /// `jsonb`-typed column — a `jsonb` value's `to_jsonb` conversion is the
 /// identity — so `staging::apply::row_as_text_jsonb_sql`'s live-row reads
 /// (`<col>::text`) and a bare `to_jsonb(t.*)` would agree even if anything
-/// in this engine still called the latter (issue #248 already replaced
-/// every such call site). Checked per #113/#116's playbook rather than
-/// assumed.
+/// in this engine still called the latter (every such call site has been
+/// replaced). Checked per the type-family playbook rather than assumed.
 #[tokio::test]
 async fn to_jsonb_and_text_agree_for_jsonb() {
     let cluster = TestCluster::start();

@@ -1,4 +1,4 @@
-//! The convergence property, first end-to-end green (issue #6, design doc
+//! The convergence property, first end-to-end green (design doc
 //! §4). Generates trivial 1-1 numeric-`+` programs, drives each through the
 //! real [`ManualBackend`] one op at a time, and after every op asserts the
 //! materialized target equals the [`generative::oracle`] recompute.
@@ -18,7 +18,7 @@
 //! -p generative --test convergence`). Failing seeds are persisted to a local,
 //! git-ignored `convergence.proptest-regressions` and replayed first; a failure
 //! worth keeping is transcribed into a hand-built pin, since a seed replays into
-//! a different program once the strategy changes shape (#505).
+//! a different program once the strategy changes shape.
 
 use generative::backend::{Backend, ManualBackend};
 use generative::generate::{
@@ -263,7 +263,7 @@ async fn a_program_over_a_partitioned_source_converges_end_to_end() {
     }
 }
 
-/// Issue #1320: partition maintenance, partition-key updates and writes
+/// Partition maintenance, partition-key updates and writes
 /// named on a leaf or a detached table converge end to end, one program per
 /// partitioning strategy. Each check after a maintenance op waits for the
 /// reconcile pass that queues its correction, and for the correction.
@@ -532,7 +532,7 @@ async fn the_harness_detects_a_corrupted_target() {
 }
 
 /// [`check_program`] reports every diverging target, in definition order, not
-/// just the first (#671): a plant sweep attributes a failure by the targets it
+/// just the first: a plant sweep attributes a failure by the targets it
 /// diverged in, so a divergence earlier in definition order must not hide a
 /// later one. Three definitions share one source; the first and last targets
 /// are corrupted and the middle one is left alone.
@@ -587,7 +587,7 @@ async fn the_harness_reports_every_corrupted_target_in_definition_order() {
     );
 }
 
-/// Closes the issue #6 gap: a program whose mutate stream includes a
+/// A program whose mutate stream includes a
 /// [`Mutate::DuplicateInsert`] — a second `INSERT` at an already-seeded pk,
 /// rejected by the source table's real primary-key constraint. Unlike the
 /// missing-pk update/delete case (`no_op_mutations_on_missing_rows_still_converge`),

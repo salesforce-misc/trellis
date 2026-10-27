@@ -1,6 +1,6 @@
-//! Integration tests for connectivity + migrations (issue #20), run against
+//! Integration tests for connectivity + migrations, run against
 //! a real, ephemeral Postgres instance via the shared harness
-//! (`testkit::TestCluster`, issue #21).
+//! (`testkit::TestCluster`).
 
 use testkit::TestCluster;
 use trellis::{Config, Error, migrate};
@@ -107,7 +107,7 @@ async fn unreachable_dsn_surfaces_a_typed_error_without_panicking() {
     }
 }
 
-/// Issue #340: a connection killed server-side (`pg_terminate_backend`, the
+/// A connection killed server-side (`pg_terminate_backend`, the
 /// same fault a chaos test injects into the producer connection) must
 /// classify as `Connectivity`, the same as a transport-level drop. The
 /// server reports it as a real `DbError` with SQLSTATE `57P01`
@@ -156,7 +156,7 @@ async fn terminated_backend_classifies_as_connectivity() {
     );
 }
 
-/// Issue #182: a pool with no `max_size`/`wait_timeout` configured lets a
+/// A pool with no `max_size`/`wait_timeout` configured lets a
 /// caller that shows up once every slot is already checked out wait
 /// forever — silently, with no error and no log line, ever. Configures a
 /// deliberately tiny `max_size` (2, via [`Config::with_pool_max_size`]) and

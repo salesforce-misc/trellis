@@ -1,7 +1,7 @@
-//! `Trellis::status` of a `JOIN` transform (#1112 J7b): the hidden tables'
+//! `Trellis::status` of a `JOIN` transform: the hidden tables'
 //! sizes and the warning when `P` approaches the fact table. Warnings only:
 //! the definition's status is unaffected. (The source indexes a JOIN needs
-//! are `source_index.rs`'s.) Nothing here waits for anything (#297): each report is a
+//! are `source_index.rs`'s.) Nothing here waits for anything: each report is a
 //! catalog read, and the sizes are made current by an explicit `ANALYZE`.
 
 use testkit::TestCluster;

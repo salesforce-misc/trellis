@@ -1,4 +1,4 @@
-//! #623 D8a: capture's live re-read runs only when another write to the
+//! Capture's live re-read runs only when another write to the
 //! same table ran in the capturing statement's span, so a `SERIALIZABLE`
 //! write that nothing else touched takes no predicate lock on the source and
 //! can't be cancelled with `40001` on Trellis's account.
@@ -25,7 +25,7 @@
 //! - **A missing begin trigger errs towards re-reading.**
 //!
 //! Capture is installed by hand and the ring is read directly; nothing waits
-//! for convergence (#297).
+//! for convergence.
 
 use std::collections::BTreeMap;
 

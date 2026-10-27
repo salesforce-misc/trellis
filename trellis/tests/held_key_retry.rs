@@ -1,7 +1,7 @@
-//! The opt-in automatic retry of held keys (#861): `retry_held_keys`, one
+//! The opt-in automatic retry of held keys: `retry_held_keys`, one
 //! pass at a time, on the real engine, driven by hand through
 //! `support/drain_driver.rs`. The pass takes the time it judges due at, so
-//! no test sleeps or polls for convergence (#297).
+//! no test sleeps or polls for convergence.
 //!
 //! Every test holds key 1 of `public.nums` for `doubles`, as
 //! `release_held_key.rs` does: a check constraint on its target refuses the

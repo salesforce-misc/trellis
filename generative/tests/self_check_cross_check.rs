@@ -1,4 +1,4 @@
-//! ADR-0013's continuous independence check (issue #174): "the generative
+//! ADR-0013's continuous independence check: "the generative
 //! suite runs both renderers over the same definitions and asserts they
 //! agree, on every run." `trellis::staging::self_check`'s leaf renderer
 //! (`render_leaf`, `trellis/src/staging/self_check.rs`) and
@@ -16,7 +16,7 @@
 //! engine"); its independently-rendered leaf SQL is observed only
 //! indirectly, through [`trellis::Divergence::Cell`]'s `recomputed` field.
 //!
-//! # Issue #237: the fixed scenario above, promoted to a swept property
+//! # The fixed scenario above, promoted to a swept property
 //!
 //! `self_checks_recompute_matches_the_generative_sql_oracles_recompute_for_a_corrupted_row`
 //! above is layer-3 bucket 6's (`docs/generative-test-suite.md` §8/§9,
@@ -61,7 +61,7 @@ use trellis::{
 };
 
 /// `Trellis::self_check` run to its end. The call starts a background job and
-/// returns (#1023). The caller stops the backend's engine first, and with it
+/// returns. The caller stops the backend's engine first, and with it
 /// the worker task that would otherwise race this one for the job, so this
 /// runs every page of it by hand, the way `ManualBackend` drains, and reads
 /// the report back through the facade. The page holds a whole generated target (the largest is
@@ -289,7 +289,7 @@ async fn self_checks_recompute_matches_the_generative_sql_oracles_recompute_for_
 }
 
 // ---------------------------------------------------------------------
-// Issue #237 (layer-3 bucket 6): the swept, generated version of the fixed
+// Layer-3 bucket 6: the swept, generated version of the fixed
 // corruption-detection scenario above.
 // ---------------------------------------------------------------------
 
@@ -443,8 +443,8 @@ fn corruption_literal(
             "corruption_literal: trivial_one_to_one_program_with never attaches an \
              Other({pg_type}) field to a OneToOne def — extend this helper if that changes"
         ),
-        // #111/#112 split Integer/Float out of Numeric after this property was
-        // written; trivial_one_to_one_program_with still only ever attaches
+        // Integer/Float are separate from Numeric;
+        // trivial_one_to_one_program_with still only ever attaches
         // Numeric/Boolean/Text/Uuid to a OneToOne field (see this function's
         // and corrupted_field_value_type's doc comments), so these two stay
         // unreached in practice — extend this helper if that generator ever
@@ -669,7 +669,7 @@ fn run_swept_tampering_case(
 proptest! {
     #![proptest_config(tampering_proptest_config())]
 
-    /// Issue #237, layer-3 bucket 6: the swept, generated counterpart of
+    /// Layer-3 bucket 6: the swept, generated counterpart of
     /// `self_checks_recompute_matches_the_generative_sql_oracles_recompute_for_a_corrupted_row`
     /// above — see this file's module doc comment. An arbitrary
     /// `trivial_one_to_one_program_with`-drawn program is settled to

@@ -1,4 +1,4 @@
-//! Integration tests for issue #52's end-to-end latency histogram (ADR-0009
+//! Integration tests for the end-to-end latency histogram (ADR-0009
 //! decision 2): time from a source commit to a *terminal* transform's apply,
 //! keyed by terminal transform only.
 //!
@@ -86,7 +86,7 @@ async fn insert_cdc_row(
 }
 
 async fn drain(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
-    // Issue #132: a throwaway, always-caught-up watermark — no live
+    // A throwaway, always-caught-up watermark — no live
     // capture runs in this test, and this file isn't exercising guard (a).
     apply::drain_once(pool, seg_seq, claimed_by, 1, "trellis_e2e_latency_test")
         .await
@@ -131,13 +131,12 @@ fn bucket_count(rendered: &str, metric: &str, target: &str, le: &str) -> u64 {
 /// single source-committed CDC row against `orders`, no manufactured second
 /// write anywhere. `apply_and_mark_drained`'s downstream propagation (step
 /// 4, `trellis/src/staging/apply.rs`) stages the second hop's
-/// `StagedChange::Recompute` row itself; prior to the multi-hop-gap fix
-/// (issues #51/#52, discovered during #52's review), `Recompute` carried no
+/// `StagedChange::Recompute` row itself; a `Recompute` that carried no
 /// `src_changed` of its own (see `staging::append::StagedChange`'s doc
-/// comment), so a transform reached only through one — the common case for
-/// any hop beyond the first — folded to a `FoldedChange` with
+/// comment) would leave a transform reached only through one — the common
+/// case for any hop beyond the first — folded to a `FoldedChange` with
 /// `src_changed: None`, and neither histogram could observe anything for
-/// it. `Recompute` now threads the triggering change's `src_changed`
+/// it. `Recompute` threads the triggering change's `src_changed`
 /// forward (`apply.rs`'s `ChangedKey`/`TargetWrite::src_changed`/
 /// `TargetDelete::src_changed`), so this test proves the terminal transform
 /// gets a genuine end-to-end observation — traced all the way back to the
@@ -245,7 +244,7 @@ async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_cha
             "trellis_transform_latency_seconds",
             "e2e_latency_chain_totals",
         ),
-        "the intermediate hop must still get its own per-transform latency (issue #51): {after_hop0}"
+        "the intermediate hop must still get its own per-transform latency: {after_hop0}"
     );
     assert!(
         !metric_mentions_transform(
@@ -267,10 +266,9 @@ async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_cha
     // the `Recompute` row chain_totals' own apply staged automatically
     // (`apply_and_mark_drained`'s downstream propagation) — no second,
     // independently-staged change anywhere. This is the real automatic
-    // hop-to-hop propagation path issues #51/#52's multi-hop gap was about:
-    // before the fix, this `Recompute` row carried no `src_changed`, so
-    // neither histogram could observe anything here; now it carries hop 0's
-    // own origin forward.
+    // hop-to-hop propagation path for multi-hop chains: were this `Recompute`
+    // row to carry no `src_changed`, neither histogram could observe
+    // anything here; it carries hop 0's own origin forward.
     let seg2 = seal_active_segment(&mut client).await;
     let outcome2 = drain(&db.pool, seg2, "worker").await;
     assert_eq!(outcome2.keys_written, 1);
@@ -313,7 +311,7 @@ async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_cha
             "trellis_transform_latency_seconds",
             "e2e_latency_chain_summary",
         ),
-        "the terminal transform's own per-transform latency (issue #51) must be recorded too, \
+        "the terminal transform's own per-transform latency must be recorded too, \
          now that hop 2 — reached only via Recompute — carries a real origin: {after_hop1}"
     );
 }

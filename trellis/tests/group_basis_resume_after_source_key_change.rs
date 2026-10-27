@@ -1,10 +1,10 @@
-//! #1324 on the group basis and for a `JOIN`: a source, or a `JOIN`'s
+//! Resume after a source key change, on the group basis and for a `JOIN`: a source, or a `JOIN`'s
 //! joined table, dropped and created again with another primary key while
 //! its readers were paused. The resume recreates the hidden tables these
 //! keep and rebuilds from the tables now at the names; a change staged
 //! under the old key before the drop is never decoded against the new one.
 //!
-//! Every pass, build and drain is stepped by hand. Nothing polls for convergence (#297).
+//! Every pass, build and drain is stepped by hand. Nothing polls for convergence.
 
 #[path = "support/resume_passes.rs"]
 mod resume_passes;
@@ -22,7 +22,7 @@ const SUMS_ACTUAL: &str = "select pid::text, total::text from public.c_sums orde
 const SUMS_ORACLE: &str =
     "select pid::text, sum(amount)::text from public.c group by pid order by 1";
 
-/// The aggregate of #1324's repro on the group basis, with a change staged
+/// The aggregate on the group basis, with a change staged
 /// under the old key and not yet drained.
 #[tokio::test]
 async fn a_group_basis_aggregate_resumes_onto_a_source_recreated_with_a_wider_key() {

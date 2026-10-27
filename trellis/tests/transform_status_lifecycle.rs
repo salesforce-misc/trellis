@@ -1,4 +1,4 @@
-//! Integration tests for issue #55 (epic #49): the transform lifecycle
+//! Integration tests that the transform lifecycle
 //! status (`waiting_to_backfill` -> `backfilling` -> `live`, plus
 //! `quarantined`) actually transitions, rather than sitting wherever
 //! creation first put it — see docs/observability.md's "Transform status
@@ -13,13 +13,13 @@
 //! through to `live` again, repopulating the target from current source
 //! state.
 //!
-//! A further scenario (issue #105) drives the whole-transform fuse's *trip*
+//! A further scenario drives the whole-transform fuse's *trip*
 //! half for real, rather than simulating it: five distinct keys on one
 //! source table each fail every real apply attempt until
 //! `staging::quarantine`'s whole-transform fuse quarantines the definition,
 //! then the same resume/rebuild lifecycle carries it back to `live`.
 //!
-//! The last (issue #160) carries that one further: once resumed and live
+//! The last carries that one further: once resumed and live
 //! again, the transform must have a *fresh* whole-transform fuse budget
 //! — one new eviction must not immediately re-quarantine it just because the
 //! pre-resume `poison` rows are (deliberately) still there, while a full
@@ -116,11 +116,11 @@ async fn insert_cdc_row(
 /// Runs any dispatched backfill chunks, then seals and drains repeatedly
 /// until nothing is pending anywhere in the ring — the same harness
 /// `defs_install_definition.rs` uses. A definition's build reads its source
-/// itself rather than staging it into the ring (ADR-0002, #418), so the
+/// itself rather than staging it into the ring, so the
 /// builds run first.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     drain_backfill_chunks(pool).await;
-    // Issue #132: a throwaway, always-caught-up watermark — this helper
+    // A throwaway, always-caught-up watermark — this helper
     // has no live capture running (these tests stage CDC rows by hand),
     // and none of this file's tests exercise guard (a) specifically, so a
     // real watermark would only ever make guard (a) reject spuriously.
@@ -146,18 +146,18 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 /// `has_pending` to clear entirely. Needed whenever a scenario leaves a
 /// permanently-parked `poison_held` row behind (an evicted key with no
 /// releasable fix, by construction) — [`has_pending`] counts *any* parked
-/// contribution as pending forever (issue #16: "it hasn't drained, it's
-/// excluded from the active batch until release replays it"), so
+/// contribution as pending forever (it hasn't drained, it's
+/// excluded from the active batch until release replays it), so
 /// `drain_to_quiescence` would spin for all 16 rounds and panic even though
 /// the one thing this test actually cares about — the target reaching live
 /// again — already happened.
 async fn drain_until_live(pool: &trellis::Pool, client: &mut Client, target: &str) {
-    // A chunked rebuild goes live from its last chunk (ADR-0002, #418).
+    // A chunked rebuild goes live from its last chunk.
     drain_backfill_chunks(pool).await;
     if status_of(client, target).await == TransformStatus::Live {
         return;
     }
-    // Issue #132: see `drain_to_quiescence`'s own comment — no live capture
+    // See `drain_to_quiescence`'s own comment — no live capture
     // is running here either, so a throwaway, always-caught-up watermark is
     // correct.
     for _ in 0..16 {
@@ -181,7 +181,7 @@ async fn drain_until_live(pool: &trellis::Pool, client: &mut Client, target: &st
 /// the harness stand-in for the staging worker and a running drain worker,
 /// matching `defs_install_definition.rs`'s `drain_backfill_chunks`.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the staging
+    // ADR-0002: registration only records a definition; the staging
     // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
         .await
@@ -200,7 +200,7 @@ async fn reconcile_pass(pool: &trellis::Pool, raw: &mut Client) {
 
 async fn status_of(client: &Client, target_table: &str) -> TransformStatus {
     // `transform_definitions.target_table` is persisted fully-qualified
-    // (issue #73) — every definition this test file installs lands in
+    // — every definition this test file installs lands in
     // `DEFAULT_TARGET_SCHEMA` ("public"), so qualify the bare name callers
     // pass rather than matching against the unqualified column value.
     let qualified = format!("{DEFAULT_TARGET_SCHEMA}.{target_table}");
@@ -269,7 +269,7 @@ async fn evict_keys_for_real(
     // `DEFAULT_DEATH_THRESHOLD` (5) takes five external failures, the fifth
     // of which evicts every one of `keys` together (they all fail every
     // attempt alike) and lets the retry drain succeed within that same call.
-    // Issue #132: see `drain_to_quiescence`'s own comment — no live capture
+    // See `drain_to_quiescence`'s own comment — no live capture
     // is running here either, so a throwaway, always-caught-up watermark is
     // correct.
     let mut real_failures = 0;
@@ -317,7 +317,7 @@ async fn evict_keys_for_real(
         .expect("retire drained segments");
 }
 
-/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's,
+/// A plain 1-1 over a captured table is the Re-derive build's,
 /// which applies from the commit that starts it and reads its chunks under
 /// the key's ledger entry, so it takes no fence: a straggler open from
 /// before the source was captured doesn't hold it in `waiting_to_backfill`.
@@ -390,7 +390,7 @@ async fn a_plain_one_to_one_is_not_held_by_the_xmin_fence() {
 /// direct status write, deliberately isolating the *resume* half of the
 /// contract from the trip mechanism — see
 /// `quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live`
-/// below for the real trip (issue #105) driving this exact same lifecycle
+/// below for the real trip driving this exact same lifecycle
 /// end to end.
 #[tokio::test]
 async fn quarantine_resume_drops_to_waiting_to_backfill_and_re_backfills_to_live() {
@@ -473,7 +473,7 @@ async fn quarantine_resume_drops_to_waiting_to_backfill_and_re_backfills_to_live
     );
 }
 
-/// Whole-transform quarantine, tripped for real (issue #105). Before this
+/// Whole-transform quarantine, tripped for real. Before this
 /// fix, nothing in the codebase ever wrote `Quarantined` to
 /// `transform_definitions.status` — the sibling test above had to simulate
 /// the trip with a raw UPDATE for exactly that reason (see its own doc
@@ -576,8 +576,8 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
     );
 
     drain_backfill_chunks(&db.pool).await;
-    // The resume deleted the five bad keys' `poison`/`poison_held` rows
-    // (#799), which no release could ever have cleared: their key can never
+    // The resume deleted the five bad keys' `poison`/`poison_held` rows,
+    // which no release could ever have cleared: their key can never
     // cast to `s4.id`'s `bigint`.
     let held: i64 = raw
         .query_one("select count(*) from poison_held", &[])
@@ -610,17 +610,17 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
     );
 }
 
-/// Regression coverage for issue #160: a resumed transform gets a **fresh**
+/// Regression coverage: a resumed transform gets a **fresh**
 /// whole-transform fuse budget, rather than re-tripping on the very next
 /// eviction forever.
 ///
-/// Before the fix, `resume_transform` moved the status out of `quarantined`
-/// but left the `poison` rows that tripped the fuse in place, and the fuse
-/// counted *every* `poison` row for the source table — so the count was
-/// already at 5 (the threshold) before any new eviction even landed, and
-/// eviction number six re-quarantined the transform immediately. Since #799
-/// a resume deletes the definition's own `poison` rows before its fresh
-/// build, so its fuse counts only the evictions after it.
+/// A resume that moved the status out of `quarantined` but left the
+/// `poison` rows that tripped the fuse in place would count *every* `poison`
+/// row for the source table, so the count would already be at 5 (the
+/// threshold) before any new eviction landed, and eviction number six
+/// would re-quarantine the transform immediately. A resume deletes the
+/// definition's own `poison` rows before its fresh build, so its fuse
+/// counts only the evictions after it.
 ///
 /// This test pins both halves of that: exactly one new eviction after a
 /// resume must **not** re-trip, and a full further threshold's worth of new
@@ -699,7 +699,7 @@ async fn a_resumed_transform_gets_a_fresh_fuse_budget_rather_than_re_tripping_at
     );
 
     // Phase 2: exactly one new eviction. The resume deleted the five
-    // pre-resume `poison` rows (#799), so only the new one is left.
+    // pre-resume `poison` rows, so only the new one is left.
     evict_keys_for_real(&db.pool, &mut raw, &s6, &["bad-6"]).await;
 
     let poisoned_total: i64 = raw
@@ -715,7 +715,7 @@ async fn a_resumed_transform_gets_a_fresh_fuse_budget_rather_than_re_tripping_at
         status_of(&raw, "t6").await,
         TransformStatus::Live,
         "one single new eviction after a resume must not re-trip the whole-transform fuse — the \
-         resumed transform gets a fresh full threshold's budget (issue #160)"
+         resumed transform gets a fresh full threshold's budget"
     );
 
     // Phase 3: four more new evictions — five fresh ones in total — must
@@ -818,7 +818,7 @@ async fn every_build_reaches_live_through_three_stored_states() {
 
     let agg_cols = numeric(&["grp", "a"]);
 
-    // The Re-derive build (#625 F3): a plain `SUM`.
+    // The Re-derive build: a plain `SUM`.
     let summed = install_definition(
         &db.pool,
         "TRANSFORM sum_t FROM agg_s GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(a) AS total",

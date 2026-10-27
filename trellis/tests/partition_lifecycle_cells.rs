@@ -1,4 +1,4 @@
-//! #958 (X12-7d, 7a): renames between passes, and a three-level tree, on a
+//! Renames between passes, and a three-level tree, on a
 //! partitioned source under a group-basis aggregate.
 //!
 //! A leaf or middle `RENAME` and `SET SCHEMA`, and a `RENAME COLUMN` of a
@@ -6,7 +6,7 @@
 //! node names and routing texts go stale, and a write must not be lost nor a
 //! later operation on the renamed node left uncorrected. Same driver and
 //! oracle as `tests/partition_group_basis.rs`; nothing waits for
-//! convergence (#297).
+//! convergence.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -399,10 +399,9 @@ async fn a_renamed_middle_is_still_captured_and_corrected() {
 
 /// `RENAME COLUMN` of the partition-key column: every recorded routing text
 /// names the old column and no lifecycle fingerprint changes, so the pass
-/// queues nothing. The column check (#622) pauses the reader instead, and a
+/// queues nothing. The column check pauses the reader instead, and a
 /// later pass leaves it paused. The resumed rebuild is
-/// `partition_lifecycle_ledger.rs`'s: a group-basis fresh build over rows is
-/// #1101.
+/// `partition_lifecycle_ledger.rs`'s.
 #[tokio::test]
 async fn a_renamed_partition_key_column_pauses_the_reader_and_queues_nothing() {
     let mut fx = Fx::start(&tree("range"), SEED).await;

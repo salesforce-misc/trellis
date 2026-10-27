@@ -1,4 +1,4 @@
-//! End-to-end tests for issue #112's binary float types (`real`/`double
+//! End-to-end tests for the binary float types (`real`/`double
 //! precision`) against a real, ephemeral Postgres via
 //! `testkit::TestCluster`.
 //!
@@ -6,7 +6,7 @@
 //!
 //! ADR-0004 makes Postgres the correctness oracle for this grammar, and
 //! `docs/type-support.md` parked this family on "IEEE edge cases need a
-//! decision". The decision #112 makes is *not* to invent semantics: it is to
+//! decision". The decision is *not* to invent semantics: it is to
 //! reproduce what Postgres already does, which in two places is famously not
 //! IEEE 754. Every claim below is therefore a claim about agreeing with a
 //! real server, and is checked against one:
@@ -110,7 +110,7 @@ async fn define_join_on(
 /// standing in for the staging worker and a running drain worker (copied
 /// from `defs_exact_integers.rs`).
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the staging
+    // ADR-0002: registration only records a definition; the staging
     // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
         .await
@@ -196,7 +196,7 @@ fn add_def() -> TransformDef {
 /// The `NaN`/±0 decision, read out of the oracle and compared against
 /// [`trellis::float::compare`].
 ///
-/// This is #112's central question and it is **not** a free design choice.
+/// This is the central question for floats and it is **not** a free design choice.
 /// Postgres deliberately departs from IEEE 754 so floats have a total order
 /// and can be used in `ORDER BY`/`GROUP BY`/`DISTINCT`/btree at all:
 /// `'NaN' = 'NaN'` is true, and `NaN` sorts above every other value
@@ -338,7 +338,7 @@ const SCALAR_CASES: &[(&str, &str)] = &[
     // the mixed case too, not `real + real`.
     ("h8", "f4 + 1.5"),
     ("h9", "f4 + 1"),
-    // Typed float literals (issue #109's grammar, issue #112's new rows).
+    // Typed float literals.
     ("h10", "REAL '1.5' + f4"),
     ("h11", "DOUBLE PRECISION '1.5' + f8"),
 ];
@@ -346,8 +346,8 @@ const SCALAR_CASES: &[(&str, &str)] = &[
 /// The type of every derived float column Trellis declares equals the type
 /// Postgres gives the same expression.
 ///
-/// Before #112 every one of these came out `numeric`, including the two
-/// Postgres types as `real`.
+/// Every one of these is a float type, never `numeric`, including the two
+/// that Postgres types as `real`.
 #[tokio::test]
 async fn derived_float_column_types_match_postgres() {
     let cluster = TestCluster::start();
@@ -633,7 +633,7 @@ async fn float_text_rendering_is_byte_identical_to_postgres_through_the_evaluato
 // 5. Values, against an independently-written SQL query
 // ---------------------------------------------------------------------
 
-/// #1418: a float against a *bare* number literal compares as Postgres does,
+/// A float against a *bare* number literal compares as Postgres does,
 /// in `double precision`: the literal is cast to `float8` and a `real`
 /// operand widens to it, so `0.1::real > 0.1` is true (the widened real is
 /// 0.10000000149...). Every verdict below is read from the server, over rows
@@ -802,19 +802,19 @@ async fn signed_zero_is_why_float_text_keys_are_unsafe() {
 
 /// `real`/`double precision` are refused as `JOIN` `ON` keys, through
 /// the same `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` allowlist that gates a 1-1
-/// transform's **primary key** (issue #107's "close the gap" fix) — so this
+/// transform's **primary key** — so this
 /// is one assertion about both roles.
 ///
 /// The `bigint` case is the control: it must still be accepted, so this is a
 /// claim about float text specifically and not about the gate being broken.
 ///
-/// **This is #112's primary-key decision.** Postgres itself would be fine
+/// **This is the primary-key decision for floats.** Postgres itself would be fine
 /// with a float PK — its float btree opclass is a total order, `NaN` and
 /// `±0` included — so the refusal is not a statement about the type. It is
 /// about *this* engine's current key scheme, which matches keys by raw
 /// `::text` and therefore cannot represent `-0 = 0` (see
 /// `signed_zero_is_why_float_text_keys_are_unsafe` just above). Admitting
-/// floats as keys is #110's typed key index to grant, by comparing decoded
+/// floats as keys would need a typed key index that compares decoded
 /// values through `float::compare`.
 #[tokio::test]
 async fn a_float_join_key_is_rejected_by_name() {
@@ -858,10 +858,9 @@ async fn a_float_join_key_is_rejected_by_name() {
 /// A float source column is refused as a **`GROUP BY` key**, with an error
 /// that names the column.
 ///
-/// This is a deliberate tightening relative to before #112: `real` used to
-/// reach this gate classified as `ValueType::Numeric` and was waved through.
-/// A `::text`-matched float group key is not correct (see the signed-zero
-/// test above), so refusing is the honest answer until #110.
+/// `real` is classified as a float, not `ValueType::Numeric`, so it does not
+/// get waved through. A `::text`-matched float group key is not correct (see
+/// the signed-zero test above), so refusing is the honest answer.
 #[test]
 fn a_float_group_by_key_is_rejected() {
     for column in ["f4", "f8"] {
@@ -877,8 +876,8 @@ fn a_float_group_by_key_is_rejected() {
         );
     }
 
-    // The control: a `numeric` key is still accepted (knowingly weaker, and
-    // #110's to tighten), so this is a claim about floats specifically.
+    // The control: a `numeric` key is still accepted (knowingly weaker),
+    // so this is a claim about floats specifically.
     let def =
         parse("TRANSFORM t FROM s GROUP BY n WITHOUT SOURCE INDEX SELECT n AS k, SUM(n) AS total")
             .expect("parses");

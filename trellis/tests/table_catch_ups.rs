@@ -1,6 +1,6 @@
-//! Issue #522: a rebuild of the readers of a table that may have missed
+//! A rebuild of the readers of a table that may have missed
 //! changes to it: an explicit `Trellis::request_backfill` and a table whose
-//! capture triggers are installed (issue #533)
+//! capture triggers are installed
 //! (`intake::catch_up::park_table_catch_ups`).
 //!
 //! Someone asks for a re-backfill because a target may have drifted from its
@@ -257,7 +257,7 @@ async fn active_seq(client: &Client) -> i64 {
         .get(0)
 }
 
-/// The Re-derive flavour (#625 F7): the call's own transaction moves the
+/// The Re-derive flavour: the call's own transaction moves the
 /// 1-1 definition `live -> backfilling` and enqueues a plan job and a sweep
 /// job, one row each, so it returns with the rebuild already visible. The
 /// definition keeps applying while the
@@ -324,7 +324,7 @@ async fn a_requested_backfill_rebuilds_a_stale_one_to_one_row() {
     );
 }
 
-/// Issue #1202: a source outside `public` and Trellis's own schemas is named
+/// A source outside `public` and Trellis's own schemas is named
 /// by its qualified name or, when exactly one captured table carries it, its
 /// bare one; a bare name two captured sources share is refused naming both.
 #[tokio::test]
@@ -379,7 +379,7 @@ async fn request_backfill_names_a_source_outside_the_search_path() {
     ));
 }
 
-/// The Re-derive flavour of the aggregate case (#625 F7): `request_backfill`
+/// The Re-derive flavour of the aggregate case: `request_backfill`
 /// on a `live` aggregate returns with the status already `backfilling`, so a
 /// caller that polls for `live` and then takes its token waits out the
 /// rebuild. A group-basis aggregate's rebuild is its sweep job alone, which
@@ -432,7 +432,7 @@ async fn a_requested_backfill_rebuilds_a_stale_aggregate_group() {
     );
 }
 
-/// A request while a rebuild runs rebuilds again (#625 F7): the first
+/// A request while a rebuild runs rebuilds again: the first
 /// rebuild may have read rows before whatever the second request repairs,
 /// so the call enqueues a rebuild of its own (for a group-basis aggregate,
 /// a sweep job alone), and the definition goes `live` when both rebuilds

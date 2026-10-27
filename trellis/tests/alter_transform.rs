@@ -1,4 +1,4 @@
-//! Integration tests for `ALTER TRANSFORM` (ADR-0015, issues #241/#242) and
+//! Integration tests for `ALTER TRANSFORM` and
 //! its retrofit of `DROP TRANSFORM`'s dependency refusal to column
 //! granularity.
 //!
@@ -12,9 +12,9 @@
 //!   `drop_single_column_removes_the_physical_column`,
 //!   `alter_single_column_recomputes_existing_rows`,
 //!   `combined_add_drop_alter_in_one_statement`)
-//! - #994: an added bare passthrough column has the type `DEFINE` gives it, modifier
+//! - an added bare passthrough column has the type `DEFINE` gives it, modifier
 //!   included (`an_added_passthrough_column_has_the_type_define_gives_it`)
-//! - #666 (#625 F8b): an `ALTER` only registers a field build and returns
+//! - an `ALTER` only registers a field build and returns
 //!   before any target row changes, and the field is built once its chunks
 //!   run (`an_alter_returns_before_any_target_row_changes_and_its_chunks_build_the_field`,
 //!   driven by hand)
@@ -26,8 +26,7 @@
 //!   which stops the build at a fixed point and drives live apply by hand)
 //! - an `ALTER` never undoes a pause it didn't create, a pause landing
 //!   mid-build survives it, and `DROP <field>` clears the dropped column's
-//!   quarantine bookkeeping (issue #309:
-//!   `an_alter_leaves_a_pause_it_did_not_create_in_place`,
+//!   quarantine bookkeeping (`an_alter_leaves_a_pause_it_did_not_create_in_place`,
 //!   `a_pause_landing_mid_field_build_survives_it`,
 //!   `dropping_a_paused_field_clears_its_quarantine_state`)
 //! - idempotency in both directions for all three edit kinds
@@ -46,7 +45,7 @@
 //!   `altering_a_target_that_is_not_live_is_rejected`,
 //!   `altering_a_field_to_a_different_result_type_is_refused`,
 //!   `a_type_changing_alter_refuses_the_whole_statement`)
-//! - #997: the modifier counts. A catalog-only widening is re-typed in place and a
+//! - the modifier counts. A catalog-only widening is re-typed in place and a
 //!   narrowing refused (`altering_a_passthrough_into_a_wider_expression_retypes_the_column_in_place`,
 //!   `altering_a_varchar_passthrough_into_a_text_expression_changes_no_column_type`,
 //!   `altering_an_expression_into_a_narrower_passthrough_is_refused`,
@@ -224,9 +223,10 @@ fn into_altered(applied: Applied) -> (Vec<String>, Vec<String>, Vec<String>) {
 // ADD / DROP / ALTER, individually and combined
 // ---------------------------------------------------------------------
 
-/// Issue #994: `ALTER TRANSFORM ... ADD` creates a bare passthrough column
+/// `ALTER TRANSFORM ... ADD` creates a bare passthrough column
 /// with the type `DEFINE` gives it (the source column's own, typmod
-/// included, #45; a `varchar(n)` is unbounded, #1207), and an expression column with its value family's type.
+/// included; a `varchar(n)` is unbounded), and an expression column with its
+/// value family's type.
 /// A second transform defined with the same select is the oracle, and the
 /// capture pass's typed-copy comparison (`defs::copies`, `CopyState::drifted`)
 /// reads a passthrough as current exactly when its `(atttypid, atttypmod)` is
@@ -357,7 +357,7 @@ async fn add_single_column_backfills_existing_rows() {
     assert_eq!(added, vec!["double_a".to_string()]);
     assert!(dropped.is_empty());
     assert!(altered.is_empty());
-    // #625 F8b: the drain workers build the field in the background, and
+    // The drain workers build the field in the background, and
     // the definition reads `live` again once they have.
     wait_for_live(&raw, "order_calc").await;
 
@@ -440,7 +440,7 @@ async fn alter_single_column_recomputes_existing_rows() {
     wait_for_live(&raw, "order_calc").await;
 
     // `total`'s new formula (`a + b + b`) infers the exact same `ValueType`
-    // (numeric) its column already has — issue #241's second review round:
+    // (numeric) its column already has:
     // this is the case a type-changing-`ALTER` refusal must *not* catch, so
     // this test also pins the column's physical type stays `numeric`
     // throughout, not just that the call succeeds.
@@ -485,7 +485,7 @@ async fn alter_single_column_recomputes_existing_rows() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Issue #241/#242's second review round: `ALTER <field> AS <expr>` refuses
+/// `ALTER <field> AS <expr>` refuses
 /// outright when the new formula's inferred result type genuinely differs
 /// from the field's current physical column type, rather than issuing the
 /// `ALTER COLUMN ... TYPE ... USING NULL` that would otherwise silently
@@ -664,7 +664,7 @@ async fn target_filenode(raw: &Client, table: &str) -> i64 {
     .get(0)
 }
 
-/// Issue #997 rule 3 and 5, as ADR-0020 leaves them: a bare passthrough of
+/// As ADR-0020 leaves it: a bare passthrough of
 /// `numeric(10,2)` is an unconstrained `numeric` column, so altering it into
 /// an expression of unconstrained `numeric` re-types nothing. The target is
 /// not rewritten, the field build's values keep their third decimal, and the
@@ -742,7 +742,7 @@ async fn altering_a_passthrough_into_a_wider_expression_changes_no_column_type()
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Issue #997 rule 3, as #1207 leaves it: a `varchar(8)` passthrough is an
+/// A `varchar(8)` passthrough is an
 /// unbounded `varchar` column, so altering it to an expression of type `text`
 /// (the same family) re-types nothing: the column and the target's file stay
 /// as they are, and the field build re-derives the values.
@@ -786,7 +786,7 @@ async fn altering_a_varchar_passthrough_into_a_text_expression_changes_no_column
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Issue #997 rule 4: an expression field altered into another value family
+/// An expression field altered into another value family
 /// (here a `numeric` expression into an `integer` passthrough) would rewrite
 /// the target, so it is refused naming `DROP`/`ADD`, with the column, the
 /// definition and its version untouched.
@@ -899,7 +899,7 @@ async fn combined_add_drop_alter_in_one_statement() {
 /// `Client`. This is the hand-driven stand-in for the staging worker and a
 /// drain worker that `defs_install_definition.rs` uses.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the staging
+    // ADR-0002: registration only records a definition; the staging
     // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
         .await
@@ -963,7 +963,7 @@ async fn run_one(pool: &trellis::Pool, kind: &str) {
     trellis::staging::build::run_claimed(pool, &chunk, BY, &worker_options()).await;
 }
 
-/// #666 (#625 F8b): `ALTER TRANSFORM` only registers its edit. On a source
+/// `ALTER TRANSFORM` only registers its edit. On a source
 /// larger than one chunk it returns before any target row changes, with
 /// the definition `backfilling` and one field-scoped plan job enqueued, and
 /// the field is built once the drain workers' build steps, driven here by
@@ -1078,7 +1078,7 @@ async fn an_alter_returns_before_any_target_row_changes_and_its_chunks_build_the
 /// twice, and every row the writer changed between the two passes would
 /// break the invariant.
 ///
-/// The `ALTER` registers one field build for both columns (#625 F8b), whose
+/// The `ALTER` registers one field build for both columns, whose
 /// chunks are driven here by hand while the writer runs. No pipeline runs,
 /// so the check reads the chunks' own output: Apply, which writes both
 /// columns from one image too, never touches it.
@@ -1253,8 +1253,8 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     panic!("the ring did not reach quiescence within 16 seal/drain rounds");
 }
 
-/// The field applies from the `ALTER`'s commit, while its build runs (#625
-/// F8b, B1), and the rest of the target stays live: checked at a fixed
+/// The field applies from the `ALTER`'s commit, while its build runs,
+/// and the rest of the target stays live: checked at a fixed
 /// point with one of three chunks built, by hand, with no pipeline running.
 /// A live change to a row the built chunk covered and one to a row no chunk
 /// has reached both reach the new field through Apply, and the rest of the
@@ -1400,7 +1400,7 @@ async fn column_pause_state(raw: &Client, transform: &str, column: &str) -> Opti
     .map(|row| (row.get(0), row.get(1)))
 }
 
-/// Issue #309: `ALTER TRANSFORM`'s own column pause (held while it backfills
+/// `ALTER TRANSFORM`'s own column pause (held while it backfills
 /// a changed field) must only ever be undone for a field whose pause *it*
 /// created. A field an operator paused, or one paused by cascade from an
 /// upstream column, stays paused through an `ALTER` of that same field —
@@ -1477,7 +1477,7 @@ async fn an_alter_leaves_a_pause_it_did_not_create_in_place() {
 /// bookkeeping with it, the same "quarantine state follows its owner" rule
 /// `DROP TRANSFORM` applies to a whole target. Otherwise a stale pause would
 /// outlive its column and silently land on a later `ADD` of the same name,
-/// now that an `ALTER` no longer clears pauses it didn't create (#309).
+/// now that an `ALTER` no longer clears pauses it didn't create.
 #[tokio::test]
 async fn dropping_a_paused_field_clears_its_quarantine_state() {
     let cluster = TestCluster::start();
@@ -1531,7 +1531,7 @@ async fn dropping_a_paused_field_clears_its_quarantine_state() {
     // definition stopped reading at the DROP, so the staging worker may have
     // narrowed `b` out of the source's capture meanwhile: the field stays
     // paused (its own pause, nothing inherited) until the capture images `b`
-    // again and the field build's start unpauses it (issue #622).
+    // again and the field build's start unpauses it.
     trellis
         .apply("ALTER TRANSFORM order_calc ADD b AS b")
         .await
@@ -1553,8 +1553,8 @@ async fn dropping_a_paused_field_clears_its_quarantine_state() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Issue #309, the mid-build half: a pause that lands on a field *while*
-/// its field build runs (#625 F8b) holds the field out of the build's
+/// The mid-build half: a pause that lands on a field *while*
+/// its field build runs holds the field out of the build's
 /// remaining chunks, and survives the build: an operator pause stays
 /// `local_fuse`, and an upstream pause cascading onto it keeps its edge.
 /// The field nothing paused is built.
@@ -1564,7 +1564,7 @@ async fn dropping_a_paused_field_clears_its_quarantine_state() {
 /// build's plan job (its walk reads the source) but not the `ALTER`, which
 /// only registers the build and so returns with the source still locked.
 ///
-/// The ring is drained before the lock (issue #903), so no page is in
+/// The ring is drained before the lock, so no page is in
 /// flight: a page re-derives under `order_calc`'s version fence and would
 /// wait on the lock holding it; the pauses bump that fence, and would wait
 /// on the page in turn. Before the pauses bumped the fence, such a page wrote all three new
@@ -1846,7 +1846,7 @@ async fn edits_are_idempotent_in_both_directions() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Issue #919: an `ADD` and a `DROP` of the same name in one edit cancel,
+/// An `ADD` and a `DROP` of the same name in one edit cancel,
 /// so the edit is a no-op. Neither its physical column nor any pause state
 /// survives it, and a later `ADD` of that name with a different result type
 /// creates the column with the new type.
@@ -1926,7 +1926,7 @@ async fn an_add_and_a_drop_of_the_same_field_in_one_edit_cancel() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Issue #919's other order: `DROP z, ADD z` replaces the field, which is
+/// `DROP z, ADD z` replaces the field, which is
 /// the supported path for a change of result type, so it drops the old
 /// column and adds one with the new type.
 #[tokio::test]
@@ -2090,7 +2090,7 @@ async fn add_and_alter_that_would_cycle_is_rejected() {
 }
 
 // ---------------------------------------------------------------------
-// An edit validates against the live source schema (issue #980)
+// An edit validates against the live source schema
 // ---------------------------------------------------------------------
 
 /// A definition's persisted `source_columns`, as the `name -> type` pairs
@@ -2294,7 +2294,7 @@ async fn an_edit_building_a_field_over_a_retyped_column_is_refused_until_a_resum
     let version = persisted_definition_version(&raw, "reading_calc").await;
     let recorded = persisted_source_columns(&raw, "reading_calc").await;
     // Another type family changes the type the definition evaluates `x` as,
-    // so the next capture pass pauses it (#703 R1). No capture pass runs
+    // so the next capture pass pauses it. No capture pass runs
     // until the pipeline restarts below, so the edits meet a live
     // definition over the retyped column.
     trellis.shutdown().await.expect("stop the pipeline");
@@ -2433,8 +2433,8 @@ async fn a_field_reading_a_column_the_source_dropped_is_dropped_by_an_edit_and_r
 }
 
 // ---------------------------------------------------------------------
-// Column-granularity drop refusal (issue #241), and its retrofit onto
-// `DROP TRANSFORM` (issue #242)
+// Column-granularity drop refusal, and its retrofit onto
+// `DROP TRANSFORM`
 // ---------------------------------------------------------------------
 
 #[tokio::test]
@@ -2494,7 +2494,7 @@ async fn dropping_a_field_still_read_by_a_dependent_is_refused() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Issue #242's retrofit: `drop_transform`'s existing table-level refusal
+/// `drop_transform`'s existing table-level refusal
 /// still refuses on *any* reader (unchanged — a reader of any column still
 /// blocks a whole-table drop), but now names the *specific* column that
 /// reader depends on, using the same column-granularity infrastructure
@@ -2551,7 +2551,7 @@ async fn dropping_a_transform_names_the_specific_column_a_dependent_reads() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Issue #242's whole point: `column_dependents_any_keyspace` must see a
+/// `column_dependents_any_keyspace` must see a
 /// dependency that only exists through a downstream **aggregate's own
 /// `GROUP BY` key** — not a `SELECT` field — since a `GROUP BY` key is not
 /// itself a [`trellis`]-internal `FieldDef`
@@ -2641,7 +2641,7 @@ async fn altering_an_aggregate_transform_is_unsupported() {
     .await
     .expect("seed");
 
-    // The aggregate's build runs in the background (#419); settling it here
+    // The aggregate's build runs in the background; settling it here
     // brings the definition live without a running pipeline.
     let trellis = define_only(db.dsn()).await;
     trellis

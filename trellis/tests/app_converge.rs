@@ -1,26 +1,25 @@
 //! Integration tests for the `Trellis`/`BlockingTrellis` facade's
-//! read-your-writes convergence methods (issue #192, T3 of epic #189):
+//! read-your-writes convergence methods:
 //! [`Trellis::watermark_token`]/[`Trellis::await_converged`] and their
 //! `BlockingTrellis` counterparts.
 //!
-//! Before this issue, the only way an embedder could block until a write was
-//! reflected in its target(s) was to reach past the facade into
-//! `trellis::staging::converge` directly (`watermark_token`/`await_converged`)
-//! — see that module's doc comment ("the caller-side await poll") and
+//! The same two calls are available on `trellis::staging::converge` directly
+//! (`watermark_token`/`await_converged`) — see that module's doc comment
+//! ("the caller-side await poll") and
 //! `generative/src/backend/manual.rs::quiesce`, the one real production-shaped
 //! caller. These tests exercise the same two-call pattern
 //! (`manual.rs::quiesce`'s `let token = watermark_token(...); await_converged(
 //! &raw, token, TIMEOUT).await`) through the public `Trellis`/`BlockingTrellis`
 //! facade instead.
 //!
-//! None of them runs a live `Client` (issue #301). They manipulate the ring
+//! None of them runs a live `Client`. They manipulate the ring
 //! directly, the style `trellis/tests/converge.rs` established, so every
 //! ordering they assert on is controlled by the test rather than raced
 //! against real capture/apply timing under a wall-clock budget.
 //! `await_converged_waits_for_a_sealed_write_until_it_is_applied` stages a
 //! real write's CDC row by hand and drains it through the engine's own apply
 //! path, so the target value it reads back is one the engine computed.
-//! `a_token_after_an_asynchronous_commit_waits_for_the_write` (issue #697)
+//! `a_token_after_an_asynchronous_commit_waits_for_the_write`
 //! writes through a real capture trigger and never drains.
 
 use std::time::{Duration, Instant};
@@ -114,7 +113,7 @@ async fn seal_active_segment(client: &mut Client) -> i64 {
 /// and by then the value must actually be in the target table (not just a
 /// flipped predicate).
 ///
-/// No live `Client` (issue #301). This used to run a staging-only pipeline
+/// No live `Client`. This used to run a staging-only pipeline
 /// and start a drain-capable one after a 400ms delay, asserting
 /// `await_converged` took at least that long, all under a fixed 30s budget.
 /// Here the insert is staged by hand with a text-valued image and a NULL
@@ -258,7 +257,7 @@ async fn await_converged_times_out_with_a_named_staging_error() {
         ) => {
             assert_eq!(got_token, token);
             assert!(waited >= timeout);
-            // Issue #586: an expired deadline is its own retryable code, not
+            // An expired deadline is its own retryable code, not
             // `internal` (which a host reads as "a Trellis bug").
             assert_eq!(err.code(), ErrorCode::Timeout);
         }
@@ -273,7 +272,7 @@ async fn await_converged_times_out_with_a_named_staging_error() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Issue #596, through the pool: a poll blocked on a lock ends in
+/// Through the pool: a poll blocked on a lock ends in
 /// [`StagingError::ConvergenceTimeout`] (code [`ErrorCode::Timeout`]) at the
 /// deadline, and the pooled connection it ran on comes back usable. The pool
 /// has one connection, so the follow-up wait (and `watermark_token` before
@@ -384,7 +383,7 @@ fn blocking_trellis_watermark_token_and_await_converged_round_trip() {
     drop(setup_runtime);
 }
 
-/// Issue #697: a writer with `synchronous_commit = off` gets its commit back
+/// A writer with `synchronous_commit = off` gets its commit back
 /// before its WAL is written, so the WAL *write* position can still be below
 /// the `origin_lsn` (an *insert* position) its capture trigger stamped. The
 /// token must bound those rows anyway, or the wait returns before the write

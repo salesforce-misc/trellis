@@ -1,4 +1,4 @@
-//! Issue #830: a bare name that is both a source column and a field whose
+//! A bare name that is both a source column and a field whose
 //! expression is something else is refused at define, naming both meanings
 //! and both qualified spellings. A qualified `<table>.<column>` reads the
 //! source column.

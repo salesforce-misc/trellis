@@ -1,4 +1,4 @@
-//! Whole-key attribution's width (#822): which definitions isolation charges
+//! Whole-key attribution's width: which definitions isolation charges
 //! a record that fails alone to, when the failure appears only when several
 //! definitions apply the record together.
 //!
@@ -6,7 +6,7 @@
 //! `isolate_and_evict` (or one `drain_once`) once. Faults are injected into
 //! one definition's writes: a check constraint, or a
 //! trigger pair that refuses two tables written in one transaction. Nothing
-//! polls for convergence (#297).
+//! polls for convergence.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -116,7 +116,7 @@ async fn deaths_for(d: &Driver) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------
-// A failure only several direct readers reproduce together (#822 question 2)
+// A failure only several direct readers reproduce together
 // ---------------------------------------------------------------------
 
 /// `public.t`, read directly by one definition per name in `readers`, each

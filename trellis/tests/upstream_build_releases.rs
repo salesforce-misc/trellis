@@ -1,4 +1,4 @@
-//! An upstream build's completion releases its readers' held keys (#1306).
+//! An upstream build's completion releases its readers' held keys.
 //!
 //! A reader of a Trellis target can hold a key for a failure the upstream
 //! caused while it was being rebuilt: between a source rewrite and the
@@ -6,7 +6,7 @@
 //! widths together, and a reader's write raises. Once the upstream's build completes, the staging
 //! worker releases every key its direct readers hold, with the automatic
 //! retry's semantics. Every step is an explicit pass, build or drain;
-//! nothing polls for convergence (#297).
+//! nothing polls for convergence.
 //!
 
 #[path = "support/drain_driver.rs"]

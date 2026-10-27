@@ -1,4 +1,4 @@
-//! Issue #864 (ADR-0018): every stored definition carries the grammar version
+//! ADR-0018: every stored definition carries the grammar version
 //! its text was written under, and every read of stored text checks it.
 
 use std::collections::HashMap;

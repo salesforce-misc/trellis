@@ -1,12 +1,12 @@
-//! End-to-end tests for issue #116's network-address types (`inet`, `cidr`,
+//! End-to-end tests for the network-address types (`inet`, `cidr`,
 //! `macaddr`, `macaddr8`) — as join/primary-key and `GROUP BY` key roles,
 //! typed literals, and the `MIN`/`MAX` aggregate role.
 //!
 //! # Why these run against a live server
 //!
-//! Issue #116's own scope note treats all four families as one group and
-//! marks `MIN`/`MAX` `⚠️` across the board. Per #119's playbook — check
-//! `pg_cast` for a second renderer before assuming `::text` is a type's own
+//! The type matrix's scope note treats all four families as one group and
+//! marks `MIN`/`MAX` `⚠️` across the board. Check `pg_cast` for a second
+//! renderer before assuming `::text` is a type's own
 //! output function, and check `pg_proc`/`pg_aggregate` for `MIN`/`MAX`
 //! before assuming it exists — asked of a real server, the four turn out
 //! **not** to land the same way at all:
@@ -20,7 +20,7 @@
 //! 2. **Key roles.** `cidr`/`macaddr`/`macaddr8` are admitted as
 //!    `JOIN`/primary keys and `GROUP BY` keys. `inet` is refused as a
 //!    `JOIN`/primary key (same reason `boolean` is) but *admitted* as
-//!    a `GROUP BY` key, the same split `boolean` got in #119, because
+//!    a `GROUP BY` key, the same split `boolean` got, because
 //!    the aggregate path's keyset match never does raw-text
 //!    comparison and `inet_in` reconciles both spellings — demonstrated here
 //!    with the same end-to-end CDC-vs-live-read regression shape
@@ -31,13 +31,13 @@
 //!    implicit upcast to `inet` — demonstrated live to return a value typed
 //!    `inet`, not `cidr` — so this crate refuses it rather than silently
 //!    changing a computed field's type. `macaddr`/`macaddr8` have no such
-//!    aggregate at all (the exact `bytea` finding from #114), demonstrated
+//!    aggregate at all (the exact `bytea` finding), demonstrated
 //!    the same way `defs_bytea.rs` demonstrates it for `bytea`.
 //! 4. **`to_jsonb`.** Checked live for all four; `inet` is the one case
 //!    where it disagrees with `::text` (it agrees with `inet_out` instead) —
-//!    not a live hazard, since issue #248 already replaced every bare
-//!    `to_jsonb(t.*)` row-body read in this engine with an explicit
-//!    `<col>::text`, so nothing here actually calls `to_jsonb` that way.
+//!    not a live hazard, since this engine reads
+//!    row bodies with an explicit per-column `<col>::text` instead of a bare
+//!    `to_jsonb(t.*)`, so nothing here actually calls `to_jsonb` that way.
 //!
 //! Per ADR-0013 every comparison is against independently-authored SQL —
 //! plain `pg_cast`, plain `network_cmp`/`<`, plain `group by`, plain
@@ -110,7 +110,7 @@ async fn define_join_on(
 // ---------------------------------------------------------------------
 
 /// `inet`/`cidr` share one dedicated `text()` cast row; `macaddr`/`macaddr8`
-/// have none — the load-bearing check per #119's playbook, done directly
+/// have none — the load-bearing check, done directly
 /// against `pg_cast` rather than assumed from the types' names.
 #[tokio::test]
 async fn inet_and_cidr_share_a_text_cast_row_macaddr_and_macaddr8_have_none() {
@@ -327,7 +327,7 @@ fn all_four_families_are_admitted_as_group_by_keys() {
 // ---------------------------------------------------------------------
 
 /// `macaddr`/`macaddr8` have no `min`/`max` aggregate in Postgres at all —
-/// the exact `bytea` finding from #114, demonstrated the same way
+/// the exact `bytea` finding, demonstrated the same way
 /// `defs_bytea.rs`'s `postgres_has_no_min_max_aggregate_for_bytea` does.
 #[tokio::test]
 async fn postgres_has_no_min_max_aggregate_for_macaddr_or_macaddr8() {
@@ -385,8 +385,8 @@ async fn postgres_has_no_min_max_aggregate_for_macaddr_or_macaddr8() {
 /// `to_jsonb` agrees with `::text` for `cidr`/`macaddr`/`macaddr8`, and
 /// disagrees for `inet` (it agrees with `inet_out` instead) — checked live,
 /// not assumed, matching every other family's `to_jsonb`-vs-`::text` sweep
-/// in this epic. Not a live hazard: issue #248 already replaced every bare
-/// `to_jsonb(t.*)` row-body read with an explicit `<col>::text`, so nothing
+/// in this suite. Not a live hazard: row bodies are read with an explicit
+/// per-column `<col>::text`, never a bare `to_jsonb(t.*)`, so nothing
 /// in the engine calls `to_jsonb` the way this test's bare Postgres call
 /// does.
 #[tokio::test]
@@ -429,7 +429,7 @@ async fn to_jsonb_agrees_with_text_except_for_inet() {
 }
 
 // ---------------------------------------------------------------------
-// 5. The #119-shaped regression, reproduced for inet's GROUP BY key
+// 5. The `boolean`-shaped regression, reproduced for inet's GROUP BY key
 // ---------------------------------------------------------------------
 
 /// An `inet` `GROUP BY` group touched once through an ordinary image-bearing
@@ -439,7 +439,7 @@ async fn to_jsonb_agrees_with_text_except_for_inet() {
 /// always-explicit spelling) must still land as **one** target row, not
 /// two — the same shape `defs_boolean.rs`'s
 /// `a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two`
-/// pins, here for the family issue #116 found the analogous divergence in.
+/// pins, here for the family with the analogous divergence.
 #[tokio::test]
 async fn an_inet_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two() {
     const DEF_SQL: &str = "TRANSFORM totals FROM events GROUP BY grp WITHOUT SOURCE INDEX SELECT grp AS grp, SUM(amount) AS total";

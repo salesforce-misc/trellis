@@ -1,4 +1,4 @@
-//! Integration tests for claim liveness (issue #15, stage 04's third
+//! Integration tests for claim liveness (stage 04's third
 //! piece), run against a real, ephemeral Postgres instance via the shared
 //! harness (`testkit::TestCluster`).
 //!
@@ -7,7 +7,7 @@
 //! tests hold the implementation to. Staleness is made by backdating a
 //! claim's `claimed_at` rather than by waiting out a short TTL against a
 //! live heartbeat, and the daemon's timing is only ever waited on as a lower
-//! bound (issue #513), so nothing here depends on how promptly a loaded box
+//! bound, so nothing here depends on how promptly a loaded box
 //! schedules a thread.
 //!
 //! [`FenceMissBackoff`]'s pure sequence is covered in-module
@@ -27,7 +27,7 @@ use trellis::staging::{
 };
 
 /// Claims in a transaction of its own and commits it. `claim::claim` takes a
-/// transaction: it holds the segment row's lock until commit (issue #690).
+/// transaction: it holds the segment row's lock until commit.
 async fn claim_committed(
     client: &mut Client,
     seg_seq: i64,
@@ -178,7 +178,7 @@ async fn reclaim_frees_a_stale_claim_and_a_fresh_claim_picks_it_up() {
         "the fresh worker must win exactly the buckets the dead worker lost"
     );
 
-    // TODO(#11): assert the reclaimed worker's apply rolls back once apply
+    // TODO: assert the reclaimed worker's apply rolls back once apply
     // exists (blocked on aggregate transform-defs) — today's test only
     // covers the claim-side reclaim, not the apply-side rollback.
 }
@@ -311,7 +311,7 @@ async fn release_is_scoped_to_claimed_by_and_leaves_other_workers_claims_alone()
     assert_eq!(claimed_buckets(&client, seg_seq, "worker-b").await, won_b);
 }
 
-/// Issue #660: the worker loop's release after a failed drain covers every
+/// The worker loop's release after a failed drain covers every
 /// segment of the batch in one statement and names the `(seg_seq, bucket)`
 /// claims it freed, so the drain-failure log can report them. Scoped to the
 /// claimant exactly like [`liveness::release`].
@@ -442,7 +442,7 @@ async fn daemon_closes_its_connection_after_idle_timeout_with_no_registered_clai
     );
 }
 
-/// Issue #654, first half. A page's claim check doubles as a heartbeat, and it
+/// First half. A page's claim check doubles as a heartbeat, and it
 /// used to stamp `claimed_at = now()`: the page transaction's *start* time. A
 /// page whose apply ran for 18 s therefore wrote a claim that was already 18 s
 /// old at commit, overwriting whatever fresher value the daemon had set while
@@ -590,7 +590,7 @@ async fn a_long_page_leaves_its_claim_stamped_at_commit_time_not_transaction_sta
     }
 }
 
-/// Issue #654, second half. `drainers.last_seen` used to be bumped only by the
+/// Second half. `drainers.last_seen` used to be bumped only by the
 /// worker loop, between drains, so a worker inside a paged drain longer than
 /// the drainer window stopped counting toward the share denominator. The
 /// daemon that keeps a worker's claims alive now keeps its drainer row alive

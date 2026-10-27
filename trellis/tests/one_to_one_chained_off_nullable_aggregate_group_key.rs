@@ -1,4 +1,4 @@
-//! Front-door integration test for issue #205: a [`KeySpace::OneToOne`]
+//! Front-door integration test: a [`KeySpace::OneToOne`]
 //! definition chained directly off an aggregate target's own (nullable)
 //! `GROUP BY` key.
 //!
@@ -8,10 +8,10 @@
 //! ```
 //!
 //! `sku_totals`' own primary key is its `sku` grouping column — genuinely
-//! nullable (`UNIQUE NULLS NOT DISTINCT`, issue #128), unlike a real `PRIMARY
+//! nullable (`UNIQUE NULLS NOT DISTINCT`), unlike a real `PRIMARY
 //! KEY`. Every consumer of the shared key-contract text this crate threads a
 //! changed row's identity through (`ddl::pk_key_sql_expr`/`join_pk_key`) must
-//! route a nullable column's part through issue #110's `NULL_KEY_SENTINEL`/
+//! route a nullable column's part through the `NULL_KEY_SENTINEL`/
 //! escape treatment — and decode it back out again before treating it as a
 //! real value. `staging::apply::apply_target`'s write path used to skip that
 //! decode, binding the still-encoded staged key text straight in as
@@ -24,7 +24,7 @@
 //! `ddl::split_pk_key` before binding/matching it as a literal key value:
 //! `None` (a genuine `NULL`-keyed group) is written and matched as a real
 //! SQL `NULL`, which `sku_totals_echo`'s `UNIQUE NULLS NOT DISTINCT` key
-//! holds (issue #1141), and a real, non-`NULL` group value that happens to
+//! holds, and a real, non-`NULL` group value that happens to
 //! contain a literal U+0001 is unescaped back to its single-character form
 //! instead of being stored doubled.
 //!
@@ -157,7 +157,7 @@ const SKU_TOTALS_ECHO: &str =
 ///
 /// Deliberately seeded with no `NULL`-`sku` row yet: the `NULL` group arrives
 /// later, purely as a live incremental change, so it exercises
-/// `staging::apply::apply_target`'s write path (issue #205's actual bug)
+/// `staging::apply::apply_target`'s write path (where the bug was)
 /// rather than `sku_totals_echo`'s own from-scratch backfill (which this
 /// target-shape gap can't reach in the first place — see this file's own
 /// doc comment).
@@ -189,7 +189,7 @@ async fn sku_totals(client: &Client) -> HashMap<Option<String>, Option<String>> 
 
 /// `sku -> echo_total`, including the `NULL`-keyed group and a row whose
 /// `sku` is literally the `ddl::NULL_KEY_SENTINEL` character (`chr(1)`) —
-/// the corrupted shape issue #205 is about — so a test can assert its
+/// the corrupted shape this test is about — so a test can assert its
 /// *absence* directly rather than only asserting the correct rows are
 /// present.
 async fn sku_totals_echo(client: &Client) -> HashMap<Option<String>, Option<String>> {
@@ -236,10 +236,10 @@ async fn install_the_chain(db: &testkit::TestDatabase, client: &mut Client) {
     );
 }
 
-/// Issue #205's exact repro: a brand-new `NULL`-keyed `sales` row creates a
-/// `NULL`-keyed group in `sku_totals` (already correct, per issue #110's
-/// fix — asserted here only as a sanity check), which must then propagate
-/// into `sku_totals_echo` as a row keyed by a real `NULL` (issue #1141),
+/// The exact repro: a brand-new `NULL`-keyed `sales` row creates a
+/// `NULL`-keyed group in `sku_totals` (asserted here only as a sanity
+/// check), which must then propagate
+/// into `sku_totals_echo` as a row keyed by a real `NULL`,
 /// never by the literal sentinel text.
 ///
 /// Grows the `NULL` group with a second row (exercising the delta path, not
@@ -272,7 +272,7 @@ async fn a_null_keyed_upstream_group_reaches_the_chained_target_keyed_by_a_real_
     assert_eq!(
         sku_totals(&client).await.get(&None).cloned(),
         Some(Some("6".to_string())),
-        "sanity check (issue #110, already fixed): the NULL-keyed group is \
+        "sanity check: the NULL-keyed group is \
          maintained correctly at the aggregate level"
     );
 
@@ -365,8 +365,8 @@ async fn a_null_keyed_upstream_group_reaches_the_chained_target_keyed_by_a_real_
 /// non-`NULL` `sku` value that happens to be a lone U+0001 (`chr(1)`) —
 /// [`ddl::NULL_KEY_SENTINEL`] itself — is a genuinely different group from
 /// the `NULL`-keyed one, and `ddl::encode_key_part` escapes it (doubles it)
-/// precisely so the two never collide. Before issue #205's fix,
-/// `apply_target` bound that *doubled* text straight in as
+/// precisely so the two never collide. Without the escape,
+/// `apply_target` would bind that *doubled* text straight in as
 /// `sku_totals_echo`'s literal primary-key value — two U+0001 characters,
 /// not the source group's actual one-character key — silently corrupting
 /// this group's identity in the chained target even though it isn't the
@@ -409,7 +409,7 @@ async fn a_real_sentinel_character_group_key_round_trips_undoubled_in_the_chaine
     assert_eq!(
         sentinel_echo_total,
         Some("5".to_string()),
-        "issue #205: the chained target's row for a real chr(1)-valued group \
+        "the chained target's row for a real chr(1)-valued group \
          key must be keyed by that single character, not a doubled pair — \
          before the fix, apply_target stored the doubled (still-escaped) \
          text as the literal PK value instead of decoding it first"

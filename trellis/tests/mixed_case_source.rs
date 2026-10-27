@@ -1,4 +1,4 @@
-//! Issue #561: a transform over a mixed-case table in a mixed-case schema
+//! A transform over a mixed-case table in a mixed-case schema
 //! (`"Shop"."OrderItems"`) installs, backfills and applies CDC.
 //!
 //! The grammar keeps an identifier's case, so `FROM Shop.OrderItems` names
@@ -126,7 +126,7 @@ async fn an_aggregate_over_a_mixed_case_table_backfills_and_applies_cdc() {
     );
 }
 
-/// #623 D4: a composed field and an expression argument over mixed-case
+/// A composed field and an expression argument over mixed-case
 /// columns of a mixed-case table follow CDC, with the group and argument
 /// columns carrying those names quoted.
 #[tokio::test]

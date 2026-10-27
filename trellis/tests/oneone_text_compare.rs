@@ -1,10 +1,10 @@
-//! #1303 (ADR-0020): a 1-1 target holds the source's exact rendering, so the
+//! ADR-0020: a 1-1 target holds the source's exact rendering, so the
 //! apply's upsert skips an update only when the two rows' texts are equal.
 //! Comparing by the column type's `=` skipped a write whose value is equal and
 //! whose text is not (`numeric` `1.25` to `1.2500`, an `interval` respelled,
 //! a float `-0` to `0`, a case change under a case-insensitive collation), and
 //! left the copy at the old text for `self_check` to report. Every cell is a
-//! 1-1 passthrough, driven by explicit seals and drains (#297).
+//! 1-1 passthrough, driven by explicit seals and drains.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;

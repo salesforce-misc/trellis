@@ -1,4 +1,4 @@
-//! Issue #236 (layer-3 bucket 5, `docs/generative-test-suite.md` §7): the
+//! Layer-3 bucket 5 (`docs/generative-test-suite.md` §7): the
 //! backup-and-restore action. The cluster is backed up with a cold,
 //! file-level copy right after op *k*, the program runs to its end, the
 //! backup is restored into a fresh cluster, and ops *k+1..n* are replayed
@@ -9,7 +9,7 @@
 //! ring back with everything else. See
 //! `generative::run::run_convergence_with_restore`.
 //!
-//! The `pg_basebackup` variant is held for #558.
+//! The `pg_basebackup` variant is held for #1422.
 //!
 //! Every hand-built pin owns its cluster. The property shares one per thread
 //! like the other properties; the backup stops it, which is harmless to
@@ -18,7 +18,7 @@
 //! deep run holds at most two extra copies of the cluster at a time.
 //!
 //! A restore starts a second cluster while the run still holds its first.
-//! testkit draws restored clusters from their own permit pool (issue #569),
+//! testkit draws restored clusters from their own permit pool,
 //! so these runs can go in parallel without four of them each holding one
 //! cluster and waiting forever for another.
 
@@ -207,7 +207,7 @@ fn a_restore_from_the_last_op_converges_with_nothing_to_replay() {
     pin(5);
 }
 
-/// Issue #752: a server stop can strand a claim, and the backend's quiesce
+/// A server stop can strand a claim, and the backend's quiesce
 /// has to outlast the engine freeing it. A worker that claims a build job
 /// just before a backup stops Postgres loses its connection before it can
 /// run the job or give the claim back, and a cold copy carries that claim

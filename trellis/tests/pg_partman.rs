@@ -1,5 +1,5 @@
 //! pg_partman driving partition maintenance under real Trellis capture
-//! (#959, X12-8 of epic #897).
+//! (X12-8).
 //!
 //! **Opt-in tier.** Every test here is `#[ignore]`d: the default `verify` and
 //! CI never need pg_partman. Run them on a machine that has it built for the

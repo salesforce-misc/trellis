@@ -1,5 +1,4 @@
-//! End-to-end tests for the [`trellis::Client`] runtime (issue #11's runtime
-//! increment): drive the *whole* pipeline — capture-trigger setup, ring
+//! End-to-end tests for the [`trellis::Client`] runtime: drive the *whole* pipeline — capture-trigger setup, ring
 //! maintenance, and application workers — through the public `Client` API
 //! against a real, ephemeral Postgres instance (`testkit::TestCluster`),
 //! rather than staging changes into the ring by hand the way `apply.rs`
@@ -171,7 +170,7 @@ async fn oracle_snapshot(
         .collect()
 }
 
-/// The kinds of a Re-derive build's work rows (#625), for
+/// The kinds of a Re-derive build's work rows, for
 /// `chunk_queue::claim_chunks_of`.
 const REDERIVE_BUILD_KINDS: [&str; 3] = [
     chunk_queue::KIND_PLAN,
@@ -278,7 +277,7 @@ async fn the_full_pipeline_converges_inserts_updates_and_deletes_to_the_oracle()
     client.shutdown().await.expect("clean shutdown");
 }
 
-/// Issue #60's end-to-end contract: load rows, derive them, `TRUNCATE` the
+/// The truncate end-to-end contract: load rows, derive them, `TRUNCATE` the
 /// source, insert new rows, and let the pipeline converge — the target must
 /// end up matching a from-scratch oracle computed against `orders`'s
 /// current (post-truncate) contents, with no trace of the truncated rows.
@@ -393,7 +392,7 @@ fn comments_calc_def() -> TransformDef {
     }
 }
 
-/// Issue #14's regression case: a transform registered — via
+/// Regression case: a transform registered — via
 /// `defs::create_definition`, mirroring what `defctl add` does under the
 /// hood — against a source table that was **not** in
 /// the catalog when `Client::start` ran must still get
@@ -489,9 +488,9 @@ async fn a_transform_registered_against_a_new_source_table_backfills_without_a_c
     client.shutdown().await.expect("clean shutdown");
 }
 
-/// The transform issue #75's regression test below exercises: identical to
+/// The transform the qualified-source regression test below exercises: identical to
 /// [`comments_calc_def`] except `explicit_source_schema` names `custom`
-/// (issue #76's grammar) — needed so [`oracle_snapshot`]'s own
+/// — needed so [`oracle_snapshot`]'s own
 /// `quoted_source_from` reads `custom.comments`, not a bare `comments` that
 /// would resolve (wrongly, for this test) via this file's pinned
 /// `search_path`.
@@ -502,8 +501,8 @@ fn comments_calc_custom_schema_def() -> TransformDef {
     }
 }
 
-/// Issue #75, ADR-0011's regression case: `client::reconcile_source_tables`
-/// (the same issue #14 periodic re-derivation the test above exercises) must
+/// ADR-0011's regression case: `client::reconcile_source_tables`
+/// (the same periodic re-derivation the test above exercises) must
 /// reconcile capture against each newly-registered source's own
 /// *actual* persisted qualified name — not a bare suffix re-guessed against
 /// `Config::target_schema` (`"public"` by default). Before the fix,
@@ -514,8 +513,8 @@ fn comments_calc_custom_schema_def() -> TransformDef {
 ///
 /// Proven with exactly that shape: a same-named, same-shaped decoy sits in
 /// `public` — the schema the old bug guessed — while the real, registered
-/// source lives in `custom`, named explicitly via issue #76's `FROM
-/// custom.comments` grammar, registered *after* the client is already
+/// source lives in `custom`, named explicitly via a `FROM
+/// custom.comments` clause, registered *after* the client is already
 /// running (so the startup reconcile never named it — discovering it is exactly the periodic-reconcile job under test). A
 /// row inserted into `custom.comments` after registration must still reach
 /// `comments_calc`: that requires the periodic reconcile to have added
@@ -754,7 +753,7 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
         "install_definition must return before its build is even dispatched"
     );
     // No staging worker here (`staging_worker: false`): stand in for its
-    // capture pass, which starts the build (ADR-0002, #418). Check that it
+    // capture pass, which starts the build. Check that it
     // did: a missing plan job would otherwise surface as the wait below
     // timing out.
     trellis::intake::harness::start_registered_builds(&db.pool)
@@ -814,11 +813,11 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
     client.shutdown().await.expect("clean shutdown");
 }
 
-/// public-api-design review gap #2: `chunk_queue::reclaim_stale_chunks` used
-/// to run only from `maintenance_loop`, which only spawns `if
-/// options.staging_worker`. A drain-only client (`staging_worker: false`,
-/// `application_threads > 0` — a normal, documented fleet topology) had no
-/// self-healing for a crashed drain worker's stale chunk claim, since nothing
+/// `chunk_queue::reclaim_stale_chunks` must not run only from
+/// `maintenance_loop`, which only spawns `if options.staging_worker`. A
+/// drain-only client (`staging_worker: false`,
+/// `application_threads > 0` — a normal, documented fleet topology) would
+/// otherwise have no self-healing for a crashed drain worker's stale chunk claim, since nothing
 /// else in a fleet running *no* `staging_worker: true` client anywhere would
 /// ever sweep it.
 ///
@@ -831,7 +830,7 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
 /// client being given a tiny TTL, so the client's first sweep frees it at
 /// once.
 ///
-/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's, so
+/// A plain 1-1 over a captured table is the Re-derive build's, so
 /// the dead claim is on its one `plan` job (the only row its start
 /// enqueues), and the build ends `live`. Until
 /// the claim is freed nothing plans the chunks, so the build can't finish.
@@ -859,7 +858,7 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
     .expect("install_definition records the definition and returns");
     assert_eq!(def.status, TransformStatus::WaitingToBackfill);
     // No staging worker here (`staging_worker: false`): stand in for its
-    // reconcile pass, which starts the Re-derive build (#625 F8a).
+    // reconcile pass, which starts the Re-derive build.
     trellis::intake::harness::start_registered_builds(&db.pool)
         .await
         .expect("start the re-derive build");
@@ -899,7 +898,7 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
         async || {
             let status: Option<String> = raw
                 .query_opt(
-                    // Issue #73: `target_table` is persisted fully-qualified now.
+                    // `target_table` is persisted fully-qualified now.
                     &format!(
                         "select status from transform_definitions \
                          where target_table = '{DEFAULT_TARGET_SCHEMA}.gadgets_calc'"
@@ -933,27 +932,23 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
     client.shutdown().await.expect("clean shutdown");
 }
 
-/// Issue #297 redesign note: this test used to also seed 99999 rows in a
-/// shape deliberately chosen to force `install_definition`'s chunk-boundary
-/// discovery (`defs::backfill::discover_pk_ranges`) to land mid-group, and to
-/// assert the exact persisted `backfill_chunks` count — the issue #121
-/// regression guard for a boundary-discovery bug that once silently
-/// over-chunked a composite-keyed source. That property needs no live client
-/// and no polling at all (`install_definition` returns as soon as chunks are
-/// planned and persisted), so it now lives as a fast, deterministic,
-/// sub-second test:
+/// The chunk-boundary property for a composite-keyed source (chunk-boundary
+/// discovery, `defs::backfill::discover_pk_ranges`, must not land mid-group
+/// and silently over-chunk) needs no live client and no polling at all
+/// (`install_definition` returns as soon as chunks are planned and persisted),
+/// so it lives as a fast, deterministic, sub-second test:
 /// `defs_install_definition.rs`'s
 /// `install_definition_chunks_a_composite_key_boundary_inside_a_group_into_exactly_two_chunks`.
 ///
-/// What *does* need a live client is the other half of the original test:
+/// What *does* need a live client is this test:
 /// that a real, running `TrellisClient`'s own upkeep task (which sweeps
 /// `reclaim_stale_chunks`) and application-thread pool (which
 /// claims and drains `backfill_chunks` work) actually notice and correctly
 /// finish a reclaimed composite-key chunk on their own, with no test code
 /// driving them step by step — that's the wiring this test proves, kept as
-/// a small, bounded (not open-ended) integration check per #297.
+/// a small, bounded (not open-ended) integration check.
 ///
-/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's, so
+/// A plain 1-1 over a captured table is the Re-derive build's, so
 /// the reclaimed chunks are its `rederive` chunks, whose `lo`/`hi` carry the
 /// same composite text encoding. The test runs the build's plan job by hand
 /// at two source rows a chunk, so nine rows over three `a` groups plan five
@@ -961,7 +956,7 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
 /// every one of them. The client's reclaim sweep must free them, and its
 /// drain workers run them and take the build `live`.
 ///
-/// This test kept timing out on CI after #297's split, and the cause was not
+/// A test like this once kept timing out on CI, and the cause was not
 /// load alone. It ran the client with a 200ms `reclaim_ttl` next to the
 /// default 5s chunk heartbeat, so a live worker's claim went stale 200ms into
 /// every chunk run. Once the 50k-row chunk took longer than that (about 80ms
@@ -996,7 +991,7 @@ async fn a_running_client_backfills_a_reclaimed_composite_key_chunk() {
     .expect("install_definition records the definition and returns");
     assert_eq!(def.status, TransformStatus::WaitingToBackfill);
     // No staging worker here (`staging_worker: false`): stand in for its
-    // reconcile pass, which starts the Re-derive build (#625 F8a).
+    // reconcile pass, which starts the Re-derive build.
     trellis::intake::harness::start_registered_builds(&db.pool)
         .await
         .expect("start the re-derive build");

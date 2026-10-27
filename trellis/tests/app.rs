@@ -9,17 +9,16 @@ mod wait_live;
 use testkit::TestCluster;
 use trellis::{Config, Trellis, TrellisOptions};
 
-/// Issue #108 regression: [`Trellis::apply`]'s own source-column
-/// introspection (`Trellis::source_columns`, private) used to classify a
-/// column's type by matching `information_schema.columns.data_type` text
-/// against a small hardcoded list that didn't even include `"uuid"` — so a
-/// `uuid` source column was silently *dropped* from the type map the
-/// validator sees, and referencing it in a definition failed with an
-/// unresolved-column error before type-checking ever ran. A `jsonb` column
-/// fared no better: also absent from that list, also dropped.
+/// Regression: [`Trellis::apply`]'s own source-column introspection
+/// (`Trellis::source_columns`, private) must not classify a column's type by
+/// matching `information_schema.columns.data_type` text against a small
+/// hardcoded list, which would silently *drop* a `uuid` or `jsonb` source
+/// column from the type map the validator sees, so that referencing it in a
+/// definition failed with an unresolved-column error before type-checking
+/// ever ran.
 ///
-/// Now that introspection classifies every column via the PG-OID registry
-/// (`pg_type::value_type_for_oid`), both a bare `uuid` passthrough and a
+/// Introspection classifies every column via the PG-OID registry
+/// (`pg_type::value_type_for_oid`), so both a bare `uuid` passthrough and a
 /// bare `jsonb` passthrough must `define()` successfully through the real
 /// public facade — and the `jsonb` column's target must land as genuine
 /// `jsonb`, not `text`.
@@ -50,7 +49,7 @@ async fn define_accepts_a_uuid_and_a_jsonb_passthrough_column() {
         .apply("TRANSFORM events_calc FROM events SELECT tag AS tag, payload AS payload")
         .await
         .expect(
-            "a uuid/jsonb passthrough must define successfully — pre-#108 the uuid column \
+            "a uuid/jsonb passthrough must define successfully — the uuid column \
              would have been silently dropped from source_columns and failed as an \
              unresolved column reference",
         );
@@ -78,10 +77,10 @@ async fn define_accepts_a_uuid_and_a_jsonb_passthrough_column() {
     );
 }
 
-/// Issue #108 review regression: a source column whose Postgres type the OID
+/// Regression: a source column whose Postgres type the OID
 /// registry can't place at all — an array, range, composite, domain, or
 /// `citext` — must stay out of the validator's type map, exactly as the
-/// pre-#108 `pg_value_type` dropped it.
+/// OID registry drops it.
 ///
 /// Classifying it as `ValueType::Other(PgType::Unrecognized)` and admitting
 /// it was strictly worse than dropping it: `PgType::name`'s `"unrecognized"`
@@ -93,9 +92,9 @@ async fn define_accepts_a_uuid_and_a_jsonb_passthrough_column() {
 /// place of a define-time rejection. Both must be the clean
 /// [`ValidationError::UnresolvedColumn`] instead.
 ///
-/// Issue #117 promoted enum types out of this bucket (they gained their own
-/// `PgType::Enum` classification and key/`GROUP BY`/`MIN`/`MAX` roles — see
-/// `trellis/tests/defs_enum.rs`), so this regression pin moved to an array
+/// Enum types are not in this bucket (they have their own `PgType::Enum`
+/// classification and key/`GROUP BY`/`MIN`/`MAX` roles — see
+/// `trellis/tests/defs_enum.rs`), so this regression pin uses an array
 /// column, which — like a range, composite, domain, or `citext` — is still
 /// genuinely `PgType::Unrecognized` today (`docs/type-support.md` defers
 /// these to #122). The original regression this test guards is about the
@@ -158,7 +157,7 @@ async fn a_column_of_an_unrecognized_type_is_not_admitted_to_the_validators_view
     assert_eq!(leftovers, 0);
 }
 
-/// Issue #234, the missing front-door pin for `Trellis::start_client`'s half
+/// The front-door pin for `Trellis::start_client`'s half
 /// of "a configured schema must be carried, not re-resolved": a `Trellis`
 /// must run its **background client** in its own `Config`'s schema, not in
 /// whatever `TRELLIS_SCHEMA`/`DEFAULT_SCHEMA` the *process* environment
@@ -234,8 +233,8 @@ async fn the_background_client_runs_in_the_configured_schema_not_the_process_def
         .await
         .expect(
             "the background client must stage and drain through the *configured* instance's \
-             ring — before issue #234 it ran against DEFAULT_SCHEMA's ring instead, leaving this \
-             instance's own convergence predicate permanently unsatisfiable",
+             ring, not DEFAULT_SCHEMA's, or this \
+             instance's own convergence predicate stays permanently unsatisfiable",
         );
 
     let price: Option<i32> = pool
@@ -256,7 +255,7 @@ async fn the_background_client_runs_in_the_configured_schema_not_the_process_def
     running.shutdown().await.expect("shutdown running trellis");
 }
 
-/// Issue #622 C5: `request_backfill` accepts a table the staging worker
+/// `request_backfill` accepts a table the staging worker
 /// captures (some registered definition reads it), and refuses any other
 /// table with `TableNotCaptured`.
 #[tokio::test]
@@ -299,10 +298,10 @@ async fn request_backfill_refuses_a_table_that_isnt_captured() {
     }
 }
 
-/// Issue #622 C5: a staging connection's setup runs one capture reconcile
+/// A staging connection's setup runs one capture reconcile
 /// pass, so a table a registered definition reads carries its capture
 /// triggers by the time `connect` returns, with no convergence wait, and the
-/// handle's own `request_backfill` accepts it (#641).
+/// handle's own `request_backfill` accepts it.
 #[tokio::test]
 async fn a_staging_connection_installs_capture_before_connect_returns() {
     let cluster = TestCluster::start();
@@ -352,10 +351,10 @@ async fn a_staging_connection_installs_capture_before_connect_returns() {
     running.shutdown().await.expect("shutdown");
 }
 
-/// Issue #427: the staging worker reads what to capture from the catalog
+/// The staging worker reads what to capture from the catalog
 /// itself, so it no longer needs a definition registered before it can start
 /// (this used to fail with `TrellisError::NoDefinitions`). It starts with
-/// nothing captured (issue #622), ready to pick up
+/// nothing captured, ready to pick up
 /// whatever is applied later.
 #[tokio::test]
 async fn a_staging_connection_starts_with_no_definitions_registered() {

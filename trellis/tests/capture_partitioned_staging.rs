@@ -1,4 +1,4 @@
-//! ADR-0017 P2b (issue #1060): capture of a partitioned source stages every
+//! ADR-0017 P2b: capture of a partitioned source stages every
 //! write exactly once under the root's identity, and stages nothing for a
 //! table that has left the tree.
 //!

@@ -1,4 +1,4 @@
-//! Issue #979: a schema-qualified `TRANSFORM <schema>.<target>` may not name
+//! A schema-qualified `TRANSFORM <schema>.<target>` may not name
 //! a Trellis catalog schema, this instance's own or another instance's (a
 //! schema holding a `trellis_instance` table). Define refuses it before it
 //! creates anything, and a `RESUME` of a definition whose target schema has

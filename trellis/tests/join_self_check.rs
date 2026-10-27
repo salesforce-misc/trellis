@@ -1,4 +1,4 @@
-//! `self_check` of a `JOIN` target (#1112 J7a, ADR-0013 "Scope", ADR-0019).
+//! `self_check` of a `JOIN` target (ADR-0013 "Scope", ADR-0019).
 //! It detects and never repairs: the visible target is compared against the
 //! definition's own `JOIN … GROUP BY`, and the hidden `P`, `M`, `J` and `T`
 //! against what the two tables say they hold. A planted divergence in each is
@@ -6,10 +6,10 @@
 //! by hand. The last tests here run the loop, check, repair, check: writes
 //! capture missed repaired by `request_backfill`, hand edits of `J`/`T` by
 //! `PAUSE`/`RESUME`. One test here checks the `J` lock-wait
-//! histogram a page records (#1112 J7b).
+//! histogram a page records.
 //!
 //! Every test drives the pipeline by hand through
-//! `support/drain_driver.rs` and never polls for convergence (#297).
+//! `support/drain_driver.rs` and never polls for convergence.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -578,7 +578,7 @@ async fn each_join_page_records_its_j_lock_wait() {
     assert_eq!(count(), Some(2.0));
 }
 
-/// The capture audit covers both tables of a `JOIN` (#1110): capture
+/// The capture audit covers both tables of a `JOIN`: capture
 /// triggers that aren't `ENABLE ALWAYS` on either table are reported as
 /// capture faults on that table, before any comparison, and nothing once
 /// they are again.
@@ -615,7 +615,7 @@ async fn a_capture_fault_on_either_table_is_reported_before_the_comparison() {
     }
 }
 
-// ------------------------------------- the ring rows not applied yet (#1140)
+// ------------------------------------- the ring rows not applied yet
 
 /// One comparison of every part of `target`, `limit` keys a page, with no
 /// convergence wait and no re-check, whatever the ring holds: the
@@ -871,7 +871,7 @@ async fn a_pending_change_a_cells_basis_saw_is_not_subtracted() {
 /// A `FROM`-side group column re-collated (between deterministic
 /// collations, which pauses nothing) while a walk pages through `P`: the
 /// part pages under the collation its hidden table was made with, not the
-/// source's new one, so the walk still reads every cell once (#1178).
+/// source's new one, so the walk still reads every cell once.
 #[tokio::test]
 async fn a_group_column_re_collated_mid_walk_skips_and_repeats_no_cell() {
     let mut d = Driver::start_with_database_defaults(
@@ -945,8 +945,8 @@ async fn a_group_column_re_collated_mid_walk_skips_and_repeats_no_cell() {
 const GROUP_IS_KEY: &str = "TRANSFORM gk FROM public.a JOIN public.b ON a.k = b.k \
      GROUP BY a.k, b.gb WITHOUT SOURCE INDEX SELECT a.k AS k, b.gb AS gb, COUNT(*) AS n, SUM(a.x) AS sx";
 
-/// A `P` or `M` page orders by the hidden cell identity, the join key first
-/// (#1198): the hidden side is a range scan of the hidden table's identity index
+/// A `P` or `M` page orders by the hidden cell identity, the join key first:
+/// the hidden side is a range scan of the hidden table's identity index
 /// and the source side a range scan of an index on the source's join columns.
 #[tokio::test]
 async fn a_p_or_m_page_is_a_range_scan_of_the_hidden_index_and_the_source_join_index() {
@@ -1026,8 +1026,8 @@ async fn a_p_or_m_page_is_a_range_scan_of_the_hidden_index_and_the_source_join_i
             "{part}: the source side is a range scan of {index}:\n{plan}"
         );
         // The page steers by that index, the one define requires, though the
-        // page's key goes on past the join columns to the group column
-        // (#1223): its groups come out of the index in order, so the source
+        // page's key goes on past the join columns to the group column:
+        // its groups come out of the index in order, so the source
         // side is not bounded by the hidden side's last key (`he`).
         assert!(
             !plan.contains("CTE Scan on he"),
@@ -1202,7 +1202,7 @@ async fn one_sided_cells_where_a_group_column_is_the_join_key_are_found_at_every
     .await;
 }
 
-/// Every `JOIN` part's page skips the drained ring slots (#1219): with
+/// Every `JOIN` part's page skips the drained ring slots: with
 /// the pipeline drained, no ring slot holding a drained segment is scanned,
 /// whichever source's ring rows the part subtracts, and a comparison still
 /// finds nothing.
@@ -1287,7 +1287,7 @@ fn assert_reported_on(found: &[Divergence], tables: &[&str]) {
     }
 }
 
-/// #1112's acceptance for `P` and `M`: a write made on each side while
+/// The acceptance for `P` and `M`: a write made on each side while
 /// capture was off leaves `P`, `M` (and `J`, `T` and the target, which follow
 /// them by delta) stale; the check reports it, `request_backfill` of each
 /// side (a rebuild in place, which writes `P`/`M` absolutely and pushes the
@@ -1295,7 +1295,7 @@ fn assert_reported_on(found: &[Divergence], tables: &[&str]) {
 /// clean.
 ///
 /// Only a write capture missed is planted: a hand edit of `P` alone would be
-/// pushed through to `T` by the rebuild as well (#1308).
+/// pushed through to `T` by the rebuild as well.
 async fn p_and_m_are_repaired_by_request_backfill(definition: &str, target: &str) {
     let mut d = start(&[definition]).await;
     seed(&mut d).await;
@@ -1360,7 +1360,7 @@ async fn a_capture_off_write_is_reported_until_request_backfill_repairs_it_inner
 /// The documented limit (known-correctness-gaps: "Rows written into a target,
 /// a hidden table or Trellis's schema"): `request_backfill` does not repair
 /// a hand edit of `join_<id>_t` or `join_<id>_j`, because they change only
-/// by delta (#1097); `PAUSE`/`RESUME` recreates the hidden tables and does.
+/// by delta; `PAUSE`/`RESUME` recreates the hidden tables and does.
 #[tokio::test]
 async fn j_and_t_divergences_are_reported_until_resume_repairs_them() {
     let mut d = start(&[INNER]).await;

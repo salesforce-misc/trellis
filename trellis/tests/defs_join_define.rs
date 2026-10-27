@@ -1,4 +1,4 @@
-//! Issues #1106 and #1107: define checks a `JOIN` definition against both
+//! Define checks a `JOIN` definition against both
 //! tables' live columns, then registers it `waiting_to_backfill` with its
 //! catalog state: both tables in its row, a `source` and a `join` edge, both
 //! version fences bumped, the visible target and its hidden tables. A
@@ -10,7 +10,7 @@
 //! (and its refusals on either side) and drop.
 //!
 //! Every test is stepped by hand: no staging worker runs, and nothing polls
-//! for convergence (#297).
+//! for convergence.
 
 use std::collections::HashMap;
 
@@ -108,7 +108,7 @@ async fn define_validates_a_join_against_both_tables_then_refuses_it() {
             .unwrap_or_else(|err| panic!("{text}: {err:?}"));
         assert_eq!(definition.target_table, format!("public.{target}"));
         assert_eq!(definition.status, TransformStatus::WaitingToBackfill);
-        // The public type keeps naming the `FROM` table (#1130).
+        // The public type keeps naming the `FROM` table.
         assert_eq!(definition.source_table, "public.orders");
     }
     let joined: Vec<String> = db
@@ -775,10 +775,10 @@ async fn assert_unpaused(trellis: &Trellis, target: &str) {
     );
 }
 
-/// #1110: the columns a JOIN copies from either table (its target's `GROUP
+/// The columns a JOIN copies from either table (its target's `GROUP
 /// BY` columns, `P`'s, `M`'s, `J`'s and `T`'s key columns, and its fields)
 /// follow a widening as a 1-1 or aggregate target's copies do. A string
-/// column's copies are unbounded `varchar` (#1207), with the column's
+/// column's copies are unbounded `varchar`, with the column's
 /// collation, so a `varchar(n)` widened, or moved to `text`, re-types
 /// nothing and pauses nothing, an `ON` pair included; one that outgrows a column (`SUM(qty)`'s
 /// `bigint` after `qty` goes `bigint`) pauses the JOIN, naming the column,
@@ -887,7 +887,7 @@ async fn a_widened_string_changes_no_copy_and_an_outgrown_column_pauses_the_join
     assert_eq!(column_type(&raw, "public.by_code", "qty").await, "numeric");
 }
 
-/// #1110: a column of the joined table retyped without a trigger to a type
+/// A column of the joined table retyped without a trigger to a type
 /// the JOIN evaluates differently (`timestamp` to `timestamptz` under a
 /// `COUNT`, which no copy of it outgrows) pauses the JOIN, as it does when
 /// the column is its `FROM` table's: the apply reads the joined table's
@@ -958,7 +958,7 @@ async fn a_joined_column_retyped_to_another_value_type_pauses_the_join() {
     }
 }
 
-/// #1110: a resume drops and recreates a JOIN's hidden tables, so it never
+/// A resume drops and recreates a JOIN's hidden tables, so it never
 /// re-types them first. `J` keeps every join key it has seen (ADR-0019), so
 /// after both `ON` columns narrow (`bigint` to `integer`, the big keys'
 /// rows deleted first) it can still hold a key the narrowed type can't: an

@@ -1,6 +1,5 @@
-//! Deterministic interleavings of the drain on `JOIN` targets (#1108 J3,
-//! ADR-0019), ported from #1091 J1's model scenarios and its review's RV
-//! cases.
+//! Deterministic interleavings of the drain on `JOIN` targets
+//! (ADR-0019), ported from the model scenarios (J1 families and RV cases).
 //!
 //! Every test turns the group-basis dev knob on before its driver starts:
 //! a `JOIN` applies only behind it. Rows arrive through capture, except the
@@ -11,7 +10,7 @@
 //! drives the pages by hand (`support/drain_driver.rs`): one page frozen at a
 //! [`PausePoint`] of its `JOIN` apply while another runs, which either
 //! queues behind the frozen page (asserted with `pg_blocking_pids`) or runs
-//! through. Nothing sleeps or polls for convergence (#297). After each
+//! through. Nothing sleeps or polls for convergence. After each
 //! scenario the pipeline settles and every target equals its `JOIN …
 //! GROUP BY` query, and the hidden structures their invariants: `P` and `M`
 //! equal each side's `GROUP BY`, `J.matches = Σ M.n`, and `T = Σ_k P ⊗ M`.
@@ -1072,7 +1071,7 @@ async fn family6_key_changes() {
     key_changes(Key::Single).await;
 }
 
-/// J1 family 6 (and #1043's R7): one batch of 900 changes over four keys,
+/// J1 family 6 (and R7): one batch of 900 changes over four keys,
 /// of both tables, split into buckets and drained by eight workers at once.
 /// Every page locks most keys: none deadlocks, and the result is exact.
 #[tokio::test]
@@ -1226,7 +1225,7 @@ async fn family11_two_phase_commit() {
     }
 }
 
-/// The decision on #1108: a `J` row a page inserts for a key no row had,
+/// A `J` row a page inserts for a key no row had,
 /// in a page that rolls back, leaves nothing behind; the page's retry
 /// creates it.
 #[tokio::test]
@@ -1399,7 +1398,7 @@ async fn family12_mixed_pages_pair_key() {
 
 // ---------------------------------------------------------------- review
 
-/// RV1 (#1091's review): a fact in a new `ga` against a second dimension
+/// RV1: a fact in a new `ga` against a second dimension
 /// row in a new `gb` on a matched key. The two pages' `T` groups are
 /// disjoint, so only the `J` lock orders them; without it the cross term
 /// `ΔP ⊗ ΔM` is lost. RV1b: the same on a key whose `J` row exists with no
@@ -1471,7 +1470,7 @@ async fn rv2_pages_read_committed_whatever_the_default() {
 
 // ------------------------------------------------------------- the rest
 
-/// #1096 decision 1: expression arguments are per-side partials and
+/// Expression arguments are per-side partials and
 /// composed fields are computed from `T`'s partials; `numeric(p,s)` keeps
 /// Postgres's scale through rows leaving a group, and a group shows only
 /// while its row count is above 0.
@@ -2758,7 +2757,7 @@ async fn a_partitioned_side_with_no_rows_builds_whole() {
 /// Each changed `T` group reaches the target-mutation seam with its prior
 /// image, so a transform reading the `JOIN` target follows it: a group
 /// written, changed, moved and deleted. (An `INNER` join, whose groups here
-/// have no `NULL` part: a 1-1 reader can't hold one, #1141.)
+/// have no `NULL` part: a 1-1 reader can't hold one.)
 #[tokio::test]
 async fn a_join_target_feeds_its_readers_through_the_seam() {
     let int8 = ValueType::Integer(IntWidth::Int8);
@@ -2926,8 +2925,8 @@ async fn a_page_that_applies_and_recomputes_one_cell_counts_it_once() {
 
 // ------------------------------------------------------------ the build
 
-// A `JOIN`'s fresh build, rebuild in place and `RESUME` (#1109, #1097's
-// decision): both structures in one transaction (`join::build`), run here by
+// A `JOIN`'s fresh build, rebuild in place and `RESUME`:
+// both structures in one transaction (`join::build`), run here by
 // hand from the plan job (a fresh build or a `RESUME`) or the sweep job (a
 // rebuild in place), frozen at the pause points of the build's transaction.
 // Every scenario ends at the oracle: each target equals its `JOIN … GROUP
@@ -3500,7 +3499,7 @@ async fn build_writes_only_the_cells_it_enumerated() {
     lab.check("a key first seen after the enumeration").await;
 }
 
-/// #1346: a fresh build writes each `P` and `M` cell once, not an insert that
+/// A fresh build writes each `P` and `M` cell once, not an insert that
 /// a second statement rewrites: every version of a hidden row is its live
 /// one, so each page's live rows fill its line pointers from 1 with no dead
 /// version among them. Its join keys have no `NULL` part (a `NULL`-key `P`
@@ -4118,7 +4117,7 @@ async fn build_refuses_a_field_build() {
     );
 }
 
-// ---------------------------------------------------- the readers (#1287)
+// ---------------------------------------------------- the readers
 
 const I2_EXPECTED: &str = "select ga, sum(n), sum(sx) from ( \
         select a.ga as ga, count(*) as n, sum(a.x) as sx from public.a \
@@ -4212,7 +4211,7 @@ async fn chain_converges(lab: &mut Lab, deeper: bool) {
 /// lock statement computes its prior image from the empty partials, so the
 /// seam row it stages moves the reader's groups by a delta against a value
 /// the reader never held. The build's commit parks the target's readers
-/// instead: a group-basis reader is rebuilt, and converges (#1287).
+/// instead: a group-basis reader is rebuilt, and converges.
 async fn a_chained_reader_is_rebuilt(deeper: bool) {
     let mut lab = chained(deeper).await;
     pause(&lab, I).await;
@@ -4415,7 +4414,7 @@ async fn build_a_pause_and_resume_wait_for_a_build_in_flight() {
     lab.check("a pause and resume during a build").await;
 }
 
-// ------------------------------------------ partitioned sides (#1286, #1109)
+// ------------------------------------------ partitioned sides
 
 /// `a` and `b` (the [`DDL`] columns), each partitioned by list on `t` into
 /// three leaves (`t` 0, 1 and 2 or 3) when its flag is set. The join key
@@ -4983,7 +4982,7 @@ async fn a_leaf_without_a_constraint_text_halts_a_join_build() {
     );
 }
 
-// ------------------------------------------- the side under build (#1112)
+// ------------------------------------------- the side under build
 
 impl Lab {
     /// What `status()` reports of the definition's build
@@ -5220,7 +5219,7 @@ async fn a_reader_of_a_join_resumed_per_leaf_is_rebuilt_once() {
 }
 
 /// A `PAUSE` and a `DROP` of a `JOIN` while a page of its joined table that
-/// planned it is in flight (#1291). The page holds only `b`'s fence, the
+/// planned it is in flight. The page holds only `b`'s fence, the
 /// joined table's, and is frozen on `i` before it reaches `l`, so it holds no
 /// lock on `l`'s tables. The drop takes the joined table's fence as well as
 /// its source's, so it waits for the page, which commits, and nothing is

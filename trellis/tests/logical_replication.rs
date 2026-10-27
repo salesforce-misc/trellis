@@ -1,5 +1,5 @@
 //! A table a logical-replication subscription replicates into isn't
-//! supported, and is detected (issue #751, `trellis::defs::subscription`):
+//! supported, and is detected (`trellis::defs::subscription`):
 //! the apply worker fires only row-level triggers, so Trellis's statement
 //! triggers never see the changes it applies.
 //!
@@ -15,7 +15,7 @@
 //! Every check and every Trellis call runs as a non-superuser login role;
 //! only creating a subscription needs the superuser.
 //!
-//! Nothing polls for convergence (#297): every pass is stepped by hand, and
+//! Nothing polls for convergence: every pass is stepped by hand, and
 //! no test waits for a subscription to apply anything.
 
 use std::time::{Duration, Instant};

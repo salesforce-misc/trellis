@@ -1,4 +1,4 @@
-//! Correctness tests for the evaluator (issue #24) against a real,
+//! Correctness tests for the evaluator against a real,
 //! ephemeral Postgres instance via `testkit::TestCluster`. The bar per the
 //! issue: `a + b` (and literal-involving additions) must be byte-identical
 //! to Postgres's own `SELECT a + b`, across a matrix of scale/precision

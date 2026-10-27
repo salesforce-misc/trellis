@@ -1,4 +1,4 @@
-//! Issue #469: every row a drain derives for a downstream transform carries
+//! Every row a drain derives for a downstream transform carries
 //! the `origin_lsn` of the source commit it traces back to, hop by hop, so
 //! `converged_through` gates it only for tokens at or past that commit. A
 //! change of unknown origin keeps its derived rows unknown, which gates every
@@ -57,7 +57,7 @@ async fn drain(pool: &trellis::Pool, seg_seq: i64) {
 /// Stages one CDC insert for `orders` key `key`, as capture would, with
 /// `origin_lsn` as given (`None` standing in for a row of unknown origin).
 ///
-/// Stages at a made-up LSN on purpose (issue #512): capture stamps a change's
+/// Stages at a made-up LSN on purpose: capture stamps a change's
 /// `origin_lsn` with its own commit LSN, and these tests assert on exact
 /// origins, so the ring `lsn` follows the chosen origin. Only 1-1 targets
 /// read these rows.

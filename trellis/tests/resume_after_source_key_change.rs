@@ -1,4 +1,4 @@
-//! A source whose primary key changed while its readers were paused (#1324):
+//! A source whose primary key changed while its readers were paused:
 //! dropped and created again with another key. The keys Trellis recorded or
 //! staged under the old key are discarded by the resume, never decoded
 //! against the new one, and the rebuild reads the table now at the name.
@@ -6,7 +6,7 @@
 //! The aggregate and the 1-1 target; a `JOIN` is in
 //! `group_basis_resume_after_source_key_change.rs`. Every pass, build and
 //! drain is stepped by hand.
-//! Nothing polls for convergence (#297).
+//! Nothing polls for convergence.
 
 #[path = "support/resume_passes.rs"]
 mod resume_passes;
@@ -24,7 +24,7 @@ const SUMS_ACTUAL: &str = "select pid::text, total::text from public.c_sums orde
 const SUMS_ORACLE: &str =
     "select pid::text, sum(amount)::text from public.c group by pid order by 1";
 
-/// #1324's repro: an aggregate's source dropped and created again with a
+/// An aggregate's source dropped and created again with a
 /// two-column key, with a change staged under the old key and not yet
 /// drained. The resume rebuilds the target from the new table, and the new
 /// table's changes apply after it.
@@ -149,7 +149,7 @@ async fn a_one_to_one_resume_onto_a_source_with_another_key_refuses() {
     );
 }
 
-/// A plain source converted to a partitioned one (#1228's routine case): a
+/// A plain source converted to a partitioned one (the routine case): a
 /// partitioned table's key must hold the partition key, so the conversion
 /// widens it. The resume rebuilds onto the tree, and capture covers the
 /// leaves.

@@ -1,4 +1,4 @@
-//! A 1-1 target over a source whose identity key is nullable (#1141): an
+//! A 1-1 target over a source whose identity key is nullable: an
 //! aggregate target's `GROUP BY` columns, keyed `UNIQUE NULLS NOT DISTINCT`.
 //!
 //! The 1-1 target takes the same identity: a `UNIQUE NULLS NOT DISTINCT`
@@ -6,7 +6,7 @@
 //! the source, so a group whose key has a `NULL` part has its row in the
 //! reader as it has in the aggregate. Each test drives the pipeline by hand
 //! through `support/drain_driver.rs` (no sleeping or polling for
-//! convergence, #297), and compares every target with a `GROUP BY` over the
+//! convergence), and compares every target with a `GROUP BY` over the
 //! source: the oracle. The aggregate and `JOIN` sources are in
 //! `group_basis_chained.rs`.
 

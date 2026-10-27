@@ -1,5 +1,5 @@
-//! DDL on a user table never makes an application writer wait (issue #621,
-//! ADR-0002 I6), and never waits for a lock inside a transaction for longer
+//! DDL on a user table never makes an application writer wait (ADR-0002
+//! I6), and never waits for a lock inside a transaction for longer
 //! than its `lock_timeout` (I7).
 //!
 //! Each attempt runs under a per-attempt `lock_timeout`
@@ -7,9 +7,9 @@
 //! [`trellis::locks::DdlRetry`] retries it, one attempt per interval, until it
 //! lands. The tests hold a lock the DDL needs for a few seconds, write to the
 //! table throughout, and check from `pg_locks` that no one DDL attempt
-//! blocks the writer for long (`testkit::blocking`, #893), and the DDL's
+//! blocks the writer for long (`testkit::blocking`), and the DDL's
 //! transactions against the timeout, never by waiting for anything to
-//! converge (#297).
+//! converge.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,7 +57,7 @@ fn spawn_writer(client: Client, stop: Arc<AtomicBool>) -> tokio::task::JoinHandl
     })
 }
 
-/// The loop #622's `CREATE TRIGGER` runs in, in #565 E7's shape: an open
+/// The loop a capture `CREATE TRIGGER` runs in: an open
 /// transaction has written to the table, so the trigger's `SHARE ROW
 /// EXCLUSIVE` waits for it, and every writer that arrives meanwhile queues
 /// behind the waiting DDL. Under the short timeout that queue empties every

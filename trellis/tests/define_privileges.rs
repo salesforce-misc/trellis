@@ -1,11 +1,11 @@
 //! Define refuses a table the Trellis role can't see by naming the missing
-//! privilege (issue #933), not by blaming the table's shape or calling it
+//! privilege, not by blaming the table's shape or calling it
 //! missing.
 //!
 //! Bare names resolve through `information_schema.tables` and the
 //! connection's `search_path`, which hide a table the role holds no
-//! privilege on and skip a schema it lacks `USAGE` on. Before #933, a
-//! `TRANSFORM` from such a table was refused as "not found". Each case here
+//! privilege on and skip a schema it lacks `USAGE` on, so such a table must
+//! not be refused as "not found". Each case here
 //! covers a define path that resolves a name: a `TRANSFORM`'s bare and
 //! qualified `FROM`, and either side of a `JOIN`.
 //!
@@ -87,7 +87,7 @@ async fn set_up(cluster: &TestCluster) -> (testkit::TestDatabase, Client, trelli
     (db, admin, pool, trellis)
 }
 
-/// `statement` is refused with #933's message: it names `table`, says what
+/// `statement` is refused with the missing-privilege message: it names `table`, says what
 /// the role lacks (`lacks`), and points at the doc section that lists the
 /// grants.
 async fn assert_refused(trellis: &Trellis, statement: &str, table: &str, lacks: &str) {

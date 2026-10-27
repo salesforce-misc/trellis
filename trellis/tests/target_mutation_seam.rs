@@ -1,4 +1,4 @@
-//! Issue #315: every write to a Trellis-owned target table reaches the
+//! Every write to a Trellis-owned target table reaches the
 //! definitions chained off it through one seam (`staging::target_mutations`),
 //! never through CDC. One regression test per writer that used to bypass it,
 //! plus the catalog rules that keep the seam the only path: a seam-only
@@ -109,8 +109,8 @@ async fn rows(raw: &Client, sql: &str) -> BTreeMap<String, String> {
 }
 
 /// Stages one CDC change as capture would, at the current WAL insert
-/// position: a real commit LSN, after everything the test set up before it
-/// (issue #512), rather than a fake one before them all.
+/// position: a real commit LSN, after everything the test set up before it,
+/// rather than a fake one before them all.
 async fn stage_cdc(
     raw: &mut Client,
     src_table: &str,
@@ -178,8 +178,8 @@ async fn stored(raw: &Client, target: &str) -> String {
     .get(0)
 }
 
-/// The ledger a 1-1 target gets with its production DDL (#623 D6,
-/// `defs::ledger::one_to_one_ledger_ddl`), for each of `targets` this file
+/// The ledger a 1-1 target gets with its production DDL
+/// (`defs::ledger::one_to_one_ledger_ddl`), for each of `targets` this file
 /// creates by hand in `public`.
 async fn one_to_one_ledgers(raw: &Client, targets: &[&str]) {
     for target in targets {
@@ -210,7 +210,7 @@ async fn a_chained_target_is_never_captured() {
         .expect("create the source");
     let mut columns = numeric_columns(&["id", "k", "v"]);
     // `k` is `agg`'s identity, which `hist` keys on: it must be a text-stable
-    // key type, so not `numeric` (issue #371).
+    // key type, so not `numeric`.
     columns.insert("k".to_string(), ValueType::Integer(IntWidth::Int4));
     install_definition(
         &db.pool,
@@ -423,7 +423,7 @@ async fn resuming_a_column_propagates_each_changed_row_to_a_chained_reader() {
     quarantine::resume_column(&db.pool, "t", "doubled")
         .await
         .expect("resume t.doubled");
-    // #625 F8b: the resume registers the column's field build; run it.
+    // The resume registers the column's field build; run it.
     trellis::staging::build::settle_builds(&db.pool).await;
 
     let staged = staged_recomputes(&raw, "public.t").await;
@@ -517,9 +517,9 @@ async fn an_aggregate_targets_truncate_clear_reaches_a_chained_reader() {
     );
 }
 
-/// Issue #385: the same truncate clear over an aggregate grouped by a
+/// The same truncate clear over an aggregate grouped by a
 /// `numeric` column. `numeric` is an admitted `GROUP BY` type (only the
-/// *source's* key type is gated, issue #371), so the aggregate installs, but
+/// *source's* key type is gated), so the aggregate installs, but
 /// the clear used to look up its target's identity through the key-type-gated
 /// `ddl::source_primary_key`, got `UnsupportedPrimaryKeyType`, and halted the
 /// instance. The clear only needs the identity's column names to report each
@@ -667,7 +667,7 @@ async fn resuming_a_column_across_several_chunks_propagates_every_changed_row() 
     quarantine::resume_column(&db.pool, "t", "doubled")
         .await
         .expect("resume t.doubled");
-    // #625 F8b: the resume registers the column's field build; run it.
+    // The resume registers the column's field build; run it.
     trellis::staging::build::settle_builds(&db.pool).await;
 
     let staged = staged_recomputes(&raw, "public.t").await;
@@ -703,7 +703,7 @@ async fn resuming_a_column_across_several_chunks_propagates_every_changed_row() 
 /// `src -> t -> d`, `d` reading `t`'s target as its source, both `live`.
 /// With `seam_fed_src`, `src` reads as another definition's target
 /// (`feed_from_a_test_definition`); `t` takes the Re-derive build either
-/// way (#625 F8a).
+/// way.
 async fn chained_pair(db: &TestDatabase, raw: &mut Client, seam_fed_src: bool) {
     raw.batch_execute(
         "create table public.src (id integer primary key, v numeric); \
@@ -741,7 +741,7 @@ async fn chained_pair(db: &TestDatabase, raw: &mut Client, seam_fed_src: bool) {
     assert_eq!(stored(raw, "d").await, "live", "precondition");
 }
 
-/// Issue #497: a definition whose source is another definition's target
+/// A definition whose source is another definition's target
 /// reports `catching_up` while that upstream is paused and while it
 /// rebuilds after the resume, applying throughout, and reports `live` again
 /// once the upstream is `live`: the rebuild writes `t` through the seam, so
@@ -827,7 +827,7 @@ async fn a_chained_reader_reports_catching_up_until_its_resumed_upstream_is_live
     );
 }
 
-/// Issue #497 under the Re-derive build (#625 F8a): a reader of a plain 1-1
+/// Under the Re-derive build, a reader of a plain 1-1
 /// over a captured table reports `catching_up` while that upstream waits
 /// for its rebuild after the resume and while the rebuild runs
 /// (`backfilling`, applying), and `live` once the rebuild takes the upstream
@@ -897,8 +897,8 @@ async fn a_chained_reader_reports_catching_up_while_its_upstream_rederives() {
     );
 }
 
-/// Issue #497: a `live` reader of an upstream that isn't `live` (here
-/// rebuilding a resumed column, #625 F8b) reports `catching_up` though
+/// A `live` reader of an upstream that isn't `live` (here
+/// rebuilding a resumed column) reports `catching_up` though
 /// nothing was parked for the reader itself, and `live` once the upstream's
 /// field build is done.
 #[tokio::test]
@@ -949,13 +949,13 @@ async fn seal_and_drain_once(pool: &trellis::Pool, client: &mut Client) {
         .expect("retire drained segments");
 }
 
-/// Issue #507: seam rows for a target staged before its pause (an update and
+/// Seam rows for a target staged before its pause (an update and
 /// a delete) are still undrained when the target's resume rebuild runs, and
 /// drain after it. Their images predate the rebuild, so neither may put its
 /// value back: `double_totals`, an aggregate chained off the target, ends at
 /// the rebuilt target.
 ///
-/// #625 F8a: the rebuild is the Re-derive build, which writes the target
+/// The rebuild is the Re-derive build, which writes the target
 /// through the seam. `orders` is made to read as another definition's target
 /// (`feed_from_a_test_definition`).
 #[tokio::test]
@@ -1105,7 +1105,7 @@ async fn drain_sealed(pool: &trellis::Pool, raw: &mut Client, seg_seq: i64) {
         .expect("retire drained segments");
 }
 
-/// Issue #754 on a seam-fed source, where every record takes the live-row
+/// On a seam-fed source, where every record takes the live-row
 /// check: a target row's delete drains after the row's re-insert reached the
 /// target, while the re-insert's seam row is still in the ring. The delete
 /// is superseded, and written from the live row it put the re-insert's
@@ -1236,7 +1236,7 @@ async fn a_superseded_seam_delete_leaves_a_key_with_a_pending_reinsert_to_that_r
 }
 
 // ---------------------------------------------------------------------------
-// #625 F6: a Re-derive build over a seam-fed source takes a fence.
+// A Re-derive build over a seam-fed source takes a fence.
 // ---------------------------------------------------------------------------
 
 /// One chunk per ten rows, as `rederive_build.rs` runs them.
@@ -1317,7 +1317,7 @@ async fn tot_and_its_oracle(raw: &Client) -> (Vec<String>, Vec<String>) {
     )
 }
 
-/// #625 F6: a Re-derive build whose source is another definition's target
+/// A Re-derive build whose source is another definition's target
 /// takes a fence, and no chunk of it is planned until the oldest running
 /// transaction began after the fence.
 ///
@@ -1556,7 +1556,7 @@ async fn text_rows(raw: &Client, sql: &str) -> Vec<String> {
         .collect()
 }
 
-/// #625 F6: a key with a `NULL` part of a seam-fed aggregate source is a row
+/// A key with a `NULL` part of a seam-fed aggregate source is a row
 /// like any other to a downstream aggregate, whose `NULL` group counts. No
 /// chunk's range reaches one that no part decides, so the plan job stages
 /// them. The oracle is the downstream's own `GROUP BY` over the upstream.
@@ -1596,7 +1596,7 @@ async fn a_build_over_a_seam_fed_aggregate_counts_its_null_keyed_groups() {
     );
 }
 
-/// #625 F6, F3: a rebuild (a resume) of a downstream aggregate over a seam-fed
+/// A rebuild (a resume) of a downstream aggregate over a seam-fed
 /// aggregate with `NULL`-keyed groups. Its sweep re-derives every ledger
 /// entry the chunks didn't, reading the source by the entry's key: a `NULL`
 /// part must match the source's `NULL`, or the group's entry would become a
@@ -1664,7 +1664,7 @@ async fn a_rebuild_over_a_seam_fed_aggregate_keeps_its_null_keyed_groups() {
     );
 }
 
-/// #625 F6: only a seam-fed source's build is fenced. A captured source has
+/// Only a seam-fed source's build is fenced. A captured source has
 /// no writer that can commit unseen by the build (its page reads the
 /// definition list after the seal fence), so its plan job takes no fence and
 /// builds past a transaction that is open, whatever its age.
@@ -1727,7 +1727,7 @@ async fn a_captured_sources_build_takes_no_fence_and_waits_for_no_transaction() 
     open.rollback().await.expect("end the old transaction");
 }
 
-/// #625 F6: a seam writer's check for readers comes after its transaction
+/// A seam writer's check for readers comes after its transaction
 /// has an id, so a build fenced after the check waits for the writer.
 ///
 /// The fence holds a build until every transaction with an id below it has

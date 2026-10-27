@@ -1,4 +1,4 @@
-//! Issue #121: coverage for a 1-1 transform whose source has a genuine
+//! Coverage for a 1-1 transform whose source has a genuine
 //! multi-column (composite) primary key: insert, update, and delete against
 //! a two-column-keyed source all drain correctly into a target table whose
 //! own primary key mirrors the source's in full, addressed throughout by this
@@ -10,7 +10,7 @@
 //! at definition time (`DdlError::CompositePrimaryKeyUnsupported`, raised by
 //! the now-removed `ddl::require_single_column_pk`).
 //!
-//! No live `Client` (issue #301). This used to drive the full runtime and
+//! No live `Client`. This used to drive the full runtime and
 //! poll the target under a 20s budget per step. Now each source change is
 //! mirrored by the ring row a capture trigger stages for it (the composite
 //! key joined with U+001F in declared order, text-valued JSON images), staged
@@ -174,7 +174,7 @@ async fn setup_source_and_target(pool: &trellis::Pool, raw: &Client) {
         &source_columns,
     )
     .await
-    .expect("issue #121: a composite-PK source is accepted, not rejected");
+    .expect("a composite-PK source is accepted, not rejected");
 
     let pk = source_primary_key(pool, "order_lines")
         .await
@@ -228,7 +228,7 @@ async fn a_composite_primary_key_transform_converges_inserts_updates_and_deletes
     //
     // `(2, 3)` is there so the key set is not closed under swapping the two
     // columns (`(3, 2)` does not exist). Without it, a decode that read the
-    // columns in the wrong order would go unnoticed: apply's issue #344 basis
+    // columns in the wrong order would go unnoticed: apply's basis
     // check looks the swapped key up in the source, finds that *other* row,
     // and re-evaluates against it, so every row still lands under the right
     // key with the right value. With it, the swapped key finds no source row

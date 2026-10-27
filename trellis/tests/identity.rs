@@ -329,7 +329,7 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     );
 }
 
-// Issue #877 (epic #806): an attach refuses a catalog schema that belongs to
+// An attach refuses a catalog schema that belongs to
 // another instance sharing the database, without refusing a second client of
 // the same instance.
 

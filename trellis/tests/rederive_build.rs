@@ -1,4 +1,4 @@
-//! The scheduled Re-derive build (#625 F2/F3, epic #556; ADR-0002 "A build
+//! The scheduled Re-derive build (ADR-0002 "A build
 //! is Re-derive over chunks, and applies from its first chunk"): the build of
 //! a plain 1-1 target. (An aggregate is built by the group basis's one
 //! absolute write, `group_basis_build.rs`.)
@@ -6,7 +6,7 @@
 //! Every test steps the engine by hand: the staging worker's reconcile pass
 //! (`trellis::client::reconcile_pass`), a drain worker's build step
 //! (`trellis::staging::build::work_once`), and the ring's seal and drain. No
-//! background worker runs and nothing waits for convergence (#297); a loop
+//! background worker runs and nothing waits for convergence; a loop
 //! here runs a bounded number of deterministic steps.
 
 use std::collections::BTreeSet;
@@ -26,7 +26,7 @@ const WAKE: &str = "rederive_wake";
 /// `SUM` and `COUNT(*)` by `g`: a shape the Re-derive build takes.
 const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
-/// A plain 1-1 target: the Re-derive build takes it since #625 F8a.
+/// A plain 1-1 target: the Re-derive build takes it.
 const ONE: &str = "TRANSFORM one FROM public.src SELECT g AS g, v + v AS dbl";
 
 const ONE_ACTUAL: &str = "select (id, g, dbl)::text from public.one order by id";
@@ -293,7 +293,7 @@ async fn changes_drained_while_backfilling_are_applied() {
     f.pass().await;
 
     // A new group, before any chunk: only a page can put it there (a
-    // Re-derive, its batch being the start's own segment, #733).
+    // Re-derive, its batch being the start's own segment).
     f.raw
         .batch_execute("insert into public.src values (1000, 99, 5)")
         .await
@@ -516,7 +516,7 @@ async fn a_drop_during_the_build_takes_its_work_with_it() {
     assert_eq!(f.step(&OPTIONS).await, Step::Idle);
 }
 
-/// #986: a build's start that fails for good (here, the definition's ledger
+/// A build's start that fails for good (here, the definition's ledger
 /// table was dropped, so the start's read of it errors) pauses that
 /// definition with the error as its `capture_failure`, instead of failing
 /// the reconcile pass on every pass after. The definition registered after
@@ -571,7 +571,7 @@ async fn a_start_that_fails_pauses_its_definition_and_the_pass_starts_the_others
     assert_eq!(f.status("one").await.as_deref(), Some("paused"));
 }
 
-/// #986: a start that fails transiently (here its read of the ledger waits
+/// A start that fails transiently (here its read of the ledger waits
 /// out `lock_timeout` behind another session's lock, `55P03`) is retried on
 /// the next pass, not paused, and the pass still starts the other
 /// definitions' builds.
@@ -677,7 +677,7 @@ async fn a_live_definition_whose_ledger_is_dropped_is_quarantined_alone() {
     );
 }
 
-/// The start waits out its source's capture gate (#625 Q2(a)): while a
+/// The start waits out its source's capture gate: while a
 /// change the old, narrower capture function staged is still pending, a
 /// definition that needs the widened column stays `waiting_to_backfill`,
 /// and the pass after that change drains starts it.
@@ -692,7 +692,7 @@ async fn the_start_waits_for_the_widens_capture_gate() {
 
     // Staged by the capture function `cnt` needs, which doesn't image `v`,
     // and left in the ring. It moves `g` too: an update of only `v`, which
-    // nothing reads yet, stages nothing (#623 D8a).
+    // nothing reads yet, stages nothing.
     f.raw
         .batch_execute("update public.src set v = v + 1000, g = g + 1 where id = 3")
         .await
@@ -743,7 +743,7 @@ async fn the_start_waits_for_the_widens_capture_gate() {
     f.assert_agg_oracle().await;
 }
 
-/// A quarantined definition resumes the same way (#625 F3): through the
+/// A quarantined definition resumes the same way: through the
 /// start, with a sweep.
 #[tokio::test]
 async fn a_quarantined_build_resumes_through_the_start() {
@@ -832,8 +832,8 @@ async fn changes_drained_while_a_one_to_one_builds_are_applied() {
 }
 
 /// A 1-1 definition paused part-way through its build, with keys deleted,
-/// updated and inserted while frozen, is rebuilt over the entries it kept
-/// (#625 F3, F8a): a sweep, and the sweep deletes the target
+/// updated and inserted while frozen, is rebuilt over the entries it kept:
+/// a sweep, and the sweep deletes the target
 /// rows of the keys deleted meanwhile, which no chunk reaches.
 #[tokio::test]
 async fn a_resumed_one_to_one_build_sweeps_the_keys_deleted_while_paused() {
@@ -931,7 +931,7 @@ async fn without_its_sweep_a_one_to_one_rebuild_keeps_a_deleted_key() {
     );
 }
 
-/// A 1-1 build leaves a quarantined key out (#625 F-A5): the build goes
+/// A 1-1 build leaves a quarantined key out: the build goes
 /// `live` without its row, and its entry is never taken.
 #[tokio::test]
 async fn a_one_to_one_build_leaves_a_quarantined_key_out() {
@@ -959,10 +959,9 @@ async fn a_one_to_one_build_leaves_a_quarantined_key_out() {
     );
 }
 
-/// A plain 1-1 whose source loses its primary key once captured (#625
-/// F8a): the start reads no key, so it isn't what fails; the plan job is
+/// A plain 1-1 whose source loses its primary key once captured: the start reads no key, so it isn't what fails; the plan job is
 /// what needs the key. That job fails, unnarrowable, and is charged and
-/// retried while status reports the error (#616); its last charge pauses
+/// retried while status reports the error; its last charge pauses
 /// the definition with the error on status. The build never goes `live`
 /// and nothing is written to the target.
 #[tokio::test]
@@ -1047,7 +1046,7 @@ async fn a_one_to_one_whose_source_lost_its_key_fails_through_its_plan_job() {
 /// once the first is live.
 const AGG2: &str = "TRANSFORM agg2 FROM public.src GROUP BY g WITHOUT SOURCE INDEX SELECT SUM(v) AS total, COUNT(*) AS n";
 
-/// #733: a change committed before a build starts, in a batch drained only
+/// A change committed before a build starts, in a batch drained only
 /// after the start, while a later change to its key was drained before the
 /// start. The later change never reaches the new definition (no page that
 /// ran before the start applies it), and the key is gone before any chunk
@@ -1123,7 +1122,7 @@ async fn a_batch_older_than_the_start_drained_after_it_does_not_revive_a_deleted
 /// first is live.
 const ONE2: &str = "TRANSFORM one2 FROM public.src SELECT g AS g, v + v AS dbl";
 
-/// #733 on a 1-1 target (F8a): the same out-of-order drain across the
+/// On a 1-1 target: the same out-of-order drain across the
 /// start as `a_batch_older_than_the_start_drained_after_it_does_not_revive_a_deleted_key`.
 /// The key's delete drained before `one2` started, so it never reached
 /// `one2`, and its insert, in an older batch, drained after the start. No
@@ -1197,7 +1196,7 @@ async fn write_and_seal(f: &mut Fixture, sql: &str) -> i64 {
         .sealed_seg_seq
 }
 
-/// #742: a page's Re-derive reads the source live, so its snapshot can see
+/// A page's Re-derive reads the source live, so its snapshot can see
 /// changes in batches newer than the page's own. Its tombstone was stamped
 /// with the page's segment all the same, so the tombstone GC collected it
 /// while a batch its read saw was still pending, and that batch's stale
@@ -1205,7 +1204,7 @@ async fn write_and_seal(f: &mut Fixture, sql: &str) -> i64 {
 ///
 /// Key 5 is updated in three batches and deleted in the last. The oldest
 /// batch is at the build's start segment, so its page re-derives the key
-/// (#733) after the delete: a tombstone. The newest batch's delete is
+/// after the delete: a tombstone. The newest batch's delete is
 /// refused (the read saw it), the GC runs while the middle batch is still
 /// pending, and then the middle batch's update drains. The steady-load
 /// tier's stall reorders drains this way (seed 1 case 7).
@@ -1262,7 +1261,7 @@ async fn build_rows(f: &Fixture) -> i64 {
     f.count("select count(*) from backfill_chunks").await
 }
 
-/// A finished build leaves none of its rows behind (#966): the flip deletes
+/// A finished build leaves none of its rows behind: the flip deletes
 /// the definition's done rows with the build, so the table doesn't keep a
 /// full set per rebuild, and the completion check (`build_done`) that reads
 /// the definition's rows after every chunk sees only the current build's.
@@ -1316,8 +1315,8 @@ async fn a_one_to_one_s_done_build_rows_do_not_pile_up_over_rebuilds() {
 }
 
 /// A build a resume superseded leaves done rows behind (the plan job and
-/// chunks it finished), which the resumed build's flip deletes with its own
-/// (#966). Completion still waits for every row of the resumed build.
+/// chunks it finished), which the resumed build's flip deletes with its own.
+/// Completion still waits for every row of the resumed build.
 #[tokio::test]
 async fn a_resumed_build_s_flip_takes_the_superseded_builds_done_rows() {
     let mut f = Fixture::new(100, &[ONE]).await;
@@ -1347,7 +1346,7 @@ async fn a_resumed_build_s_flip_takes_the_superseded_builds_done_rows() {
     f.assert_one_oracle().await;
 }
 
-/// The flip leaves an undone row behind (#966): a chunk a worker held
+/// The flip leaves an undone row behind: a chunk a worker held
 /// across a pause and a resume (`chunk_queue::STALE`). The resumed build
 /// goes live without it, and the worker that still holds it writes nothing
 /// when it runs it after the flip; giving it up discards the row.
@@ -1626,7 +1625,7 @@ async fn a_plan_batch_behind_a_drop_writes_nothing() {
     );
 }
 
-/// #1201: a rebuild of a 1-1 target deletes rows someone added or re-keyed
+/// A rebuild of a 1-1 target deletes rows someone added or re-keyed
 /// by hand, which the source no longer backs, not only the rows it
 /// re-derives from the source.
 #[tokio::test]
@@ -1656,7 +1655,7 @@ async fn a_rebuild_deletes_target_rows_added_or_rekeyed_by_hand() {
     );
 }
 
-/// #1201: a resume of a definition whose target table is gone refuses and
+/// A resume of a definition whose target table is gone refuses and
 /// names the repair, as for a missing ledger, instead of succeeding and
 /// leaving a build that fails.
 #[tokio::test]
@@ -1682,7 +1681,7 @@ async fn a_resume_refuses_when_the_target_table_is_gone() {
     assert_eq!(f.status("one").await.as_deref(), Some("paused"));
 }
 
-/// #1201: the sweep of a rebuild walks more hand-added rows than one
+/// The sweep of a rebuild walks more hand-added rows than one
 /// batch holds, and never deletes a target row the source backs: a key whose
 /// source row committed after the plan read the source, with its captured
 /// change still in the ring when the sweep runs, is re-derived from the
@@ -1732,7 +1731,7 @@ async fn a_rebuild_sweeps_many_hand_added_rows_and_keeps_a_row_the_source_backs(
     f.assert_one_oracle().await;
 }
 
-/// A plain 1-1 target's build (#625 F8a) is `waiting_to_backfill ->
+/// A plain 1-1 target's build is `waiting_to_backfill ->
 /// backfilling -> live`, with no `catching_up`: its chunks
 /// write the target rows.
 #[tokio::test]
@@ -1763,7 +1762,7 @@ async fn a_one_to_one_build_goes_from_waiting_to_live_with_no_catch_up() {
     assert_eq!(
         f.count("select count(*) from backfill_chunks").await,
         0,
-        "the flip deleted the build's rows (#966)"
+        "the flip deleted the build's rows"
     );
     assert_eq!(
         f.count("select count(*) from public.one__ledger where __basis is null")
@@ -1774,7 +1773,7 @@ async fn a_one_to_one_build_goes_from_waiting_to_live_with_no_catch_up() {
     f.assert_one_oracle().await;
 }
 
-/// A worker whose claim the stale-claim sweep took (#434) writes nothing when
+/// A worker whose claim the stale-claim sweep took writes nothing when
 /// it runs the chunk after all: the claim fence stops its first write, and
 /// the chunk stays undone for the next claimant.
 #[tokio::test]
@@ -1873,7 +1872,7 @@ async fn chunks_finishing_after_a_pause_leave_the_definition_paused() {
 // The Re-derive build's plan, rederive and sweep jobs run through the chunk
 // queue (`defs::chunk_queue`): the claim, its fence, the failure ladder and the
 // reclaim. Each test claims by hand and runs with `build::run_claimed`, and
-// moves a backoff or a claim's age with SQL instead of waiting for it (#297).
+// moves a backoff or a claim's age with SQL instead of waiting for it.
 
 /// Claims the lowest claimable chunk of `kind` as `who`.
 async fn claim(f: &Fixture, who: &str, kind: &str) -> chunk_queue::ClaimedChunk {
@@ -2267,7 +2266,7 @@ async fn a_composite_key_data_failure_narrows_to_its_key() {
 }
 
 /// The key a build quarantines keeps the SQLSTATE of the failure that
-/// narrowed to it (#824): an overflow is `22003`.
+/// narrowed to it: an overflow is `22003`.
 #[tokio::test]
 async fn a_build_quarantined_key_keeps_its_sqlstate() {
     let mut f = composite_overflow_fixture().await;

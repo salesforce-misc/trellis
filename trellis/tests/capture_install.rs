@@ -1,10 +1,10 @@
-//! Installing, widening, narrowing and uninstalling trigger capture (#622
-//! C3), driven by hand. The staging worker's reconcile pass that calls
+//! Installing, widening, narrowing and uninstalling trigger capture, driven by hand.
+//! The staging worker's reconcile pass that calls
 //! `trellis::capture::install` (C5) is `capture_join.rs`'s subject.
 //!
 //! Every test here steps the pieces itself (the seal's phases, the drain, the
 //! build) and holds a writer open where it needs one. None waits for
-//! anything to converge (#297).
+//! anything to converge.
 //!
 //! - A2: writers at `REPEATABLE READ` and `SERIALIZABLE` that took their
 //!   snapshot before two seals, and a prepared transaction that straddles a
@@ -12,7 +12,7 @@
 //! - A3's primitive: an install and an uninstall wait out a writer that stays
 //!   open, and no other writer queues behind them for longer than one
 //!   attempt's lock timeout.
-//! - The waiting report (#622 plan Q1): an install that runs out of its
+//! - The waiting report: an install that runs out of its
 //!   deadline names the session holding the table and one queued for it,
 //!   and the next pass lands once they let go. Nothing is cancelled.
 //! - A6's trigger-fed half: a `TRUNCATE` whose writer straddles a seal
@@ -264,8 +264,8 @@ async fn an_install_captures_writes_and_a_repeat_install_changes_nothing() {
 /// The capture triggers are `ENABLE ALWAYS`, so a session in
 /// `session_replication_role = replica` (a migration tool, a trigger-skipping
 /// bulk load) is captured like any other, transition tables included. Only a
-/// logical-replication apply worker skips statement triggers (#751,
-/// `trellis::defs::subscription`), and the docs rely on this to say so.
+/// logical-replication apply worker skips statement triggers
+/// (`trellis::defs::subscription`), and the docs rely on this to say so.
 #[tokio::test]
 async fn a_replica_role_session_is_captured() {
     let cluster = TestCluster::start();
@@ -381,7 +381,7 @@ async fn an_uninstall_leaves_nothing_behind() {
 }
 
 /// A read of what is installed that races installs and uninstalls sees
-/// each one whole or not at all (#622 C5 review): the four events are read
+/// each one whole or not at all: the four events are read
 /// in one statement, so a commit can't land between them and leave a
 /// spurious [`Installed::Partial`]. Read one statement per event, this saw a
 /// partial install on about a third of its reads.
@@ -557,7 +557,7 @@ fn spawn_writer(
     })
 }
 
-/// A3's primitive, in #565 E7's shape: a writer transaction stays open on the
+/// A3's primitive: a writer transaction stays open on the
 /// table, so the install's `SHARE ROW EXCLUSIVE` (and the uninstall's
 /// `ACCESS EXCLUSIVE`) waits for it, and every other writer that arrives
 /// meanwhile would queue behind a waiting DDL. Each attempt gives up after
@@ -664,7 +664,7 @@ async fn install_and_uninstall_wait_out_an_open_writer_without_queueing_others()
     }
 }
 
-/// The waiting report (#622 plan Q1): an install whose deadline passes while
+/// The waiting report: an install whose deadline passes while
 /// another session holds the table returns, having changed nothing, a
 /// [`install::LockWait`] naming that session, and one queued behind it; the
 /// next bounded pass after both let go installs.
@@ -836,7 +836,7 @@ async fn assert_claimed_exactly_once(client: &Client, batches: &[i64], key: &str
     );
 }
 
-/// A2, through the trigger (#597's tests restated): a writer at a snapshot
+/// A2, through the trigger: a writer at a snapshot
 /// isolation level takes its snapshot, two seals flip the ring past it, and
 /// only then does it write. The capture function must read the live slot from
 /// the mirror, not its snapshot's stale pointer, or the row lands in a slot no
@@ -883,7 +883,7 @@ async fn a_serializable_writer_is_captured_into_a_batch_that_claims_it() {
     a_snapshot_isolation_writer_is_claimed_exactly_once(IsolationLevel::Serializable).await;
 }
 
-/// Issue #701: a DBA pre-creates the instance schema as role X, and a login
+/// A DBA pre-creates the instance schema as role X, and a login
 /// role L, a member of X, runs the migrations and the install. The ring is
 /// L's and X has no privilege on it, so the capture functions must be L's
 /// too, or every captured write fails. A test cluster connects as a
@@ -955,8 +955,7 @@ async fn a_schema_pre_created_by_another_role_still_captures_writes() {
         .apply("TRANSFORM t_copy FROM public.t SELECT a AS a")
         .await
         .expect("define a reader of public.t");
-    // A plain 1-1 over a captured table is the Re-derive build's (#625
-    // F8a): run it to `live`.
+    // A plain 1-1 over a captured table is the Re-derive build's: run it to `live`.
     harness::settle_builds(&pool).await;
     let def = trellis::defs::catalog::definition_by_target(&pool, "t_copy")
         .await
@@ -1046,7 +1045,7 @@ async fn a_blocker_this_role_cant_see_is_unknown_not_prepared() {
 /// A prepared transaction that wrote through the trigger before a seal and
 /// commits after it: its xid is in progress in the seal's fence, so its row
 /// belongs to the next batch's predecessor half, and that batch claims it
-/// once `COMMIT PREPARED` lands (the #565 spike's `prepared_probe`). Until
+/// once `COMMIT PREPARED` lands. Until
 /// then it holds the table like any open writer, and the blocker report
 /// names it by its gid even though it has no backend.
 #[tokio::test]
@@ -1100,7 +1099,7 @@ async fn a_prepared_transaction_straddling_a_seal_is_claimed_once_committed() {
     );
 }
 
-/// A6's trigger-fed half (#598 case 2 through the truncate trigger): the
+/// A6's trigger-fed half (through the truncate trigger): the
 /// writer's `TRUNCATE` stages its sentinel into slot 0 and stays open across
 /// a seal, so batch 2 claims it through its predecessor half. Batch 2's own
 /// slot holds enough rows to split, and the barrier must still see the
@@ -1543,7 +1542,7 @@ async fn a_new_reader_waits_for_the_rows_staged_before_its_widen_to_drain() {
 /// Without ownership of a source (here `SELECT` and `TRIGGER` on it, which a
 /// DBA might grant thinking it's enough), the staging worker can't install
 /// capture, and `status` reports why in Postgres's own words. It used to
-/// report only "capture DDL or catalog read failed: db error" (issue #833).
+/// report only "capture DDL or catalog read failed: db error".
 /// Stepped by hand: one capture pass.
 #[tokio::test]
 async fn a_source_the_role_does_not_own_reports_why_capture_failed() {

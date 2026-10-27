@@ -1,19 +1,17 @@
 //! Deterministic interleavings of the drain on a 1-1 target's slim side
-//! ledger (#623 D1 and D6, epic #556, ADR-0002 invariants I1 and I2).
+//! ledger (ADR-0002 invariants I1 and I2).
 //!
 //! Each test drives one interleaving by hand through
 //! `support/drain_driver.rs`: source writes go through trigger capture, the
 //! test seals batches itself and drains each one on a worker it names,
 //! freezing a worker at a pause point (`trellis::staging::interleave`) where
-//! the scenario needs one. No test sleeps or polls for convergence (#297).
+//! the scenario needs one. No test sleeps or polls for convergence.
 //! Every test ends by checking the target against a from-scratch oracle over
 //! the source.
 //!
-//! The scenarios are experiment 2's from #558
-//! (<https://github.com/salesforce-misc/trellis/issues/558#issuecomment-5840353484>),
-//! the shapes of the issues the ledger supersedes (#389, #392, #494, #539,
-//! #550), and `chunked_read_exact_point` (the per-chunk exact read point,
-//! the user's Q1 on the D split).
+//! The scenarios are the design experiment's interleavings, the shapes of
+//! the earlier bugs the ledger supersedes, and `chunked_read_exact_point`
+//! (the per-chunk exact read point).
 //!
 //! "Re-derive" below is an image-less `Recompute` for a key. A 1-1 target is
 //! on its ledger (`trellis::staging::one_to_one_ledger`), where a Re-derive
@@ -146,7 +144,7 @@ async fn pause_points_fire_in_page_order_one_to_one() {
 
 // ---------------------------------------------------------------- exp 2, 2b
 
-/// Exp 2 scenario 2 (#344): a Re-derive of key 1 is frozen after its read,
+/// Exp 2 scenario 2: a Re-derive of key 1 is frozen after its read,
 /// and a CDC change C for the same key, committed *before* that read, drains
 /// on a second worker. The second worker must queue behind the first (I1),
 /// then count C exactly once.
@@ -325,9 +323,9 @@ async fn exp2_9d_one_to_one() {
 /// older than the truncate. Here one is staged by hand at an `lsn` below the
 /// truncate's; applied, it would bring back a row the source no longer has.
 /// On either ledger the key's Apply would write its entry in the lock's
-/// insert (#623 D6, #775), so that insert must check the floor itself.
+/// insert, so that insert must check the floor itself.
 ///
-/// The refused change leaves no entry behind (#774): the lock's insert gave
+/// The refused change leaves no entry behind: the lock's insert gave
 /// its key a placeholder, which nothing then writes, and which the
 /// tombstone GC would never collect.
 async fn a_change_from_before_a_truncate_does_not_come_back(flavour: Flavour) {
@@ -375,8 +373,8 @@ async fn a_change_from_before_a_truncate_does_not_bring_back_a_one_to_one_row() 
     a_change_from_before_a_truncate_does_not_come_back(Flavour::OneToOne).await;
 }
 
-/// A page whose placeholder another page is queued behind deletes it
-/// (#774), and the queued page's insert then goes ahead. Page A holds a
+/// A page whose placeholder another page is queued behind deletes it,
+/// and the queued page's insert then goes ahead. Page A holds a
 /// change to key 9 from before the truncate, and is frozen once its insert
 /// has given the key a placeholder; page B holds the key's real insert, and
 /// its own insert of the entry queues on A's uncommitted one. A's statement
@@ -423,7 +421,7 @@ async fn a_dropped_placeholder_lets_a_queued_insert_write_the_entry_one_to_one()
     a_dropped_placeholder_lets_a_queued_insert_write_the_entry(Flavour::OneToOne).await;
 }
 
-/// A truncate and an insert in one source transaction (#774). The truncate
+/// A truncate and an insert in one source transaction. The truncate
 /// floor refuses every change at or below the truncate's ring `lsn`, so the
 /// insert applies only because its `lsn` is strictly above the truncate's.
 /// Each trigger reads `pg_current_wal_insert_lsn()`, and the truncate's
@@ -488,7 +486,7 @@ async fn exp2_10_one_to_one() {
 // ------------------------------------------------------ superseded issues
 
 /// The CDC text-format image of `public.src`'s row `id`, as the old go-live
-/// enumeration attached it to a `Recompute` (#392).
+/// enumeration attached it to a `Recompute`.
 async fn src_image(d: &Driver, id: i32) -> String {
     d.ctl
         .query_one(
@@ -501,10 +499,10 @@ async fn src_image(d: &Driver, id: i32) -> String {
         .get(0)
 }
 
-/// #392: a `Recompute` for key 1 carrying key 1's image (as the old go-live
+/// A `Recompute` for key 1 carrying key 1's image (as the old go-live
 /// enumeration staged it) drains after key 1 is deleted, and before the
 /// delete's own batch. Group 1 must end without key 1.
-async fn issue_392(flavour: Flavour) {
+async fn recompute_before_delete_batch(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 1, 10), (2, 1, 5)]).await;
     let image = src_image(&d, 1).await;
     d.stage_recomputes_with_prior(SRC, &[("1", Some(image))])
@@ -518,17 +516,17 @@ async fn issue_392(flavour: Flavour) {
 }
 
 #[tokio::test]
-async fn issue_392_one_to_one() {
-    issue_392(Flavour::OneToOne).await;
+async fn recompute_before_delete_batch_one_to_one() {
+    recompute_before_delete_batch(Flavour::OneToOne).await;
 }
 
-/// #550: key 1 is quarantined. It moves a → z (C1); a Re-derive of z counts
+/// Key 1 is quarantined. It moves a → z (C1); a Re-derive of z counts
 /// it there; it moves z → b (C2); C1, C2 and a `Recompute` of key 1 fold into
 /// one record, which the drain parks. Released, the replay must leave z
 /// without key 1.
-async fn issue_550(flavour: Flavour) {
+async fn moved_key_released_from_quarantine(flavour: Flavour) {
     let mut d = start(flavour, A_Z_B).await;
-    // Whole-key poison is per transform (#799): key 1 is held for the one
+    // Whole-key poison is per transform: key 1 is held for the one
     // definition on the source.
     d.ctl
         .execute(
@@ -555,15 +553,15 @@ async fn issue_550(flavour: Flavour) {
 }
 
 #[tokio::test]
-async fn issue_550_one_to_one() {
-    issue_550(Flavour::OneToOne).await;
+async fn moved_key_released_from_quarantine_one_to_one() {
+    moved_key_released_from_quarantine(Flavour::OneToOne).await;
 }
 
-// ------------------------------------------------------------ C's Q7 / #680
+// ------------------------------------------------------------ C's Q7
 
-/// C's Q7 (#680): an application `AFTER ROW` trigger rewrites the row its
+/// C's Q7: an application `AFTER ROW` trigger rewrites the row its
 /// own statement wrote. The nested statement's capture runs first, so the
-/// outer statement's ring row has the higher position. Since #623 D8a it
+/// outer statement's ring row has the higher position. It
 /// images the live row, the final one, not the transition table's.
 async fn nested_same_key(flavour: Flavour) {
     let mut d = start(flavour, &[(1, 3, 10), (2, 3, 5)]).await;
@@ -585,9 +583,10 @@ async fn nested_same_key(flavour: Flavour) {
     assert_oracle(&mut d, flavour).await;
 }
 
-/// Before #623 D8a: `[(1,1,30), (2,3,5)]` against the oracle's `[(1,2,30),
-/// (2,3,5)]`: a 1-1 Apply writes its image (D6), and the last captured image
-/// was key 1 in group 1. Capture now images the live row.
+/// Imaging the transition row instead would give `[(1,1,30), (2,3,5)]`
+/// against the oracle's `[(1,2,30), (2,3,5)]`: a 1-1 Apply writes its image,
+/// and the last captured image would be key 1 in group 1. Capture images the
+/// live row.
 #[tokio::test]
 async fn nested_same_key_one_to_one() {
     nested_same_key(Flavour::OneToOne).await;
@@ -818,8 +817,8 @@ async fn exp2_9_gc_waits_for_the_older_update_one_to_one() {
 
 /// [`exp2_9_gc_waits_for_the_older_update`] for a key the ledger has never
 /// had: key 3's insert lags in batch 1 while its delete drains from batch
-/// 2. The delete's Apply writes key 3's tombstone in the lock's insert
-/// (#623 D6, #775), and that insert's segment stamp must keep it past the
+/// 2. The delete's Apply writes key 3's tombstone in the lock's insert,
+/// and that insert's segment stamp must keep it past the
 /// GC until the insert drains, or the insert applies to no entry and brings
 /// key 3 back.
 async fn a_new_keys_tombstone_waits_for_its_older_insert(flavour: Flavour) {
@@ -858,7 +857,7 @@ async fn entry_stamp(d: &Driver, flavour: Flavour, id: i32) -> (bool, Option<i64
     (row.get(0), row.get(1))
 }
 
-/// Only a tombstone carries `applied_seg` (#775): a write that leaves an
+/// Only a tombstone carries `applied_seg`: a write that leaves an
 /// entry live leaves its stamp alone, so an Apply to a live entry changes no
 /// indexed column, and the GC's partial index can still key on the stamp.
 /// The stamp a live entry keeps is stale, here an earlier tombstone's, kept
@@ -903,7 +902,7 @@ async fn a_revived_keys_tombstone_is_stamped_afresh_one_to_one() {
     a_revived_keys_tombstone_is_stamped_afresh(Flavour::OneToOne).await;
 }
 
-/// A Re-derive that leaves an entry live stamps nothing (#775), and an Apply
+/// A Re-derive that leaves an entry live stamps nothing, and an Apply
 /// that then deletes the key stamps only its own batch, though the entry's
 /// `basis` saw a change in a later one. That is enough: the delete was
 /// applied because the `basis` doesn't see it, so every change the `basis`
@@ -942,8 +941,8 @@ async fn a_live_rederive_then_a_delete_stamps_the_deletes_batch_one_to_one() {
 }
 
 /// A Re-derive that leaves a tombstone stamps the newest segment its read
-/// sees (#742), not its page's, also on an entry that was live and
-/// unstamped (#775). Key 1's Re-derive (batch 1) drains after the key's
+/// sees, not its page's, also on an entry that was live and
+/// unstamped. Key 1's Re-derive (batch 1) drains after the key's
 /// update (2) and delete (3, still the active segment) commit: it reads no
 /// row, so it writes a tombstone whose `basis` sees both. The delete is then refused. While
 /// batch 2 lags, the GC, whose prefix is batch 1, must keep the tombstone,
@@ -1009,7 +1008,7 @@ async fn an_out_of_order_drain_holds_gc_back_one_to_one() {
 /// frozen after its placeholder insert, which found key 1's tombstone and
 /// so inserted nothing. The GC collects that tombstone before the page's
 /// entry lock, which then finds no entry for key 1: the page must roll
-/// back and retry, inserting key 1's placeholder afresh (#712), or the
+/// back and retry, inserting key 1's placeholder afresh, or the
 /// re-insert is lost. The same page holds
 /// an update of key 3 older than key 3's delete, drained in the batch above
 /// it, so key 3's tombstone must outlive the GC.
@@ -1054,7 +1053,7 @@ async fn gc_under_a_concurrent_reinsert_one_to_one() {
 }
 
 /// A page whose entry lock loses a key to the GC keeps I5's one global
-/// order (#712). Page A (batch 2) is frozen after its placeholder insert,
+/// order. Page A (batch 2) is frozen after its placeholder insert,
 /// which found key 2's tombstone and so inserted nothing. The GC collects
 /// that tombstone, and page B (batch 3, on the same keys) inserts key 2's
 /// placeholder in its place and is frozen there. A then locks key 1, finds
@@ -1115,10 +1114,10 @@ async fn an_entry_lost_to_the_gc_never_deadlocks_one_to_one() {
 }
 
 /// A GC batch reads the ledger through its tombstone index, never by a
-/// sequential or bitmap scan (#738), so its cost is the tombstones it
-/// collects, not the ledger's size (#722), and the index keys on
-/// `__applied_seg`, so it isn't the tombstones not yet collectable either
-/// (#775). Each load is analyzed to tempt the
+/// sequential or bitmap scan, so its cost is the tombstones it
+/// collects, not the ledger's size, and the index keys on
+/// `__applied_seg`, so it isn't the tombstones not yet collectable either.
+/// Each load is analyzed to tempt the
 /// planner away from the index:
 ///
 /// - tombstone-heavy (a quarter of the entries, all at or below the
@@ -1173,7 +1172,7 @@ async fn the_gc_statement_reads_the_ledger_by_its_tombstone_index(flavour: Flavo
             "{load}: the batch walks {index}:\n{explained}"
         );
         // It seeks the collectable tombstones by their stamp, so its cost
-        // doesn't grow with the tombstones above the drained prefix (#775).
+        // doesn't grow with the tombstones above the drained prefix.
         assert!(
             explained
                 .lines()
@@ -1198,8 +1197,8 @@ async fn the_gc_statement_reads_the_ledger_by_its_tombstone_index_one_to_one() {
 }
 
 /// The page's statements that read a ledger by entry key reach the entries
-/// through the key's index while the ledger's statistics lag its growth
-/// (#778): never analyzed (`empty`), or analyzed while it held a handful of
+/// through the key's index while the ledger's statistics lag its growth:
+/// never analyzed (`empty`), or analyzed while it held a handful of
 /// entries (`stale`), and then grown by a large insert, as a fast-filling
 /// ledger is before `autoanalyze` catches up. Left to the planner, the
 /// page's entry update joined its records to a sequential scan of the
@@ -1303,7 +1302,7 @@ async fn heap_only(d: &Driver, flavour: Flavour, id: i32) -> bool {
 
 /// An Apply or a Re-derive that leaves an entry live, in its group, changes
 /// no column a ledger index reads, so it can be a HOT update and write no
-/// index entry (#775). It moves `applied_lsn` or `basis` and the entry's
+/// index entry. It moves `applied_lsn` or `basis` and the entry's
 /// contributions, which no index reads, and leaves `applied_seg`, which the
 /// GC's partial index keys on, alone: only a tombstone carries it
 /// (`defs::ledger::tombstone_seg_sql`). Key 1 is updated (an Apply) and
@@ -1338,7 +1337,7 @@ async fn a_live_entrys_apply_and_rederive_are_hot_one_to_one() {
 }
 
 /// A page's Apply of a key with no entry writes the entry in its lock's
-/// insert (#775), and the insert is the lock (I1): a Re-derive of the same
+/// insert, and the insert is the lock (I1): a Re-derive of the same
 /// key queues on that uncommitted entry and reads only once it commits.
 /// Page A (key 2's insert) is frozen holding the entry it wrote; key 2 is
 /// then moved to group 2, and page R, the move folded with a Re-derive of
@@ -1374,7 +1373,7 @@ async fn a_rederive_queues_on_a_new_keys_applied_entry_one_to_one() {
 }
 
 /// The other order: a Re-derive's placeholder for a key with no entry holds
-/// off a page whose Apply would write that entry in its insert (#775). Page
+/// off a page whose Apply would write that entry in its insert. Page
 /// R, a Re-derive of key 2, is frozen after its placeholder insert, before
 /// its read; key 2's insert and then an update commit; page A, draining
 /// both (folded into an Apply of the update), queues on R's placeholder.
@@ -1413,7 +1412,7 @@ async fn a_new_keys_apply_queues_on_a_rederives_placeholder_one_to_one() {
 // ------------------------------------- a 1-1 and an aggregate in one page
 
 // A column resume's and an `ALTER TRANSFORM`'s rewrite of a 1-1 field are
-// field builds since #625 F8b; their chunks' interleavings with pages are in
+// field builds; their chunks' interleavings with pages are in
 // `one_to_one_build_interleavings.rs` ("a field build's chunk").
 
-// ---------------------------------- fresh and read entries in one page (#775)
+// ---------------------------------- fresh and read entries in one page

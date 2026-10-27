@@ -1,12 +1,12 @@
-//! Integration tests for bucket partitioning and multi-worker claims (issue
-//! #14, stage 04's second half), run against a real, ephemeral Postgres
+//! Integration tests for bucket partitioning and multi-worker claims
+//! (stage 04's second half), run against a real, ephemeral Postgres
 //! instance via the shared harness (`testkit::TestCluster`).
 //!
 //! See docs/staging-and-claiming/04-claiming-and-the-fold.md,
 //! "Partitioning a batch across workers" and "The claim is a cursor", for
 //! the design these tests hold the implementation to. Completion
-//! (`draining -> drained`, issue #11) and the real heartbeat/reclaim/pause
-//! lease (issue #15) are out of scope — a claimed batch is expected to sit
+//! (`draining -> drained`) and the real heartbeat/reclaim/pause
+//! lease are out of scope — a claimed batch is expected to sit
 //! in `draining` with rows in `seg_claims` by the end of every test here.
 
 use std::collections::BTreeMap;
@@ -18,7 +18,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::{BucketFilter, SegmentState, claim, fold, seal};
 
 /// Claims in a transaction of its own and commits it. `claim::claim` takes a
-/// transaction: it holds the segment row's lock until commit (issue #690).
+/// transaction: it holds the segment row's lock until commit.
 async fn claim_committed(
     client: &mut Client,
     seg_seq: i64,
@@ -487,7 +487,7 @@ async fn drainer_registration_is_the_share_denominator_floored_at_one() {
     assert_eq!(count, 4);
 }
 
-/// Issue #756: every process start registers drainers under a fresh worker
+/// Every process start registers drainers under a fresh worker
 /// id, so the maintenance loop's sweep is all that bounds the table. It
 /// removes a row last seen before its horizon and keeps a live one.
 #[tokio::test]

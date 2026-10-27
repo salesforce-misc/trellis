@@ -20,7 +20,7 @@
 //! empirical check that this is really true (design doc §6: don't assert
 //! what you haven't run), not just a restated assumption.
 //!
-//! Issue #236 later built the restart follow-up: see `tests/db_admin.rs`.
+//! The restart follow-up lives in `tests/db_admin.rs`.
 //!
 //! Reuses the shared-cluster/isolated-database-per-case `Harness` pattern
 //! from `tests/convergence.rs` (see that file's module doc comment for why

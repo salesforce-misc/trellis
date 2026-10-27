@@ -1,15 +1,10 @@
-//! Issue #104 pin: the aggregate-write path's staged `Recompute` rows must
-//! carry a real `src_changed` origin, the same way issues #51/#52 already
-//! fixed for the 1-1 propagation path (`end_to_end_latency.rs`, this file's
-//! sibling, pins that one). Before this fix, the old aggregate path's
-//! written-group shape carried no origin at all, so
-//! `apply.rs`'s "3b" step always staged an aggregate write's downstream
+//! The aggregate-write path's staged `Recompute` rows must carry a real
+//! `src_changed` origin, the same way the 1-1 propagation path's do
+//! (`end_to_end_latency.rs`, this file's sibling, pins that one). Without
+//! one, `apply.rs`'s "3b" step would stage an aggregate write's downstream
 //! `Recompute` with `src_changed: None` — silently blanking both the
 //! per-transform and end-to-end latency histograms for any transform
-//! chained off an aggregate target. This was believed moot (no definition
-//! could survive its first drain attempt reading from an aggregate target's
-//! composite key) until issue #103 disproved that for single-group-by-column
-//! aggregates and was fixed, making the gap live rather than moot.
+//! chained off an aggregate target.
 //!
 //! Structurally this mirrors `end_to_end_latency.rs`'s
 //! `end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_chain`
@@ -18,10 +13,10 @@
 //! rather than a 1-1 transform, and hop 1 (`sku_totals -> sku_totals_v2`,
 //! itself also an aggregate) is reached purely through the aggregate-write
 //! path's own automatic downstream propagation (`apply.rs`'s "3b" step),
-//! not the 1-1 propagation path #51/#52 already covered. Schema/helper
+//! not the 1-1 propagation path. Schema/helper
 //! conventions (`qualify_fixture_table`, `active_seg_table`) are cribbed from
 //! `defs_aggregate_chained_single_column_group_key.rs`, the front-door
-//! aggregate-chaining fixture issue #103's fix already exercises.
+//! aggregate-chaining fixture.
 
 use std::collections::HashMap;
 
@@ -207,7 +202,7 @@ fn bucket_count(rendered: &str, metric: &str, target: &str, le: &str) -> u64 {
 /// the second (chained onto the first aggregate's own composite/PK identity)
 /// being the only terminal transform. Hop 1 is driven purely by the
 /// aggregate-write path's own automatic downstream propagation — no second,
-/// independently-staged change — exactly the shape issue #104 is about.
+/// independently-staged change — exactly the shape this test is about.
 #[tokio::test]
 async fn end_to_end_latency_fires_at_the_terminal_transform_chained_off_an_aggregate() {
     let cluster = TestCluster::start();
@@ -263,8 +258,7 @@ async fn end_to_end_latency_fires_at_the_terminal_transform_chained_off_an_aggre
             "trellis_transform_latency_seconds",
             "e2e_latency_agg_sku_totals",
         ),
-        "the intermediate aggregate hop must still get its own per-transform latency \
-         (issue #51): {after_hop0}"
+        "the intermediate aggregate hop must still get its own per-transform latency: {after_hop0}"
     );
     assert!(
         !metric_mentions_transform(
@@ -286,10 +280,8 @@ async fn end_to_end_latency_fires_at_the_terminal_transform_chained_off_an_aggre
     // (terminal), driven *purely* by the `Recompute` row the upstream
     // aggregate's own write staged automatically (`apply.rs`'s "3b" step +
     // downstream-propagation step 4) — no second, independently-staged
-    // change anywhere. Before issue #104's fix, the old aggregate
-    // path's written-group shape carried no `src_changed`, so this `Recompute` row
-    // always staged with `src_changed: None` and neither histogram could
-    // observe anything here.
+    // change anywhere. A `Recompute` row staged with `src_changed: None`
+    // would leave neither histogram able to observe anything here.
     let seg2 = seal_active_segment(&mut client).await;
     let outcome2 = drain(&db.pool, seg2).await;
     assert_eq!(
@@ -304,7 +296,7 @@ async fn end_to_end_latency_fires_at_the_terminal_transform_chained_off_an_aggre
             "trellis_end_to_end_latency_seconds",
             "e2e_latency_agg_sku_totals_v2",
         ),
-        "issue #104: the terminal transform chained off an aggregate target must get an \
+        "the terminal transform chained off an aggregate target must get an \
          end-to-end observation once it's reached purely through the aggregate-write path's \
          own automatic downstream propagation, with no manufactured second write: {after_hop1}"
     );
@@ -335,7 +327,7 @@ async fn end_to_end_latency_fires_at_the_terminal_transform_chained_off_an_aggre
             "trellis_transform_latency_seconds",
             "e2e_latency_agg_sku_totals_v2",
         ),
-        "the terminal transform's own per-transform latency (issue #51) must be recorded too, \
+        "the terminal transform's own per-transform latency must be recorded too, \
          now that this hop — reached only via a Recompute staged from an aggregate write — \
          carries a real origin: {after_hop1}"
     );

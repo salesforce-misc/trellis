@@ -5,7 +5,7 @@
 //! `TrellisOptions::call_deadline`. The stuck statement is a held lock: a
 //! second session takes `ACCESS EXCLUSIVE` on the catalog tables, so any
 //! statement of the engine's that reads one queues behind it. No test sleeps
-//! or polls for convergence (#297): each call returns when the server's
+//! or polls for convergence: each call returns when the server's
 //! `statement_timeout` fires, and the assertions read `pg_stat_activity` at
 //! that moment.
 //!
@@ -154,7 +154,7 @@ impl Fixture {
     /// error, and that nothing is left waiting on the server.
     ///
     /// Nothing here bounds how late the call returned, or asks which side
-    /// ended it (#1029). A host stalled for a second around the deadline
+    /// ended it. A host stalled for a second around the deadline
     /// makes the client-side backstop return first even though the server
     /// stopped the statement on time, and on this box that has happened
     /// (1.701 s against a 1.7 s backstop). What the deadline promises is that
@@ -216,7 +216,7 @@ async fn a_call_stuck_on_a_lock_ends_at_its_deadline_and_the_server_drops_it() {
     // Capped to the deadline: an hour's wait is one call's 700 ms.
     stuck!(f, "await_converged", t => t.await_converged(token, Duration::from_secs(3600)));
     // A start and a poll read the catalog and nothing else: the comparison is
-    // a worker's, not a call's (#1023).
+    // a worker's, not a call's.
     stuck!(f, "self_check", t => t.self_check("widget_totals", SelfCheckMode::Strict, Duration::from_secs(1)));
     stuck!(f, "self_check_job", t => t.self_check_job(1));
 
@@ -284,7 +284,7 @@ async fn the_wait_for_a_pooled_connection_counts() {
         .expect_err("no connection");
         let elapsed = started.elapsed();
         // The pool's wait ended it, not the client-side backstop a second
-        // later (#1029: asked of the error, not timed). Load can't flip this:
+        // later (asked of the error, not timed). Load can't flip this:
         // the pool's timer is due first, and the backstop polls the call
         // before checking its own.
         assert!(
@@ -360,7 +360,7 @@ async fn a_shorter_session_timeout_is_kept() {
     let err = trellis.definitions().await.expect_err("blocked");
     // The session's 50 ms ended it, not the call's 30 s (which would be a
     // `CallTimeout`), and since that is not the call's deadline it stays the
-    // database's own `57014`. Asked of the error, not timed (#1029).
+    // database's own `57014`. Asked of the error, not timed.
     assert!(!matches!(err, TrellisError::CallTimeout { .. }), "{err}");
     assert_eq!(
         sqlstate(&err),

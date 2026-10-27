@@ -1,4 +1,4 @@
-//! ADR-0017 P8 (issue #1067, decided on #1052): a dump and restore of a
+//! ADR-0017 P8: a dump and restore of a
 //! partitioned source's recorded state pauses every definition that reads
 //! it, and nothing is routed from the recorded state.
 //!
@@ -6,7 +6,7 @@
 //! `partition_sources` is changed under the same `system_identifier` (a dump
 //! restored into the same cluster), or the identifier is changed and every
 //! recorded node oid moved (a restore into another cluster). Each pass and
-//! the correction engine are called by hand (#297).
+//! the correction engine are called by hand.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -275,7 +275,7 @@ impl Fx {
     }
 }
 
-/// #1052: a dump restored into the same cluster keeps the
+/// A dump restored into the same cluster keeps the
 /// `system_identifier` but recreates `partition_sources`, so the stored
 /// catalog oid no longer names it.
 #[tokio::test]
@@ -359,7 +359,7 @@ async fn a_changed_identifier_with_new_oids_is_a_restore() {
 }
 
 /// A root dropped and recreated, or swapped in by renames, under the same
-/// identifier and catalog oid is no restore: it is table maintenance (#1200),
+/// identifier and catalog oid is no restore: it is table maintenance,
 /// so the pass pauses the readers with the changed-outside-Trellis wording
 /// and corrects nothing.
 #[tokio::test]

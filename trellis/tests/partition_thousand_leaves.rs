@@ -1,4 +1,4 @@
-//! ADR-0017 P10 (issue #1068): a partitioned source at the supported limit
+//! ADR-0017 P10: a partitioned source at the supported limit
 //! of 1,000 leaves.
 //!
 //! The default path runs one cheap check: a 101-leaf source, past

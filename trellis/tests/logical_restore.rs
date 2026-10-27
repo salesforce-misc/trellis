@@ -1,5 +1,5 @@
-//! A logical restore (`pg_dump`, `pg_restore`) of a database running Trellis
-//! (#1205): the ordering state it brings back holds the original cluster's WAL
+//! A logical restore (`pg_dump`, `pg_restore`) of a database running Trellis:
+//! the ordering state it brings back holds the original cluster's WAL
 //! positions and transaction ids, so the capture pass pauses every definition
 //! with the restore reason and discards the ring, and `RESUME` resets the
 //! ordering state before its rebuild. The operations that keep the counters
@@ -9,7 +9,7 @@
 //! The original is a 1-1, a group-basis aggregate and a `JOIN`, all `live`,
 //! in a cluster whose WAL and transaction counter were advanced before the
 //! definitions applied anything, so their ledgers and groups hold positions
-//! ahead of a fresh cluster's. Nothing polls for convergence (#297); every step is an
+//! ahead of a fresh cluster's. Nothing polls for convergence; every step is an
 //! explicit call.
 
 #![allow(dead_code)]
@@ -281,7 +281,7 @@ async fn original(cluster: &TestCluster) -> Original {
         "the 1-1 ledger and its floor hold the cluster's positions"
     );
     let (agg, join) = hidden_ids(&raw).await;
-    // A group-basis rebuild (#1101) stamps every group it recomputes with a
+    // A group-basis rebuild stamps every group it recomputes with a
     // snapshot and the segment it read; the steady state leaves both null.
     raw.batch_execute(&format!(
         "update agg_{agg} set __basis = pg_current_snapshot(), __stamp = 1000"
@@ -415,7 +415,7 @@ async fn resume_groups_and_check_the_reset(raw: &Client, trellis: &Trellis) {
 /// query's.
 async fn resume_and_write(raw: &mut Client, trellis: &Trellis, pool: &trellis::Pool) {
     resume_groups_and_check_the_reset(raw, trellis).await;
-    // The `JOIN`'s resume rebuilt both its tables, keeping its target (#1109):
+    // The `JOIN`'s resume rebuilt both its tables, keeping its target:
     // zero diff, and later changes on either side apply, among them a flip.
     bring_live_only(raw, pool, "jl").await;
     assert_oracle(raw, "the JOIN after the resume", &["jl"]).await;
@@ -456,7 +456,7 @@ async fn resume_and_write(raw: &mut Client, trellis: &Trellis, pool: &trellis::P
         &["one", "gsum"],
     )
     .await;
-    // `self_check` over the restarted registry (#1219's page filter): the
+    // `self_check` over the restarted registry (its page filter): the
     // slots the restore left with no segment count as applied, and the
     // comparison agrees with the oracle.
     use trellis::staging::self_check::{CheckPageExt, SelfCheckScope};
@@ -691,7 +691,7 @@ async fn a_physical_copy_and_a_template_database_pause_nothing() {
     );
 }
 
-/// #1249: a drain worker's gate before its first claim. With the restore
+/// A drain worker's gate before its first claim. With the restore
 /// signal set and a sealed segment holding a ring row, the gate reports
 /// "wait" while a claim would still hand the segment out (without the gate a
 /// drain-only worker applies the pre-detection row); once the staging pass

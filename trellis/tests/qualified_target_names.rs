@@ -1,4 +1,4 @@
-//! Issue #1168: every call that names a transform takes either spelling of
+//! Every call that names a transform takes either spelling of
 //! its target name, the schema-qualified one `apply` returns
 //! (`<target schema>.<table>`) or the bare table name its text declared. A
 //! qualified name with the wrong schema names nothing; there is no fallback to

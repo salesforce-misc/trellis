@@ -1,5 +1,5 @@
 //! DDL that changes what a read column holds without firing a capture
-//! trigger (#703 R1 and R3b), and the routine operations that must not look
+//! trigger, and the routine operations that must not look
 //! like it.
 //!
 //! Each case runs the step-1 study's operation (`local_docs/diag/703` in
@@ -8,7 +8,7 @@
 //! and then checks what the pass did to the table's two readers: nothing,
 //! a rebuild (`backfilling`, or `catching_up` reported downstream of one, counted in
 //! `capture_auto_rebuilds_total`), or a pause. Nothing polls for
-//! convergence (#297).
+//! convergence.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -354,7 +354,7 @@ async fn maintenance_rebuilds_and_pauses_nothing_part_2() {
 }
 
 /// Single migrations. A pure widening never rebuilds or pauses here, except
-/// that an integer width a copy is outgrown by pauses `r` by #767's check
+/// that an integer width a copy is outgrown by pauses `r` by the copy-type check
 /// (a copy has no modifier, ADR-0020, so a modifier never outgrows one). A
 /// narrowed `varchar` and a `numeric` scale change rebuild.
 fn single_migration_cases() -> Vec<Case> {
@@ -399,7 +399,7 @@ fn single_migration_cases() -> Vec<Case> {
             "alter table public.{t} alter column v type text",
             Expect::Nothing,
         ),
-        // #767: the passthrough's `integer` copy is outgrown.
+        // The passthrough's `integer` copy is outgrown.
         (
             "D9",
             "alter table public.{t} alter column a type bigint",
@@ -471,14 +471,14 @@ fn single_migration_cases() -> Vec<Case> {
             Expect::Nothing,
         ),
         // R1: a narrowed modifier. Every definition is still valid, and the
-        // passthrough's copy holds every value (#824), so the readers
+        // passthrough's copy holds every value, so the readers
         // rebuild.
         (
             "D22",
             "alter table public.{t} alter column v type varchar(10)",
             Expect::Rebuilt("column_changed"),
         ),
-        // #767: `s`'s `GROUP BY` copy is outgrown.
+        // `s`'s `GROUP BY` copy is outgrown.
         (
             "D23",
             "alter table public.{t} alter column g type bigint",
@@ -630,7 +630,7 @@ fn real_change_cases() -> Vec<Case> {
              alter table public.{t} add column a int; commit",
             Expect::Rebuilt("column_changed"),
         ),
-        // A pure widening R1 leaves alone; #767 pauses both readers, whose
+        // A pure widening R1 leaves alone; the copy-type check pauses both readers, whose
         // copies of `b` it outgrew. A reader with no such copy misses the
         // values (docs/known-correctness-gaps.md).
         (

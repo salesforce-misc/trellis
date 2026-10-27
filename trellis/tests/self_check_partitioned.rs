@@ -1,4 +1,4 @@
-//! #1179: `self_check`'s capture audit over a partitioned source. A root the
+//! `self_check`'s capture audit over a partitioned source. A root the
 //! reconcile pass records is no hierarchy fault, and the audit reads the five
 //! capture triggers of every recorded node, naming a node whose triggers were
 //! disabled (ADR-0017, "Every node carries capture").
@@ -229,11 +229,9 @@ async fn a_leaf_detached_or_attached_since_the_pass_is_no_fault() {
     );
 }
 
-/// A `JOIN` reading a partitioned root as its joined side. Its build refuses
-/// a partitioned side until #1111 (J6), so the definition never goes live
-/// here and `self_check` would skip it; the audit runs on the definition as
-/// if it were live. It is clean, and a leaf's disabled trigger is named, as
-/// for an aggregate.
+/// A `JOIN` reading a partitioned root as its joined side. The audit runs
+/// on the definition as if it were live. It is clean, and a leaf's disabled
+/// trigger is named, as for an aggregate.
 #[tokio::test]
 async fn a_join_reading_a_partitioned_side_audits_clean_and_names_a_leafs_disabled_trigger() {
     let cluster = testkit::TestCluster::start();

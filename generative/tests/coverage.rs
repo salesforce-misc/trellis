@@ -1,4 +1,4 @@
-//! Generator coverage meta-tests (issue #7, design doc §3 "Generator coverage
+//! Generator coverage meta-tests (design doc §3 "Generator coverage
 //! meta-tests"): no database, run in milliseconds. These check the
 //! *generator's own surface*, not any oracle comparison — that coverage that
 //! silently drops out (a type stops appearing in a derivation, an operator
@@ -56,8 +56,8 @@ fn sorted_value_types(types: impl IntoIterator<Item = ValueType>) -> Vec<&'stati
 ///
 /// The **primary-key** column is excluded, and that exclusion is the
 /// assertion's shape, not a hole in it: the pk exists to be a *key*, and its
-/// `bigint` type (`model::PRIMARY_KEY_VALUE_TYPE`, honest since issue #111
-/// rather than the `Numeric` placeholder it used to carry) is exercised on
+/// `bigint` type (`model::PRIMARY_KEY_VALUE_TYPE`, an honest type rather
+/// than a `Numeric` placeholder) is exercised on
 /// every single op of every single program — as the target's own primary
 /// key, as the identity every `Update`/`Delete` addresses a row by, and as
 /// the value every snapshot comparison is keyed on. Requiring it to *also*
@@ -123,8 +123,8 @@ fn collect_column_types(expr: &Expr, source: &Table, out: &mut Vec<ValueType>) {
                 collect_column_types(arg, source, out);
             }
         }
-        // A literal carries no *source column* type — including issue
-        // #109's typed literal, whose type is its own, not a column's.
+        // A literal carries no *source column* type — including a typed
+        // literal, whose type is its own, not a column's.
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
     }
 }
@@ -175,7 +175,7 @@ fn every_supported_operator_appears_over_every_supported_argument_type() {
 /// `columns[6]` — see `generate::build_program_multi_with_shapes`'s doc
 /// comment on that index), and `generate::strategy::grain_value` draws an
 /// occasional `NULL` for it *unconditionally*, independent of the
-/// `awkward_values` flag (issue #128) — so a "never draws NULL" check scoped
+/// `awkward_values` flag — so a "never draws NULL" check scoped
 /// to the flag must exclude this one structurally-always-on column.
 fn grain_column(program: &Program, table: &str) -> Option<String> {
     program
@@ -224,11 +224,11 @@ fn all_op_values(program: &generative::model::Program) -> Vec<Option<String>> {
 }
 
 /// With the awkward-value feature flag off, the generator's *flag-gated*
-/// value draws are structurally identical to before issue #7 widened the
-/// generator: a bare `0..=VALUE_MAX` integer, never `None`/SQL `NULL`. Every
+/// value draws are structurally plain: a bare `0..=VALUE_MAX` integer,
+/// never `None`/SQL `NULL`. Every
 /// table's grain column is excluded from this check ([`all_op_values`]/
 /// [`grain_column`]) because it draws an occasional `NULL` unconditionally,
-/// regardless of this flag (issue #128) — see `generate::strategy::grain_value`'s
+/// regardless of this flag — see `generate::strategy::grain_value`'s
 /// doc comment. Sampling many programs (rather than instrumenting the exact
 /// strategy call sequence) is the practical way to prove the *behavior* —
 /// what actually gets drawn — hasn't silently changed; see
@@ -269,8 +269,8 @@ fn awkward_values_on_sometimes_draws_null() {
     );
 }
 
-/// A grouping (grain) value's `NULL` draw (improvement-plan task B4, issue
-/// #128) actually appears, and does so **regardless of `awkward_values`** —
+/// A grouping (grain) value's `NULL` draw (improvement-plan task B4)
+/// actually appears, and does so **regardless of `awkward_values`** —
 /// unlike every other awkward-value column, `generate::strategy::grain_value`
 /// is not gated by the flag (see `trivial_program_with`'s doc comment), so
 /// this samples both `false` and `true` and expects to see it either way.
@@ -311,7 +311,7 @@ fn grain_value_sometimes_draws_null_regardless_of_awkward_values() {
 
 /// The default [`trivial_program`] strategy (awkward values on) also
 /// occasionally draws a genuine `apply()`-failing duplicate-pk insert
-/// (issue #6's gap) — sampled the same way as the NULL check above.
+/// — sampled the same way as the NULL check above.
 #[test]
 fn trivial_program_sometimes_draws_a_duplicate_pk_insert() {
     let mut runner = TestRunner::default();
@@ -470,8 +470,8 @@ fn a_real_run_of_the_default_strategy_meets_its_coverage_floors() {
                  {program:#?}"
             );
             // The pk is excluded above because it is a key, not a value —
-            // but it is still pinned, since issue #111 made its recorded
-            // type an honest `bigint` that every DDL and cast site now
+            // but it is still pinned, since its recorded type is an
+            // honest `bigint` that every DDL and cast site
             // renders straight from (`backend::sql::column_pg_type`).
             let pk = table
                 .columns
@@ -706,7 +706,7 @@ fn trivial_program_sometimes_draws_a_nested_expression() {
     );
 }
 
-/// The aggregate calls a `GROUP BY` definition can draw: the group basis's admitted set (issue #1100). Define refuses every
+/// The aggregate calls a `GROUP BY` definition can draw: the group basis's admitted set. Define refuses every
 /// other aggregate function on a plain aggregate.
 const ADMITTED_AGGREGATE_CALLS: &[(&str, &str)] = &[
     ("COUNT", "*"),
@@ -715,7 +715,7 @@ const ADMITTED_AGGREGATE_CALLS: &[(&str, &str)] = &[
     ("AVG", "column"),
 ];
 
-/// Issue #1100: every aggregate function the generator draws on a
+/// Every aggregate function the generator draws on a
 /// `GROUP BY` definition is one the group basis admits, and every admitted
 /// call shape is actually drawn. A `SUM`/`AVG` argument is a bare column of a
 /// `numeric` (declared `numeric(14,2)` by the DDL) or integer type, never an
@@ -1147,7 +1147,7 @@ fn bulk_insert_row_count_gets_meaningfully_large() {
     );
 }
 
-/// Issue #294: the generator draws `COUNT(<col>)` inside a `GROUP BY` def,
+/// The generator draws `COUNT(<col>)` inside a `GROUP BY` def,
 /// which counts only the group's rows whose column is not `NULL`.
 ///
 /// Sampled with [`TestRunner::deterministic`] rather than `default()`, so
@@ -1174,7 +1174,7 @@ fn trivial_program_draws_count_of_a_column_in_a_group_by() {
     );
 }
 
-/// Issue #505: a failure that doesn't need the tables interleaved shrinks
+/// A failure that doesn't need the tables interleaved shrinks
 /// back to the table-by-table order, within proptest's real shrink budget
 /// (`4 * cases` iterations; `16` is the convergence properties' default
 /// case count). The planted failure is "a `TRUNCATE` in a program with at
@@ -1229,7 +1229,7 @@ fn an_order_independent_failure_shrinks_to_the_table_by_table_order() {
     );
 }
 
-/// Issue #557: the concurrent tier's hot-key cases reach every
+/// The concurrent tier's hot-key cases reach every
 /// [`ConcurrentShape`] in most cases, where the tier's original draw
 /// (`trivial_program` in bursts of 1 to 4 ops, one lane) reaches almost
 /// none. Both tallies are printed, so a run of this test is the before/after
@@ -1286,7 +1286,7 @@ fn the_hot_key_tier_draws_every_concurrent_shape() {
     }
 }
 
-/// Issue #557 part 2: the mid-burst cases reach every [`ConcurrentShape`],
+/// The mid-burst cases reach every [`ConcurrentShape`],
 /// the mid-burst actions included (`hot_key_case` takes no
 /// action at all: `the_hot_key_tier_draws_every_concurrent_shape` checks
 /// that). Prints the shape tally and the per-action counts. The action
@@ -1335,7 +1335,7 @@ fn the_mid_burst_tier_draws_every_action_shape() {
     }
 }
 
-/// Issue #557 part 3b: the cooling-key cases keep every hot-key shape and
+/// The cooling-key cases keep every hot-key shape and
 /// add cooling keys, in nearly every case, and take no mid-burst action.
 #[test]
 fn the_cooling_key_tier_draws_cooling_keys_and_every_hot_key_shape() {
@@ -1380,7 +1380,7 @@ fn the_cooling_key_tier_draws_cooling_keys_and_every_hot_key_shape() {
 
 /// ADR-0017: every `partitioned_program` case reads a partitioned source (its
 /// first table, through at least one definition), and 500 samples draw every
-/// partitioning strategy and every partition operation (issue #1320), so the
+/// partitioning strategy and every partition operation, so the
 /// partitioned properties can't pass vacuously over plain tables or a tree
 /// that never changes.
 ///
@@ -1420,7 +1420,7 @@ fn partitioned_program_always_reads_a_partitioned_source_and_draws_every_strateg
             "no {name} partitioning across 500 deterministic samples:\n{coverage}"
         );
     }
-    // Issue #1320: partition maintenance, partition-key updates and writes
+    // Partition maintenance, partition-key updates and writes
     // named on a leaf, each drawn, and the outcomes that turn on the tree.
     for name in [
         "detach",
@@ -1444,7 +1444,7 @@ fn partitioned_program_always_reads_a_partitioned_source_and_draws_every_strateg
     }
 }
 
-/// Issue #1100: the aggregate definitions the generator draws really land
+/// The aggregate definitions the generator draws really land
 /// on the group basis, checked against the catalog: after a real run, the
 /// instance has one `agg_<id>` hidden table per `GROUP BY` definition. Without this floor a generator or engine change
 /// that silently routed definitions to the ledger would still pass every

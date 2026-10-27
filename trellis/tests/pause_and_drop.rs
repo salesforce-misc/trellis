@@ -1,4 +1,4 @@
-//! Integration tests for issue #142 / ADR-0014 — the other half of a
+//! Integration tests for ADR-0014 — the other half of a
 //! definition's lifecycle: **pause**, **resume**, and **drop**.
 //!
 //! Every pause, resume and drop here goes through the public
@@ -9,7 +9,7 @@
 //! with a raw connection rather than re-asking the engine what it thinks it
 //! did.
 //!
-//! No test runs a live pipeline (issue #301). Where a scenario needs work a
+//! No test runs a live pipeline. Where a scenario needs work a
 //! running `Client` would do — starting and running a definition's build,
 //! draining CDC changes — the test
 //! does that step itself through the same engine function the `Client`
@@ -21,7 +21,7 @@
 //! - pause is idempotent, and reaching a paused definition it didn't create
 //!   is a success (`pausing_twice_is_a_no_op_success`)
 //! - a pause landing while a worker holds the last backfill chunk survives
-//!   that chunk finishing — issue #331
+//!   that chunk finishing
 //!   (`rederive_build::chunks_finishing_after_a_pause_leave_the_definition_paused`)
 //! - resume rebuilds by a fresh backfill rather than catching up over
 //!   buffered changes, and a paused definition never pins the ring for its
@@ -30,7 +30,7 @@
 //!   (`dropping_takes_the_target_table_and_its_data_with_it`)
 //! - a live dependent refuses the drop and is named
 //!   (`dropping_is_refused_and_names_the_live_dependents`), and so does a
-//!   dependent in any other status short of gone — issue #231
+//!   dependent in any other status short of gone
 //!   (`dropping_is_refused_by_a_dependent_in_any_status_not_only_live`)
 //! - dropping an absent definition is a success
 //!   (`dropping_an_unregistered_definition_is_a_no_op_success`)
@@ -40,7 +40,7 @@
 //! - a drop leaves the source's capture to the staging worker's reconcile
 //!   (`dropping_leaves_capture_to_the_staging_worker`)
 //! - the target's `schema_nodes` row is actually reaped, not merely
-//!   unreachable — issue #232 (`dropping_reaps_the_targets_schema_nodes_row`)
+//!   unreachable (`dropping_reaps_the_targets_schema_nodes_row`)
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
@@ -48,9 +48,9 @@ use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 // Internals reaches (ADR-0012's `internals` feature, on for this crate's own
 // test targets), for two reasons. The durable chunk queue's dispatch gate has
 // no facade spelling, and asserting it through a hand-written copy of its own
-// `where` clause is what issue #231 called out. And the ring, the chunk queue
+// `where` clause would be a self-fulfilling check. And the ring, the chunk queue
 // and the start of each build are driven by hand in place of a running
-// pipeline (issue #301); see the module doc.
+// pipeline; see the module doc.
 use trellis::defs::chunk_queue;
 use trellis::intake::harness;
 use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
@@ -71,7 +71,7 @@ async fn connect_raw(dsn: &str) -> Client {
     client
 }
 
-/// The kinds of a Re-derive build's work rows (#625), for
+/// The kinds of a Re-derive build's work rows, for
 /// `chunk_queue::claim_chunks_of`.
 const REDERIVE_KINDS: [&str; 3] = [
     chunk_queue::KIND_PLAN,
@@ -122,7 +122,7 @@ async fn count(raw: &Client, sql: &str) -> i64 {
 /// (`alter_transform.rs`'s helper of the same name). A 1-1 target reaches
 /// `live` this way with no running pipeline and nothing to wait for.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the staging
+    // ADR-0002: registration only records a definition; the staging
     // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
         .await
@@ -188,8 +188,8 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 }
 
 /// Seeds a source table. Aggregates are this file's default
-/// transform shape. Registration only records one as `waiting_to_backfill`
-/// (issue #419); a test that needs it `live` settles it with
+/// transform shape. Registration only records one as `waiting_to_backfill`;
+/// a test that needs it `live` settles it with
 /// [`harness::settle_builds`], which starts and runs its build (one plan
 /// job) in place of the staging worker and a drain thread.
 async fn seed_source(raw: &Client, table: &str, rows: i64) {
@@ -236,7 +236,7 @@ async fn pausing_twice_is_a_no_op_success() {
             .expect("registered")
             .status,
         TransformStatus::WaitingToBackfill,
-        "registration only records an aggregate; the staging worker starts its build (#419)"
+        "registration only records an aggregate; the staging worker starts its build"
     );
     harness::settle_builds(&db.pool).await;
     assert_eq!(
@@ -328,7 +328,7 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
     let mut raw = connect_raw(db.dsn()).await;
     seed_source(&raw, "orders", 4).await;
 
-    // No live pipeline (issue #301): every change below is staged by hand and
+    // No live pipeline: every change below is staged by hand and
     // drained through the engine's own apply path, and the resume's build is
     // started and run by hand, so each claim is checked the moment its
     // precondition holds instead of polled for under a wall-clock budget.
@@ -341,7 +341,7 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
         .apply("TRANSFORM order_echo FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total")
         .await
         .expect("define a sibling over the same source");
-    // Registration only records the two aggregates (#419); their builds take
+    // Registration only records the two aggregates; their builds take
     // both live before one is paused.
     harness::settle_builds(&db.pool).await;
 
@@ -439,7 +439,7 @@ async fn resume_rebuilds_by_backfill_and_a_paused_definition_never_pins_the_ring
 
     // Claim 2, mechanism continued: the staging worker's next pass starts the
     // same build a freshly registered one gets: on the group basis that is one
-    // plan job, with no ledger to sweep (#1100).
+    // plan job, with no ledger to sweep.
     trellis::intake::harness::start_registered_builds(&db.pool)
         .await
         .expect("start the rebuild");
@@ -556,7 +556,7 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
     );
 }
 
-/// Issue #418: re-registering a transform after dropping it builds it again
+/// Re-registering a transform after dropping it builds it again
 /// from scratch through its own build, like any registration: the
 /// drop leaves no gate, chunk or status behind that the new definition
 /// could trip over, and the new target holds every source row.
@@ -610,9 +610,9 @@ async fn a_transform_registered_again_after_its_drop_is_built_afresh() {
         0,
         "the new target is built from the source as it is now"
     );
-    // #623 D2: the drop took the old ledger, so registering again could
-    // create a new one. The Re-derive build of a plain 1-1 (#625 F8a) puts
-    // every key it writes on the 1-1 slim ledger (#623 D6), so the new
+    // The drop took the old ledger, so registering again could
+    // create a new one. The Re-derive build of a plain 1-1 puts
+    // every key it writes on the 1-1 slim ledger, so the new
     // ledger holds the 30 surviving keys and none of the 40 the dropped
     // target's build entered.
     assert_eq!(
@@ -626,13 +626,13 @@ async fn a_transform_registered_again_after_its_drop_is_built_afresh() {
     );
 }
 
-/// Issue #232: the node reap inside `drop_transform` decides whether the
+/// The node reap inside `drop_transform` decides whether the
 /// target's `schema_nodes` row can go with a `not exists (... from
 /// transform_definitions ...)` guard. That guard used to run *before* the
 /// `transform_definitions` row itself was deleted, so it always found the
 /// about-to-vanish row still there and never reaped the node — every drop
 /// left an orphaned `schema_nodes` row behind. Confirmed benign at the time
-/// (unreachable by `all_source_tables`'s walk, unlike #231's surviving
+/// (unreachable by `all_source_tables`'s walk, unlike a surviving
 /// *edge*), but still worth actually reaping rather than leaving litter.
 #[tokio::test]
 async fn dropping_reaps_the_targets_schema_nodes_row() {
@@ -678,7 +678,7 @@ async fn dropping_reaps_the_targets_schema_nodes_row() {
         )
         .await,
         0,
-        "the target's schema_nodes row is actually reaped, not left orphaned (issue #232)"
+        "the target's schema_nodes row is actually reaped, not left orphaned"
     );
 }
 
@@ -703,7 +703,7 @@ async fn dropping_is_refused_and_names_the_live_dependents() {
         .await
         .expect("define the upstream");
     // A transform chains only off a live target; the upstream's build takes
-    // it there (#419).
+    // it there.
     harness::settle_builds(&db.pool).await;
     trellis
         .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g WITHOUT SOURCE INDEX SELECT count(*) AS t")
@@ -767,7 +767,7 @@ async fn dropping_is_refused_and_names_the_live_dependents() {
     );
 }
 
-/// Issue #231: the refusal's question is "is anything still registered that
+/// The refusal's question is "is anything still registered that
 /// could need this target?", not "is anything *live* on it right now". Every
 /// status other than gone answers yes, and for two different reasons:
 ///
@@ -796,7 +796,7 @@ async fn dropping_is_refused_by_a_dependent_in_any_status_not_only_live() {
         .await
         .expect("define the upstream");
     // A transform chains only off a live target; the upstream's build takes
-    // it there (#419).
+    // it there.
     harness::settle_builds(&db.pool).await;
     trellis
         .apply("TRANSFORM grand_total FROM order_rollup GROUP BY g WITHOUT SOURCE INDEX SELECT count(*) AS t")
@@ -948,7 +948,7 @@ async fn dropping_a_live_definition_is_refused_until_it_is_paused() {
 ///   the target and goes with it; its forensic value is about rows that are
 ///   about to stop existing.
 /// - the whole-key poison band (`poison`, `poison_held`, `key_deaths`) and the
-///   fuse gate are per transform (#799): the dropped definition's rows go
+///   fuse gate are per transform: the dropped definition's rows go
 ///   with it, by `on delete cascade`, and a sibling reading the same source
 ///   keeps its own, exactly as the drop found them. A drain worker may be
 ///   mid-batch over that source right now, for the sibling that is still
@@ -1077,7 +1077,7 @@ async fn dropping_takes_target_owned_quarantine_rows_and_leaves_a_siblings_poiso
         "a cascade edge naming the dropped target on either end goes with it"
     );
 
-    // Per transform (#799): the dropped definition's rows go with it, and
+    // Per transform: the dropped definition's rows go with it, and
     // the sibling's stay.
     let echo = "(select id from transform_definitions \
                  where split_part(target_table, '.', 2) = 'order_echo')";
@@ -1104,7 +1104,7 @@ async fn dropping_takes_target_owned_quarantine_rows_and_leaves_a_siblings_poiso
 /// paused definition also stops being handed new chunks — the pause is what
 /// quiesces the durable backfill queue, exactly as it quiesces the fold.
 ///
-/// #625 F8a: a plain 1-1 over a captured table is the Re-derive build's, so
+/// A plain 1-1 over a captured table is the Re-derive build's, so
 /// the queue holds its plan job, claimed through `claim_chunks_of` with the
 /// Re-derive build's kinds; the dispatch gate under test is the same one.
 #[tokio::test]
@@ -1182,7 +1182,7 @@ async fn pausing_stops_chunk_dispatch_and_dropping_cascades_the_chunks_away() {
 }
 
 /// ADR-0014's capture set shrinks by reconciliation, which ADR-0002's
-/// staging worker runs from the catalog alone (issue #427) and #622 C5 restates it for trigger capture: a drop only
+/// staging worker runs from the catalog alone, and trigger capture restates it: a drop only
 /// removes catalog rows and never touches the source's capture triggers, so
 /// the process applying it needs no privilege on the source. The staging
 /// worker's next reconcile pass uninstalls them from the catalog;

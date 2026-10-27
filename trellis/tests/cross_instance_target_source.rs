@@ -1,4 +1,4 @@
-//! Issue #376: a second Trellis instance must not capture another instance's
+//! A second Trellis instance must not capture another instance's
 //! aggregate target.
 //!
 //! An aggregate target has no primary key (its identity is the `UNIQUE NULLS
@@ -76,7 +76,7 @@ async fn two_instances(db: &testkit::TestDatabase) -> (Pool, Client) {
     )
     .await
     .expect("instance A installs its aggregate");
-    // The aggregate builds in the background (#419); settle it so A's target
+    // The aggregate builds in the background; settle it so A's target
     // is live and populated, as a chain off it requires.
     trellis::intake::harness::settle_builds(&db.pool).await;
 
@@ -231,7 +231,7 @@ async fn the_owning_instance_can_still_chain_off_its_own_aggregate_target() {
 }
 
 /// A 1-1 target has a real primary key, so another instance can still read it
-/// over CDC (issue #312's cross-instance hop), and that instance still
+/// over CDC (the cross-instance hop), and that instance still
 /// captures it.
 #[tokio::test]
 async fn another_instances_one_to_one_target_is_still_accepted() {
@@ -264,7 +264,7 @@ async fn another_instances_one_to_one_target_is_still_accepted() {
 }
 
 /// A 1-1 target over an aggregate target takes the aggregate's identity, a
-/// `UNIQUE NULLS NOT DISTINCT` constraint, not a primary key (issue #1141),
+/// `UNIQUE NULLS NOT DISTINCT` constraint, not a primary key,
 /// so capture can't key its changes either, and instance B rejects a
 /// definition over it as it does one over the aggregate.
 #[tokio::test]
@@ -300,7 +300,7 @@ async fn another_instances_one_to_one_target_over_an_aggregate_is_rejected() {
 }
 
 /// The keying rule is about the table, not its owner, so a plain source table the
-/// capture triggers can't key is held to it too (issue #622 C5): every ring
+/// capture triggers can't key is held to it too: every ring
 /// row is keyed by the primary key, so a table without one is refused even
 /// with a unique constraint or unique index on its key columns, and so is a
 /// partitioned table, which statement triggers on its parent would capture

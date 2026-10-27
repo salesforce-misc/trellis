@@ -1,4 +1,4 @@
-//! The table-gone check of #707/#999 for a `JOIN`'s joined table. Its own
+//! The table-gone check for a `JOIN`'s joined table. Its own
 //! test binary: a `JOIN` needs the
 //! group-basis knob, which is process-wide and would change every aggregate
 //! build in `capture_disruption.rs`.
@@ -125,7 +125,7 @@ async fn bring_live(raw: &mut Client, pool: &trellis::Pool) {
 
 /// The table-gone case for a `JOIN`'s joined table: it pauses its reader (the
 /// 1-1 and aggregate sources are the matrix's). A `JOIN`'s joined table once
-/// panicked the pass (#1177).
+/// panicked the pass.
 #[tokio::test]
 async fn a_gone_joined_table_pauses_its_readers() {
     let cluster = TestCluster::start();
@@ -175,7 +175,6 @@ async fn record_counts(raw: &Client, table: &str) -> (i64, i64, i64) {
     (counts[0], counts[1], counts[2])
 }
 
-// #1217
 /// Dropping the last reader of a `JOIN`'s joined table forgets that table's
 /// records; a table another definition still reads keeps them.
 #[tokio::test]

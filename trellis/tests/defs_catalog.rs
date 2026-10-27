@@ -1,4 +1,4 @@
-//! Integration tests for the transform-definition catalog (issue #23),
+//! Integration tests for the transform-definition catalog,
 //! run against a real, ephemeral Postgres instance via the shared harness
 //! (`testkit::TestCluster`).
 
@@ -13,9 +13,9 @@ use trellis::defs::{
 
 /// Starts every registered definition's Re-derive build and runs it to
 /// completion by hand, so a 1-1 target goes `live` without a running drain
-/// worker — a definition can only chain off a live target (issue #315).
+/// worker — a definition can only chain off a live target.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the staging
+    // ADR-0002: registration only records a definition; the staging
     // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
         .await
@@ -34,14 +34,14 @@ fn columns(names: &[&str]) -> HashMap<String, ValueType> {
 /// `create_bare_source_table`/`create_authors_and_posts` actually land a
 /// bare `create table` (the pool's ambient `search_path`, Trellis schema
 /// first). `transforms_for_source` now requires its argument already
-/// fully-qualified (issue #74, ADR-0011); a bare name silently matches
+/// fully-qualified (ADR-0011); a bare name silently matches
 /// nothing rather than erroring.
 fn qualified(name: &str) -> String {
     format!("{DEFAULT_SCHEMA}.{name}")
 }
 
 /// Creates a minimal backing relation for a definition's source table
-/// (issue #23's backfill enumerates it for real, via a live `regclass`/
+/// (the backfill enumerates it for real, via a live `regclass`/
 /// catalog lookup) — a bare PK column is enough, since `validate()` checks
 /// column references against the passed-in `source_columns` map, not the
 /// live schema. Left unqualified so it lands via the pool's ambient
@@ -81,7 +81,7 @@ async fn valid_definition_is_stored_and_retrievable() {
     assert_eq!(subscribers[0].def.target, "order_totals");
 }
 
-/// Issue #72 / ADR-0011: `transform_definitions.source_table` (and its
+/// ADR-0011: `transform_definitions.source_table` (and its
 /// `source_table_versions` counterpart) must persist the *fully-qualified*
 /// `schema.table` identity a bare `FROM` clause resolves to — not the bare
 /// spelling the definition text names. `posts` is created explicitly in
@@ -97,7 +97,7 @@ async fn valid_definition_is_stored_and_retrievable() {
 /// `definition_text`, and this definition's own `FROM` clause is bare too
 /// (see [`trellis::defs::TransformDef`]'s own doc comment for why `source`
 /// never carries a dotted spelling even for a definition that *did* qualify
-/// it explicitly, issue #76) — so this test reads
+/// it explicitly) — so this test reads
 /// `transform_definitions.source_table` back directly to observe the
 /// persisted identity, rather than trusting the returned `Definition`.
 #[tokio::test]
@@ -145,7 +145,7 @@ async fn source_table_is_persisted_fully_qualified() {
     assert_eq!(version, 1);
 }
 
-/// Issue #73 / ADR-0011's mirror of `source_table_is_persisted_fully_qualified`
+/// ADR-0011's mirror of `source_table_is_persisted_fully_qualified`
 /// above, for the target side: `transform_definitions.target_table` must
 /// persist `def.target` resolved to `{Config::target_schema}.{def.target}`,
 /// not the bare spelling the definition text names. Unlike the source side,
@@ -186,8 +186,8 @@ async fn target_table_is_persisted_fully_qualified() {
     assert_eq!(target_table, "public.post_titles");
 }
 
-/// Issue #73's chained/multi-hop coverage: once both the source and target
-/// sides are qualified (issues #72 and #73 together), a second definition
+/// Chained/multi-hop coverage: once both the source and target
+/// sides are qualified, a second definition
 /// chained off a first definition's *target* must still resolve correctly —
 /// the second definition's `resolve_source_schema_in_txn` walk over its bare
 /// `FROM` clause finds the first definition's physical target table via
@@ -264,7 +264,7 @@ async fn a_definitions_target_table_matches_a_chained_definitions_source_table()
     );
 }
 
-/// Issue #76 / ADR-0011: an explicit `FROM <schema>.<source>`
+/// ADR-0011: an explicit `FROM <schema>.<source>`
 /// resolves to *that exact relation*, never a `search_path` walk. Proven
 /// here by deliberately creating two same-named `orders` tables — one that
 /// bare resolution would win (landed in the Trellis-pinned schema, first on
@@ -272,7 +272,7 @@ async fn a_definitions_target_table_matches_a_chained_definitions_source_table()
 /// in a schema nowhere near the front of the path — and confirming the
 /// explicitly-qualified spelling still resolves to the *non-default* one.
 /// If explicit qualification silently fell back to a `search_path` walk
-/// (the #72 bare-name behavior), this would instead persist the
+/// (the bare-name behavior), this would instead persist the
 /// Trellis-schema `orders`, not `custom.orders`.
 #[tokio::test]
 async fn an_explicitly_qualified_source_resolves_to_that_exact_relation_not_search_path() {
@@ -364,9 +364,9 @@ async fn an_explicitly_qualified_source_naming_a_schema_without_that_table_is_re
     assert_eq!(count, 0, "the rejected definition must not persist");
 }
 
-/// Issue #76's own follow-up to
-/// `a_target_table_colliding_on_bare_suffix_under_a_different_schema_is_rejected`
-/// (issue #73's guard): an explicitly-qualified `TRANSFORM <schema>.<target>`
+/// A companion to
+/// `a_target_table_colliding_on_bare_suffix_under_a_different_schema_is_rejected`:
+/// an explicitly-qualified `TRANSFORM <schema>.<target>`
 /// must trip the very same [`CatalogError::TargetTableSuffixCollision`] guard
 /// a resolved-bare target under a different `Config::target_schema` does —
 /// the check operates on the final qualified string and the bare suffix
@@ -376,7 +376,7 @@ async fn an_explicitly_qualified_source_naming_a_schema_without_that_table_is_re
 /// target-table DDL itself, so `custom.foo` is materialized by hand first
 /// (mirroring `a_definitions_target_table_matches_a_chained_definitions_source_table`'s
 /// `create_target_table` call) — otherwise the new
-/// `QualifiedTargetTableNotFound` existence check (also issue #76) would
+/// `QualifiedTargetTableNotFound` existence check would
 /// reject it before the collision guard is ever reached.
 #[tokio::test]
 async fn an_explicitly_qualified_target_still_triggers_the_suffix_collision_guard() {
@@ -453,7 +453,7 @@ async fn an_explicitly_qualified_target_still_triggers_the_suffix_collision_guar
     assert_eq!(count, 1, "the rejected second definition must not persist");
 }
 
-/// Issue #63's write-path gap: the source-column type map a definition was
+/// The write path: the source-column type map a definition was
 /// validated against must be persisted, not just returned transiently from
 /// `create_definition` — `transforms_for_source` (what the physical apply
 /// path loads) must read the exact same map back, mixed value types
@@ -490,7 +490,7 @@ async fn transforms_for_source_returns_the_persisted_source_column_types() {
     );
 }
 
-/// Issue #69's batched read path: `transforms_for_source` now decodes every
+/// The batched read path: `transforms_for_source` decodes every
 /// subscriber's `source_columns` via a single `left join lateral
 /// jsonb_each_text(...)` query rather than one query per row. A `left`
 /// (not inner) join matters specifically for a definition whose
@@ -524,7 +524,7 @@ async fn a_definition_with_no_source_columns_survives_the_left_join_read() {
     );
 }
 
-/// Issue #69's by-id grouping: with more than one definition subscribed to
+/// By-id grouping: with more than one definition subscribed to
 /// the same source table, the single lateral-joined query's rows (one per
 /// definition per source-column entry) must regroup correctly per
 /// definition rather than smearing one definition's `source_columns` into
@@ -629,7 +629,7 @@ async fn a_column_cycle_within_a_target_is_rejected() {
     }
 }
 
-/// Issue #63's end-to-end passthrough bar: a `Text`-typed source column
+/// End-to-end passthrough: a `Text`-typed source column
 /// parses, validates, and is stored as a calculated field with no operator
 /// applied to it.
 #[tokio::test]
@@ -650,7 +650,7 @@ async fn a_text_column_passthrough_is_stored_and_retrievable() {
     assert_eq!(def.def.target, "labels");
 }
 
-/// Issue #63's type-mismatch bar: `text_col + 1` must be rejected at
+/// Type mismatch: `text_col + 1` must be rejected at
 /// validation time with a clear [`ValidationError::TypeMismatch`], not a
 /// panic.
 #[tokio::test]
@@ -796,7 +796,7 @@ async fn source_to_transform_mapping_reflects_a_newly_created_definition() {
     assert!(unrelated.is_empty());
 }
 
-/// Issue #80: `CatalogError::Db`'s `Display` must surface the real Postgres
+/// `CatalogError::Db`'s `Display` must surface the real Postgres
 /// error text (e.g. the duplicate-key detail), not just the bare "db error"
 /// `tokio_postgres::Error`'s own `Display` prints on its own.
 #[tokio::test]
@@ -834,8 +834,7 @@ async fn a_duplicate_target_table_surfaces_the_underlying_postgres_detail() {
     );
 }
 
-/// Reviewer follow-up to issue #73 (see
-/// `CatalogError::TargetTableSuffixCollision`'s own doc comment):
+/// See `CatalogError::TargetTableSuffixCollision`'s own doc comment:
 /// qualifying `target_table` narrowed its `unique` constraint to the
 /// *qualified* spelling only, so two live definitions could otherwise
 /// coexist as `public.foo` and `custom.foo` — most plausibly from
@@ -913,9 +912,8 @@ async fn a_target_table_colliding_on_bare_suffix_under_a_different_schema_is_rej
     assert_eq!(count, 1, "the rejected second definition must not persist");
 }
 
-/// Reviewer follow-up to issue #73's own follow-up
-/// (`transform_definitions_target_suffix_idx`): the TOCTOU race the
-/// index exists to close, reproduced for real rather than merely asserted by
+/// The TOCTOU race that `transform_definitions_target_suffix_idx` exists to
+/// close, reproduced for real rather than merely asserted by
 /// inspection. `create_definition_inner`'s pre-check
 /// (`a_target_table_colliding_on_bare_suffix_under_a_different_schema_is_rejected`
 /// above) only ever sees its own transaction's snapshot, so it cannot see a
@@ -1108,7 +1106,7 @@ async fn a_concurrent_insert_racing_the_target_suffix_index_is_translated_to_a_c
 }
 
 /// `all_source_tables` returns the anchor `source_table` of each registered
-/// transform. Issue #75, ADR-0011: fully-qualified, not a bare suffix.
+/// transform. ADR-0011: fully-qualified, not a bare suffix.
 #[tokio::test]
 async fn all_source_tables_returns_each_transforms_anchor_table() {
     let cluster = TestCluster::start();
@@ -1128,15 +1126,14 @@ async fn all_source_tables_returns_each_transforms_anchor_table() {
     assert_eq!(tables, vec![qualified("orders")]);
 }
 
-/// Issue #75, ADR-0011: `all_source_tables` must return each source's own
+/// ADR-0011: `all_source_tables` must return each source's own
 /// *actual* persisted qualified name, not a bare suffix a caller then has to
-/// re-guess against one assumed schema. Before this fix it returned the bare
-/// `split_part(source_table, '.', 2)` suffix, and its one production caller
-/// (`client::reconcile_source_tables`) re-qualified every result against
-/// `Config::target_schema` (`"public"` by default) — wrong for a source
-/// living anywhere else, including via issue #76's explicit-schema grammar.
+/// re-guess against one assumed schema (its one production caller,
+/// `client::reconcile_source_tables`, would otherwise re-qualify every result
+/// against `Config::target_schema` (`"public"` by default) — wrong for a
+/// source living anywhere else, including via the explicit-schema grammar).
 ///
-/// Proven the same way issue #76's own
+/// Proven the same way
 /// `an_explicitly_qualified_source_resolves_to_that_exact_relation_not_search_path`
 /// proves explicit qualification itself: a same-named decoy table sits in
 /// the schema the old bug would have guessed (`public`, `reconcile_source_tables`'s
@@ -1183,12 +1180,12 @@ async fn all_source_tables_returns_the_actual_schema_not_a_target_schema_guess()
     );
 }
 
-/// Issue #36's exact repro: a 1-1 transform with a pass-through field named
+/// A 1-1 transform with a pass-through field named
 /// the same as the source column it reads (`author AS author`) must not be
 /// rejected as a self-referencing cycle, even alongside other calculated
 /// fields on the same target. `is_self_passthrough` in `validate.rs`
 /// already exempts `column == field.name` when `column` is a source
-/// column — this pins that exemption against the issue's literal schema
+/// column — this pins that exemption against a literal schema
 /// and DSL so a regression here fails loudly.
 #[tokio::test]
 async fn a_passthrough_field_sharing_its_source_columns_name_is_not_a_cycle() {
@@ -1236,8 +1233,7 @@ async fn a_passthrough_field_sharing_its_source_columns_name_is_not_a_cycle() {
 }
 
 /// Seeds the `authors`/`posts` schema from `poc/schema_dump.sql` (the same
-/// DDL issue #36's test above uses) — the exact repro schema issue #47's
-/// report is filed against.
+/// DDL the passthrough-cycle test above uses).
 async fn create_authors_and_posts(pool: &trellis::pool::Pool) {
     let client = pool.get().await.expect("get connection");
     client
@@ -1263,7 +1259,7 @@ async fn create_authors_and_posts(pool: &trellis::pool::Pool) {
         .expect("seed authors and posts");
 }
 
-/// Issue #47: an aggregate (`GROUP BY`) transform's delta maintenance needs
+/// An aggregate (`GROUP BY`) transform's delta maintenance needs
 /// the source row's old image on delete/update/re-parent to find which group
 /// to decrement. The capture trigger sees every column of the old row
 /// whatever the table's settings, so an aggregate over a plain table is
@@ -1287,8 +1283,7 @@ async fn an_aggregate_transform_on_a_plain_table_is_accepted() {
     .expect("an aggregate transform on a plain table should be accepted");
 }
 
-/// Reviewer follow-up to issue #74 (epic #78's own whole-branch review): a
-/// bare aggregate `FROM t` chained off a *different* definition's target
+/// A bare aggregate `FROM t` chained off a *different* definition's target
 /// that was explicitly qualified into a non-default schema. `custom` is
 /// nowhere on this pool's pinned `search_path`
 /// (`Config::schema`/`Config::target_schema`/`public`), so a bare
@@ -1337,21 +1332,12 @@ async fn an_aggregate_against_a_bare_source_chained_off_an_explicitly_qualified_
     );
 }
 
-/// Issue #121: a `OneToOne` target's primary key used to be narrowed down to
-/// a single column, mirroring the source's own (issue #177's
-/// `create_definition_inner` gate, backed by the now-removed
-/// `ddl::require_single_column_pk`) — so a source with a genuinely composite
-/// primary key used to be rejected outright. This issue removed that
-/// narrowing: the target's own primary key now mirrors the source's in full,
-/// at whatever arity it has, so a composite-PK source is accepted instead.
+/// A `OneToOne` target's primary key mirrors the source's in full, at
+/// whatever arity it has, so a composite-PK source is accepted.
 ///
 /// [`create_definition`] is the ring-path entry point this test calls
-/// directly, deliberately bypassing [`install_definition`] entirely — the
-/// same entry point issue #177 found didn't run the (then-existing) arity
-/// check at all, so a composite-PK source reaching Postgres only via
-/// `create_definition`/`create_definition_without_backfill` used to skip
-/// straight through to `staging::apply`'s own machinery instead of being
-/// rejected up front; now there is nothing left to reject, so it drains
+/// directly, deliberately bypassing [`install_definition`] entirely; there
+/// is no arity check to skip, so a composite-PK source drains
 /// cleanly through this same entry point (see `quarantine.rs`'s
 /// `a_composite_primary_key_source_drains_cleanly_with_no_quarantine_or_halt`
 /// for the fuller end-to-end pin of that, and

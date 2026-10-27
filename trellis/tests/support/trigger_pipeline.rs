@@ -8,15 +8,15 @@
 //! starts their readers' builds. From then on the application's own writes
 //! stage their ring rows, and [`Pipeline::drain`] seals and drains the ring
 //! by hand until nothing is pending. So a source row reaches the ring spelled
-//! exactly the way capture spells it (the half of issue #267 a test that
+//! exactly the way capture spells it (the half a test that
 //! hand-stages the row would write in itself), with no background worker, no
-//! seal timer and no waiting for convergence (#297). Each seal/drain round is
+//! seal timer and no waiting for convergence. Each seal/drain round is
 //! its own batch, so a hop's own downstream staging always lands in a later
 //! batch than the write that produced it.
 //!
 //! The captured set is exactly what [`trellis::defs::tables_to_capture`]
-//! asks for, and [`Pipeline::attach`] asserts it up front: since issue #315
-//! no Trellis-owned target is ever captured.
+//! asks for, and [`Pipeline::attach`] asserts it up front: no Trellis-owned
+//! target is ever captured.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -122,7 +122,7 @@ impl Pipeline {
             .expect("tables_to_capture");
         assert_eq!(
             desired, expected_captured,
-            "only tables this instance does not own are captured (issues #315, #375)"
+            "only tables this instance does not own are captured"
         );
         let mut waiting = -1;
         for _ in 0..MAX_PASSES {
@@ -164,7 +164,7 @@ impl Pipeline {
     }
 
     /// Seals and drains until nothing is pending. A drain that fails panics
-    /// with its error rather than being retried forever (issue #267's
+    /// with its error rather than being retried forever (a
     /// live-lock).
     pub async fn drain(&mut self) {
         for _ in 0..MAX_ROUNDS {

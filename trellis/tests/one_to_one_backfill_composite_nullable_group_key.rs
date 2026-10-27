@@ -1,9 +1,9 @@
-//! Regression test for a panic found during review of issue #121 (composite
-//! primary keys for 1-1 transforms): a plain (non-aggregate)
+//! Regression test for a panic found during review of composite
+//! primary keys for 1-1 transforms: a plain (non-aggregate)
 //! [`KeySpace::OneToOne`] chained directly onto a **composite** aggregate
 //! `GROUP BY` key — one of whose columns is nullable
 //! (`create_aggregate_target_table`'s `UNIQUE NULLS NOT DISTINCT` grouping
-//! constraint, issue #128) — could panic during its own from-scratch
+//! constraint) — could panic during its own from-scratch
 //! backfill, rather than silently skipping the `NULL`-keyed group the way
 //! `one_to_one_chained_off_nullable_aggregate_group_key.rs` already
 //! documents for the live-apply path.
@@ -33,7 +33,7 @@
 //! the ring instead
 //! (`staging::build`'s `stage_null_keys`), and the drain writes its row:
 //! `stock_echo` is keyed `UNIQUE NULLS NOT DISTINCT` like `stock_totals`,
-//! so it holds that group (issue #1141).
+//! so it holds that group.
 //!
 //! [`KeySpace::OneToOne`]: trellis::defs::ast::KeySpace::OneToOne
 
@@ -178,7 +178,7 @@ async fn backfill_across_a_composite_nullable_group_key_writes_the_null_group_wi
             (("z".to_string(), None), Some("2".to_string())),
         ]),
         "the NULL-sku group has its row in the chained target, keyed by a \
-         real NULL (issue #1141)"
+         real NULL"
     );
 }
 

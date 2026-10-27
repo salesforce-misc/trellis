@@ -1,19 +1,17 @@
-//! End-to-end tests for issue #113's temporal types (`date`, `time`,
+//! End-to-end tests for the temporal types (`date`, `time`,
 //! `timetz`, `timestamp`, `timestamptz`, `interval`) against a real,
-//! ephemeral Postgres via `testkit::TestCluster` — including issue #248's
-//! fix, which reconciled `to_jsonb`'s row-body renderer with `::text` and
-//! re-admitted `timestamp` to every key role `date`/`time`/
-//! `timetz` already held, and issue #246's fix, which pinned the walsender's
-//! output GUCs (including, now, `TimeZone`) the same way the pool's already
-//! were and let `timestamptz` join them too.
+//! ephemeral Postgres via `testkit::TestCluster` — including the row-body
+//! renderer that agrees with `::text` (so `timestamp` holds every key role
+//! `date`/`time`/`timetz` do), and the walsender's output GUCs (including
+//! `TimeZone`) pinned the same way the pool's are, which lets `timestamptz`
+//! join them too.
 //!
 //! # Why these run against a live server
 //!
-//! `docs/type-support.md` had every temporal row marked `🎯 typed index`,
-//! on the premise that #110's typed key index was the prerequisite for any
-//! key role. #111 found that premise wrong for `oid` and #112 found it
-//! right for floats, so #113 treats it as a question to be *asked of a
-//! server*, per family, rather than answered from the block's name. Every
+//! A typed key index is not automatically the prerequisite for a key
+//! role: that premise is wrong for `oid` and right for floats, so each
+//! family is a question to be *asked of a
+//! server*, rather than answered from the block's name. Every
 //! claim below is therefore a claim about agreeing with a real Postgres,
 //! and is checked against one:
 //!
@@ -25,17 +23,16 @@
 //! 2. **The one remaining refusal, demonstrated not asserted.** `interval`
 //!    is refused every key role because `'24 hours' = '1 day'` is **true**
 //!    while their `::text` differs; the test reads both facts out of the
-//!    server. `timestamptz` used to be refused too, because its rendering
-//!    moved with `TimeZone` on a walsender Trellis couldn't pin — issue
-//!    #246 closed that (independently of #248), and
+//!    server. `timestamptz` is admitted because Trellis pins `TimeZone` on
+//!    the walsender as well as the pool, and
 //!    `timestamptz_text_moves_with_the_session_timezone` below still shows
 //!    the underlying hazard `TimeZone` pinning now defends against.
-//! 3. **Issue #248's fix, both directly and end-to-end.**
+//! 3. **The row renderer, both directly and end-to-end.**
 //!    `the_engine_s_own_row_renderer_agrees_with_text_for_every_temporal_family`
 //!    exercises the actual replacement renderer
 //!    (`staging::apply::row_as_text_jsonb_sql`) against `::text`, and
 //!    `a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_not_two`
-//!    reproduces #113's review finding end-to-end through a real drain —
+//!    reproduces the two-renderer hazard end-to-end through a real drain —
 //!    one Postgres `GROUP BY` group, one target row, seeded partly through
 //!    an image-bearing change and partly through a bare, image-less
 //!    recompute trigger (the shape that used to force
@@ -293,14 +290,14 @@ async fn the_text_stability_verdict_is_the_server_s_not_this_crate_s() {
         );
 
         // Bijective-under-`::text` is necessary and **not sufficient** —
-        // that used to be the whole shape of the finding for `timestamp`/
+        // that is the whole shape of the hazard for `timestamp`/
         // `timestamptz`: a single reader groups them perfectly (this probe,
         // one session throughout, measures exactly that), but a *second*
-        // renderer used to disagree. For `timestamp` that second renderer
-        // was `to_jsonb` (issue #248, see
+        // renderer could disagree. For `timestamp` that second renderer
+        // would be raw `to_jsonb` (see
         // `to_jsonb_and_text_agree_for_every_admitted_key_type`); for
-        // `timestamptz` it was additionally the walsender, whose `TimeZone`
-        // Trellis couldn't pin until issue #246
+        // `timestamptz` it would additionally be the walsender, whose
+        // `TimeZone` Trellis pins
         // (`timestamptz_text_moves_with_the_session_timezone` below still
         // demonstrates the underlying hazard `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`
         // now defends against on the pool and in the capture function). Both
@@ -320,7 +317,7 @@ async fn the_text_stability_verdict_is_the_server_s_not_this_crate_s() {
 /// `interval`'s specific defect, spelled out rather than inferred from the
 /// count above: two values that are `=` and render differently.
 ///
-/// This is the `-0`/`0` of #112, one family over, and it is why no GUC
+/// This is the float `-0`/`0` problem, one family over, and it is why no GUC
 /// rescues `interval`'s key roles — `IntervalStyle` changes *which* two
 /// spellings these are, never that there are two.
 #[tokio::test]
@@ -353,16 +350,12 @@ async fn equal_intervals_can_render_differently() {
 /// the *same* value renders differently depending on the reading session's
 /// `TimeZone`, rather than two different values rendering the same.
 ///
-/// Issue #113 considered pinning `TimeZone = 'UTC'` alongside `DateStyle`
-/// to make this go away, and declined at the time — see
-/// `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` for why (Trellis used to render
-/// `timestamptz` on a walsender whose GUCs it could not set, so the pin
-/// would have guaranteed an asymmetry it only risked before). Issue #246
-/// closed that gap by pinning the walsender too, so `TimeZone` now *is*
-/// pinned (to `'UTC'`) on every connection Trellis opens, and `timestamptz`
-/// is a text-stable key type as of this issue. What this test still pins is
-/// the underlying, session-scoped fact that made the old decision necessary
-/// in the first place — an *unpinned* connection's rendering genuinely does
+/// Pinning `TimeZone = 'UTC'` alongside `DateStyle` makes this go away: see
+/// `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`. `TimeZone` is pinned (to `'UTC'`)
+/// on every connection Trellis opens, the walsender's included, and
+/// `timestamptz` is a text-stable key type. What this test still pins is
+/// the underlying, session-scoped fact that makes the pin necessary
+/// — an *unpinned* connection's rendering genuinely does
 /// move with `TimeZone`, which is exactly the hazard the pin defends
 /// against.
 #[tokio::test]
@@ -484,7 +477,7 @@ async fn datestyle_moves_date_and_timestamp_but_not_time() {
 // 4. Aggregates
 // ---------------------------------------------------------------------
 
-/// **The guard for the #113 review's finding.** Every type Trellis admits
+/// **The guard for the two-renderer hazard.** Every type Trellis admits
 /// as a key must render *identically* under both of the engine's two
 /// renderers — the per-column `<col>::text` most paths use, and the
 /// whole-row `to_jsonb(t.*)`/`jsonb_each_text` the live-row reads use
@@ -496,14 +489,14 @@ async fn datestyle_moves_date_and_timestamp_but_not_time() {
 /// target rows for one Postgres group. `timestamp`/`timestamptz` disagree
 /// under raw `to_jsonb(t.*)` — it writes an ISO-8601 `T` — which is why
 /// **that specific renderer** is never used for a row read any more
-/// (`staging::apply::row_as_text_jsonb_sql` replaced it, issue #248); both
+/// (`staging::apply::row_as_text_jsonb_sql` replaced it); both
 /// are admitted key types today despite this raw disagreement persisting,
 /// which this test also pins so a future regression back to raw
 /// `to_jsonb(t.*)` fails loudly here instead of shipping silently.
 ///
 /// This sweeps the *whole* allowlist rather than the temporal families, so
-/// it also guards the types #111/#112 and earlier issues admitted, and will
-/// fail for any family a future issue adds without checking.
+/// it also guards every admitted type, and will
+/// fail for any family added without checking.
 #[tokio::test]
 async fn to_jsonb_and_text_agree_for_every_admitted_key_type() {
     let cluster = TestCluster::start();
@@ -528,8 +521,8 @@ async fn to_jsonb_and_text_agree_for_every_admitted_key_type() {
         ("c_date", "date", "2024-06-15", true),
         ("c_time", "time", "12:34:56", true),
         ("c_timetz", "timetz", "12:34:56+00", true),
-        // Controls: both admitted key types (`timestamp` since #248,
-        // `timestamptz` since #246) despite raw `to_jsonb(t.*)` disagreeing
+        // Controls: both admitted key types (`timestamp`,
+        // `timestamptz`) despite raw `to_jsonb(t.*)` disagreeing
         // with `::text` for both — the reason that disagreement doesn't
         // block admission is that nothing inside Trellis calls raw
         // `to_jsonb(t.*)` any more (`staging::apply::row_as_text_jsonb_sql`
@@ -588,16 +581,16 @@ async fn to_jsonb_and_text_agree_for_every_admitted_key_type() {
 
     // Raw `to_jsonb(t.*)` still disagrees with `::text` for `timestamp` and
     // `timestamptz` (see `c_ts`/`c_tstz` above, `expect_agreement = false`)
-    // — that is a fact about bare Postgres, unaffected by issue #248, and
-    // it will stay true forever. What #248 changed is that **nothing inside
+    // — that is a fact about bare Postgres, and
+    // it will stay true forever. What matters is that **nothing inside
     // Trellis calls raw `to_jsonb(t.*)` for a row read any more** (see
     // `the_engine_s_own_row_renderer_agrees_with_text_for_every_temporal_family`,
     // below, which cross-checks the actual renderer
     // `staging::apply::row_as_text_jsonb_sql` now uses), so both are
     // admitted here despite this raw-`to_jsonb` disagreement persisting —
-    // `timestamptz` needed issue #246 on top of #248 (the pool-vs-walsender
-    // `TimeZone` gap, independent of `to_jsonb` vs. `::text`) before it
-    // could join. `interval` is admitted here too (raw `to_jsonb` agrees
+    // `timestamptz` additionally needs the pool and the walsender pinned to
+    // the same `TimeZone` (independent of `to_jsonb` vs. `::text`).
+    // `interval` is admitted here too (raw `to_jsonb` agrees
     // with `::text` for it) but still refused every key role, because it
     // fails the *other* half of `is_text_stable` — equal values render
     // differently (`'1 day'` vs `'24 hours'`), which no renderer
@@ -612,7 +605,7 @@ async fn to_jsonb_and_text_agree_for_every_admitted_key_type() {
     assert!(!temporal::is_text_stable(PgType::Interval));
 }
 
-/// Issue #248's actual fix, exercised directly against a live server: the
+/// The engine's row renderer, exercised directly against a live server: the
 /// renderer Trellis now uses in place of `to_jsonb(t.*)` —
 /// `staging::apply::live_row_columns` (the live column list) plus
 /// `staging::apply::row_as_text_jsonb_sql` (the explicit per-column
@@ -623,14 +616,10 @@ async fn to_jsonb_and_text_agree_for_every_admitted_key_type() {
 /// This is the direct counterpart to
 /// `to_jsonb_and_text_agree_for_every_admitted_key_type` above, but it
 /// exercises the actual SQL Trellis's read paths now build, rather than bare
-/// `to_jsonb(t.*)`. It deliberately covers `timestamptz` too, even though
-/// `timestamptz` still holds no key/MIN-MAX role: that refusal is issue
-/// #246 (a *different* renderer pair — the pool vs. the walsender — which
-/// this fix does not and cannot touch), not a residual `to_jsonb`-vs-`::text`
-/// disagreement. Proving the renderer itself is fully reconciled here is
-/// what makes it legible, from the test suite alone, that `timestamptz`'s
-/// continued refusal in `trellis::temporal` is a deliberate, independent
-/// deferral rather than an oversight.
+/// `to_jsonb(t.*)`. It deliberately covers `timestamptz` too: the pool vs.
+/// the walsender is a *different* renderer pair, handled by pinning
+/// `TimeZone`, and this test shows the row renderer has no residual
+/// `to_jsonb`-vs-`::text` disagreement of its own.
 #[tokio::test]
 async fn the_engine_s_own_row_renderer_agrees_with_text_for_every_temporal_family() {
     use trellis::staging::apply;
@@ -701,7 +690,7 @@ async fn the_engine_s_own_row_renderer_agrees_with_text_for_every_temporal_famil
             .get(0);
         assert_eq!(
             via_text, via_engine[*name],
-            "{pg_type}: the engine's own row renderer must agree with ::text (issue #248)"
+            "{pg_type}: the engine's own row renderer must agree with ::text"
         );
     }
 }
@@ -715,10 +704,10 @@ async fn the_engine_s_own_row_renderer_agrees_with_text_for_every_temporal_famil
 /// allowlist, `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`, gates both), while
 /// `interval` alone is refused.
 ///
-/// This is the headline change of #113 (`date`/`time`/`timetz`) plus #248
-/// (`timestamp`, once its `to_jsonb`-vs-`::text` divergence was fixed) plus
-/// #246 (`timestamptz`, once the walsender could be pinned to the same
-/// `TimeZone` as the pool), and the split is the point: the matrix had all
+/// `date`/`time`/`timetz` need nothing special, `timestamp` is admitted
+/// because its `to_jsonb`-vs-`::text` divergence is avoided, and
+/// `timestamptz` because the walsender is pinned to the same
+/// `TimeZone` as the pool, and the split is the point: the matrix had all
 /// six marked `🎯 typed index`, and five of them never needed the index at
 /// all.
 #[tokio::test]
@@ -746,17 +735,15 @@ async fn temporal_join_keys_are_admitted_per_family() {
         ("j_date", "d", "p_date"),
         ("j_tm", "tm", "p_tm"),
         ("j_tmtz", "tmtz", "p_tmtz"),
-        // `timestamp` used to be refused for the #113 review's reason: it is
-        // a bijection under `::text` but `to_jsonb` spelled it with an
-        // ISO-8601 `T`, and the engine used both renderers. Issue #248 fixed
+        // `timestamp` is a bijection under `::text`, but raw `to_jsonb`
+        // spells it with an ISO-8601 `T`; the engine's row renderer avoids
         // that (see `to_jsonb_and_text_agree_for_every_admitted_key_type`
         // and `the_engine_s_own_row_renderer_agrees_with_text_for_every_temporal_family`
-        // below), so `timestamp` now joins the accepted group.
+        // below), so `timestamp` joins the accepted group.
         ("j_ts", "ts", "p_ts"),
-        // `timestamptz` used to be refused for a *second*, independent
-        // reason on top of the `to_jsonb` one above: its rendering moved
-        // with `TimeZone`, and issue #113 could pin that on the pool but
-        // not on the walsender. Issue #246 closed that gap, so `timestamptz`
+        // `timestamptz` has a *second*, independent hazard on top of the
+        // `to_jsonb` one above: its rendering moves with `TimeZone`. Trellis
+        // pins that on both the pool and the walsender, so `timestamptz`
         // joins the accepted group too.
         ("j_tstz", "tstz", "p_tstz"),
     ] {
@@ -816,8 +803,8 @@ async fn a_precision_modified_temporal_key_is_still_recognized() {
     // `format_type` renders this `time(2) with time zone`, which the old
     // `split('(')` truncated to `time`. (`timestamp(3)` above shows the
     // rendering hazard itself; `timetz` is what actually exercises the fix
-    // end-to-end. `timestamp` is an admitted key type since #248, but this
-    // test predates that and there's no need to duplicate coverage here —
+    // end-to-end. `timestamp` is an admitted key type, but there's no need
+    // to duplicate coverage here —
     // `temporal_join_keys_are_admitted_per_family` already covers plain
     // `timestamp`.)
     client
@@ -887,7 +874,7 @@ async fn time_and_timetz_literals_are_canonical_only() {
         "TIMETZ '13:45:00+05:30:15'",
         // A zero *minutes* field with a non-zero seconds field IS canonical
         // — `timetz_out` drops only a trailing all-zero tail, so
-        // `'12:00:00+05:00:30'` prints as itself (#113 review).
+        // `'12:00:00+05:00:30'` prints as itself.
         "TIMETZ '13:45:00+05:00:30'",
         "TIMETZ '13:45:00+00:00:30'",
         "TIMETZ '13:45:00-00:00:30'",
@@ -1005,20 +992,19 @@ async fn interval_in_reads_intervalstyle_which_is_why_there_is_no_interval_liter
 // 7. The live delta path
 // ---------------------------------------------------------------------
 
-/// Issue #113's review finding, reproduced end-to-end and pinned as a
+/// The two-renderer hazard, reproduced end-to-end and pinned as a
 /// regression: a `timestamp` `GROUP BY` group whose two source rows reach
 /// the engine through *different* row-decode paths must still fold into
 /// **one** target row, not two.
 ///
-/// Before issue #248, `staging::apply::read_live_rows_batch` decoded a
-/// live-refetched row via `to_jsonb(t.*)`, which spells a `timestamp`
+/// Were `staging::apply::read_live_rows_batch` to decode a
+/// live-refetched row via `to_jsonb(t.*)`, it would spell a `timestamp`
 /// `2024-06-15T12:34:56` — a `T` where `::text` (and a real CDC image) renders
-/// a space. The old aggregate path read a change's
-/// `GROUP BY` column straight off the decoded `Row`, so a group touched once
+/// a space. A group touched once
 /// through an ordinary image-bearing change (space-spelled) and once through
-/// a live refetch (`T`-spelled, pre-#248) staged as *two* distinct group-key
-/// strings for what is, in Postgres, one single group — the `total = 20`
-/// instead of `total = 15` finding from #113's review.
+/// a live refetch (`T`-spelled) would then stage as *two* distinct group-key
+/// strings for what is, in Postgres, one single group — `total = 20`
+/// instead of `total = 15`.
 ///
 /// This reproduces exactly that shape:
 ///
@@ -1029,7 +1015,7 @@ async fn interval_in_reads_intervalstyle_which_is_why_there_is_no_interval_liter
 ///   propagation/definition-re-derive all use, per `append.rs`'s own doc
 ///   comment). `compute()` has no image to decode for it, so it lands in
 ///   `live_refetch_indices` and is decoded via
-///   `staging::apply::read_live_rows_batch` — the exact call site issue #248
+///   `staging::apply::read_live_rows_batch` — the exact call site
 ///   fixed.
 ///
 /// Both rows share the identical `grp` instant. If the two decode paths ever
@@ -1157,8 +1143,7 @@ async fn a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_
     assert_eq!(
         rows.len(),
         1,
-        "one Postgres GROUP BY group must land as one target row, not two \
-         (issue #113's review finding); got {rows:?}",
+        "one Postgres GROUP BY group must land as one target row, not two; got {rows:?}",
         rows = rows
             .iter()
             .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))

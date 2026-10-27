@@ -1,6 +1,6 @@
 //! An enum value relabelled (`ALTER TYPE ... RENAME VALUE`) pauses every
 //! definition that reads a column of the type, and `RESUME` rebuilds it from
-//! the source without casting any label it stored (#1241, ADR-0020 "Stored
+//! the source without casting any label it stored (ADR-0020 "Stored
 //! value text is trusted only under the type's current value identity").
 //!
 //! Trellis keeps an enum value as its label text in ring images, held keys
@@ -15,7 +15,7 @@
 //!
 //! Each shape: the relabel pauses it with the reason, and `RESUME` then
 //! gives zero oracle difference, no held key and `self_check` `Converged`.
-//! Every step is explicit; nothing polls (#297).
+//! Every step is explicit; nothing polls.
 
 #[path = "support/relabel.rs"]
 mod relabel;
@@ -304,7 +304,7 @@ async fn a_relabel_of_a_type_no_longer_read_pauses_nothing() {
         "alter table public.s alter column tone type public.mood using tone::text::public.mood",
     )
     .await;
-    // The re-type pauses it (#1327), and the resume rebuilds it.
+    // The re-type pauses it, and the resume rebuilds it.
     for _ in 0..4 {
         h.pass().await;
         if h.status("t1").await == TransformStatus::Paused {

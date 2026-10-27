@@ -1,23 +1,23 @@
-//! #1103 (G5): partition maintenance under a group-basis aggregate.
+//! Partition maintenance under a group-basis aggregate.
 //!
 //! A leaf or middle `DROP`, `DETACH`, `TRUNCATE` or `ATTACH`, a new leaf
 //! written directly before its capture, a `DEFAULT` whose siblings changed,
 //! and the complement sweep's correction are each corrected by recomputing
 //! the groups that route to the node: the target's, those of undrained ring
 //! images and those of the node's current rows, with a snapshot taken after
-//! the operation as each group's basis (#1043 F4). Never by a zero.
+//! the operation as each group's basis. Never by a zero.
 //!
 //! Every test starts from an empty source, built before
 //! its tree is recorded, and seeds it through capture. The pass, the
-//! drain and the engine are called by hand; nothing waits for convergence
-//! (#297). The oracle is a from-scratch `GROUP BY` over the source, and the
+//! drain and the engine are called by hand; nothing waits for convergence.
+//! The oracle is a from-scratch `GROUP BY` over the source, and the
 //! hidden partials must never go negative.
 //!
-//! The cases are #1043 E1's variant-L scenarios (`P.*`), #958's lifecycle
+//! The cases are the variant-L scenarios (`P.*`), the lifecycle
 //! cells (X12-7a two-level trees, X12-7b a `DEFAULT` operated on, X12-7c a
 //! `HASH` re-split, X12-7e writes into the node while it is corrected), and
 //! the sweep's interleavings from `tests/partition_sweep.rs`, with no
-//! full-routing fallback (#1129).
+//! full-routing fallback.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -313,7 +313,7 @@ impl Fx {
     }
 }
 
-// --- Leaf and middle operations (#1043 E1 variant L, `P.*`) ---------------
+// --- Leaf and middle operations (variant L, `P.*`) ---------------
 
 /// `P.drop` / `P.detach`: a leaf dropped or detached with changes to it
 /// still undrained in the ring. The recompute's basis sees their
@@ -595,7 +595,7 @@ async fn a_group_first_written_after_the_enumeration_is_kept() {
 }
 
 /// A re-attach detected after a reader enumerated a queued `new_leaf`'s
-/// groups, and before it recomputed them, queues its own entry (#1151): the
+/// groups, and before it recomputed them, queues its own entry: the
 /// reader has started, so its enumeration misses a group the leaf gained
 /// while it was detached, and the queued entry cannot absorb the operation.
 #[tokio::test]
@@ -720,7 +720,7 @@ async fn writes_into_the_leaf_during_its_correction_converge() {
 }
 
 /// How a leaf operation's correction meets the page in flight of changes the
-/// operation removed (#1309).
+/// operation removed.
 #[derive(Debug, Clone, Copy)]
 enum Race {
     /// The page holds the groups; the correction's recompute queues behind
@@ -734,7 +734,7 @@ enum Race {
     PageBetweenEnumerationAndRecompute,
 }
 
-/// #1309: a leaf `TRUNCATE`, `DETACH` or `DROP` while a page applying rows
+/// A leaf `TRUNCATE`, `DETACH` or `DROP` while a page applying rows
 /// of the leaf's groups, committed before the operation, is in flight. The
 /// page is frozen right after its group lock or after its increments, and
 /// meets the operation's correction each way round ([`Race`]); a write into
@@ -877,7 +877,7 @@ async fn leaf_operation_races_a_page(
         .then(|| format!("{what}: {groups:?}, negative {partials:?}"))
 }
 
-/// #1309: a leaf truncate's correction whose recompute gives up on a group a
+/// A leaf truncate's correction whose recompute gives up on a group a
 /// page holds (its `lock_timeout`) stays queued and runs again, so the
 /// truncated rows are not left counted: under `run_pending` and under a
 /// drain worker's claim alike. (The #1117 soak's model ran its
@@ -989,7 +989,7 @@ async fn a_detach_pending_leaf_waits_for_the_detach_to_finalize() {
     assert!(fx.queue().await.is_empty());
 }
 
-// --- Two-level trees, DEFAULTs and HASH re-splits (#958) ------------------
+// --- Two-level trees, DEFAULTs and HASH re-splits ------------------
 
 /// `RANGE` then `HASH`: the root's ranges 0-7 and 8-15, the second a `HASH`
 /// middle of four leaves.
@@ -1125,7 +1125,7 @@ async fn a_hash_resplit_converges() {
 
 /// A new `HASH` leaf's correction routes by the leaf's text, which embeds its
 /// middle's oid. A middle dropped before the correction runs makes that text
-/// raise `XX000`; the correction is complete without work instead (#1148),
+/// raise `XX000`; the correction is complete without work instead,
 /// and the middle's own `gone_node`, queued by the next pass, recomputes the
 /// region.
 #[tokio::test]
@@ -1459,8 +1459,8 @@ async fn a_complement_whose_hash_middle_is_dropped_completes_and_converges() {
     assert!(fx.queue().await.is_empty());
 }
 
-/// A recorded leaf whose capture was switched off by hand is a disruption
-/// (#707, #1200): the reader pauses, nothing is reinstalled or rebuilt, and
+/// A recorded leaf whose capture was switched off by hand is a disruption:
+/// the reader pauses, nothing is reinstalled or rebuilt, and
 /// the install's new-nodes shortcut is for nodes the recorded tree never
 /// held.
 #[tokio::test]
@@ -1489,7 +1489,7 @@ async fn a_recorded_leaf_whose_capture_was_switched_off_pauses_the_reader() {
     assert_eq!(disabled, ["(5)"], "nothing reinstalls");
 }
 
-/// #1147: a new leaf, empty or loaded before its capture, is corrected in the
+/// A new leaf, empty or loaded before its capture, is corrected in the
 /// pass that sees it, leaf alone. The reinstall of its capture records no
 /// capture gate and rebuilds no reader (either would re-read every key of the
 /// source for each reader): the aggregate stays `live` through the pass, and
@@ -1542,9 +1542,8 @@ async fn a_new_leaf_costs_no_rebuild_and_no_source_wide_enumeration() {
     }
 }
 
-/// `--ignored`: what a leaf's correction costs on the group basis (#1043
-/// E2's world): a `RANGE` leaf of `TRELLIS_MEASURE_LEAF_ROWS` rows (1M by
-/// default) over 1,560 groups beside a leaf of a tenth as many over 1,000
+/// `--ignored`: what a leaf's correction costs on the group basis: a `RANGE` leaf of
+/// `TRELLIS_MEASURE_LEAF_ROWS` rows (1M by default) over 1,560 groups beside a leaf of a tenth as many over 1,000
 /// groups, the group key the partition key with an index leading on it (the
 /// primary key). The leaf is loaded outside capture and attached, then
 /// detached, attached again, truncated, and a second loaded leaf attached and
@@ -1736,7 +1735,7 @@ async fn a_default_narrowed_before_its_recompute_is_read_through_the_root() {
     assert!(fx.queue().await.is_empty());
 }
 
-// --- A rebuild of a partitioned source: one transaction per leaf (#1101) ---
+// --- A rebuild of a partitioned source: one transaction per leaf ---
 
 const REBUILD_OPTIONS: WorkerOptions = WorkerOptions {
     chunk_rows: 1_000,
@@ -2228,7 +2227,7 @@ async fn groups_with_a_null_part_read_through_the_root_are_exact() {
     assert_eq!(fx.status().await, "live");
 }
 
-// --- A RESUME over a partitioned source: one transaction per leaf (#1101) ---
+// --- A RESUME over a partitioned source: one transaction per leaf ---
 
 /// `RESUME` of the aggregate over a four-leaf source keeps the visible
 /// target and rebuilds it one leaf at a time, then the groups no leaf
@@ -2417,7 +2416,7 @@ async fn a_reader_of_an_aggregate_resumed_per_leaf_is_rebuilt_once() {
 /// A leaf's correction that reads it by one `GROUP BY` matches the leaf's
 /// groups to the locked ones at the hidden table's types: a `varchar` group
 /// column is held as `text`, and its array match with the leaf's own
-/// `varchar` column would have no `=` (#1318's review). One label per `g`,
+/// `varchar` column would have no `=`. One label per `g`,
 /// so the oracle by `g` still checks every `(g, label)` group.
 #[tokio::test]
 async fn a_leaf_read_matches_a_varchar_group_column_at_its_held_type() {

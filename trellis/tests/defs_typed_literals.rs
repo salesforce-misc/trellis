@@ -1,4 +1,4 @@
-//! End-to-end tests for issue #109's typed-literal grammar, against a real,
+//! End-to-end tests for the typed-literal grammar, against a real,
 //! ephemeral Postgres via `testkit::TestCluster`.
 //!
 //! The point of this issue is that a calculated field can *produce* a value
@@ -44,9 +44,9 @@ use trellis::staging::apply;
 // ---------------------------------------------------------------------
 // The families that exercise this shared mechanism, each with a canonical
 // literal and the Postgres text it must round-trip to. `date` and
-// `timestamp` are the temporal cases (#113) issue #109 itself proved the
-// mechanism against, `bytea` the binary one (#114), `bit varying` the
-// bit-string one (#118), and `jsonb` (#115) the first case whose canonical
+// `timestamp` are the temporal cases that prove the
+// mechanism against, `bytea` the binary one, `bit varying` the
+// bit-string one, and `jsonb` the first case whose canonical
 // form needs a real recursive checker rather than a fixed-shape one;
 // fixed-length `bit` is deliberately absent — see
 // `defs::typed_literal::TYPED_LITERALS`.
@@ -62,12 +62,12 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "timestamp without time zone",
     ),
     ("b", "BYTEA", "\\x0102ff", "bytea"),
-    // Issue #118: `bit varying` joins the allowlist; fixed-length `bit` does
+    // `bit varying` joins the allowlist; fixed-length `bit` does
     // not (see `defs::typed_literal::TYPED_LITERALS`'s doc comment for why —
     // its bare default typmod is `bit(1)`, a truncation trap `bit varying`'s
     // unconstrained default doesn't have).
     ("v", "VARBIT", "101", "bit varying"),
-    // Issue #115: exercises a nested object/array, sorted keys and a
+    // Exercises a nested object/array, sorted keys and a
     // decimal-scale-preserving number all in one literal — see
     // `crate::jsonb::canonical_jsonb`.
     (
@@ -150,7 +150,7 @@ async fn insert_cdc_row(client: &Client, key: &str, new_image: &str) {
 /// `application_threads` drain worker (copied from
 /// `defs_install_definition.rs`).
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the staging
+    // ADR-0002: registration only records a definition; the staging
     // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
         .await
@@ -261,7 +261,7 @@ fn non_canonical_literals_are_rejected_by_the_validator() {
         "BYTEA '\\xAB'",
         "BYTEA '\\x0'",
         "CAST('today' AS date)",
-        // Issue #115: exponent notation (`jsonb_out` never emits one) and
+        // Exponent notation (`jsonb_out` never emits one) and
         // missing canonical whitespace (`jsonb_out` always separates with
         // `": "`, never a bare `":"`) are both non-canonical.
         "JSONB '1e2'",
@@ -281,10 +281,10 @@ fn non_canonical_literals_are_rejected_by_the_validator() {
 /// *which* families are spellable rather than reporting a generic parse
 /// failure. `timestamptz` is the interesting one: a real Postgres type the
 /// OID registry already knows, held back for the reasons
-/// `defs::typed_literal::TYPED_LITERALS` documents. `jsonb` used to be a
-/// case here too, before issue #115 gave it a canonical-form checker
-/// (`crate::jsonb::canonical_jsonb`) and moved it into the allowlist — its
-/// coverage now lives in `CASES` above (every `CASES`-driven test in this
+/// `defs::typed_literal::TYPED_LITERALS` documents. `jsonb` is not a
+/// case here: it has a canonical-form checker
+/// (`crate::jsonb::canonical_jsonb`) and is in the allowlist — its
+/// coverage lives in `CASES` above (every `CASES`-driven test in this
 /// file) and in `non_canonical_literals_are_rejected_by_the_validator`'s
 /// `JSONB` cases.
 #[test]
@@ -381,7 +381,7 @@ async fn evaluator_and_sql_oracle_agree_on_every_literal() {
 
 /// parse -> install -> **build** -> read. `install_definition` is the real
 /// front door, so this covers the SQL the build actually emits for a typed
-/// literal, plus the DDL that decides the target column's type. #625 F8a: a
+/// literal, plus the DDL that decides the target column's type. A
 /// plain 1-1 is the Re-derive build's, whose chunk renders each field
 /// through `defs::oracle`.
 #[tokio::test]
@@ -412,8 +412,8 @@ async fn install_and_backfill_produce_real_typed_columns() {
     drain_backfill_chunks(&db.pool).await;
 
     // The columns are genuinely their own Postgres types — this is the
-    // "computed 1-1 target" claim. Before #109 the only way to get a `date`
-    // column here was to pass one through from the source.
+    // "computed 1-1 target" claim. Without typed literals the only way to get
+    // a `date` column here would be to pass one through from the source.
     for (name, _, _, expected_pg_type) in CASES {
         assert_eq!(
             &column_pg_type(&client, "t", name).await,
@@ -537,7 +537,7 @@ async fn a_cdc_apply_writes_typed_literal_values_matching_the_evaluator() {
 
 /// The reviewer's scenario, reproduced and then defended against.
 ///
-/// Issue #109's canonical-form rule has two halves. The first — an ISO
+/// The canonical-form rule has two halves. The first — an ISO
 /// literal *parses* to the same value under every `DateStyle` — is a
 /// property of the literal itself and needs no help. The second — the Rust
 /// evaluator's text and Postgres's rendering are byte-identical — is only
@@ -556,8 +556,8 @@ async fn a_cdc_apply_writes_typed_literal_values_matching_the_evaluator() {
 /// ones the engine opens itself — and then asserts the engine still reads
 /// canonical text. It fails without `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS`.
 ///
-/// Every type family in epic #123 hits the same wall — `interval` under
-/// `IntervalStyle`, floats under `extra_float_digits`, and (issue #246)
+/// Every type family hits the same wall — `interval` under
+/// `IntervalStyle`, floats under `extra_float_digits`, and
 /// `timestamptz` under `TimeZone`, all now pinned in
 /// `pool::DETERMINISTIC_TEXT_OUTPUT_GUCS` — and a future family will hit it
 /// too; extending that one constant and this one test's hostile-GUC list is
@@ -633,7 +633,7 @@ async fn a_hostile_database_level_output_guc_does_not_change_what_the_engine_rea
         rendered_bytea, "\\x0102ff",
         "a pooled connection must render hex regardless of the database's bytea_output"
     );
-    // Issue #112's half of the same hazard. `extra_float_digits = 0` is the
+    // The float half of the same hazard. `extra_float_digits = 0` is the
     // pre-Postgres-12 default and rounds to `DBL_DIG` significant digits,
     // which is *lossy*: `0.1::float8 + 0.2::float8` renders `0.3` under `0`
     // and `0.30000000000000004` under `1`. `float::render` reproduces the

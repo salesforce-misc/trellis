@@ -1,4 +1,4 @@
-//! Issue #364: every connection Trellis opens turns on server-side TCP
+//! Every connection Trellis opens turns on server-side TCP
 //! keepalives, so a partitioned client's backend (and the locks it holds,
 //! the producer singleton above all) goes away in seconds rather than the
 //! ~2h the kernel defaults allow.

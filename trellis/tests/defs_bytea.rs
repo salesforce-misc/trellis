@@ -1,16 +1,14 @@
-//! End-to-end tests for issue #114's `bytea` support — as a computed/
-//! passthrough target (already landed: ingest since #108, typed literal
-//! since #109) and, new here, via the join/primary-key and `GROUP BY` key
+//! End-to-end tests for `bytea` support — as a computed/
+//! passthrough target and via the join/primary-key and `GROUP BY` key
 //! roles, plus a clear verdict on the `MIN`/`MAX` aggregate role.
 //!
 //! # Why these run against a live server
 //!
-//! Issue #114's own scope note predicted the same shape #110's typed key
-//! index exists for: "text/wire rendering depends on the `bytea_output` GUC
-//! -> key role needs decoded comparison." #111 found that kind of premise
-//! wrong for `oid`, #113 found it wrong for four of the six temporal
-//! families, and #112 found it *right* for floats — so, per that playbook,
-//! this issue treats it as a question to put to a real Postgres rather than
+//! The typed key index exists because text/wire rendering can depend on a
+//! GUC (here `bytea_output`), which would make a key role need decoded
+//! comparison. That premise is wrong for `oid` and for four of the six
+//! temporal families, and right for floats — so, per that playbook,
+//! `bytea` is a question to put to a real Postgres rather than
 //! infer from the type's name. Every claim below is grounded that way:
 //!
 //! 1. **Text stability.** `byteaout` under the pinned `bytea_output = 'hex'`
@@ -22,7 +20,7 @@
 //!    with `bytea_cmp` — checked directly.
 //! 3. **Render consistency.** `to_jsonb` and `::text` must agree on
 //!    `bytea`, both as bare Postgres functions and as the actual SQL
-//!    `staging::apply::row_as_text_jsonb_sql` builds (issue #248's fix).
+//!    `staging::apply::row_as_text_jsonb_sql` builds.
 //! 4. **Key roles.** `JOIN` `ON` keys, 1-1 primary keys and `GROUP BY`
 //!    keys must all accept a `bytea` column.
 //! 5. **The `MIN`/`MAX` verdict.** Demonstrated, not asserted: Postgres
@@ -30,10 +28,10 @@
 //!    having a full, `IMMUTABLE` btree opclass, so this crate can never
 //!    support the role — not a rendering hazard, a missing server-side
 //!    construct ADR-0004 has nothing to be a subset of.
-//! 6. **The #113/#248 regression shape, reproduced for `bytea`.** A
+//! 6. **The temporal regression shape, reproduced for `bytea`.** A
 //!    `GROUP BY` group touched once through an image-bearing change and once
 //!    through a bare, image-less live refetch must still land as one target
-//!    row, not two — the exact defect issue #248 fixed for `timestamp`.
+//!    row, not two — the exact defect fixed for `timestamp`.
 //!
 //! Per ADR-0013 every comparison is against independently-authored SQL —
 //! plain `count(distinct ...)`, plain `to_jsonb`, plain `::text` — never
@@ -257,9 +255,8 @@ async fn bytea_hex_text_order_matches_native_bytea_cmp() {
 // ---------------------------------------------------------------------
 
 /// Bare Postgres `to_jsonb` and `::text` must agree on `bytea` — unlike
-/// `timestamp`/`timestamptz`, which #248 had to reconcile, `bytea` was never
-/// routed through `to_jsonb`'s special datetime writer, so this should hold
-/// even for a value predating #114's own changes.
+/// `timestamp`/`timestamptz`, which had to be reconciled, `bytea` is not
+/// routed through `to_jsonb`'s special datetime writer, so this holds.
 #[tokio::test]
 async fn to_jsonb_and_text_agree_for_bytea() {
     let cluster = TestCluster::start();
@@ -294,8 +291,8 @@ async fn to_jsonb_and_text_agree_for_bytea() {
     }
 }
 
-/// The actual SQL `staging::apply::row_as_text_jsonb_sql` builds (issue
-/// #248's replacement for bare `to_jsonb(t.*)`) must agree with `::text` for
+/// The actual SQL `staging::apply::row_as_text_jsonb_sql` builds (the
+/// replacement for bare `to_jsonb(t.*)`) must agree with `::text` for
 /// `bytea` — the direct counterpart to
 /// `defs_temporal.rs`'s `the_engine_s_own_row_renderer_agrees_with_text_for_every_temporal_family`.
 #[tokio::test]
@@ -378,8 +375,8 @@ async fn bytea_join_keys_and_primary_keys_are_admitted() {
 }
 
 /// The `GROUP BY` key gate (`validate::reject_unsupported_group_by_key_type`)
-/// admits `bytea`, the same allowlist-widening #111 did for `oid` and #113
-/// did for four of the six temporal families.
+/// admits `bytea`, the same allowlist-widening done for `oid` and for four
+/// of the six temporal families.
 #[test]
 fn bytea_group_by_key_is_admitted() {
     let def =
@@ -394,14 +391,14 @@ fn bytea_group_by_key_is_admitted() {
 // ---------------------------------------------------------------------
 
 // ---------------------------------------------------------------------
-// 6. The #113/#248 regression shape, reproduced for bytea
+// 6. The temporal regression shape, reproduced for bytea
 // ---------------------------------------------------------------------
 
 /// A `bytea` `GROUP BY` group touched once through an ordinary image-bearing
 /// change and once through a bare, image-less live refetch must still land
 /// as **one** target row, not two — the same shape `defs_temporal.rs`'s
 /// `a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_not_two`
-/// pins for `timestamp`. `bytea` was never exposed to the defect #248 fixed
+/// pins for `timestamp`. `bytea` was never exposed to the defect fixed for `timestamp`
 /// (see `to_jsonb_and_text_agree_for_bytea`), so this is a regression guard
 /// rather than a reproduction of a live bug — if a future change ever routed
 /// a `bytea` row-read back through raw `to_jsonb(t.*)`, or introduced any

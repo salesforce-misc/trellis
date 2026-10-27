@@ -1,14 +1,14 @@
 //! A re-type of a 1-1 target's column that invalidates a definition reading
-//! it (#1188): a `RESUME` that re-types the column pauses the reader define
+//! it: a `RESUME` that re-types the column pauses the reader define
 //! would now refuse. `ALTER TRANSFORM` re-types no column (a copy has no type
 //! modifier, ADR-0020), so it refuses no reader here.
 //!
 //! The re-type is the one a source's `integer` column moved to an unscaled
 //! `numeric` makes. Trellis's copy of it becomes an unconstrained `numeric`,
 //! which a group-basis `SUM`/`AVG` or a `JOIN`'s define refuses over a column
-//! of a table Trellis creates (#1096 decision 2, ADR-0020, #1120). The
+//! of a table Trellis creates (ADR-0020, #1120). The
 //! readers are group-basis aggregates. Every step is a bounded, explicit pass or drain; nothing
-//! polls for convergence (#297). The one wait, in the lock-order test, is for
+//! polls for convergence. The one wait, in the lock-order test, is for
 //! a backend to block on a lock.
 
 use std::collections::HashMap;
@@ -254,7 +254,7 @@ async fn a_resume_retype_takes_reader_rows_before_the_target_lock() {
 
 /// The same interleaving with the holder stalled past the re-type's
 /// `lock_timeout` while the pass waits on `roll`'s row (what a box under load
-/// does to the test above, #1281): the pass gives the re-type up for its next
+/// does to the test above): the pass gives the re-type up for its next
 /// one, and that one re-types `t.p`, pausing `roll`.
 #[tokio::test]
 async fn a_resume_retype_whose_row_wait_times_out_is_retried_by_the_next_pass() {
@@ -332,7 +332,7 @@ async fn resume_retype_against_a_reader_row_holder(stall: Duration, expect_retry
     // The re-type's wait on `roll`'s row is capped by its 2 s lock_timeout
     // (`RETYPE_LOCK_TIMEOUT`); a box so loaded that this task stalls past it
     // between the pass blocking and the holder committing makes the pass
-    // leave the re-type for its next one (#1281), which is the engine's
+    // leave the re-type for its next one, which is the engine's
     // contract, not the ordering bug. What the ordering bug produces is a
     // deadlock, which Postgres breaks by aborting a side: the holder (its
     // read above would have failed) or the pass, whose recorded last error
@@ -422,8 +422,8 @@ async fn a_chained_resume_retype_pauses_the_reader_define_would_refuse() {
 
 /// The captured-source path: a source column a group-basis `SUM` and a
 /// `JOIN`'s `SUM` read is re-typed to an unconstrained `numeric`, and the
-/// capture pass's re-validation (#703 R1) pauses both with define's refusal
-/// (#1096 decision 2). For the plain aggregate only `revalidate`'s
+/// capture pass's re-validation pauses both with define's refusal.
+/// For the plain aggregate only `revalidate`'s
 /// group-basis check refuses.
 #[tokio::test]
 async fn a_source_retype_to_unscaled_numeric_pauses_its_sum_readers() {
@@ -471,7 +471,7 @@ async fn a_source_retype_to_unscaled_numeric_pauses_its_sum_readers() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// #703's narrowed R1 after an unscaled re-type: the paused reader's
+/// The narrowed R1 after an unscaled re-type: the paused reader's
 /// `RESUME` refuses with define's refusal while the column has no scale.
 #[tokio::test]
 async fn a_resume_refuses_a_sum_over_a_column_re_typed_to_unscaled_numeric() {
@@ -504,7 +504,7 @@ async fn a_resume_refuses_a_sum_over_a_column_re_typed_to_unscaled_numeric() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// #703's narrowed R1 for a change between two declared scales: a `SUM`
+/// The narrowed R1 for a change between two declared scales: a `SUM`
 /// over `numeric(10,2)` re-typed to `numeric(12,4)` pauses nothing, and the
 /// capture pass rebuilds the aggregate on its own, whose total is still the
 /// source's sum.
@@ -543,7 +543,7 @@ async fn a_scale_change_between_two_declared_scales_rebuilds_the_sum_reader() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// #1096 decision 1 after define: a `SUM` argument re-typed from `integer`
+/// After define: a `SUM` argument re-typed from `integer`
 /// to `double precision` pauses its aggregate on the capture pass, and the
 /// resume refuses with define's family refusal (#1119) until the column is
 /// an admitted type again.
@@ -581,7 +581,7 @@ async fn a_source_retype_to_a_float_pauses_its_sum_reader_and_the_resume_refuses
 
 /// Rules 1 and 4: an alter that changes a column's type within the string
 /// family leaves a `JOIN` key pair `t.k = o.k` valid (Trellis's copy of a
-/// `varchar(n)` column is unbounded, #1207, and `varchar` and `text` pair),
+/// `varchar(n)` column is unbounded, and `varchar` and `text` pair),
 /// so the alter is accepted and the `JOIN` is untouched.
 #[tokio::test]
 async fn an_alter_that_keeps_a_join_key_pair_valid_is_accepted() {

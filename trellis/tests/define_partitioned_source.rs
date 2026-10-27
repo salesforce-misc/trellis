@@ -1,8 +1,8 @@
 //! Define accepts the shape of a partitioned source and refuses every shape
-//! routing can't serve (ADR-0017, issue #1058).
+//! routing can't serve.
 //!
 //! A partitioned root of a servable shape defines; each accepted definition is
-//! dropped again so the next check can reuse its name. Nothing polls (#297):
+//! dropped again so the next check can reuse its name. Nothing polls:
 //! every check is a catalog read or an `apply` call.
 
 use testkit::{TestCluster, TestDatabase};
@@ -461,7 +461,7 @@ async fn a_partitioned_root_without_a_primary_key_is_refused_as_unkeyed() {
 /// fact table partitioned on the column it joins by needs nothing in its
 /// `GROUP BY`; one joined by another column needs the partition key grouped;
 /// a dimension partitioned on a column outside its join key and `GROUP BY`
-/// is refused, naming the column (#1111).
+/// is refused, naming the column.
 #[tokio::test]
 async fn a_join_side_is_held_to_the_rule_over_its_partial_key() {
     let cluster = TestCluster::start();

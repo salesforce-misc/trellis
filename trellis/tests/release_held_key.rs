@@ -1,8 +1,8 @@
-//! Releasing a key a definition holds in quarantine (#759):
+//! Releasing a key a definition holds in quarantine:
 //! `Trellis::release_key`, the held-key metadata `status` and `self_check`
 //! report, and the release's interleavings with a drain page and a resume,
 //! on the real engine, driven by hand through `support/drain_driver.rs`. No
-//! test sleeps or polls for convergence (#297): the one wait,
+//! test sleeps or polls for convergence: the one wait,
 //! `Driver::wait_blocked`, waits for a backend to queue on a lock the test
 //! holds.
 //!
@@ -173,7 +173,7 @@ async fn releasing_a_fixed_key_rederives_it_and_clears_its_quarantine() {
         .await
         .expect("fix the cause");
     let trellis = trellis(&d).await;
-    // The bare spelling of the table, which the release resolves (#283).
+    // The bare spelling of the table, which the release resolves.
     trellis
         .release_key("doubles", "nums", "1")
         .await
@@ -251,7 +251,7 @@ async fn status_reports_a_definitions_held_keys_until_they_are_released() {
         "a definition holding a key below the fuse is still live"
     );
     let copies = trellis.status("copies").await.expect("status").unwrap();
-    assert_eq!(copies.held_keys, None, "the sibling holds nothing (#799)");
+    assert_eq!(copies.held_keys, None, "the sibling holds nothing");
 
     trellis
         .release_key("doubles", NUMS, "1")
@@ -337,7 +337,7 @@ async fn a_release_naming_no_held_key_is_refused_and_changes_nothing() {
 }
 
 /// A release whose first lock, the bump of the key's table's version fence,
-/// waits out the lock timeout behind a page holding the fence (#842). It's
+/// waits out the lock timeout behind a page holding the fence. It's
 /// [`ApplyError::ReleaseLockTimeout`], a retryable [`ErrorCode::Timeout`]
 /// rather than a raw `55P03`, and it changes nothing: the fence and the held
 /// key are as they were, and the same release succeeds once the page is
@@ -408,7 +408,7 @@ async fn a_release_that_waits_out_the_lock_timeout_is_a_retryable_timeout_and_ch
 }
 
 /// A page that parks a change for the held key and a release of the key
-/// (#759, ADR-0002 I1). The page holds `nums`' fence `for share` from its
+/// (ADR-0002 I1). The page holds `nums`' fence `for share` from its
 /// first lock to its commit, and parks the change before it commits. The
 /// release's first lock is a bump of that fence, so it waits for the page,
 /// then reads the key's rows, the page's parked change among them, and
@@ -437,7 +437,7 @@ async fn a_release_waits_for_a_page_parking_a_change_for_the_key_and_releases_it
     let reached = page.reached(PausePoint::BeforeCommit).await;
 
     // The eviction's parked change, before the page merges its own into the
-    // key's held row (#803).
+    // key's held row.
     let evicted = d
         .rows("select origin_lsn::text, old_image::text from poison_held")
         .await;

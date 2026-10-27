@@ -1,7 +1,7 @@
-//! Issue #622 (C2), acceptance A1: a capture trigger stages exactly the
+//! A capture trigger stages exactly the
 //! images its golden fixture records for the same write.
 //!
-//! One column per `docs/type-support.md` family (the #565 E3 matrix), with
+//! One column per `docs/type-support.md` family, with
 //! edge values and an all-`NULL` row, goes through insert, update and delete.
 //! Alongside it: a primary-key move, a composite primary key declared out of
 //! physical order whose parts contain the separator bytes, control-character
@@ -27,7 +27,7 @@
 //! intake decoded from the WAL for the same transactions, with two
 //! normalizations: an update that moved a primary key compared as the
 //! delete plus insert a trigger stages, and intake's images restricted to the
-//! trigger's columns. Intake is gone (#622 C7), so the fixture is the oracle.
+//! trigger's columns. Intake is gone, so the fixture is the oracle.
 //! Regenerate it with `TRELLIS_BLESS_CAPTURE_PARITY=1` only for a change to
 //! what capture images, and review the diff as a behaviour change.
 
@@ -56,7 +56,7 @@ const HOSTILE: &str = "set datestyle to 'SQL, DMY'; set bytea_output to 'escape'
 const APP_ROLE: &str = "capture_parity_app";
 
 /// `(column, type, values)`: row `i` of `public.fam` takes `values[i]`, or
-/// `NULL` past the end. The #565 E3 matrix.
+/// `NULL` past the end.
 const FAMILIES: &[(&str, &str, &[&str])] = &[
     ("c_int2", "smallint", &["-32768", "7"]),
     ("c_int4", "integer", &["2147483647", "0"]),

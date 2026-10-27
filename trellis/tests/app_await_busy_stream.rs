@@ -1,4 +1,4 @@
-//! Issue #469: `Trellis::await_converged` must converge while unrelated
+//! `Trellis::await_converged` must converge while unrelated
 //! writers keep the pipeline busy.
 //!
 //! `converged_through` gates a token on ring rows whose `origin_lsn` is at or

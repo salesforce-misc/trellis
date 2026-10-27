@@ -1,18 +1,18 @@
-//! End-to-end tests for issue #118's `bit`/`bit varying` support as
+//! End-to-end tests for `bit`/`bit varying` support as
 //! join/primary-key and `GROUP BY` key roles. The `bit_and`/`bit_or`
 //! aggregates are refused at define (`ValidationError::DeferredAggregate`).
 //! The typed-literal ("computed 1-1 target") role is
-//! covered by `defs_typed_literals.rs`'s shared `CASES` table, which this
-//! issue added a `VARBIT` row to.
+//! covered by `defs_typed_literals.rs`'s shared `CASES` table, which has a
+//! `VARBIT` row.
 //!
 //! # Why these run against a live server
 //!
-//! The issue's own framing treats `bit`/`bit varying` as one homogeneous
-//! family sharing one verdict per role. Asked of a real server, per
-//! #111-#114/#119's playbook rather than assumed, that turns out to be
+//! It is tempting to treat `bit`/`bit varying` as one homogeneous
+//! family sharing one verdict per role. Asked of a real server rather than
+//! assumed, that turns out to be
 //! wrong in two independent ways:
 //!
-//! 1. **Unlike `boolean` (#119), neither bit-string type has a second,
+//! 1. **Unlike `boolean`, neither bit-string type has a second,
 //!    disagreeing `::text` renderer.** `select castfunc from pg_cast where
 //!    castsource in ('bit'::regtype, 'varbit'::regtype) and casttarget =
 //!    'text'::regtype` returns **no rows** — `::text` is `bit_out`/
@@ -107,7 +107,7 @@ async fn define_join_on(
 // ---------------------------------------------------------------------
 
 /// Neither `bit` nor `bit varying` has a dedicated `::text` cast function —
-/// unlike `boolean` (#119), `::text` is each type's own output function
+/// unlike `boolean`, `::text` is each type's own output function
 /// (`bit_out`/`varbit_out`) directly. Contrasted with a spread of types
 /// already admitted (and `boolean`, which is not) to confirm the probe
 /// itself is discriminating.
@@ -148,11 +148,11 @@ async fn bit_and_varbit_have_no_dedicated_text_cast_function() {
         .await
         .expect("pg_cast probe for boolean");
     let n: i64 = row.get(0);
-    assert_eq!(n, 1, "boolean must still have its own ::text cast (#119)");
+    assert_eq!(n, 1, "boolean must still have its own ::text cast");
 }
 
 /// `to_jsonb` and `::text` must agree for both types — the render-agreement
-/// half of the #113/#248 defect shape. Neither type is a datetime family
+/// half of the datetime defect shape. Neither type is a datetime family
 /// (the only families `to_jsonb` special-cases), so this is expected to
 /// hold, but it is checked live rather than assumed.
 #[tokio::test]
@@ -303,7 +303,7 @@ async fn fixed_length_bit_truncates_under_a_bare_cast_but_bit_varying_does_not()
 
 /// A `bit varying` `GROUP BY` group touched once through an ordinary
 /// image-bearing CDC change and once through a bare, image-less live
-/// refetch must still land as **one** target row, not two — the #113/#248
+/// refetch must still land as **one** target row, not two — the datetime
 /// defect shape. `bit varying` was never exposed to that defect (see
 /// `to_jsonb_and_text_agree_for_bit_and_varbit` above), so this is a
 /// regression guard rather than a reproduction of a live bug, the same

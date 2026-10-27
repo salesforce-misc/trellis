@@ -1,4 +1,4 @@
-//! Issue #873 (epic #806): `trellis_instance_up` follows each handle's life,
+//! `trellis_instance_up` follows each handle's life,
 //! per instance, in the one registry the process renders.
 //!
 //! Two instances share a process and a database, each with its own catalog

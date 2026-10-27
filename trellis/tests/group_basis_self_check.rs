@@ -1,4 +1,4 @@
-//! `self_check` of an aggregate target on the group basis (#1104, ADR-0013
+//! `self_check` of an aggregate target on the group basis (ADR-0013
 //! "Scope"). It detects and never repairs: a planted divergence is reported,
 //! and gone once the planted damage is undone (the repair for real damage
 //! is `request_backfill` of the source, which rebuilds the groups in place:
@@ -7,7 +7,7 @@
 //!
 //! Every test turns the group-basis dev knob on before its driver starts,
 //! drives the pipeline by hand through `support/drain_driver.rs` and never
-//! polls for convergence (#297): a check either runs on a drained pipeline or
+//! polls for convergence: a check either runs on a drained pipeline or
 //! meets a sealed page nobody drained.
 
 #[path = "support/drain_driver.rs"]
@@ -483,7 +483,7 @@ async fn a_key_on_one_side_only_is_reported_alike_at_every_page_size() {
     assert_eq!(found.len(), 4, "three partials and the row: {found:?}");
 }
 
-// ------------------------------------- the ring rows not applied yet (#1140)
+// ------------------------------------- the ring rows not applied yet
 
 /// Every page of one comparison of `agg`, `limit` groups at a time, with no
 /// convergence wait and no re-check, whatever the ring holds: the
@@ -682,7 +682,7 @@ async fn segment_tables(d: &Driver) -> Vec<String> {
         .collect()
 }
 
-/// A drained slot is skipped (#1219): a page reads the ring slots that hold
+/// A drained slot is skipped: a page reads the ring slots that hold
 /// undrained rows and never executes the scan of one whose segment is
 /// drained, however many rows it still holds, for a definition with no held
 /// key. A slot with no segment is skipped too.
@@ -802,7 +802,7 @@ async fn slot_and_late_rows(d: &Driver, seg_seq: i64) -> (String, String) {
     (row.get(0), row.get(1))
 }
 
-/// A real late writer (#1219): a transaction that wrote into the active
+/// A real late writer: a transaction that wrote into the active
 /// segment and is still open when it seals leaves its row in that slot,
 /// outside the fence, and the segment drains without it. The retire pass
 /// doesn't count the slot's late rows while the writer is open (it could
@@ -981,7 +981,7 @@ async fn a_pending_change_at_or_below_the_truncate_floor_is_not_subtracted() {
 
 /// Groups page in the order of their key's type, `NULL` last, not of its
 /// text (`10` after `9`): a walk at every page size compares each group once
-/// and finds nothing, and the cursor never skips or repeats one (#1178).
+/// and finds nothing, and the cursor never skips or repeats one.
 #[tokio::test]
 async fn groups_page_in_their_key_order_with_the_null_group_last() {
     let mut d = start().await;
@@ -1021,7 +1021,7 @@ async fn groups_page_in_their_key_order_with_the_null_group_last() {
 
 /// A page of an aggregate's source is a range scan of an index that leads
 /// with the group columns; without one it is a scan of the source (the
-/// documented cost, #1167).
+/// documented cost).
 #[tokio::test]
 async fn an_aggregate_page_reads_its_source_by_an_index_that_leads_with_the_group_column() {
     let d = start_with(
@@ -1070,7 +1070,7 @@ async fn an_aggregate_page_reads_its_source_by_an_index_that_leads_with_the_grou
 
 /// A composite group key's page is a range scan of an index that leads with
 /// the group columns in `GROUP BY` order, with or without trailing columns,
-/// read forward or, all descending with `NULL` first, backward (#1223).
+/// read forward or, all descending with `NULL` first, backward.
 /// Define refuses any other order (`tests/source_index.rs`).
 #[tokio::test]
 async fn a_composite_page_is_index_served_by_an_index_in_group_by_order() {
@@ -1115,7 +1115,7 @@ async fn a_composite_page_is_index_served_by_an_index_in_group_by_order() {
 /// A two-column nullable group key, `NULL` in either part, against pending
 /// changes that add groups only the ring knows (a deleted group's rows, a
 /// new group's), with and without an index leading with the group columns
-/// (the ordered, unbounded page of #1178): at every page size the
+/// (the ordered, unbounded page): at every page size the
 /// comparison finds nothing, and a group planted on one side only is
 /// reported alike.
 #[tokio::test]
@@ -1229,7 +1229,7 @@ async fn request_backfill_and_rebuild(d: &Driver) {
     );
 }
 
-/// #1104's acceptance end to end: planted damage of every kind (a hand-edited
+/// The acceptance test end to end: planted damage of every kind (a hand-edited
 /// partial, a hand-edited visible row, a group missing from both tables, a
 /// visible row of no group, and a write made while capture was off, which
 /// no undo of a plant could repair) is reported by the check, the user's

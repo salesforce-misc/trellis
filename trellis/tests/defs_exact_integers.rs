@@ -1,11 +1,11 @@
-//! End-to-end tests for issue #111's exact integer types
+//! End-to-end tests for the exact integer types
 //! (`smallint`/`integer`/`bigint`, plus `oid`) against a real, ephemeral
 //! Postgres via `testkit::TestCluster`.
 //!
 //! # Why these run against a live server
 //!
 //! ADR-0004 makes Postgres the correctness oracle for this grammar, and the
-//! two claims #111 actually makes are *exactly* claims about agreeing with
+//! two claims made for these types are *exactly* claims about agreeing with
 //! Postgres:
 //!
 //! 1. **Result types.** `int4 + int4` is `integer` in Postgres, `int2 + int8`
@@ -112,7 +112,7 @@ async fn define_join_on(
 /// standing in for the staging worker and a running drain worker (copied
 /// from `defs_typed_literals.rs`).
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the staging
+    // ADR-0002: registration only records a definition; the staging
     // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
         .await
@@ -204,9 +204,8 @@ const SCALAR_CASES: &[(&str, &str, &str)] = &[
 /// The type of every derived column Trellis declares equals the type
 /// Postgres gives the same expression.
 ///
-/// This is the whole "type honesty" half of #111 in one assertion. Before
-/// this issue every one of these columns came out `numeric`, including the
-/// six that Postgres types as one of the three integer widths.
+/// This is the whole "type honesty" half in one assertion: a column Postgres
+/// types as one of the three integer widths is not declared `numeric`.
 #[tokio::test]
 async fn derived_column_types_match_postgres() {
     let cluster = TestCluster::start();
@@ -345,12 +344,11 @@ fn row2(a: i64, b: i64) -> Row {
 /// Trellis raises exactly when Postgres raises, and produces exactly what
 /// Postgres produces otherwise.
 ///
-/// This is the behavioural half of #111. The evaluator used to fold every
-/// one of these through arbitrary-precision `numeric`, so it silently
-/// produced `32768` where a server-side `select a2 + b2` raised
-/// `22003 numeric_value_out_of_range` — meaning an incremental apply and a
-/// backfill of the *same definition* could disagree about whether it works
-/// at all.
+/// This is the behavioural half. Folding these through arbitrary-precision
+/// `numeric` would silently produce `32768` where a server-side
+/// `select a2 + b2` raises `22003 numeric_value_out_of_range` — so an
+/// incremental apply and a backfill of the *same definition* could disagree
+/// about whether it works at all.
 ///
 /// The Postgres side is written independently (`select $1::<w> + $2::<w>`),
 /// with the operands bound as text and cast server-side, so neither side
@@ -614,7 +612,7 @@ async fn oid_has_no_arithmetic_in_trellis_because_it_has_none_in_postgres() {
 }
 
 /// An `oid` literal is spellable (`OID '12345'`), and only in Postgres's own
-/// canonical rendering — the typed-literal allowlist row #111 adds.
+/// canonical rendering — the typed-literal allowlist row.
 #[test]
 fn an_oid_literal_must_be_in_canonical_form() {
     for good in ["OID '0'", "OID '12345'", "CAST('4294967295' AS oid)"] {
@@ -642,8 +640,7 @@ fn an_oid_literal_must_be_in_canonical_form() {
 /// itself — byte-identically to Postgres's own rendering.
 ///
 /// This is the "exact key round-trip" claim stated directly. Integer keys
-/// worked before #111 by luck of sharing `Numeric`'s decimal rendering; now
-/// they work because `Value::Integer`'s `Display` *is* Postgres's
+/// work because `Value::Integer`'s `Display` *is* Postgres's
 /// `int4out`, which is what lets these types stay on
 /// `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`.
 #[tokio::test]
@@ -761,7 +758,7 @@ async fn an_incremental_bigint_sum_stays_equal_to_a_hand_written_group_by() {
     .await
     .expect("connect running trellis");
 
-    // Wait out the build first (#728): `await_converged` covers a definition
+    // Wait out the build first: `await_converged` covers a definition
     // only once it is `live`, and from then on every statement below goes
     // through Apply, the incremental path this test is about.
     wait_live::wait_for_live(&trellis, "t").await;
@@ -828,7 +825,7 @@ async fn an_incremental_bigint_sum_stays_equal_to_a_hand_written_group_by() {
 
 /// An `oid` column is accepted as a **`JOIN` `ON` key**, and a
 /// `smallint`/`integer`/`bigint` one keeps being accepted — the
-/// `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` allowlist #111 widens.
+/// `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` allowlist.
 ///
 /// The `numeric` case is the control: it must still be *rejected*, because
 /// `1.0::text != 1.00::text` though the two are equal to Postgres. That

@@ -1,4 +1,4 @@
-//! Integration tests for target-table DDL generation (issue #25), run
+//! Integration tests for target-table DDL generation, run
 //! against a real, ephemeral Postgres instance via `testkit::TestCluster`.
 
 use std::collections::HashMap;
@@ -215,7 +215,7 @@ async fn creating_the_target_table_twice_fails_rather_than_adopting_it() {
     )
     .await
     .expect("first create");
-    // Issue #440: Trellis never adopts a table it didn't create, so the DDL
+    // Trellis never adopts a table it didn't create, so the DDL
     // is a plain `create table`, not `create table if not exists`.
     let err = create_target_table(
         &db.pool,
@@ -299,7 +299,7 @@ async fn text_and_boolean_calculated_fields_get_matching_target_column_types() {
     );
 }
 
-/// Issue #79: a `uuid` source column must be passthrough-able onto a target
+/// A `uuid` source column must be passthrough-able onto a target
 /// table (bare `col AS col`, no arithmetic/regex support required).
 #[tokio::test]
 async fn uuid_column_passthrough_gets_a_matching_target_column_type() {
@@ -365,7 +365,7 @@ async fn uuid_column_passthrough_gets_a_matching_target_column_type() {
     );
 }
 
-/// Issue #108: a bare passthrough of a column whose Postgres type has no
+/// A bare passthrough of a column whose Postgres type has no
 /// first-class [`ValueType`] variant of its own — classified via the
 /// PG-OID registry as [`ValueType::Other`] instead of the old `_ => Text`
 /// fallthrough — still creates a target column of the *correct native*
@@ -458,7 +458,7 @@ async fn other_typed_passthrough_columns_get_their_real_native_target_type() {
     );
 }
 
-/// Issue #45: a bare passthrough of an integer-family source column keeps the
+/// A bare passthrough of an integer-family source column keeps the
 /// source column's *concrete* Postgres type on the target (`integer` stays
 /// `integer`, `bigint` stays `bigint`, `smallint` stays `smallint`), instead
 /// of collapsing through `ValueType::Numeric` to `numeric` — so the target
@@ -553,7 +553,7 @@ async fn integer_family_passthrough_keeps_its_concrete_type_but_arithmetic_widen
     );
 }
 
-/// Issue #45 review: a passthrough of a genuinely `numeric`-family source
+/// A passthrough of a genuinely `numeric`-family source
 /// column (`numeric(10,2)`, `real`, `double precision` — as opposed to the
 /// `integer`/`bigint`/`smallint` family the fix targets) must still get its
 /// own correct concrete type on the target table, not something wrong.
@@ -637,7 +637,7 @@ async fn numeric_family_passthrough_keeps_its_own_concrete_type() {
     );
 }
 
-/// Issue #79's downstream case: a `uuid` column carried through a 1-1
+/// A `uuid` column carried through a 1-1
 /// passthrough must also work as an aggregate `GROUP BY` key.
 #[tokio::test]
 async fn uuid_column_works_as_an_aggregate_group_by_key() {
@@ -711,7 +711,7 @@ async fn uuid_column_works_as_an_aggregate_group_by_key() {
         ]
     );
 
-    // Issue #128: keyed by a `UNIQUE` constraint (not a `PRIMARY KEY`) —
+    // Keyed by a `UNIQUE` constraint (not a `PRIMARY KEY`) —
     // see the dedicated test below for the `NULLS NOT DISTINCT` assertion.
     let key_columns = client
         .query(
@@ -799,7 +799,7 @@ async fn aggregate_target_table_gets_a_nulls_not_distinct_unique_key_from_the_gr
          live in the catalog schema's group basis"
     );
 
-    // Issue #128: the grouping columns are keyed by a `UNIQUE NULLS NOT
+    // The grouping columns are keyed by a `UNIQUE NULLS NOT
     // DISTINCT` constraint, not a bare `PRIMARY KEY` — a `PRIMARY KEY` would
     // forbid a NULL grouping value outright, but `GROUP BY` folds NULLs into
     // their own group like any other value, so the target must be able to
@@ -877,7 +877,7 @@ async fn a_source_table_without_a_primary_key_is_rejected() {
     }
 }
 
-/// Issue #126: `source_primary_key` itself no longer rejects a composite
+/// `source_primary_key` itself no longer rejects a composite
 /// (multi-column) primary key — it returns every column, in the key's own
 /// declared order, for every consumer except the 1-1 target-DDL slice (and
 /// its key-range-chunked direct backfill) to use. Column order matters here:
@@ -912,13 +912,11 @@ async fn a_source_table_with_a_composite_primary_key_is_returned_in_declared_col
     assert!(pk.iter().all(|c| c.data_type == "integer"));
 }
 
-/// Issue #121: the 1-1 target-DDL slice (and its key-range-chunked direct
+/// The 1-1 target-DDL slice (and its key-range-chunked direct
 /// backfill) now mirrors a composite source primary key onto the target in
 /// full, as a real multi-column `primary key (...)` table constraint —
-/// `create_target_table` no longer narrows `source_primary_key`'s result
-/// down to one column (issue #126 already lifted `source_primary_key`'s own
-/// blanket rejection; this issue removed the narrowing every 1-1-specific
-/// consumer still layered on top of it).
+/// `create_target_table` doesn't narrow `source_primary_key`'s result
+/// down to one column.
 #[tokio::test]
 async fn create_target_table_mirrors_a_composite_primary_key_in_full() {
     let cluster = TestCluster::start();
@@ -980,7 +978,7 @@ async fn create_target_table_mirrors_a_composite_primary_key_in_full() {
     );
 }
 
-/// Issue #107: a single-column primary key of an unsafe (non-text-stable)
+/// A single-column primary key of an unsafe (non-text-stable)
 /// type must be rejected exactly like a `JOIN` key of the same type
 /// already is — 1-1 apply/backfill
 /// compare the primary key via `::text` casts throughout, so e.g. a
@@ -989,9 +987,9 @@ async fn create_target_table_mirrors_a_composite_primary_key_in_full() {
 /// rows with no error.
 ///
 /// `timestamptz` used to be this test's example — its `::text` rendering is
-/// session-`TimeZone`-dependent, and until issue #246 pinned `TimeZone`
-/// identically on every connection Trellis opens
-/// that made it exactly as unsafe as `numeric`. It is a *safe* primary-key
+/// session-`TimeZone`-dependent, which made it exactly as unsafe as `numeric`
+/// until `TimeZone` was pinned identically on every connection Trellis
+/// opens. It is a *safe* primary-key
 /// type now (`join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`), which is what
 /// [`a_source_table_with_a_timestamptz_primary_key_is_accepted`] below
 /// proves — `numeric` (this test) takes over as the "still genuinely
@@ -1009,7 +1007,7 @@ async fn a_source_table_with_a_timestamptz_primary_key_is_accepted() {
 
     let pk = source_primary_key(&db.pool, "events")
         .await
-        .expect("timestamptz is a text-stable primary key type as of issue #246");
+        .expect("timestamptz is a text-stable primary key type");
     assert_eq!(
         pk,
         vec![PrimaryKeyColumn {
@@ -1021,10 +1019,10 @@ async fn a_source_table_with_a_timestamptz_primary_key_is_accepted() {
     );
 }
 
-/// Issue #107, `numeric` variant: `1.0::text` != `1.00::text` even though the
+/// `numeric` variant: `1.0::text` != `1.00::text` even though the
 /// two values are numerically equal, so a `numeric` primary key is unsafe
 /// under `::text` comparison, and no GUC pin (unlike `timestamptz`'s
-/// `TimeZone`, issue #246) fixes it — it is a structural defect of the
+/// `TimeZone`) fixes it — it is a structural defect of the
 /// rendering, not a session-configuration one.
 #[tokio::test]
 async fn a_source_table_with_a_numeric_primary_key_is_rejected() {
@@ -1054,11 +1052,11 @@ async fn a_source_table_with_a_numeric_primary_key_is_rejected() {
 
 #[tokio::test]
 async fn a_nulls_distinct_unique_index_is_not_accepted_as_a_primary_key_stand_in() {
-    // Issue #128 follow-up: a plain `UNIQUE` index on a nullable column
+    // A plain `UNIQUE` index on a nullable column
     // allows multiple NULLs, so it doesn't actually guarantee row identity
     // the way a `PRIMARY KEY` or a `UNIQUE NULLS NOT DISTINCT` constraint
     // does. Falling back to it here would silently reintroduce the "NULL
-    // rows collide/vanish" failure mode #128 fixed, through a side door.
+    // rows collide/vanish" failure mode, through a side door.
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let client = db.pool.get().await.expect("connection");

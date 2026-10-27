@@ -1,11 +1,11 @@
-//! Correctness tests for the four text functions (issue #64) against a real,
+//! Correctness tests for the four text functions against a real,
 //! ephemeral Postgres instance via `testkit::TestCluster`. Follows the same
 //! pattern as `defs_eval.rs`'s `pg_add`: bind the operands as text, run the
 //! equivalent Postgres expression, and assert the evaluator's result is
 //! byte-identical.
 //!
 //! `regexp_count` uses the `regex` crate (added as a direct dependency once
-//! the epic owner approved it — see the issue #64 report) and is
+//! the epic owner approved it) and is
 //! cross-checked with both literal and real-metacharacter patterns,
 //! including ones that can match the empty string.
 
@@ -59,9 +59,8 @@ fn row2(a_name: &str, a: Option<&str>, b_name: &str, b: Option<&str>) -> Row {
 
 /// The evaluator's result for a single `out` field, as text.
 ///
-/// Issue #111 gave these four functions their real Postgres return type
-/// (`integer`, per `pg_proc.prorettype`) instead of the `Numeric` they
-/// collapsed into before, so the value arrives as `Value::Integer`. The
+/// These four functions have their real Postgres return type
+/// (`integer`, per `pg_proc.prorettype`), so the value arrives as `Value::Integer`. The
 /// comparisons below are against Postgres's own `::text` rendering, and an
 /// exact integer's text is identical on both sides, so reading the value out
 /// as text is exactly the right granularity here.
@@ -187,10 +186,8 @@ const REGEXP_COUNT_LITERAL_CASES: &[(&str, &str)] = &[
     ("aaaa", "aa"),
 ];
 
-/// Patterns using real regex metacharacters (issue #64/#65 follow-up: once
-/// `regex` became an approved direct dependency, `regexp_count` moved off
-/// literal-only matching onto a global-match loop over the `regex` crate,
-/// replicating Postgres's exact non-overlapping counting rule, including for
+/// Patterns using real regex metacharacters (`regexp_count` is a global-match loop over
+/// the `regex` crate, replicating Postgres's exact non-overlapping counting rule, including for
 /// a pattern that can match the empty string — see `eval::regexp_count`).
 /// Restricted to syntax common to Rust's `regex` crate and Postgres's
 /// default ARE dialect (`.`, `*`, `+`, `?`, `[...]`, `|`, `^`, `$`), so a

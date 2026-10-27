@@ -1,4 +1,4 @@
-//! The staging worker's capture reconcile pass (#622 C5): a registration
+//! The staging worker's capture reconcile pass: a registration
 //! makes the next pass install a table's capture triggers, and every later
 //! change to the catalog widens, narrows or uninstalls them, in the
 //! background, never on `apply`'s path.
@@ -6,7 +6,7 @@
 //! Most tests step the pass by hand (`trellis::capture::reconcile::reconcile`
 //! for the capture half, `trellis::client::reconcile_pass` for the whole pass
 //! with its start of ready builds) and hold a table's lock with a transaction left open,
-//! with no convergence polling (#297). Two drive a running client end to
+//! with no convergence polling. Two drive a running client end to
 //! end: A3 (a join and a drop wait out a writer that stays open, and no other
 //! writer queues behind them) and an `ON DELETE CASCADE` parent/child pair,
 //! whose capture order within one transaction is the reverse of the WAL's.
@@ -282,7 +282,7 @@ async fn a_second_definition_reading_a_new_column_widens_capture() {
 
 /// A table whose join is blocked by a writer that stays open doesn't hold
 /// back another table's join in the same pass. The blocked one reports who
-/// holds it, on the waiting definition's status too (#622 plan Q5), and the
+/// holds it, on the waiting definition's status too, and the
 /// pass after the writer ends installs it. Nothing is cancelled.
 #[tokio::test]
 async fn a_table_whose_join_is_blocked_does_not_delay_another_tables_join() {
@@ -365,7 +365,7 @@ async fn a_table_whose_join_is_blocked_does_not_delay_another_tables_join() {
 /// budget on locked tables: each gets its first attempt, and no retry starts
 /// that couldn't end by the deadline.
 ///
-/// Asserts the attempts each wait reports, not how long the pass took (#1005).
+/// Asserts the attempts each wait reports, not how long the pass took.
 /// A retry needs `USER_TABLE_DDL_RETRY_INTERVAL` plus one lock timeout left
 /// before the deadline when it is decided, after an attempt: a budget under
 /// that allows exactly one attempt per table however slow the box is, and
@@ -444,9 +444,8 @@ async fn a_pass_respects_its_budget_on_locked_tables() {
 
 /// A pass reads the tables to capture (`desired`) before it reads its
 /// catalog snapshot, so a definition registered in between is in the
-/// snapshot's waiting list while its source isn't in `desired` (#622 C5
-/// review). Such a source must not read as seam-fed: nothing captures it
-/// yet, so the definition waits for the next pass.
+/// snapshot's waiting list while its source isn't in `desired`. Such a source must not read as
+/// seam-fed: nothing captures it yet, so the definition waits for the next pass.
 #[tokio::test]
 async fn a_definition_registered_after_the_pass_read_its_tables_waits() {
     let cluster = TestCluster::start();
@@ -495,8 +494,8 @@ async fn a_definition_registered_after_the_pass_read_its_tables_waits() {
 
 /// The lock wait `status().capture_wait` reports goes once the table stops
 /// waiting for its lock, including when its capture then fails for another
-/// reason (#622 C5 review): its primary key dropped here. The failure takes
-/// its place (#687). (A dropped read column no longer fails the pass: since
+/// reason: its primary key dropped here. The failure takes
+/// its place. (A dropped read column no longer fails the pass: since
 /// C6 the pass pauses its reader instead.)
 #[tokio::test]
 async fn a_table_that_fails_after_waiting_no_longer_reports_the_wait() {
@@ -541,7 +540,7 @@ async fn a_table_that_fails_after_waiting_no_longer_reports_the_wait() {
 
 /// What holds a definition's capture back is recorded in the catalog, so a
 /// handle in a process that doesn't run the staging worker reports it too
-/// (#687, the user's Q5 decision: in a typical deployment the web process
+/// (in a typical deployment the web process
 /// polls `status()` and a separate worker process runs staging). Here the
 /// worker's in-process state is dropped, as when its process stops, and a
 /// fresh handle still sees the wait, then the failure.
@@ -825,7 +824,7 @@ async fn a3_join_and_drop_wait_out_an_open_writer_without_stalling_other_writers
 }
 
 /// An `ON DELETE CASCADE` child's capture runs before its parent's statement
-/// trigger, whereas the WAL put the parent's delete first (#622 plan Risks).
+/// trigger, whereas the WAL put the parent's delete first.
 /// Per-key order is unaffected, and a parent/child pair read through a
 /// `JOIN` still converges.
 #[tokio::test]
@@ -925,12 +924,11 @@ async fn an_on_delete_cascade_parent_child_pair_converges() {
     client.shutdown().await.expect("shutdown");
 }
 
-/// #680, #622 plan finding 10: an application `AFTER ROW` trigger that
+/// An application `AFTER ROW` trigger that
 /// rewrites the row its own statement just wrote. The nested statement's
 /// capture runs first, so the outer statement's ring row has the higher
-/// position. Before #623 D8a it imaged the transition table's older version,
-/// and a `GROUP BY` target folded the two into the wrong group; now it
-/// images the live row.
+/// position. Capture images the live row, not the transition table's older
+/// version, which would fold the two writes into the wrong `GROUP BY` group.
 #[tokio::test]
 async fn a_nested_rewrite_of_the_same_key_lands_in_the_right_group() {
     let cluster = TestCluster::start();
@@ -1036,7 +1034,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 
 /// `drain_to_quiescence` drains a segment it didn't seal itself. A running
 /// `Client`'s maintenance loop can seal one just before `shutdown` lands,
-/// after its drain worker's last claim (#714's CI failure, in
+/// after its drain worker's last claim (as happened in
 /// `an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen`).
 /// Left sealed, it keeps every newer segment from retiring, so the helper's
 /// own seals fill the ring and the next one is refused `RingFull`.
@@ -1111,14 +1109,14 @@ async fn u_version(raw: &Client) -> i64 {
 }
 
 /// `ALTER TRANSFORM ... ADD` of a field on a source column the capture
-/// doesn't image yet (#622 C5 review). The edit is `apply`'s, so it only
+/// doesn't image yet. The edit is `apply`'s, so it only
 /// registers: the widen that images the new column is the staging worker's,
 /// in the background, and here an open writer keeps it from landing. A row
 /// written meanwhile runs the old capture body, so its image lacks the
 /// column. The new field must stay paused until the widen has landed and
 /// every row the old body staged has drained (the widen's capture gate), or
 /// that row fails with `MissingColumn` and its key is quarantined. The
-/// edit's field build (#625 F8b) is what unpauses it, so its plan job must
+/// edit's field build is what unpauses it, so its plan job must
 /// wait while the capture doesn't image the column.
 ///
 /// A running client takes the definition live; the rest is stepped by hand.
@@ -1248,7 +1246,7 @@ async fn bring_live(raw: &mut Client, pool: &trellis::Pool, target: &str) {
 /// `tu` over `public.u (id, a, b)`, live and reading `a` only, then an
 /// `ALTER TRANSFORM tu ADD b AS b2` whose widen of `u`'s capture waits on
 /// the returned open writer through one staging-worker pass, so `b2` stays
-/// paused awaiting capture and `tu`'s field build waits (#625 F8b). Stepped
+/// paused awaiting capture and `tu`'s field build waits. Stepped
 /// by hand.
 async fn edit_held_by_a_writer(
     dsn: &str,
@@ -1286,10 +1284,9 @@ async fn edit_held_by_a_writer(
 }
 
 /// An edited definition whose new field waits for a widen that can't take
-/// its table's lock reports the wait, as a waiting registration does (#687,
-/// the user's Q5 decision): it is `backfilling` (its field build waits,
-/// #625 F8b), not `waiting_to_backfill`, but it is stuck on the same thing.
-/// The wait goes once the widen lands.
+/// its table's lock reports the wait, as a waiting registration does: it is
+/// `backfilling` (its field build waits), not `waiting_to_backfill`, but it is stuck on the same
+/// thing. The wait goes once the widen lands.
 #[tokio::test]
 async fn an_edit_whose_widen_waits_on_a_lock_reports_the_wait() {
     let cluster = TestCluster::start();
@@ -1326,7 +1323,7 @@ async fn an_edit_whose_widen_waits_on_a_lock_reports_the_wait() {
 }
 
 /// An operator `RESUME` of a field that awaits its capture widen is refused
-/// and leaves it paused (#687). Unpausing it early would let the rows the
+/// and leaves it paused. Unpausing it early would let the rows the
 /// old capture function staged, which lack the field's column, reach it and
 /// fail with `MissingColumn`. The field build's start unpauses it once the
 /// widened capture images the column, as it does without a resume.
@@ -1381,7 +1378,7 @@ async fn resuming_a_field_awaiting_its_widen_is_refused() {
 }
 
 /// A capture install that fails for a reason other than a lock is reported
-/// on the waiting definition's status (#687): here the source lost its
+/// on the waiting definition's status: here the source lost its
 /// primary key after the definition registered. Without this the definition
 /// sat in `waiting_to_backfill` with nothing but a warning in the staging
 /// worker's log. The report goes once the install lands.

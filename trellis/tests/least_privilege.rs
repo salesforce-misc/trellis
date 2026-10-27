@@ -1,12 +1,12 @@
 //! The whole Trellis lifecycle as a login role holding only the privileges
-//! `docs/recommendations.md` ("One Trellis role") lists (issue #833).
+//! `docs/recommendations.md` ("One Trellis role") lists.
 //!
 //! Each privilege is checked piecewise elsewhere (`capture_install.rs`,
 //! `self_check.rs`, `row_security.rs`, `staging::halt`). This test runs the
 //! lifecycle through the real staging and drain workers as one such role,
 //! so the list is shown sufficient: migrate, define, build, drain,
 //! `self_check`, `ALTER TRANSFORM`, `PAUSE`/`RESUME`, a widened key's pause
-//! and resume (#767), `DROP TRANSFORM` and defining again, and the staging
+//! and resume, `DROP TRANSFORM` and defining again, and the staging
 //! worker removing capture. A `JOIN` transform covers a read of two tables.
 //!
 //! The roles, as the doc's example sets them up:
@@ -22,7 +22,7 @@
 //! The database revokes what `PUBLIC` holds by default (`CONNECT` and
 //! `TEMPORARY` on the database, `USAGE` on `public`), so each of those is a
 //! grant of its own. Dropping any one of
-//! [`trellis_grants`] makes a step fail; that was checked by hand for #833.
+//! [`trellis_grants`] makes a step fail; that was checked by hand.
 //!
 //! It runs the real background pipeline, so it polls `status` the way an
 //! embedder does (`docs/embedding.md`, "Poll to `live`, don't wait"),
@@ -431,7 +431,7 @@ async fn the_documented_privileges_run_the_whole_lifecycle() {
     assert_targets_match(&app, &admin, true).await;
     assert_no_privilege_refusal("PAUSE and RESUME");
 
-    // A widened key (#767) pauses the 1-1 keyed by it; a resume re-types
+    // A widened key pauses the 1-1 keyed by it; a resume re-types
     // Trellis's copies and rebuilds.
     admin
         .batch_execute("alter table public.orders alter column id type bigint")

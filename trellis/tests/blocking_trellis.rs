@@ -1,6 +1,6 @@
 //! Integration tests for [`trellis::BlockingTrellis`] (`docs/decisions/0008-public-api-design.md`,
 //! decision 1): the synchronous wrapper around [`trellis::Trellis`] built for
-//! issue #87's future FFI embedding, where the calling convention can't
+//! a future FFI embedding, where the calling convention can't
 //! assume a `tokio` runtime already exists on the calling thread.
 //!
 //! Every test function here is a plain, non-`async` `#[test]` — deliberately
@@ -66,7 +66,7 @@ fn full_lifecycle_is_synchronous_start_to_finish() {
 
     let defs = trellis.definitions().expect("definitions (sync)");
     assert_eq!(defs.len(), 1);
-    // Issue #73: `DefinitionSummary.target_table` reports the persisted,
+    // `DefinitionSummary.target_table` reports the persisted,
     // fully-qualified identity now.
     assert_eq!(
         defs[0].target_table,
@@ -79,7 +79,7 @@ fn full_lifecycle_is_synchronous_start_to_finish() {
         "a just-registered definition must report some status"
     );
 
-    // Issue #587: `self_check` reaches the engine through the blocking
+    // `self_check` reaches the engine through the blocking
     // facade too. An unregistered target is refused when the job is started,
     // so this proves the bridge without needing a worker.
     let result = trellis.self_check(
@@ -202,7 +202,7 @@ fn calling_from_inside_a_tokio_runtime_errors_instead_of_panicking() {
 /// waited out the stuck one's whole wait.
 ///
 /// The only wait is for the stuck call to be queued on the lock, a
-/// precondition the test cannot proceed without (#297's concern is a wait for
+/// precondition the test cannot proceed without (not a wait for
 /// convergence): the assertions that follow are about the *other* call.
 #[test]
 fn a_stuck_call_times_out_and_does_not_hold_up_the_calls_behind_it() {
@@ -295,7 +295,7 @@ fn a_stuck_call_times_out_and_does_not_hold_up_the_calls_behind_it() {
 /// instead of waiting out its deadline.
 ///
 /// The only wait is for the stuck call to be queued on the lock, a
-/// precondition the test cannot proceed without (#297's concern is a wait for
+/// precondition the test cannot proceed without (not a wait for
 /// convergence).
 #[test]
 fn a_started_call_wakes_its_waker_and_a_shutdown_does_not_wait_for_it() {

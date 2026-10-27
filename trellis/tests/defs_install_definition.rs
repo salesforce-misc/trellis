@@ -1,6 +1,6 @@
-//! Integration tests for `defs::catalog::install_definition` (issue #63 C1):
+//! Integration tests for `defs::catalog::install_definition`:
 //! the front door that creates a definition's target table once, then
-//! records it `waiting_to_backfill` (ADR-0002, #418, #419) for the Re-derive
+//! records it `waiting_to_backfill` for the Re-derive
 //! build (`staging::build`): a plain 1-1 definition's `rederive` chunks, or an
 //! aggregate's one absolute write in its plan job.
 //!
@@ -34,7 +34,7 @@ use trellis::staging::{has_pending, retire_drained_segments};
 /// (`drain_to_quiescence`) — a build failure here means the test itself is
 /// broken, not something to retry past.
 async fn drain_backfill_chunks(pool: &trellis::Pool) {
-    // ADR-0002 (#418): registration only records a definition; the staging
+    // ADR-0002: registration only records a definition; the staging
     // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
         .await
@@ -89,10 +89,10 @@ async fn staged_count_for_source(client: &Client, src_table: &str) -> i64 {
 /// `create table` in this file's own fixtures actually lands, since
 /// `connect_raw` pins `search_path` to `{DEFAULT_SCHEMA}, public` and never
 /// qualifies its own DDL. Mirrors `apply.rs`'s `qualify_fixture_table`: a
-/// real CDC producer always stages a fully-qualified `src_table` (issue
-/// #76), and `compute`'s forward-propagation lookup
-/// (`catalog::transforms_for_source`) now requires that exact qualified
-/// identity to match `schema_nodes`/`schema_edges` (issue #74, ADR-0011).
+/// real CDC producer always stages a fully-qualified `src_table`,
+/// and `compute`'s forward-propagation lookup
+/// (`catalog::transforms_for_source`) requires that exact qualified
+/// identity to match `schema_nodes`/`schema_edges` (ADR-0011).
 /// Already-qualified input (containing a `.`) passes through unchanged.
 fn qualify_fixture_table(name: &str) -> String {
     if name.contains('.') {
@@ -128,15 +128,14 @@ async fn stage_cdc(
 
 /// A composite primary-key identity string, U+001F-joined in the key's own
 /// declared column order: the encoding the capture trigger produces, and the one
-/// `ddl::pk_key_sql_expr`/`ddl::split_pk_key` on the apply side agree with
-/// (issue #126).
+/// `ddl::pk_key_sql_expr`/`ddl::split_pk_key` on the apply side agree with.
 fn composite_key(parts: &[&str]) -> String {
     parts.join("\u{1f}")
 }
 
 /// Seals and drains repeatedly until nothing is pending anywhere in the ring.
 async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
-    // Issue #132: a throwaway, always-caught-up watermark — this helper
+    // A throwaway, always-caught-up watermark — this helper
     // has no live capture running, and none of this file's tests exercise guard (a) specifically, so a
     // real watermark would only ever make guard (a) reject spuriously.
     for _ in 0..16 {
@@ -227,7 +226,7 @@ async fn install_definition_fast_path_builds_target_without_staging_the_ring() {
     );
 }
 
-/// #625 F8a: the Re-derive build of a plain 1-1 over an explicitly-qualified
+/// The Re-derive build of a plain 1-1 over an explicitly-qualified
 /// source: its plan and chunk SQL must read `custom.orders`, not the
 /// `public.orders` decoy on the pool's pinned `search_path`.
 #[tokio::test]
@@ -319,7 +318,7 @@ async fn explicitly_qualified_source_is_read_not_a_same_named_decoy(seam_fed: bo
     );
 }
 
-/// Issue #76 / ADR-0011, through the real front door: an
+/// ADR-0011, through the real front door: an
 /// explicitly-qualified `TRANSFORM <schema>.<target>` must override the
 /// `target_schema` argument this function is called with, for *every* step —
 /// the physical `CREATE TABLE` DDL, the build's writes, and the
@@ -327,12 +326,12 @@ async fn explicitly_qualified_source_is_read_not_a_same_named_decoy(seam_fed: bo
 /// `"public"` this call still passes as its own `target_schema` argument
 /// (mirroring a real caller who never changed `Config::target_schema` but
 /// wants to redirect just this one definition). This is the regression this
-/// module's own bug would have reintroduced: an earlier draft of issue #76's
-/// change checked the target's existence *before* this function's DDL step
-/// ran, which would reject every legitimate explicit-target install outright
+/// module's own bug would have reintroduced: checking the target's existence
+/// *before* this function's DDL step
+/// ran would reject every legitimate explicit-target install outright
 /// (the table doesn't exist yet — DDL is what's about to create it) —
 /// exercising the fast path (not just `create_definition`'s ring path, which
-/// `defs_catalog.rs`'s own issue #76 tests already cover) is what catches
+/// `defs_catalog.rs`'s own tests already cover) is what catches
 /// that class of ordering bug.
 #[tokio::test]
 async fn install_definition_honors_an_explicitly_qualified_target_schema() {
@@ -404,7 +403,7 @@ async fn install_definition_honors_an_explicitly_qualified_target_schema() {
 }
 
 // ---------------------------------------------------------------------
-// Status lifecycle (issue #55): `install_definition` persists exactly one
+// Status lifecycle: `install_definition` persists exactly one
 // `WaitingToBackfill` row, which its build flips in place to `Live`.
 // ---------------------------------------------------------------------
 
@@ -432,7 +431,7 @@ async fn install_definition_fast_path_ends_up_live() {
     .await
     .expect("install_definition via the fast path");
 
-    // ADR-0002 (#418): `install_definition` returns once the definition is
+    // ADR-0002: `install_definition` returns once the definition is
     // recorded, before its build is even dispatched — so the definition it
     // hands back (and the persisted row) must still be `WaitingToBackfill`
     // right here.
@@ -530,7 +529,7 @@ async fn install_definition_refuses_fields_that_inline_past_the_budget() {
 
 // ---------------------------------------------------------------------
 // Fast-path success branch: a plain 1-1 field that references another
-// calculated field's alias (issue #83 — `double_price + tax AS total` where
+// calculated field's alias (`double_price + tax AS total` where
 // `double_price = price + price`). The build inlines the alias chain
 // (`substitute_all_fields`) and builds it set-based, so the source is never
 // staged into the ring.
@@ -640,7 +639,7 @@ async fn install_definition_fast_path_builds_an_aggregate_cross_field_alias_chai
     )
     .await
     .expect("install_definition builds the aggregate alias chain directly");
-    // ADR-0002 (#419): the build runs as a background job the staging
+    // ADR-0002: the build runs as a background job the staging
     // worker starts; run it before reading the target.
     trellis::intake::harness::settle_builds(&db.pool).await;
 
@@ -716,7 +715,7 @@ async fn install_definition_builds_a_bare_alias_of_a_sum_field_declared_before_i
     )
     .await
     .expect("install_definition builds a bare alias of a SUM field declared before it");
-    // ADR-0002 (#419): the build runs as a background job the staging
+    // ADR-0002: the build runs as a background job the staging
     // worker starts; run it before reading the target.
     trellis::intake::harness::settle_builds(&db.pool).await;
 
@@ -781,7 +780,7 @@ async fn install_definition_shares_one_count_column_across_several_aliases_of_a_
     )
     .await
     .expect("install_definition shares one count column across several SUM aliases");
-    // ADR-0002 (#419): the build runs as a background job the staging
+    // ADR-0002: the build runs as a background job the staging
     // worker starts; run it before reading the target.
     trellis::intake::harness::settle_builds(&db.pool).await;
 
@@ -816,7 +815,7 @@ async fn install_definition_shares_one_count_column_across_several_aliases_of_a_
 }
 
 // ---------------------------------------------------------------------
-// A coalesce-wrapped aggregate (`coalesce(sum(word_count), 0)`, issue #83),
+// A coalesce-wrapped aggregate (`coalesce(sum(word_count), 0)`),
 // the normal way to write a nullable aggregate: the aggregate nested inside
 // `coalesce` builds with an all-`NULL` group coalesced to 0.
 // ---------------------------------------------------------------------
@@ -881,7 +880,7 @@ async fn install_definition_fast_path_builds_a_coalesce_wrapped_aggregate() {
 }
 
 // ---------------------------------------------------------------------
-// The deepest nesting issue #83's repro implies: an alias-derived field
+// The deepest nesting: an alias-derived field
 // summing two coalesce-wrapped aggregates (`total_words = total_posted_words
 // + total_commented_words`, each itself `coalesce(sum(...), 0)`).
 // Substitution inlines both, giving `coalesce(sum(posted), 0) +
@@ -965,14 +964,13 @@ async fn install_definition_fast_path_builds_nested_coalesce_alias_chain() {
 }
 
 // ---------------------------------------------------------------------
-// Reviewer follow-up to issue #74 (epic #78's own whole-branch review):
 // `install_definition`'s own source resolution (`resolve_source_for_install`,
 // and the since-retired coverage-fence planning that ran beside it) walked
 // bare `def.source` only through
 // `search_path` (`resolve_source_schema`/`resolve_source_schema_in_txn`),
 // never through `resolve_graph_identity`/`resolve_graph_identity_in_txn`'s
 // bare-target-suffix fallback the way `create_definition_inner`'s own
-// resolution of the identical bare source already does (issue #74). Since
+// resolution of the identical bare source already does. Since
 // `install_definition` runs its own DDL *before*
 // `create_definition_inner` is ever reached — a distinct fast path, not a
 // thin wrapper around the ring — a second definition's bare `FROM t` failed
@@ -1061,7 +1059,7 @@ async fn install_definition_fast_path_resolves_a_bare_from_chained_off_a_non_def
     );
 }
 
-/// ADR-0002 (#418): registration reads no source rows. It succeeds while
+/// ADR-0002: registration reads no source rows. It succeeds while
 /// another session holds the source `ACCESS EXCLUSIVE` (which blocks every
 /// read of it) — and goes live once the lock is released and its build runs. The timeout only turns a registration stuck on the lock
 /// into a failure instead of a hang.
@@ -1124,7 +1122,7 @@ async fn registration_reads_no_source_rows() {
 }
 
 // ---------------------------------------------------------------------
-// Issue #440: registration never adopts a relation it didn't create, and a
+// Registration never adopts a relation it didn't create, and a
 // failed registration leaves nothing behind that would block a retry.
 // ---------------------------------------------------------------------
 
@@ -1407,7 +1405,7 @@ async fn a_cycle_closing_registration_reports_the_cycle_not_the_existing_target(
 }
 
 // ---------------------------------------------------------------------
-// Issue #566: a field named after a 1-1 source's primary key column.
+// A field named after a 1-1 source's primary key column.
 // ---------------------------------------------------------------------
 
 async fn table_exists(client: &Client, qualified: &str) -> bool {
@@ -1541,7 +1539,7 @@ async fn alter_transform_add_of_a_field_named_after_a_primary_key_column_is_reje
     }
 }
 
-/// Issue #566's key read runs before `validate` for a 1-1 definition with a
+/// The key read runs before `validate` for a 1-1 definition with a
 /// field named like a source column (`a AS a`). With an explicit `FROM
 /// <schema>.<table>` naming a table that doesn't exist, that read would find
 /// no key and report `NoPrimaryKey`. The explicit-schema existence check runs
@@ -1575,10 +1573,9 @@ async fn an_explicit_source_without_its_table_is_reported_missing_before_the_key
     );
 }
 
-/// Regression for the DDL-before-validate ordering bug #94 turned up:
-/// `install_definition` used to emit the target table's DDL *before* running
-/// `validate()`, so a definition rejected for any reason still left an orphan
-/// table behind. The failure here is plain `UngroupedColumnReference`,
+/// Regression for DDL-before-validate ordering: if `install_definition`
+/// emitted the target table's DDL *before* running `validate()`, a definition
+/// rejected for any reason would still leave an orphan table behind. The failure here is plain `UngroupedColumnReference`,
 /// because the fix is about ordering for *every* key-space.
 #[tokio::test]
 async fn an_invalid_aggregate_definition_leaves_no_target_table() {
@@ -1618,7 +1615,7 @@ async fn an_invalid_aggregate_definition_leaves_no_target_table() {
     );
 }
 
-/// Issue #126: `staging::apply::compute` calls `ddl::source_primary_key` for
+/// `staging::apply::compute` calls `ddl::source_primary_key` for
 /// every source table a drain batch touches, so a composite-PK source
 /// feeding an ordinary `GROUP BY` definition must build and then drain a
 /// forward insert, a group-migrating update and a delete, each keyed by the

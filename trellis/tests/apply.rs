@@ -1,4 +1,4 @@
-//! Integration tests for apply ∪ mark-drained (issue #11, stage 05),
+//! Integration tests for apply ∪ mark-drained (stage 05),
 //! 1-1/scalar subset only, run against a real, ephemeral Postgres instance
 //! via the shared harness (`testkit::TestCluster`).
 //!
@@ -83,13 +83,12 @@ async fn drained_mask(client: &Client, seg_seq: i64) -> i64 {
 /// `connect_raw` pins `search_path` to `{DEFAULT_SCHEMA}, public` and never
 /// qualifies its own DDL. Used by [`insert_cdc_row`]/[`insert_truncate_row`]
 /// so a hand-staged ring row's `src_table` matches what a real CDC producer
-/// would actually stage (issue #76: always fully-qualified) and, as of
-/// issue #74, what `schema_nodes`/`schema_edges` now key on — before #74
-/// neither mattered, since `schema_nodes` was itself bare-keyed and the
-/// physical read paths (`ddl::source_primary_key`/`read_live_rows_batch`)
-/// tolerate a bare name fine via their own connection's `search_path`
-/// (Postgres resolves it live), so this file's fixtures got away with
-/// staging a bare `src_table` even after #76. Already-qualified input
+/// would actually stage (always fully-qualified) and what
+/// `schema_nodes`/`schema_edges` key on. The physical read paths
+/// (`ddl::source_primary_key`/`read_live_rows_batch`) would tolerate a bare
+/// name via their own connection's `search_path` (Postgres resolves it
+/// live), so only the catalog-keyed paths need the qualified form.
+/// Already-qualified input
 /// (containing a `.`) passes through unchanged — e.g. a target-table src
 /// under `public` some test builds by hand instead of through this helper.
 fn qualify_fixture_table(name: &str) -> String {
@@ -128,7 +127,7 @@ async fn insert_cdc_row(
 
 /// Stages a truncate sentinel directly into `table`, for `src_table`,
 /// stamped with the insert position as the capture trigger stamps one: the
-/// drain raises the truncate floor to it (#774).
+/// drain raises the truncate floor to it.
 async fn insert_truncate_row(client: &Client, table: &str, src_table: &str) {
     let src_table = qualify_fixture_table(src_table);
     client
@@ -167,7 +166,7 @@ fn order_totals_def() -> TransformDef {
 /// does, and panics with the underlying error on failure — this test file's
 /// standard "drain and expect it to succeed" step.
 async fn drain(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
-    // Issue #132: a throwaway, always-caught-up watermark — no live
+    // A throwaway, always-caught-up watermark — no live
     // capture runs in this test file, and it isn't exercising guard (a).
     apply::drain_once(pool, seg_seq, claimed_by, 1, "trellis_apply_test")
         .await
@@ -283,7 +282,7 @@ async fn drain_matches_the_oracle_across_an_insert_update_and_delete() {
     }
 }
 
-/// A reviewer's high-severity follow-up to issue #76's grammar work, at the
+/// A follow-up to the explicit-schema grammar work, at the
 /// CDC-apply layer this time (`defs_install_definition.rs`'s
 /// `rederive_build_reads_the_explicitly_qualified_source_not_a_same_named_decoy`
 /// covers the build layer): a definition created with an
@@ -377,9 +376,8 @@ async fn explicitly_qualified_source_reads_the_right_table_on_a_live_refetch() {
 
 /// The target-side twin of
 /// [`explicitly_qualified_source_reads_the_right_table_on_a_live_refetch`]
-/// above, and the one this round of issue #78's own fix-sweep exists for: a
-/// definition installed with an explicit non-default *target* schema (issue
-/// #76's `TRANSFORM custom.<target> FROM ...` grammar) backfills fine (its
+/// above: a definition installed with an explicit non-default *target*
+/// schema (the `TRANSFORM custom.<target> FROM ...` grammar) backfills fine (its
 /// build reads `Definition::target_table`/`resolve_source_for_install`
 /// correctly), but a
 /// subsequent *live* CDC write against its source used to fail outright:
@@ -524,7 +522,7 @@ async fn explicitly_qualified_target_receives_a_live_cdc_write() {
     );
 }
 
-/// Issue #380: two definitions over same-named source tables in different
+/// Two definitions over same-named source tables in different
 /// schemas (`blog.posts`, `shop.posts`) must each drain against their own
 /// source. The drain's version fence used to look `source_table_versions` up
 /// by the bare table-name suffix, which matched both rows and failed every
@@ -839,7 +837,7 @@ async fn a_definition_change_on_a_touched_source_trips_the_version_fence() {
     // definition text just to move the counter.
     client
         .execute(
-            // Issue #72: `source_table` is now persisted fully-qualified
+            // `source_table` is now persisted fully-qualified
             // (`{schema}.orders`, not bare `orders`) — `orders` was created
             // bare above, so it landed in the pool's default first
             // search-path schema, `DEFAULT_SCHEMA`.
@@ -953,7 +951,7 @@ async fn a_definition_change_on_an_unrelated_source_does_not_trip_the_fence() {
     // `widgets`, so it must not be in the fence set.
     client
         .execute(
-            // Issue #72: `source_table` is persisted fully-qualified now.
+            // `source_table` is persisted fully-qualified now.
             &format!(
                 "update source_table_versions set version = version + 1 \
                  where source_table = '{DEFAULT_SCHEMA}.widgets'"
@@ -1040,9 +1038,9 @@ async fn a_write_that_changes_nothing_is_suppressed_as_a_no_op() {
     assert_eq!(total, "11.50");
 }
 
-/// Issue #392's check on the 1-1 path: a `recompute` folded with the key's
+/// The 1-1 path's check: a `recompute` folded with the key's
 /// CDC update leaves a record that looks like a plain update, but it carries
-/// `has_recompute`, so the 1-1 ledger (#623 D6) re-derives it from the live
+/// `has_recompute`, so the 1-1 ledger re-derives it from the live
 /// row rather than applying the update's image. So a stale target row (999
 /// here) is still repaired.
 #[tokio::test]
@@ -1422,10 +1420,9 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
 
     // The apply must have staged a Recompute trigger for order_totals's own
     // downstream reader, landing in the ring's active segment — under
-    // `order_totals`'s *qualified* identity (issue #267: propagation used to
-    // stage the bare `def.target`, which the fold could never coalesce with
-    // the qualified spelling CDC intake staged for the very same table once
-    // an intermediate hop was captured).
+    // `order_totals`'s *qualified* identity (propagation stages the qualified
+    // identity, not the bare `def.target`, which the fold could never coalesce
+    // with the qualified spelling CDC intake stages for the very same table).
     let staged: i64 = client
         .query_one(
             "select count(*) from (
@@ -1480,7 +1477,7 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
     );
 }
 
-/// Issue #63's write-path gap: a text-column passthrough must round-trip
+/// Write-path gap: a text-column passthrough must round-trip
 /// through `compute()`/apply with the persisted `source_columns` type map
 /// (`catalog::create_definition`), not default every column to Numeric and
 /// fail to parse. Also exercises a numeric-*looking* text value ("007") to
@@ -1725,14 +1722,13 @@ async fn a_boolean_column_passthrough_round_trips_through_compute() {
     assert!(!out2);
 }
 
-/// Issue #108's "typed CDC round-trip": a column whose Postgres type has no
+/// Typed CDC round-trip: a column whose Postgres type has no
 /// first-class [`ValueType`] variant of its own — here `jsonb`, classified
 /// as [`ValueType::Other`] via the PG-OID registry — still round-trips
 /// byte-exact through the real `compute()` write path: `parse_value` tags
 /// the CDC-decoded text with its [`trellis::defs::PgType`] family
 /// ([`Value::Other`]), and the write plan's `field_pg_types` (`ddl::pg_type_name`)
-/// casts it back to a genuine `jsonb` target column — not the `text` column
-/// a pre-#108 build would have silently created and wired here.
+/// casts it back to a genuine `jsonb` target column — not a `text` column.
 #[tokio::test]
 async fn a_jsonb_column_passthrough_round_trips_through_compute() {
     let cluster = TestCluster::start();
@@ -1847,7 +1843,7 @@ async fn a_jsonb_column_passthrough_round_trips_through_compute() {
     );
 }
 
-/// `SELECT strpos(name, 'foo') > 0 AS has_foo` (issue #65's composed
+/// `SELECT strpos(name, 'foo') > 0 AS has_foo` (a composed
 /// function-call-plus-comparison example) must round-trip through
 /// `compute()`/apply into a real `boolean` target column, for both the
 /// keyword-present and keyword-absent cases.
@@ -1949,7 +1945,7 @@ async fn a_function_call_composed_with_greater_than_round_trips_through_compute(
     );
 }
 
-/// Issue #13: a backfill's initial enumeration stages every pre-existing
+/// A backfill's initial enumeration stages every pre-existing
 /// source row as a bare `Recompute` trigger with no image, which
 /// `compute()` must re-read live from the source table. Before the fix,
 /// that re-read was one `select ... where id = $1` round trip per key; this
@@ -2033,7 +2029,7 @@ async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batc
     let refetch_queries: Vec<&str> = log
         .lines()
         // `join unnest(` singles out the batched read of `orders` by key: on
-        // the 1-1 ledger (#623 D6) it is Phase 3's Re-derive read, under the
+        // the 1-1 ledger it is Phase 3's Re-derive read, under the
         // entry lock, and Phase 2 reads nothing.
         .filter(|line| {
             line.contains("from \"trellis\".\"orders\" t")
@@ -2049,8 +2045,7 @@ async fn a_backfill_style_batch_of_bare_recompute_triggers_refetches_in_one_batc
     assert!(
         refetch_queries[0].contains("::text[]::"),
         "the one refetch query must batch every key via one bound array parameter \
-         (`read_live_rows_batch`'s `join unnest($1::text[]::<type>[])`, issue #126 — no \
-         longer literally `= any($1)` once the live refetch had to generalize to an \
+         (`read_live_rows_batch`'s `join unnest($1::text[]::<type>[])`, which generalizes to an \
          arbitrary-arity primary key), not a single-key `= $1`:\n{}",
         refetch_queries[0]
     );
@@ -2301,7 +2296,7 @@ async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch
     let refetch_queries: Vec<&str> = log
         .lines()
         // `join unnest(` singles out the batched read of `orders` by key: on
-        // the 1-1 ledger (#623 D6) it is Phase 3's Re-derive read, under the
+        // the 1-1 ledger it is Phase 3's Re-derive read, under the
         // entry lock, and Phase 2 reads nothing.
         .filter(|line| {
             line.contains("from \"trellis\".\"orders\" t")
@@ -2317,7 +2312,7 @@ async fn a_mixed_bucket_of_all_three_change_shapes_drains_correctly_in_one_batch
     assert!(
         refetch_queries[0].contains("::text[]::"),
         "the one refetch query must batch its keys via one bound array parameter \
-         (`read_live_rows_batch`'s `join unnest($1::text[]::<type>[])`, issue #126):\n{}",
+         (`read_live_rows_batch`'s `join unnest($1::text[]::<type>[])`):\n{}",
         refetch_queries[0]
     );
 
@@ -2554,7 +2549,7 @@ async fn next_claimable_segments_stops_at_the_first_undrained_truncate() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #344: two batches for the same key, applied out of order.
+// Two batches for the same key, applied out of order.
 //
 // Segments drain in any order and nothing orders one batch's Phase 3 against
 // another's for the same key, so a slow worker can commit a value computed
@@ -2564,7 +2559,7 @@ async fn next_claimable_segments_stops_at_the_first_undrained_truncate() {
 // only then does batch 1's Phase 3 run. The target must end on the value the
 // source's current state implies, whatever batch 1 computed.
 //
-// On the 1-1 ledger (#623 D6) batch 1's Phase 3 takes the key's entry lock,
+// On the 1-1 ledger batch 1's Phase 3 takes the key's entry lock,
 // then an Apply writes only if ADR-0002's I2 holds (here its `lsn` is below
 // the entry's `applied_lsn`, which batch 2 raised), and a Re-derive reads the
 // live row under that lock. The `stale_one_to_one_write` plant, which drops
@@ -2667,7 +2662,7 @@ async fn drain_everything_left(pool: &trellis::Pool, client: &Client) {
     }
 }
 
-/// The repro from issue #344: batch 1 is a bare recompute trigger (the shape
+/// The repro: batch 1 is a bare recompute trigger (the shape
 /// the `create_definition` fixture's enumeration stages), a Re-derive. Its live read now happens in
 /// Phase 3 under the entry lock, so it reads the row batch 2 wrote.
 #[tokio::test]

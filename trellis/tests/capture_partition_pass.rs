@@ -1,10 +1,10 @@
-//! ADR-0017 P3 (issue #1061): the reconcile pass records a partitioned
+//! ADR-0017 P3: the reconcile pass records a partitioned
 //! source's tree, detects partition maintenance by two persisted fingerprints
 //! and queues a correction request for each node it touches.
 //!
 //! The corrections are consumed by P4; these tests read the durable queue
 //! (`partition_corrections`) directly. Every pass is stepped by hand and
-//! nothing waits for convergence (#297).
+//! nothing waits for convergence.
 
 use std::time::{Duration, Instant};
 
@@ -827,8 +827,8 @@ async fn the_root_attached_under_another_table_pauses_the_reader() {
     it.trellis.shutdown().await.expect("shutdown");
 }
 
-/// A root renamed away is table maintenance, not partition maintenance
-/// (#1200): the pass pauses the readers instead of correcting, and renaming
+/// A root renamed away is table maintenance, not partition maintenance:
+/// the pass pauses the readers instead of correcting, and renaming
 /// it back queues nothing either; a resume rebuilds. The replaced and swapped
 /// roots are `capture_disruption_partitioned.rs`'s.
 #[tokio::test]
@@ -982,7 +982,7 @@ async fn sources(raw: &Client) -> i64 {
         .get(0)
 }
 
-/// #1217: the last definition on a partitioned root goes, the root is dropped
+/// The last definition on a partitioned root goes, the root is dropped
 /// and created again, and a definition is made, all before a pass. The new
 /// definition never read the old tree, so the pass records the new one
 /// instead of pausing it for a root that is "not the one Trellis captured".
@@ -1014,7 +1014,7 @@ async fn a_definition_made_after_the_root_was_replaced_is_not_paused() {
     it.trellis.shutdown().await.expect("shutdown");
 }
 
-/// #1217: the drop that forgets the recorded tree and a queued correction
+/// The drop that forgets the recorded tree and a queued correction
 /// leaves the triggers to the pass, which still finds every node's from the
 /// catalog and removes them all.
 #[tokio::test]
@@ -1050,7 +1050,7 @@ async fn the_pass_uninstalls_every_node_after_the_drop_forgot_the_tree() {
     it.trellis.shutdown().await.expect("shutdown");
 }
 
-/// #1217: the last reader goes and a definition is made again on the same,
+/// The last reader goes and a definition is made again on the same,
 /// untouched root before a pass. Its triggers are still on every node, with
 /// no record: the pass records the tree afresh and pauses nothing.
 #[tokio::test]

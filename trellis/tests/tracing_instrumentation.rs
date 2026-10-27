@@ -1,4 +1,4 @@
-//! Integration tests for issue #56 (epic #49): the `tracing` spans/events
+//! Integration tests for the `tracing` spans/events
 //! added along the propagation path (`staging::apply::compute`,
 //! `staging::apply::apply_target`/`apply_and_mark_drained`/`drain_once`,
 //! quarantine trips, backfill status transitions) actually fire, with the
@@ -232,7 +232,7 @@ async fn insert_cdc_row(
 // Tests
 // ---------------------------------------------------------------------
 
-/// Issue #56's apply-phase span tree: `staging.drain_once` parents
+/// The apply-phase span tree: `staging.drain_once` parents
 /// `staging.compute` and `staging.apply_and_mark_drained`, the latter
 /// parenting one `staging.apply_target` per consuming transform — exercised
 /// via the same direct-staging harness `apply.rs`/`end_to_end_latency.rs`
@@ -358,8 +358,8 @@ async fn compute_and_apply_spans_fire_with_batch_and_transform_fields() {
 
     // A per-source `tracing::debug!` event, not a nested span (see
     // `compute`'s own doc comment on why) — still visible as a captured
-    // event with the source table's qualified name (issue #380 keys
-    // `compute`'s per-source loop on it).
+    // event with the source table's qualified name (`compute`'s
+    // per-source loop keys on it).
     let events = captured.events();
     let qualified_orders = format!("{DEFAULT_SCHEMA}.orders");
     assert!(
@@ -420,7 +420,7 @@ async fn seed_orders_totals(db: &testkit::TestDatabase, client: &Client, target:
         .expect("seed source row");
 }
 
-/// Issue #56's quarantine event: isolating and evicting a poisoned key
+/// The quarantine event: isolating and evicting a poisoned key
 /// (`quarantine::evict_key`, called from `isolate_and_evict`) emits a
 /// `WARN` event naming the key — mirroring
 /// `tests/quarantine.rs`'s `zero_threshold_disables_eviction_even_past_the_default_threshold`'s
@@ -451,7 +451,7 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
         row_count: 1,
         has_recompute: false,
         ends_in_delete: false,
-        // #623 D6: an Apply (its image is the change), not a Re-derive.
+        // An Apply (its image is the change), not a Re-derive.
         last_change: Some(LastChange {
             lsn: PgLsn::from(1),
             row_txid: "1".to_string(),
@@ -486,7 +486,7 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
     );
     let evicted = evicted.unwrap();
     // The *canonical* identity, not the bare `src_table` the folded change above
-    // carries (issue #283): every quarantine table is keyed on it, so the
+    // carries: every quarantine table is keyed on it, so the
     // eviction warning names the row it actually wrote. An operator reading this
     // line and then grepping `poison` for the name in it only gets a hit if
     // those two agree, which is exactly what that issue restored.
@@ -497,7 +497,7 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
     );
     assert_eq!(evicted.fields.get("key").map(String::as_str), Some("1"));
 
-    // Issue #670: isolation logs its start and its end, the end naming the
+    // Isolation logs its start and its end, the end naming the
     // outcome, the keys it pinned, the probes it used and how long it took.
     let field = |event: &CapturedEvent, name: &str| {
         event
@@ -527,7 +527,7 @@ async fn isolating_and_evicting_a_poisoned_key_emits_a_warning_event() {
         .expect("elapsed_ms is a number");
 }
 
-/// Issue #614: when isolation pins a failure on a key that is still below the
+/// When isolation pins a failure on a key that is still below the
 /// death threshold, `classify_and_retry` must say so at `WARN`, naming the key
 /// and its death count, not log the same "isolation reproduced nothing" line a
 /// batch with no attributable key gets. One `drain_once` call over a batch
@@ -580,7 +580,7 @@ async fn a_below_threshold_charge_is_logged_as_a_warning_naming_the_key() {
                 && e.message().contains("still below the death threshold")
         })
         .unwrap_or_else(|| panic!("expected a WARN event naming the charged key: {events:#?}"));
-    // #799: a death is charged to the definition the key fails in.
+    // A death is charged to the definition the key fails in.
     let expected = format!("spans_charge_totals: {DEFAULT_SCHEMA}.orders key=1 (1/5 deaths)");
     assert_eq!(
         charged.fields.get("charged").map(String::as_str),
@@ -595,7 +595,7 @@ async fn a_below_threshold_charge_is_logged_as_a_warning_naming_the_key() {
     );
 }
 
-/// #625 F8a: the Re-derive build of a plain 1-1 over a captured table
+/// The Re-derive build of a plain 1-1 over a captured table
 /// reports its start (`waiting_to_backfill` -> `backfilling`) and its
 /// finish (`backfilling` -> `live`), and nothing else: it is never
 /// `catching_up`.

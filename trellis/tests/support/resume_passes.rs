@@ -1,6 +1,6 @@
-//! A staging worker stepped by hand for the resume tests of #1324: whole
+//! A staging worker stepped by hand for the resume tests: whole
 //! passes, the capture half of one, backfill jobs and drains, each called
-//! directly. Nothing polls for convergence (#297).
+//! directly. Nothing polls for convergence.
 
 #![allow(dead_code)]
 

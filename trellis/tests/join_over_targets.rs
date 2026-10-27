@@ -1,5 +1,5 @@
-//! `JOIN` transforms whose sides are other definitions' targets (#1108,
-//! #1096 decision 5, ADR-0019 "A side may be another transform's target").
+//! `JOIN` transforms whose sides are other definitions' targets
+//! (ADR-0019 "A side may be another transform's target").
 //!
 //! A target is never captured: its writers stage its changes through the
 //! target-mutation seam, and a target a `JOIN` reads is on the seam's image
@@ -11,7 +11,7 @@
 //!
 //! Each test drives the pipeline by hand through `support/drain_driver.rs`,
 //! and none sleeps or polls for
-//! convergence (#297). After each step the `JOIN` target equals its query
+//! convergence. After each step the `JOIN` target equals its query
 //! written over the captured tables, so the upstreams are checked through
 //! it.
 
@@ -273,8 +273,8 @@ async fn a_join_defined_over_seeded_upstreams_builds_from_their_rows() {
     assert_exact(&mut d, "written after the build").await;
 }
 
-/// A `JOIN` defined while an upstream writer is in flight (#1096 decision
-/// 5): the upstream page resolved its target's feed before the `JOIN`
+/// A `JOIN` defined while an upstream writer is in flight:
+/// the upstream page resolved its target's feed before the `JOIN`
 /// existed, so it stages nothing for it, and commits after the `JOIN`'s
 /// build started. The plan waits on its seam fence until that page has
 /// ended, so the build counts the page's row rather than missing it. One
@@ -423,7 +423,7 @@ async fn an_upstream_rebuild_in_place_reaches_the_join_through_the_seam() {
 /// writes its rows through the seam, as images of the rows its target held.
 /// The group-basis upstream's build starts from empty partials while its
 /// target keeps the earlier rows, so the `JOIN` reading it is rebuilt, once,
-/// when that build commits (#1287).
+/// when that build commits.
 #[tokio::test]
 async fn an_upstream_resume_reaches_the_join() {
     let mut d = start().await;
@@ -581,7 +581,7 @@ async fn facade(d: &Driver) -> trellis::Trellis {
 }
 
 /// A `JOIN` reading a paused column of a 1-1 target reports `catching_up`
-/// and names the column, as an aggregate does (#1208); one reading the other
+/// and names the column, as an aggregate does; one reading the other
 /// side's upstream only is unaffected. The column's resume writes the
 /// upstream's rows through the seam, so the `JOIN` is exact again with no
 /// rebuild.

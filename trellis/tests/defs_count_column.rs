@@ -1,4 +1,4 @@
-//! End-to-end tests for issue #120's `COUNT(<column>)` in a `GROUP BY`
+//! End-to-end tests for `COUNT(<column>)` in a `GROUP BY`
 //! definition — counting non-null occurrences of a specific column, a
 //! different Postgres semantic from `COUNT(*)`'s unconditional row count.
 //!
@@ -21,21 +21,18 @@
 //!    type-checked at all once the grammar accepted it. Fixed with a
 //!    `COUNT`-specific early return in `infer_expr` that validates the
 //!    argument unconditionally (Postgres's own `count(x)` accepts any type).
-//! 3. **Two silently-wrong SQL renderers**: the old aggregate path's
-//!    (deleted in #623 D5) forced-full-recompute paths, single-group and
-//!    bulk, both hardcoded `count(*)` for every `COUNT` field — correct for
-//!    `COUNT(*)`, silently wrong for `COUNT(<column>)` (it would have
-//!    written the group's *row count*, not the column's non-null count, any
+//! 3. **Two silently-wrong SQL renderers**: a forced-full-recompute path,
+//!    single-group or bulk, that hardcoded `count(*)` for every `COUNT`
+//!    field would be correct for
+//!    `COUNT(*)`, silently wrong for `COUNT(<column>)` (it would write the
+//!    group's *row count*, not the column's non-null count, any
 //!    time an image-less recompute trigger forced that field's group onto
 //!    the full-recompute path). `count_column_forced_full_recompute_...`
 //!    below drives image-less recomputes through the group basis.
 //!
-//! Bundled in, since `docs/type-support.md` (#111's own "exact integer
-//! semantics" note) explicitly earmarks it for this issue: `COUNT` is now
-//! declared `bigint` (`Integer(Int8)`), matching Postgres's own
-//! `pg_typeof(count(*))`/`pg_typeof(count(x))`, rather than the `numeric`
-//! every aggregate used to collapse into before issue #111 had anywhere to
-//! put an integer.
+//! Also covered: `COUNT` is declared `bigint` (`Integer(Int8)`), matching
+//! Postgres's own `pg_typeof(count(*))`/`pg_typeof(count(x))`, rather than
+//! `numeric`.
 //!
 //! Harness conventions follow `defs_enum.rs`.
 

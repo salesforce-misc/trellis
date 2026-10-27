@@ -1,5 +1,5 @@
 //! Capture triggers or functions changed outside Trellis, on a partitioned
-//! source (#1200, slice 2 of #707): a disruption of the root's or any node's
+//! source: a disruption of the root's or any node's
 //! capture pauses both readers of the source, and partition maintenance of
 //! every routine kind pauses nothing.
 //!
@@ -8,7 +8,7 @@
 //! partition key), and `s_<case>`, `SUM(b)` by `g`. (A 1-1 transform over a
 //! partitioned source is refused at define, so aggregates are the readers.)
 //! The case's windows run between calls of the capture pass, which is called
-//! directly. Nothing polls for convergence (#297).
+//! directly. Nothing polls for convergence.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -231,7 +231,7 @@ async fn settle(
         for reader in ["r", "s"] {
             let status = trellis.status(&format!("{reader}_{id}")).await.unwrap();
             let status = status.expect("the reader exists");
-            // A live reader's pause is a `disruption` (#1181), so the
+            // A live reader's pause is a `disruption`, so the
             // client test helper's `resume_capture_disruptions` resumes it.
             if let Some(f) = &status.capture_failure
                 && f.kind != trellis::CaptureFailureKind::Disruption
@@ -806,7 +806,7 @@ async fn count(raw: &Client, sql: &str) -> String {
 
 /// A root that is dropped, renamed away, moved to another schema, swapped by
 /// renames or dropped and recreated is table maintenance, not partition
-/// maintenance (#1200): both readers pause on the first pass that sees it,
+/// maintenance: both readers pause on the first pass that sees it,
 /// nothing is corrected and nothing is reinstalled before a `RESUME`, and
 /// after it the targets equal what the source holds.
 #[tokio::test]

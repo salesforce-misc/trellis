@@ -1,11 +1,11 @@
-//! Bounded drain paging (issue #620, epic #556 milestone A2a).
+//! Bounded drain paging.
 //!
 //! A drain holds at most `drain_batch_cap` folded records at once: a share
 //! larger than the cap drains in keyset pages on `(route, src_table, key)`,
 //! each its own compute-and-apply transaction that advances the bucket's
 //! `drain_cursor` behind a claim check. These tests drive the pages directly
 //! (`drain_many_with_hooks`) with small caps, never by waiting for a running
-//! client to converge (#297), and check the target against the oracle: SUM and
+//! client to converge, and check the target against the oracle: SUM and
 //! COUNT over the live source for the aggregate, the source's own rows for the
 //! 1-1 copy.
 
@@ -50,7 +50,7 @@ fn source_columns() -> HashMap<String, ValueType> {
 }
 
 /// Claims in a transaction of its own and commits it. `claim::claim` takes a
-/// transaction: it holds the segment row's lock until commit (issue #690).
+/// transaction: it holds the segment row's lock until commit.
 async fn claim_committed(
     client: &mut Client,
     seg_seq: i64,
@@ -1480,7 +1480,7 @@ async fn stage_copy_keys(client: &Client, ids: &[i32]) {
     }
 }
 
-/// Issue #620 A2b: a reclaim while the first claimant still holds its
+/// A reclaim while the first claimant still holds its
 /// materialized share. Worker A materializes 60 keys at cap 10, commits page
 /// 1 and pauses before page 2 with its `TEMP` table live. Its claim is
 /// reclaimed, and worker B drains the rest start to finish in its own session,
@@ -1537,7 +1537,7 @@ async fn a_reclaim_mid_materialized_drain_resumes_from_the_cursor_in_a_new_sessi
     no_page_tables_within(&client, Duration::from_secs(10)).await;
 }
 
-/// Issue #620 A2b: a paged drain's `TEMP` table never reaches a pooled
+/// A paged drain's `TEMP` table never reaches a pooled
 /// connection and never outlives its drain call, whether the call finishes,
 /// fails its claim check, or is dropped mid-page. The pool here has exactly
 /// one connection, reused by every call: its backend never changes, and it
@@ -1626,7 +1626,7 @@ async fn no_page_table_outlives_a_drain_call_or_reaches_a_pooled_connection() {
     assert_eq!(read_copy(&client).await, oracle_copy(&client).await);
 }
 
-/// Issue #670: a page whose apply fails hands its pooled connection back
+/// A page whose apply fails hands its pooled connection back
 /// before isolating, so isolation's probes can check one out even from a
 /// one-connection pool. The page used to hold its connection (and plan)
 /// through the whole isolation: every probe's checkout waited out the pool's
@@ -1672,7 +1672,7 @@ async fn isolation_can_check_out_the_connection_its_failed_page_held() {
 }
 
 // ---------------------------------------------------------------------
-// Lock timeouts (issue #621, ADR-0002 I7)
+// Lock timeouts (ADR-0002 I7)
 // ---------------------------------------------------------------------
 
 /// The `lock_timeout` the impatient pool below gives each of its sessions.
@@ -1820,7 +1820,7 @@ async fn charges_and_holdups(client: &Client) -> (i64, i64) {
     (row.get(0), row.get(1))
 }
 
-/// A connection that drops after page 1's COMMIT landed (#856): the drain
+/// A connection that drops after page 1's COMMIT landed: the drain
 /// sees only the dropped connection, a transient failure, and retries the
 /// page with the same records and claim ending. A non-final page still holds
 /// its claim, so the retry finds its buckets' cursor already at its last key
@@ -1857,7 +1857,7 @@ async fn a_non_final_page_retried_after_its_commit_landed_applies_nothing_twice(
     assert_eq!(charges_and_holdups(&client).await, (0, 0));
 }
 
-/// A connection that drops after a final page's COMMIT landed (#856): the
+/// A connection that drops after a final page's COMMIT landed: the
 /// retry's completion finds the claim the commit released already gone, so
 /// it rolls back whole as `ClaimLost`, which is surfaced as it is: no
 /// charge, no holdup. The committed page stands.

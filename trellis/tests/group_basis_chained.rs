@@ -1,22 +1,21 @@
 //! Group-basis aggregates whose source is another definition's target
-//! (#1100's chained sources, #1096 decision 5, ADR-0002 "Multi-hop").
+//! (ADR-0002 "Multi-hop").
 //!
 //! A target is never captured: its writers stage its changes through the
 //! target-mutation seam, and a target with a group-basis reader is on the
 //! seam's image feed (`staging::target_mutations`, "The image feed"). Each
 //! test here drives the pipeline by hand through `support/drain_driver.rs`
-//! and none sleeps or polls for convergence (#297). Every source starts empty and is written through
+//! and none sleeps or polls for convergence. Every source starts empty and is written through
 //! capture once every definition is live, except where a test says it builds
 //! over rows.
 //!
 //! The first tests cover a chained aggregate over a single-column and a
 //! composite group key, and one whose upstream 1-1 target loses a row. The
-//! rest are decision 5's: a row that moves group upstream (#1043
-//! F8), a rollup whose upstream group is emptied and refilled in one page, a
+//! rest cover a row that moves group upstream, a rollup whose upstream group is emptied and refilled in one page, a
 //! reader defined while an upstream writer is in flight, and an upstream
 //! rebuild that rebuilds the reader. The last group is a reader's build over an
 //! upstream target whose keys have `NULL` parts, with writes and source
-//! `TRUNCATE`s around it (#1102).
+//! `TRUNCATE`s around it.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -120,7 +119,7 @@ fn agg_g_columns() -> Vec<(&'static str, ValueType)> {
 }
 
 /// An extinct upstream group removes the chained group it was the only
-/// contributor to, and a shrunk one reduces it (#180), with a plain
+/// contributor to, and a shrunk one reduces it, with a plain
 /// single-column `GROUP BY` at both levels.
 #[tokio::test]
 async fn an_extinct_upstream_group_removes_its_rollup_group() {
@@ -150,7 +149,7 @@ async fn an_extinct_upstream_group_removes_its_rollup_group() {
 }
 
 /// A coarser rollup over a composite upstream `GROUP BY`: an extinct
-/// `(g, h)` group reduces its `g`'s total and its group count (#171, #180).
+/// `(g, h)` group reduces its `g`'s total and its group count.
 #[tokio::test]
 async fn an_extinct_composite_upstream_group_reduces_its_coarser_rollup() {
     let mut d = start(
@@ -214,7 +213,7 @@ async fn a_deleted_one_to_one_row_reduces_the_aggregate_over_it() {
 
 // ------------------------------------------------------ decision 5's cases
 
-/// The computed-measure pattern (#1043 F8): an upstream 1-1 row moves group,
+/// The computed-measure pattern: an upstream 1-1 row moves group,
 /// so the aggregate over it decrements the group it left, which only the old
 /// image names. A key-only `Recompute` would leave it counted there.
 #[tokio::test]
@@ -285,7 +284,7 @@ async fn a_rollup_follows_upstream_groups_emptied_and_refilled_in_one_page() {
 /// existed, so it stages nothing for it, and commits after the reader's
 /// build started. The build's plan waits on its fence until that page has
 /// ended, so it sees the page's row rather than missing it: the build
-/// (#1101) counts it and the reader goes `live` with it.
+/// counts it and the reader goes `live` with it.
 #[tokio::test]
 async fn a_reader_defined_while_an_upstream_writer_is_in_flight_does_not_miss_its_write() {
     let mut d = Driver::start(SRC_DDL, &src_columns(), &[ONE], &[SRC]).await;
@@ -385,7 +384,7 @@ async fn run_plan(d: &Driver) -> bool {
 }
 
 /// A rebuild of a group-basis upstream reaches its group-basis reader
-/// through the seam (#1101): each visible row the rebuild changes is staged
+/// through the seam: each visible row the rebuild changes is staged
 /// with the row the target held as its prior image, so the reader moves
 /// each group between its rollup groups exactly once. Here the rebuild's
 /// snapshot sees an undrained insert and delete, which it folds into
@@ -437,11 +436,11 @@ async fn an_upstream_rebuild_reaches_its_reader_through_the_seam() {
     assert_equal(&mut d, ROLL, ORACLE).await;
 }
 
-// ------------------------------------- 1-1 readers of a nullable key (#1141)
+// ------------------------------------- 1-1 readers of a nullable key
 
 /// A 1-1 reader of a group-basis aggregate holds the groups whose key has a
 /// `NULL` part, as the aggregate does: its key is the aggregate's `UNIQUE
-/// NULLS NOT DISTINCT` one (#1141). A row moves into, within and out of
+/// NULLS NOT DISTINCT` one. A row moves into, within and out of
 /// such a group.
 #[tokio::test]
 async fn a_one_to_one_reader_holds_the_null_keyed_groups() {
@@ -476,7 +475,7 @@ async fn a_one_to_one_reader_holds_the_null_keyed_groups() {
 }
 
 /// A 1-1 reader of a `JOIN` target, whose `GROUP BY` value can be `NULL`,
-/// holds the `NULL` group as the `JOIN` target does (#1141).
+/// holds the `NULL` group as the `JOIN` target does.
 #[tokio::test]
 async fn a_one_to_one_reader_of_a_join_target_holds_the_null_group() {
     let mut d = Driver::start(
@@ -530,7 +529,7 @@ async fn a_one_to_one_reader_of_a_join_target_holds_the_null_group() {
 /// a `NULL`-keyed row that leaves a group (its count changes, or its group
 /// goes extinct upstream) is found in the group it left through its prior
 /// image, which the 1-1 apply captures for a `NULL`-keyed row as for any
-/// other (#1141).
+/// other.
 #[tokio::test]
 async fn a_rollup_over_a_one_to_one_reader_follows_its_null_keyed_rows() {
     let mut d = start(
@@ -570,7 +569,7 @@ async fn a_rollup_over_a_one_to_one_reader_follows_its_null_keyed_rows() {
 }
 
 /// A `PAUSE` and a `DROP` of a reader while a page that planned it is in
-/// flight (#1291). The page holds the reader's feed from its plan; the drop
+/// flight. The page holds the reader's feed from its plan; the drop
 /// removes the reader's hidden table under it. The page must not fail on the
 /// dropped table, and nothing may be charged for it.
 #[tokio::test]
@@ -654,7 +653,7 @@ async fn a_pause_and_drop_of_a_reader_wait_for_a_page_that_planned_it() {
 }
 
 /// A `PAUSE` and a `DROP` of a 1-1 definition while a page that planned it
-/// is in flight (#1291). The page writes its 1-1 targets in name order and
+/// is in flight. The page writes its 1-1 targets in name order and
 /// queues on a row of `a1` before it reaches `m`, so it holds no lock on `m`
 /// yet, only its source's fence from its plan. The drop waits for the page,
 /// which commits, and nothing is charged.

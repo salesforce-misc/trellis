@@ -1,5 +1,5 @@
 //! A type renamed or moved to another schema after define is followed in
-//! place (issues #1204, #1242).
+//! place.
 //!
 //! `ALTER TYPE tone RENAME TO tone2` and `ALTER TYPE tone SET SCHEMA other`
 //! change no value and touch nothing Trellis created, but Trellis casts
@@ -11,7 +11,7 @@
 //! rebuilds or reinstalls, whenever the rename happens.
 //!
 //! Every test is stepped by hand: writes, then explicit capture passes and
-//! drains. Nothing polls for convergence (#297).
+//! drains. Nothing polls for convergence.
 
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -426,7 +426,7 @@ async fn an_unchanged_name_is_never_re_recorded() {
 }
 
 /// `ALTER TYPE ... RENAME VALUE` after the writes drained is no rename: the
-/// labels Trellis stored no longer name a value (#1241), so every reader of
+/// labels Trellis stored no longer name a value, so every reader of
 /// the type pauses, the chained one over the passthrough's copy included,
 /// and `RESUME` rebuilds each (`capture_enum_relabel.rs` has each shape).
 #[tokio::test]
@@ -779,7 +779,7 @@ const PASS_AND_COUNTS: [&str; 2] = [
     "TRANSFORM per_tone FROM public.items GROUP BY tone WITHOUT SOURCE INDEX SELECT tone AS tone, COUNT(*) AS n",
 ];
 
-/// #1242 window 1: the type is renamed between define and the pass that
+/// Window 1: the type is renamed between define and the pass that
 /// installs the source's capture, so the baseline that pass records already
 /// has the new name. The definitions' own record still has the type's OID
 /// beside the old name: the first pass follows the rename, nothing pauses,
@@ -838,7 +838,7 @@ async fn a_rename_before_the_first_pass_is_followed() {
     );
 }
 
-/// #1242 window 2: a chained reader over an upstream paused for a capture
+/// Window 2: a chained reader over an upstream paused for a capture
 /// failure. The paused upstream no longer counts toward its source's
 /// captured columns, and no other captured table has the type, so no
 /// capture baseline records it; the chained definition reads the upstream's
@@ -933,7 +933,7 @@ fn run(command: &mut Command) {
     );
 }
 
-/// #1242, a logical restore: every OID is new. The pass pauses every
+/// A logical restore: every OID is new. The pass pauses every
 /// definition for the restore and compares none of their recorded OIDs, even
 /// one that names another type here (a decoy, standing in for the original
 /// database's OID taken by an unrelated type). `RESUME` records the new OIDs,
@@ -1056,7 +1056,7 @@ async fn a_logical_restore_is_re_recorded_by_resume_and_a_later_rename_followed(
     }
 }
 
-/// #1242, a simulated `pg_upgrade`: the cluster's identifier changes and
+/// A simulated `pg_upgrade`: the cluster's identifier changes and
 /// every OID and name stays. Nothing is re-recorded and nothing pauses.
 #[tokio::test]
 async fn a_simulated_pg_upgrade_re_records_nothing() {

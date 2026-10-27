@@ -1,4 +1,4 @@
-//! The columns of the tables Trellis created that hold a `varchar` (#1207).
+//! The columns of the tables Trellis created that hold a `varchar`.
 
 /// Every column of every table outside `pg_catalog` holding a `varchar`, or
 /// an array of one, as `relation.column type`, except the sources `sources`
