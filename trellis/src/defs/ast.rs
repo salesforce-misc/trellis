@@ -17,7 +17,7 @@ use crate::float::FloatWidth;
 use crate::integer::IntWidth;
 
 /// A parsed transform definition, ready for the validator and
-/// evaluator.
+/// the SQL renderer.
 ///
 /// **`target`/`source` are always bare table names, never a dotted
 /// `schema.table` spelling — even when the definition explicitly qualified
@@ -360,7 +360,7 @@ pub struct FieldDef {
 pub enum Expr {
     /// A reference to a column on the (single, 1-1) source row.
     Column(String),
-    /// A numeric literal, kept as the source text so the evaluator picks
+    /// A numeric literal, kept as the source text so the validator picks
     /// the numeric type/precision rather than the parser.
     NumberLiteral(String),
     /// A single-quoted string literal.
@@ -544,7 +544,7 @@ impl fmt::Display for ValueType {
 }
 
 /// An operator accepted by the expression grammar; see [`super::registry`]
-/// for the list the parser validates against and the evaluator reuses.
+/// for the list the parser validates against and the renderer reuses.
 /// [`Operator::Add`] is `Numeric, Numeric -> Numeric`; [`Operator::GreaterThan`]
 /// is `Numeric, Numeric -> Boolean`, matching Postgres's `>` on
 /// `numeric` exactly.

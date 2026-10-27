@@ -464,7 +464,7 @@ async fn float_text_rendering_is_byte_identical_to_postgres_through_the_apply_pa
 /// operand widens to it, so `0.1::real > 0.1` is true (the widened real is
 /// 0.10000000149...). Every verdict below is read from the server, over rows
 /// that include `NULL`, `NaN`, `-0`, a subnormal and a `real` that rounded,
-/// and the evaluator must agree; narrowing the literal to `f32` flips the
+/// and the real apply path must agree; narrowing the literal to `f32` flips the
 /// `r` rows. A literal is refused at define exactly where the server raises
 /// `22003` for it.
 #[tokio::test]

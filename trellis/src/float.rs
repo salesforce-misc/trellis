@@ -169,9 +169,9 @@ pub fn checked_add(
 ///
 /// The bar is *canonical form*, not "`float8in` would accept it", and it is
 /// the same bar [`crate::defs::typed_literal`] sets for every other family:
-/// a value travels through the staging ring as text, so a spelling the
-/// evaluator accepts but renders back differently would make the evaluator
-/// and the SQL oracle disagree — exactly the divergence ADR-0013 exists to
+/// a value travels through the staging ring as text, so a spelling
+/// Postgres accepts but renders back differently would make the target and
+/// the SQL oracle disagree — exactly the divergence ADR-0013 exists to
 /// catch. `float8in` accepts `1.5e1`, `+1.5`, ` 1.5 `, `inf`, `nan` and
 /// `1.50`; none of those is what `float8out` emits, so none is accepted
 /// here. The check is implemented as "parse, then round-trip through

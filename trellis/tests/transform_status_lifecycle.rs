@@ -534,7 +534,7 @@ async fn quarantine_trips_for_real_on_five_poisoned_keys_then_resumes_to_live() 
     // attempts. A bad key is a `key-shape` failure exactly like ADR-0003's
     // own example ("a key-shape/DDL failure that dooms every column's write
     // for that row alike") — [`quarantine::attribute_column_failure`] only
-    // ever fires for [`trellis::defs::eval::EvalError`], so this charges
+    // ever fires for a data exception (SQLSTATE class 22), so this charges
     // only the row-level fuse, letting the whole-transform fuse trip for
     // real. Staged into the *currently* active ring table, not a hardcoded
     // `"seg_0"` — the build and drain activity above has already sealed

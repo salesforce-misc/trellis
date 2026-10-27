@@ -58,7 +58,7 @@ pub struct DrainFailure {
     /// The latest failure's error, as the drain surfaced it.
     pub error: String,
     /// The latest failure's SQLSTATE, `None` when it didn't come from
-    /// Postgres (an evaluator error, say).
+    /// Postgres (a connection error, say).
     pub sqlstate: Option<String>,
     /// When a drain first failed on the page.
     pub since: SystemTime,

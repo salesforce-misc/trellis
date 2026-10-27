@@ -384,10 +384,9 @@ async fn self_check_reports_a_paused_definition_as_not_live() {
 /// by Postgres, in the same session, with `date_out` applied to each — so a
 /// non-canonical literal would be normalized identically on both sides and
 /// cancel out. The comparisons that genuinely depend on canonical form are
-/// the ones where a *Rust*-produced string meets a Postgres-produced one:
-/// the generative suite's `evaluator_vs_sql` leg, and
+/// the ones where an engine-side string meets a Postgres-produced one:
 /// `defs_typed_literals.rs`'s own
-/// `evaluator_and_sql_oracle_agree_on_every_literal`.
+/// `postgres_renders_every_literal_as_its_source_text`.
 ///
 /// Goes through the public `define` front door, so it also pins that the
 /// whole grammar addition is reachable by an ordinary embedder and not just

@@ -5456,13 +5456,10 @@ async fn drain_batch(
                 attempt -= 1;
                 continue;
             }
-            // Every other Phase 2 failure (an evaluator error against a
-            // malformed staged image is the common case) goes through the
-            // exact same classification the Phase 3 branch below uses — a
-            // bad key's image fails `compute()` for the whole batch just as
-            // surely as it would fail Phase 3, and isolation must attribute
-            // it the same way regardless of which phase first tripped over
-            // it.
+            // Every other Phase 2 failure goes through the exact same
+            // classification the Phase 3 branch below uses, and isolation
+            // must attribute it the same way regardless of which phase
+            // first tripped over it.
             Err(err) => {
                 classify_and_retry(
                     pool,

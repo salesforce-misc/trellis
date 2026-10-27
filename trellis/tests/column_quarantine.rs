@@ -209,7 +209,7 @@ async fn seed_order_summaries(db: &TestDatabase, orders_def: &TransformDef) {
 
 /// Stages one malformed (`price` = `"not-a-number"`) CDC insert per id in
 /// `ids`, all into the *same* segment, seals it, and drains it once —
-/// expecting an evaluator failure to surface (the drive-by-real-failures
+/// expecting a data-exception failure to surface (the drive-by-real-failures
 /// pattern `tests/quarantine.rs`'s own eviction test uses, just for the
 /// column fuse instead of the row-level one).
 ///
@@ -1654,8 +1654,8 @@ async fn pausing_an_upstream_column_never_cascades_into_a_downstream_aggregate()
 //     sibling column on the same transform is also paused (must-fix 3).
 // ---------------------------------------------------------------------
 
-/// `resume_column`'s `recompute_column` used to call the un-excluding
-/// evaluator, so a still-paused sibling column
+/// `resume_column`'s `recompute_column` used to render the un-excluding
+/// field set, so a still-paused sibling column
 /// (`busted` below, whose formula throws for every row given the malformed —
 /// but genuinely persisted — source data) made the *whole* per-row
 /// evaluation fail, and the resumed column (`doubled`) silently never got
@@ -2410,7 +2410,7 @@ async fn a_bare_src_table_failure_is_still_attributed_to_its_column() {
     let status = column_status_row(&client, "order_totals", "total")
         .await
         .expect(
-            "a threshold's worth of evaluator failures on a bare `src_table` must pause the \
+            "a threshold's worth of data-exception failures on a bare `src_table` must pause the \
              column, not go unattributed",
         );
     assert!(status.0, "a threshold trip is a local fuse, not a cascade");

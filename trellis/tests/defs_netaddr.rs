@@ -41,8 +41,7 @@
 //!
 //! Per ADR-0013 every comparison is against independently-authored SQL —
 //! plain `pg_cast`, plain `network_cmp`/`<`, plain `group by`, plain
-//! `min`/`max` — never against `defs::oracle::recompute`, which would be the
-//! engine's own renderer grading itself. Harness conventions follow
+//! `min`/`max` — never against the engine's own renderer. Harness conventions follow
 //! `defs_boolean.rs`/`defs_bytea.rs`.
 
 use std::collections::HashMap;

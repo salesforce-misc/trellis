@@ -211,9 +211,8 @@
 //! -- NULL                   -- only a genuinely *empty* group is SQL NULL
 //! ```
 //!
-//! `super::defs::eval`'s `JSONB_AGG` fold path threads each row's `Option<Value>`
-//! through as a JSON element (`null` for `None`) instead of filtering `None`
-//! out first, unlike every other aggregate's shared fold helper.
+//! Postgres computes the aggregate, so a rendered `JSONB_AGG` keeps that
+//! behavior by construction.
 //!
 //! # `MIN`/`MAX(jsonb)` — not attempted
 //!

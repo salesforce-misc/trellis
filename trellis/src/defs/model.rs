@@ -11,9 +11,9 @@ use super::ast::{TransformDef, ValueType};
 /// table's version at the moment this definition was created (the value
 /// stage 05's version fence will read), and the source-column type map `def`
 /// was validated against (persisted so the
-/// physical apply path — [`crate::staging::apply::compute`] — can evaluate
-/// non-Numeric fields the same way [`super::catalog::create_definition`]
-/// validated them, rather than re-deriving or defaulting to Numeric).
+/// physical apply path can render non-Numeric fields the same way
+/// [`super::catalog::create_definition`] validated them, rather than
+/// re-deriving or defaulting to Numeric).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Definition {
     pub id: i64,

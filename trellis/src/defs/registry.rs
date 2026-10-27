@@ -1,11 +1,11 @@
 //! The function/operator registry ADR-0004 requires: the grammar's accepted
-//! operators and functions must equal the evaluator's re-implemented set
-//! (the evaluator consumes this list too), so it lives as a plain, reusable
+//! operators and functions must equal the set the SQL renderer emits (the
+//! renderer consumes this list too), so it lives as a plain, reusable
 //! table rather than being baked into the parser's control flow.
 //!
 //! The text functions (`strpos`, `octet_length`, `char_length`,
 //! `regexp_count`) each carry their arity and argument/
-//! return [`ValueType`]s so the parser, validator, and evaluator all read
+//! return [`ValueType`]s so the parser, validator, and renderer all read
 //! the same source of truth rather than each hardcoding a function's shape.
 
 use super::ast::{Operator, ValueType};
@@ -54,7 +54,7 @@ pub mod precedence {
     pub const ADDITIVE: u8 = 20;
 }
 
-/// The full set of operators this grammar/evaluator pairing supports.
+/// The full set of operators this grammar supports.
 ///
 /// # Precedence table
 ///
@@ -142,9 +142,9 @@ pub fn operator_spec(operator: Operator) -> &'static OperatorSpec {
 /// operand through its implicit cast and then running `numeric_add`, which
 /// is *unbounded* — so a mixed-type sum correctly cannot overflow, while an
 /// all-integer one correctly can (the SQL raises on overflow).
-/// [`super::eval`]'s `apply_operator` dispatches on the same shape, and has
-/// to: if the two disagreed, the target column's declared type and the value
-/// written into it would disagree too.
+/// The renderer emits the same operator, so Postgres types the sum as this
+/// table does; if the two disagreed, the target column's declared type and
+/// the value written into it would disagree too.
 ///
 /// The float rows look asymmetric and are not: Postgres has
 /// `float4pl`/`float8pl`/`float48pl`/`float84pl` and nothing else, so *any*
@@ -208,9 +208,8 @@ pub struct FunctionSpec {
 }
 
 /// Function names the grammar accepts as calculated-field functions,
-/// each re-implemented in [`super::eval`] with identical Postgres 15+
-/// semantics (per ADR-0004: the grammar and evaluator function sets are one
-/// list).
+/// each rendered as the Postgres function of the same name (per ADR-0004:
+/// the grammar and renderer function sets are one list).
 ///
 /// All four return Postgres `integer` (`int4`), not `numeric` — checked
 /// against `pg_proc.prorettype` for `strpos`/`octet_length`/`char_length`/

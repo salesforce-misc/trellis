@@ -40,8 +40,7 @@
 //!
 //! Per ADR-0013 every comparison is against independently-authored SQL —
 //! plain `pg_typeof`, plain `select ... group by ...`, plain `::text` —
-//! never against `defs::oracle::recompute`, which would be the engine's own
-//! renderer grading the engine's own evaluator.
+//! never against the engine's own renderer.
 //!
 //! Harness conventions follow `defs_floats.rs`.
 

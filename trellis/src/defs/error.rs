@@ -127,11 +127,11 @@ impl fmt::Display for ParseError {
             }
             ParseError::UnsupportedOperator { operator } => write!(
                 f,
-                "unsupported operator '{operator}': only '+' and '>' are currently implemented (ADR-0004: grammar and evaluator function sets must match)"
+                "unsupported operator '{operator}': only '+' and '>' are currently implemented (ADR-0004: grammar and renderer function sets must match)"
             ),
             ParseError::UnsupportedFunction { name } => write!(
                 f,
-                "unsupported function '{name}': not in the registered function set (ADR-0004: grammar and evaluator function sets must match)"
+                "unsupported function '{name}': not in the registered function set (ADR-0004: grammar and renderer function sets must match)"
             ),
             ParseError::FunctionArityMismatch {
                 name,

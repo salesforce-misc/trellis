@@ -676,7 +676,7 @@ async fn install_definition_fast_path_builds_an_aggregate_cross_field_alias_chai
 /// A bare (not `BinaryOp`-wrapped) alias of a `SUM` field, declared *before*
 /// the field it aliases — `SELECT ..., total AS grand_total, SUM(amount) AS
 /// total`. Forward references are legal (the validator's cycle check and the
-/// evaluator's `fields_by_name` lookup are both declaration-order-agnostic),
+/// renderer's substitution are both declaration-order-agnostic),
 /// so `grand_total`'s classification (does it need a hidden running-count
 /// column, and under what name?) can only be answered from its *substituted*
 /// form (`SUM(amount)`), not its raw `Column("total")` shape. This pins the

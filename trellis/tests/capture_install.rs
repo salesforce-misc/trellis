@@ -1414,7 +1414,7 @@ async fn catalog_spec(client: &Client, table: &str) -> CaptureSpec {
 /// then is still undrained when an aggregate over `amount` registers and the
 /// table is widened for it. Started at once, the aggregate would build, go
 /// live and then drain that row, whose image has no `amount`:
-/// `EvalError::MissingColumn`, and the key quarantined. The widen's capture
+/// a missing-column data exception, and the key quarantined. The widen's capture
 /// gate holds the aggregate's start until the row has drained through the 1-1 reader
 /// alone; then the aggregate builds from the table and applies only rows
 /// that carry `amount`.

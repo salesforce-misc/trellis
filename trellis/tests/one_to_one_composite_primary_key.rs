@@ -20,12 +20,10 @@
 //! checked directly: `capture_parity.rs`'s composite primary key declared out
 //! of physical order, against its golden fixture.
 //!
-//! `defs::oracle::recompute` (the cross-check oracle `client_e2e.rs` compares
-//! against) is intentionally not used here: that oracle's own `pk_column: &str`
-//! parameter is single-column-only, and widening it is out of this issue's
-//! scope (the issue is about the engine's own composite-key support, not the
-//! oracle's) — so this file asserts against the target table's contents
-//! directly instead.
+//! `support/sql_recompute.rs` (the oracle `client_e2e.rs` compares against) is
+//! intentionally not used here: its `pk_column: &str` parameter is
+//! single-column-only, so this file asserts against the target table's
+//! contents directly instead.
 
 use std::collections::HashMap;
 

@@ -326,8 +326,8 @@ async fn quarantine_release_preserves_origin_position_so_convergence_stays_block
     );
 }
 
-/// Scenario: a batch with one key whose staged image is malformed (an
-/// evaluator-class failure — isolate-eligible, not transient/halting/fence)
+/// Scenario: a batch with one key whose staged image is malformed (a
+/// data-exception failure — isolate-eligible, not transient/halting/fence)
 /// and one healthy batch-mate. Below the death threshold, isolation
 /// attributes the failure to the bad key alone, charges it exactly one
 /// death, leaves the innocent key's counter and the `poison` marker
@@ -347,7 +347,7 @@ async fn an_innocent_batch_mate_is_not_charged_and_the_error_surfaces_unattribut
         .await
         .expect("seed orders rows");
 
-    // Key "1" carries a malformed numeric field — fails `eval::evaluate`
+    // Key "1" carries a malformed numeric field — fails the rendered cast
     // (`22P02`, a data exception), an isolate-eligible failure. Key "2" is
     // healthy.
     let orders = qualify_fixture_table("orders");

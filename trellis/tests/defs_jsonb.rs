@@ -33,8 +33,7 @@
 //!
 //! Per ADR-0013 every comparison is against independently-authored SQL —
 //! plain `pg_cast`, plain `pg_proc`, plain `=` — never
-//! against `defs::oracle::recompute`, which would be the engine's own
-//! renderer grading itself. Harness conventions follow
+//! against the engine's own renderer. Harness conventions follow
 //! `defs_bit.rs`/`defs_boolean.rs`.
 
 use std::collections::HashMap;

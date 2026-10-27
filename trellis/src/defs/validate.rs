@@ -251,8 +251,8 @@ pub enum ValidationError {
     /// `BYTEA '\xAB'`. See `super::typed_literal`'s module doc comment for
     /// why the bar is canonical form rather than "Postgres would parse it":
     /// in short, immutability (`date_in` is `STABLE` precisely because of
-    /// `'today'`) and text round-trip identity between the Rust evaluator
-    /// and the SQL oracle.
+    /// `'today'`) and text round-trip identity between the literal and
+    /// Postgres's rendering of the value.
     InvalidTypedLiteral {
         field: String,
         value_type: ValueType,
@@ -264,7 +264,7 @@ pub enum ValidationError {
     /// parser can't produce one — it only builds the node from that same
     /// table — so this is the validator's defense-in-depth against an AST
     /// assembled directly, in the same spirit as
-    /// `super::eval::EvalError::Cycle`.
+    /// the cycle check.
     UnsupportedLiteralType {
         field: String,
         value_type: ValueType,
@@ -1016,8 +1016,8 @@ pub fn validate(
                 // A calculated field aliased to a real source column's name
                 // must be a bare passthrough of it — the same
                 // shape the `Aggregate` arm below enforces for grouping
-                // columns. `is_self_passthrough`'s exemption in `infer_expr`/
-                // `eval_expr` only covers a field referencing its *own* name;
+                // columns. `is_self_passthrough`'s exemption in `infer_expr`
+                // only covers a field referencing its *own* name;
                 // without this check here, a different, non-passthrough
                 // field could still claim the column's name, and any *third*
                 // field referencing that name would then silently resolve to
@@ -2919,8 +2919,7 @@ fn infer_expr(
             .unwrap_or(ValueType::Numeric)),
         // An unadorned literal is typed exactly as Postgres's
         // own lexer types it — `integer` if it fits, else `bigint`, else
-        // (or if fractional) `numeric`. `eval::number_literal` is the
-        // value-level twin of this rule and must agree with it.
+        // (or if fractional) `numeric`.
         Expr::NumberLiteral(text) => Ok(number_literal_type(text)),
         Expr::StringLiteral(_) => Ok(ValueType::Text),
         Expr::TypedLiteral { value_type, text } => {
@@ -2928,7 +2927,7 @@ fn infer_expr(
             // `regexp_count`'s pattern is (see `validate_regexp_pattern`):
             // this runs on every path into the catalog, including a
             // hand-built AST that never went through `parse`, so a literal
-            // can't reach the evaluator un-checked. See
+            // can't reach the renderer un-checked. See
             // `super::typed_literal` for why the bar is *canonical* form
             // rather than merely "Postgres would parse it".
             let spec = super::typed_literal::lookup_typed_literal(
@@ -3285,9 +3284,9 @@ fn infer_expr(
 /// `integer`, one that only fits `bigint` is `bigint`, and a fractional
 /// literal (or an integral one too wide even for `bigint`) is `numeric`.
 ///
-/// The type-level twin of [`super::eval`]'s `number_literal`; the two must
-/// agree, or the validator and the evaluator would disagree about a field's
-/// target column type.
+/// The SQL renderer casts the literal to this type (`defs::oracle`'s
+/// `number_literal_sql`), so the target column type and the computed value
+/// agree.
 pub(crate) fn number_literal_type(text: &str) -> ValueType {
     if !text.contains('.')
         && let Ok(value) = text.parse::<i64>()

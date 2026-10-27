@@ -190,10 +190,8 @@
 //!
 //! - **NULL in a nullable column** — implemented. `c1`/`c2` are already
 //!   nullable at the schema level (`ManualBackend::create_source_table` never
-//!   emits `NOT NULL` for a non-primary-key column), and the engine's `+`
-//!   evaluator already treats a `NULL` operand as short-circuiting to `NULL`
-//!   (`defs::eval`'s `Operator::Add` arm), matching Postgres's own
-//!   `numeric + NULL = NULL`. So drawing `None` for `c1`/`c2` needed no
+//!   emits `NOT NULL` for a non-primary-key column), and Postgres's
+//!   `numeric + NULL = NULL` already gives a `NULL` operand a `NULL` sum. So drawing `None` for `c1`/`c2` needed no
 //!   engine or model change — see [`Mutate`] and the `value` strategy below.
 //! - **Empty string, the literal text `"NULL"`, delimiter-containing
 //!   strings** — implemented by task B1 above, on the new `Text` column: see
@@ -1112,61 +1110,35 @@ fn aggregate_field_def(func: AggregateFn, c1: &str, c2: &str) -> FieldDef {
 
 /// Improvement-plan task B2's D0 investigation ("with `>` and the five new
 /// functions in play, is there now a genuine, row-data-dependent way for a
-/// *valid* (post-`validate()`) definition to still error at eval time?").
+/// *valid* (post-`validate()`) definition to still fail at run time?").
 ///
-/// **Finding: no.** Every shape [`DerivedShape`] draws stays eval-time-
-/// infallible for the *values* this generator actually produces, the same
-/// way AVG's hidden count-partial already keeps `+`/`AVG` divide-by-zero-free
-/// (see this module's numeric-path pairing note above). Walked one shape at a
-/// time (`trellis/src/defs/eval.rs`'s `apply_operator`/`apply_function`):
+/// **Finding: no.** Postgres computes every field, and every shape
+/// [`DerivedShape`] draws is infallible for the *values* this generator
+/// actually produces, the same way AVG's hidden count-partial already keeps
+/// `+`/`AVG` divide-by-zero-free (see this module's numeric-path pairing
+/// note above). Walked one shape at a time:
 ///
-/// - **`Operator::GreaterThan`**: both operands are `trellis::numeric::Numeric`
-///   (arbitrary-precision decimal, like `+`), and `Numeric::compare` never
-///   errors — there is no overflow, division, or precision loss to trigger
-///   one. `Postgres::numeric >` cannot error either.
-/// - **`STRPOS`**: `haystack.find(needle)` is a total function over any two
-///   `&str`s (`""`, no match, unicode — all handled, see
-///   `trellis/tests/defs_text_functions.rs`'s `STRPOS_CASES`); it always
-///   returns a `usize`, never fails. Postgres's `strpos` is equally total.
-/// - **`OCTET_LENGTH`/`CHAR_LENGTH`**: `str::len`/`str::chars().count()` never
-///   fail for any valid Rust `String` (which every `Text` value already is,
-///   having come from a Postgres `text` column — always valid UTF-8).
-/// - **`REGEXP_COUNT`**: the *only* eval-time failure mode `eval::regexp_count`
-///   has is `Regex::new(pattern)` failing to compile — and `validate.rs`'s
-///   `validate_regexp_pattern` already compiles the pattern with the exact
-///   same `regex` crate at *validate* time and rejects the definition before
-///   it ever reaches eval, for every pattern this generator draws (a string
-///   literal, never a column reference, so it's always the specific literal
-///   `validate` checked). A validated definition can therefore never hit a
-///   pattern-compile failure at eval time. The one caveat worth naming for a
-///   future widening: Rust's `regex` crate and Postgres's own ARE dialect are
-///   different engines, so a pattern the Rust crate compiles is not
-///   guaranteed to be one Postgres's `regexp_count` also accepts (or accepts
-///   with the same semantics) — a *dialect* mismatch, not a data-dependent
-///   one. This generator sidesteps that risk entirely by only ever drawing
-///   `REGEXP_COUNT` patterns from `strategy::REGEXP_COUNT_PATTERN_POOL`, the
-///   same dialect-common subset (literal text, `.`, `*`, `+`, `?`, `[...]`,
-///   `|`, `^`, `$`) `trellis/tests/defs_text_functions.rs` already vets against
-///   real Postgres — never an arbitrary pattern that might expose that gap.
-///   A future widening that draws *arbitrary* regex syntax would need to
-///   cross exactly this boundary (and would be the first place a genuine
-///   SQL-oracle-vs-engine divergence, not a row-data-dependent eval error,
-///   could show up).
-/// - **`COALESCE`**: pure control flow (`eval_expr`'s `COALESCE` arm
-///   short-circuits on the first non-`None` argument) — there is no
-///   computation of its own to fail.
+/// - **`Operator::GreaterThan`**: both operands are `numeric`; there is no
+///   overflow, division, or precision loss to trigger an error.
+/// - **`STRPOS`**: total over any two `text` values (`""`, no match,
+///   unicode — see `trellis/tests/defs_text_functions.rs`).
+/// - **`OCTET_LENGTH`/`CHAR_LENGTH`**: total over any `text` value.
+/// - **`REGEXP_COUNT`**: the only failure mode is a pattern Postgres cannot
+///   compile. This generator only ever draws `REGEXP_COUNT` patterns from
+///   `strategy::REGEXP_COUNT_PATTERN_POOL`, a dialect-common subset (literal
+///   text, `.`, `*`, `+`, `?`, `[...]`, `|`, `^`, `$`) that
+///   `trellis/tests/defs_text_functions.rs` vets against real Postgres —
+///   never an arbitrary pattern. A future widening that draws arbitrary regex
+///   syntax would cross exactly this boundary.
+/// - **`COALESCE`**: pure control flow; no computation of its own to fail.
 ///
 /// Since no shape here has a real, generator-reachable, row-data-dependent
 /// error path, D0's "error-to-NULL oracle rendering" design (the plan's
-/// option 2) has nothing to quarantine yet and is **not built** in this
-/// session — building it now would be unused machinery with nothing to
-/// exercise it, the same call this module's original numeric-`+`-only D0
-/// pass made, just re-verified against the wider operator/function set this
-/// task adds. The day a future widening draws something genuinely
-/// data-dependent-fallible (an arbitrary regex pattern against arbitrary
-/// text, a numeric cast that can overflow a *narrower* column type, division
-/// by a column that can be zero, ...), this is the comment to update and the
-/// decision to revisit.
+/// option 2) has nothing to quarantine yet and is **not built**. The day a
+/// future widening draws something genuinely data-dependent-fallible (an
+/// arbitrary regex pattern against arbitrary text, a numeric cast that can
+/// overflow a *narrower* column type, division by a column that can be
+/// zero, ...), this is the comment to update and the decision to revisit.
 ///
 /// **Scoped to `OneToOne` defs only (post-B4 design note).** Every
 /// `DerivedShape` variant references `c1`/`c2`/the text column *bare*

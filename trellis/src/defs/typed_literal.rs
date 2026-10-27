@@ -40,7 +40,7 @@
 //! * `CAST(<any non-literal expr> AS <type>)` — a **general** cast, i.e. a
 //!   coercion lattice. That is a much larger design than this issue: every
 //!   (source, target) pair needs its own volatility verdict and its own
-//!   re-implemented evaluator arm, and most of the interesting pairs are not
+//!   rendering rule, and most of the interesting pairs are not
 //!   immutable (`timestamptz` → `date` reads the `TimeZone` GUC). It is also
 //!   worth very little today, since [`super::registry`] grants
 //!   [`ValueType::Other`] no operator or function at all — the only operands
@@ -66,15 +66,13 @@
 //!    lets a `date`/`timestamp` constant be treated as immutable here
 //!    without lying about `provolatile`.
 //!
-//! 2. **Round-trip identity.** A computed value travels as text
-//!    ([`super::eval::Value::Other`] carries the literal verbatim) and is
-//!    cast back to its native type on write. The Rust evaluator has no type
-//!    library to normalize `2024-1-5` into `2024-01-05` the way `date_out`
-//!    would, so the evaluator's text and the oracle's rendering would
-//!    disagree on a non-canonical spelling — precisely the cross-check
-//!    ADR-0013 exists to catch. Requiring the canonical spelling up front
-//!    makes the two renderers agree by construction, rather than by adding a
-//!    per-family normalizer this issue has no business writing.
+//! 2. **Round-trip identity.** The literal is rendered into SQL verbatim and
+//!    Postgres casts it to its native type. Engine-side text that is compared
+//!    with Postgres's rendering (a `self_check` walk compares `::text`) would
+//!    disagree on a non-canonical spelling: `2024-1-5` renders back as
+//!    `2024-01-05` the way `date_out` does. Requiring the canonical spelling
+//!    up front makes the two agree by construction, rather than by adding a
+//!    per-family normalizer.
 //!
 //! Half 2 has a dependency worth naming, because it is *not* a property of
 //! the literal alone: "canonical" means canonical **under the session's
@@ -367,9 +365,7 @@ pub fn lookup_typed_literal(keyword: &str) -> Option<&'static TypedLiteralSpec> 
 /// turns an [`super::ast::Expr`] into text: the oracle
 /// ([`super::oracle::render_expr_sql`] and [`super::oracle::render_qualified_expr_sql`]),
 /// the 1-1 build, and `staging::self_check`'s recompute leg.
-/// Shared here so the five of them can't drift — ADR-0013's cross-check only
-/// catches a renderer that disagrees with the *evaluator*, not two renderers
-/// that agree with each other and are both wrong.
+/// Shared here so the five of them can't drift.
 ///
 /// Emits the `'<text>'::<type>` spelling rather than the `<type> '<text>'`
 /// one a user may have written. The two are the same constant to Postgres
@@ -422,7 +418,7 @@ fn canonical_float(text: &str, width: FloatWidth) -> Result<(), &'static str> {
 /// `+`-prefixed spelling is rejected even though `oidin` would accept
 /// `-1` (wrapping it to `4294967295`) — a literal whose own text differs
 /// from what the value renders back as is precisely what breaks the
-/// evaluator/oracle round-trip this module's doc comment describes.
+/// round-trip identity this module's doc comment describes.
 fn canonical_oid(text: &str) -> Result<(), &'static str> {
     const SHAPE: &str = "an unsigned decimal in 0..=4294967295, with no sign and no leading zeros";
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {

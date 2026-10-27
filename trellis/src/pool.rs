@@ -428,10 +428,10 @@ impl Pool {
 /// on an engine connection instead of being silently reinterpreted.
 ///
 /// Why Trellis needs it, concretely: a computed value travels through the
-/// engine as **text** ([`crate::defs::eval::Value`]), and correctness is
-/// established by comparing two independently-authored renderings of it —
-/// the Rust evaluator's and Postgres's own (ADR-0013's continuous
-/// cross-check; `docs/generative-test-suite.md`). For a
+/// engine as **text**, and correctness is established by comparing two
+/// independently-authored renderings of it — the target's and the SQL
+/// oracle's (ADR-0013's continuous cross-check;
+/// `docs/generative-test-suite.md`). For a
 /// [`crate::defs::ValueType::Other`] value that comparison is **byte-exact**
 /// (the generative suite's `Comparison::Exact`), so any GUC that changes how
 /// Postgres spells a value turns a perfectly converged target into a

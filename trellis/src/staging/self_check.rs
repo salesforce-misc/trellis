@@ -12,9 +12,8 @@
 //! # Postgres is the oracle; the comparison is two-way
 //!
 //! `self_check` compares the persisted target against an equivalent
-//! recompute *query* executed by Postgres. It does not run the engine's Rust
-//! evaluator ([`crate::defs::eval::evaluate`]) as part of the comparison —
-//! re-running the evaluator would check the engine against itself.
+//! recompute *query* executed by Postgres. The engine computes no value
+//! itself, so there is no second engine-side computation to compare with.
 //!
 //! # The leaf renderer is independent of the write path
 //!

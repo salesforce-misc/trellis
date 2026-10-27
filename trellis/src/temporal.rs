@@ -20,8 +20,7 @@
 //! # Text stability, which is the whole ballgame for the key roles
 //!
 //! Trellis matches keys by raw `::text` rendering
-//! (`crate::defs::join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`,
-//! `crate::defs::eval`'s `to_rows_by_key`), so a family may hold a key role
+//! (`crate::defs::join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`), so a family may hold a key role
 //! only if `a::text = b::text` agrees with that family's own `=` for every
 //! value. A typed key index is not a prerequisite for most of them:
 //! text-stability is a property of the rendering, not of the operator set

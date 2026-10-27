@@ -35,20 +35,15 @@
 //! `pg_typeof(min(v))` keeps the argument's own concrete enum type — the same
 //! "own family, own terms" shape `inet`'s `MIN`/`MAX` landed under.
 //!
-//! The one place this type family is *not* like every earlier one: it is the
-//! first whose ordering is not a fixed, universal property of the family
-//! itself but a live, per-type, schema-defined fact — see
-//! `trellis::defs::eval::EvalError::EnumOrderingUnavailable`'s own doc
-//! comment (pinned by unit tests in `defs::eval`'s own test module, not
-//! here) for the one evaluator-internal consequence of that: the pure,
-//! DB-less Rust fold this issue's `MIN`/`MAX` support shares with every
-//! other family cannot always answer a multi-distinct-value group's
-//! ordering honestly, and refuses rather than guess.
+//! The one place this type family is *not* like every earlier one: its
+//! ordering is not a fixed, universal property of the family but a live,
+//! per-type, schema-defined fact. Postgres orders an enum by its labels'
+//! declared sort order, and the rendered `min`/`max` runs in Postgres, so
+//! the engine needs no ordering of its own.
 //!
 //! Per ADR-0013 every comparison is against independently-authored SQL —
 //! plain `pg_cast`, plain `to_jsonb`, plain `min`/`max`, plain `group by` —
-//! never against `defs::oracle::recompute`, which would be the engine's own
-//! renderer grading itself. Harness conventions follow `defs_netaddr.rs`/
+//! never against the engine's own renderer. Harness conventions follow `defs_netaddr.rs`/
 //! `defs_bit.rs`.
 
 use std::collections::HashMap;

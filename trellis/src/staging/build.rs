@@ -119,7 +119,7 @@
 //! resume rebuild only the fields they change, in the background
 //! ([`start_field_build`]). The fields they change take in every field that
 //! reads one of them by alias, directly or through others
-//! (`defs::eval::AliasReaders`), since its value moves with theirs; a column
+//! (`defs::alias_readers::AliasReaders`), since its value moves with theirs; a column
 //! pause holds such a reader out of Apply with the field it reads, so the
 //! resume rebuilds both. Each chunk takes the readers in again from the
 //! definition as it stands when the chunk is planned, so a reader an edit

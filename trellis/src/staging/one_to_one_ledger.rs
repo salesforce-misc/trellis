@@ -341,7 +341,7 @@ fn update_statement(target: &str, predicate: bool) -> String {
 /// keys whose entry this transaction inserted and neither its insert nor
 /// [`update_entries`] changed: an Apply at or below the truncate floor, and
 /// a Re-derive the page skipped (re-staged, or a direct writer's row that
-/// failed to evaluate). Such an entry has no `applied_lsn`, no `basis` and
+/// failed to apply). Such an entry has no `applied_lsn`, no `basis` and
 /// no tombstone, so the tombstone GC would never collect it, and I2 treats
 /// it as it treats no entry at all, so deleting it changes no later
 /// change's outcome. The statement re-checks that state, so it can't delete

@@ -7,7 +7,7 @@
 //! logic lived in `catalog.rs` and `staging::apply`. Anything the match
 //! missed silently fell through to `ValueType::Text`, so a `jsonb` or
 //! `timestamptz` column was indistinguishable from an actual `text` column
-//! by the time it reached the evaluator.
+//! by the time it reached the renderer.
 //!
 //! This registry instead keys off the column's `pg_attribute.atttypid` —
 //! the raw, stable Postgres type OID — which sidesteps the modifier-stripping
@@ -35,15 +35,14 @@ use crate::float::FloatWidth;
 use crate::integer::IntWidth;
 
 /// A recognized Postgres type family that doesn't (yet) have its own
-/// first-class [`ValueType`] variant. Carried inside [`ValueType::Other`]
-/// and [`super::eval::Value::Other`] so passthrough/ingest
-/// can tag a value with its real type instead of collapsing it into
+/// first-class [`ValueType`] variant. Carried inside [`ValueType::Other`] so passthrough/ingest
+/// can tag a column with its real type instead of collapsing it into
 /// `Text`, while filtering/keys/casts/aggregates for it stay gated until the
 /// matching epic child ([`docs/type-support.md`]) lands.
 ///
 /// Deliberately a unit-variant-only enum (no OID/name payload) so
-/// [`ValueType`] and [`super::eval::Value`]'s `Other` case can stay cheap and
-/// `Copy`-friendly like every other bucket.
+/// [`ValueType`]'s `Other` case can stay cheap and `Copy`-friendly like every
+/// other bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PgType {
     /// `oid` — an *unsigned* 32-bit row/object identifier.
@@ -104,7 +103,7 @@ pub enum PgType {
     /// this type's *own persisted token* (`"enum:<schema>.<typname>"`,
     /// [`Self::name`]'s exact return value for this variant) — not the raw
     /// OID. The token is the rendering Trellis casts the column's values by,
-    /// and what the evaluator, which has no connection, carries for the
+    /// and what a definition, which has no connection, carries for the
     /// type. The type's identity is its OID (ADR-0020): each definition records
     /// it beside the token (`definition_types`, `defs::key_types::record_types`),
     /// and the staging worker's capture pass follows a rename by that OID,
@@ -378,7 +377,7 @@ mod oid {
     pub const JSONB: u32 = 3802;
 }
 
-/// Classifies a column's raw `pg_attribute.atttypid` into the evaluator's
+/// Classifies a column's raw `pg_attribute.atttypid` into a
 /// [`ValueType`], for every *fixed builtin* family — the OID-based
 /// replacement for the old `format_type`-text-matching `value_type_from_pg`
 /// helpers duplicated in `catalog.rs` and `staging::apply`. Pure and
@@ -433,7 +432,7 @@ fn value_type_for_builtin_oid(type_oid: u32) -> ValueType {
     }
 }
 
-/// Classifies a column's raw `pg_attribute.atttypid` into the evaluator's
+/// Classifies a column's raw `pg_attribute.atttypid` into a
 /// [`ValueType`] — [`value_type_for_builtin_oid`], widened to
 /// also recognize a user-defined enum type rather than collapsing it into
 /// [`PgType::Unrecognized`] the way every other unrecognized OID still does.

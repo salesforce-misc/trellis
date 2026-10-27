@@ -57,8 +57,7 @@
 //!
 //! Per ADR-0013 every comparison is against independently-authored SQL —
 //! plain `pg_cast`, plain `boolout`, plain `group by` — never against
-//! `defs::oracle::recompute`, which would be the engine's own renderer
-//! grading itself. Harness conventions follow
+//! the engine's own renderer. Harness conventions follow
 //! `defs_bytea.rs`.
 
 use std::collections::HashMap;

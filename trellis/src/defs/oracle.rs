@@ -131,40 +131,25 @@ pub fn render_aggregate_select_sql(def: &TransformDef) -> String {
 
 /// The set of `def.source` column names any calculated field references —
 /// i.e. every [`Expr::Column`] name that isn't itself *another* calculated
-/// field's name. Used to select only the columns a recompute actually needs.
+/// field's name. `crate::capture::columns` uses it to decide which columns a
+/// table's capture trigger images; it leaves out `GROUP BY` keys, which that
+/// caller adds.
 ///
-/// A field referencing a source column of its own name (`SELECT c AS c`,
-/// the generative suite's improvement-plan task B1 identity-passthrough
-/// shape) is a passthrough, not a reference to another calculated field —
-/// this must mirror the same `is_self_passthrough` carve-out
-/// `eval.rs`'s `eval_expr` and `validate.rs`'s cycle detection already make,
-/// or a self-referencing passthrough field's own source column never makes
-/// it into the recompute's `SELECT` list and `eval_expr` fails with
-/// `EvalError::MissingColumn` even though the same definition installs and
-/// backfills correctly (the build's `SELECT a AS a` already has this
-/// carve-out via `ddl::passthrough_source_column`).
+/// A field referencing a source column of its own name (`SELECT c AS c`, an
+/// identity passthrough) is a passthrough, not a reference to another
+/// calculated field, so its own source column is included — the same
+/// `is_self_passthrough` carve-out `validate.rs`'s cycle detection makes (the
+/// build's `SELECT a AS a` has it via `ddl::passthrough_source_column`).
 ///
-/// Unlike `eval.rs`'s and `validate.rs`'s versions of this same carve-out,
-/// this one doesn't also check that `name` actually names a real source
-/// column (`is_self_passthrough = name == field_name &&
-/// source_columns.contains_key(name)`) — it can't, cheaply, since this
-/// function takes no `source_columns` map. That's safe only because both
-/// callers ([`recompute`], [`recompute_aggregate`]) are documented as
-/// running exclusively against an already-validated, already-installed
-/// `TransformDef` (see `recompute`'s own doc comment), and `validate()`
-/// already rejects a field naming itself when that name isn't a real source
-/// column (`UnresolvedColumn`, not treated as a passthrough) before a
-/// definition can ever be persisted. This is an implicit invariant enforced
-/// by caller discipline, not the type system — if a future caller ever
-/// invokes `recompute`/`recompute_aggregate` against a `TransformDef` that
-/// hasn't been through `validate()`, thread `source_columns` through here
-/// too and add the same guard.
-///
-/// `crate::capture::columns` also calls this, to decide which
-/// columns a table's capture trigger images. It runs against persisted
-/// definitions only, which `validate()` has already accepted, so the same
-/// invariant covers it. It leaves out `GROUP BY` keys; that caller adds
-/// them.
+/// Unlike `validate.rs`'s version of that carve-out, this one doesn't also
+/// check that `name` actually names a real source column: it takes no
+/// `source_columns` map. That's safe because the caller runs only against
+/// persisted definitions, which `validate()` has already accepted, and
+/// `validate()` rejects a field naming itself when that name isn't a real
+/// source column (`UnresolvedColumn`). It is an invariant enforced by caller
+/// discipline: a caller holding a definition that hasn't been through
+/// `validate()` must thread `source_columns` through here and add the same
+/// guard.
 pub(crate) fn referenced_source_columns(def: &TransformDef) -> HashSet<String> {
     let field_names: HashSet<&str> = def.fields.iter().map(|f| f.name.as_str()).collect();
 
@@ -221,12 +206,10 @@ fn collect_columns(
 }
 
 /// Renders a calculated-field expression back to the equivalent Postgres
-/// SQL expression text, so the generative correctness oracle
-/// (`docs/generative-test-suite.md`) can cross-check a function call's
-/// rendered `SELECT` against this evaluator's output over the same source
-/// data — the ADR-0004 claim ("our grammar is an immutable subset of
-/// Postgres semantics") made checkable per expression, not just per
-/// operator. Column references are quoted identifiers, since a source
+/// SQL expression text: the statements that write a 1-1 target embed it, so
+/// Postgres computes the field (ADR-0002) — the ADR-0004 claim ("our grammar
+/// is an immutable subset of Postgres semantics") made literal for every
+/// expression. Column references are quoted identifiers, since a source
 /// column name could collide with a SQL keyword; literals carry an explicit
 /// cast so the rendered text is unambiguous regardless of context.
 pub fn render_expr_sql(expr: &Expr) -> String {
@@ -386,16 +369,11 @@ mod tests {
         );
     }
 
-    /// A field naming itself (`SELECT c AS c`, the generative suite's
-    /// improvement-plan task B1 identity-passthrough shape) must still
-    /// include its own source column — `is_self_passthrough`'s carve-out in
-    /// `collect_columns`. Before this test's fix, a field's own name was
-    /// treated identically to *any other* calculated field's name (both were
-    /// in `field_names`), so a self-named field's source column was silently
-    /// dropped from the recompute `SELECT` list and `evaluate` failed with
-    /// `EvalError::MissingColumn` even though the definition installs and
-    /// backfills correctly through its build (`SELECT a AS a`), which
-    /// already special-cases this via `ddl::passthrough_source_column`.
+    /// A field naming itself (`SELECT c AS c`, an identity passthrough) must
+    /// still include its own source column — `is_self_passthrough`'s carve-out
+    /// in `collect_columns` — or the capture trigger would not image it,
+    /// though the build (`SELECT a AS a`) special-cases it via
+    /// `ddl::passthrough_source_column`.
     #[test]
     fn referenced_source_columns_includes_a_self_named_passthrough_columns_own_source() {
         let def = TransformDef {
@@ -442,8 +420,7 @@ mod tests {
     #[test]
     fn render_expr_sql_renders_coalesce_as_a_postgres_function_call() {
         // COALESCE renders through the generic `name(args)` arm to lowercase
-        // `coalesce(...)` — valid Postgres — so the correctness oracle can
-        // cross-check the evaluator's COALESCE output against Postgres's own.
+        // `coalesce(...)` — valid Postgres.
         let expr = Expr::FunctionCall {
             name: "COALESCE".to_string(),
             args: vec![

@@ -636,9 +636,8 @@ async fn a_duplicate_pk_insert_error_still_converges() {
 }
 
 /// A seeded row with `NULL` in a nullable column (design doc §3's awkward
-/// values) converges: `NULL + n = NULL` on both sides (Postgres's `numeric`
-/// arithmetic and `defs::eval`'s `Operator::Add` arm agree), so the
-/// SQL oracle and the maintained target must agree too.
+/// values) converges: `NULL + n = NULL` (Postgres's `numeric` arithmetic), so the
+/// SQL oracle and the maintained target must agree.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_null_value_in_a_nullable_column_converges() {
     let cluster = TestCluster::start();
