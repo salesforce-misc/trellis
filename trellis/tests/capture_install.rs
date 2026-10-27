@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use testkit::TestCluster;
 use tokio_postgres::types::PgLsn;
@@ -718,6 +718,9 @@ async fn a_bounded_install_reports_who_holds_the_table_then_lands_once_released(
     let spec = spec_of_t(&["a"]);
     let mut ddl = connect(db.dsn()).await;
     let pass = || Some(Instant::now() + Duration::from_millis(300));
+    // The holder's transaction began before this instant, on the same host
+    // clock the server stamps `xact_start` with.
+    let before_install = SystemTime::now();
     let progress = install::install(&mut ddl, DEFAULT_SCHEMA, &spec, pass())
         .await
         .expect("install");
@@ -744,7 +747,11 @@ async fn a_bounded_install_reports_who_holds_the_table_then_lands_once_released(
     );
     assert!(held.query.contains("capture_install_holder"), "{held:?}");
     assert!(
-        held.since.is_some_and(|since| since <= wait.waiting_since),
+        // Not compared with `wait.waiting_since`: that is the server's
+        // `clock_timestamp()` minus a client-side `Instant` elapsed, so it
+        // carries the observing query's round trip, which a loaded box
+        // stretches past the gap between the holder and the install.
+        held.since.is_some_and(|since| since <= before_install),
         "the holder's transaction began before the install waited: {held:?}"
     );
     let queued = wait
