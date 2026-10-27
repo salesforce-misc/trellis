@@ -396,6 +396,31 @@ async fn self_check_reports_a_reader_of_a_rebuilding_upstream_as_catching_up() {
         report.outcome
     );
     assert_eq!(report.rows_compared, 0, "nothing was compared");
+    // The queued job ends the same way, and its saved status word reads back.
+    let job = trellis
+        .self_check("price_copies", SelfCheckMode::Standard, GENEROUS_TIMEOUT)
+        .await
+        .expect("start the job");
+    assert!(
+        work_once(&db.pool, "w1", &worker(100))
+            .await
+            .expect("worker"),
+        "a worker ran the job's page"
+    );
+    let done = trellis
+        .self_check_job(job.id)
+        .await
+        .expect("poll")
+        .expect("job");
+    assert_eq!(done.state, SelfCheckJobState::Done);
+    let outcome = done.report.expect("a done job has its report").outcome;
+    assert!(
+        matches!(
+            outcome,
+            SelfCheckOutcome::NotLive(TransformStatus::CatchingUp)
+        ),
+        "expected the job to end NotLive(CatchingUp), got {outcome:?}"
+    );
 
     trellis::intake::harness::settle_builds(&db.pool).await;
     drain_to_quiescence(&db.pool, &mut raw).await;
