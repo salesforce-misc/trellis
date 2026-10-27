@@ -1,4 +1,4 @@
-//! Improvement-plan task E3 (rescoped): engine lifecycle — in-process
+//! Engine lifecycle — in-process
 //! `trellis::Client` restart/scale-out, **not** `testkit::CrashGuard`.
 //!
 //! `testkit::CrashGuard` is a SIGKILL-based subprocess crash primitive, the

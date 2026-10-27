@@ -3,177 +3,102 @@
 //! this crate enforces is that only [`crate::backend`] drives the engine's
 //! pipeline.
 //!
-//! Today's scope is the *trivial* generator: every source table is
-//! shaped `(numeric pk, numeric c1, numeric c2)` and every definition is a 1-1
-//! numeric-`+`, each with a seed-before-mutate op stream. Improvement-plan task
-//! **B3** widened this from *exactly* one table/one definition to **1-3 tables
-//! and 1-3 definitions**, each definition independently drawing one of the
-//! tables as its source — see [`build_program_multi`] and [`TableSpec`]. The
-//! proptest [`Strategy`]s that draw these live behind the `proptest` feature
-//! (see `Cargo.toml`); the pure builders they map onto ([`build_program`],
-//! [`build_program_multi`]) are always available so a hand-built pin can reuse
-//! the exact same shape without pulling in proptest.
+//! The *trivial* generator draws programs over **1-3 source tables and 1-3
+//! definitions**, each definition independently drawing one of the tables as
+//! its source (see [`build_program_multi`] and [`TableSpec`]), each table with
+//! a seed-before-mutate op stream. The proptest [`Strategy`]s that draw these
+//! live behind the `proptest` feature (see `Cargo.toml`); the pure builders
+//! they map onto ([`build_program`], [`build_program_multi`]) are always
+//! available so a hand-built pin can reuse the exact same shape without
+//! pulling in proptest.
 //!
-//! `build_program` is kept as a single-table/single-def convenience
-//! wrapper around [`build_program_multi`] (rather than changing its
-//! signature) because every existing hand-built pin/test across
-//! `generative/tests/*.rs` and this module already calls it with the old
-//! two-argument shape; delegating keeps every one of those call sites
-//! unchanged while sharing the exact same op-construction and pk-liveness
-//! logic multi-table programs use.
+//! `build_program` is a single-table/single-def convenience wrapper around
+//! [`build_program_multi`]: hand-built pins across `generative/tests/*.rs`
+//! call it with the two-argument shape, and delegating shares the
+//! op-construction and pk-liveness logic multi-table programs use.
 //!
-//! Improvement-plan task **B1** ("Multi-type schemas and the remaining
-//! awkward values") widens each table further: every table now also gets
-//! exactly one column each of [`ValueType::Text`], [`ValueType::Boolean`],
-//! and [`ValueType::Uuid`] — unconditionally, not a probabilistically-drawn
-//! dimension stacked on top of B3's table/def-count widening (mirroring
-//! `crate::model::Table::new`'s existing "every table gets its pk column
-//! unconditionally" philosophy) — and every definition sourced from that
-//! table gets a matching identity-passthrough field for each (`SELECT <col>
-//! AS <col>`, the same bare-`Expr::Column` shape
-//! `trellis/tests/defs_backfill_direct.rs` already exercises by hand, and the
-//! same narrowing `defs::ddl::passthrough_source_column` already
-//! special-cases). See [`TableSpec`]'s `text_values`/`bool_values`/
-//! `uuid_values` fields and the `text_value`/`bool_value`/`uuid_value`
-//! strategies below.
+//! # Table shape
 //!
-//! Improvement-plan task **B4** ("Aggregates") widens the generator past
-//! `KeySpace::OneToOne` for the first time: every table now *also*
-//! gets a "grain" column — one more [`ValueType::Numeric`] column,
-//! unconditionally, the same "every table gets it" philosophy B1 used for
-//! `Text`/`Boolean`/`Uuid` (see [`TableSpec`]'s `grain_values` field and the
-//! `grain_value` strategy below) — and each definition independently draws
-//! either the existing `total = c1 + c2` [`KeySpace::OneToOne`] shape, or a
-//! new [`KeySpace::Aggregate`] shape grouped by that table's grain column,
-//! with 2–4 fields drawn from the group basis's admitted set (`COUNT(*)`,
-//! and `COUNT`/`SUM`/`AVG` over `c1`/`c2`; see [`DefShape`],
-//! [`AggregateFn`], and the `aggregate_functions`/`def_shape` strategies
-//! below). The grain column is deliberately **not**
-//! `c1`/`c2` (which keep their existing wider `0..=VALUE_MAX` range and
-//! remain the *values being aggregated*) — it's a tiny three-value domain
-//! (`0`, `1`, or `2`, see [`GRAIN_MAX`]) specifically so a handful of seed
-//! rows collide onto the same group, and a handful of `Delete` mutates has
-//! real odds of emptying one out entirely — the single hardest edge in
-//! aggregate maintenance (`docs/generative-test-suite.md` §4 calls the
-//! aggregate delta path "the hardest guarantee": the only non-idempotent
-//! maintenance in the engine); improvement-plan task B4.
+//! Every table has a numeric primary key and numeric `c1`/`c2` columns, plus
+//! exactly one column each of [`ValueType::Text`], [`ValueType::Boolean`] and
+//! [`ValueType::Uuid`], and one "grain" [`ValueType::Numeric`] column. They
+//! are unconditional, not a drawn dimension (mirroring
+//! `crate::model::Table::new`'s "every table gets its pk column
+//! unconditionally"), and every definition sourced from a table gets an
+//! identity-passthrough field for each of the `Text`/`Boolean`/`Uuid` columns
+//! (`SELECT <col> AS <col>`, the bare-`Expr::Column` shape
+//! `trellis/tests/defs_backfill_direct.rs` exercises by hand and
+//! `defs::ddl::passthrough_source_column` special-cases). See [`TableSpec`]'s
+//! `text_values`/`bool_values`/`uuid_values`/`grain_values` fields and the
+//! `text_value`/`bool_value`/`uuid_value`/`grain_value` strategies below.
 //!
-//! **The domain *is* now "0, 1, 2, plus `NULL`"**, matching the improvement
-//! plan's original text. It wasn't always: a `NULL` grouping
-//! value was implemented and drawn early in task B4's development, and
-//! immediately found a real engine bug — `defs::ddl::create_aggregate_target_table`
-//! declared the `GROUP BY` columns as the target's Postgres `PRIMARY KEY`,
-//! which is unconditionally `NOT NULL`, so a source row with a `NULL`
-//! grouping value made every attempted write to that group fail with a
-//! genuine `null value in column ... violates not-null constraint` error.
-//! The failure itself was never a liveness wedge on its own — `trellis::client`'s
-//! `app_worker_loop` releases a failed claim and re-fetches the same segment,
-//! and `staging::quarantine`'s isolate-before-blaming machinery
-//! (`quarantine::classify` routes a plain Postgres constraint-violation error
-//! to `FailureClass::Isolate`) probes the offending row alone, charges it a
-//! death, and evicts/parks it once past `quarantine::DEFAULT_DEATH_THRESHOLD`,
-//! letting the rest of the batch drain normally — but the parked row's
-//! contribution was then permanently and silently excluded from its
-//! aggregate group, with no automatic recovery, and not even a manual
-//! `quarantine::release_key` could recover it, since replaying the same row
-//! just reproduced the identical constraint violation and re-quarantined it.
-//! And because `staging::converge::converged_through`'s condition 4
-//! deliberately treats any live `poison_held` row as "not converged" until an
-//! operator releases it, a token at or past the poisoned row's LSN never
-//! converged — observed directly as this suite's own `quiesce` hanging past
-//! its 30-second `QUIESCE_TIMEOUT`.
+//! Every table gets the grain column, not just tables an `Aggregate`
+//! definition happens to source from, because `table_spec` draws a
+//! `TableSpec` independently of, and before, any definition that might
+//! reference it. A uniform table shape means an `Aggregate` definition can
+//! source from any drawn table, and a `OneToOne` definition simply leaves the
+//! grain column unreferenced.
 //!
-//! The root cause is fixed: `create_aggregate_target_table` now keys
-//! the `GROUP BY` columns with a `UNIQUE NULLS NOT DISTINCT` constraint
-//! instead of a bare `PRIMARY KEY`, so a NULL-keyed group is representable
-//! and still deduplicated correctly, `defs::backfill`'s direct aggregate
-//! build no longer silently drops a NULL-keyed group, and
-//! `ddl::source_primary_key` falls back to a unique constraint when a source
-//! table has no `PRIMARY KEY` so chaining off an aggregate target still
-//! works. A NULL grouping value no longer hits the not-null violation at
-//! all, so it's never quarantined and never blocks `converge`/`quiesce` in
-//! the first place — see [`grain_value`]'s doc comment for how the domain is
-//! drawn now.
+//! # Definition shapes
 //!
-//! **Design choice: every table gets a grain column, not just tables an
-//! `Aggregate` def happens to source from.** The alternative (only tables
-//! selected as an aggregate def's source get one) would need the table shape
-//! itself to depend on how the *definitions* built on top of it turn out to
-//! be drawn — but `table_spec` draws a `TableSpec` independently of, and
-//! before, any def that might reference it (`trivial_program_with` draws all
-//! tables first, then draws each def's source table index and shape). Making
-//! every table's shape identical regardless of how it ends up used keeps
-//! `TableSpec`/`Table::new` exactly as uniform as B1 already left them, and
-//! costs nothing: an `Aggregate` def can then source from *any* drawn table
-//! without a second table-shape variant to thread through, and a `OneToOne`
-//! def sourced from a table just leaves that table's grain column
-//! undrawn-from (present in the schema, never referenced by a field) —
-//! exactly how a `OneToOne` def already leaves the pk column's *identity* as
-//! a pk unused as a value.
+//! Each definition independently draws the `total = c1 + c2`
+//! [`KeySpace::OneToOne`] shape, or a [`KeySpace::Aggregate`] shape grouped by
+//! the source table's grain column, with 2-4 fields drawn from the group
+//! basis's admitted set (`COUNT(*)`, and `COUNT`/`SUM`/`AVG` over `c1`/`c2`;
+//! see [`DefShape`], [`AggregateFn`] and the `aggregate_functions`/`def_shape`
+//! strategies below). The grain column is deliberately not `c1`/`c2` (which
+//! keep the wider `0..=VALUE_MAX` range and are the values being aggregated):
+//! it is a tiny domain (`0`, `1` or `2`, see [`GRAIN_MAX`], plus `NULL`) so a
+//! handful of seed rows collide onto the same group and a `Delete` has real
+//! odds of emptying one out entirely, the sharpest edge in aggregate
+//! maintenance (`docs/generative-test-suite.md` §4 calls the aggregate delta
+//! path "the hardest guarantee": the only non-idempotent maintenance in the
+//! engine).
 //!
-//! **B4 scope cuts:** the grain column is seeded once at `INSERT` time and
-//! never touched by `Update`/`Delete`/`DuplicateInsert` (same B1 precedent —
-//! a group changing membership via delete/insert of whole rows is already
-//! the sharpest edge; *migrating* a live row from one group to another via
-//! `Update` is real, separate coverage `trellis/tests/group_basis_interleavings.rs`
-//! exercises by hand, not drawn by `trivial_program`; the
-//! concurrent tier draws it as [`Mutate::MoveGroup`]). `KeySpace::Aggregate.group_by`
-//! is always exactly one column (never a composite/multi-column group-by,
-//! which the engine grammar supports but this generator does not draw).
-//! `OneToOne` defs never get a grain passthrough field (unlike the B1
-//! `Text`/`Boolean`/`Uuid` columns) — the grain column's role here is
-//! structural (an aggregate grouping key), not a type-coverage dimension, so
-//! giving it a bare passthrough field would add surface without adding
-//! coverage of anything the derivation-type coverage meta-test
-//! (`tests/coverage.rs`'s `every_column_scalar_type_appears_via_a_derivation`)
-//! doesn't already assert via `c1`/`c2`.
+//! A `NULL` grouping value is drawn (see [`grain_value`]). The aggregate
+//! target keys its `GROUP BY` columns with a `UNIQUE NULLS NOT DISTINCT`
+//! constraint rather than a bare `PRIMARY KEY`, so a NULL-keyed group is
+//! representable and deduplicated, and `ddl::source_primary_key` falls back
+//! to a unique constraint when a source table has no `PRIMARY KEY`, so
+//! chaining off an aggregate target works.
 //!
-//! **B1 scope cuts, stated plainly (design doc §3's own standard for honest
-//! narrowing):**
-//! - The new columns are seeded once at `INSERT` time and never touched by
-//!   [`Mutate::Update`]/[`Mutate::Delete`]/[`Mutate::DuplicateInsert`], which
-//!   continue to read/write only `c1`/`c2` exactly as before. (The one later
-//!   exception is the `Boolean` column, which
-//!   [`Mutate::UpdateFlag`] rewrites in place.) This fully
-//!   covers "every column scalar type appears via a derivation"
-//!   (`generative/tests/coverage.rs`'s
-//!   `every_column_scalar_type_appears_via_a_derivation`) without also
-//!   having to model heterogeneous per-type `Update`/`DuplicateInsert`
-//!   payloads — a separate future widening, not this task.
-//! - At the time B1 landed, no operators/functions/comparisons over the new
-//!   types were drawn yet (that widening was gated on a precedence-table
-//!   prerequisite, deferred to a later session). Improvement-plan task
-//!   **B2** ("Operators, functions, and literals") is that later session: it
-//!   adds `Operator::GreaterThan`, `Expr::NumberLiteral`/`Expr::StringLiteral`,
-//!   and the five scalar functions (`STRPOS`/`OCTET_LENGTH`/`CHAR_LENGTH`/
-//!   `REGEXP_COUNT`/`COALESCE`) as one additional, nested "derived" field per
-//!   definition — see [`DerivedShape`] and
-//!   [`build_program_multi_with_shapes_and_derived`]. **B2 predates B4**
-//!   (this doc comment is written after both have merged): a derived field
-//!   is attached only to `OneToOne` defs, never `Aggregate` ones — see that
-//!   function's own doc comment for why (in short,
-//!   `defs::validate::validate`'s `UngroupedColumnReference` check
-//!   would reject a derived field's bare, unaggregated column reference on
-//!   an `Aggregate` def; every `DerivedShape` references `c1`/`c2`/the text
-//!   column bare, none of them wrapped in `SUM`/`COUNT`/`AVG`).
-//! - Only syntactically-valid UUID text is ever drawn, or `NULL` — never a
-//!   malformed UUID string. A malformed one would fail the `INSERT`/
-//!   `UPDATE` statement's own `$n::text::uuid` cast, which is real, separate
-//!   future coverage (a new `OpOutcome::Fails` case), not this task.
+//! A `OneToOne` definition also carries one nested "derived" field (see
+//! [`DerivedShape`] and [`build_program_multi_with_shapes_and_derived`]):
+//! `Operator::GreaterThan`, `Expr::NumberLiteral`/`Expr::StringLiteral` and
+//! the five scalar functions (`STRPOS`/`OCTET_LENGTH`/`CHAR_LENGTH`/
+//! `REGEXP_COUNT`/`COALESCE`). It is never attached to an `Aggregate`
+//! definition: every `DerivedShape` references `c1`/`c2`/the text column
+//! bare, none wrapped in `SUM`/`COUNT`/`AVG`, so
+//! `defs::validate::validate`'s `UngroupedColumnReference` check would reject
+//! it there.
+//!
+//! # Scope
+//!
+//! - The `Text`/`Boolean`/`Uuid` and grain columns are seeded once at
+//!   `INSERT` time and never touched by [`Mutate::Update`]/[`Mutate::Delete`]/
+//!   [`Mutate::DuplicateInsert`], which read and write only `c1`/`c2`. The
+//!   exceptions are the `Boolean` column, which [`Mutate::UpdateFlag`] rewrites
+//!   in place, and the grain column, which the concurrent tier moves with
+//!   [`Mutate::MoveGroup`] (migrating a live row between groups by `Update`
+//!   is also exercised by hand in
+//!   `trellis/tests/group_basis_interleavings.rs`).
+//! - `KeySpace::Aggregate.group_by` is always exactly one column: the engine
+//!   grammar supports a composite group-by, but this generator does not draw
+//!   one.
+//! - `OneToOne` definitions get no grain passthrough field: the grain
+//!   column's role is structural (an aggregate grouping key), not a
+//!   type-coverage dimension.
+//! - Only syntactically-valid UUID text is drawn, or `NULL`. A malformed UUID
+//!   would fail the statement's own `$n::text::uuid` cast, which would be a
+//!   separate `OpOutcome::Fails` case.
 //! - Awkward text values (empty string, the literal text `"NULL"`, a
-//!   U+001F-containing string, a comma/quote/backslash string) are drawn
-//!   here, but this does **not** close the improvement plan's "attacks the
-//!   key encoding" framing for B1: `defs::ddl::join_pk_key`'s
-//!   composite-key delimiter and `defs::oracle::group_key`'s `Aggregate`
-//!   grouping-key encoding only matter for a *multi-column* primary key
-//!   (never drawn — the pk stays single-column `Numeric`) or a *`Text`-typed*
-//!   `Aggregate` key-space `GROUP BY` column — B4's `Aggregate` support
-//!   groups only by the grain column, which is `Numeric`, not `Text`, so even
-//!   with `Aggregate` defs now real, an awkward text value drawn here still
-//!   never reaches a `GROUP BY` column. The awkward text values drawn here
-//!   are still real, valuable coverage of plain text round-tripping (SQL
-//!   binding, `::text` casts, this harness's own snapshot diffing) — just not
-//!   of that specific key-encoding risk, which remains open.
+//!   U+001F-containing string, a comma/quote/backslash string) are drawn.
+//!   They cover plain text round-tripping (SQL binding, `::text` casts, this
+//!   harness's snapshot diffing) but do not reach the delimiter-sensitive key
+//!   encodings (`defs::ddl::join_pk_key`'s composite-key delimiter,
+//!   `defs::oracle::group_key`'s grouping-key encoding): those matter only
+//!   for a multi-column primary key (never drawn) or a `Text`-typed
+//!   `GROUP BY` column (the grain column is `Numeric`).
 //!
 //! The generator interleaves the tables' op streams. The builders emit one
 //! table's whole op stream before the next, so on their own a program's
@@ -196,11 +121,11 @@
 //!   `numeric + NULL = NULL`. So drawing `None` for `c1`/`c2` needed no
 //!   engine or model change — see [`Mutate`] and the `value` strategy below.
 //! - **Empty string, the literal text `"NULL"`, delimiter-containing
-//!   strings** — implemented by task B1 above, on the new `Text` column: see
-//!   the `awkward_text_literal`/`text_value` strategies below. As noted
-//!   above, this is real coverage of plain-text round-tripping, but it does
-//!   *not* yet reach the delimiter-sensitive key-encoding paths (those need
-//!   a multi-column pk or an `Aggregate` key space, both still future work).
+//!   strings** — implemented on the `Text` column: see the
+//!   `awkward_text_literal`/`text_value` strategies below. As noted above,
+//!   this is coverage of plain-text round-tripping, but it does not reach the
+//!   delimiter-sensitive key-encoding paths (those need a multi-column pk or
+//!   a `Text`-typed `GROUP BY` column, neither of which is drawn).
 //!
 //! [`Strategy`]: proptest::strategy::Strategy
 
@@ -244,7 +169,7 @@ pub const MAX_SEED_ROWS: usize = 4;
 /// a real cluster, so the per-case cost scales with the op count.
 pub const MAX_MUTATES: usize = 4;
 
-/// The most source tables a drawn program has (improvement-plan task B3).
+/// The most source tables a drawn program has.
 /// `1..=MAX_TABLES` via `prop_flat_map`, matching the `MAX_SEED_ROWS`/
 /// `MAX_MUTATES` idiom above, so proptest's default numeric-range shrinking
 /// reduces the table *count* first — a 1-table counterexample is the
@@ -253,21 +178,21 @@ pub const MAX_MUTATES: usize = 4;
 /// forces one of them.
 pub const MAX_TABLES: usize = 3;
 
-/// The most definitions a drawn program has (improvement-plan task B3). Each
+/// The most definitions a drawn program has. Each
 /// definition independently draws one of the program's tables as its
 /// source — see [`build_program_multi`] — so this is deliberately not tied
 /// to `MAX_TABLES`: two definitions can and do land on the same table.
 pub const MAX_DEFS: usize = 3;
 
-/// The inclusive upper bound of the grain column's *non-`NULL`* value domain
-/// (improvement-plan task B4): `0..=GRAIN_MAX` is the grain column's non-NULL
+/// The inclusive upper bound of the grain column's *non-`NULL`* value domain:
+/// `0..=GRAIN_MAX` is the grain column's non-NULL
 /// value space — kept at `2` (three possible non-`NULL` values; see
 /// [`grain_value`]'s doc comment for the fourth, `NULL`, value) so it stays
 /// "tiny, heavily-repeating" (the plan's own words): with `MAX_SEED_ROWS` (4)
 /// rows drawn from a 3-value domain, a real collision (two seed rows landing
 /// in the same group) is the common case, not a rare one, and a handful of
 /// `Delete` mutates has real odds of emptying a group entirely — see the
-/// module doc comment's B4 section.
+/// module doc comment's "Definition shapes" section.
 pub const GRAIN_MAX: i64 = 2;
 
 /// The concurrent tier's hot-key shape: the range of rows its
@@ -413,8 +338,8 @@ pub enum Mutate {
     /// either way (see its `expect: OpOutcome` derivation).
     ///
     /// A revival's rendered [`Op::Insert`] ([`render_mutate`]) carries the
-    /// *original* seed row's `Text`/`Boolean`/`Uuid`/grain column values
-    /// (tasks B1/B4), not fresh `NULL`s: those columns are "seeded once,
+    /// *original* seed row's `Text`/`Boolean`/`Uuid`/grain column values,
+    /// not fresh `NULL`s: those columns are "seeded once,
     /// never touched again" (this enum only ever carries `c1`/`c2`, plus
     /// [`Mutate::UpdateFlag`]'s `Boolean` value), so a revival is still
     /// logically the same row coming back, and must keep its original
@@ -433,8 +358,7 @@ pub enum Mutate {
         c1: Option<i64>,
         c2: Option<i64>,
     },
-    /// Clears every row of this table in one statement (improvement-plan task
-    /// E6). Renders to [`Op::Truncate`]. Whether this "affects rows" tracks
+    /// Clears every row of this table in one statement. Renders to [`Op::Truncate`]. Whether this "affects rows" tracks
     /// the table's *current* liveness set exactly like every other variant
     /// here (`OpOutcome::Succeeds` if any pk is still live, `AffectsNoRows`
     /// if the table happens to already be empty) — but unlike
@@ -444,8 +368,8 @@ pub enum Mutate {
     /// Postgres would.
     Truncate,
     /// Moves row `pk` into group `grain` by setting its grain column,
-    /// and nothing else. The one exception to the B4 scope cut that
-    /// the grain column is seeded once and never updated: only the
+    /// and nothing else. The exception to "the grain column is seeded once
+    /// and never updated": only the
     /// concurrent tier's hot-key strategy draws it (see [`HOT_GRAIN_MAX`]),
     /// so a group can lose and regain members mid-burst and a
     /// group nobody seeded can appear. `trivial_program` never draws it. A
@@ -454,16 +378,15 @@ pub enum Mutate {
 }
 
 /// Which of a source table's two aggregated columns (`c1`/`c2`) a generated
-/// `SUM`/`AVG`/`COUNT(<col>)` field aggregates over (improvement-plan task
-/// B4). `COUNT(*)` has no column argument at all (see [`AggregateFn::Count`]).
+/// `SUM`/`AVG`/`COUNT(<col>)` field aggregates over `COUNT(*)` has no column argument at all (see [`AggregateFn::Count`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateColumn {
     C1,
     C2,
 }
 
-/// One calculated field of a generated [`KeySpace::Aggregate`] definition
-/// (task B4), carrying which column it aggregates where there is a choice.
+/// One calculated field of a generated [`KeySpace::Aggregate`] definition,
+/// carrying which column it aggregates where there is a choice.
 /// Kept as a small enum — rather than a bare `(name, column)` pair — so
 /// [`aggregate_field_def`]'s match stays exhaustive.
 ///
@@ -494,8 +417,7 @@ impl AggregateFn {
     }
 }
 
-/// Which shape a generated [`TransformDef`] takes (improvement-plan task B4
-/// widens this past the previous always-`OneToOne` assumption): the existing
+/// Which shape a generated [`TransformDef`] takes: the
 /// `total = c1 + c2` [`KeySpace::OneToOne`] shape, or a `GROUP BY`
 /// [`KeySpace::Aggregate`] shape over one of its source table's grain column,
 /// with `functions` giving its calculated fields beyond the grain-column
@@ -527,42 +449,42 @@ pub struct TableSpec {
     pub seed_values: Vec<(Option<i64>, Option<i64>)>,
     /// `text_values[i]` is the rendered value (already in [`Op`]'s
     /// `Option<String>` convention — `None` is SQL `NULL`) for seeded
-    /// primary key `i + 1`'s `Text` column (improvement-plan task B1). Must
+    /// primary key `i + 1`'s `Text` column. Must
     /// have exactly `seed_values.len()` entries — [`build_program_multi`]
     /// panics otherwise, a generator-bug-style check matching this module's
     /// other `assert!`s.
     pub text_values: Vec<Option<String>>,
     /// `bool_values[i]` is the rendered value (`"true"`/`"false"`, or `None`
-    /// for SQL `NULL`) for seeded primary key `i + 1`'s `Boolean` column
-    /// (task B1). Same length contract as `text_values`.
+    /// for SQL `NULL`) for seeded primary key `i + 1`'s `Boolean` column.
+    /// Same length contract as `text_values`.
     pub bool_values: Vec<Option<String>>,
     /// `uuid_values[i]` is the rendered value (a syntactically-valid UUID
     /// string, or `None` for SQL `NULL` — never a malformed UUID string, see
-    /// the module doc comment's B1 scope cuts) for seeded primary key
-    /// `i + 1`'s `Uuid` column (task B1). Same length contract as
+    /// the module doc comment's "Scope" section) for seeded primary key
+    /// `i + 1`'s `Uuid` column. Same length contract as
     /// `text_values`.
     pub uuid_values: Vec<Option<String>>,
     /// `grain_values[i]` is the rendered value (`"0"`/`"1"`/`"2"`, see
     /// [`GRAIN_MAX`], or `None` for a `NULL` group — see [`grain_value`]'s
     /// doc comment) for seeded primary key `i + 1`'s grain
-    /// column (improvement-plan task B4). Stays `Option<String>` — the same
+    /// column. Stays `Option<String>` — the same
     /// shape every other seeded column here uses — so a hand-built pin can
     /// construct a `None` (SQL `NULL`) grain value directly for a targeted
     /// regression pin, same as the `grain_value` proptest strategy itself now
     /// draws one on its own. Same length contract as `text_values`. Only
     /// [`Mutate::MoveGroup`] (the concurrent tier) touches it — see
-    /// the module doc comment's B4 scope cuts.
+    /// the module doc comment's "Scope" section.
     pub grain_values: Vec<Option<String>>,
     /// Mutates appended after this table's seed inserts (seed-before-mutate,
     /// design doc §3), targeting only this table's own pks. Never touches
     /// the `Text`/`Boolean`/`Uuid`/grain columns above — see the module doc
-    /// comment's B1/B4 scope cuts.
+    /// comment's "Scope" section.
     pub mutates: Vec<Mutate>,
 }
 
 impl TableSpec {
-    /// Builds a `TableSpec` whose `Text`/`Boolean`/`Uuid` columns (task B1)
-    /// and grain column (task B4) are all `NULL` for every seed row — a
+    /// Builds a `TableSpec` whose `Text`/`Boolean`/`Uuid` columns
+    /// and grain column are all `NULL` for every seed row — a
     /// convenience for callers that only care about the numeric seed/mutate
     /// shape (e.g. the pk-liveness unit tests below, and [`build_program`]'s
     /// two-argument convenience wrapper), sparing them from hand-counting a
@@ -755,7 +677,7 @@ fn render_mutate(
 /// signature rather than folded away: every existing hand-built pin across
 /// `generative/tests/*.rs` and this module's own tests already calls it this
 /// shape, and there was no reason to touch two dozen call sites for a change
-/// scoped to table/def *count* (improvement-plan task B3).
+/// scoped to table/def *count*.
 pub fn build_program(seed_values: &[(Option<i64>, Option<i64>)], mutates: &[Mutate]) -> Program {
     build_program_multi(
         &[TableSpec::numeric_only(
@@ -766,15 +688,15 @@ pub fn build_program(seed_values: &[(Option<i64>, Option<i64>)], mutates: &[Muta
     )
 }
 
-/// Builds a program over 1 or more tables and 1 or more definitions
-/// (improvement-plan task B3): `tables[i]` describes source table `i`'s seed
+/// Builds a program over 1 or more tables and 1 or more definitions:
+/// `tables[i]` describes source table `i`'s seed
 /// rows and mutate stream (see [`TableSpec`]), and `def_sources[j]` is the
 /// index into `tables` that definition `j` reads from — independently drawn,
 /// so two definitions landing on the same table (fan-out) and definitions
 /// spread across different tables are both representable, including every
 /// mix of the two in one program.
 ///
-/// Every table gets its own numeric pk/`c1`/`c2` schema, plus (task B1) one
+/// Every table gets its own numeric pk/`c1`/`c2` schema, plus one
 /// `Text`/`Boolean`/`Uuid` column each, and its own independent pk-liveness
 /// simulation (a fresh liveness map per `TableSpec`, via [`render_mutate`]):
 /// table A's deletes and inserts can never be mistaken for table B's, and
@@ -782,11 +704,11 @@ pub fn build_program(seed_values: &[(Option<i64>, Option<i64>)], mutates: &[Muta
 /// earlier table seeded — table identity, not draw order, is what a pk is
 /// scoped to. Every definition sourced from a table gets the same field
 /// list: `total = c1 + c2`, plus an identity-passthrough field for each of
-/// that table's `Text`/`Boolean`/`Uuid` columns (task B1) — this function
-/// widens *how many* tables/defs a program has and, since B1, *how many
+/// that table's `Text`/`Boolean`/`Uuid` columns — this function
+/// widens *how many* tables/defs a program has and, also *how many
 /// scalar types* each table/def touches; it does not draw operators,
-/// functions, or comparisons over those types (that's B2, out of scope
-/// here).
+/// functions, or comparisons over those types (see
+/// [`build_program_multi_with_shapes_and_derived`]).
 ///
 /// Ops are emitted one table at a time, in `tables` order: all of table 0's
 /// seeds and mutates, then all of table 1's, and so on. This keeps a
@@ -805,7 +727,7 @@ pub fn build_program(seed_values: &[(Option<i64>, Option<i64>)], mutates: &[Muta
 /// `OneToOne`) kept at its original `&[usize]` signature rather than folded
 /// away — the same "don't touch two dozen call sites for an orthogonal
 /// widening" reasoning [`build_program`]'s own doc comment gives for staying
-/// at its two-argument shape (improvement-plan task B4 widens *which shapes*
+/// at its two-argument shape (the shape widening is *which shapes*
 /// a def can take, not how many tables/defs a program has, which is what
 /// this signature already expresses).
 pub fn build_program_multi(tables: &[TableSpec], def_sources: &[usize]) -> Program {
@@ -816,15 +738,15 @@ pub fn build_program_multi(tables: &[TableSpec], def_sources: &[usize]) -> Progr
     build_program_multi_with_shapes(tables, &defs)
 }
 
-/// [`build_program_multi`]'s general form (improvement-plan task B4): `defs[j]`
+/// [`build_program_multi`]'s general form: `defs[j]`
 /// is `(source table index, shape)` for definition `j`, so each definition
 /// independently draws not just *which* table it sources from but *which
 /// shape* it takes — the existing `total = c1 + c2` [`KeySpace::OneToOne`], or
 /// a `GROUP BY` [`KeySpace::Aggregate`] over that table's grain column with
 /// [`DefShape::Aggregate`]'s `functions` as its non-grouping fields.
 ///
-/// Every table gets its own numeric pk/`c1`/`c2` schema, plus (task B1) one
-/// `Text`/`Boolean`/`Uuid` column each, plus (task B4) one further Numeric
+/// Every table gets its own numeric pk/`c1`/`c2` schema, plus one
+/// `Text`/`Boolean`/`Uuid` column each, plus one further Numeric
 /// "grain" column (see the module doc comment), and its own independent
 /// pk-liveness simulation (a fresh liveness map per `TableSpec`, via
 /// [`render_mutate`]): table A's deletes and inserts can never be mistaken
@@ -892,7 +814,7 @@ pub fn build_program_multi_with_shapes(
             spec.grain_values.len()
         );
 
-        // Tasks B1/B4: every table gets a Text/Boolean/Uuid column and a
+        // Every table gets a Text/Boolean/Uuid column and a
         // grain column, always — see the module doc comment. `Table::new`
         // builds columns in the order given, so `columns[3..=5]` are
         // Text/Boolean/Uuid and `columns[6]` is the grain column, after the
@@ -938,15 +860,15 @@ pub fn build_program_multi_with_shapes(
                     (source.pk_col.clone(), Some(pk.to_string())),
                     (c1.clone(), render(*a)),
                     (c2.clone(), render(*b)),
-                    // Task B1: seeded once, here, and never touched again
+                    // Seeded once, here, and never touched again
                     // (except the Boolean column, which
                     // [`Mutate::UpdateFlag`] rewrites) — see [`Mutate`]/the
                     // module doc comment's scope cut.
                     (text_col.clone(), spec.text_values[i].clone()),
                     (bool_col.clone(), spec.bool_values[i].clone()),
                     (uuid_col.clone(), spec.uuid_values[i].clone()),
-                    // Task B4: likewise seeded once and never mutated — see
-                    // the module doc comment's B4 scope cuts.
+                    // Likewise seeded once and never mutated — see
+                    // the module doc comment's "Scope" section.
                     (grain_col.clone(), spec.grain_values[i].clone()),
                 ],
                 expect: OpOutcome::Succeeds,
@@ -995,7 +917,7 @@ pub fn build_program_multi_with_shapes(
                                 rhs: Box::new(Expr::Column(c2)),
                             },
                         },
-                        // Task B1: one identity-passthrough field per new
+                        // One identity-passthrough field per new
                         // column, reusing the column's own name as the field
                         // name (`SELECT <col> AS <col>`) — the exact shape
                         // `trellis/tests/defs_backfill_direct.rs` already
@@ -1003,9 +925,9 @@ pub fn build_program_multi_with_shapes(
                         // table gets the same three, determined by the
                         // table's shape rather than drawn independently per
                         // def (matching how `total` already works). The
-                        // grain column (task B4) deliberately gets no
+                        // grain column deliberately gets no
                         // matching passthrough field here — see the module
-                        // doc comment's B4 scope cuts.
+                        // doc comment's "Scope" section.
                         FieldDef {
                             name: text_col.clone(),
                             expr: Expr::Column(text_col),
@@ -1059,7 +981,7 @@ pub fn build_program_multi_with_shapes(
         })
         .collect();
 
-    // Improvement-plan task E2: every definition built here installs up
+    // Every definition built here installs up
     // front (`0`) by default — deferring one is [`defer_def_install`]'s job,
     // layered on top of this builder's output exactly like
     // [`build_program_multi_with_shapes_and_derived`] layers derived fields
@@ -1076,8 +998,7 @@ pub fn build_program_multi_with_shapes(
     }
 }
 
-/// Builds one [`FieldDef`] for a drawn [`AggregateFn`] (improvement-plan task
-/// B4): the field name encodes both the function and its aggregated column
+/// Builds one [`FieldDef`] for a drawn [`AggregateFn`]: the field name encodes both the function and its aggregated column
 /// (`sum_c1`, `avg_c2`, `count_c1`, ...) so distinct `(function, column)`
 /// draws — even two functions sharing the same column, e.g. `SUM(c1)` and
 /// `AVG(c1)` — never collide; `COUNT(*)` has no column and always takes the
@@ -1110,9 +1031,9 @@ fn aggregate_field_def(func: AggregateFn, c1: &str, c2: &str) -> FieldDef {
     }
 }
 
-/// Improvement-plan task B2's D0 investigation ("with `>` and the five new
-/// functions in play, is there now a genuine, row-data-dependent way for a
-/// *valid* (post-`validate()`) definition to still error at eval time?").
+/// The question these shapes must answer: with `>` and the five scalar
+/// functions in play, is there a genuine, row-data-dependent way for a
+/// *valid* (post-`validate()`) definition to still error at eval time?
 ///
 /// **Finding: no.** Every shape [`DerivedShape`] draws stays eval-time-
 /// infallible for the *values* this generator actually produces, the same
@@ -1157,18 +1078,15 @@ fn aggregate_field_def(func: AggregateFn, c1: &str, c2: &str) -> FieldDef {
 ///   computation of its own to fail.
 ///
 /// Since no shape here has a real, generator-reachable, row-data-dependent
-/// error path, D0's "error-to-NULL oracle rendering" design (the plan's
-/// option 2) has nothing to quarantine yet and is **not built** in this
-/// session — building it now would be unused machinery with nothing to
-/// exercise it, the same call this module's original numeric-`+`-only D0
-/// pass made, just re-verified against the wider operator/function set this
-/// task adds. The day a future widening draws something genuinely
+/// error path, an "error-to-NULL" oracle rendering has nothing to quarantine
+/// and is **not built**: it would be unused machinery with nothing to
+/// exercise it. The day a future widening draws something genuinely
 /// data-dependent-fallible (an arbitrary regex pattern against arbitrary
 /// text, a numeric cast that can overflow a *narrower* column type, division
 /// by a column that can be zero, ...), this is the comment to update and the
 /// decision to revisit.
 ///
-/// **Scoped to `OneToOne` defs only (post-B4 design note).** Every
+/// **Scoped to `OneToOne` defs only (a design note).** Every
 /// `DerivedShape` variant references `c1`/`c2`/the text column *bare*
 /// (`Expr::Column`), never wrapped in an aggregate function — that's exactly
 /// what makes a `OneToOne` field a legal `SELECT` projection. On an
@@ -1189,7 +1107,7 @@ pub enum DerivedShape {
     CharLength,
     /// `REGEXP_COUNT(<text_col>, '<pattern>')` — Numeric. `pattern` is always
     /// one of `strategy::REGEXP_COUNT_PATTERN_POOL` — see this enum's own
-    /// doc comment (the D0 finding) for why that pool, specifically, is what
+    /// doc comment for why that pool, specifically, is what
     /// keeps this shape eval-time-infallible.
     RegexpCount { pattern: String },
     /// `COALESCE(<c1>, <fallback>)` — Numeric.
@@ -1198,12 +1116,10 @@ pub enum DerivedShape {
     /// case.
     PlainGreaterThan,
     /// `(<c1> + <c2>) > <c1>` — Boolean, depth 3: a `BinaryOp` nested inside
-    /// another `BinaryOp` (the `c1 + c2 > c1` shape improvement-plan task B2
-    /// names explicitly).
+    /// another `BinaryOp` (the `c1 + c2 > c1` shape).
     ArithmeticGreaterThan,
     /// `STRPOS(<text_col>, '<needle>') > <threshold>` — Boolean, depth 3: a
-    /// `FunctionCall` nested inside a `BinaryOp` (the `STRPOS(...) > 0` shape
-    /// improvement-plan task B2 names explicitly) — the mixed
+    /// `FunctionCall` nested inside a `BinaryOp` (the `STRPOS(...) > 0` shape) — the mixed
     /// operator-and-function nesting `tests/convergence.rs`'s hand-built pin
     /// exercises end-to-end.
     StrposGreaterThan { needle: String, threshold: i64 },
@@ -1275,7 +1191,7 @@ impl DerivedShape {
 }
 
 /// [`build_program_multi_with_shapes`]'s general form, folding in
-/// improvement-plan task B2's "derived" field on top of task B4's per-def
+/// the "derived" field on top of the per-def
 /// shape choice: `defs[j]` is `(source table index, shape)` exactly as
 /// [`build_program_multi_with_shapes`] takes, and `derived[j]` is the
 /// optional [`DerivedShape`] to append as one more calculated field (named
@@ -1299,9 +1215,8 @@ impl DerivedShape {
 /// into it: every existing caller of `build_program_multi`/
 /// `build_program_multi_with_shapes` — every hand-built pin across
 /// `generative/tests/*.rs`, this module's own unit tests, `tests/coverage.rs`'s
-/// exact-field-count assertions — keeps its exact prior behavior (task B3's
-/// fixed `total`/passthrough shape and task B4's aggregate shape, both
-/// untouched), and only the (new) default proptest strategy (see
+/// exact-field-count assertions — keeps the fixed `total`/passthrough
+/// shape and the aggregate shape unchanged, and only the default proptest strategy (see
 /// `strategy::trivial_program_with`) actually draws a `derived` field.
 ///
 /// Panics if `derived.len() != defs.len()` — a generator bug, matching this
@@ -1972,8 +1887,8 @@ pub struct ConcurrentCase {
 
 /// [`build_program_multi_with_derived`] is [`build_program_multi_with_shapes_and_derived`]'s
 /// convenience wrapper for the common "every def is `OneToOne`" case
-/// (improvement-plan task B2, kept at its original `&[usize]`/`&[DerivedShape]`
-/// signature after task B4 introduced per-def shapes): every existing
+/// (kept at its `&[usize]`/`&[DerivedShape]`
+/// signature even though definitions can take per-def shapes): every
 /// hand-built pin across `generative/tests/*.rs` that calls this two-list
 /// shape keeps working unchanged, the same "don't touch two dozen call
 /// sites for an orthogonal widening" reasoning [`build_program`]'s own doc
@@ -1992,7 +1907,7 @@ pub fn build_program_multi_with_derived(
 }
 
 // ---------------------------------------------------------------------
-// Improvement-plan task E2: definition lifecycle — install mid-stream.
+// Definition lifecycle — install mid-stream.
 // ---------------------------------------------------------------------
 
 /// Defers `program.defs[def_index]`'s install to just before `program.ops[after_op]`
@@ -2043,13 +1958,13 @@ pub fn defer_def_install(mut program: Program, def_index: usize, after_op: usize
 }
 
 // ---------------------------------------------------------------------
-// Improvement-plan task E3: engine lifecycle — in-process client
+// Engine lifecycle — in-process client
 // restart/scale-out.
 // ---------------------------------------------------------------------
 
 /// Schedules a [`crate::backend::Backend::restart`] (simulating an in-process
-/// engine client crash-and-restart) right before `program.ops[after_op]` runs
-/// (improvement-plan task E3). Layered on top of an already-built `Program`,
+/// engine client crash-and-restart) right before `program.ops[after_op]` runs.
+/// Layered on top of an already-built `Program`,
 /// same idiom as [`defer_def_install`].
 ///
 /// # Panics
@@ -2071,7 +1986,7 @@ pub fn schedule_restart(mut program: Program, after_op: usize) -> Program {
 
 /// Schedules a [`crate::backend::Backend::scale_out`] (starting an additional
 /// application-worker-only engine client) right before `program.ops[after_op]`
-/// runs (improvement-plan task E3). Same shape and bounds as
+/// runs. Same shape and bounds as
 /// [`schedule_restart`] — see its doc comment.
 pub fn schedule_scale_out(mut program: Program, after_op: usize) -> Program {
     assert!(
@@ -2085,11 +2000,11 @@ pub fn schedule_scale_out(mut program: Program, after_op: usize) -> Program {
 }
 
 // ---------------------------------------------------------------------
-// Improvement-plan task E6: bulk operations (TRUNCATE, bulk insert).
+// Bulk operations (TRUNCATE, bulk insert).
 // ---------------------------------------------------------------------
 
 /// The most rows [`build_bulk_insert_program`] draws into its single
-/// [`Op::BulkInsert`] (improvement-plan task E6) — far larger than
+/// [`Op::BulkInsert`] — far larger than
 /// [`MAX_SEED_ROWS`] (4, tuned for a *legible shrunk counterexample* across
 /// many per-row round trips) since a bulk insert is deliberately the opposite
 /// shape: one row count, one `apply` → `quiesce` → `snapshot` → compare round
@@ -2097,11 +2012,11 @@ pub fn schedule_scale_out(mut program: Program, after_op: usize) -> Program {
 /// statement's worth of extra data, not extra round trips.
 pub const MAX_BULK_INSERT_ROWS: usize = 500;
 
-/// Builds a small, self-contained program exercising [`Op::BulkInsert`]
-/// (improvement-plan task E6): one table (the same numeric
+/// Builds a small, self-contained program exercising [`Op::BulkInsert`]:
+/// one table (the same numeric
 /// pk/`c1`/`c2`/grain shape [`build_program_multi_with_shapes`] uses, minus
 /// the `Text`/`Boolean`/`Uuid` columns — bulk-insert coverage is about row
-/// *count*, not type coverage, which task B1 already covers elsewhere), a
+/// *count*, not type coverage, which the other programs cover), a
 /// single `Op::BulkInsert` seeding `row_count` rows in one statement
 /// (`pk = 1..=row_count`, `c1 = pk`, `c2 = pk * 2`, `grain = pk % 3`), one
 /// `OneToOne` def (`total = c1 + c2`) and one `Aggregate` def (`SUM(c1)`/
@@ -2212,7 +2127,7 @@ pub fn build_bulk_insert_program(row_count: usize) -> Program {
 }
 
 // ---------------------------------------------------------------------
-// Improvement-plan workstream D, task D2: order-insensitivity over
+// Order-insensitivity over
 // commuting ops.
 // ---------------------------------------------------------------------
 //
@@ -2221,9 +2136,9 @@ pub fn build_bulk_insert_program(row_count: usize) -> Program {
 // convergence must be identical. The load-bearing design point is what
 // "distinct derived-target keys" means: it must be keyed off **the target
 // key each op maps to under each installed definition sourced from that
-// op's table**, not off the op's raw source `(table, pk)` — since
-// improvement-plan task B4 added real [`KeySpace::Aggregate`] definitions,
-// those two things no longer always coincide: two ops on *different* source
+// op's table**, not off the op's raw source `(table, pk)` — with real
+// [`KeySpace::Aggregate`] definitions, those two things don't always
+// coincide: two ops on *different* source
 // pks can land in the *same* aggregate group (the `GROUP BY` columns
 // match), so reordering them relative to an op that reads a *different*
 // group is not obviously safe the way "different pk, different row" is for
@@ -2252,7 +2167,7 @@ fn op_table(op: &Op) -> &str {
 /// carry that column (a generator bug: every [`Op::Insert`] this crate
 /// builds always carries the pk column, non-`NULL`, and `Update`/`Delete`
 /// carry it directly as `pk`), or if `op` inherently touches more than one
-/// pk at once (improvement-plan task E6's `Op::Truncate`/`Op::BulkInsert` —
+/// pk at once (the `Op::Truncate`/`Op::BulkInsert` —
 /// `None` here is the same "conservative, may conflict with anything on this
 /// table" signal [`ops_commute`] already treats an unresolved pk as, which is
 /// exactly right for a whole-table clear or a multi-row insert).
@@ -2283,10 +2198,8 @@ fn op_pk_value(op: &Op, table: &Table) -> Option<String> {
 /// Callers must treat `None` conservatively, as "may conflict with anything
 /// on this table", never as "definitely independent" — see [`ops_commute`].
 ///
-/// **The `Aggregate` arm is real, exercised code as of improvement-plan task
-/// B4** (it was written, and this doc comment previously described it, as an
-/// honest-but-unreachable seam before B4 added any generator that actually
-/// draws a `KeySpace::Aggregate` definition — that generator now exists, see
+/// **The `Aggregate` arm is real, exercised code**: the generator draws
+/// `KeySpace::Aggregate` definitions (see
 /// [`DefShape::Aggregate`]/`strategy::def_shape`). An `Insert` that carries
 /// every `group_by` column in its own row resolves its group exactly the way
 /// `OneToOne` reads the pk column off the same row; `Update`/`Delete` still
@@ -2315,7 +2228,7 @@ pub fn target_key_for(def: &TransformDef, table: &Table, op: &Op) -> Option<Stri
                 Some(parts.join("\u{1f}"))
             }
             Op::Update { .. } | Op::Delete { .. } => None,
-            // Improvement-plan task E6: a whole-table `Truncate` or a
+            // A whole-table `Truncate` or a
             // multi-row `BulkInsert` can touch more than one group at once —
             // conservatively unresolved, same as `Update`/`Delete` above.
             Op::Truncate { .. } | Op::BulkInsert { .. } => None,
@@ -2329,7 +2242,7 @@ pub fn target_key_for(def: &TransformDef, table: &Table, op: &Op) -> Option<Stri
 
 /// Whether `a` and `b` — two ops belonging to `program` — may be freely
 /// reordered relative to each other without changing the program's eventual
-/// converged state (D2).
+/// converged state.
 ///
 /// Ops on different tables always commute: every definition this generator
 /// installs gets its own freshly-minted target ([`NamePool::next_table_name`]),
@@ -2467,8 +2380,7 @@ pub fn reordered_by_commute_groups(program: &Program) -> Program {
     }
 }
 
-/// A noise table's fixed shape (improvement-plan Workstream E, task E1:
-/// untracked-object noise): a `Numeric` primary key column plus one extra
+/// A noise table's fixed shape (untracked-object noise): a `Numeric` primary key column plus one extra
 /// column of `extra_type`. Kept to exactly two columns (pk + one extra) —
 /// noise doesn't need [`Table`]'s full multi-type-column richness, just
 /// enough shape for DML (`Insert`/`Update`/`Delete`) and DDL
@@ -2495,7 +2407,7 @@ pub fn noise_table(name: &str, pk_col: &str, extra_col: &str, extra_type: ValueT
     }
 }
 
-/// A fixed, deliberately adversarial default noise table (task E1): named
+/// A fixed, deliberately adversarial default noise table: named
 /// `"noise_untracked"` so it can never collide with a drawn [`Program`]'s own
 /// table/def names — [`NamePool`] only ever produces `t0`, `t1`, ... and
 /// `d0`, `d1`, ..., and `"noise_untracked"` matches neither pattern — but
@@ -2553,7 +2465,7 @@ mod strategy {
     }
 
     /// Weight of one specific awkward text literal, relative to a plain
-    /// short string, when awkward values are enabled (task B1). Kept small
+    /// short string, when awkward values are enabled. Kept small
     /// like `NULL_WEIGHT` — rare per draw, reliably hit across a handful of
     /// seed rows.
     const AWKWARD_TEXT_WEIGHT: u32 = 1;
@@ -2564,13 +2476,12 @@ mod strategy {
         "[a-zA-Z0-9 ]{0,8}".boxed()
     }
 
-    /// One specific awkward *text* value (design doc §3 / improvement-plan
-    /// task B1): the empty string; the literal four-character text `"NULL"`
+    /// One specific awkward *text* value (design doc §3): the empty string; the literal four-character text `"NULL"`
     /// (distinct from SQL `NULL`, i.e. `None` — that's [`value`]'s job, this
     /// is the string that spells the word); a string containing the U+001F
     /// unit-separator (`defs::ddl::join_pk_key`'s composite-key
-    /// delimiter — see the module doc comment's scope-cut note on why this
-    /// doesn't yet reach that risk); and a string containing a
+    /// delimiter — see the module doc comment's "Scope" section on why this
+    /// doesn't reach that risk); and a string containing a
     /// comma/quote/backslash (SQL-binding/escaping awkwardness, independent
     /// of any delimiter).
     fn awkward_text_literal() -> BoxedStrategy<String> {
@@ -2583,7 +2494,7 @@ mod strategy {
         .boxed()
     }
 
-    /// A single `Text` column value (task B1): a plain short string, or —
+    /// A single `Text` column value: a plain short string, or —
     /// when `awkward_values` is set — occasionally `None` (SQL `NULL`) or
     /// one of [`awkward_text_literal`]'s specific awkward strings.
     fn text_value(awkward_values: bool) -> BoxedStrategy<Option<String>> {
@@ -2599,7 +2510,7 @@ mod strategy {
         }
     }
 
-    /// A single `Boolean` column value (task B1): the rendered text form
+    /// A single `Boolean` column value: the rendered text form
     /// [`Op`] wants (`"true"`/`"false"`), or — when `awkward_values` is set —
     /// occasionally `None` (SQL `NULL`).
     fn bool_value(awkward_values: bool) -> BoxedStrategy<Option<String>> {
@@ -2660,10 +2571,10 @@ mod strategy {
             .boxed()
     }
 
-    /// A single `Uuid` column value (task B1): a freshly-generated,
+    /// A single `Uuid` column value: a freshly-generated,
     /// syntactically-valid UUID string, or — when `awkward_values` is set —
     /// occasionally `None` (SQL `NULL`). Deliberately **never** a malformed
-    /// UUID string (see the module doc comment's B1 scope cuts): a bad UUID
+    /// UUID string (see the module doc comment's "Scope" section): a bad UUID
     /// would fail the `INSERT`/`UPDATE` statement's own `$n::text::uuid`
     /// cast — real, separate future coverage (a new `OpOutcome::Fails`
     /// case), not this task.
@@ -2679,8 +2590,8 @@ mod strategy {
         }
     }
 
-    /// A short ASCII string, drawn from the same alphabet as [`plain_text`]
-    /// (improvement-plan task B2), used as `STRPOS`'s needle argument. Kept
+    /// A short ASCII string, drawn from the same alphabet as [`plain_text`],
+    /// used as `STRPOS`'s needle argument. Kept
     /// in that alphabet (rather than fully arbitrary text) so a meaningful
     /// fraction of draws actually land a hit against a table's `Text` column
     /// (also drawn from [`plain_text`]'s alphabet) — a `STRPOS` that only
@@ -2696,7 +2607,7 @@ mod strategy {
     /// dialect (literal text, `.`, `*`, `+`, `?`, `[...]`, `|`, `^`, `$`),
     /// the exact same restriction `trellis/tests/defs_text_functions.rs`'s
     /// `REGEXP_COUNT_METACHARACTER_CASES` already vets against real
-    /// Postgres. See [`DerivedShape`]'s doc comment (the D0 finding) for why
+    /// Postgres. See [`DerivedShape`]'s doc comment for why
     /// this specific restriction is what keeps `REGEXP_COUNT` eval-time-
     /// infallible for what this generator draws — a pattern outside this
     /// pool could in principle compile under the `regex` crate (so pass
@@ -2713,7 +2624,7 @@ mod strategy {
             .boxed()
     }
 
-    /// Draws one [`DerivedShape`] (improvement-plan task B2), equally
+    /// Draws one [`DerivedShape`], equally
     /// weighted across every variant — each of the five scalar functions,
     /// the plain and nested `Operator::GreaterThan` shapes, all reachable
     /// with the same probability, since the coverage floor
@@ -2734,7 +2645,7 @@ mod strategy {
         ]
     }
 
-    /// A single grain column value (improvement-plan task B4): `0..=GRAIN_MAX`
+    /// A single grain column value: `0..=GRAIN_MAX`
     /// most of the time, occasionally `None` (SQL `NULL`) — the "0, 1, 2, plus
     /// NULL" domain the improvement plan originally asked for. This was
     /// deliberately cut down to the three non-`NULL` values for a while:
@@ -2783,7 +2694,7 @@ mod strategy {
     }
 
     /// Which of a source table's two aggregated columns (`c1`/`c2`) a drawn
-    /// `SUM`/`AVG`/`COUNT(<col>)` field aggregates over (task B4).
+    /// `SUM`/`AVG`/`COUNT(<col>)` field aggregates over.
     fn aggregate_column() -> impl Strategy<Value = AggregateColumn> {
         prop_oneof![Just(AggregateColumn::C1), Just(AggregateColumn::C2),]
     }
@@ -2805,7 +2716,7 @@ mod strategy {
     const ALL_FN_KINDS: [FnKind; 4] =
         [FnKind::Sum, FnKind::Count, FnKind::CountColumn, FnKind::Avg];
 
-    /// A drawn `Aggregate` def's non-grouping fields (task B4): 2 to 4 of the
+    /// A drawn `Aggregate` def's non-grouping fields: 2 to 4 of the
     /// group basis's admitted functions in [`ALL_FN_KINDS`], each drawn at
     /// most once (`subsequence` never repeats an element), so multiple
     /// functions genuinely co-occur on the same def without ever needing two
@@ -2845,10 +2756,10 @@ mod strategy {
             })
     }
 
-    /// Which shape a drawn definition takes (task B4): the existing
+    /// Which shape a drawn definition takes: the existing
     /// `OneToOne` `total = c1 + c2` shape, or a new `Aggregate` shape.
     /// Weighted evenly so both shapes get substantial, comparable coverage
-    /// across a run — this is the dimension `tests/coverage.rs`'s B4 floor
+    /// across a run — this is the dimension `tests/coverage.rs`'s aggregate floor
     /// tests sample against, so it must not be so lopsided that 500 samples
     /// has a real chance of missing one of the aggregate functions.
     fn def_shape() -> impl Strategy<Value = DefShape> {
@@ -2871,10 +2782,10 @@ mod strategy {
     }
 
     /// Pairs a drawn [`DefShape`] with the optional [`DerivedShape`]
-    /// (improvement-plan task B2) that rides along with it: `Some` when the
+    /// that rides along with it: `Some` when the
     /// shape is `OneToOne` (every `OneToOne` def always gets one derived
     /// field — the same "unconditional, not a probabilistically-drawn
-    /// dimension" choice task B1 made for the `Text`/`Boolean`/`Uuid`
+    /// dimension" choice made for the `Text`/`Boolean`/`Uuid`
     /// columns), `None` when it's `Aggregate` (see [`DerivedShape`]'s and
     /// [`build_program_multi_with_shapes_and_derived`]'s doc comments for why
     /// a derived field can never legally attach to an `Aggregate` def).
@@ -2906,7 +2817,7 @@ mod strategy {
     /// `UpdateFlag` draws its pk exactly like `Update`, at
     /// weight `2`: it only matters to a def reading the `Boolean` column, so
     /// it shouldn't crowd out the `c1`/`c2` writes every other def reads.
-    /// `Truncate` (improvement-plan task E6) is weighted at `1` against the
+    /// `Truncate` is weighted at `1` against the
     /// other per-pk variants' `3` apiece — rare enough that most mutates still
     /// exercise the ordinary per-pk paths (a `Truncate` wipes every remaining
     /// live pk at once, so drawing it often would starve `Update`/`Delete`/
@@ -2965,12 +2876,12 @@ mod strategy {
 
     /// One drawn table's seed rows and mutate stream (see [`TableSpec`]):
     /// seed `1..=MAX_SEED_ROWS` rows with random values (now including one
-    /// `Text`/`Boolean`/`Uuid` value and one grain value per row, tasks
-    /// B1/B4), then append `0..=MAX_MUTATES` mutates over the numeric columns
-    /// and the Boolean column (the other new columns are never mutated — see
-    /// the module doc comment's scope cuts) — the per-table shape
-    /// [`trivial_program_with`] always drew, now reusable once per table in a
-    /// multi-table program (improvement-plan task B3).
+    /// `Text`/`Boolean`/`Uuid` value and one grain value per row), then append
+    /// `0..=MAX_MUTATES` mutates over the numeric columns and the Boolean
+    /// column (the other columns are never mutated — see the module doc
+    /// comment's "Scope" section) — the per-table shape
+    /// [`trivial_program_with`] draws, reusable once per table in a
+    /// multi-table program.
     fn table_spec(awkward_values: bool) -> impl Strategy<Value = TableSpec> {
         (1..=MAX_SEED_ROWS)
             .prop_flat_map(move |seed_count| {
@@ -3001,11 +2912,11 @@ mod strategy {
     }
 
     /// Draws a [`Program`] over `1..=MAX_TABLES` tables and `1..=MAX_DEFS`
-    /// definitions (improvement-plan task B3): each table independently
+    /// definitions: each table independently
     /// draws its own seed/mutate stream ([`table_spec`]), and each
     /// definition independently draws both *which* table it reads from —
     /// uniformly over `0..table_count`, with no bias toward distinct
-    /// sources — and (task B4) *which shape* it takes, paired (task B2) with
+    /// sources — and *which shape* it takes, paired with
     /// an optional derived field ([`def_shape_and_derived`]), so "two
     /// definitions sharing one source table" and "definitions spread across
     /// different tables" are both reachable in the same program, including a
@@ -3891,8 +3802,8 @@ mod strategy {
         schedule
     }
 
-    /// A single [`NoiseAction`] against [`adversarial_noise_table`]'s shape
-    /// (task E1): a small pk domain (so `Update`/`Delete` sometimes land on a
+    /// A single [`NoiseAction`] against [`adversarial_noise_table`]'s shape:
+    /// a small pk domain (so `Update`/`Delete` sometimes land on a
     /// row an earlier `Insert` in the same draw actually seeded, and
     /// sometimes miss — mirroring [`mutate`]'s own pk-liveness-agnostic
     /// design, since nothing here checks a noise op's outcome either way),
@@ -3935,9 +3846,9 @@ mod strategy {
         ]
     }
 
-    /// Draws a task-E1 noise plan sized to a program with `op_count` real
-    /// ops: [`adversarial_noise_table`] (shared across every draw — task E1
-    /// only asks for "one extra noise table", not a whole drawn-table-shape
+    /// Draws a noise plan sized to a program with `op_count` real
+    /// ops: [`adversarial_noise_table`] (shared across every draw — the plan
+    /// only needs "one extra noise table", not a whole drawn-table-shape
     /// dimension) plus 0-5 [`NoiseEvent`]s at random positions in
     /// `0..=op_count`, so a drawn plan sometimes fires before the very first
     /// op, sometimes after the very last, and sometimes not at all.
@@ -3954,7 +3865,7 @@ mod strategy {
         })
     }
 
-    /// Draws a task-E5 administration-only noise plan: no noise table at
+    /// Draws an administration-only noise plan: no noise table at
     /// all, just 0-3 bare `CHECKPOINT` statements at random positions in
     /// `0..=op_count`.
     pub fn checkpoint_plan_for(op_count: usize) -> impl Strategy<Value = NoisePlan> {
@@ -4000,7 +3911,7 @@ mod strategy {
         })
     }
 
-    /// Improvement-plan task E2: draws a [`trivial_program_with`] program,
+    /// Draws a [`trivial_program_with`] program,
     /// then defers exactly one of its definitions' installs
     /// ([`defer_def_install`]) to some point strictly after the first seed
     /// insert into that definition's own source table — so the deferred
@@ -4075,7 +3986,7 @@ mod strategy {
             })
     }
 
-    /// Improvement-plan task E3: draws a [`trivial_one_to_one_program_with`]
+    /// Draws a [`trivial_one_to_one_program_with`]
     /// program (see that function's own doc comment for the scope cut this
     /// applies), then schedules a [`schedule_restart`] at a uniformly-drawn
     /// mid-stream op index — a program with fewer than 2 ops (no room for a
@@ -4141,7 +4052,7 @@ mod strategy {
         })
     }
 
-    /// Improvement-plan task E3's other lifecycle event: [`schedule_scale_out`]
+    /// the other lifecycle event: [`schedule_scale_out`]
     /// at a uniformly-drawn mid-stream op index, same shape as
     /// [`program_with_client_restart`].
     pub fn program_with_scale_out(awkward_values: bool) -> impl Strategy<Value = Program> {
@@ -4156,8 +4067,7 @@ mod strategy {
         })
     }
 
-    /// Improvement-plan task E6: [`build_bulk_insert_program`] with a
-    /// shrinkable row count, following the same `1..=MAX` via
+    /// [`build_bulk_insert_program`] with a shrinkable row count, following the same `1..=MAX` via
     /// `prop_flat_map` idiom [`MAX_SEED_ROWS`]/[`MAX_MUTATES`] already use —
     /// proptest's integrated shrinking reduces the row count toward the
     /// smallest one that still reproduces a failure.
@@ -4329,7 +4239,7 @@ mod tests {
         assert_eq!(def.key_space, KeySpace::OneToOne);
         assert_eq!(def.predicate, Predicate::True);
         // `total` plus one identity-passthrough field per new Text/Boolean/
-        // Uuid column (task B1) — see `build_program_multi`'s doc comment.
+        // Uuid column — see `build_program_multi`'s doc comment.
         assert_eq!(def.fields.len(), 4);
         assert_eq!(def.fields[0].name, "total");
         assert!(matches!(
@@ -4572,7 +4482,7 @@ mod tests {
     }
 
     /// [`build_program_multi`]'s pk-liveness simulation must be *per table*,
-    /// not shared across tables (improvement-plan task B3) — fast, DB-free
+    /// not shared across tables — fast, DB-free
     /// pins for exactly the class of bug the task's own validation section
     /// calls out: multi-table is new surface where a liveness-tracking bug
     /// (or a pk-numbering bug) could slip in undetected without a test
@@ -4682,7 +4592,7 @@ mod tests {
             );
         }
 
-        /// Sanity check on the multi-def side of B3: two definitions can
+        /// Sanity check on the multi-def side: two definitions can
         /// independently draw the *same* source table (fan-out), and each
         /// still gets its own target and its own `total = c1 + c2` shape.
         #[test]
@@ -4702,7 +4612,7 @@ mod tests {
         }
     }
 
-    /// Improvement-plan task D2: fast, DB-free pins on the commutation
+    /// Fast, DB-free pins on the commutation
     /// analysis itself ([`ops_commute`]/[`commute_groups`]/
     /// [`reordered_by_commute_groups`]) — the slow, DB-backed half (do two
     /// commuting orderings actually converge identically against a real

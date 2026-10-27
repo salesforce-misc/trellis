@@ -323,12 +323,11 @@ fn quote_ident(ident: &str) -> String {
 /// its `SELECT` shares no code with the thing it checks (both happen to
 /// choose the same idiomatic rendering — quoted identifiers, an explicit cast
 /// on every literal, `name(args)` for a function call — independently, not by
-/// sharing an implementation). Improvement-plan task B2 widened this past the
-/// original numeric-`+` slice to `Operator::GreaterThan`,
+/// sharing an implementation). It covers `Operator::GreaterThan`,
 /// `Expr::StringLiteral`, and the five scalar functions
 /// (`STRPOS`/`OCTET_LENGTH`/`CHAR_LENGTH`/`REGEXP_COUNT`/`COALESCE`) the
-/// generator now draws (see `crate::generate::DerivedShape`); task B4 widens
-/// it again to the `KeySpace::Aggregate` functions
+/// generator draws (see `crate::generate::DerivedShape`), and the
+/// `KeySpace::Aggregate` functions
 /// (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`, plus `BOOL_AND`/`BOOL_OR`, see
 /// `crate::generate::AggregateFn`). Every one of those renders as the same generic `name(args)`
 /// Postgres call syntax (the fallthrough `FunctionCall` arm below) except `COUNT`'s
@@ -351,9 +350,8 @@ fn quote_ident(ident: &str) -> String {
 /// classes like `[[:alpha:]]`), and `COALESCE` does no comparison at all (it
 /// just returns its first non-`NULL` argument). `SUM`/`COUNT`/`AVG`/`MIN`/
 /// `MAX` are likewise all numeric aggregation, and `BOOL_AND`/`BOOL_OR`
-/// boolean aggregation, with no text/collation involvement. So unlike task B1's text *ordering* concern (which that
-/// task's own plan flags as the load-bearing collation risk), nothing B2 or
-/// B4 adds needs the oracle and the engine's underlying Postgres session
+/// boolean aggregation, with no text/collation involvement. So unlike a text *ordering* comparison (the load-bearing
+/// collation risk), nothing here needs the oracle and the engine's underlying Postgres session
 /// pinned to the same collation — there is no ordering comparison in this
 /// grammar for the two to disagree about.
 fn render_expr(expr: &Expr) -> String {
@@ -369,7 +367,7 @@ fn render_expr(expr: &Expr) -> String {
             };
             format!("({} {symbol} {})", render_expr(lhs), render_expr(rhs))
         }
-        // `COUNT(*)` (task B4, mirroring `trellis::dev::defs::oracle::render_expr_sql`'s
+        // `COUNT(*)` (mirroring `trellis::dev::defs::oracle::render_expr_sql`'s
         // own special case): the parser's only accepted `COUNT` shape has no
         // argument at all in the AST (`args` is empty), so `*` is rendered
         // back explicitly rather than falling through to the generic
@@ -385,7 +383,7 @@ fn render_expr(expr: &Expr) -> String {
 }
 
 /// Renders a 1-1 `def` back to `SELECT <pk>, (<expr>) AS <field>, ... FROM
-/// <source>`, or (task B4) an `Aggregate` `def` back to `SELECT (<expr>) AS
+/// <source>`, or an `Aggregate` `def` back to `SELECT (<expr>) AS
 /// <field>, ... FROM <source> GROUP BY <group_by>`. Every projection is cast
 /// to `text` so the read-back matches the rendered-text shape
 /// [`crate::backend::Snapshot`] uses. The `Aggregate` arm renders every field
@@ -450,7 +448,7 @@ fn render_select(def: &TransformDef, pk_column: &str) -> String {
 /// Runs `def` rendered as a `SELECT` (see [`render_select`]) in `pool`'s
 /// cluster and reads the result back into field-only [`Rows`] keyed by the
 /// primary key (1-1) or the grouping columns' composite [`group_key`]
-/// (`Aggregate`, task B4). The authority side of the three-way comparison.
+/// (`Aggregate`). The authority side of the three-way comparison.
 ///
 /// For an `Aggregate` def, `pk_column` is unused: there is no single leading
 /// pk expression in the rendered `SELECT` (see [`render_select`]'s doc
@@ -526,7 +524,7 @@ pub async fn sql_oracle(
 
 /// Recomputes `def`'s target with the engine's own evaluator
 /// ([`trellis::dev::defs::oracle::recompute`] for 1-1,
-/// [`trellis::dev::defs::oracle::recompute_aggregate`] for `Aggregate` — task B4)
+/// [`trellis::dev::defs::oracle::recompute_aggregate`] for `Aggregate`)
 /// and renders each `Value` to text, into field-only [`Rows`] keyed by the
 /// primary key (1-1) or the grouping columns' composite [`group_key`]
 /// (`Aggregate`, already computed by `recompute_aggregate` itself, since it's
@@ -663,7 +661,7 @@ fn diff(
 ///
 /// Field types drive the per-cell comparison: numeric fields (`total =
 /// c1 + c2`) compare by decimal value, `Text`/`Boolean`/`Uuid` passthrough
-/// fields (task B1) compare byte-exact — this resolves each field's type
+/// fields compare byte-exact — this resolves each field's type
 /// from `def` and `source_columns` rather than assuming it, so it stays
 /// correct as the grammar widens.
 pub fn three_way(
@@ -700,14 +698,14 @@ pub fn three_way(
 /// refuses, keeping the two in lockstep so the oracle never infers a type for
 /// a shape it can't render.
 ///
-/// Improvement-plan task B1 widened the generator to draw bare
+/// The generator draws bare
 /// `Expr::Column` passthrough fields over `Text`/`Boolean`/`Uuid` source
 /// columns (`SELECT <col> AS <col>`), not just the numeric operands of
-/// `total = c1 + c2` — so a `Column` reference is no longer always Numeric;
-/// this now looks its actual type up on the source schema.
+/// `total = c1 + c2` — so a `Column` reference is not always Numeric;
+/// this looks its actual type up on the source schema.
 ///
-/// Task B2 widens it again: `BinaryOp`/`FunctionCall`'s return type is no
-/// longer hardcoded `Numeric` either — it's read off
+/// `BinaryOp`/`FunctionCall`'s return type is not
+/// hardcoded `Numeric` either — it's read off
 /// `trellis::dev::defs::registry::operator_spec`/`lookup_function`, the same
 /// source of truth the parser/validator/evaluator all already share
 /// (ADR-0004), rather than this oracle keeping its own separate copy of
@@ -717,7 +715,7 @@ pub fn three_way(
 /// exactly as `validate.rs`'s `infer_expr` computes it) — self-recursing into
 /// the first argument mirrors that.
 ///
-/// Task B4 widens it once more: a `FunctionCall` that isn't registered in
+/// A `FunctionCall` that isn't registered in
 /// `registry::FUNCTIONS` (the scalar functions) is also checked against
 /// `registry::lookup_aggregate_function` (`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`,
 /// `registry::AGGREGATE_FUNCTION_SPECS`) before giving up — both registries'
@@ -1138,10 +1136,7 @@ mod tests {
         );
     }
 
-    /// Task B4: `render_select` now renders a real `GROUP BY` instead of
-    /// panicking (the old pin here, `render_select_panics_on_an_aggregate_key_space`,
-    /// asserted the pre-B4 refuse-to-guess behavior; this is its
-    /// replacement now that the real thing works), over an `order_summary`
+    /// `render_select` renders a real `GROUP BY` over an `order_summary`
     /// model aggregate definition.
     #[test]
     fn render_select_renders_a_group_by_aggregate() {
@@ -1183,7 +1178,7 @@ mod tests {
         );
     }
 
-    /// Task B4: `render_expr` now renders `MIN`/`MAX`/`AVG` too, not just
+    /// `render_expr` renders `MIN`/`MAX`/`AVG` as well as
     /// `SUM`/`COUNT` (the two above already get end-to-end coverage via
     /// `render_select_renders_a_group_by_aggregate` and
     /// `field_value_type_classifies_every_aggregate_function_as_numeric`
@@ -1204,13 +1199,8 @@ mod tests {
         }
     }
 
-    /// Post-merge coherence note: the pre-merge B4 pin here
-    /// (`render_expr_still_panics_on_a_non_aggregate_function_call`) asserted
-    /// that `render_expr` panicked on `STRPOS` — true on the B4 branch in
-    /// isolation, where B2's scalar-function rendering didn't exist yet, but
-    /// false now that it's merged in (`render_expr`'s `FunctionCall` arm is
-    /// fully generic, see its doc comment). `render_expr` itself no longer
-    /// refuses *any* function name — the real "refuse to guess" boundary
+    /// `render_expr` does not refuse any function name (its `FunctionCall`
+    /// arm is fully generic, see its doc comment) — the real "refuse to guess" boundary
     /// moved to [`field_value_type`], which panics on a function name absent
     /// from *both* `registry::FUNCTIONS` and `registry::AGGREGATE_FUNCTION_SPECS`
     /// (nothing in this grammar reaches `render_expr` with such a name
@@ -1297,9 +1287,8 @@ mod tests {
         assert!(report.to_string().contains("evaluator leg not run"));
     }
 
-    /// Improvement-plan task B2: `>` renders like `+` (parenthesized,
-    /// operator between the two rendered operands) — the oracle no longer
-    /// panics on `Operator::GreaterThan` the way it did before this task.
+    /// `>` renders like `+` (parenthesized, operator between the two rendered
+    /// operands).
     #[test]
     fn render_expr_renders_greater_than() {
         let expr = Expr::BinaryOp {

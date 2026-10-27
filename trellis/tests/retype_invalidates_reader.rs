@@ -6,7 +6,7 @@
 //! The re-type is the one a source's `integer` column moved to an unscaled
 //! `numeric` makes. Trellis's copy of it becomes an unconstrained `numeric`,
 //! which a group-basis `SUM`/`AVG` or a `JOIN`'s define refuses over a column
-//! of a table Trellis creates (ADR-0020, #1120). The
+//! of a table Trellis creates (ADR-0020). The
 //! readers are group-basis aggregates. Every step is a bounded, explicit pass or drain; nothing
 //! polls for convergence. The one wait, in the lock-order test, is for
 //! a backend to block on a lock.
@@ -129,7 +129,7 @@ async fn bring_live(raw: &mut Client, pool: &trellis::Pool, targets: &[&str]) {
 ///
 /// - `roll`: `SUM(p)` per `g` (valid over an integer, refused over a numeric with no scale);
 /// - `cnt`: `COUNT(p)` per `g` (valid over any type);
-/// - `c`: a 1-1 passthrough of `p` (valid; #828's copies are its business).
+/// - `c`: a 1-1 passthrough of `p` (valid).
 async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
     raw.batch_execute(
         "create table public.src (id int primary key, g int, price int); \
@@ -165,7 +165,7 @@ async fn column_type(raw: &Client, table: &str, column: &str) -> String {
     .get(0)
 }
 
-/// Rule 2: a `RESUME` that re-types `t.p` pauses `roll`, with
+/// A `RESUME` that re-types `t.p` pauses `roll`, with
 /// define's refusal as the reason naming the re-type, and its own
 /// `RESUME` refuses. `cnt` and `c` stay valid and are not paused by it.
 #[tokio::test]
@@ -239,7 +239,7 @@ async fn wait_blocked_behind(raw: &Client, pid: i32) {
     panic!("nothing blocked behind backend {pid} within 30s");
 }
 
-/// Rule 2's lock order: the re-type takes the readers' definition rows
+/// Lock order: the re-type takes the readers' definition rows
 /// before the target's `ACCESS EXCLUSIVE` lock. A transaction holding the
 /// reader's row (`roll`'s, as its build or an `ALTER TRANSFORM roll` would)
 /// and then reading the target `t` is not deadlocked by the resume's
@@ -360,8 +360,8 @@ async fn resume_retype_against_a_reader_row_holder(stall: Duration, expect_retry
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Rule 2 down a chain `t -> c -> roll2`: `t`'s resume re-types `t.p`,
-/// which pauses `c` (its copy of `p` is outgrown, #828); `c`'s chained
+/// The same down a chain `t -> c -> roll2`: `t`'s resume re-types `t.p`,
+/// which pauses `c` (its copy of `p` is outgrown); `c`'s chained
 /// resume re-types `c.q`, which pauses `roll2`, a `SUM(q)` define would now
 /// refuse. `c` goes live again.
 #[tokio::test]
@@ -545,7 +545,7 @@ async fn a_scale_change_between_two_declared_scales_rebuilds_the_sum_reader() {
 
 /// After define: a `SUM` argument re-typed from `integer`
 /// to `double precision` pauses its aggregate on the capture pass, and the
-/// resume refuses with define's family refusal (#1119) until the column is
+/// resume refuses with define's family refusal until the column is
 /// an admitted type again.
 #[tokio::test]
 async fn a_source_retype_to_a_float_pauses_its_sum_reader_and_the_resume_refuses() {
@@ -579,7 +579,7 @@ async fn a_source_retype_to_a_float_pauses_its_sum_reader_and_the_resume_refuses
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Rules 1 and 4: an alter that changes a column's type within the string
+/// An alter that changes a column's type within the string
 /// family leaves a `JOIN` key pair `t.k = o.k` valid (Trellis's copy of a
 /// `varchar(n)` column is unbounded, and `varchar` and `text` pair),
 /// so the alter is accepted and the `JOIN` is untouched.

@@ -1,4 +1,4 @@
-//! Improvement-plan task D3, negative control.
+//! Negative control for the read-your-own-writes property.
 //!
 //! `generative::run::run_convergence` already does read-your-own-writes
 //! (RYOW), asserted incrementally: apply → quiesce → snapshot → compare,

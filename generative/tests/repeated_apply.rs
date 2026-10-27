@@ -1,8 +1,8 @@
-//! Improvement-plan task D1, scoped down from its original framing.
+//! Repeated identical source operations.
 //!
-//! The plan as originally written asked for "apply every op twice" as a
-//! stand-in for at-least-once CDC redelivery. That framing doesn't survive
-//! contact with how this backend seam actually works:
+//! "Apply every op twice" is not a stand-in for at-least-once CDC
+//! redelivery. That framing doesn't survive contact with how this backend
+//! seam actually works:
 //!
 //! - Trellis's derived-write path is structurally exactly-once by
 //!   construction — claim, fold, apply, and mark-drained all happen in one
@@ -21,8 +21,7 @@
 //! at-least-once *redelivery* of a single change — that would require
 //! injecting the same already-staged row into the ring twice, below
 //! `Backend::apply`'s deliberately narrow API (staging-ring-level fault
-//! injection, out of scope here; flagged in the workstream report as a real
-//! gap for a future fault-injection effort).
+//! injection, out of scope here; a real gap for a future fault-injection effort).
 //!
 //! What's left, and what this file actually tests: **repeated identical
 //! *transactions* still converge to the correct — cumulative, not
@@ -71,7 +70,7 @@ use generative::run::check_program;
 use testkit::TestCluster;
 use trellis::{Config, Pool};
 
-/// The genuinely non-trivial D1 case: two `Update`s against the same row,
+/// The genuinely non-trivial case: two `Update`s against the same row,
 /// back to back (no quiesce in between, so both deltas can land close
 /// together in the staging ring before either is folded). Both calls are
 /// real, live-row updates with *distinct* `c1`/`c2` values — see the module
@@ -148,7 +147,7 @@ async fn two_distinct_updates_to_the_same_row_back_to_back_still_converge() {
     );
 }
 
-/// The lesser D1 case: the same `Delete` applied twice in a row. The first
+/// The lesser case: the same `Delete` applied twice in a row. The first
 /// call is a genuine delete (the row is live); the second finds nothing (the
 /// row is already gone) and is a source no-op (`0` rows affected), not an
 /// error — the "operation errors are checked, not swallowed" no-op path

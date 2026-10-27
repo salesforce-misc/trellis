@@ -647,7 +647,7 @@ async fn apply_write(
             raw.execute(&sql, &[pk]).await?
         }
         Op::Truncate { table, .. } => {
-            // Improvement-plan task E6's load-bearing gotcha: Postgres's
+            // The load-bearing gotcha: Postgres's
             // `TRUNCATE` command tag always reports `0` rows affected,
             // regardless of how many rows actually existed — trusting that
             // raw count into `run_convergence`'s `Ok(0) => AffectsNoRows`

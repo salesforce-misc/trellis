@@ -231,7 +231,7 @@ pub async fn run_two_instance_convergence<A: Backend, B: Backend>(
         max_checks > 0,
         "run_two_instance_convergence: max_checks must be at least 1"
     );
-    // Task E2's deferred definition installs and E3's scheduled
+    // Deferred definition installs and scheduled
     // restarts/scale-outs are deliberately *not* supported here, and are
     // refused loudly rather than silently ignored — a program carrying one
     // would otherwise be quietly under-tested (every definition installed up
@@ -298,14 +298,14 @@ fn reject_unsupported_schedule<B: Backend>(
     let program = run.program;
     if program.def_install_after_op.iter().any(|at| *at != 0) {
         return Err(run.tag(RunError::Install(
-            "two-instance runs do not implement task E2's mid-stream definition installs \
+            "two-instance runs do not implement mid-stream definition installs \
              (`def_install_after_op`)"
                 .to_string(),
         )));
     }
     if !program.restart_after_ops.is_empty() || !program.scale_out_after_ops.is_empty() {
         return Err(run.tag(RunError::Install(
-            "two-instance runs do not implement task E3's scheduled restarts/scale-outs \
+            "two-instance runs do not implement scheduled restarts/scale-outs \
              (`restart_after_ops`/`scale_out_after_ops`)"
                 .to_string(),
         )));

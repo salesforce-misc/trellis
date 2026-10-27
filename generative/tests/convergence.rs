@@ -38,7 +38,7 @@ use trellis::{Config, Pool};
 /// One tokio runtime and one shared, initdb-once cluster for a test thread's
 /// proptest cases. See the module doc comment for why this is thread-local.
 ///
-/// `coverage` (improvement-plan task A2, `docs/generative-test-suite.md` §3)
+/// `coverage` (`docs/generative-test-suite.md` §3)
 /// accumulates every program `run_one` drives, pass or fail, so the property
 /// can report what it actually exercised instead of a single green/red bit —
 /// see [`Harness`]'s `Drop` impl below.
@@ -70,12 +70,12 @@ thread_local! {
     static HARNESS: Harness = Harness {
         runtime: tokio::runtime::Runtime::new().expect("build tokio runtime"),
         cluster: {
-            // Improvement-plan workstream C, task C2: opt-in per-call timing
+            // Opt-in per-call timing
             // around cluster startup (`initdb` + `pg_ctl start`), the most
             // expensive one-time cost the shared thread-local harness pays.
             // Silent and free unless `GENERATIVE_COST_TIMING` is set, same
             // convention as C1's `GENERATIVE_QUIESCE_TIMING` in
-            // `generative/src/backend/manual.rs` (improvement-plan task C2).
+            // `generative/src/backend/manual.rs`.
             let timing_enabled = std::env::var_os("GENERATIVE_COST_TIMING").is_some();
             let start = timing_enabled.then(std::time::Instant::now);
             let cluster = TestCluster::start().long_lived();
@@ -668,7 +668,7 @@ async fn a_null_value_in_a_nullable_column_converges() {
     assert!(outcome.as_pass(), "run did not pass: {outcome}");
 }
 
-/// Improvement-plan task B3: a hand-built, fully-worked 2-table/2-def
+/// A hand-built, fully-worked 2-table/2-def
 /// program (one definition per table) driven through the real convergence
 /// property end-to-end. `trivial_program`'s proptest strategy now draws
 /// multi-table/multi-def shapes too (see `tests/coverage.rs`'s
@@ -709,7 +709,7 @@ async fn a_two_table_two_def_program_converges_end_to_end() {
                 }],
             ),
         ],
-        // One definition per table (not fan-out) — the other B3 shape,
+        // One definition per table (not fan-out) — the other multi-table shape,
         // two defs sharing one source, is covered by
         // `generate::tests::pk_liveness_multi_table::two_definitions_can_share_one_source_table`
         // (DB-free) and by the property itself
@@ -730,15 +730,15 @@ async fn a_two_table_two_def_program_converges_end_to_end() {
     assert!(outcome.as_pass(), "run did not pass: {outcome}");
 }
 
-/// Improvement-plan task B1: a hand-built program exercising the new
+/// A hand-built program exercising the new
 /// `Text`/`Boolean`/`Uuid` columns (and their identity-passthrough fields)
 /// end-to-end against a real cluster — not just `trivial_program`'s property
 /// happening to draw them, per this suite's own "coverage that silently
-/// drops out" principle (same rationale as the B3 pin above).
+/// drops out" principle (same rationale as the multi-table pin above).
 ///
 /// Row 1 carries plain, unremarkable values for all three new columns. Row 2
 /// carries the U+001F ("unit separator") awkward text literal specifically
-/// (design doc §3 / the module doc comment's B1 scope-cut note): it's the
+/// (design doc §3 / the generator's module doc comment): it's the
 /// same byte `defs::ddl::join_pk_key`'s composite-key encoding treats
 /// specially, so proving *this* value round-trips correctly through a plain
 /// `Text` column — SQL binding, the `::text` cast on both insert and every
@@ -789,12 +789,12 @@ async fn a_text_boolean_uuid_program_converges_end_to_end() {
     assert!(outcome.as_pass(), "run did not pass: {outcome}");
 }
 
-/// Improvement-plan task B2: a hand-built program whose "derived" field is
+/// A hand-built program whose "derived" field is
 /// `STRPOS(text_col, 'wor') > 0` — a nested, *mixed* operator-and-function
 /// expression (`Operator::GreaterThan` wrapping a `FunctionCall`) — driven
 /// through the real convergence property end-to-end. Not just the property
 /// happening to draw this `DerivedShape` sometimes (per this suite's own
-/// "coverage that silently drops out" principle, same rationale as the B1/B3
+/// "coverage that silently drops out" principle, same rationale as the
 /// pins above): this is the specific shape the render_expr parenthesization
 /// fix (`generative::backend::manual::render_expr`) and the oracle's new
 /// `>`/function rendering (`generative::oracle::render_expr`) both exist for.
@@ -858,7 +858,7 @@ async fn a_nested_mixed_operator_and_function_expression_converges_end_to_end() 
     assert!(outcome.as_pass(), "run did not pass: {outcome}");
 }
 
-/// Improvement-plan task B4, the non-negotiable pin: a hand-built
+/// The non-negotiable pin: a hand-built
 /// `KeySpace::Aggregate` program driven through the real convergence property
 /// end-to-end, specifically driving one group to empty via deletes — the
 /// single hardest edge the task names (the only non-idempotent maintenance
@@ -944,7 +944,7 @@ async fn an_aggregate_group_emptied_by_deletes_converges_and_the_row_disappears(
     );
 }
 
-/// Improvement-plan task B4: `AVG`'s hidden sum/count partials, and — since
+/// `AVG`'s hidden sum/count partials, and — since
 /// this def's `SUM` and `AVG` both aggregate the exact same column — the one
 /// partial the group basis keeps for them (`trellis::staging::group_basis`,
 /// one per distinct argument). An

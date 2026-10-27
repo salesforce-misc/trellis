@@ -107,7 +107,7 @@ rebuilds a definition (an explicit `request_backfill`, a resume, an `ALTER
 TRANSFORM`, a capture re-install) does its work in background jobs the wait
 knows nothing about. A comparison made while the definition is being built
 would agree or disagree with a state the build is about to change. After the
-capture audit, `self_check` therefore reads the definition's status and
+capture audit, `self_check` therefore reads the definition's reported status and
 compares only a `live` one. Any other (`waiting_to_backfill`, `backfilling`,
 `catching_up`, `paused`, `quarantined`) returns the outcome `NotLive`, which
 carries that status. It compares nothing and waits for nothing. Like

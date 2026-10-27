@@ -56,7 +56,7 @@ use std::time::Duration;
 
 use tokio_postgres::types::{PgLsn, Type};
 
-use crate::defs::model::StoredStatus;
+use crate::defs::model::TransformStatus;
 use crate::pool::Pool;
 
 use super::holdup::DrainFailure;
@@ -367,7 +367,10 @@ async fn report_of(
             let status: &str = row
                 .get::<_, Option<&str>>(7)
                 .expect("a not_live job saved the status it found");
-            SelfCheckOutcome::NotLive(StoredStatus::from_row(status).into())
+            SelfCheckOutcome::NotLive(
+                TransformStatus::from_word(status)
+                    .expect("a not_live job saved a reported status word"),
+            )
         }
         other => panic!("a done self_check job held outcome {other:?}"),
     };

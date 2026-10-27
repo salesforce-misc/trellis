@@ -292,6 +292,11 @@ impl TransformStatus {
         matches!(self, TransformStatus::Paused | TransformStatus::Quarantined)
     }
 
+    /// The status a word names ([`Self::as_str`]'s inverse).
+    pub(crate) fn from_word(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|status| status.as_str() == word)
+    }
+
     /// The word this status is reported as.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -415,6 +420,9 @@ mod tests {
                 "every listed variant round-trips through its persisted word"
             );
             assert_eq!(status.as_str(), TransformStatus::from(status).as_str());
+        }
+        for status in TransformStatus::ALL {
+            assert_eq!(TransformStatus::from_word(status.as_str()), Some(status));
         }
         let names: std::collections::HashSet<&str> =
             StoredStatus::ALL.iter().map(|s| s.as_str()).collect();

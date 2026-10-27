@@ -1,5 +1,5 @@
-//! Workstream E, tasks E1 (untracked-object noise) and E5 (cluster-
-//! administration noise, `CHECKPOINT` only — see the module doc comment on
+//! Untracked-object noise and cluster-
+//! administration noise (`CHECKPOINT` only — see the module doc comment on
 //! why plain restart is out of scope) both need to interleave raw SQL
 //! against [`crate::backend::ManualBackend`]'s own connection with a
 //! program's real op stream — something [`super::run_convergence`]'s generic
@@ -14,7 +14,7 @@
 //! hypothetical future backend that doesn't expose a raw connection at all.
 //! [`super::run_convergence`] itself is completely untouched by this file.
 //!
-//! Both tasks are "bucket 1" (improvement-plan workstream E): neither is meant
+//! Neither kind of noise is meant
 //! to perturb a tracked program's oracle-verified convergence at all, so
 //! [`run_convergence_with_noise`] below reuses [`super::check_program`]
 //! unchanged and asserts the exact same thing [`super::run_convergence`] does
@@ -39,7 +39,7 @@ async fn fire_events(backend: &ManualBackend, plan: &NoisePlan, position: usize)
 }
 
 /// [`super::run_convergence`], widened to interleave `noise`'s events into
-/// the real op stream (workstream E, tasks E1 + E5). `noise.table` (if
+/// the real op stream (untracked-table noise and administration statements). `noise.table` (if
 /// `Some`) is created once, right after `program`'s own install, via
 /// [`ManualBackend::install_noise_table`] — never registered as tracked, so
 /// it cannot affect anything [`check_program`] looks at (see that function's

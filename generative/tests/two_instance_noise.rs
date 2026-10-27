@@ -1,4 +1,4 @@
-//! Layer-3 bucket 1 remainder (design doc §8/§9):
+//! Layer-3 remainder (design doc §8/§9):
 //! **two Trellis instances side by side, each converging against its own
 //! oracle** — the one shape of bug a single-instance suite structurally
 //! cannot see.

@@ -324,6 +324,93 @@ async fn self_check_reports_a_definition_under_a_rebuild_as_not_live() {
     trellis.shutdown().await.expect("shutdown");
 }
 
+/// A definition that is stored `live` but reads an upstream that is being
+/// rebuilt reports `catching_up` (`Trellis::status`), and `self_check` answers
+/// with that reported status rather than comparing a target the upstream is
+/// about to rewrite. Once the upstream is `live` again the same check compares.
+#[tokio::test]
+async fn self_check_reports_a_reader_of_a_rebuilding_upstream_as_catching_up() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, mut raw) = converged_fixture(
+        &db,
+        "create table widgets (id integer primary key, price integer)",
+        "widgets",
+        "TRANSFORM widget_prices FROM widgets SELECT price AS price",
+        &[
+            ("1", r#"{"id":"1","price":"10"}"#),
+            ("2", r#"{"id":"2","price":"20"}"#),
+        ],
+    )
+    .await;
+    trellis
+        .apply("TRANSFORM price_copies FROM widget_prices SELECT price AS price")
+        .await
+        .expect("define the reader");
+    capture_tables(
+        &mut raw,
+        &[
+            &format!("{DEFAULT_SCHEMA}.widgets"),
+            &format!("{DEFAULT_SCHEMA}.widget_prices"),
+        ],
+    )
+    .await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    let reported = || async {
+        trellis
+            .status("price_copies")
+            .await
+            .expect("status")
+            .expect("price_copies")
+            .status
+    };
+    assert_eq!(reported().await, TransformStatus::Live);
+    let check = || async {
+        trellis
+            .self_check_page(
+                "price_copies",
+                SelfCheckScope {
+                    after: None,
+                    limit: 100,
+                },
+                SelfCheckMode::Standard,
+                GENEROUS_TIMEOUT,
+            )
+            .await
+            .expect("self_check")
+    };
+
+    trellis
+        .request_backfill("widgets")
+        .await
+        .expect("request a rebuild of the upstream");
+    assert_eq!(reported().await, TransformStatus::CatchingUp);
+    let report = check().await;
+    assert!(
+        matches!(
+            report.outcome,
+            SelfCheckOutcome::NotLive(TransformStatus::CatchingUp)
+        ),
+        "expected NotLive(CatchingUp), got {:?}",
+        report.outcome
+    );
+    assert_eq!(report.rows_compared, 0, "nothing was compared");
+
+    trellis::intake::harness::settle_builds(&db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(reported().await, TransformStatus::Live);
+    let report = check().await;
+    assert!(
+        matches!(report.outcome, SelfCheckOutcome::Converged),
+        "expected Converged once the upstream is live, got {:?}",
+        report.outcome
+    );
+    assert_eq!(report.rows_compared, 2);
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
 /// Likewise a frozen definition: its target is deliberately not maintained.
 #[tokio::test]
 async fn self_check_reports_a_paused_definition_as_not_live() {

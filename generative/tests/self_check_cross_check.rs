@@ -342,7 +342,7 @@ fn tampering_proptest_config() -> ProptestConfig {
 /// `self_check`'s own documented, deliberate scope boundary instead of on a
 /// real tampering-detection question. `trivial_one_to_one_program_with`
 /// already exists, restricted to exactly that same boundary, for the
-/// unrelated E3 client-restart property — reused here rather than
+/// unrelated client-restart property — reused here rather than
 /// duplicated.
 ///
 /// **Design choice: the corruption target is selected post-settle, by index
@@ -367,7 +367,7 @@ fn program_with_corruption_selectors() -> impl Strategy<Value = (Program, usize,
 /// closed set of top-level field shapes that generator actually builds for a
 /// `OneToOne` def (see `crate::generate::DerivedShape`'s doc comment, and
 /// `build_program_multi_with_shapes`'s `OneToOne` arm): a bare source-column
-/// passthrough (the `Text`/`Boolean`/`Uuid` columns, task B1), the fixed
+/// passthrough (the `Text`/`Boolean`/`Uuid` columns), the fixed
 /// `total = c1 + c2` field, or one more `BinaryOp`/`FunctionCall` "derived"
 /// field. Every `FunctionCall` this generator ever attaches to a `OneToOne`
 /// def (`STRPOS`/`OCTET_LENGTH`/`CHAR_LENGTH`/`REGEXP_COUNT`/`COALESCE`)

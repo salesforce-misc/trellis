@@ -644,7 +644,7 @@ impl super::Backend for SubprocessBackend {
     /// Starts an additional, application-worker-only (`staging_worker:
     /// false`) `engine_subprocess`, alongside whatever primary subprocess
     /// `install` already started — the subprocess analog of
-    /// `ManualBackend::scale_out` (improvement-plan task E3).
+    /// `ManualBackend::scale_out`.
     async fn scale_out(&mut self) -> Result<(), SubprocessBackendError> {
         self.spawn_engine(false).await
     }

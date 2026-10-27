@@ -6,38 +6,31 @@
 //! [`EngineClient`] runs). Drives the real engine as far as its current
 //! 1-1/numeric-`+` subset allows — a real [`EngineClient`] (one staging
 //! worker, one *or more* application workers — see
-//! [`ManualBackend::connect_with_workers`]/[`ManualBackend::connect_with_options`],
-//! improvement-plan task D4) against a real, already-migrated Postgres
+//! [`ManualBackend::connect_with_workers`]/[`ManualBackend::connect_with_options`])
+//! against a real, already-migrated Postgres
 //! database, reached only over raw source DML (never an application-level
 //! notify API), matching the production ingestion path
 //! (`docs/data-flow.md#capture-by-triggers`).
 //!
-//! **D4's "second runtime" is this same type, just started with more than one
-//! application worker** — not a separate `ConcurrentBackend` type. Nothing in
-//! `ManualBackend` (DDL rendering, DML rendering, `quiesce`, `snapshot`)
-//! assumes a single worker; the worker count only ever mattered to one line
-//! inside [`Backend::install`] that hardcoded `application_threads: 1`. A
-//! second type would have had to duplicate this module's substantial
-//! rendering logic for zero behavioral difference; a parameterized
-//! constructor shares all of it and keeps exactly one implementation of the
-//! seam's DDL/DML/read-back logic to maintain. See
-//! `generative/tests/concurrent_convergence.rs` for the new, separate
-//! property/test file this constructor is meant to be driven from.
+//! **The concurrent runtime is this same type, started with more than one
+//! application worker** — there is no separate `ConcurrentBackend`. Nothing
+//! in `ManualBackend` (DDL rendering, DML rendering, `quiesce`, `snapshot`)
+//! assumes a single worker; the worker count only sets `application_threads`
+//! in [`Backend::install`]. A parameterized constructor shares the rendering
+//! logic and keeps exactly one implementation of the seam's DDL/DML/read-back
+//! logic. See `generative/tests/concurrent_convergence.rs` for the tests that
+//! drive it.
 //!
-//! **Update**: that same DDL/DML/read-back rendering logic
+//! The DDL/DML/read-back rendering logic
 //! (`render_definition`/`render_expr`/`create_source_table`/`apply_op`/
 //! `read_table`/`read_aggregate_table`, none of which cares whether the
-//! engine driving the ring is in-process or a real subprocess) has since
-//! moved to [`super::sql`], a module shared with
-//! [`super::SubprocessBackend`] — the second `Backend` impl this doc comment
-//! used to argue against, but for a genuinely different reason than D4's
-//! worker count: a subprocess-supervised engine that `testkit::CrashGuard`
-//! can `SIGKILL` mid-drain. What differs between `ManualBackend` and
-//! `SubprocessBackend` is *only* how the engine itself is started, stopped,
-//! and restarted — never the DDL/DML/read-back shape, which is why sharing
-//! [`super::sql`] rather than duplicating it keeps exactly one
-//! implementation of the seam's rendering logic, same as this doc comment's
-//! original D4 argument.
+//! engine driving the ring is in-process or a real subprocess) lives in
+//! [`super::sql`], shared with [`super::SubprocessBackend`], whose engine is
+//! a subprocess `testkit::CrashGuard` can `SIGKILL` mid-drain. What differs
+//! between `ManualBackend` and `SubprocessBackend` is *only* how the engine
+//! itself is started, stopped, and restarted — never the DDL/DML/read-back
+//! shape, so there is exactly one implementation of the seam's rendering
+//! logic.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -203,7 +196,7 @@ pub enum ManualBackendError {
     UnnamedTarget,
     /// [`ManualBackend::restart`] was called before [`ManualBackend::install`]
     /// ever started a primary engine client — nothing to restart. A generator
-    /// bug (improvement-plan task E3's `restart_after_ops` is only ever
+    /// bug (`restart_after_ops` is only ever
     /// nonzero on a program that also has at least one table, so `install`
     /// always starts a client before any restart point is reached), not a
     /// condition a caller should need to handle gracefully.
@@ -295,7 +288,7 @@ impl From<sql::QuiesceError> for ManualBackendError {
 }
 
 /// Renders one [`NoiseAction`] to the SQL text [`ManualBackend::fire_noise_event`]
-/// runs directly (task E1) — the noise-table analog of [`render_definition`]/
+/// runs directly — the noise-table analog of [`render_definition`]/
 /// [`render_expr`], but for plain DDL/DML rather than a `TRANSFORM`
 /// definition. `Insert`/`Update` target `table.columns[1]` by name (falling
 /// back to the pk column if `table` is somehow columnless) — the one non-pk
@@ -384,12 +377,12 @@ pub struct ManualBackend {
     raw: tokio_postgres::Client,
     engine_client: Option<EngineClient>,
     /// The options the primary `engine_client` was started with — remembered
-    /// so [`ManualBackend::restart`] (improvement-plan task E3) can start a
+    /// so [`ManualBackend::restart`] can start a
     /// fresh client against the exact same target rather than needing the
     /// caller to hand the options back in.
     client_options: Option<ClientOptions>,
     /// Additional application-worker-only clients started by
-    /// [`ManualBackend::scale_out`] (improvement-plan task E3). Kept alive for
+    /// [`ManualBackend::scale_out`]. Kept alive for
     /// the backend's own lifetime (dropped, and so best-effort-signalled to
     /// stop, only when `self` is) — nothing here ever reads back out of this
     /// list, it exists purely so these clients keep running and aren't
@@ -398,9 +391,9 @@ pub struct ManualBackend {
     tables: HashMap<String, Table>,
     defs: Vec<TransformDef>,
     /// How many application-worker tasks [`Backend::install`] starts the
-    /// underlying [`EngineClient`] with (improvement-plan task D4). `1` for
-    /// every existing single-worker caller (unchanged default via
-    /// [`ManualBackend::connect`]); `>1` is the "second runtime"
+    /// underlying [`EngineClient`] with. `1` for
+    /// a single-worker caller (the default via
+    /// [`ManualBackend::connect`]); `>1` is the concurrent runtime
     /// `generative/tests/concurrent_convergence.rs` drives.
     application_threads: usize,
     /// How often the underlying `EngineClient`'s maintenance loop
@@ -410,7 +403,7 @@ pub struct ManualBackend {
     /// hand-built pin can widen it comfortably past how long a large burst of
     /// raw DML takes to apply, guaranteeing every row of that burst lands in
     /// the *same* sealed batch instead of splitting across an arbitrary
-    /// number of 300ms-apart maintenance ticks (see the D4 hand-built
+    /// number of 300ms-apart maintenance ticks (see the hand-built
     /// "genuinely exceeds `MIN_ROWS_TO_SPLIT`" pin in
     /// `generative/tests/concurrent_convergence.rs`).
     maintenance_interval: Duration,
@@ -477,7 +470,7 @@ impl ManualBackend {
 
     /// Like [`ManualBackend::connect`], but starts the underlying
     /// [`EngineClient`] with `application_threads` app-worker tasks instead
-    /// of a hardcoded `1` (improvement-plan task D4's "second runtime" —
+    /// of a hardcoded `1` (the concurrent runtime —
     /// same `Backend` seam, same DDL/DML/quiesce/snapshot code, a real
     /// multi-worker pool underneath). The engine's default maintenance
     /// cadence is unchanged; see [`ManualBackend::connect_with_options`] if a
@@ -710,8 +703,7 @@ impl ManualBackend {
         Ok(rows.iter().map(|row| row.get(0)).collect())
     }
 
-    /// Diagnostic-only (improvement-plan task D4): the largest `bucket_count`
-    /// across every segment sealed so far, straight from
+    /// Diagnostic-only: the largest `bucket_count` across every segment sealed so far, straight from
     /// the engine's own `staging::claim` partition decision (`segments.bucket_count`,
     /// fixed at seal time from row count alone — see
     /// `staging::claim::MIN_ROWS_TO_SPLIT`/`SEG_BUCKETS`). `0` if no
@@ -930,7 +922,7 @@ impl ManualBackend {
     }
 
     /// Creates a table with the exact same DDL shape [`ManualBackend::install`]
-    /// gives a real source table (task E1: untracked-object noise), so it is
+    /// gives a real source table (untracked-object noise), so it is
     /// indistinguishable from a real one at the DDL level, but never
     /// registers it in `self.tables`, and no definition reads it, so the
     /// engine never captures it (the engine captures exactly the tables
@@ -949,7 +941,7 @@ impl ManualBackend {
 
     /// Runs one arbitrary SQL statement directly against this backend's own
     /// connection, bypassing [`ManualBackend::apply`]'s op-shaped DML
-    /// entirely (task E1 noise DDL/DML; task E5's `CHECKPOINT`). Returns the
+    /// entirely (noise DDL/DML and `CHECKPOINT`). Returns the
     /// statement's affected-row count (`0` for a DDL statement or
     /// `CHECKPOINT`, same as any other statement that doesn't affect table
     /// rows).
@@ -963,7 +955,7 @@ impl ManualBackend {
     /// are swallowed (logged to stderr, never returned) — noise/
     /// administration is deliberately allowed to fail (e.g. a `DROP COLUMN`
     /// on a column an earlier event already dropped) without that ever
-    /// counting as a run failure; the whole point of tasks E1/E5 is that
+    /// counting as a run failure; the whole point of noise events is that
     /// nothing here can affect the tracked convergence check regardless of
     /// whether it succeeds.
     pub async fn fire_noise_event(&self, table: Option<&Table>, event: &NoiseEvent) {
@@ -1158,7 +1150,7 @@ impl super::Backend for ManualBackend {
             }
             let client = EngineClient::start_with_config(self.config.clone(), options.clone())?;
             self.engine_client = Some(client);
-            // Remembered so `restart` (improvement-plan task E3) can start an
+            // Remembered so `restart` can start an
             // equivalent replacement client without the caller needing to
             // hand these options back in.
             self.client_options = Some(options);
@@ -1182,7 +1174,7 @@ impl super::Backend for ManualBackend {
     }
 
     async fn quiesce(&mut self) -> Result<(), ManualBackendError> {
-        // Improvement-plan workstream C, task C1: opt-in per-call timing
+        // Opt-in per-call timing
         // around the whole quiesce (the settle and partition
         // waits as well as the watermark -> converge round trip), to test the
         // hypothesis that the convergence property's wall-clock variance came
@@ -1268,7 +1260,7 @@ impl super::Backend for ManualBackend {
         Ok(snapshot)
     }
 
-    /// Improvement-plan task E3: tears down the current primary
+    /// Tears down the current primary
     /// `trellis::Client` and starts a fresh one against the same dsn/options
     /// [`ManualBackend::install`] remembered. The ring is durable Postgres
     /// state untouched by any of this, so the new client resumes exactly
@@ -1334,7 +1326,7 @@ impl super::Backend for ManualBackend {
         Ok(())
     }
 
-    /// Improvement-plan task E3: starts an additional, application-worker-only
+    /// Starts an additional, application-worker-only
     /// (`staging_worker: false`) `trellis::Client` against the same dsn,
     /// alongside whatever primary client `install` already started —
     /// confirming multiple clients can coexist draining the same ring (the

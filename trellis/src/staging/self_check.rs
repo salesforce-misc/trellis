@@ -85,7 +85,7 @@
 //! background jobs the ring knows nothing about. A comparison made while the
 //! definition is being built would therefore agree or disagree with a state
 //! the build is about to change. So `self_check` compares only a `live`
-//! definition, and reports any other as [`SelfCheckOutcome::NotLive`] with
+//! definition (by its reported status), and reports any other as [`SelfCheckOutcome::NotLive`] with
 //! its status, after the capture audit and before the wait. `live` is strict:
 //! every job of a rebuild is done before the definition reads it again, and
 //! a repair's own transaction moves the definition out of it, so a caller
@@ -155,7 +155,7 @@ use tokio_postgres::types::PgLsn;
 use crate::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
-use crate::defs::model::{Definition, StoredStatus, TransformStatus};
+use crate::defs::model::{Definition, TransformStatus};
 use crate::defs::typed_literal;
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
@@ -330,9 +330,10 @@ pub enum SelfCheckOutcome {
     /// A stable divergence — present, and (under [`SelfCheckMode::Standard`])
     /// still present after a fresh re-check.
     Diverged(Vec<Divergence>),
-    /// The definition isn't [`TransformStatus::Live`]: it is being
-    /// built or rebuilt, catching up, paused or quarantined, with the
-    /// carried status. Nothing was compared and nothing was awaited.
+    /// The definition isn't [`TransformStatus::Live`] as an operator reads it
+    /// (`Trellis::status`): it is being built or rebuilt, catching up (a
+    /// `live` definition behind an upstream that isn't), paused or
+    /// quarantined, with the carried reported status. Nothing was compared and nothing was awaited.
     /// **Not a verdict on correctness**, like
     /// [`SelfCheckOutcome::NotCaughtUp`]; poll the definition's status until
     /// it is `live` and check again. A rebuild a repair starts
@@ -761,14 +762,26 @@ pub(crate) async fn audit(
     // wait and the comparison, which a definition that is being built would
     // pass or fail for reasons that have nothing to do with its steady
     // state.
-    if def.status != StoredStatus::Live {
+    //
+    // `live` here is the status an operator reads (`Trellis::status`), not the
+    // stored one: a stored-`live` definition behind a not-live upstream
+    // reports `catching_up` and is not compared either.
+    let (reported, read_at) = {
         let client = pool.get().await?;
+        let reported = crate::defs::catalog::reported_statuses(&**client)
+            .await?
+            .get(&def.id)
+            .copied()
+            .unwrap_or_else(|| def.status.into());
+        (reported, converge::watermark_token(&**client).await?)
+    };
+    if reported != TransformStatus::Live {
         return Ok(SelfCheckPage {
             target: target_table.to_string(),
-            checked_through: converge::watermark_token(&**client).await?,
+            checked_through: read_at,
             rows_compared: 0,
             next_after: scope.after.clone(),
-            outcome: SelfCheckOutcome::NotLive(def.status.into()),
+            outcome: SelfCheckOutcome::NotLive(reported),
             held_keys: None,
             drain_failures: Vec::new(),
         });

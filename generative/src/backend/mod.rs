@@ -68,7 +68,7 @@ pub trait Backend {
     fn snapshot(&mut self) -> impl Future<Output = Result<Snapshot, Self::Error>> + Send;
 
     /// Simulates an ungraceful crash-and-restart of the backend's primary
-    /// engine client (improvement-plan task E3): tears down whatever is
+    /// engine client: tears down whatever is
     /// currently running it and starts a fresh one against the same target.
     /// The ring is durable Postgres state, not in-memory, so a fresh client
     /// is expected to pick back up exactly where the crashed one left off:
@@ -92,7 +92,7 @@ pub trait Backend {
     /// running, application-worker-only (never a second staging worker —
     /// see `trellis::client`'s module doc comment: exactly one staging worker
     /// per fleet), demonstrating multiple clients can coexist draining the
-    /// same ring (improvement-plan task E3).
+    /// same ring.
     fn scale_out(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
