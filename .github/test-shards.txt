@@ -166,7 +166,7 @@ test:ledger_xmloption 0.5
 test:one_to_one_composite_primary_key 0.4
 test:quarantine_recompute_null_group_key 0.4
 test:one_to_one_backfill_composite_nullable_group_key 0.4
-test:defs_eval 0.4
+test:defs_numeric_add 0.4
 test:one_to_one_control_char_pk 0.4
 test:origin_propagation 0.4
 test:meta 0.3
