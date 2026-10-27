@@ -141,8 +141,14 @@ def non_exhaustive_violations(doc, nameable):
         if kind == "enum":
             needs = True
         elif kind == "struct":
-            plain = item["inner"]["struct"]["kind"]
-            fields = plain.get("plain", {}).get("fields", []) if isinstance(plain, dict) else []
+            shape = item["inner"]["struct"]["kind"]
+            if isinstance(shape, dict) and "plain" in shape:
+                fields = shape["plain"]["fields"]
+            elif isinstance(shape, dict) and "tuple" in shape:
+                # A tuple struct lists each private field as null.
+                fields = [f for f in shape["tuple"] if f is not None]
+            else:
+                fields = []
             needs = any(index[str(f)]["visibility"] == "public" for f in fields)
             if needs and name in INPUT_STRUCTS:
                 seen_inputs.add(name)
