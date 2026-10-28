@@ -324,6 +324,101 @@ async fn a_float_division_by_zero_quarantines_only_its_record() {
     .await;
 }
 
+/// A `CASE` branch that raises (`22012`, `22003`) fails only the records that
+/// take it: a record whose condition is false never evaluates it, so it
+/// applies. The poisoned record is charged to the column.
+#[tokio::test]
+async fn a_case_branch_division_by_zero_quarantines_only_the_records_that_take_it() {
+    // Records 24 to 26 have a zero divisor too, but their condition is false.
+    arithmetic_error_quarantines_only_its_record(
+        "CASE WHEN a > 0 THEN n / d ELSE 0 END",
+        &[
+            ("a", "integer", INT4),
+            ("n", "numeric", ValueType::Numeric),
+            ("d", "numeric", ValueType::Numeric),
+        ],
+        23,
+        |id| {
+            let (a, d) = match id {
+                23 => (1, 0),
+                24..=26 => (-1, 0),
+                _ => (1, 2),
+            };
+            vec![a.to_string(), "1.5".to_string(), d.to_string()]
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_case_branch_overflow_quarantines_only_its_record() {
+    arithmetic_error_quarantines_only_its_record(
+        "CASE WHEN a > 0 THEN a * 2 WHEN a < 0 THEN a ELSE 0 END",
+        &[("a", "integer", INT4)],
+        29,
+        |id| vec![if id == 29 { i32::MAX } else { id % 100 }.to_string()],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_else_branch_error_quarantines_only_its_record() {
+    arithmetic_error_quarantines_only_its_record(
+        "CASE WHEN a > 0 THEN 1 ELSE a - 1 END",
+        &[("a", "integer", INT4)],
+        31,
+        |id| vec![if id == 31 { i32::MIN } else { id }.to_string()],
+    )
+    .await;
+}
+
+/// `x / NULLIF(y, 0)` is the guard: a zero divisor gives `NULL`, no record
+/// fails, and none is quarantined.
+#[tokio::test]
+async fn nullif_guards_a_division_so_no_record_is_quarantined() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    define(
+        &db,
+        &client,
+        "guarded",
+        "id integer primary key, n numeric, d numeric",
+        "TRANSFORM guarded_out FROM public.guarded SELECT n / NULLIF(d, 0) AS v",
+        &[
+            ("id", ValueType::Integer(IntWidth::Int4)),
+            ("n", ValueType::Numeric),
+            ("d", ValueType::Numeric),
+        ],
+    )
+    .await;
+    let rows: Vec<(String, String)> = (1..=300)
+        .map(|id| {
+            let d = if id % 10 == 0 { "0" } else { "2" };
+            (
+                id.to_string(),
+                format!(r#"{{"id":"{id}","n":"3","d":"{d}"}}"#),
+            )
+        })
+        .collect();
+    let seg_seq = stage(&mut client, "guarded", &rows).await;
+    let failed = drain_until_applied(&db, seg_seq, 2).await;
+    assert_eq!(failed, 0);
+    assert!(poisoned_keys(&client).await.is_empty());
+    assert_eq!(
+        count(&client, "select count(*) from public.guarded_out").await,
+        300
+    );
+    assert_eq!(
+        count(
+            &client,
+            "select count(*) from public.guarded_out where v is null"
+        )
+        .await,
+        30
+    );
+}
+
 /// `COALESCE(r, n)` casts `n` to `real` where `r` is `NULL`, which raises
 /// `22003` for an `n` outside `real`'s range, per row. Only that row's
 /// record is isolated; its batch-mates, `n` in range, apply.

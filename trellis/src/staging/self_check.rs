@@ -1611,6 +1611,30 @@ impl<'a> FieldInliner<'a> {
             Expr::Cast { expr, target } => {
                 format!("cast({} as {target})", self.expr(expr, owner, depth + 1)?)
             }
+            Expr::Not(operand) => {
+                format!("(not {})", self.expr(operand, owner, depth + 1)?)
+            }
+            Expr::IsNull { expr, negated } => {
+                let test = if *negated { "is not null" } else { "is null" };
+                format!("({} {test})", self.expr(expr, owner, depth + 1)?)
+            }
+            Expr::Case {
+                branches,
+                otherwise,
+            } => {
+                let mut sql = String::from("(case");
+                for (condition, result) in branches {
+                    let c = self.expr(condition, owner, depth + 1)?;
+                    let r = self.expr(result, owner, depth + 1)?;
+                    sql.push_str(&format!(" when {c} then {r}"));
+                }
+                if let Some(otherwise) = otherwise {
+                    let o = self.expr(otherwise, owner, depth + 1)?;
+                    sql.push_str(&format!(" else {o}"));
+                }
+                sql.push_str(" end)");
+                sql
+            }
             Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
                 "count(*)".to_string()
             }

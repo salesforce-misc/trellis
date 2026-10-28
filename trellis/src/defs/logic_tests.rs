@@ -307,6 +307,17 @@ fn case_parses_with_one_or_many_branches_and_an_optional_else() {
     );
 }
 
+/// `NOT` or `CASE` directly before a `-` is a column of that name minus the
+/// rest (so text that read that way before `NOT` existed still does); the
+/// unresolved name carries the remedy.
+#[test]
+fn not_before_a_minus_is_a_subtraction_and_the_refusal_says_how_to_write_the_operator() {
+    assert_grouping("NOT -a > 0", "(> (- NOT a) 0)");
+    assert_refused("NOT -i4 > 0", "NOT (-x > 0)");
+    assert_type("NOT (-i4 > 0)", B);
+    assert_type("case - 1", I4);
+}
+
 #[test]
 fn nullif_takes_two_arguments() {
     assert_grouping("NULLIF(a, 0)", "(nullif a 0)");

@@ -200,26 +200,64 @@ impl Numeric {
         })
     }
 
-    /// The quotient, to at least forty significant digits (truncated), and
-    /// `None` for a zero divisor. Postgres rounds its quotient to a scale of
-    /// its own choosing (at least sixteen significant digits); a define-time
-    /// fold needs the value only to decide zero and range, which the extra
-    /// digits serve.
+    /// Postgres `numeric` division: the quotient rounded (half away from
+    /// zero) to the scale `select_div_scale` picks, and `None` for a zero
+    /// divisor. The scale gives the quotient at least sixteen significant
+    /// digits, and at least each operand's own scale (a quotient's tail below
+    /// that is gone, which matters when a later `%` or zero test reads it).
     pub fn div(&self, other: &Numeric) -> Option<Numeric> {
         if other.is_zero() {
             return None;
         }
-        let extra = 40 + other.digits.len() + other.scale as usize;
-        let mut dividend = self.digits.clone();
-        dividend.extend(std::iter::repeat_n(0, extra));
-        let (quotient, _) = divmod_magnitudes(&dividend, &other.digits);
-        let scale = extra as u32 + self.scale - other.scale;
+        let rscale = select_div_scale(self, other);
+        // The quotient to `rscale + 1` digits, truncated, then rounded.
+        let shift = i64::from(rscale) + 1 + i64::from(other.scale) - i64::from(self.scale);
+        let (mut dividend, mut divisor) = (self.digits.clone(), other.digits.clone());
+        if shift >= 0 {
+            dividend.extend(std::iter::repeat_n(0, shift as usize));
+        } else {
+            divisor.extend(std::iter::repeat_n(0, (-shift) as usize));
+        }
+        let (mut quotient, _) = divmod_magnitudes(&dividend, &divisor);
+        // At least `rscale + 1` digits, so the last one is the rounding digit.
+        while quotient.len() < rscale as usize + 2 {
+            quotient.insert(0, 0);
+        }
+        let round_up = quotient.pop().is_some_and(|digit| digit >= 5);
+        if round_up {
+            let mut one = vec![1];
+            pad_front(&mut one, quotient.len());
+            quotient = add_magnitudes(&quotient, &one);
+        }
+        strip_leading_zeros(&mut quotient);
         let is_zero = quotient.iter().all(|&d| d == 0);
         Some(Numeric {
             negative: (self.negative != other.negative) && !is_zero,
             digits: quotient,
-            scale,
+            scale: rscale,
         })
+    }
+
+    /// The weight (in base-10000 digits, as Postgres stores a `numeric`) and
+    /// value of the leading base-10000 digit; `(0, 0)` for zero.
+    fn leading_base_10000_digit(&self) -> (i64, u32) {
+        if self.is_zero() {
+            return (0, 0);
+        }
+        // `digits[0]` sits at decimal exponent `exponent`.
+        let exponent = self.digits.len() as i64 - 1 - i64::from(self.scale);
+        let weight = exponent.div_euclid(4);
+        let mut first = 0u32;
+        for p in (4 * weight..4 * weight + 4).rev() {
+            let at = exponent - p;
+            let digit = if at >= 0 && (at as usize) < self.digits.len() {
+                u32::from(self.digits[at as usize])
+            } else {
+                0
+            };
+            first = first * 10 + digit;
+        }
+        (weight, first)
     }
 
     /// This value's digit vector re-expressed at `scale` (which must be
@@ -270,6 +308,23 @@ impl fmt::Display for Numeric {
         }
         Ok(())
     }
+}
+
+/// Postgres's `select_div_scale`: the result scale of `a / b`, giving the
+/// quotient sixteen significant digits, and no fewer fractional digits than
+/// either operand has, within `0..=1000`.
+fn select_div_scale(a: &Numeric, b: &Numeric) -> u32 {
+    let (weight_a, first_a) = a.leading_base_10000_digit();
+    let (weight_b, first_b) = b.leading_base_10000_digit();
+    let mut quotient_weight = weight_a - weight_b;
+    if first_a <= first_b {
+        quotient_weight -= 1;
+    }
+    let scale = (16 - quotient_weight * 4)
+        .max(i64::from(a.scale))
+        .max(i64::from(b.scale))
+        .clamp(0, 1000);
+    scale as u32
 }
 
 /// Schoolbook long division of two magnitude digit vectors (most-significant
@@ -469,11 +524,41 @@ mod tests {
         assert!(n("4").rem(&n("0.0")).is_none());
         assert!(n("4").div(&n("0")).is_none());
         assert!(n("0").div(&n("9223372036854775808")).unwrap().is_zero());
-        let quotient = n("1").div(&n("3")).unwrap().to_string();
-        assert!(
-            quotient.starts_with("0.33333333333333333333333333333333333333"),
-            "{quotient}"
+        // Postgres: `select 1::numeric / 3` is 0.33333333333333333333.
+        assert_eq!(
+            n("1").div(&n("3")).unwrap().to_string(),
+            "0.33333333333333333333"
         );
+        assert_eq!(
+            n("2").div(&n("3")).unwrap().to_string(),
+            "0.66666666666666666667"
+        );
+        assert_eq!(
+            n("-7").div(&n("2")).unwrap().to_string(),
+            "-3.5000000000000000"
+        );
+        // Quotients as Postgres 17 prints them.
+        for (a, b, expected) in [
+            ("1", "7", "0.14285714285714285714"),
+            ("123456789", "7", "17636684.142857142857"),
+            ("0.5", "3", "0.16666666666666666667"),
+            ("1", "1000000", "0.000001000000000000000000"),
+            ("100.00", "3", "33.3333333333333333"),
+            (
+                "12345678901234567890",
+                "0.000123",
+                "100371373180768844634146.341463",
+            ),
+            ("5", "-0.0003", "-16666.666666666667"),
+        ] {
+            assert_eq!(n(a).div(&n(b)).unwrap().to_string(), expected, "{a} / {b}");
+        }
+        // The quotient's tail beyond the chosen scale is rounded away, as
+        // Postgres does: this is `-4294967294.00000000` there, and its
+        // remainder by one is zero.
+        let q = n("9223372036854775808").div(&n("-2147483649")).unwrap();
+        assert_eq!(q.to_string(), "-4294967294.00000000");
+        assert!(q.rem(&n("1")).unwrap().is_zero());
         assert_eq!(
             n("9223372036854775808")
                 .div(&n("1"))

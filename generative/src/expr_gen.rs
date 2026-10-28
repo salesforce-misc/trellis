@@ -588,14 +588,19 @@ fn write_text(expr: &Expr, style: TextStyle, out: &mut String) {
             out.push_str(&keyword(style, "NOT"));
             out.push(' ');
             // `NOT` takes everything tighter than `AND`: only an `AND` or
-            // `OR` operand needs the parentheses.
-            let wrap = !style.minimal || precedence_of(operand) < registry::precedence::NOT;
+            // `OR` operand needs the parentheses. An operand that starts with
+            // a minus would read as a subtraction from a column named `not`.
+            let mut text = String::new();
+            write_text(operand, style, &mut text);
+            let wrap = !style.minimal
+                || precedence_of(operand) < registry::precedence::NOT
+                || text.starts_with('-');
             if wrap {
                 out.push('(');
-                write_text(operand, style, out);
+                out.push_str(&text);
                 out.push(')');
             } else {
-                write_text(operand, style, out);
+                out.push_str(&text);
             }
         }
         Expr::IsNull { expr, negated } => {

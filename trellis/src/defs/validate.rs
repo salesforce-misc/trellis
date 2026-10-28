@@ -800,11 +800,30 @@ impl fmt::Display for ValidationError {
                  column is in the target without it), or give it a name that isn't a key \
                  column's (e.g. `{field} AS source_{field}`)"
             ),
-            ValidationError::UnresolvedColumn { field, column } => write!(
-                f,
-                "calculated field '{field}' references '{column}', which is neither a \
-                 source column nor another calculated field on this target"
-            ),
+            ValidationError::UnresolvedColumn { field, column } => {
+                write!(
+                    f,
+                    "calculated field '{field}' references '{column}', which is neither a \
+                     source column nor another calculated field on this target"
+                )?;
+                if column.eq_ignore_ascii_case("not") || column.eq_ignore_ascii_case("case") {
+                    write!(
+                        f,
+                        "; if you meant the {} operator, note that a {} directly before a '-' \
+                         reads as a column of that name minus the rest (a column called {} \
+                         keeps working), so parenthesize the operand: {}",
+                        column.to_uppercase(),
+                        column.to_uppercase(),
+                        column,
+                        if column.eq_ignore_ascii_case("not") {
+                            "NOT (-x > 0)"
+                        } else {
+                            "CASE WHEN (-x > 0) THEN ..."
+                        }
+                    )?;
+                }
+                Ok(())
+            }
             ValidationError::Cycle { cycle } => {
                 write!(f, "cycle among calculated columns: {}", cycle.join(" -> "))
             }
@@ -3028,6 +3047,14 @@ enum Constant {
     Float(f64, crate::float::FloatWidth),
     /// A `boolean` constant (a comparison or logic over constants).
     Bool(bool),
+    /// A text or typed-literal constant, by its type and canonical text. It
+    /// is never `NULL`; two of one type are equal exactly when their
+    /// canonical texts are (a canonical form is unique per value, and `timetz`
+    /// compares its zone too).
+    Literal(ValueType, String),
+    /// `NULL`: what `NULLIF` of two equal constants, or a `CASE` that no
+    /// condition selects, folds to.
+    Null,
 }
 
 impl Constant {
@@ -3036,7 +3063,7 @@ impl Constant {
         match self {
             Constant::Exact(n) => n.is_zero(),
             Constant::Float(v, _) => *v == 0.0,
-            Constant::Bool(_) => false,
+            Constant::Bool(_) | Constant::Literal(..) | Constant::Null => false,
         }
     }
 
@@ -3048,9 +3075,76 @@ impl Constant {
                 .ok()
                 .map(|v| (v, crate::float::FloatWidth::Float8)),
             Constant::Float(v, w) => Some((*v, *w)),
-            Constant::Bool(_) => None,
+            Constant::Bool(_) | Constant::Literal(..) | Constant::Null => None,
         }
     }
+
+    /// The order of two constants of one comparable pair, when this check
+    /// can tell: exact and float values by value (a float beside an exact
+    /// one as `double precision`), `false` before `true`, and the canonical
+    /// `date`, `timestamp` and `time` literals, whose fixed-width text sorts
+    /// as the value does.
+    fn order(&self, other: &Constant) -> Option<std::cmp::Ordering> {
+        Some(match (self, other) {
+            (Constant::Exact(a), Constant::Exact(b)) => exact_order(a, b),
+            (Constant::Bool(a), Constant::Bool(b)) => a.cmp(b),
+            (Constant::Literal(ta, a), Constant::Literal(tb, b))
+                if ta == tb
+                    && matches!(
+                        ta,
+                        ValueType::Other(PgType::Date | PgType::Timestamp | PgType::Time)
+                    ) =>
+            {
+                a.cmp(b)
+            }
+            (Constant::Literal(ta, a), Constant::Literal(tb, b))
+                if ta == tb && *ta == ValueType::Other(PgType::TimeTz) =>
+            {
+                timetz_key(a)?.cmp(&timetz_key(b)?)
+            }
+            (Constant::Literal(..) | Constant::Bool(_) | Constant::Null, _)
+            | (_, Constant::Literal(..) | Constant::Bool(_) | Constant::Null) => return None,
+            (a, b) => float_order(a.as_float()?.0, b.as_float()?.0),
+        })
+    }
+
+    /// Whether two constants of one comparable pair are equal, when this
+    /// check can tell: exact and float values by value (a float beside an
+    /// exact one as `double precision`), literals of one type by text.
+    fn equals(&self, other: &Constant) -> Option<bool> {
+        Some(match (self, other) {
+            (Constant::Exact(a), Constant::Exact(b)) => {
+                exact_order(a, b) == std::cmp::Ordering::Equal
+            }
+            (Constant::Literal(ta, a), Constant::Literal(tb, b)) if ta == tb => a == b,
+            (Constant::Bool(a), Constant::Bool(b)) => a == b,
+            (a, b) => float_order(a.as_float()?.0, b.as_float()?.0) == std::cmp::Ordering::Equal,
+        })
+    }
+}
+
+/// A canonical `timetz` literal as Postgres orders it: by the instant (the
+/// time plus the seconds the zone lies west of UTC, in microseconds), then
+/// by that zone.
+fn timetz_key(text: &str) -> Option<(i64, i64)> {
+    let sign_at = text.rfind(['+', '-'])?;
+    let (clock, zone) = text.split_at(sign_at);
+    let (hms, fraction) = clock.split_once('.').unwrap_or((clock, ""));
+    let mut parts = hms.split(':').map(|p| p.parse::<i64>().ok());
+    let (h, m, s) = (parts.next()??, parts.next()??, parts.next()??);
+    let micros = if fraction.is_empty() {
+        0
+    } else {
+        format!("{fraction:0<6}").parse::<i64>().ok()?
+    };
+    let time = ((h * 60 + m) * 60 + s) * 1_000_000 + micros;
+    let mut fields = zone[1..].split(':').map(|p| p.parse::<i64>().ok());
+    let east = fields.next()?? * 3600
+        + fields.next().flatten().unwrap_or(0) * 60
+        + fields.next().flatten().unwrap_or(0);
+    // The sign in the text is the offset east of UTC.
+    let west = if zone.starts_with('-') { east } else { -east };
+    Some((time + west * 1_000_000, west))
 }
 
 /// Postgres's order on two `double precision` values: `NaN` equals itself and
@@ -3132,15 +3226,38 @@ fn fold_constant<'f>(
         } => crate::float::parse(text, *width)
             .ok()
             .map(|v| Constant::Float(v, *width)),
+        Expr::StringLiteral(text) => Some(Constant::Literal(ValueType::Text, text.clone())),
+        Expr::TypedLiteral { value_type, text } => {
+            Some(Constant::Literal(*value_type, text.clone()))
+        }
         Expr::BinaryOp { op, lhs, rhs } if op.is_comparison() => {
-            let order = match (recurse(lhs, field_name)?, recurse(rhs, field_name)?) {
-                (Constant::Exact(a), Constant::Exact(b)) => exact_order(&a, &b),
-                (a, b) => float_order(a.as_float()?.0, b.as_float()?.0),
-            };
-            Some(Constant::Bool(comparison_holds(*op, order)))
+            use super::ast::Operator;
+            let (a, b) = (recurse(lhs, field_name)?, recurse(rhs, field_name)?);
+            // `IS [NOT] DISTINCT FROM` takes `NULL` as a value; the rest are
+            // `NULL` beside it.
+            let distinct = matches!(op, Operator::IsDistinctFrom | Operator::IsNotDistinctFrom);
+            match (&a, &b) {
+                (Constant::Null, Constant::Null) if distinct => {
+                    return Some(Constant::Bool(matches!(op, Operator::IsNotDistinctFrom)));
+                }
+                (Constant::Null, _) | (_, Constant::Null) if distinct => {
+                    return Some(Constant::Bool(matches!(op, Operator::IsDistinctFrom)));
+                }
+                (Constant::Null, _) | (_, Constant::Null) => return Some(Constant::Null),
+                _ => {}
+            }
+            if op.is_ordering() {
+                return Some(Constant::Bool(comparison_holds(*op, a.order(&b)?)));
+            }
+            let equal = a.equals(&b)?;
+            Some(Constant::Bool(match op {
+                Operator::Equal | Operator::IsNotDistinctFrom => equal,
+                _ => !equal,
+            }))
         }
         // The planner stops at the first operand that decides the result
-        // (`false AND x`, `true OR x`), whatever the rest reads.
+        // (`false AND x`, `true OR x`), whatever the rest reads. A `NULL`
+        // operand decides nothing: `NULL AND true` is `NULL`.
         Expr::BinaryOp {
             op: op @ (super::ast::Operator::And | super::ast::Operator::Or),
             lhs,
@@ -3154,19 +3271,21 @@ fn fold_constant<'f>(
                 (Some(Constant::Bool(_)), Some(Constant::Bool(_))) => {
                     Some(Constant::Bool(!decides))
                 }
+                (Some(Constant::Null), Some(Constant::Bool(_) | Constant::Null))
+                | (Some(Constant::Bool(_)), Some(Constant::Null)) => Some(Constant::Null),
                 _ => None,
             }
         }
         Expr::Not(operand) => match recurse(operand, field_name)? {
             Constant::Bool(b) => Some(Constant::Bool(!b)),
+            Constant::Null => Some(Constant::Null),
             _ => None,
         },
-        // A folded constant is never `NULL` (the grammar has no `NULL`
-        // literal, and a `NULL` result such as `NULLIF(1, 1)` is not folded).
         Expr::IsNull { expr, negated } => {
-            recurse(expr, field_name)?;
-            Some(Constant::Bool(*negated))
+            let is_null = matches!(recurse(expr, field_name)?, Constant::Null);
+            Some(Constant::Bool(is_null != *negated))
         }
+        // A `NULL` condition selects nothing, like a false one.
         Expr::Case {
             branches,
             otherwise,
@@ -3174,30 +3293,31 @@ fn fold_constant<'f>(
             for (condition, result) in branches {
                 match recurse(condition, field_name)? {
                     Constant::Bool(true) => return recurse(result, field_name),
-                    Constant::Bool(false) => {}
+                    Constant::Bool(false) | Constant::Null => {}
                     _ => return None,
                 }
             }
-            recurse(otherwise.as_deref()?, field_name)
+            match otherwise {
+                Some(otherwise) => recurse(otherwise, field_name),
+                None => Some(Constant::Null),
+            }
         }
         Expr::FunctionCall { name, args } if name == "NULLIF" && args.len() == 2 => {
             let (a, b) = (
                 recurse(&args[0], field_name)?,
                 recurse(&args[1], field_name)?,
             );
-            let equal = match (&a, &b) {
-                (Constant::Exact(x), Constant::Exact(y)) => {
-                    exact_order(x, y) == std::cmp::Ordering::Equal
-                }
-                (x, y) => {
-                    float_order(x.as_float()?.0, y.as_float()?.0) == std::cmp::Ordering::Equal
-                }
-            };
-            (!equal).then_some(a)
+            match (&a, &b) {
+                (Constant::Null, _) => Some(Constant::Null),
+                (_, Constant::Null) => Some(a),
+                _ => Some(if a.equals(&b)? { Constant::Null } else { a }),
+            }
         }
+        // An arithmetic operator is strict: a `NULL` operand makes it `NULL`.
         Expr::BinaryOp { op, lhs, rhs } => {
             let op = ConstOp::of_operator(*op)?;
             match (recurse(lhs, field_name)?, recurse(rhs, field_name)?) {
+                (Constant::Null, _) | (_, Constant::Null) => Some(Constant::Null),
                 (Constant::Exact(a), Constant::Exact(b)) => {
                     op.exact(&a, Some(&b)).map(Constant::Exact)
                 }
@@ -3213,7 +3333,8 @@ fn fold_constant<'f>(
         Expr::Negate(operand) => match recurse(operand, field_name)? {
             Constant::Exact(n) => Some(Constant::Exact(n.negate())),
             Constant::Float(v, w) => Some(Constant::Float(-v, w)),
-            Constant::Bool(_) => None,
+            Constant::Null => Some(Constant::Null),
+            Constant::Bool(_) | Constant::Literal(..) => None,
         },
         // A widening cast keeps the value.
         Expr::Cast { expr, .. } => recurse(expr, field_name),
@@ -3221,11 +3342,19 @@ fn fold_constant<'f>(
             match recurse(&args[0], field_name)? {
                 Constant::Exact(n) => Some(Constant::Exact(n.abs())),
                 Constant::Float(v, w) => Some(Constant::Float(v.abs(), w)),
-                Constant::Bool(_) => None,
+                Constant::Null => Some(Constant::Null),
+                Constant::Bool(_) | Constant::Literal(..) => None,
             }
         }
+        // The first argument that is not `NULL` is the result.
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
-            recurse(args.first()?, field_name)
+            for arg in args {
+                match recurse(arg, field_name)? {
+                    Constant::Null => {}
+                    value => return Some(value),
+                }
+            }
+            Some(Constant::Null)
         }
         Expr::Column(name) => {
             let is_self_passthrough = name == field_name && source_columns.contains_key(name);
@@ -3268,8 +3397,12 @@ fn reads_no_column<'f>(
     match expr {
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => true,
         Expr::SourceColumn { .. } => false,
-        Expr::BinaryOp { op, lhs, rhs } => {
-            reads_no_column(
+        // Here "constant" means a constant that is not `NULL`: a `COALESCE`
+        // skips a `NULL` one. An operator over a `NULL` constant is `NULL`
+        // (so not constant here) unless it decides regardless (`false AND
+        // NULL`, `NULL IS NULL`), which the fold knows.
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            (reads_no_column(
                 lhs,
                 field_name,
                 source_columns,
@@ -3283,18 +3416,9 @@ fn reads_no_column<'f>(
                 fields_by_name,
                 memo,
                 depth + 1,
-            ) || matches!(op, super::ast::Operator::And | super::ast::Operator::Or)
-                && fold_constant(
-                    expr,
-                    field_name,
-                    source_columns,
-                    fields_by_name,
-                    &mut HashMap::new(),
-                    depth + 1,
-                )
-                .is_some()
+            )) || folds_to_a_value(expr, field_name, source_columns, fields_by_name, depth)
         }
-        Expr::Not(operand) | Expr::IsNull { expr: operand, .. } => reads_no_column(
+        Expr::Not(operand) => reads_no_column(
             operand,
             field_name,
             source_columns,
@@ -3302,27 +3426,37 @@ fn reads_no_column<'f>(
             memo,
             depth + 1,
         ),
-        // A `CASE` or `NULLIF` that can be `NULL` is not a constant a
-        // `COALESCE` stops at, so only one the planner folds to a value
-        // counts.
-        Expr::Case { .. } => fold_constant(
+        Expr::IsNull { expr: operand, .. } => {
+            reads_no_column(
+                operand,
+                field_name,
+                source_columns,
+                fields_by_name,
+                memo,
+                depth + 1,
+            ) || folds_to_a_value(expr, field_name, source_columns, fields_by_name, depth)
+        }
+        // A `CASE` or `NULLIF` is constant when the planner folds it to a
+        // value; one it folds to `NULL` is not, and one this check cannot
+        // evaluate is constant if everything under it is.
+        Expr::Case { .. } => nullable_is_constant(
             expr,
+            expr.logic_children(),
             field_name,
             source_columns,
             fields_by_name,
-            &mut HashMap::new(),
-            depth + 1,
-        )
-        .is_some(),
-        Expr::FunctionCall { name, .. } if name == "NULLIF" => fold_constant(
+            memo,
+            depth,
+        ),
+        Expr::FunctionCall { name, args } if name == "NULLIF" => nullable_is_constant(
             expr,
+            args.iter().collect(),
             field_name,
             source_columns,
             fields_by_name,
-            &mut HashMap::new(),
-            depth + 1,
-        )
-        .is_some(),
+            memo,
+            depth,
+        ),
         Expr::Negate(operand) => reads_no_column(
             operand,
             field_name,
@@ -3343,16 +3477,32 @@ fn reads_no_column<'f>(
         // constant and drops the rest unevaluated, so what follows the first
         // argument does not matter.
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
-            args.first().is_some_and(|arg| {
-                reads_no_column(
-                    arg,
-                    field_name,
-                    source_columns,
-                    fields_by_name,
-                    memo,
-                    depth + 1,
-                )
-            })
+            // A `NULL` constant argument is dropped; the first other one
+            // decides.
+            for arg in args {
+                let null = matches!(
+                    fold_constant(
+                        arg,
+                        field_name,
+                        source_columns,
+                        fields_by_name,
+                        &mut HashMap::new(),
+                        depth + 1,
+                    ),
+                    Some(Constant::Null)
+                );
+                if !null {
+                    return reads_no_column(
+                        arg,
+                        field_name,
+                        source_columns,
+                        fields_by_name,
+                        memo,
+                        depth + 1,
+                    );
+                }
+            }
+            false
         }
         Expr::FunctionCall { name, args } => {
             super::registry::lookup_aggregate_function(name).is_none()
@@ -3393,6 +3543,61 @@ fn reads_no_column<'f>(
     }
 }
 
+/// [`reads_no_column`] for a node that can fold to `NULL` (`CASE`,
+/// `NULLIF`), whose `children` are the expressions under it.
+fn nullable_is_constant<'f>(
+    expr: &Expr,
+    children: Vec<&Expr>,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&'f str, &'f super::ast::FieldDef>,
+    memo: &mut HashMap<&'f str, bool>,
+    depth: usize,
+) -> bool {
+    match fold_constant(
+        expr,
+        field_name,
+        source_columns,
+        fields_by_name,
+        &mut HashMap::new(),
+        depth + 1,
+    ) {
+        Some(Constant::Null) => false,
+        Some(_) => true,
+        None => children.into_iter().all(|child| {
+            reads_no_column(
+                child,
+                field_name,
+                source_columns,
+                fields_by_name,
+                memo,
+                depth + 1,
+            )
+        }),
+    }
+}
+
+/// Whether the planner folds `expr` to a value that is not `NULL`.
+fn folds_to_a_value<'f>(
+    expr: &Expr,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&'f str, &'f super::ast::FieldDef>,
+    depth: usize,
+) -> bool {
+    !matches!(
+        fold_constant(
+            expr,
+            field_name,
+            source_columns,
+            fields_by_name,
+            &mut HashMap::new(),
+            depth + 1,
+        ),
+        None | Some(Constant::Null)
+    )
+}
+
 /// [`fold_constant`] restricted to an exact value.
 fn exact_constant<'f>(
     expr: &Expr,
@@ -3403,7 +3608,7 @@ fn exact_constant<'f>(
 ) -> Option<crate::numeric::Numeric> {
     match fold_constant(expr, field_name, source_columns, fields_by_name, memo, 0)? {
         Constant::Exact(n) => Some(n),
-        Constant::Float(..) | Constant::Bool(_) => None,
+        Constant::Float(..) | Constant::Bool(_) | Constant::Literal(..) | Constant::Null => None,
     }
 }
 
@@ -3482,6 +3687,7 @@ fn check_constant_op<'f>(
     expr: &Expr,
     op: ConstOp,
     operands: &[&Expr],
+    operand_types: &[ValueType],
     result: ValueType,
     field_name: &str,
     source_columns: &HashMap<String, ValueType>,
@@ -3495,7 +3701,24 @@ fn check_constant_op<'f>(
     let mut memo = HashMap::new();
     let mut fold =
         |e: &Expr| fold_constant(e, field_name, source_columns, fields_by_name, &mut memo, 0);
-    let folded: Vec<Option<Constant>> = operands.iter().map(|e| fold(e)).collect();
+    // A `CASE` or `COALESCE` casts the result it picks to the type of the
+    // whole, so a constant under a float-typed operand is computed in that
+    // float type (`CASE WHEN true THEN 5 ELSE f4 END` is a `real` 5).
+    let folded: Vec<Option<Constant>> = operands
+        .iter()
+        .zip(operand_types)
+        .map(|(e, ty)| match (fold(e), ty) {
+            (Some(Constant::Exact(n)), ValueType::Float(width)) => {
+                crate::float::literal_to_width(&n.to_string(), *width)
+                    .ok()
+                    .map(|v| Constant::Float(v, *width))
+            }
+            (Some(Constant::Float(v, _)), ValueType::Float(width)) => {
+                Some(Constant::Float(v, *width))
+            }
+            (folded, _) => folded,
+        })
+        .collect();
     // A `NaN` dividend divides by zero to `NaN` without an error
     // (`float8div` checks the dividend first), so only that constant is
     // spared.
@@ -3559,6 +3782,9 @@ fn check_constant_op<'f>(
 enum Truth {
     /// It folds to this value.
     Known(bool),
+    /// It folds to `NULL`: a `CASE` skips it like a false one, an `AND` or
+    /// `OR` is not decided by it.
+    Null,
     /// It reads no column, but this check cannot compute its value (so what
     /// the planner skips after it is unknown, and nothing after it is
     /// refused).
@@ -3573,7 +3799,7 @@ fn classify_condition<'f>(
     source_columns: &HashMap<String, ValueType>,
     fields_by_name: &HashMap<&'f str, &'f super::ast::FieldDef>,
 ) -> Truth {
-    if let Some(Constant::Bool(value)) = fold_constant(
+    match fold_constant(
         expr,
         field_name,
         source_columns,
@@ -3581,7 +3807,9 @@ fn classify_condition<'f>(
         &mut HashMap::new(),
         0,
     ) {
-        return Truth::Known(value);
+        Some(Constant::Bool(value)) => return Truth::Known(value),
+        Some(Constant::Null) => return Truth::Null,
+        _ => {}
     }
     if reads_no_column(
         expr,
@@ -3667,7 +3895,8 @@ fn infer_case(
         } else {
             Truth::Variable
         };
-        let result_reached = reached && !matches!(truth, Truth::Known(false) | Truth::Unknown);
+        let result_reached =
+            reached && !matches!(truth, Truth::Known(false) | Truth::Null | Truth::Unknown);
         let result_t = infer_expr(
             result,
             field_name,
@@ -3904,7 +4133,7 @@ fn infer_expr(
                     ) {
                         Truth::Known(value) => value != decides,
                         Truth::Unknown => false,
-                        Truth::Variable => true,
+                        Truth::Null | Truth::Variable => true,
                     };
                 }
             }
@@ -4030,6 +4259,7 @@ fn infer_expr(
                         expr,
                         kind,
                         &[lhs, rhs],
+                        &[lhs_t, rhs_t],
                         result,
                         field_name,
                         source_columns,
@@ -4098,6 +4328,7 @@ fn infer_expr(
                     expr,
                     ConstOp::Negate,
                     &[operand],
+                    &[operand_t],
                     result,
                     field_name,
                     source_columns,
@@ -4454,6 +4685,7 @@ fn infer_overloaded_call(
             expr,
             ConstOp::Abs,
             &[&args[0]],
+            &arg_types[..1],
             spec.return_type,
             field_name,
             source_columns,

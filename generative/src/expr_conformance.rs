@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use testkit::TestDatabase;
 use tokio_postgres::{Client, NoTls};
 use trellis::dev::config::DEFAULT_SCHEMA;
-use trellis::dev::defs::ast::{Expr, ValueType};
+use trellis::dev::defs::ast::{Expr, Operator, ValueType};
 use trellis::dev::defs::oracle::render_expr_sql;
 use trellis::dev::defs::{FloatWidth, IntWidth};
 use trellis::dev::defs::{
@@ -596,9 +596,11 @@ impl Fixture {
                 Ok(Agreement::RefusedAndRaises(err.to_string()))
             }
             // Postgres evaluates a `COALESCE` argument only for the rows the
-            // earlier ones leave `NULL`, so the division may never run.
+            // earlier ones leave `NULL`, a `CASE` result only where its
+            // condition holds, and an `AND` operand only where the earlier
+            // ones allow, so the division may never run.
             // Define refuses it all the same: a zero divisor is never useful.
-            Ok(_) if has_coalesce(expr) => Ok(Agreement::RefusedAndRaises(err.to_string())),
+            Ok(_) if may_skip_evaluation(expr) => Ok(Agreement::RefusedAndRaises(err.to_string())),
             Ok(_) => Err(diverge(format!(
                 "refused ({err}) but Postgres computes a value for some row"
             ))),
@@ -879,6 +881,11 @@ impl Fixture {
         };
         let value: Option<String> = row.get(0);
         let pg_type: String = row.get(1);
+        // A call that gives `NULL` (over a `NULLIF` that is) has no literal
+        // to stand for it: it stays, and the rest has to explain the failure.
+        if value.is_none() {
+            return;
+        }
         *expr = match (pg_type.as_str(), value) {
             ("smallint" | "integer", Some(v)) => Expr::NumberLiteral(v),
             // A bare literal is typed by its value, so a `numeric` or
@@ -942,14 +949,23 @@ impl Fixture {
     }
 }
 
-fn has_coalesce(expr: &Expr) -> bool {
+/// Whether `expr` holds a construct that evaluates only part of itself at run
+/// time: `COALESCE`, `CASE`, `AND` and `OR`.
+fn may_skip_evaluation(expr: &Expr) -> bool {
     match expr {
-        Expr::BinaryOp { lhs, rhs, .. } => has_coalesce(lhs) || has_coalesce(rhs),
-        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => has_coalesce(operand),
+        Expr::BinaryOp {
+            op: Operator::And | Operator::Or,
+            ..
+        } => true,
+        Expr::Case { .. } => true,
+        Expr::BinaryOp { lhs, rhs, .. } => may_skip_evaluation(lhs) || may_skip_evaluation(rhs),
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => may_skip_evaluation(operand),
         Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-            expr.logic_children().into_iter().any(has_coalesce)
+            expr.logic_children().into_iter().any(may_skip_evaluation)
         }
-        Expr::FunctionCall { name, args } => name == "COALESCE" || args.iter().any(has_coalesce),
+        Expr::FunctionCall { name, args } => {
+            name == "COALESCE" || args.iter().any(may_skip_evaluation)
+        }
         _ => false,
     }
 }
