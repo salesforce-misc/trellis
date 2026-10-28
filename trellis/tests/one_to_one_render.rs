@@ -160,6 +160,170 @@ async fn an_integer_overflow_quarantines_only_its_record() {
     );
 }
 
+/// One record of a page raises in the field's arithmetic (`22003` overflow,
+/// `22012` division by zero): Postgres computes the field, so the record is
+/// isolated, charged to its column (the per-field probe names `v`) and, at the
+/// death threshold, held, and every other record applies. `columns` are the
+/// source's data columns (DDL and type, in order); `image` is the record
+/// `id`'s values, as the row image carries them.
+async fn arithmetic_error_quarantines_only_its_record(
+    expr: &str,
+    columns: &[(&str, &str, ValueType)],
+    poisoned: i32,
+    image: impl Fn(i32) -> Vec<String>,
+) {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    let ddl: Vec<String> = columns.iter().map(|(n, t, _)| format!("{n} {t}")).collect();
+    let mut types = vec![("id", ValueType::Integer(IntWidth::Int4))];
+    types.extend(columns.iter().map(|(n, _, t)| (*n, *t)));
+    define(
+        &db,
+        &client,
+        "ops",
+        &format!("id integer primary key, {}", ddl.join(", ")),
+        &format!("TRANSFORM ops_out FROM public.ops SELECT {expr} AS v"),
+        &types,
+    )
+    .await;
+    const ROWS: i32 = 300;
+    let rows: Vec<(String, String)> = (1..=ROWS)
+        .map(|id| {
+            let cells: Vec<String> = columns
+                .iter()
+                .zip(image(id))
+                .map(|((name, _, _), value)| format!(r#""{name}":"{value}""#))
+                .collect();
+            (
+                id.to_string(),
+                format!(r#"{{"id":"{id}",{}}}"#, cells.join(",")),
+            )
+        })
+        .collect();
+    assert!(rows.iter().any(|(k, _)| *k == poisoned.to_string()));
+    let seg_seq = stage(&mut client, "ops", &rows).await;
+    let failed = drain_until_applied(&db, seg_seq, DEFAULT_DEATH_THRESHOLD as usize + 1).await;
+    assert_eq!(failed, DEFAULT_DEATH_THRESHOLD as usize - 1, "`{expr}`");
+    assert_eq!(
+        poisoned_keys(&client).await,
+        vec![poisoned.to_string()],
+        "`{expr}`"
+    );
+    assert_eq!(
+        column_failure_keys(&client, "ops_out", "v").await,
+        vec![poisoned.to_string()],
+        "`{expr}`: the per-field probe names the failing column"
+    );
+    assert_eq!(
+        count(&client, "select count(*) from public.ops_out").await,
+        ROWS as i64 - 1,
+        "`{expr}`"
+    );
+}
+
+const INT4: ValueType = ValueType::Integer(IntWidth::Int4);
+
+#[tokio::test]
+async fn an_integer_product_overflow_quarantines_only_its_record() {
+    arithmetic_error_quarantines_only_its_record("a * 2", &[("a", "integer", INT4)], 7, |id| {
+        vec![if id == 7 { i32::MAX } else { id }.to_string()]
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_smallint_product_overflow_quarantines_only_its_record() {
+    arithmetic_error_quarantines_only_its_record(
+        "s * s",
+        &[("s", "smallint", ValueType::Integer(IntWidth::Int2))],
+        9,
+        |id| vec![if id == 9 { 200 } else { id % 100 }.to_string()],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_integer_difference_overflow_quarantines_only_its_record() {
+    arithmetic_error_quarantines_only_its_record("a - 1", &[("a", "integer", INT4)], 11, |id| {
+        vec![if id == 11 { i32::MIN } else { id }.to_string()]
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn negating_the_smallest_integer_quarantines_only_its_record() {
+    arithmetic_error_quarantines_only_its_record("-a", &[("a", "integer", INT4)], 13, |id| {
+        vec![if id == 13 { i32::MIN } else { id }.to_string()]
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_absolute_value_of_the_smallest_integer_quarantines_only_its_record() {
+    arithmetic_error_quarantines_only_its_record("ABS(a)", &[("a", "integer", INT4)], 15, |id| {
+        vec![if id == 15 { i32::MIN } else { id }.to_string()]
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_numeric_division_by_zero_quarantines_only_its_record() {
+    arithmetic_error_quarantines_only_its_record(
+        "n / d",
+        &[
+            ("n", "numeric", ValueType::Numeric),
+            ("d", "numeric", ValueType::Numeric),
+        ],
+        17,
+        |id| {
+            vec![
+                "1.5".to_string(),
+                if id == 17 { "0" } else { "2" }.to_string(),
+            ]
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_integer_remainder_by_zero_quarantines_only_its_record() {
+    arithmetic_error_quarantines_only_its_record(
+        "a % d",
+        &[("a", "integer", INT4), ("d", "integer", INT4)],
+        19,
+        |id| vec![id.to_string(), if id == 19 { 0 } else { 3 }.to_string()],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_float_division_by_zero_quarantines_only_its_record() {
+    arithmetic_error_quarantines_only_its_record(
+        "x / y",
+        &[
+            (
+                "x",
+                "double precision",
+                ValueType::Float(FloatWidth::Float8),
+            ),
+            (
+                "y",
+                "double precision",
+                ValueType::Float(FloatWidth::Float8),
+            ),
+        ],
+        21,
+        |id| {
+            vec![
+                "1.5".to_string(),
+                if id == 21 { "0" } else { "4" }.to_string(),
+            ]
+        },
+    )
+    .await;
+}
+
 /// `COALESCE(r, n)` casts `n` to `real` where `r` is `NULL`, which raises
 /// `22003` for an `n` outside `real`'s range, per row. Only that row's
 /// record is isolated; its batch-mates, `n` in range, apply.

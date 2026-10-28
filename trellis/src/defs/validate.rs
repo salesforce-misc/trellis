@@ -1941,6 +1941,9 @@ fn rename_join_columns(
             rename_join_columns(lhs, source, left, right, types);
             rename_join_columns(rhs, source, left, right, types);
         }
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
+            rename_join_columns(operand, source, left, right, types);
+        }
         Expr::FunctionCall { args, .. } => {
             for arg in args {
                 rename_join_columns(arg, source, left, right, types);
@@ -6214,6 +6217,16 @@ mod tests {
             "AVG(price)",
             "SUM(cost + 1)",
             "AVG(cost + qty)",
+            // Arithmetic over a `numeric` still has no declared scale.
+            "SUM(cost * 2)",
+            "AVG(cost - 1)",
+            "SUM(-cost)",
+            "SUM(price * qty)",
+            "SUM(cost / qty)",
+            "SUM(cost % 3)",
+            "SUM(ABS(cost))",
+            "SUM(ROUND(cost, 2))",
+            "SUM(CAST(qty AS numeric))",
         ] {
             let err = check(&format!("{call} AS v")).unwrap_err();
             assert!(
@@ -6226,6 +6239,11 @@ mod tests {
             "COUNT(*) AS n, COUNT(note) AS notes, COUNT(price) AS priced",
             "SUM(qty) AS s, AVG(qty) AS a, SUM(cost) AS c, AVG(cost) AS ac",
             "SUM(qty + order_id) AS s, COALESCE(SUM(cost), 0) + COUNT(*) AS c",
+            // Integer arithmetic keeps its type, so a sum of it is admitted.
+            "SUM(qty * order_id) AS s, AVG(qty - order_id) AS a",
+            "SUM(-qty) AS s, SUM(ABS(qty)) AS a, SUM(CAST(qty AS bigint)) AS b",
+            "SUM(qty % 7) AS s, SUM(qty * 2 - 1) AS t",
+            "-SUM(qty) AS s, COALESCE(SUM(qty), 0) * 2 AS t, ROUND(AVG(qty), 2) AS r",
         ] {
             if let Err(err) = check(fields) {
                 panic!("{fields}: {err:?}");
@@ -6516,6 +6534,49 @@ mod tests {
         ] {
             check(&format!("orders.region AS region, {select}"))
                 .unwrap_or_else(|err| panic!("{select}: {err:?}"));
+        }
+    }
+
+    #[test]
+    fn join_admits_arithmetic_in_one_side_arguments_and_composed_fields() {
+        for select in [
+            "SUM(items.qty * 2) AS v",
+            "SUM(items.qty - items.order_id) AS v",
+            "AVG(-items.qty) AS v",
+            "SUM(ABS(items.qty)) AS v",
+            "SUM(CAST(items.qty AS bigint)) AS v",
+            "SUM(orders.id % 7) AS v",
+            "-SUM(items.qty) AS v",
+            "SUM(items.qty) * 2 - COUNT(*) AS v",
+            "ROUND(AVG(items.qty), 2) AS v",
+            "ABS(SUM(items.qty)) AS v",
+            "CAST(SUM(items.qty) AS numeric) / COUNT(*) AS v",
+        ] {
+            check(&format!("orders.region AS region, {select}"))
+                .unwrap_or_else(|err| panic!("{select}: {err:?}"));
+        }
+        for select in [
+            "SUM(items.qty * orders.id) AS v",
+            "SUM(items.qty - orders.id) AS v",
+            "SUM(-COALESCE(items.qty, orders.id)) AS v",
+        ] {
+            assert!(
+                matches!(
+                    check(&format!("orders.region AS region, {select}")),
+                    Err(ValidationError::JoinMixedSideArgument { .. })
+                ),
+                "{select}"
+            );
+        }
+        // A numeric argument has no declared scale, whatever is done to it.
+        for select in ["SUM(orders.total * 2) AS v", "SUM(-orders.total) AS v"] {
+            assert!(
+                matches!(
+                    check(&format!("orders.region AS region, {select}")),
+                    Err(ValidationError::UnconstrainedNumericAggregate { .. })
+                ),
+                "{select}"
+            );
         }
     }
 

@@ -1192,6 +1192,11 @@ impl DerivedShape {
                     lhs: Box::new(rename(lhs, names)),
                     rhs: Box::new(rename(rhs, names)),
                 },
+                Expr::Negate(operand) => Expr::Negate(Box::new(rename(operand, names))),
+                Expr::Cast { expr, target } => Expr::Cast {
+                    expr: Box::new(rename(expr, names)),
+                    target: *target,
+                },
                 Expr::FunctionCall { name, args } => Expr::FunctionCall {
                     name: name.clone(),
                     args: args.iter().map(|arg| rename(arg, names)).collect(),
