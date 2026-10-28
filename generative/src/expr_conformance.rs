@@ -237,6 +237,14 @@ pub enum Agreement {
     KnownGap(&'static str),
 }
 
+/// The second open gap: a `REGEXP_COUNT` pattern Rust's `regex` accepts and
+/// Postgres rejects with `2201B`, so every row fails. Filed as #1448.
+pub const KNOWN_GAP_REGEX_DIALECT: &str = "define compiles a regexp_count pattern with Rust's regex crate, which accepts patterns \
+     Postgres rejects (2201B)";
+
+/// SQLSTATE `invalid_regular_expression`.
+const INVALID_REGEX: &str = "2201B";
+
 /// The open gap the property tolerates, so a fix has one place to remove.
 /// Filed as #1446.
 pub const KNOWN_GAP_CONSTANT_CALL: &str = "constant function calls are folded by Postgres at plan \
@@ -468,6 +476,9 @@ impl Fixture {
             )),
             Ok(()) => {
                 if let Some(code) = probe {
+                    if code == INVALID_REGEX {
+                        return Ok(Agreement::KnownGap(KNOWN_GAP_REGEX_DIALECT));
+                    }
                     if has_constant_call(&expr) {
                         return Ok(Agreement::KnownGap(KNOWN_GAP_CONSTANT_CALL));
                     }
@@ -477,8 +488,10 @@ impl Fixture {
                     ));
                 }
                 self.check_type(text, &def, &diverge).await?;
-                self.check_value(text, &expr, &diverge).await?;
-                Ok(Agreement::Admitted)
+                match self.check_value(text, &expr, &diverge).await? {
+                    Some(gap) => Ok(Agreement::KnownGap(gap)),
+                    None => Ok(Agreement::Admitted),
+                }
             }
         }
     }
@@ -560,7 +573,7 @@ impl Fixture {
         text: &str,
         expr: &Expr,
         diverge: &impl Fn(Property, String) -> Divergence,
-    ) -> Result<(), Divergence> {
+    ) -> Result<Option<&'static str>, Divergence> {
         let user = self
             .rows(&format!(
                 "select id, ({text})::text from {TABLE} order by id"
@@ -573,7 +586,7 @@ impl Fixture {
             ))
             .await;
         match (user, rendered) {
-            (Ok(u), Ok(r)) if u == r => Ok(()),
+            (Ok(u), Ok(r)) if u == r => Ok(None),
             (Ok(u), Ok(r)) => {
                 let at = u.iter().zip(&r).position(|(a, b)| a != b).unwrap_or(0);
                 Err(diverge(
@@ -585,7 +598,10 @@ impl Fixture {
                     ),
                 ))
             }
-            (Err(u), Err(r)) if class_of(&u) == class_of(&r) => Ok(()),
+            // Both reject the pattern: the gap, not agreement on a data
+            // error, because the pattern is the definition's, not a row's.
+            (Err(u), Err(_)) if u == INVALID_REGEX => Ok(Some(KNOWN_GAP_REGEX_DIALECT)),
+            (Err(u), Err(r)) if class_of(&u) == class_of(&r) => Ok(None),
             (u, r) => Err(diverge(
                 Property::Value,
                 format!(

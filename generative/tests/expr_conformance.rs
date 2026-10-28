@@ -68,7 +68,7 @@ fn report() {
     HARNESS.with(|h| {
         eprintln!(
             "expression conformance: {} admitted and agreeing, {} refused and raising, \
-             {} tolerated as the constant-call gap",
+             {} tolerated as known gaps",
             h.admitted.get(),
             h.refused.get(),
             h.gaps.get()
@@ -346,6 +346,20 @@ fn a_range_overflow_around_a_constant_call_is_a_known_gap() {
         "CHAR_LENGTH('abc') + 2147483647",
     ] {
         match check_text(text, None) {
+            Ok(Agreement::KnownGap(_)) => {}
+            other => panic!("`{text}`: expected the known gap, got {other:?}"),
+        }
+    }
+}
+
+/// The other open gap: a pattern Rust's `regex` compiles and Postgres
+/// rejects. Fails the day define refuses it (then `KNOWN_GAP_REGEX_DIALECT`,
+/// the pool `REGEX_DIALECT_PATTERNS` and the tolerance go).
+#[test]
+fn a_pattern_postgres_rejects_is_a_known_gap() {
+    for pattern in expr_gen::REGEX_DIALECT_PATTERNS {
+        let text = format!("REGEXP_COUNT(ta, '{pattern}')");
+        match check_text(&text, None) {
             Ok(Agreement::KnownGap(_)) => {}
             other => panic!("`{text}`: expected the known gap, got {other:?}"),
         }

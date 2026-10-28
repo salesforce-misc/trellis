@@ -287,6 +287,20 @@ pub const REGEX_PATTERNS: &[&str] = &[
     "x.z", "a*", "z?", ".",
 ];
 
+/// Patterns Rust's `regex` crate compiles (so define admits them) but
+/// Postgres's dialect rejects with `2201B`, drawn by the conformance
+/// profile only. Filed as #1448; the checker tolerates the failure.
+pub const REGEX_DIALECT_PATTERNS: &[&str] = &[
+    "(?<n>a)",
+    "a\\z",
+    "a++",
+    "\\pL",
+    "a{1,2}{3}",
+    "(?i:a)",
+    "(?-i)a",
+    "x*+",
+];
+
 /// Strings for text literals and `STRPOS` needles, some of them drawn from
 /// the same alphabet as the end-to-end tables' text columns so a needle
 /// sometimes hits.
@@ -796,7 +810,11 @@ pub mod strategy {
                     let mut parts: BoxedStrategy<Vec<Expr>> = Just(Vec::new()).boxed();
                     for (i, ty) in args.iter().enumerate() {
                         let arg = if LITERAL_ONLY_ARGS.contains(&(*name, i)) {
-                            prop::sample::select(REGEX_PATTERNS.to_vec())
+                            let mut patterns = REGEX_PATTERNS.to_vec();
+                            if self.profile.magnitude == Magnitude::Extreme {
+                                patterns.extend(REGEX_DIALECT_PATTERNS);
+                            }
+                            prop::sample::select(patterns)
                                 .prop_map(|p| Expr::StringLiteral(p.to_string()))
                                 .boxed()
                         } else {

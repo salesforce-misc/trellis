@@ -221,6 +221,11 @@ probe" as agreement, and flags both a refusal where Postgres plans the
 expression without error (a false refusal) and an acceptance where Postgres
 raises while planning it (a missed refusal).
 
+A gap that is open (define admits what Postgres rejects) is tolerated in one
+named place in `generative::expr_conformance`, reported as a known gap, and
+pinned by a test that fails the day define refuses it, which is when the
+tolerance goes.
+
 Deterministic tests in the same file pin each precedence tier (every pair of
 registry operators, generically) and each refusal by name; they run in the
 normal suite, with a small-case-count run of each property. The randomized
