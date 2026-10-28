@@ -25,6 +25,8 @@ changes. The definition version of
 [ADR-0015](0015-transform-redefinition.md) counts edits to one definition, not
 changes to the language, and the catalog's ordered schema migrations version
 the catalog's own schema; both are out of scope.
+Which way the expression grammar may change, toward Postgres's, is
+[ADR-0022](0022-grammar-mirrors-postgres.md)'s.
 
 ## Decisions
 

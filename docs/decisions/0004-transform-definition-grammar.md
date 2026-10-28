@@ -23,6 +23,9 @@ Postgres's**. That subset lets Postgres serve as the correctness oracle (see the
 [generative test suite](../generative-test-suite.md)), because Postgres
 evaluates every expression: the engine renders a definition into the
 statements that write the target and computes no value itself.
+Every expression rule mirrors Postgres's lexer and parser, and the grammar may
+refuse what Postgres accepts but never accept what it refuses
+([ADR-0022](0022-grammar-mirrors-postgres.md)).
 
 ## The grammar is split by concern
 
