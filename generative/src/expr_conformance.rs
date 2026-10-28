@@ -654,7 +654,11 @@ impl Fixture {
         let result = match made {
             Err(e) => Err(diverge(
                 Property::MissedRefusal,
-                format!("CREATE TABLE AS fails: {e}"),
+                format!(
+                    "CREATE TABLE AS fails: {}",
+                    e.as_db_error()
+                        .map_or_else(|| e.to_string(), ToString::to_string)
+                ),
             )),
             Ok(()) => {
                 let engine = type_of(target.clone()).await.expect("target column type");
@@ -958,6 +962,8 @@ fn may_skip_evaluation(expr: &Expr) -> bool {
             ..
         } => true,
         Expr::Case { .. } => true,
+        // A dividend `NULLIF` makes `NULL` never raises.
+        Expr::FunctionCall { name, .. } if name == "NULLIF" => true,
         Expr::BinaryOp { lhs, rhs, .. } => may_skip_evaluation(lhs) || may_skip_evaluation(rhs),
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => may_skip_evaluation(operand),
         Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {

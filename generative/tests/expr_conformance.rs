@@ -624,6 +624,8 @@ fn comparison_and_logic_rows_agree_with_postgres() {
             "NULLIF(1, 2)",
             "1 IS NULL",
             "NULLIF(1, 1) IS NULL",
+            "NULLIF(1.5, 1.5) / 0",
+            "1.5 / NULLIF(2, 2) + 2147483647",
             "COALESCE(NULLIF(1, 1), 7)",
             "COALESCE(CASE WHEN 1 = 2 THEN 1 END, 7)",
             "2147483647 > 1",

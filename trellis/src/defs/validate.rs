@@ -3763,6 +3763,11 @@ fn check_constant_op<'f>(
             (folded, _) => folded,
         })
         .collect();
+    // An operator is strict: a `NULL` constant operand makes it `NULL` without
+    // evaluating it (`NULLIF(1, 1) / 0` is `NULL`).
+    if folded.iter().any(|c| matches!(c, Some(Constant::Null))) {
+        return Ok(());
+    }
     // A `NaN` dividend divides by zero to `NaN` without an error
     // (`float8div` checks the dividend first), so only that constant is
     // spared.
