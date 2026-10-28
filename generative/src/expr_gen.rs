@@ -404,6 +404,28 @@ pub struct TextStyle {
     pub lower_names: bool,
     /// Spell typed literals `CAST('..' AS type)` instead of `type '..'`.
     pub cast_form: bool,
+    /// Spell a `CAST` target as its n-th Postgres alias
+    /// (`registry::CAST_TARGET_ALIASES`) instead of its canonical name; 0, or
+    /// a target with fewer aliases, keeps the canonical name. Rendering a
+    /// parsed tree always gives the canonical name back.
+    pub cast_alias: u8,
+}
+
+/// How a `CAST` target is spelled under `style`.
+fn cast_target_text(target: ValueType, style: TextStyle) -> String {
+    let aliases: Vec<&str> = registry::CAST_TARGET_ALIASES
+        .iter()
+        .filter(|(_, t)| *t == target)
+        .map(|&(name, _)| name)
+        .collect();
+    match usize::from(style.cast_alias)
+        .checked_sub(1)
+        .and_then(|i| aliases.get(i))
+    {
+        Some(alias) if style.lower_names => alias.to_string(),
+        Some(alias) => alias.to_uppercase(),
+        None => target.to_string(),
+    }
 }
 
 fn precedence_of(expr: &Expr) -> u8 {
@@ -500,7 +522,7 @@ fn write_text(expr: &Expr, style: TextStyle, out: &mut String) {
             out.push_str(cast);
             out.push('(');
             write_text(expr, style, out);
-            out.push_str(&format!(" {as_} {target})"));
+            out.push_str(&format!(" {as_} {})", cast_target_text(*target, style)));
         }
         Expr::FunctionCall { name, args } => {
             out.push_str(&if style.lower_names {
@@ -695,7 +717,16 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
     }
     // Cast targets the grammar has no spelling for, and a modifier.
     if let Some(col) = column_of(columns, ValueType::Integer(IntWidth::Int2)) {
-        for target in ["smallint", "text", "real", "int", "numeric(10, 2)"] {
+        for target in [
+            "smallint",
+            "text",
+            "real",
+            "int2",
+            "bigserial",
+            "float8",
+            "numeric(10, 2)",
+            "decimal(10, 2)",
+        ] {
             out.push(NearMiss {
                 kind: "cast-target",
                 text: format!("CAST({col} AS {target})"),
@@ -885,11 +916,12 @@ pub mod strategy {
     }
 
     pub fn text_style() -> impl Strategy<Value = TextStyle> {
-        (any::<bool>(), any::<bool>(), any::<bool>()).prop_map(
-            |(minimal, lower_names, cast_form)| TextStyle {
+        (any::<bool>(), any::<bool>(), any::<bool>(), 0u8..=2).prop_map(
+            |(minimal, lower_names, cast_form, cast_alias)| TextStyle {
                 minimal,
                 lower_names,
                 cast_form,
+                cast_alias,
             },
         )
     }

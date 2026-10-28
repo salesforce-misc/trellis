@@ -258,8 +258,8 @@ operator against a live server,
 | `-a`, `ABS(a)` | any integer, `numeric` or float | the operand's type |
 | `CEIL(a)`, `FLOOR(a)`, `TRUNC(a)` | `numeric`, `double precision` | the operand's type |
 | `ROUND(a)`, `ROUND(a, n)`, `TRUNC(a, n)` | `numeric`; `n` an integer literal | `numeric`; rounds half away from zero, `TRUNC` toward zero |
-| `CAST(a AS integer)`, `AS bigint` | a strictly narrower integer | the named integer |
-| `CAST(a AS numeric)` | any integer | `numeric` |
+| `CAST(a AS integer)` (or `int`, `int4`), `AS bigint` (or `int8`) | a strictly narrower integer | the named integer |
+| `CAST(a AS numeric)` (or `decimal`) | any integer | `numeric` |
 
 Prefix `-` binds tighter than every binary operator, and `*`, `/` and `%`
 bind tighter than `+` and `-`. A minus before a number literal is one negative
@@ -423,7 +423,9 @@ date)`. The accepted keywords are `DATE`, `TIMESTAMP`, `TIME`, `TIMETZ`,
 literal's text must be in the type's canonical Postgres output spelling, which
 also makes the literal's spelling agree with Postgres's rendering byte for byte. A
 `CAST(<expr> AS <type>)` over a non-literal admits only the lossless integer
-widenings ([Arithmetic](#arithmetic)); every other one is refused by name. See
+widenings ([Arithmetic](#arithmetic)), with Postgres's `int`, `int4`, `int8` and
+`decimal` accepted as spellings of the target (and only there); every other one
+is refused by name. See
 [ADR-0004](decisions/0004-transform-definition-grammar.md#typed-literals-spell-constants-in-canonical-postgres-form).
 
 ## Immutability

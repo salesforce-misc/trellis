@@ -63,6 +63,11 @@ fn columns() -> HashMap<String, ValueType> {
         ("round", ValueType::Numeric),
         ("abs", ValueType::Integer(IntWidth::Int4)),
         ("cast", ValueType::Integer(IntWidth::Int4)),
+        // Type-name aliases that are also valid column names (#1455).
+        ("int", ValueType::Integer(IntWidth::Int2)),
+        ("int4", ValueType::Integer(IntWidth::Int2)),
+        ("int8", ValueType::Integer(IntWidth::Int2)),
+        ("decimal", ValueType::Integer(IntWidth::Int2)),
     ] {
         map.insert(name.to_string(), ty);
     }
@@ -255,16 +260,87 @@ fn casts_parse_to_a_cast_node_with_the_named_target() {
 }
 
 #[test]
+fn cast_aliases_parse_to_the_canonical_target_in_any_case() {
+    for (alias, canonical) in [
+        ("int", "integer"),
+        ("int4", "integer"),
+        ("int8", "bigint"),
+        ("decimal", "numeric"),
+    ] {
+        for spelling in [
+            alias.to_string(),
+            alias.to_uppercase(),
+            alias[..1].to_uppercase() + &alias[1..],
+        ] {
+            assert_eq!(
+                sexp(&expr_of(&format!("CAST(i2 AS {spelling})"))),
+                format!("(cast i2 {canonical})"),
+                "{spelling}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_cast_alias_types_as_its_canonical_target_and_narrows_alike() {
+    assert_type("CAST(i2 AS int)", I4);
+    assert_type("CAST(i2 AS INT4)", I4);
+    assert_type("CAST(i4 AS int8)", I8);
+    assert_type("CAST(i4 AS Decimal)", N);
+    assert_refused("CAST(i8 AS int)", "integer");
+    assert_refused("CAST(i8 AS int4)", "integer");
+    assert_refused("CAST(i4 AS int)", "integer");
+    assert_refused("CAST(n AS int4)", "numeric value to integer");
+    assert_refused("CAST(n AS decimal)", "numeric value to numeric");
+    assert_refused("CAST(i8 AS int8)", "bigint");
+}
+
+#[test]
+fn a_cast_alias_modifier_is_refused_exactly_like_numerics() {
+    let canonical = parse_err("CAST(i2 AS numeric(10, 2))");
+    let alias = parse_err("CAST(i2 AS decimal(10, 2))");
+    let (
+        ParseError::UnsupportedCastTarget { name: a },
+        ParseError::UnsupportedCastTarget { name: b },
+    ) = (&canonical, &alias)
+    else {
+        panic!("{canonical:?} / {alias:?}");
+    };
+    assert_eq!(a, "numeric(...)");
+    assert_eq!(b, "decimal(...)");
+    assert_eq!(
+        canonical.to_string().replace(a.as_str(), "X"),
+        alias.to_string().replace(b.as_str(), "X")
+    );
+}
+
+#[test]
+fn alias_spellings_stay_columns_outside_the_cast_target() {
+    // `columns()` has smallint columns named `int`, `int4`, `int8`, `decimal`.
+    for name in ["int", "int4", "int8", "decimal"] {
+        assert_type(name, I2);
+        assert_type(&format!("{name} + 1"), I4);
+        assert_type(
+            &format!("CAST({name} AS {name})"),
+            super::registry::cast_target(name).unwrap(),
+        );
+        assert_type(&format!("-{name}"), I2);
+    }
+}
+
+#[test]
 fn a_cast_to_any_other_type_or_with_a_modifier_is_refused_by_name() {
     for target in [
         "smallint",
-        "int",
-        "int8",
+        "int2",
+        "bigserial",
+        "float8",
         "text",
         "real",
         "double precision",
         "numeric(10, 2)",
-        "decimal",
+        "decimal(10, 2)",
+        "int(4)",
         "date",
     ] {
         let err = parse_err(&format!("CAST(i2 AS {target})"));

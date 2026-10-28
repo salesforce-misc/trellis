@@ -643,6 +643,39 @@ fn every_coalesce_over_every_leaf_conforms() {
     every_instance_conforms(|r| matches!(r, expr_gen::Rule::Coalesce { .. }));
 }
 
+/// `CAST(x AS int)`, `AS int4`, `AS int8` and `AS decimal` (#1455) are typed
+/// like their canonical targets by define and by Postgres, and parse back to
+/// the canonical tree (the checker's round trip). Over every leaf, in each
+/// alias spelling and both cases.
+#[test]
+fn every_cast_alias_over_every_leaf_conforms() {
+    let mut checked = 0;
+    let mut failures = Vec::new();
+    for rule in expr_gen::rules()
+        .iter()
+        .filter(|r| matches!(r, expr_gen::Rule::Cast { .. }))
+    {
+        for expr in instances(rule) {
+            for cast_alias in 1..=2 {
+                for lower_names in [true, false] {
+                    let style = TextStyle {
+                        cast_alias,
+                        lower_names,
+                        ..TextStyle::default()
+                    };
+                    let text = render_text(&expr, style);
+                    checked += 1;
+                    if let Err(d) = check_text(&text, Some(&expr)) {
+                        failures.push(d.to_string());
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 0);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// An expression Postgres folds and rejects for every row is refused at
 /// define, and Postgres raises on the where-false probe: agreement.
 #[test]

@@ -38,7 +38,7 @@ use super::ast::{
 use super::error::ParseError;
 use super::lexer::{Token, lex};
 use super::registry::{
-    AGGREGATE_FUNCTIONS, CAST_TARGETS, NON_IMMUTABLE_NAMES, function_overloads,
+    AGGREGATE_FUNCTIONS, NON_IMMUTABLE_NAMES, cast_target, function_overloads,
     lookup_aggregate_function, lookup_operator, operator_spec,
 };
 use super::typed_literal::lookup_typed_literal;
@@ -1204,7 +1204,7 @@ impl Parser {
     /// A quoted literal operand (`'<literal>' AS <type>)`) builds the same
     /// [`Expr::TypedLiteral`] the `<type> '<literal>'` spelling builds. Any
     /// other operand is a cast of an expression, to one of
-    /// [`CAST_TARGETS`]; whether that operand converts to it is the
+    /// `CAST_TARGETS` or an alias of one; whether that operand converts to it is the
     /// validator's to check.
     fn parse_cast_body(&mut self) -> Result<Expr, ParseError> {
         if !matches!(self.peek(), Token::String(_)) {
@@ -1212,10 +1212,7 @@ impl Parser {
             self.expect_keyword("AS")?;
             let type_name = self.expect_ident()?;
             let keyword = self.take_type_keyword(&type_name.to_ascii_uppercase());
-            let target = CAST_TARGETS
-                .iter()
-                .copied()
-                .find(|t| t.to_string().eq_ignore_ascii_case(&keyword));
+            let target = cast_target(&keyword);
             if self.peek_is_symbol('(') {
                 // A modifier: `numeric(10,2)`. Consume it so the error is the
                 // only one reported.

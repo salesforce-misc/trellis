@@ -237,6 +237,33 @@ pub const CAST_TARGETS: &[ValueType] = &[
     ValueType::Numeric,
 ];
 
+/// Postgres's exact, permanent synonyms for the [`CAST_TARGETS`], accepted in
+/// `CAST` target position only (issue #1455): `int` and `int4` for `integer`,
+/// `int8` for `bigint`, `decimal` for `numeric`. Every other place a type name
+/// appears (typed literals, column names) is unchanged, and rendering always
+/// emits the canonical name.
+pub const CAST_TARGET_ALIASES: &[(&str, ValueType)] = &[
+    ("int", ValueType::Integer(IntWidth::Int4)),
+    ("int4", ValueType::Integer(IntWidth::Int4)),
+    ("int8", ValueType::Integer(IntWidth::Int8)),
+    ("decimal", ValueType::Numeric),
+];
+
+/// The `CAST` target a type keyword names, matched case-insensitively: a
+/// canonical spelling or an alias, resolved to its canonical [`ValueType`].
+pub fn cast_target(keyword: &str) -> Option<ValueType> {
+    CAST_TARGETS
+        .iter()
+        .copied()
+        .find(|t| t.to_string().eq_ignore_ascii_case(keyword))
+        .or_else(|| {
+            CAST_TARGET_ALIASES
+                .iter()
+                .find(|(alias, _)| alias.eq_ignore_ascii_case(keyword))
+                .map(|&(_, t)| t)
+        })
+}
+
 /// The result type of `CAST(<operand> AS <target>)`, or `None` if the cast is
 /// not one of the lossless, total ones: an integer to a strictly wider
 /// integer, or any integer to `numeric`. Every other cast narrows (and can

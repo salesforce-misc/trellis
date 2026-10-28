@@ -71,7 +71,7 @@ SELECT <expr> AS <field> [, <expr> AS <field> ...]
 `<expr>` is a column reference, a numeric or single-quoted string literal,
 `<expr> + <expr>`, `<expr> - <expr>`, `<expr> * <expr>`, `<expr> / <expr>`,
 `<expr> % <expr>`, `-<expr>`, `<expr> > <expr>`, `CAST(<expr> AS <integer or
-numeric type>)`, or a function call (`strpos`, `octet_length`, `char_length`,
+numeric type>)` (the target also spelled `int`, `int4`, `int8` or `decimal`), or a function call (`strpos`, `octet_length`, `char_length`,
 `regexp_count`, `abs`, `ceil`, `floor`, `round`, `trunc`; general `func(args)`
 syntax). Values
 carry a Postgres type (the ones [type support](../type-support.md) lists), and
