@@ -137,6 +137,14 @@ pub enum CatalogError {
     /// dropped, renamed, or never existed under that bare name. Also a table
     /// dropped between resolving it and a later check that reads it.
     SourceTableNotFound(String),
+    /// A `REGEXP_COUNT` pattern literal that Postgres's own `regexp_count`
+    /// rejects with `2201B` (`invalid_regular_expression`): it would define
+    /// and then fail every non-`NULL` row. `error` is the server's message.
+    InvalidRegexPattern {
+        field: String,
+        pattern: String,
+        error: String,
+    },
     /// A table a definition names exists, but the role
     /// Trellis connects as can't use it: it lacks `USAGE` on the
     /// table's schema, holds no privilege on the table itself (it neither
@@ -421,6 +429,7 @@ impl CatalogError {
             CatalogError::UnknownValueType { .. } => ErrorCode::Internal,
             CatalogError::Backfill(err) => err.code(),
             CatalogError::SourceTableNotFound(_) => ErrorCode::NotFound,
+            CatalogError::InvalidRegexPattern { .. } => ErrorCode::Validation,
             // A setup the definition can't run under, like
             // `RowSecurityApplies`: the fix is a grant.
             CatalogError::TableNotAccessible { .. } => ErrorCode::Validation,
@@ -509,6 +518,15 @@ impl fmt::Display for CatalogError {
             CatalogError::SourceTableNotFound(table) => {
                 write!(f, "source table \"{table}\" not found on the search path")
             }
+            CatalogError::InvalidRegexPattern {
+                field,
+                pattern,
+                error,
+            } => write!(
+                f,
+                "calculated field '{field}': regexp_count's pattern '{pattern}' is rejected by \
+                 Postgres: {error}"
+            ),
             CatalogError::TableNotAccessible {
                 table,
                 role,
@@ -714,6 +732,7 @@ impl std::error::Error for CatalogError {
             CatalogError::UnknownValueType { .. } => None,
             CatalogError::Backfill(err) => Some(err),
             CatalogError::SourceTableNotFound(_) => None,
+            CatalogError::InvalidRegexPattern { .. } => None,
             CatalogError::TableNotAccessible { .. } => None,
             CatalogError::SourceKeyChanged { .. } => None,
             CatalogError::SourceIndexMissing { .. } => None,
@@ -1794,6 +1813,7 @@ pub async fn alter_transform(
     let edited: Vec<FieldDef> = real_adds.iter().chain(&real_alters).cloned().collect();
     assert_collation_safe_text_functions(&txn, &merged, &current.source_table, Some(&edited))
         .await?;
+    assert_regexp_patterns_accepted(&txn, &merged, Some(&edited)).await?;
 
     for field in &real_drops {
         txn.batch_execute(&format!(
@@ -4266,6 +4286,7 @@ pub(crate) async fn validate_live_schema(
         .map_err(CatalogError::Ddl)?;
     assert_deterministic_definition_keys(txn, def, qualified_source, &source_key).await?;
     assert_collation_safe_text_functions(txn, def, qualified_source, None).await?;
+    assert_regexp_patterns_accepted(txn, def, None).await?;
     reject_unkeyed_source(txn, qualified_source, def).await?;
 
     let read_tables = vec![side_read_table(txn, qualified_source).await?];
@@ -4301,6 +4322,7 @@ pub(crate) async fn validate_live_join_schema(
         side_read_table(txn, &sides.from).await?,
         side_read_table(txn, &sides.joined).await?,
     ];
+    assert_regexp_patterns_accepted(txn, def, None).await?;
     reject_row_security(txn, schema, &read_tables).await?;
     reject_subscribed(txn, &[sides.from.as_str(), sides.joined.as_str()]).await
 }
@@ -4791,6 +4813,60 @@ async fn assert_deterministic_definition_keys(
             column,
         )
         .await?;
+    }
+    Ok(())
+}
+
+/// Refuses a definition with a `REGEXP_COUNT` pattern literal Postgres
+/// rejects: Postgres alone judges the pattern, since it alone runs it. Each
+/// literal is bound to `select regexp_count('', $1::text)`, under a
+/// savepoint so a refused probe leaves `txn` usable; only SQLSTATE `2201B`
+/// is a refusal, any other error propagates. `only_fields`, if given, limits
+/// the check to those fields (`ALTER TRANSFORM`'s added and altered ones).
+pub async fn assert_regexp_patterns_accepted(
+    txn: &tokio_postgres::Transaction<'_>,
+    def: &TransformDef,
+    only_fields: Option<&[FieldDef]>,
+) -> Result<(), CatalogError> {
+    for (field, pattern) in super::validate::regexp_pattern_literals(def) {
+        if let Some(only) = only_fields
+            && !only.iter().any(|f| f.name == field)
+        {
+            continue;
+        }
+        txn.batch_execute("savepoint trellis_regexp_probe").await?;
+        match txn
+            .query_one("select regexp_count('', $1::text)", &[&pattern])
+            .await
+        {
+            Ok(_) => {
+                txn.batch_execute("release savepoint trellis_regexp_probe")
+                    .await?
+            }
+            Err(err) => {
+                txn.batch_execute(
+                    "rollback to savepoint trellis_regexp_probe; \
+                     release savepoint trellis_regexp_probe",
+                )
+                .await?;
+                return Err(
+                    if err.code()
+                        == Some(&tokio_postgres::error::SqlState::INVALID_REGULAR_EXPRESSION)
+                    {
+                        let error = err
+                            .as_db_error()
+                            .map_or_else(|| err.to_string(), |db| db.message().to_string());
+                        CatalogError::InvalidRegexPattern {
+                            field,
+                            pattern,
+                            error,
+                        }
+                    } else {
+                        err.into()
+                    },
+                );
+            }
+        }
     }
     Ok(())
 }

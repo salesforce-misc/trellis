@@ -65,7 +65,6 @@ getrandom = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 refinery = { version = "0.9.2", default-features = false, features = ["tokio-postgres"] }
-regex = "1.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tokio-postgres = "0.7.13"
 # TLS for the connections to Postgres (`src/tls.rs`). rustls with the `ring`
@@ -144,6 +143,7 @@ test-util = []
 internals = ["test-util"]
 
 [dev-dependencies]
+regex = "1.13"
 testkit = { path = "../testkit" }
 # Turns on `internals` (see above) for this crate's own test targets only —
 # `tests/*.rs` are separate compilation units and cannot otherwise see the

@@ -102,6 +102,8 @@ pub use backfill::BackfillError;
 #[cfg(any(test, feature = "internals"))]
 pub use catalog::all_source_tables;
 #[cfg(any(test, feature = "internals"))]
+pub use catalog::assert_regexp_patterns_accepted;
+#[cfg(any(test, feature = "internals"))]
 pub use catalog::{
     create_definition, dependents_of, edges_from, node_for_table, persist_edge, resolve_node,
     source_table_version, transforms_for_source,

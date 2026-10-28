@@ -443,8 +443,9 @@ async fn a_row_without_a_column_a_field_reads_is_isolated_not_read_as_null() {
     );
 }
 
-/// A pattern Rust's `regex` accepts at define and Postgres refuses
-/// (`2201B`) fails every record. Each one isolation pins is a distinct
+/// A pattern Postgres refuses (`2201B`) fails every record. Define refuses
+/// such a pattern, so the test plants it in the catalog after define, as a
+/// server whose verdict changed would leave it. Each one isolation pins is a distinct
 /// failing row of the column, so the column fuse trips at its threshold,
 /// the column pauses, and the page applies without it: the healthy field is
 /// written for every record and no key is held.
@@ -459,13 +460,21 @@ async fn an_invalid_regex_trips_its_column_fuse_and_the_rest_applies() {
         "notes",
         "id integer primary key, t text",
         "TRANSFORM notes_out FROM public.notes \
-         SELECT REGEXP_COUNT(t, '(?P<n>a)') AS named, CHAR_LENGTH(t) AS len",
+         SELECT REGEXP_COUNT(t, 'zzz') AS named, CHAR_LENGTH(t) AS len",
         &[
             ("id", ValueType::Integer(IntWidth::Int4)),
             ("t", ValueType::Text),
         ],
     )
     .await;
+    client
+        .execute(
+            "update trellis.transform_definitions \
+             set definition_text = replace(definition_text, 'zzz', '(?P<n>a)')",
+            &[],
+        )
+        .await
+        .expect("plant the pattern");
     let rows: Vec<(String, String)> = (1..=200)
         .map(|id| (id.to_string(), format!(r#"{{"id":"{id}","t":"abc{id}"}}"#)))
         .collect();

@@ -228,7 +228,8 @@ impl std::fmt::Display for Divergence {
 pub enum Agreement {
     /// Admitted; type and values agree.
     Admitted,
-    /// Refused at define (the message), and Postgres raises on the probe.
+    /// Refused at define (the message), and Postgres raises: on the probe, or
+    /// on a `REGEXP_COUNT` pattern literal define asks it to judge.
     RefusedAndRaises(String),
     /// Admitted, but Postgres raises while planning it, and the expression
     /// holds a call whose arguments are all constants: Postgres folds it and
@@ -236,11 +237,6 @@ pub enum Agreement {
     /// (see [`KNOWN_GAP_CONSTANT_CALL`]).
     KnownGap(&'static str),
 }
-
-/// The second open gap: a `REGEXP_COUNT` pattern Rust's `regex` accepts and
-/// Postgres rejects with `2201B`, so every row fails. Filed as #1448.
-pub const KNOWN_GAP_REGEX_DIALECT: &str = "define compiles a regexp_count pattern with Rust's regex crate, which accepts patterns \
-     Postgres rejects (2201B)";
 
 /// SQLSTATE `invalid_regular_expression`.
 const INVALID_REGEX: &str = "2201B";
@@ -483,10 +479,12 @@ impl Fixture {
                 format!("a well-typed expression was refused: {err}"),
             )),
             Ok(()) => {
+                // Define asks Postgres to judge each literal pattern.
+                if let Some(message) = self.rejected_pattern(&expr).await {
+                    return Ok(Agreement::RefusedAndRaises(message));
+                }
                 if let Some(code) = probe {
-                    let gap = if code == INVALID_REGEX {
-                        Some(KNOWN_GAP_REGEX_DIALECT)
-                    } else if has_constant_call(&expr) {
+                    let gap = if has_constant_call(&expr) {
                         Some(KNOWN_GAP_CONSTANT_CALL)
                     } else {
                         None
@@ -713,9 +711,6 @@ impl Fixture {
                     ),
                 ))
             }
-            // Both reject the pattern: the gap, not agreement on a data
-            // error, because the pattern is the definition's, not a row's.
-            (Err(u), Err(_)) if u == INVALID_REGEX => Ok(Some(KNOWN_GAP_REGEX_DIALECT)),
             (Err(u), Err(r)) if class_of(u) == class_of(&r) => Ok(None),
             (u, r) => Err(diverge(
                 Property::Value,
@@ -742,7 +737,6 @@ impl Fixture {
         gap: &'static str,
     ) -> Result<Agreement, Divergence> {
         let mut rewritten = expr.clone();
-        self.replace_rejected_patterns(&mut rewritten).await;
         self.fold_constant_calls(&mut rewritten).await;
         normalize_negations(&mut rewritten);
         if rewritten == *expr {
@@ -768,8 +762,10 @@ impl Fixture {
         }
     }
 
-    /// Replaces each `REGEXP_COUNT` pattern Postgres rejects with `'a'`.
-    async fn replace_rejected_patterns(&self, expr: &mut Expr) {
+    /// The refusal define gives `expr` when a `REGEXP_COUNT` pattern literal
+    /// in it is one Postgres rejects (`2201B`): the probe define runs, here
+    /// run on the harness's own connection.
+    async fn rejected_pattern(&self, expr: &Expr) -> Option<String> {
         let mut stack = vec![expr];
         while let Some(e) = stack.pop() {
             match e {
@@ -780,19 +776,22 @@ impl Fixture {
                 Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => stack.push(operand),
                 Expr::FunctionCall { name, args } => {
                     if name == "REGEXP_COUNT"
-                        && let Some(Expr::StringLiteral(pattern)) = args.get_mut(1)
+                        && let Some(Expr::StringLiteral(pattern)) = args.get(1)
                     {
                         let probe =
                             format!("select regexp_count('', '{}')", pattern.replace('\'', "''"));
                         if self.raises(&probe).await.as_deref() == Some(INVALID_REGEX) {
-                            *pattern = "a".to_string();
+                            return Some(format!(
+                                "regexp_count's pattern '{pattern}' is rejected by Postgres"
+                            ));
                         }
                     }
-                    stack.extend(args.iter_mut());
+                    stack.extend(args.iter());
                 }
                 _ => {}
             }
         }
+        None
     }
 
     /// Replaces each function call (not `COALESCE`) that reads no column with

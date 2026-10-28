@@ -307,17 +307,16 @@ pub fn typed_literal_samples(keyword: &str, magnitude: Magnitude) -> &'static [&
     }
 }
 
-/// `REGEXP_COUNT` patterns: the syntax Rust's `regex` crate and Postgres's
-/// default dialect share (literal text, `.`, `*`, `+`, `?`, `[...]`, `|`,
-/// `^`, `$`), which define compiles with the former and Postgres runs.
+/// `REGEXP_COUNT` patterns Postgres accepts: basic syntax (literal text, `.`,
+/// `*`, `+`, `?`, `[...]`, `|`, `^`, `$`) and constructs only Postgres has
+/// (a back-reference, lookahead, `\m`).
 pub const REGEX_PATTERNS: &[&str] = &[
     "a", "o", "e", "b+", "[ab]", "a.c", "colou?r", "cat|dog", "[a-z]+", "^a", "a$", "c$", "a|b",
-    "x.z", "a*", "z?", ".",
+    "x.z", "a*", "z?", ".", "(a)\\1", "a(?=b)", "\\ma",
 ];
 
-/// Patterns Rust's `regex` crate compiles (so define admits them) but
-/// Postgres's dialect rejects with `2201B`, drawn by the conformance
-/// profile only. Filed as #1448; the checker tolerates the failure.
+/// Patterns Postgres's dialect rejects with `2201B`, which define refuses
+/// (Postgres judges each), drawn by the conformance profile only.
 pub const REGEX_DIALECT_PATTERNS: &[&str] = &[
     "(?<n>a)",
     "a\\z",

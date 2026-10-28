@@ -15,8 +15,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use regex::Regex;
-
 use super::ast::{
     Expr, FieldDef, KeySpace, Predicate, QualifiedColumn, TransformDef, ValueType,
     render_field_expr,
@@ -269,16 +267,9 @@ pub enum ValidationError {
         found: ValueType,
     },
     /// `regexp_count`'s pattern argument was not a string literal. The pattern must be
-    /// known at validate time so it can be compiled and checked here, once, rather than
-    /// re-parsed on every row at eval time — a column-sourced pattern is out of scope.
+    /// known at define time so Postgres can judge it once (`CatalogError::InvalidRegexPattern`)
+    /// — a column-sourced pattern is out of scope.
     NonLiteralRegexPattern { field: String },
-    /// `regexp_count`'s pattern literal does not compile as a regular
-    /// expression, per the `regex` crate.
-    InvalidRegexPattern {
-        field: String,
-        pattern: String,
-        error: String,
-    },
     /// A typed literal's text isn't in its family's **canonical**
     /// Postgres output spelling — `DATE '2024-1-5'`, `DATE 'today'`,
     /// `BYTEA '\xAB'`. See `super::typed_literal`'s module doc comment for
@@ -902,15 +893,6 @@ impl fmt::Display for ValidationError {
                 f,
                 "calculated field '{field}': regexp_count's pattern argument must be a string \
                  literal, not a column reference or expression"
-            ),
-            ValidationError::InvalidRegexPattern {
-                field,
-                pattern,
-                error,
-            } => write!(
-                f,
-                "calculated field '{field}': regexp_count's pattern '{pattern}' is not a valid \
-                 regular expression: {error}"
             ),
             ValidationError::InvalidTypedLiteral {
                 field,
@@ -3763,22 +3745,54 @@ fn common_numeric_type(a: ValueType, b: ValueType) -> Option<ValueType> {
     })
 }
 
-/// Checks `regexp_count`'s pattern argument is a string literal that
-/// compiles as a regular expression. Validating once here, rather than at
-/// eval time on every row, is why the pattern must be a literal at all —
-/// see [`ValidationError::NonLiteralRegexPattern`].
+/// Checks `regexp_count`'s pattern argument is a string literal. Whether
+/// Postgres accepts it is the catalog's probe, which needs a literal to bind
+/// — see [`ValidationError::NonLiteralRegexPattern`].
 fn validate_regexp_pattern(field_name: &str, pattern_arg: &Expr) -> Result<(), ValidationError> {
-    let Expr::StringLiteral(pattern) = pattern_arg else {
+    if !matches!(pattern_arg, Expr::StringLiteral(_)) {
         return Err(ValidationError::NonLiteralRegexPattern {
             field: field_name.to_string(),
         });
-    };
-    Regex::new(pattern).map_err(|error| ValidationError::InvalidRegexPattern {
-        field: field_name.to_string(),
-        pattern: pattern.clone(),
-        error: error.to_string(),
-    })?;
+    }
     Ok(())
+}
+
+/// Every `(field, pattern)` of a `REGEXP_COUNT` call with a string-literal
+/// pattern in `def`'s fields, once each, in field order. The catalog has
+/// Postgres judge each one (`CatalogError::InvalidRegexPattern`); a
+/// non-literal pattern is [`validate`]'s refusal.
+pub(crate) fn regexp_pattern_literals(def: &TransformDef) -> Vec<(String, String)> {
+    fn walk(expr: &Expr, field: &str, out: &mut Vec<(String, String)>) {
+        match expr {
+            Expr::FunctionCall { name, args } => {
+                if name == "REGEXP_COUNT"
+                    && let Some(Expr::StringLiteral(pattern)) = args.get(1)
+                {
+                    out.push((field.to_string(), pattern.clone()));
+                }
+                for arg in args {
+                    walk(arg, field, out);
+                }
+            }
+            Expr::BinaryOp { lhs, rhs, .. } => {
+                walk(lhs, field, out);
+                walk(rhs, field, out);
+            }
+            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => walk(operand, field, out),
+            Expr::Column(_)
+            | Expr::SourceColumn { .. }
+            | Expr::NumberLiteral(_)
+            | Expr::StringLiteral(_)
+            | Expr::TypedLiteral { .. } => {}
+        }
+    }
+    let mut out = Vec::new();
+    for field in &def.fields {
+        walk(&field.expr, &field.name, &mut out);
+    }
+    let mut seen = HashSet::new();
+    out.retain(|entry| seen.insert(entry.clone()));
+    out
 }
 
 /// A calculated field's reads of other calculated fields, for the cycle and
@@ -5362,26 +5376,6 @@ mod tests {
                 found: ValueType::Text,
             }
         );
-    }
-
-    #[test]
-    fn regexp_count_with_an_uncompilable_pattern_literal_is_rejected() {
-        let d = def(vec![FieldDef {
-            name: "out".to_string(),
-            expr: Expr::FunctionCall {
-                name: "REGEXP_COUNT".to_string(),
-                args: vec![col("text_col"), Expr::StringLiteral("(".to_string())],
-            },
-        }]);
-        let source_columns = HashMap::from([("text_col".to_string(), ValueType::Text)]);
-        let err = validate(&d, &source_columns).unwrap_err();
-        match err {
-            ValidationError::InvalidRegexPattern { field, pattern, .. } => {
-                assert_eq!(field, "out");
-                assert_eq!(pattern, "(");
-            }
-            other => panic!("expected InvalidRegexPattern, got {other:?}"),
-        }
     }
 
     fn parsed(text: &str) -> TransformDef {

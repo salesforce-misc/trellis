@@ -715,16 +715,24 @@ fn a_range_overflow_around_a_constant_call_is_a_known_gap() {
     }
 }
 
-/// The other open gap: a pattern Rust's `regex` compiles and Postgres
-/// rejects. Fails the day define refuses it (then `KNOWN_GAP_REGEX_DIALECT`,
-/// the pool `REGEX_DIALECT_PATTERNS` and the tolerance go).
+/// A pattern Postgres rejects (`2201B`) is refused at define, by the probe
+/// that asks Postgres; a pattern only Postgres accepts is admitted.
 #[test]
-fn a_pattern_postgres_rejects_is_a_known_gap() {
+fn a_pattern_postgres_rejects_is_refused() {
     for pattern in expr_gen::REGEX_DIALECT_PATTERNS {
         let text = format!("REGEXP_COUNT(ta, '{pattern}')");
         match check_text(&text, None) {
-            Ok(Agreement::KnownGap(_)) => {}
-            other => panic!("`{text}`: expected the known gap, got {other:?}"),
+            Ok(Agreement::RefusedAndRaises(message)) => {
+                assert!(message.contains(pattern), "{message}");
+            }
+            other => panic!("`{text}`: expected the refusal, got {other:?}"),
+        }
+    }
+    for pattern in [r"(a)\1", "a(?=b)", r"\ma"] {
+        let text = format!("REGEXP_COUNT(ta, '{pattern}')");
+        match check_text(&text, None) {
+            Ok(Agreement::Admitted) => {}
+            other => panic!("`{text}`: expected it admitted, got {other:?}"),
         }
     }
 }
@@ -749,9 +757,6 @@ fn each_refusal_names_its_construct() {
         ("CHAR_LENGTH(i4a)", "char_length"),
         // The pattern must be a literal.
         ("REGEXP_COUNT(ta, tb)", "regexp_count"),
-        // A pattern define's regex engine rejects (back-references, `\m`).
-        (r"REGEXP_COUNT(ta, '(a)\1')", "regexp_count's pattern"),
-        (r"REGEXP_COUNT(ta, '\ma')", "regexp_count's pattern"),
         // Operators and functions outside the registry.
         ("i4a = i4b", "="),
         ("i4a < i4b", "'<'"),
