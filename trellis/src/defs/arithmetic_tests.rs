@@ -155,7 +155,6 @@ fn a_minus_before_a_number_is_one_negative_literal() {
         ("- - - 5", "-5"),
         ("-5 * a", "(* -5 a)"),
         ("a - -5", "(- a -5)"),
-        ("a--5", "(- a -5)"),
         ("-0", "-0"),
     ] {
         assert_eq!(sexp(&expr_of(text)), grouping, "`{text}`");
@@ -167,6 +166,19 @@ fn a_minus_before_a_number_is_one_negative_literal() {
     assert_type("-9223372036854775809", N);
     assert_type("-0.5", N);
     assert_type("- -2147483648", I8);
+}
+
+#[test]
+fn two_adjacent_minuses_are_refused_as_a_sql_comment() {
+    // In SQL `a--5` is `a` followed by a comment, not `a - -5`.
+    for text in ["a--5", "a--b", "--a", "ROUND(n, --2)", "a - --5"] {
+        assert!(
+            matches!(parse_err(text), ParseError::DoubleMinus),
+            "`{text}`"
+        );
+    }
+    assert_eq!(sexp(&expr_of("a - -5")), "(- a -5)");
+    assert_eq!(sexp(&expr_of("-(-a)")), "(neg (neg a))");
 }
 
 #[test]

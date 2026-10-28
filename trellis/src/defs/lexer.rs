@@ -103,6 +103,14 @@ pub fn lex(input: &str) -> Result<Vec<Token>, ParseError> {
             return Err(ParseError::UnsupportedCastOperator);
         }
 
+        // In SQL `--` starts a comment, so `a--1` is `a`. This grammar has
+        // no comments, and reading the two characters as two minuses would
+        // give the same text another meaning (`a - (-1)`), so the pair is
+        // refused by name.
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            return Err(ParseError::DoubleMinus);
+        }
+
         if SYMBOLS.contains(&c) {
             tokens.push(Token::Symbol(c));
             i += 1;

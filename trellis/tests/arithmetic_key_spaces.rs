@@ -16,7 +16,8 @@ use std::time::Duration;
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::{Config, Trellis, TrellisOptions};
+use trellis::staging::self_check::{CheckPageExt, SelfCheckScope};
+use trellis::{Config, SelfCheckMode, SelfCheckOutcome, Trellis, TrellisOptions};
 
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -81,6 +82,28 @@ async fn differences(raw: &Client, target: &str, columns: &str, oracle: &str) ->
     .await
     .unwrap_or_else(|e| panic!("difference query for {target}: {e}"))
     .get(0)
+}
+
+/// `self_check` renders each field with its own audit renderer (ADR-0013),
+/// independent of the write path, and must agree with what apply wrote.
+async fn audit_converges(trellis: &Trellis, target: &str) {
+    let page = trellis
+        .self_check_page(
+            target,
+            SelfCheckScope {
+                after: None,
+                limit: 1000,
+            },
+            SelfCheckMode::Strict,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("self_check {target}: {e}"));
+    assert!(
+        matches!(page.outcome, SelfCheckOutcome::Converged),
+        "self_check {target}: {:?}",
+        page.outcome
+    );
 }
 
 async fn count(raw: &Client, sql: &str) -> i64 {
@@ -149,6 +172,7 @@ async fn a_one_to_one_field_computes_every_arithmetic_form() {
         count(&raw, "select count(*) from t").await,
         count(&raw, "select count(*) from s").await
     );
+    audit_converges(&trellis, "t").await;
     trellis.shutdown().await.expect("shutdown");
 }
 
@@ -186,6 +210,7 @@ async fn an_aggregate_argument_and_composed_field_compute_arithmetic() {
                   cast(sum(a4) as numeric) / count(*), abs(sum(a4 - 100)) \
                   from s group by a2";
     assert_eq!(differences(&raw, "g", columns, oracle).await, 0);
+    audit_converges(&trellis, "g").await;
     trellis.shutdown().await.expect("shutdown");
 }
 
@@ -209,7 +234,8 @@ async fn a_join_computes_arithmetic_in_arguments_and_composed_fields() {
            WITHOUT SOURCE INDEX SELECT fa.g AS g, SUM(fa.v * 2 - 1) AS sv, \
            SUM(db.y - db.w) AS sy, AVG(-db.y) AS ay, SUM(ABS(db.w)) AS aw, \
            -COUNT(*) AS nn, SUM(fa.v) * 2 - COUNT(*) AS c1, \
-           ROUND(AVG(db.y), 1) AS c2, CAST(SUM(fa.v) AS numeric) / COUNT(*) AS c3",
+           ROUND(AVG(db.y), 1) AS c2, CAST(SUM(fa.v) AS numeric) / COUNT(*) AS c3, \
+           SUM(CAST(db.w AS bigint) * 3) AS cw, ROUND(AVG(fa.v * 10), -1) AS c4",
         ],
     )
     .await;
@@ -230,12 +256,14 @@ async fn a_join_computes_arithmetic_in_arguments_and_composed_fields() {
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
     converge(&trellis).await;
-    let columns = "g, sv, sy, ay, aw, nn, c1, c2, c3";
+    let columns = "g, sv, sy, ay, aw, nn, c1, c2, c3, cw, c4";
     let oracle = "select fa.g, sum(fa.v * 2 - 1), sum(db.y - db.w), avg(-db.y), \
                   sum(abs(db.w)), -count(*), sum(fa.v) * 2 - count(*), round(avg(db.y), 1), \
-                  cast(sum(fa.v) as numeric) / count(*) \
+                  cast(sum(fa.v) as numeric) / count(*), sum(cast(db.w as bigint) * 3), \
+                  round(avg(fa.v * 10), -1) \
                   from public.fa join public.db on fa.k = db.k group by fa.g";
     assert_eq!(differences(&raw, "j", columns, oracle).await, 0);
+    audit_converges(&trellis, "j").await;
     trellis.shutdown().await.expect("shutdown");
 }
 
@@ -265,5 +293,6 @@ async fn alter_transform_adds_an_arithmetic_field() {
     let columns = "id, a4, x, y, z, w";
     let oracle = "select id, a4, a4 * 2 - a2, -n / 3, round(n, 1), cast(a2 as bigint) from s";
     assert_eq!(differences(&raw, "t", columns, oracle).await, 0);
+    audit_converges(&trellis, "t").await;
     trellis.shutdown().await.expect("shutdown");
 }

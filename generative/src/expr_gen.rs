@@ -657,6 +657,15 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
             needles: vec![name.to_lowercase()],
         });
     }
+    // Two adjacent minuses: a comment in SQL, refused rather than read as a
+    // minus and a negative literal.
+    if let Some(col) = column_of(columns, ValueType::Integer(IntWidth::Int4)) {
+        out.push(NearMiss {
+            kind: "double-minus",
+            text: format!("{col}--1"),
+            needles: vec!["comment".to_string()],
+        });
+    }
     // Prefix minus over a non-numeric operand.
     for &ty in &types {
         if registry::negate_result_type(ty).is_none()

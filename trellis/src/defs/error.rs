@@ -61,6 +61,8 @@ pub enum ParseError {
     UnsupportedCastTarget { name: String },
     /// A run of prefix `-` operators longer than the parser keeps.
     PrefixMinusChainTooLong { max: usize },
+    /// Two adjacent `-` characters, which start a comment in SQL.
+    DoubleMinus,
     /// A `CAST(<literal> AS <type>)` or `<type> '<literal>'` naming a type
     /// that isn't in `super::typed_literal::TYPED_LITERALS`'s allowlist.
     UnsupportedLiteralType { name: String },
@@ -204,6 +206,11 @@ impl fmt::Display for ParseError {
             ParseError::ExpressionTooDeep { limit } => write!(
                 f,
                 "expression nested too deeply: an expression may nest at most {limit} levels (a chain of {limit} operands joined by operators, or fewer nested parentheses or calls); split it into calculated fields"
+            ),
+            ParseError::DoubleMinus => write!(
+                f,
+                "'--' starts a comment in SQL, and comments are not supported: separate the \
+                 two minuses with a space or parentheses (a - -1, -(-a))"
             ),
             ParseError::UnsupportedCastOperator => write!(
                 f,
