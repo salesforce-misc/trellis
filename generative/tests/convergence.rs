@@ -817,10 +817,7 @@ async fn a_nested_mixed_operator_and_function_expression_converges_end_to_end() 
             mutates: vec![],
         }],
         &[0],
-        &[DerivedShape::StrposGreaterThan {
-            needle: "wor".to_string(),
-            threshold: 0,
-        }],
+        &[DerivedShape::strpos_greater_than("wor", 0)],
     );
     assert_eq!(program.tables.len(), 1);
     assert_eq!(program.defs.len(), 1);

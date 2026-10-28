@@ -833,21 +833,16 @@ fn operator_name(op: Operator) -> &'static str {
 /// collapses to `"Other"` rather than leaking an arbitrary caller-owned
 /// `String` into a `HashSet<&'static str>`.
 fn function_name(name: &str) -> &'static str {
-    match name {
-        "STRPOS" => "STRPOS",
-        "OCTET_LENGTH" => "OCTET_LENGTH",
-        "CHAR_LENGTH" => "CHAR_LENGTH",
-        "REGEXP_COUNT" => "REGEXP_COUNT",
-        "COALESCE" => "COALESCE",
-        "SUM" => "SUM",
-        "MIN" => "MIN",
-        "MAX" => "MAX",
-        "AVG" => "AVG",
-        "COUNT" => "COUNT",
-        "BOOL_AND" => "BOOL_AND",
-        "BOOL_OR" => "BOOL_OR",
-        _ => "Other",
+    // Read off the registries, so a function added there is tracked without a
+    // change here. `COALESCE` is the one call outside both.
+    if name == "COALESCE" {
+        return "COALESCE";
     }
+    registry::FUNCTIONS
+        .iter()
+        .chain(registry::AGGREGATE_FUNCTION_SPECS)
+        .find(|spec| spec.name == name)
+        .map_or("Other", |spec| spec.name)
 }
 
 /// Sorted `(name, count)` pairs, since `HashMap` iteration order isn't

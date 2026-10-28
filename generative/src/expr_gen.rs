@@ -47,6 +47,11 @@ pub struct Profile {
     /// The deepest nesting of operators, calls and `COALESCE`s.
     pub max_depth: u32,
     pub magnitude: Magnitude,
+    /// Draw a `COALESCE` over numeric types of different kinds
+    /// (`COALESCE(integer_col, numeric_col)`), whose result type Postgres
+    /// picks. Off for the end-to-end tiers, whose oracle types a `COALESCE`
+    /// as its first argument.
+    pub mixed_coalesce: bool,
 }
 
 impl Profile {
@@ -54,12 +59,14 @@ impl Profile {
     pub const CONFORMANCE: Profile = Profile {
         max_depth: 3,
         magnitude: Magnitude::Extreme,
+        mixed_coalesce: true,
     };
     /// The end-to-end tiers: small literals and depth 2, so a program the
     /// engine accepts also runs.
     pub const END_TO_END: Profile = Profile {
         max_depth: 2,
         magnitude: Magnitude::Small,
+        mixed_coalesce: false,
     };
 }
 
@@ -275,10 +282,17 @@ pub fn typed_literal_samples(keyword: &str, magnitude: Magnitude) -> &'static [&
 /// `REGEXP_COUNT` patterns: the syntax Rust's `regex` crate and Postgres's
 /// default dialect share (literal text, `.`, `*`, `+`, `?`, `[...]`, `|`,
 /// `^`, `$`), which define compiles with the former and Postgres runs.
-pub const REGEX_PATTERNS: &[&str] = &["a", "b+", "[ab]", "^a", "c$", "a|b", "x.z", "a*", "z?", "."];
+pub const REGEX_PATTERNS: &[&str] = &[
+    "a", "o", "e", "b+", "[ab]", "a.c", "colou?r", "cat|dog", "[a-z]+", "^a", "a$", "c$", "a|b",
+    "x.z", "a*", "z?", ".",
+];
 
-/// Strings for text literals and `STRPOS` needles.
-pub const TEXT_LITERALS: &[&str] = &["", "a", "abc", "b", "it's", "x y", "é", "%"];
+/// Strings for text literals and `STRPOS` needles, some of them drawn from
+/// the same alphabet as the end-to-end tables' text columns so a needle
+/// sometimes hits.
+pub const TEXT_LITERALS: &[&str] = &[
+    "", "a", "abc", "b", "o", "e", "wor", "it's", "x y", "é", "%",
+];
 
 /// Every literal a tree can use at `ty`.
 pub fn literals(ty: ValueType, magnitude: Magnitude) -> Vec<Expr> {
@@ -835,7 +849,7 @@ pub mod strategy {
             .collect();
         // `COALESCE` over numeric types of different kinds: Postgres picks
         // the result type, so no rule can name it.
-        if profile.max_depth > 0 {
+        if profile.max_depth > 0 && profile.mixed_coalesce {
             let numeric: Vec<BoxedStrategy<Expr>> = universe()
                 .into_iter()
                 .filter(|ty| ty.is_numeric_family())

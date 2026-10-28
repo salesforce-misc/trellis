@@ -627,8 +627,7 @@ fn trivial_program_sometimes_draws_defs_sharing_a_source_and_sometimes_draws_def
 /// Improvement-plan task B2: the default strategy's new "derived" field
 /// (`generate::DerivedShape`) must sometimes draw `Operator::GreaterThan` —
 /// sampled the same way as every other genuinely-probabilistic floor above
-/// (many samples, not every sample: which `DerivedShape` variant a def draws
-/// is random).
+/// (many samples, not every sample: which expression a def draws is random).
 #[test]
 fn trivial_program_sometimes_draws_greater_than() {
     let mut runner = TestRunner::default();
@@ -647,11 +646,11 @@ fn trivial_program_sometimes_draws_greater_than() {
     );
 }
 
-/// Improvement-plan task B2: each of the five scalar functions
-/// (`STRPOS`/`OCTET_LENGTH`/`CHAR_LENGTH`/`REGEXP_COUNT`/`COALESCE`) must
-/// appear at least once across many samples — the same "each shape reachable
-/// across a bounded number of samples" floor as `GreaterThan` above, applied
-/// to every function `generate::DerivedShape` can draw.
+/// Every scalar function in the registry, and `COALESCE`, must appear at
+/// least once across many samples — the same "each shape reachable across a
+/// bounded number of samples" floor as `GreaterThan` above, applied to every
+/// function `generate::DerivedShape` can draw (which is every one the registry
+/// admits).
 #[test]
 fn trivial_program_draws_every_scalar_function_at_least_once() {
     let mut runner = TestRunner::default();
@@ -664,13 +663,13 @@ fn trivial_program_draws_every_scalar_function_at_least_once() {
             .current();
         coverage.record_program(&program);
     }
-    for function in [
-        "STRPOS",
-        "OCTET_LENGTH",
-        "CHAR_LENGTH",
-        "REGEXP_COUNT",
-        "COALESCE",
-    ] {
+    // Every function the registry admits, so a new entry is held to the same
+    // floor with no change here.
+    for function in trellis::dev::defs::registry::FUNCTIONS
+        .iter()
+        .map(|spec| spec.name)
+        .chain(["COALESCE"])
+    {
         assert!(
             coverage.functions.contains(function),
             "coverage floor failed: expected {function:?} among functions across 500 samples:\n{coverage}"
@@ -679,11 +678,9 @@ fn trivial_program_draws_every_scalar_function_at_least_once() {
 }
 
 /// Improvement-plan task B2: the default strategy must sometimes draw a
-/// nested (depth >= 3) expression tree — e.g. `(c1 + c2) > c1`
-/// (`DerivedShape::ArithmeticGreaterThan`) or `STRPOS(text_col, 'x') > 0`
-/// (`DerivedShape::StrposGreaterThan`) — not just the single-operator/
-/// single-function leaves every other `DerivedShape` variant (and `total`)
-/// draws. `Coverage::max_expr_depth` is the accumulator this asserts
+/// nested (depth >= 3) expression tree — e.g. `(c1 + c2) > c1` or
+/// `STRPOS(text_col, 'x') > 0` — not just the single-operator/single-function
+/// leaves a shallow draw (and `total`) gives. `Coverage::max_expr_depth` is the accumulator this asserts
 /// against; see its doc comment for why it's tracked separately from
 /// `expr_shapes`.
 #[test]

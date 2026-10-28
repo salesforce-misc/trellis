@@ -2764,16 +2764,18 @@ fn reads_no_column<'f>(
         // The planner reduces a `COALESCE` led by a constant to that
         // constant and drops the rest unevaluated, so what follows the first
         // argument does not matter.
-        Expr::FunctionCall { name, args } if name == "COALESCE" => args.first().is_some_and(|arg| {
-            reads_no_column(
-                arg,
-                field_name,
-                source_columns,
-                fields_by_name,
-                memo,
-                depth + 1,
-            )
-        }),
+        Expr::FunctionCall { name, args } if name == "COALESCE" => {
+            args.first().is_some_and(|arg| {
+                reads_no_column(
+                    arg,
+                    field_name,
+                    source_columns,
+                    fields_by_name,
+                    memo,
+                    depth + 1,
+                )
+            })
+        }
         Expr::FunctionCall { name, args } => {
             super::registry::lookup_aggregate_function(name).is_none()
                 && args.iter().all(|arg| {

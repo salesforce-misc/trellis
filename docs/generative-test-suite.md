@@ -162,6 +162,88 @@ Two rules protect the suite from lying to itself:
   as a column and via a derivation; every operator appears over every supported
   argument type. Coverage that silently drops out is otherwise invisible.
 
+### Generated expressions
+
+A derived field is not a fixed shape. `generate::DerivedShape` is a random
+well-typed expression drawn from `generative::expr_gen`, so the end-to-end
+tiers (capture, apply, target equals the source query) run the same
+expressions the conformance properties check against Postgres.
+
+The generator grows trees from rules read off the registry
+(`trellis::dev::defs::registry`), not from a list of its own: for every
+operator, each operand-type pair `operator_result_type` admits; for every
+function, its declared signature. Adding an entry to `OPERATORS` or
+`FUNCTIONS` therefore adds it to every property and tier that draws
+expressions, with no change to the generator. What the registry cannot say is
+written by hand, each with a test that fails when it falls behind:
+
+- `COALESCE`, which is variadic and so outside the registry.
+- The literal pools. Every `TYPED_LITERALS` keyword needs canonical samples in
+  `typed_literal_samples`.
+- A function argument that must be a literal (`LITERAL_ONLY_ARGS`, today
+  `REGEXP_COUNT`'s pattern).
+- The unadmitted constructs a near miss names (`UNADMITTED_OPERATORS`,
+  `UNADMITTED_FUNCTIONS`). A line the registry later admits stops being a near
+  miss on its own.
+- The float against a bare number literal, which define admits although the
+  registry refuses the float/exact mix.
+
+A `Profile` sets the literal magnitude and nesting depth. The conformance
+properties draw boundary literals (`NaN`, `±Infinity`, range edges, numbers
+wider than any type) to depth 3. The end-to-end tiers draw small literals to
+depth 2, so a program the engine accepts also runs: Postgres computes every
+field, and one that raised for some row would quarantine it and keep the
+program from converging.
+
+#### Expression conformance
+
+`tests/expr_conformance.rs` checks the generated expressions against a real
+Postgres, over a throwaway table of random rows (`NULL`, extremes, `NaN`,
+`±Infinity`, infinite dates), with four properties:
+
+1. **Type.** The column define creates has the `format_type` of `CREATE TABLE
+   AS SELECT <the user's text>`.
+2. **Value.** `SELECT <the engine's rendered SQL>` and `SELECT <the user's
+   text>` agree on every row: equal text, or the same SQLSTATE class.
+3. **Round trip.** Parsing the text gives the tree it was written from (in the
+   minimal-parentheses and the fully parenthesized spelling), and
+   `parse(render(parse(text))) == parse(text)`.
+4. **Refusal.** Every near miss is refused at define, and the error names the
+   construct. The near misses are the wrong-typed operand of each operator and
+   function, a chained comparison, a literal-only argument given a column,
+   relative or non-canonical typed literals, and the operators and functions
+   the registry does not admit (including the `STABLE` and `VOLATILE` ones).
+
+Postgres folds constants while it plans, so an expression it rejects for every
+row (`2147483647 + 1`) is refused at define by design. The Value property
+treats "refused at define, and Postgres raises class 22 on a `WHERE false`
+probe" as agreement, and flags both a refusal where Postgres plans the
+expression without error (a false refusal) and an acceptance where Postgres
+raises while planning it (a missed refusal).
+
+Deterministic tests in the same file pin each precedence tier (every pair of
+registry operators, generically) and each refusal by name; they run in the
+normal suite, with a small-case-count run of each property. The randomized
+properties are `#[ignore]`d: `PROPTEST_CASES=2000 cargo test -p generative
+--test expr_conformance -- --ignored`. A property over constants only
+(`property_constant_expressions_conform_to_postgres`) is where the plan-time
+range refusals are reached.
+
+#### Adding an operator or function
+
+1. Add the entry to `OPERATORS` or `FUNCTIONS` with its precedence and types.
+   Every operand-type pair `operator_result_type` admits is drawn from then on.
+2. Run the conformance properties with a large `PROPTEST_CASES`. A failure
+   names the property, the text and the row or type that differs.
+3. If define refuses a combination Postgres accepts on purpose (the float/exact
+   comparison is one), teach the generator the admitted spelling next to
+   `Rule::FloatVsLiteral` and the near-miss list the refused one.
+4. If the operator makes a new constant fold fail at plan time, make define
+   refuse it and let the Value property confirm Postgres raises on the probe.
+5. Teach the end-to-end oracle (`oracle::render_expr`, `field_value_type`) the
+   operator's rendering and typing, and add a literal pool for any new
+   typed-literal keyword.
+
 ## 4. The properties
 
 Each property is a test under `generative/tests/`. The properties are

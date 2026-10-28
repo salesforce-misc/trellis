@@ -27,10 +27,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use trellis::Pool;
-use trellis::dev::defs::IntWidth;
 use trellis::dev::defs::ast::{Expr, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::dev::defs::registry;
 use trellis::dev::defs::typed_literal;
+use trellis::dev::defs::{FloatWidth, IntWidth};
 
 use crate::model::{Program, group_key};
 
@@ -692,6 +692,23 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
         Expr::BinaryOp { op, lhs, rhs } => {
             let lhs_t = field_value_type(lhs, source_columns);
             let rhs_t = field_value_type(rhs, source_columns);
+            // A float against a bare number literal is the one mixed
+            // float/exact comparison define admits: Postgres types the
+            // literal as the float.
+            let literal_beside_float = registry::is_mixed_float_exact(lhs_t, rhs_t)
+                && matches!(
+                    (&**lhs, &**rhs),
+                    (Expr::NumberLiteral(_), _) | (_, Expr::NumberLiteral(_))
+                );
+            if literal_beside_float
+                && registry::operator_result_type(
+                    *op,
+                    ValueType::Float(FloatWidth::Float8),
+                    ValueType::Float(FloatWidth::Float8),
+                ) == Some(ValueType::Boolean)
+            {
+                return ValueType::Boolean;
+            }
             registry::operator_result_type(*op, lhs_t, rhs_t).unwrap_or_else(|| {
                 panic!(
                     "oracle: operator {op:?} has no result type for operands \
@@ -1350,6 +1367,27 @@ mod tests {
             ("c2".to_string(), ValueType::Numeric),
         ]);
         assert_eq!(field_value_type(&expr, &source_columns), ValueType::Boolean);
+    }
+
+    /// A float against a bare number literal is a comparison define admits,
+    /// so the oracle types it `boolean` instead of panicking on the
+    /// float/exact mix it refuses between two columns.
+    #[test]
+    fn a_float_compared_with_a_bare_literal_is_boolean() {
+        let source_columns = HashMap::from([
+            ("f".to_string(), ValueType::Float(FloatWidth::Float4)),
+            ("n".to_string(), ValueType::Numeric),
+        ]);
+        let compare = |lhs: Expr, rhs: Expr| Expr::BinaryOp {
+            op: Operator::GreaterThan,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        };
+        let literal = || Expr::NumberLiteral("0.5".to_string());
+        let col = |name: &str| Expr::Column(name.to_string());
+        for expr in [compare(col("f"), literal()), compare(literal(), col("f"))] {
+            assert_eq!(field_value_type(&expr, &source_columns), ValueType::Boolean);
+        }
     }
 
     /// Every one of the four scalar functions type-checks to its registered
