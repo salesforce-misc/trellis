@@ -38,15 +38,14 @@
 //!   `CAST`. [`super::lexer`] rejects a `:` with a message naming the two
 //!   accepted spellings.
 //! * `CAST(<any non-literal expr> AS <type>)` — a **general** cast, i.e. a
-//!   coercion lattice. That is a much larger design than this issue: every
-//!   (source, target) pair needs its own volatility verdict and its own
+//!   coercion lattice. That is a much larger design than a typed literal:
+//!   every (source, target) pair needs its own volatility verdict and its own
 //!   rendering rule, and most of the interesting pairs are not
-//!   immutable (`timestamptz` → `date` reads the `TimeZone` GUC). It is also
-//!   worth very little today, since [`super::registry`] grants
-//!   [`ValueType::Other`] no operator or function at all — the only operands
-//!   a general cast could have are a column or another literal. Each type
-//!   family decides its own cast pairs; [`super::error::ParseError::UnsupportedCast`]
-//!   says so by name.
+//!   immutable (`timestamptz` → `date` reads the `TimeZone` GUC). Each type
+//!   family decides its own cast pairs. The integers have decided theirs: a
+//!   strictly wider integer, or `numeric`
+//!   ([`super::registry::cast_result_type`]); every other pair is refused by
+//!   name.
 //!
 //! # Why the literal text must be canonical
 //!

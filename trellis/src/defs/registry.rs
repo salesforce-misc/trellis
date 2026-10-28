@@ -137,9 +137,9 @@ pub fn operator_spec(operator: Operator) -> &'static OperatorSpec {
 }
 
 /// The result type of `op` applied to operands of `lhs`/`rhs` type, or
-/// `None` if Postgres has no such operator — the **overload-resolution**
-/// replacement for the old "compare both operands to [`OperatorSpec::arg_types`]
-/// for exact equality" check.
+/// `None` if Postgres has no such operator or the grammar refuses it — the
+/// **overload-resolution** replacement for the old "compare both operands to
+/// [`OperatorSpec::arg_types`] for exact equality" check.
 ///
 /// Exact equality was sufficient while every arithmetic/comparison operand
 /// was the single [`ValueType::Numeric`] bucket. It stops being sufficient
@@ -149,20 +149,21 @@ pub fn operator_spec(operator: Operator) -> &'static OperatorSpec {
 /// `int4_col + numeric_col` is `numeric`. This function encodes exactly that
 /// and nothing more — it is deliberately **not** a general coercion lattice
 /// (`super::typed_literal` rejects building one for the same reason), just
-/// the closed set of combinations the two registered operators admit:
+/// the closed set of combinations the registered operators admit:
 ///
-/// | lhs | rhs | `+` | `>` |
-/// |---|---|---|---|
-/// | `Integer(a)` | `Integer(b)` | `Integer(wider(a,b))` | `Boolean` |
-/// | `Integer(_)` | `Numeric` | `Numeric` | `Boolean` |
-/// | `Numeric` | `Integer(_)` | `Numeric` | `Boolean` |
-/// | `Numeric` | `Numeric` | `Numeric` | `Boolean` |
-/// | `Float(a)` | `Float(b)` | `Float(wider(a,b))` | `Boolean` |
-/// | `Float(_)` | `Integer(_)`/`Numeric` | `Float(Float8)` | `Boolean` |
-/// | `Integer(_)`/`Numeric` | `Float(_)` | `Float(Float8)` | `Boolean` |
+/// | lhs | rhs | `+` `-` `*` | `/` | `%` | `>` |
+/// |---|---|---|---|---|---|
+/// | `Integer(a)` | `Integer(b)` | `Integer(wider(a,b))` | refused | `Integer(wider(a,b))` | `Boolean` |
+/// | `Integer(_)` | `Numeric` | `Numeric` | `Numeric` | `Numeric` | `Boolean` |
+/// | `Numeric` | `Integer(_)` | `Numeric` | `Numeric` | `Numeric` | `Boolean` |
+/// | `Numeric` | `Numeric` | `Numeric` | `Numeric` | `Numeric` | `Boolean` |
+/// | `Float(a)` | `Float(b)` | `Float(wider(a,b))` | `Float(wider(a,b))` | refused | `Boolean` |
+/// | `Float(_)` | `Integer(_)`/`Numeric` | `Float(Float8)` | `Float(Float8)` | refused | refused |
+/// | `Integer(_)`/`Numeric` | `Float(_)` | `Float(Float8)` | `Float(Float8)` | refused | refused |
 ///
 /// Any other combination is `None`: `Text`/`Boolean`/`Uuid`/`Other` have no
-/// `+` or `>` in this grammar, exactly as before.
+/// arithmetic or `>` in this grammar. `Integer / Integer` is refused because
+/// Postgres truncates the quotient, and `%` has no float form in Postgres.
 ///
 /// `Integer + Numeric -> Numeric` mirrors Postgres promoting the integer
 /// operand through its implicit cast and then running `numeric_add`, which
@@ -278,9 +279,11 @@ pub struct FunctionSpec {
 /// each rendered as the Postgres function of the same name (per ADR-0004:
 /// the grammar and renderer function sets are one list).
 ///
-/// All four return Postgres `integer` (`int4`), not `numeric` — checked
-/// against `pg_proc.prorettype` for `strpos`/`octet_length`/`char_length`/
-/// `regexp_count`. Declaring them as [`ValueType`] integers is what
+/// The four text functions return Postgres `integer` (`int4`), not `numeric` —
+/// checked against `pg_proc.prorettype` for `strpos`/`octet_length`/
+/// `char_length`/`regexp_count`. The numeric functions (`ABS`, `CEIL`,
+/// `FLOOR`, `ROUND`, `TRUNC`) are typed by their argument, so a name has one
+/// entry per signature ([`function_overloads`], [`resolve_function`]). Declaring them as [`ValueType`] integers is what
 /// makes `char_length(t) + 1` type — and overflow — the way Postgres does,
 /// and what declares the derived column `integer` rather than `numeric`.
 pub const FUNCTIONS: &[FunctionSpec] = &[

@@ -221,10 +221,11 @@ results, by the type's `=`
 Postgres, not IEEE 754, is the oracle: `NaN = NaN` is true, `NaN` sorts above
 `Infinity`, and `-0 = 0`. Operators follow Postgres's families: `real + real`
 is `real`, a float mixed with anything else is `double precision`, a finite
-overflow raises `22003`, `sum(real)` is `real`, `avg(real)` is
+overflow raises `22003` (as does a `*` or `/` that underflows to zero from
+nonzero operands), `sum(real)` is `real`, `avg(real)` is
 `double precision`. `COALESCE` resolves a `real`/`numeric` pair to `real`,
-unlike the operators, and is modelled separately. `+` admits a float mixed
-with an exact numeric. `>` admits a float against a bare number literal
+unlike the operators, and is modelled separately. `+`, `-`, `*` and `/` admit
+a float mixed with an exact numeric. `>` admits a float against a bare number literal
 (`f > 0.5`, `f > 1`) and refuses a float against any other exact numeric
 ([Supported sources and targets](transforms.md#supported-sources-and-targets)).
 As in Postgres, the literal is cast to `double precision` and a `real` operand
@@ -238,6 +239,39 @@ float addition is not associative, and `NaN`/`Infinity` are absorbing, so
 there is no exact inverse. `extra_float_digits >= 1` is pinned for the
 shortest-round-trip rendering `trellis::float::render` reproduces. Checked in
 `trellis/tests/defs_floats.rs`.
+
+## Arithmetic
+
+Operators follow Postgres's families, and a result type is the one
+`CREATE TABLE AS` gives the expression (the conformance harness checks every
+operator against a live server,
+[the generative suite](generative-test-suite.md#expression-conformance)).
+
+| Expression | Operands | Result |
+|---|---|---|
+| `a + b`, `a - b`, `a * b` | two integers | the wider integer (`smallint * smallint` is `smallint`) |
+| | an integer and `numeric`, or two `numeric` | `numeric` |
+| | two floats | the wider float (`real * real` is `real`) |
+| | a float and anything else | `double precision` |
+| `a / b` | at least one `numeric` or float | `numeric`, or the float rule |
+| `a % b` | exact types only | two integers the wider integer, else `numeric`; the sign follows the dividend |
+| `-a`, `ABS(a)` | any integer, `numeric` or float | the operand's type |
+| `CEIL(a)`, `FLOOR(a)`, `TRUNC(a)` | `numeric`, `double precision` | the operand's type |
+| `ROUND(a)`, `ROUND(a, n)`, `TRUNC(a, n)` | `numeric`; `n` an integer literal | `numeric`; rounds half away from zero, `TRUNC` toward zero |
+| `CAST(a AS integer)`, `AS bigint` | a strictly narrower integer | the named integer |
+| `CAST(a AS numeric)` | any integer | `numeric` |
+
+Prefix `-` binds tighter than every binary operator, and `*`, `/` and `%`
+bind tighter than `+` and `-`. A minus before a number literal is one negative
+literal typed by its value (`-2147483648` is an `integer`, as in Postgres,
+not a negated `bigint`). An integer overflow, a division by zero and a float
+overflow raise `22003` or `22012` for the row, as an overflowing `+` does. Where
+Postgres would truncate, round differently by type or cast behind the user's
+back (`integer / integer`, an integer or float argument to `ROUND`, `%` on a
+float), define refuses the expression with a remedy
+([transforms](transforms.md#supported-sources-and-targets)).
+Checked in `trellis/tests/arithmetic_key_spaces.rs` and
+`trellis/tests/one_to_one_render.rs`.
 
 ## Temporal types
 
@@ -388,7 +422,8 @@ date)`. The accepted keywords are `DATE`, `TIMESTAMP`, `TIME`, `TIMETZ`,
 `MACADDR8`, `VARBIT` and `JSONB` (`defs::typed_literal::TYPED_LITERALS`). The
 literal's text must be in the type's canonical Postgres output spelling, which
 also makes the literal's spelling agree with Postgres's rendering byte for byte. A
-general `CAST(<expr> AS <type>)` over a non-literal is refused by name. See
+`CAST(<expr> AS <type>)` over a non-literal admits only the lossless integer
+widenings ([Arithmetic](#arithmetic)); every other one is refused by name. See
 [ADR-0004](decisions/0004-transform-definition-grammar.md#typed-literals-spell-constants-in-canonical-postgres-form).
 
 ## Immutability

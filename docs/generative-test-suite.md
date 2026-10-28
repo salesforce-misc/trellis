@@ -212,12 +212,19 @@ Postgres, over a throwaway table of random rows (`NULL`, extremes, `NaN`,
    `parse(render(parse(text))) == parse(text)`.
 4. **Refusal.** Every near miss is refused at define, and the error names the
    construct. The near misses are the wrong-typed operand of each operator and
-   function, a chained comparison, a literal-only argument given a column,
-   relative or non-canonical typed literals, and the operators and functions
-   the registry does not admit (including the `STABLE` and `VOLATILE` ones).
+   function (a call no overload of the name accepts), prefix `-` over a
+   non-numeric operand, a `CAST` the registry does not admit and a target it has
+   no spelling for, a constant zero divisor, a chained comparison, a
+   literal-only or integer-literal-only argument given a column, relative or
+   non-canonical typed literals, and the operators and functions the registry
+   does not admit (including the `STABLE` and `VOLATILE` ones).
 
 Postgres folds constants while it plans, so an expression it rejects for every
-row (`2147483647 + 1`) is refused at define by design. The Value property
+row (`2147483647 + 1`, `1.5 / 0`) is refused at define by design. A constant
+zero divisor is refused whatever the dividend, so for a column dividend (which
+Postgres plans without error) the checker accepts the refusal when no row of
+the table computes a value, or when a `COALESCE` may keep the division from
+running. The Value property
 treats "refused at define, and Postgres raises class 22 on a `WHERE false`
 probe" as agreement, and flags both a refusal where Postgres plans the
 expression without error (a false refusal) and an acceptance where Postgres
@@ -228,8 +235,8 @@ named place in `generative::expr_conformance`, reported as a known gap, and
 pinned by a test that fails the day define refuses it, which is when the
 tolerance goes. The tolerance covers the gap and nothing beside it: the
 checker rewrites the gap away (a pattern Postgres rejects becomes `'a'`, a
-function call over constants becomes the literal Postgres computes for it)
-and the rewritten expression must pass every property.
+function call over constants, innermost first, becomes the literal Postgres
+computes for it) and the rewritten expression must pass every property.
 
 Deterministic tests in the same file pin each precedence tier (every pair of
 registry operators, generically) and each refusal by name, and check every
@@ -246,8 +253,12 @@ range refusals are reached.
 
 #### Adding an operator or function
 
-1. Add the entry to `OPERATORS` or `FUNCTIONS` with its precedence and types.
-   Every operand-type pair `operator_result_type` admits is drawn from then on.
+1. Add the entry to `OPERATORS` or `FUNCTIONS` with its precedence and types
+   (a function with several signatures is several entries of one name; an
+   argument that must be an integer literal is listed in
+   `INTEGER_LITERAL_ARGS`). Every operand-type pair `operator_result_type`
+   admits is drawn from then on, as are prefix `-` (`negate_result_type`) and
+   each `CAST` (`cast_result_type`, `CAST_TARGETS`).
 2. Run the conformance properties with a large `PROPTEST_CASES`. A failure
    names the property, the text and the row or type that differs.
 3. If define refuses a combination Postgres accepts on purpose (the float/exact

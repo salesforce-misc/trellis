@@ -69,8 +69,11 @@ SELECT <expr> AS <field> [, <expr> AS <field> ...]
 ```
 
 `<expr>` is a column reference, a numeric or single-quoted string literal,
-`<expr> + <expr>`, `<expr> > <expr>`, or a function call (`strpos`,
-`octet_length`, `char_length`, `regexp_count`; general `func(args)` syntax). Values
+`<expr> + <expr>`, `<expr> - <expr>`, `<expr> * <expr>`, `<expr> / <expr>`,
+`<expr> % <expr>`, `-<expr>`, `<expr> > <expr>`, `CAST(<expr> AS <integer or
+numeric type>)`, or a function call (`strpos`, `octet_length`, `char_length`,
+`regexp_count`, `abs`, `ceil`, `floor`, `round`, `trunc`; general `func(args)`
+syntax). Values
 carry a Postgres type (the ones [type support](../type-support.md) lists), and
 every operator/function's argument and return types are type-checked at
 definition time. `<predicate>` accepts only the
@@ -102,7 +105,9 @@ Deliberately out:
   Every (source, target) pair needs its own volatility verdict and rendering
   rule, and most interesting pairs aren't immutable (`timestamptz` → `date`
   reads `TimeZone`). Each type family decides its own pairs when it is
-  admitted; rejected here by name.
+  admitted. Admitted today: an integer to a strictly wider integer (`integer`,
+  `bigint`) and any integer to `numeric`, the casts that are lossless and
+  cannot fail, with no modifier; every other pair is rejected by name.
 
 The literal's text must be in that family's **canonical Postgres output
 spelling** — `DATE '2024-1-5'` is refused even though Postgres parses it. This
@@ -205,7 +210,7 @@ tier there.
   outside the list is refused until then.
 * The accepted language is narrower than Postgres's in places a SQL user will
   notice: a typed literal must use its type's canonical spelling, `::` casts and
-  general `CAST` are refused, and `COALESCE` refuses mixed non-numeric argument
+  a `CAST` other than the integer widenings are refused, and `COALESCE` refuses mixed non-numeric argument
   types and has no `NULL` literal.
 * Precedence lives in our own operator table, so each new operator has to
   declare its tier there correctly.

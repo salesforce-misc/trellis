@@ -20,9 +20,9 @@
 //! `FROM <source>` is where the key-space clause slots in: absent for 1-1,
 //! `GROUP BY <cols>` for an aggregate, `[LEFT|INNER] JOIN <other> ON <cond>
 //! GROUP BY <cols>` for a join aggregate (ADR-0019). `<expr>` supports column references,
-//! numeric and string literals, `+`, `>`, parenthesized
-//! grouping (`(<expr>)` — needed once a caller composes `+` and
-//! `>` and must override the precedence table's own grouping), `name(args)`
+//! numeric and string literals, `+`, `-`, `*`, `/`, `%`, `>`, prefix `-`,
+//! parenthesized grouping (`(<expr>)`, to override the precedence table's own
+//! grouping), `CAST(<expr> AS <integer or numeric type>)`, `name(args)`
 //! function calls against [`super::registry::FUNCTIONS`], and
 //! qualified columns, `<table>.<column>` or `<schema>.<table>.<column>`
 //! (see [`Parser::parse_dotted_reference`]). **Typed literals** are spelled
