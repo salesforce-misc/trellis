@@ -184,6 +184,10 @@ per value. So:
   they read, directly or through `COALESCE` or another field, because Postgres refuses them under a nondeterministic one while
   Trellis would compute them from the exact text. `CHAR_LENGTH` and
   `OCTET_LENGTH` accept any column.
+- **Text comparisons need a deterministic collation** on the column they
+  read (`=`, `<>`, `!=`, `IS [NOT] DISTINCT FROM`, `NULLIF`), directly or
+  through `COALESCE`, a `CASE` result or another field: such a collation's `=`
+  calls two different texts equal. `IS [NOT] NULL` accepts any column.
 - **`char(n)`** is treated as `text` but is not on the key allowlist: its
   blank-padding is a hazard, not a volatility one.
 

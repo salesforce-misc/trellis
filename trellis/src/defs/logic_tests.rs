@@ -569,6 +569,8 @@ fn constant_failures_inside_a_branch_are_refused_wherever_postgres_folds_them() 
     for (text, ty) in [
         ("CASE WHEN 1 = 1 THEN 1 ELSE n / 0 END", N),
         ("CASE WHEN 1 = 0 THEN n / 0 ELSE 2 END", N),
+        // A condition that folds to `NULL` selects nothing, like a false one.
+        ("CASE WHEN NULLIF(1, 1) = 1 THEN n / 0 ELSE 2 END", N),
         ("CASE WHEN 1 = 1 THEN 1 WHEN i4 > 0 THEN n / 0 END", N),
         ("CASE WHEN 1 < 2 THEN n / 0 + 1 END", N),
     ] {

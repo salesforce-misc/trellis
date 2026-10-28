@@ -682,6 +682,7 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
     let dropped = [
         "CASE WHEN 1 = 1 THEN 1 ELSE 1.5 / 0 END",
         "CASE WHEN 1 = 2 THEN 1.5 / 0 ELSE 2 END",
+        "CASE WHEN NULLIF(1, 1) = 1 THEN 1.5 / 0 ELSE 2 END",
         "CASE WHEN 1 = 1 THEN 1 WHEN ba THEN 1.5 / 0 END",
         "CASE WHEN 1 < 2 THEN 1 WHEN 1.5 / 0 > 0 THEN 3 END",
         "CASE WHEN ba THEN 1 WHEN 1 = 1 THEN 2 ELSE 1.5 / 0 END",
