@@ -259,13 +259,23 @@ async fn the_accept_and_refuse_matrix() {
     };
 
     // `b`'s ON columns are not unique: a plain column, one column of a
-    // composite unique key, and a partial or expression unique index.
+    // composite unique key (also under an invalid unique index), and a
+    // partial or expression unique index.
     batch(
         &db.pool,
         "create unique index customers_partial on customers (tier) where tier = 'gold';
          create unique index customers_expr on customers (lower(name));",
     )
     .await;
+    // An invalid unique index (a concurrent build that failed on the
+    // duplicates of `a`) guarantees nothing either.
+    db.pool
+        .get()
+        .await
+        .expect("get connection")
+        .batch_execute("create unique index concurrently customers_a_invalid on customers (a)")
+        .await
+        .expect_err("customers.a holds duplicates");
     for text in [
         on("orders.region = customers.tier"),
         on("orders.cust = customers.a"),
@@ -828,6 +838,25 @@ async fn a_one_to_one_join_pauses_resumes_revalidates_and_drops_with_its_hidden_
         .await
         .expect("pause");
 
+    // The target is keyed by `a`'s key as define found it: a redefined key
+    // refuses the resume, as for a plain 1-1 target.
+    raw.batch_execute(
+        "alter table public.orders drop constraint orders_pkey, add primary key (id, region)",
+    )
+    .await
+    .expect("redefine a's key");
+    let err = trellis
+        .apply("RESUME TRANSFORM order_view")
+        .await
+        .expect_err("the resume checks a's key");
+    assert!(err.to_string().contains("orders"), "{err}");
+    assert!(err.to_string().contains("region"), "{err}");
+    raw.batch_execute(
+        "alter table public.orders drop constraint orders_pkey, add primary key (id)",
+    )
+    .await
+    .expect("restore a's key");
+
     // DROP takes the target, the hidden tables, the floors of `R` and `M`,
     // the row and its edges.
     raw.batch_execute(&format!(
@@ -862,5 +891,133 @@ async fn a_one_to_one_join_pauses_resumes_revalidates_and_drops_with_its_hidden_
     assert_eq!(
         count(&raw, "select count(*) from transform_definitions").await,
         0
+    );
+}
+
+/// Seals the ring and drains every claimable segment by hand, until nothing
+/// is pending.
+async fn drain(raw: &mut Client, pool: &trellis::Pool) {
+    const WAKE: &str = "one_to_one_join_wake";
+    for _ in 0..16 {
+        trellis::staging::seal_if_active_nonempty(raw, WAKE)
+            .await
+            .expect("seal");
+        while let Some(seg) = trellis::staging::apply::next_claimable_segment(raw)
+            .await
+            .expect("next claimable segment")
+        {
+            trellis::staging::apply::drain_once(pool, seg, "drainer", 1, WAKE)
+                .await
+                .expect("drain_once");
+        }
+        trellis::staging::retire_drained_segments(raw)
+            .await
+            .expect("retire drained segments");
+        if !trellis::staging::has_pending(raw)
+            .await
+            .expect("has_pending")
+        {
+            return;
+        }
+    }
+    panic!("the ring did not quiesce within 16 seal/drain rounds");
+}
+
+/// A change to either side that reaches the drain halts the 1-1 JOIN with
+/// the reason, rather than applying it as a plain 1-1 change of `a` (a target
+/// row computed from `a` alone), and a `TRUNCATE` of either side halts it
+/// rather than clearing nothing. The build start pauses a 1-1 JOIN before any
+/// page applies to it, so the definition is marked live by hand here, as a
+/// later milestone's build would leave it.
+#[tokio::test]
+async fn a_change_reaching_the_drain_halts_a_one_to_one_join_rather_than_apply_it() {
+    let _knob = with_knob(true).await;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(TABLES).await.expect("seed");
+    let trellis = define_only(db.dsn()).await;
+    trellis.apply(LEFT_JOIN).await.expect("define the 1-1 JOIN");
+    make_live(&raw, "order_view").await;
+
+    // The pass installs both captures; a live definition starts no build.
+    pass(&mut raw, &db.pool).await;
+    for (change, reason) in [
+        (
+            "insert into public.orders values (4, 'emea', 3.00, 1, 'w')",
+            "a change of a 1-1 JOIN side",
+        ),
+        (
+            "update public.customers set name = 'bea' where id = 2",
+            "a change of a 1-1 JOIN side",
+        ),
+        ("truncate public.customers", "a TRUNCATE of a 1-1 JOIN side"),
+    ] {
+        raw.batch_execute(change).await.expect("change a side");
+        drain(&mut raw, &db.pool).await;
+        let reported = trellis
+            .status("order_view")
+            .await
+            .expect("status")
+            .expect("defined");
+        assert_eq!(reported.status, TransformStatus::Paused, "{change}");
+        let failure = reported.capture_failure.expect("a reason for the pause");
+        assert!(failure.error.contains(reason), "{change}: {failure:?}");
+        assert_eq!(
+            count(&raw, "select count(*) from public.order_view").await,
+            0,
+            "nothing was written to the target"
+        );
+        make_live(&raw, "order_view").await;
+        raw.execute("delete from capture_failures", &[])
+            .await
+            .expect("clear the pause record");
+    }
+}
+
+/// No transform reads a 1-1 JOIN target, however it came to: a reader whose
+/// source was dropped while it was paused, and whose source's name a 1-1
+/// JOIN's target then took, is refused at `RESUME` as at define.
+#[tokio::test]
+async fn a_resume_refuses_a_reader_whose_source_became_a_one_to_one_join_target() {
+    let _knob = with_knob(true).await;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(TABLES).await.expect("seed");
+    raw.batch_execute("create table public.shadow (id integer primary key, who text)")
+        .await
+        .expect("the reader's source");
+    let trellis = define_only(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM shadow_copy FROM shadow SELECT who AS who")
+        .await
+        .expect("define the reader");
+    trellis
+        .apply("PAUSE TRANSFORM shadow_copy")
+        .await
+        .expect("pause the reader");
+    raw.batch_execute("drop table public.shadow")
+        .await
+        .expect("drop the reader's source");
+    trellis
+        .apply(
+            "TRANSFORM shadow FROM orders LEFT JOIN customers ON orders.cust = customers.id \
+             SELECT customers.name AS who",
+        )
+        .await
+        .expect("a 1-1 JOIN whose target takes the dropped source's name");
+    // Live, as a later milestone's build would leave it; a resume otherwise
+    // waits for its upstream to go live, and revalidates then.
+    make_live(&raw, "shadow").await;
+
+    let err = trellis
+        .apply("RESUME TRANSFORM shadow_copy")
+        .await
+        .expect_err("the resumed reader would read a 1-1 JOIN target");
+    assert!(err.to_string().contains("1-1 JOIN"), "{err}");
+    assert_eq!(
+        status(&trellis, "shadow_copy").await,
+        Some(TransformStatus::Paused)
     );
 }

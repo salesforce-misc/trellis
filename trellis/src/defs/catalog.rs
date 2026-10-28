@@ -4453,7 +4453,13 @@ pub(crate) async fn revalidate(
 ) -> Result<Revalidated, CatalogError> {
     let source = definition.source_table.as_str();
     reject_target_in_catalog_schema(txn, schema, &definition.target_table).await?;
-    if let Some(joined) = join_table_of(txn, definition.id).await? {
+    let joined = join_table_of(txn, definition.id).await?;
+    // No transform reads a 1-1 JOIN's target (ADR-0021), even one whose
+    // table took the name of a source dropped while this one was paused.
+    let mut read = vec![source];
+    read.extend(joined.as_deref());
+    super::join_one_to_one::reject_reader_of_target(txn, &read).await?;
+    if let Some(joined) = joined {
         return revalidate_join(txn, schema, definition, joined).await;
     }
     let source_columns = live_source_columns(txn, source).await?;
