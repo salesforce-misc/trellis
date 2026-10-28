@@ -726,7 +726,9 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
                 )
             })
         }
-        Expr::FunctionCall { name, args } if name == "COALESCE" => {
+        // `NULLIF` is typed by its first argument (the generator never draws the
+        // pairs Postgres casts it for).
+        Expr::FunctionCall { name, args } if name == "COALESCE" || name == "NULLIF" => {
             field_value_type(&args[0], source_columns)
         }
         // Likewise for the aggregates — `sum(int4)` is `bigint`,

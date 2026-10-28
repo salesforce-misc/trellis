@@ -664,7 +664,9 @@ fn trivial_program_draws_every_scalar_function_at_least_once() {
     let mut runner = TestRunner::default();
     let strategy = trivial_program();
     let mut coverage = generative::run::Coverage::new();
-    for _ in 0..500 {
+    // Many registry entries share the draw (every comparison family, `CASE`,
+    // `NULLIF`), so a function is rare enough to need the larger sample.
+    for _ in 0..4000 {
         let program = strategy
             .new_tree(&mut runner)
             .expect("strategy must produce a value")
@@ -680,7 +682,7 @@ fn trivial_program_draws_every_scalar_function_at_least_once() {
     {
         assert!(
             coverage.functions.contains(function),
-            "coverage floor failed: expected {function:?} among functions across 500 samples:\n{coverage}"
+            "coverage floor failed: expected {function:?} among functions across 4000 samples:\n{coverage}"
         );
     }
 }
