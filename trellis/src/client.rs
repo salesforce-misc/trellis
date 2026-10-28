@@ -1264,17 +1264,21 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
 
     let seal_config = SealConfig::default();
     // The capture pass rate-limits its logs in memory under the instance's
-    // database and schema; the loop forgets them when it stops.
-    let database: Option<String> = match &session {
-        Some(session) => session
+    // database and schema; the loop forgets them when it stops. Read from the
+    // first session this loop leads on (a standby has none yet).
+    async fn database_of(session: &ProducerSession) -> Option<String> {
+        session
             .client()
             .query_one("select pg_catalog.current_database()::text", &[])
             .await
             .ok()
-            .map(|row| row.get(0)),
+            .map(|row| row.get(0))
+    }
+    let mut database: Option<String> = match &session {
+        Some(session) => database_of(session).await,
         None => None,
     };
-    let stop = async |session: Option<ProducerSession>| {
+    let stop = async |database: Option<String>, session: Option<ProducerSession>| {
         if let Some(database) = &database {
             capture::reconcile::forget_instance(database, &schema);
         }
@@ -1303,7 +1307,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
 
     loop {
         if *shutdown_rx.borrow() {
-            stop(session).await;
+            stop(database, session).await;
             return;
         }
 
@@ -1312,6 +1316,9 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 Ok(taken) => {
                     let _ = failures.check("connect", Ok::<_, StagingError>(()));
                     crate::instance_log::info!("took the staging-worker lock; leading");
+                    if database.is_none() {
+                        database = database_of(&taken).await;
+                    }
                     session = Some(taken);
                     // A new leader's first pass is a capture pass, at once.
                     next_reconcile = Instant::now();
@@ -1472,7 +1479,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         };
         tokio::select! {
             _ = shutdown_rx.changed() => {
-                stop(session).await;
+                stop(database, session).await;
                 return;
             }
             _ = tokio::time::sleep(wait) => {}
