@@ -462,7 +462,8 @@ impl Fixture {
 
         match validate(&def, &self.source_columns) {
             Err(err @ ValidationError::ConstantDivisorZero { .. }) => {
-                self.check_zero_divisor_refusal(text, &err, probe).await
+                self.check_zero_divisor_refusal(text, &expr, &err, probe)
+                    .await
             }
             Err(err) if is_range_refusal(&err) => match probe {
                 Some(code) if class_of(&code) == "22" => {
@@ -516,6 +517,7 @@ impl Fixture {
     async fn check_zero_divisor_refusal(
         &self,
         text: &str,
+        expr: &Expr,
         err: &ValidationError,
         probe: Option<String>,
     ) -> Result<Agreement, Divergence> {
@@ -552,6 +554,10 @@ impl Fixture {
             {
                 Ok(Agreement::RefusedAndRaises(err.to_string()))
             }
+            // Postgres evaluates a `COALESCE` argument only for the rows the
+            // earlier ones leave `NULL`, so the division may never run.
+            // Define refuses it all the same: a zero divisor is never useful.
+            Ok(_) if has_coalesce(expr) => Ok(Agreement::RefusedAndRaises(err.to_string())),
             Ok(_) => Err(diverge(format!(
                 "refused ({err}) but Postgres computes a value for some row"
             ))),
@@ -715,6 +721,7 @@ impl Fixture {
         let mut rewritten = expr.clone();
         self.replace_rejected_patterns(&mut rewritten).await;
         self.fold_constant_calls(&mut rewritten).await;
+        normalize_negations(&mut rewritten);
         if rewritten == *expr {
             return Err(Divergence {
                 property: Property::MissedRefusal,
@@ -766,53 +773,73 @@ impl Fixture {
     }
 
     /// Replaces each function call (not `COALESCE`) that reads no column with
-    /// the literal Postgres computes for it.
+    /// the literal Postgres computes for it, innermost first. A call Postgres
+    /// cannot compute (its constant arguments raise) is left as it is: the
+    /// rest of the expression then has to explain the failure on its own, as
+    /// a refusal.
     async fn fold_constant_calls(&self, expr: &mut Expr) {
-        let mut stack = vec![expr];
-        while let Some(e) = stack.pop() {
-            if let Expr::FunctionCall { name, .. } = &*e
-                && name != "COALESCE"
-                && !reads_column(e)
-            {
-                let rendered = render_expr_sql(e);
-                let sql = format!("select ({rendered})::text, pg_typeof({rendered})::text");
-                let row = self
-                    .client
-                    .query_one(&sql, &[])
-                    .await
-                    .unwrap_or_else(|err| panic!("`{sql}` fails: {err}"));
-                let value: Option<String> = row.get(0);
-                let pg_type: String = row.get(1);
-                *e = match (pg_type.as_str(), value) {
-                    ("smallint" | "integer" | "bigint" | "numeric", Some(v)) => {
-                        Expr::NumberLiteral(v)
-                    }
-                    ("text", Some(v)) => Expr::StringLiteral(v),
-                    ("real", Some(v)) => Expr::TypedLiteral {
-                        value_type: ValueType::Float(FloatWidth::Float4),
-                        text: v,
-                    },
-                    ("double precision", Some(v)) => Expr::TypedLiteral {
-                        value_type: ValueType::Float(FloatWidth::Float8),
-                        text: v,
-                    },
-                    (ty, v) => panic!(
-                        "`{sql}` of type {ty} gives {v:?}: teach fold_constant_calls to \
-                         spell it as a literal"
-                    ),
-                };
-                continue;
+        match expr {
+            Expr::BinaryOp { lhs, rhs, .. } => {
+                Box::pin(self.fold_constant_calls(lhs)).await;
+                Box::pin(self.fold_constant_calls(rhs)).await;
             }
-            match e {
-                Expr::BinaryOp { lhs, rhs, .. } => {
-                    stack.push(lhs);
-                    stack.push(rhs);
+            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
+                Box::pin(self.fold_constant_calls(operand)).await;
+            }
+            Expr::FunctionCall { args, .. } => {
+                for arg in args.iter_mut() {
+                    Box::pin(self.fold_constant_calls(arg)).await;
                 }
-                Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => stack.push(operand),
-                Expr::FunctionCall { args, .. } => stack.extend(args.iter_mut()),
-                _ => {}
             }
+            _ => {}
         }
+        let Expr::FunctionCall { name, .. } = &*expr else {
+            return;
+        };
+        if name == "COALESCE" || reads_column(expr) {
+            return;
+        }
+        let rendered = render_expr_sql(expr);
+        let sql = format!("select ({rendered})::text, pg_typeof({rendered})::text");
+        let Ok(row) = self.client.query_one(&sql, &[]).await else {
+            return;
+        };
+        let value: Option<String> = row.get(0);
+        let pg_type: String = row.get(1);
+        *expr = match (pg_type.as_str(), value) {
+            ("smallint" | "integer", Some(v)) => Expr::NumberLiteral(v),
+            // A bare literal is typed by its value, so a `numeric` or
+            // `bigint` result that reads as a smaller type is cast to its
+            // own.
+            ("bigint" | "numeric", Some(v)) => {
+                let target = if pg_type == "bigint" {
+                    ValueType::Integer(IntWidth::Int8)
+                } else {
+                    ValueType::Numeric
+                };
+                if crate::expr_gen::number_literal_type(&v) == target {
+                    Expr::NumberLiteral(v)
+                } else {
+                    Expr::Cast {
+                        expr: Box::new(Expr::NumberLiteral(v)),
+                        target,
+                    }
+                }
+            }
+            ("text", Some(v)) => Expr::StringLiteral(v),
+            ("real", Some(v)) => Expr::TypedLiteral {
+                value_type: ValueType::Float(FloatWidth::Float4),
+                text: v,
+            },
+            ("double precision", Some(v)) => Expr::TypedLiteral {
+                value_type: ValueType::Float(FloatWidth::Float8),
+                text: v,
+            },
+            (ty, v) => panic!(
+                "`{sql}` of type {ty} gives {v:?}: teach fold_constant_calls to spell it as a \
+                 literal"
+            ),
+        };
     }
 
     /// The Refusal property: `miss` is refused at define and the error
@@ -839,6 +866,39 @@ impl Fixture {
                 miss.needles
             )))
         }
+    }
+}
+
+fn has_coalesce(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryOp { lhs, rhs, .. } => has_coalesce(lhs) || has_coalesce(rhs),
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => has_coalesce(operand),
+        Expr::FunctionCall { name, args } => name == "COALESCE" || args.iter().any(has_coalesce),
+        _ => false,
+    }
+}
+
+/// A prefix minus over a number literal is one negative literal, as the parser
+/// reads it: rewrite the tree to the form its text parses back to.
+fn normalize_negations(expr: &mut Expr) {
+    match expr {
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            normalize_negations(lhs);
+            normalize_negations(rhs);
+        }
+        Expr::FunctionCall { args, .. } => args.iter_mut().for_each(normalize_negations),
+        Expr::Cast { expr: operand, .. } => normalize_negations(operand),
+        Expr::Negate(operand) => {
+            normalize_negations(operand);
+            if let Expr::NumberLiteral(text) = &**operand {
+                let flipped = match text.strip_prefix('-') {
+                    Some(positive) => positive.to_string(),
+                    None => format!("-{text}"),
+                };
+                *expr = Expr::NumberLiteral(flipped);
+            }
+        }
+        _ => {}
     }
 }
 

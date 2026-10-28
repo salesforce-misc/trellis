@@ -1005,20 +1005,23 @@ pub mod strategy {
                 Rule::Negate { ty } => {
                     // A minus applied to a number literal is the negative
                     // literal (as Postgres reads it), so a literal operand
-                    // becomes that literal. It can be one type narrower than
-                    // the operand's (`-2147483648` is an `integer`); define
-                    // types the tree, so the draw stays well typed.
+                    // becomes that literal. Postgres types a literal by its
+                    // value, so a draw whose sign flip changes the type
+                    // (`2147483648` is a `bigint`, `-2147483648` an
+                    // `integer`) is dropped: the rule promised `ty`.
                     let operand = self.expr(*ty, depth)?;
                     Some(
                         operand
-                            .prop_map(|e| match e {
+                            .prop_filter_map("a sign flip that keeps the type", |e| match e {
                                 Expr::NumberLiteral(text) => {
-                                    Expr::NumberLiteral(match text.strip_prefix('-') {
+                                    let flipped = match text.strip_prefix('-') {
                                         Some(positive) => positive.to_string(),
                                         None => format!("-{text}"),
-                                    })
+                                    };
+                                    (number_literal_type(&flipped) == number_literal_type(&text))
+                                        .then_some(Expr::NumberLiteral(flipped))
                                 }
-                                e => Expr::Negate(Box::new(e)),
+                                e => Some(Expr::Negate(Box::new(e))),
                             })
                             .boxed(),
                     )

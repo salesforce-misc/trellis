@@ -3020,20 +3020,16 @@ impl ConstOp {
         a: &crate::numeric::Numeric,
         b: Option<&crate::numeric::Numeric>,
     ) -> Option<crate::numeric::Numeric> {
-        use crate::numeric::Numeric;
         Some(match (self, b) {
             (ConstOp::Add, Some(b)) => a.add(b),
             (ConstOp::Subtract, Some(b)) => a.sub(b),
             (ConstOp::Multiply, Some(b)) => a.mul(b),
             (ConstOp::Negate, None) => a.negate(),
             (ConstOp::Abs, None) => a.abs(),
-            // The remainder of two integers: Postgres's `%` takes the
-            // dividend's sign, as `i128`'s does. A quotient or a fractional
-            // remainder needs `numeric`'s division, which no refusal needs.
-            (ConstOp::Modulo, Some(b)) => {
-                let (a, b) = (a.to_i128()?, b.to_i128()?);
-                Numeric::from_i128(a.checked_rem(b)?)
-            }
+            // Postgres's `%` takes the dividend's sign. The quotient is
+            // computed to forty significant digits (see `Numeric::div`).
+            (ConstOp::Modulo, Some(b)) => a.rem(b)?,
+            (ConstOp::Divide, Some(b)) => a.div(b)?,
             _ => return None,
         })
     }
@@ -3082,7 +3078,12 @@ fn check_constant_op<'f>(
     let mut fold =
         |e: &Expr| fold_constant(e, field_name, source_columns, fields_by_name, &mut memo, 0);
     let folded: Vec<Option<Constant>> = operands.iter().map(|e| fold(e)).collect();
+    // A `NaN` dividend divides by zero to `NaN` without an error
+    // (`float8div` checks the dividend first), so only that constant is
+    // spared.
+    let nan_dividend = matches!(folded.first(), Some(Some(Constant::Float(v, _))) if v.is_nan());
     if matches!(op, ConstOp::Divide | ConstOp::Modulo)
+        && !nan_dividend
         && folded
             .get(1)
             .is_some_and(|c| c.as_ref().is_some_and(Constant::is_zero))

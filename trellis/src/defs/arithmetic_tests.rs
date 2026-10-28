@@ -391,6 +391,9 @@ fn a_constant_zero_divisor_is_refused_however_it_is_spelled() {
         "n / n",
         "n / (1 + 1)",
         "i4 % (i4 - i4)",
+        // Postgres divides a NaN by zero to NaN.
+        "DOUBLE PRECISION 'NaN' / 0",
+        "(REAL 'NaN' + REAL '0') / -(REAL '0')",
     ] {
         assert!(type_of(text).is_ok(), "`{text}`: {:?}", type_of(text));
     }

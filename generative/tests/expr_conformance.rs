@@ -306,6 +306,9 @@ fn hard_cases_agree_with_postgres() {
         "COALESCE(5, 2147483647 + 1)",
         "COALESCE(i4a, 5, 2147483647 + 1)",
         "REAL '1.5' + f4a",
+        // A NaN divided by zero is NaN, not an error.
+        "DOUBLE PRECISION 'NaN' / 0",
+        "(REAL 'NaN' + REAL '0') / -(REAL '0') > 0",
         "DOUBLE PRECISION 'NaN' > f8a",
         "CAST('Infinity' AS REAL) + 1",
         "DATE '2024-02-29'",
@@ -483,7 +486,6 @@ fn arithmetic_constants_postgres_rejects_are_refused() {
         "1.5 / 0",
         "7 % 0",
         "DOUBLE PRECISION 'Infinity' / 0",
-        "DOUBLE PRECISION 'NaN' / 0",
     ] {
         match check_text(text, None) {
             Ok(Agreement::RefusedAndRaises(_)) => {}

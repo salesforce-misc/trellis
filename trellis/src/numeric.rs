@@ -183,21 +183,43 @@ impl Numeric {
         }
     }
 
-    /// The value as an integer, when it has no fractional digits and fits
-    /// an `i128`.
-    pub fn to_i128(&self) -> Option<i128> {
-        if self.scale != 0 || self.digits.len() > 38 {
+    /// Postgres `numeric` remainder (`%`): the result has the dividend's sign
+    /// and the common scale of the operands, and `None` for a zero divisor.
+    pub fn rem(&self, other: &Numeric) -> Option<Numeric> {
+        if other.is_zero() {
             return None;
         }
-        let magnitude = self.digits.iter().try_fold(0i128, |acc, &d| {
-            acc.checked_mul(10)?.checked_add(i128::from(d))
-        })?;
-        Some(if self.negative { -magnitude } else { magnitude })
+        let scale = self.scale.max(other.scale);
+        let (_, remainder) =
+            divmod_magnitudes(&self.scaled_digits(scale), &other.scaled_digits(scale));
+        let is_zero = remainder.iter().all(|&d| d == 0);
+        Some(Numeric {
+            negative: self.negative && !is_zero,
+            digits: remainder,
+            scale,
+        })
     }
 
-    /// An integer as a `Numeric`.
-    pub fn from_i128(value: i128) -> Numeric {
-        Numeric::parse(&value.to_string()).expect("an integer's text is a decimal")
+    /// The quotient, to at least forty significant digits (truncated), and
+    /// `None` for a zero divisor. Postgres rounds its quotient to a scale of
+    /// its own choosing (at least sixteen significant digits); a define-time
+    /// fold needs the value only to decide zero and range, which the extra
+    /// digits serve.
+    pub fn div(&self, other: &Numeric) -> Option<Numeric> {
+        if other.is_zero() {
+            return None;
+        }
+        let extra = 40 + other.digits.len() + other.scale as usize;
+        let mut dividend = self.digits.clone();
+        dividend.extend(std::iter::repeat_n(0, extra));
+        let (quotient, _) = divmod_magnitudes(&dividend, &other.digits);
+        let scale = extra as u32 + self.scale - other.scale;
+        let is_zero = quotient.iter().all(|&d| d == 0);
+        Some(Numeric {
+            negative: (self.negative != other.negative) && !is_zero,
+            digits: quotient,
+            scale,
+        })
     }
 
     /// This value's digit vector re-expressed at `scale` (which must be
@@ -248,6 +270,37 @@ impl fmt::Display for Numeric {
         }
         Ok(())
     }
+}
+
+/// Schoolbook long division of two magnitude digit vectors (most-significant
+/// first): the quotient and the remainder, both normalized. `divisor` is
+/// nonzero.
+fn divmod_magnitudes(dividend: &[u8], divisor: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut quotient = Vec::with_capacity(dividend.len());
+    let mut remainder: Vec<u8> = vec![0];
+    for &digit in dividend {
+        remainder.push(digit);
+        strip_leading_zeros(&mut remainder);
+        let mut count = 0u8;
+        loop {
+            let len = remainder.len().max(divisor.len());
+            let mut a = remainder.clone();
+            let mut b = divisor.to_vec();
+            pad_front(&mut a, len);
+            pad_front(&mut b, len);
+            if compare_magnitudes(&a, &b) == Ordering::Less {
+                break;
+            }
+            remainder = sub_magnitudes(&a, &b);
+            count += 1;
+        }
+        quotient.push(count);
+    }
+    strip_leading_zeros(&mut quotient);
+    if quotient.is_empty() {
+        quotient.push(0);
+    }
+    (quotient, remainder)
 }
 
 /// Pads `digits` with leading zeros (the front, since digits are
@@ -405,9 +458,34 @@ mod tests {
         assert_eq!(n("-0.50").negate().negate().to_string(), "-0.50");
         assert!(n("0.00").negate().is_zero());
         assert_eq!(n("-3").abs().to_string(), "3");
-        assert_eq!(n("-7").to_i128(), Some(-7));
-        assert_eq!(n("7.0").to_i128(), None);
-        assert_eq!(Numeric::from_i128(-12).to_string(), "-12");
+    }
+
+    #[test]
+    fn rem_and_div_follow_the_dividends_sign() {
+        assert_eq!(n("-7").rem(&n("2")).unwrap().to_string(), "-1");
+        assert_eq!(n("7").rem(&n("-2")).unwrap().to_string(), "1");
+        assert_eq!(n("-1.5").rem(&n("1.0")).unwrap().to_string(), "-0.5");
+        assert_eq!(n("4").rem(&n("2")).unwrap().to_string(), "0");
+        assert!(n("4").rem(&n("0.0")).is_none());
+        assert!(n("4").div(&n("0")).is_none());
+        assert!(n("0").div(&n("9223372036854775808")).unwrap().is_zero());
+        let quotient = n("1").div(&n("3")).unwrap().to_string();
+        assert!(
+            quotient.starts_with("0.33333333333333333333333333333333333333"),
+            "{quotient}"
+        );
+        assert_eq!(
+            n("9223372036854775808")
+                .div(&n("1"))
+                .unwrap()
+                .to_string()
+                .split('.')
+                .next(),
+            Some("9223372036854775808")
+        );
+        // A tiny quotient keeps its significant digits.
+        let tiny = n("1").div(&n(&format!("1{}", "0".repeat(400)))).unwrap();
+        assert!(!tiny.is_zero());
     }
 
     #[test]
