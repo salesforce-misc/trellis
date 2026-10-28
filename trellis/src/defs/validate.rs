@@ -3253,7 +3253,9 @@ fn comparison_holds(op: super::ast::Operator, order: std::cmp::Ordering) -> bool
 /// `COALESCE` whose first argument is one (the grammar has no `NULL`, so it
 /// is the result), or a calculated field whose expression is one, resolved
 /// as [`infer_expr`] resolves a name. `None` for anything that reads a
-/// column, and for a sum whose value Postgres could not compute (which
+/// column (except a strict operator with a `NULL` constant operand, which
+/// the planner folds to `NULL` whatever the other reads), and for a sum
+/// whose value Postgres could not compute (which
 /// [`check_constant_sum`] has refused). `memo` holds each calculated field
 /// already folded, so a chain of fields that each read the one before twice
 /// folds in linear time.
@@ -3303,10 +3305,18 @@ fn fold_constant<'f>(
         }
         Expr::BinaryOp { op, lhs, rhs } if op.is_comparison() => {
             use super::ast::Operator;
-            let (a, b) = (recurse(lhs, field_name)?, recurse(rhs, field_name)?);
             // `IS [NOT] DISTINCT FROM` takes `NULL` as a value; the rest are
-            // `NULL` beside it.
+            // strict, so `NULL` beside anything, a column or a call define
+            // has no value for included, is `NULL`: the planner replaces a
+            // strict call with a `NULL` constant input by `NULL` whatever
+            // its other inputs.
             let distinct = matches!(op, Operator::IsDistinctFrom | Operator::IsNotDistinctFrom);
+            let (a, b) = (recurse(lhs, field_name), recurse(rhs, field_name));
+            if !distinct && (matches!(a, Some(Constant::Null)) || matches!(b, Some(Constant::Null)))
+            {
+                return Some(Constant::Null);
+            }
+            let (a, b) = (a?, b?);
             match (&a, &b) {
                 (Constant::Null, Constant::Null) if distinct => {
                     return Some(Constant::Bool(matches!(op, Operator::IsNotDistinctFrom)));
@@ -3384,12 +3394,16 @@ fn fold_constant<'f>(
                 _ => Some(if a.equals(&b)? { Constant::Null } else { a }),
             }
         }
-        // An arithmetic operator is strict: a `NULL` operand makes it `NULL`.
+        // An arithmetic operator is strict: a `NULL` operand makes it `NULL`,
+        // whatever the other operand reads.
         Expr::BinaryOp { op, lhs, rhs } => {
             let operator = *op;
             let op = ConstOp::of_operator(*op)?;
-            match (recurse(lhs, field_name)?, recurse(rhs, field_name)?) {
-                (Constant::Null, _) | (_, Constant::Null) => Some(Constant::Null),
+            let (a, b) = (recurse(lhs, field_name), recurse(rhs, field_name));
+            if matches!(a, Some(Constant::Null)) || matches!(b, Some(Constant::Null)) {
+                return Some(Constant::Null);
+            }
+            match (a?, b?) {
                 (
                     a @ (Constant::Date(_) | Constant::Exact(_)),
                     b @ (Constant::Date(_) | Constant::Exact(_)),

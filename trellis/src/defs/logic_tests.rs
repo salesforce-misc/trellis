@@ -609,6 +609,33 @@ fn constant_failures_inside_a_branch_are_refused_wherever_postgres_folds_them() 
             type_of(text)
         );
     }
+    // A strict operator with a `NULL` constant operand is `NULL` whatever the
+    // other operand reads (a column, or a call define has no value for), so
+    // the planner drops the branch it conditions, and a `NULL` dividend
+    // divides by zero without an error (#1471).
+    for (text, ty) in [
+        (
+            "CASE WHEN (STRPOS('','') <= NULLIF(-2147483649, -2147483649)) \
+             THEN ((9223372036854775807 % -9223372036854775808) * 2) ELSE (REAL '0') END",
+            F4,
+        ),
+        (
+            "CASE WHEN i4 > NULLIF(1, 1) THEN 2147483647 + 1 ELSE 0 END",
+            I4,
+        ),
+        (
+            "CASE WHEN (i4 + NULLIF(1, 1)) IS NULL THEN 1 ELSE 2147483647 + 1 END",
+            I4,
+        ),
+        ("(n * NULLIF(1, 1)) / 0", N),
+    ] {
+        assert_type(text, ty);
+    }
+    // `IS DISTINCT FROM` is not strict: its other side decides.
+    assert_refused(
+        "CASE WHEN i4 IS DISTINCT FROM NULLIF(1, 1) THEN 2147483647 + 1 ELSE 0 END",
+        "out of range",
+    );
     // A runtime failure (a divisor read from a column) is not a define-time refusal.
     assert_type("CASE WHEN i4 > 0 THEN n / i4 END", N);
     assert_type("CASE WHEN i4 <> 0 THEN i8 % i4 END", I8);

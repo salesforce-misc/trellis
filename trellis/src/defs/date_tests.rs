@@ -544,6 +544,21 @@ fn a_constant_timestamp_from_a_cast_decides_a_case() {
          THEN 1.0 / 0 ELSE 1.5 END",
         ValueType::Numeric,
     );
+    // A `NULL` beside a call define has no value for (`DATE_TRUNC` of
+    // constants) still makes the comparison `NULL`, so its branch is dropped.
+    assert_type(
+        "CASE WHEN NULLIF(TIMESTAMP '1970-01-01 00:00:00.5', TIMESTAMP '1970-01-01 00:00:00.5') \
+         = DATE_TRUNC('microseconds', TIMESTAMP '2024-02-29 12:00:00') \
+         THEN 0 + (9223372036854775807 * 2) ELSE 1 END",
+        I8,
+    );
+    // The latest date that casts (294276-12-31) folds to a timestamp too, so
+    // the false condition keeps the planner's `ELSE`.
+    assert_refused(
+        "CASE WHEN CAST(DATE '9999-12-31' + 106751982 - 2921939 AS timestamp) \
+         < TIMESTAMP '9999-01-01 00:00:00' THEN 1.5 ELSE 1.0 / 0 END",
+        &["zero"],
+    );
 }
 
 /// Operators the date grammar does not touch keep their text meaning.
