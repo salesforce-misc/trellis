@@ -1575,25 +1575,29 @@ impl<'a> FieldInliner<'a> {
         if depth > MAX_INLINED_DEPTH {
             return Err(self.too_large());
         }
+        if let Expr::Column(name) = expr
+            && name != owner
+            && let Some((key, body)) = self.fields.get_key_value(name.as_str())
+        {
+            // The read itself is replaced, so it costs nothing: the count is
+            // the inlined expressions' size, the quantity define's equal
+            // budget bounds.
+            let (key, body) = (*key, *body);
+            if let Some((done, nodes)) = self.memo.get(key) {
+                // A memo hit still materializes its text: charge its nodes.
+                let (done, nodes) = (done.clone(), *nodes);
+                self.charge(nodes)?;
+                return Ok(done);
+            }
+            let before = self.nodes;
+            let rendered = self.expr(body, key, depth + 1)?;
+            // Its own nodes, memo hits inside it included.
+            self.memo
+                .insert(key, (rendered.clone(), self.nodes - before));
+            return Ok(rendered);
+        }
         self.charge(1)?;
         Ok(match expr {
-            Expr::Column(name) if name != owner && self.fields.contains_key(name.as_str()) => {
-                let (key, body) = self.fields.get_key_value(name.as_str()).expect("checked");
-                let (key, body) = (*key, *body);
-                if let Some((done, nodes)) = self.memo.get(key) {
-                    // A memo hit still materializes its text: charge its nodes.
-                    let (done, nodes) = (done.clone(), *nodes);
-                    self.charge(nodes)?;
-                    done
-                } else {
-                    let before = self.nodes;
-                    let rendered = self.expr(body, key, depth + 1)?;
-                    // Its own nodes, memo hits inside it included.
-                    self.memo
-                        .insert(key, (rendered.clone(), self.nodes - before));
-                    rendered
-                }
-            }
             Expr::BinaryOp { op, lhs, rhs } => {
                 let symbol = match op {
                     Operator::Add => "+",
@@ -1702,6 +1706,89 @@ mod tests {
             matches!(err, SelfCheckError::UnsupportedExpr { .. }),
             "{err:?}"
         );
+    }
+
+    /// The largest definition of `shape(n)` define admits (`n` grown until
+    /// validation refuses it).
+    fn largest_admitted(shape: impl Fn(usize) -> Vec<String>) -> crate::defs::TransformDef {
+        let columns = HashMap::from([("c".to_string(), crate::defs::ValueType::Numeric)]);
+        let mut admitted = None;
+        for n in 1.. {
+            let text = format!("TRANSFORM t FROM s SELECT {}", shape(n).join(", "));
+            match crate::defs::parse(&text) {
+                Ok(def) if crate::defs::validate::validate(&def, &columns).is_ok() => {
+                    admitted = Some(def);
+                }
+                _ => break,
+            }
+        }
+        admitted.expect("the smallest shape is admitted")
+    }
+
+    #[test]
+    fn every_field_of_the_largest_definitions_define_admits_inlines() {
+        type Shape = fn(usize) -> Vec<String>;
+        // Each field reads the previous one twice: the node budget binds.
+        let doubling: Shape = |n| {
+            let mut fields = vec!["c AS f0".to_string()];
+            for k in 1..n {
+                fields.push(format!("f{p} + f{p} AS f{k}", p = k - 1));
+            }
+            fields
+        };
+        // One field reads another many times.
+        let fan_out: Shape = |n| {
+            vec![
+                "c + c + c + c + c + c + c + c AS f0".to_string(),
+                format!("COALESCE({}) AS g", vec!["f0"; n * 100].join(", ")),
+            ]
+        };
+        // Bare alias reads, and reads one level down: the depth bound binds.
+        let aliases: Shape = |n| {
+            let mut fields = vec!["c AS f0".to_string()];
+            for k in 1..n {
+                fields.push(format!("f{} AS f{k}", k - 1));
+            }
+            fields
+        };
+        let plus_one: Shape = |n| {
+            let mut fields = vec!["c AS f0".to_string()];
+            for k in 1..n {
+                fields.push(format!("COALESCE(f{}, 1) AS f{k}", k - 1));
+            }
+            fields
+        };
+        // On a 2 MiB stack, the default for a spawned thread in debug builds.
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                for shape in [doubling, fan_out, aliases, plus_one] {
+                    let def = largest_admitted(shape);
+                    let mut inliner = FieldInliner::new("t", &def.fields);
+                    for field in &def.fields {
+                        if let Err(err) = inliner.render(field) {
+                            panic!("{} fields: {err:?}", def.fields.len());
+                        }
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn inlining_a_cyclic_catalog_fails() {
+        // Only a catalog define never admitted can hold a cycle.
+        let fields = vec![field("a", col("b")), field("b", col("a"))];
+        let mut inliner = FieldInliner::new("t", &fields);
+        assert!(inliner.render(&fields[0]).is_err());
+        let fields = vec![
+            field("a", sum(col("b"), col("b"))),
+            field("b", sum(col("a"), col("a"))),
+        ];
+        let mut inliner = FieldInliner::new("t", &fields);
+        assert!(inliner.render(&fields[0]).is_err());
     }
 
     #[test]

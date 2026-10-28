@@ -563,8 +563,10 @@ async fn a_field_reading_another_field_by_name_audits_converged() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// A wrong value in a field that another field reads by alias is a
-/// divergence, in the corrupted field and in the field reading it.
+/// A wrong value in a field that another field reads by alias, and one in
+/// the field reading it, are each a divergence in that field alone: the
+/// reader's recompute inlines the read field's expression, not its persisted
+/// value.
 #[tokio::test]
 async fn a_planted_wrong_value_in_a_field_read_by_alias_is_a_divergence() {
     let cluster = TestCluster::start();
@@ -574,25 +576,66 @@ async fn a_planted_wrong_value_in_a_field_read_by_alias_is_a_divergence() {
         "create table s (id integer primary key, c numeric)",
         "s",
         "TRANSFORM t FROM s SELECT c AS f0, f0 + 1 AS f1",
-        &[("1", r#"{"id":"1","c":"5"}"#)],
+        &[
+            ("1", r#"{"id":"1","c":"5"}"#),
+            ("2", r#"{"id":"2","c":"7"}"#),
+        ],
     )
     .await;
-    raw.execute("update t set f0 = 99 where id = '1'", &[])
+    raw.batch_execute("update t set f0 = 99 where id = '1'; update t set f1 = 0 where id = '2'")
         .await
-        .expect("corrupt target row");
+        .expect("corrupt target rows");
 
     match audit_target(&trellis, "t").await {
         SelfCheckOutcome::Diverged(divergences) => assert_eq!(
             divergences,
-            vec![Divergence::Cell {
-                key: "1".to_string(),
-                column: "f0".to_string(),
-                persisted: Some("99".to_string()),
-                recomputed: Some("5".to_string()),
-            }]
+            vec![
+                Divergence::Cell {
+                    key: "1".to_string(),
+                    column: "f0".to_string(),
+                    persisted: Some("99".to_string()),
+                    recomputed: Some("5".to_string()),
+                },
+                Divergence::Cell {
+                    key: "2".to_string(),
+                    column: "f1".to_string(),
+                    persisted: Some("0".to_string()),
+                    recomputed: Some("8".to_string()),
+                },
+            ]
         ),
         other => panic!("expected Diverged, got {other:?}"),
     }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// The recompute agrees with what the write path wrote for reads inside
+/// function arguments and operators, over NULLs and text.
+#[tokio::test]
+async fn field_reads_inside_calls_over_nulls_and_text_audit_converged() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, _raw) = converged_fixture(
+        &db,
+        "create table s (id integer primary key, c numeric, name text)",
+        "s",
+        "TRANSFORM t FROM s SELECT c + 1 AS c1, c1 + c1 AS d, COALESCE(d, c, 0) AS e, \
+         name AS n, CHAR_LENGTH(n) AS len, STRPOS(n, 'b') + len AS pos, \
+         REGEXP_COUNT(n, 'a') AS hits",
+        &[
+            ("1", r#"{"id":"1","c":"5","name":"abba"}"#),
+            ("2", r#"{"id":"2","c":null,"name":null}"#),
+            ("3", r#"{"id":"3","c":"-2.50","name":"éa"}"#),
+        ],
+    )
+    .await;
+
+    let outcome = audit_target(&trellis, "t").await;
+    assert!(
+        matches!(outcome, SelfCheckOutcome::Converged),
+        "expected Converged, got {outcome:?}"
+    );
 
     trellis.shutdown().await.expect("shutdown");
 }
