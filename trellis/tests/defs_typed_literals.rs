@@ -309,8 +309,8 @@ fn types_outside_the_allowlist_are_rejected_at_parse_time() {
     }
 }
 
-/// A **general** cast is recognized and refused by name, pointing at the
-/// per-family issues that own the coercion lattice — the same
+/// A **general** cast to a type outside the integer widenings is recognized
+/// and refused by name, listing the targets that are admitted — the same
 /// recognize-and-explain treatment this grammar already gives `JOIN` and
 /// `COUNT(<column>)`.
 #[test]
@@ -320,7 +320,8 @@ fn a_general_cast_is_rejected_with_a_pointed_error() {
             .expect_err(&format!("{bad} must be rejected"));
         let message = err.to_string();
         assert!(
-            message.contains("CAST is only supported over a single-quoted literal"),
+            message.contains("'date' is not a CAST target")
+                && message.contains("only integer, bigint, numeric are supported"),
             "{bad}: {message}"
         );
     }
