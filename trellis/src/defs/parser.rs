@@ -44,6 +44,12 @@ use super::registry::{
 use super::typed_literal::lookup_typed_literal;
 use super::validate::is_deferred_aggregate_name;
 
+/// The deepest an expression may nest: the longest `+` chain, the most
+/// parentheses and the most nested calls a definition may write. Every pass
+/// that walks an expression recurses once per level, so this bounds them all
+/// on a 2 MiB thread stack.
+pub const MAX_EXPRESSION_DEPTH: usize = 100;
+
 const OPERATOR_CHARS: &[char] = &['+', '-', '*', '/', '%', '>', '<', '='];
 
 /// What [`Parser::parse_statement`] expects to lead a statement, spelled out
@@ -62,6 +68,8 @@ pub fn parse(input: &str) -> Result<TransformDef, ParseError> {
     Parser {
         tokens,
         pos: 0,
+        nest: 0,
+        last_height: 0,
         is_aggregate: false,
         source: None,
         joined: None,
@@ -109,6 +117,8 @@ pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
     Parser {
         tokens,
         pos: 0,
+        nest: 0,
+        last_height: 0,
         is_aggregate: false,
         source: None,
         joined: None,
@@ -156,6 +166,10 @@ impl Verb {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// How many `parse_expr` calls are open (parentheses and call arguments).
+    nest: usize,
+    /// The height of the expression `parse_expr` or `parse_primary` returned last.
+    last_height: usize,
     /// Set once [`Self::parse_key_space_clause`] has parsed a `GROUP BY`.
     /// Gates whether [`Self::parse_primary`] will accept a
     /// `SUM`/`MIN`/`MAX`/`AVG` call — a plain field rather than threading
@@ -792,7 +806,15 @@ impl Parser {
     /// precedence-aware grammar like Postgres's rather than flat
     /// left-to-right.
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        self.parse_binary_expr(0)
+        if self.nest >= MAX_EXPRESSION_DEPTH {
+            return Err(ParseError::ExpressionTooDeep {
+                limit: MAX_EXPRESSION_DEPTH,
+            });
+        }
+        self.nest += 1;
+        let result = self.parse_binary_expr(0);
+        self.nest -= 1;
+        result
     }
 
     /// Precedence-climbing loop: parses a primary term, then repeatedly
@@ -811,6 +833,7 @@ impl Parser {
     /// `parse_binary_expr(COMPARISON + 1)` call parsing `>`'s rhs).
     fn parse_binary_expr(&mut self, min_precedence: u8) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_primary()?;
+        let mut lhs_height = self.last_height;
         loop {
             let symbol = match self.peek() {
                 Token::Symbol(c) if OPERATOR_CHARS.contains(c) => *c,
@@ -832,16 +855,48 @@ impl Parser {
             }
             self.advance();
             let rhs = self.parse_binary_expr(precedence + 1)?;
+            // The tree is measured as it is built, so a chain too deep to
+            // walk is refused before it exists (and before it must be dropped).
+            lhs_height = 1 + lhs_height.max(self.last_height);
+            if lhs_height > MAX_EXPRESSION_DEPTH {
+                return Err(ParseError::ExpressionTooDeep {
+                    limit: MAX_EXPRESSION_DEPTH,
+                });
+            }
             lhs = Expr::BinaryOp {
                 op,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
             };
         }
+        self.last_height = lhs_height;
         Ok(lhs)
     }
 
+    /// [`Self::parse_primary_inner`], recording the term's height in
+    /// `last_height`: a leaf is 1, a call is 1 above its tallest argument
+    /// (left in `last_height` by `parse_call_args`), a parenthesized
+    /// expression keeps its own height.
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        self.last_height = 0;
+        let grouping = self.peek_is_symbol('(');
+        let expr = self.parse_primary_inner()?;
+        if grouping {
+            // Keeps the inner expression's height.
+        } else if matches!(expr, Expr::FunctionCall { .. }) {
+            self.last_height += 1;
+            if self.last_height > MAX_EXPRESSION_DEPTH {
+                return Err(ParseError::ExpressionTooDeep {
+                    limit: MAX_EXPRESSION_DEPTH,
+                });
+            }
+        } else if self.last_height == 0 {
+            self.last_height = 1;
+        }
+        Ok(expr)
+    }
+
+    fn parse_primary_inner(&mut self) -> Result<Expr, ParseError> {
         match self.advance() {
             Token::Symbol('(') => {
                 // Parenthesized grouping (the precedence-climbing
@@ -1128,18 +1183,22 @@ impl Parser {
     /// so calls can nest.
     fn parse_call_args(&mut self) -> Result<Vec<Expr>, ParseError> {
         let mut args = Vec::new();
+        let mut tallest = 0;
         if self.peek_is_symbol(')') {
             self.advance();
+            self.last_height = 0;
             return Ok(args);
         }
         loop {
             args.push(self.parse_expr()?);
+            tallest = tallest.max(self.last_height);
             if self.peek_is_symbol(',') {
                 self.advance();
                 continue;
             }
             break;
         }
+        self.last_height = tallest;
         match self.advance() {
             Token::Symbol(')') => Ok(args),
             Token::Eof => Err(ParseError::UnexpectedEof {
@@ -1187,5 +1246,148 @@ impl Parser {
                 ),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Runs `f` on a thread with the default 2 MiB stack, the smallest stack a
+    /// tokio worker or a `cargo test` thread gets.
+    fn on_default_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .expect("thread overflowed or panicked")
+    }
+
+    /// `1 + 1 + ... + 1` with `n` terms: a left-deep chain `n` high.
+    fn chain(n: usize) -> String {
+        vec!["1"; n].join(" + ")
+    }
+
+    /// `((((1))))` nested `n` parentheses deep.
+    fn parens(n: usize) -> String {
+        format!("{}1{}", "(".repeat(n), ")".repeat(n))
+    }
+
+    /// `COALESCE(COALESCE(... 1 ...), 1)` with `n` calls.
+    fn calls(n: usize) -> String {
+        format!("{}1{}", "COALESCE(".repeat(n), ")".repeat(n))
+    }
+
+    /// Defines `SELECT <expr> AS out` all the way through the validator, as a
+    /// define does, and reports whether the parser refused it for depth.
+    fn define(expr: String) -> Result<(), ParseError> {
+        on_default_stack(move || {
+            let sql = format!("TRANSFORM t FROM s SELECT {expr} AS out");
+            let def = parse(&sql)?;
+            walk_every_way(&def);
+            Ok(())
+        })
+    }
+
+    /// Runs the passes that walk a definition's expressions, as a define does.
+    fn walk_every_way(def: &TransformDef) {
+        let columns: HashMap<String, crate::defs::ValueType> =
+            HashMap::from([("c".to_string(), crate::defs::ValueType::Numeric)]);
+        let _ = crate::defs::validate::validate(def, &columns);
+        let _ = crate::defs::backfill::substitute_all_fields(def);
+        for field in &def.fields {
+            let _ = crate::defs::ast::render_field_expr(&field.expr);
+            let _ = crate::defs::oracle::render_expr_sql(&field.expr);
+            let _ = crate::defs::oracle::render_qualified_expr_sql(&field.expr, "s");
+            drop(field.expr.clone());
+        }
+    }
+
+    /// Defines `n` calculated fields, each reading the previous one through
+    /// `step` (`"{prev}"` is replaced by its name), and reports whether the
+    /// validator refused the chain as too deep.
+    fn fields_refused(n: usize, step: &'static str) -> bool {
+        on_default_stack(move || {
+            let mut fields = vec!["1 AS f0".to_string()];
+            for i in 1..n {
+                let body = step.replace("{prev}", &format!("f{}", i - 1));
+                fields.push(format!("{body} AS f{i}"));
+            }
+            let def = parse(&format!("TRANSFORM t FROM s SELECT {}", fields.join(", "))).unwrap();
+            let refused = matches!(
+                crate::defs::validate::validate(&def, &HashMap::new()),
+                Err(crate::defs::validate::ValidationError::FieldExpansionTooLarge)
+            );
+            if !refused {
+                walk_every_way(&def);
+            }
+            refused
+        })
+    }
+
+    #[test]
+    fn calculated_fields_reading_each_other_are_bounded_by_the_inlined_height() {
+        // A read at the root costs one level per hop: 100 fields in a chain.
+        assert!(!fields_refused(MAX_EXPRESSION_DEPTH, "{prev}"));
+        assert!(fields_refused(MAX_EXPRESSION_DEPTH + 1, "{prev}"));
+        // `{prev} + 1` puts the read one level down, so each hop costs two.
+        assert!(!fields_refused(MAX_EXPRESSION_DEPTH / 2, "{prev} + 1"));
+        assert!(fields_refused(MAX_EXPRESSION_DEPTH / 2 + 1, "{prev} + 1"));
+        // Far past the limit, without overflowing the stack.
+        assert!(fields_refused(100_000, "{prev} + 1"));
+    }
+
+    fn too_deep(r: Result<(), ParseError>) -> bool {
+        matches!(r, Err(ParseError::ExpressionTooDeep { .. }))
+    }
+
+    #[test]
+    fn chain_at_limit_defines_and_one_past_is_refused() {
+        define(chain(MAX_EXPRESSION_DEPTH)).unwrap();
+        assert!(too_deep(define(chain(MAX_EXPRESSION_DEPTH + 1))));
+    }
+
+    #[test]
+    fn chain_of_columns_at_limit_validates_against_a_real_column() {
+        let sql = format!(
+            "TRANSFORM t FROM s SELECT {} AS out",
+            vec!["c"; MAX_EXPRESSION_DEPTH].join(" + ")
+        );
+        on_default_stack(move || {
+            let def = parse(&sql).unwrap();
+            let columns = HashMap::from([("c".to_string(), crate::defs::ValueType::Numeric)]);
+            crate::defs::validate::validate(&def, &columns).unwrap();
+            walk_every_way(&def);
+        });
+    }
+
+    #[test]
+    fn nested_parentheses_at_limit_define_and_one_past_is_refused() {
+        // The field's own expression is the outermost level.
+        define(parens(MAX_EXPRESSION_DEPTH - 1)).unwrap();
+        assert!(too_deep(define(parens(MAX_EXPRESSION_DEPTH))));
+    }
+
+    #[test]
+    fn nested_calls_at_limit_define_and_one_past_is_refused() {
+        // The innermost literal is a level of its own.
+        define(calls(MAX_EXPRESSION_DEPTH - 1)).unwrap();
+        assert!(too_deep(define(calls(MAX_EXPRESSION_DEPTH))));
+    }
+
+    #[test]
+    fn a_huge_chain_is_refused_without_overflowing() {
+        assert!(too_deep(define(chain(200_000))));
+        assert!(too_deep(define(parens(200_000))));
+        assert!(too_deep(define(calls(200_000))));
+    }
+
+    #[test]
+    fn a_flat_sum_of_many_columns_still_defines() {
+        let cols: Vec<String> = (0..2000).map(|i| format!("c{i}")).collect();
+        let flat = format!("COALESCE({})", cols.join(", "));
+        define(flat).unwrap();
     }
 }

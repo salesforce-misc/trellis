@@ -21,6 +21,7 @@ use super::ast::{
     Expr, FieldDef, KeySpace, Predicate, QualifiedColumn, TransformDef, ValueType,
     render_field_expr,
 };
+use super::parser::MAX_EXPRESSION_DEPTH;
 use super::pg_type::PgType;
 use crate::error_code::ErrorCode;
 use crate::integer::IntWidth;
@@ -636,8 +637,9 @@ impl fmt::Display for ValidationError {
             }
             ValidationError::FieldExpansionTooLarge => write!(
                 f,
-                "the calculated fields read each other so many times that inlining them into \
-                 one expression yields more than a build can render; make the chain shorter"
+                "the calculated fields read each other so deeply or so many times that inlining \
+                 them into one expression yields more than a build can render; make the chain \
+                 shorter"
             ),
             ValidationError::TableCycle { cycle } => {
                 write!(f, "cycle among tables: {}", cycle.join(" -> "))
@@ -1111,7 +1113,7 @@ pub fn validate(
     }
 
     let aggregates = aggregate_field_names(def.fields.iter().map(|f| (f.name.as_str(), &f.expr)));
-    let mut deps: HashMap<&str, Vec<String>> = HashMap::with_capacity(def.fields.len());
+    let mut deps: HashMap<&str, FieldDeps> = HashMap::with_capacity(def.fields.len());
     for field in &def.fields {
         let mut refs = Vec::new();
         let mut aggregate_args = Vec::new();
@@ -1135,6 +1137,8 @@ pub fn validate(
             });
         }
 
+        let mut column_depths = HashMap::new();
+        let own_height = column_depths_in(&field.expr, 1, &mut column_depths);
         let mut calc_deps = Vec::new();
         for column in refs {
             let is_source_column = source_columns.contains_key(&column);
@@ -1163,10 +1167,17 @@ pub fn validate(
                 });
             }
             if is_calc_field {
-                calc_deps.push(column);
+                let depth = column_depths.get(&column).copied().unwrap_or(1);
+                calc_deps.push((column, depth));
             }
         }
-        deps.insert(field.name.as_str(), calc_deps);
+        deps.insert(
+            field.name.as_str(),
+            FieldDeps {
+                own_height,
+                reads: calc_deps,
+            },
+        );
     }
 
     detect_cycle(&deps)?;
@@ -3346,17 +3357,60 @@ fn validate_regexp_pattern(field_name: &str, pattern_arg: &Expr) -> Result<(), V
     Ok(())
 }
 
+/// A calculated field's reads of other calculated fields, for the cycle and
+/// depth walk.
+struct FieldDeps {
+    /// The height of the field's own expression.
+    own_height: usize,
+    /// Each calculated field it reads, with the deepest level of the
+    /// expression a read sits at (the root is level 1).
+    reads: Vec<(String, usize)>,
+}
+
+/// The height of `expr` (a leaf is `depth`), recording in `out` the deepest
+/// level each column is read at. The parser bounds an expression's height, so
+/// the recursion is bounded.
+fn column_depths_in(expr: &Expr, depth: usize, out: &mut HashMap<String, usize>) -> usize {
+    match expr {
+        Expr::Column(name) => {
+            let level = out.entry(name.clone()).or_insert(depth);
+            *level = (*level).max(depth);
+            depth
+        }
+        Expr::SourceColumn { .. }
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::TypedLiteral { .. } => depth,
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            column_depths_in(lhs, depth + 1, out).max(column_depths_in(rhs, depth + 1, out))
+        }
+        Expr::FunctionCall { args, .. } => args
+            .iter()
+            .map(|arg| column_depths_in(arg, depth + 1, out))
+            .max()
+            .unwrap_or(depth),
+    }
+}
+
 #[derive(PartialEq, Eq)]
 enum Mark {
     Visiting,
-    Done,
+    /// Finished, with the height of the field's expression once every
+    /// calculated field it reads is inlined.
+    Done(usize),
 }
 
 /// DFS with a visiting/done mark set, hand-rolled per the repo's convention
-/// of avoiding a graph crate for a problem this small.
-fn detect_cycle(deps: &HashMap<&str, Vec<String>>) -> Result<(), ValidationError> {
+/// of avoiding a graph crate for a problem this small. It also bounds how
+/// deep the fields' reads of one another nest: a field's expression, with the
+/// calculated fields it reads inlined (each read costing at least one level),
+/// may be at most [`MAX_EXPRESSION_DEPTH`] high, so the passes that walk the
+/// fields' dependency graph or an inlined expression recurse a bounded number
+/// of times.
+fn detect_cycle(deps: &HashMap<&str, FieldDeps>) -> Result<(), ValidationError> {
     let mut marks: HashMap<&str, Mark> = HashMap::with_capacity(deps.len());
-    let names: Vec<&str> = deps.keys().copied().collect();
+    let mut names: Vec<&str> = deps.keys().copied().collect();
+    names.sort_unstable();
     for name in names {
         if !marks.contains_key(name) {
             let mut stack = Vec::new();
@@ -3368,12 +3422,12 @@ fn detect_cycle(deps: &HashMap<&str, Vec<String>>) -> Result<(), ValidationError
 
 fn visit<'a>(
     name: &'a str,
-    deps: &'a HashMap<&'a str, Vec<String>>,
+    deps: &'a HashMap<&'a str, FieldDeps>,
     marks: &mut HashMap<&'a str, Mark>,
     stack: &mut Vec<String>,
-) -> Result<(), ValidationError> {
+) -> Result<usize, ValidationError> {
     match marks.get(name) {
-        Some(Mark::Done) => return Ok(()),
+        Some(Mark::Done(height)) => return Ok(*height),
         Some(Mark::Visiting) => {
             stack.push(name.to_string());
             return Err(ValidationError::Cycle {
@@ -3382,19 +3436,28 @@ fn visit<'a>(
         }
         None => {}
     }
+    if stack.len() >= MAX_EXPRESSION_DEPTH {
+        return Err(ValidationError::FieldExpansionTooLarge);
+    }
 
     marks.insert(name, Mark::Visiting);
     stack.push(name.to_string());
 
-    if let Some(children) = deps.get(name) {
-        for child in children {
-            visit(child.as_str(), deps, marks, stack)?;
+    let mut height = 1;
+    if let Some(field) = deps.get(name) {
+        height = field.own_height;
+        for (child, depth) in &field.reads {
+            let child_height = visit(child.as_str(), deps, marks, stack)?;
+            height = height.max(depth + child_height);
         }
+    }
+    if height > MAX_EXPRESSION_DEPTH {
+        return Err(ValidationError::FieldExpansionTooLarge);
     }
 
     stack.pop();
-    marks.insert(name, Mark::Done);
-    Ok(())
+    marks.insert(name, Mark::Done(height));
+    Ok(height)
 }
 
 #[cfg(test)]

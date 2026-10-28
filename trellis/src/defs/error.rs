@@ -66,6 +66,8 @@ pub enum ParseError {
     /// accept — rejected by name so the message can point at
     /// `CAST(...)`/`<type> '...'` instead of reporting an unexpected `:`.
     UnsupportedCastOperator,
+    /// An expression nested deeper than `super::parser::MAX_EXPRESSION_DEPTH`.
+    ExpressionTooDeep { limit: usize },
     /// A `PAUSE`/`RESUME`/`DROP` address whose shape doesn't fit the statement
     /// it was written in: too many `.`-separated parts, or a
     /// `<transform>.<column>` address under `DROP TRANSFORM`, which is
@@ -184,6 +186,10 @@ impl fmt::Display for ParseError {
                     .map(|spec| spec.keyword)
                     .collect::<Vec<_>>()
                     .join(", ")
+            ),
+            ParseError::ExpressionTooDeep { limit } => write!(
+                f,
+                "expression nested too deeply: an expression may nest at most {limit} levels (a chain of {limit} operands joined by operators, or fewer nested parentheses or calls); split it into calculated fields"
             ),
             ParseError::UnsupportedCastOperator => write!(
                 f,
