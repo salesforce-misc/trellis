@@ -243,6 +243,42 @@ async fn a_refused_probe_leaves_the_callers_transaction_usable() {
         .expect("an unedited field is not probed");
 }
 
+/// Only `2201B` is a refusal: any other error the probe hits (here a role
+/// that may not execute `regexp_count`, `42501`) propagates as a database
+/// error, never as a pattern Postgres rejects, and still leaves the caller's
+/// transaction usable.
+#[tokio::test]
+async fn a_probe_error_other_than_an_invalid_pattern_is_not_a_refusal() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create role regexp_probe_denied; \
+         revoke execute on function pg_catalog.regexp_count(text, text) from public",
+    )
+    .await
+    .expect("setup");
+    let txn = raw.transaction().await.expect("begin");
+    txn.batch_execute("set local role regexp_probe_denied")
+        .await
+        .expect("set role");
+    let def = parse("TRANSFORM t FROM s SELECT REGEXP_COUNT(txt, 'a') AS n").expect("parse");
+    let err = assert_regexp_patterns_accepted(&txn, &def, None)
+        .await
+        .expect_err("the probe is denied");
+    match &err {
+        trellis::defs::CatalogError::Db(db_err) => assert_eq!(
+            db_err.code(),
+            Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+            "{err}"
+        ),
+        other => panic!("expected the database error, got {other:?}"),
+    }
+    txn.query_one("select 1", &[])
+        .await
+        .expect("the transaction is still usable");
+}
+
 /// The patterns the admitted set counts agree with Postgres's own
 /// `regexp_count`, which is the only evaluator.
 #[tokio::test]
