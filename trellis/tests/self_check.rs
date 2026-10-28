@@ -518,6 +518,115 @@ async fn self_check_detects_a_divergence_seeded_by_directly_corrupting_a_target_
     trellis.shutdown().await.expect("shutdown");
 }
 
+/// One `Standard` page over all of `target`, for the field-read tests.
+async fn audit_target(trellis: &Trellis, target: &str) -> SelfCheckOutcome {
+    trellis
+        .self_check_page(
+            target,
+            SelfCheckScope {
+                after: None,
+                limit: 100,
+            },
+            SelfCheckMode::Standard,
+            GENEROUS_TIMEOUT,
+        )
+        .await
+        .expect("self_check")
+        .outcome
+}
+
+/// A field reading another field by name (a bare alias read, and a read
+/// inside an operator) is recomputed with the field's own expression
+/// inlined, not as a source column that doesn't exist (#1447).
+#[tokio::test]
+async fn a_field_reading_another_field_by_name_audits_converged() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, _raw) = converged_fixture(
+        &db,
+        "create table s (id integer primary key, c numeric)",
+        "s",
+        "TRANSFORM t FROM s SELECT c AS f0, f0 AS f1, f1 + 1 AS f2, f2 + f0 AS f3",
+        &[
+            ("1", r#"{"id":"1","c":"5"}"#),
+            ("2", r#"{"id":"2","c":"7"}"#),
+        ],
+    )
+    .await;
+
+    let outcome = audit_target(&trellis, "t").await;
+    assert!(
+        matches!(outcome, SelfCheckOutcome::Converged),
+        "expected Converged, got {outcome:?}"
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A wrong value in a field that another field reads by alias is a
+/// divergence, in the corrupted field and in the field reading it.
+#[tokio::test]
+async fn a_planted_wrong_value_in_a_field_read_by_alias_is_a_divergence() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let (trellis, raw) = converged_fixture(
+        &db,
+        "create table s (id integer primary key, c numeric)",
+        "s",
+        "TRANSFORM t FROM s SELECT c AS f0, f0 + 1 AS f1",
+        &[("1", r#"{"id":"1","c":"5"}"#)],
+    )
+    .await;
+    raw.execute("update t set f0 = 99 where id = '1'", &[])
+        .await
+        .expect("corrupt target row");
+
+    match audit_target(&trellis, "t").await {
+        SelfCheckOutcome::Diverged(divergences) => assert_eq!(
+            divergences,
+            vec![Divergence::Cell {
+                key: "1".to_string(),
+                column: "f0".to_string(),
+                persisted: Some("99".to_string()),
+                recomputed: Some("5".to_string()),
+            }]
+        ),
+        other => panic!("expected Diverged, got {other:?}"),
+    }
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// The longest chain define admits (each field reads the previous one inside
+/// an operator, so the inlined expression reaches the nesting bound) audits
+/// `Converged`.
+#[tokio::test]
+async fn a_field_chain_at_the_define_bound_audits_converged() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let hops = trellis::defs::MAX_EXPRESSION_DEPTH / 2;
+    let mut fields = vec!["c AS f0".to_string()];
+    for k in 1..hops {
+        fields.push(format!("f{} + 1 AS f{k}", k - 1));
+    }
+    let (trellis, _raw) = converged_fixture(
+        &db,
+        "create table s (id integer primary key, c numeric)",
+        "s",
+        &format!("TRANSFORM t FROM s SELECT {}", fields.join(", ")),
+        &[("1", r#"{"id":"1","c":"5"}"#)],
+    )
+    .await;
+
+    let outcome = audit_target(&trellis, "t").await;
+    assert!(
+        matches!(outcome, SelfCheckOutcome::Converged),
+        "expected Converged, got {outcome:?}"
+    );
+
+    trellis.shutdown().await.expect("shutdown");
+}
+
 /// A target that has real, unapplied source work pending — i.e. is merely
 /// lagging, not wrong — must report [`SelfCheckOutcome::NotCaughtUp`], never
 /// [`SelfCheckOutcome::Diverged`] (ADR-0013: "the correctness promise is

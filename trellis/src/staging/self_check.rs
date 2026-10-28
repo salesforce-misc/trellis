@@ -31,6 +31,12 @@
 //! suite's cross-check test (`generative/tests/self_check_cross_check.rs`)
 //! is what keeps the two from silently drifting apart.
 //!
+//! A 1-1 field that reads another calculated field by name is recomputed with
+//! that field's expression inlined ([`FieldInliner`]), by the same independent
+//! walk: it shares no code with `defs::backfill::substitute_all_fields`, and is
+//! bounded by a node budget and a nesting limit so a definition define would
+//! refuse fails the job with an error rather than expanding.
+//!
 //! # The capture audit comes first
 //!
 //! Before it waits or compares anything, `self_check` checks from the
@@ -144,7 +150,7 @@
 //! `Converged` page that never reached one, or a `NotCaughtUp` it causes,
 //! can't hide it.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::time::Duration;
 
@@ -1197,11 +1203,11 @@ fn page_sql(
 
     let mut recomputed = Vec::with_capacity(comparable.len());
     let mut persisted = Vec::with_capacity(comparable.len());
-    for (i, field) in comparable.iter().enumerate() {
-        let leaf = render_leaf(&field.expr);
+    let mut inliner = FieldInliner::new(&def.target_table, &def.def.fields);
+    for field in comparable {
+        let leaf = inliner.render(field)?;
         recomputed.push(format!("({leaf})::text"));
         persisted.push(format!("{}::text", quote_ident(&field.name)));
-        let _ = i;
     }
     // The recompute side reads the source as the target has applied it
     // (`super::self_check_ring`): a key with an unapplied change is its
@@ -1503,6 +1509,115 @@ async fn check_schema(
     Ok(divergences)
 }
 
+/// Node budget for one page's field inlining ([`FieldInliner`]). Define
+/// refuses a definition whose inlined fields exceed its own, equal budget
+/// (`ValidationError::FieldExpansionTooLarge`), so this trips only on a
+/// definition define never admitted.
+const MAX_INLINED_NODES: usize = 100_000;
+
+/// Bound on the nesting of one inlined expression. Define bounds an expression
+/// at `MAX_EXPRESSION_DEPTH` including the fields it reads; twice that leaves
+/// headroom and keeps the recursion shallow whatever the catalog holds.
+const MAX_INLINED_DEPTH: usize = 2 * crate::defs::MAX_EXPRESSION_DEPTH;
+
+/// Renders each calculated field of a 1-1 definition against the source row,
+/// reading another calculated field by name as that field's own expression
+/// (inlined), as `defs::backfill::substitute_all_fields` does for the write
+/// path. Written fresh here on [`render_leaf`]'s grammar, sharing nothing
+/// with the write path (ADR-0013): a name that is not another field is a
+/// source column, and a field's own name inside its expression is the source
+/// column of that name.
+struct FieldInliner<'a> {
+    target: &'a str,
+    fields: HashMap<&'a str, &'a Expr>,
+    /// Rendered SQL of the fields already inlined, with its node count.
+    memo: HashMap<&'a str, (String, usize)>,
+    nodes: usize,
+}
+
+impl<'a> FieldInliner<'a> {
+    fn new(target: &'a str, fields: &'a [FieldDef]) -> Self {
+        FieldInliner {
+            target,
+            fields: fields.iter().map(|f| (f.name.as_str(), &f.expr)).collect(),
+            memo: HashMap::new(),
+            nodes: 0,
+        }
+    }
+
+    fn too_large(&self) -> SelfCheckError {
+        SelfCheckError::UnsupportedExpr {
+            target: self.target.to_string(),
+            detail: "the calculated fields read each other so deeply or so many times that \
+                     inlining them into one expression exceeds the recompute's size budget"
+                .to_string(),
+        }
+    }
+
+    fn render(&mut self, field: &'a FieldDef) -> Result<String, SelfCheckError> {
+        self.expr(&field.expr, &field.name, 0)
+    }
+
+    fn charge(&mut self, cost: usize) -> Result<(), SelfCheckError> {
+        self.nodes = self.nodes.saturating_add(cost);
+        if self.nodes > MAX_INLINED_NODES {
+            return Err(self.too_large());
+        }
+        Ok(())
+    }
+
+    fn expr(
+        &mut self,
+        expr: &'a Expr,
+        owner: &str,
+        depth: usize,
+    ) -> Result<String, SelfCheckError> {
+        if depth > MAX_INLINED_DEPTH {
+            return Err(self.too_large());
+        }
+        self.charge(1)?;
+        Ok(match expr {
+            Expr::Column(name) if name != owner && self.fields.contains_key(name.as_str()) => {
+                let (key, body) = self.fields.get_key_value(name.as_str()).expect("checked");
+                let (key, body) = (*key, *body);
+                if let Some((done, nodes)) = self.memo.get(key) {
+                    // A memo hit still materializes its text: charge its nodes.
+                    let (done, nodes) = (done.clone(), *nodes);
+                    self.charge(nodes)?;
+                    done
+                } else {
+                    let before = self.nodes;
+                    let rendered = self.expr(body, key, depth + 1)?;
+                    // Its own nodes, memo hits inside it included.
+                    self.memo
+                        .insert(key, (rendered.clone(), self.nodes - before));
+                    rendered
+                }
+            }
+            Expr::BinaryOp { op, lhs, rhs } => {
+                let symbol = match op {
+                    Operator::Add => "+",
+                    Operator::GreaterThan => ">",
+                };
+                let l = self.expr(lhs, owner, depth + 1)?;
+                let r = self.expr(rhs, owner, depth + 1)?;
+                format!("({l} {symbol} {r})")
+            }
+            Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
+                "count(*)".to_string()
+            }
+            Expr::FunctionCall { name, args } => {
+                let mut rendered = Vec::with_capacity(args.len());
+                for arg in args {
+                    rendered.push(self.expr(arg, owner, depth + 1)?);
+                }
+                format!("{}({})", name.to_lowercase(), rendered.join(", "))
+            }
+            leaf => render_leaf(leaf),
+        })
+    }
+}
+
 /// Renders a calculated-field expression to Postgres SQL text — the "small"
 /// leaf renderer ADR-0013 requires be duplicated for an honest audit rather
 /// than shared with the write path or with either test-only oracle (see the
@@ -1538,6 +1653,66 @@ pub(super) fn render_leaf(expr: &Expr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn field(name: &str, expr: Expr) -> FieldDef {
+        FieldDef {
+            name: name.to_string(),
+            expr,
+        }
+    }
+
+    fn col(name: &str) -> Expr {
+        Expr::Column(name.to_string())
+    }
+
+    fn sum(lhs: Expr, rhs: Expr) -> Expr {
+        Expr::BinaryOp {
+            op: Operator::Add,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
+    #[test]
+    fn inlining_replaces_a_field_read_and_keeps_a_fields_own_name_a_source_column() {
+        let one = || Expr::NumberLiteral("1".into());
+        let fields = vec![
+            field("x", sum(col("x"), one())),
+            field("b", sum(col("x"), col("x"))),
+        ];
+        let mut inliner = FieldInliner::new("t", &fields);
+        // `x` reads the source column `x`; `b` reads the field `x`.
+        assert_eq!(
+            inliner.render(&fields[1]).unwrap(),
+            "((\"x\" + 1::numeric) + (\"x\" + 1::numeric))"
+        );
+        assert_eq!(inliner.render(&fields[0]).unwrap(), "(\"x\" + 1::numeric)");
+    }
+
+    #[test]
+    fn inlining_a_doubling_chain_past_the_budget_fails_rather_than_expanding() {
+        let mut fields = vec![field("f0", col("c"))];
+        for k in 1..40 {
+            let prev = format!("f{}", k - 1);
+            fields.push(field(&format!("f{k}"), sum(col(&prev), col(&prev))));
+        }
+        let mut inliner = FieldInliner::new("t", &fields);
+        let err = inliner.render(&fields[39]).unwrap_err();
+        assert!(
+            matches!(err, SelfCheckError::UnsupportedExpr { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn inlining_a_chain_deeper_than_any_define_admits_fails() {
+        let mut fields = vec![field("f0", col("c"))];
+        for k in 1..400 {
+            fields.push(field(&format!("f{k}"), col(&format!("f{}", k - 1))));
+        }
+        let mut inliner = FieldInliner::new("t", &fields);
+        assert!(inliner.render(&fields[399]).is_err());
+    }
 
     #[test]
     fn render_leaf_renders_a_column_reference() {

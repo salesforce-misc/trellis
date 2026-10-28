@@ -160,6 +160,29 @@ async fn composed_fields_and_numerics_converge_without_divergence() {
     }
 }
 
+/// An aggregate field reading another field by name (inside an operator, and
+/// a bare alias read) audits clean: the recompute reads the aliased
+/// expressions, not target columns that aren't on the source (#1447).
+#[tokio::test]
+async fn an_aggregate_field_reading_another_field_by_name_converges() {
+    let mut d = start_with(
+        "TRANSFORM agg FROM public.src GROUP BY g \
+        WITHOUT SOURCE INDEX SELECT SUM(m) AS total, COUNT(*) AS n, total + n AS both, both AS again",
+        "create table public.src (id integer primary key, g integer, m numeric(10, 2)); \
+         create index on public.src (g)",
+        &[("id", int4()), ("g", int4()), ("m", ValueType::Numeric)],
+    )
+    .await;
+    for sql in [
+        "insert into public.src values (1, 1, 1.5), (2, 1, 2), (3, 2, 4)",
+        "update public.src set m = 3 where id = 1",
+        "delete from public.src where id = 3",
+    ] {
+        step(&mut d, sql).await;
+        assert_eq!(walk(&d, 2).await.0, [], "after {sql}");
+    }
+}
+
 /// A sealed page nobody has drained yet is "not caught up", never a
 /// divergence: the source is ahead of both the partials and the target.
 #[tokio::test]
