@@ -4828,6 +4828,11 @@ pub(crate) fn regexp_pattern_literals(def: &TransformDef) -> Vec<(String, String
                 walk(rhs, field, out);
             }
             Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => walk(operand, field, out),
+            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+                for child in expr.logic_children() {
+                    walk(child, field, out);
+                }
+            }
             Expr::Column(_)
             | Expr::SourceColumn { .. }
             | Expr::NumberLiteral(_)

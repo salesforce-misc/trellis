@@ -824,7 +824,7 @@ impl Fixture {
                 }
                 Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => stack.push(operand),
                 Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-                    stack.extend(e.logic_children_mut());
+                    stack.extend(e.logic_children());
                 }
                 Expr::FunctionCall { name, args } => {
                     if name == "REGEXP_COUNT"
