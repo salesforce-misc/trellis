@@ -1114,9 +1114,9 @@ async fn drain_workers_waiting_an_hour_still_build_and_drain_on_notifications_al
     };
     let client = TrellisClient::start(db.dsn(), options).expect("client start");
 
-    // Both workers' `LISTEN`s and the `self_check` worker's are in place (the
-    // last statement of a wake listener's session), so a notification from
-    // here on reaches them.
+    // The client's one `LISTEN`, shared by both drain workers and the
+    // `self_check` worker, is in place (the last statement of a wake
+    // listener's session), so a notification from here on reaches them.
     poll_until(
         Duration::from_secs(20),
         Duration::from_millis(20),
@@ -1131,7 +1131,7 @@ async fn drain_workers_waiting_an_hour_still_build_and_drain_on_notifications_al
                 .await
                 .expect("count listeners")
                 .get(0);
-            listening == 3
+            listening == 1
         },
     )
     .await;
