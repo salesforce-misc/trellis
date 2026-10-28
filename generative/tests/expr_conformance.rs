@@ -324,6 +324,175 @@ fn hard_cases_agree_with_postgres() {
     }
 }
 
+/// Each row of the arithmetic table, by Postgres's own answer: the type, the
+/// value on every row (the checker compares the user's text with both
+/// renderers) and the round trip.
+#[test]
+fn arithmetic_rows_agree_with_postgres() {
+    let admitted = [
+        // `-` and `*`, every width pairing and the float rule.
+        "i2a - i2b",
+        "i2a * i2b",
+        "i2a - i4b",
+        "i4a * i8b",
+        "i8a - na",
+        "na * nb",
+        "f4a - f4b",
+        "f4a * f8b",
+        "f4a * i2a",
+        "na - f4a",
+        "i4a - 1",
+        "i4a * -1",
+        "1 - i4a",
+        // `/`
+        "na / nb",
+        "i2a / na",
+        "na / i8a",
+        "f4a / f4b",
+        "f4a / i4a",
+        "i4a / f8b",
+        "na / f4a",
+        "na / 2",
+        "na / -3",
+        // `%`
+        "i2a % i2b",
+        "i2a % i8b",
+        "i4a % na",
+        "na % nb",
+        "i4a % -1",
+        "i8a % -1",
+        "i4a % 7",
+        "-7 % 2",
+        "na % 3",
+        // Prefix minus, `ABS`
+        "-i2a",
+        "-i4a",
+        "-i8a",
+        "-na",
+        "-f4a",
+        "-f8a",
+        "- -i4a",
+        "-(-na)",
+        "-REAL '1.5'",
+        "ABS(i2a)",
+        "ABS(i4a)",
+        "ABS(i8a)",
+        "ABS(na)",
+        "ABS(f4a)",
+        "ABS(f8a)",
+        "ABS(-5)",
+        "ABS(-2147483647)",
+        // `CEIL`, `FLOOR`, `TRUNC`, `ROUND`
+        "CEIL(na)",
+        "CEIL(f8a)",
+        "FLOOR(na)",
+        "FLOOR(f8a)",
+        "TRUNC(na)",
+        "TRUNC(f8a)",
+        "ROUND(na)",
+        "ROUND(na, 2)",
+        "ROUND(na, 0)",
+        "ROUND(na, -2)",
+        "ROUND(na, 20)",
+        "TRUNC(na, 1)",
+        "TRUNC(na, -1)",
+        "ROUND(-2.5)",
+        "ROUND(-2.5, 0)",
+        "ROUND(na) + 2147483647",
+        // Widening casts
+        "CAST(i2a AS integer)",
+        "CAST(i2a AS bigint)",
+        "CAST(i4a AS bigint)",
+        "CAST(i2a AS numeric)",
+        "CAST(i4a AS numeric)",
+        "CAST(i8a AS numeric)",
+        "CAST(i4a AS numeric) / i4b",
+        "CAST(i4a AS bigint) * 4294967296",
+        "CAST(5 AS bigint)",
+        // Literals typed by value
+        "-2147483648",
+        "-2147483649",
+        "-9223372036854775808",
+        "-9223372036854775809",
+        "i4a + -2147483648",
+        "i4a * -2147483648",
+        // Precedence
+        "i4a - i2a * i2b",
+        "-i4a * i2b",
+        "i4a - i2a - i2b",
+        "i4a * i2a % i2b",
+        "i4a % i2a * i2b",
+        "na - nb * nb > nb",
+        // Data errors are left to the rows
+        "i4a * i4b",
+        "i8a * i8b",
+        "i2a * i2b * i2a",
+        "-i4a",
+        "ABS(i4a)",
+        "na / nb",
+        "f8a / f8b",
+        "f8a * f8b",
+        "f4a * f4b",
+    ];
+    for text in admitted {
+        match check_text(text, None) {
+            Ok(Agreement::Admitted) => {}
+            Ok(other) => panic!("`{text}` should be admitted, got {other:?}"),
+            Err(d) => panic!("{d}"),
+        }
+    }
+}
+
+/// Constants Postgres folds into an error at plan time are refused at
+/// define: range overflow under each operator, the smallest integer under
+/// prefix minus and `ABS`, float overflow and underflow, and a constant zero
+/// divisor.
+#[test]
+fn arithmetic_constants_postgres_rejects_are_refused() {
+    for text in [
+        "2147483647 - -1",
+        "-2147483648 - 1",
+        "2147483647 * 2",
+        "46341 * 46341",
+        "-(-2147483647 - 1)",
+        "ABS(-2147483648)",
+        "-(ABS(-2147483647) + 1)  * 2147483647",
+        "-9223372036854775808 - 1",
+        "9223372036854775807 * 2",
+        "-(-9223372036854775807 - 1)",
+        "ABS(-9223372036854775807 - 1)",
+        "CAST(2147483647 AS bigint) * 4294967296 * 4294967296",
+        "REAL '3.4028235e+38' * REAL '2'",
+        "REAL '3.4028235e+38' - REAL '-3.4028235e+38'",
+        "REAL '1e-30' * REAL '1e-30'",
+        "DOUBLE PRECISION '1e+308' * DOUBLE PRECISION '10'",
+        "DOUBLE PRECISION '1e-200' * DOUBLE PRECISION '1e-200'",
+        "DOUBLE PRECISION '1e-300' / DOUBLE PRECISION '1e+300'",
+        "DOUBLE PRECISION '1e+308' / DOUBLE PRECISION '0.1'",
+        "DOUBLE PRECISION '1e+308' * 10",
+        "f8a + DOUBLE PRECISION '1e+308' * 10",
+        "na / 0",
+        "na / 0.0",
+        "i4a % 0",
+        "f8a / 0",
+        "f4a / REAL '0'",
+        "f4a / REAL '-0'",
+        "na / (1 - 1)",
+        "na % (2 - 2)",
+        "1.0 / 0 + na",
+        "1.5 / 0",
+        "7 % 0",
+        "DOUBLE PRECISION 'Infinity' / 0",
+        "DOUBLE PRECISION 'NaN' / 0",
+    ] {
+        match check_text(text, None) {
+            Ok(Agreement::RefusedAndRaises(_)) => {}
+            Ok(other) => panic!("`{text}` should be refused and raise, got {other:?}"),
+            Err(d) => panic!("{d}"),
+        }
+    }
+}
+
 /// Every leaf a rule can take: the table's column of that type and every
 /// literal the conformance profile draws at it.
 fn leaves(ty: ValueType) -> Vec<Expr> {
@@ -549,23 +718,46 @@ fn each_refusal_names_its_construct() {
         (r"REGEXP_COUNT(ta, '(a)\1')", "regexp_count's pattern"),
         (r"REGEXP_COUNT(ta, '\ma')", "regexp_count's pattern"),
         // Operators and functions outside the registry.
-        ("i4a - i4b", "-"),
-        ("i4a * i4b", "*"),
-        ("i4a / i4b", "/"),
         ("i4a = i4b", "="),
         ("i4a < i4b", "'<'"),
         ("i4a >= i4b", "'>='"),
         ("i4a <= i4b", "'<='"),
         ("i4a <> i4b", "'<>'"),
         ("ta || tb", "|"),
-        ("ABS(i4a)", "abs"),
+        ("LENGTH(ta)", "length"),
+        // The arithmetic refusals: each says what Postgres would do and
+        // names the construct.
+        ("i4a / i4b", "/"),
+        ("i2a / i8a", "/"),
+        ("f4a % i4a", "%"),
+        ("na % f8a", "%"),
+        ("-ta", "'-'"),
+        ("ta * 2", "'*'"),
+        ("CEIL(i4a)", "ceil"),
+        ("FLOOR(i2a)", "floor"),
+        ("ROUND(i8a)", "round"),
+        ("TRUNC(i4a)", "trunc"),
+        ("ROUND(f8a)", "round"),
+        ("ROUND(f8a, 2)", "round"),
+        ("CEIL(f4a)", "ceil"),
+        ("ROUND(na, i4a)", "round"),
+        ("ROUND(na, 1.5)", "round"),
+        ("ABS(ta)", "abs"),
+        ("CAST(i8a AS integer)", "integer"),
+        ("CAST(na AS bigint)", "bigint"),
+        ("CAST(f8a AS numeric)", "numeric"),
+        ("CAST(i4a AS smallint)", "smallint"),
+        ("CAST(i4a AS numeric(10, 2))", "numeric"),
+        ("na / 0", "zero"),
+        ("i4a % 0", "zero"),
+        ("f8a / 0.0", "zero"),
+        ("na / (1 - 1)", "zero"),
         // Not immutable: these change between calls.
         ("NOW()", "now"),
         ("RANDOM()", "random"),
         // Reads a session setting.
         ("TO_CHAR(da, 'YYYY')", "to_char"),
         ("i4a::bigint", "::"),
-        ("CAST(i4a AS bigint)", "cast"),
     ];
     HARNESS.with(|h| {
         for (text, needle) in pins {

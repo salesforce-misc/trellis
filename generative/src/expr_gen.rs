@@ -1003,14 +1003,25 @@ pub mod strategy {
                     )
                 }
                 Rule::Negate { ty } => {
-                    // A minus applied to a number literal is one negative
-                    // literal, so the operand is never a literal.
-                    let operand = self
-                        .expr(*ty, depth)?
-                        .prop_filter("not a number literal", |e| {
-                            !matches!(e, Expr::NumberLiteral(_))
-                        });
-                    Some(operand.prop_map(|e| Expr::Negate(Box::new(e))).boxed())
+                    // A minus applied to a number literal is the negative
+                    // literal (as Postgres reads it), so a literal operand
+                    // becomes that literal. It can be one type narrower than
+                    // the operand's (`-2147483648` is an `integer`); define
+                    // types the tree, so the draw stays well typed.
+                    let operand = self.expr(*ty, depth)?;
+                    Some(
+                        operand
+                            .prop_map(|e| match e {
+                                Expr::NumberLiteral(text) => {
+                                    Expr::NumberLiteral(match text.strip_prefix('-') {
+                                        Some(positive) => positive.to_string(),
+                                        None => format!("-{text}"),
+                                    })
+                                }
+                                e => Expr::Negate(Box::new(e)),
+                            })
+                            .boxed(),
+                    )
                 }
                 Rule::Cast { from, to } => {
                     let to = *to;
