@@ -678,6 +678,8 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // and a group-basis aggregate's.
     txn.batch_execute(&super::join::drop_hidden_tables_sql(pool.schema(), id))
         .await?;
+    txn.batch_execute(&super::join_one_to_one_ledger::drop_sql(pool.schema(), id))
+        .await?;
     txn.batch_execute(&crate::staging::group_basis::drop_hidden_table_sql(
         pool.schema(),
         id,
@@ -687,9 +689,13 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // just above. Its truncate floor is keyed by the target's
     // name, so without this a later target of the same name would inherit
     // it.
+    // A 1-1 JOIN's hidden ledgers went with the tables above; their floors
+    // are keyed by their quoted idents.
+    let mut floors = super::join_one_to_one_ledger::floor_keys(pool.schema(), id);
+    floors.push(qualified.to_string());
     txn.execute(
-        "delete from ledger_truncate_floor where target_table = $1",
-        &[&qualified],
+        "delete from ledger_truncate_floor where target_table = any($1)",
+        &[&floors],
     )
     .await?;
 

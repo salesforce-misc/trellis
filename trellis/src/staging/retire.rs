@@ -218,14 +218,25 @@ const DRAINED_PREFIX_SQL: &str = "\
 
 /// Every ledger table there is, schema-qualified and quoted: a
 /// definition's `<target>__ledger`, where it exists, with the definition's
-/// id. An aggregate target's and a 1-1 target's carry the same
-/// ordering-state columns, so [`collect_tombstones`] collects both alike.
+/// id, and a 1-1 `JOIN`'s hidden ledgers `R` and `M`
+/// ([`crate::defs::join_one_to_one_ledger`], in the catalog schema, as
+/// [`hidden_tables_sql`] finds the other hidden tables). An aggregate
+/// target's, a 1-1 target's and a hidden ledger carry the same
+/// ordering-state columns, so [`collect_tombstones`] collects them alike.
 const LEDGER_TABLES_SQL: &str = "\
     select format('%I.%I', n.nspname, c.relname), d.id \
     from transform_definitions d \
     join pg_catalog.pg_namespace n on n.nspname = split_part(d.target_table, '.', 1) \
     join pg_catalog.pg_class c on c.relnamespace = n.oid \
      and c.relname = split_part(d.target_table, '.', 2) || $1 \
+    union all \
+    select format('%I.%I', n.nspname, c.relname), d.id \
+    from transform_definitions d \
+    join pg_catalog.pg_class c on c.relname in ( \
+         ('join1_' || d.id || '_r'), ('join1_' || d.id || '_m')) \
+     and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
+                           where oid = 'transform_definitions'::regclass) \
+    join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
     order by 1";
 
 /// The most tombstones one GC transaction deletes.

@@ -80,20 +80,20 @@ pub(super) fn lock_statement(ledger: &str) -> String {
 }
 
 /// Whether a page whose lowest segment is `first_seg` may hold a change
-/// committed before `target`'s Re-derive build started: its batch
-/// is at or below the target's `build_seg` (`super::build`'s start). Such a
+/// committed before `ledger`'s definition's Re-derive build started: its batch
+/// is at or below the definition's `build_seg` (`super::build`'s start). Such a
 /// page re-derives every key it holds for the target rather than applying
 /// their changes (`super::apply`'s `settle_one_to_one_target`).
 pub(crate) async fn page_may_predate_build(
     txn: &Transaction<'_>,
-    target: &str,
+    ledger: &super::one_to_one_ledger::LedgerRef,
     first_seg: i64,
 ) -> Result<bool, tokio_postgres::Error> {
     Ok(txn
         .query_one(
             "select coalesce($2 <= (select build_seg from transform_definitions \
                                     where target_table = $1), false)",
-            &[&target, &first_seg],
+            &[&ledger.owner_target, &first_seg],
         )
         .await?
         .get(0))
@@ -166,6 +166,49 @@ mod tests {
         assert_eq!(
             apply_predicate(),
             r#"(l."__basis" is null or not pg_visible_in_snapshot(v.__txid, l."__basis")) and (l."__applied_lsn" is null or v.__lsn > l."__applied_lsn") and not exists (select 1 from fl where v.__lsn <= fl.floor)"#
+        );
+    }
+
+    /// The build-start rule reads the definition's `build_seg` through the
+    /// ledger's `owner_target`, whatever the ledger's own ident and floor key
+    /// are: a hidden ledger answers for its definition's build.
+    #[tokio::test]
+    async fn the_build_start_rule_reads_the_owner_targets_build_for_a_hidden_ledger() {
+        use crate::defs::join_one_to_one_ledger::LedgerTable;
+        use crate::staging::one_to_one_ledger::LedgerRef;
+
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(connection);
+        client
+            .batch_execute(&format!(
+                "set search_path to {}, public; \
+                 insert into source_table_versions (source_table, version) \
+                 values ('public.src', 1); \
+                 insert into transform_definitions \
+                     (target_table, source_table, source_version, definition_text, build_seg) \
+                 values ('public.joined', 'public.src', 1, 'n/a', 5)",
+                crate::config::DEFAULT_SCHEMA
+            ))
+            .await
+            .expect("a definition with a build");
+        let mut client = client;
+        let txn = client.transaction().await.expect("begin");
+        let hidden = LedgerRef::hidden("trellis", 1, LedgerTable::From, "public.joined");
+        assert!(page_may_predate_build(&txn, &hidden, 5).await.unwrap());
+        assert!(!page_may_predate_build(&txn, &hidden, 6).await.unwrap());
+        let named_by_its_own_ident = LedgerRef {
+            owner_target: hidden.ident.clone(),
+            ..hidden
+        };
+        assert!(
+            !page_may_predate_build(&txn, &named_by_its_own_ident, 5)
+                .await
+                .unwrap(),
+            "looked up by a hidden name, no definition is found"
         );
     }
 }

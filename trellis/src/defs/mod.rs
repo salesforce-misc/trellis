@@ -41,6 +41,7 @@ pub mod grammar;
 pub mod hierarchy;
 pub(crate) mod join;
 pub(crate) mod join_key_types;
+pub(crate) mod join_one_to_one_ledger;
 pub(crate) mod key_types;
 pub mod ledger;
 mod lexer;

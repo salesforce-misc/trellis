@@ -3578,9 +3578,10 @@ async fn settle_one_to_one_target(
     seg_seq: i64,
     mutations: &mut TargetMutations,
 ) -> Result<AppliedTarget, ApplyError> {
+    let ledger = one_to_one_ledger::LedgerRef::of_target(&plan.qualified_target);
     let rederived_records: Vec<OneToOneRecord>;
     let records: &[OneToOneRecord] = if plan.records.iter().any(|r| r.apply.is_some())
-        && super::ledger::page_may_predate_build(txn, &plan.qualified_target, first_seg).await?
+        && super::ledger::page_may_predate_build(txn, &ledger, first_seg).await?
     {
         rederived_records = plan
             .records
@@ -3635,15 +3636,8 @@ async fn settle_one_to_one_target(
                 .is_none_or(|(_, _, values)| values.is_some()),
         })
         .collect();
-    let inserted = one_to_one_ledger::lock_entries(
-        txn,
-        &plan.qualified_target,
-        &to_lock,
-        seg_seq,
-        predicate,
-        false,
-    )
-    .await?;
+    let inserted =
+        one_to_one_ledger::lock_entries(txn, &ledger, &to_lock, seg_seq, predicate, false).await?;
 
     let rederive_keys: Vec<&str> = by_key
         .values()
@@ -3696,7 +3690,7 @@ async fn settle_one_to_one_target(
     }
     let mut changed = one_to_one_ledger::update_entries(
         txn,
-        &plan.qualified_target,
+        &ledger,
         &changes,
         snapshot.as_deref(),
         entry_seg,
@@ -3711,7 +3705,7 @@ async fn settle_one_to_one_target(
         .filter(|key| !changed.contains(*key))
         .map(String::as_str)
         .collect();
-    one_to_one_ledger::drop_placeholders(txn, &plan.qualified_target, &unwritten).await?;
+    one_to_one_ledger::drop_placeholders(txn, &ledger, &unwritten).await?;
 
     let mut writes = Vec::new();
     let mut deletes = Vec::new();
@@ -4413,7 +4407,12 @@ pub(crate) async fn apply_page(
     // see this function's doc comment on why "clear, then write" is safe
     // here specifically (single-bucket batch, barrier-drained).
     for clear in plan.clears.values() {
-        one_to_one_ledger::truncate(txn, &clear.qualified_target, clear.truncate_lsn).await?;
+        one_to_one_ledger::truncate(
+            txn,
+            &one_to_one_ledger::LedgerRef::of_target(&clear.qualified_target),
+            clear.truncate_lsn,
+        )
+        .await?;
         keys_deleted += clear_target(
             txn,
             &clear.qualified_target,

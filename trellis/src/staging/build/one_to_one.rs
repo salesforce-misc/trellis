@@ -670,7 +670,15 @@ async fn lock_chunk_entries(
         crate::locks::set_local_lock_timeout(txn, CHUNK_LOCK_TIMEOUT).await?;
         // The segment stamp is only for an Apply the insert settles; a
         // Re-derive's placeholder takes none.
-        one_to_one_ledger::lock_entries(txn, &plan.target, &changes, 0, true, skip_lock).await?;
+        one_to_one_ledger::lock_entries(
+            txn,
+            &one_to_one_ledger::LedgerRef::of_target(&plan.target),
+            &changes,
+            0,
+            true,
+            skip_lock,
+        )
+        .await?;
         txn.execute("select set_config('lock_timeout', $1, true)", &[&previous])
             .await?;
         Ok::<_, ApplyError>(())

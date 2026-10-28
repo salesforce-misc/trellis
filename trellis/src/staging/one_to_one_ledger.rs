@@ -62,6 +62,60 @@ pub(crate) fn ledger_ident(target: &str) -> String {
     ddl::qualified_target_table_ident(&schema::ledger_table_name(target))
 }
 
+/// One ordering ledger the functions below work on: the 1-1 target's
+/// `<target>__ledger`, or a hidden ledger (a 1-1 `JOIN`'s `R` or `M`,
+/// [`crate::defs::join_one_to_one_ledger`]). The ledger's ident, its
+/// `ledger_truncate_floor` key, its pause label and its definition's build
+/// lookup are separate fields, since a hidden ledger shares none of them
+/// with its definition's target.
+#[derive(Debug, Clone)]
+pub(crate) struct LedgerRef {
+    /// The ledger table, quoted and qualified, for SQL text.
+    pub ident: String,
+    /// The `ledger_truncate_floor.target_table` key of the ledger's floor: a
+    /// target's qualified identity, or a hidden ledger's quoted ident, as a
+    /// `JOIN`'s `P` and `M` floors are keyed.
+    pub floor_key: String,
+    /// What names the ledger in a pause point and in
+    /// [`ApplyError::LedgerEntryCollected`].
+    pub label: String,
+    /// The definition's target (qualified): the key of its
+    /// `transform_definitions` row, which holds the build the build-start
+    /// rule reads ([`super::ledger::page_may_predate_build`]).
+    pub owner_target: String,
+}
+
+impl LedgerRef {
+    /// The ledger of the 1-1 target `target` (qualified identity).
+    pub(crate) fn of_target(target: &str) -> Self {
+        LedgerRef {
+            ident: ledger_ident(target),
+            floor_key: target.to_string(),
+            label: target.to_string(),
+            owner_target: target.to_string(),
+        }
+    }
+
+    /// The hidden ledger `table` of definition `id` in `catalog_schema`,
+    /// whose target is `owner_target`. The `JOIN`'s page code builds its
+    /// ledgers with it; the tests below exercise it until that lands.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn hidden(
+        catalog_schema: &str,
+        id: i64,
+        table: crate::defs::join_one_to_one_ledger::LedgerTable,
+        owner_target: &str,
+    ) -> Self {
+        let ident = table.ident(catalog_schema, id);
+        LedgerRef {
+            floor_key: ident.clone(),
+            label: format!("{catalog_schema}.{}", table.name(id)),
+            ident,
+            owner_target: owner_target.to_string(),
+        }
+    }
+}
+
 /// The keys [`lock_entries`] inserted an entry for.
 #[derive(Debug, Default)]
 pub(crate) struct Inserted {
@@ -74,26 +128,26 @@ pub(crate) struct Inserted {
     pub applied: HashSet<String>,
 }
 
-/// Locks the entries of `changes`' keys on `target`'s ledger, sorted; see
+/// Locks the entries of `changes`' keys on `ledger`, sorted; see
 /// the module doc. A key with no entry gets one: an Apply's records its
 /// change (`seg_seq` and the tombstone as [`update_entries`] sets them), and
 /// a Re-derive's, or that of an Apply below the truncate floor, is a
 /// placeholder, and a Re-derive's `present` is ignored. That spares a new
 /// key's entry a second version and a lock.
-/// Only the keys that had an entry are then locked `for update`. `target`
-/// is the target's qualified identity; `predicate` is as for
+/// Only the keys that had an entry are then locked `for update`.
+/// `predicate` is as for
 /// [`update_entries`]. `skip_lock` is the `chunk_without_entry_lock`
 /// plant's (a build chunk's only): the existing entries are read
 /// without the lock.
 pub(crate) async fn lock_entries(
     txn: &Transaction<'_>,
-    target: &str,
+    ledger: &LedgerRef,
     changes: &[EntryChange<'_>],
     seg_seq: i64,
     predicate: bool,
     skip_lock: bool,
 ) -> Result<Inserted, ApplyError> {
-    let ledger = ledger_ident(target);
+    let ledger_sql = &ledger.ident;
     let q = |c: &str| quote_ident(c);
     let (key_col, applied, seg, tombstone) = (
         q(schema::KEY_COLUMN),
@@ -120,7 +174,7 @@ pub(crate) async fn lock_entries(
                      from unnest($1::text[], $2::text[], $3::bool[]) as u(__k, __lsn, __present) \
                  ), \
                  fl as (select floor from ledger_truncate_floor where target_table = $4) \
-                 insert into {ledger} ({key_col}, {applied}, {seg}, {tombstone}) \
+                 insert into {ledger_sql} ({key_col}, {applied}, {seg}, {tombstone}) \
                  select v.__k, case when o.ok then v.__lsn end, \
                         {stamp}, o.ok and not v.__present \
                  from v cross join lateral \
@@ -130,7 +184,7 @@ pub(crate) async fn lock_entries(
                  returning {key_col}, {applied} is not null",
                 stamp = schema::tombstone_seg_sql(None, "o.ok and not v.__present", "$5::bigint"),
             ),
-            &[&keys, &lsns, &present, &target, &seg_seq],
+            &[&keys, &lsns, &present, &ledger.floor_key, &seg_seq],
         )
         .await?;
     let mut inserted = Inserted::default();
@@ -146,7 +200,7 @@ pub(crate) async fn lock_entries(
     super::interleave::pause_at(
         txn,
         super::interleave::PausePoint::AfterPlaceholders,
-        target,
+        &ledger.label,
     )
     .await?;
     let existing: Vec<&str> = keys
@@ -157,20 +211,25 @@ pub(crate) async fn lock_entries(
     if !existing.is_empty() && !skip_lock {
         let locked = super::ledger::query_by_entry_key(
             txn,
-            &super::ledger::lock_statement(&ledger),
+            &super::ledger::lock_statement(ledger_sql),
             &[&existing],
         )
         .await?
         .len();
         if locked < existing.len() {
             return Err(ApplyError::LedgerEntryCollected {
-                target: target.to_string(),
+                target: ledger.label.clone(),
             });
         }
     }
     // Test-only pause point. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
-    super::interleave::pause_at(txn, super::interleave::PausePoint::AfterEntryLock, target).await?;
+    super::interleave::pause_at(
+        txn,
+        super::interleave::PausePoint::AfterEntryLock,
+        &ledger.label,
+    )
+    .await?;
     Ok(inserted)
 }
 
@@ -256,7 +315,7 @@ pub(crate) struct EntryChange<'a> {
     pub present: bool,
 }
 
-/// Updates the locked entries of `changes` on `target`'s ledger, an Apply
+/// Updates the locked entries of `changes` on `ledger`, an Apply
 /// only if ADR-0002's I2 holds for it; see the module doc. `snapshot` is the
 /// Re-derive read's, and `seg_seq` the page's latest segment, which a
 /// tombstone's `applied_seg` is raised to. Returns the keys it changed. `predicate`
@@ -264,7 +323,7 @@ pub(crate) struct EntryChange<'a> {
 /// entry.
 pub(crate) async fn update_entries(
     txn: &Transaction<'_>,
-    target: &str,
+    ledger: &LedgerRef,
     changes: &[EntryChange<'_>],
     snapshot: Option<&str>,
     seg_seq: i64,
@@ -283,23 +342,30 @@ pub(crate) async fn update_entries(
     let present: Vec<bool> = changes.iter().map(|c| c.present).collect();
     let rows = super::ledger::query_by_entry_key(
         txn,
-        &update_statement(target, predicate),
+        &update_statement(ledger, predicate),
         &[
-            &keys, &rederive, &lsns, &txids, &present, &target, &snapshot, &seg_seq,
+            &keys,
+            &rederive,
+            &lsns,
+            &txids,
+            &present,
+            &ledger.floor_key,
+            &snapshot,
+            &seg_seq,
         ],
     )
     .await?;
     Ok(rows.into_iter().map(|row| row.get(0)).collect())
 }
 
-/// [`update_entries`]' statement on `target`'s ledger. Binds `$1` the keys,
+/// [`update_entries`]' statement on `ledger`. Binds `$1` the keys,
 /// `$2` the Re-derive flags, `$3` the `lsn`s and `$4` the `row_txid`s (null
 /// for a Re-derive), `$5` whether each key has a row after its change, `$6`
-/// the target, `$7` the Re-derive read's snapshot and `$8` the page's
+/// the ledger's floor key, `$7` the Re-derive read's snapshot and `$8` the page's
 /// latest segment. Returns the keys it changed. It reads the ledger only
 /// through `$1`'s keys, and runs under
 /// `super::ledger::ENTRY_PLAN_SETTINGS`.
-fn update_statement(target: &str, predicate: bool) -> String {
+fn update_statement(ledger: &LedgerRef, predicate: bool) -> String {
     let q = |c: &str| quote_ident(c);
     let (key, basis, applied, seg, tombstone) = (
         q(schema::KEY_COLUMN),
@@ -330,13 +396,13 @@ fn update_statement(target: &str, predicate: bool) -> String {
          where l.{key} = any($1::text[]) and l.{key} = v.__k \
            and (v.__rederive or ({predicate})) \
          returning l.{key}",
-        ledger = ledger_ident(target),
+        ledger = ledger.ident,
         stamp =
             schema::tombstone_seg_sql(Some(&format!("l.{seg}")), "not v.__present", "$8::bigint"),
     )
 }
 
-/// Deletes the placeholders among `keys` on `target`'s ledger: the entries
+/// Deletes the placeholders among `keys` on `ledger`: the entries
 /// [`lock_entries`] inserted that nothing then wrote. `keys` are the
 /// keys whose entry this transaction inserted and neither its insert nor
 /// [`update_entries`] changed: an Apply at or below the truncate floor, and
@@ -351,24 +417,24 @@ fn update_statement(target: &str, predicate: bool) -> String {
 /// of a few thousand keys is a sequential scan.
 pub(crate) async fn drop_placeholders(
     txn: &Transaction<'_>,
-    target: &str,
+    ledger: &LedgerRef,
     keys: &[&str],
 ) -> Result<(), ApplyError> {
     if keys.is_empty() {
         return Ok(());
     }
-    super::ledger::query_by_entry_key(txn, &drop_statement(target), &[&keys]).await?;
+    super::ledger::query_by_entry_key(txn, &drop_statement(ledger), &[&keys]).await?;
     Ok(())
 }
 
-/// [`drop_placeholders`]' statement on `target`'s ledger. Binds `$1` the
+/// [`drop_placeholders`]' statement on `ledger`. Binds `$1` the
 /// keys (`text[]`).
-fn drop_statement(target: &str) -> String {
+fn drop_statement(ledger: &LedgerRef) -> String {
     let q = |c: &str| quote_ident(c);
     format!(
         "delete from {ledger} where {key} = any($1::text[]) \
            and {applied} is null and {basis} is null and not {tombstone}",
-        ledger = ledger_ident(target),
+        ledger = ledger.ident,
         key = q(schema::KEY_COLUMN),
         applied = q(schema::APPLIED_LSN_COLUMN),
         basis = q(schema::BASIS_COLUMN),
@@ -390,6 +456,7 @@ pub async fn explain_page(
     keys: &[&str],
 ) -> Result<Vec<(&'static str, String)>, ApplyError> {
     let n = keys.len();
+    let ledger = LedgerRef::of_target(target);
     let rederive = vec![false; n];
     let lsns: Vec<Option<String>> = vec![Some("0/10".to_string()); n];
     let txids: Vec<Option<&str>> = vec![Some("100"); n];
@@ -406,10 +473,7 @@ pub async fn explain_page(
     let lock = explain(
         super::ledger::query_by_entry_key(
             &txn,
-            &format!(
-                "explain {}",
-                super::ledger::lock_statement(&ledger_ident(target))
-            ),
+            &format!("explain {}", super::ledger::lock_statement(&ledger.ident)),
             &[&keys],
         )
         .await?,
@@ -417,9 +481,16 @@ pub async fn explain_page(
     let update = explain(
         super::ledger::query_by_entry_key(
             &txn,
-            &format!("explain {}", update_statement(target, true)),
+            &format!("explain {}", update_statement(&ledger, true)),
             &[
-                &keys, &rederive, &lsns, &txids, &present, &target, &snapshot, &1_i64,
+                &keys,
+                &rederive,
+                &lsns,
+                &txids,
+                &present,
+                &ledger.floor_key,
+                &snapshot,
+                &1_i64,
             ],
         )
         .await?,
@@ -427,7 +498,7 @@ pub async fn explain_page(
     let drop = explain(
         super::ledger::query_by_entry_key(
             &txn,
-            &format!("explain {}", drop_statement(target)),
+            &format!("explain {}", drop_statement(&ledger)),
             &[&keys],
         )
         .await?,
@@ -440,23 +511,52 @@ pub async fn explain_page(
     ])
 }
 
-/// Empties a 1-1 target's ledger for a source `TRUNCATE` and raises its
+/// Empties `ledger` for a source `TRUNCATE` and raises its
 /// truncate floor to `lsn`, the truncate's ring `lsn` (the D split's Q6). The caller
 /// clears the target rows. `lsn` is required: a truncate that raised no
 /// floor would let a change from before it apply over it.
 pub(crate) async fn truncate(
     txn: &Transaction<'_>,
-    target: &str,
+    ledger: &LedgerRef,
     lsn: PgLsn,
 ) -> Result<(), ApplyError> {
-    txn.batch_execute(&format!("truncate {}", ledger_ident(target)))
+    txn.batch_execute(&format!("truncate {}", ledger.ident))
         .await?;
     txn.execute(
         "insert into ledger_truncate_floor (target_table, floor) values ($1, $2) \
          on conflict (target_table) do update \
          set floor = greatest(ledger_truncate_floor.floor, excluded.floor)",
-        &[&target, &lsn],
+        &[&ledger.floor_key, &lsn],
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::defs::join_one_to_one_ledger::LedgerTable;
+
+    /// A target's ledger keys everything by the target, as before the split;
+    /// a hidden ledger keys its floor by its own quoted ident and keeps the
+    /// definition's target for the build lookup.
+    #[test]
+    fn a_ledger_ref_separates_ident_floor_label_and_owner() {
+        let target = LedgerRef::of_target("public.t");
+        assert_eq!(target.ident, ledger_ident("public.t"));
+        assert_eq!(
+            (&target.floor_key, &target.label, &target.owner_target),
+            (
+                &"public.t".to_string(),
+                &"public.t".to_string(),
+                &"public.t".to_string()
+            )
+        );
+
+        let r = LedgerRef::hidden("trellis", 7, LedgerTable::From, "public.joined");
+        assert_eq!(r.ident, "\"trellis\".\"join1_7_r\"");
+        assert_eq!(r.floor_key, r.ident);
+        assert_eq!(r.label, "trellis.join1_7_r");
+        assert_eq!(r.owner_target, "public.joined");
+    }
 }

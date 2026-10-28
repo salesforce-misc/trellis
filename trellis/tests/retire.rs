@@ -600,3 +600,76 @@ async fn collect_tombstones_skips_a_ledger_under_a_build() {
         .expect("collect_tombstones");
     assert_eq!(collected, 1, "k1's tombstone goes once no build runs");
 }
+
+/// A 1-1 `JOIN`'s hidden ledgers `R` and `M` (`join1_{id}_{r|m}`, in the
+/// catalog schema) are collected like a target's ledger: their tombstones at
+/// or below the drained prefix go, and their live entries stay. The
+/// GC finds them by definition id, not through the target's name.
+#[tokio::test]
+async fn collect_tombstones_collects_a_one_to_one_joins_hidden_ledgers() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+
+    client
+        .batch_execute(
+            r#"
+            insert into source_table_versions (source_table, version)
+            values ('public.src', 1);
+            insert into transform_definitions
+                (target_table, source_table, source_version, definition_text)
+            values ('public.joined', 'public.src', 1, 'n/a');
+            "#,
+        )
+        .await
+        .expect("create the catalog row");
+    let id: i64 = client
+        .query_one(
+            "select id from transform_definitions where target_table = 'public.joined'",
+            &[],
+        )
+        .await
+        .expect("read the id")
+        .get(0);
+    for side in ["r", "m"] {
+        client
+            .batch_execute(&format!(
+                r#"
+                create table "join1_{id}_{side}" (
+                    "__from_key" text primary key,
+                    "__applied_lsn" pg_lsn,
+                    "__applied_seg" bigint,
+                    "__basis" pg_snapshot,
+                    "__tombstone" boolean not null default false
+                );
+                create index on "join1_{id}_{side}" ("__applied_seg") where "__tombstone";
+                insert into "join1_{id}_{side}"
+                    ("__from_key", "__applied_seg", "__tombstone")
+                values ('dead', 1, true), ('live', 1, false);
+                "#
+            ))
+            .await
+            .expect("create a hand-made hidden ledger");
+    }
+
+    seal_and_fence(&mut client).await; // segment 1
+    mark_drained(&client, 1).await;
+
+    let collected = retire::collect_tombstones(&mut client)
+        .await
+        .expect("collect_tombstones");
+    assert_eq!(collected, 2, "one tombstone from each of R and M");
+    for side in ["r", "m"] {
+        let keys: Vec<String> = client
+            .query(
+                &format!(r#"select "__from_key" from "join1_{id}_{side}" order by 1"#),
+                &[],
+            )
+            .await
+            .expect("read the ledger")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(keys, ["live"], "{side}: only the live entry stays");
+    }
+}

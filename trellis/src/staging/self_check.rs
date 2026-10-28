@@ -1243,7 +1243,9 @@ fn page_sql(
     Ok(keyset.ranked(
         &format!(
             "{}recomputed as materialized ({}), persisted as materialized ({}), ",
-            ring.one_to_one_ctes(&def.target_table),
+            ring.one_to_one_ctes(&super::one_to_one_ledger::LedgerRef::of_target(
+                &def.target_table
+            )),
             side(&expected, &recomputed),
             side(&target_ident, &persisted)
         ),
