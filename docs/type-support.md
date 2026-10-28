@@ -342,13 +342,10 @@ quarantined like any data error; a constant that does is refused at define
 What each form reads: none of these reads `DateStyle`, `IntervalStyle` or
 `TimeZone` (the pins above stay). `AT TIME ZONE 'UTC'` parses its zone name
 under `timezone_abbreviations`, which every Trellis session pins to
-`Default` (`pool::EXPRESSION_INPUT_GUCS`). The forms Postgres picks silently
-and are `STABLE` are refused: `DATE_TRUNC` and `EXTRACT` of a `timestamptz`
-(they read `TimeZone`), `DATE_TRUNC` of a `date` (the `timestamptz`
-overload), and `CAST(tz AS timestamp)`. Also refused, each with a remedy:
-`interval` in any form (`timestamp - timestamp`, `timestamp ± interval`), any
-zone but `'UTC'` (a time zone database release changes past results), and
-`date_part` (`double precision`).
+`Default` (`pool::EXPRESSION_INPUT_GUCS`). Where Postgres would silently pick
+a `STABLE` overload that reads `TimeZone`, produce an `interval`, or read the
+time zone database, define refuses the expression with a remedy
+([transforms](transforms.md#supported-sources-and-targets)).
 Checked in `trellis/tests/date_key_spaces.rs`,
 `trellis/tests/one_to_one_render.rs` and the harness.
 
