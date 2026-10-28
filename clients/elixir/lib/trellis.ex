@@ -72,15 +72,18 @@ defmodule Trellis do
   per request. The handle is shut down when `shutdown/1` is called, or, as a
   backstop, when it is garbage collected.
 
-  Each handle pays for itself. It owns a connection pool of up to 20
-  connections and a small Rust runtime (`:worker_threads` threads). A handle
-  with `staging: true` or `drain_threads` above `0` also owns a second runtime
-  and pool of the same size, plus connections outside both pools: one for the
-  staging worker, and for each drain thread a `LISTEN` connection and up to two
-  more while it drains.
+  Each handle pays for itself. It owns a call pool of up to 20 connections
+  (`:max_call_pool_size`; they close after 60 idle seconds) and a small Rust
+  runtime (`:worker_threads` threads). A handle with `staging: true` or
+  `drain_threads` above `0` also owns a second runtime and a background pool
+  sized by those roles (`2N + 5` for a worker at `drain_threads: N`), plus
+  connections outside both pools: one for the staging worker while it leads,
+  one `LISTEN` shared by its drain threads, and a claim keep-alive and a paged
+  drain's session while they are needed.
   Handles share no budget, so size all of them together against the server's
-  `max_connections`. Each instance has its own staging worker, so set
-  `staging: true` in one process of the fleet per instance.
+  `max_connections`. Each instance has one staging worker at a time: any number
+  of processes may set `staging: true`, and one leads while the rest stand by
+  (see `docs/embedding.md`, "Rolling deploys").
 
   In an application, let a supervisor own each handle: `{Trellis, options}` in
   the supervision tree starts a process that connects the handle as it starts
@@ -256,9 +259,9 @@ defmodule Trellis do
   rather than calling this directly.
 
   Returns `{:error, %Trellis.Error{}}` if the connect fails, so the
-  supervisor's start fails with the reason. A second `staging: true`
-  process for the same instance fails that way (`:conflict`) while the first
-  is alive: in a rolling deploy, stop the old one before the new one starts.
+  supervisor's start fails with the reason. A `staging: true` process whose
+  instance already has a staging worker does not fail: it stands by and takes
+  over when the first goes away, so a rolling deploy needs no ordering.
 
   The process only keeps the handle's lifecycle. A call made through its
   name asks it for the handle and then runs in the caller's own process, so

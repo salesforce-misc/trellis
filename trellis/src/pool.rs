@@ -363,8 +363,8 @@ impl Drop for SweepTask {
 }
 
 impl Pool {
-    /// Builds a call pool from `config`: [`DEFAULT_CALL_POOL_MAX_SIZE`]
-    /// connections, a [`DEFAULT_CALL_POOL_WAIT_TIMEOUT`] wait. See
+    /// Builds a call pool from `config`: `DEFAULT_CALL_POOL_MAX_SIZE`
+    /// connections, a `DEFAULT_CALL_POOL_WAIT_TIMEOUT` wait. See
     /// [`Pool::with_limits`].
     pub fn new(config: &Config) -> Result<Self, Error> {
         Self::with_limits(
@@ -386,7 +386,7 @@ impl Pool {
     /// checkout on an exhausted pool would wait forever, with no error and no
     /// log.
     ///
-    /// A connection unused for [`POOL_IDLE_TIMEOUT`] is closed: the pool hands
+    /// A connection unused for `POOL_IDLE_TIMEOUT` is closed: the pool hands
     /// out its most recently used connection first, and, when built inside a
     /// tokio runtime, a task sweeps the rest.
     pub fn with_limits(
@@ -399,7 +399,7 @@ impl Pool {
 
     /// Builds the pool a handle's background client runs on, of exactly
     /// `max_size` connections (see [`background_pool_size`]). Its checkouts
-    /// wait [`DEFAULT_CALL_POOL_WAIT_TIMEOUT`], and in debug builds a task
+    /// wait `DEFAULT_CALL_POOL_WAIT_TIMEOUT`, and in debug builds a task
     /// that holds more than [`MAX_BACKGROUND_HELD`] of them at once panics.
     pub(crate) fn background(config: &Config, max_size: usize) -> Result<Self, Error> {
         Self::build(config, max_size, DEFAULT_CALL_POOL_WAIT_TIMEOUT, true)
@@ -479,7 +479,7 @@ impl Pool {
     }
 
     /// Closes every idle connection unused for `idle` or longer. The pool's
-    /// own sweep calls this every half [`POOL_IDLE_TIMEOUT`]; tests call it
+    /// own sweep calls this every half `POOL_IDLE_TIMEOUT`; tests call it
     /// directly. A connection's last-use time is stamped at checkout, so one
     /// held for a long transaction counts as idle the moment it comes back,
     /// and may be closed by the next sweep (one reconnect).

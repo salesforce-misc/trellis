@@ -139,20 +139,28 @@ The surface mirrors the Rust crate's `BlockingTrellis`. Every function has a ban
 ```
 
 `connect/1`'s defaults (`staging: false, drain_threads: 0`) run nothing in
-the background. For each instance (catalog schema), exactly one connection
-in a fleet should set `staging: true`, and some connection must run drain
-threads, or no definition ever reaches `:live`.
+the background. For each instance (catalog schema), some connection in the
+fleet must set `staging: true` and some connection must run drain threads, or
+no definition ever reaches `:live`. Any number of connections may set
+`staging: true`: one takes the producer lock and leads, the rest stand by and
+take over when it goes away, so a rolling deploy needs no operator step and
+the application boots even when the old worker is still running (see
+[Rolling deploys](../../docs/embedding.md#rolling-deploys)).
 
 ### Resources
 
-At the defaults, a handle holds up to 20 Postgres connections (opened as
-calls need them) and 3 threads. A worker handle (`staging: true,
-drain_threads: N`) holds up to `42 + 3N` connections and 6 threads: drain
-threads are tasks on its runtime, not OS threads. Its memory is bounded by
-row counts, not bytes: about `N` × 100,000 changed rows' images at its peak.
-`TRELLIS_POOL_MAX_SIZE` lowers the 20 (it sizes each of a handle's two
-pools), and `worker_threads:` sets the threads. Every handle (each `{Trellis, name: ...}` child) costs this
-again. The full accounting is in
+At the defaults, a handle holds up to 20 Postgres connections (its call pool,
+opened as calls need them and closed after 60 seconds idle) and 3 threads. A
+worker handle (`staging: true, drain_threads: N`) also owns a background pool
+of up to `2N + 5` connections (`2N + 4` without staging, `1` with staging
+alone), closed after 60 seconds idle, and two connections that stay open: the
+staging session and one `LISTEN` shared by its drain threads. It holds 6
+threads: drain threads are tasks on its runtime, not OS threads. Its memory is
+bounded by row counts, not bytes: about `N` × 100,000 changed rows' images at
+its peak. `:max_call_pool_size` lowers the 20 (the background pool is sized by
+the handle's roles, not by an option), and `:worker_threads` sets the threads.
+Every handle (each `{Trellis, name: ...}` child) costs this again. The full
+accounting is in
 [`docs/embedding.md`](../../docs/embedding.md#what-a-handle-uses).
 
 ### Conventions

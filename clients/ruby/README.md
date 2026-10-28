@@ -144,21 +144,32 @@ Trellis.shutdown
 | `staging:` | `false` | run the staging worker (installs change capture, starts backfills) here |
 | `drain_threads:` | `0` | threads applying staged changes to the targets |
 | `worker_threads:` | `2` | the threads of each Rust runtime a handle owns (its calls', and its background client's), invisible to Ruby's own sizing |
+| `max_call_pool_size:` | `20` | the most connections the handle's call pool opens; the background pool is sized by `staging:` and `drain_threads:` |
+| `call_pool_wait_timeout_ms:` | `30_000` | how long a call waits for a free call-pool connection before a `ConnectivityError` |
 
-The defaults run nothing in the background. Exactly one process in a fleet
-should set `staging: true`, and some process must run drain threads, or no
-definition ever reaches `:live`.
+The defaults run nothing in the background. Some process in a fleet must set
+`staging: true` and some process must run drain threads, or no definition ever
+reaches `:live`. Any number of processes may set `staging: true`: one takes the
+producer lock and leads, the rest stand by and take over when it goes away, so a
+rolling deploy needs no operator step. Under a preforking Puma with
+`TRELLIS_WORKER=1`, every Puma worker connects with `staging: true`, so all but
+one stand by; that is harmless, and each polls the lock every 5 seconds (see
+[Rolling deploys](../../docs/embedding.md#rolling-deploys)).
 
 ### Resources
 
-At the defaults, a handle holds up to 20 Postgres connections (opened as
-calls need them) and 3 threads. A worker handle (`staging: true,
-drain_threads: N`) holds up to `42 + 3N` connections and 6 threads: drain
-threads are tasks on its runtime, not OS threads. Its memory is bounded by
-row counts, not bytes: about `N` × 100,000 changed rows' images at its peak.
-`TRELLIS_POOL_MAX_SIZE` lowers the 20 (it sizes each of a handle's two
-pools), and `worker_threads:` sets the threads. Every handle (each `Trellis::Instance` too) costs this
-again. The full accounting is in
+At the defaults, a handle holds up to 20 Postgres connections (its call pool,
+opened as calls need them and closed after 60 seconds idle) and 3 threads. A
+worker handle (`staging: true, drain_threads: N`) also owns a background pool
+of up to `2N + 5` connections (`2N + 4` without staging, `1` with staging
+alone), closed after 60 seconds idle, and two connections that stay open: the
+staging session and one `LISTEN` shared by its drain threads. It holds 6
+threads: drain threads are tasks on its runtime, not OS threads. Its memory is
+bounded by row counts, not bytes: about `N` × 100,000 changed rows' images at
+its peak. `max_call_pool_size:` lowers the 20 (the background pool is sized by
+the handle's roles, not by an option), and `worker_threads:` sets the threads.
+Every handle (each `Trellis::Instance` too) costs this again. The full
+accounting is in
 [`docs/embedding.md`](../../docs/embedding.md#what-a-handle-uses).
 
 ### Several instances

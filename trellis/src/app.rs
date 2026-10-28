@@ -148,10 +148,12 @@ pub struct TrellisOptions {
     pub staging: bool,
     /// How many drain (application) worker threads this connection runs. Zero
     /// (the default) runs none. Each is a task on the background client's
-    /// runtime, not an OS thread, and holds up to three connections outside
-    /// the pools (see [`Pool::background`](crate::Pool)'s sizing);
-    /// `docs/embedding.md`, "What a handle uses", adds up a
-    /// handle's connections, threads and memory.
+    /// runtime, not an OS thread. With `n` of them the background pool holds
+    /// up to `2n + 5` connections (`2n + 4` without `staging`), each thread
+    /// holding at most two at once; they share one `LISTEN` connection and one
+    /// claim keep-alive, and a paged drain opens a session of its own.
+    /// `docs/embedding.md`, "What a handle uses", adds up a handle's
+    /// connections, threads and memory.
     pub drain_threads: usize,
     /// Caps the worker-thread count of each `tokio` runtime this connection
     /// owns: the background [`Client`]'s (built when `staging` or
@@ -213,7 +215,7 @@ pub struct TrellisOptions {
     pub held_key_retry: Option<HeldKeyRetry>,
     /// The most physical connections the handle's call pool opens: the pool
     /// that serves the handle's API calls (`status`, `apply`, `define`,
-    /// `migrate`, ...). Default 20 ([`DEFAULT_CALL_POOL_MAX_SIZE`]).
+    /// `migrate`, ...). Default 20 (`DEFAULT_CALL_POOL_MAX_SIZE`).
     /// Connections open as calls need them and close after 60 seconds idle,
     /// so a handle that makes few calls holds none. Most calls hold one
     /// connection, a few hold two or three while they run.
@@ -224,7 +226,7 @@ pub struct TrellisOptions {
     pub max_call_pool_size: usize,
     /// How long a call waits for a free call-pool connection before failing
     /// with a connectivity error. Default 30 seconds
-    /// ([`DEFAULT_CALL_POOL_WAIT_TIMEOUT`]). A call's own deadline can cut the
+    /// (`DEFAULT_CALL_POOL_WAIT_TIMEOUT`). A call's own deadline can cut the
     /// wait shorter.
     pub call_pool_wait_timeout: Duration,
 }
