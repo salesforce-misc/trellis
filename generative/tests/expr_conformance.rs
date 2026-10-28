@@ -1514,6 +1514,26 @@ fn every_near_miss_is_refused() {
     });
 }
 
+/// Operator lexing mirrors Postgres: split comparisons and adjacent runs
+/// with no operator are refused (by name) exactly where Postgres rejects
+/// them. The same cases are in `every_near_miss_is_refused`; this one fails
+/// on its own if the lexer drifts.
+#[test]
+fn operator_lexing_near_misses_are_refused() {
+    let misses: Vec<_> = near_misses(&columns())
+        .into_iter()
+        .filter(|m| m.kind == "operator-lexing")
+        .collect();
+    assert!(misses.len() >= 8, "only {} operator-lexing misses", misses.len());
+    HARNESS.with(|h| {
+        for miss in &misses {
+            if let Err(d) = h.fixture.check_refusal(miss) {
+                panic!("{d}");
+            }
+        }
+    });
+}
+
 /// The types the conformance table's columns carry are the ones the
 /// generator reasons about (a new column type needs a generator entry).
 #[test]

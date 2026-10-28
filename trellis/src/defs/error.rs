@@ -61,6 +61,10 @@ pub enum ParseError {
     UnsupportedCastTarget { name: String },
     /// A run of prefix `-` operators longer than the parser keeps.
     PrefixMinusChainTooLong { max: usize },
+    /// A two-character comparison split by whitespace (`a < = b`, `a ! = b`).
+    /// Postgres lexes `<=`, `>=`, `<>` and `!=` only when adjacent, so the
+    /// split form is a syntax error there and here.
+    SplitOperator { found: String, joined: String },
     /// Two adjacent `-` characters, which start a comment in SQL.
     DoubleMinus,
     /// `a < b < c`, `a = b = c` and the like: Postgres's comparisons (and
@@ -239,6 +243,10 @@ impl fmt::Display for ParseError {
             ParseError::ExpressionTooDeep { limit } => write!(
                 f,
                 "expression nested too deeply: an expression may nest at most {limit} levels (a chain of {limit} operands joined by operators, or fewer nested parentheses or calls); split it into calculated fields"
+            ),
+            ParseError::SplitOperator { found, joined } => write!(
+                f,
+                "'{found}' is not an operator: the characters of a two-character operator must be adjacent, as in Postgres; write '{joined}'"
             ),
             ParseError::DoubleMinus => write!(
                 f,

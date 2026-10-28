@@ -928,22 +928,33 @@ impl Parser {
     fn peek_infix(&self) -> Result<Option<(Infix, usize)>, ParseError> {
         match self.peek() {
             Token::Symbol(c) if OPERATOR_CHARS.contains(c) => {
-                // The lexer reads one character at a time, so a two-character
-                // comparison (`>=`, `<=`, `<>`, `!=`) arrives as two symbols.
-                // Name it whole, not as the `>` or `<` it starts with.
-                let mut symbol = c.to_string();
-                let mut tokens = 1;
+                // A comparison's characters must be adjacent (the lexer
+                // emits `>=` whole), as in Postgres: `a > = b` is a syntax
+                // error there and here.
                 if let Token::Symbol(next) = self.peek_at(1)
                     && matches!((*c, *next), ('<' | '>' | '!', '=') | ('<', '>'))
                 {
-                    symbol.push(*next);
-                    tokens = 2;
+                    return Err(ParseError::SplitOperator {
+                        found: format!("{c} {next}"),
+                        joined: format!("{c}{next}"),
+                    });
                 }
-                match lookup_operator(&symbol) {
-                    Some(op) => Ok(Some((Infix::Binary(op), tokens))),
-                    None => Err(ParseError::UnsupportedOperator { operator: symbol }),
+                match lookup_operator(&c.to_string()) {
+                    Some(op) => Ok(Some((Infix::Binary(op), 1))),
+                    None => Err(ParseError::UnsupportedOperator {
+                        operator: c.to_string(),
+                    }),
                 }
             }
+            // A run of adjacent operator characters is one operator, as in
+            // Postgres; a run with no registered operator is refused whole
+            // rather than split (`a<=>b`, `a!=-1`, `a%-1`).
+            Token::Operator(symbol) => match lookup_operator(symbol) {
+                Some(op) => Ok(Some((Infix::Binary(op), 1))),
+                None => Err(ParseError::UnsupportedOperator {
+                    operator: symbol.clone(),
+                }),
+            },
             // `AT` is a keyword only here, after a complete operand and
             // followed by `TIME ZONE` (ADR-0018): anywhere else the word is a
             // name, or the error it always was.

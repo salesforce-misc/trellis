@@ -606,3 +606,73 @@ fn definition_text_round_trips_for_every_new_construct() {
         assert_eq!(first, again, "`{text}` rendered `{rendered}`");
     }
 }
+
+/// Operators are lexed as Postgres lexes them (verified on Postgres 17): a
+/// run of adjacent operator characters is one token, and a run gives back
+/// trailing `+`/`-` unless it holds one of `~ ! @ # ^ & | ` ? %`.
+#[test]
+fn adjacent_comparison_operators_are_accepted() {
+    for (text, want) in [
+        ("a<=b", "(<= a b)"),
+        ("a>=b", "(>= a b)"),
+        ("a<>b", "(<> a b)"),
+        ("a!=b", "(<> a b)"),
+        ("a<-1", "(< a -1)"),
+        ("a>-1", "(> a -1)"),
+        ("a>=-1", "(>= a -1)"),
+        ("a<=-1", "(<= a -1)"),
+        ("a<>-1", "(<> a -1)"),
+        ("a=-1", "(= a -1)"),
+        ("a*-1", "(* a -1)"),
+        ("a/-1", "(/ a -1)"),
+        ("a+-1", "(+ a -1)"),
+    ] {
+        assert_eq!(sexp(&expr_of(text)), want, "`{text}`");
+    }
+}
+
+#[test]
+fn a_comparison_split_by_whitespace_is_refused_by_name() {
+    for (text, found, joined) in [
+        ("a < = b", "< =", "<="),
+        ("a > = b", "> =", ">="),
+        ("a ! = b", "! =", "!="),
+        ("a < > b", "< >", "<>"),
+    ] {
+        match parse_err(text) {
+            ParseError::SplitOperator { found: f, joined: j } => {
+                assert_eq!((f.as_str(), j.as_str()), (found, joined), "`{text}`");
+            }
+            other => panic!("`{text}`: {other:?}"),
+        }
+    }
+}
+
+/// Postgres lexes these runs as one operator it has no definition for (or,
+/// for `=>`, a syntax error); splitting them would give the text a meaning
+/// Postgres refuses, so each is refused whole.
+#[test]
+fn an_operator_run_without_an_operator_is_refused_whole() {
+    for (text, run) in [
+        ("a<=>b", "<=>"),
+        ("a==b", "=="),
+        ("a<<b", "<<"),
+        ("a>>b", ">>"),
+        ("a=>b", "=>"),
+        ("a!=-1", "!=-"),
+        ("a%-1", "%-"),
+        ("a><b", "><"),
+        ("a=<b", "=<"),
+        ("a=!b", "=!"),
+        ("a<>=b", "<>="),
+        ("a%+1", "%+"),
+        ("a*/b", "*/"),
+    ] {
+        match parse_err(text) {
+            ParseError::UnsupportedOperator { operator } => {
+                assert_eq!(operator, run, "`{text}`");
+            }
+            other => panic!("`{text}`: {other:?}"),
+        }
+    }
+}

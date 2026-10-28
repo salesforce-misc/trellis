@@ -13,6 +13,11 @@ pub enum Token {
     /// `''` escapes resolved to a literal `'`), per SQL's spelling.
     String(String),
     Symbol(char),
+    /// A run of two or more adjacent operator characters, lexed as Postgres
+    /// lexes it (see [`lex`]): `<=`, `>=`, `<>`, `!=`, or a run this grammar
+    /// has no operator for (`<=>`, `!=-`, `%-`), which the parser refuses by
+    /// name.
+    Operator(String),
     Eof,
 }
 
@@ -23,6 +28,7 @@ impl Token {
             Token::Number(s) => format!("number '{s}'"),
             Token::String(s) => format!("string '{s}'"),
             Token::Symbol(c) => format!("'{c}'"),
+            Token::Operator(s) => format!("'{s}'"),
             Token::Eof => "end of input".to_string(),
         }
     }
@@ -31,6 +37,40 @@ impl Token {
 const SYMBOLS: &[char] = &[
     '+', '-', '*', '/', '%', '=', ',', '(', ')', '.', '<', '>', '!',
 ];
+
+/// The characters Postgres lexes into operators (`scan.l`'s `op_chars`).
+const OP_CHARS: &str = "~!@#^&|`?+-*/%<>=";
+
+/// Operator characters that let a run end in `+` or `-`.
+const OP_RUN_KEEPS_SIGN: &str = "~!@#^&|`?%";
+
+/// The length of the operator run starting at `chars[0]`, by Postgres's
+/// rules: the longest stretch of operator characters that stops before a
+/// `--` or `/*` comment start, and, unless it holds one of
+/// `~ ! @ # ^ & | ` ? %`, gives back its trailing `+` and `-` (down to one
+/// character) so `a<-1` is `a < -1` but `a!=-1` is the single operator `!=-`.
+fn operator_run_len(chars: &[char]) -> usize {
+    let mut n = 0;
+    while let Some(&c) = chars.get(n) {
+        if !OP_CHARS.contains(c) {
+            break;
+        }
+        let next = chars.get(n + 1);
+        if n > 0 && ((c == '-' && next == Some(&'-')) || (c == '/' && next == Some(&'*'))) {
+            break;
+        }
+        n += 1;
+    }
+    if n > 1
+        && matches!(chars[n - 1], '+' | '-')
+        && !chars[..n].iter().any(|c| OP_RUN_KEEPS_SIGN.contains(*c))
+    {
+        while n > 1 && matches!(chars[n - 1], '+' | '-') {
+            n -= 1;
+        }
+    }
+    n
+}
 
 pub fn lex(input: &str) -> Result<Vec<Token>, ParseError> {
     let mut tokens = Vec::new();
@@ -111,6 +151,18 @@ pub fn lex(input: &str) -> Result<Vec<Token>, ParseError> {
         // refused by name.
         if c == '-' && chars.get(i + 1) == Some(&'-') {
             return Err(ParseError::DoubleMinus);
+        }
+
+        // Operators are lexed as runs, exactly as Postgres does, so a
+        // two-character comparison exists only when its characters are
+        // adjacent (`a<=b`, never `a< =b`) and `a!=-1` is one operator.
+        if OP_CHARS.contains(c) {
+            let n = operator_run_len(&chars[i..]);
+            if n > 1 {
+                tokens.push(Token::Operator(chars[i..i + n].iter().collect()));
+                i += n;
+                continue;
+            }
         }
 
         if SYMBOLS.contains(&c) {

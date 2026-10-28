@@ -1081,14 +1081,30 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
             out.push(NearMiss {
                 kind: "unadmitted-operator",
                 text: format!("{a} {symbol} {b}"),
-                // The refusal names the whole symbol, quoted (`'<='`, not
-                // the `'<'` it starts with), except a character the lexer
-                // has no operator for at all (`|`), which it names alone.
-                needles: vec![if symbol.starts_with('|') {
-                    "'|'".to_string()
-                } else {
-                    format!("'{symbol}'")
-                }],
+                // The refusal names the whole run, quoted.
+                needles: vec![format!("'{symbol}'")],
+            });
+        }
+        // Operator spellings Postgres lexes differently from a naive
+        // character-at-a-time reading: a two-character comparison split by
+        // whitespace is a syntax error there, and an adjacent run with no
+        // operator (`<=>`, `!=-`, `%-`) is one undefined operator, never two.
+        for (text, needle) in [
+            (format!("{a} < = {b}"), "'< ='"),
+            (format!("{a} > = {b}"), "'> ='"),
+            (format!("{a} ! = {b}"), "'! ='"),
+            (format!("{a} < > {b}"), "'< >'"),
+            (format!("{a} <=> {b}"), "'<=>'"),
+            (format!("{a} == {b}"), "'=='"),
+            (format!("{a} => {b}"), "'=>'"),
+            (format!("{a}!=-1"), "'!=-'"),
+            (format!("{a}%-1"), "'%-'"),
+            (format!("{a} =< {b}"), "'=<'"),
+        ] {
+            out.push(NearMiss {
+                kind: "operator-lexing",
+                text,
+                needles: vec![needle.to_string()],
             });
         }
         for name in UNADMITTED_FUNCTIONS {

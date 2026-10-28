@@ -57,6 +57,23 @@ grammar-plus-renderer change. Adopting a full SQL parser would invert this —
 we'd inherit its entire surface and forbid it piece by piece — and we parse
 fragments, not whole statements. We want the accepted language to *be* the spec.
 
+## The expression grammar is a subset of Postgres's
+
+Apart from Trellis's own language (`TRANSFORM`, `FROM`, `SELECT` and the like),
+the expression grammar accepts a subset of what Postgres accepts, with the
+same meaning, and never text Postgres rejects. A grammar change mirrors
+Postgres's lexing and parsing rules: token boundaries, precedence,
+associativity and keywords.
+
+The lexer reads operator characters the way Postgres's does. A run of adjacent
+operator characters (`+ - * / % < > = ! ~ @ # ^ & | \` ?`) is one token, which
+stops before a `--` or `/*` comment start, and which gives back its trailing
+`+` and `-` unless it holds one of `~ ! @ # ^ & | \` ? %`. So `a<=b`, `a>=b`,
+`a<>b` and `a!=b` are comparisons only with their characters adjacent;
+`a < = b` is refused by name; `a<-1` is `a < -1`; and `a!=-1`, `a%-1`, `a<=>b`
+and `a==b` are one operator each that the registry lacks, refused whole rather
+than split into operators Postgres would not have read.
+
 ## A 1-1 definition is `TRANSFORM`, `FROM`, `SELECT` and an optional `WHERE`
 
 The 1-1 statement is:
