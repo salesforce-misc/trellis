@@ -211,9 +211,9 @@ impl Parser {
     }
 
     /// The token `n` positions ahead of the cursor (`peek_at(0)` is
-    /// [`Self::peek`]), clamped to the trailing `Eof` — two-token lookahead
-    /// exists solely for `DOUBLE PRECISION`, the grammar's only multi-word
-    /// type keyword.
+    /// [`Self::peek`]), clamped to the trailing `Eof` — for `DOUBLE
+    /// PRECISION`, the grammar's only multi-word type keyword, and for naming
+    /// a two-character operator in its refusal.
     fn peek_at(&self, n: usize) -> &Token {
         let i = (self.pos + n).min(self.tokens.len() - 1);
         &self.tokens[i]
@@ -816,7 +816,15 @@ impl Parser {
                 Token::Symbol(c) if OPERATOR_CHARS.contains(c) => *c,
                 _ => break,
             };
-            let symbol_str = symbol.to_string();
+            // The lexer reads one character at a time, so a two-character
+            // comparison (`>=`, `<=`, `<>`) arrives as two symbols. Name it
+            // whole, not as the `>` or `<` it starts with.
+            let mut symbol_str = symbol.to_string();
+            if let Token::Symbol(next) = self.peek_at(1)
+                && matches!((symbol, *next), ('<' | '>', '=') | ('<', '>'))
+            {
+                symbol_str.push(*next);
+            }
             let op = match lookup_operator(&symbol_str) {
                 Some(op) => op,
                 None => {

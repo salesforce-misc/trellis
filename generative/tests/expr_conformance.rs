@@ -14,7 +14,7 @@ use generative::expr_conformance::{Agreement, Divergence, Fixture, columns};
 use generative::expr_gen::strategy::{Draw, any_expr, near_miss};
 use generative::expr_gen::{self, Profile, TextStyle, near_misses, render_text};
 use proptest::prelude::*;
-use proptest::test_runner::{Config, TestRunner};
+use proptest::test_runner::{Config, RngSeed, TestRunner};
 use testkit::{TestCluster, TestDatabase};
 use trellis::dev::defs::ast::{Expr, Operator, ValueType};
 use trellis::dev::defs::{parse, registry};
@@ -83,19 +83,30 @@ fn cases(default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-fn runner(cases: u32) -> TestRunner {
-    TestRunner::new(Config {
+/// The seed of the normal suite's runs: they draw the same cases every
+/// time, so a red `verify` is never a matter of luck. The `#[ignore]`d
+/// properties draw fresh cases each run (or `PROPTEST_RNG_SEED`'s). A failure
+/// prints the expression text, which replays as a pin in
+/// `hard_cases_agree_with_postgres`.
+const SMOKE_SEED: u64 = 1413;
+
+fn runner(cases: u32, seed: Option<u64>) -> TestRunner {
+    let mut config = Config {
         cases,
         failure_persistence: None,
         ..Config::default()
-    })
+    };
+    if let Some(seed) = seed {
+        config.rng_seed = RngSeed::Fixed(seed);
+    }
+    TestRunner::new(config)
 }
 
 /// Type, Value and Round trip over `cases` random expressions, drawn over
 /// `columns` (none: constants only, which Postgres folds at plan time).
-fn run_expression_property(cases: u32, columns: &[expr_gen::Column]) {
+fn run_expression_property(cases: u32, columns: &[expr_gen::Column], seed: Option<u64>) {
     let strategy = any_expr(columns, Profile::CONFORMANCE);
-    let result = runner(cases).run(&strategy, |draw: Draw| {
+    let result = runner(cases, seed).run(&strategy, |draw: Draw| {
         let text = draw.text();
         check_text(&text, Some(&draw.expr))
             .map(|_| ())
@@ -108,9 +119,9 @@ fn run_expression_property(cases: u32, columns: &[expr_gen::Column]) {
 }
 
 /// Refusal over `cases` random near misses.
-fn run_refusal_property(cases: u32) {
+fn run_refusal_property(cases: u32, seed: Option<u64>) {
     let strategy = near_miss(&columns());
-    let result = runner(cases).run(&strategy, |miss| {
+    let result = runner(cases, seed).run(&strategy, |miss| {
         HARNESS
             .with(|h| h.fixture.check_refusal(&miss))
             .map(|_| ())
@@ -123,23 +134,23 @@ fn run_refusal_property(cases: u32) {
 
 #[test]
 fn expressions_conform_to_postgres_smoke() {
-    run_expression_property(cases(60), &columns());
+    run_expression_property(cases(60), &columns(), Some(SMOKE_SEED));
 }
 
 #[test]
 fn constant_expressions_conform_to_postgres_smoke() {
-    run_expression_property(cases(60), &[]);
+    run_expression_property(cases(60), &[], Some(SMOKE_SEED));
 }
 
 #[test]
 fn near_misses_are_refused_smoke() {
-    run_refusal_property(cases(60));
+    run_refusal_property(cases(60), Some(SMOKE_SEED));
 }
 
 #[test]
 #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
 fn property_expressions_conform_to_postgres() {
-    run_expression_property(cases(1000), &columns());
+    run_expression_property(cases(1000), &columns(), None);
 }
 
 /// No column in sight: every subexpression is a constant Postgres folds at
@@ -147,13 +158,13 @@ fn property_expressions_conform_to_postgres() {
 #[test]
 #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
 fn property_constant_expressions_conform_to_postgres() {
-    run_expression_property(cases(1000), &[]);
+    run_expression_property(cases(1000), &[], None);
 }
 
 #[test]
 #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
 fn property_near_misses_are_refused() {
-    run_refusal_property(cases(1000));
+    run_refusal_property(cases(1000), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +324,137 @@ fn hard_cases_agree_with_postgres() {
     }
 }
 
+/// Every leaf a rule can take: the table's column of that type and every
+/// literal the conformance profile draws at it.
+fn leaves(ty: ValueType) -> Vec<Expr> {
+    let mut out: Vec<Expr> = columns()
+        .into_iter()
+        .filter(|(_, t)| *t == ty)
+        .take(1)
+        .map(|(name, _)| Expr::Column(name))
+        .collect();
+    out.extend(expr_gen::literals(ty, Profile::CONFORMANCE.magnitude));
+    out
+}
+
+/// Every argument list whose `i`th argument is one of `options[i]`.
+fn product(options: &[Vec<Expr>]) -> Vec<Vec<Expr>> {
+    options.iter().fold(vec![Vec::new()], |acc, choices| {
+        acc.iter()
+            .flat_map(|prefix| {
+                choices.iter().map(move |c| {
+                    let mut next = prefix.clone();
+                    next.push(c.clone());
+                    next
+                })
+            })
+            .collect()
+    })
+}
+
+/// Every instance of `rule` one level deep: each operand or argument is a
+/// column or a literal of its type, in every combination.
+fn instances(rule: &expr_gen::Rule) -> Vec<Expr> {
+    use expr_gen::Rule;
+    match rule {
+        Rule::Op { op, lhs, rhs, .. } => product(&[leaves(*lhs), leaves(*rhs)])
+            .into_iter()
+            .map(|mut v| {
+                let r = v.pop().expect("rhs");
+                let l = v.pop().expect("lhs");
+                bin(*op, l, r)
+            })
+            .collect(),
+        Rule::FloatVsLiteral { op, float } => {
+            let literals = expr_gen::comparison_literals(Profile::CONFORMANCE.magnitude);
+            let mut out = Vec::new();
+            for f in leaves(ValueType::Float(*float)) {
+                for lit in &literals {
+                    out.push(bin(*op, f.clone(), lit.clone()));
+                    out.push(bin(*op, lit.clone(), f.clone()));
+                }
+            }
+            out
+        }
+        Rule::Call { name, args, .. } => {
+            let options: Vec<Vec<Expr>> = args
+                .iter()
+                .enumerate()
+                .map(|(i, ty)| {
+                    if expr_gen::LITERAL_ONLY_ARGS.contains(&(*name, i)) {
+                        expr_gen::REGEX_PATTERNS
+                            .iter()
+                            .chain(expr_gen::REGEX_DIALECT_PATTERNS)
+                            .map(|p| Expr::StringLiteral((*p).to_string()))
+                            .collect()
+                    } else {
+                        leaves(*ty)
+                    }
+                })
+                .collect();
+            product(&options)
+                .into_iter()
+                .map(|args| Expr::FunctionCall {
+                    name: (*name).to_string(),
+                    args,
+                })
+                .collect()
+        }
+        Rule::Coalesce { ty } => product(&[leaves(*ty), leaves(*ty)])
+            .into_iter()
+            .map(|args| Expr::FunctionCall {
+                name: "COALESCE".to_string(),
+                args,
+            })
+            .collect(),
+    }
+}
+
+/// Checks every instance of every rule of `kind` (one level deep, over
+/// every leaf), deterministically: what the random properties reach only
+/// by luck (a renderer's cast for one literal, one refusal's boundary) is
+/// reached on every run.
+fn every_instance_conforms(kind: fn(&expr_gen::Rule) -> bool) {
+    let mut failures = Vec::new();
+    let mut checked = 0;
+    for rule in expr_gen::rules().iter().filter(|r| kind(r)) {
+        for expr in instances(rule) {
+            let text = render_text(&expr, TextStyle::default());
+            checked += 1;
+            if let Err(d) = check_text(&text, Some(&expr)) {
+                failures.push(d.to_string());
+            }
+        }
+    }
+    assert!(checked > 0, "no rule of this kind");
+    assert!(
+        failures.is_empty(),
+        "{} of {checked} one-level expressions diverge:\n{}",
+        failures.len(),
+        failures[..failures.len().min(10)].join("\n")
+    );
+}
+
+#[test]
+fn every_operator_over_every_leaf_conforms() {
+    every_instance_conforms(|r| {
+        matches!(
+            r,
+            expr_gen::Rule::Op { .. } | expr_gen::Rule::FloatVsLiteral { .. }
+        )
+    });
+}
+
+#[test]
+fn every_function_over_every_leaf_conforms() {
+    every_instance_conforms(|r| matches!(r, expr_gen::Rule::Call { .. }));
+}
+
+#[test]
+fn every_coalesce_over_every_leaf_conforms() {
+    every_instance_conforms(|r| matches!(r, expr_gen::Rule::Coalesce { .. }));
+}
+
 /// An expression Postgres folds and rejects for every row is refused at
 /// define, and Postgres raises on the where-false probe: agreement.
 #[test]
@@ -386,12 +528,18 @@ fn each_refusal_names_its_construct() {
         ("CHAR_LENGTH(i4a)", "char_length"),
         // The pattern must be a literal.
         ("REGEXP_COUNT(ta, tb)", "regexp_count"),
+        // A pattern define's regex engine rejects (back-references, `\m`).
+        (r"REGEXP_COUNT(ta, '(a)\1')", "regexp_count's pattern"),
+        (r"REGEXP_COUNT(ta, '\ma')", "regexp_count's pattern"),
         // Operators and functions outside the registry.
         ("i4a - i4b", "-"),
         ("i4a * i4b", "*"),
         ("i4a / i4b", "/"),
         ("i4a = i4b", "="),
-        ("i4a < i4b", "<"),
+        ("i4a < i4b", "'<'"),
+        ("i4a >= i4b", "'>='"),
+        ("i4a <= i4b", "'<='"),
+        ("i4a <> i4b", "'<>'"),
         ("ta || tb", "|"),
         ("ABS(i4a)", "abs"),
         // Not immutable: these change between calls.
@@ -483,7 +631,7 @@ fn the_generator_reaches_every_registry_entry() {
     }
 
     let strategy = any_expr(&columns(), Profile::CONFORMANCE);
-    let mut test_runner = runner(1);
+    let mut test_runner = runner(1, Some(SMOKE_SEED));
     let mut seen = BTreeSet::new();
     let mut deepest = 0;
     for _ in 0..4000 {

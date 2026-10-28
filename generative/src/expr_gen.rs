@@ -630,9 +630,14 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
             out.push(NearMiss {
                 kind: "unadmitted-operator",
                 text: format!("{a} {symbol} {b}"),
-                // The lexer reads symbols one character at a time, so a
-                // two-character operator is refused at its first character.
-                needles: symbol.chars().map(|c| c.to_string()).collect(),
+                // The refusal names the whole symbol, quoted (`'<='`, not
+                // the `'<'` it starts with), except a character the lexer
+                // has no operator for at all (`|`), which it names alone.
+                needles: vec![if symbol.starts_with('|') {
+                    "'|'".to_string()
+                } else {
+                    format!("'{symbol}'")
+                }],
             });
         }
         for name in UNADMITTED_FUNCTIONS {

@@ -31,10 +31,11 @@ use tokio_postgres::{Client, NoTls};
 use trellis::dev::config::DEFAULT_SCHEMA;
 use trellis::dev::defs::ast::{Expr, ValueType};
 use trellis::dev::defs::oracle::render_expr_sql;
+use trellis::dev::defs::registry;
 use trellis::dev::defs::{FloatWidth, IntWidth};
 use trellis::dev::defs::{
     PgType, ValidationError, create_target_table, parse, render_definition_text,
-    source_primary_key, validate,
+    render_qualified_expr_sql, source_primary_key, validate,
 };
 use trellis::{Config, Pool};
 
@@ -253,19 +254,21 @@ pub const KNOWN_GAP_CONSTANT_CALL: &str = "constant function calls are folded by
 /// Whether `expr` holds a function call (not `COALESCE`) with no column in
 /// it, which Postgres evaluates while planning.
 pub fn has_constant_call(expr: &Expr) -> bool {
-    fn reads_column(expr: &Expr) -> bool {
-        match expr {
-            Expr::Column(_) | Expr::SourceColumn { .. } => true,
-            Expr::BinaryOp { lhs, rhs, .. } => reads_column(lhs) || reads_column(rhs),
-            Expr::FunctionCall { args, .. } => args.iter().any(reads_column),
-            _ => false,
-        }
-    }
     match expr {
         Expr::BinaryOp { lhs, rhs, .. } => has_constant_call(lhs) || has_constant_call(rhs),
         Expr::FunctionCall { name, args } => {
             (name != "COALESCE" && !reads_column(expr)) || args.iter().any(has_constant_call)
         }
+        _ => false,
+    }
+}
+
+/// Whether `expr` reads a column anywhere in it.
+fn reads_column(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(_) | Expr::SourceColumn { .. } => true,
+        Expr::BinaryOp { lhs, rhs, .. } => reads_column(lhs) || reads_column(rhs),
+        Expr::FunctionCall { args, .. } => args.iter().any(reads_column),
         _ => false,
     }
 }
@@ -476,11 +479,15 @@ impl Fixture {
             )),
             Ok(()) => {
                 if let Some(code) = probe {
-                    if code == INVALID_REGEX {
-                        return Ok(Agreement::KnownGap(KNOWN_GAP_REGEX_DIALECT));
-                    }
-                    if has_constant_call(&expr) {
-                        return Ok(Agreement::KnownGap(KNOWN_GAP_CONSTANT_CALL));
+                    let gap = if code == INVALID_REGEX {
+                        Some(KNOWN_GAP_REGEX_DIALECT)
+                    } else if has_constant_call(&expr) {
+                        Some(KNOWN_GAP_CONSTANT_CALL)
+                    } else {
+                        None
+                    };
+                    if let Some(gap) = gap {
+                        return self.recheck_without_gaps(text, &expr, gap).await;
                     }
                     return Err(diverge(
                         Property::MissedRefusal,
@@ -489,7 +496,7 @@ impl Fixture {
                 }
                 self.check_type(text, &def, &diverge).await?;
                 match self.check_value(text, &expr, &diverge).await? {
-                    Some(gap) => Ok(Agreement::KnownGap(gap)),
+                    Some(gap) => self.recheck_without_gaps(text, &expr, gap).await,
                     None => Ok(Agreement::Admitted),
                 }
             }
@@ -579,14 +586,38 @@ impl Fixture {
                 "select id, ({text})::text from {TABLE} order by id"
             ))
             .await;
-        let rendered_sql = render_expr_sql(expr);
-        let rendered = self
-            .rows(&format!(
-                "select id, ({rendered_sql})::text from {TABLE} order by id"
-            ))
-            .await;
+        // The build's renderer, then the one a 1-1 apply and a `JOIN` write
+        // embed (each column read through an alias): separate code, so each
+        // is checked against the user's text.
+        let mut gap = None;
+        for (rendered_sql, from) in [
+            (render_expr_sql(expr), TABLE.to_string()),
+            (
+                render_qualified_expr_sql(expr, "s"),
+                format!("{TABLE} as s"),
+            ),
+        ] {
+            let rendered = self
+                .rows(&format!(
+                    "select id, ({rendered_sql})::text from {from} order by id"
+                ))
+                .await;
+            if let Some(g) = Self::compare_rows(&user, rendered, &rendered_sql, diverge)? {
+                gap = Some(g);
+            }
+        }
+        Ok(gap)
+    }
+
+    /// One renderer's rows against the user's.
+    fn compare_rows(
+        user: &Result<Vec<Option<String>>, String>,
+        rendered: Result<Vec<Option<String>>, String>,
+        rendered_sql: &str,
+        diverge: &impl Fn(Property, String) -> Divergence,
+    ) -> Result<Option<&'static str>, Divergence> {
         match (user, rendered) {
-            (Ok(u), Ok(r)) if u == r => Ok(None),
+            (Ok(u), Ok(r)) if *u == r => Ok(None),
             (Ok(u), Ok(r)) => {
                 let at = u.iter().zip(&r).position(|(a, b)| a != b).unwrap_or(0);
                 Err(diverge(
@@ -601,15 +632,118 @@ impl Fixture {
             // Both reject the pattern: the gap, not agreement on a data
             // error, because the pattern is the definition's, not a row's.
             (Err(u), Err(_)) if u == INVALID_REGEX => Ok(Some(KNOWN_GAP_REGEX_DIALECT)),
-            (Err(u), Err(r)) if class_of(&u) == class_of(&r) => Ok(None),
+            (Err(u), Err(r)) if class_of(u) == class_of(&r) => Ok(None),
             (u, r) => Err(diverge(
                 Property::Value,
                 format!(
                     "Postgres {}, rendered `{rendered_sql}` {}",
-                    describe(&u),
+                    describe(u),
                     describe(&r)
                 ),
             )),
+        }
+    }
+
+    /// An expression that hit an open gap agrees only if the gap is all
+    /// that is wrong with it: each pattern Postgres rejects becomes `'a'`,
+    /// then each function call over constants becomes the literal Postgres
+    /// computes for it (what define would see if it could fold the call),
+    /// and the result must pass every property on its own. Otherwise a
+    /// different missed refusal, or a wrong value, beside the gap would be
+    /// tolerated with it.
+    async fn recheck_without_gaps(
+        &self,
+        text: &str,
+        expr: &Expr,
+        gap: &'static str,
+    ) -> Result<Agreement, Divergence> {
+        let mut rewritten = expr.clone();
+        self.replace_rejected_patterns(&mut rewritten).await;
+        self.fold_constant_calls(&mut rewritten).await;
+        if rewritten == *expr {
+            return Err(Divergence {
+                property: Property::MissedRefusal,
+                text: text.to_string(),
+                detail: format!("tolerated as `{gap}`, but nothing in it is that gap"),
+            });
+        }
+        let again = crate::expr_gen::render_text(&rewritten, Default::default());
+        match Box::pin(self.check(&again, Some(&rewritten))).await {
+            Ok(Agreement::KnownGap(other)) => Err(Divergence {
+                property: Property::MissedRefusal,
+                text: text.to_string(),
+                detail: format!("`{again}`, with the gaps rewritten away, still hits `{other}`"),
+            }),
+            Ok(_) => Ok(Agreement::KnownGap(gap)),
+            Err(d) => Err(Divergence {
+                detail: format!("beside the known gap `{gap}`, as `{again}`: {}", d.detail),
+                text: text.to_string(),
+                ..d
+            }),
+        }
+    }
+
+    /// Replaces each `REGEXP_COUNT` pattern Postgres rejects with `'a'`.
+    async fn replace_rejected_patterns(&self, expr: &mut Expr) {
+        let mut stack = vec![expr];
+        while let Some(e) = stack.pop() {
+            match e {
+                Expr::BinaryOp { lhs, rhs, .. } => {
+                    stack.push(lhs);
+                    stack.push(rhs);
+                }
+                Expr::FunctionCall { name, args } => {
+                    if name == "REGEXP_COUNT"
+                        && let Some(Expr::StringLiteral(pattern)) = args.get_mut(1)
+                    {
+                        let probe =
+                            format!("select regexp_count('', '{}')", pattern.replace('\'', "''"));
+                        if self.raises(&probe).await.as_deref() == Some(INVALID_REGEX) {
+                            *pattern = "a".to_string();
+                        }
+                    }
+                    stack.extend(args.iter_mut());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Replaces each function call (not `COALESCE`) that reads no column with
+    /// the literal Postgres computes for it.
+    async fn fold_constant_calls(&self, expr: &mut Expr) {
+        let mut stack = vec![expr];
+        while let Some(e) = stack.pop() {
+            if let Expr::FunctionCall { name, .. } = &*e
+                && name != "COALESCE"
+                && !reads_column(e)
+            {
+                let spec = registry::lookup_function(name).expect("a registry function");
+                let sql = format!("select ({})::text", render_expr_sql(e));
+                let value: Option<String> = self
+                    .client
+                    .query_one(&sql, &[])
+                    .await
+                    .unwrap_or_else(|err| panic!("`{sql}` fails: {err}"))
+                    .get(0);
+                *e = match (spec.return_type, value) {
+                    (ValueType::Integer(_), Some(v)) => Expr::NumberLiteral(v),
+                    (ValueType::Text, Some(v)) => Expr::StringLiteral(v),
+                    (ty, v) => panic!(
+                        "`{sql}` of type {ty} gives {v:?}: teach fold_constant_calls to \
+                         spell it as a literal"
+                    ),
+                };
+                continue;
+            }
+            match e {
+                Expr::BinaryOp { lhs, rhs, .. } => {
+                    stack.push(lhs);
+                    stack.push(rhs);
+                }
+                Expr::FunctionCall { args, .. } => stack.extend(args.iter_mut()),
+                _ => {}
+            }
         }
     }
 

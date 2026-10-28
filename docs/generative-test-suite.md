@@ -204,7 +204,9 @@ Postgres, over a throwaway table of random rows (`NULL`, extremes, `NaN`,
 1. **Type.** The column define creates has the `format_type` of `CREATE TABLE
    AS SELECT <the user's text>`.
 2. **Value.** `SELECT <the engine's rendered SQL>` and `SELECT <the user's
-   text>` agree on every row: equal text, or the same SQLSTATE class.
+   text>` agree on every row: equal text, or the same SQLSTATE class. Both
+   renderers are checked: the build's (`render_expr_sql`) and the one a 1-1
+   apply and a `JOIN` write embed (`render_qualified_expr_sql`).
 3. **Round trip.** Parsing the text gives the tree it was written from (in the
    minimal-parentheses and the fully parenthesized spelling), and
    `parse(render(parse(text))) == parse(text)`.
@@ -224,13 +226,21 @@ raises while planning it (a missed refusal).
 A gap that is open (define admits what Postgres rejects) is tolerated in one
 named place in `generative::expr_conformance`, reported as a known gap, and
 pinned by a test that fails the day define refuses it, which is when the
-tolerance goes.
+tolerance goes. The tolerance covers the gap and nothing beside it: the
+checker rewrites the gap away (a pattern Postgres rejects becomes `'a'`, a
+function call over constants becomes the literal Postgres computes for it)
+and the rewritten expression must pass every property.
 
 Deterministic tests in the same file pin each precedence tier (every pair of
-registry operators, generically) and each refusal by name; they run in the
-normal suite, with a small-case-count run of each property. The randomized
-properties are `#[ignore]`d: `PROPTEST_CASES=2000 cargo test -p generative
---test expr_conformance -- --ignored`. A property over constants only
+registry operators, generically) and each refusal by name, and check every
+rule one level deep over every leaf of its types (the table's column and
+each literal in the pool), so a renderer's cast for one literal or one
+refusal's boundary is reached on every run, not by luck. They run in the
+normal suite, with a small-case-count run of each property from a fixed seed.
+The randomized properties are `#[ignore]`d and draw fresh cases each run:
+`PROPTEST_CASES=2000 cargo test -p generative --test expr_conformance --
+--ignored`. A failure prints the expression's text; add it to
+`hard_cases_agree_with_postgres` to replay it. A property over constants only
 (`property_constant_expressions_conform_to_postgres`) is where the plan-time
 range refusals are reached.
 

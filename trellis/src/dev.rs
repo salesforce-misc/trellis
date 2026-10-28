@@ -81,6 +81,14 @@ pub mod defs {
     pub fn render_definition_text(def: &crate::defs::ast::TransformDef) -> String {
         crate::defs::ast::render_definition_text(def)
     }
+
+    /// `expr` rendered as the SQL a 1-1 apply and a `JOIN` write embed, each
+    /// column read through `source_sql`. The expression conformance harness
+    /// checks it against the user's text beside `oracle::render_expr_sql`
+    /// (the build's renderer), since the two are separate code.
+    pub fn render_qualified_expr_sql(expr: &crate::defs::ast::Expr, source_sql: &str) -> String {
+        crate::defs::oracle::render_qualified_expr_sql(expr, source_sql)
+    }
 }
 
 /// The engine items `generative`'s backend drivers reach for under `staging`.

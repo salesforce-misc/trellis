@@ -541,6 +541,19 @@ mod tests {
         }
     }
 
+    /// A two-character comparison is named whole: `>=` is not the supported
+    /// `>` followed by a stray `=`, and `<=` is not `<`.
+    #[test]
+    fn rejects_a_two_character_comparison_by_its_whole_symbol() {
+        for symbol in [">=", "<=", "<>"] {
+            let err = parse(&format!("TRANSFORM t FROM s SELECT a {symbol} b AS x")).unwrap_err();
+            match err {
+                ParseError::UnsupportedOperator { operator } => assert_eq!(operator, symbol),
+                other => panic!("`{symbol}`: expected UnsupportedOperator, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn rejects_aggregate_function_call_with_key_space_specific_message() {
         let err = parse("TRANSFORM t FROM s SELECT SUM(a) AS x").unwrap_err();
