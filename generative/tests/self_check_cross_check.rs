@@ -40,6 +40,7 @@
 //! pins for why a hand-built pin is kept alongside a property that
 //! subsumes its *coverage* rather than replacing it.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use generative::backend::{Backend, ManualBackend};
@@ -361,46 +362,16 @@ fn program_with_corruption_selectors() -> impl Strategy<Value = (Program, usize,
         .prop_flat_map(|program| (Just(program), any::<usize>(), any::<usize>()))
 }
 
-/// The [`ValueType`] one of [`trivial_one_to_one_program_with`]'s `OneToOne`
-/// field expressions produces — resolved independently of
-/// `generative::oracle`'s own (private) `field_value_type`, over the small,
-/// closed set of top-level field shapes that generator actually builds for a
-/// `OneToOne` def (see `crate::generate::DerivedShape`'s doc comment, and
-/// `build_program_multi_with_shapes`'s `OneToOne` arm): a bare source-column
-/// passthrough (the `Text`/`Boolean`/`Uuid` columns, task B1), the fixed
-/// `total = c1 + c2` field, or one more `BinaryOp`/`FunctionCall` "derived"
-/// field. Every `FunctionCall` this generator ever attaches to a `OneToOne`
-/// def (`STRPOS`/`OCTET_LENGTH`/`CHAR_LENGTH`/`REGEXP_COUNT`/`COALESCE`)
-/// returns `Numeric` — `COUNT` is aggregate-only, and this program space
-/// never draws `DefShape::Aggregate` — so no case here needs a registry
-/// lookup the way the oracle's own general-purpose version does. A shape
-/// outside this closed set (a bare literal at field top level, which
-/// `trivial_one_to_one_program_with` never builds) is a generator-scope bug
-/// for this property and panics loudly rather than guessing (design doc §2
-/// "refuse to guess").
-fn corrupted_field_value_type(expr: &Expr, source: &Table) -> ValueType {
-    match expr {
-        Expr::Column(name) => source.column_type(name).unwrap_or_else(|| {
-            panic!(
-                "corrupted_field_value_type: field references column {name:?} absent from its \
-                 own source table {:?} — a generator bug",
-                source.name
-            )
-        }),
-        Expr::BinaryOp {
-            op: Operator::Add, ..
-        } => ValueType::Numeric,
-        Expr::BinaryOp {
-            op: Operator::GreaterThan,
-            ..
-        } => ValueType::Boolean,
-        Expr::FunctionCall { .. } => ValueType::Numeric,
-        other => panic!(
-            "corrupted_field_value_type: {other:?} is outside the closed set of top-level field \
-             shapes trivial_one_to_one_program_with draws for a OneToOne def — extend this \
-             helper if that generator ever widens"
-        ),
-    }
+/// The [`ValueType`] of field `field_index` of `program.defs[def_index]`,
+/// from the oracle's own inference over the source table's columns: a
+/// derived field is a generated expression of any admitted type.
+fn corrupted_field_value_type(def: &TransformDef, field_index: usize, source: &Table) -> ValueType {
+    let source_columns: HashMap<String, ValueType> = source
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.value_type))
+        .collect();
+    generative::oracle::field_types(def, &source_columns)[field_index].1
 }
 
 /// A `(SQL literal expression, its exact ::text rendering)` pair to write
@@ -420,45 +391,55 @@ fn corrupted_field_value_type(expr: &Expr, source: &Table) -> ValueType {
 /// generator produces; corrupting the key column would change *which row*
 /// is being audited rather than what value it holds, a different (also
 /// legitimate) bucket-6 question left for a follow-up.
-fn corruption_literal(
-    value_type: ValueType,
-    current: &Option<String>,
-) -> (&'static str, &'static str) {
+fn corruption_literal(value_type: ValueType, current: &Option<String>) -> (String, String) {
+    use generative::expr_gen::{Magnitude, typed_literal_samples};
+    use trellis::dev::defs::typed_literal::TYPED_LITERALS;
     let (a_sql, a_text, b_sql, b_text) = match value_type {
-        ValueType::Numeric => ("12345::numeric", "12345", "-98765::numeric", "-98765"),
-        ValueType::Boolean => ("true::boolean", "true", "false::boolean", "false"),
+        // One pair for every numeric type: 123 and -45 fit all of them.
+        ValueType::Numeric | ValueType::Integer(_) | ValueType::Float(_) => (
+            format!("123::{value_type}"),
+            "123".to_string(),
+            format!("-45::{value_type}"),
+            "-45".to_string(),
+        ),
+        ValueType::Boolean => (
+            "true::boolean".to_string(),
+            "true".to_string(),
+            "false::boolean".to_string(),
+            "false".to_string(),
+        ),
         ValueType::Text => (
-            "'zzz_tampered_a'::text",
-            "zzz_tampered_a",
-            "'zzz_tampered_b'::text",
-            "zzz_tampered_b",
+            "'zzz_tampered_a'::text".to_string(),
+            "zzz_tampered_a".to_string(),
+            "'zzz_tampered_b'::text".to_string(),
+            "zzz_tampered_b".to_string(),
         ),
         ValueType::Uuid => (
-            "'00000000-0000-0000-0000-0000000000a1'::uuid",
-            "00000000-0000-0000-0000-0000000000a1",
-            "'00000000-0000-0000-0000-0000000000b2'::uuid",
-            "00000000-0000-0000-0000-0000000000b2",
+            "'00000000-0000-0000-0000-0000000000a1'::uuid".to_string(),
+            "00000000-0000-0000-0000-0000000000a1".to_string(),
+            "'00000000-0000-0000-0000-0000000000b2'::uuid".to_string(),
+            "00000000-0000-0000-0000-0000000000b2".to_string(),
         ),
-        ValueType::Other(ref pg_type) => panic!(
-            "corruption_literal: trivial_one_to_one_program_with never attaches an \
-             Other({pg_type}) field to a OneToOne def — extend this helper if that changes"
-        ),
-        // Integer/Float are separate from Numeric;
-        // trivial_one_to_one_program_with still only ever attaches
-        // Numeric/Boolean/Text/Uuid to a OneToOne field (see this function's
-        // and corrupted_field_value_type's doc comments), so these two stay
-        // unreached in practice — extend this helper if that generator ever
-        // widens to emit an exact-integer or floating-point column.
-        ValueType::Integer(width) => panic!(
-            "corruption_literal: trivial_one_to_one_program_with never attaches an \
-             Integer({width:?}) field to a OneToOne def — extend this helper if that changes"
-        ),
-        ValueType::Float(width) => panic!(
-            "corruption_literal: trivial_one_to_one_program_with never attaches a \
-             Float({width:?}) field to a OneToOne def — extend this helper if that changes"
-        ),
+        // A type only a typed literal produces: two of its canonical
+        // spellings, whose text is the spelling itself.
+        ValueType::Other(_) => {
+            let spec = TYPED_LITERALS
+                .iter()
+                .find(|spec| spec.value_type == value_type)
+                .unwrap_or_else(|| {
+                    panic!("corruption_literal: no typed literal produces {value_type}")
+                });
+            let samples = typed_literal_samples(spec.keyword, Magnitude::Small);
+            let sql_type = spec.keyword.to_lowercase();
+            (
+                format!("'{}'::{sql_type}", samples[0]),
+                samples[0].to_string(),
+                format!("'{}'::{sql_type}", samples[1]),
+                samples[1].to_string(),
+            )
+        }
     };
-    if current.as_deref() == Some(a_text) {
+    if current.as_deref() == Some(a_text.as_str()) {
         (b_sql, b_text)
     } else {
         (a_sql, a_text)
@@ -546,7 +527,11 @@ fn run_swept_tampering_case(
                 .find(|t| t.name == def.source)
                 .expect("every def's source names a table in the same program");
             let field = &def.fields[field_selector % def.fields.len()];
-            let value_type = corrupted_field_value_type(&field.expr, source);
+            let value_type = corrupted_field_value_type(
+                def,
+                field_selector % def.fields.len(),
+                source,
+            );
 
             let qualified = qualified_target_table("public", def);
             let pk_ident = format!("\"{}\"", source.pk_col);
@@ -566,6 +551,7 @@ fn run_swept_tampering_case(
                 .get(0);
 
             let (corruption_sql, corruption_text) = corruption_literal(value_type, &current);
+            let (corruption_sql, corruption_text) = (corruption_sql.as_str(), corruption_text.as_str());
             client
                 .execute(
                     format!(

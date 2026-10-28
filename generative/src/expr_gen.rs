@@ -270,9 +270,9 @@ pub fn typed_literal_samples(keyword: &str, magnitude: Magnitude) -> &'static [&
         ("TIMETZ", _) => &["00:00:00+00", "12:30:00-05"],
         ("OID", _) => &["0", "4294967295"],
         ("INET", _) => &["10.0.0.1/32", "::1/128"],
-        ("CIDR", _) => &["10.0.0.0/8"],
-        ("MACADDR", _) => &["08:00:2b:01:02:03"],
-        ("MACADDR8", _) => &["08:00:2b:01:02:03:04:05"],
+        ("CIDR", _) => &["10.0.0.0/8", "192.168.0.0/16"],
+        ("MACADDR", _) => &["08:00:2b:01:02:03", "08:00:2b:01:02:04"],
+        ("MACADDR8", _) => &["08:00:2b:01:02:03:04:05", "08:00:2b:01:02:03:04:06"],
         ("VARBIT", _) => &["", "101"],
         ("JSONB", _) => &["{}", "[1, 2]", "null"],
         _ => &[],
@@ -923,8 +923,9 @@ mod tests {
             for magnitude in [Magnitude::Small, Magnitude::Extreme] {
                 let samples = typed_literal_samples(spec.keyword, magnitude);
                 assert!(
-                    !samples.is_empty(),
-                    "{} has no samples; add them to typed_literal_samples",
+                    samples.len() >= 2,
+                    "{} needs two distinct samples (the self_check tampering property writes \
+                     one over the other); add them to typed_literal_samples",
                     spec.keyword
                 );
                 for text in samples {
