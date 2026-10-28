@@ -99,8 +99,8 @@ option: `2N + 5` for a worker at `drain_threads: N`, `2N + 4` drain-only, `1`
 staging-only. Calls never use the background pool, so drain work cannot starve
 them. Each drain thread holds at most two pooled connections at once, which a
 debug-build assertion enforces. Both pools hand out their most recently used
-connection first and close connections idle for 60 seconds, so a quiet handle
-holds almost nothing.
+connection first and close connections idle for 60 seconds, so a burst's extra
+connections close once it is over.
 
 Outside the pools a client keeps few dedicated connections: the staging
 session while it leads, one `LISTEN` connection shared by every drain thread

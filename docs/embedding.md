@@ -139,12 +139,14 @@ holds no staging session; it opens a connection for a moment every 5 seconds to
 try the lock.
 
 A worker handle with `staging: true, drain_threads: 2` therefore holds a
-background pool of up to 9 that empties when idle, and two connections that stay
-open for as long as it runs: the staging session and the `LISTEN`. On top of
-those come a heartbeat connection while a claim runs long, a session for each
-paged drain, and a call pool that empties when idle. Its worst case is 35
-connections (20 + 9 + 1 + 1 + 1 + 2 + 1: call pool, background pool, session,
-`LISTEN`, keep-alive, two paged drains, attach); its steady state is about two.
+background pool of up to 9, and two connections that stay open for as long as
+it runs: the staging session and the `LISTEN`. When the work stops, the
+background pool shrinks to the one or two connections the idle drain threads'
+polls keep in use. On top of those come a heartbeat connection while a claim
+runs long, a session for each paged drain, and a call pool that empties when
+idle. Its worst case is 35 connections (20 + 9 + 1 + 1 + 1 + 2 + 1: call pool,
+background pool, session, `LISTEN`, keep-alive, two paged drains, attach); idle,
+it holds three or four.
 A handle at the defaults uses at most `max_call_pool_size`, plus one while it
 connects. A call pool of one connection still runs, but a few calls hold two or
 three connections while they run and would wait on themselves until

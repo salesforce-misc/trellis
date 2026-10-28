@@ -165,7 +165,12 @@ module Trellis
           raise ValidationError,
                 "max_call_pool_size must be a positive Integer, got: #{max_call_pool_size.inspect}"
         end
-        timeout_ms!(call_pool_wait_timeout_ms)
+        unless call_pool_wait_timeout_ms.is_a?(Integer) &&
+               call_pool_wait_timeout_ms.between?(0, MAX_TIMEOUT_MS)
+          raise ValidationError,
+                "call_pool_wait_timeout_ms must be a non-negative Integer, got: " \
+                "#{call_pool_wait_timeout_ms.inspect}"
+        end
 
         handle = Native.connect(url, schema, target_schema, staging, drain_threads, worker_threads,
                                 max_call_pool_size, call_pool_wait_timeout_ms)

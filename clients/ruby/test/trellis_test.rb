@@ -150,7 +150,7 @@ class TrellisTest < Minitest::Test
       [{ url: TestCluster.dsn, drain_threads: -1 }, "drain_threads must be a non-negative"],
       [{ url: TestCluster.dsn, worker_threads: 0 }, "worker_threads must be a positive"],
       [{ url: TestCluster.dsn, max_call_pool_size: 0 }, "max_call_pool_size must be a positive"],
-      [{ url: TestCluster.dsn, call_pool_wait_timeout_ms: -1 }, "timeout_ms must be a non-negative"]
+      [{ url: TestCluster.dsn, call_pool_wait_timeout_ms: -1 }, "call_pool_wait_timeout_ms must be a non-negative"]
     ].each do |options, message|
       error = assert_raises(Trellis::ValidationError, options.inspect) { Trellis.connect(**options) }
       assert_match message, error.message
