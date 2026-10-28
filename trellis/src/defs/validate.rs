@@ -829,17 +829,10 @@ impl fmt::Display for ValidationError {
                 if column.eq_ignore_ascii_case("not") || column.eq_ignore_ascii_case("case") {
                     write!(
                         f,
-                        "; if you meant the {} operator, note that a {} directly before a '-' \
-                         reads as a column of that name minus the rest (a column called {} \
-                         keeps working), so parenthesize the operand: {}",
-                        column.to_uppercase(),
-                        column.to_uppercase(),
-                        column,
-                        if column.eq_ignore_ascii_case("not") {
-                            "NOT (-x > 0)"
-                        } else {
-                            "CASE WHEN (-x > 0) THEN ..."
-                        }
+                        "; {} is a reserved word in Postgres and in this grammar (identifiers \
+                         cannot be quoted), so a source column of that name cannot be \
+                         referenced: rename the column",
+                        column.to_uppercase()
                     )?;
                 }
                 Ok(())

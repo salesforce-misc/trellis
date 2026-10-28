@@ -46,7 +46,6 @@ a key, index or policy itself.
 | `IS TRUE`, `IS NOT TRUE`, `IS FALSE`, `IS NOT FALSE`, `IS UNKNOWN`, `IS NOT UNKNOWN`; the simple `CASE <operand> WHEN <value> THEN ...` | Yes (`UnsupportedIsForm`, `SimpleCaseUnsupported`, parse errors). Only `IS [NOT] NULL` and `IS [NOT] DISTINCT FROM` are admitted, and only the searched `CASE`. | n/a | `COALESCE(x, <fallback>)` covers the truth-value tests; write `CASE WHEN <operand> = <value> THEN ...`. |
 | A `CASE` condition that is not a `boolean`, or `CASE` results that Postgres cannot unify the way `COALESCE` does (`CASE WHEN c THEN 1 ELSE 'x' END`). Results unify to a common type: two integers the wider, an exact numeric with a float the float, otherwise `numeric`, so `CASE WHEN c THEN 1 ELSE 2.5 END` is `numeric` and `real` with `numeric` is `real` | Yes (`CaseConditionNotBoolean`, `CaseResultTypeMismatch`), for the definition and an `ALTER TRANSFORM`. | A column retyped so the results no longer unify pauses the transform, as in the rows above. | Make the results one type, with `CAST` where an integer meets a float. |
 | `NULLIF(a, b)` where Postgres casts `a` to compare it, so the result is not `a`'s type: an integer `a` with a `numeric` `b` (the result is `numeric`), and an exact `a` with a float `b` (the result is `double precision`). `NULLIF(a, b)` otherwise has `a`'s type, for any pair `=` admits, and `x / NULLIF(y, 0)` guards a division | Yes (`NullIfFirstArgumentCast`), naming both types and the type Postgres gives. | A column retyped into such a pair pauses the transform, as in the rows above. | `NULLIF(CAST(a AS numeric), b)`, or write the float first. |
-| `NOT` or `CASE` directly before a `-` (`NOT -x > 0`). A column called `not` or `case` stays a column, so `not - 1` is a subtraction from it | Yes, as an unresolved column when no column has that name, with the parenthesized spelling in the message. | n/a | `NOT (-x > 0)`. |
 | An expression whose calculated fields inline to more than 100,000 nodes in total, a very wide `CASE` included (each `WHEN x = 1 THEN 1` branch is four nodes, so about 25,000 of them) | Yes (`FieldExpansionTooLarge`). | n/a | Shorten the expression or split it into calculated fields. |
 | `/` between two integers (`smallint`, `integer`, `bigint`), such as `qty / 2` | Yes (`IntegerDivision`), naming both operand types. Postgres truncates an integer quotient (`7 / 2` is `3`), which reads as a rounding rule a `numeric` quotient does not have. `numeric / integer`, `integer / numeric`, `numeric / numeric` and every float quotient are admitted. | A column retyped from `numeric` to an integer type pauses the transform on the staging worker's next capture pass, with the reason in `status()`'s `capture_failure`, and `RESUME` refuses while define would refuse the definition. | Divide as `numeric`: `CAST(qty AS numeric) / 2`. |
 | `%` with a float operand (`real`, `double precision`). `%` takes integers and `numeric`: two integers give the wider width, anything with a `numeric` gives `numeric`, and the sign follows the dividend (`-7 % 2` is `-1`) | Yes (`FloatModulo`). Postgres has no float modulo. | A column retyped into a float pauses the transform, as in the row above. | Use `numeric` operands. |
@@ -301,8 +300,10 @@ planning (a `1.5 / 0` in a branch fails every row), which define refuses. In
 an aggregate, `COUNT(CASE WHEN c THEN 1 END)` and `SUM(CASE WHEN c THEN qty
 ELSE 0 END)` over an integer define; `SUM(CASE WHEN c THEN amount END)` over a
 `numeric(10,2)` column does not, because the `CASE` has no declared scale.
-`NOT` and `CASE` are keywords only where an operand follows, so a column
-named `not`, `case` or `end` is still a column. Families, types and
+`NOT` and `CASE` are keywords wherever an operand follows (a `-` begins one:
+`NOT -x > 0` is `NOT ((-x) > 0)`, as in Postgres), so a column named `not` or
+`case` can be referenced only where no operand follows, such as `not AS c`;
+rename it otherwise. A column named `end` is still a column. Families, types and
 refusals are in [Supported sources and
 targets](#supported-sources-and-targets) and [type
 support](type-support.md#comparison-and-logic).

@@ -307,15 +307,34 @@ fn case_parses_with_one_or_many_branches_and_an_optional_else() {
     );
 }
 
-/// `NOT` or `CASE` directly before a `-` is a column of that name minus the
-/// rest (so text that read that way before `NOT` existed still does); the
-/// unresolved name carries the remedy.
+/// `NOT` and `CASE` are reserved in Postgres, so a `-` after either begins
+/// the operand (verified on Postgres 17: `NOT -1 > 0` is `NOT ((-1) > 0)`).
 #[test]
-fn not_before_a_minus_is_a_subtraction_and_the_refusal_says_how_to_write_the_operator() {
-    assert_grouping("NOT -a > 0", "(> (- NOT a) 0)");
-    assert_refused("NOT -i4 > 0", "NOT (-x > 0)");
+fn not_and_case_before_a_minus_are_the_keywords() {
+    assert_grouping("NOT -a > 0", "(not (> (neg a) 0))");
+    assert_grouping("NOT - a > 0", "(not (> (neg a) 0))");
+    assert_grouping("NOT NOT -a > 0", "(not (not (> (neg a) 0)))");
+    assert_grouping("NOT (-a > 0)", "(not (> (neg a) 0))");
+    assert_type("NOT -i4 > 0", B);
+    assert_type("NOT NOT -i4 > 0", B);
     assert_type("NOT (-i4 > 0)", B);
-    assert_type("case - 1", I4);
+    assert!(
+        matches!(parse_err("CASE -a WHEN 1 THEN 2 END"), ParseError::SimpleCaseUnsupported),
+        "CASE -x is a simple CASE"
+    );
+    assert!(matches!(
+        parse_err("case - 1"),
+        ParseError::SimpleCaseUnsupported
+    ));
+}
+
+/// A column named `not` or `case` cannot be an operand of a `-`; where it
+/// is left unresolved the message says to rename it.
+#[test]
+fn an_unresolved_not_or_case_column_says_to_rename_it() {
+    for name in ["NOT", "CASE"] {
+        assert_refused(&format!("{name} AND b"), "rename the column");
+    }
 }
 
 #[test]
@@ -348,8 +367,6 @@ fn a_column_named_like_a_keyword_is_still_a_column() {
         );
     }
     // Where an operand cannot follow, a prefix keyword is a column too.
-    assert_grouping("not - 1", "(- not 1)");
-    assert_grouping("case - 1", "(- case 1)");
     assert_grouping("not + 1", "(+ not 1)");
     assert_grouping("case * end", "(* case end)");
     assert_grouping("not = and", "(= not and)");

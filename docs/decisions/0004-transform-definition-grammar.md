@@ -97,7 +97,7 @@ SELECT <expr> AS <field> [, <expr> AS <field> ...]
 `floor`, `round`, `trunc`, `date_trunc`, `coalesce`, `nullif`; general
 `func(args)` syntax). `AND`, `OR`, `IS` and `AT` are operators only after a
 complete operand, `END` only closes a `CASE`, `NOT` and `CASE` are keywords
-only where an operand follows, and `EXTRACT` is one only before a `(`, so a
+only where an operand follows (a prefix `-` begins one, as in Postgres), and `EXTRACT` is one only before a `(`, so a
 column of any of those names is still a column. `AT TIME ZONE` binds tighter
 than `*` and looser than prefix `-`.
 Values

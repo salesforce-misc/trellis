@@ -1002,12 +1002,13 @@ impl Parser {
     /// Whether the cursor is a prefix `NOT` or `CASE` keyword rather than a
     /// column of that name: the next token has to begin an operand. A bare
     /// `not` before `AS`, an operator or the end of a list stays a column
-    /// (ADR-0018), and `-` after it is a subtraction, as it was before `NOT`
-    /// existed.
+    /// (ADR-0018). A `-` after it begins an operand: `NOT -x > 0` is
+    /// `NOT ((-x) > 0)` and `CASE -x WHEN ...` a simple `CASE`, as in Postgres,
+    /// where both words are reserved.
     fn peek_prefix_keyword(&self, keyword: &str) -> bool {
         self.peek_is_keyword(keyword)
             && match self.peek_at(1) {
-                Token::Number(_) | Token::String(_) | Token::Symbol('(') => true,
+                Token::Number(_) | Token::String(_) | Token::Symbol('(' | '-') => true,
                 Token::Ident(word) => !CONTINUATION_KEYWORDS
                     .iter()
                     .any(|kw| word.eq_ignore_ascii_case(kw)),
@@ -1405,7 +1406,7 @@ impl Parser {
     fn case_follows(&self) -> bool {
         self.peek_is_keyword("WHEN")
             || match self.peek() {
-                Token::Number(_) | Token::String(_) | Token::Symbol('(') => true,
+                Token::Number(_) | Token::String(_) | Token::Symbol('(' | '-') => true,
                 Token::Ident(word) => !CONTINUATION_KEYWORDS
                     .iter()
                     .any(|kw| word.eq_ignore_ascii_case(kw)),
