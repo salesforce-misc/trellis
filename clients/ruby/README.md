@@ -149,6 +149,18 @@ The defaults run nothing in the background. Exactly one process in a fleet
 should set `staging: true`, and some process must run drain threads, or no
 definition ever reaches `:live`.
 
+### Resources
+
+At the defaults, a handle holds up to 20 Postgres connections (opened as
+calls need them) and 3 threads. A worker handle (`staging: true,
+drain_threads: N`) holds up to `42 + 3N` connections and 6 threads: drain
+threads are tasks on its runtime, not OS threads. Its memory is bounded by
+row counts, not bytes: about `N` × 100,000 changed rows' images at its peak.
+`TRELLIS_POOL_MAX_SIZE` lowers the 20 (it sizes each of a handle's two
+pools), and `worker_threads:` sets the threads. Every handle (each `Trellis::Instance` too) costs this
+again. The full accounting is in
+[`docs/embedding.md`](../../docs/embedding.md#what-a-handle-uses).
+
 ### Several instances
 
 A process can hold several Trellis instances, for different catalog schemas

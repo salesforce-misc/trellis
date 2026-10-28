@@ -145,7 +145,10 @@ pub struct TrellisOptions {
     /// next reconcile pass; none need be registered before it starts.
     pub staging: bool,
     /// How many drain (application) worker threads this connection runs. Zero
-    /// (the default) runs none.
+    /// (the default) runs none. Each is a task on the background client's
+    /// runtime, not an OS thread, and holds up to three connections outside
+    /// the pools; `docs/embedding.md`, "What a handle uses", adds up a
+    /// handle's connections, threads and memory.
     pub drain_threads: usize,
     /// Caps the worker-thread count of each `tokio` runtime this connection
     /// owns: the background [`Client`]'s (built when `staging` or
