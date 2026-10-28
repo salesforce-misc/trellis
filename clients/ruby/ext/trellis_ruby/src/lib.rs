@@ -388,14 +388,22 @@ impl Handle {
     }
 
     /// The configuration the handle connected with, all but the connection
-    /// string (see [`PlainConfig`]).
+    /// string, and its call pool's limits (see [`PlainConfig`]).
     fn config(ruby: &Ruby, rb_self: &Self) -> Result<RHash, Error> {
-        let config = rb_self.with_engine(ruby, |trellis| PlainConfig::from(trellis.config()))?;
+        let config = rb_self.with_engine(ruby, |trellis| PlainConfig::from(trellis))?;
         record(
             ruby,
             [
                 ("schema", ruby.into_value(config.schema)),
                 ("target_schema", ruby.into_value(config.target_schema)),
+                (
+                    "max_call_pool_size",
+                    ruby.into_value(config.max_call_pool_size),
+                ),
+                (
+                    "call_pool_wait_timeout_ms",
+                    ruby.into_value(config.call_pool_wait_timeout_ms),
+                ),
             ],
         )
     }
@@ -428,6 +436,10 @@ impl Handle {
 ///
 /// Raises `Trellis::ForkedHandleError`, before starting anything, in a
 /// process forked while its parent had an engine running.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "`function!` binds each Ruby argument to its own parameter"
+)]
 fn connect(
     ruby: &Ruby,
     url: String,

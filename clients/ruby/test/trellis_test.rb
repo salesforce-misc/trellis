@@ -82,11 +82,15 @@ class TrellisTest < Minitest::Test
     # The test cluster trusts every local connection, so the password is
     # accepted and ignored: it's here to be looked for in the output.
     password = "s3cret-hunter2"
-    Trellis.connect(url: "#{TestCluster.dsn} password=#{password}", target_schema: "reporting")
+    Trellis.connect(url: "#{TestCluster.dsn} password=#{password}", target_schema: "reporting",
+                    max_call_pool_size: 7, call_pool_wait_timeout_ms: 2_500)
     config = Trellis.config
     assert_instance_of Trellis::Config, config
     assert_equal "trellis", config.schema
     assert_equal "reporting", config.target_schema
+    # The call pool as the handle built it, not the defaults.
+    assert_equal 7, config.max_call_pool_size
+    assert_equal 2_500, config.call_pool_wait_timeout_ms
 
     # A config is the kind of value that gets logged whole.
     refute_includes config.to_h.keys, :url

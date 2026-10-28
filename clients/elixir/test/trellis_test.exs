@@ -122,13 +122,24 @@ defmodule TrellisTest do
     # accepted and ignored: it's here to be looked for in the output.
     password = "s3cret-hunter2"
     url = TestCluster.info()["dsn"] <> " password=" <> password
-    trellis = Trellis.connect!(url: url, target_schema: "reporting")
+
+    trellis =
+      Trellis.connect!(
+        url: url,
+        target_schema: "reporting",
+        max_call_pool_size: 7,
+        call_pool_wait_timeout_ms: 2_500
+      )
+
     on_exit(fn -> Trellis.shutdown(trellis) end)
 
+    # The call pool as the handle built it, not the defaults.
     assert {:ok,
             %Trellis.Config{
               schema: "trellis",
-              target_schema: "reporting"
+              target_schema: "reporting",
+              max_call_pool_size: 7,
+              call_pool_wait_timeout_ms: 2_500
             } = config} = Trellis.config(trellis)
 
     # A config is the kind of value that gets logged whole.

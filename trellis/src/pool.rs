@@ -529,6 +529,17 @@ impl Pool {
         (status.size, status.available)
     }
 
+    /// The most connections this pool opens at once.
+    pub fn max_size(&self) -> usize {
+        self.inner.status().max_size
+    }
+
+    /// How long a checkout waits for a free connection before failing (a
+    /// call's remaining budget can cut one checkout's wait shorter).
+    pub fn wait_timeout(&self) -> Duration {
+        self.wait_timeout
+    }
+
     /// Acquires a connection, waiting up to the pool's wait timeout
     /// (see [`Pool::with_limits`]) for one to become available if the pool is at
     /// capacity. Once that timeout elapses, returns

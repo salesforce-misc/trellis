@@ -934,16 +934,20 @@ fn self_check_job<'a>(env: Env<'a>, handle: ResourceArc<Handle>, id: i64) -> Nif
 struct ConfigTerm {
     schema: String,
     target_schema: String,
+    max_call_pool_size: u64,
+    call_pool_wait_timeout_ms: u64,
 }
 
 /// The configuration the handle connected with. Read from memory, so it
 /// returns the term itself, on a normal scheduler.
 #[rustler::nif]
 fn config(handle: ResourceArc<Handle>) -> NifReply<ConfigTerm> {
-    let config = handle.with(|trellis| PlainConfig::from(trellis.config()))?;
+    let config = handle.with(|trellis| PlainConfig::from(trellis))?;
     Ok(ConfigTerm {
         schema: config.schema,
         target_schema: config.target_schema,
+        max_call_pool_size: config.max_call_pool_size,
+        call_pool_wait_timeout_ms: config.call_pool_wait_timeout_ms,
     })
 }
 

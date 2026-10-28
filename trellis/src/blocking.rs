@@ -148,7 +148,18 @@ pub struct BlockingTrellis {
     /// reference without a round trip. [`Config`] is immutable once built, so
     /// the copy can't drift from the original.
     config: Config,
+    /// The call pool's size and wait timeout, read from the connected
+    /// [`Trellis`]'s pool ([`BlockingTrellis::max_call_pool_size`],
+    /// [`BlockingTrellis::call_pool_wait_timeout`]).
+    call_pool: CallPool,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// What [`BlockingTrellis`] keeps of its [`Trellis`]'s call pool.
+#[derive(Debug, Clone, Copy)]
+struct CallPool {
+    max_size: usize,
+    wait_timeout: Duration,
 }
 
 impl BlockingTrellis {
@@ -163,7 +174,7 @@ impl BlockingTrellis {
     /// option's doc comment).
     pub fn connect(config: Config, options: TrellisOptions) -> Result<Self, TrellisError> {
         let (job_tx, job_rx) = mpsc::unbounded_channel::<Submitted>();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), TrellisError>>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<CallPool, TrellisError>>();
         let kept_config = config.clone();
 
         let thread = std::thread::Builder::new()
@@ -181,9 +192,10 @@ impl BlockingTrellis {
             .map_err(TrellisError::BlockingSpawn)?;
 
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(BlockingTrellis {
+            Ok(Ok(call_pool)) => Ok(BlockingTrellis {
                 job_tx,
                 config: kept_config,
+                call_pool,
                 thread: Some(thread),
             }),
             Ok(Err(err)) => {
@@ -206,6 +218,18 @@ impl BlockingTrellis {
     /// own copy of the (immutable) [`Config`] it was connected with.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// The most connections this handle's call pool opens at once
+    /// ([`TrellisOptions::max_call_pool_size`]), as the pool was built.
+    pub fn max_call_pool_size(&self) -> usize {
+        self.call_pool.max_size
+    }
+
+    /// How long a call waits for a free call-pool connection
+    /// ([`TrellisOptions::call_pool_wait_timeout`]), as the pool was built.
+    pub fn call_pool_wait_timeout(&self) -> Duration {
+        self.call_pool.wait_timeout
     }
 
     /// Applies Trellis's schema migrations. See [`Trellis::migrate`].
@@ -655,7 +679,7 @@ async fn run(
     config: Config,
     options: TrellisOptions,
     mut job_rx: mpsc::UnboundedReceiver<Submitted>,
-    ready_tx: std::sync::mpsc::Sender<Result<(), TrellisError>>,
+    ready_tx: std::sync::mpsc::Sender<Result<CallPool, TrellisError>>,
 ) {
     let shared = match Trellis::connect(config, options).await {
         Ok(trellis) => Arc::new(trellis),
@@ -664,7 +688,11 @@ async fn run(
             return;
         }
     };
-    if ready_tx.send(Ok(())).is_err() {
+    let call_pool = CallPool {
+        max_size: shared.pool().max_size(),
+        wait_timeout: shared.pool().wait_timeout(),
+    };
+    if ready_tx.send(Ok(call_pool)).is_err() {
         // `BlockingTrellis::connect` gave up waiting on us — can't happen
         // from this crate's own API, but a defensive exit here costs
         // nothing (same reasoning as `Client::start`'s equivalent comment).

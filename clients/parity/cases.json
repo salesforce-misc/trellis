@@ -126,7 +126,9 @@
     },
     "Config": {
       "schema": "string",
-      "target_schema": "string"
+      "target_schema": "string",
+      "max_call_pool_size": "integer",
+      "call_pool_wait_timeout_ms": "integer"
     }
   },
   "live": [

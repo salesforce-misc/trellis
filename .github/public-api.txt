@@ -37,6 +37,7 @@ function Applied::into_transform
 function ApplyError::code
 function BlockingTrellis::apply
 function BlockingTrellis::await_converged
+function BlockingTrellis::call_pool_wait_timeout
 function BlockingTrellis::config
 function BlockingTrellis::connect
 function BlockingTrellis::definitions
@@ -44,6 +45,7 @@ function BlockingTrellis::detect_capture_disruptions
 function BlockingTrellis::dump_definitions_sql
 function BlockingTrellis::has_live_drain_workers
 function BlockingTrellis::has_live_staging_worker
+function BlockingTrellis::max_call_pool_size
 function BlockingTrellis::metrics
 function BlockingTrellis::migrate
 function BlockingTrellis::poisoned_since
@@ -105,7 +107,9 @@ function PendingCall::wait
 function Pool::close_idle
 function Pool::counts
 function Pool::get
+function Pool::max_size
 function Pool::new
+function Pool::wait_timeout
 function Pool::with_limits
 function PooledClient::build_transaction
 function PooledClient::transaction
