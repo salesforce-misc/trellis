@@ -3727,6 +3727,7 @@ impl ConstOp {
 /// constant, so `col + 2147483647` still defines and fails only for the rows
 /// it overflows. Each nested operation is checked as it is inferred, so the
 /// innermost offender is the one reported.
+#[allow(clippy::too_many_arguments)]
 fn check_constant_op<'f>(
     expr: &Expr,
     op: ConstOp,
