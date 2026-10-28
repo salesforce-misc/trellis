@@ -570,6 +570,10 @@ fn collect_refusing_calls(
             } else {
                 fields_by_name
             };
+            if name == "NULLIF" {
+                let operands: Vec<&Expr> = args.iter().collect();
+                collect_text_comparison("NULLIF", &operands, field, fields_by_name, out);
+            }
             if NONDETERMINISTIC_COLLATION_REFUSING_FUNCTIONS.contains(&name.as_str()) {
                 let mut columns = Vec::new();
                 let mut visited = HashSet::new();
@@ -586,7 +590,16 @@ fn collect_refusing_calls(
                 collect_refusing_calls(arg, field, fields_by_name, out);
             }
         }
-        Expr::BinaryOp { lhs, rhs, .. } => {
+        Expr::BinaryOp { op, lhs, rhs } => {
+            if op.is_comparison() && !op.is_ordering() {
+                collect_text_comparison(
+                    super::registry::operator_spec(*op).symbol,
+                    &[lhs, rhs],
+                    field,
+                    fields_by_name,
+                    out,
+                );
+            }
             collect_refusing_calls(lhs, field, fields_by_name, out);
             collect_refusing_calls(rhs, field, fields_by_name, out);
         }
@@ -603,6 +616,75 @@ fn collect_refusing_calls(
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::TypedLiteral { .. } => {}
+    }
+}
+
+/// The reads of a text comparison (`construct`: its operator, or `NULLIF`)
+/// of `operands`: the columns whose text values reach it. Under a
+/// nondeterministic collation `=` calls two different texts equal, which
+/// Trellis's own exact-text comparisons do not.
+fn collect_text_comparison(
+    construct: &str,
+    operands: &[&Expr],
+    field: &str,
+    fields_by_name: &HashMap<&str, &FieldDef>,
+    out: &mut Vec<CollationRefusingRead>,
+) {
+    let mut columns = Vec::new();
+    let mut visited = HashSet::new();
+    for operand in operands {
+        collect_value_columns(operand, field, fields_by_name, &mut visited, &mut columns);
+    }
+    out.extend(columns.into_iter().map(|column| CollationRefusingRead {
+        field: field.to_string(),
+        function: construct.to_string(),
+        column,
+    }));
+}
+
+/// The columns whose values `expr` can return as its own value: a column, a
+/// calculated field it reads, and the arguments of `COALESCE` and `NULLIF`
+/// and the results (not the conditions) of a `CASE`. Anything else (a call,
+/// an operator) returns a value of another type or a computed one.
+fn collect_value_columns<'a>(
+    expr: &Expr,
+    field: &str,
+    fields_by_name: &HashMap<&str, &'a FieldDef>,
+    visited: &mut HashSet<&'a str>,
+    out: &mut Vec<String>,
+) {
+    match expr {
+        Expr::Column(name) => match fields_by_name.get(name.as_str()) {
+            Some(other) if name != field => {
+                if visited.insert(other.name.as_str()) {
+                    collect_value_columns(&other.expr, &other.name, fields_by_name, visited, out);
+                }
+            }
+            _ => out.push(name.clone()),
+        },
+        Expr::SourceColumn { column, .. } => out.push(column.clone()),
+        Expr::FunctionCall { name, args } if name == "COALESCE" => {
+            for arg in args {
+                collect_value_columns(arg, field, fields_by_name, visited, out);
+            }
+        }
+        Expr::FunctionCall { name, args } if name == "NULLIF" => {
+            if let Some(first) = args.first() {
+                collect_value_columns(first, field, fields_by_name, visited, out);
+            }
+        }
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            for (_, result) in branches {
+                collect_value_columns(result, field, fields_by_name, visited, out);
+            }
+            if let Some(otherwise) = otherwise {
+                collect_value_columns(otherwise, field, fields_by_name, visited, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -726,9 +808,10 @@ impl fmt::Display for ValidationError {
             }
             ValidationError::FieldExpansionTooLarge => write!(
                 f,
-                "the calculated fields read each other so deeply or so many times that inlining \
+                "the calculated fields read each other so deeply or so many times, or one \
+                 expression is so large (a CASE with thousands of branches), that inlining \
                  them into one expression yields more than a build can render; make the chain \
-                 shorter"
+                 or the expression shorter"
             ),
             ValidationError::TableCycle { cycle } => {
                 write!(f, "cycle among tables: {}", cycle.join(" -> "))
@@ -1144,12 +1227,25 @@ impl fmt::Display for ValidationError {
                     column,
                     collation,
                 } = refused.as_ref();
+                let reason = if NONDETERMINISTIC_COLLATION_REFUSING_FUNCTIONS
+                    .contains(&function.as_str())
+                {
+                    format!(
+                        "Postgres refuses {function} under a nondeterministic collation, while \
+                         Trellis would compute it from the exact text"
+                    )
+                } else {
+                    format!(
+                        "such a collation can call two different texts equal (a case-insensitive \
+                         one equates 'a' and 'A'), which {function} would then also do while \
+                         Trellis compares the exact text"
+                    )
+                };
                 write!(
                     f,
                     "calculated field '{field}': {function} reads {table}.{column}, whose \
-                     collation \"{collation}\" is nondeterministic; Postgres refuses {function} \
-                     under a nondeterministic collation, while Trellis would compute it from \
-                     the exact text, so the column needs a deterministic collation"
+                     collation \"{collation}\" is nondeterministic; {reason}, so the column \
+                     needs a deterministic collation"
                 )
             }
             ValidationError::QualifiedSourceTableNotFound { schema, table } => write!(

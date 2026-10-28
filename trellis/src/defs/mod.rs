@@ -121,6 +121,8 @@ pub use validate::{
 
 #[cfg(test)]
 mod arithmetic_tests;
+#[cfg(test)]
+mod logic_tests;
 
 #[cfg(test)]
 mod tests {
