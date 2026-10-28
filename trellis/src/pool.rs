@@ -123,49 +123,69 @@ impl PooledClient {
 
 /// The most background-pool connections one task may hold at once: the
 /// background pools are sized on it (`2N + ...`, see [`Pool::background`]).
-/// Debug builds fail a test whose task holds more.
+/// A debug build aborts the process when a task holds more.
 pub const MAX_BACKGROUND_HELD: usize = 2;
 
 /// Debug-build accounting of how many background-pool connections each task
 /// holds. A task that wants its checkouts counted runs inside
 /// [`depth::scope`]; checkouts outside any scope (a test's own pool use, a
 /// momentary `ChunkHeartbeat` task) are not counted.
+///
+/// A violation aborts the process rather than panicking: the counted tasks
+/// are the background client's, whose panics end only the task (`client::run`
+/// joins them and moves on), so a panic would pass a test unnoticed. An abort
+/// fails the whole test binary, and a binding's test run with it.
 mod depth {
     #[cfg(debug_assertions)]
     use std::sync::Arc;
     #[cfg(debug_assertions)]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// One scope's count of held checkouts.
+    #[cfg(debug_assertions)]
+    pub(super) struct Count {
+        held: AtomicUsize,
+        /// Panic on a violation instead of aborting: only this module's own
+        /// test, which checks that a violation is caught.
+        panic: bool,
+    }
+
     #[cfg(debug_assertions)]
     tokio::task_local! {
-        static HELD: Arc<AtomicUsize>;
+        static HELD: Arc<Count>;
     }
 
     /// One counted checkout, released on drop.
     #[cfg(debug_assertions)]
-    pub(super) struct Held(Arc<AtomicUsize>);
+    pub(super) struct Held(Arc<Count>);
 
     #[cfg(debug_assertions)]
     impl Drop for Held {
         fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::SeqCst);
+            self.0.held.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
     /// Counts one more checkout against the running task, if it is scoped.
-    /// Panics (debug builds) when that is more than
+    /// Aborts the process (debug builds) when that is more than
     /// [`super::MAX_BACKGROUND_HELD`].
     #[cfg(debug_assertions)]
     pub(super) fn enter() -> Option<Held> {
-        HELD.try_with(|held| {
-            let guard = Held(held.clone());
-            let now = held.fetch_add(1, Ordering::SeqCst) + 1;
-            assert!(
-                now <= super::MAX_BACKGROUND_HELD,
-                "a task holds {now} background-pool connections at once (the pools are sized \
-                 for at most {}): release one before taking the next",
-                super::MAX_BACKGROUND_HELD
-            );
+        HELD.try_with(|count| {
+            let guard = Held(count.clone());
+            let now = count.held.fetch_add(1, Ordering::SeqCst) + 1;
+            if now > super::MAX_BACKGROUND_HELD {
+                let message = format!(
+                    "a task holds {now} background-pool connections at once (the pools are \
+                     sized for at most {}): release one before taking the next",
+                    super::MAX_BACKGROUND_HELD
+                );
+                if count.panic {
+                    panic!("{message}");
+                }
+                eprintln!("{message}\n{}", std::backtrace::Backtrace::force_capture());
+                std::process::abort();
+            }
             guard
         })
         .ok()
@@ -175,12 +195,26 @@ mod depth {
     pub(crate) async fn scope<F: std::future::Future>(fut: F) -> F::Output {
         #[cfg(debug_assertions)]
         {
-            HELD.scope(Arc::new(AtomicUsize::new(0)), fut).await
+            let count = Count {
+                held: AtomicUsize::new(0),
+                panic: false,
+            };
+            HELD.scope(Arc::new(count), fut).await
         }
         #[cfg(not(debug_assertions))]
         {
             fut.await
         }
+    }
+
+    /// [`scope`], but a violation panics the task instead of aborting.
+    #[cfg(all(test, debug_assertions))]
+    pub(super) async fn panicking_scope<F: std::future::Future>(fut: F) -> F::Output {
+        let count = Count {
+            held: AtomicUsize::new(0),
+            panic: true,
+        };
+        HELD.scope(Arc::new(count), fut).await
     }
 }
 
@@ -400,7 +434,8 @@ impl Pool {
     /// Builds the pool a handle's background client runs on, of exactly
     /// `max_size` connections (see [`background_pool_size`]). Its checkouts
     /// wait `DEFAULT_CALL_POOL_WAIT_TIMEOUT`, and in debug builds a task
-    /// that holds more than [`MAX_BACKGROUND_HELD`] of them at once panics.
+    /// that holds more than [`MAX_BACKGROUND_HELD`] of them at once aborts the
+    /// process.
     pub(crate) fn background(config: &Config, max_size: usize) -> Result<Self, Error> {
         Self::build(config, max_size, DEFAULT_CALL_POOL_WAIT_TIMEOUT, true)
     }
@@ -1727,11 +1762,11 @@ mod tests {
     }
 
     /// A task that holds more than [`MAX_BACKGROUND_HELD`] background
-    /// connections fails (debug builds); two are fine, and a released one is
-    /// not counted.
+    /// connections is caught (debug builds; outside this test, by aborting the
+    /// process); two are fine, and a released one is not counted.
     #[cfg(debug_assertions)]
     #[tokio::test]
-    async fn a_third_background_connection_in_one_task_panics() {
+    async fn a_third_background_connection_in_one_task_is_caught() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let config = Config::from_dsn(db.dsn().to_string()).expect("dsn");
@@ -1750,7 +1785,7 @@ mod tests {
         .await;
 
         let pool2 = pool.clone();
-        let result = tokio::spawn(count_background_connections(async move {
+        let result = tokio::spawn(depth::panicking_scope(async move {
             let _a = pool2.get().await.expect("a");
             let _b = pool2.get().await.expect("b");
             let _c = pool2.get().await;
