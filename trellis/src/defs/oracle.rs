@@ -293,8 +293,9 @@ pub(crate) fn render_case_sql(
 /// Postgres's own lexer gives the bare literal. Overflow, and the result
 /// type an operator over it has, are then the ones the definition's
 /// declared column types were inferred with: `int4_col + 1` is `integer`
-/// and overflows where an `integer` does.
-fn number_literal_sql(text: &str) -> String {
+/// and overflows where an `integer` does. `self_check`'s audit renders a
+/// literal with this too, so a date takes `date + integer` there as here.
+pub(crate) fn number_literal_sql(text: &str) -> String {
     // A negative literal is parenthesized: `::` binds tighter than the sign,
     // and `-2147483648::integer` casts 2147483648 first.
     let shown = if text.starts_with('-') {

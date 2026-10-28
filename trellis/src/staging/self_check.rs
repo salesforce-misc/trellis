@@ -1723,25 +1723,14 @@ pub(super) fn render_leaf(expr: &Expr) -> String {
     }
 }
 
-/// A number literal as SQL, typed as Postgres types the bare literal: an
-/// integral one `integer` when it fits, else `bigint`, else `numeric`, and a
-/// fractional one `numeric`. A date takes `date + integer` and no other
-/// numeric type, and `integer` arithmetic raises where it overflows, as the
-/// field it audits does.
+/// A number literal as SQL, typed as the write path types it
+/// ([`crate::defs::oracle::number_literal_sql`]: an integral one `integer`
+/// when it fits, else `bigint`, else `numeric`, and a fractional one
+/// `numeric`, as Postgres types the bare literal). A date takes
+/// `date + integer` and no other numeric type, and `integer` arithmetic
+/// raises where it overflows, as the field it audits does.
 fn number_literal(text: &str) -> String {
-    let integral = !text.contains('.');
-    let pg_type = match text.parse::<i64>() {
-        Ok(value) if integral && i32::try_from(value).is_ok() => "integer",
-        Ok(_) if integral => "bigint",
-        _ => "numeric",
-    };
-    // `::` binds tighter than the sign: `-2147483648::integer` would cast
-    // 2147483648 first.
-    if text.starts_with('-') {
-        format!("({text})::{pg_type}")
-    } else {
-        format!("{text}::{pg_type}")
-    }
+    crate::defs::oracle::number_literal_sql(text)
 }
 
 /// One argument of a call, rendered: the scale of `ROUND(a, n)` is an
