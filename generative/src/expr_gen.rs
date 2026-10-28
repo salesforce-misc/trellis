@@ -94,6 +94,10 @@ pub enum Rule {
     },
     /// `COALESCE(a, b, ...)` of arguments that resolve to `ty`.
     Coalesce { ty: ValueType },
+    /// Prefix `-` over an operand of type `ty`.
+    Negate { ty: ValueType },
+    /// `CAST(operand AS to)` over an operand of type `from`.
+    Cast { from: ValueType, to: ValueType },
 }
 
 impl Rule {
@@ -103,6 +107,8 @@ impl Rule {
             Rule::Op { out, .. } | Rule::Call { out, .. } => *out,
             Rule::FloatVsLiteral { .. } => ValueType::Boolean,
             Rule::Coalesce { ty } => *ty,
+            Rule::Negate { ty } => *ty,
+            Rule::Cast { to, .. } => *to,
         }
     }
 }
@@ -111,6 +117,11 @@ impl Rule {
 /// `(function, argument index)`: `regexp_count`'s pattern is compiled at
 /// define time. The registry has no field for it.
 pub const LITERAL_ONLY_ARGS: &[(&str, usize)] = &[("REGEXP_COUNT", 1)];
+
+/// The scales drawn for an argument in [`registry::INTEGER_LITERAL_ARGS`]:
+/// `ROUND(a, n)` of a large positive `n` makes a value with that many digits,
+/// so the pool stays small.
+pub const SCALE_LITERALS: &[&str] = &["0", "1", "2", "5", "-1", "-2", "-5", "20", "-20"];
 
 /// Every type the generator reasons about: the numeric types, `text`,
 /// `boolean`, `uuid` and each type a typed literal can produce.
@@ -177,6 +188,14 @@ pub fn rules() -> Vec<Rule> {
     }
     for &ty in &types {
         rules.push(Rule::Coalesce { ty });
+        if registry::negate_result_type(ty).is_some() {
+            rules.push(Rule::Negate { ty });
+        }
+        for &to in registry::CAST_TARGETS {
+            if registry::cast_result_type(ty, to).is_some() {
+                rules.push(Rule::Cast { from: ty, to });
+            }
+        }
     }
     rules
 }
@@ -198,7 +217,9 @@ pub fn number_literal_type(text: &str) -> ValueType {
 /// Bare number literals, by the type they take.
 fn number_literals(ty: ValueType, magnitude: Magnitude) -> Vec<&'static str> {
     let pool: &[&str] = match magnitude {
-        Magnitude::Small => &["0", "1", "2", "7", "42", "99", "0.5", "1.25", "10.0"],
+        Magnitude::Small => &[
+            "0", "1", "2", "7", "42", "99", "-1", "-3", "0.5", "1.25", "10.0", "-0.5",
+        ],
         Magnitude::Extreme => &[
             "0",
             "1",
@@ -210,7 +231,14 @@ fn number_literals(ty: ValueType, magnitude: Magnitude) -> Vec<&'static str> {
             "9223372036854775807",
             "9223372036854775808",
             "99999999999999999999",
+            "-1",
+            "-32768",
+            "-2147483648",
+            "-2147483649",
+            "-9223372036854775808",
+            "-9223372036854775809",
             "0.5",
+            "-0.5",
             "0.0000001",
             "123456789012345678901234567890.123456789",
             "1.10",
@@ -385,6 +413,17 @@ fn precedence_of(expr: &Expr) -> u8 {
     }
 }
 
+/// Whether `expr` needs parentheses as the operand of a prefix `-`: anything
+/// but a column, a call, a cast or a non-negative literal. (`- -a` would
+/// read as a comment in SQL, and `-(-5)` is a different tree from `- -5`.)
+fn negate_operand_needs_parens(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryOp { .. } | Expr::Negate(_) => true,
+        Expr::NumberLiteral(text) => text.starts_with('-'),
+        _ => false,
+    }
+}
+
 fn symbol_of(op: Operator) -> &'static str {
     registry::operator_spec(op).symbol
 }
@@ -442,6 +481,27 @@ fn write_text(expr: &Expr, style: TextStyle, out: &mut String) {
             out.push(' ');
             side(rhs, wrap_rhs, out);
         }
+        Expr::Negate(operand) => {
+            out.push('-');
+            if style.minimal && !negate_operand_needs_parens(operand) {
+                write_text(operand, style, out);
+            } else {
+                out.push('(');
+                write_text(operand, style, out);
+                out.push(')');
+            }
+        }
+        Expr::Cast { expr, target } => {
+            let (cast, as_) = if style.lower_names {
+                ("cast", "as")
+            } else {
+                ("CAST", "AS")
+            };
+            out.push_str(cast);
+            out.push('(');
+            write_text(expr, style, out);
+            out.push_str(&format!(" {as_} {target})"));
+        }
         Expr::FunctionCall { name, args } => {
             out.push_str(&if style.lower_names {
                 name.to_lowercase()
@@ -476,16 +536,12 @@ pub struct NearMiss {
 
 /// Operator symbols Postgres has and the registry does not. A line whose
 /// symbol the registry now admits stops being a near miss and is skipped.
-pub const UNADMITTED_OPERATORS: &[&str] = &["-", "*", "/", "%", "=", "<", "<=", ">=", "<>", "||"];
+pub const UNADMITTED_OPERATORS: &[&str] = &["=", "<", "<=", ">=", "<>", "||"];
 
 /// Functions and special forms Postgres has and the registry does not. A
 /// `STABLE` or `VOLATILE` one is the trap: `now()` and `random()` change
 /// between calls, `to_char` reads a session setting.
 pub const UNADMITTED_FUNCTIONS: &[&str] = &[
-    "ABS",
-    "ROUND",
-    "FLOOR",
-    "CEIL",
     "LENGTH",
     "LOWER",
     "UPPER",
@@ -534,48 +590,145 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
             }
         }
     }
-    // Wrong-typed argument of every registry function.
-    for spec in registry::FUNCTIONS {
-        for (i, expected) in spec.arg_types.iter().enumerate() {
-            for &found in &types {
-                if found == *expected || LITERAL_ONLY_ARGS.contains(&(spec.name, i)) {
-                    continue;
+    // Wrong-typed argument of every registry function: a call no overload
+    // of the name accepts, varying one argument at a time.
+    let mut names: Vec<&'static str> = registry::FUNCTIONS.iter().map(|s| s.name).collect();
+    names.dedup();
+    for name in names {
+        for spec in registry::function_overloads(name) {
+            for (i, expected) in spec.arg_types.iter().enumerate() {
+                for &found in &types {
+                    if found == *expected
+                        || LITERAL_ONLY_ARGS.contains(&(name, i))
+                        || registry::INTEGER_LITERAL_ARGS.contains(&(name, i))
+                    {
+                        continue;
+                    }
+                    let Some(bad) = column_of(columns, found) else {
+                        continue;
+                    };
+                    let mut arg_types = spec.arg_types.to_vec();
+                    arg_types[i] = found;
+                    if registry::resolve_function(name, &arg_types).is_some() {
+                        continue;
+                    }
+                    let args: Vec<String> = spec
+                        .arg_types
+                        .iter()
+                        .enumerate()
+                        .map(|(j, t)| {
+                            if i == j {
+                                bad.to_string()
+                            } else if LITERAL_ONLY_ARGS.contains(&(name, j)) {
+                                "'a'".to_string()
+                            } else if registry::INTEGER_LITERAL_ARGS.contains(&(name, j)) {
+                                "1".to_string()
+                            } else if let Some(c) = column_of(columns, *t) {
+                                c.to_string()
+                            } else {
+                                "''".to_string()
+                            }
+                        })
+                        .collect();
+                    out.push(NearMiss {
+                        kind: "function-argument-type",
+                        text: format!("{name}({})", args.join(", ")),
+                        needles: vec![name.to_lowercase()],
+                    });
                 }
-                let Some(bad) = column_of(columns, found) else {
-                    continue;
-                };
-                let args: Vec<String> = spec
-                    .arg_types
-                    .iter()
-                    .enumerate()
-                    .map(|(j, t)| {
-                        if i == j {
-                            bad.to_string()
-                        } else if let Some(c) = column_of(columns, *t) {
-                            c.to_string()
-                        } else {
-                            "''".to_string()
-                        }
-                    })
-                    .collect();
-                // Only a literal pattern is checked for the literal-only
-                // argument, so give it one when it is not the bad argument.
-                let args: Vec<String> = args
-                    .into_iter()
-                    .enumerate()
-                    .map(|(j, a)| {
-                        if LITERAL_ONLY_ARGS.contains(&(spec.name, j)) && j != i {
-                            "'a'".to_string()
-                        } else {
-                            a
-                        }
-                    })
-                    .collect();
+            }
+        }
+    }
+    // A scale given as a column rather than a literal.
+    for (name, index) in registry::INTEGER_LITERAL_ARGS {
+        let Some(spec) = registry::function_overloads(name).find(|s| s.arg_types.len() > *index)
+        else {
+            continue;
+        };
+        let Some(col) = column_of(columns, spec.arg_types[*index]) else {
+            continue;
+        };
+        let Some(first) = column_of(columns, spec.arg_types[0]) else {
+            continue;
+        };
+        out.push(NearMiss {
+            kind: "scale-not-literal",
+            text: format!("{name}({first}, {col})"),
+            needles: vec![name.to_lowercase()],
+        });
+    }
+    // Prefix minus over a non-numeric operand.
+    for &ty in &types {
+        if registry::negate_result_type(ty).is_none()
+            && let Some(col) = column_of(columns, ty)
+        {
+            out.push(NearMiss {
+                kind: "negate-operand-type",
+                text: format!("-{col}"),
+                needles: vec!["'-'".to_string()],
+            });
+        }
+    }
+    // Casts the registry does not admit, to each target.
+    for &ty in &types {
+        let Some(col) = column_of(columns, ty) else {
+            continue;
+        };
+        for &to in registry::CAST_TARGETS {
+            if registry::cast_result_type(ty, to).is_none() {
                 out.push(NearMiss {
-                    kind: "function-argument-type",
-                    text: format!("{}({})", spec.name, args.join(", ")),
-                    needles: vec![spec.name.to_lowercase()],
+                    kind: "cast-operand-type",
+                    text: format!("CAST({col} AS {to})"),
+                    needles: vec![to.to_string()],
                 });
+            }
+        }
+    }
+    // Cast targets the grammar has no spelling for, and a modifier.
+    if let Some(col) = column_of(columns, ValueType::Integer(IntWidth::Int2)) {
+        for target in ["smallint", "text", "real", "int", "numeric(10, 2)"] {
+            out.push(NearMiss {
+                kind: "cast-target",
+                text: format!("CAST({col} AS {target})"),
+                needles: vec![target.split('(').next().unwrap_or(target).to_string()],
+            });
+        }
+    }
+    // A divisor that is the constant zero.
+    for &ty in &types {
+        if !ty.is_numeric_family() {
+            continue;
+        }
+        let Some(col) = column_of(columns, ty) else {
+            continue;
+        };
+        for op in ["/", "%"] {
+            if registry::lookup_operator(op).is_none() {
+                continue;
+            }
+            for zero in ["0", "0.0", "(1 - 1)"] {
+                let text = format!("{col} {op} {zero}");
+                // Only the pairs the registry types are refused for the
+                // zero; the rest are near misses of their own kind.
+                let zero_type = number_literal_type(
+                    zero.trim_matches(['(', ')'])
+                        .split(' ')
+                        .next()
+                        .unwrap_or("0"),
+                );
+                if registry::operator_result_type(
+                    registry::lookup_operator(op).expect("checked"),
+                    ty,
+                    zero_type,
+                )
+                .is_some()
+                {
+                    out.push(NearMiss {
+                        kind: "constant-zero-divisor",
+                        text,
+                        needles: vec!["zero".to_string()],
+                    });
+                }
             }
         }
     }
@@ -817,7 +970,11 @@ pub mod strategy {
                 Rule::Call { name, args, .. } => {
                     let mut parts: BoxedStrategy<Vec<Expr>> = Just(Vec::new()).boxed();
                     for (i, ty) in args.iter().enumerate() {
-                        let arg = if LITERAL_ONLY_ARGS.contains(&(*name, i)) {
+                        let arg = if registry::INTEGER_LITERAL_ARGS.contains(&(*name, i)) {
+                            prop::sample::select(SCALE_LITERALS.to_vec())
+                                .prop_map(|n| Expr::NumberLiteral(n.to_string()))
+                                .boxed()
+                        } else if LITERAL_ONLY_ARGS.contains(&(*name, i)) {
                             let mut patterns = REGEX_PATTERNS.to_vec();
                             if self.profile.magnitude == Magnitude::Extreme {
                                 patterns.extend(REGEX_DIALECT_PATTERNS);
@@ -841,6 +998,28 @@ pub mod strategy {
                             .prop_map(move |args| Expr::FunctionCall {
                                 name: name.clone(),
                                 args,
+                            })
+                            .boxed(),
+                    )
+                }
+                Rule::Negate { ty } => {
+                    // A minus applied to a number literal is one negative
+                    // literal, so the operand is never a literal.
+                    let operand = self
+                        .expr(*ty, depth)?
+                        .prop_filter("not a number literal", |e| {
+                            !matches!(e, Expr::NumberLiteral(_))
+                        });
+                    Some(operand.prop_map(|e| Expr::Negate(Box::new(e))).boxed())
+                }
+                Rule::Cast { from, to } => {
+                    let to = *to;
+                    let operand = self.expr(*from, depth)?;
+                    Some(
+                        operand
+                            .prop_map(move |e| Expr::Cast {
+                                expr: Box::new(e),
+                                target: to,
                             })
                             .boxed(),
                     )

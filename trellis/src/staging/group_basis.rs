@@ -419,6 +419,16 @@ pub(super) fn rewrite(
             lhs: Box::new(rewrite(lhs, type_of, arg_of, shape)?),
             rhs: Box::new(rewrite(rhs, type_of, arg_of, shape)?),
         }),
+        Expr::Negate(operand) => Some(Expr::Negate(Box::new(rewrite(
+            operand, type_of, arg_of, shape,
+        )?))),
+        Expr::Cast {
+            expr: operand,
+            target,
+        } => Some(Expr::Cast {
+            expr: Box::new(rewrite(operand, type_of, arg_of, shape)?),
+            target: *target,
+        }),
         other => Some(other.clone()),
     }
 }
@@ -447,6 +457,7 @@ fn distinct_arguments(
                 walk(lhs, out);
                 walk(rhs, out);
             }
+            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => walk(operand, out),
             Expr::Column(_)
             | Expr::SourceColumn { .. }
             | Expr::NumberLiteral(_)

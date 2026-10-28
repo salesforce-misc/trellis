@@ -188,6 +188,7 @@ fn walk_columns(expr: &Expr, visit: &mut impl FnMut(&QualifiedColumn)) {
             walk_columns(lhs, visit);
             walk_columns(rhs, visit);
         }
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => walk_columns(operand, visit),
         Expr::FunctionCall { args, .. } => {
             for arg in args {
                 walk_columns(arg, visit);
@@ -234,6 +235,9 @@ pub(crate) fn side_arguments(def: &TransformDef, side: Side) -> Vec<Expr> {
             Expr::BinaryOp { lhs, rhs, .. } => {
                 collect(lhs, def, join, side, out);
                 collect(rhs, def, join, side, out);
+            }
+            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
+                collect(operand, def, join, side, out);
             }
             _ => {}
         }

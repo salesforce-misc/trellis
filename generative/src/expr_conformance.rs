@@ -31,7 +31,6 @@ use tokio_postgres::{Client, NoTls};
 use trellis::dev::config::DEFAULT_SCHEMA;
 use trellis::dev::defs::ast::{Expr, ValueType};
 use trellis::dev::defs::oracle::render_expr_sql;
-use trellis::dev::defs::registry;
 use trellis::dev::defs::{FloatWidth, IntWidth};
 use trellis::dev::defs::{
     PgType, ValidationError, create_target_table, parse, render_definition_text,
@@ -256,6 +255,7 @@ pub const KNOWN_GAP_CONSTANT_CALL: &str = "constant function calls are folded by
 pub fn has_constant_call(expr: &Expr) -> bool {
     match expr {
         Expr::BinaryOp { lhs, rhs, .. } => has_constant_call(lhs) || has_constant_call(rhs),
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => has_constant_call(operand),
         Expr::FunctionCall { name, args } => {
             (name != "COALESCE" && !reads_column(expr)) || args.iter().any(has_constant_call)
         }
@@ -268,6 +268,7 @@ fn reads_column(expr: &Expr) -> bool {
     match expr {
         Expr::Column(_) | Expr::SourceColumn { .. } => true,
         Expr::BinaryOp { lhs, rhs, .. } => reads_column(lhs) || reads_column(rhs),
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => reads_column(operand),
         Expr::FunctionCall { args, .. } => args.iter().any(reads_column),
         _ => false,
     }
@@ -460,6 +461,9 @@ impl Fixture {
             .await;
 
         match validate(&def, &self.source_columns) {
+            Err(err @ ValidationError::ConstantDivisorZero { .. }) => {
+                self.check_zero_divisor_refusal(text, &err, probe).await
+            }
             Err(err) if is_range_refusal(&err) => match probe {
                 Some(code) if class_of(&code) == "22" => {
                     Ok(Agreement::RefusedAndRaises(err.to_string()))
@@ -500,6 +504,57 @@ impl Fixture {
                     None => Ok(Agreement::Admitted),
                 }
             }
+        }
+    }
+
+    /// A refusal for a constant zero divisor. Postgres folds a constant
+    /// division and raises at plan time; with a column dividend it plans the
+    /// division and raises for every row that has a dividend. The refusal
+    /// stands when no row of the table computes a value: each raises class
+    /// 22, or is `NULL` (a `NULL` dividend) or `NaN` (a `NaN` dividend divides
+    /// by zero to `NaN`).
+    async fn check_zero_divisor_refusal(
+        &self,
+        text: &str,
+        err: &ValidationError,
+        probe: Option<String>,
+    ) -> Result<Agreement, Divergence> {
+        let diverge = |detail: String| Divergence {
+            property: Property::FalseRefusal,
+            text: text.to_string(),
+            detail,
+        };
+        if let Some(code) = probe {
+            return if class_of(&code) == "22" {
+                Ok(Agreement::RefusedAndRaises(err.to_string()))
+            } else {
+                Err(diverge(format!(
+                    "refused ({err}) but Postgres raises {code}, not class 22"
+                )))
+            };
+        }
+        match self
+            .rows(&format!(
+                "select id, ({text})::text from {TABLE} order by id"
+            ))
+            .await
+        {
+            Err(code) if class_of(&code) == "22" => {
+                Ok(Agreement::RefusedAndRaises(err.to_string()))
+            }
+            Err(code) => Err(diverge(format!(
+                "refused ({err}) but Postgres raises {code}, not class 22"
+            ))),
+            Ok(rows)
+                if rows
+                    .iter()
+                    .all(|v| matches!(v.as_deref(), None | Some("NaN"))) =>
+            {
+                Ok(Agreement::RefusedAndRaises(err.to_string()))
+            }
+            Ok(_) => Err(diverge(format!(
+                "refused ({err}) but Postgres computes a value for some row"
+            ))),
         }
     }
 
@@ -692,6 +747,7 @@ impl Fixture {
                     stack.push(lhs);
                     stack.push(rhs);
                 }
+                Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => stack.push(operand),
                 Expr::FunctionCall { name, args } => {
                     if name == "REGEXP_COUNT"
                         && let Some(Expr::StringLiteral(pattern)) = args.get_mut(1)
@@ -718,17 +774,28 @@ impl Fixture {
                 && name != "COALESCE"
                 && !reads_column(e)
             {
-                let spec = registry::lookup_function(name).expect("a registry function");
-                let sql = format!("select ({})::text", render_expr_sql(e));
-                let value: Option<String> = self
+                let rendered = render_expr_sql(e);
+                let sql = format!("select ({rendered})::text, pg_typeof({rendered})::text");
+                let row = self
                     .client
                     .query_one(&sql, &[])
                     .await
-                    .unwrap_or_else(|err| panic!("`{sql}` fails: {err}"))
-                    .get(0);
-                *e = match (spec.return_type, value) {
-                    (ValueType::Integer(_), Some(v)) => Expr::NumberLiteral(v),
-                    (ValueType::Text, Some(v)) => Expr::StringLiteral(v),
+                    .unwrap_or_else(|err| panic!("`{sql}` fails: {err}"));
+                let value: Option<String> = row.get(0);
+                let pg_type: String = row.get(1);
+                *e = match (pg_type.as_str(), value) {
+                    ("smallint" | "integer" | "bigint" | "numeric", Some(v)) => {
+                        Expr::NumberLiteral(v)
+                    }
+                    ("text", Some(v)) => Expr::StringLiteral(v),
+                    ("real", Some(v)) => Expr::TypedLiteral {
+                        value_type: ValueType::Float(FloatWidth::Float4),
+                        text: v,
+                    },
+                    ("double precision", Some(v)) => Expr::TypedLiteral {
+                        value_type: ValueType::Float(FloatWidth::Float8),
+                        text: v,
+                    },
                     (ty, v) => panic!(
                         "`{sql}` of type {ty} gives {v:?}: teach fold_constant_calls to \
                          spell it as a literal"
@@ -741,6 +808,7 @@ impl Fixture {
                     stack.push(lhs);
                     stack.push(rhs);
                 }
+                Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => stack.push(operand),
                 Expr::FunctionCall { args, .. } => stack.extend(args.iter_mut()),
                 _ => {}
             }

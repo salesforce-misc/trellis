@@ -131,6 +131,75 @@ impl Numeric {
         }
     }
 
+    /// The value with its sign flipped (zero stays zero).
+    pub fn negate(&self) -> Numeric {
+        Numeric {
+            negative: !self.negative && !self.is_zero(),
+            digits: self.digits.clone(),
+            scale: self.scale,
+        }
+    }
+
+    /// The absolute value.
+    pub fn abs(&self) -> Numeric {
+        Numeric {
+            negative: false,
+            digits: self.digits.clone(),
+            scale: self.scale,
+        }
+    }
+
+    /// Whether the value is zero, at any scale.
+    pub fn is_zero(&self) -> bool {
+        self.digits.iter().all(|&d| d == 0)
+    }
+
+    /// Postgres `numeric` subtraction: `self + (-other)`.
+    pub fn sub(&self, other: &Numeric) -> Numeric {
+        self.add(&other.negate())
+    }
+
+    /// Postgres `numeric` multiplication. The exact product's scale is the
+    /// sum of the operands' (Postgres's `mul_var` result scale before it
+    /// rounds to its display scale, which only matters past 16 digits).
+    pub fn mul(&self, other: &Numeric) -> Numeric {
+        let mut product = vec![0u32; self.digits.len() + other.digits.len()];
+        for (i, &a) in self.digits.iter().enumerate().rev() {
+            for (j, &b) in other.digits.iter().enumerate().rev() {
+                product[i + j + 1] += u32::from(a) * u32::from(b);
+            }
+        }
+        for k in (1..product.len()).rev() {
+            product[k - 1] += product[k] / 10;
+            product[k] %= 10;
+        }
+        let mut digits: Vec<u8> = product.into_iter().map(|d| d as u8).collect();
+        strip_leading_zeros(&mut digits);
+        let is_zero = digits.iter().all(|&d| d == 0);
+        Numeric {
+            negative: (self.negative != other.negative) && !is_zero,
+            digits,
+            scale: self.scale + other.scale,
+        }
+    }
+
+    /// The value as an integer, when it has no fractional digits and fits
+    /// an `i128`.
+    pub fn to_i128(&self) -> Option<i128> {
+        if self.scale != 0 || self.digits.len() > 38 {
+            return None;
+        }
+        let magnitude = self.digits.iter().try_fold(0i128, |acc, &d| {
+            acc.checked_mul(10)?.checked_add(i128::from(d))
+        })?;
+        Some(if self.negative { -magnitude } else { magnitude })
+    }
+
+    /// An integer as a `Numeric`.
+    pub fn from_i128(value: i128) -> Numeric {
+        Numeric::parse(&value.to_string()).expect("an integer's text is a decimal")
+    }
+
     /// This value's digit vector re-expressed at `scale` (which must be
     /// `>= self.scale`), by appending trailing zero digits — the digit
     /// vector's fractional end, since digits are most-significant first.
@@ -320,6 +389,25 @@ mod tests {
         let a = Numeric::parse(&big).unwrap();
         let sum = a.add(&n("1")).to_string();
         assert_eq!(sum, format!("1{}", "0".repeat(50)));
+    }
+
+    #[test]
+    fn sub_mul_and_sign_operations() {
+        assert_eq!(n("5").sub(&n("7.5")).to_string(), "-2.5");
+        assert_eq!(n("-2").mul(&n("3.5")).to_string(), "-7.0");
+        assert_eq!(n("0").mul(&n("-3")).to_string(), "0");
+        assert_eq!(
+            n("99999999999999999999")
+                .mul(&n("99999999999999999999"))
+                .to_string(),
+            "9999999999999999999800000000000000000001"
+        );
+        assert_eq!(n("-0.50").negate().negate().to_string(), "-0.50");
+        assert!(n("0.00").negate().is_zero());
+        assert_eq!(n("-3").abs().to_string(), "3");
+        assert_eq!(n("-7").to_i128(), Some(-7));
+        assert_eq!(n("7.0").to_i128(), None);
+        assert_eq!(Numeric::from_i128(-12).to_string(), "-12");
     }
 
     #[test]

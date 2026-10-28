@@ -151,10 +151,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio_postgres::types::PgLsn;
 
-use crate::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate};
+use crate::defs::ast::{Expr, FieldDef, KeySpace, Predicate};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
 use crate::defs::model::{Definition, TransformStatus};
+use crate::defs::registry;
 use crate::defs::typed_literal;
 use crate::error_code::{self, ErrorCode};
 use crate::pool::{Pool, quote_ident};
@@ -1519,25 +1520,49 @@ pub(super) fn render_leaf(expr: &Expr) -> String {
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
-            let symbol = match op {
-                Operator::Add => "+",
-                Operator::GreaterThan => ">",
-            };
+            let symbol = registry::operator_spec(*op).symbol;
             format!("({} {symbol} {})", render_leaf(lhs), render_leaf(rhs))
         }
+        Expr::Negate(operand) => format!("(-({}))", render_leaf(operand)),
+        Expr::Cast { expr, target } => format!("cast({} as {target})", render_leaf(expr)),
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             "count(*)".to_string()
         }
         Expr::FunctionCall { name, args } => {
-            let rendered: Vec<String> = args.iter().map(render_leaf).collect();
+            let rendered: Vec<String> = args
+                .iter()
+                .enumerate()
+                .map(|(i, arg)| render_call_arg(name, i, arg, render_leaf))
+                .collect();
             format!("{}({})", name.to_lowercase(), rendered.join(", "))
         }
+    }
+}
+
+/// One argument of a call, rendered: the scale of `ROUND(a, n)` is an
+/// `integer` (Postgres has no `round(numeric, numeric)`), anything else is
+/// rendered by `render`.
+pub(super) fn render_call_arg(
+    function: &str,
+    index: usize,
+    arg: &Expr,
+    render: impl Fn(&Expr) -> String,
+) -> String {
+    match arg {
+        Expr::NumberLiteral(text)
+            if registry::INTEGER_LITERAL_ARGS
+                .contains(&(function.to_ascii_uppercase().as_str(), index)) =>
+        {
+            format!("({text})::integer")
+        }
+        _ => render(arg),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::defs::ast::Operator;
 
     #[test]
     fn render_leaf_renders_a_column_reference() {

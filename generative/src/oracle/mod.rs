@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use trellis::Pool;
-use trellis::dev::defs::ast::{Expr, KeySpace, Operator, Predicate, TransformDef, ValueType};
+use trellis::dev::defs::ast::{Expr, KeySpace, Predicate, TransformDef, ValueType};
 use trellis::dev::defs::registry;
 use trellis::dev::defs::typed_literal;
 use trellis::dev::defs::{FloatWidth, IntWidth};
@@ -357,12 +357,11 @@ fn render_expr(expr: &Expr) -> String {
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
-            let symbol = match op {
-                Operator::Add => "+",
-                Operator::GreaterThan => ">",
-            };
+            let symbol = registry::operator_spec(*op).symbol;
             format!("({} {symbol} {})", render_expr(lhs), render_expr(rhs))
         }
+        Expr::Negate(operand) => format!("(-({}))", render_expr(operand)),
+        Expr::Cast { expr, target } => format!("cast({} as {target})", render_expr(expr)),
         // `COUNT(*)` (task B4, mirroring `trellis::dev::defs::oracle::render_expr_sql`'s
         // own special case): the parser's only accepted `COUNT` shape has no
         // argument at all in the AST (`args` is empty), so `*` is rendered
@@ -743,6 +742,24 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
                 )
             })
         }
+        Expr::Negate(operand) => {
+            let operand_t = field_value_type(operand, source_columns);
+            registry::negate_result_type(operand_t).unwrap_or_else(|| {
+                panic!("oracle: unary minus has no result type for operand {operand_t}")
+            })
+        }
+        Expr::Cast { target, .. } => *target,
+        Expr::FunctionCall { name, args }
+            if registry::function_overloads(name).nth(1).is_some() =>
+        {
+            let arg_types: Vec<ValueType> = args
+                .iter()
+                .map(|a| field_value_type(a, source_columns))
+                .collect();
+            registry::resolve_function(name, &arg_types)
+                .unwrap_or_else(|| panic!("oracle: no overload of {name} for {arg_types:?}"))
+                .return_type
+        }
         Expr::FunctionCall { name, .. } => registry::lookup_function(name)
             .or_else(|| registry::lookup_aggregate_function(name))
             .map(|spec| spec.return_type)
@@ -846,12 +863,11 @@ fn render_join_expr(expr: &Expr) -> String {
         Expr::BinaryOp { op, lhs, rhs } => format!(
             "({} {} {})",
             render_join_expr(lhs),
-            match op {
-                Operator::Add => "+",
-                Operator::GreaterThan => ">",
-            },
+            registry::operator_spec(*op).symbol,
             render_join_expr(rhs)
         ),
+        Expr::Negate(operand) => format!("(-({}))", render_join_expr(operand)),
+        Expr::Cast { expr, target } => format!("cast({} as {target})", render_join_expr(expr)),
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             "count(*)".to_string()
         }
@@ -924,6 +940,7 @@ pub async fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trellis::dev::defs::ast::Operator;
 
     /// The SQL oracle reads a qualified name inside an aggregate
     /// as the source column it names.

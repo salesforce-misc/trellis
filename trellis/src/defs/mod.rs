@@ -118,6 +118,9 @@ pub use validate::{
 };
 
 #[cfg(test)]
+mod arithmetic_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -515,12 +518,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_plus_operator() {
-        let err = parse("TRANSFORM t FROM s SELECT a - b AS x").unwrap_err();
-        match err {
-            ParseError::UnsupportedOperator { operator } => assert_eq!(operator, "-"),
-            other => panic!("expected UnsupportedOperator, got {other:?}"),
-        }
+    fn rejects_an_operator_the_registry_does_not_list() {
+        let err = parse("TRANSFORM t FROM s SELECT a ^ b AS x").unwrap_err();
+        assert!(
+            matches!(err, ParseError::UnexpectedChar { found: '^' }),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -569,10 +572,10 @@ mod tests {
     fn rejects_unregistered_function_call() {
         // Rejected via a `registry::lookup_function` lookup, not a
         // hardcoded parser branch — see ADR-0004's registry-sharing goal.
-        assert!(registry::lookup_function("ROUND").is_none());
-        let err = parse("TRANSFORM t FROM s SELECT ROUND(a) AS x").unwrap_err();
+        assert!(registry::lookup_function("LENGTH").is_none());
+        let err = parse("TRANSFORM t FROM s SELECT LENGTH(a) AS x").unwrap_err();
         match err {
-            ParseError::UnsupportedFunction { name } => assert_eq!(name, "ROUND"),
+            ParseError::UnsupportedFunction { name } => assert_eq!(name, "LENGTH"),
             other => panic!("expected UnsupportedFunction, got {other:?}"),
         }
     }

@@ -22,7 +22,7 @@ pub enum ParseError {
     /// A construct outside the 1-1 key-space this grammar slice supports
     /// (aggregate `GROUP BY`, cross-join `JOIN`).
     UnsupportedKeySpace { construct: String, detail: String },
-    /// An operator other than `+`.
+    /// An operator `super::registry::OPERATORS` does not list.
     UnsupportedOperator { operator: String },
     /// A function call other than one in `super::registry::FUNCTIONS`.
     UnsupportedFunction { name: String },
@@ -53,12 +53,14 @@ pub enum ParseError {
     /// whose head is not the `FROM` table. `source` is the `FROM` table's bare
     /// name. A key of another table is grouped by with a `JOIN`.
     GroupByKeyNotFromSource { reference: String, source: String },
-    /// A `CAST(<expr> AS <type>)` whose operand is not a single-quoted
-    /// string literal — i.e. a request for a **general** cast
-    /// rather than a typed literal. See `super::typed_literal` for why the
-    /// coercion lattice a general cast implies is each type family's own
-    /// epic child, not this grammar's.
-    UnsupportedCast { found: String },
+    /// A `CAST(<expr> AS <type>)` naming a type that is not one of
+    /// `super::registry::CAST_TARGETS`, or naming a modifier (`numeric(10,2)`).
+    /// `name` is the target as written. Whether the operand converts to a
+    /// target is the validator's to check
+    /// ([`super::validate::ValidationError::UnsupportedCast`]).
+    UnsupportedCastTarget { name: String },
+    /// A run of prefix `-` operators longer than the parser keeps.
+    PrefixMinusChainTooLong { max: usize },
     /// A `CAST(<literal> AS <type>)` or `<type> '<literal>'` naming a type
     /// that isn't in `super::typed_literal::TYPED_LITERALS`'s allowlist.
     UnsupportedLiteralType { name: String },
@@ -175,12 +177,19 @@ impl fmt::Display for ParseError {
                  qualified <schema>.<table> is supported, not a third '.'-separated \
                  part"
             ),
-            ParseError::UnsupportedCast { found } => write!(
+            ParseError::UnsupportedCastTarget { name } => write!(
                 f,
-                "CAST is only supported over a single-quoted literal — \
-                 CAST('<literal>' AS <type>), equivalently <type> '<literal>' — found {found}. \
-                 General casts between expression types are not supported: most interesting \
-                 pairs are not immutable (ADR-0004; docs/type-support.md)"
+                "'{name}' is not a CAST target: only {} are supported, each from a narrower \
+                 integer (or any integer to numeric), with no modifier (docs/type-support.md)",
+                crate::defs::registry::CAST_TARGETS
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            ParseError::PrefixMinusChainTooLong { max } => write!(
+                f,
+                "more than {max} prefix '-' operators in a row; write the expression with fewer"
             ),
             ParseError::UnsupportedLiteralType { name } => write!(
                 f,

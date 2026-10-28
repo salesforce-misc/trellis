@@ -164,6 +164,65 @@ pub fn checked_add(
     Ok((sum, width))
 }
 
+/// `a - b`, with the same overflow rule as [`checked_add`].
+pub fn checked_sub(
+    a: f64,
+    a_width: FloatWidth,
+    b: f64,
+    b_width: FloatWidth,
+) -> Result<(f64, FloatWidth), FloatError> {
+    let width = a_width.wider(b_width);
+    let difference = width.round(a - b);
+    if difference.is_infinite() && a.is_finite() && b.is_finite() {
+        return Err(FloatError::OutOfRange { width });
+    }
+    Ok((difference, width))
+}
+
+/// `a * b` with Postgres's `float4mul`/`float8mul` semantics: an infinite
+/// result from two finite operands is an overflow, and a zero result from two
+/// nonzero operands is an underflow; both raise `22003`.
+pub fn checked_mul(
+    a: f64,
+    a_width: FloatWidth,
+    b: f64,
+    b_width: FloatWidth,
+) -> Result<(f64, FloatWidth), FloatError> {
+    let width = a_width.wider(b_width);
+    let product = width.round(a * b);
+    if (product.is_infinite() && a.is_finite() && b.is_finite())
+        || (product == 0.0 && a != 0.0 && b != 0.0)
+    {
+        return Err(FloatError::OutOfRange { width });
+    }
+    Ok((product, width))
+}
+
+/// `a / b` with Postgres's `float4div`/`float8div` semantics: a zero divisor
+/// raises `22012` unless the dividend is `NaN`; an infinite result from two
+/// finite operands is an overflow; a zero result from a nonzero dividend and a
+/// finite divisor is an underflow (`1 / Infinity` is a plain `0`). Every
+/// failure is reported as [`FloatError::OutOfRange`], the caller having
+/// refused a zero divisor already.
+pub fn checked_div(
+    a: f64,
+    a_width: FloatWidth,
+    b: f64,
+    b_width: FloatWidth,
+) -> Result<(f64, FloatWidth), FloatError> {
+    let width = a_width.wider(b_width);
+    if b == 0.0 && !a.is_nan() {
+        return Err(FloatError::OutOfRange { width });
+    }
+    let quotient = width.round(a / b);
+    if (quotient.is_infinite() && a.is_finite() && b.is_finite())
+        || (quotient == 0.0 && a != 0.0 && b.is_finite())
+    {
+        return Err(FloatError::OutOfRange { width });
+    }
+    Ok((quotient, width))
+}
+
 /// Parses Postgres's canonical text rendering of a float, rejecting anything
 /// [`render`] would not itself have produced for that width.
 ///

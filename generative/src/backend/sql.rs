@@ -233,6 +233,10 @@ pub(super) fn render_expr(expr: &Expr) -> String {
                 render_expr(rhs)
             )
         }
+        Expr::Negate(operand) => format!("-({})", render_expr(operand)),
+        Expr::Cast { expr, target } => {
+            format!("CAST({} AS {})", render_expr(expr), pg_type_name(*target))
+        }
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             "COUNT(*)".to_string()
         }
@@ -244,10 +248,7 @@ pub(super) fn render_expr(expr: &Expr) -> String {
 }
 
 pub(super) fn render_operator(op: Operator) -> &'static str {
-    match op {
-        Operator::Add => "+",
-        Operator::GreaterThan => ">",
-    }
+    trellis::dev::defs::registry::operator_spec(op).symbol
 }
 
 /// `source_columns` for `table`, as `trellis::dev::defs::install_definition` wants

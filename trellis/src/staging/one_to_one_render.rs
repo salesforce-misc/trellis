@@ -159,6 +159,7 @@ fn collect_columns(expr: &Expr, out: &mut BTreeSet<String>) {
             collect_columns(lhs, out);
             collect_columns(rhs, out);
         }
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => collect_columns(operand, out),
         Expr::FunctionCall { args, .. } => {
             for arg in args {
                 collect_columns(arg, out);

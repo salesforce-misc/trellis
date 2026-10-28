@@ -296,6 +296,14 @@ fn substitute(def: &TransformDef, expr: &Expr, depth: usize) -> Option<Expr> {
             lhs: Box::new(substitute(def, lhs, depth)?),
             rhs: Box::new(substitute(def, rhs, depth)?),
         },
+        Expr::Negate(operand) => Expr::Negate(Box::new(substitute(def, operand, depth)?)),
+        Expr::Cast {
+            expr: operand,
+            target,
+        } => Expr::Cast {
+            expr: Box::new(substitute(def, operand, depth)?),
+            target: *target,
+        },
         other => other.clone(),
     })
 }

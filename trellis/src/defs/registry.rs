@@ -52,6 +52,8 @@ pub mod precedence {
     pub const COMPARISON: u8 = 10;
     /// Binary `+`, `-`.
     pub const ADDITIVE: u8 = 20;
+    /// Binary `*`, `/`, `%`.
+    pub const MULTIPLICATIVE: u8 = 30;
 }
 
 /// The full set of operators this grammar supports.
@@ -89,6 +91,30 @@ pub const OPERATORS: &[OperatorSpec] = &[
         operator: Operator::Add,
         arg_types: (ValueType::Numeric, ValueType::Numeric),
         precedence: precedence::ADDITIVE,
+    },
+    OperatorSpec {
+        symbol: "-",
+        operator: Operator::Subtract,
+        arg_types: (ValueType::Numeric, ValueType::Numeric),
+        precedence: precedence::ADDITIVE,
+    },
+    OperatorSpec {
+        symbol: "*",
+        operator: Operator::Multiply,
+        arg_types: (ValueType::Numeric, ValueType::Numeric),
+        precedence: precedence::MULTIPLICATIVE,
+    },
+    OperatorSpec {
+        symbol: "/",
+        operator: Operator::Divide,
+        arg_types: (ValueType::Numeric, ValueType::Numeric),
+        precedence: precedence::MULTIPLICATIVE,
+    },
+    OperatorSpec {
+        symbol: "%",
+        operator: Operator::Modulo,
+        arg_types: (ValueType::Numeric, ValueType::Numeric),
+        precedence: precedence::MULTIPLICATIVE,
     },
     OperatorSpec {
         symbol: ">",
@@ -161,16 +187,28 @@ pub fn operator_result_type(op: Operator, lhs: ValueType, rhs: ValueType) -> Opt
     if !lhs.is_numeric_family() || !rhs.is_numeric_family() {
         return None;
     }
+    // The type `+`, `-` and `*` give: two integers the wider width, a float
+    // beside anything the float rule, otherwise `numeric`.
+    let arithmetic = || match (lhs, rhs) {
+        (ValueType::Float(a), ValueType::Float(b)) => ValueType::Float(a.wider(b)),
+        // A float mixed with anything else is the `float8` operator on two
+        // `double precision` operands.
+        (ValueType::Float(_), _) | (_, ValueType::Float(_)) => ValueType::Float(FloatWidth::Float8),
+        (ValueType::Integer(a), ValueType::Integer(b)) => ValueType::Integer(a.wider(b)),
+        _ => ValueType::Numeric,
+    };
     Some(match op {
-        Operator::Add => match (lhs, rhs) {
-            (ValueType::Float(a), ValueType::Float(b)) => ValueType::Float(a.wider(b)),
-            // A float mixed with anything else is `float8pl` on two
-            // `double precision` operands.
-            (ValueType::Float(_), _) | (_, ValueType::Float(_)) => {
-                ValueType::Float(FloatWidth::Float8)
-            }
-            (ValueType::Integer(a), ValueType::Integer(b)) => ValueType::Integer(a.wider(b)),
-            _ => ValueType::Numeric,
+        Operator::Add | Operator::Subtract | Operator::Multiply => arithmetic(),
+        // Postgres truncates `integer / integer` (`7 / 2` is `3`), so the
+        // quotient of two integers is refused rather than typed.
+        Operator::Divide => match (lhs, rhs) {
+            (ValueType::Integer(_), ValueType::Integer(_)) => return None,
+            _ => arithmetic(),
+        },
+        // Postgres has no float modulo.
+        Operator::Modulo => match (lhs, rhs) {
+            (ValueType::Float(_), _) | (_, ValueType::Float(_)) => return None,
+            _ => arithmetic(),
         },
         // A float against an exact numeric is refused: Postgres resolves it
         // by casting the exact side to `double precision`, so the comparison
@@ -181,6 +219,35 @@ pub fn operator_result_type(op: Operator, lhs: ValueType, rhs: ValueType) -> Opt
         Operator::GreaterThan if is_mixed_float_exact(lhs, rhs) => return None,
         Operator::GreaterThan => ValueType::Boolean,
     })
+}
+
+/// The result type of prefix `-` over an operand of type `operand`: the
+/// operand's own type (`int2um`, `int4um`, `int8um`, `numeric_uminus`,
+/// `float4um`, `float8um`), `None` for a non-numeric operand.
+pub fn negate_result_type(operand: ValueType) -> Option<ValueType> {
+    operand.is_numeric_family().then_some(operand)
+}
+
+/// The types `CAST(<expr> AS <type>)` can name, spelled as Postgres prints
+/// them. A modifier (`numeric(10,2)`) is not a target.
+pub const CAST_TARGETS: &[ValueType] = &[
+    ValueType::Integer(IntWidth::Int4),
+    ValueType::Integer(IntWidth::Int8),
+    ValueType::Numeric,
+];
+
+/// The result type of `CAST(<operand> AS <target>)`, or `None` if the cast is
+/// not one of the lossless, total ones: an integer to a strictly wider
+/// integer, or any integer to `numeric`. Every other cast narrows (and can
+/// overflow), rounds, or goes to or from a float.
+pub fn cast_result_type(operand: ValueType, target: ValueType) -> Option<ValueType> {
+    match (operand, target) {
+        (ValueType::Integer(from), ValueType::Integer(to)) if from.range().1 < to.range().1 => {
+            Some(target)
+        }
+        (ValueType::Integer(_), ValueType::Numeric) => Some(ValueType::Numeric),
+        _ => None,
+    }
 }
 
 /// Whether one operand is a float and the other an exact numeric (an integer
@@ -237,12 +304,109 @@ pub const FUNCTIONS: &[FunctionSpec] = &[
         arg_types: &[ValueType::Text, ValueType::Text],
         return_type: ValueType::Integer(IntWidth::Int4),
     },
+    FunctionSpec {
+        name: "ABS",
+        arg_types: &[ValueType::Integer(IntWidth::Int2)],
+        return_type: ValueType::Integer(IntWidth::Int2),
+    },
+    FunctionSpec {
+        name: "ABS",
+        arg_types: &[ValueType::Integer(IntWidth::Int4)],
+        return_type: ValueType::Integer(IntWidth::Int4),
+    },
+    FunctionSpec {
+        name: "ABS",
+        arg_types: &[ValueType::Integer(IntWidth::Int8)],
+        return_type: ValueType::Integer(IntWidth::Int8),
+    },
+    FunctionSpec {
+        name: "ABS",
+        arg_types: &[ValueType::Numeric],
+        return_type: ValueType::Numeric,
+    },
+    FunctionSpec {
+        name: "ABS",
+        arg_types: &[ValueType::Float(FloatWidth::Float4)],
+        return_type: ValueType::Float(FloatWidth::Float4),
+    },
+    FunctionSpec {
+        name: "ABS",
+        arg_types: &[ValueType::Float(FloatWidth::Float8)],
+        return_type: ValueType::Float(FloatWidth::Float8),
+    },
+    FunctionSpec {
+        name: "CEIL",
+        arg_types: &[ValueType::Numeric],
+        return_type: ValueType::Numeric,
+    },
+    FunctionSpec {
+        name: "CEIL",
+        arg_types: &[ValueType::Float(FloatWidth::Float8)],
+        return_type: ValueType::Float(FloatWidth::Float8),
+    },
+    FunctionSpec {
+        name: "FLOOR",
+        arg_types: &[ValueType::Numeric],
+        return_type: ValueType::Numeric,
+    },
+    FunctionSpec {
+        name: "FLOOR",
+        arg_types: &[ValueType::Float(FloatWidth::Float8)],
+        return_type: ValueType::Float(FloatWidth::Float8),
+    },
+    FunctionSpec {
+        name: "TRUNC",
+        arg_types: &[ValueType::Numeric],
+        return_type: ValueType::Numeric,
+    },
+    FunctionSpec {
+        name: "TRUNC",
+        arg_types: &[ValueType::Float(FloatWidth::Float8)],
+        return_type: ValueType::Float(FloatWidth::Float8),
+    },
+    FunctionSpec {
+        name: "ROUND",
+        arg_types: &[ValueType::Numeric],
+        return_type: ValueType::Numeric,
+    },
+    FunctionSpec {
+        name: "ROUND",
+        arg_types: &[ValueType::Numeric, ValueType::Integer(IntWidth::Int4)],
+        return_type: ValueType::Numeric,
+    },
+    FunctionSpec {
+        name: "TRUNC",
+        arg_types: &[ValueType::Numeric, ValueType::Integer(IntWidth::Int4)],
+        return_type: ValueType::Numeric,
+    },
 ];
 
-/// Looks up a function by its canonical uppercased name.
-pub fn lookup_function(name: &str) -> Option<&'static FunctionSpec> {
-    FUNCTIONS.iter().find(|spec| spec.name == name)
+/// Every overload of the function named `name` (canonical uppercase).
+///
+/// A name with one signature has one entry. The numeric functions have
+/// several, because Postgres types them by argument: `ABS` of a `smallint`
+/// is `smallint`, of a `numeric` is `numeric`.
+pub fn function_overloads(name: &str) -> impl Iterator<Item = &'static FunctionSpec> + '_ {
+    FUNCTIONS.iter().filter(move |spec| spec.name == name)
 }
+
+/// Looks up a function by its canonical uppercased name: its first
+/// overload.
+pub fn lookup_function(name: &str) -> Option<&'static FunctionSpec> {
+    function_overloads(name).next()
+}
+
+/// The overload of `name` whose declared argument types are exactly
+/// `arg_types`.
+pub fn resolve_function(name: &str, arg_types: &[ValueType]) -> Option<&'static FunctionSpec> {
+    function_overloads(name).find(|spec| spec.arg_types == arg_types)
+}
+
+/// Function arguments the grammar requires to be an integer literal, as
+/// `(function, argument index)`: the scale of `ROUND(a, n)` and
+/// `TRUNC(a, n)`. A column there would make the result's scale depend on the
+/// row; a literal may be negative (`ROUND(a, -2)`).
+pub const INTEGER_LITERAL_ARGS: &[(&str, usize)] = &[("ROUND", 1), ("TRUNC", 1)];
 
 /// Aggregate function names, called out specifically so a rejection can
 /// explain that they need an aggregate key-space (`GROUP BY`), not that

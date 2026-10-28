@@ -513,6 +513,10 @@ fn expr_reads(
             expr_reads(rhs, source, source_columns, out);
             None
         }
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
+            expr_reads(operand, source, source_columns, out);
+            None
+        }
         Expr::Column(_)
         | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)

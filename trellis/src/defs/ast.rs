@@ -435,6 +435,14 @@ pub enum Expr {
     /// syntactically identical `name(args)` calls, just resolved against a
     /// different registry depending on key-space.
     FunctionCall { name: String, args: Vec<Expr> },
+    /// Prefix `-<operand>` over anything but a number literal (`-5` is one
+    /// negative [`Expr::NumberLiteral`], as Postgres reads it). The result
+    /// has the operand's type.
+    Negate(Box<Expr>),
+    /// `CAST(<operand> AS <target>)` for the lossless integer widenings
+    /// [`super::registry::cast_result_type`] admits. A cast of a quoted
+    /// literal is an [`Expr::TypedLiteral`] instead.
+    Cast { expr: Box<Expr>, target: ValueType },
 }
 
 /// The value type a column or expression carries. `Text` and
@@ -551,6 +559,10 @@ impl fmt::Display for ValueType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operator {
     Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
     GreaterThan,
 }
 
@@ -666,6 +678,10 @@ pub(crate) fn render_field_expr(expr: &Expr) -> String {
             let rendered_args: Vec<String> = args.iter().map(render_field_expr).collect();
             format!("{name}({})", rendered_args.join(", "))
         }
+        Expr::Negate(operand) => format!("(-{})", render_field_expr(operand)),
+        Expr::Cast { expr, target } => {
+            format!("CAST({} AS {target})", render_field_expr(expr))
+        }
     }
 }
 
@@ -696,10 +712,7 @@ pub(crate) fn qualified_column_text(schema: Option<&str>, table: &str, column: &
 }
 
 fn render_operator(op: Operator) -> &'static str {
-    match op {
-        Operator::Add => "+",
-        Operator::GreaterThan => ">",
-    }
+    super::registry::operator_spec(op).symbol
 }
 
 /// The typed-literal keyword [`super::typed_literal::TYPED_LITERALS`] spells

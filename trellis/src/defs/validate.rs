@@ -224,6 +224,37 @@ pub enum ValidationError {
         text: String,
         target: ValueType,
     },
+    /// A `/` or `%` whose divisor is a constant zero (`a / 0`, `a % (1 - 1)`,
+    /// `a / 0.0`). Postgres raises `22012` for every row that reads a
+    /// non-null dividend, so the definition could never write one. `text` is
+    /// the operation as written.
+    ConstantDivisorZero { field: String, text: String },
+    /// A `/` between two integers. Postgres truncates (`7 / 2` is `3`).
+    IntegerDivision {
+        field: String,
+        lhs: ValueType,
+        rhs: ValueType,
+    },
+    /// A `%` with a float operand: Postgres has no float modulo.
+    FloatModulo { field: String },
+    /// A `CAST` the grammar does not admit: only an integer to a strictly
+    /// wider integer, or any integer to `numeric`, converts losslessly and
+    /// totally.
+    UnsupportedCast {
+        field: String,
+        from: ValueType,
+        to: ValueType,
+    },
+    /// An argument of a numeric function (`ABS`, `CEIL`, `FLOOR`, `ROUND`,
+    /// `TRUNC`) whose type the function does not admit, with the reason.
+    NumericFunctionArgument {
+        field: String,
+        function: String,
+        found: ValueType,
+        reason: &'static str,
+    },
+    /// The scale of `ROUND(a, n)` / `TRUNC(a, n)` is not an integer literal.
+    ScaleNotIntegerLiteral { field: String, function: String },
     /// A function call's argument had the wrong `ValueType` for its
     /// position — e.g. `octet_length(1)`. Distinct from
     /// [`ValidationError::TypeMismatch`] so the message can name the
@@ -518,6 +549,9 @@ fn collect_refusing_calls(
             collect_refusing_calls(lhs, field, fields_by_name, out);
             collect_refusing_calls(rhs, field, fields_by_name, out);
         }
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
+            collect_refusing_calls(operand, field, fields_by_name, out);
+        }
         Expr::Column(_)
         | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
@@ -554,6 +588,9 @@ fn collect_text_columns<'a>(
         Expr::BinaryOp { lhs, rhs, .. } => {
             collect_text_columns(lhs, field, fields_by_name, visited, out);
             collect_text_columns(rhs, field, fields_by_name, visited, out);
+        }
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
+            collect_text_columns(operand, field, fields_by_name, visited, out);
         }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
     }
@@ -801,6 +838,45 @@ impl fmt::Display for ValidationError {
                  {target}; Postgres folds it at plan time and raises an out-of-range error for \
                  every row. Use values that fit, or a column (see \"Supported sources and \
                  targets\" in docs/transforms.md)"
+            ),
+            ValidationError::ConstantDivisorZero { field, text } => write!(
+                f,
+                "calculated field '{field}' divides by the constant zero in {text}; Postgres \
+                 raises a division-by-zero error for every row that has a dividend. Use a \
+                 nonzero divisor, or a column (see \"Supported sources and targets\" in \
+                 docs/transforms.md)"
+            ),
+            ValidationError::IntegerDivision { field, lhs, rhs } => write!(
+                f,
+                "calculated field '{field}' divides a {lhs} value by a {rhs} value; Postgres \
+                 truncates an integer quotient (7 / 2 is 3). Divide as numeric: \
+                 CAST(<dividend> AS numeric) / <divisor>"
+            ),
+            ValidationError::FloatModulo { field } => write!(
+                f,
+                "calculated field '{field}' applies '%' to a float; Postgres has no \
+                 modulo for real or double precision. '%' takes integers and numeric"
+            ),
+            ValidationError::UnsupportedCast { field, from, to } => write!(
+                f,
+                "calculated field '{field}' casts a {from} value to {to}; the only casts \
+                 admitted are an integer to a wider integer and any integer to numeric, \
+                 because only those are lossless and cannot fail (see \"Supported sources \
+                 and targets\" in docs/transforms.md)"
+            ),
+            ValidationError::NumericFunctionArgument {
+                field,
+                function,
+                found,
+                reason,
+            } => write!(
+                f,
+                "calculated field '{field}': {function} does not take a {found} value: {reason}"
+            ),
+            ValidationError::ScaleNotIntegerLiteral { field, function } => write!(
+                f,
+                "calculated field '{field}': the scale argument of {function} must be an \
+                 integer literal (it may be negative), not a column or expression"
             ),
             ValidationError::MixedFloatExactComparison { field, lhs, rhs } => write!(
                 f,
@@ -1410,6 +1486,9 @@ fn check_aggregate_calls(
             check_aggregate_calls(lhs, columns, value_types)?;
             check_aggregate_calls(rhs, columns, value_types)
         }
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
+            check_aggregate_calls(operand, columns, value_types)
+        }
         Expr::FunctionCall { name, args } => {
             let upper = name.to_ascii_uppercase();
             if !(is_deferred_aggregate_name(&upper)
@@ -1741,6 +1820,15 @@ fn check_join_field_expr<'a>(
             )?;
             check_join_field_expr(rhs, field, resolve, in_aggregate, left, right, aggregates)
         }
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => check_join_field_expr(
+            operand,
+            field,
+            resolve,
+            in_aggregate,
+            left,
+            right,
+            aggregates,
+        ),
         Expr::FunctionCall { name, args } => {
             let upper = name.to_ascii_uppercase();
             let is_aggregate = is_deferred_aggregate_name(&upper)
@@ -1942,6 +2030,9 @@ pub(crate) fn validate_qualified_columns(
                 walk(lhs, field, def, source_columns, source_schema)?;
                 walk(rhs, field, def, source_columns, source_schema)
             }
+            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
+                walk(operand, field, def, source_columns, source_schema)
+            }
             Expr::FunctionCall { args, .. } => args
                 .iter()
                 .try_for_each(|arg| walk(arg, field, def, source_columns, source_schema)),
@@ -2004,6 +2095,9 @@ fn reject_ambiguous_names(
                 first_ambiguous(lhs, reader, in_aggregate_arg, shadowing, aggregates).or_else(
                     || first_ambiguous(rhs, reader, in_aggregate_arg, shadowing, aggregates),
                 )
+            }
+            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
+                first_ambiguous(operand, reader, in_aggregate_arg, shadowing, aggregates)
             }
             Expr::FunctionCall { name, args } => {
                 let in_arg =
@@ -2123,6 +2217,13 @@ fn validate_aggregate_field_expr(
                 in_aggregate_call,
             )
         }
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => validate_aggregate_field_expr(
+            operand,
+            field_name,
+            group_by,
+            source_columns,
+            in_aggregate_call,
+        ),
         Expr::FunctionCall { name, args } => {
             let is_aggregate_call = super::registry::lookup_aggregate_function(name).is_some();
             for arg in args {
@@ -2159,6 +2260,7 @@ pub(super) fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
             collect_columns(lhs, out);
             collect_columns(rhs, out);
         }
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => collect_columns(operand, out),
         Expr::FunctionCall { args, .. } => {
             for arg in args {
                 collect_columns(arg, out);
@@ -2175,6 +2277,7 @@ fn has_aggregate_call(expr: &Expr) -> bool {
                 || args.iter().any(has_aggregate_call)
         }
         Expr::BinaryOp { lhs, rhs, .. } => has_aggregate_call(lhs) || has_aggregate_call(rhs),
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => has_aggregate_call(operand),
         Expr::Column(_)
         | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
@@ -2263,6 +2366,15 @@ pub(crate) fn collect_reads(
         Expr::BinaryOp { lhs, rhs, .. } => {
             collect_reads(lhs, aggregates, in_aggregate_arg, fields, aggregate_args);
             collect_reads(rhs, aggregates, in_aggregate_arg, fields, aggregate_args);
+        }
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
+            collect_reads(
+                operand,
+                aggregates,
+                in_aggregate_arg,
+                fields,
+                aggregate_args,
+            );
         }
         Expr::FunctionCall { name, args } => {
             let in_arg =
@@ -2644,6 +2756,14 @@ enum Constant {
 }
 
 impl Constant {
+    /// Whether the value is zero (`-0` included).
+    fn is_zero(&self) -> bool {
+        match self {
+            Constant::Exact(n) => n.is_zero(),
+            Constant::Float(v, _) => *v == 0.0,
+        }
+    }
+
     /// The value as the float an operand beside a float is cast to (`double
     /// precision` for an exact one), `None` where Postgres's cast raises.
     fn as_float(&self) -> Option<(f64, crate::float::FloatWidth)> {
@@ -2697,20 +2817,33 @@ fn fold_constant<'f>(
         } => crate::float::parse(text, *width)
             .ok()
             .map(|v| Constant::Float(v, *width)),
-        Expr::BinaryOp {
-            op: super::ast::Operator::Add,
-            lhs,
-            rhs,
-        } => match (recurse(lhs, field_name)?, recurse(rhs, field_name)?) {
-            (Constant::Exact(a), Constant::Exact(b)) => Some(Constant::Exact(a.add(&b))),
-            (a, b) => {
-                let (a, a_width) = a.as_float()?;
-                let (b, b_width) = b.as_float()?;
-                crate::float::checked_add(a, a_width, b, b_width)
-                    .ok()
-                    .map(|(sum, width)| Constant::Float(sum, width))
+        Expr::BinaryOp { op, lhs, rhs } => {
+            let op = ConstOp::of_operator(*op)?;
+            match (recurse(lhs, field_name)?, recurse(rhs, field_name)?) {
+                (Constant::Exact(a), Constant::Exact(b)) => {
+                    op.exact(&a, Some(&b)).map(Constant::Exact)
+                }
+                (a, b) => {
+                    let a = a.as_float()?;
+                    let b = b.as_float()?;
+                    op.float(a, b)?
+                        .ok()
+                        .map(|(value, width)| Constant::Float(value, width))
+                }
             }
+        }
+        Expr::Negate(operand) => match recurse(operand, field_name)? {
+            Constant::Exact(n) => Some(Constant::Exact(n.negate())),
+            Constant::Float(v, w) => Some(Constant::Float(-v, w)),
         },
+        // A widening cast keeps the value.
+        Expr::Cast { expr, .. } => recurse(expr, field_name),
+        Expr::FunctionCall { name, args } if name == "ABS" && args.len() == 1 => {
+            match recurse(&args[0], field_name)? {
+                Constant::Exact(n) => Some(Constant::Exact(n.abs())),
+                Constant::Float(v, w) => Some(Constant::Float(v.abs(), w)),
+            }
+        }
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
             recurse(args.first()?, field_name)
         }
@@ -2772,6 +2905,22 @@ fn reads_no_column<'f>(
                 depth + 1,
             )
         }
+        Expr::Negate(operand) => reads_no_column(
+            operand,
+            field_name,
+            source_columns,
+            fields_by_name,
+            memo,
+            depth + 1,
+        ),
+        Expr::Cast { expr, .. } => reads_no_column(
+            expr,
+            field_name,
+            source_columns,
+            fields_by_name,
+            memo,
+            depth + 1,
+        ),
         // The planner reduces a `COALESCE` led by a constant to that
         // constant and drops the rest unevaluated, so what follows the first
         // argument does not matter.
@@ -2840,17 +2989,85 @@ fn exact_constant<'f>(
     }
 }
 
-/// Refuses a `+` Postgres cannot compute at plan time, whatever the row:
-/// two integer constants whose sum does not fit the result width, two float
-/// constants whose sum overflows the float, or an exact constant beside a
-/// float that does not fit `double precision` (Postgres casts it to the
-/// float's type when it plans the `+`). An operand that reads a column is
-/// not a constant, so `col + 2147483647` still defines and fails only for
-/// the rows it overflows. Each nested `+` is checked as it is inferred, so
-/// the innermost offender is the one reported.
-fn check_constant_sum<'f>(
+/// The arithmetic a constant is folded through.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConstOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
+    Negate,
+    Abs,
+}
+
+impl ConstOp {
+    fn of_operator(op: super::ast::Operator) -> Option<ConstOp> {
+        use super::ast::Operator;
+        Some(match op {
+            Operator::Add => ConstOp::Add,
+            Operator::Subtract => ConstOp::Subtract,
+            Operator::Multiply => ConstOp::Multiply,
+            Operator::Divide => ConstOp::Divide,
+            Operator::Modulo => ConstOp::Modulo,
+            Operator::GreaterThan => return None,
+        })
+    }
+
+    /// The exact result, for the operations whose exact result is known.
+    fn exact(
+        self,
+        a: &crate::numeric::Numeric,
+        b: Option<&crate::numeric::Numeric>,
+    ) -> Option<crate::numeric::Numeric> {
+        use crate::numeric::Numeric;
+        Some(match (self, b) {
+            (ConstOp::Add, Some(b)) => a.add(b),
+            (ConstOp::Subtract, Some(b)) => a.sub(b),
+            (ConstOp::Multiply, Some(b)) => a.mul(b),
+            (ConstOp::Negate, None) => a.negate(),
+            (ConstOp::Abs, None) => a.abs(),
+            // The remainder of two integers: Postgres's `%` takes the
+            // dividend's sign, as `i128`'s does. A quotient or a fractional
+            // remainder needs `numeric`'s division, which no refusal needs.
+            (ConstOp::Modulo, Some(b)) => {
+                let (a, b) = (a.to_i128()?, b.to_i128()?);
+                Numeric::from_i128(a.checked_rem(b)?)
+            }
+            _ => return None,
+        })
+    }
+
+    /// The float result, or `Err` where Postgres raises.
+    fn float(
+        self,
+        (a, a_width): (f64, crate::float::FloatWidth),
+        (b, b_width): (f64, crate::float::FloatWidth),
+    ) -> Option<Result<(f64, crate::float::FloatWidth), crate::float::FloatError>> {
+        Some(match self {
+            ConstOp::Add => crate::float::checked_add(a, a_width, b, b_width),
+            ConstOp::Subtract => crate::float::checked_sub(a, a_width, b, b_width),
+            ConstOp::Multiply => crate::float::checked_mul(a, a_width, b, b_width),
+            ConstOp::Divide => crate::float::checked_div(a, a_width, b, b_width),
+            ConstOp::Modulo | ConstOp::Negate | ConstOp::Abs => return None,
+        })
+    }
+}
+
+/// Refuses an operation Postgres cannot compute at plan time, whatever the
+/// row: a `+`, `-` or `*` of two integer constants whose result does not fit
+/// the result width, negating or taking the absolute value of the smallest
+/// integer, two float constants whose result overflows or underflows, an
+/// exact constant beside a float that does not fit `double precision`
+/// (Postgres casts it to the float's type when it plans the operator), and a
+/// `/` or `%` by a constant zero. An operand that reads a column is not a
+/// constant, so `col + 2147483647` still defines and fails only for the rows
+/// it overflows. Each nested operation is checked as it is inferred, so the
+/// innermost offender is the one reported.
+fn check_constant_op<'f>(
     expr: &Expr,
-    (lhs, rhs): (&Expr, &Expr),
+    op: ConstOp,
+    operands: &[&Expr],
     result: ValueType,
     field_name: &str,
     source_columns: &HashMap<String, ValueType>,
@@ -2864,12 +3081,30 @@ fn check_constant_sum<'f>(
     let mut memo = HashMap::new();
     let mut fold =
         |e: &Expr| fold_constant(e, field_name, source_columns, fields_by_name, &mut memo, 0);
-    let (l, r) = (fold(lhs), fold(rhs));
+    let folded: Vec<Option<Constant>> = operands.iter().map(|e| fold(e)).collect();
+    if matches!(op, ConstOp::Divide | ConstOp::Modulo)
+        && folded
+            .get(1)
+            .is_some_and(|c| c.as_ref().is_some_and(Constant::is_zero))
+    {
+        return Err(ValidationError::ConstantDivisorZero {
+            field: field_name.to_string(),
+            text: super::ast::render_field_expr(expr),
+        });
+    }
     match result {
         ValueType::Integer(width) => {
-            if let (Some(Constant::Exact(a)), Some(Constant::Exact(b))) = (&l, &r) {
-                let fits = a
-                    .add(b)
+            let exact: Option<Vec<&crate::numeric::Numeric>> = folded
+                .iter()
+                .map(|c| match c {
+                    Some(Constant::Exact(n)) => Some(n),
+                    _ => None,
+                })
+                .collect();
+            if let Some(exact) = exact
+                && let Some(value) = op.exact(exact[0], exact.get(1).copied())
+            {
+                let fits = value
                     .to_string()
                     .parse::<i64>()
                     .is_ok_and(|v| width.fits(v));
@@ -2879,7 +3114,7 @@ fn check_constant_sum<'f>(
             }
         }
         ValueType::Float(_) => {
-            for (arg, constant) in [(lhs, &l), (rhs, &r)] {
+            for (arg, constant) in operands.iter().zip(&folded) {
                 if let Some(c @ Constant::Exact(_)) = constant
                     && c.as_float().is_none()
                 {
@@ -2889,9 +3124,9 @@ fn check_constant_sum<'f>(
                     ));
                 }
             }
-            if let (Some(a), Some(b)) = (&l, &r)
-                && let (Some((a, a_width)), Some((b, b_width))) = (a.as_float(), b.as_float())
-                && crate::float::checked_add(a, a_width, b, b_width).is_err()
+            if let [Some(a), Some(b)] = folded.as_slice()
+                && let (Some(a), Some(b)) = (a.as_float(), b.as_float())
+                && let Some(Err(_)) = op.float(a, b)
             {
                 return Err(out_of_range(expr, result));
             }
@@ -3001,10 +3236,11 @@ fn infer_expr(
             // to compare against. `OperatorSpec::arg_types` survives only as
             // the canonical shape a `TypeMismatch` names.
             if let Some(result) = super::registry::operator_result_type(*op, lhs_t, rhs_t) {
-                if folded && matches!(op, super::ast::Operator::Add) {
-                    check_constant_sum(
+                if folded && let Some(kind) = ConstOp::of_operator(*op) {
+                    check_constant_op(
                         expr,
-                        (lhs, rhs),
+                        kind,
+                        &[lhs, rhs],
                         result,
                         field_name,
                         source_columns,
@@ -3052,6 +3288,23 @@ fn infer_expr(
                     rhs: rhs_t,
                 });
             }
+            if lhs_t.is_numeric_family() && rhs_t.is_numeric_family() {
+                match op {
+                    super::ast::Operator::Divide => {
+                        return Err(ValidationError::IntegerDivision {
+                            field: field_name.to_string(),
+                            lhs: lhs_t,
+                            rhs: rhs_t,
+                        });
+                    }
+                    super::ast::Operator::Modulo => {
+                        return Err(ValidationError::FloatModulo {
+                            field: field_name.to_string(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
             // Blame the operand that actually isn't admissible. At least one
             // of them isn't (or resolution above would have succeeded), and
             // the left one is reported first so the error reads in source
@@ -3067,6 +3320,58 @@ fn infer_expr(
                 operator: spec.symbol,
                 expected,
                 found,
+            })
+        }
+        Expr::Negate(operand) => {
+            let operand_t = infer_expr(
+                operand,
+                field_name,
+                source_columns,
+                fields_by_name,
+                types,
+                in_progress,
+                folded,
+            )?;
+            let result = super::registry::negate_result_type(operand_t).ok_or_else(|| {
+                ValidationError::TypeMismatch {
+                    field: field_name.to_string(),
+                    operator: "-",
+                    expected: ValueType::Numeric,
+                    found: operand_t,
+                }
+            })?;
+            if folded {
+                check_constant_op(
+                    expr,
+                    ConstOp::Negate,
+                    &[operand],
+                    result,
+                    field_name,
+                    source_columns,
+                    fields_by_name,
+                )?;
+            }
+            Ok(result)
+        }
+        Expr::Cast {
+            expr: operand,
+            target,
+        } => {
+            let operand_t = infer_expr(
+                operand,
+                field_name,
+                source_columns,
+                fields_by_name,
+                types,
+                in_progress,
+                folded,
+            )?;
+            super::registry::cast_result_type(operand_t, *target).ok_or_else(|| {
+                ValidationError::UnsupportedCast {
+                    field: field_name.to_string(),
+                    from: operand_t,
+                    to: *target,
+                }
             })
         }
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
@@ -3162,6 +3467,17 @@ fn infer_expr(
             // just above.
             let aggregate_spec = super::registry::lookup_aggregate_function(name);
             let is_aggregate = aggregate_spec.is_some();
+            if !is_aggregate && super::registry::function_overloads(name).nth(1).is_some() {
+                return infer_overloaded_call(
+                    expr,
+                    field_name,
+                    source_columns,
+                    fields_by_name,
+                    types,
+                    in_progress,
+                    folded,
+                );
+            }
             // An aggregate outside the admitted set is refused
             // by family, before its argument is typed: the grammar parses
             // these names only to refuse them.
@@ -3307,6 +3623,91 @@ fn infer_expr(
             Ok(spec.return_type)
         }
     }
+}
+
+/// Types a call of a function with several signatures (`ABS`, `CEIL`,
+/// `FLOOR`, `ROUND`, `TRUNC`): the overload whose declared argument types
+/// equal the arguments' types, or the refusal that says why none does.
+fn infer_overloaded_call(
+    expr: &Expr,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
+    types: &mut HashMap<String, ValueType>,
+    in_progress: &mut HashSet<String>,
+    folded: bool,
+) -> Result<ValueType, ValidationError> {
+    let Expr::FunctionCall { name, args } = expr else {
+        unreachable!("only a call is typed here");
+    };
+    let mut arg_types = Vec::with_capacity(args.len());
+    for (i, arg) in args.iter().enumerate() {
+        if super::registry::INTEGER_LITERAL_ARGS.contains(&(name.as_str(), i)) {
+            // The scale: an integer literal, possibly negative, in `integer`
+            // range, so the result's scale never depends on a row.
+            let literal = matches!(arg, Expr::NumberLiteral(text) if text.parse::<i32>().is_ok());
+            if !literal {
+                return Err(ValidationError::ScaleNotIntegerLiteral {
+                    field: field_name.to_string(),
+                    function: name.clone(),
+                });
+            }
+        }
+        arg_types.push(infer_expr(
+            arg,
+            field_name,
+            source_columns,
+            fields_by_name,
+            types,
+            in_progress,
+            folded,
+        )?);
+    }
+    let Some(spec) = super::registry::resolve_function(name, &arg_types) else {
+        let found = arg_types[0];
+        if !found.is_numeric_family() {
+            return Err(ValidationError::FunctionArgTypeMismatch {
+                field: field_name.to_string(),
+                function: name.clone(),
+                arg_index: 0,
+                expected: ValueType::Numeric,
+                found,
+            });
+        }
+        let reason = match (name.as_str(), found, args.len()) {
+            (_, ValueType::Integer(_), _) => {
+                "an integer is already whole, and Postgres would cast it to double precision, \
+                 changing the result's type; use the integer itself"
+            }
+            ("ROUND", ValueType::Float(_), _) => {
+                "a float rounds half to even where numeric rounds half away from zero, so one \
+                 name would carry two rules; round a numeric value"
+            }
+            (_, ValueType::Float(_), 1) => {
+                "only numeric and double precision are admitted; Postgres promotes a real to \
+                 double precision"
+            }
+            _ => "the scale form takes a numeric value",
+        };
+        return Err(ValidationError::NumericFunctionArgument {
+            field: field_name.to_string(),
+            function: name.clone(),
+            found,
+            reason,
+        });
+    };
+    if folded && name == "ABS" {
+        check_constant_op(
+            expr,
+            ConstOp::Abs,
+            &[&args[0]],
+            spec.return_type,
+            field_name,
+            source_columns,
+            fields_by_name,
+        )?;
+    }
+    Ok(spec.return_type)
 }
 
 /// The [`ValueType`] an unadorned numeric literal carries, matching

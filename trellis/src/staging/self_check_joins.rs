@@ -74,14 +74,17 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use tokio_postgres::types::PgLsn;
 
-use crate::defs::ast::{Expr, JoinKind, KeySpace, Operator, Predicate, TransformDef};
+use crate::defs::ast::{Expr, JoinKind, KeySpace, Predicate, TransformDef};
 use crate::defs::catalog;
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::join::{self as spec, HiddenTable, Side as JoinSide};
 use crate::defs::model::Definition;
+use crate::defs::registry;
 use crate::pool::{Pool, quote_ident};
 
-use super::self_check::{ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_leaf};
+use super::self_check::{
+    ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_call_arg, render_leaf,
+};
 use super::self_check_groups::{
     Side, Uncertain, bound, drop_equal_values, partial_text, weighted_partials,
 };
@@ -203,23 +206,27 @@ fn render(def: &TransformDef, expr: &Expr, from: &str, joined: &str) -> Result<S
             ));
         }
         Expr::BinaryOp { op, lhs, rhs } => {
-            let symbol = match op {
-                Operator::Add => "+",
-                Operator::GreaterThan => ">",
-            };
+            let symbol = registry::operator_spec(*op).symbol;
             format!(
                 "({} {symbol} {})",
                 render(def, lhs, from, joined)?,
                 render(def, rhs, from, joined)?
             )
         }
+        Expr::Negate(operand) => format!("(-({}))", render(def, operand, from, joined)?),
+        Expr::Cast { expr, target } => {
+            format!("cast({} as {target})", render(def, expr, from, joined)?)
+        }
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             "count(*)".to_string()
         }
         Expr::FunctionCall { name, args } => {
             let mut rendered = Vec::with_capacity(args.len());
-            for arg in args {
-                rendered.push(render(def, arg, from, joined)?);
+            for (i, arg) in args.iter().enumerate() {
+                rendered.push(match arg {
+                    Expr::NumberLiteral(_) => render_call_arg(name, i, arg, render_leaf),
+                    _ => render(def, arg, from, joined)?,
+                });
             }
             format!("{}({})", name.to_lowercase(), rendered.join(", "))
         }
@@ -277,6 +284,7 @@ fn summed(def: &TransformDef, args: &[Expr]) -> Vec<bool> {
                 walk(lhs, args, out);
                 walk(rhs, args, out);
             }
+            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => walk(operand, args, out),
             _ => {}
         }
     }
@@ -878,23 +886,27 @@ fn render_signed(def: &TransformDef, expr: &Expr, args: &[Expr]) -> Result<Strin
                 }
                 _ => {
                     let mut rendered = Vec::with_capacity(called.len());
-                    for arg in called {
-                        rendered.push(render_signed(def, arg, args)?);
+                    for (i, arg) in called.iter().enumerate() {
+                        rendered.push(match arg {
+                            Expr::NumberLiteral(_) => render_call_arg(name, i, arg, render_leaf),
+                            _ => render_signed(def, arg, args)?,
+                        });
                     }
                     format!("{}({})", name.to_lowercase(), rendered.join(", "))
                 }
             }
         }
         Expr::BinaryOp { op, lhs, rhs } => {
-            let symbol = match op {
-                Operator::Add => "+",
-                Operator::GreaterThan => ">",
-            };
+            let symbol = registry::operator_spec(*op).symbol;
             format!(
                 "({} {symbol} {})",
                 render_signed(def, lhs, args)?,
                 render_signed(def, rhs, args)?
             )
+        }
+        Expr::Negate(operand) => format!("(-({}))", render_signed(def, operand, args)?),
+        Expr::Cast { expr, target } => {
+            format!("cast({} as {target})", render_signed(def, expr, args)?)
         }
         Expr::SourceColumn { table, column, .. }
             if join_of(def)

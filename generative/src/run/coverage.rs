@@ -272,6 +272,14 @@ impl Coverage {
                 let rhs_depth = self.record_expr(rhs);
                 1 + lhs_depth.max(rhs_depth)
             }
+            Expr::Negate(operand) => {
+                self.expr_shapes.insert("Negate");
+                1 + self.record_expr(operand)
+            }
+            Expr::Cast { expr, .. } => {
+                self.expr_shapes.insert("Cast");
+                1 + self.record_expr(expr)
+            }
             Expr::FunctionCall { name, args } => {
                 self.expr_shapes.insert("FunctionCall");
                 self.functions.insert(function_name(name));
@@ -313,6 +321,9 @@ fn collect_aggregate_calls(
         Expr::BinaryOp { lhs, rhs, .. } => {
             collect_aggregate_calls(lhs, key_space, out);
             collect_aggregate_calls(rhs, key_space, out);
+        }
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
+            collect_aggregate_calls(operand, key_space, out);
         }
         Expr::Column(_)
         | Expr::SourceColumn { .. }
@@ -822,6 +833,10 @@ fn partition_strategy_name(strategy: PartitionStrategy) -> &'static str {
 fn operator_name(op: Operator) -> &'static str {
     match op {
         Operator::Add => "Add",
+        Operator::Subtract => "Subtract",
+        Operator::Multiply => "Multiply",
+        Operator::Divide => "Divide",
+        Operator::Modulo => "Modulo",
         Operator::GreaterThan => "GreaterThan",
     }
 }

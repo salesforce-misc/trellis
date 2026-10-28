@@ -6193,6 +6193,12 @@ fn expr_references_column(
         Expr::FunctionCall { args, .. } => args
             .iter()
             .any(|arg| expr_references_column(arg, def_source, upstream_table, upstream_column)),
+        Expr::Negate(operand) => {
+            expr_references_column(operand, def_source, upstream_table, upstream_column)
+        }
+        Expr::Cast { expr, .. } => {
+            expr_references_column(expr, def_source, upstream_table, upstream_column)
+        }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => false,
     }
 }

@@ -238,6 +238,34 @@ fn substitute_field_aliases(
                 text: text.clone(),
             })
         }
+        Expr::Negate(operand) => {
+            charge_budget(budget, 1)?;
+            Ok(Expr::Negate(Box::new(substitute_field_aliases(
+                operand,
+                self_name,
+                fields_by_name,
+                visiting,
+                memo,
+                budget,
+            )?)))
+        }
+        Expr::Cast {
+            expr: operand,
+            target,
+        } => {
+            charge_budget(budget, 1)?;
+            Ok(Expr::Cast {
+                expr: Box::new(substitute_field_aliases(
+                    operand,
+                    self_name,
+                    fields_by_name,
+                    visiting,
+                    memo,
+                    budget,
+                )?),
+                target: *target,
+            })
+        }
         Expr::BinaryOp { op, lhs, rhs } => {
             charge_budget(budget, 1)?;
             Ok(Expr::BinaryOp {
@@ -322,6 +350,8 @@ fn node_count(expr: &Expr) -> usize {
         | Expr::StringLiteral(_)
         | Expr::TypedLiteral { .. } => 1,
         Expr::BinaryOp { lhs, rhs, .. } => 1 + node_count(lhs) + node_count(rhs),
+        Expr::Negate(operand) => 1 + node_count(operand),
+        Expr::Cast { expr, .. } => 1 + node_count(expr),
         Expr::FunctionCall { args, .. } => 1 + args.iter().map(node_count).sum::<usize>(),
     }
 }

@@ -376,12 +376,29 @@ fn instances(rule: &expr_gen::Rule) -> Vec<Expr> {
             }
             out
         }
+        Rule::Negate { ty } => leaves(*ty)
+            .into_iter()
+            .filter(|e| !matches!(e, Expr::NumberLiteral(_)))
+            .map(|e| Expr::Negate(Box::new(e)))
+            .collect(),
+        Rule::Cast { from, to } => leaves(*from)
+            .into_iter()
+            .map(|e| Expr::Cast {
+                expr: Box::new(e),
+                target: *to,
+            })
+            .collect(),
         Rule::Call { name, args, .. } => {
             let options: Vec<Vec<Expr>> = args
                 .iter()
                 .enumerate()
                 .map(|(i, ty)| {
-                    if expr_gen::LITERAL_ONLY_ARGS.contains(&(*name, i)) {
+                    if registry::INTEGER_LITERAL_ARGS.contains(&(*name, i)) {
+                        expr_gen::SCALE_LITERALS
+                            .iter()
+                            .map(|n| Expr::NumberLiteral((*n).to_string()))
+                            .collect()
+                    } else if expr_gen::LITERAL_ONLY_ARGS.contains(&(*name, i)) {
                         expr_gen::REGEX_PATTERNS
                             .iter()
                             .chain(expr_gen::REGEX_DIALECT_PATTERNS)
@@ -615,6 +632,14 @@ fn the_generator_reaches_every_registry_entry() {
                     walk(arg, seen, depth + 1, deepest);
                 }
             }
+            Expr::Negate(operand) => {
+                seen.insert("prefix -".to_string());
+                walk(operand, seen, depth + 1, deepest);
+            }
+            Expr::Cast { expr, target } => {
+                seen.insert(format!("cast to {target}"));
+                walk(expr, seen, depth + 1, deepest);
+            }
             Expr::TypedLiteral { value_type, .. } => {
                 seen.insert(format!("literal {value_type}"));
             }
@@ -642,7 +667,16 @@ fn the_generator_reaches_every_registry_entry() {
         .iter()
         .map(|o| format!("op {}", o.symbol))
         .chain(registry::FUNCTIONS.iter().map(|f| format!("fn {}", f.name)))
-        .chain(["fn COALESCE".to_string(), "column".to_string()])
+        .chain([
+            "fn COALESCE".to_string(),
+            "column".to_string(),
+            "prefix -".to_string(),
+        ])
+        .chain(
+            registry::CAST_TARGETS
+                .iter()
+                .map(|t| format!("cast to {t}")),
+        )
         .collect();
     expected.extend(
         trellis::dev::defs::typed_literal::TYPED_LITERALS

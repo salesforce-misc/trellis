@@ -12,7 +12,7 @@ use crate::pool::quote_ident;
 
 #[cfg(any(test, feature = "test-util"))]
 use super::ast::KeySpace;
-use super::ast::{Expr, Operator, TransformDef, ValueType};
+use super::ast::{Expr, TransformDef, ValueType};
 use super::typed_literal;
 use crate::integer::IntWidth;
 
@@ -197,6 +197,9 @@ fn collect_columns(
             collect_columns(lhs, field_name, field_names, out);
             collect_columns(rhs, field_name, field_names, out);
         }
+        Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
+            collect_columns(operand, field_name, field_names, out);
+        }
         Expr::FunctionCall { args, .. } => {
             for arg in args {
                 collect_columns(arg, field_name, field_names, out);
@@ -219,15 +222,16 @@ pub fn render_expr_sql(expr: &Expr) -> String {
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
-            let symbol = match op {
-                Operator::Add => "+",
-                Operator::GreaterThan => ">",
-            };
+            let symbol = super::registry::operator_spec(*op).symbol;
             format!(
                 "({} {symbol} {})",
                 render_expr_sql(lhs),
                 render_expr_sql(rhs)
             )
+        }
+        Expr::Negate(operand) => format!("(-({}))", render_expr_sql(operand)),
+        Expr::Cast { expr, target } => {
+            format!("cast({} as {target})", render_expr_sql(expr))
         }
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             // `COUNT(*)`: the parser's only accepted `COUNT`
@@ -251,12 +255,19 @@ pub fn render_expr_sql(expr: &Expr) -> String {
 /// declared column types were inferred with: `int4_col + 1` is `integer`
 /// and overflows where an `integer` does.
 fn number_literal_sql(text: &str) -> String {
+    // A negative literal is parenthesized: `::` binds tighter than the sign,
+    // and `-2147483648::integer` casts 2147483648 first.
+    let shown = if text.starts_with('-') {
+        format!("({text})")
+    } else {
+        text.to_string()
+    };
     let pg_type = match super::validate::number_literal_type(text) {
         ValueType::Integer(IntWidth::Int4) => "integer",
         ValueType::Integer(IntWidth::Int8) => "bigint",
         _ => "numeric",
     };
-    format!("{text}::{pg_type}")
+    format!("{shown}::{pg_type}")
 }
 
 /// [`render_expr_sql`] with every source column qualified by `source_sql`
@@ -272,16 +283,20 @@ pub(crate) fn render_qualified_expr_sql(expr: &Expr, source_sql: &str) -> String
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
-            let symbol = match op {
-                Operator::Add => "+",
-                Operator::GreaterThan => ">",
-            };
+            let symbol = super::registry::operator_spec(*op).symbol;
             format!(
                 "({} {symbol} {})",
                 render_qualified_expr_sql(lhs, source_sql),
                 render_qualified_expr_sql(rhs, source_sql)
             )
         }
+        Expr::Negate(operand) => {
+            format!("(-({}))", render_qualified_expr_sql(operand, source_sql))
+        }
+        Expr::Cast { expr, target } => format!(
+            "cast({} as {target})",
+            render_qualified_expr_sql(expr, source_sql)
+        ),
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             "count(*)".to_string()
         }
