@@ -1084,4 +1084,27 @@ mod tests {
             ]
         );
     }
+
+    /// A 1-1 JOIN's sides are keyed by their row identity and matched by
+    /// their join columns, as an aggregate JOIN's are.
+    #[test]
+    fn a_one_to_one_join_side_uses_its_source_key_and_its_join_columns() {
+        let def = crate::defs::parse("TRANSFORM v FROM a LEFT JOIN b ON a.k = b.j SELECT b.x AS x")
+            .unwrap();
+        let key = ["id".to_string()];
+        assert_eq!(
+            key_uses(&def, "public.a", "public.a", &key),
+            [
+                ("id".to_string(), KeyUse::SourceKey),
+                ("k".to_string(), KeyUse::JoinOn)
+            ]
+        );
+        assert_eq!(
+            key_uses(&def, "public.a", "public.b", &key),
+            [
+                ("id".to_string(), KeyUse::SourceKey),
+                ("j".to_string(), KeyUse::JoinOn)
+            ]
+        );
+    }
 }

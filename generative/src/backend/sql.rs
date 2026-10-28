@@ -115,6 +115,23 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
                     .join(", ")
             )
         }
+        // The 1-1 JOIN tier: the same clause without `GROUP BY`.
+        KeySpace::JoinOneToOne(join) => {
+            let qualified = |c: &QualifiedColumn| format!("{}.{}", c.table, c.column);
+            format!(
+                " {} {} ON {}",
+                match join.kind {
+                    JoinKind::Inner => "INNER JOIN",
+                    JoinKind::Left => "LEFT JOIN",
+                },
+                join.right,
+                join.on
+                    .iter()
+                    .map(|on| format!("{} = {}", qualified(&on.lhs), qualified(&on.rhs)))
+                    .collect::<Vec<_>>()
+                    .join(" AND "),
+            )
+        }
         KeySpace::OneToOne => String::new(),
         KeySpace::Aggregate { group_by } => format!(
             " GROUP BY {}",
@@ -144,7 +161,7 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
 /// not the engine requires it: the index serves a `self_check` walk either way.
 pub(super) fn required_source_indexes(def: &TransformDef) -> Vec<(String, Vec<String>)> {
     match &def.key_space {
-        KeySpace::OneToOne => Vec::new(),
+        KeySpace::OneToOne | KeySpace::JoinOneToOne(_) => Vec::new(),
         KeySpace::Aggregate { group_by } => {
             let columns: Vec<String> = group_by.to_vec();
             if columns.len() == group_by.len() {

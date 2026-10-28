@@ -485,7 +485,7 @@ impl Parser {
             self.advance();
             self.expect_keyword("SOURCE")?;
             self.expect_keyword("INDEX")?;
-            if matches!(key_space, KeySpace::OneToOne) {
+            if matches!(key_space, KeySpace::OneToOne | KeySpace::JoinOneToOne(_)) {
                 return Err(ParseError::UnsupportedKeySpace {
                     construct: "WITHOUT SOURCE INDEX".to_string(),
                     detail: "only a GROUP BY or JOIN target needs a source index; a 1-1 \
@@ -595,13 +595,19 @@ impl Parser {
     /// `FROM <source>` and `SELECT`: absent -> [`KeySpace::OneToOne`],
     /// `GROUP BY <key>[, <key>...]` -> [`KeySpace::Aggregate`], and
     /// `[LEFT|INNER] JOIN <other> ON <equi-join> GROUP BY <key>[, ...]` ->
-    /// [`KeySpace::Join`] (ADR-0019).
+    /// [`KeySpace::Join`] (ADR-0019), or the same without `GROUP BY` ->
+    /// [`KeySpace::JoinOneToOne`] (ADR-0021).
     fn parse_key_space_clause(&mut self) -> Result<KeySpace, ParseError> {
         if ["JOIN", "LEFT", "INNER", "RIGHT", "FULL", "CROSS", "NATURAL"]
             .iter()
             .any(|kw| self.peek_is_keyword(kw))
         {
-            return self.parse_join_clause().map(KeySpace::Join);
+            let (spec, grouped) = self.parse_join_clause()?;
+            return Ok(if grouped {
+                KeySpace::Join(spec)
+            } else {
+                KeySpace::JoinOneToOne(spec)
+            });
         }
         if self.peek_is_symbol(',') {
             return Err(ParseError::UnsupportedKeySpace {
@@ -629,7 +635,7 @@ impl Parser {
     /// `JOIN` always aggregates, so `GROUP BY` is required. The shape of the
     /// result (`ON` terms across the two tables, column types, aggregates) is
     /// the validator's to check.
-    fn parse_join_clause(&mut self) -> Result<JoinSpec, ParseError> {
+    fn parse_join_clause(&mut self) -> Result<(JoinSpec, bool), ParseError> {
         let unsupported = |construct: &str, detail: &str| ParseError::UnsupportedKeySpace {
             construct: construct.to_string(),
             detail: detail.to_string(),
@@ -700,9 +706,18 @@ impl Parser {
         }
 
         if !self.peek_is_keyword("GROUP") {
-            return Err(unsupported(
-                "JOIN",
-                "a JOIN aggregates, so it needs a GROUP BY after the ON clause",
+            // No `GROUP BY`: a 1-1 JOIN (ADR-0021). Whether it is admitted is
+            // the validator's to say (it is gated at define, not here, so a
+            // stored definition still loads with the gate off).
+            return Ok((
+                JoinSpec {
+                    kind,
+                    right,
+                    explicit_right_schema,
+                    on,
+                    group_by: Vec::new(),
+                },
+                false,
             ));
         }
         self.advance();
@@ -713,13 +728,16 @@ impl Parser {
             group_by.push(self.parse_join_column("JOIN GROUP BY")?);
         }
         self.is_aggregate = true;
-        Ok(JoinSpec {
-            kind,
-            right,
-            explicit_right_schema,
-            on,
-            group_by,
-        })
+        Ok((
+            JoinSpec {
+                kind,
+                right,
+                explicit_right_schema,
+                on,
+                group_by,
+            },
+            true,
+        ))
     }
 
     /// One `<table>.<column> = <table>.<column>` term of a `JOIN ... ON`.

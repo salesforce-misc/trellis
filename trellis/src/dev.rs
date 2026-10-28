@@ -62,6 +62,14 @@ pub mod defs {
     /// the same reason `registry` is reachable here.
     pub use crate::defs::typed_literal;
 
+    /// The 1-1 JOIN dev knob (ADR-0021, epic #1392): tests and `benchmark`
+    /// turn the grammar on, once, before a client starts. It is removed with
+    /// the epic's last milestone.
+    pub use crate::defs::join_one_to_one::{
+        KNOB_ENV as ONE_TO_ONE_JOIN_ENV, enabled as one_to_one_join_enabled,
+        set_enabled as set_one_to_one_join,
+    };
+
     pub use crate::float::FloatWidth;
     pub use crate::integer::IntWidth;
 

@@ -413,7 +413,9 @@ fn render_select(def: &TransformDef, pk_column: &str) -> String {
     }
 
     match &def.key_space {
-        KeySpace::Join(_) => unreachable!("the generator never produces a JOIN definition"),
+        KeySpace::Join(_) | KeySpace::JoinOneToOne(_) => {
+            unreachable!("the generator never produces a JOIN definition")
+        }
         KeySpace::OneToOne => {
             let mut select_list = vec![format!("{}::text", quote_ident(pk_column))];
             for field in &def.fields {
@@ -476,7 +478,9 @@ pub async fn sql_oracle(
     let db_rows = client.query(sql.as_str(), &[]).await?;
 
     match &def.key_space {
-        KeySpace::Join(_) => unreachable!("the generator never produces a JOIN definition"),
+        KeySpace::Join(_) | KeySpace::JoinOneToOne(_) => {
+            unreachable!("the generator never produces a JOIN definition")
+        }
         KeySpace::OneToOne => {
             let mut rows: Rows = BTreeMap::new();
             for db_row in db_rows {

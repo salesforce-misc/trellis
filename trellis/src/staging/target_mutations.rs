@@ -166,7 +166,8 @@ struct ImageFeed {
 }
 
 /// Whether an applying definition that needs exact images reads `$1` (see
-/// the module doc's "The image feed"): a `JOIN` transform with the table on
+/// the module doc's "The image feed"): a `JOIN` transform (aggregate or 1-1,
+/// where a `b` change needs the old join key) with the table on
 /// either side, or an aggregate on the group basis, which is the one kind of
 /// definition with a hidden table named by its id in the catalog's schema
 /// (`super::group_basis::hidden_table_name`).

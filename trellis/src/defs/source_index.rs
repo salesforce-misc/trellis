@@ -171,7 +171,7 @@ pub(crate) async fn gaps(
 }
 
 /// The indexes `def` needs: an aggregate on the group basis needs one on its
-/// source, a `JOIN` one on each side, and any other target none.
+/// source, an aggregate `JOIN` one on each side, and any other target none.
 /// `source_columns` are the source's, which decide whether the group basis
 /// takes an aggregate. `join_table` is a `JOIN`'s joined table, qualified.
 pub(crate) fn required(
@@ -181,7 +181,9 @@ pub(crate) fn required(
     join_table: Option<&str>,
 ) -> Vec<SourceIndex> {
     match &def.key_space {
-        KeySpace::OneToOne => Vec::new(),
+        // A 1-1 JOIN walks `a` by its primary key, and the uniqueness define
+        // requires of `b`'s `ON` columns is an index on them.
+        KeySpace::OneToOne | KeySpace::JoinOneToOne(_) => Vec::new(),
         KeySpace::Aggregate { group_by } => {
             if crate::staging::group_basis::route(def, source_columns).is_none() {
                 return Vec::new();
@@ -563,5 +565,14 @@ mod tests {
                 .without_source_index
         );
         assert!(parse("TRANSFORM t FROM s WITHOUT SOURCE INDEX SELECT v AS x").is_err());
+    }
+
+    /// A 1-1 JOIN walks `a` by its primary key and requires `b`'s `ON`
+    /// columns to be unique (so indexed) at define: no source index.
+    #[test]
+    fn a_one_to_one_join_requires_no_source_index() {
+        let def = crate::defs::parse("TRANSFORM v FROM a LEFT JOIN b ON a.k = b.k SELECT b.x AS x")
+            .unwrap();
+        assert!(required(&def, &HashMap::new(), "public.a", Some("public.b")).is_empty());
     }
 }

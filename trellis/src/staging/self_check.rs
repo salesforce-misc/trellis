@@ -459,8 +459,9 @@ impl fmt::Display for SelfCheckError {
             }
             SelfCheckError::UnsupportedKeySpace { target } => write!(
                 f,
-                "self_check audits a 1-1 target, an aggregate or a JOIN; \"{target}\" is an \
-                 aggregate the group basis doesn't take, which it can't audit"
+                "self_check audits a 1-1 target, an aggregate or a JOIN; \"{target}\" is a 1-1 \
+                 JOIN (not audited yet) or an aggregate the group basis doesn't take, which it \
+                 can't audit"
             ),
             SelfCheckError::UnsupportedExpr { target, detail } => {
                 write!(f, "self_check can't audit \"{target}\": {detail}")

@@ -114,7 +114,7 @@ pub(crate) fn qualified_ledger_table(target_schema: &str, target: &str) -> Strin
 }
 
 /// The ordering-state columns every ledger ends with.
-fn ordering_state_columns() -> String {
+pub(crate) fn ordering_state_columns() -> String {
     format!(
         "{} pg_lsn, {} bigint, {} pg_snapshot, {} boolean not null default false",
         quote_ident(APPLIED_LSN_COLUMN),

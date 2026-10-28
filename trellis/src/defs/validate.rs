@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use super::ast::{
-    Expr, FieldDef, KeySpace, Predicate, QualifiedColumn, TransformDef, ValueType,
+    Expr, FieldDef, JoinSpec, KeySpace, Predicate, QualifiedColumn, TransformDef, ValueType,
     render_field_expr,
 };
 use super::parser::MAX_EXPRESSION_DEPTH;
@@ -140,6 +140,20 @@ pub enum ValidationError {
     /// A `JOIN` definition's field is neither a `GROUP BY` key passthrough
     /// nor an admitted aggregate over a single column.
     JoinFieldShape { field: String, detail: String },
+    /// A 1-1 `JOIN` (a `JOIN` with no `GROUP BY`, ADR-0021) was defined while
+    /// the dev knob that admits it is off.
+    OneToOneJoinDisabled,
+    /// A 1-1 `JOIN` field calls an aggregate. A 1-1 `JOIN` has one target row
+    /// per `FROM` row and no `GROUP BY` to aggregate over.
+    OneToOneJoinAggregate { field: String, function: String },
+    /// The joined table's `ON` columns are not unique, so one `FROM` row could
+    /// match several rows of it (ADR-0021).
+    OneToOneJoinKeyNotUnique { table: String, columns: Vec<String> },
+    /// A construct a 1-1 `JOIN` doesn't take, with the remedy.
+    OneToOneJoinUnsupported { what: String, remedy: String },
+    /// A definition reads the target of a 1-1 `JOIN`, which no transform may
+    /// until the seam can stream a large fan-out (ADR-0021).
+    OneToOneJoinTargetRead { table: String },
     /// An aggregate in a deferred family (`MIN`/`MAX`, `bool_*`/`bit_*`,
     /// float or `interval` `SUM`/`AVG`, `array_agg`/`string_agg`/`jsonb_agg`).
     /// Only the aggregates the group basis keeps exact from signed deltas are
@@ -932,6 +946,38 @@ impl fmt::Display for ValidationError {
             ValidationError::JoinFieldShape { field, detail } => {
                 write!(f, "field '{field}' of a JOIN definition: {detail}")
             }
+            ValidationError::OneToOneJoinDisabled => write!(
+                f,
+                "a JOIN aggregates, so it needs a GROUP BY after the ON clause (a JOIN without \
+                 one, a 1-1 JOIN, is not available yet)"
+            ),
+            ValidationError::OneToOneJoinAggregate { field, function } => write!(
+                f,
+                "field '{field}' of a 1-1 JOIN calls {function}, an aggregate, but a JOIN \
+                 without a GROUP BY has one target row per row of the FROM table and nothing \
+                 to aggregate. Add a GROUP BY to aggregate, or compute the aggregate in a \
+                 transform of the joined table and join to its target"
+            ),
+            ValidationError::OneToOneJoinKeyNotUnique { table, columns } => write!(
+                f,
+                "a 1-1 JOIN needs the ON columns of '{table}' ({}) to be unique, so a row of \
+                 the FROM table matches at most one row of it, but no primary key, unique \
+                 constraint or non-partial unique index without expressions on '{table}' \
+                 lies within them. Add a unique constraint on those columns, or join on a \
+                 column set that is unique (the group key of an aggregate target works)",
+                columns.join(", ")
+            ),
+            ValidationError::OneToOneJoinTargetRead { table } => write!(
+                f,
+                "'{table}' is the target of a 1-1 JOIN, which no transform can read yet: a \
+                 change on the joined table rewrites every target row on its key, and the \
+                 target-mutation seam holds each changed key's prior image in memory until \
+                 commit (about 300 MB per million rows). Read the sources of the 1-1 JOIN \
+                 instead"
+            ),
+            ValidationError::OneToOneJoinUnsupported { what, remedy } => {
+                write!(f, "a 1-1 JOIN doesn't take {what}: {remedy}")
+            }
             ValidationError::DeferredAggregate { function, family } => write!(
                 f,
                 "{function} is not supported: {family} is not an aggregate Trellis maintains; \
@@ -1357,7 +1403,7 @@ pub fn validate(
 
     // A JOIN is validated by [`validate_join`], which needs both tables'
     // columns; this entry point has only the source's.
-    if let KeySpace::Join(_) = def.key_space {
+    if let KeySpace::Join(_) | KeySpace::JoinOneToOne(_) = def.key_space {
         return Err(ValidationError::JoinNeedsBothTables);
     }
 
@@ -1368,7 +1414,9 @@ pub fn validate(
     // `Aggregate` has real runtime checks (below), since — unlike the other
     // arm here — the AST can encode an invalid one.
     match &def.key_space {
-        KeySpace::Join(_) => return Err(ValidationError::JoinNeedsBothTables),
+        KeySpace::Join(_) | KeySpace::JoinOneToOne(_) => {
+            return Err(ValidationError::JoinNeedsBothTables);
+        }
         KeySpace::OneToOne => {
             for field in &def.fields {
                 // A calculated field aliased to a real source column's name
@@ -1622,7 +1670,7 @@ pub struct JoinColumnInfo {
 
 /// Which table of a `JOIN` a column belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JoinSide {
+pub(crate) enum JoinSide {
     Left,
     Right,
 }
@@ -1821,25 +1869,60 @@ fn written(column: &QualifiedColumn) -> String {
     }
 }
 
-/// Validates a [`KeySpace::Join`] definition against the live columns of its
-/// two tables (`left` is the `FROM` table, `right` the joined one).
-///
-/// The join is admitted when: the tables differ; every column is qualified
-/// and exists; each `ON` term is an equality between one column of each
-/// table, of one type, modifier and collation (the join-key rules); every `GROUP BY` key, from either table, is an admitted key type;
-/// and each field is a key passthrough or composes admitted aggregates
-/// (`COUNT(*)`, and `COUNT`/`SUM`/`AVG` of a column or an expression over
-/// one table's columns, per [`check_aggregate_admitted`]) with literals,
-/// operators and scalar functions. An argument reading
-/// both tables is refused as [`ValidationError::JoinMixedSideArgument`].
-pub fn validate_join(
+/// The resolver of a `JOIN` definition's qualified columns: the side each
+/// belongs to and its live column, or the refusal naming what didn't resolve.
+/// Shared by both `JOIN` validators.
+pub(crate) fn join_resolver<'a>(
+    def: &'a TransformDef,
+    join: &'a JoinSpec,
+    left: &'a HashMap<String, JoinColumnInfo>,
+    right: &'a HashMap<String, JoinColumnInfo>,
+) -> impl Fn(&QualifiedColumn) -> Result<(JoinSide, &'a JoinColumnInfo), ValidationError> + 'a {
+    move |column: &QualifiedColumn| -> Result<(JoinSide, &JoinColumnInfo), ValidationError> {
+        let side = if column.table == def.source {
+            JoinSide::Left
+        } else if column.table == join.right {
+            JoinSide::Right
+        } else {
+            return Err(ValidationError::JoinUnknownTable {
+                reference: written(column),
+            });
+        };
+        let schema_written = match side {
+            JoinSide::Left => def.explicit_source_schema.as_deref(),
+            JoinSide::Right => join.explicit_right_schema.as_deref(),
+        };
+        if let (Some(used), Some(declared)) = (column.schema.as_deref(), schema_written)
+            && used != declared
+        {
+            return Err(ValidationError::JoinUnknownTable {
+                reference: written(column),
+            });
+        }
+        let columns = match side {
+            JoinSide::Left => left,
+            JoinSide::Right => right,
+        };
+        columns
+            .get(&column.column)
+            .map(|info| (side, info))
+            .ok_or_else(|| ValidationError::JoinUnresolvedColumn {
+                reference: written(column),
+            })
+    }
+}
+
+/// The rules every `JOIN` definition's tables and `ON` clause share, for the
+/// aggregate and the 1-1 `JOIN` alike: the names are checked, the tables
+/// differ, the target isn't the joined table, and each `ON` term is an
+/// equality between one column of each table, of one type, modifier and
+/// collation, with a text-stable key type.
+pub(crate) fn validate_join_tables_and_on(
     def: &TransformDef,
+    join: &JoinSpec,
     left: &HashMap<String, JoinColumnInfo>,
     right: &HashMap<String, JoinColumnInfo>,
 ) -> Result<(), ValidationError> {
-    let KeySpace::Join(join) = &def.key_space else {
-        return Ok(());
-    };
     validate_target_names(def)?;
     if join.right == def.source {
         return Err(ValidationError::JoinSelf {
@@ -1854,39 +1937,7 @@ pub fn validate_join(
         });
     }
 
-    let resolve =
-        |column: &QualifiedColumn| -> Result<(JoinSide, &JoinColumnInfo), ValidationError> {
-            let side = if column.table == def.source {
-                JoinSide::Left
-            } else if column.table == join.right {
-                JoinSide::Right
-            } else {
-                return Err(ValidationError::JoinUnknownTable {
-                    reference: written(column),
-                });
-            };
-            let schema_written = match side {
-                JoinSide::Left => def.explicit_source_schema.as_deref(),
-                JoinSide::Right => join.explicit_right_schema.as_deref(),
-            };
-            if let (Some(used), Some(declared)) = (column.schema.as_deref(), schema_written)
-                && used != declared
-            {
-                return Err(ValidationError::JoinUnknownTable {
-                    reference: written(column),
-                });
-            }
-            let columns = match side {
-                JoinSide::Left => left,
-                JoinSide::Right => right,
-            };
-            columns
-                .get(&column.column)
-                .map(|info| (side, info))
-                .ok_or_else(|| ValidationError::JoinUnresolvedColumn {
-                    reference: written(column),
-                })
-        };
+    let resolve = join_resolver(def, join, left, right);
 
     let check_key_type = |column: &QualifiedColumn, info: &JoinColumnInfo| {
         if !super::join_key_types::is_text_stable_join_key_type(&info.pg_type) && !info.is_enum {
@@ -1941,6 +1992,34 @@ pub fn validate_join(
             });
         }
     }
+
+    Ok(())
+}
+
+/// Validates a [`KeySpace::Join`] definition against the live columns of its
+/// two tables (`left` is the `FROM` table, `right` the joined one).
+///
+/// The join is admitted when: the tables differ; every column is qualified
+/// and exists; each `ON` term is an equality between one column of each
+/// table, of one type, modifier and collation (the join-key rules); every `GROUP BY` key, from either table, is an admitted key type;
+/// and each field is a key passthrough or composes admitted aggregates
+/// (`COUNT(*)`, and `COUNT`/`SUM`/`AVG` of a column or an expression over
+/// one table's columns, per [`check_aggregate_admitted`]) with literals,
+/// operators and scalar functions. An argument reading
+/// both tables is refused as [`ValidationError::JoinMixedSideArgument`].
+pub fn validate_join(
+    def: &TransformDef,
+    left: &HashMap<String, JoinColumnInfo>,
+    right: &HashMap<String, JoinColumnInfo>,
+) -> Result<(), ValidationError> {
+    if let KeySpace::JoinOneToOne(_) = &def.key_space {
+        return super::validate_join_one_to_one::validate(def, left, right);
+    }
+    let KeySpace::Join(join) = &def.key_space else {
+        return Ok(());
+    };
+    validate_join_tables_and_on(def, join, left, right)?;
+    let resolve = join_resolver(def, join, left, right);
 
     let mut key_columns: HashMap<&str, &QualifiedColumn> =
         HashMap::with_capacity(join.group_by.len());
@@ -2214,7 +2293,7 @@ fn check_join_field_expr<'a>(
 /// Rewrites every side-qualified column in `expr` to a bare name unique to
 /// its side, recording its type in `types`, so a composed field can be typed
 /// by the single-table inference.
-fn rename_join_columns(
+pub(crate) fn rename_join_columns(
     expr: &mut Expr,
     source: &str,
     left: &HashMap<String, JoinColumnInfo>,

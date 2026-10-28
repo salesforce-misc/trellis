@@ -127,7 +127,9 @@ pub(crate) async fn for_definition(
     join_table: Option<&str>,
     def: &TransformDef,
 ) -> Result<Option<JoinStatus>, tokio_postgres::Error> {
-    if spec::spec(def).is_none() {
+    // A 1-1 JOIN keeps other hidden tables (`join1_{id}_*`); its status is
+    // the status milestone's (ADR-0021, #1402).
+    if !spec::is_grouped(def) {
         return Ok(None);
     }
     let mut hidden_tables = Vec::new();

@@ -438,4 +438,24 @@ mod tests {
             "it is still the reader a marker names"
         );
     }
+
+    /// Capture images a 1-1 JOIN's sides by the columns each side's join key
+    /// and fields read (the `b` side too, for its old join key).
+    #[test]
+    fn a_one_to_one_join_reads_the_columns_of_each_side() {
+        let mut catalog = catalog(&[(
+            "public.orders",
+            "TRANSFORM v FROM orders LEFT JOIN customers ON orders.cust = customers.id \
+             SELECT customers.name AS who, orders.total * 2 AS doubled",
+        )]);
+        catalog.definitions[0].join = Some("public.customers".to_string());
+        assert_eq!(
+            read_columns(&catalog, "public.orders").columns,
+            set(&["cust", "total"])
+        );
+        assert_eq!(
+            read_columns(&catalog, "public.customers").columns,
+            set(&["id", "name"])
+        );
+    }
 }

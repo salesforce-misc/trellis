@@ -575,6 +575,9 @@ fn refusal_for(
                 )
             })
         }
+        KeySpace::JoinOneToOne(_) => Some(PartitionRefusal::OneToOneJoinSide {
+            table: table.to_string(),
+        }),
         KeySpace::OneToOne => Some(PartitionRefusal::OneToOneFrom {
             table: table.to_string(),
         }),

@@ -1230,6 +1230,9 @@ impl super::Backend for ManualBackend {
                     sql::read_aggregate_table(&self.raw, &qualified, &group_by_names, &def.fields)
                         .await?
                 }
+                KeySpace::JoinOneToOne(_) => {
+                    unreachable!("the generator never produces a 1-1 JOIN definition")
+                }
                 KeySpace::OneToOne => {
                     // `source_primary_key` accepts an arbitrary-arity source
                     // primary key, and the

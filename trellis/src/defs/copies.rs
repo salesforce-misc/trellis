@@ -171,6 +171,9 @@ pub(crate) async fn typed_copies(
         };
     match &def.key_space {
         KeySpace::Join(_) => return join_copies(client, schema, def, source, target).await,
+        // A 1-1 JOIN's drift is the schema-change milestone's (#1403): it
+        // has no typed copies until the staging worker re-types them.
+        KeySpace::JoinOneToOne(_) => return Ok(Vec::new()),
         KeySpace::OneToOne => {
             let source_columns: HashSet<String> = client
                 .query(
@@ -442,7 +445,7 @@ async fn inferred_copies(
     };
     match &def.key_space {
         // Never reached: `typed_copies` returns before it for a JOIN.
-        KeySpace::Join(_) => {}
+        KeySpace::Join(_) | KeySpace::JoinOneToOne(_) => {}
         KeySpace::OneToOne => {
             for field in &def.fields {
                 // A bare passthrough is a copy of its column, as

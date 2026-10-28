@@ -55,12 +55,26 @@ pub(crate) enum Side {
     Joined,
 }
 
-/// `def`'s [`JoinSpec`], if it is a `JOIN` definition.
+/// `def`'s [`JoinSpec`], if it is a `JOIN` definition of either kind: an
+/// aggregate JOIN ([`KeySpace::Join`]) or a 1-1 JOIN
+/// ([`KeySpace::JoinOneToOne`]). Everything built on it (sides, join key,
+/// columns captured) is right for both; [`is_grouped`] and [`is_one_to_one`]
+/// tell them apart.
 pub(crate) fn spec(def: &TransformDef) -> Option<&JoinSpec> {
     match &def.key_space {
-        KeySpace::Join(spec) => Some(spec),
+        KeySpace::Join(spec) | KeySpace::JoinOneToOne(spec) => Some(spec),
         _ => None,
     }
+}
+
+/// Whether `def` is an aggregate (`GROUP BY`) JOIN.
+pub(crate) fn is_grouped(def: &TransformDef) -> bool {
+    matches!(def.key_space, KeySpace::Join(_))
+}
+
+/// Whether `def` is a 1-1 JOIN (ADR-0021).
+pub(crate) fn is_one_to_one(def: &TransformDef) -> bool {
+    matches!(def.key_space, KeySpace::JoinOneToOne(_))
 }
 
 /// The side a column written `<table>.<column>` belongs to, by `table`.
@@ -713,5 +727,34 @@ mod tests {
              \"n\" bigint, \"qty\" bigint, \"avg_total\" numeric, \"composed\" bigint, \
              \"nq\" bigint, unique nulls not distinct (\"region\", \"sku\"))"
         );
+    }
+
+    const ONE_TO_ONE: &str = "TRANSFORM v FROM orders LEFT JOIN items \
+        ON orders.id = items.order_id SELECT items.sku AS sku, orders.total * 2 AS doubled";
+
+    /// A 1-1 JOIN reads the same two tables an aggregate JOIN does, so the
+    /// helpers built on `spec` serve it, and the two predicates tell the
+    /// kinds apart.
+    #[test]
+    fn a_one_to_one_join_has_a_spec_sides_and_columns_but_is_not_grouped() {
+        let def = parse(ONE_TO_ONE).unwrap();
+        assert!(is_one_to_one(&def) && !is_grouped(&def));
+        assert!(spec(&def).is_some_and(|join| join.group_by.is_empty()));
+        assert_eq!(side_of_table(&def, "public.orders"), Some(Side::From));
+        assert_eq!(side_of_table(&def, "shop.items"), Some(Side::Joined));
+        assert_eq!(join_key(&def, Side::Joined), ["order_id"]);
+        assert_eq!(
+            side_columns(&def, Side::From),
+            BTreeSet::from(["id", "total"].map(String::from))
+        );
+        assert_eq!(
+            side_columns(&def, Side::Joined),
+            BTreeSet::from(["order_id", "sku"].map(String::from))
+        );
+        let grouped = parse(DEF).unwrap();
+        assert!(is_grouped(&grouped) && !is_one_to_one(&grouped));
+        // Only an aggregate JOIN takes the aggregate JOIN apply.
+        assert!(!crate::staging::join::applies(&def));
+        assert!(crate::staging::join::applies(&grouped));
     }
 }

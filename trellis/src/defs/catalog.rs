@@ -878,7 +878,7 @@ pub async fn create_definition_without_backfill(
 fn refuse_join_fixture(source_text: &str) {
     if let Ok(def) = parse(source_text) {
         assert!(
-            !matches!(def.key_space, KeySpace::Join(_)),
+            !matches!(def.key_space, KeySpace::Join(_) | KeySpace::JoinOneToOne(_)),
             "a JOIN definition can't be registered `live`: only its build makes one live"
         );
     }
@@ -1016,6 +1016,28 @@ pub async fn install_definition(
             super::join::target_ddl(
                 &def,
                 &ddl::qualified_target_table(target_schema, &def),
+                &sides.from_columns,
+                &sides.joined_columns,
+            )?
+        }
+        KeySpace::JoinOneToOne(_) => {
+            // The target is keyed by `a`'s primary key, as a 1-1 target is;
+            // `b` is held to the source rules too. Hidden tables are created
+            // with the definition row, as an aggregate JOIN's are.
+            let sides = JoinSides::resolve(pool, &def).await?;
+            reject_non_live_upstream(&**pool.get().await?, &sides.joined).await?;
+            for side in [&sides.from, &sides.joined] {
+                reject_unkeyed_source(&**pool.get().await?, side, &def).await?;
+            }
+            let pk = ddl::source_primary_key(pool, &sides.from)
+                .await
+                .map_err(CatalogError::Ddl)?;
+            let pk_names: Vec<&str> = pk.iter().map(|c| c.name.as_str()).collect();
+            reject_primary_key_named_fields(&def.fields, &pk_names)?;
+            super::join_one_to_one::target_ddl(
+                &def,
+                &ddl::qualified_target_table(target_schema, &def),
+                &pk,
                 &sides.from_columns,
                 &sides.joined_columns,
             )?
@@ -2905,6 +2927,8 @@ async fn create_definition_inner(
     // The authoritative check (`install_definition` repeats it
     // earlier, before any DDL, as a fail-fast).
     reject_non_live_upstream(&*txn, &qualified_source).await?;
+    // No transform reads a 1-1 JOIN's target (ADR-0021).
+    super::join_one_to_one::reject_reader_of_target(&*txn, &[qualified_source.as_str()]).await?;
     // A JOIN's joined table resolves the way its `FROM` does, and is
     // held to the same checks. Its columns are read here, in this
     // transaction, for the catalog row and the hidden tables.
@@ -2924,8 +2948,13 @@ async fn create_definition_inner(
                 },
             };
             reject_non_live_upstream(&*txn, &joined).await?;
+            super::join_one_to_one::reject_reader_of_target(&*txn, &[joined.as_str()]).await?;
             let sides = JoinSides::read(&*txn, qualified_source.clone(), joined).await?;
             super::validate::validate_join(&def, &sides.from_columns, &sides.joined_columns)?;
+            if super::join::is_one_to_one(&def) {
+                super::join_one_to_one::check_define(&*txn, &def, &sides.from, &sides.joined)
+                    .await?;
+            }
             Some(sides)
         }
         None => {
@@ -3328,14 +3357,24 @@ async fn create_definition_inner(
     // A JOIN's hidden tables, in the catalog schema,
     // named by this definition's id, created empty with its row.
     if let Some(sides) = &join_sides {
-        txn.batch_execute(&super::join::hidden_tables_ddl(
-            pool.schema(),
-            id,
-            &def,
-            &sides.from_columns,
-            &sides.joined_columns,
-        ))
-        .await?;
+        let ddl = if super::join::is_one_to_one(&def) {
+            super::join_one_to_one::hidden_tables_ddl(
+                pool.schema(),
+                id,
+                &def,
+                &sides.from_columns,
+                &sides.joined_columns,
+            )
+        } else {
+            super::join::hidden_tables_ddl(
+                pool.schema(),
+                id,
+                &def,
+                &sides.from_columns,
+                &sides.joined_columns,
+            )
+        };
+        txn.batch_execute(&ddl).await?;
     }
     // An aggregate outside the admitted set is refused by
     // family, whatever its arguments' types were when `validate` ran.
@@ -3920,13 +3959,15 @@ async fn validate_for_define(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<(), CatalogError> {
-    if let KeySpace::Join(_) = &def.key_space {
+    if let KeySpace::Join(_) | KeySpace::JoinOneToOne(_) = &def.key_space {
         let sides = JoinSides::resolve(pool, def).await?;
-        return Ok(super::validate::validate_join(
-            def,
-            &sides.from_columns,
-            &sides.joined_columns,
-        )?);
+        super::validate::validate_join(def, &sides.from_columns, &sides.joined_columns)?;
+        if super::join::is_one_to_one(def) {
+            let client = pool.get().await?;
+            super::join_one_to_one::check_define(&**client, def, &sides.from, &sides.joined)
+                .await?;
+        }
+        return Ok(());
     }
     match validate(def, source_columns) {
         Err(err @ ValidationError::AmbiguousColumnReference(_)) => {
@@ -4475,6 +4516,31 @@ async fn revalidate_join(
     }
     super::validate::validate_join(&definition.def, &sides.from_columns, &sides.joined_columns)?;
     validate_live_join_schema(txn, schema, &definition.def, &sides).await?;
+    if super::join::is_one_to_one(&definition.def) {
+        // The joined table's `ON` columns are still unique, and the target
+        // is still keyed by `a`'s key; a changed key's only repair is to
+        // drop and define again, as for a 1-1 target.
+        super::join_one_to_one::check_define(txn, &definition.def, &sides.from, &sides.joined)
+            .await?;
+        let target_key: Vec<String> = ddl::identity_key_columns(txn, &definition.target_table)
+            .await?
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        let source_key: Vec<String> = ddl::source_primary_key_in_txn(txn, &sides.from)
+            .await
+            .map_err(CatalogError::Ddl)?
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        if !target_key.is_empty() && target_key != source_key {
+            return Err(CatalogError::SourceKeyChanged {
+                source_table: sides.from.clone(),
+                target_key,
+                source_key,
+            });
+        }
+    }
     reject_row_security(
         txn,
         schema,
@@ -4524,12 +4590,30 @@ pub(crate) async fn recreate_hidden_tables(
     def: &TransformDef,
     sides: &JoinSides,
 ) -> Result<(), CatalogError> {
-    txn.batch_execute(&format!(
-        "{};\n{}",
-        super::join::drop_hidden_tables_sql(schema, id),
-        super::join::hidden_tables_ddl(schema, id, def, &sides.from_columns, &sides.joined_columns)
-    ))
-    .await?;
+    let (drop, create) = if super::join::is_one_to_one(def) {
+        (
+            super::join_one_to_one::drop_hidden_tables_sql(schema, id),
+            super::join_one_to_one::hidden_tables_ddl(
+                schema,
+                id,
+                def,
+                &sides.from_columns,
+                &sides.joined_columns,
+            ),
+        )
+    } else {
+        (
+            super::join::drop_hidden_tables_sql(schema, id),
+            super::join::hidden_tables_ddl(
+                schema,
+                id,
+                def,
+                &sides.from_columns,
+                &sides.joined_columns,
+            ),
+        )
+    };
+    txn.batch_execute(&format!("{drop};\n{create}")).await?;
     Ok(())
 }
 
@@ -5021,6 +5105,11 @@ async fn reject_unkeyed_source(
                 ),
                 None => None,
             },
+            KeySpace::JoinOneToOne(_) => {
+                Some(super::partition_tree::PartitionRefusal::OneToOneJoinSide {
+                    table: qualified_source.to_string(),
+                })
+            }
             KeySpace::OneToOne => Some(super::partition_tree::PartitionRefusal::OneToOneFrom {
                 table: qualified_source.to_string(),
             }),

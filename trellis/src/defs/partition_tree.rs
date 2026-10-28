@@ -253,6 +253,10 @@ pub enum PartitionRefusal {
     OneToOneFrom {
         table: String,
     },
+    /// A side of a 1-1 `JOIN` (ADR-0021).
+    OneToOneJoinSide {
+        table: String,
+    },
 }
 
 impl fmt::Display for PartitionRefusal {
@@ -303,6 +307,12 @@ impl fmt::Display for PartitionRefusal {
                  doesn't contain; a partitioned source's GROUP BY must contain every \
                  partition-key column at every level, so each group lives in one partition. \
                  Add \"{column}\" to the GROUP BY"
+            ),
+            PartitionRefusal::OneToOneJoinSide { table } => write!(
+                f,
+                "partitioned table {table} can't be a side of a 1-1 JOIN; Trellis reads a \
+                 partitioned table as an aggregate's FROM or an aggregate JOIN's table. Join \
+                 an unpartitioned table, or add a GROUP BY"
             ),
             PartitionRefusal::OneToOneFrom { table } => write!(
                 f,

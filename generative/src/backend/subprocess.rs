@@ -574,7 +574,9 @@ impl super::Backend for SubprocessBackend {
         for def in &self.defs {
             let qualified = qualified_target_table("public", def);
             let rows = match &def.key_space {
-                KeySpace::Join(_) => unreachable!("the generator never produces a JOIN definition"),
+                KeySpace::Join(_) | KeySpace::JoinOneToOne(_) => {
+                    unreachable!("the generator never produces a JOIN definition")
+                }
                 KeySpace::OneToOne => {
                     // This generative suite never itself constructs a
                     // composite-PK 1-1 definition, even though `source_primary_key`

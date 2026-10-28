@@ -705,18 +705,23 @@ async fn an_unresolved_column_reference_is_rejected() {
 }
 
 #[tokio::test]
-async fn cross_join_and_partial_data_definitions_are_rejected_cleanly() {
+async fn unresolvable_join_and_partial_data_definitions_are_rejected_cleanly() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
-    let cross_join = create_definition(
+    // A JOIN with no GROUP BY parses (a 1-1 JOIN); its tables don't exist
+    // here, so define refuses it.
+    let unresolved_join = create_definition(
         &db.pool,
-        "TRANSFORM t FROM s JOIN other ON s.id = other.id SELECT a AS x",
+        "TRANSFORM t FROM s JOIN other ON s.id = other.id SELECT s.a AS x",
         &HashMap::new(),
     )
     .await
     .unwrap_err();
-    assert!(matches!(cross_join, CatalogError::Parse(_)));
+    assert!(
+        !matches!(unresolved_join, CatalogError::Parse(_)),
+        "{unresolved_join:?}"
+    );
 
     let partial_data = create_definition(
         &db.pool,

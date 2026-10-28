@@ -145,7 +145,8 @@ pub enum ApplyError {
     /// recorded, or a build or rebuild over one whose tree is not recorded or
     /// has a leaf with no usable constraint text; or, on a `JOIN`
     /// (`super::join`), a field build, or a partitioned side whose tree
-    /// is not recorded or has a leaf with no usable constraint text.
+    /// is not recorded or has a leaf with no usable constraint text; or a
+    /// 1-1 `JOIN` (ADR-0021) whose apply, truncate or build is not built yet.
     /// Every page of the target would reproduce it, so it halts the target
     /// rather than charging each key a death.
     GroupBasisUnsupported { target: String, what: &'static str },
@@ -361,10 +362,9 @@ impl fmt::Display for ApplyError {
                 "a ledger entry of '{target}' was collected while its lock was being taken; \
                  retry the transaction"
             ),
-            ApplyError::GroupBasisUnsupported { target, what } => write!(
-                f,
-                "group-basis aggregate target '{target}' can't apply {what}"
-            ),
+            ApplyError::GroupBasisUnsupported { target, what } => {
+                write!(f, "transform '{target}' can't apply {what}")
+            }
             ApplyError::GroupLockGap { target, groups } => write!(
                 f,
                 "a write of '{target}''s group table staged {groups} group(s) that no lock \
@@ -2772,6 +2772,16 @@ pub(super) async fn compute_page(
                 }
                 continue;
             }
+            // A 1-1 JOIN's apply is not built yet (ADR-0021, #1396). Without
+            // this it would fall through to the plain 1-1 plan below and
+            // write `a`'s row with the join's fields evaluated over `a`
+            // alone, so it halts.
+            if crate::defs::join::is_one_to_one(&def.def) {
+                return Err(ApplyError::GroupBasisUnsupported {
+                    target: def.def.target.clone(),
+                    what: "a change of a 1-1 JOIN side (its apply path is not built yet)",
+                });
+            }
             // An aggregate on the group basis takes each change's
             // ring rows as they are; Phase 3 sums their sides
             // (`super::group_basis`).
@@ -2950,6 +2960,15 @@ pub(super) async fn compute_page(
                         }
                     };
                     target_plan.truncate(side, truncate_lsn, change);
+                }
+                // A TRUNCATE of either side of a 1-1 JOIN is the truncate
+                // milestone's (ADR-0021, #1399): until it exists the page
+                // halts rather than clear nothing.
+                KeySpace::JoinOneToOne(_) => {
+                    return Err(ApplyError::GroupBasisUnsupported {
+                        target: def.def.target.clone(),
+                        what: "a TRUNCATE of a 1-1 JOIN side (its apply path is not built yet)",
+                    });
                 }
                 KeySpace::Aggregate { .. } => {
                     if let Some(existing) = aggregate_clears.get_mut(&def.def.target) {

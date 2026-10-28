@@ -7,7 +7,8 @@
 //!
 //! - **Key-space**: 1-1 ([`ast::KeySpace::OneToOne`]), aggregate
 //!   ([`ast::KeySpace::Aggregate`], a `GROUP BY <cols>` clause), or a `JOIN`
-//!   aggregate ([`ast::KeySpace::Join`], ADR-0019).
+//!   aggregate ([`ast::KeySpace::Join`], ADR-0019), or a `JOIN` with no
+//!   `GROUP BY` ([`ast::KeySpace::JoinOneToOne`], ADR-0021).
 //! - **Calculated fields**: column references, numeric and string literals,
 //!   the `+` operator (Numeric-only), the `>` comparison operator
 //!   (`Numeric, Numeric -> Boolean`), and `name(args)` function calls,
@@ -41,6 +42,7 @@ pub mod grammar;
 pub mod hierarchy;
 pub(crate) mod join;
 pub(crate) mod join_key_types;
+pub mod join_one_to_one;
 pub(crate) mod key_types;
 pub mod ledger;
 mod lexer;
@@ -56,6 +58,7 @@ pub mod source_index;
 pub mod subscription;
 pub mod typed_literal;
 pub mod validate;
+pub(crate) mod validate_join_one_to_one;
 
 // This module is tier 3 (`pub(crate)`, ADR-0012), so these flattened
 // re-exports are a convenience for the engine itself and for the two gated
@@ -420,15 +423,47 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_self_join_and_a_join_without_group_by() {
+    fn rejects_a_self_join() {
         let (construct, detail) =
             refusal("TRANSFORM t FROM a JOIN a ON a.k = a.j GROUP BY a.g SELECT COUNT(*) AS n");
         assert_eq!(construct, "JOIN");
         assert!(detail.contains("itself"), "{detail}");
-        let (construct, detail) =
-            refusal("TRANSFORM t FROM s JOIN other ON s.id = other.id SELECT a AS x");
-        assert_eq!(construct, "JOIN");
-        assert!(detail.contains("GROUP BY"), "{detail}");
+    }
+
+    /// A `JOIN` with no `GROUP BY` parses to the 1-1 JOIN key space; whether
+    /// it is admitted is the validator's (the dev knob gates at define, not
+    /// at parse, so a stored definition still loads with the knob off), and
+    /// it renders back without a `GROUP BY`.
+    #[test]
+    fn a_join_without_group_by_parses_as_a_one_to_one_join() {
+        let text = "TRANSFORM t FROM s LEFT JOIN other ON s.id = other.id AND s.k = other.k \
+                    SELECT s.a AS x, other.b AS y";
+        let def = parse(text).unwrap();
+        let KeySpace::JoinOneToOne(spec) = &def.key_space else {
+            panic!("expected a 1-1 JOIN, got {:?}", def.key_space);
+        };
+        assert_eq!(spec.kind, ast::JoinKind::Left);
+        assert_eq!(spec.right, "other");
+        assert_eq!(spec.on.len(), 2);
+        assert!(spec.group_by.is_empty());
+        let rendered = ast::render_definition_text(&def);
+        assert!(!rendered.contains("GROUP BY"), "{rendered}");
+        assert_eq!(parse(&rendered).unwrap(), def);
+        // `WITHOUT SOURCE INDEX` names an index a 1-1 JOIN never needs.
+        let (construct, _) = refusal(
+            "TRANSFORM t FROM s JOIN other ON s.id = other.id WITHOUT SOURCE INDEX \
+             SELECT s.a AS x",
+        );
+        assert_eq!(construct, "WITHOUT SOURCE INDEX");
+        // Aggregates still need a `GROUP BY`; a deferred family parses (the
+        // validator names it).
+        let (construct, _) =
+            refusal("TRANSFORM t FROM s JOIN other ON s.id = other.id SELECT COUNT(*) AS n");
+        assert_eq!(construct, "COUNT(...)");
+        assert!(
+            parse("TRANSFORM t FROM s JOIN other ON s.id = other.id SELECT MAX(other.b) AS m")
+                .is_ok()
+        );
     }
 
     #[test]

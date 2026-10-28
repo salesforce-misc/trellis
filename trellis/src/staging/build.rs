@@ -258,8 +258,11 @@ pub async fn start_ready_builds(
         }
         // A JOIN's plan job builds both structures
         // (`super::join`), so both of its tables' gates hold it.
+        // A 1-1 JOIN's build reads `b` too (ADR-0021).
         let join = match &definition.def.key_space {
-            crate::defs::ast::KeySpace::Join(_) => catalog::join_table_of(&*client, id).await?,
+            crate::defs::ast::KeySpace::Join(_) | crate::defs::ast::KeySpace::JoinOneToOne(_) => {
+                catalog::join_table_of(&*client, id).await?
+            }
             _ => None,
         };
         let mut gated = crate::capture::gate::holds(&*client, &definition.source_table).await?;
@@ -553,6 +556,17 @@ async fn start(
     if status.as_deref() != Some(TransformStatus::WaitingToBackfill.as_str()) {
         txn.rollback().await?;
         return Ok(None);
+    }
+    // A 1-1 JOIN's build (ADR-0021, #1400) doesn't exist yet. Its plan job
+    // would otherwise walk `a` as a plain 1-1 source and write the target
+    // from `a` alone. The caller pauses the definition with this as its
+    // `capture_failure`.
+    if crate::defs::join::is_one_to_one(&definition.def) {
+        txn.rollback().await?;
+        return Err(ApplyError::GroupBasisUnsupported {
+            target: definition.target_table.clone(),
+            what: "a build of a 1-1 JOIN (its build path is not built yet)",
+        });
     }
     let ledger = ddl::qualified_target_table_ident(&crate::defs::ledger::ledger_table_name(
         &definition.target_table,
@@ -1792,6 +1806,12 @@ async fn run_plan(
         )
         .await;
     }
+    if crate::defs::join::is_one_to_one(&definition.def) {
+        return Err(build_error(ApplyError::GroupBasisUnsupported {
+            target: definition.target_table.clone(),
+            what: "a build of a 1-1 JOIN (its build path is not built yet)",
+        }));
+    }
     // A plain group-basis aggregate's fresh build or resume is its whole
     // build: one absolute write of every group, as a rebuild of a live
     // definition is (ADR-0002), run after the seam fence above so its
@@ -2181,7 +2201,7 @@ async fn reads_a_target(
     if catalog::is_definition_target(client, &definition.source_table).await? {
         return Ok(true);
     }
-    if super::join::applies(&definition.def)
+    if crate::defs::join::spec(&definition.def).is_some()
         && let Some(joined) = catalog::join_table_of(client, definition.id).await?
     {
         return Ok(catalog::is_definition_target(client, &joined).await?);

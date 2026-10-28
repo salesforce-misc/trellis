@@ -1446,6 +1446,43 @@ pub async fn create_target_table(
     Ok(())
 }
 
+/// The key columns of a 1-1 target mirroring its source key `pk`, and the
+/// table constraint that keys them. The columns keep the source key's
+/// collation and nullability: a key with a nullable column (an aggregate or
+/// `JOIN` target's `GROUP BY` columns) is `unique nulls not distinct`, any
+/// other a `primary key`. A table-level constraint works uniformly for one
+/// column or several.
+pub(crate) fn pk_columns_ddl(pk: &[PrimaryKeyColumn]) -> (Vec<String>, String) {
+    let nullable_key = pk.iter().any(|c| c.nullable);
+    let columns: Vec<String> = pk
+        .iter()
+        .map(|c| {
+            let collate = c
+                .collation
+                .as_ref()
+                .map(|collation| format!(" collate {collation}"))
+                .unwrap_or_default();
+            let not_null = if nullable_key && !c.nullable {
+                " not null"
+            } else {
+                ""
+            };
+            format!(
+                "{} {}{collate}{not_null}",
+                quote_ident(&c.name),
+                c.data_type
+            )
+        })
+        .collect();
+    let pk_names: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
+    let constraint = if nullable_key {
+        "unique nulls not distinct"
+    } else {
+        "primary key"
+    };
+    (columns, format!("{constraint} ({})", pk_names.join(", ")))
+}
+
 /// Renders [`create_target_table`]'s `create table` statement without
 /// running it. Reads `pg_catalog` (a passthrough field's concrete source
 /// column type) through `pool`.
@@ -1505,41 +1542,13 @@ pub(crate) async fn target_table_ddl(
     // on the source; any other key is a `primary key`. Mirroring each
     // column's nullability keeps the target's own key text
     // (`pk_key_sql_expr`, when a definition reads it in turn) the source's.
-    let nullable_key = pk.iter().any(|c| c.nullable);
-    let pk_cols: Vec<String> = pk
-        .iter()
-        .map(|c| {
-            let collate = c
-                .collation
-                .as_ref()
-                .map(|collation| format!(" collate {collation}"))
-                .unwrap_or_default();
-            let not_null = if nullable_key && !c.nullable {
-                " not null"
-            } else {
-                ""
-            };
-            format!(
-                "{} {}{collate}{not_null}",
-                quote_ident(&c.name),
-                c.data_type
-            )
-        })
-        .collect();
-    sql.push_str(&pk_cols.join(", "));
+    let (mut pk_cols, constraint) = pk_columns_ddl(pk);
     for field in &def.fields {
         let pg_type = &field_pg_types[&field.name];
-        sql.push_str(&format!(", {} {}", quote_ident(&field.name), pg_type));
+        pk_cols.push(format!("{} {}", quote_ident(&field.name), pg_type));
     }
-    // A table-level constraint, not an inline column-level one: it works
-    // uniformly for one column or several.
-    let pk_names: Vec<String> = pk.iter().map(|c| quote_ident(&c.name)).collect();
-    let constraint = if nullable_key {
-        "unique nulls not distinct"
-    } else {
-        "primary key"
-    };
-    sql.push_str(&format!(", {constraint} ({})", pk_names.join(", ")));
+    pk_cols.push(constraint);
+    sql.push_str(&pk_cols.join(", "));
     sql.push(')');
     // The target's ledger, created with it.
     sql.push_str(&super::ledger::one_to_one_ledger_ddl(

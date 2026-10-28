@@ -291,6 +291,10 @@ pub enum KeySpace {
     /// `FROM a [LEFT|INNER] JOIN b ON <equi-join> GROUP BY <keys>` (ADR-0019):
     /// an aggregate over the join of two tables.
     Join(JoinSpec),
+    /// `FROM a [LEFT|INNER] JOIN b ON <equi-join>` with no `GROUP BY`
+    /// (ADR-0021): one target row per `a` row, with `b`'s columns copied onto
+    /// it. The spec's `group_by` is empty.
+    JoinOneToOne(JoinSpec),
 }
 
 /// Which rows of the `FROM` table a [`JoinSpec`] keeps when no `JOIN` table
@@ -692,7 +696,7 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
             out.push_str(" GROUP BY ");
             out.push_str(&group_by.join(", "));
         }
-        KeySpace::Join(join) => {
+        KeySpace::Join(join) | KeySpace::JoinOneToOne(join) => {
             let qualified = |column: &QualifiedColumn| match &column.schema {
                 Some(schema) => format!("{schema}.{}.{}", column.table, column.column),
                 None => format!("{}.{}", column.table, column.column),
@@ -709,9 +713,11 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
                 .map(|term| format!("{} = {}", qualified(&term.lhs), qualified(&term.rhs)))
                 .collect();
             out.push_str(&terms.join(" AND "));
-            out.push_str(" GROUP BY ");
-            let keys: Vec<String> = join.group_by.iter().map(qualified).collect();
-            out.push_str(&keys.join(", "));
+            if matches!(def.key_space, KeySpace::Join(_)) {
+                out.push_str(" GROUP BY ");
+                let keys: Vec<String> = join.group_by.iter().map(qualified).collect();
+                out.push_str(&keys.join(", "));
+            }
         }
     }
 
