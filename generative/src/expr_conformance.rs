@@ -613,8 +613,8 @@ impl Fixture {
         }
     }
 
-    /// 4. Refusal: `miss` is refused at define and the error names the
-    /// construct.
+    /// The Refusal property: `miss` is refused at define and the error
+    /// names the construct.
     pub fn check_refusal(&self, miss: &NearMiss) -> Result<String, Divergence> {
         let diverge = |detail: String| Divergence {
             property: Property::Refusal,

@@ -727,11 +727,14 @@ pub mod strategy {
         )
     }
 
+    /// Strategies already built, by type and remaining depth.
+    type Cache = Vec<((ValueType, u32), Option<BoxedStrategy<Expr>>)>;
+
     struct Builder {
         columns: Vec<(ValueType, Vec<String>)>,
         rules: Vec<Rule>,
         profile: Profile,
-        cache: RefCell<Vec<((ValueType, u32), Option<BoxedStrategy<Expr>>)>>,
+        cache: RefCell<Cache>,
     }
 
     impl Builder {

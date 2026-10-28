@@ -3889,7 +3889,7 @@ mod tests {
             err,
             ValidationError::TypeMismatch {
                 field: "out".to_string(),
-                operator: ">",
+                operator: "+",
                 expected: ValueType::Numeric,
                 found: ValueType::Text,
             }
@@ -4058,7 +4058,7 @@ mod tests {
             err,
             ValidationError::TypeMismatch {
                 field: "out".to_string(),
-                operator: "+",
+                operator: ">",
                 expected: ValueType::Numeric,
                 found: ValueType::Text,
             }
