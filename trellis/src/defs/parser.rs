@@ -22,7 +22,8 @@
 //! GROUP BY <cols>` for a join aggregate (ADR-0019). `<expr>` supports column references,
 //! numeric and string literals, `+`, `-`, `*`, `/`, `%`, `>`, prefix `-`,
 //! parenthesized grouping (`(<expr>)`, to override the precedence table's own
-//! grouping), `CAST(<expr> AS <integer or numeric type>)`, `name(args)`
+//! grouping), `CAST(<expr> AS <integer, numeric or timestamp type>)`,
+//! `<expr> AT TIME ZONE 'UTC'`, `EXTRACT(<field> FROM <expr>)`, `name(args)`
 //! function calls against [`super::registry::FUNCTIONS`], and
 //! qualified columns, `<table>.<column>` or `<schema>.<table>.<column>`
 //! (see [`Parser::parse_dotted_reference`]). **Typed literals** are spelled
@@ -943,6 +944,16 @@ impl Parser {
                     None => Err(ParseError::UnsupportedOperator { operator: symbol }),
                 }
             }
+            // `AT` is a keyword only here, after a complete operand and
+            // followed by `TIME ZONE` (ADR-0018): anywhere else the word is a
+            // name, or the error it always was.
+            Token::Ident(word)
+                if word.eq_ignore_ascii_case("AT")
+                    && matches!(self.peek_at(1), Token::Ident(w) if w.eq_ignore_ascii_case("TIME"))
+                    && matches!(self.peek_at(2), Token::Ident(w) if w.eq_ignore_ascii_case("ZONE")) =>
+            {
+                Ok(Some((Infix::Binary(Operator::AtTimeZone), 3)))
+            }
             Token::Ident(word) if word.eq_ignore_ascii_case("AND") => {
                 Ok(Some((Infix::Binary(Operator::And), 1)))
             }
@@ -1189,6 +1200,13 @@ impl Parser {
                         return self.parse_cast_body();
                     }
 
+                    // `EXTRACT(<field> FROM <operand>)`: the one call whose
+                    // argument list is not comma-separated. It builds a call
+                    // named `EXTRACT` whose first argument is the field.
+                    if upper == "EXTRACT" {
+                        return self.parse_extract_body();
+                    }
+
                     // In a `JOIN` the deferred aggregate families parse (to
                     // any argument list) so the validator can refuse each by
                     // name rather than the parser calling it an unknown
@@ -1301,7 +1319,14 @@ impl Parser {
                         return Err(ParseError::UnsupportedFunction { name });
                     };
 
-                    let args = self.parse_call_args()?;
+                    let mut args = self.parse_call_args()?;
+                    // A unit is case-insensitive in Postgres; the tree keeps
+                    // the lower-case spelling `DATE_TRUNC_UNITS` lists.
+                    if upper == "DATE_TRUNC"
+                        && let Some(Expr::StringLiteral(unit)) = args.first_mut()
+                    {
+                        unit.make_ascii_lowercase();
+                    }
                     if !arities.contains(&args.len()) {
                         return Err(ParseError::FunctionArityMismatch {
                             name,
@@ -1463,6 +1488,34 @@ impl Parser {
         Ok(Expr::TypedLiteral {
             value_type: spec.value_type,
             text,
+        })
+    }
+
+    /// Parses the remainder of an `EXTRACT(...)`, with `EXTRACT` and its `(`
+    /// already consumed: `<field> FROM <operand> )`. The field is a bare word,
+    /// kept lower-case as a string literal; whether the operand's type has it
+    /// is the validator's to check.
+    fn parse_extract_body(&mut self) -> Result<Expr, ParseError> {
+        let field = match self.advance() {
+            Token::Ident(field) => field.to_ascii_lowercase(),
+            Token::Eof => {
+                return Err(ParseError::UnexpectedEof {
+                    expected: "an EXTRACT field such as year".to_string(),
+                });
+            }
+            other => {
+                return Err(ParseError::UnexpectedToken {
+                    expected: "an EXTRACT field such as year".to_string(),
+                    found: other.describe(),
+                });
+            }
+        };
+        self.expect_keyword("FROM")?;
+        let operand = self.parse_expr()?;
+        self.expect_symbol(')')?;
+        Ok(Expr::FunctionCall {
+            name: "EXTRACT".to_string(),
+            args: vec![Expr::StringLiteral(field), operand],
         })
     }
 

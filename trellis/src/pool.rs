@@ -556,16 +556,34 @@ impl Pool {
 ///   session. Ordering is handled with explicit `collate "C"` and the
 ///   deterministic-collation checks on key columns.
 /// * `client_encoding` is fixed to `UTF8` by `tokio-postgres` itself.
-/// * `xmlbinary` and `timezone_abbreviations` change how *input* is parsed
-///   (or, for `xmlbinary`, what the `xml*` constructor functions build),
-///   not how a stored value is rendered, and no SQL Trellis writes depends
-///   on them.
+/// * `xmlbinary` changes what the `xml*` constructor functions build, not
+///   how a stored value is rendered, and no SQL Trellis writes depends on it.
+/// * `timezone_abbreviations` changes how a zone name is parsed, not how a
+///   value is rendered; the one SQL that parses one, `AT TIME ZONE 'UTC'`,
+///   is covered by [`EXPRESSION_INPUT_GUCS`].
 /// * `escape_string_warning` and `backslash_quote` only matter when
 ///   `standard_conforming_strings` is `off`, which it never is here.
 pub(crate) const DETERMINISTIC_TEXT_OUTPUT_GUCS: &str = "set datestyle to 'ISO, YMD'; \
      set bytea_output to 'hex'; set extra_float_digits to 1; set intervalstyle to 'postgres'; \
      set timezone to 'UTC'; set lc_monetary to 'C'; set standard_conforming_strings to 'on'; \
      set xmloption to 'content'";
+
+/// Pins the setting a calculated field's `AT TIME ZONE 'UTC'` parses its zone
+/// name under.
+///
+/// `timestamptz AT TIME ZONE 'UTC'` looks the name up in the
+/// timezone-abbreviation table before the zone database, so a
+/// `timezone_abbreviations` set that redefines `UTC` (an operator's
+/// `ALTER DATABASE ... SET timezone_abbreviations = '...'`) shifts every
+/// value the field writes. `Default` is the set Postgres ships, in which `UTC`
+/// is offset 0. It is not part of [`DETERMINISTIC_TEXT_OUTPUT_GUCS`]: it
+/// changes how an expression reads its input, not how a value prints, and
+/// that list is also pinned on every capture function, which evaluates no
+/// calculated field.
+///
+/// It is applied by [`session_bootstrap`] and [`dedicated_session_setup`],
+/// so every connection Trellis opens itself carries it.
+pub(crate) const EXPRESSION_INPUT_GUCS: &str = "set timezone_abbreviations to 'Default'";
 
 /// Makes a read or write that row-level security would filter **raise**
 /// instead.
@@ -661,7 +679,7 @@ pub(crate) const READ_COMMITTED: &str = "set default_transaction_isolation to 'r
 /// even when it lives outside both `schema` and `public`) and `public`
 /// (Postgres's own default, kept last as a fallback for anything that
 /// depends on it today), plus [`DETERMINISTIC_TEXT_OUTPUT_GUCS`],
-/// [`ROW_SECURITY_OFF`], [`JIT_OFF`], [`READ_COMMITTED`], the server-side
+/// [`EXPRESSION_INPUT_GUCS`], [`ROW_SECURITY_OFF`], [`JIT_OFF`], [`READ_COMMITTED`], the server-side
 /// TCP keepalives ([`tcp_keepalive_gucs`], without the user timeout: see
 /// [`DeadPeerDetection::KeepalivesOnly`]) and the session's
 /// `lock_timeout` cap ([`crate::locks::session_lock_timeout_sql`], ADR-0002
@@ -674,7 +692,7 @@ async fn session_bootstrap(
     client
         .batch_execute(&format!(
             "set search_path to {}, {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; \
-             {ROW_SECURITY_OFF}; {JIT_OFF}; {READ_COMMITTED}; {}; {}",
+             {EXPRESSION_INPUT_GUCS}; {ROW_SECURITY_OFF}; {JIT_OFF}; {READ_COMMITTED}; {}; {}",
             quote_ident(schema),
             quote_ident(target_schema),
             tcp_keepalive_gucs(DeadPeerDetection::KeepalivesOnly),
@@ -899,13 +917,14 @@ pub(crate) type DedicatedConnection = tokio_postgres::Connection<
 /// The session setup a dedicated connection runs straight after
 /// [`connect_dedicated`], mirroring what [`session_bootstrap`] does for a
 /// pooled one: `search_path` pinned to `schema` then `public`,
-/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], [`ROW_SECURITY_OFF`], [`JIT_OFF`],
+/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], [`EXPRESSION_INPUT_GUCS`],
+/// [`ROW_SECURITY_OFF`], [`JIT_OFF`],
 /// [`READ_COMMITTED`], [`tcp_keepalive_gucs`] with the user timeout, and
 /// the `lock_timeout` cap ([`crate::locks::session_lock_timeout_sql`]).
 pub(crate) fn dedicated_session_setup(schema: &str) -> String {
     format!(
-        "set search_path to {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; {ROW_SECURITY_OFF}; \
-         {JIT_OFF}; {READ_COMMITTED}; {}; {}",
+        "set search_path to {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; \
+         {EXPRESSION_INPUT_GUCS}; {ROW_SECURITY_OFF}; {JIT_OFF}; {READ_COMMITTED}; {}; {}",
         quote_ident(schema),
         tcp_keepalive_gucs(DeadPeerDetection::KeepalivesAndUserTimeout),
         crate::locks::session_lock_timeout_sql()

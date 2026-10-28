@@ -256,10 +256,13 @@ pub fn render_expr_sql(expr: &Expr) -> String {
             // below.
             "count(*)".to_string()
         }
-        Expr::FunctionCall { name, args } => {
-            let rendered_args: Vec<String> = args.iter().map(render_expr_sql).collect();
-            format!("{}({})", name.to_lowercase(), rendered_args.join(", "))
-        }
+        Expr::FunctionCall { name, args } => match super::ast::as_extract(name, args) {
+            Some((field, operand)) => format!("extract({field} from {})", render_expr_sql(operand)),
+            None => {
+                let rendered_args: Vec<String> = args.iter().map(render_expr_sql).collect();
+                format!("{}({})", name.to_lowercase(), rendered_args.join(", "))
+            }
+        },
     }
 }
 
@@ -349,13 +352,19 @@ pub(crate) fn render_qualified_expr_sql(expr: &Expr, source_sql: &str) -> String
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             "count(*)".to_string()
         }
-        Expr::FunctionCall { name, args } => {
-            let rendered: Vec<String> = args
-                .iter()
-                .map(|arg| render_qualified_expr_sql(arg, source_sql))
-                .collect();
-            format!("{}({})", name.to_lowercase(), rendered.join(", "))
-        }
+        Expr::FunctionCall { name, args } => match super::ast::as_extract(name, args) {
+            Some((field, operand)) => format!(
+                "extract({field} from {})",
+                render_qualified_expr_sql(operand, source_sql)
+            ),
+            None => {
+                let rendered: Vec<String> = args
+                    .iter()
+                    .map(|arg| render_qualified_expr_sql(arg, source_sql))
+                    .collect();
+                format!("{}({})", name.to_lowercase(), rendered.join(", "))
+            }
+        },
     }
 }
 

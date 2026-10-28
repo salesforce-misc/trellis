@@ -312,6 +312,46 @@ is not, because the `CASE` has no declared scale
 Checked in `trellis/tests/logic_key_spaces.rs`,
 `trellis/tests/one_to_one_render.rs` and the harness.
 
+## Dates and times
+
+Date and time expressions follow Postgres, which computes every value; define
+admits only the `IMMUTABLE` forms whose result type follows from their
+operand types (the conformance harness checks each against a live server,
+[the generative suite](generative-test-suite.md#expression-conformance)).
+
+| Expression | Operands | Result |
+|---|---|---|
+| `d + n`, `n + d`, `d - n` | a `date`, a `smallint` or `integer` day count | `date` |
+| `d1 - d2` | two `date`s | `integer`, the days between |
+| `DATE_TRUNC('<unit>', ts)` | a `timestamp`; `<unit>` a literal: `microseconds`, `milliseconds`, `second`, `minute`, `hour`, `day`, `week` (to Monday), `month`, `quarter`, `year`, `decade`, `century`, `millennium` | `timestamp` |
+| `EXTRACT(<field> FROM d)` | a `date`; `year`, `quarter`, `month`, `week`, `day`, `dow`, `isodow`, `doy`, `isoyear`, `decade`, `century`, `millennium`, `epoch` | `numeric` |
+| `EXTRACT(<field> FROM ts)` | a `timestamp`; the date fields and `hour`, `minute`, `second`, `milliseconds`, `microseconds` | `numeric`; `epoch` is seconds since 1970-01-01 00:00 with no zone |
+| `tz AT TIME ZONE 'UTC'` | a `timestamptz`; the literal `'UTC'` only | `timestamp` |
+| `CAST(d AS timestamp)` | a `date` | `timestamp` |
+
+`EXTRACT` is an unconstrained `numeric`, so `SUM` or `AVG` of one is refused for
+its undeclared scale; a bucket for an aggregate is a 1-1 field
+(`DATE_TRUNC('month', ts) AS bucket`, `EXTRACT(year FROM d) AS yr`) that an
+aggregate over its target groups by (`timestamp` and `numeric` are `GROUP BY`
+key types). `infinity` and `-infinity` follow Postgres. `d + n` past
+5874897-12-31 or before 4714-11-24 BC, `d1 - d2` with an infinite date and a
+`CAST` of a date past 294276-12-31 raise `22008` for the row, which is
+quarantined like any data error; a constant that does is refused at define
+([transforms](transforms.md#supported-sources-and-targets)).
+
+What each form reads: none of these reads `DateStyle`, `IntervalStyle` or
+`TimeZone` (the pins above stay). `AT TIME ZONE 'UTC'` parses its zone name
+under `timezone_abbreviations`, which every Trellis session pins to
+`Default` (`pool::EXPRESSION_INPUT_GUCS`). The forms Postgres picks silently
+and are `STABLE` are refused: `DATE_TRUNC` and `EXTRACT` of a `timestamptz`
+(they read `TimeZone`), `DATE_TRUNC` of a `date` (the `timestamptz`
+overload), and `CAST(tz AS timestamp)`. Also refused, each with a remedy:
+`interval` in any form (`timestamp - timestamp`, `timestamp ± interval`), any
+zone but `'UTC'` (a time zone database release changes past results), and
+`date_part` (`double precision`).
+Checked in `trellis/tests/date_key_spaces.rs`,
+`trellis/tests/one_to_one_render.rs` and the harness.
+
 ## Temporal types
 
 `date`, `time`, `timetz`, `timestamp` and `timestamptz` are keys in every
@@ -462,7 +502,8 @@ date)`. The accepted keywords are `DATE`, `TIMESTAMP`, `TIME`, `TIMETZ`,
 literal's text must be in the type's canonical Postgres output spelling, which
 also makes the literal's spelling agree with Postgres's rendering byte for byte. A
 `CAST(<expr> AS <type>)` over a non-literal admits only the lossless integer
-widenings ([Arithmetic](#arithmetic)), with Postgres's `int`, `int4`, `int8` and
+widenings ([Arithmetic](#arithmetic)) and a `date` to `timestamp` ([Dates and
+times](#dates-and-times)), with Postgres's `int`, `int4`, `int8` and
 `decimal` accepted as spellings of the target (and only there); every other one
 is refused by name. See
 [ADR-0004](decisions/0004-transform-definition-grammar.md#typed-literals-spell-constants-in-canonical-postgres-form).

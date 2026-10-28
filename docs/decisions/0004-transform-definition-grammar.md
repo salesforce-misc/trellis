@@ -72,13 +72,17 @@ SELECT <expr> AS <field> [, <expr> AS <field> ...]
 `<expr> + <expr>`, `<expr> - <expr>`, `<expr> * <expr>`, `<expr> / <expr>`,
 `<expr> % <expr>`, `-<expr>`, a comparison (`=`, `<>`, `!=`, `<`, `<=`, `>`,
 `>=`, `IS [NOT] DISTINCT FROM`), `<expr> AND <expr>`, `<expr> OR <expr>`,
-`NOT <expr>`, `<expr> IS [NOT] NULL`, a searched `CASE WHEN <expr> THEN <expr>
-[WHEN ...] [ELSE <expr>] END`, `CAST(<expr> AS <integer or numeric type>)`
-(the target also spelled `int`, `int4`, `int8` or `decimal`), or a function call (`strpos`, `octet_length`,
-`char_length`, `regexp_count`, `abs`, `ceil`, `floor`, `round`, `trunc`, `coalesce`, `nullif`; general
-`func(args)` syntax). `AND`, `OR` and `IS` are operators only after a complete
-operand, `END` only closes a `CASE`, and `NOT` and `CASE` are keywords only
-where an operand follows, so a column of any of those names is still a column.
+`NOT <expr>`, `<expr> IS [NOT] NULL`, `<expr> AT TIME ZONE 'UTC'`, a searched
+`CASE WHEN <expr> THEN <expr> [WHEN ...] [ELSE <expr>] END`, `CAST(<expr> AS
+<integer, numeric or timestamp type>)` (the target also spelled `int`, `int4`,
+`int8` or `decimal`), `EXTRACT(<field> FROM <expr>)`, or a function call
+(`strpos`, `octet_length`, `char_length`, `regexp_count`, `abs`, `ceil`,
+`floor`, `round`, `trunc`, `date_trunc`, `coalesce`, `nullif`; general
+`func(args)` syntax). `AND`, `OR`, `IS` and `AT` are operators only after a
+complete operand, `END` only closes a `CASE`, `NOT` and `CASE` are keywords
+only where an operand follows, and `EXTRACT` is one only before a `(`, so a
+column of any of those names is still a column. `AT TIME ZONE` binds tighter
+than `*` and looser than prefix `-`.
 Values
 carry a Postgres type (the ones [type support](../type-support.md) lists), and
 every operator/function's argument and return types are type-checked at
@@ -112,8 +116,9 @@ Deliberately out:
   rule, and most interesting pairs aren't immutable (`timestamptz` → `date`
   reads `TimeZone`). Each type family decides its own pairs when it is
   admitted. Admitted today: an integer to a strictly wider integer (`integer`,
-  `bigint`) and any integer to `numeric`, the casts that are lossless and
-  cannot fail, with no modifier; every other pair is rejected by name.
+  `bigint`), any integer to `numeric` and a `date` to `timestamp`, the casts
+  that are exact and read no setting, with no modifier; every other pair is
+  rejected by name.
 
 The literal's text must be in that family's **canonical Postgres output
 spelling** — `DATE '2024-1-5'` is refused even though Postgres parses it. This
@@ -216,7 +221,7 @@ tier there.
   outside the list is refused until then.
 * The accepted language is narrower than Postgres's in places a SQL user will
   notice: a typed literal must use its type's canonical spelling, `::` casts and
-  a `CAST` other than the integer widenings are refused, and `COALESCE` refuses mixed non-numeric argument
+  a `CAST` other than the integer widenings and `date` to `timestamp` are refused, and `COALESCE` refuses mixed non-numeric argument
   types and has no `NULL` literal.
 * Precedence lives in our own operator table, so each new operator has to
   declare its tier there correctly.

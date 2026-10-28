@@ -251,6 +251,116 @@ async fn an_integer_difference_overflow_quarantines_only_its_record() {
     .await;
 }
 
+const DATE: ValueType = ValueType::Other(trellis::defs::PgType::Date);
+const TIMESTAMP: ValueType = ValueType::Other(trellis::defs::PgType::Timestamp);
+
+/// A date past the latest `date` (`d + 1` of 5874897-12-31): Postgres raises
+/// `22008` for the record that holds it, and every other record applies.
+#[tokio::test]
+async fn a_date_past_the_latest_date_quarantines_only_its_record() {
+    arithmetic_error_quarantines_only_its_record("d + 1", &[("d", "date", DATE)], 17, |id| {
+        vec![if id == 17 {
+            "5874897-12-31".to_string()
+        } else {
+            "2024-02-29".to_string()
+        }]
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_date_before_the_earliest_date_quarantines_only_its_record() {
+    arithmetic_error_quarantines_only_its_record("d - 1", &[("d", "date", DATE)], 19, |id| {
+        vec![if id == 19 {
+            "4714-11-24 BC".to_string()
+        } else {
+            "2024-02-29".to_string()
+        }]
+    })
+    .await;
+}
+
+/// An integer day count that takes a date out of range.
+#[tokio::test]
+async fn a_day_count_that_leaves_the_date_range_quarantines_only_its_record() {
+    arithmetic_error_quarantines_only_its_record(
+        "d + n",
+        &[("d", "date", DATE), ("n", "integer", INT4)],
+        21,
+        |id| {
+            vec![
+                "2024-02-29".to_string(),
+                if id == 21 { i32::MAX } else { id }.to_string(),
+            ]
+        },
+    )
+    .await;
+}
+
+/// The days between two dates are undefined when one is infinite
+/// (`cannot subtract infinite dates`, `22008`); a finite pair and an
+/// infinite `date + integer` are values.
+#[tokio::test]
+async fn subtracting_an_infinite_date_quarantines_only_its_record() {
+    arithmetic_error_quarantines_only_its_record(
+        "d - e",
+        &[("d", "date", DATE), ("e", "date", DATE)],
+        23,
+        |id| {
+            vec![
+                if id == 23 { "infinity" } else { "2024-02-29" }.to_string(),
+                "2024-01-01".to_string(),
+            ]
+        },
+    )
+    .await;
+}
+
+/// A date past what a `timestamp` holds (294276-12-31) raises `22008` in the
+/// cast; the dates below it, `infinity` included, cast.
+#[tokio::test]
+async fn casting_a_date_past_the_timestamp_range_quarantines_only_its_record() {
+    arithmetic_error_quarantines_only_its_record(
+        "CAST(d AS timestamp)",
+        &[("d", "date", DATE)],
+        25,
+        |id| {
+            vec![
+                match id {
+                    25 => "294277-01-01",
+                    26 => "infinity",
+                    27 => "294276-12-31",
+                    _ => "2024-02-29",
+                }
+                .to_string(),
+            ]
+        },
+    )
+    .await;
+}
+
+/// Truncating the earliest timestamps to a millennium leaves the range
+/// (`timestamp out of range`, `22008`).
+#[tokio::test]
+async fn truncating_a_timestamp_out_of_range_quarantines_only_its_record() {
+    arithmetic_error_quarantines_only_its_record(
+        "DATE_TRUNC('millennium', ts)",
+        &[("ts", "timestamp", TIMESTAMP)],
+        27,
+        |id| {
+            vec![
+                if id == 27 {
+                    "4713-01-01 00:00:00 BC"
+                } else {
+                    "2024-02-29 12:00:00"
+                }
+                .to_string(),
+            ]
+        },
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn negating_the_smallest_integer_quarantines_only_its_record() {
     arithmetic_error_quarantines_only_its_record("-a", &[("a", "integer", INT4)], 13, |id| {

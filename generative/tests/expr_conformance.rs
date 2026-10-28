@@ -790,14 +790,23 @@ fn product(options: &[Vec<Expr>]) -> Vec<Vec<Expr>> {
 fn instances(rule: &expr_gen::Rule) -> Vec<Expr> {
     use expr_gen::Rule;
     match rule {
-        Rule::Op { op, lhs, rhs, .. } => product(&[leaves(*lhs), leaves(*rhs)])
-            .into_iter()
-            .map(|mut v| {
-                let r = v.pop().expect("rhs");
-                let l = v.pop().expect("lhs");
-                bin(*op, l, r)
-            })
-            .collect(),
+        Rule::Op { op, lhs, rhs, .. } => product(&[
+            leaves(*lhs),
+            match expr_gen::LITERAL_RHS_OPERATORS
+                .iter()
+                .find(|(o, _)| o == op)
+            {
+                Some((_, zone)) => vec![Expr::StringLiteral((*zone).to_string())],
+                None => leaves(*rhs),
+            },
+        ])
+        .into_iter()
+        .map(|mut v| {
+            let r = v.pop().expect("rhs");
+            let l = v.pop().expect("lhs");
+            bin(*op, l, r)
+        })
+        .collect(),
         Rule::FloatVsLiteral { op, float } => {
             let literals = expr_gen::comparison_literals(Profile::CONFORMANCE.magnitude);
             let mut out = Vec::new();
@@ -831,6 +840,11 @@ fn instances(rule: &expr_gen::Rule) -> Vec<Expr> {
                             .iter()
                             .map(|n| Expr::NumberLiteral((*n).to_string()))
                             .collect()
+                    } else if *name == "DATE_TRUNC" && i == 0 {
+                        registry::DATE_TRUNC_UNITS
+                            .iter()
+                            .map(|u| Expr::StringLiteral((*u).to_string()))
+                            .collect()
                     } else if expr_gen::LITERAL_ONLY_ARGS.contains(&(*name, i)) {
                         expr_gen::REGEX_PATTERNS
                             .iter()
@@ -847,6 +861,18 @@ fn instances(rule: &expr_gen::Rule) -> Vec<Expr> {
                 .map(|args| Expr::FunctionCall {
                     name: (*name).to_string(),
                     args,
+                })
+                .collect()
+        }
+        Rule::Extract { operand } => {
+            let fields = registry::extract_fields(*operand).expect("a rule's type has fields");
+            leaves(*operand)
+                .into_iter()
+                .flat_map(|e| {
+                    fields.iter().map(move |field| Expr::FunctionCall {
+                        name: "EXTRACT".to_string(),
+                        args: vec![Expr::StringLiteral((*field).to_string()), e.clone()],
+                    })
                 })
                 .collect()
         }
@@ -964,7 +990,12 @@ fn every_operator_over_every_leaf_conforms() {
 
 #[test]
 fn every_function_over_every_leaf_conforms() {
-    every_instance_conforms(|r| matches!(r, expr_gen::Rule::Call { .. }));
+    every_instance_conforms(|r| {
+        matches!(
+            r,
+            expr_gen::Rule::Call { .. } | expr_gen::Rule::Extract { .. }
+        )
+    });
 }
 
 #[test]
@@ -1081,6 +1112,251 @@ fn a_pattern_postgres_rejects_is_refused() {
     }
 }
 
+/// The date forms with the values Postgres gives them: leap days, year
+/// boundaries, ISO week 53, the Monday a week truncates to, `infinity`. The
+/// column forms run over the table's dates (`infinity`, the earliest and the
+/// latest date among them); the constant forms are pinned to their answers.
+#[test]
+fn date_rows_agree_with_postgres() {
+    let pins: &[(&str, &str)] = &[
+        ("DATE '2024-02-28' + 1", "2024-02-29"),
+        ("1 + DATE '2023-02-28'", "2023-03-01"),
+        ("DATE '2024-12-31' + 1", "2025-01-01"),
+        ("DATE '2024-03-01' - 1", "2024-02-29"),
+        ("DATE '2024-03-01' - DATE '2024-02-01'", "29"),
+        ("DATE '2025-01-01' - DATE '2024-01-01'", "366"),
+        ("DATE '2024-02-29' + 0", "2024-02-29"),
+        ("EXTRACT(week FROM DATE '2020-12-31')", "53"),
+        ("EXTRACT(isoyear FROM DATE '2021-01-01')", "2020"),
+        ("EXTRACT(year FROM DATE '2021-01-01')", "2021"),
+        ("EXTRACT(dow FROM DATE '2024-02-25')", "0"),
+        ("EXTRACT(isodow FROM DATE '2024-02-25')", "7"),
+        ("EXTRACT(doy FROM DATE '2024-12-31')", "366"),
+        ("EXTRACT(quarter FROM DATE '2024-11-30')", "4"),
+        ("EXTRACT(decade FROM DATE '2020-01-01')", "202"),
+        ("EXTRACT(century FROM DATE '2000-12-31')", "20"),
+        ("EXTRACT(century FROM DATE '2001-01-01')", "21"),
+        ("EXTRACT(millennium FROM DATE '2000-12-31')", "2"),
+        ("EXTRACT(epoch FROM DATE '1970-01-02')", "86400"),
+        (
+            "EXTRACT(epoch FROM TIMESTAMP '1970-01-01 00:00:01.5')",
+            "1.500000",
+        ),
+        (
+            "EXTRACT(second FROM TIMESTAMP '2024-02-29 12:00:30.25')",
+            "30.250000",
+        ),
+        (
+            "EXTRACT(milliseconds FROM TIMESTAMP '2024-02-29 12:00:30.25')",
+            "30250.000",
+        ),
+        (
+            "EXTRACT(microseconds FROM TIMESTAMP '2024-02-29 12:00:30.25')",
+            "30250000",
+        ),
+        (
+            "DATE_TRUNC('week', TIMESTAMP '2024-02-29 12:34:56.789')",
+            "2024-02-26 00:00:00",
+        ),
+        (
+            "DATE_TRUNC('week', TIMESTAMP '2021-01-03 12:00:00')",
+            "2020-12-28 00:00:00",
+        ),
+        (
+            "DATE_TRUNC('quarter', TIMESTAMP '2024-11-30 12:00:00')",
+            "2024-10-01 00:00:00",
+        ),
+        (
+            "DATE_TRUNC('decade', TIMESTAMP '2024-11-30 12:00:00')",
+            "2020-01-01 00:00:00",
+        ),
+        (
+            "DATE_TRUNC('century', TIMESTAMP '2024-11-30 12:00:00')",
+            "2001-01-01 00:00:00",
+        ),
+        (
+            "DATE_TRUNC('millennium', TIMESTAMP '2024-11-30 12:00:00')",
+            "2001-01-01 00:00:00",
+        ),
+        (
+            "DATE_TRUNC('milliseconds', TIMESTAMP '2024-11-30 12:00:00.123456')",
+            "2024-11-30 12:00:00.123",
+        ),
+        (
+            "DATE_TRUNC('year', TIMESTAMP '1970-01-01 00:00:00.5')",
+            "1970-01-01 00:00:00",
+        ),
+        (
+            "CAST(DATE '2024-02-29' AS timestamp)",
+            "2024-02-29 00:00:00",
+        ),
+        (
+            "CAST(DATE '0001-01-01' AS timestamp)",
+            "0001-01-01 00:00:00",
+        ),
+        (
+            "DATE_TRUNC('month', CAST(DATE '2024-02-29' + 1 AS timestamp))",
+            "2024-03-01 00:00:00",
+        ),
+    ];
+    // The column forms, over `infinity` and the extremes among the rows.
+    let columns = [
+        "da + 1",
+        "1 + da",
+        "da - 1",
+        "da + i2a",
+        "i2b + da",
+        "da - i4a",
+        "da - db",
+        "(da - db) + 1",
+        "da + (da - db)",
+        "da + 2147483647",
+        "da - 2147483647",
+        "CAST(da AS timestamp)",
+        "CAST(da + 1 AS timestamp) = tsa",
+        "DATE_TRUNC('month', CAST(da AS timestamp))",
+        "DATE_TRUNC('week', tsa)",
+        "DATE_TRUNC('millennium', tsa)",
+        "DATE_TRUNC('microseconds', tsa)",
+        "DATE_TRUNC('day', tza AT TIME ZONE 'UTC')",
+        "tza AT TIME ZONE 'UTC'",
+        "tza AT TIME ZONE 'UTC' > tsa",
+        "EXTRACT(year FROM da)",
+        "EXTRACT(week FROM da) + EXTRACT(dow FROM db)",
+        "EXTRACT(epoch FROM da)",
+        "EXTRACT(epoch FROM tza AT TIME ZONE 'UTC') - EXTRACT(epoch FROM tsa)",
+        "EXTRACT(hour FROM tsa)",
+        "EXTRACT(microseconds FROM tsa)",
+        "EXTRACT(isoyear FROM DATE_TRUNC('week', tsa))",
+        "CASE WHEN da > db THEN da ELSE db + 7 END",
+        "COALESCE(da, DATE '2024-02-29') - DATE '1970-01-01'",
+        "NULLIF(da, db)",
+        "da IS NULL",
+        "da + 1 = db",
+        "DATE_TRUNC('day', tsa) = CAST(da AS timestamp)",
+    ];
+    for (text, answer) in pins {
+        match check_text(text, None) {
+            Ok(Agreement::Admitted) => {}
+            other => panic!("`{text}`: expected it admitted, got {other:?}"),
+        }
+        let found = HARNESS.with(|h| h.runtime.block_on(h.fixture.scalar(text)));
+        assert_eq!(found, Ok(Some((*answer).to_string())), "`{text}`");
+    }
+    for text in columns {
+        match check_text(text, None) {
+            Ok(Agreement::Admitted) => {}
+            other => panic!("`{text}`: expected it admitted, got {other:?}"),
+        }
+    }
+}
+
+/// Infinite and out-of-range dates are data: a row that holds one is
+/// quarantined (class 22) or follows Postgres (`infinity + 1` is `infinity`;
+/// `EXTRACT(year FROM 'infinity')` is `Infinity`; `EXTRACT(day FROM
+/// 'infinity')` is `NULL`), and define neither refuses nor evaluates it.
+#[test]
+fn infinite_and_out_of_range_dates_follow_postgres() {
+    HARNESS.with(|h| {
+        let value = |sql: &str| h.runtime.block_on(h.fixture.scalar(sql));
+        assert_eq!(value("'infinity'::date + 1"), Ok(Some("infinity".into())));
+        assert_eq!(value("'-infinity'::date - 1"), Ok(Some("-infinity".into())));
+        assert_eq!(value("1 + '-infinity'::date"), Ok(Some("-infinity".into())));
+        assert_eq!(
+            value("EXTRACT(year FROM 'infinity'::date)"),
+            Ok(Some("Infinity".into()))
+        );
+        assert_eq!(
+            value("EXTRACT(epoch FROM '-infinity'::date)"),
+            Ok(Some("-Infinity".into()))
+        );
+        assert_eq!(value("EXTRACT(day FROM 'infinity'::date)"), Ok(None));
+        assert_eq!(value("EXTRACT(dow FROM 'infinity'::timestamp)"), Ok(None));
+        assert_eq!(value("EXTRACT(hour FROM 'infinity'::timestamp)"), Ok(None));
+        assert_eq!(
+            value("DATE_TRUNC('week', 'infinity'::timestamp)"),
+            Ok(Some("infinity".into()))
+        );
+        assert_eq!(
+            value("'infinity'::timestamptz AT TIME ZONE 'UTC'"),
+            Ok(Some("infinity".into()))
+        );
+        assert_eq!(
+            value("CAST('-infinity'::date AS timestamp)"),
+            Ok(Some("-infinity".into()))
+        );
+        // The errors a row can hold: class 22.
+        for sql in [
+            "'infinity'::date - '2024-01-01'::date",
+            "'5874897-12-31'::date + 1",
+            "'4714-11-24 BC'::date - 1",
+            "CAST('5874897-12-31'::date AS timestamp)",
+            "DATE_TRUNC('millennium', '4713-01-01 BC'::timestamp)",
+            "'2024-01-01'::date + 2147483647",
+        ] {
+            match value(sql) {
+                Err(code) => assert_eq!(&code[..2], "22", "{sql}: {code}"),
+                other => panic!("`{sql}` should raise class 22, got {other:?}"),
+            }
+        }
+    });
+    // Over a column, define admits what Postgres raises for some rows only.
+    for text in [
+        "da + 2147483647",
+        "da - db",
+        "CAST(da + 1 AS timestamp)",
+        "DATE_TRUNC('millennium', tsa)",
+    ] {
+        match check_text(text, None) {
+            Ok(Agreement::Admitted) => {}
+            other => panic!("`{text}`: expected it admitted, got {other:?}"),
+        }
+    }
+}
+
+/// A constant date operation Postgres folds and rejects is refused at define,
+/// exactly at the boundary Postgres rejects it, and a cast of a constant past
+/// `timestamp`'s range likewise. The boundaries are the engine's own
+/// (`date_const`), so these are what pin them against Postgres.
+#[test]
+fn date_constants_postgres_rejects_are_refused_at_the_same_boundary() {
+    let refused = [
+        "DATE '9999-12-31' + 2142110010",
+        "2142110010 + DATE '9999-12-31'",
+        "DATE '2024-01-01' + 2147483647",
+        "DATE '2024-01-01' - 2147483647",
+        "DATE '0001-01-01' - 1721427",
+        "DATE '0001-01-01' + -1721427",
+        "CAST(DATE '9999-12-31' + 106751982 - 2921939 + 1 AS timestamp)",
+        "CAST(DATE '9999-12-31' + 2142110009 AS timestamp)",
+        "(DATE '9999-12-31' + 2142110009) + 1",
+        "EXTRACT(year FROM DATE '9999-12-31' + 2142110010)",
+        "DATE_TRUNC('day', CAST(DATE '9999-12-31' + 2142110009 AS timestamp))",
+    ];
+    let admitted = [
+        "DATE '9999-12-31' + 2142110009",
+        "DATE '0001-01-01' - 1721426",
+        "DATE '0001-01-01' + -1721426",
+        "CAST(DATE '9999-12-31' + 106751982 - 2921939 AS timestamp)",
+        "CAST(DATE '0001-01-01' - 1721426 AS timestamp)",
+        "(DATE '9999-12-31' + 2142110009) - 1",
+        "EXTRACT(year FROM DATE '9999-12-31' + 2142110009)",
+        "DATE '2024-01-01' - DATE '0001-01-01'",
+    ];
+    for text in refused {
+        match check_text(text, None) {
+            Ok(Agreement::RefusedAndRaises(_)) => {}
+            other => panic!("`{text}` should be refused and raise, got {other:?}"),
+        }
+    }
+    for text in admitted {
+        match check_text(text, None) {
+            Ok(Agreement::Admitted) => {}
+            other => panic!("`{text}`: expected it admitted, got {other:?}"),
+        }
+    }
+}
+
 /// Each refusal, by name: the near miss, and that the error names it.
 #[test]
 fn each_refusal_names_its_construct() {
@@ -1120,7 +1396,6 @@ fn each_refusal_names_its_construct() {
         ("NULLIF(0, f4a)", "casts the first argument"),
         ("NULLIF(f4a, i4a)", "round the exact side"),
         ("NULLIF(ta, 1)", "cannot compare"),
-        ("da + 1", "date"),
         // Comparisons do not chain.
         ("na > nb > na", "do not chain"),
         ("na = nb = na", "do not chain"),
@@ -1166,6 +1441,43 @@ fn each_refusal_names_its_construct() {
         ("i4a % 0", "zero"),
         ("f8a / 0.0", "zero"),
         ("na / (1 - 1)", "zero"),
+        // Date arithmetic with an operand Postgres has no operator for.
+        ("da + i8a", "smallint or integer"),
+        ("i8a + da", "smallint or integer"),
+        ("da - na", "smallint or integer"),
+        ("da + f8a", "smallint or integer"),
+        ("da + db", "two dates"),
+        ("i4a - da", "number minus a date"),
+        ("da * 2", "'*'"),
+        ("tsa + 1", "date takes a number of days"),
+        // Intervals are out of scope, with the remedy for a duration.
+        ("tsa - tsb", "extract(epoch"),
+        ("tza - tzb", "extract(epoch"),
+        ("da - tsa", "interval"),
+        ("tsa - da", "interval"),
+        ("tma - tmb", "interval"),
+        // The STABLE overloads Postgres picks silently.
+        ("DATE_TRUNC('month', da)", "cast(d as timestamp)"),
+        ("DATE_TRUNC('day', tza)", "at time zone 'utc'"),
+        ("EXTRACT(year FROM tza)", "at time zone 'utc'"),
+        ("EXTRACT(hour FROM tma)", "date or a timestamp"),
+        ("CAST(tza AS timestamp)", "at time zone 'utc'"),
+        ("CAST(tsa AS timestamp)", "timestamp"),
+        ("CAST(da AS timestamptz)", "timestamptz"),
+        // A field or unit the type does not have, or is not a literal.
+        ("EXTRACT(hour FROM da)", "cast(d as timestamp)"),
+        ("EXTRACT(julian FROM da)", "julian"),
+        ("EXTRACT(timezone FROM tsa)", "timezone"),
+        ("EXTRACT(years FROM da)", "fields admitted"),
+        ("DATE_TRUNC('days', tsa)", "units admitted"),
+        ("DATE_TRUNC(ta, tsa)", "literal"),
+        ("DATE_PART('year', da)", "date_part"),
+        // `AT TIME ZONE` is the literal 'UTC' over a timestamptz.
+        ("tza AT TIME ZONE 'America/New_York'", "'utc'"),
+        ("tza AT TIME ZONE 'utc'", "'utc'"),
+        ("tza AT TIME ZONE ta", "literal"),
+        ("tsa AT TIME ZONE 'UTC'", "timestamptz"),
+        ("da AT TIME ZONE 'UTC'", "cast(d as timestamp)"),
         // Not immutable: these change between calls.
         ("NOW()", "now"),
         ("RANDOM()", "random"),
@@ -1289,6 +1601,7 @@ fn the_generator_reaches_every_registry_entry() {
         .chain([
             "fn COALESCE".to_string(),
             "fn NULLIF".to_string(),
+            "fn EXTRACT".to_string(),
             "column".to_string(),
             "prefix -".to_string(),
             "NOT".to_string(),

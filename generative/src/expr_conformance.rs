@@ -440,6 +440,19 @@ impl Fixture {
         self.client.query(sql, &[]).await.err().map(|e| code_of(&e))
     }
 
+    /// The value of a one-row `select <expression>`, as text, or the
+    /// SQLSTATE: what a pin compares a known answer with.
+    pub async fn scalar(&self, expression: &str) -> Result<Option<String>, String> {
+        match self
+            .client
+            .query_one(&format!("select ({expression})::text"), &[])
+            .await
+        {
+            Ok(row) => Ok(row.get(0)),
+            Err(e) => Err(code_of(&e)),
+        }
+    }
+
     /// The first column of every row, as text, or the SQLSTATE.
     async fn rows(&self, sql: &str) -> Result<Vec<Option<String>>, String> {
         match self.client.query(sql, &[]).await {
@@ -911,6 +924,26 @@ impl Fixture {
                 }
             }
             ("text", Some(v)) => Expr::StringLiteral(v),
+            // A date or timestamp has a literal only in its canonical
+            // spelling; a value outside it (a BC year) stays a call.
+            ("date" | "timestamp without time zone", Some(v)) => {
+                let value_type = if pg_type == "date" {
+                    ValueType::Other(PgType::Date)
+                } else {
+                    ValueType::Other(PgType::Timestamp)
+                };
+                let canonical = trellis::dev::defs::typed_literal::TYPED_LITERALS
+                    .iter()
+                    .find(|spec| spec.value_type == value_type)
+                    .is_some_and(|spec| (spec.canonical)(&v).is_ok());
+                if !canonical {
+                    return;
+                }
+                Expr::TypedLiteral {
+                    value_type,
+                    text: v,
+                }
+            }
             ("real", Some(v)) => Expr::TypedLiteral {
                 value_type: ValueType::Float(FloatWidth::Float4),
                 text: v,

@@ -381,6 +381,9 @@ fn render_expr(expr: &Expr) -> String {
             "count(*)".to_string()
         }
         Expr::FunctionCall { name, args } => {
+            if let Some((field, operand)) = trellis::dev::defs::ast::as_extract(name, args) {
+                return format!("extract({field} from {})", render_expr(operand));
+            }
             let rendered_args: Vec<String> = args.iter().map(render_expr).collect();
             format!("{}({})", name.to_lowercase(), rendered_args.join(", "))
         }
@@ -731,6 +734,8 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
         Expr::FunctionCall { name, args } if name == "COALESCE" || name == "NULLIF" => {
             field_value_type(&args[0], source_columns)
         }
+        // `EXTRACT` is an unconstrained `numeric` for any operand.
+        Expr::FunctionCall { name, .. } if name == "EXTRACT" => ValueType::Numeric,
         // Likewise for the aggregates — `sum(int4)` is `bigint`,
         // `sum(numeric)` is `numeric`. `COUNT` is excluded on purpose:
         // `registry::aggregate_result_type` deliberately has no row for it
@@ -934,14 +939,19 @@ fn render_join_expr(expr: &Expr) -> String {
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             "count(*)".to_string()
         }
-        Expr::FunctionCall { name, args } => format!(
-            "{}({})",
-            name.to_lowercase(),
-            args.iter()
-                .map(render_join_expr)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        Expr::FunctionCall { name, args } => {
+            if let Some((field, operand)) = trellis::dev::defs::ast::as_extract(name, args) {
+                return format!("extract({field} from {})", render_join_expr(operand));
+            }
+            format!(
+                "{}({})",
+                name.to_lowercase(),
+                args.iter()
+                    .map(render_join_expr)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
         other => trellis::dev::defs::oracle::render_expr_sql(other),
     }
 }

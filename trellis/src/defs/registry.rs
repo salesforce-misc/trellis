@@ -63,6 +63,9 @@ pub mod precedence {
     pub const ADDITIVE: u8 = 20;
     /// Binary `*`, `/`, `%`.
     pub const MULTIPLICATIVE: u8 = 30;
+    /// `AT TIME ZONE`: tighter than `*` and looser than prefix `-`, as in
+    /// Postgres.
+    pub const AT_TIME_ZONE: u8 = 40;
 }
 
 /// The full set of operators this grammar supports.
@@ -172,6 +175,12 @@ pub const OPERATORS: &[OperatorSpec] = &[
         operator: Operator::IsNotDistinctFrom,
         arg_types: (ValueType::Numeric, ValueType::Numeric),
         precedence: precedence::IS,
+    },
+    OperatorSpec {
+        symbol: "AT TIME ZONE",
+        operator: Operator::AtTimeZone,
+        arg_types: (ValueType::Other(PgType::TimestampTz), ValueType::Text),
+        precedence: precedence::AT_TIME_ZONE,
     },
     OperatorSpec {
         symbol: "AND",
@@ -292,6 +301,15 @@ pub fn operator_result_type(op: Operator, lhs: ValueType, rhs: ValueType) -> Opt
         return (lhs == ValueType::Boolean && rhs == ValueType::Boolean)
             .then_some(ValueType::Boolean);
     }
+    if op == Operator::AtTimeZone {
+        // The zone is a text literal (`validate` admits only `'UTC'`); the
+        // `timestamptz` operand gives the same instant as a `timestamp`.
+        return (lhs == ValueType::Other(PgType::TimestampTz) && rhs == ValueType::Text)
+            .then_some(ValueType::Other(PgType::Timestamp));
+    }
+    if let Some(result) = date_arithmetic_result_type(op, lhs, rhs) {
+        return result;
+    }
     if !lhs.is_numeric_family() || !rhs.is_numeric_family() {
         return None;
     }
@@ -320,6 +338,42 @@ pub fn operator_result_type(op: Operator, lhs: ValueType, rhs: ValueType) -> Opt
         },
         // Comparisons and `AND`/`OR` returned above.
         _ => unreachable!("comparisons and logic returned above"),
+    })
+}
+
+/// `date ± integer`, `integer + date` and `date - date`, the date operators
+/// `+`/`-` have (`date_pli`, `date_mii`, `date_mi`): `Some(Some(result))` for
+/// an admitted pair, `Some(None)` for a pair with a date that is refused, and
+/// `None` when neither operand is a date (the numeric rules apply).
+///
+/// | operands | `+` | `-` |
+/// |---|---|---|
+/// | `date`, `smallint`/`integer` | `date` | `date` |
+/// | `smallint`/`integer`, `date` | `date` | refused |
+/// | `date`, `date` | refused | `integer` (days) |
+///
+/// Postgres has no `date + bigint` or `date + numeric`; a `smallint` widens to
+/// `integer`.
+fn date_arithmetic_result_type(
+    op: Operator,
+    lhs: ValueType,
+    rhs: ValueType,
+) -> Option<Option<ValueType>> {
+    const DATE: ValueType = ValueType::Other(PgType::Date);
+    if !matches!(op, Operator::Add | Operator::Subtract) || (lhs != DATE && rhs != DATE) {
+        return None;
+    }
+    let days = |t: ValueType| {
+        matches!(
+            t,
+            ValueType::Integer(IntWidth::Int2) | ValueType::Integer(IntWidth::Int4)
+        )
+    };
+    Some(match (op, lhs, rhs) {
+        (_, DATE, n) if days(n) => Some(DATE),
+        (Operator::Add, n, DATE) if days(n) => Some(DATE),
+        (Operator::Subtract, DATE, DATE) => Some(ValueType::Integer(IntWidth::Int4)),
+        _ => None,
     })
 }
 
@@ -378,6 +432,7 @@ pub const CAST_TARGETS: &[ValueType] = &[
     ValueType::Integer(IntWidth::Int4),
     ValueType::Integer(IntWidth::Int8),
     ValueType::Numeric,
+    ValueType::Other(PgType::Timestamp),
 ];
 
 /// Postgres's exact, permanent synonyms for the [`CAST_TARGETS`], accepted in
@@ -408,15 +463,21 @@ pub fn cast_target(keyword: &str) -> Option<ValueType> {
 }
 
 /// The result type of `CAST(<operand> AS <target>)`, or `None` if the cast is
-/// not one of the lossless, total ones: an integer to a strictly wider
-/// integer, or any integer to `numeric`. Every other cast narrows (and can
-/// overflow), rounds, or goes to or from a float.
+/// not one of the admitted ones: an integer to a strictly wider integer, any
+/// integer to `numeric`, or a `date` to `timestamp`. Every other cast narrows
+/// (and can overflow), rounds, goes to or from a float, or reads a session
+/// setting (`timestamptz` to `timestamp`).
+///
+/// `date` to `timestamp` is exact and `IMMUTABLE`, but not total: a date past
+/// 294276 AD is out of range for `timestamp`, which is a data error (class 22)
+/// for the row that holds it.
 pub fn cast_result_type(operand: ValueType, target: ValueType) -> Option<ValueType> {
     match (operand, target) {
         (ValueType::Integer(from), ValueType::Integer(to)) if from.range().1 < to.range().1 => {
             Some(target)
         }
         (ValueType::Integer(_), ValueType::Numeric) => Some(ValueType::Numeric),
+        (ValueType::Other(PgType::Date), ValueType::Other(PgType::Timestamp)) => Some(target),
         _ => None,
     }
 }
@@ -476,6 +537,11 @@ pub const FUNCTIONS: &[FunctionSpec] = &[
         name: "REGEXP_COUNT",
         arg_types: &[ValueType::Text, ValueType::Text],
         return_type: ValueType::Integer(IntWidth::Int4),
+    },
+    FunctionSpec {
+        name: "DATE_TRUNC",
+        arg_types: &[ValueType::Text, ValueType::Other(PgType::Timestamp)],
+        return_type: ValueType::Other(PgType::Timestamp),
     },
     FunctionSpec {
         name: "ABS",
@@ -580,6 +646,70 @@ pub fn resolve_function(name: &str, arg_types: &[ValueType]) -> Option<&'static 
 /// `TRUNC(a, n)`. A column there would make the result's scale depend on the
 /// row; a literal may be negative (`ROUND(a, -2)`).
 pub const INTEGER_LITERAL_ARGS: &[(&str, usize)] = &[("ROUND", 1), ("TRUNC", 1)];
+
+/// The units `DATE_TRUNC('<unit>', <timestamp>)` takes, spelled as Postgres
+/// prints them. `week` truncates to Monday.
+pub const DATE_TRUNC_UNITS: &[&str] = &[
+    "microseconds",
+    "milliseconds",
+    "second",
+    "minute",
+    "hour",
+    "day",
+    "week",
+    "month",
+    "quarter",
+    "year",
+    "decade",
+    "century",
+    "millennium",
+];
+
+/// The `EXTRACT(<field> FROM <date>)` fields a `date` has. A `timestamp` has
+/// these and [`EXTRACT_CLOCK_FIELDS`].
+pub const EXTRACT_DATE_FIELDS: &[&str] = &[
+    "year",
+    "quarter",
+    "month",
+    "week",
+    "day",
+    "dow",
+    "isodow",
+    "doy",
+    "isoyear",
+    "decade",
+    "century",
+    "millennium",
+    "epoch",
+];
+
+/// The `EXTRACT` fields only a `timestamp` has: Postgres raises for these on
+/// a `date`.
+pub const EXTRACT_CLOCK_FIELDS: &[&str] =
+    &["hour", "minute", "second", "milliseconds", "microseconds"];
+
+/// The `EXTRACT` fields Postgres accepts for a `date` or `timestamp` and the
+/// grammar refuses: `julian` (a different epoch per type) and the zone
+/// fields, which a zone-less value does not have.
+pub const EXTRACT_REFUSED_FIELDS: &[&str] =
+    &["julian", "timezone", "timezone_hour", "timezone_minute"];
+
+/// The `EXTRACT` fields `operand` has, or `None` when `EXTRACT` does not
+/// admit the type (`timestamptz` reads `TimeZone`; `time` and `interval` are
+/// not admitted).
+pub fn extract_fields(operand: ValueType) -> Option<Vec<&'static str>> {
+    match operand {
+        ValueType::Other(PgType::Date) => Some(EXTRACT_DATE_FIELDS.to_vec()),
+        ValueType::Other(PgType::Timestamp) => Some(
+            EXTRACT_DATE_FIELDS
+                .iter()
+                .chain(EXTRACT_CLOCK_FIELDS)
+                .copied()
+                .collect(),
+        ),
+        _ => None,
+    }
+}
 
 /// Aggregate function names, called out specifically so a rejection can
 /// explain that they need an aggregate key-space (`GROUP BY`), not that
@@ -877,5 +1007,130 @@ mod tests {
             assert_eq!(operator_result_type(Operator::Add, f8, other), None);
             assert_eq!(operator_result_type(Operator::Add, other, f8), None);
         }
+    }
+
+    /// `date ± integer`, `integer + date` and `date - date`, as Postgres's
+    /// `date_pli`, `date_mii` and `date_mi` type them; everything else with a
+    /// date is refused.
+    #[test]
+    fn date_arithmetic_result_types_match_postgres() {
+        const DATE: ValueType = ValueType::Other(PgType::Date);
+        const TS: ValueType = ValueType::Other(PgType::Timestamp);
+        let (i2, i4, i8) = (
+            ValueType::Integer(IntWidth::Int2),
+            ValueType::Integer(IntWidth::Int4),
+            ValueType::Integer(IntWidth::Int8),
+        );
+        for n in [i2, i4] {
+            assert_eq!(operator_result_type(Operator::Add, DATE, n), Some(DATE));
+            assert_eq!(operator_result_type(Operator::Add, n, DATE), Some(DATE));
+            assert_eq!(
+                operator_result_type(Operator::Subtract, DATE, n),
+                Some(DATE)
+            );
+            assert_eq!(operator_result_type(Operator::Subtract, n, DATE), None);
+        }
+        assert_eq!(
+            operator_result_type(Operator::Subtract, DATE, DATE),
+            Some(i4)
+        );
+        assert_eq!(operator_result_type(Operator::Add, DATE, DATE), None);
+        for other in [
+            i8,
+            ValueType::Numeric,
+            ValueType::Float(FloatWidth::Float8),
+            TS,
+            ValueType::Text,
+        ] {
+            for op in [Operator::Add, Operator::Subtract] {
+                assert_eq!(
+                    operator_result_type(op, DATE, other),
+                    None,
+                    "date {op:?} {other}"
+                );
+                assert_eq!(
+                    operator_result_type(op, other, DATE),
+                    None,
+                    "{other} {op:?} date"
+                );
+            }
+        }
+        for op in [Operator::Multiply, Operator::Divide, Operator::Modulo] {
+            assert_eq!(operator_result_type(op, DATE, i4), None);
+        }
+        // Timestamps have no arithmetic here: their difference is an interval.
+        assert_eq!(operator_result_type(Operator::Subtract, TS, TS), None);
+        assert_eq!(operator_result_type(Operator::Add, TS, i4), None);
+    }
+
+    /// `AT TIME ZONE` takes a `timestamptz` and a text zone, and gives the
+    /// `timestamp`; no other operand pair.
+    #[test]
+    fn at_time_zone_types_a_timestamptz_as_a_timestamp() {
+        const TS: ValueType = ValueType::Other(PgType::Timestamp);
+        const TZ: ValueType = ValueType::Other(PgType::TimestampTz);
+        assert_eq!(
+            operator_result_type(Operator::AtTimeZone, TZ, ValueType::Text),
+            Some(TS)
+        );
+        for lhs in [TS, ValueType::Other(PgType::Date), ValueType::Text] {
+            assert_eq!(
+                operator_result_type(Operator::AtTimeZone, lhs, ValueType::Text),
+                None
+            );
+        }
+        assert_eq!(
+            operator_result_type(Operator::AtTimeZone, TZ, ValueType::Integer(IntWidth::Int4)),
+            None
+        );
+    }
+
+    /// `date` and `timestamp` have the fields `EXTRACT` is admitted for, and
+    /// nothing else has any; `timestamp` has the clock fields besides.
+    #[test]
+    fn extract_fields_are_a_dates_and_a_timestamps() {
+        let date = extract_fields(ValueType::Other(PgType::Date)).expect("date");
+        let timestamp = extract_fields(ValueType::Other(PgType::Timestamp)).expect("timestamp");
+        assert_eq!(date, EXTRACT_DATE_FIELDS);
+        assert_eq!(timestamp.len(), date.len() + EXTRACT_CLOCK_FIELDS.len());
+        for field in EXTRACT_CLOCK_FIELDS {
+            assert!(
+                !date.contains(field) && timestamp.contains(field),
+                "{field}"
+            );
+        }
+        for field in EXTRACT_REFUSED_FIELDS {
+            assert!(
+                !date.contains(field) && !timestamp.contains(field),
+                "{field}"
+            );
+        }
+        for ty in [
+            ValueType::Other(PgType::TimestampTz),
+            ValueType::Other(PgType::Time),
+            ValueType::Other(PgType::Interval),
+            ValueType::Integer(IntWidth::Int4),
+            ValueType::Text,
+        ] {
+            assert_eq!(extract_fields(ty), None, "{ty}");
+        }
+    }
+
+    /// `CAST(date AS timestamp)` is admitted; the reverse and the same-type
+    /// casts are not, and `timestamp` is a target by name.
+    #[test]
+    fn a_date_casts_to_a_timestamp_and_nothing_else_does() {
+        const DATE: ValueType = ValueType::Other(PgType::Date);
+        const TS: ValueType = ValueType::Other(PgType::Timestamp);
+        assert_eq!(cast_result_type(DATE, TS), Some(TS));
+        assert_eq!(cast_result_type(TS, TS), None);
+        assert_eq!(cast_result_type(TS, DATE), None);
+        assert_eq!(
+            cast_result_type(ValueType::Other(PgType::TimestampTz), TS),
+            None
+        );
+        assert_eq!(cast_target("TIMESTAMP"), Some(TS));
+        assert_eq!(cast_target("timestamptz"), None);
+        assert_eq!(cast_target("date"), None);
     }
 }

@@ -219,7 +219,11 @@ Postgres, over a throwaway table of random rows (`NULL`, extremes, `NaN`,
    the wrong type, a `NULLIF` whose first argument Postgres casts, a
    literal-only or integer-literal-only argument given a column, relative or
    non-canonical typed literals, and the operators and functions the registry
-   does not admit (including the `STABLE` and `VOLATILE` ones).
+   does not admit (including the `STABLE` and `VOLATILE` ones). The date
+   constructs add their own: a field or unit the type lacks, the `STABLE`
+   overloads Postgres picks silently (`DATE_TRUNC` of a `date`, `EXTRACT` of a
+   `timestamptz`, `CAST(tz AS timestamp)`), a zone that is not `'UTC'`, an
+   interval-producing `-`, and a constant date past `date`'s range.
 
 Postgres folds constants while it plans, so an expression it rejects for every
 row (`2147483647 + 1`, `1.5 / 0`) is refused at define by design. A constant
@@ -262,11 +266,14 @@ range refusals are reached.
 1. Add the entry to `OPERATORS` or `FUNCTIONS` with its precedence and types
    (a function with several signatures is several entries of one name; an
    argument that must be an integer literal is listed in
-   `INTEGER_LITERAL_ARGS`). Every operand-type pair `operator_result_type`
+   `INTEGER_LITERAL_ARGS`; one that must be a string literal is in
+   `expr_gen::LITERAL_ONLY_ARGS`, and an operator whose right side is a given
+   literal, as `AT TIME ZONE`'s `'UTC'`, in `LITERAL_RHS_OPERATORS`). Every
+   operand-type pair `operator_result_type`
    admits is drawn from then on, as are prefix `-` (`negate_result_type`) and
    each `CAST` (`cast_result_type`, `CAST_TARGETS`).
    The forms the registry cannot express (`NOT`, `IS [NOT] NULL`, `CASE`,
-   `NULLIF`) are `Rule` variants in `expr_gen` with a spelling in `write_text`
+   `NULLIF`, `EXTRACT(<field> FROM x)`) are `Rule` variants in `expr_gen` with a spelling in `write_text`
    that keeps the tree through a re-parse (an operand that starts with `-`
    after `NOT` is parenthesized).
 2. Run the conformance properties with a large `PROPTEST_CASES`. A failure

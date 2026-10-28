@@ -865,6 +865,7 @@ fn operator_name(op: Operator) -> &'static str {
         Operator::IsNotDistinctFrom => "IsNotDistinctFrom",
         Operator::And => "And",
         Operator::Or => "Or",
+        Operator::AtTimeZone => "AtTimeZone",
     }
 }
 
@@ -879,6 +880,11 @@ fn function_name(name: &str) -> &'static str {
     // change here. `COALESCE` is the one call outside both.
     if name == "COALESCE" {
         return "COALESCE";
+    }
+    // `EXTRACT(<field> FROM x)` is the other: its argument list is not the
+    // registry's.
+    if name == "EXTRACT" {
+        return "EXTRACT";
     }
     registry::FUNCTIONS
         .iter()

@@ -192,8 +192,9 @@ impl fmt::Display for ParseError {
             ),
             ParseError::UnsupportedCastTarget { name } => write!(
                 f,
-                "'{name}' is not a CAST target: only {} are supported, each from a narrower \
-                 integer (or any integer to numeric), with no modifier (docs/type-support.md)",
+                "'{name}' is not a CAST target: only {} are supported, an integer to a wider \
+                 integer or to numeric, or a date to timestamp, with no modifier \
+                 (docs/type-support.md)",
                 crate::defs::registry::CAST_TARGETS
                     .iter()
                     .map(|t| t.to_string())

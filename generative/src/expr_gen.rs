@@ -118,6 +118,10 @@ pub enum Rule {
     NullIfLiteral { float: FloatWidth },
     /// `CAST(operand AS to)` over an operand of type `from`.
     Cast { from: ValueType, to: ValueType },
+    /// `EXTRACT(<field> FROM operand)` over an operand of type `operand`,
+    /// giving a `numeric`. The fields are the type's
+    /// ([`registry::extract_fields`]).
+    Extract { operand: ValueType },
 }
 
 impl Rule {
@@ -129,6 +133,7 @@ impl Rule {
             Rule::Coalesce { ty } => *ty,
             Rule::Negate { ty } => *ty,
             Rule::Cast { to, .. } => *to,
+            Rule::Extract { .. } => ValueType::Numeric,
             Rule::Not | Rule::IsNull { .. } => ValueType::Boolean,
             Rule::Case { ty } => *ty,
             Rule::CaseMixed { out, .. } => *out,
@@ -141,7 +146,12 @@ impl Rule {
 /// Function arguments the grammar requires to be a string literal, as
 /// `(function, argument index)`: `regexp_count`'s pattern is compiled at
 /// define time. The registry has no field for it.
-pub const LITERAL_ONLY_ARGS: &[(&str, usize)] = &[("REGEXP_COUNT", 1)];
+pub const LITERAL_ONLY_ARGS: &[(&str, usize)] = &[("REGEXP_COUNT", 1), ("DATE_TRUNC", 0)];
+
+/// The operators whose right operand must be a given string literal, as
+/// `(operator, literal)`: the zone of `AT TIME ZONE`. The registry types the
+/// operand as `text`, which would draw any string.
+pub const LITERAL_RHS_OPERATORS: &[(Operator, &str)] = &[(Operator::AtTimeZone, "UTC")];
 
 /// The scales drawn for an argument in [`registry::INTEGER_LITERAL_ARGS`]:
 /// `ROUND(a, n)` of a large positive `n` makes a value with that many digits,
@@ -214,6 +224,11 @@ pub fn rules() -> Vec<Rule> {
         });
     }
     rules.push(Rule::Not);
+    for &ty in &types {
+        if registry::extract_fields(ty).is_some() {
+            rules.push(Rule::Extract { operand: ty });
+        }
+    }
     for width in FloatWidth::ALL {
         rules.push(Rule::NullIfLiteral { float: width });
     }
@@ -487,6 +502,10 @@ fn cast_target_text(target: ValueType, style: TextStyle) -> String {
     }
 }
 
+fn registry_extract<'e>(name: &str, args: &'e [Expr]) -> Option<(&'e str, &'e Expr)> {
+    trellis::dev::defs::ast::as_extract(name, args)
+}
+
 fn precedence_of(expr: &Expr) -> u8 {
     match expr {
         Expr::BinaryOp { op, .. } => registry::operator_spec(*op).precedence,
@@ -674,6 +693,22 @@ fn write_text(expr: &Expr, style: TextStyle, out: &mut String) {
             write_text(expr, style, out);
             out.push_str(&format!(" {as_} {})", cast_target_text(*target, style)));
         }
+        Expr::FunctionCall { name, args } if registry_extract(name, args).is_some() => {
+            let (field, operand) = registry_extract(name, args).expect("checked");
+            out.push_str(&keyword(style, "EXTRACT"));
+            out.push('(');
+            // The field is a bare word, in any case.
+            out.push_str(&if style.lower_names {
+                field.to_string()
+            } else {
+                field.to_uppercase()
+            });
+            out.push(' ');
+            out.push_str(&keyword(style, "FROM"));
+            out.push(' ');
+            write_text(operand, style, out);
+            out.push(')');
+        }
         Expr::FunctionCall { name, args } => {
             out.push_str(&if style.lower_names {
                 name.to_lowercase()
@@ -722,6 +757,7 @@ pub const UNADMITTED_FUNCTIONS: &[&str] = &[
     "TO_CHAR",
     "CURRENT_DATE",
     "GREATEST",
+    "DATE_PART",
 ];
 
 /// A column of type `ty`, when the schema has one.
@@ -791,7 +827,9 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
                             if i == j {
                                 bad.to_string()
                             } else if LITERAL_ONLY_ARGS.contains(&(name, j)) {
-                                "'a'".to_string()
+                                // A unit `DATE_TRUNC` takes, so the wrong
+                                // type beside it is what is refused.
+                                if name == "DATE_TRUNC" { "'day'" } else { "'a'" }.to_string()
                             } else if registry::INTEGER_LITERAL_ARGS.contains(&(name, j)) {
                                 "1".to_string()
                             } else if let Some(c) = column_of(columns, *t) {
@@ -875,6 +913,9 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
             "float8",
             "numeric(10, 2)",
             "decimal(10, 2)",
+            "timestamptz",
+            "timestamp(3)",
+            "date",
         ] {
             out.push(NearMiss {
                 kind: "cast-target",
@@ -1061,6 +1102,7 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
             });
         }
     }
+    date_near_misses(columns, &mut out);
     // Typed literals in a spelling Postgres accepts and define refuses.
     for (keyword, text) in NONCANONICAL_LITERALS {
         if TYPED_LITERALS.iter().any(|s| s.keyword == *keyword) {
@@ -1072,6 +1114,176 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
         }
     }
     out
+}
+
+/// The near misses of the date constructs: the traps each one has a named
+/// refusal for. The typed operand/field matrices come from the registry;
+/// what is listed here is what it cannot say.
+fn date_near_misses(columns: &[Column], out: &mut Vec<NearMiss>) {
+    let Some(date) = column_of(columns, DATE) else {
+        return;
+    };
+    let ts = column_of(columns, TIMESTAMP);
+    let tz = column_of(columns, ValueType::Other(PgType::TimestampTz));
+    let text = column_of(columns, ValueType::Text);
+    let mut miss = |kind: &'static str, text: String, needles: &[&str]| {
+        out.push(NearMiss {
+            kind,
+            text,
+            needles: needles.iter().map(|n| n.to_lowercase()).collect(),
+        });
+    };
+    // A field the type does not have, or that is refused for every type.
+    for field in registry::EXTRACT_CLOCK_FIELDS {
+        miss(
+            "extract-field-of-a-date",
+            format!("EXTRACT({field} FROM {date})"),
+            &["extract", field],
+        );
+    }
+    for field in registry::EXTRACT_REFUSED_FIELDS {
+        miss(
+            "extract-refused-field",
+            format!("EXTRACT({field} FROM {date})"),
+            &["extract", field],
+        );
+        if let Some(ts) = ts {
+            miss(
+                "extract-refused-field",
+                format!("EXTRACT({field} FROM {ts})"),
+                &["extract", field],
+            );
+        }
+    }
+    for field in ["years", "y", "bogus", "dayofweek"] {
+        miss(
+            "extract-unknown-field",
+            format!("EXTRACT({field} FROM {date})"),
+            &["extract", field],
+        );
+    }
+    // The STABLE overloads Postgres picks silently.
+    if let Some(tz) = tz {
+        miss(
+            "extract-timestamptz",
+            format!("EXTRACT(year FROM {tz})"),
+            &["extract", "at time zone"],
+        );
+        miss(
+            "date-trunc-timestamptz",
+            format!("DATE_TRUNC('day', {tz})"),
+            &["date_trunc", "at time zone"],
+        );
+        miss(
+            "cast-timestamptz-to-timestamp",
+            format!("CAST({tz} AS timestamp)"),
+            &["timestamp", "at time zone"],
+        );
+    }
+    miss(
+        "date-trunc-date",
+        format!("DATE_TRUNC('month', {date})"),
+        &["date_trunc", "cast"],
+    );
+    // A unit that is not one, and one that is not a literal.
+    for unit in ["days", "mon", "dow", "", "timezone"] {
+        if let Some(ts) = ts {
+            miss(
+                "date-trunc-unit",
+                format!("DATE_TRUNC('{unit}', {ts})"),
+                &["date_trunc", "units admitted"],
+            );
+        }
+    }
+    if let (Some(ts), Some(text)) = (ts, text) {
+        miss(
+            "date-trunc-unit-not-literal",
+            format!("DATE_TRUNC({text}, {ts})"),
+            &["date_trunc", "literal"],
+        );
+    }
+    // A zone that is not the literal 'UTC'.
+    if let Some(tz) = tz {
+        for zone in ["America/New_York", "utc", "+01:00", "Europe/Paris", ""] {
+            miss(
+                "at-time-zone-zone",
+                format!("{tz} AT TIME ZONE '{zone}'"),
+                &["at time zone", "'utc'"],
+            );
+        }
+        if let Some(text) = text {
+            miss(
+                "at-time-zone-not-literal",
+                format!("{tz} AT TIME ZONE {text}"),
+                &["at time zone", "literal"],
+            );
+        }
+        miss(
+            "at-time-zone-twice",
+            format!("({tz} AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'"),
+            &["at time zone", "timestamptz"],
+        );
+    }
+    if let Some(ts) = ts {
+        miss(
+            "at-time-zone-timestamp",
+            format!("{ts} AT TIME ZONE 'UTC'"),
+            &["at time zone", "timestamptz"],
+        );
+        miss(
+            "interval-difference",
+            format!("{ts} - {ts}"),
+            &["'-'", "interval", "extract(epoch"],
+        );
+    }
+    miss(
+        "at-time-zone-date",
+        format!("{date} AT TIME ZONE 'UTC'"),
+        &["at time zone", "cast(d as timestamp)"],
+    );
+    // Date arithmetic with an operand Postgres has no operator for.
+    miss(
+        "date-plus-date",
+        format!("{date} + {date}"),
+        &["'+'", "two dates"],
+    );
+    if let Some(big) = column_of(columns, ValueType::Integer(IntWidth::Int8)) {
+        miss(
+            "date-plus-bigint",
+            format!("{date} + {big}"),
+            &["'+'", "bigint", "smallint or integer"],
+        );
+    }
+    if let Some(n) = column_of(columns, ValueType::Numeric) {
+        miss(
+            "date-plus-numeric",
+            format!("{date} - {n}"),
+            &["'-'", "numeric"],
+        );
+    }
+    if let Some(int) = column_of(columns, ValueType::Integer(IntWidth::Int4)) {
+        miss(
+            "integer-minus-date",
+            format!("{int} - {date}"),
+            &["'-'", "number minus a date"],
+        );
+    }
+    // A constant date past `date`'s range, folded at plan time.
+    miss(
+        "constant-date-overflow",
+        "DATE '2024-02-29' + 2147483647".to_string(),
+        &["out of range", "date"],
+    );
+    miss(
+        "constant-date-underflow",
+        "DATE '2024-02-29' - 2147483647".to_string(),
+        &["out of range", "date"],
+    );
+    miss(
+        "constant-date-overflow",
+        "2147483647 + DATE '0001-01-01'".to_string(),
+        &["out of range", "date"],
+    );
 }
 
 /// Typed-literal spellings Postgres accepts and define refuses, as
@@ -1197,7 +1409,12 @@ pub mod strategy {
         fn rule(self: &Rc<Self>, rule: &Rule, depth: u32) -> Option<BoxedStrategy<Expr>> {
             match rule {
                 Rule::Op { op, lhs, rhs, .. } => {
-                    let (op, l, r) = (*op, self.expr(*lhs, depth)?, self.expr(*rhs, depth)?);
+                    let (op, l) = (*op, self.expr(*lhs, depth)?);
+                    // The zone of `AT TIME ZONE` is the literal, not a draw.
+                    let r = match LITERAL_RHS_OPERATORS.iter().find(|(o, _)| *o == op) {
+                        Some((_, zone)) => Just(Expr::StringLiteral((*zone).to_string())).boxed(),
+                        None => self.expr(*rhs, depth)?,
+                    };
                     Some(
                         (l, r)
                             .prop_map(move |(lhs, rhs)| Expr::BinaryOp {
@@ -1231,6 +1448,10 @@ pub mod strategy {
                         let arg = if registry::INTEGER_LITERAL_ARGS.contains(&(*name, i)) {
                             prop::sample::select(SCALE_LITERALS.to_vec())
                                 .prop_map(|n| Expr::NumberLiteral(n.to_string()))
+                                .boxed()
+                        } else if *name == "DATE_TRUNC" && i == 0 {
+                            prop::sample::select(registry::DATE_TRUNC_UNITS.to_vec())
+                                .prop_map(|u| Expr::StringLiteral(u.to_string()))
                                 .boxed()
                         } else if LITERAL_ONLY_ARGS.contains(&(*name, i)) {
                             let mut patterns = REGEX_PATTERNS.to_vec();
@@ -1292,6 +1513,18 @@ pub mod strategy {
                             .prop_map(move |e| Expr::Cast {
                                 expr: Box::new(e),
                                 target: to,
+                            })
+                            .boxed(),
+                    )
+                }
+                Rule::Extract { operand } => {
+                    let fields = registry::extract_fields(*operand)?;
+                    let operand = self.expr(*operand, depth)?;
+                    Some(
+                        (prop::sample::select(fields), operand)
+                            .prop_map(|(field, operand)| Expr::FunctionCall {
+                                name: "EXTRACT".to_string(),
+                                args: vec![Expr::StringLiteral(field.to_string()), operand],
                             })
                             .boxed(),
                     )

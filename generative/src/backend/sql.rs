@@ -265,6 +265,9 @@ pub(super) fn render_expr(expr: &Expr) -> String {
             "COUNT(*)".to_string()
         }
         Expr::FunctionCall { name, args } => {
+            if let Some((field, operand)) = trellis::dev::defs::ast::as_extract(name, args) {
+                return format!("EXTRACT({field} FROM {})", render_expr(operand));
+            }
             let args: Vec<String> = args.iter().map(render_expr).collect();
             format!("{name}({})", args.join(", "))
         }

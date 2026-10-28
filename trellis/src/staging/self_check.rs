@@ -157,7 +157,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio_postgres::types::PgLsn;
 
-use crate::defs::ast::{Expr, FieldDef, KeySpace, Predicate};
+use crate::defs::ast::{Expr, FieldDef, KeySpace, Predicate, as_extract};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
 use crate::defs::model::{Definition, TransformStatus};
@@ -1638,6 +1638,13 @@ impl<'a> FieldInliner<'a> {
             Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
                 "count(*)".to_string()
             }
+            Expr::FunctionCall { name, args } if as_extract(name, args).is_some() => {
+                let (field, operand) = as_extract(name, args).expect("checked");
+                format!(
+                    "extract({field} from {})",
+                    self.expr(operand, owner, depth + 1)?
+                )
+            }
             Expr::FunctionCall { name, args } => {
                 let mut rendered = Vec::with_capacity(args.len());
                 for (i, arg) in args.iter().enumerate() {
@@ -1666,7 +1673,7 @@ impl<'a> FieldInliner<'a> {
 pub(super) fn render_leaf(expr: &Expr) -> String {
     match expr {
         Expr::Column(name) | Expr::SourceColumn { column: name, .. } => quote_ident(name),
-        Expr::NumberLiteral(text) => format!("{text}::numeric"),
+        Expr::NumberLiteral(text) => number_literal(text),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
@@ -1701,6 +1708,10 @@ pub(super) fn render_leaf(expr: &Expr) -> String {
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             "count(*)".to_string()
         }
+        Expr::FunctionCall { name, args } if as_extract(name, args).is_some() => {
+            let (field, operand) = as_extract(name, args).expect("checked");
+            format!("extract({field} from {})", render_leaf(operand))
+        }
         Expr::FunctionCall { name, args } => {
             let rendered: Vec<String> = args
                 .iter()
@@ -1709,6 +1720,27 @@ pub(super) fn render_leaf(expr: &Expr) -> String {
                 .collect();
             format!("{}({})", name.to_lowercase(), rendered.join(", "))
         }
+    }
+}
+
+/// A number literal as SQL, typed as Postgres types the bare literal: an
+/// integral one `integer` when it fits, else `bigint`, else `numeric`, and a
+/// fractional one `numeric`. A date takes `date + integer` and no other
+/// numeric type, and `integer` arithmetic raises where it overflows, as the
+/// field it audits does.
+fn number_literal(text: &str) -> String {
+    let integral = !text.contains('.');
+    let pg_type = match text.parse::<i64>() {
+        Ok(value) if integral && i32::try_from(value).is_ok() => "integer",
+        Ok(_) if integral => "bigint",
+        _ => "numeric",
+    };
+    // `::` binds tighter than the sign: `-2147483648::integer` would cast
+    // 2147483648 first.
+    if text.starts_with('-') {
+        format!("({text})::{pg_type}")
+    } else {
+        format!("{text}::{pg_type}")
     }
 }
 
@@ -1767,9 +1799,9 @@ mod tests {
         // `x` reads the source column `x`; `b` reads the field `x`.
         assert_eq!(
             inliner.render(&fields[1]).unwrap(),
-            "((\"x\" + 1::numeric) + (\"x\" + 1::numeric))"
+            "((\"x\" + 1::integer) + (\"x\" + 1::integer))"
         );
-        assert_eq!(inliner.render(&fields[0]).unwrap(), "(\"x\" + 1::numeric)");
+        assert_eq!(inliner.render(&fields[0]).unwrap(), "(\"x\" + 1::integer)");
     }
 
     #[test]
@@ -1951,7 +1983,7 @@ mod tests {
             lhs: Box::new(Expr::Column("a".to_string())),
             rhs: Box::new(Expr::NumberLiteral("0".to_string())),
         };
-        assert_eq!(render_leaf(&expr), "(\"a\" > 0::numeric)");
+        assert_eq!(render_leaf(&expr), "(\"a\" > 0::integer)");
     }
 
     #[test]
@@ -1961,6 +1993,30 @@ mod tests {
             args: Vec::new(),
         };
         assert_eq!(render_leaf(&expr), "count(*)");
+    }
+
+    /// A bare literal is typed as Postgres types it, so `date + 1` and
+    /// `d + 2 * 3` audit as the field computes them.
+    #[test]
+    fn render_leaf_types_a_number_literal_as_postgres_does() {
+        for (text, expected) in [
+            ("1", "1::integer"),
+            ("2147483647", "2147483647::integer"),
+            ("2147483648", "2147483648::bigint"),
+            ("9223372036854775807", "9223372036854775807::bigint"),
+            ("9223372036854775808", "9223372036854775808::numeric"),
+            ("1.5", "1.5::numeric"),
+            ("-1", "(-1)::integer"),
+            ("-2147483648", "(-2147483648)::integer"),
+            ("-2147483649", "(-2147483649)::bigint"),
+            ("-0.5", "(-0.5)::numeric"),
+        ] {
+            assert_eq!(
+                render_leaf(&Expr::NumberLiteral(text.to_string())),
+                expected,
+                "{text}"
+            );
+        }
     }
 
     #[test]

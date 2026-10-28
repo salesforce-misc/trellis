@@ -287,9 +287,29 @@ pub enum ValidationError {
     },
     /// A `%` with a float operand: Postgres has no float modulo.
     FloatModulo { field: String },
+    /// A date or time construct (`+`/`-` on a temporal operand, `AT TIME
+    /// ZONE`, `DATE_TRUNC`, `EXTRACT`, or a `CAST` to `timestamp`) over an
+    /// operand type it does not admit. `construct` names it and `reason` says
+    /// why and gives the remedy.
+    TemporalOperand {
+        field: String,
+        construct: String,
+        found: ValueType,
+        reason: &'static str,
+    },
+    /// A literal a date construct needs to know at define time that is not
+    /// one it admits: the unit of `DATE_TRUNC`, the field of `EXTRACT`, or the
+    /// zone of `AT TIME ZONE`. `text` is what was written (`None` when it is
+    /// not a literal) and `reason` says what is admitted.
+    TemporalLiteral {
+        field: String,
+        construct: &'static str,
+        text: Option<String>,
+        reason: String,
+    },
     /// A `CAST` the grammar does not admit: only an integer to a strictly
-    /// wider integer, or any integer to `numeric`, converts losslessly and
-    /// totally.
+    /// wider integer, any integer to `numeric`, or a `date` to `timestamp`
+    /// converts exactly and without reading a setting.
     UnsupportedCast {
         field: String,
         from: ValueType,
@@ -1016,10 +1036,36 @@ impl fmt::Display for ValidationError {
             ValidationError::UnsupportedCast { field, from, to } => write!(
                 f,
                 "calculated field '{field}' casts a {from} value to {to}; the only casts \
-                 admitted are an integer to a wider integer and any integer to numeric, \
-                 because only those are lossless and cannot fail (see \"Supported sources \
-                 and targets\" in docs/transforms.md)"
+                 admitted are an integer to a wider integer, any integer to numeric and a \
+                 date to timestamp, because only those are exact and read no session \
+                 setting (see \"Supported sources and targets\" in docs/transforms.md)"
             ),
+            ValidationError::TemporalOperand {
+                field,
+                construct,
+                found,
+                reason,
+            } => write!(
+                f,
+                "calculated field '{field}': {construct} does not take a {found} value: \
+                 {reason} (see \"Supported sources and targets\" in docs/transforms.md)"
+            ),
+            ValidationError::TemporalLiteral {
+                field,
+                construct,
+                text,
+                reason,
+            } => match text {
+                Some(text) => write!(
+                    f,
+                    "calculated field '{field}': {construct} cannot take '{text}': {reason}"
+                ),
+                None => write!(
+                    f,
+                    "calculated field '{field}': {construct} needs a literal here, not a \
+                     column or expression: {reason}"
+                ),
+            },
             ValidationError::NumericFunctionArgument {
                 field,
                 function,
@@ -3056,6 +3102,10 @@ enum Constant {
     /// `NULL`: what `NULLIF` of two equal constants, or a `CASE` that no
     /// condition selects, folds to.
     Null,
+    /// A `date`, as its day count since 2000-01-01 (see `date_const`).
+    Date(i64),
+    /// A `timestamp`, as its microseconds since 2000-01-01 00:00:00.
+    Timestamp(i64),
 }
 
 impl Constant {
@@ -3064,7 +3114,11 @@ impl Constant {
         match self {
             Constant::Exact(n) => n.is_zero(),
             Constant::Float(v, _) => *v == 0.0,
-            Constant::Bool(_) | Constant::Literal(..) | Constant::Null => false,
+            Constant::Bool(_)
+            | Constant::Literal(..)
+            | Constant::Null
+            | Constant::Date(_)
+            | Constant::Timestamp(_) => false,
         }
     }
 
@@ -3076,7 +3130,11 @@ impl Constant {
                 .ok()
                 .map(|v| (v, crate::float::FloatWidth::Float8)),
             Constant::Float(v, w) => Some((*v, *w)),
-            Constant::Bool(_) | Constant::Literal(..) | Constant::Null => None,
+            Constant::Bool(_)
+            | Constant::Literal(..)
+            | Constant::Null
+            | Constant::Date(_)
+            | Constant::Timestamp(_) => None,
         }
     }
 
@@ -3089,6 +3147,8 @@ impl Constant {
         Some(match (self, other) {
             (Constant::Exact(a), Constant::Exact(b)) => exact_order(a, b),
             (Constant::Bool(a), Constant::Bool(b)) => a.cmp(b),
+            (Constant::Date(a), Constant::Date(b))
+            | (Constant::Timestamp(a), Constant::Timestamp(b)) => a.cmp(b),
             (Constant::Literal(ta, a), Constant::Literal(tb, b))
                 if ta == tb
                     && matches!(
@@ -3119,6 +3179,8 @@ impl Constant {
             }
             (Constant::Literal(ta, a), Constant::Literal(tb, b)) if ta == tb => a == b,
             (Constant::Bool(a), Constant::Bool(b)) => a == b,
+            (Constant::Date(a), Constant::Date(b))
+            | (Constant::Timestamp(a), Constant::Timestamp(b)) => a == b,
             (a, b) => float_order(a.as_float()?.0, b.as_float()?.0) == std::cmp::Ordering::Equal,
         })
     }
@@ -3228,6 +3290,14 @@ fn fold_constant<'f>(
             .ok()
             .map(|v| Constant::Float(v, *width)),
         Expr::StringLiteral(text) => Some(Constant::Literal(ValueType::Text, text.clone())),
+        Expr::TypedLiteral {
+            value_type: ValueType::Other(PgType::Date),
+            text,
+        } => super::date_const::days_of_canonical_date(text).map(Constant::Date),
+        Expr::TypedLiteral {
+            value_type: ValueType::Other(PgType::Timestamp),
+            text,
+        } => super::date_const::micros_of_canonical_timestamp(text).map(Constant::Timestamp),
         Expr::TypedLiteral { value_type, text } => {
             Some(Constant::Literal(*value_type, text.clone()))
         }
@@ -3316,9 +3386,16 @@ fn fold_constant<'f>(
         }
         // An arithmetic operator is strict: a `NULL` operand makes it `NULL`.
         Expr::BinaryOp { op, lhs, rhs } => {
+            let operator = *op;
             let op = ConstOp::of_operator(*op)?;
             match (recurse(lhs, field_name)?, recurse(rhs, field_name)?) {
                 (Constant::Null, _) | (_, Constant::Null) => Some(Constant::Null),
+                (
+                    a @ (Constant::Date(_) | Constant::Exact(_)),
+                    b @ (Constant::Date(_) | Constant::Exact(_)),
+                ) if matches!(a, Constant::Date(_)) || matches!(b, Constant::Date(_)) => {
+                    date_constant_op(operator, &a, &b)?
+                }
                 (Constant::Exact(a), Constant::Exact(b)) => {
                     op.exact(&a, Some(&b)).map(Constant::Exact)
                 }
@@ -3335,7 +3412,21 @@ fn fold_constant<'f>(
             Constant::Exact(n) => Some(Constant::Exact(n.negate())),
             Constant::Float(v, w) => Some(Constant::Float(-v, w)),
             Constant::Null => Some(Constant::Null),
-            Constant::Bool(_) | Constant::Literal(..) => None,
+            Constant::Bool(_)
+            | Constant::Literal(..)
+            | Constant::Date(_)
+            | Constant::Timestamp(_) => None,
+        },
+        // A date casts to its midnight, when it is in `timestamp`'s range.
+        Expr::Cast {
+            expr,
+            target: ValueType::Other(PgType::Timestamp),
+        } => match recurse(expr, field_name)? {
+            Constant::Null => Some(Constant::Null),
+            Constant::Date(days) if days <= super::date_const::MAX_TIMESTAMP_DATE_DAYS => Some(
+                Constant::Timestamp(super::date_const::midnight_micros(days)),
+            ),
+            _ => None,
         },
         // A widening cast keeps the value.
         Expr::Cast { expr, .. } => recurse(expr, field_name),
@@ -3344,7 +3435,10 @@ fn fold_constant<'f>(
                 Constant::Exact(n) => Some(Constant::Exact(n.abs())),
                 Constant::Float(v, w) => Some(Constant::Float(v.abs(), w)),
                 Constant::Null => Some(Constant::Null),
-                Constant::Bool(_) | Constant::Literal(..) => None,
+                Constant::Bool(_)
+                | Constant::Literal(..)
+                | Constant::Date(_)
+                | Constant::Timestamp(_) => None,
             }
         }
         // The first argument that is not `NULL` is the result.
@@ -3378,6 +3472,33 @@ fn fold_constant<'f>(
         }
         _ => None,
     }
+}
+
+/// `date ± integer`, `integer + date` and `date - date` over constants:
+/// `Some(Some(value))` for the result, `Some(None)` when it leaves `date`'s
+/// range (Postgres raises `22008`), and `None` for any other operand pair.
+fn date_constant_op(
+    op: super::ast::Operator,
+    a: &Constant,
+    b: &Constant,
+) -> Option<Option<Constant>> {
+    use super::ast::Operator;
+    let days = |n: &crate::numeric::Numeric| n.to_string().parse::<i64>().ok();
+    let in_range = |d: i64| {
+        (super::date_const::MIN_DATE_DAYS..=super::date_const::MAX_DATE_DAYS)
+            .contains(&d)
+            .then_some(Constant::Date(d))
+    };
+    Some(match (op, a, b) {
+        (Operator::Add, Constant::Date(d), Constant::Exact(n))
+        | (Operator::Add, Constant::Exact(n), Constant::Date(d)) => in_range(d + days(n)?),
+        (Operator::Subtract, Constant::Date(d), Constant::Exact(n)) => in_range(d - days(n)?),
+        // Two dates in range differ by less than an `integer` holds.
+        (Operator::Subtract, Constant::Date(x), Constant::Date(y)) => Some(Constant::Exact(
+            crate::numeric::Numeric::parse(&(x - y).to_string()).ok()?,
+        )),
+        _ => return None,
+    })
 }
 
 /// Whether `expr` reads no column (directly or through a calculated field)
@@ -3652,7 +3773,12 @@ fn exact_constant<'f>(
 ) -> Option<crate::numeric::Numeric> {
     match fold_constant(expr, field_name, source_columns, fields_by_name, memo, 0)? {
         Constant::Exact(n) => Some(n),
-        Constant::Float(..) | Constant::Bool(_) | Constant::Literal(..) | Constant::Null => None,
+        Constant::Float(..)
+        | Constant::Bool(_)
+        | Constant::Literal(..)
+        | Constant::Null
+        | Constant::Date(_)
+        | Constant::Timestamp(_) => None,
     }
 }
 
@@ -4277,6 +4403,18 @@ fn infer_expr(
             }
             Ok(lhs_t)
         }
+        Expr::FunctionCall { name, args } if name == "EXTRACT" || name == "DATE_TRUNC" => {
+            infer_date_part_call(
+                name,
+                args,
+                field_name,
+                source_columns,
+                fields_by_name,
+                types,
+                in_progress,
+                folded,
+            )
+        }
         Expr::BinaryOp { op, lhs, rhs } => {
             let lhs_t = infer_expr(
                 lhs,
@@ -4304,6 +4442,9 @@ fn infer_expr(
             // to compare against. `OperatorSpec::arg_types` survives only as
             // the canonical shape a `TypeMismatch` names.
             if let Some(result) = super::registry::operator_result_type(*op, lhs_t, rhs_t) {
+                if *op == super::ast::Operator::AtTimeZone {
+                    check_utc_zone(rhs, field_name)?;
+                }
                 if folded && let Some(kind) = ConstOp::of_operator(*op) {
                     check_constant_op(
                         expr,
@@ -4315,11 +4456,25 @@ fn infer_expr(
                         source_columns,
                         fields_by_name,
                     )?;
+                    if lhs_t == DATE_TYPE || rhs_t == DATE_TYPE {
+                        check_constant_date_op(
+                            expr,
+                            *op,
+                            lhs,
+                            rhs,
+                            field_name,
+                            source_columns,
+                            fields_by_name,
+                        )?;
+                    }
                 }
                 return Ok(result);
             }
             if op.is_comparison() {
                 return comparison_type(*op, lhs, rhs, lhs_t, rhs_t, field_name, folded);
+            }
+            if let Some(refusal) = temporal_operator_refusal(*op, lhs_t, rhs_t, field_name) {
+                return Err(refusal);
             }
             if lhs_t.is_numeric_family() && rhs_t.is_numeric_family() {
                 match op {
@@ -4400,13 +4555,45 @@ fn infer_expr(
                 in_progress,
                 folded,
             )?;
-            super::registry::cast_result_type(operand_t, *target).ok_or_else(|| {
-                ValidationError::UnsupportedCast {
+            let result =
+                super::registry::cast_result_type(operand_t, *target).ok_or_else(|| {
+                    match (operand_t, *target) {
+                        (
+                            ValueType::Other(PgType::TimestampTz),
+                            ValueType::Other(PgType::Timestamp),
+                        ) => ValidationError::TemporalOperand {
+                            field: field_name.to_string(),
+                            construct: "CAST(... AS timestamp)".to_string(),
+                            found: operand_t,
+                            reason: "the conversion reads the session time zone; use \
+                                    <value> AT TIME ZONE 'UTC', which gives the timestamp in UTC",
+                        },
+                        _ => ValidationError::UnsupportedCast {
+                            field: field_name.to_string(),
+                            from: operand_t,
+                            to: *target,
+                        },
+                    }
+                })?;
+            if folded
+                && operand_t == DATE_TYPE
+                && let Some(Constant::Date(days)) = fold_constant(
+                    operand,
+                    field_name,
+                    source_columns,
+                    fields_by_name,
+                    &mut HashMap::new(),
+                    0,
+                )
+                && days > super::date_const::MAX_TIMESTAMP_DATE_DAYS
+            {
+                return Err(ValidationError::ConstantOutOfRange {
                     field: field_name.to_string(),
-                    from: operand_t,
-                    to: *target,
-                }
-            })
+                    text: super::ast::render_field_expr(expr),
+                    target: result,
+                });
+            }
+            Ok(result)
         }
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
             // The planner simplifies the arguments in order and stops at the
@@ -4657,6 +4844,283 @@ fn infer_expr(
             Ok(spec.return_type)
         }
     }
+}
+
+const DATE_TYPE: ValueType = ValueType::Other(PgType::Date);
+const TIMESTAMP_TYPE: ValueType = ValueType::Other(PgType::Timestamp);
+const TIMESTAMPTZ_TYPE: ValueType = ValueType::Other(PgType::TimestampTz);
+
+/// The date and time types, the ones `+` and `-` refuse by name.
+fn is_temporal(t: ValueType) -> bool {
+    matches!(
+        t,
+        ValueType::Other(
+            PgType::Date
+                | PgType::Time
+                | PgType::TimeTz
+                | PgType::Timestamp
+                | PgType::TimestampTz
+                | PgType::Interval
+        )
+    )
+}
+
+/// The named refusal for a `+`, `-` or `AT TIME ZONE` over operand types
+/// [`super::registry::operator_result_type`] does not admit, when one of them
+/// is a date or time type; `None` for any other pair (the caller's generic
+/// type mismatch applies).
+fn temporal_operator_refusal(
+    op: super::ast::Operator,
+    lhs_t: ValueType,
+    rhs_t: ValueType,
+    field_name: &str,
+) -> Option<ValidationError> {
+    use super::ast::Operator;
+    let operand_error = |construct: &str, found: ValueType, reason: &'static str| {
+        Some(ValidationError::TemporalOperand {
+            field: field_name.to_string(),
+            construct: construct.to_string(),
+            found,
+            reason,
+        })
+    };
+    if op == Operator::AtTimeZone {
+        if lhs_t == TIMESTAMPTZ_TYPE {
+            return Some(ValidationError::TemporalLiteral {
+                field: field_name.to_string(),
+                construct: "AT TIME ZONE",
+                text: None,
+                reason: "the zone must be the string literal 'UTC'".to_string(),
+            });
+        }
+        let reason = match lhs_t {
+            TIMESTAMP_TYPE => {
+                "on a timestamp it gives a timestamptz, which nothing here accepts; \
+                 AT TIME ZONE takes a timestamptz and gives the timestamp it is in UTC"
+            }
+            DATE_TYPE => {
+                "Postgres converts a date to timestamptz through the session time zone \
+                 first; use CAST(d AS timestamp), which has no zone"
+            }
+            _ => "AT TIME ZONE takes a timestamptz",
+        };
+        return operand_error("AT TIME ZONE", lhs_t, reason);
+    }
+    if !matches!(op, Operator::Add | Operator::Subtract)
+        || !(is_temporal(lhs_t) || is_temporal(rhs_t))
+    {
+        return None;
+    }
+    let symbol = super::registry::operator_spec(op).symbol;
+    let construct = format!("'{symbol}'");
+    let interval = |t: ValueType| t == ValueType::Other(PgType::Interval);
+    let integer = |t: ValueType| matches!(t, ValueType::Integer(_));
+    let (found, reason) = if interval(lhs_t) || interval(rhs_t) {
+        (
+            if interval(lhs_t) { lhs_t } else { rhs_t },
+            "interval arithmetic is not admitted (a month is not a fixed number of days, so \
+             results depend on the date they are added to). For a duration in seconds use \
+             EXTRACT(EPOCH FROM b) - EXTRACT(EPOCH FROM a)",
+        )
+    } else if op == Operator::Subtract && is_temporal(lhs_t) && is_temporal(rhs_t) {
+        (
+            lhs_t,
+            "the difference of two timestamps (or of a date and a timestamp) is an \
+             interval, which is not admitted. For a duration in seconds use \
+             EXTRACT(EPOCH FROM b) - EXTRACT(EPOCH FROM a); two dates subtract to days",
+        )
+    } else if op == Operator::Add && lhs_t == DATE_TYPE && rhs_t == DATE_TYPE {
+        (
+            lhs_t,
+            "adding two dates has no meaning. Subtract them for the days between, or add \
+             a number of days to one",
+        )
+    } else if (lhs_t == DATE_TYPE && (rhs_t.is_numeric_family()))
+        || (rhs_t == DATE_TYPE && lhs_t.is_numeric_family())
+    {
+        let other = if lhs_t == DATE_TYPE { rhs_t } else { lhs_t };
+        if op == Operator::Subtract && lhs_t != DATE_TYPE {
+            (
+                lhs_t,
+                "a number minus a date has no meaning; subtract the number from the date \
+                 instead",
+            )
+        } else {
+            (
+                other,
+                "date arithmetic takes a smallint or integer number of days; Postgres has \
+                 no operator for any other numeric type",
+            )
+        }
+    } else if (is_temporal(lhs_t) && integer(rhs_t)) || (is_temporal(rhs_t) && integer(lhs_t)) {
+        (
+            if is_temporal(lhs_t) { lhs_t } else { rhs_t },
+            "Postgres has no operator that adds a number to this type; only a date takes \
+             a number of days. Truncate with DATE_TRUNC, or take a part with EXTRACT",
+        )
+    } else {
+        (
+            if is_temporal(lhs_t) { lhs_t } else { rhs_t },
+            "the only date arithmetic admitted is a date plus or minus a number of days \
+             and the days between two dates",
+        )
+    };
+    operand_error(&construct, found, reason)
+}
+
+/// Refuses an `AT TIME ZONE` whose zone is not the string literal `'UTC'`:
+/// any other zone's offsets come from the tz database, which changes.
+fn check_utc_zone(zone: &Expr, field_name: &str) -> Result<(), ValidationError> {
+    let refused = |text: Option<String>| ValidationError::TemporalLiteral {
+        field: field_name.to_string(),
+        construct: "AT TIME ZONE",
+        text,
+        reason: "only the literal 'UTC' is admitted: any other zone's offsets come from the \
+                 time zone database, which a release can change under past results"
+            .to_string(),
+    };
+    match zone {
+        Expr::StringLiteral(text) if text == "UTC" => Ok(()),
+        Expr::StringLiteral(text) => Err(refused(Some(text.clone()))),
+        _ => Err(refused(None)),
+    }
+}
+
+/// Refuses a `date ± integer` (or `integer + date`) of constants whose result
+/// leaves `date`'s range, which Postgres folds and raises `22008` for at plan
+/// time, whatever the row.
+fn check_constant_date_op<'f>(
+    expr: &Expr,
+    op: super::ast::Operator,
+    lhs: &Expr,
+    rhs: &Expr,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&'f str, &'f super::ast::FieldDef>,
+) -> Result<(), ValidationError> {
+    let mut memo = HashMap::new();
+    let mut fold =
+        |e: &Expr| fold_constant(e, field_name, source_columns, fields_by_name, &mut memo, 0);
+    let (Some(a), Some(b)) = (fold(lhs), fold(rhs)) else {
+        return Ok(());
+    };
+    if let Some(None) = date_constant_op(op, &a, &b) {
+        return Err(ValidationError::ConstantOutOfRange {
+            field: field_name.to_string(),
+            text: super::ast::render_field_expr(expr),
+            target: DATE_TYPE,
+        });
+    }
+    Ok(())
+}
+
+/// Types `EXTRACT(<field> FROM <date or timestamp>)` (a `numeric`) and
+/// `DATE_TRUNC('<unit>', <timestamp>)` (a `timestamp`), or names why the
+/// call is refused.
+#[allow(clippy::too_many_arguments)]
+fn infer_date_part_call(
+    name: &str,
+    args: &[Expr],
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
+    types: &mut HashMap<String, ValueType>,
+    in_progress: &mut HashSet<String>,
+    folded: bool,
+) -> Result<ValueType, ValidationError> {
+    let extract = name == "EXTRACT";
+    let construct: &'static str = if extract { "EXTRACT" } else { "DATE_TRUNC" };
+    let literal_error = |text: Option<String>, reason: String| ValidationError::TemporalLiteral {
+        field: field_name.to_string(),
+        construct,
+        text,
+        reason,
+    };
+    let [word, operand] = args else {
+        return Err(literal_error(
+            None,
+            "it takes a unit or field and one operand".to_string(),
+        ));
+    };
+    // The unit of `DATE_TRUNC` and the field of `EXTRACT` are literals the
+    // parser keeps as lower-case string literals.
+    let Expr::StringLiteral(word) = word else {
+        return Err(literal_error(
+            None,
+            if extract {
+                "the field is a bare word, as in EXTRACT(year FROM d)".to_string()
+            } else {
+                "the unit is a string literal, as in DATE_TRUNC('month', ts)".to_string()
+            },
+        ));
+    };
+    let operand_t = infer_expr(
+        operand,
+        field_name,
+        source_columns,
+        fields_by_name,
+        types,
+        in_progress,
+        folded,
+    )?;
+    let operand_error = |reason: &'static str| ValidationError::TemporalOperand {
+        field: field_name.to_string(),
+        construct: construct.to_string(),
+        found: operand_t,
+        reason,
+    };
+    if extract {
+        let Some(fields) = super::registry::extract_fields(operand_t) else {
+            return Err(operand_error(if operand_t == TIMESTAMPTZ_TYPE {
+                "EXTRACT of a timestamptz reads the session time zone. Extract from the \
+                 timestamp in UTC: EXTRACT(hour FROM ts AT TIME ZONE 'UTC')"
+            } else {
+                "EXTRACT takes a date or a timestamp"
+            }));
+        };
+        if !fields.contains(&word.as_str()) {
+            let reason = if super::registry::EXTRACT_REFUSED_FIELDS.contains(&word.as_str()) {
+                "its value is not the same for every type, or needs a time zone this \
+                 value does not have"
+                    .to_string()
+            } else if super::registry::EXTRACT_CLOCK_FIELDS.contains(&word.as_str()) {
+                format!(
+                    "a date has no {word}; extract it from the timestamp: EXTRACT({word} FROM \
+                     CAST(d AS timestamp))"
+                )
+            } else {
+                format!(
+                    "the fields admitted for a {operand_t} are {}",
+                    fields.join(", ")
+                )
+            };
+            return Err(literal_error(Some(word.clone()), reason));
+        }
+        return Ok(ValueType::Numeric);
+    }
+    if !super::registry::DATE_TRUNC_UNITS.contains(&word.as_str()) {
+        return Err(literal_error(
+            Some(word.clone()),
+            format!(
+                "the units admitted are {}",
+                super::registry::DATE_TRUNC_UNITS.join(", ")
+            ),
+        ));
+    }
+    if operand_t != TIMESTAMP_TYPE {
+        return Err(operand_error(match operand_t {
+            DATE_TYPE => {
+                "Postgres resolves a date to the timestamptz overload, which reads the session \
+                 time zone. Truncate the timestamp: DATE_TRUNC('month', CAST(d AS timestamp))"
+            }
+            TIMESTAMPTZ_TYPE => {
+                "DATE_TRUNC of a timestamptz reads the session time zone. Truncate the \
+                 timestamp in UTC: DATE_TRUNC('day', ts AT TIME ZONE 'UTC')"
+            }
+            _ => "DATE_TRUNC takes a timestamp",
+        }));
+    }
+    Ok(TIMESTAMP_TYPE)
 }
 
 /// Types a call of a function with several signatures (`ABS`, `CEIL`,

@@ -439,7 +439,8 @@ pub enum Expr {
     /// negative [`Expr::NumberLiteral`], as Postgres reads it). The result
     /// has the operand's type.
     Negate(Box<Expr>),
-    /// `CAST(<operand> AS <target>)` for the lossless integer widenings
+    /// `CAST(<operand> AS <target>)` for the casts (the lossless integer widenings
+    /// and `date` to `timestamp`)
     /// [`super::registry::cast_result_type`] admits. A cast of a quoted
     /// literal is an [`Expr::TypedLiteral`] instead.
     Cast { expr: Box<Expr>, target: ValueType },
@@ -659,6 +660,9 @@ pub enum Operator {
     IsNotDistinctFrom,
     And,
     Or,
+    /// `<timestamptz> AT TIME ZONE 'UTC'`: the right operand is the zone, a
+    /// string literal that validation admits only as `UTC`.
+    AtTimeZone,
 }
 
 /// Renders `def` back into valid Trellis grammar text — the inverse of
@@ -769,10 +773,15 @@ pub(crate) fn render_field_expr(expr: &Expr) -> String {
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             "COUNT(*)".to_string()
         }
-        Expr::FunctionCall { name, args } => {
-            let rendered_args: Vec<String> = args.iter().map(render_field_expr).collect();
-            format!("{name}({})", rendered_args.join(", "))
-        }
+        Expr::FunctionCall { name, args } => match as_extract(name, args) {
+            Some((field, operand)) => {
+                format!("EXTRACT({field} FROM {})", render_field_expr(operand))
+            }
+            None => {
+                let rendered_args: Vec<String> = args.iter().map(render_field_expr).collect();
+                format!("{name}({})", rendered_args.join(", "))
+            }
+        },
         Expr::Negate(operand) => format!("(-{})", render_field_expr(operand)),
         Expr::Cast { expr, target } => {
             format!("CAST({} AS {target})", render_field_expr(expr))
@@ -801,6 +810,18 @@ pub(crate) fn render_field_expr(expr: &Expr) -> String {
             text.push_str(" END");
             text
         }
+    }
+}
+
+/// The field and operand of an `EXTRACT(<field> FROM <operand>)` call. The
+/// call is a [`Expr::FunctionCall`] named `EXTRACT` whose first argument is
+/// the field as a [`Expr::StringLiteral`], so every walk over a call's
+/// arguments visits the operand, and a renderer spells the pair with `FROM`
+/// instead of a comma.
+pub fn as_extract<'e>(name: &str, args: &'e [Expr]) -> Option<(&'e str, &'e Expr)> {
+    match (name, args) {
+        ("EXTRACT", [Expr::StringLiteral(field), operand]) => Some((field, operand)),
+        _ => None,
     }
 }
 

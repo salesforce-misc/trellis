@@ -321,7 +321,7 @@ fn a_general_cast_is_rejected_with_a_pointed_error() {
         let message = err.to_string();
         assert!(
             message.contains("'date' is not a CAST target")
-                && message.contains("only integer, bigint, numeric are supported"),
+                && message.contains("only integer, bigint, numeric, timestamp are supported"),
             "{bad}: {message}"
         );
     }

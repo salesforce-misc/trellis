@@ -34,6 +34,7 @@ pub mod catalog;
 pub mod chunk_queue;
 pub(crate) mod copies;
 pub(crate) mod copy_type;
+mod date_const;
 pub mod ddl;
 pub mod error;
 pub mod grammar;
@@ -121,6 +122,8 @@ pub use validate::{
 
 #[cfg(test)]
 mod arithmetic_tests;
+#[cfg(test)]
+mod date_tests;
 #[cfg(test)]
 mod logic_tests;
 

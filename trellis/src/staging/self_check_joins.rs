@@ -74,7 +74,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use tokio_postgres::types::PgLsn;
 
-use crate::defs::ast::{Expr, JoinKind, KeySpace, Predicate, TransformDef};
+use crate::defs::ast::{Expr, JoinKind, KeySpace, Predicate, TransformDef, as_extract};
 use crate::defs::catalog;
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::join::{self as spec, HiddenTable, Side as JoinSide};
@@ -231,6 +231,13 @@ fn render(def: &TransformDef, expr: &Expr, from: &str, joined: &str) -> Result<S
         })?,
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             "count(*)".to_string()
+        }
+        Expr::FunctionCall { name, args } if as_extract(name, args).is_some() => {
+            let (field, operand) = as_extract(name, args).expect("checked");
+            format!(
+                "extract({field} from {})",
+                render(def, operand, from, joined)?
+            )
         }
         Expr::FunctionCall { name, args } => {
             let mut rendered = Vec::with_capacity(args.len());
@@ -922,6 +929,13 @@ fn render_signed(def: &TransformDef, expr: &Expr, args: &[Expr]) -> Result<Strin
                               else ({sum})::numeric / ({count})::numeric end)"
                         ),
                     }
+                }
+                _ if as_extract(name, called).is_some() => {
+                    let (field, operand) = as_extract(name, called).expect("checked");
+                    format!(
+                        "extract({field} from {})",
+                        render_signed(def, operand, args)?
+                    )
                 }
                 _ => {
                     let mut rendered = Vec::with_capacity(called.len());
