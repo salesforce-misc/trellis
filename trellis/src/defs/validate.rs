@@ -219,12 +219,14 @@ pub enum ValidationError {
         lhs: ValueType,
         rhs: ValueType,
     },
-    /// `NULLIF(a, b)` with an integer `a` and a `numeric` `b`: Postgres types
-    /// the result `numeric` (it casts `a`), not `a`'s type.
-    NullIfIntegerAgainstNumeric {
+    /// `NULLIF(a, b)` where Postgres casts `a` to compare it (an integer
+    /// beside a `numeric`, an exact numeric beside a float), so the result
+    /// has that cast's type rather than `a`'s.
+    NullIfFirstArgumentCast {
         field: String,
         lhs: ValueType,
         rhs: ValueType,
+        result: ValueType,
     },
     /// A `CASE` condition that is not a `boolean`.
     CaseConditionNotBoolean { field: String, found: ValueType },
@@ -1056,11 +1058,17 @@ impl fmt::Display for ValidationError {
                  temporal type (date, timestamp, timestamptz, time, timetz), two booleans, two \
                  uuids, or two text values (text with =, <>, != and IS [NOT] DISTINCT FROM only)"
             ),
-            ValidationError::NullIfIntegerAgainstNumeric { field, lhs, rhs } => write!(
+            ValidationError::NullIfFirstArgumentCast {
+                field,
+                lhs,
+                rhs,
+                result,
+            } => write!(
                 f,
                 "calculated field '{field}': NULLIF of a {lhs} value and a {rhs} value is a \
-                 numeric in Postgres, not the first argument's type. Cast the first argument: \
-                 NULLIF(CAST(a AS numeric), b)"
+                 {result} in Postgres, which casts the first argument to compare it, not the \
+                 first argument's type. Cast the first argument to {result} yourself, or \
+                 write the {rhs} value first"
             ),
             ValidationError::CaseConditionNotBoolean { field, found } => write!(
                 f,
@@ -3970,14 +3978,22 @@ fn infer_expr(
                 field_name,
                 folded,
             )?;
-            // Postgres casts an integer first argument to `numeric` beside a
-            // `numeric` second one (there is no `integer = numeric`
-            // operator), so the result is not the first argument's type.
-            if matches!(lhs_t, ValueType::Integer(_)) && rhs_t == ValueType::Numeric {
-                return Err(ValidationError::NullIfIntegerAgainstNumeric {
+            // Postgres casts the first argument when no `=` takes the pair as
+            // it is (there is no `integer = numeric` or `numeric = float8`
+            // operator), so the result is that cast's type, not `lhs_t`.
+            let cast = match (lhs_t, rhs_t) {
+                (ValueType::Integer(_), ValueType::Numeric) => Some(ValueType::Numeric),
+                (l, ValueType::Float(_)) if l.is_exact_numeric_family() => {
+                    Some(ValueType::Float(crate::float::FloatWidth::Float8))
+                }
+                _ => None,
+            };
+            if let Some(result) = cast {
+                return Err(ValidationError::NullIfFirstArgumentCast {
                     field: field_name.to_string(),
                     lhs: lhs_t,
                     rhs: rhs_t,
+                    result,
                 });
             }
             Ok(lhs_t)

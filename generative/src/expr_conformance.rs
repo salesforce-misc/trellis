@@ -164,6 +164,41 @@ fn bases() -> Vec<Base> {
             ],
         },
         Base {
+            stem: "u",
+            pg: "uuid",
+            ty: ValueType::Uuid,
+            pool: &[
+                "00000000-0000-0000-0000-000000000000",
+                "ffffffff-ffff-ffff-ffff-ffffffffffff",
+                "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+                "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12",
+            ],
+        },
+        Base {
+            stem: "tm",
+            pg: "time",
+            ty: ValueType::Other(PgType::Time),
+            pool: &["00:00:00", "23:59:59.999999", "12:30:00", "24:00:00"],
+        },
+        Base {
+            stem: "tt",
+            pg: "timetz",
+            ty: ValueType::Other(PgType::TimeTz),
+            pool: &["00:00:00+00", "12:30:00-05", "12:30:00+05", "23:59:59.5+14"],
+        },
+        Base {
+            stem: "tz",
+            pg: "timestamptz",
+            ty: ValueType::Other(PgType::TimestampTz),
+            pool: &[
+                "2024-02-29 12:00:00+00",
+                "2024-02-29 07:00:00-05",
+                "infinity",
+                "-infinity",
+                "4713-01-01 00:00:00+00 BC",
+            ],
+        },
+        Base {
             stem: "ts",
             pg: "timestamp",
             ty: ValueType::Other(PgType::Timestamp),
@@ -252,8 +287,12 @@ pub fn has_constant_call(expr: &Expr) -> bool {
     match expr {
         Expr::BinaryOp { lhs, rhs, .. } => has_constant_call(lhs) || has_constant_call(rhs),
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => has_constant_call(operand),
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            expr.logic_children().into_iter().any(has_constant_call)
+        }
         Expr::FunctionCall { name, args } => {
-            (name != "COALESCE" && !reads_column(expr)) || args.iter().any(has_constant_call)
+            (name != "COALESCE" && name != "NULLIF" && !reads_column(expr))
+                || args.iter().any(has_constant_call)
         }
         _ => false,
     }
@@ -265,6 +304,9 @@ fn reads_column(expr: &Expr) -> bool {
         Expr::Column(_) | Expr::SourceColumn { .. } => true,
         Expr::BinaryOp { lhs, rhs, .. } => reads_column(lhs) || reads_column(rhs),
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => reads_column(operand),
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            expr.logic_children().into_iter().any(reads_column)
+        }
         Expr::FunctionCall { args, .. } => args.iter().any(reads_column),
         _ => false,
     }
@@ -287,6 +329,7 @@ fn is_range_refusal(err: &ValidationError) -> bool {
         ValidationError::CoalesceLiteralOutOfRange { .. }
             | ValidationError::ConstantOutOfRange { .. }
             | ValidationError::FloatComparisonLiteralOutOfRange { .. }
+            | ValidationError::CaseLiteralOutOfRange { .. }
     )
 }
 
@@ -774,6 +817,9 @@ impl Fixture {
                     stack.push(rhs);
                 }
                 Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => stack.push(operand),
+                Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+                    stack.extend(e.logic_children_mut());
+                }
                 Expr::FunctionCall { name, args } => {
                     if name == "REGEXP_COUNT"
                         && let Some(Expr::StringLiteral(pattern)) = args.get(1)
@@ -808,6 +854,11 @@ impl Fixture {
             Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
                 Box::pin(self.fold_constant_calls(operand)).await;
             }
+            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+                for child in expr.logic_children_mut() {
+                    Box::pin(self.fold_constant_calls(child)).await;
+                }
+            }
             Expr::FunctionCall { args, .. } => {
                 for arg in args.iter_mut() {
                     Box::pin(self.fold_constant_calls(arg)).await;
@@ -818,7 +869,7 @@ impl Fixture {
         let Expr::FunctionCall { name, .. } = &*expr else {
             return;
         };
-        if name == "COALESCE" || reads_column(expr) {
+        if name == "COALESCE" || name == "NULLIF" || reads_column(expr) {
             return;
         }
         let rendered = render_expr_sql(expr);
@@ -895,6 +946,9 @@ fn has_coalesce(expr: &Expr) -> bool {
     match expr {
         Expr::BinaryOp { lhs, rhs, .. } => has_coalesce(lhs) || has_coalesce(rhs),
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => has_coalesce(operand),
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            expr.logic_children().into_iter().any(has_coalesce)
+        }
         Expr::FunctionCall { name, args } => name == "COALESCE" || args.iter().any(has_coalesce),
         _ => false,
     }
@@ -910,6 +964,11 @@ fn normalize_negations(expr: &mut Expr) {
         }
         Expr::FunctionCall { args, .. } => args.iter_mut().for_each(normalize_negations),
         Expr::Cast { expr: operand, .. } => normalize_negations(operand),
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            expr.logic_children_mut()
+                .into_iter()
+                .for_each(normalize_negations);
+        }
         Expr::Negate(operand) => {
             normalize_negations(operand);
             if let Expr::NumberLiteral(text) = &**operand {

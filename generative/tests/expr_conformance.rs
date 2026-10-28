@@ -201,6 +201,13 @@ fn every_precedence_tier_groups_as_the_registry_says() {
                 Expr::Column("b".into()),
                 Expr::Column("c".into()),
             );
+            // Two comparisons of one level do not chain, in Postgres or here.
+            if p.precedence == q.precedence && p.operator.is_non_associative() {
+                let err = parse(&format!("TRANSFORM t FROM x SELECT {text} AS v"))
+                    .expect_err(&format!("`{text}` should not parse"));
+                assert!(err.to_string().contains("do not chain"), "`{text}`: {err}");
+                continue;
+            }
             let expected = if p.precedence < q.precedence {
                 bin(p.operator, a, bin(q.operator, b, c))
             } else {
@@ -446,6 +453,258 @@ fn arithmetic_rows_agree_with_postgres() {
     }
 }
 
+/// Each comparison and logic row of the issue's table, by Postgres's own
+/// answer: the type, the value on every row (the checker compares the user's
+/// text with both renderers, so `NULL` on either side, `NaN` and the
+/// boundary rows are all covered) and the round trip.
+#[test]
+fn comparison_and_logic_rows_agree_with_postgres() {
+    let mut admitted: Vec<String> = Vec::new();
+    // Every operator over one pair of each family, with a column on each
+    // side and against a literal.
+    let pairs = [
+        ("i2a", "i2b"),
+        ("i2a", "i8b"),
+        ("i4a", "nb"),
+        ("na", "nb"),
+        ("na", "i4b"),
+        ("f4a", "f4b"),
+        ("f4a", "f8b"),
+        ("f8a", "f8b"),
+        ("da", "db"),
+        ("tsa", "tsb"),
+        ("tza", "tzb"),
+        ("tma", "tmb"),
+        ("tta", "ttb"),
+        ("ba", "bb"),
+        ("ua", "ub"),
+        ("ta", "tb"),
+        ("ta", "'abc'"),
+        ("i4a", "1000"),
+        ("f4a", "1.5"),
+        ("f8a", "0"),
+        ("1.5", "f4a"),
+        ("na", "1.5"),
+        ("da", "DATE '2024-02-29'"),
+        ("tsa", "TIMESTAMP '1970-01-01 00:00:00.5'"),
+    ];
+    for (a, b) in pairs {
+        for op in [
+            "=",
+            "<>",
+            "!=",
+            "<",
+            "<=",
+            ">",
+            ">=",
+            "IS DISTINCT FROM",
+            "IS NOT DISTINCT FROM",
+        ] {
+            // Text orders by collation: refused (pinned below).
+            if a == "ta" && ["<", "<=", ">", ">="].contains(&op) {
+                continue;
+            }
+            admitted.push(format!("{a} {op} {b}"));
+        }
+    }
+    admitted.extend(
+        [
+            // NaN is equal to itself and sorts above everything; -0 equals 0.
+            "f8a = DOUBLE PRECISION 'NaN'",
+            "DOUBLE PRECISION 'NaN' = DOUBLE PRECISION 'NaN'",
+            "REAL 'NaN' >= f4a",
+            "DOUBLE PRECISION 'NaN' > DOUBLE PRECISION 'Infinity'",
+            "REAL '-0' = REAL '0'",
+            "f4a IS NOT DISTINCT FROM REAL 'NaN'",
+            "f8a < DOUBLE PRECISION 'Infinity'",
+            "na = nb",
+            // A float against a bare literal: Postgres widens the literal.
+            "f4a = 0.1",
+            "f4a <> 16777217",
+            "f8a = 9007199254740993",
+            "0.1 = f4a",
+            "f8a IS DISTINCT FROM 1",
+            // NULL on either side, in each form.
+            "i4a = i4b",
+            "i4a IS DISTINCT FROM i4b",
+            "i4a IS NOT DISTINCT FROM i4b",
+            // Three-valued logic.
+            "ba AND bb",
+            "ba OR bb",
+            "NOT ba",
+            "ba AND NOT bb",
+            "NOT ba OR bb",
+            "NOT (ba AND bb)",
+            "NOT ba AND NOT bb",
+            "(i4a > 0) AND (i4b > 0)",
+            "i4a > 0 OR i4b > 0",
+            "i4a > 0 AND ba OR bb",
+            "ba IS NULL",
+            "ba IS NOT NULL",
+            "i4a IS NULL",
+            "ta IS NOT NULL",
+            "da IS NULL",
+            "f8a IS NULL",
+            "(i4a > i4b) IS NULL",
+            "i4a > i4b IS NOT NULL",
+            "ba IS NULL IS NULL",
+            "ba IS NULL = bb",
+            "NOT ba IS NULL",
+            "NOT i4a IS NULL",
+            "NOT i4a = i4b",
+            "NOT i4a IS DISTINCT FROM i4b",
+            "i4a IS NULL OR i4b IS NULL",
+            "i4a + 1 > i4b * 2",
+            "i4a - i4b = 0",
+            "-i4a < 0",
+            "ba = NOT bb",
+            "ba = (NOT bb)",
+            "ba = bb IS NULL",
+            "(ba = bb) = (bb = ba)",
+            "ba IS DISTINCT FROM bb",
+            // CASE.
+            "CASE WHEN ba THEN i4a END",
+            "CASE WHEN ba THEN i4a ELSE i4b END",
+            "CASE WHEN ba THEN 1 ELSE 2 END",
+            "CASE WHEN ba THEN 1 ELSE 2.5 END",
+            "CASE WHEN ba THEN 1 END",
+            "CASE WHEN ba THEN i2a ELSE i8a END",
+            "CASE WHEN ba THEN f4a ELSE na END",
+            "CASE WHEN ba THEN na ELSE f4a END",
+            "CASE WHEN ba THEN f4a ELSE f8a END",
+            "CASE WHEN ba THEN i2a ELSE i4a END",
+            "CASE WHEN ba THEN ta ELSE 'x' END",
+            "CASE WHEN ba THEN da ELSE DATE '2024-01-01' END",
+            "CASE WHEN ba THEN bb ELSE NOT bb END",
+            "CASE WHEN ba THEN i4a WHEN bb THEN i4b ELSE 0 END",
+            "CASE WHEN i4a > 0 THEN 'pos' WHEN i4a < 0 THEN 'neg' ELSE 'zero' END",
+            "CASE WHEN i4a IS NULL THEN 0 ELSE i4a END",
+            "CASE WHEN ba AND bb THEN i4a END",
+            "CASE WHEN CASE WHEN ba THEN bb END THEN 1 END",
+            "CASE WHEN ba THEN CASE WHEN bb THEN 1 ELSE 2 END ELSE 3 END",
+            "CASE WHEN ba THEN i4a END + 1",
+            "1 + CASE WHEN ba THEN i4a ELSE 0 END",
+            "CASE WHEN ba THEN i4a END IS NULL",
+            "CASE WHEN ba THEN i4a END > 0",
+            "COALESCE(CASE WHEN ba THEN i4a END, 0)",
+            "CASE WHEN i4a <> 0 THEN na / i4a END",
+            "CASE WHEN i4b <> 0 THEN i4a % i4b END",
+            "CASE WHEN ba THEN 'a' ELSE 'c' END",
+            // NULLIF.
+            "NULLIF(i4a, 0)",
+            "NULLIF(i4a, i4b)",
+            "NULLIF(i2a, i8b)",
+            "NULLIF(i8a, i2b)",
+            "NULLIF(na, 0)",
+            "NULLIF(na, i4a)",
+            "NULLIF(na, nb)",
+            "NULLIF(f4a, f8b)",
+            "NULLIF(f8a, 0)",
+            "NULLIF(f4a, 0.5)",
+            "NULLIF(ta, '')",
+            "NULLIF(da, db)",
+            "NULLIF(ba, bb)",
+            "NULLIF(ua, ub)",
+            "NULLIF(tsa, tsb)",
+            "na / NULLIF(nb, 0)",
+            "na / NULLIF(i4a, 0)",
+            "i4a % NULLIF(i4b, 0)",
+            "NULLIF(i4a, 0) IS NULL",
+            "COALESCE(na / NULLIF(nb, 0), 0)",
+            "CASE WHEN NULLIF(i4a, 0) IS NULL THEN 0 ELSE 1 END",
+            "NULLIF(NULLIF(i4a, 0), 1)",
+            // Constants.
+            "1 = 1",
+            "1 < 2 AND 2 < 3",
+            "NOT (1 = 2)",
+            "CASE WHEN 1 = 1 THEN 1 ELSE 2 END",
+            "CASE WHEN 1 = 2 THEN 1 END",
+            "CASE WHEN 1 = 2 THEN 1 ELSE 5 END",
+            "NULLIF(1, 1)",
+            "NULLIF(1, 2)",
+            "1 IS NULL",
+            "NULLIF(1, 1) IS NULL",
+            "COALESCE(NULLIF(1, 1), 7)",
+            "COALESCE(CASE WHEN 1 = 2 THEN 1 END, 7)",
+            "2147483647 > 1",
+            "CASE WHEN ba THEN 1 ELSE 2 END = 2",
+        ]
+        .map(String::from),
+    );
+    let mut failures = Vec::new();
+    for text in &admitted {
+        match check_text(text, None) {
+            Ok(Agreement::Admitted) => {}
+            Ok(other) => failures.push(format!("`{text}` should be admitted, got {other:?}")),
+            Err(d) => failures.push(d.to_string()),
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Plan-time constants inside CASE branches and AND/OR operands: Postgres
+/// simplifies a branch's result whatever its condition (so `CASE WHEN x > 0
+/// THEN 1 / 0 END` fails every row), and stops at the first constant
+/// condition (so a branch after `WHEN true`, or after a false `AND`
+/// operand, is never simplified). Define refuses what Postgres rejects and
+/// admits what it drops.
+#[test]
+fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
+    let refused = [
+        "CASE WHEN i4a > 0 THEN 1.5 / 0 END",
+        "CASE WHEN i4a > 0 THEN 1 ELSE 1.5 / 0 END",
+        "CASE WHEN i4a > 0 THEN 1 WHEN i4b > 0 THEN 5 % 0 END",
+        "CASE WHEN na / 0 > 0 THEN 1 END",
+        "CASE WHEN i4a > 0 THEN 2147483647 + 1 END",
+        "CASE WHEN ba THEN i4a ELSE 2147483647 * 2 END",
+        "CASE WHEN 1 = 1 THEN 1.5 / 0 END",
+        "CASE WHEN 1 = 2 THEN 1 WHEN ba THEN 1.5 / 0 END",
+        "CASE WHEN ba THEN f4a ELSE 100000000000000000000000000000000000000000 END",
+        "ba AND 1.5 / 0 = 1",
+        "1 = 1 AND 1.5 / 0 = 1",
+        "1.5 / 0 = 1 AND 1 = 2",
+        "ba OR 2147483647 + 1 > 0",
+        "1 = 2 OR 1.5 / 0 = 1",
+        "NOT (ba AND 1.5 / 0 = 1)",
+        "NULLIF(i4a, 2147483647 + 1)",
+        "NULLIF(1.5 / 0, na)",
+        "i4a IS NULL OR 1.5 / 0 = 1",
+    ];
+    for text in refused {
+        match check_text(text, None) {
+            Ok(Agreement::RefusedAndRaises(_)) => {}
+            Ok(other) => panic!("`{text}` should be refused and raise, got {other:?}"),
+            Err(d) => panic!("{d}"),
+        }
+    }
+    let dropped = [
+        "CASE WHEN 1 = 1 THEN 1 ELSE 1.5 / 0 END",
+        "CASE WHEN 1 = 2 THEN 1.5 / 0 ELSE 2 END",
+        "CASE WHEN 1 = 1 THEN 1 WHEN ba THEN 1.5 / 0 END",
+        "CASE WHEN 1 < 2 THEN 1 WHEN 1.5 / 0 > 0 THEN 3 END",
+        "CASE WHEN ba THEN 1 WHEN 1 = 1 THEN 2 ELSE 1.5 / 0 END",
+        "CASE WHEN ba THEN f4a WHEN 1 = 2 THEN 100000000000000000000000000000000000000000 END",
+        "1 = 2 AND 1.5 / 0 = 1",
+        "ba AND 1 = 2 AND 1.5 / 0 = 1",
+        "1 = 1 OR 1.5 / 0 = 1",
+        "ba OR 1 = 1 OR 1.5 / 0 = 1",
+        "NOT (1 = 2 AND 1.5 / 0 = 1)",
+        "(1 = 2 AND 1.5 / 0 = 1) OR ba",
+        "COALESCE(i4a, CASE WHEN 1 = 1 THEN 1 ELSE 1.5 / 0 END)",
+        // A runtime divisor is left to the rows.
+        "CASE WHEN i4a > 0 THEN na / i4a END",
+        "i4a <> 0 AND na / i4a > 1",
+        "CASE WHEN ba THEN i4a * i4b END",
+    ];
+    for text in dropped {
+        match check_text(text, None) {
+            Ok(Agreement::Admitted) => {}
+            Ok(other) => panic!("`{text}` should be admitted, got {other:?}"),
+            Err(d) => panic!("{d}"),
+        }
+    }
+}
+
 /// Constants Postgres folds into an error at plan time are refused at
 /// define: range overflow under each operator, the smallest integer under
 /// prefix minus and `ABS`, float overflow and underflow, and a constant zero
@@ -595,6 +854,73 @@ fn instances(rule: &expr_gen::Rule) -> Vec<Expr> {
                 args,
             })
             .collect(),
+        Rule::Not => leaves(ValueType::Boolean)
+            .into_iter()
+            .map(|e| Expr::Not(Box::new(e)))
+            .collect(),
+        Rule::IsNull { ty } => leaves(*ty)
+            .into_iter()
+            .flat_map(|e| {
+                [false, true].map(|negated| Expr::IsNull {
+                    expr: Box::new(e.clone()),
+                    negated,
+                })
+            })
+            .collect(),
+        Rule::Case { ty } => {
+            let conditions = leaves(ValueType::Boolean);
+            let results = leaves(*ty);
+            let mut out = Vec::new();
+            for condition in &conditions {
+                for result in &results {
+                    out.push(Expr::Case {
+                        branches: vec![(condition.clone(), result.clone())],
+                        otherwise: None,
+                    });
+                    for otherwise in &results {
+                        out.push(Expr::Case {
+                            branches: vec![(condition.clone(), result.clone())],
+                            otherwise: Some(Box::new(otherwise.clone())),
+                        });
+                    }
+                }
+            }
+            out
+        }
+        Rule::CaseMixed { then, other, .. } => {
+            let conditions = leaves(ValueType::Boolean);
+            let mut out = Vec::new();
+            for condition in &conditions {
+                for t in leaves(*then) {
+                    for o in leaves(*other) {
+                        out.push(Expr::Case {
+                            branches: vec![(condition.clone(), t.clone())],
+                            otherwise: Some(Box::new(o)),
+                        });
+                    }
+                }
+            }
+            out
+        }
+        Rule::NullIf { lhs, rhs } => product(&[leaves(*lhs), leaves(*rhs)])
+            .into_iter()
+            .map(|args| Expr::FunctionCall {
+                name: "NULLIF".to_string(),
+                args,
+            })
+            .collect(),
+        Rule::NullIfLiteral { float } => {
+            let literals = expr_gen::comparison_literals(Profile::CONFORMANCE.magnitude);
+            leaves(ValueType::Float(*float))
+                .into_iter()
+                .flat_map(|f| {
+                    literals.iter().map(move |lit| Expr::FunctionCall {
+                        name: "NULLIF".to_string(),
+                        args: vec![f.clone(), lit.clone()],
+                    })
+                })
+                .collect()
+        }
     }
 }
 
@@ -676,6 +1002,21 @@ fn every_cast_alias_over_every_leaf_conforms() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+#[test]
+fn every_logic_form_over_every_leaf_conforms() {
+    every_instance_conforms(|r| {
+        matches!(
+            r,
+            expr_gen::Rule::Not
+                | expr_gen::Rule::IsNull { .. }
+                | expr_gen::Rule::Case { .. }
+                | expr_gen::Rule::CaseMixed { .. }
+                | expr_gen::Rule::NullIf { .. }
+                | expr_gen::Rule::NullIfLiteral { .. }
+        )
+    });
+}
+
 /// An expression Postgres folds and rejects for every row is refused at
 /// define, and Postgres raises on the where-false probe: agreement.
 #[test]
@@ -744,10 +1085,45 @@ fn each_refusal_names_its_construct() {
         // A wrong-typed operand.
         ("ta + 1", "text"),
         ("1 + ba", "boolean"),
-        ("ta > tb", "text"),
+        // Text orders by the collation, which is not evaluated.
+        ("ta > tb", "orders text"),
+        ("ta < 'x'", "orders text"),
+        ("ta <= tb", "orders text"),
+        ("ta >= tb", "orders text"),
+        // The comparison refusals: each names its reason and remedy.
+        ("f4a = i4a", "round the exact side"),
+        ("f8a <> na", "round the exact side"),
+        ("f4a IS DISTINCT FROM i2a", "round the exact side"),
+        ("da = tsa", "cast one side"),
+        ("tsa < tza", "cast one side"),
+        ("tma >= tta", "cast one side"),
+        ("da IS NOT DISTINCT FROM tza", "cast one side"),
+        ("ta = i4a", "cannot compare"),
+        ("ba = i4a", "cannot compare"),
+        ("ua = ta", "cannot compare"),
+        // Logic over a non-boolean.
+        ("i4a AND ba", "'and'"),
+        ("ba OR ta", "'or'"),
+        ("NOT i4a", "'not'"),
+        // The truth-value tests and the simple CASE.
+        ("ba IS TRUE", "is true"),
+        ("ba IS NOT FALSE", "is not false"),
+        ("ba IS UNKNOWN", "is unknown"),
+        ("CASE i4a WHEN 1 THEN 2 END", "simple case"),
+        ("CASE WHEN i4a THEN 1 END", "case condition"),
+        ("CASE WHEN ba THEN ta ELSE 1 END", "share a type"),
+        // NULLIF where Postgres casts the first argument.
+        ("NULLIF(i4a, na)", "casts the first argument"),
+        ("NULLIF(0, f4a)", "casts the first argument"),
+        ("NULLIF(f4a, i4a)", "round the exact side"),
+        ("NULLIF(ta, 1)", "cannot compare"),
         ("da + 1", "date"),
-        // A chained comparison compares a boolean.
-        ("na > nb > na", "boolean"),
+        // Comparisons do not chain.
+        ("na > nb > na", "do not chain"),
+        ("na = nb = na", "do not chain"),
+        ("na < nb = na", "do not chain"),
+        ("na IS DISTINCT FROM nb IS DISTINCT FROM na", "do not chain"),
+        ("na IS DISTINCT FROM nb IS NULL", "do not chain"),
         // A float against an exact numeric, in a column or an expression.
         ("f4a > i4a", ">"),
         ("na > f8a", ">"),
@@ -758,11 +1134,6 @@ fn each_refusal_names_its_construct() {
         // The pattern must be a literal.
         ("REGEXP_COUNT(ta, tb)", "regexp_count"),
         // Operators and functions outside the registry.
-        ("i4a = i4b", "="),
-        ("i4a < i4b", "'<'"),
-        ("i4a >= i4b", "'>='"),
-        ("i4a <= i4b", "'<='"),
-        ("i4a <> i4b", "'<>'"),
         ("ta || tb", "|"),
         ("LENGTH(ta)", "length"),
         // The arithmetic refusals: each says what Postgres would do and
@@ -914,8 +1285,12 @@ fn the_generator_reaches_every_registry_entry() {
         .chain(registry::FUNCTIONS.iter().map(|f| format!("fn {}", f.name)))
         .chain([
             "fn COALESCE".to_string(),
+            "fn NULLIF".to_string(),
             "column".to_string(),
             "prefix -".to_string(),
+            "NOT".to_string(),
+            "IS NULL".to_string(),
+            "CASE".to_string(),
         ])
         .chain(
             registry::CAST_TARGETS

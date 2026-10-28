@@ -520,8 +520,13 @@ fn nullif_is_typed_by_its_first_argument() {
     assert_type("n / NULLIF(n, 0)", N);
     assert_type("i4 % NULLIF(i4, 0)", I4);
     // Postgres types NULLIF(integer, numeric) `numeric`, not the integer: refused.
-    assert_refused("NULLIF(i4, n)", "CAST(a AS numeric)");
-    assert_refused("NULLIF(i8, 1.5)", "CAST(a AS numeric)");
+    assert_refused("NULLIF(i4, n)", "casts the first argument");
+    assert_refused("NULLIF(i8, 1.5)", "casts the first argument");
+    // And an exact first argument beside a float is a double precision.
+    assert_refused("NULLIF(0, f4)", "double precision");
+    assert_refused("NULLIF(n, f8)", "round the exact side");
+    assert_type("NULLIF(f4, 0)", F4);
+    assert_type("NULLIF(f4, 0.5)", F4);
     assert_type("NULLIF(CAST(i4 AS numeric), n)", N);
     // The comparison families of `=` apply.
     assert_refused("NULLIF(f8, i4)", "round the exact side");

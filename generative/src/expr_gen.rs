@@ -96,6 +96,26 @@ pub enum Rule {
     Coalesce { ty: ValueType },
     /// Prefix `-` over an operand of type `ty`.
     Negate { ty: ValueType },
+    /// `NOT <boolean>`.
+    Not,
+    /// `<operand of type ty> IS [NOT] NULL`.
+    IsNull { ty: ValueType },
+    /// A searched `CASE` whose results all have type `ty`.
+    Case { ty: ValueType },
+    /// A searched `CASE` whose `THEN` results have type `then` and whose
+    /// `ELSE` has type `other`, two numeric types Postgres unifies to `out`
+    /// (`CASE WHEN c THEN 1 ELSE 2.5 END` is `numeric`).
+    CaseMixed {
+        then: ValueType,
+        other: ValueType,
+        out: ValueType,
+    },
+    /// `NULLIF(a, b)` of operands `lhs` and `rhs` that `=` compares, giving
+    /// `lhs`.
+    NullIf { lhs: ValueType, rhs: ValueType },
+    /// `NULLIF(float, <bare number literal>)`, the spelling define admits
+    /// beside a float.
+    NullIfLiteral { float: FloatWidth },
     /// `CAST(operand AS to)` over an operand of type `from`.
     Cast { from: ValueType, to: ValueType },
 }
@@ -109,6 +129,11 @@ impl Rule {
             Rule::Coalesce { ty } => *ty,
             Rule::Negate { ty } => *ty,
             Rule::Cast { to, .. } => *to,
+            Rule::Not | Rule::IsNull { .. } => ValueType::Boolean,
+            Rule::Case { ty } => *ty,
+            Rule::CaseMixed { out, .. } => *out,
+            Rule::NullIf { lhs, .. } => *lhs,
+            Rule::NullIfLiteral { float } => ValueType::Float(*float),
         }
     }
 }
@@ -130,6 +155,8 @@ pub fn universe() -> Vec<ValueType> {
     types.push(ValueType::Numeric);
     types.extend(FloatWidth::ALL.into_iter().map(ValueType::Float));
     types.extend([ValueType::Text, ValueType::Boolean, ValueType::Uuid]);
+    // A type with a column in the conformance table and no typed literal.
+    types.push(ValueType::Other(PgType::TimestampTz));
     for spec in TYPED_LITERALS {
         if !types.contains(&spec.value_type) {
             types.push(spec.value_type);
@@ -186,7 +213,40 @@ pub fn rules() -> Vec<Rule> {
             out: spec.return_type,
         });
     }
+    rules.push(Rule::Not);
+    for width in FloatWidth::ALL {
+        rules.push(Rule::NullIfLiteral { float: width });
+    }
     for &ty in &types {
+        rules.push(Rule::IsNull { ty });
+        rules.push(Rule::Case { ty });
+        for &rhs in &types {
+            // `NULLIF` is typed by its first argument, and refused where
+            // Postgres casts that argument to compare it.
+            let cast = matches!((ty, rhs), (ValueType::Integer(_), ValueType::Numeric))
+                || (ty.is_exact_numeric_family() && matches!(rhs, ValueType::Float(_)));
+            if !cast && registry::comparison_result_type(Operator::Equal, ty, rhs).is_some() {
+                rules.push(Rule::NullIf { lhs: ty, rhs });
+            }
+            if ty != rhs && ty.is_numeric_family() && rhs.is_numeric_family() {
+                // The type `COALESCE` and `CASE` resolve: a float beside an
+                // exact type is the float, two floats the wider, two integers
+                // the wider, otherwise numeric.
+                let out = match (ty, rhs) {
+                    (ValueType::Float(a), ValueType::Float(b)) => ValueType::Float(a.wider(b)),
+                    (ValueType::Float(w), _) | (_, ValueType::Float(w)) => ValueType::Float(w),
+                    (ValueType::Integer(a), ValueType::Integer(b)) => {
+                        ValueType::Integer(a.wider(b))
+                    }
+                    _ => ValueType::Numeric,
+                };
+                rules.push(Rule::CaseMixed {
+                    then: ty,
+                    other: rhs,
+                    out,
+                });
+            }
+        }
         rules.push(Rule::Coalesce { ty });
         if registry::negate_result_type(ty).is_some() {
             rules.push(Rule::Negate { ty });
@@ -430,6 +490,8 @@ fn cast_target_text(target: ValueType, style: TextStyle) -> String {
 fn precedence_of(expr: &Expr) -> u8 {
     match expr {
         Expr::BinaryOp { op, .. } => registry::operator_spec(*op).precedence,
+        Expr::Not(_) => registry::precedence::NOT,
+        Expr::IsNull { .. } => registry::precedence::IS,
         _ => u8::MAX,
     }
 }
@@ -439,7 +501,11 @@ fn precedence_of(expr: &Expr) -> u8 {
 /// read as a comment in SQL, and `-(-5)` is a different tree from `- -5`.)
 fn negate_operand_needs_parens(expr: &Expr) -> bool {
     match expr {
-        Expr::BinaryOp { .. } | Expr::Negate(_) => true,
+        Expr::BinaryOp { .. }
+        | Expr::Negate(_)
+        | Expr::Not(_)
+        | Expr::IsNull { .. }
+        | Expr::Case { .. } => true,
         Expr::NumberLiteral(text) => text.starts_with('-'),
         _ => false,
     }
@@ -454,6 +520,32 @@ pub fn render_text(expr: &Expr, style: TextStyle) -> String {
     let mut out = String::new();
     write_text(expr, style, &mut out);
     out
+}
+
+/// A keyword in the style's case.
+fn keyword(style: TextStyle, word: &str) -> String {
+    if style.lower_names {
+        word.to_lowercase()
+    } else {
+        word.to_string()
+    }
+}
+
+/// Writes `e`, in parentheses when `wrap` and it is an operator expression
+/// (the only nodes that can bind looser than their context).
+fn write_operand(e: &Expr, wrap: bool, style: TextStyle, out: &mut String) {
+    if wrap
+        && matches!(
+            e,
+            Expr::BinaryOp { .. } | Expr::Not(_) | Expr::IsNull { .. }
+        )
+    {
+        out.push('(');
+        write_text(e, style, out);
+        out.push(')');
+    } else {
+        write_text(e, style, out);
+    }
 }
 
 fn write_text(expr: &Expr, style: TextStyle, out: &mut String) {
@@ -479,28 +571,82 @@ fn write_text(expr: &Expr, style: TextStyle, out: &mut String) {
         }
         Expr::BinaryOp { op, lhs, rhs } => {
             let p = registry::operator_spec(*op).precedence;
-            let is_comparison = p == registry::precedence::COMPARISON;
             // Left-associative: the right operand needs parentheses at equal
             // precedence. A comparison does not associate in Postgres at
             // all, so it needs them on the left too.
             let wrap_lhs = !style.minimal
                 || precedence_of(lhs) < p
-                || (is_comparison && precedence_of(lhs) == p);
+                || (op.is_non_associative() && precedence_of(lhs) == p);
             let wrap_rhs = !style.minimal || precedence_of(rhs) <= p;
-            let side = |e: &Expr, wrap: bool, out: &mut String| {
-                if wrap && matches!(e, Expr::BinaryOp { .. }) {
+            write_operand(lhs, wrap_lhs, style, out);
+            out.push(' ');
+            out.push_str(&keyword(style, symbol_of(*op)));
+            out.push(' ');
+            write_operand(rhs, wrap_rhs, style, out);
+        }
+        Expr::Not(operand) => {
+            out.push_str(&keyword(style, "NOT"));
+            out.push(' ');
+            // `NOT` takes everything tighter than `AND`: only an `AND` or
+            // `OR` operand needs the parentheses.
+            let wrap = !style.minimal || precedence_of(operand) < registry::precedence::NOT;
+            if wrap {
+                out.push('(');
+                write_text(operand, style, out);
+                out.push(')');
+            } else {
+                write_text(operand, style, out);
+            }
+        }
+        Expr::IsNull { expr, negated } => {
+            // `IS` binds looser than a comparison, and `IS DISTINCT FROM`
+            // does not chain with a following `IS`.
+            let wrap = !style.minimal
+                || precedence_of(expr) < registry::precedence::IS
+                || matches!(&**expr, Expr::BinaryOp { op, .. } if op.is_non_associative()
+                    && registry::operator_spec(*op).precedence == registry::precedence::IS);
+            write_operand(expr, wrap, style, out);
+            out.push(' ');
+            out.push_str(&keyword(style, "IS"));
+            out.push(' ');
+            if *negated {
+                out.push_str(&keyword(style, "NOT"));
+                out.push(' ');
+            }
+            out.push_str(&keyword(style, "NULL"));
+        }
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            let part = |e: &Expr, out: &mut String| {
+                if style.minimal {
+                    write_text(e, style, out);
+                } else {
                     out.push('(');
                     write_text(e, style, out);
                     out.push(')');
-                } else {
-                    write_text(e, style, out);
                 }
             };
-            side(lhs, wrap_lhs, out);
+            out.push_str(&keyword(style, "CASE"));
+            for (condition, result) in branches {
+                out.push(' ');
+                out.push_str(&keyword(style, "WHEN"));
+                out.push(' ');
+                part(condition, out);
+                out.push(' ');
+                out.push_str(&keyword(style, "THEN"));
+                out.push(' ');
+                part(result, out);
+            }
+            if let Some(otherwise) = otherwise {
+                out.push(' ');
+                out.push_str(&keyword(style, "ELSE"));
+                out.push(' ');
+                part(otherwise, out);
+            }
             out.push(' ');
-            out.push_str(symbol_of(*op));
-            out.push(' ');
-            side(rhs, wrap_rhs, out);
+            out.push_str(&keyword(style, "END"));
         }
         Expr::Negate(operand) => {
             out.push('-');
@@ -522,39 +668,6 @@ fn write_text(expr: &Expr, style: TextStyle, out: &mut String) {
             out.push('(');
             write_text(expr, style, out);
             out.push_str(&format!(" {as_} {})", cast_target_text(*target, style)));
-        }
-        Expr::Not(operand) => {
-            out.push_str("NOT (");
-            write_text(operand, style, out);
-            out.push(')');
-        }
-        Expr::IsNull { expr, negated } => {
-            out.push('(');
-            write_text(expr, style, out);
-            out.push_str(if *negated {
-                ") IS NOT NULL"
-            } else {
-                ") IS NULL"
-            });
-        }
-        Expr::Case {
-            branches,
-            otherwise,
-        } => {
-            out.push_str("CASE");
-            for (condition, result) in branches {
-                out.push_str(" WHEN (");
-                write_text(condition, style, out);
-                out.push_str(") THEN (");
-                write_text(result, style, out);
-                out.push(')');
-            }
-            if let Some(otherwise) = otherwise {
-                out.push_str(" ELSE (");
-                write_text(otherwise, style, out);
-                out.push(')');
-            }
-            out.push_str(" END");
         }
         Expr::FunctionCall { name, args } => {
             out.push_str(&if style.lower_names {
@@ -590,7 +703,7 @@ pub struct NearMiss {
 
 /// Operator symbols Postgres has and the registry does not. A line whose
 /// symbol the registry now admits stops being a near miss and is skipped.
-pub const UNADMITTED_OPERATORS: &[&str] = &["=", "<", "<=", ">=", "<>", "||"];
+pub const UNADMITTED_OPERATORS: &[&str] = &["||"];
 
 /// Functions and special forms Postgres has and the registry does not. A
 /// `STABLE` or `VOLATILE` one is the trap: `now()` and `random()` change
@@ -603,7 +716,6 @@ pub const UNADMITTED_FUNCTIONS: &[&str] = &[
     "RANDOM",
     "TO_CHAR",
     "CURRENT_DATE",
-    "NULLIF",
     "GREATEST",
 ];
 
@@ -639,7 +751,7 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
                 out.push(NearMiss {
                     kind: "operator-operand-type",
                     text: format!("{a} {} {b}", spec.symbol),
-                    needles: vec![spec.symbol.to_string()],
+                    needles: vec![spec.symbol.to_lowercase()],
                 });
             }
         }
@@ -830,18 +942,86 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
             needles: vec![spec.name.to_lowercase()],
         });
     }
-    // Chained comparison: a comparison whose operand is a comparison.
+    // Chained comparison: `a < b < c`, a syntax error in Postgres.
     for spec in registry::OPERATORS {
-        if spec.precedence != registry::precedence::COMPARISON {
+        if !spec.operator.is_non_associative() {
             continue;
         }
         if let Some(n) = column_of(columns, ValueType::Numeric) {
             out.push(NearMiss {
                 kind: "chained-comparison",
                 text: format!("{n} {0} {n} {0} {n}", spec.symbol),
-                needles: vec!["boolean".to_string()],
+                needles: vec!["do not chain".to_string()],
             });
         }
+    }
+    let first = |ty: ValueType| column_of(columns, ty);
+    let (int, boolean, text, numeric) = (
+        first(ValueType::Integer(IntWidth::Int4)),
+        first(ValueType::Boolean),
+        first(ValueType::Text),
+        first(ValueType::Numeric),
+    );
+    // The simple `CASE`, and the truth-value tests `COALESCE` covers.
+    if let Some(int) = int {
+        out.push(NearMiss {
+            kind: "simple-case",
+            text: format!("CASE {int} WHEN 1 THEN 2 END"),
+            needles: vec!["simple case".to_string()],
+        });
+        out.push(NearMiss {
+            kind: "case-condition-type",
+            text: format!("CASE WHEN {int} THEN 1 END"),
+            needles: vec!["case condition".to_string()],
+        });
+        out.push(NearMiss {
+            kind: "not-operand-type",
+            text: format!("NOT {int}"),
+            needles: vec!["'not'".to_string()],
+        });
+    }
+    if let Some(boolean) = boolean {
+        for form in ["IS TRUE", "IS NOT TRUE", "IS FALSE", "IS UNKNOWN"] {
+            out.push(NearMiss {
+                kind: "unsupported-is-form",
+                text: format!("{boolean} {form}"),
+                needles: vec![form.to_lowercase()],
+            });
+        }
+        if let Some(int) = int {
+            out.push(NearMiss {
+                kind: "case-result-types",
+                text: format!("CASE WHEN {boolean} THEN {int} ELSE {boolean} END"),
+                needles: vec!["share a type".to_string()],
+            });
+        }
+        if let Some(text) = text {
+            out.push(NearMiss {
+                kind: "case-result-types",
+                text: format!("CASE WHEN {boolean} THEN {text} ELSE 1 END"),
+                needles: vec!["share a type".to_string()],
+            });
+        }
+    }
+    if let (Some(int), Some(numeric)) = (int, numeric) {
+        // Postgres types these by a cast of the first argument.
+        out.push(NearMiss {
+            kind: "nullif-first-argument-cast",
+            text: format!("NULLIF({int}, {numeric})"),
+            needles: vec!["casts the first argument".to_string()],
+        });
+        out.push(NearMiss {
+            kind: "nullif-first-argument-cast",
+            text: format!("NULLIF(0, {numeric}) + NULLIF({int}, 1.5)"),
+            needles: vec!["casts the first argument".to_string()],
+        });
+    }
+    if let Some(int) = int {
+        out.push(NearMiss {
+            kind: "nullif-arity",
+            text: format!("NULLIF({int})"),
+            needles: vec!["nullif".to_string()],
+        });
     }
     // Operators the registry does not admit.
     if let (Some(a), Some(b)) = (
@@ -1107,6 +1287,77 @@ pub mod strategy {
                             .prop_map(move |e| Expr::Cast {
                                 expr: Box::new(e),
                                 target: to,
+                            })
+                            .boxed(),
+                    )
+                }
+                Rule::Not => {
+                    let operand = self.expr(ValueType::Boolean, depth)?;
+                    Some(operand.prop_map(|e| Expr::Not(Box::new(e))).boxed())
+                }
+                Rule::IsNull { ty } => {
+                    let operand = self.expr(*ty, depth)?;
+                    Some(
+                        (operand, any::<bool>())
+                            .prop_map(|(e, negated)| Expr::IsNull {
+                                expr: Box::new(e),
+                                negated,
+                            })
+                            .boxed(),
+                    )
+                }
+                Rule::Case { ty } => {
+                    let condition = self.expr(ValueType::Boolean, depth)?;
+                    let result = self.expr(*ty, depth)?;
+                    Some(
+                        (
+                            prop::collection::vec((condition, result.clone()), 1..=3),
+                            prop::option::of(result),
+                        )
+                            .prop_map(|(branches, otherwise)| Expr::Case {
+                                branches,
+                                otherwise: otherwise.map(Box::new),
+                            })
+                            .boxed(),
+                    )
+                }
+                Rule::CaseMixed { then, other, .. } => {
+                    let condition = self.expr(ValueType::Boolean, depth)?;
+                    let (then, other) = (self.expr(*then, depth)?, self.expr(*other, depth)?);
+                    Some(
+                        (condition, then, other, any::<bool>())
+                            .prop_map(|(condition, then, other, swap)| {
+                                // Either order: the unified type does not
+                                // depend on which result comes first.
+                                let (first, second) =
+                                    if swap { (other, then) } else { (then, other) };
+                                Expr::Case {
+                                    branches: vec![(condition, first)],
+                                    otherwise: Some(Box::new(second)),
+                                }
+                            })
+                            .boxed(),
+                    )
+                }
+                Rule::NullIf { lhs, rhs } => {
+                    let (a, b) = (self.expr(*lhs, depth)?, self.expr(*rhs, depth)?);
+                    Some(
+                        (a, b)
+                            .prop_map(|(a, b)| Expr::FunctionCall {
+                                name: "NULLIF".to_string(),
+                                args: vec![a, b],
+                            })
+                            .boxed(),
+                    )
+                }
+                Rule::NullIfLiteral { float } => {
+                    let a = self.expr(ValueType::Float(*float), depth)?;
+                    let literal = prop::sample::select(comparison_literals(self.profile.magnitude));
+                    Some(
+                        (a, literal)
+                            .prop_map(|(a, lit)| Expr::FunctionCall {
+                                name: "NULLIF".to_string(),
+                                args: vec![a, lit],
                             })
                             .boxed(),
                     )
