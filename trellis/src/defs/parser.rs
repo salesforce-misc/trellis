@@ -1339,6 +1339,53 @@ mod depth_tests {
         assert!(fields_refused(100_000, "{prev} + 1"));
     }
 
+    #[test]
+    fn a_long_alias_chain_walked_from_its_head_is_refused_without_overflowing() {
+        // Named so the chain's head sorts first: the walk starts at the head
+        // and would recurse once per hop before it knows any height.
+        let n = 100_000;
+        let refused = on_default_stack(move || {
+            let mut fields = vec![format!("1 AS f{n:06}")];
+            for i in (1..n).rev() {
+                fields.push(format!("f{:06} AS f{i:06}", i + 1));
+            }
+            let def = parse(&format!("TRANSFORM t FROM s SELECT {}", fields.join(", "))).unwrap();
+            crate::defs::validate::validate(&def, &HashMap::new())
+        });
+        assert_eq!(
+            refused,
+            Err(crate::defs::validate::ValidationError::FieldExpansionTooLarge)
+        );
+    }
+
+    #[test]
+    fn a_call_over_a_chain_counts_the_call_as_a_level() {
+        define(format!("COALESCE({})", chain(MAX_EXPRESSION_DEPTH - 1))).unwrap();
+        assert!(too_deep(define(format!(
+            "COALESCE({})",
+            chain(MAX_EXPRESSION_DEPTH)
+        ))));
+    }
+
+    #[test]
+    fn a_definition_at_the_limit_reparses_from_its_rendered_text() {
+        // `ALTER TRANSFORM` stores the rendered text, which wraps every
+        // operator in parentheses, and every load parses it again.
+        let at_limit = [
+            chain(MAX_EXPRESSION_DEPTH),
+            format!("COALESCE({})", chain(MAX_EXPRESSION_DEPTH - 1)),
+            calls(MAX_EXPRESSION_DEPTH - 1),
+            format!("1 + {}1{}", "COALESCE(1 + ".repeat(49), ")".repeat(49)),
+        ];
+        for expr in at_limit {
+            on_default_stack(move || {
+                let def = parse(&format!("TRANSFORM t FROM s SELECT {expr} AS out")).unwrap();
+                let text = crate::defs::ast::render_definition_text(&def);
+                assert_eq!(parse(&text).unwrap(), def, "{text}");
+            });
+        }
+    }
+
     fn too_deep(r: Result<(), ParseError>) -> bool {
         matches!(r, Err(ParseError::ExpressionTooDeep { .. }))
     }
