@@ -60,23 +60,6 @@ grammar-plus-renderer change. Adopting a full SQL parser would invert this —
 we'd inherit its entire surface and forbid it piece by piece — and we parse
 fragments, not whole statements. We want the accepted language to *be* the spec.
 
-## The expression grammar is a subset of Postgres's
-
-Apart from Trellis's own language (`TRANSFORM`, `FROM`, `SELECT` and the like),
-the expression grammar accepts a subset of what Postgres accepts, with the
-same meaning, and never text Postgres rejects. A grammar change mirrors
-Postgres's lexing and parsing rules: token boundaries, precedence,
-associativity and keywords.
-
-The lexer reads operator characters the way Postgres's does. A run of adjacent
-operator characters (`+ - * / % < > = ! ~ @ # ^ & | \` ?`) is one token, which
-stops before a `--` or `/*` comment start, and which gives back its trailing
-`+` and `-` unless it holds one of `~ ! @ # ^ & | \` ? %`. So `a<=b`, `a>=b`,
-`a<>b` and `a!=b` are comparisons only with their characters adjacent;
-`a < = b` is refused by name; `a<-1` is `a < -1`; and `a!=-1`, `a%-1`, `a<=>b`
-and `a==b` are one operator each that the registry lacks, refused whole rather
-than split into operators Postgres would not have read.
-
 ## A 1-1 definition is `TRANSFORM`, `FROM`, `SELECT` and an optional `WHERE`
 
 The 1-1 statement is:
@@ -98,12 +81,15 @@ SELECT <expr> AS <field> [, <expr> AS <field> ...]
 `int8` or `decimal`), `EXTRACT(<field> FROM <expr>)`, or a function call
 (`strpos`, `octet_length`, `char_length`, `regexp_count`, `abs`, `ceil`,
 `floor`, `round`, `trunc`, `date_trunc`, `coalesce`, `nullif`; general
-`func(args)` syntax). `AND`, `OR`, `IS` and `AT` are operators only after a
-complete operand, `END` only closes a `CASE`, `NOT` and `CASE` are keywords
-only where an operand follows (a prefix `-` begins one, as in Postgres), and `EXTRACT` is one only before a `(`, so a
-column of any of those names is still a column. `AT TIME ZONE` binds tighter
-than `*` and looser than prefix `-`.
-Values
+`func(args)` syntax). Operators lex and bind as Postgres's do
+([ADR-0022](0022-grammar-mirrors-postgres.md)). `AND`, `OR`, `IS` and `AT` are
+operators only after a complete operand, `END` only closes a `CASE`, and
+`EXTRACT` is a keyword only before a `(`; elsewhere each of those words is a
+column name. `NOT` and `CASE` are keywords wherever an operand follows them (a
+name other than `AS`, `IS`, `AND`, `OR`, `WHEN`, `THEN`, `ELSE` or `END`, a
+number, a string, a `(` or a `-`), so `NOT -x > 0` is `NOT ((-x) > 0)`; where
+none follows (`not AS c`, `not + 1`) the word is a column name. `AT TIME ZONE`
+binds tighter than `*` and looser than prefix `-`. Values
 carry a Postgres type (the ones [type support](../type-support.md) lists), and
 every operator/function's argument and return types are type-checked at
 definition time. `<predicate>` accepts only the
@@ -231,8 +217,10 @@ identical to a stable PostgreSQL 15+ operator/function**; (b) **immutable** per
 Anything volatile, session- or collation-dependent stays out.
 
 Binary operators parse by precedence climbing over a per-operator precedence table
-in the operator registry; all are left-associative. A new operator declares its
-tier there.
+in the operator registry. As in Postgres, the arithmetic operators, `AND` and
+`OR` are left-associative, and the comparisons (`IS [NOT] DISTINCT FROM`
+among them) are non-associative, so `a < b < c` is refused. A new operator
+declares its tier there.
 
 ## Consequences
 

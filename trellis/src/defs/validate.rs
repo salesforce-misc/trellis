@@ -829,9 +829,9 @@ impl fmt::Display for ValidationError {
                 if column.eq_ignore_ascii_case("not") || column.eq_ignore_ascii_case("case") {
                     write!(
                         f,
-                        "; {} is a reserved word in Postgres and in this grammar (identifiers \
-                         cannot be quoted), so a source column of that name cannot be \
-                         referenced: rename the column",
+                        "; {} reads as a column name here because no operand follows it (an \
+                         operand starts with a name, a number, a string, '(' or '-'); write \
+                         the operand right after the keyword",
                         column.to_uppercase()
                     )?;
                 }

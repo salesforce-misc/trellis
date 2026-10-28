@@ -331,12 +331,13 @@ fn not_and_case_before_a_minus_are_the_keywords() {
     ));
 }
 
-/// A column named `not` or `case` cannot be an operand of a `-`; where it
-/// is left unresolved the message says to rename it.
+/// `NOT` or `CASE` with no operand after it reads as a column name; where no
+/// column has that name the message says why the word was not the keyword.
 #[test]
-fn an_unresolved_not_or_case_column_says_to_rename_it() {
+fn an_unresolved_not_or_case_column_says_why_it_is_a_column() {
     for name in ["NOT", "CASE"] {
-        assert_refused(&format!("{name} AND b"), "rename the column");
+        assert_refused(&format!("{name} AND b"), "no operand follows it");
+        assert_refused(&format!("{name} + i4 > 0"), "no operand follows it");
     }
 }
 

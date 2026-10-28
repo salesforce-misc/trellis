@@ -41,26 +41,42 @@ the two can drift apart, so the grammar is where this ADR binds.
 Each rule the expression grammar has is the rule Postgres's `scan.l` and
 `gram.y` have for that construct:
 
-- **Token boundaries.** A multi-character operator is one token only when its
-  characters are written adjacent (`<=`, `<>`, `!=`, `>=`); `a < = b` is two
-  operators, which Postgres refuses, so Trellis refuses it. An operator is the
-  longest run of operator characters, trimmed as Postgres trims it (a run ending
-  in `+` or `-` gives back that character unless the run holds one of
-  `` ~ ! @ # % ^ & | ` ? ``), so `a<-1` is `a < -1`, as in Postgres. String
-  quoting and numeric literals lex as Postgres lexes them, and a lexical form
-  Trellis doesn't implement is refused, never read as something else.
+- **Token boundaries.** An operator is the longest run of adjacent operator
+  characters (`` + - * / % < > = ~ ! @ # ^ & | ` ? ``), cut before a `--` or
+  `/*` and trimmed as Postgres trims it: a run ending in `+` or `-` gives back
+  those characters unless it holds one of `` ~ ! @ # % ^ & | ` ? ``. So
+  `a<-1` is `a < -1` and `a>=-1` is `a >= -1`, while `a!=-1` and `a%-1` are
+  the single operators `!=-` and `%-`, which Postgres doesn't have, and
+  Trellis refuses each whole rather than splitting it. A multi-character
+  operator is one token only when its characters are adjacent (`<=`, `<>`,
+  `!=`, `>=`); `a < = b` is two operators, which Postgres refuses, so Trellis
+  refuses it by name. String quoting and numeric literals lex as Postgres
+  lexes them, and a lexical form Trellis doesn't implement (`1e3`, `.5`,
+  `1_000`, `0x1F`, `E'...'`, a `/* */` or `--` comment) is refused, never read
+  as something else.
+  [OPEN: a number directly followed by a letter (`a>1AND b<2`, `1IS NULL`,
+  `a+1AS x`) lexes as the number and then a word, though PostgreSQL 15 and
+  later reject it as trailing junk after a numeric literal; the 0.1.0-alpha
+  accepted `a+1AS x`. Recommendation: refuse it, as Postgres does.]
 - **Precedence and associativity.** Each operator sits at Postgres's tier and
   associates as Postgres's does, including non-associativity: the comparisons
   don't chain (`a < b < c` is refused), `NOT` binds looser than the comparisons
   and `IS`, and `AT TIME ZONE` binds tighter than `*` and looser than prefix
   `-`.
-- **Keywords.** A word Postgres reserves is a keyword everywhere. A non-reserved
-  keyword is a keyword only in the positions where Postgres's grammar treats it
-  as one, and a name elsewhere. So `NOT` and `CASE` are always keywords, even
-  before `-`: `not - 1` is `NOT (-1)`, as in Postgres. Trellis has no quoted
-  identifiers, so a source column named `not` or `case` can't be referenced
-  bare; Postgres would require `"not"` there too, and Trellis refuses rather
-  than reading the word as a column.
+- **Keywords.** `NOT` and `CASE`, which Postgres reserves, are keywords
+  before every operand the grammar has, `-` included: `not - 1` is `NOT (-1)`, as in
+  Postgres. Trellis has no quoted identifiers, so a source column named `not`
+  or `case` can't be referenced before an operand; Postgres would need
+  `"not"` there.
+  [OPEN: whether every word Postgres reserves is a keyword everywhere. A
+  reserved word with no operand after it, or one the grammar has no use for,
+  reads as a column name today: `not AS c`, `not + 1` (which Postgres reads as
+  `NOT (+1)`), `case * b`, `end + 1`, and `true`, `false` and `null`, which
+  are literals in Postgres. Each resolves only to a source column of that
+  name, which Postgres would need quoted, and is refused as an unresolved
+  column otherwise. The 0.1.0-alpha read `not AS c`, `not + 1` and `true AS c`
+  this way. Recommendation: the rule covers the keywords the grammar uses, not
+  every reserved word.]
 - **Spellings.** An alternative spelling is accepted only where Postgres
   accepts it, and means what it means there. `CAST(x AS int)` (and `int4`,
   `int8`, `decimal`) is accepted because Postgres spells those types so; `!=`
@@ -76,11 +92,13 @@ reads differently, is refused.
 ### Settings Postgres reads are pinned, or the construct is refused
 
 Where Postgres's result for a construct depends on a setting, either every
-Trellis session pins the setting or define refuses the construct. Sessions pin
-`DateStyle`, `TimeZone`, `timezone_abbreviations`, `IntervalStyle`,
-`extra_float_digits`, `search_path` and the other output settings
-[type support](../type-support.md#text-rendering) lists, so `AT TIME ZONE 'UTC'`
-reads `'UTC'` the same way everywhere. What can't be pinned per session, such as
+Trellis session pins the setting or define refuses the construct. Every
+connection Trellis opens pins the output settings
+[type support](../type-support.md#text-rendering) lists (`DateStyle`,
+`IntervalStyle`, `TimeZone`, `extra_float_digits` and the rest),
+`timezone_abbreviations`, so `AT TIME ZONE 'UTC'` reads `'UTC'` the same way
+everywhere, and `search_path`, to Trellis's schema, the target schema and
+`public`, after the implicit `pg_catalog`. What can't be pinned per session, such as
 a column's collation for text ordering, or the time zone database behind
 `'America/New_York'`, is refused.
 
@@ -159,9 +177,9 @@ Postgres.
   refusals in the transforms table, and no quoted identifiers, so a column whose
   name Postgres reserves can't be referenced.
 - The oracle is every supported Postgres version, PostgreSQL 15 or later. Where
-  majors differ (PostgreSQL 16 accepts `1_000` and `0x1F` as integer literals;
-  15 rejects both), Trellis accepts only what every supported major accepts with
-  one meaning. Supporting a new major means running the reviewer's checks and
+  majors differ (PostgreSQL 16 and later read `1_000` as 1000 and `0x1F` as
+  31; 15 rejects both as trailing junk), Trellis accepts only what every
+  supported major accepts with one meaning, so it refuses both. Supporting a new major means running the reviewer's checks and
   the harness against it; a rule it changes for text Trellis accepts is refused
   until the older majors leave the supported range, then follows the new rule
   under ADR-0018. Dropping a major can only widen what Trellis accepts.
