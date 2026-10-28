@@ -65,7 +65,7 @@ pub use ast::{AlterTransform, DefinitionRef, Statement, StatementKind, Transform
 pub use catalog::{CatalogError, alter_transform, install_definition, tables_to_capture};
 pub use error::ParseError;
 pub use model::TransformStatus;
-pub use parser::{parse_statement, statement_kind};
+pub use parser::{MAX_EXPRESSION_DEPTH, parse_statement, statement_kind};
 // Stored text loads through `grammar::load`; the integration tests parse
 // fresh text directly.
 #[cfg(any(test, feature = "internals", feature = "test-util"))]
