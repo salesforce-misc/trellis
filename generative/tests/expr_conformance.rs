@@ -30,6 +30,7 @@ struct Harness {
     runtime: tokio::runtime::Runtime,
     admitted: Cell<usize>,
     refused: Cell<usize>,
+    gaps: Cell<usize>,
 }
 
 thread_local! {
@@ -45,6 +46,7 @@ thread_local! {
             fixture,
             admitted: Cell::new(0),
             refused: Cell::new(0),
+            gaps: Cell::new(0),
         }
     };
 }
@@ -55,6 +57,7 @@ fn check_text(text: &str, intended: Option<&Expr>) -> Result<Agreement, Divergen
         match &result {
             Ok(Agreement::Admitted) => h.admitted.set(h.admitted.get() + 1),
             Ok(Agreement::RefusedAndRaises(_)) => h.refused.set(h.refused.get() + 1),
+            Ok(Agreement::KnownGap(_)) => h.gaps.set(h.gaps.get() + 1),
             Err(_) => {}
         }
         result
@@ -64,9 +67,11 @@ fn check_text(text: &str, intended: Option<&Expr>) -> Result<Agreement, Divergen
 fn report() {
     HARNESS.with(|h| {
         eprintln!(
-            "expression conformance: {} admitted and agreeing, {} refused and raising",
+            "expression conformance: {} admitted and agreeing, {} refused and raising, \
+             {} tolerated as the constant-call gap",
             h.admitted.get(),
-            h.refused.get()
+            h.refused.get(),
+            h.gaps.get()
         );
     });
 }
@@ -86,9 +91,10 @@ fn runner(cases: u32) -> TestRunner {
     })
 }
 
-/// Type, Value and Round trip over `cases` random expressions.
-fn run_expression_property(cases: u32) {
-    let strategy = any_expr(&columns(), Profile::CONFORMANCE);
+/// Type, Value and Round trip over `cases` random expressions, drawn over
+/// `columns` (none: constants only, which Postgres folds at plan time).
+fn run_expression_property(cases: u32, columns: &[expr_gen::Column]) {
+    let strategy = any_expr(columns, Profile::CONFORMANCE);
     let result = runner(cases).run(&strategy, |draw: Draw| {
         let text = draw.text();
         check_text(&text, Some(&draw.expr))
@@ -117,7 +123,12 @@ fn run_refusal_property(cases: u32) {
 
 #[test]
 fn expressions_conform_to_postgres_smoke() {
-    run_expression_property(cases(60));
+    run_expression_property(cases(60), &columns());
+}
+
+#[test]
+fn constant_expressions_conform_to_postgres_smoke() {
+    run_expression_property(cases(60), &[]);
 }
 
 #[test]
@@ -128,7 +139,15 @@ fn near_misses_are_refused_smoke() {
 #[test]
 #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
 fn property_expressions_conform_to_postgres() {
-    run_expression_property(cases(1000));
+    run_expression_property(cases(1000), &columns());
+}
+
+/// No column in sight: every subexpression is a constant Postgres folds at
+/// plan time, which is where the define-time range refusals live.
+#[test]
+#[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
+fn property_constant_expressions_conform_to_postgres() {
+    run_expression_property(cases(1000), &[]);
 }
 
 #[test]
@@ -314,6 +333,25 @@ fn constants_postgres_rejects_at_plan_time_are_refused_at_define() {
     }
 }
 
+/// The open gap the properties tolerate: Postgres evaluates a function call
+/// over constants while planning, then the sum around it, so an overflow
+/// there raises for every row, while define (which has no value for the
+/// call) admits it. This pin fails the day define refuses it, which is when
+/// `KNOWN_GAP_CONSTANT_CALL` and the tolerance in the checker go.
+#[test]
+fn a_range_overflow_around_a_constant_call_is_a_known_gap() {
+    for text in [
+        "2147483647 + CHAR_LENGTH('abc')",
+        "9223372036854775807 + REGEXP_COUNT('a', 'a*')",
+        "CHAR_LENGTH('abc') + 2147483647",
+    ] {
+        match check_text(text, None) {
+            Ok(Agreement::KnownGap(_)) => {}
+            other => panic!("`{text}`: expected the known gap, got {other:?}"),
+        }
+    }
+}
+
 /// Each refusal, by name: the near miss, and that the error names it.
 #[test]
 fn each_refusal_names_its_construct() {
@@ -391,4 +429,66 @@ fn the_tables_columns_are_types_the_generator_knows() {
         );
     }
     let _ = ValueType::Numeric;
+}
+
+/// The generator is not vacuous: over a few thousand draws it reaches every
+/// registry operator and function, `COALESCE`, every typed-literal type, a
+/// float against a bare literal, and expressions nested to the full depth.
+#[test]
+fn the_generator_reaches_every_registry_entry() {
+    use proptest::strategy::{Strategy, ValueTree};
+    use std::collections::BTreeSet;
+
+    fn walk(expr: &Expr, seen: &mut BTreeSet<String>, depth: usize, deepest: &mut usize) {
+        *deepest = (*deepest).max(depth);
+        match expr {
+            Expr::BinaryOp { op, lhs, rhs } => {
+                seen.insert(format!("op {}", registry::operator_spec(*op).symbol));
+                walk(lhs, seen, depth + 1, deepest);
+                walk(rhs, seen, depth + 1, deepest);
+            }
+            Expr::FunctionCall { name, args } => {
+                seen.insert(format!("fn {name}"));
+                for arg in args {
+                    walk(arg, seen, depth + 1, deepest);
+                }
+            }
+            Expr::TypedLiteral { value_type, .. } => {
+                seen.insert(format!("literal {value_type}"));
+            }
+            Expr::NumberLiteral(_) => {
+                seen.insert("number literal".to_string());
+            }
+            Expr::StringLiteral(_) => {
+                seen.insert("string literal".to_string());
+            }
+            Expr::Column(_) | Expr::SourceColumn { .. } => {
+                seen.insert("column".to_string());
+            }
+        }
+    }
+
+    let strategy = any_expr(&columns(), Profile::CONFORMANCE);
+    let mut test_runner = runner(1);
+    let mut seen = BTreeSet::new();
+    let mut deepest = 0;
+    for _ in 0..4000 {
+        let draw = strategy.new_tree(&mut test_runner).expect("tree").current();
+        walk(&draw.expr, &mut seen, 0, &mut deepest);
+    }
+    let mut expected: Vec<String> = registry::OPERATORS
+        .iter()
+        .map(|o| format!("op {}", o.symbol))
+        .chain(registry::FUNCTIONS.iter().map(|f| format!("fn {}", f.name)))
+        .chain(["fn COALESCE".to_string(), "column".to_string()])
+        .collect();
+    expected.extend(
+        trellis::dev::defs::typed_literal::TYPED_LITERALS
+            .iter()
+            .map(|spec| format!("literal {}", spec.value_type)),
+    );
+    for want in &expected {
+        assert!(seen.contains(want), "never drew {want}; saw {seen:?}");
+    }
+    assert!(deepest >= 3, "deepest draw was {deepest}");
 }

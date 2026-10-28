@@ -829,10 +829,29 @@ pub mod strategy {
             profile,
             cache: RefCell::new(Vec::new()),
         });
-        let strategies: Vec<BoxedStrategy<Expr>> = universe()
+        let mut strategies: Vec<BoxedStrategy<Expr>> = universe()
             .into_iter()
             .filter_map(|ty| builder.expr(ty, profile.max_depth))
             .collect();
+        // `COALESCE` over numeric types of different kinds: Postgres picks
+        // the result type, so no rule can name it.
+        if profile.max_depth > 0 {
+            let numeric: Vec<BoxedStrategy<Expr>> = universe()
+                .into_iter()
+                .filter(|ty| ty.is_numeric_family())
+                .filter_map(|ty| builder.expr(ty, profile.max_depth - 1))
+                .collect();
+            if !numeric.is_empty() {
+                strategies.push(
+                    prop::collection::vec(Union::new(numeric), 2..=3)
+                        .prop_map(|args| Expr::FunctionCall {
+                            name: "COALESCE".to_string(),
+                            args,
+                        })
+                        .boxed(),
+                );
+            }
+        }
         // Boxed trees hold no `Rc`; the builder is dropped here.
         (Union::new(strategies), text_style())
             .prop_map(|(expr, style)| Draw { expr, style })

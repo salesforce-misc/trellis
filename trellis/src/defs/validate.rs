@@ -2761,6 +2761,19 @@ fn reads_no_column<'f>(
                 depth + 1,
             )
         }
+        // The planner reduces a `COALESCE` led by a constant to that
+        // constant and drops the rest unevaluated, so what follows the first
+        // argument does not matter.
+        Expr::FunctionCall { name, args } if name == "COALESCE" => args.first().is_some_and(|arg| {
+            reads_no_column(
+                arg,
+                field_name,
+                source_columns,
+                fields_by_name,
+                memo,
+                depth + 1,
+            )
+        }),
         Expr::FunctionCall { name, args } => {
             super::registry::lookup_aggregate_function(name).is_none()
                 && args.iter().all(|arg| {
@@ -4327,6 +4340,29 @@ mod tests {
             let d = parsed(&format!("TRANSFORM t FROM s SELECT {fields}"));
             assert_eq!(validate(&d, &source_columns), Ok(()), "{fields}");
         }
+    }
+
+    /// A `COALESCE` whose first argument is a constant is itself a constant to
+    /// Postgres, whatever follows (it drops the rest), so an enclosing
+    /// `COALESCE` that has a constant first argument drops the rest too: the
+    /// overflowing sum after it is never evaluated, and refusing it was a
+    /// false refusal (found by the expression conformance harness).
+    #[test]
+    fn a_coalesce_led_by_a_constant_is_a_constant_argument() {
+        let source_columns = HashMap::from([
+            ("r".to_string(), ValueType::Float(FloatWidth::Float4)),
+            ("d".to_string(), ValueType::Float(FloatWidth::Float8)),
+        ]);
+        for expr in [
+            "COALESCE(COALESCE(REAL '0', r + r), d + (2147483647 + 1))",
+            "COALESCE(COALESCE(5, r), 2147483647 + 1)",
+        ] {
+            let d = parsed(&format!("TRANSFORM t FROM s SELECT {expr} AS out"));
+            assert_eq!(validate(&d, &source_columns), Ok(()), "{expr}");
+        }
+        // Led by a column, the constant after it is still folded.
+        let d = parsed("TRANSFORM t FROM s SELECT COALESCE(COALESCE(r, 5), 2147483647 + 1) AS out");
+        assert!(validate(&d, &source_columns).is_err());
     }
 
     #[test]
