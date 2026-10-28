@@ -319,7 +319,10 @@ fn not_and_case_before_a_minus_are_the_keywords() {
     assert_type("NOT NOT -i4 > 0", B);
     assert_type("NOT (-i4 > 0)", B);
     assert!(
-        matches!(parse_err("CASE -a WHEN 1 THEN 2 END"), ParseError::SimpleCaseUnsupported),
+        matches!(
+            parse_err("CASE -a WHEN 1 THEN 2 END"),
+            ParseError::SimpleCaseUnsupported
+        ),
         "CASE -x is a simple CASE"
     );
     assert!(matches!(

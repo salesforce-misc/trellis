@@ -1524,7 +1524,11 @@ fn operator_lexing_near_misses_are_refused() {
         .into_iter()
         .filter(|m| m.kind == "operator-lexing")
         .collect();
-    assert!(misses.len() >= 8, "only {} operator-lexing misses", misses.len());
+    assert!(
+        misses.len() >= 8,
+        "only {} operator-lexing misses",
+        misses.len()
+    );
     HARNESS.with(|h| {
         for miss in &misses {
             if let Err(d) = h.fixture.check_refusal(miss) {

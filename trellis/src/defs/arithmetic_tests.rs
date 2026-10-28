@@ -640,7 +640,10 @@ fn a_comparison_split_by_whitespace_is_refused_by_name() {
         ("a < > b", "< >", "<>"),
     ] {
         match parse_err(text) {
-            ParseError::SplitOperator { found: f, joined: j } => {
+            ParseError::SplitOperator {
+                found: f,
+                joined: j,
+            } => {
                 assert_eq!((f.as_str(), j.as_str()), (found, joined), "`{text}`");
             }
             other => panic!("`{text}`: {other:?}"),
