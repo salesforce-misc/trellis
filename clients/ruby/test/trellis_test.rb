@@ -87,8 +87,6 @@ class TrellisTest < Minitest::Test
     assert_instance_of Trellis::Config, config
     assert_equal "trellis", config.schema
     assert_equal "reporting", config.target_schema
-    assert_operator config.pool_max_size, :>=, 1
-    assert_operator config.pool_wait_timeout_ms, :>=, 1
 
     # A config is the kind of value that gets logged whole.
     refute_includes config.to_h.keys, :url
@@ -150,7 +148,9 @@ class TrellisTest < Minitest::Test
       [{ url: TestCluster.dsn, target_schema: 1 }, "target_schema must be a String"],
       [{ url: TestCluster.dsn, staging: "yes" }, "staging must be true or false"],
       [{ url: TestCluster.dsn, drain_threads: -1 }, "drain_threads must be a non-negative"],
-      [{ url: TestCluster.dsn, worker_threads: 0 }, "worker_threads must be a positive"]
+      [{ url: TestCluster.dsn, worker_threads: 0 }, "worker_threads must be a positive"],
+      [{ url: TestCluster.dsn, max_call_pool_size: 0 }, "max_call_pool_size must be a positive"],
+      [{ url: TestCluster.dsn, call_pool_wait_timeout_ms: -1 }, "timeout_ms must be a non-negative"]
     ].each do |options, message|
       error = assert_raises(Trellis::ValidationError, options.inspect) { Trellis.connect(**options) }
       assert_match message, error.message

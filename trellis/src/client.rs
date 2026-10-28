@@ -189,7 +189,7 @@ pub struct ClientOptions {
     /// A share over the cap is folded once into a session `TEMP` table on a
     /// Postgres connection the drain opens outside the pool and closes when
     /// it finishes, so while paging a client holds up to
-    /// `application_threads` connections beyond `pool_max_size`. Leave that
+    /// `application_threads` connections beyond its pools. Leave that
     /// headroom under the server's `max_connections`: without it, an
     /// oversized share fails to connect, is released, and retries each poll.
     pub drain_batch_cap: usize,
@@ -581,7 +581,9 @@ impl Client {
                         return;
                     }
                 };
-                runtime.block_on(run(dsn, config, options, shutdown_rx, ready_tx));
+                runtime.block_on(crate::pool::count_background_connections(run(
+                    dsn, config, options, shutdown_rx, ready_tx,
+                )));
             })
             .map_err(ClientError::Spawn)?;
 
@@ -725,7 +727,13 @@ async fn run(
     mut shutdown_rx: watch::Receiver<bool>,
     ready_tx: std::sync::mpsc::Sender<Result<(), ClientError>>,
 ) {
-    let pool = match Pool::new(&config) {
+    // Sized by this client's roles (see `crate::pool::background_pool_size`).
+    let pool_size = crate::pool::background_pool_size(
+        options.staging_worker,
+        options.application_threads,
+    )
+    .unwrap_or(1);
+    let pool = match Pool::background(&config, pool_size) {
         Ok(pool) => pool,
         Err(err) => {
             let _ = ready_tx.send(Err(err.into()));
@@ -763,10 +771,10 @@ async fn run(
             held_key_retry: options.held_key_retry,
             drain_batch_cap: options.drain_batch_cap,
         };
-        maintenance_task = Some(tokio::spawn(maintenance_loop(
+        maintenance_task = Some(tokio::spawn(crate::pool::count_background_connections(maintenance_loop(
             maintenance_config,
             shutdown_rx.clone(),
-        )));
+        ))));
     }
 
     // Unique across processes and restarts: see `new_worker_id`.
@@ -838,10 +846,10 @@ async fn run(
             drain_batch_cap: options.drain_batch_cap,
             build_chunk_rows: options.build_chunk_rows.max(1),
         };
-        app_worker_tasks.push(tokio::spawn(app_worker_loop(
+        app_worker_tasks.push(tokio::spawn(crate::pool::count_background_connections(app_worker_loop(
             worker_config,
             shutdown_rx.clone(),
-        )));
+        ))));
     }
 
     // The process's one worker-registry heartbeat and chunk-reclaim sweep
@@ -851,25 +859,27 @@ async fn run(
         let pool = pool.clone();
         let worker_id = client_id.clone();
         let reclaim_ttl = options.reclaim_ttl;
-        tokio::spawn(worker_upkeep_loop(
+        tokio::spawn(crate::pool::count_background_connections(worker_upkeep_loop(
             upkeep_interval(reclaim_ttl),
             live_workers.clone(),
             shutdown_rx.clone(),
             async move || worker_upkeep_pass(&pool, &worker_id, reclaim_ttl).await,
-        ))
+        )))
     });
 
     // `self_check` jobs run beside the drain workers, never in their
     // loop (see `self_check_loop`), wherever drain workers run.
     if let Some(self_check_wake) = self_check_wake {
-        app_worker_tasks.push(tokio::spawn(self_check_loop(
-            pool.clone(),
-            self_check_wake,
-            format!("{client_id}-self-check"),
-            options.reclaim_ttl,
-            options.poll_interval,
-            options.idle_wake_cap,
-            shutdown_rx.clone(),
+        app_worker_tasks.push(tokio::spawn(crate::pool::count_background_connections(
+            self_check_loop(
+                pool.clone(),
+                self_check_wake,
+                format!("{client_id}-self-check"),
+                options.reclaim_ttl,
+                options.poll_interval,
+                options.idle_wake_cap,
+                shutdown_rx.clone(),
+            ),
         )));
     }
 
@@ -878,12 +888,12 @@ async fn run(
     let registration_task = (options.application_threads > 0).then(|| {
         let pool = pool.clone();
         let workers = live_workers.clone();
-        tokio::spawn(worker_upkeep_loop(
+        tokio::spawn(crate::pool::count_background_connections(worker_upkeep_loop(
             drainer_registration_interval(options.drainer_window),
             live_workers.clone(),
             shutdown_rx.clone(),
             async move || drainer_registration_pass(&pool, &workers).await,
-        ))
+        )))
     });
 
     // Keeps this instance's gauges set for as long as the client runs, so the

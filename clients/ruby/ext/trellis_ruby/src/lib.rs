@@ -396,11 +396,6 @@ impl Handle {
             [
                 ("schema", ruby.into_value(config.schema)),
                 ("target_schema", ruby.into_value(config.target_schema)),
-                ("pool_max_size", ruby.into_value(config.pool_max_size)),
-                (
-                    "pool_wait_timeout_ms",
-                    ruby.into_value(config.pool_wait_timeout_ms),
-                ),
             ],
         )
     }
@@ -441,6 +436,8 @@ fn connect(
     staging: bool,
     drain_threads: usize,
     worker_threads: usize,
+    max_call_pool_size: usize,
+    call_pool_wait_timeout_ms: u64,
 ) -> Result<Handle, Error> {
     engine::check().map_err(|err| forked_handle_error(ruby, forked_while_running(&err)))?;
     // Connecting can wait on the database (a staging worker installs its
@@ -460,6 +457,8 @@ fn connect(
                     staging,
                     drain_threads,
                     worker_threads: Some(worker_threads),
+                    max_call_pool_size,
+                    call_pool_wait_timeout: Duration::from_millis(call_pool_wait_timeout_ms),
                     ..Default::default()
                 };
                 // Can't fail after `check` passed (a process's answer never
@@ -1229,7 +1228,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     }
 
     let native = ruby.define_module("Trellis")?.define_module("Native")?;
-    native.define_module_function("connect", function!(connect, 6))?;
+    native.define_module_function("connect", function!(connect, 8))?;
     native.define_module_function("error_codes", function!(error_codes, 0))?;
     native.define_module_function("status_names", function!(status_names, 0))?;
     native.define_module_function("quarantine_states", function!(quarantine_states, 0))?;

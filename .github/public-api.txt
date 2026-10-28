@@ -86,13 +86,9 @@ function ClientError::code
 function ClientOptions::wake_channel_for
 function Config::dsn
 function Config::from_dsn
-function Config::pool_max_size
-function Config::pool_wait_timeout
 function Config::resolve
 function Config::schema
 function Config::target_schema
-function Config::with_pool_max_size
-function Config::with_pool_wait_timeout
 function Config::with_schema
 function Config::with_target_schema
 function DdlError::code
@@ -106,8 +102,11 @@ function Metrics::new
 function Metrics::render_prometheus
 function ParseError::code
 function PendingCall::wait
+function Pool::close_idle
+function Pool::counts
 function Pool::get
 function Pool::new
+function Pool::with_limits
 function PooledClient::build_transaction
 function PooledClient::transaction
 function QuarantineState::as_str

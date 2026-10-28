@@ -111,7 +111,7 @@ use std::time::{Duration, SystemTime};
 use tokio_postgres::types::PgLsn;
 
 use crate::client::{Client, ClientError, ClientOptions};
-use crate::config::Config;
+use crate::config::{Config, DEFAULT_CALL_POOL_MAX_SIZE, DEFAULT_CALL_POOL_WAIT_TIMEOUT};
 use crate::defs::source_index::SourceIndexGap;
 use crate::defs::{self, CatalogError, ParseError, StoredStatus, TransformStatus, ValueType};
 use crate::error_code::{self, ErrorCode};
@@ -135,11 +135,13 @@ use crate::staging::{DEFAULT_RECLAIM_TTL, StagingError, converge, worker_registr
 /// (nothing background starts); a connection that runs the live pipeline
 /// sets `staging` and a non-zero `drain_threads`. `worker_threads` is
 /// unrelated to either — see its own doc comment.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TrellisOptions {
     /// Whether this connection runs capture reconciliation and ring
-    /// maintenance (the staging worker). Exactly one connection in a fleet
-    /// should set this. When set, the staging worker installs capture
+    /// maintenance (the staging worker). Any number of connections may set
+    /// this: one takes the producer lock and leads, the rest stand by and take
+    /// over when the leader goes away (see `docs/embedding.md`, "Rolling
+    /// deploys"). When set, the leader installs capture
     /// triggers on whatever tables the registered definitions read, straight
     /// from the catalog, and picks up definitions registered later on its
     /// next reconcile pass; none need be registered before it starts.
@@ -147,7 +149,8 @@ pub struct TrellisOptions {
     /// How many drain (application) worker threads this connection runs. Zero
     /// (the default) runs none. Each is a task on the background client's
     /// runtime, not an OS thread, and holds up to three connections outside
-    /// the pools; `docs/embedding.md`, "What a handle uses", adds up a
+    /// the pools (see [`Pool::background`](crate::Pool)'s sizing);
+    /// `docs/embedding.md`, "What a handle uses", adds up a
     /// handle's connections, threads and memory.
     pub drain_threads: usize,
     /// Caps the worker-thread count of each `tokio` runtime this connection
@@ -208,6 +211,36 @@ pub struct TrellisOptions {
     /// attempt count; the next retry time is reported only by a connection
     /// with this option set.
     pub held_key_retry: Option<HeldKeyRetry>,
+    /// The most physical connections the handle's call pool opens: the pool
+    /// that serves the handle's API calls (`status`, `apply`, `define`,
+    /// `migrate`, ...). Default 20 ([`DEFAULT_CALL_POOL_MAX_SIZE`]).
+    /// Connections open as calls need them and close after 60 seconds idle,
+    /// so a handle that makes few calls holds none. Most calls hold one
+    /// connection, a few hold two or three while they run.
+    ///
+    /// Calls never use the background pool, which serves the background
+    /// client (`staging`, `drain_threads`) and is sized by those roles, not
+    /// by this option. Must be at least 1.
+    pub max_call_pool_size: usize,
+    /// How long a call waits for a free call-pool connection before failing
+    /// with a connectivity error. Default 30 seconds
+    /// ([`DEFAULT_CALL_POOL_WAIT_TIMEOUT`]). A call's own deadline can cut the
+    /// wait shorter.
+    pub call_pool_wait_timeout: Duration,
+}
+
+impl Default for TrellisOptions {
+    fn default() -> Self {
+        Self {
+            staging: false,
+            drain_threads: 0,
+            worker_threads: None,
+            call_deadline: None,
+            held_key_retry: None,
+            max_call_pool_size: DEFAULT_CALL_POOL_MAX_SIZE,
+            call_pool_wait_timeout: DEFAULT_CALL_POOL_WAIT_TIMEOUT,
+        }
+    }
 }
 
 /// A connected Trellis instance — see the [crate docs](crate).
@@ -246,7 +279,11 @@ impl Trellis {
     /// (none yet is fine) and runs ring maintenance; with a non-zero `drain_threads`,
     /// that many application workers start.
     pub async fn connect(config: Config, options: TrellisOptions) -> Result<Self, TrellisError> {
-        let pool = Pool::new(&config)?;
+        let pool = Pool::with_limits(
+            &config,
+            options.max_call_pool_size,
+            options.call_pool_wait_timeout,
+        )?;
         let client = if options.staging || options.drain_threads > 0 {
             Some(Self::start_client(&config, &options)?)
         } else {
@@ -1598,7 +1635,7 @@ impl Trellis {
     /// caller that wants to wait longer calls again.
     ///
     /// Holds one pooled connection for the whole call (it polls on it), so a
-    /// long `timeout` on a small `pool_max_size` is a real, if bounded, draw
+    /// long `timeout` on a small `max_call_pool_size` is a real, if bounded, draw
     /// on this [`Trellis`]'s own pool — note the background [`Client`]'s
     /// drain workers use a *separate* pool, so this can't starve them.
     pub async fn await_converged(
@@ -2803,8 +2840,7 @@ mod client_options_tests {
             staging: true,
             drain_threads: 3,
             worker_threads: Some(2),
-            call_deadline: None,
-            held_key_retry: None,
+            ..Default::default()
         };
         let client = Trellis::client_options(&options);
         assert_eq!(client.worker_threads, Some(2));

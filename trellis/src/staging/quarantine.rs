@@ -2425,50 +2425,54 @@ async fn charge_column_failure(
     key: &str,
     error: &str,
 ) -> Result<(), ApplyError> {
-    let client = pool.get().await?;
-    let inserted = client
-        .execute(
-            "insert into column_failures (transform_table, column_name, src_table, key, error) \
-             values ($1, $2, $3, $4, $5) \
-             on conflict (transform_table, column_name, src_table, key) do nothing",
-            &[&transform, &column, &src_table, &key, &error],
-        )
-        .await?;
-    if inserted == 0 {
-        // This row was charged already. If its charge reached the threshold
-        // and the trip then failed, the count is still at or past it: the
-        // trip resets it in the transaction that writes the pause, and that
-        // transaction's first lock is a fence bump that can wait out the
-        // lock timeout behind a writer in flight. Trip now,
-        // rather than wait for another row's failure.
-        let deaths: Option<i32> = client
-            .query_opt(
-                "select deaths from column_deaths \
-                 where transform_table = $1 and column_name = $2",
-                &[&transform, &column],
+    // The charge's connection goes back before any trip: the trip takes
+    // connections of its own (and nests one more under its cascade), and a
+    // drain thread must never hold more than two pooled connections at once
+    // (`crate::pool::MAX_BACKGROUND_HELD`).
+    let trip = {
+        let client = pool.get().await?;
+        let inserted = client
+            .execute(
+                "insert into column_failures (transform_table, column_name, src_table, key, error) \
+                 values ($1, $2, $3, $4, $5) \
+                 on conflict (transform_table, column_name, src_table, key) do nothing",
+                &[&transform, &column, &src_table, &key, &error],
             )
-            .await?
-            .map(|row| row.get(0));
-        if deaths.is_some_and(|deaths| deaths >= DEFAULT_COLUMN_DEATH_THRESHOLD) {
-            trip_column_fuse(pool, transform, column, error).await?;
+            .await?;
+        if inserted == 0 {
+            // This row was charged already. If its charge reached the
+            // threshold and the trip then failed, the count is still at or
+            // past it: the trip resets it in the transaction that writes the
+            // pause, and that transaction's first lock is a fence bump that
+            // can wait out the lock timeout behind a writer in flight. Trip
+            // now, rather than wait for another row's failure.
+            let deaths: Option<i32> = client
+                .query_opt(
+                    "select deaths from column_deaths \
+                     where transform_table = $1 and column_name = $2",
+                    &[&transform, &column],
+                )
+                .await?
+                .map(|row| row.get(0));
+            deaths.is_some_and(|deaths| deaths >= DEFAULT_COLUMN_DEATH_THRESHOLD)
+        } else {
+            let row = client
+                .query_one(
+                    "insert into column_deaths (transform_table, column_name, deaths, last_error, last_death_at) \
+                     values ($1, $2, 1, $3, now()) \
+                     on conflict (transform_table, column_name) do update set \
+                         deaths = column_deaths.deaths + 1, \
+                         last_error = excluded.last_error, \
+                         last_death_at = now() \
+                     returning deaths",
+                    &[&transform, &column, &error],
+                )
+                .await?;
+            let deaths: i32 = row.get(0);
+            deaths >= DEFAULT_COLUMN_DEATH_THRESHOLD
         }
-        return Ok(());
-    }
-
-    let row = client
-        .query_one(
-            "insert into column_deaths (transform_table, column_name, deaths, last_error, last_death_at) \
-             values ($1, $2, 1, $3, now()) \
-             on conflict (transform_table, column_name) do update set \
-                 deaths = column_deaths.deaths + 1, \
-                 last_error = excluded.last_error, \
-                 last_death_at = now() \
-             returning deaths",
-            &[&transform, &column, &error],
-        )
-        .await?;
-    let deaths: i32 = row.get(0);
-    if deaths >= DEFAULT_COLUMN_DEATH_THRESHOLD {
+    };
+    if trip {
         trip_column_fuse(pool, transform, column, error).await?;
     }
     Ok(())

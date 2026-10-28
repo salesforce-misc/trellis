@@ -178,14 +178,21 @@ defmodule Trellis do
     Default `"public"`.
   - `:staging`: whether this connection runs the staging worker, which
     installs change capture on the source tables and starts each new
-    transform's backfill. Exactly one connection of each instance in a fleet
-    should. Default `false`.
+    transform's backfill. Any number of connections of an instance may set it:
+    one takes the producer lock and leads, the rest stand by and take over when
+    it goes away, so a rolling deploy needs no operator step. Default `false`.
   - `:drain_threads`: how many threads apply staged changes to the targets.
     Default `0`.
   - `:worker_threads`: the worker threads of each Rust runtime a handle owns
     (its calls', and its background client's). Default `2`; the
     work is IO, so a small count is enough, and the BEAM has already sized
     its own schedulers to the cores.
+  - `:max_call_pool_size`: the most connections the handle's call pool (its
+    API calls) opens at once. They open as calls need them and close after 60
+    seconds idle. The background client's pool is sized by `:staging` and
+    `:drain_threads`, not by this. Default `20`.
+  - `:call_pool_wait_timeout_ms`: how long a call waits for a free call-pool
+    connection before failing with a `:connectivity` error. Default `30_000`.
 
   The defaults (`staging: false, drain_threads: 0`) run nothing in the
   background, which is right for a web process or a migration run. Some
@@ -199,6 +206,8 @@ defmodule Trellis do
           | {:staging, boolean()}
           | {:drain_threads, non_neg_integer()}
           | {:worker_threads, pos_integer()}
+          | {:max_call_pool_size, pos_integer()}
+          | {:call_pool_wait_timeout_ms, non_neg_integer()}
 
   # The largest `limit` and `timeout_ms` the engine takes (an `i64` and a
   # `u64` millisecond count); anything larger is refused as `:validation`
@@ -212,7 +221,9 @@ defmodule Trellis do
     target_schema: "public",
     staging: false,
     drain_threads: 0,
-    worker_threads: 2
+    worker_threads: 2,
+    max_call_pool_size: 20,
+    call_pool_wait_timeout_ms: 30_000
   }
 
   @doc """
@@ -757,6 +768,19 @@ defmodule Trellis do
         not (is_integer(options.worker_threads) and options.worker_threads >= 1) ->
           invalid(
             ":worker_threads must be a positive integer, got: #{inspect(options.worker_threads)}"
+          )
+
+        not (is_integer(options.max_call_pool_size) and options.max_call_pool_size >= 1) ->
+          invalid(
+            ":max_call_pool_size must be a positive integer, got: " <>
+              inspect(options.max_call_pool_size)
+          )
+
+        not (is_integer(options.call_pool_wait_timeout_ms) and
+                 options.call_pool_wait_timeout_ms in 0..@max_timeout_ms) ->
+          invalid(
+            ":call_pool_wait_timeout_ms must be a non-negative integer, got: " <>
+              inspect(options.call_pool_wait_timeout_ms)
           )
 
         true ->

@@ -25,12 +25,43 @@
 //! dedicated, non-pooled connections get the same through
 //! [`connect_dedicated`] and [`dedicated_session_setup`].
 
-use crate::config::Config;
+use crate::config::{
+    Config, DEFAULT_CALL_POOL_MAX_SIZE, DEFAULT_CALL_POOL_WAIT_TIMEOUT, POOL_IDLE_TIMEOUT,
+};
 use crate::error::Error;
 use deadpool_postgres::{
     Hook, HookError, Manager, ManagerConfig, Pool as DeadpoolPool, RecyclingMethod, Runtime,
 };
+use deadpool::managed::QueueMode;
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Closes `pool`'s idle connections unused for `idle` or longer.
+fn close_idle(pool: &DeadpoolPool, idle: Duration) {
+    pool.retain(|_, metrics| metrics.last_used() < idle);
+}
+
+/// The size of the background pool for a client's roles, or `None` when it
+/// has neither: a pool that never waits on its own tasks.
+///
+/// A drain thread holds at most 2 pooled connections at once
+/// ([`MAX_BACKGROUND_HELD`]; a column-fuse trip releases its connection
+/// first), and so does `self_check` (1 when it runs a single query). On top of
+/// those:
+///
+/// - a worker (`staging` with `N` drain threads): `2N` for the drain threads,
+///   plus `self_check` 2, the upkeep task 1, the staging maintenance loop 1 and
+///   the registration/startup task 1: `2N + 5`;
+/// - drain only: the same without maintenance, `2N + 4`;
+/// - staging only: the maintenance loop's one pooled connection, `1`.
+pub(crate) fn background_pool_size(staging: bool, drain_threads: usize) -> Option<usize> {
+    match (staging, drain_threads) {
+        (false, 0) => None,
+        (true, 0) => Some(1),
+        (true, n) => Some(2 * n + 5),
+        (false, n) => Some(2 * n + 4),
+    }
+}
 
 /// A pooled connection, handed out by [`Pool::get`].
 ///
@@ -50,6 +81,10 @@ pub struct PooledClient {
     /// `Some` when this checkout ran under a call's deadline: how long to
     /// wait for the connection to settle before giving up on it.
     settle: Option<Duration>,
+    /// Counts this checkout against its task's background-connection depth
+    /// ([`depth`]); debug builds only.
+    #[cfg(debug_assertions)]
+    _depth: Option<depth::Held>,
 }
 
 impl PooledClient {
@@ -57,6 +92,8 @@ impl PooledClient {
         Self {
             inner: Some(inner),
             settle: None,
+            #[cfg(debug_assertions)]
+            _depth: None,
         }
     }
 
@@ -83,6 +120,71 @@ impl PooledClient {
         }
     }
 }
+
+/// The most background-pool connections one task may hold at once: the
+/// background pools are sized on it (`2N + ...`, see [`Pool::background`]).
+/// Debug builds fail a test whose task holds more.
+pub const MAX_BACKGROUND_HELD: usize = 2;
+
+/// Debug-build accounting of how many background-pool connections each task
+/// holds. A task that wants its checkouts counted runs inside
+/// [`depth::scope`]; checkouts outside any scope (a test's own pool use, a
+/// momentary `ChunkHeartbeat` task) are not counted.
+mod depth {
+    #[cfg(debug_assertions)]
+    use std::sync::Arc;
+    #[cfg(debug_assertions)]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(debug_assertions)]
+    tokio::task_local! {
+        static HELD: Arc<AtomicUsize>;
+    }
+
+    /// One counted checkout, released on drop.
+    #[cfg(debug_assertions)]
+    pub(super) struct Held(Arc<AtomicUsize>);
+
+    #[cfg(debug_assertions)]
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Counts one more checkout against the running task, if it is scoped.
+    /// Panics (debug builds) when that is more than
+    /// [`super::MAX_BACKGROUND_HELD`].
+    #[cfg(debug_assertions)]
+    pub(super) fn enter() -> Option<Held> {
+        HELD.try_with(|held| {
+            let guard = Held(held.clone());
+            let now = held.fetch_add(1, Ordering::SeqCst) + 1;
+            assert!(
+                now <= super::MAX_BACKGROUND_HELD,
+                "a task holds {now} background-pool connections at once (the pools are sized \
+                 for at most {}): release one before taking the next",
+                super::MAX_BACKGROUND_HELD
+            );
+            guard
+        })
+        .ok()
+    }
+
+    /// Runs `fut` with its own background-connection count.
+    pub(crate) async fn scope<F: std::future::Future>(fut: F) -> F::Output {
+        #[cfg(debug_assertions)]
+        {
+            HELD.scope(Arc::new(AtomicUsize::new(0)), fut).await
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            fut.await
+        }
+    }
+}
+
+pub(crate) use depth::scope as count_background_connections;
 
 /// `SET LOCAL statement_timeout` for the running call's remaining budget, as
 /// a transaction's first statement. Nothing outside a call.
@@ -238,29 +340,82 @@ pub struct Pool {
     /// The name this pool's instance logs under ([`crate::instance_log`]),
     /// for the drivers [`Pool::connect_unpooled`] spawns.
     instance: std::sync::Arc<str>,
-    /// `Config::pool_wait_timeout`, which a call's remaining budget can
-    /// shorten for one checkout ([`Pool::get`]).
+    /// How long a checkout waits for a free connection, which a call's
+    /// remaining budget can shorten ([`Pool::get`]).
     wait_timeout: Duration,
+    /// Whether this is a background pool ([`Pool::background`]), whose
+    /// checkouts are counted per task in debug builds.
+    background: bool,
+    /// Stops the idle sweep when the last clone of the pool goes.
+    _sweep: Arc<SweepTask>,
+}
+
+/// The pool's idle sweep; aborted when the pool's last clone drops.
+#[derive(Debug)]
+struct SweepTask(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for SweepTask {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
 }
 
 impl Pool {
-    /// Builds a pool from `config`. Fails only if `config.dsn` can't be
-    /// parsed as a Postgres connection string or deadpool's builder rejects
-    /// the resulting configuration; no network I/O happens here — the pool
-    /// connects lazily on first `get()`.
-    ///
-    /// Sized and timed out per `config.pool_max_size()`/
-    /// `config.pool_wait_timeout()` rather than deadpool's own
-    /// defaults (`2 * num_cpus` connections, no wait timeout at all): with
-    /// no cap and no timeout, a handful of concurrent callers each needing
-    /// a *second* connection while their own transaction holds a first
-    /// (`crate::staging::quarantine::trip_transform_fuse_if_crossed`'s
-    /// `catalog::transforms_for_source` call) could exhaust a small box's
-    /// pool and then [`Pool::get`] would wait forever — no error, no log,
-    /// just every drain thread stuck. See `crate::config::DEFAULT_POOL_MAX_SIZE`/
-    /// `crate::config::DEFAULT_POOL_WAIT_TIMEOUT` for the sizing/timeout
-    /// reasoning.
+    /// Builds a call pool from `config`: [`DEFAULT_CALL_POOL_MAX_SIZE`]
+    /// connections, a [`DEFAULT_CALL_POOL_WAIT_TIMEOUT`] wait. See
+    /// [`Pool::with_limits`].
     pub fn new(config: &Config) -> Result<Self, Error> {
+        Self::with_limits(
+            config,
+            DEFAULT_CALL_POOL_MAX_SIZE,
+            DEFAULT_CALL_POOL_WAIT_TIMEOUT,
+        )
+    }
+
+    /// Builds a pool of at most `max_size` connections, each checkout waiting
+    /// up to `wait_timeout` for a free one. Fails only if `config.dsn` can't
+    /// be parsed as a Postgres connection string, `max_size` is `0` (a pool
+    /// that can never open a connection is broken, not smaller), or
+    /// deadpool's builder rejects the resulting configuration; no network I/O
+    /// happens here: the pool connects lazily on first `get()`.
+    ///
+    /// Sized and timed out explicitly rather than by deadpool's defaults
+    /// (`2 * num_cpus` connections, no wait timeout at all): with no timeout a
+    /// checkout on an exhausted pool would wait forever, with no error and no
+    /// log.
+    ///
+    /// A connection unused for [`POOL_IDLE_TIMEOUT`] is closed: the pool hands
+    /// out its most recently used connection first, and, when built inside a
+    /// tokio runtime, a task sweeps the rest.
+    pub fn with_limits(
+        config: &Config,
+        max_size: usize,
+        wait_timeout: Duration,
+    ) -> Result<Self, Error> {
+        Self::build(config, max_size, wait_timeout, false)
+    }
+
+    /// Builds the pool a handle's background client runs on, of exactly
+    /// `max_size` connections (see [`background_pool_size`]). Its checkouts
+    /// wait [`DEFAULT_CALL_POOL_WAIT_TIMEOUT`], and in debug builds a task
+    /// that holds more than [`MAX_BACKGROUND_HELD`] of them at once panics.
+    pub(crate) fn background(config: &Config, max_size: usize) -> Result<Self, Error> {
+        Self::build(config, max_size, DEFAULT_CALL_POOL_WAIT_TIMEOUT, true)
+    }
+
+    fn build(
+        config: &Config,
+        max_size: usize,
+        wait_timeout: Duration,
+        background: bool,
+    ) -> Result<Self, Error> {
+        if max_size == 0 {
+            return Err(Error::Config(
+                "a pool must allow at least 1 connection (max_call_pool_size)".to_string(),
+            ));
+        }
         let (mut pg_config, tls_spec) = crate::config::parse_dsn_tls(config.dsn())?;
         let tls = tls_spec.connector()?;
         with_client_keepalives(&mut pg_config, DeadPeerDetection::KeepalivesOnly);
@@ -282,7 +437,11 @@ impl Pool {
                         .map_err(HookError::Backend)
                 })
             }))
-            .max_size(config.pool_max_size())
+            .max_size(max_size)
+            // Reuse the hottest connection, so a burst's extra connections go
+            // unused and the idle sweep can close them (first-in-first-out
+            // would rotate through all of them and none would look idle).
+            .queue_mode(QueueMode::Lifo)
             // A `Runtime` is required for `wait_timeout` to take effect at
             // all — without one, `deadpool`'s `PoolBuilder::build` rejects
             // the config outright (`BuildError::NoRuntimeSpecified`) rather
@@ -291,8 +450,20 @@ impl Pool {
             // every other async runtime this crate already assumes
             // (tokio_postgres::Client, the post_create hook above).
             .runtime(Runtime::Tokio1)
-            .wait_timeout(Some(config.pool_wait_timeout()))
+            .wait_timeout(Some(wait_timeout))
             .build()?;
+
+        let sweep = tokio::runtime::Handle::try_current().ok().map(|runtime| {
+            let pool = inner.clone();
+            runtime.spawn(async move {
+                let mut tick = tokio::time::interval(POOL_IDLE_TIMEOUT / 2);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    close_idle(&pool, POOL_IDLE_TIMEOUT);
+                }
+            })
+        });
 
         Ok(Self {
             inner,
@@ -301,12 +472,30 @@ impl Pool {
             schema: config.schema().to_string(),
             target_schema: config.target_schema().to_string(),
             instance: crate::instance_log::name_of(config),
-            wait_timeout: config.pool_wait_timeout(),
+            wait_timeout,
+            background,
+            _sweep: Arc::new(SweepTask(sweep)),
         })
     }
 
-    /// Acquires a connection, waiting up to `config.pool_wait_timeout()`
-    /// (see [`Pool::new`]) for one to become available if the pool is at
+    /// Closes every idle connection unused for `idle` or longer. The pool's
+    /// own sweep calls this every half [`POOL_IDLE_TIMEOUT`]; tests call it
+    /// directly. A connection's last-use time is stamped at checkout, so one
+    /// held for a long transaction counts as idle the moment it comes back,
+    /// and may be closed by the next sweep (one reconnect).
+    pub fn close_idle(&self, idle: Duration) {
+        close_idle(&self.inner, idle);
+    }
+
+    /// The pool's `(size, available)` connection counts: connections open,
+    /// and how many of them are idle.
+    pub fn counts(&self) -> (usize, usize) {
+        let status = self.inner.status();
+        (status.size, status.available)
+    }
+
+    /// Acquires a connection, waiting up to the pool's wait timeout
+    /// (see [`Pool::with_limits`]) for one to become available if the pool is at
     /// capacity. Once that timeout elapses, returns
     /// `Err(Error::Pool(deadpool_postgres::PoolError::Timeout(_)))` — a
     /// clear, typed, loggable failure (categorized [`crate::ErrorCode::Connectivity`]
@@ -318,7 +507,7 @@ impl Pool {
     /// the call can no longer wait for.
     pub async fn get(&self) -> Result<PooledClient, Error> {
         let Some(deadline) = crate::deadline::current() else {
-            return Ok(PooledClient::plain(self.inner.get().await?));
+            return Ok(self.counted(PooledClient::plain(self.inner.get().await?)));
         };
         let remaining = deadline.remaining();
         if remaining.is_zero() {
@@ -331,7 +520,8 @@ impl Pool {
             create: Some(remaining),
             recycle: Some(remaining),
         };
-        let mut client = PooledClient::plain(self.inner.timeout_get(&timeouts).await?);
+        let mut client =
+            self.counted(PooledClient::plain(self.inner.timeout_get(&timeouts).await?));
         client.settle = Some(deadline.settle_time());
         client
             .simple_query(&deadline.set_statement_timeout_sql(false))
@@ -339,10 +529,20 @@ impl Pool {
         Ok(client)
     }
 
+    /// Counts a background checkout against its task (debug builds).
+    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+    fn counted(&self, mut client: PooledClient) -> PooledClient {
+        #[cfg(debug_assertions)]
+        if self.background {
+            client._depth = depth::enter();
+        }
+        client
+    }
+
     /// Opens one connection outside the pool, set up exactly like a pooled
     /// one ([`session_bootstrap`]), and spawns its driver. It closes when the
     /// returned client is dropped, and it never counts against
-    /// `pool_max_size` or waits on it.
+    /// the pool's size or waits on it.
     ///
     /// For session state that must never reach a pooled connection: a paged
     /// drain's `TEMP` table ([`crate::staging::page`]) lives on
@@ -1384,11 +1584,8 @@ mod tests {
         let setup = tokio::runtime::Runtime::new().expect("setup runtime");
         let cluster = testkit::TestCluster::start();
         let db = setup.block_on(cluster.create_isolated_database());
-        let config = Config::from_dsn(db.dsn().to_string())
-            .expect("dsn")
-            .with_pool_max_size(1)
-            .expect("pool size");
-        let pool = Pool::new(&config).expect("pool");
+        let config = Config::from_dsn(db.dsn().to_string()).expect("dsn");
+        let pool = Pool::with_limits(&config, 1, DEFAULT_CALL_POOL_WAIT_TIMEOUT).expect("pool");
         // Opened here, so its driver lives on `setup`.
         setup.block_on(async {
             drop(pool.get().await.expect("open the connection"));
@@ -1462,5 +1659,115 @@ mod tests {
         let printed = format!("{pool:?}");
         assert!(!printed.contains("s3cret"), "leaked: {printed}");
         assert!(printed.contains("db.example.com"), "{printed}");
+    }
+
+    /// The background pool is sized by the client's roles: `2N + 5` for a
+    /// worker, `2N + 4` drain-only, `1` staging-only, none otherwise.
+    #[test]
+    fn the_background_pool_is_sized_by_role() {
+        assert_eq!(background_pool_size(false, 0), None);
+        assert_eq!(background_pool_size(true, 0), Some(1));
+        assert_eq!(background_pool_size(true, 1), Some(7));
+        assert_eq!(background_pool_size(true, 2), Some(9));
+        assert_eq!(background_pool_size(true, 4), Some(13));
+        assert_eq!(background_pool_size(false, 1), Some(6));
+        assert_eq!(background_pool_size(false, 2), Some(8));
+    }
+
+    #[test]
+    fn an_empty_pool_is_refused() {
+        let config = Config::from_dsn("postgresql://example/db").expect("config");
+        let err = Pool::with_limits(&config, 0, DEFAULT_CALL_POOL_WAIT_TIMEOUT).unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err}");
+    }
+
+    /// Idle connections close and a busy one stays: `close_idle` is what the
+    /// pool's sweep runs, driven here directly.
+    #[tokio::test]
+    async fn idle_connections_close_and_the_most_recent_one_is_reused() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = Config::from_dsn(db.dsn().to_string()).expect("dsn");
+        let pool = Pool::new(&config).expect("pool");
+
+        // A burst opens three connections.
+        let held = [
+            pool.get().await.expect("one"),
+            pool.get().await.expect("two"),
+            pool.get().await.expect("three"),
+        ];
+        drop(held);
+        assert_eq!(pool.counts(), (3, 3));
+
+        // Last in, first out: serial checkouts keep reusing one connection,
+        // so the other two age while it stays warm.
+        async fn backend(pool: &Pool) -> i32 {
+            let client = pool.get().await.expect("get");
+            client
+                .query_one("select pg_backend_pid()", &[])
+                .await
+                .expect("pid")
+                .get(0)
+        }
+        let first = backend(&pool).await;
+        for _ in 0..3 {
+            assert_eq!(backend(&pool).await, first);
+        }
+
+        // Nothing is idle for an hour yet.
+        pool.close_idle(Duration::from_secs(3600));
+        assert_eq!(pool.counts(), (3, 3));
+        // Anything unused for a moment goes: the two that were not reused.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let warm = pool.get().await.expect("get");
+        drop(warm);
+        pool.close_idle(Duration::from_millis(15));
+        assert_eq!(pool.counts(), (1, 1), "only the warm connection is left");
+    }
+
+    /// A task that holds more than [`MAX_BACKGROUND_HELD`] background
+    /// connections fails (debug builds); two are fine, and a released one is
+    /// not counted.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn a_third_background_connection_in_one_task_panics() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let config = Config::from_dsn(db.dsn().to_string()).expect("dsn");
+        let pool = Pool::background(&config, 4).expect("pool");
+
+        count_background_connections(async {
+            let a = pool.get().await.expect("a");
+            let b = pool.get().await.expect("b");
+            drop(a);
+            let c = pool.get().await.expect("a released one, so this is the second");
+            drop((b, c));
+        })
+        .await;
+
+        let pool2 = pool.clone();
+        let result = tokio::spawn(count_background_connections(async move {
+            let _a = pool2.get().await.expect("a");
+            let _b = pool2.get().await.expect("b");
+            let _c = pool2.get().await;
+        }))
+        .await;
+        assert!(result.is_err(), "the third held connection must panic");
+
+        // A pool of calls, or a task outside any scope, is not counted.
+        let call_pool = Pool::new(&config).expect("pool");
+        count_background_connections(async {
+            let _held: Vec<_> = futures_three(&call_pool).await;
+        })
+        .await;
+    }
+
+    #[cfg(debug_assertions)]
+    async fn futures_three(pool: &Pool) -> Vec<PooledClient> {
+        vec![
+            pool.get().await.expect("a"),
+            pool.get().await.expect("b"),
+            pool.get().await.expect("c"),
+        ]
     }
 }

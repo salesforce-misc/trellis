@@ -128,13 +128,8 @@ defmodule TrellisTest do
     assert {:ok,
             %Trellis.Config{
               schema: "trellis",
-              target_schema: "reporting",
-              pool_max_size: pool_max_size,
-              pool_wait_timeout_ms: pool_wait_timeout_ms
+              target_schema: "reporting"
             } = config} = Trellis.config(trellis)
-
-    assert pool_max_size >= 1
-    assert pool_wait_timeout_ms >= 1
 
     # A config is the kind of value that gets logged whole.
     refute Map.has_key?(config, :url)
