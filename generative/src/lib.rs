@@ -34,6 +34,10 @@ pub mod backend;
 #[cfg(feature = "engine-access")]
 pub mod baseline_quarantine;
 #[cfg(feature = "engine-access")]
+pub mod expr_conformance;
+#[cfg(feature = "engine-access")]
+pub mod expr_gen;
+#[cfg(feature = "engine-access")]
 pub mod generate;
 #[cfg(feature = "engine-access")]
 pub mod model;

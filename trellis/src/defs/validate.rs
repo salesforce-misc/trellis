@@ -179,9 +179,10 @@ pub enum ValidationError {
     TargetNameTooLong { target: String, max: usize },
     /// An operator was applied to an operand of the wrong `ValueType` —
     /// e.g. `+` given a `Text` operand (`+` stays Numeric-only,
-    /// no implicit string concatenation).
+    /// no implicit string concatenation). `operator` is its symbol.
     TypeMismatch {
         field: String,
+        operator: &'static str,
         expected: ValueType,
         found: ValueType,
     },
@@ -764,11 +765,13 @@ impl fmt::Display for ValidationError {
             ),
             ValidationError::TypeMismatch {
                 field,
+                operator,
                 expected,
                 found,
             } => write!(
                 f,
-                "calculated field '{field}' expects a {expected} value here, found {found}"
+                "calculated field '{field}': operator '{operator}' expects a {expected} value \
+                 here, found {found}"
             ),
             ValidationError::FloatComparisonLiteralOutOfRange { field, text } => write!(
                 f,
@@ -3028,13 +3031,14 @@ fn infer_expr(
             // the left one is reported first so the error reads in source
             // order.
             let spec = super::registry::operator_spec(*op);
-            let (found, expected) = if lhs_t.is_exact_numeric_family() {
+            let (found, expected) = if lhs_t.is_numeric_family() {
                 (rhs_t, spec.arg_types.1)
             } else {
                 (lhs_t, spec.arg_types.0)
             };
             Err(ValidationError::TypeMismatch {
                 field: field_name.to_string(),
+                operator: spec.symbol,
                 expected,
                 found,
             })
@@ -3870,6 +3874,7 @@ mod tests {
             err,
             ValidationError::TypeMismatch {
                 field: "out".to_string(),
+                operator: ">",
                 expected: ValueType::Numeric,
                 found: ValueType::Text,
             }
@@ -4038,6 +4043,7 @@ mod tests {
             err,
             ValidationError::TypeMismatch {
                 field: "out".to_string(),
+                operator: "+",
                 expected: ValueType::Numeric,
                 found: ValueType::Text,
             }

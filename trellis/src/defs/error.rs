@@ -127,7 +127,12 @@ impl fmt::Display for ParseError {
             }
             ParseError::UnsupportedOperator { operator } => write!(
                 f,
-                "unsupported operator '{operator}': only '+' and '>' are currently implemented (ADR-0004: grammar and renderer function sets must match)"
+                "unsupported operator '{operator}': only {} are currently implemented (ADR-0004: grammar and renderer function sets must match)",
+                crate::defs::registry::OPERATORS
+                    .iter()
+                    .map(|spec| format!("'{}'", spec.symbol))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             ParseError::UnsupportedFunction { name } => write!(
                 f,

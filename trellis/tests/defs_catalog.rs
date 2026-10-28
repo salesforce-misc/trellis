@@ -670,10 +670,12 @@ async fn adding_a_text_column_to_a_number_is_rejected_at_validation() {
     match err {
         CatalogError::Validate(ValidationError::TypeMismatch {
             field,
+            operator,
             expected,
             found,
         }) => {
             assert_eq!(field, "out");
+            assert_eq!(operator, "+");
             assert_eq!(expected, ValueType::Numeric);
             assert_eq!(found, ValueType::Text);
         }
