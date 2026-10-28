@@ -797,6 +797,14 @@ async fn run(
         let _ = staging::register_drainers(&**conn, &drainer_ids).await;
     }
 
+    // One keep-alive connection for every drain thread's claims (lazy
+    // connect, idle exit): `HeartbeatDaemon` refreshes any number of claims
+    // in one statement.
+    let heartbeat = Arc::new(HeartbeatDaemon::spawn(
+        dsn.clone(),
+        config.schema().to_string(),
+        options.heartbeat.clone(),
+    ));
     let live_workers = LiveWorkers::default();
     let mut app_worker_tasks = Vec::with_capacity(options.application_threads + 1);
     for claimed_by in drainer_ids {
@@ -808,7 +816,8 @@ async fn run(
             claimed_by,
             wake_channel: wake_channel.clone(),
             drainer_window: options.drainer_window,
-            heartbeat_config: options.heartbeat.clone(),
+            heartbeat: heartbeat.clone(),
+            chunk_heartbeat_interval: options.heartbeat.interval,
             poll_interval: options.poll_interval,
             idle_wake_cap: options.idle_wake_cap,
             reclaim_ttl: options.reclaim_ttl,
@@ -1788,7 +1797,10 @@ struct AppWorkerConfig {
     claimed_by: String,
     wake_channel: String,
     drainer_window: Duration,
-    heartbeat_config: HeartbeatDaemonConfig,
+    /// The client's one claim keep-alive, shared by every drain thread.
+    heartbeat: Arc<HeartbeatDaemon>,
+    /// Interval a build chunk's claim heartbeats at (the daemon's own).
+    chunk_heartbeat_interval: Duration,
     poll_interval: Duration,
     /// [`ClientOptions::idle_wake_cap`].
     idle_wake_cap: Duration,
@@ -1894,7 +1906,8 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         claimed_by,
         wake_channel,
         drainer_window,
-        heartbeat_config,
+        heartbeat,
+        chunk_heartbeat_interval,
         poll_interval,
         idle_wake_cap,
         reclaim_ttl,
@@ -1903,17 +1916,14 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         build_chunk_rows,
     } = config;
 
-    // Captured before `heartbeat_config` is moved into `HeartbeatDaemon::spawn`
-    // below: a build chunk's claim heartbeats at the same margin under
+    // A build chunk's claim heartbeats at the same margin under
     // `reclaim_ttl` as a segment drain.
-    let chunk_heartbeat_interval = heartbeat_config.interval;
     let build_options = staging::build::WorkerOptions {
         chunk_rows: build_chunk_rows,
         drain_batch_cap,
         heartbeat_interval: chunk_heartbeat_interval,
         reclaim_ttl,
     };
-    let heartbeat = HeartbeatDaemon::spawn(dsn.clone(), schema.clone(), heartbeat_config);
     let mut wake = WakeListener::spawn(dsn.clone(), schema.clone(), wake_channel.clone());
 
     let mut drain_failures = DrainFailures::default();
@@ -4782,7 +4792,12 @@ mod restore_gate_tests {
             claimed_by: "gate-test-app-0".to_string(),
             wake_channel: "wake".to_string(),
             drainer_window: staging::DEFAULT_DRAINER_WINDOW,
-            heartbeat_config: HeartbeatDaemonConfig::default(),
+            heartbeat: Arc::new(HeartbeatDaemon::spawn(
+                db.dsn().to_string(),
+                DEFAULT_SCHEMA,
+                HeartbeatDaemonConfig::default(),
+            )),
+            chunk_heartbeat_interval: HeartbeatDaemonConfig::default().interval,
             poll_interval: Duration::from_secs(3600),
             idle_wake_cap: Duration::from_secs(3600),
             reclaim_ttl: staging::DEFAULT_RECLAIM_TTL,
