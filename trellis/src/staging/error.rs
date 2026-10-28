@@ -25,7 +25,9 @@ pub enum StagingError {
     InvalidRingSlot(i16),
     /// A second producer session tried to start while another holds the
     /// singleton lock. Two concurrent producers would double-append every
-    /// change.
+    /// change. The background client treats it as "stand by" and never
+    /// returns it from a connect; it surfaces only to callers that open a
+    /// `ProducerSession` themselves.
     ProducerAlreadyRunning,
     /// A seal would lap a ring slot that still holds a live registry row.
     /// A retirement pass is run and the seal retried once (see

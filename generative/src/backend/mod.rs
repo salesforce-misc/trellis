@@ -79,7 +79,7 @@ pub trait Backend {
     /// dropping it — `Drop`'s shutdown signal is best-effort and doesn't
     /// join the background thread, so a bare drop-then-restart could race
     /// the old producer's advisory-lock release against the new producer's
-    /// acquire and spuriously fail with `ProducerAlreadyRunning`; no
+    /// acquire and come up as a standby, taking the lock only at its next poll; no
     /// subprocess/`SIGKILL` machinery is needed there either way.
     /// [`SubprocessBackend`] does the real thing: `SIGKILL`s the
     /// actual OS process, *waits for it to actually exit* and then for

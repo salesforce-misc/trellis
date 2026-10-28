@@ -29,10 +29,10 @@ use crate::config::{
     Config, DEFAULT_CALL_POOL_MAX_SIZE, DEFAULT_CALL_POOL_WAIT_TIMEOUT, POOL_IDLE_TIMEOUT,
 };
 use crate::error::Error;
+use deadpool::managed::QueueMode;
 use deadpool_postgres::{
     Hook, HookError, Manager, ManagerConfig, Pool as DeadpoolPool, RecyclingMethod, Runtime,
 };
-use deadpool::managed::QueueMode;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -520,8 +520,9 @@ impl Pool {
             create: Some(remaining),
             recycle: Some(remaining),
         };
-        let mut client =
-            self.counted(PooledClient::plain(self.inner.timeout_get(&timeouts).await?));
+        let mut client = self.counted(PooledClient::plain(
+            self.inner.timeout_get(&timeouts).await?,
+        ));
         client.settle = Some(deadline.settle_time());
         client
             .simple_query(&deadline.set_statement_timeout_sql(false))
@@ -903,7 +904,7 @@ async fn session_bootstrap(
 /// The producer session is where this hurt: its backend holds the
 /// instance's producer-singleton advisory lock
 /// ([`crate::staging::session::producer_singleton_lock_key`]), so a partitioned
-/// producer kept every restart refused with `ProducerAlreadyRunning` for the
+/// producer kept every restart standing by, unable to take the lock, for the
 /// whole two hours. But any connection partitioned mid-transaction pins its row
 /// and advisory locks the same way, so the pool and every dedicated connection
 /// get the keepalives too. Only the dedicated ones also get
@@ -1740,7 +1741,10 @@ mod tests {
             let a = pool.get().await.expect("a");
             let b = pool.get().await.expect("b");
             drop(a);
-            let c = pool.get().await.expect("a released one, so this is the second");
+            let c = pool
+                .get()
+                .await
+                .expect("a released one, so this is the second");
             drop((b, c));
         })
         .await;

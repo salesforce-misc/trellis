@@ -290,8 +290,8 @@ async fn await_converged_times_out_on_a_blocked_poll_and_leaves_the_pool_usable(
             ..TrellisOptions::default()
         },
     )
-        .await
-        .expect("connect");
+    .await
+    .expect("connect");
 
     let token = trellis.watermark_token().await.expect("watermark_token");
     let raw = connect_raw(db.dsn()).await;

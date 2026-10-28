@@ -270,8 +270,8 @@ async fn the_wait_for_a_pooled_connection_counts() {
             ..options(DEADLINE)
         },
     )
-        .await
-        .expect("connect");
+    .await
+    .expect("connect");
     let only = trellis
         .pool()
         .get()
@@ -327,8 +327,8 @@ async fn a_pooled_connection_comes_back_without_the_calls_timeout() {
             ..options(Duration::from_secs(30))
         },
     )
-        .await
-        .expect("connect");
+    .await
+    .expect("connect");
 
     // Runs on the pool's connection, under the call's deadline.
     trellis.definitions().await.expect("definitions");

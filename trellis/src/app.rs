@@ -1544,7 +1544,9 @@ impl Trellis {
     /// the lock with it. It also reads `false` for the tick or so the loop
     /// takes to reconnect after a failed step. Changes are captured by
     /// triggers in the application's own transactions meanwhile,
-    /// but nothing seals or dispatches a backfill.
+    /// but nothing seals or dispatches a backfill. A connection that stands
+    /// by (`staging: true`, but another worker holds the singleton) does not
+    /// count: the check is `true` only while some worker leads.
     pub async fn has_live_staging_worker(&self) -> Result<bool, TrellisError> {
         self.call(async {
             let client = self.pool.get().await?;

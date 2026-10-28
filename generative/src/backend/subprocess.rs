@@ -489,9 +489,9 @@ impl SubprocessBackend {
     /// backends frees what it held only once Postgres schedules it to read
     /// the EOF. Under CPU contention that can trail the process's exit by
     /// several milliseconds, and a fresh engine that asks for the singleton
-    /// first fails its start with `ProducerAlreadyRunning`. That's the race
-    /// `ManualBackend::restart` retries around; waiting here
-    /// instead makes the release happen before the fresh engine's acquire.
+    /// first comes up as a standby that takes it at its next poll. Waiting
+    /// here makes the release happen before the fresh engine's acquire (and
+    /// `ManualBackend::restart` waits the same way).
     async fn wait_for_producer_release(&self) -> Result<(), SubprocessBackendError> {
         let trellis = trellis::Trellis::connect(
             Config::from_dsn(self.dsn.clone())?,

@@ -13,9 +13,12 @@
 //! Two independent knobs, per the constructor contract:
 //!
 //! - `staging_worker: bool` — whether this client also owns capture
-//!   installation and ring maintenance. Exactly one client in a fleet should
-//!   set this; every other client (any number of them, across any number of
-//!   processes) sets only `application_threads`.
+//!   installation and ring maintenance. Any number of clients may set it:
+//!   one takes the instance's producer lock and leads, the rest stand by,
+//!   polling for the lock every few seconds, and take over when the leader
+//!   goes away. A fleet needs at least one; the clients that only drain
+//!   (any number, across any number of processes) set only
+//!   `application_threads`.
 //! - `application_threads: usize` — how many app-worker tasks this client
 //!   runs, each independently claiming and draining sealed batches. Zero is
 //!   legal: a staging-only client stages and seals but drains nothing.
@@ -75,8 +78,9 @@ use crate::staging::{
 #[derive(Debug, Clone)]
 pub struct ClientOptions {
     /// Whether this client owns capture installation and ring maintenance
-    /// (seal/recover/reclaim). Exactly one client in a fleet should set
-    /// this.
+    /// (seal/recover/reclaim). Any number of clients may set this: one
+    /// takes the producer lock and leads, the rest stand by and take over
+    /// when it goes away. A fleet needs at least one.
     pub staging_worker: bool,
     /// How many independent application-worker tasks this client runs.
     /// Zero is legal — a staging-only client.
@@ -582,7 +586,11 @@ impl Client {
                     }
                 };
                 runtime.block_on(crate::pool::count_background_connections(run(
-                    dsn, config, options, shutdown_rx, ready_tx,
+                    dsn,
+                    config,
+                    options,
+                    shutdown_rx,
+                    ready_tx,
                 )));
             })
             .map_err(ClientError::Spawn)?;
@@ -728,11 +736,9 @@ async fn run(
     ready_tx: std::sync::mpsc::Sender<Result<(), ClientError>>,
 ) {
     // Sized by this client's roles (see `crate::pool::background_pool_size`).
-    let pool_size = crate::pool::background_pool_size(
-        options.staging_worker,
-        options.application_threads,
-    )
-    .unwrap_or(1);
+    let pool_size =
+        crate::pool::background_pool_size(options.staging_worker, options.application_threads)
+            .unwrap_or(1);
     let pool = match Pool::background(&config, pool_size) {
         Ok(pool) => pool,
         Err(err) => {
@@ -742,12 +748,16 @@ async fn run(
     };
 
     let mut staging_session = None;
+    let mut staging_standby = false;
     // One resolved name for every notify and every idle worker's `LISTEN`.
     let wake_channel = options.wake_channel_for(config.schema());
 
     if options.staging_worker {
         match setup_staging(&dsn, &config, &pool).await {
-            Ok(session) => staging_session = Some(session),
+            Ok(session) => {
+                staging_standby = session.is_none();
+                staging_session = session;
+            }
             Err(err) => {
                 let _ = ready_tx.send(Err(err));
                 return;
@@ -756,12 +766,13 @@ async fn run(
     }
 
     let mut maintenance_task = None;
-    if let Some(session) = staging_session {
+    if options.staging_worker {
         let maintenance_config = MaintenanceConfig {
             dsn: dsn.clone(),
             schema: config.schema().to_string(),
             pool: pool.clone(),
-            session,
+            session: staging_session,
+            standby: staging_standby,
             wake_channel: wake_channel.clone(),
             interval: options.maintenance_interval,
             housekeeping_interval: options.housekeeping_interval,
@@ -771,10 +782,9 @@ async fn run(
             held_key_retry: options.held_key_retry,
             drain_batch_cap: options.drain_batch_cap,
         };
-        maintenance_task = Some(tokio::spawn(crate::pool::count_background_connections(maintenance_loop(
-            maintenance_config,
-            shutdown_rx.clone(),
-        ))));
+        maintenance_task = Some(tokio::spawn(crate::pool::count_background_connections(
+            maintenance_loop(maintenance_config, shutdown_rx.clone()),
+        )));
     }
 
     // Unique across processes and restarts: see `new_worker_id`.
@@ -835,7 +845,9 @@ async fn run(
             pool: pool.clone(),
             claimed_by,
             wake_channel: wake_channel.clone(),
-            wake: drain_wakes.next().expect("one wake subscriber per drain thread"),
+            wake: drain_wakes
+                .next()
+                .expect("one wake subscriber per drain thread"),
             drainer_window: options.drainer_window,
             heartbeat: heartbeat.clone(),
             chunk_heartbeat_interval: options.heartbeat.interval,
@@ -846,10 +858,9 @@ async fn run(
             drain_batch_cap: options.drain_batch_cap,
             build_chunk_rows: options.build_chunk_rows.max(1),
         };
-        app_worker_tasks.push(tokio::spawn(crate::pool::count_background_connections(app_worker_loop(
-            worker_config,
-            shutdown_rx.clone(),
-        ))));
+        app_worker_tasks.push(tokio::spawn(crate::pool::count_background_connections(
+            app_worker_loop(worker_config, shutdown_rx.clone()),
+        )));
     }
 
     // The process's one worker-registry heartbeat and chunk-reclaim sweep
@@ -859,12 +870,14 @@ async fn run(
         let pool = pool.clone();
         let worker_id = client_id.clone();
         let reclaim_ttl = options.reclaim_ttl;
-        tokio::spawn(crate::pool::count_background_connections(worker_upkeep_loop(
-            upkeep_interval(reclaim_ttl),
-            live_workers.clone(),
-            shutdown_rx.clone(),
-            async move || worker_upkeep_pass(&pool, &worker_id, reclaim_ttl).await,
-        )))
+        tokio::spawn(crate::pool::count_background_connections(
+            worker_upkeep_loop(
+                upkeep_interval(reclaim_ttl),
+                live_workers.clone(),
+                shutdown_rx.clone(),
+                async move || worker_upkeep_pass(&pool, &worker_id, reclaim_ttl).await,
+            ),
+        ))
     });
 
     // `self_check` jobs run beside the drain workers, never in their
@@ -888,12 +901,14 @@ async fn run(
     let registration_task = (options.application_threads > 0).then(|| {
         let pool = pool.clone();
         let workers = live_workers.clone();
-        tokio::spawn(crate::pool::count_background_connections(worker_upkeep_loop(
-            drainer_registration_interval(options.drainer_window),
-            live_workers.clone(),
-            shutdown_rx.clone(),
-            async move || drainer_registration_pass(&pool, &workers).await,
-        )))
+        tokio::spawn(crate::pool::count_background_connections(
+            worker_upkeep_loop(
+                drainer_registration_interval(options.drainer_window),
+                live_workers.clone(),
+                shutdown_rx.clone(),
+                async move || drainer_registration_pass(&pool, &workers).await,
+            ),
+        ))
     });
 
     // Keeps this instance's gauges set for as long as the client runs, so the
@@ -1066,16 +1081,17 @@ mod worker_id_tests {
 // Staging setup: the staging-worker singleton and the first capture pass
 // ---------------------------------------------------------------------
 
-/// Takes the staging-worker singleton and runs one capture reconcile pass
-/// ([`capture::reconcile::reconcile`]) and starts the build
-/// of every definition the pass finds ready.
+/// Tries to take the staging-worker singleton and, if it gets it, runs one
+/// capture reconcile pass ([`capture::reconcile::reconcile`]) and starts the
+/// build of every definition the pass finds ready.
 ///
-/// Returns the [`ProducerSession`] that holds the singleton. The
-/// maintenance loop runs every step on it, and re-takes the singleton when it
-/// reconnects, so the lock is held for as long as the staging worker runs and
-/// `liveness::has_live_staging_worker` reads it from `pg_locks`. A second
-/// staging worker for the same instance fails here with
-/// [`StagingError::ProducerAlreadyRunning`].
+/// Returns the [`ProducerSession`] that holds the singleton, or `None` when
+/// another staging worker of this instance holds it: this client then starts
+/// as a standby, and [`maintenance_loop`] takes over when the lock frees. The
+/// maintenance loop runs every step on the session, and re-takes the
+/// singleton when it reconnects, so the lock is held for as long as the
+/// staging worker leads and `liveness::has_live_staging_worker` reads it from
+/// `pg_locks`.
 ///
 /// A table whose capture can't be installed yet (a lock held on it, a
 /// missing primary key) doesn't fail the start: the pass logs it, and every
@@ -1084,15 +1100,19 @@ mod worker_id_tests {
 /// A pass that fails as a whole releases the singleton before this returns,
 /// as the maintenance loop does when it stops. Dropping the session
 /// would free it only once the server noticed the closed connection, so a
-/// client restarted at once could fail with `ProducerAlreadyRunning`.
+/// client restarted at once could find the lock still held and stand by.
 async fn setup_staging(
     dsn: &str,
     config: &Config,
     pool: &Pool,
-) -> Result<ProducerSession, ClientError> {
-    let mut session = ProducerSession::connect(dsn, config.schema()).await?;
+) -> Result<Option<ProducerSession>, ClientError> {
+    let mut session = match ProducerSession::connect(dsn, config.schema()).await {
+        Ok(session) => session,
+        Err(StagingError::ProducerAlreadyRunning) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
     match first_capture_pass(&mut session, config, pool).await {
-        Ok(()) => Ok(session),
+        Ok(()) => Ok(Some(session)),
         Err(err) => {
             release_singleton(Some(session)).await;
             Err(err)
@@ -1182,9 +1202,13 @@ struct MaintenanceConfig {
     dsn: String,
     schema: String,
     pool: Pool,
-    /// The staging-worker singleton [`setup_staging`] took; the loop's own
-    /// connection.
-    session: ProducerSession,
+    /// The staging-worker singleton [`setup_staging`] took, the loop's own
+    /// connection; `None` when another worker holds it and this one stands by.
+    session: Option<ProducerSession>,
+    /// The singleton was held elsewhere when the client started (so the
+    /// loop polls at the standby cadence from the start), as opposed to a
+    /// leader that lost its session.
+    standby: bool,
     wake_channel: String,
     interval: Duration,
     /// [`ClientOptions::housekeeping_interval`], before the clamp under
@@ -1214,15 +1238,20 @@ struct MaintenanceConfig {
 /// Holds one dedicated connection across ticks (reconnecting lazily on error)
 /// rather than opening a fresh one every tick. That connection is a
 /// [`ProducerSession`]: it holds the staging-worker singleton, and a reconnect
-/// takes it again. While another session holds it (this worker's previous backend,
-/// until the server notices it is gone, or another staging worker that took over),
-/// the reconnect fails and is retried every tick.
+/// takes it again.
+///
+/// A worker without the singleton stands by: it tries to take it on a
+/// short-lived connection every [`STANDBY_POLL`] (connect, `pg_try_advisory_lock`,
+/// disconnect if refused), so a standby keeps no connection open, and becomes
+/// the leader the first time it gets it, running a capture pass at once. A
+/// leader that loses its session retries sooner first ([`LockSchedule`]).
 async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Receiver<bool>) {
     let MaintenanceConfig {
         dsn,
         schema,
         pool,
         session,
+        standby,
         wake_channel,
         interval,
         housekeeping_interval: housekeeping_interval_option,
@@ -1236,19 +1265,28 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
     let seal_config = SealConfig::default();
     // The capture pass rate-limits its logs in memory under the instance's
     // database and schema; the loop forgets them when it stops.
-    let database: Option<String> = session
-        .client()
-        .query_one("select pg_catalog.current_database()::text", &[])
-        .await
-        .ok()
-        .map(|row| row.get(0));
+    let database: Option<String> = match &session {
+        Some(session) => session
+            .client()
+            .query_one("select pg_catalog.current_database()::text", &[])
+            .await
+            .ok()
+            .map(|row| row.get(0)),
+        None => None,
+    };
     let stop = async |session: Option<ProducerSession>| {
         if let Some(database) = &database {
             capture::reconcile::forget_instance(database, &schema);
         }
         release_singleton(session).await;
     };
-    let mut session: Option<ProducerSession> = Some(session);
+    let mut session: Option<ProducerSession> = session;
+    // When the next attempt at the singleton is due, while there is no session.
+    let mut lock_schedule = if standby {
+        LockSchedule::standby(Instant::now())
+    } else {
+        LockSchedule::lost(Instant::now())
+    };
     let mut failures = StepFailures::default();
     let mut housekeeping = HousekeepingSchedule::new(housekeeping_interval(
         housekeeping_interval_option,
@@ -1269,9 +1307,24 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
             return;
         }
 
-        if session.is_none() {
-            let connected = ProducerSession::connect(&dsn, &schema).await;
-            session = failures.check("connect", connected).ok();
+        if session.is_none() && lock_schedule.due(Instant::now()) {
+            match ProducerSession::connect(&dsn, &schema).await {
+                Ok(taken) => {
+                    let _ = failures.check("connect", Ok::<_, StagingError>(()));
+                    crate::instance_log::info!("took the staging-worker lock; leading");
+                    session = Some(taken);
+                    // A new leader's first pass is a capture pass, at once.
+                    next_reconcile = Instant::now();
+                }
+                // Another worker leads: not a failure of this one.
+                Err(StagingError::ProducerAlreadyRunning) => {
+                    lock_schedule.refused(Instant::now());
+                }
+                Err(err) => {
+                    let _ = failures.check("connect", Err::<(), _>(err));
+                    lock_schedule.refused(Instant::now());
+                }
+            }
         }
 
         if let Some(held) = session.as_mut() {
@@ -1358,10 +1411,16 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                         }
                     }
                 }
-                if !failed && let Some(policy) = &held_key_retry {
+                if !failed
+                    && !c.is_closed()
+                    && let Some(policy) = &held_key_retry
+                {
                     // Its own pool connections, and a failure is logged
                     // and tried again at the next housekeeping, not a reason
-                    // to reconnect this session.
+                    // to reconnect this session. Skipped once the session has
+                    // closed: the lock is gone, and the next leader's pass
+                    // does this step (it is safe to overlap with ours, but
+                    // there's no point starting it).
                     if let Err(err) =
                         staging::quarantine::retry_held_keys(&pool, policy, drain_batch_cap, None)
                             .await
@@ -1400,16 +1459,82 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 // connection still works, so the reconnect can take it again
                 // at once.
                 release_singleton(session.take()).await;
+                lock_schedule = LockSchedule::lost(Instant::now());
             }
         }
 
+        // Without the singleton, sleep until the next attempt at it rather
+        // than tick.
+        let wait = if session.is_none() {
+            lock_schedule.until_due(Instant::now())
+        } else {
+            interval
+        };
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 stop(session).await;
                 return;
             }
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(wait) => {}
         }
+    }
+}
+
+/// How often a standby tries to take the staging-worker singleton.
+const STANDBY_POLL: Duration = Duration::from_secs(5);
+
+/// How soon a leader that lost its session retries the singleton, then again,
+/// before it falls back to [`STANDBY_POLL`]. Its lock frees as soon as the
+/// server sees the session go, so the retry usually wins it straight back.
+const LOST_LEADER_RETRIES: [Duration; 3] = [
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
+
+/// When [`maintenance_loop`] next tries to take the singleton while it has no
+/// session.
+#[derive(Debug)]
+struct LockSchedule {
+    /// How many attempts have been refused since the schedule began.
+    refused: usize,
+    next: Instant,
+}
+
+impl LockSchedule {
+    /// A standby: its first attempt (at client start) was refused, so the next
+    /// is a poll away.
+    fn standby(now: Instant) -> Self {
+        Self {
+            refused: LOST_LEADER_RETRIES.len(),
+            next: now + STANDBY_POLL,
+        }
+    }
+
+    /// A leader that just lost its session.
+    fn lost(now: Instant) -> Self {
+        Self {
+            refused: 0,
+            next: now + LOST_LEADER_RETRIES[0],
+        }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        now >= self.next
+    }
+
+    fn until_due(&self, now: Instant) -> Duration {
+        self.next.saturating_duration_since(now)
+    }
+
+    /// An attempt was refused (or failed): the next waits one step longer.
+    fn refused(&mut self, now: Instant) {
+        self.refused += 1;
+        let delay = LOST_LEADER_RETRIES
+            .get(self.refused)
+            .copied()
+            .unwrap_or(STANDBY_POLL);
+        self.next = now + delay;
     }
 }
 
@@ -1769,6 +1894,13 @@ async fn reconcile_source_tables(
     let desired = defs::tables_to_capture(pool).await?;
     let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
     let outcome = capture::reconcile::reconcile(client, schema, &desired, deadline).await?;
+    // The steps below run on the pool, not the session. Once the session has
+    // closed the lock is gone and the next leader's pass does them: each is
+    // safe to overlap with another leader's, so this only skips work that is
+    // no longer ours.
+    if client.is_closed() {
+        return Ok(());
+    }
     release_retyped_keys(pool).await;
     release_upstream_rebuilt_keys(pool).await;
     complete_pause_cascades(pool).await;
@@ -1784,6 +1916,9 @@ async fn reconcile_source_tables(
         );
     }
     // A ready definition's Re-derive build starts here.
+    if client.is_closed() {
+        return Ok(());
+    }
     staging::build::start_ready_builds(client, pool, &outcome.ready).await?;
     Ok(())
 }
@@ -2771,6 +2906,40 @@ async fn open_wake_session<Sink: WakeSink + Send + 'static>(
 }
 
 #[cfg(test)]
+mod lock_schedule_tests {
+    use super::*;
+
+    /// A leader that lost its session retries at 0.5 s, 1 s and 2 s, then
+    /// polls every 5 s; a standby polls every 5 s from the start.
+    #[test]
+    fn a_lost_leader_retries_quickly_then_polls_like_a_standby() {
+        let ms = Duration::from_millis;
+        let start = Instant::now();
+
+        let mut lost = LockSchedule::lost(start);
+        let mut at = start;
+        let mut gaps = Vec::new();
+        for _ in 0..5 {
+            let gap = lost.until_due(at);
+            assert!(!lost.due(at) || gap.is_zero());
+            at += gap;
+            assert!(lost.due(at));
+            lost.refused(at);
+            gaps.push(gap);
+        }
+        assert_eq!(gaps, [ms(500), ms(1000), ms(2000), ms(5000), ms(5000)]);
+        assert_eq!(lost.until_due(at), STANDBY_POLL);
+
+        let standby = LockSchedule::standby(start);
+        assert!(!standby.due(start));
+        assert_eq!(standby.until_due(start), STANDBY_POLL);
+        let mut standby = standby;
+        standby.refused(start + STANDBY_POLL);
+        assert_eq!(standby.until_due(start + STANDBY_POLL), STANDBY_POLL);
+    }
+}
+
+#[cfg(test)]
 mod wake_listener_tests {
     //! A dead `LISTEN` connection must neither read as a wake nor
     //! be reopened in a tight loop. Paused-clock tests, no Postgres.
@@ -2887,7 +3056,10 @@ mod wake_listener_tests {
 
         sink.notification("engine", "work");
         for n in &notifies {
-            assert!(pending(n).await, "every drain task hears the engine channel");
+            assert!(
+                pending(n).await,
+                "every drain task hears the engine channel"
+            );
         }
         assert!(
             !pending(&self_check).await,
@@ -3368,9 +3540,12 @@ mod maintenance_failure_tests {
             dsn: db.dsn().to_string(),
             schema: "no_trellis_here".to_string(),
             pool,
-            session: ProducerSession::connect(db.dsn(), "no_trellis_here")
-                .await
-                .expect("take the staging-worker singleton"),
+            standby: false,
+            session: Some(
+                ProducerSession::connect(db.dsn(), "no_trellis_here")
+                    .await
+                    .expect("take the staging-worker singleton"),
+            ),
             wake_channel: "wake".to_string(),
             interval: Duration::from_millis(20),
             housekeeping_interval: Duration::from_secs(5),
@@ -3448,9 +3623,12 @@ mod maintenance_failure_tests {
             dsn: db.dsn().to_string(),
             schema: schema.to_string(),
             pool,
-            session: ProducerSession::connect(db.dsn(), schema)
-                .await
-                .expect("take the staging-worker singleton"),
+            standby: false,
+            session: Some(
+                ProducerSession::connect(db.dsn(), schema)
+                    .await
+                    .expect("take the staging-worker singleton"),
+            ),
             wake_channel: "wake".to_string(),
             interval: Duration::from_millis(20),
             housekeeping_interval: Duration::from_secs(5),
@@ -3545,9 +3723,12 @@ mod maintenance_failure_tests {
             dsn: db.dsn().to_string(),
             schema: schema.to_string(),
             pool,
-            session: ProducerSession::connect(db.dsn(), schema)
-                .await
-                .expect("take the staging-worker singleton"),
+            standby: false,
+            session: Some(
+                ProducerSession::connect(db.dsn(), schema)
+                    .await
+                    .expect("take the staging-worker singleton"),
+            ),
             wake_channel: "wake".to_string(),
             interval: Duration::from_millis(20),
             housekeeping_interval: Duration::from_secs(3600),
@@ -3999,7 +4180,7 @@ mod reconcile_tests {
 
     /// A `setup_staging` whose first capture pass fails releases the
     /// staging-worker singleton before it returns, so a restart right
-    /// after doesn't fail with `ProducerAlreadyRunning`. Here the pass can't
+    /// after finds it free (and doesn't stand by). Here the pass can't
     /// read the catalog: the schema has no Trellis tables.
     ///
     /// Dropping the session isn't enough: its connection task only closes the

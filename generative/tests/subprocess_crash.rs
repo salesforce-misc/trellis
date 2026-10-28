@@ -240,8 +240,8 @@ async fn a_sigkill_mid_phase_3_drain_still_converges_on_redrive() {
 /// staging-worker singleton is still held. A killed engine's backend frees it
 /// only once Postgres schedules that backend to read the EOF, which under CPU
 /// contention can trail the kill by milliseconds; a fresh engine that asked
-/// first failed its start with `ProducerAlreadyRunning`, and the restart above
-/// timed out waiting for a readiness marker that never came (seen in CI).
+/// first would come up as a standby, polling for the lock every few seconds
+/// instead of leading at once.
 ///
 /// The stand-in for that slow backend is a session of this test's own,
 /// queued on the singleton behind the running primary: Postgres hands it the
