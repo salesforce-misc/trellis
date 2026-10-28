@@ -872,6 +872,19 @@ fn the_generator_reaches_every_registry_entry() {
                 seen.insert(format!("cast to {target}"));
                 walk(expr, seen, depth + 1, deepest);
             }
+            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+                seen.insert(
+                    match expr {
+                        Expr::Not(_) => "NOT",
+                        Expr::IsNull { .. } => "IS NULL",
+                        _ => "CASE",
+                    }
+                    .to_string(),
+                );
+                for child in expr.logic_children() {
+                    walk(child, seen, depth + 1, deepest);
+                }
+            }
             Expr::TypedLiteral { value_type, .. } => {
                 seen.insert(format!("literal {value_type}"));
             }

@@ -362,6 +362,16 @@ fn render_expr(expr: &Expr) -> String {
         }
         Expr::Negate(operand) => format!("(-({}))", render_expr(operand)),
         Expr::Cast { expr, target } => format!("cast({} as {target})", render_expr(expr)),
+        Expr::Not(operand) => format!("(not {})", render_expr(operand)),
+        Expr::IsNull { expr, negated } => format!(
+            "({} is {}null)",
+            render_expr(expr),
+            if *negated { "not " } else { "" }
+        ),
+        Expr::Case {
+            branches,
+            otherwise,
+        } => render_case(branches, otherwise.as_deref(), render_expr),
         // `COUNT(*)` (task B4, mirroring `trellis::dev::defs::oracle::render_expr_sql`'s
         // own special case): the parser's only accepted `COUNT` shape has no
         // argument at all in the AST (`args` is empty), so `*` is rendered
@@ -749,6 +759,26 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
             })
         }
         Expr::Cast { target, .. } => *target,
+        Expr::Not(_) | Expr::IsNull { .. } => ValueType::Boolean,
+        // The results unify as `COALESCE`'s arguments do: an exact numeric
+        // beside a float is the float, two integers the wider, otherwise
+        // `numeric`; equal types are themselves.
+        Expr::Case {
+            branches,
+            otherwise,
+        } => branches
+            .iter()
+            .map(|(_, result)| result)
+            .chain(otherwise.as_deref())
+            .map(|result| field_value_type(result, source_columns))
+            .reduce(|a, b| match (a, b) {
+                _ if a == b => a,
+                (ValueType::Float(x), ValueType::Float(y)) => ValueType::Float(x.wider(y)),
+                (ValueType::Float(x), _) | (_, ValueType::Float(x)) => ValueType::Float(x),
+                (ValueType::Integer(x), ValueType::Integer(y)) => ValueType::Integer(x.wider(y)),
+                _ => ValueType::Numeric,
+            })
+            .expect("a CASE has a branch"),
         Expr::FunctionCall { name, args }
             if registry::function_overloads(name).nth(1).is_some() =>
         {
@@ -853,6 +883,27 @@ pub fn render_join_select(def: &TransformDef) -> String {
     )
 }
 
+/// A searched `CASE` as SQL, each part rendered by `render`.
+fn render_case(
+    branches: &[(Expr, Expr)],
+    otherwise: Option<&Expr>,
+    render: fn(&Expr) -> String,
+) -> String {
+    let mut sql = String::from("(case");
+    for (condition, result) in branches {
+        sql.push_str(&format!(
+            " when {} then {}",
+            render(condition),
+            render(result)
+        ));
+    }
+    if let Some(otherwise) = otherwise {
+        sql.push_str(&format!(" else {}", render(otherwise)));
+    }
+    sql.push_str(" end)");
+    sql
+}
+
 /// One `JOIN` field expression as SQL: every column is read through the
 /// table it names (`a.x`, or a joined `b.y`).
 fn render_join_expr(expr: &Expr) -> String {
@@ -868,6 +919,16 @@ fn render_join_expr(expr: &Expr) -> String {
         ),
         Expr::Negate(operand) => format!("(-({}))", render_join_expr(operand)),
         Expr::Cast { expr, target } => format!("cast({} as {target})", render_join_expr(expr)),
+        Expr::Not(operand) => format!("(not {})", render_join_expr(operand)),
+        Expr::IsNull { expr, negated } => format!(
+            "({} is {}null)",
+            render_join_expr(expr),
+            if *negated { "not " } else { "" }
+        ),
+        Expr::Case {
+            branches,
+            otherwise,
+        } => render_case(branches, otherwise.as_deref(), render_join_expr),
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             "count(*)".to_string()
         }

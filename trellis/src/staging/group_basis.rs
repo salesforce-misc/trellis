@@ -429,6 +429,10 @@ pub(super) fn rewrite(
             expr: Box::new(rewrite(operand, type_of, arg_of, shape)?),
             target: *target,
         }),
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => expr
+            .map_logic_children(|child| rewrite(child, type_of, arg_of, shape).ok_or(()))
+            .expect("a logic node")
+            .ok(),
         other => Some(other.clone()),
     }
 }
@@ -458,6 +462,11 @@ fn distinct_arguments(
                 walk(rhs, out);
             }
             Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => walk(operand, out),
+            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+                for child in expr.logic_children() {
+                    walk(child, out);
+                }
+            }
             Expr::Column(_)
             | Expr::SourceColumn { .. }
             | Expr::NumberLiteral(_)

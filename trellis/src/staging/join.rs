@@ -304,6 +304,10 @@ fn substitute(def: &TransformDef, expr: &Expr, depth: usize) -> Option<Expr> {
             expr: Box::new(substitute(def, operand, depth)?),
             target: *target,
         },
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => expr
+            .map_logic_children(|child| substitute(def, child, depth).ok_or(()))
+            .expect("a logic node")
+            .ok()?,
         other => other.clone(),
     })
 }

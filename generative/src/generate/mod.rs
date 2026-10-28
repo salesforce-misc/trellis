@@ -1201,6 +1201,10 @@ impl DerivedShape {
                     name: name.clone(),
                     args: args.iter().map(|arg| rename(arg, names)).collect(),
                 },
+                Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => expr
+                    .map_logic_children(|child| Ok::<_, ()>(rename(child, names)))
+                    .expect("a logic node")
+                    .expect("renaming cannot fail"),
                 other => other.clone(),
             }
         }

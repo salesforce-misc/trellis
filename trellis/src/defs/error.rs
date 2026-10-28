@@ -63,6 +63,17 @@ pub enum ParseError {
     PrefixMinusChainTooLong { max: usize },
     /// Two adjacent `-` characters, which start a comment in SQL.
     DoubleMinus,
+    /// `a < b < c`, `a = b = c` and the like: Postgres's comparisons (and
+    /// `IS [NOT] DISTINCT FROM`) are non-associative, so a second one at the
+    /// same level is a syntax error there and here.
+    NonAssociativeComparison { operator: String },
+    /// `IS TRUE`, `IS NOT FALSE`, `IS UNKNOWN` and the like. Only `IS [NOT]
+    /// NULL` and `IS [NOT] DISTINCT FROM` are admitted.
+    UnsupportedIsForm { found: String },
+    /// A run of prefix `NOT` operators longer than the parser keeps.
+    NotChainTooLong { max: usize },
+    /// `CASE <operand> WHEN <value> THEN ...`, the simple form.
+    SimpleCaseUnsupported,
     /// A `CAST(<literal> AS <type>)` or `<type> '<literal>'` naming a type
     /// that isn't in `super::typed_literal::TYPED_LITERALS`'s allowlist.
     UnsupportedLiteralType { name: String },
@@ -188,6 +199,27 @@ impl fmt::Display for ParseError {
                     .map(|t| t.to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
+            ),
+            ParseError::NonAssociativeComparison { operator } => write!(
+                f,
+                "'{operator}' follows another comparison: comparisons do not chain in SQL \
+                 (a < b < c is a syntax error). Join them with AND, as in a < b AND b < c, \
+                 or add parentheses"
+            ),
+            ParseError::UnsupportedIsForm { found } => write!(
+                f,
+                "unsupported IS form '{found}': only IS [NOT] NULL and IS [NOT] DISTINCT FROM \
+                 are supported; COALESCE(x, <fallback>) covers the truth-value tests \
+                 (IS [NOT] TRUE, FALSE, UNKNOWN)"
+            ),
+            ParseError::NotChainTooLong { max } => write!(
+                f,
+                "more than {max} prefix NOT operators in a row; write the expression with fewer"
+            ),
+            ParseError::SimpleCaseUnsupported => write!(
+                f,
+                "the simple CASE form (CASE <operand> WHEN <value> THEN ...) is not supported: \
+                 write the searched form, CASE WHEN <operand> = <value> THEN ... END"
             ),
             ParseError::PrefixMinusChainTooLong { max } => write!(
                 f,

@@ -28,7 +28,9 @@ impl Token {
     }
 }
 
-const SYMBOLS: &[char] = &['+', '-', '*', '/', '%', '=', ',', '(', ')', '.', '<', '>'];
+const SYMBOLS: &[char] = &[
+    '+', '-', '*', '/', '%', '=', ',', '(', ')', '.', '<', '>', '!',
+];
 
 pub fn lex(input: &str) -> Result<Vec<Token>, ParseError> {
     let mut tokens = Vec::new();

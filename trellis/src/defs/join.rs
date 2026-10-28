@@ -189,6 +189,11 @@ fn walk_columns(expr: &Expr, visit: &mut impl FnMut(&QualifiedColumn)) {
             walk_columns(rhs, visit);
         }
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => walk_columns(operand, visit),
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            for child in expr.logic_children() {
+                walk_columns(child, visit);
+            }
+        }
         Expr::FunctionCall { args, .. } => {
             for arg in args {
                 walk_columns(arg, visit);
@@ -238,6 +243,11 @@ pub(crate) fn side_arguments(def: &TransformDef, side: Side) -> Vec<Expr> {
             }
             Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
                 collect(operand, def, join, side, out);
+            }
+            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+                for child in expr.logic_children() {
+                    collect(child, def, join, side, out);
+                }
             }
             _ => {}
         }

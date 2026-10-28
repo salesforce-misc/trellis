@@ -517,6 +517,12 @@ fn expr_reads(
             expr_reads(operand, source, source_columns, out);
             None
         }
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            for child in expr.logic_children() {
+                expr_reads(child, source, source_columns, out);
+            }
+            None
+        }
         Expr::Column(_)
         | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)

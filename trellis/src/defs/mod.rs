@@ -528,34 +528,35 @@ mod tests {
         );
     }
 
+    /// Each comparison spelling parses to its operator, a two-character one
+    /// whole (`>=` is not `>` then a stray `=`), and `!=` is `<>`.
     #[test]
-    fn rejects_less_than_operator_as_unsupported_operator() {
-        let err = parse("TRANSFORM t FROM s SELECT a < b AS x").unwrap_err();
-        match err {
-            ParseError::UnsupportedOperator { operator } => assert_eq!(operator, "<"),
-            other => panic!("expected UnsupportedOperator, got {other:?}"),
+    fn each_comparison_symbol_parses_to_its_operator() {
+        for (symbol, op) in [
+            ("=", Operator::Equal),
+            ("<>", Operator::NotEqual),
+            ("!=", Operator::NotEqual),
+            ("<", Operator::LessThan),
+            ("<=", Operator::LessThanOrEqual),
+            (">", Operator::GreaterThan),
+            (">=", Operator::GreaterThanOrEqual),
+        ] {
+            let def = parse(&format!("TRANSFORM t FROM s SELECT a {symbol} b AS x")).unwrap();
+            assert!(
+                matches!(&def.fields[0].expr, Expr::BinaryOp { op: found, .. } if *found == op),
+                "`{symbol}`: {:?}",
+                def.fields[0].expr
+            );
         }
     }
 
+    /// A lone `!` is not an operator, and is named as such.
     #[test]
-    fn rejects_equals_operator_as_unsupported_operator() {
-        let err = parse("TRANSFORM t FROM s SELECT a = b AS x").unwrap_err();
+    fn rejects_a_lone_bang_as_unsupported_operator() {
+        let err = parse("TRANSFORM t FROM s SELECT a ! b AS x").unwrap_err();
         match err {
-            ParseError::UnsupportedOperator { operator } => assert_eq!(operator, "="),
+            ParseError::UnsupportedOperator { operator } => assert_eq!(operator, "!"),
             other => panic!("expected UnsupportedOperator, got {other:?}"),
-        }
-    }
-
-    /// A two-character comparison is named whole: `>=` is not the supported
-    /// `>` followed by a stray `=`, and `<=` is not `<`.
-    #[test]
-    fn rejects_a_two_character_comparison_by_its_whole_symbol() {
-        for symbol in [">=", "<=", "<>"] {
-            let err = parse(&format!("TRANSFORM t FROM s SELECT a {symbol} b AS x")).unwrap_err();
-            match err {
-                ParseError::UnsupportedOperator { operator } => assert_eq!(operator, symbol),
-                other => panic!("`{symbol}`: expected UnsupportedOperator, got {other:?}"),
-            }
         }
     }
 

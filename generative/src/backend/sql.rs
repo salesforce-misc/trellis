@@ -237,6 +237,30 @@ pub(super) fn render_expr(expr: &Expr) -> String {
         Expr::Cast { expr, target } => {
             format!("CAST({} AS {})", render_expr(expr), pg_type_name(*target))
         }
+        Expr::Not(operand) => format!("NOT ({})", render_expr(operand)),
+        Expr::IsNull { expr, negated } => format!(
+            "({}) IS {}NULL",
+            render_expr(expr),
+            if *negated { "NOT " } else { "" }
+        ),
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            let mut text = String::from("CASE");
+            for (condition, result) in branches {
+                text.push_str(&format!(
+                    " WHEN ({}) THEN ({})",
+                    render_expr(condition),
+                    render_expr(result)
+                ));
+            }
+            if let Some(otherwise) = otherwise {
+                text.push_str(&format!(" ELSE ({})", render_expr(otherwise)));
+            }
+            text.push_str(" END");
+            text
+        }
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             "COUNT(*)".to_string()
         }

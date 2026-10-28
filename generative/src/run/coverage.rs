@@ -280,6 +280,19 @@ impl Coverage {
                 self.expr_shapes.insert("Cast");
                 1 + self.record_expr(expr)
             }
+            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+                self.expr_shapes.insert(match expr {
+                    Expr::Not(_) => "Not",
+                    Expr::IsNull { .. } => "IsNull",
+                    _ => "Case",
+                });
+                1 + expr
+                    .logic_children()
+                    .into_iter()
+                    .map(|child| self.record_expr(child))
+                    .max()
+                    .unwrap_or(0)
+            }
             Expr::FunctionCall { name, args } => {
                 self.expr_shapes.insert("FunctionCall");
                 self.functions.insert(function_name(name));
@@ -324,6 +337,11 @@ fn collect_aggregate_calls(
         }
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
             collect_aggregate_calls(operand, key_space, out);
+        }
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            for child in expr.logic_children() {
+                collect_aggregate_calls(child, key_space, out);
+            }
         }
         Expr::Column(_)
         | Expr::SourceColumn { .. }
@@ -838,6 +856,15 @@ fn operator_name(op: Operator) -> &'static str {
         Operator::Divide => "Divide",
         Operator::Modulo => "Modulo",
         Operator::GreaterThan => "GreaterThan",
+        Operator::GreaterThanOrEqual => "GreaterThanOrEqual",
+        Operator::LessThan => "LessThan",
+        Operator::LessThanOrEqual => "LessThanOrEqual",
+        Operator::Equal => "Equal",
+        Operator::NotEqual => "NotEqual",
+        Operator::IsDistinctFrom => "IsDistinctFrom",
+        Operator::IsNotDistinctFrom => "IsNotDistinctFrom",
+        Operator::And => "And",
+        Operator::Or => "Or",
     }
 }
 

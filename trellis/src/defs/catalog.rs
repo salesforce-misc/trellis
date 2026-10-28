@@ -6276,6 +6276,11 @@ fn expr_references_column(
             expr_references_column(expr, def_source, upstream_table, upstream_column)
         }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => false,
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            expr.logic_children().into_iter().any(|child| {
+                expr_references_column(child, def_source, upstream_table, upstream_column)
+            })
+        }
     }
 }
 

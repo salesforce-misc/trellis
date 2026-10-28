@@ -48,6 +48,15 @@ pub struct OperatorSpec {
 /// tightest. Gaps are left between levels for future operators (e.g. `NOT`
 /// or `AND`/`OR`, both lower than comparison) without renumbering.
 pub mod precedence {
+    /// `OR`.
+    pub const OR: u8 = 2;
+    /// `AND`.
+    pub const AND: u8 = 4;
+    /// Prefix `NOT`: it binds looser than `IS` and every comparison, so
+    /// `NOT a = b` is `NOT (a = b)`.
+    pub const NOT: u8 = 6;
+    /// `IS NULL`, `IS NOT NULL`, `IS [NOT] DISTINCT FROM`.
+    pub const IS: u8 = 8;
     /// `=`, `<>`, `<`, `>`, `<=`, `>=` and similar comparisons.
     pub const COMPARISON: u8 = 10;
     /// Binary `+`, `-`.
@@ -122,7 +131,98 @@ pub const OPERATORS: &[OperatorSpec] = &[
         arg_types: (ValueType::Numeric, ValueType::Numeric),
         precedence: precedence::COMPARISON,
     },
+    OperatorSpec {
+        symbol: ">=",
+        operator: Operator::GreaterThanOrEqual,
+        arg_types: (ValueType::Numeric, ValueType::Numeric),
+        precedence: precedence::COMPARISON,
+    },
+    OperatorSpec {
+        symbol: "<",
+        operator: Operator::LessThan,
+        arg_types: (ValueType::Numeric, ValueType::Numeric),
+        precedence: precedence::COMPARISON,
+    },
+    OperatorSpec {
+        symbol: "<=",
+        operator: Operator::LessThanOrEqual,
+        arg_types: (ValueType::Numeric, ValueType::Numeric),
+        precedence: precedence::COMPARISON,
+    },
+    OperatorSpec {
+        symbol: "=",
+        operator: Operator::Equal,
+        arg_types: (ValueType::Numeric, ValueType::Numeric),
+        precedence: precedence::COMPARISON,
+    },
+    OperatorSpec {
+        symbol: "<>",
+        operator: Operator::NotEqual,
+        arg_types: (ValueType::Numeric, ValueType::Numeric),
+        precedence: precedence::COMPARISON,
+    },
+    OperatorSpec {
+        symbol: "IS DISTINCT FROM",
+        operator: Operator::IsDistinctFrom,
+        arg_types: (ValueType::Numeric, ValueType::Numeric),
+        precedence: precedence::IS,
+    },
+    OperatorSpec {
+        symbol: "IS NOT DISTINCT FROM",
+        operator: Operator::IsNotDistinctFrom,
+        arg_types: (ValueType::Numeric, ValueType::Numeric),
+        precedence: precedence::IS,
+    },
+    OperatorSpec {
+        symbol: "AND",
+        operator: Operator::And,
+        arg_types: (ValueType::Boolean, ValueType::Boolean),
+        precedence: precedence::AND,
+    },
+    OperatorSpec {
+        symbol: "OR",
+        operator: Operator::Or,
+        arg_types: (ValueType::Boolean, ValueType::Boolean),
+        precedence: precedence::OR,
+    },
 ];
+
+impl Operator {
+    /// Whether this operator compares its operands (every operator whose
+    /// result is a `boolean` from two non-boolean-only operands).
+    pub fn is_comparison(self) -> bool {
+        matches!(
+            self,
+            Operator::GreaterThan
+                | Operator::GreaterThanOrEqual
+                | Operator::LessThan
+                | Operator::LessThanOrEqual
+                | Operator::Equal
+                | Operator::NotEqual
+                | Operator::IsDistinctFrom
+                | Operator::IsNotDistinctFrom
+        )
+    }
+
+    /// Whether this comparison orders its operands (`<`, `<=`, `>`, `>=`),
+    /// as opposed to testing equality (`=`, `<>`, `IS [NOT] DISTINCT FROM`).
+    pub fn is_ordering(self) -> bool {
+        matches!(
+            self,
+            Operator::GreaterThan
+                | Operator::GreaterThanOrEqual
+                | Operator::LessThan
+                | Operator::LessThanOrEqual
+        )
+    }
+
+    /// Whether Postgres's grammar refuses `a OP b OP c` for this operator
+    /// instead of grouping it: the comparisons and `IS [NOT] DISTINCT FROM`
+    /// are non-associative.
+    pub fn is_non_associative(self) -> bool {
+        self.is_comparison()
+    }
+}
 
 /// Looks up an operator's spec by its own [`Operator`] variant (as opposed
 /// to [`lookup_operator`], keyed by concrete syntax) — what
@@ -185,6 +285,13 @@ pub fn operator_spec(operator: Operator) -> &'static OperatorSpec {
 /// `common_numeric_type`, which models that separately because Postgres
 /// does.
 pub fn operator_result_type(op: Operator, lhs: ValueType, rhs: ValueType) -> Option<ValueType> {
+    if op.is_comparison() {
+        return comparison_result_type(op, lhs, rhs);
+    }
+    if matches!(op, Operator::And | Operator::Or) {
+        return (lhs == ValueType::Boolean && rhs == ValueType::Boolean)
+            .then_some(ValueType::Boolean);
+    }
     if !lhs.is_numeric_family() || !rhs.is_numeric_family() {
         return None;
     }
@@ -211,15 +318,51 @@ pub fn operator_result_type(op: Operator, lhs: ValueType, rhs: ValueType) -> Opt
             (ValueType::Float(_), _) | (_, ValueType::Float(_)) => return None,
             _ => arithmetic(),
         },
-        // A float against an exact numeric is refused: Postgres resolves it
-        // by casting the exact side to `double precision`, so the comparison
-        // inherits float rounding (`0.1::numeric + 0.2 = 0.3::float8` is
-        // false). `float > float` and `exact > exact` are admitted, and so
-        // is a float against a *bare number literal*, but that exemption
-        // needs the operand's syntax, which only `validate::infer_expr` sees.
-        Operator::GreaterThan if is_mixed_float_exact(lhs, rhs) => return None,
-        Operator::GreaterThan => ValueType::Boolean,
+        // Comparisons and `AND`/`OR` returned above.
+        _ => unreachable!("comparisons and logic returned above"),
     })
+}
+
+/// Whether `lhs` and `rhs` are two operands one family of comparison
+/// operators takes, and `boolean` if so:
+///
+/// | operands | `=`, `<>`, `IS [NOT] DISTINCT FROM` | `<`, `<=`, `>`, `>=` |
+/// |---|---|---|
+/// | exact numeric (any integer width, `numeric`) | yes | yes |
+/// | float beside float (either width) | yes | yes |
+/// | float beside an exact numeric | refused | refused |
+/// | the same temporal type (`date`, `timestamp`, `timestamptz`, `time`, `timetz`) | yes | yes |
+/// | `boolean`, `uuid` beside the same | yes | yes |
+/// | `text` beside `text` | yes | refused (collation order) |
+///
+/// Everything else is `None`. A float against a *bare number literal* is
+/// admitted by [`super::validate`], which sees the operand's syntax.
+pub fn comparison_result_type(op: Operator, lhs: ValueType, rhs: ValueType) -> Option<ValueType> {
+    let comparable = match (lhs, rhs) {
+        (l, r) if l.is_exact_numeric_family() && r.is_exact_numeric_family() => true,
+        (ValueType::Float(_), ValueType::Float(_)) => true,
+        (ValueType::Boolean, ValueType::Boolean) | (ValueType::Uuid, ValueType::Uuid) => true,
+        (ValueType::Text, ValueType::Text) => !op.is_ordering(),
+        (ValueType::Other(a), ValueType::Other(b)) => a == b && is_comparable_temporal(a),
+        _ => false,
+    };
+    comparable.then_some(ValueType::Boolean)
+}
+
+/// The temporal types whose same-type comparison is `IMMUTABLE`.
+pub fn is_comparable_temporal(pg_type: PgType) -> bool {
+    matches!(
+        pg_type,
+        PgType::Date | PgType::Time | PgType::TimeTz | PgType::Timestamp | PgType::TimestampTz
+    )
+}
+
+/// Whether `lhs` and `rhs` are two different temporal types of the
+/// comparable set (`date` beside `timestamp`): the pair a comparison refuses
+/// with the cast remedy.
+pub fn is_mixed_temporal(lhs: ValueType, rhs: ValueType) -> bool {
+    matches!((lhs, rhs), (ValueType::Other(a), ValueType::Other(b))
+        if a != b && is_comparable_temporal(a) && is_comparable_temporal(b))
 }
 
 /// The result type of prefix `-` over an operand of type `operand`: the
@@ -619,6 +762,8 @@ pub const NON_IMMUTABLE_NAMES: &[&str] = &[
 
 /// Looks up an operator by its concrete-syntax symbol.
 pub fn lookup_operator(symbol: &str) -> Option<Operator> {
+    // `!=` is Postgres's second spelling of `<>`.
+    let symbol = if symbol == "!=" { "<>" } else { symbol };
     OPERATORS
         .iter()
         .find(|spec| spec.symbol == symbol)

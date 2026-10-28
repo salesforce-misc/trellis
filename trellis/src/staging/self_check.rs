@@ -1651,6 +1651,29 @@ pub(super) fn render_leaf(expr: &Expr) -> String {
         }
         Expr::Negate(operand) => format!("(-({}))", render_leaf(operand)),
         Expr::Cast { expr, target } => format!("cast({} as {target})", render_leaf(expr)),
+        Expr::Not(operand) => format!("(not {})", render_leaf(operand)),
+        Expr::IsNull { expr, negated } => {
+            let test = if *negated { "is not null" } else { "is null" };
+            format!("({} {test})", render_leaf(expr))
+        }
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            let mut sql = String::from("(case");
+            for (condition, result) in branches {
+                sql.push_str(&format!(
+                    " when {} then {}",
+                    render_leaf(condition),
+                    render_leaf(result)
+                ));
+            }
+            if let Some(otherwise) = otherwise {
+                sql.push_str(&format!(" else {}", render_leaf(otherwise)));
+            }
+            sql.push_str(" end)");
+            sql
+        }
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             "count(*)".to_string()
         }

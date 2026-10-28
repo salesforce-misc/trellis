@@ -443,6 +443,90 @@ pub enum Expr {
     /// [`super::registry::cast_result_type`] admits. A cast of a quoted
     /// literal is an [`Expr::TypedLiteral`] instead.
     Cast { expr: Box<Expr>, target: ValueType },
+    /// Prefix `NOT <operand>` over a `boolean`.
+    Not(Box<Expr>),
+    /// `<operand> IS NULL` (or `IS NOT NULL` when `negated`), which is never
+    /// itself `NULL`.
+    IsNull { expr: Box<Expr>, negated: bool },
+    /// The searched `CASE WHEN <condition> THEN <result> [WHEN ...]
+    /// [ELSE <result>] END`. Without an `ELSE` the value is `NULL` where no
+    /// condition is true.
+    Case {
+        branches: Vec<(Expr, Expr)>,
+        otherwise: Option<Box<Expr>>,
+    },
+}
+
+impl Expr {
+    /// The direct subexpressions of a [`Expr::Not`], [`Expr::IsNull`] or
+    /// [`Expr::Case`] node, in source order (a `CASE`'s conditions and
+    /// results interleaved, then its `ELSE`), and none for any other node.
+    /// The three nodes have no per-site meaning in most tree walks, so those
+    /// walks recurse through this.
+    pub fn logic_children(&self) -> Vec<&Expr> {
+        match self {
+            Expr::Not(operand) | Expr::IsNull { expr: operand, .. } => vec![operand],
+            Expr::Case {
+                branches,
+                otherwise,
+            } => branches
+                .iter()
+                .flat_map(|(condition, result)| [condition, result])
+                .chain(otherwise.as_deref())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// [`Expr::logic_children`], mutably.
+    pub fn logic_children_mut(&mut self) -> Vec<&mut Expr> {
+        match self {
+            Expr::Not(operand) | Expr::IsNull { expr: operand, .. } => vec![operand],
+            Expr::Case {
+                branches,
+                otherwise,
+            } => branches
+                .iter_mut()
+                .flat_map(|(condition, result)| [condition, result])
+                .chain(otherwise.as_deref_mut())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Rebuilds a [`Expr::Not`], [`Expr::IsNull`] or [`Expr::Case`] node with
+    /// `f` applied to each direct subexpression (the same order as
+    /// [`Expr::logic_children`]); `None` for any other node.
+    pub fn map_logic_children<E>(
+        &self,
+        mut f: impl FnMut(&Expr) -> Result<Expr, E>,
+    ) -> Option<Result<Expr, E>> {
+        Some(match self {
+            Expr::Not(operand) => f(operand).map(|e| Expr::Not(Box::new(e))),
+            Expr::IsNull { expr, negated } => f(expr).map(|e| Expr::IsNull {
+                expr: Box::new(e),
+                negated: *negated,
+            }),
+            Expr::Case {
+                branches,
+                otherwise,
+            } => (|| {
+                let mut rebuilt = Vec::with_capacity(branches.len());
+                for (condition, result) in branches {
+                    rebuilt.push((f(condition)?, f(result)?));
+                }
+                let otherwise = match otherwise {
+                    Some(e) => Some(Box::new(f(e)?)),
+                    None => None,
+                };
+                Ok(Expr::Case {
+                    branches: rebuilt,
+                    otherwise,
+                })
+            })(),
+            _ => return None,
+        })
+    }
 }
 
 /// The value type a column or expression carries. `Text` and
@@ -564,6 +648,17 @@ pub enum Operator {
     Divide,
     Modulo,
     GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
+    Equal,
+    NotEqual,
+    /// `a IS DISTINCT FROM b`: `<>` that treats `NULL` as a value.
+    IsDistinctFrom,
+    /// `a IS NOT DISTINCT FROM b`: `=` that treats `NULL` as a value.
+    IsNotDistinctFrom,
+    And,
+    Or,
 }
 
 /// Renders `def` back into valid Trellis grammar text — the inverse of
@@ -681,6 +776,30 @@ pub(crate) fn render_field_expr(expr: &Expr) -> String {
         Expr::Negate(operand) => format!("(-{})", render_field_expr(operand)),
         Expr::Cast { expr, target } => {
             format!("CAST({} AS {target})", render_field_expr(expr))
+        }
+        Expr::Not(operand) => format!("(NOT {})", render_field_expr(operand)),
+        Expr::IsNull { expr, negated } => format!(
+            "({} IS {}NULL)",
+            render_field_expr(expr),
+            if *negated { "NOT " } else { "" }
+        ),
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            let mut text = String::from("CASE");
+            for (condition, result) in branches {
+                text.push_str(&format!(
+                    " WHEN {} THEN {}",
+                    render_field_expr(condition),
+                    render_field_expr(result)
+                ));
+            }
+            if let Some(otherwise) = otherwise {
+                text.push_str(&format!(" ELSE {}", render_field_expr(otherwise)));
+            }
+            text.push_str(" END");
+            text
         }
     }
 }

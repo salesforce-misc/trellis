@@ -249,6 +249,13 @@ fn substitute_field_aliases(
                 budget,
             )?)))
         }
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            charge_budget(budget, 1)?;
+            expr.map_logic_children(|child| {
+                substitute_field_aliases(child, self_name, fields_by_name, visiting, memo, budget)
+            })
+            .expect("a logic node")
+        }
         Expr::Cast {
             expr: operand,
             target,
@@ -353,6 +360,13 @@ fn node_count(expr: &Expr) -> usize {
         Expr::Negate(operand) => 1 + node_count(operand),
         Expr::Cast { expr, .. } => 1 + node_count(expr),
         Expr::FunctionCall { args, .. } => 1 + args.iter().map(node_count).sum::<usize>(),
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            1 + expr
+                .logic_children()
+                .into_iter()
+                .map(node_count)
+                .sum::<usize>()
+        }
     }
 }
 

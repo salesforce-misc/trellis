@@ -217,6 +217,18 @@ fn render(def: &TransformDef, expr: &Expr, from: &str, joined: &str) -> Result<S
         Expr::Cast { expr, target } => {
             format!("cast({} as {target})", render(def, expr, from, joined)?)
         }
+        Expr::Not(operand) => format!("(not {})", render(def, operand, from, joined)?),
+        Expr::IsNull { expr, negated } => format!(
+            "({} {})",
+            render(def, expr, from, joined)?,
+            if *negated { "is not null" } else { "is null" }
+        ),
+        Expr::Case {
+            branches,
+            otherwise,
+        } => case_sql(branches, otherwise.as_deref(), |e| {
+            render(def, e, from, joined)
+        })?,
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             "count(*)".to_string()
         }
@@ -234,6 +246,28 @@ fn render(def: &TransformDef, expr: &Expr, from: &str, joined: &str) -> Result<S
             render_leaf(expr)
         }
     })
+}
+
+/// A searched `CASE` as SQL text, each condition and result rendered by
+/// `render`.
+fn case_sql(
+    branches: &[(Expr, Expr)],
+    otherwise: Option<&Expr>,
+    mut render: impl FnMut(&Expr) -> Result<String, String>,
+) -> Result<String, String> {
+    let mut sql = String::from("(case");
+    for (condition, result) in branches {
+        sql.push_str(&format!(
+            " when {} then {}",
+            render(condition)?,
+            render(result)?
+        ));
+    }
+    if let Some(otherwise) = otherwise {
+        sql.push_str(&format!(" else {}", render(otherwise)?));
+    }
+    sql.push_str(" end)");
+    Ok(sql)
 }
 
 /// The fields of the visible target that aren't a `GROUP BY` key, in
@@ -285,6 +319,11 @@ fn summed(def: &TransformDef, args: &[Expr]) -> Vec<bool> {
                 walk(rhs, args, out);
             }
             Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => walk(operand, args, out),
+            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+                for child in expr.logic_children() {
+                    walk(child, args, out);
+                }
+            }
             _ => {}
         }
     }
@@ -908,6 +947,18 @@ fn render_signed(def: &TransformDef, expr: &Expr, args: &[Expr]) -> Result<Strin
         Expr::Cast { expr, target } => {
             format!("cast({} as {target})", render_signed(def, expr, args)?)
         }
+        Expr::Not(operand) => format!("(not {})", render_signed(def, operand, args)?),
+        Expr::IsNull { expr, negated } => format!(
+            "({} {})",
+            render_signed(def, expr, args)?,
+            if *negated { "is not null" } else { "is null" }
+        ),
+        Expr::Case {
+            branches,
+            otherwise,
+        } => case_sql(branches, otherwise.as_deref(), |e| {
+            render_signed(def, e, args)
+        })?,
         Expr::SourceColumn { table, column, .. }
             if join_of(def)
                 .group_by

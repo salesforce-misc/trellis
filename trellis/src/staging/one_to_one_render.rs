@@ -165,6 +165,11 @@ fn collect_columns(expr: &Expr, out: &mut BTreeSet<String>) {
                 collect_columns(arg, out);
             }
         }
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            for child in expr.logic_children() {
+                collect_columns(child, out);
+            }
+        }
     }
 }
 

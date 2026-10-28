@@ -205,6 +205,11 @@ fn collect_columns(
                 collect_columns(arg, field_name, field_names, out);
             }
         }
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+            for child in expr.logic_children() {
+                collect_columns(child, field_name, field_names, out);
+            }
+        }
     }
 }
 
@@ -233,6 +238,16 @@ pub fn render_expr_sql(expr: &Expr) -> String {
         Expr::Cast { expr, target } => {
             format!("cast({} as {target})", render_expr_sql(expr))
         }
+        Expr::Not(operand) => format!("(not {})", render_expr_sql(operand)),
+        Expr::IsNull { expr, negated } => format!(
+            "({} is {}null)",
+            render_expr_sql(expr),
+            if *negated { "not " } else { "" }
+        ),
+        Expr::Case {
+            branches,
+            otherwise,
+        } => render_case_sql(branches, otherwise.as_deref(), render_expr_sql),
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             // `COUNT(*)`: the parser's only accepted `COUNT`
             // shape, but its AST has no argument to render — `count()` is
@@ -246,6 +261,28 @@ pub fn render_expr_sql(expr: &Expr) -> String {
             format!("{}({})", name.to_lowercase(), rendered_args.join(", "))
         }
     }
+}
+
+/// A searched `CASE` as SQL text, each condition and result rendered by
+/// `render`. Shared by every renderer so they spell the construct alike.
+pub(crate) fn render_case_sql(
+    branches: &[(Expr, Expr)],
+    otherwise: Option<&Expr>,
+    mut render: impl FnMut(&Expr) -> String,
+) -> String {
+    let mut text = String::from("(case");
+    for (condition, result) in branches {
+        text.push_str(&format!(
+            " when {} then {}",
+            render(condition),
+            render(result)
+        ));
+    }
+    if let Some(otherwise) = otherwise {
+        text.push_str(&format!(" else {}", render(otherwise)));
+    }
+    text.push_str(" end)");
+    text
 }
 
 /// An unadorned number literal, cast to the type `validate` infers for it
@@ -297,6 +334,18 @@ pub(crate) fn render_qualified_expr_sql(expr: &Expr, source_sql: &str) -> String
             "cast({} as {target})",
             render_qualified_expr_sql(expr, source_sql)
         ),
+        Expr::Not(operand) => format!("(not {})", render_qualified_expr_sql(operand, source_sql)),
+        Expr::IsNull { expr, negated } => format!(
+            "({} is {}null)",
+            render_qualified_expr_sql(expr, source_sql),
+            if *negated { "not " } else { "" }
+        ),
+        Expr::Case {
+            branches,
+            otherwise,
+        } => render_case_sql(branches, otherwise.as_deref(), |e| {
+            render_qualified_expr_sql(e, source_sql)
+        }),
         Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
             "count(*)".to_string()
         }

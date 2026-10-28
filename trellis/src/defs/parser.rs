@@ -33,7 +33,8 @@
 
 use super::ast::{
     AlterClause, AlterTransform, DefinitionRef, Expr, FieldDef, JoinKind, JoinOn, JoinSpec,
-    KeySpace, Predicate, QualifiedColumn, Statement, StatementKind, TransformDef, TransformRef,
+    KeySpace, Operator, Predicate, QualifiedColumn, Statement, StatementKind, TransformDef,
+    TransformRef,
 };
 use super::error::ParseError;
 use super::lexer::{Token, lex};
@@ -50,7 +51,39 @@ use super::validate::is_deferred_aggregate_name;
 /// on a 2 MiB thread stack.
 pub const MAX_EXPRESSION_DEPTH: usize = 100;
 
-const OPERATOR_CHARS: &[char] = &['+', '-', '*', '/', '%', '>', '<', '='];
+const OPERATOR_CHARS: &[char] = &['+', '-', '*', '/', '%', '>', '<', '=', '!'];
+
+/// Words that continue or close an expression rather than begin an operand,
+/// so a prefix `NOT` or `CASE` before one of them is a column of that name.
+const CONTINUATION_KEYWORDS: &[&str] = &["AS", "IS", "AND", "OR", "THEN", "ELSE", "END", "WHEN"];
+
+/// The longest run of prefix `NOT` operators the parser keeps.
+const MAX_PREFIX_NOT: usize = 100;
+
+/// An infix operator at the cursor: a binary operator, or the postfix
+/// `IS [NOT] NULL`.
+#[derive(Debug, Clone, Copy)]
+enum Infix {
+    Binary(Operator),
+    IsNull { negated: bool },
+}
+
+impl Infix {
+    fn precedence(self) -> u8 {
+        match self {
+            Infix::Binary(op) => operator_spec(op).precedence,
+            Infix::IsNull { .. } => super::registry::precedence::IS,
+        }
+    }
+
+    fn symbol(self) -> &'static str {
+        match self {
+            Infix::Binary(op) => operator_spec(op).symbol,
+            Infix::IsNull { negated: false } => "IS NULL",
+            Infix::IsNull { negated: true } => "IS NOT NULL",
+        }
+    }
+}
 
 /// The longest run of prefix `-` operators (`- - - a`) the parser keeps. Each
 /// one is a node deep, and the tree is walked recursively.
@@ -838,51 +871,126 @@ impl Parser {
     fn parse_binary_expr(&mut self, min_precedence: u8) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_unary()?;
         let mut lhs_height = self.last_height;
-        loop {
-            let symbol = match self.peek() {
-                Token::Symbol(c) if OPERATOR_CHARS.contains(c) => *c,
-                _ => break,
-            };
-            // The lexer reads one character at a time, so a two-character
-            // comparison (`>=`, `<=`, `<>`) arrives as two symbols. Name it
-            // whole, not as the `>` or `<` it starts with.
-            let mut symbol_str = symbol.to_string();
-            if let Token::Symbol(next) = self.peek_at(1)
-                && matches!((symbol, *next), ('<' | '>', '=') | ('<', '>'))
-            {
-                symbol_str.push(*next);
-            }
-            let op = match lookup_operator(&symbol_str) {
-                Some(op) => op,
-                None => {
-                    self.advance();
-                    return Err(ParseError::UnsupportedOperator {
-                        operator: symbol_str,
-                    });
-                }
-            };
-            let precedence = operator_spec(op).precedence;
+        // The precedence of the non-associative operator that built `lhs`
+        // (`a < b`), which no operator of its own level may follow.
+        let mut non_associative: Option<u8> = None;
+        while let Some((infix, tokens)) = self.peek_infix()? {
+            let precedence = infix.precedence();
             if precedence < min_precedence {
                 break;
             }
-            self.advance();
-            let rhs = self.parse_binary_expr(precedence + 1)?;
+            if non_associative == Some(precedence) {
+                return Err(ParseError::NonAssociativeComparison {
+                    operator: infix.symbol().to_string(),
+                });
+            }
+            for _ in 0..tokens {
+                self.advance();
+            }
+            let node = match infix {
+                Infix::Binary(op) => {
+                    let rhs = self.parse_binary_expr(precedence + 1)?;
+                    lhs_height = 1 + lhs_height.max(self.last_height);
+                    non_associative = op.is_non_associative().then_some(precedence);
+                    Expr::BinaryOp {
+                        op,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    }
+                }
+                Infix::IsNull { negated } => {
+                    lhs_height += 1;
+                    non_associative = None;
+                    Expr::IsNull {
+                        expr: Box::new(lhs),
+                        negated,
+                    }
+                }
+            };
             // The tree is measured as it is built, so a chain too deep to
             // walk is refused before it exists (and before it must be dropped).
-            lhs_height = 1 + lhs_height.max(self.last_height);
             if lhs_height > MAX_EXPRESSION_DEPTH {
                 return Err(ParseError::ExpressionTooDeep {
                     limit: MAX_EXPRESSION_DEPTH,
                 });
             }
-            lhs = Expr::BinaryOp {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            };
+            lhs = node;
         }
         self.last_height = lhs_height;
         Ok(lhs)
+    }
+
+    /// The infix operator at the cursor and how many tokens spell it, or
+    /// `None` when the next token ends the operand. `AND`, `OR` and `IS` are
+    /// keywords only here, after a complete operand, so a column of that name
+    /// is still a column wherever an operand starts (ADR-0018).
+    fn peek_infix(&self) -> Result<Option<(Infix, usize)>, ParseError> {
+        match self.peek() {
+            Token::Symbol(c) if OPERATOR_CHARS.contains(c) => {
+                // The lexer reads one character at a time, so a two-character
+                // comparison (`>=`, `<=`, `<>`, `!=`) arrives as two symbols.
+                // Name it whole, not as the `>` or `<` it starts with.
+                let mut symbol = c.to_string();
+                let mut tokens = 1;
+                if let Token::Symbol(next) = self.peek_at(1)
+                    && matches!((*c, *next), ('<' | '>' | '!', '=') | ('<', '>'))
+                {
+                    symbol.push(*next);
+                    tokens = 2;
+                }
+                match lookup_operator(&symbol) {
+                    Some(op) => Ok(Some((Infix::Binary(op), tokens))),
+                    None => Err(ParseError::UnsupportedOperator { operator: symbol }),
+                }
+            }
+            Token::Ident(word) if word.eq_ignore_ascii_case("AND") => {
+                Ok(Some((Infix::Binary(Operator::And), 1)))
+            }
+            Token::Ident(word) if word.eq_ignore_ascii_case("OR") => {
+                Ok(Some((Infix::Binary(Operator::Or), 1)))
+            }
+            Token::Ident(word) if word.eq_ignore_ascii_case("IS") => {
+                let word_at = |n: usize, kw: &str| matches!(self.peek_at(n), Token::Ident(w) if w.eq_ignore_ascii_case(kw));
+                let negated = word_at(1, "NOT");
+                let after = 1 + usize::from(negated);
+                if word_at(after, "NULL") {
+                    Ok(Some((Infix::IsNull { negated }, after + 1)))
+                } else if word_at(after, "DISTINCT") && word_at(after + 1, "FROM") {
+                    let op = if negated {
+                        Operator::IsNotDistinctFrom
+                    } else {
+                        Operator::IsDistinctFrom
+                    };
+                    Ok(Some((Infix::Binary(op), after + 2)))
+                } else {
+                    let mut found = String::from("IS");
+                    for n in 1..=after {
+                        if let Token::Ident(w) = self.peek_at(n) {
+                            found.push(' ');
+                            found.push_str(&w.to_ascii_uppercase());
+                        }
+                    }
+                    Err(ParseError::UnsupportedIsForm { found })
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Whether the cursor is a prefix `NOT` or `CASE` keyword rather than a
+    /// column of that name: the next token has to begin an operand. A bare
+    /// `not` before `AS`, an operator or the end of a list stays a column
+    /// (ADR-0018), and `-` after it is a subtraction, as it was before `NOT`
+    /// existed.
+    fn peek_prefix_keyword(&self, keyword: &str) -> bool {
+        self.peek_is_keyword(keyword)
+            && match self.peek_at(1) {
+                Token::Number(_) | Token::String(_) | Token::Symbol('(') => true,
+                Token::Ident(word) => !CONTINUATION_KEYWORDS
+                    .iter()
+                    .any(|kw| word.eq_ignore_ascii_case(kw)),
+                _ => false,
+            }
     }
 
     /// A primary term under any number of prefix `-`, which binds tighter
@@ -894,6 +1002,43 @@ impl Parser {
     /// the literal's sign instead of building a node; any other operand is
     /// wrapped once per remaining minus.
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        // Prefix `NOT` binds looser than `IS` and every comparison, so its
+        // operand is everything at `IS` and tighter (`NOT a = b` is
+        // `NOT (a = b)`). A run of them wraps one operand, counted in a loop,
+        // so a long run costs no stack. The operand's own parse is a nesting
+        // level (`a + NOT b + NOT c + ...` would otherwise recurse once per
+        // `NOT`).
+        let mut nots = 0usize;
+        while self.peek_prefix_keyword("NOT") {
+            self.advance();
+            nots += 1;
+            if nots > MAX_PREFIX_NOT {
+                return Err(ParseError::NotChainTooLong {
+                    max: MAX_PREFIX_NOT,
+                });
+            }
+        }
+        if nots > 0 {
+            if self.nest >= MAX_EXPRESSION_DEPTH {
+                return Err(ParseError::ExpressionTooDeep {
+                    limit: MAX_EXPRESSION_DEPTH,
+                });
+            }
+            self.nest += 1;
+            let operand = self.parse_binary_expr(super::registry::precedence::NOT + 1);
+            self.nest -= 1;
+            let mut expr = operand?;
+            self.last_height += nots;
+            if self.last_height > MAX_EXPRESSION_DEPTH {
+                return Err(ParseError::ExpressionTooDeep {
+                    limit: MAX_EXPRESSION_DEPTH,
+                });
+            }
+            for _ in 0..nots {
+                expr = Expr::Not(Box::new(expr));
+            }
+            return Ok(expr);
+        }
         let mut minuses = 0usize;
         while self.peek_is_symbol('-') {
             self.advance();
@@ -941,7 +1086,10 @@ impl Parser {
         let expr = self.parse_primary_inner()?;
         if grouping {
             // Keeps the inner expression's height.
-        } else if matches!(expr, Expr::FunctionCall { .. } | Expr::Cast { .. }) {
+        } else if matches!(
+            expr,
+            Expr::FunctionCall { .. } | Expr::Cast { .. } | Expr::Case { .. }
+        ) {
             self.last_height += 1;
             if self.last_height > MAX_EXPRESSION_DEPTH {
                 return Err(ParseError::ExpressionTooDeep {
@@ -974,6 +1122,11 @@ impl Parser {
             Token::String(s) => Ok(Expr::StringLiteral(s)),
             Token::Ident(name) => {
                 let upper = name.to_ascii_uppercase();
+
+                // `CASE` is a keyword only where an operand follows it.
+                if upper == "CASE" && self.case_follows() {
+                    return self.parse_case_body();
+                }
 
                 if NON_IMMUTABLE_NAMES.contains(&upper.as_str()) {
                     return Err(ParseError::NonImmutableConstruct { name });
@@ -1118,6 +1271,18 @@ impl Parser {
                         return Ok(Expr::FunctionCall { name: upper, args });
                     }
 
+                    if upper == "NULLIF" {
+                        let args = self.parse_call_args()?;
+                        if args.len() != 2 {
+                            return Err(ParseError::FunctionArityMismatch {
+                                name: upper,
+                                expected: 2,
+                                found: args.len(),
+                            });
+                        }
+                        return Ok(Expr::FunctionCall { name: upper, args });
+                    }
+
                     if upper == "COALESCE" {
                         let args = self.parse_call_args()?;
                         if args.is_empty() {
@@ -1195,6 +1360,56 @@ impl Parser {
             schema: Some(first),
             table: second,
             column: third,
+        })
+    }
+
+    /// Whether the `CASE` just consumed begins a `CASE` expression (an
+    /// operand follows) rather than being a column named `case`
+    /// (`SELECT case AS c`, ADR-0018).
+    fn case_follows(&self) -> bool {
+        self.peek_is_keyword("WHEN")
+            || match self.peek() {
+                Token::Number(_) | Token::String(_) | Token::Symbol('(') => true,
+                Token::Ident(word) => !CONTINUATION_KEYWORDS
+                    .iter()
+                    .any(|kw| word.eq_ignore_ascii_case(kw)),
+                _ => false,
+            }
+    }
+
+    /// Parses the remainder of a searched `CASE`, with `CASE` consumed:
+    /// `WHEN <condition> THEN <result>` once or more, an optional `ELSE
+    /// <result>`, and `END`. The simple form (`CASE <operand> WHEN ...`) is
+    /// refused by name. Each condition and result is a nesting level, and the
+    /// node is one level above its tallest.
+    fn parse_case_body(&mut self) -> Result<Expr, ParseError> {
+        if !self.peek_is_keyword("WHEN") {
+            return Err(ParseError::SimpleCaseUnsupported);
+        }
+        let mut branches = Vec::new();
+        let mut tallest = 0;
+        while self.peek_is_keyword("WHEN") {
+            self.advance();
+            let condition = self.parse_expr()?;
+            tallest = tallest.max(self.last_height);
+            self.expect_keyword("THEN")?;
+            let result = self.parse_expr()?;
+            tallest = tallest.max(self.last_height);
+            branches.push((condition, result));
+        }
+        let otherwise = if self.peek_is_keyword("ELSE") {
+            self.advance();
+            let result = self.parse_expr()?;
+            tallest = tallest.max(self.last_height);
+            Some(Box::new(result))
+        } else {
+            None
+        };
+        self.expect_keyword("END")?;
+        self.last_height = tallest;
+        Ok(Expr::Case {
+            branches,
+            otherwise,
         })
     }
 

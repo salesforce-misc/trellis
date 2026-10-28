@@ -523,6 +523,39 @@ fn write_text(expr: &Expr, style: TextStyle, out: &mut String) {
             write_text(expr, style, out);
             out.push_str(&format!(" {as_} {})", cast_target_text(*target, style)));
         }
+        Expr::Not(operand) => {
+            out.push_str("NOT (");
+            write_text(operand, style, out);
+            out.push(')');
+        }
+        Expr::IsNull { expr, negated } => {
+            out.push('(');
+            write_text(expr, style, out);
+            out.push_str(if *negated {
+                ") IS NOT NULL"
+            } else {
+                ") IS NULL"
+            });
+        }
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            out.push_str("CASE");
+            for (condition, result) in branches {
+                out.push_str(" WHEN (");
+                write_text(condition, style, out);
+                out.push_str(") THEN (");
+                write_text(result, style, out);
+                out.push(')');
+            }
+            if let Some(otherwise) = otherwise {
+                out.push_str(" ELSE (");
+                write_text(otherwise, style, out);
+                out.push(')');
+            }
+            out.push_str(" END");
+        }
         Expr::FunctionCall { name, args } => {
             out.push_str(&if style.lower_names {
                 name.to_lowercase()
