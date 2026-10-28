@@ -326,3 +326,71 @@ async fn altering_in_a_substring_search_on_a_nondeterministic_column_is_refused(
         .get(0);
     assert!(!added, "a refused ALTER must not add its column");
 }
+
+/// A nondeterministic collation's `=` calls `'A'` and `'a'` equal, so a text
+/// comparison (`=`, `<>`, `IS [NOT] DISTINCT FROM`, `NULLIF`) that reads such
+/// a column is refused like the text functions: directly, through `COALESCE`
+/// or a `CASE` result, and through another field. A comparison of a
+/// deterministic column, or of a value computed from the column that is not
+/// text (`char_length(title) = 3`), installs.
+#[tokio::test]
+async fn text_comparisons_on_a_nondeterministic_column_are_refused() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_case_insensitive_collation(&db.pool).await;
+    batch(
+        &db.pool,
+        "create table notes (id bigint primary key, title text collate case_insensitive, \
+                             body text)",
+    )
+    .await;
+    let note_columns = columns(&[
+        ("id", ValueType::Numeric),
+        ("title", ValueType::Text),
+        ("body", ValueType::Text),
+    ]);
+    for (n, (formula, function)) in [
+        ("title = 'a'", "="),
+        ("title <> body", "<>"),
+        ("'a' != title", "<>"),
+        ("title IS DISTINCT FROM body", "IS DISTINCT FROM"),
+        ("body IS NOT DISTINCT FROM title", "IS NOT DISTINCT FROM"),
+        ("COALESCE(body, title) = 'a'", "="),
+        ("CASE WHEN body = 'x' THEN title ELSE body END = 'a'", "="),
+        ("NULLIF(title, 'a') IS NULL", "NULLIF"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let err = install_definition(
+            &db.pool,
+            &format!("TRANSFORM refused_{n} FROM notes SELECT {formula} AS same"),
+            &note_columns,
+            "public",
+        )
+        .await
+        .expect_err(formula);
+        assert_text_function_refused(err, "same", function, "trellis.notes", "title");
+        assert_no_target(&db.pool, &format!("refused_{n}")).await;
+    }
+    // Through another field.
+    let err = install_definition(
+        &db.pool,
+        "TRANSFORM via_field FROM notes SELECT title AS t, t = body AS same",
+        &note_columns,
+        "public",
+    )
+    .await
+    .expect_err("a comparison through another field");
+    assert_text_function_refused(err, "same", "=", "trellis.notes", "title");
+
+    install_definition(
+        &db.pool,
+        "TRANSFORM fine FROM notes SELECT char_length(title) = 3 AS short, body = 'a' AS is_a, \
+                title IS NULL AS missing, CASE WHEN title IS NULL THEN body END AS b",
+        &note_columns,
+        "public",
+    )
+    .await
+    .expect("non-text values, a deterministic column and IS NULL need no deterministic collation");
+}
