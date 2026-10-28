@@ -235,7 +235,8 @@ async fn a_join_computes_arithmetic_in_arguments_and_composed_fields() {
            SUM(db.y - db.w) AS sy, AVG(-db.y) AS ay, SUM(ABS(db.w)) AS aw, \
            -COUNT(*) AS nn, SUM(fa.v) * 2 - COUNT(*) AS c1, \
            ROUND(AVG(db.y), 1) AS c2, CAST(SUM(fa.v) AS numeric) / COUNT(*) AS c3, \
-           SUM(CAST(db.w AS bigint) * 3) AS cw, ROUND(AVG(fa.v * 10), -1) AS c4",
+           SUM(CAST(db.w AS bigint) * 3) AS cw, ROUND(AVG(fa.v * 10), -1) AS c4, \
+           COUNT(ROUND(CAST(db.y AS numeric) / 3, 1)) AS mr",
         ],
     )
     .await;
@@ -256,11 +257,11 @@ async fn a_join_computes_arithmetic_in_arguments_and_composed_fields() {
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
     converge(&trellis).await;
-    let columns = "g, sv, sy, ay, aw, nn, c1, c2, c3, cw, c4";
+    let columns = "g, sv, sy, ay, aw, nn, c1, c2, c3, cw, c4, mr";
     let oracle = "select fa.g, sum(fa.v * 2 - 1), sum(db.y - db.w), avg(-db.y), \
                   sum(abs(db.w)), -count(*), sum(fa.v) * 2 - count(*), round(avg(db.y), 1), \
                   cast(sum(fa.v) as numeric) / count(*), sum(cast(db.w as bigint) * 3), \
-                  round(avg(fa.v * 10), -1) \
+                  round(avg(fa.v * 10), -1), count(round(cast(db.y as numeric) / 3, 1)) \
                   from public.fa join public.db on fa.k = db.k group by fa.g";
     assert_eq!(differences(&raw, "j", columns, oracle).await, 0);
     audit_converges(&trellis, "j").await;

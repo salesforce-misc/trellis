@@ -667,6 +667,29 @@ impl Fixture {
                 gap = Some(g);
             }
         }
+        // The two renderers type the expression alike (a value's text can
+        // agree across types: `cast(x as bigint)` and `cast(x as numeric)`).
+        // Preparing the statement types it without running it.
+        let (build, qualified) = (render_expr_sql(expr), render_qualified_expr_sql(expr, "s"));
+        if let Ok(statement) = self
+            .client
+            .prepare(&format!(
+                "select ({build}), ({qualified}) from {TABLE} as s"
+            ))
+            .await
+        {
+            let columns = statement.columns();
+            if columns[0].type_() != columns[1].type_() {
+                return Err(diverge(
+                    Property::Value,
+                    format!(
+                        "`{build}` is {} but `{qualified}` is {}",
+                        columns[0].type_(),
+                        columns[1].type_()
+                    ),
+                ));
+            }
+        }
         Ok(gap)
     }
 
