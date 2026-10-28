@@ -926,7 +926,8 @@ impl fmt::Display for ValidationError {
                  precise value in the group, which a running sum can't track (see \"Supported \
                  sources and targets\" in docs/transforms.md). Sum a numeric(p,s) column \
                  directly (ALTER TABLE ... ALTER COLUMN ... TYPE numeric(p,s)); an expression \
-                 over numeric has no declared scale"
+                 over numeric (arithmetic, a CASE) has no declared scale: Postgres drops the \
+                 column's modifier there, and a branch such as ELSE 0 would mix scales"
             ),
             ValidationError::ChainedNumericAggregate { function, column } => write!(
                 f,
@@ -3401,7 +3402,24 @@ fn reads_no_column<'f>(
         // skips a `NULL` one. An operator over a `NULL` constant is `NULL`
         // (so not constant here) unless it decides regardless (`false AND
         // NULL`, `NULL IS NULL`), which the fold knows.
-        Expr::BinaryOp { lhs, rhs, .. } => {
+        Expr::BinaryOp { op, lhs, rhs } => {
+            // `IS [NOT] DISTINCT FROM` takes `NULL` as a value, so it is a
+            // constant whenever both sides are constants, `NULL` included.
+            if matches!(
+                op,
+                super::ast::Operator::IsDistinctFrom | super::ast::Operator::IsNotDistinctFrom
+            ) && [lhs, rhs].into_iter().all(|side| {
+                constant_even_if_null(
+                    side,
+                    field_name,
+                    source_columns,
+                    fields_by_name,
+                    memo,
+                    depth,
+                )
+            }) {
+                return true;
+            }
             (reads_no_column(
                 lhs,
                 field_name,
@@ -3426,16 +3444,14 @@ fn reads_no_column<'f>(
             memo,
             depth + 1,
         ),
-        Expr::IsNull { expr: operand, .. } => {
-            reads_no_column(
-                operand,
-                field_name,
-                source_columns,
-                fields_by_name,
-                memo,
-                depth + 1,
-            ) || folds_to_a_value(expr, field_name, source_columns, fields_by_name, depth)
-        }
+        Expr::IsNull { expr: operand, .. } => constant_even_if_null(
+            operand,
+            field_name,
+            source_columns,
+            fields_by_name,
+            memo,
+            depth,
+        ),
         // A `CASE` or `NULLIF` is constant when the planner folds it to a
         // value; one it folds to `NULL` is not, and one this check cannot
         // evaluate is constant if everything under it is.
@@ -3575,6 +3591,34 @@ fn nullable_is_constant<'f>(
             )
         }),
     }
+}
+
+/// Whether `expr` is a constant, a `NULL` one included.
+fn constant_even_if_null<'f>(
+    expr: &Expr,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&'f str, &'f super::ast::FieldDef>,
+    memo: &mut HashMap<&'f str, bool>,
+    depth: usize,
+) -> bool {
+    fold_constant(
+        expr,
+        field_name,
+        source_columns,
+        fields_by_name,
+        &mut HashMap::new(),
+        depth + 1,
+    )
+    .is_some()
+        || reads_no_column(
+            expr,
+            field_name,
+            source_columns,
+            fields_by_name,
+            memo,
+            depth + 1,
+        )
 }
 
 /// Whether the planner folds `expr` to a value that is not `NULL`.

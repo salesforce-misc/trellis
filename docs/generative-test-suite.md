@@ -214,7 +214,9 @@ Postgres, over a throwaway table of random rows (`NULL`, extremes, `NaN`,
    construct. The near misses are the wrong-typed operand of each operator and
    function (a call no overload of the name accepts), prefix `-` over a
    non-numeric operand, a `CAST` the registry does not admit and a target it has
-   no spelling for, a constant zero divisor, a chained comparison, a
+   no spelling for, a constant zero divisor, a chained comparison, a simple
+   `CASE`, an `IS TRUE`-style test, a `CASE` whose condition or results have
+   the wrong type, a `NULLIF` whose first argument Postgres casts, a
    literal-only or integer-literal-only argument given a column, relative or
    non-canonical typed literals, and the operators and functions the registry
    does not admit (including the `STABLE` and `VOLATILE` ones).
@@ -223,8 +225,12 @@ Postgres folds constants while it plans, so an expression it rejects for every
 row (`2147483647 + 1`, `1.5 / 0`) is refused at define by design. A constant
 zero divisor is refused whatever the dividend, so for a column dividend (which
 Postgres plans without error) the checker accepts the refusal when no row of
-the table computes a value, or when a `COALESCE` may keep the division from
-running. The Value property
+the table computes a value, or when a `COALESCE`, `CASE`, `AND` or `OR` may
+keep the division from running. Inside those, define follows the planner: it
+refuses a constant in a `CASE` result whatever the condition, and nothing
+after a constant that ends the `CASE`, `AND`, `OR` or `COALESCE` (the
+constants-only property reaches those folds, including `NULL` ones from
+`NULLIF`). The Value property
 treats "refused at define, and Postgres raises class 22 on a `WHERE false`
 probe" as agreement, and flags both a refusal where Postgres plans the
 expression without error (a false refusal) and an acceptance where Postgres
@@ -259,6 +265,10 @@ range refusals are reached.
    `INTEGER_LITERAL_ARGS`). Every operand-type pair `operator_result_type`
    admits is drawn from then on, as are prefix `-` (`negate_result_type`) and
    each `CAST` (`cast_result_type`, `CAST_TARGETS`).
+   The forms the registry cannot express (`NOT`, `IS [NOT] NULL`, `CASE`,
+   `NULLIF`) are `Rule` variants in `expr_gen` with a spelling in `write_text`
+   that keeps the tree through a re-parse (an operand that starts with `-`
+   after `NOT` is parenthesized).
 2. Run the conformance properties with a large `PROPTEST_CASES`. A failure
    names the property, the text and the row or type that differs.
 3. If define refuses a combination Postgres accepts on purpose (the float/exact

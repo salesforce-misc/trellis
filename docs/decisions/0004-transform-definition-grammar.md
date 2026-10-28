@@ -70,11 +70,16 @@ SELECT <expr> AS <field> [, <expr> AS <field> ...]
 
 `<expr>` is a column reference, a numeric or single-quoted string literal,
 `<expr> + <expr>`, `<expr> - <expr>`, `<expr> * <expr>`, `<expr> / <expr>`,
-`<expr> % <expr>`, `-<expr>`, `<expr> > <expr>`, `CAST(<expr> AS <integer or
-numeric type>)` (the target also spelled `int`, `int4`, `int8` or
-`decimal`), or a function call (`strpos`, `octet_length`, `char_length`,
-`regexp_count`, `abs`, `ceil`, `floor`, `round`, `trunc`; general `func(args)`
-syntax). Values
+`<expr> % <expr>`, `-<expr>`, a comparison (`=`, `<>`, `!=`, `<`, `<=`, `>`,
+`>=`, `IS [NOT] DISTINCT FROM`), `<expr> AND <expr>`, `<expr> OR <expr>`,
+`NOT <expr>`, `<expr> IS [NOT] NULL`, a searched `CASE WHEN <expr> THEN <expr>
+[WHEN ...] [ELSE <expr>] END`, `CAST(<expr> AS <integer or numeric type>)`
+(the target also spelled `int`, `int4`, `int8` or `decimal`), or a function call (`strpos`, `octet_length`, `char_length`, `regexp_count`,
+`abs`, `ceil`, `floor`, `round`, `trunc`, `coalesce`, `nullif`; general
+`func(args)` syntax). `AND`, `OR` and `IS` are operators only after a complete
+operand, `END` only closes a `CASE`, and `NOT` and `CASE` are keywords only
+where an operand follows, so a column of any of those names is still a column.
+Values
 carry a Postgres type (the ones [type support](../type-support.md) lists), and
 every operator/function's argument and return types are type-checked at
 definition time. `<predicate>` accepts only the

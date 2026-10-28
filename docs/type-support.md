@@ -273,6 +273,41 @@ float), define refuses the expression with a remedy
 Checked in `trellis/tests/arithmetic_key_spaces.rs` and
 `trellis/tests/one_to_one_render.rs`.
 
+## Comparison and logic
+
+Comparisons, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, the searched `CASE` and
+`NULLIF` follow Postgres, which computes every value; define decides which
+operand pairs are admitted and the type of the result (the conformance harness
+checks each against a live server,
+[the generative suite](generative-test-suite.md#expression-conformance)).
+
+| Operands | `=`, `<>`, `!=`, `IS [NOT] DISTINCT FROM` | `<`, `<=`, `>`, `>=` |
+|---|---|---|
+| exact numerics (any integer width, `numeric`) | yes | yes |
+| two floats (`real`, `double precision`) | yes (`NaN = NaN` is true, `NaN` sorts above every number, `-0 = 0`) | yes |
+| a float and an exact numeric | refused (Postgres rounds the exact side to a float), except a bare number literal against a float | refused, same exception |
+| one temporal type on both sides: `date`, `timestamp`, `timestamptz`, `time`, `timetz` | yes | yes |
+| two different temporal types | refused | refused |
+| `boolean`, `uuid` against their own type | yes | yes |
+| `text` against `text` | yes, under a deterministic collation ([collation](#collation)) | refused (collation order) |
+| any other pair or type | refused | refused |
+
+A comparison, `IS [NOT] NULL`, `AND`, `OR` and `NOT` give `boolean`; `AND`, `OR`
+and `NOT` take `boolean`, and `IS [NOT] NULL` takes any type. A `boolean`
+field is a `boolean` column in the target and another field may read it.
+`CASE` unifies its `THEN` and `ELSE` results as `COALESCE` unifies its
+arguments (two integers the wider, an exact numeric with a float the float,
+otherwise `numeric`; other types must match), and is `NULL` where no
+condition holds and there is no `ELSE`. `NULLIF(a, b)` has `a`'s type for any
+pair `=` admits, except where Postgres casts `a` to compare (an integer with
+a `numeric`, an exact numeric with a float), which is refused. In an aggregate
+argument, `COUNT(CASE WHEN c THEN 1 END)` and an integer `SUM(CASE WHEN c THEN
+qty ELSE 0 END)` are admitted; `SUM` or `AVG` of a `CASE` over `numeric(p,s)`
+is not, because the `CASE` has no declared scale
+([transforms](transforms.md#supported-sources-and-targets)).
+Checked in `trellis/tests/logic_key_spaces.rs`,
+`trellis/tests/one_to_one_render.rs` and the harness.
+
 ## Temporal types
 
 `date`, `time`, `timetz`, `timestamp` and `timestamptz` are keys in every
