@@ -966,7 +966,7 @@ fn may_skip_evaluation(expr: &Expr) -> bool {
         Expr::FunctionCall { name, .. } if name == "NULLIF" => true,
         Expr::BinaryOp { lhs, rhs, .. } => may_skip_evaluation(lhs) || may_skip_evaluation(rhs),
         Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => may_skip_evaluation(operand),
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+        Expr::Not(_) | Expr::IsNull { .. } => {
             expr.logic_children().into_iter().any(may_skip_evaluation)
         }
         Expr::FunctionCall { name, args } => {
