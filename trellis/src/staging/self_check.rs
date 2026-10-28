@@ -1600,21 +1600,28 @@ impl<'a> FieldInliner<'a> {
         self.charge(1)?;
         Ok(match expr {
             Expr::BinaryOp { op, lhs, rhs } => {
-                let symbol = match op {
-                    Operator::Add => "+",
-                    Operator::GreaterThan => ">",
-                };
+                let symbol = registry::operator_spec(*op).symbol;
                 let l = self.expr(lhs, owner, depth + 1)?;
                 let r = self.expr(rhs, owner, depth + 1)?;
                 format!("({l} {symbol} {r})")
+            }
+            Expr::Negate(operand) => {
+                format!("(-({}))", self.expr(operand, owner, depth + 1)?)
+            }
+            Expr::Cast { expr, target } => {
+                format!("cast({} as {target})", self.expr(expr, owner, depth + 1)?)
             }
             Expr::FunctionCall { name, args } if name == "COUNT" && args.is_empty() => {
                 "count(*)".to_string()
             }
             Expr::FunctionCall { name, args } => {
                 let mut rendered = Vec::with_capacity(args.len());
-                for arg in args {
-                    rendered.push(self.expr(arg, owner, depth + 1)?);
+                for (i, arg) in args.iter().enumerate() {
+                    let text = match arg {
+                        Expr::NumberLiteral(_) => render_call_arg(name, i, arg, render_leaf),
+                        _ => self.expr(arg, owner, depth + 1)?,
+                    };
+                    rendered.push(text);
                 }
                 format!("{}({})", name.to_lowercase(), rendered.join(", "))
             }
@@ -1716,6 +1723,39 @@ mod tests {
             "((\"x\" + 1::numeric) + (\"x\" + 1::numeric))"
         );
         assert_eq!(inliner.render(&fields[0]).unwrap(), "(\"x\" + 1::numeric)");
+    }
+
+    #[test]
+    fn inlining_reaches_a_field_read_under_negate_cast_and_a_call() {
+        use crate::defs::ast::ValueType;
+        let fields = vec![
+            field("x", col("c")),
+            field("n", Expr::Negate(Box::new(col("x")))),
+            field(
+                "k",
+                Expr::Cast {
+                    expr: Box::new(col("x")),
+                    target: ValueType::Numeric,
+                },
+            ),
+            field(
+                "r",
+                Expr::FunctionCall {
+                    name: "ROUND".into(),
+                    args: vec![col("x"), Expr::NumberLiteral("2".into())],
+                },
+            ),
+        ];
+        let mut inliner = FieldInliner::new("t", &fields);
+        assert_eq!(inliner.render(&fields[1]).unwrap(), "(-(\"c\"))");
+        assert_eq!(
+            inliner.render(&fields[2]).unwrap(),
+            "cast(\"c\" as numeric)"
+        );
+        assert_eq!(
+            inliner.render(&fields[3]).unwrap(),
+            "round(\"c\", (2)::integer)"
+        );
     }
 
     #[test]
