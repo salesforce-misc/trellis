@@ -3813,6 +3813,9 @@ fn column_depths_in(expr: &Expr, depth: usize, out: &mut HashMap<String, usize>)
             .map(|arg| column_depths_in(arg, depth + 1, out))
             .max()
             .unwrap_or(depth),
+        Expr::Negate(inner) | Expr::Cast { expr: inner, .. } => {
+            column_depths_in(inner, depth + 1, out)
+        }
     }
 }
 

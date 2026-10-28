@@ -1404,6 +1404,49 @@ mod depth_tests {
         })
     }
 
+    /// `-(-(... -(c)))` with `minuses` prefix minuses at each of `levels`
+    /// parenthesis levels (spaced so no `--` comment forms).
+    fn minuses_at_each_level(minuses: usize, levels: usize) -> String {
+        let unit = format!("{}(", "- ".repeat(minuses));
+        format!("{}c{}", unit.repeat(levels), ")".repeat(levels))
+    }
+
+    #[test]
+    fn prefix_minuses_and_casts_count_toward_the_height_bound() {
+        // 100 minuses at each of 99 parenthesis levels is ~10,000 nodes deep
+        // while no single chain or nest exceeds its own bound.
+        assert!(matches!(
+            define(minuses_at_each_level(100, 99)),
+            Err(ParseError::ExpressionTooDeep { .. })
+        ));
+        // Minuses count one level each, wherever they sit.
+        assert!(define(minuses_at_each_level(1, 50)).is_ok());
+        assert!(matches!(
+            define(minuses_at_each_level(2, 99)),
+            Err(ParseError::ExpressionTooDeep { .. })
+        ));
+        // A cast counts a level like a call.
+        let casts = |n: usize| format!("{}1{}", "CAST(".repeat(n), " AS bigint)".repeat(n));
+        assert!(matches!(
+            define(casts(MAX_EXPRESSION_DEPTH + 1)),
+            Err(ParseError::ExpressionTooDeep { .. })
+        ));
+        assert!(!matches!(
+            define(casts(MAX_EXPRESSION_DEPTH - 1)),
+            Err(ParseError::ExpressionTooDeep { .. })
+        ));
+    }
+
+    #[test]
+    fn calculated_fields_reading_each_other_through_minus_and_cast_are_bounded() {
+        assert!(fields_refused(MAX_EXPRESSION_DEPTH / 2 + 1, "-{prev} + 1"));
+        assert!(fields_refused(
+            MAX_EXPRESSION_DEPTH + 1,
+            "CAST({prev} AS bigint)"
+        ));
+        assert!(fields_refused(100_000, "-{prev}"));
+    }
+
     #[test]
     fn calculated_fields_reading_each_other_are_bounded_by_the_inlined_height() {
         // A read at the root costs one level per hop: 100 fields in a chain.

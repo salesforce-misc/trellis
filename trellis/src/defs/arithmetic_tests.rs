@@ -212,7 +212,9 @@ fn a_run_of_prefix_minuses_is_bounded_and_costs_no_stack() {
             }
             // A chain within the bound parses, and is dropped, validated and
             // rendered without recursing past the bound.
-            let text = format!("{}i4", "- ".repeat(100));
+            // (99 minuses: the leaf is a level too, and the whole tree may be
+            // at most `MAX_EXPRESSION_DEPTH` high.)
+            let text = format!("{}i4", "- ".repeat(99));
             let expr = expr_of(&text);
             let mut depth = 0;
             let mut node = &expr;
@@ -220,7 +222,12 @@ fn a_run_of_prefix_minuses_is_bounded_and_costs_no_stack() {
                 depth += 1;
                 node = inner;
             }
-            assert_eq!(depth, 100);
+            assert_eq!(depth, 99);
+            let err = parse_err(&format!("{}i4", "- ".repeat(100)));
+            assert!(
+                matches!(err, ParseError::ExpressionTooDeep { .. }),
+                "{err:?}"
+            );
             assert_type(&text, I4);
         })
         .expect("spawn")
