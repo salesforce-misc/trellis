@@ -335,6 +335,8 @@ fn a_cast_to_any_other_type_or_with_a_modifier_is_refused_by_name() {
         "int2",
         "bigserial",
         "float8",
+        // Postgres's `dec` is a `numeric` alias #1455 did not admit.
+        "dec",
         "text",
         "real",
         "double precision",
