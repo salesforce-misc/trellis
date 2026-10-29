@@ -658,3 +658,46 @@ async fn resuming_a_join_whose_read_column_became_nondeterministic_is_refused() 
     }
     set_enabled(false);
 }
+
+/// An aggregate JOIN's text read is refused wherever the aggregate puts it:
+/// under `SUM`, `AVG` and `COUNT`'s arguments directly, in a field composed
+/// of two aggregates, and written with the table's schema.
+#[tokio::test]
+async fn aggregate_join_text_reads_are_refused_in_every_aggregate_position() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_case_insensitive_collation(&db.pool).await;
+    batch(&db.pool, JOIN_TABLES).await;
+    for (n, (select, function)) in [
+        ("SUM(STRPOS(posts.author, 'a')) AS n", "STRPOS"),
+        ("AVG(CASE WHEN posts.author = 'a' THEN 1 END) AS n", "="),
+        ("COUNT(NULLIF(posts.author, 'a')) AS n", "NULLIF"),
+        (
+            "COUNT(*) + SUM(REGEXP_COUNT(posts.author, 'a')) AS n",
+            "REGEXP_COUNT",
+        ),
+        (
+            "COUNT(CASE WHEN public.posts.author <> 'a' THEN 1 END) AS n",
+            "<>",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("positions_{n}");
+        let err = install_definition(
+            &db.pool,
+            &format!(
+                "TRANSFORM {name} FROM post_tags JOIN posts ON post_tags.post = posts.id \
+                 GROUP BY post_tags.tag WITHOUT SOURCE INDEX \
+                 SELECT post_tags.tag AS tag, {select}"
+            ),
+            &HashMap::new(),
+            "public",
+        )
+        .await
+        .expect_err(select);
+        assert_text_function_refused(err, "n", function, "posts", "author");
+        assert_no_target(&db.pool, &name).await;
+    }
+}
