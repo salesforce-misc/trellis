@@ -1514,6 +1514,30 @@ fn every_near_miss_is_refused() {
     });
 }
 
+/// Numeric-literal lexing mirrors Postgres's `scan.l`: a number directly
+/// followed by an identifier character is refused as trailing junk, and an
+/// exponent, radix or `_`-separated literal is refused by name. Fails on its
+/// own if the lexer drifts.
+#[test]
+fn numeric_literal_near_misses_are_refused() {
+    let misses: Vec<_> = near_misses(&columns())
+        .into_iter()
+        .filter(|m| m.kind == "numeric-literal")
+        .collect();
+    assert!(
+        misses.len() >= 10,
+        "only {} numeric-literal misses",
+        misses.len()
+    );
+    HARNESS.with(|h| {
+        for miss in &misses {
+            if let Err(d) = h.fixture.check_refusal(miss) {
+                panic!("{d}");
+            }
+        }
+    });
+}
+
 /// Operator lexing mirrors Postgres: split comparisons and adjacent runs
 /// with no operator are refused (by name) exactly where Postgres rejects
 /// them. The same cases are in `every_near_miss_is_refused`; this one fails

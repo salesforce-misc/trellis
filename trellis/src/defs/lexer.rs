@@ -72,6 +72,94 @@ fn operator_run_len(chars: &[char]) -> usize {
     n
 }
 
+/// Identifier-start characters as Postgres's `ident_start` has them: a
+/// letter, `_`, or any non-ASCII character (its high-bit bytes).
+fn is_ident_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_' || !c.is_ascii()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumberShape {
+    /// Digits with an optional fraction: the only form this grammar reads.
+    Plain,
+    /// A form Postgres's lexer reads as one number that this grammar does
+    /// not implement: an exponent, a `0x`/`0o`/`0b` integer, or `_` digit
+    /// separators.
+    Other,
+}
+
+/// `D(_?D)*` from `start`: the end of a digit run in `radix`, or `None` if
+/// it does not begin with a digit. The second value is whether a `_`
+/// separator was used.
+fn scan_digits(chars: &[char], start: usize, radix: u32) -> Option<(usize, bool)> {
+    let digit = |i: usize| chars.get(i).is_some_and(|c| c.is_digit(radix));
+    if !digit(start) {
+        return None;
+    }
+    let (mut i, mut underscore) = (start + 1, false);
+    loop {
+        if digit(i) {
+            i += 1;
+        } else if chars.get(i) == Some(&'_') && digit(i + 1) {
+            underscore = true;
+            i += 2;
+        } else {
+            return Some((i, underscore));
+        }
+    }
+}
+
+/// The longest numeric literal at `start` (a digit), as Postgres's `scan.l`
+/// matches it: a `0x`/`0o`/`0b` integer, or decimal digits with an optional
+/// fraction (`1.` and `1.5`, never a leading `.`) and an optional exponent
+/// (`e`, an optional sign, digits). A `.` joins the number only before a
+/// digit or an identifier character, so `1..2` is the number `1` and two
+/// stray dots for the parser.
+fn scan_number(chars: &[char], start: usize) -> (usize, NumberShape) {
+    if chars[start] == '0'
+        && let Some(radix) = chars.get(start + 1).and_then(|c| match c {
+            'x' | 'X' => Some(16),
+            'o' | 'O' => Some(8),
+            'b' | 'B' => Some(2),
+            _ => None,
+        })
+    {
+        let from = if chars.get(start + 2) == Some(&'_') {
+            start + 3
+        } else {
+            start + 2
+        };
+        if let Some((end, _)) = scan_digits(chars, from, radix) {
+            return (end, NumberShape::Other);
+        }
+    }
+    let Some((mut end, mut other)) = scan_digits(chars, start, 10) else {
+        unreachable!("the caller checked for a digit")
+    };
+    if chars.get(end) == Some(&'.') {
+        if let Some((frac, underscore)) = scan_digits(chars, end + 1, 10) {
+            end = frac;
+            other |= underscore;
+        } else if chars.get(end + 1).is_some_and(|c| is_ident_start(*c)) {
+            end += 1; // `1.e3` is a number, `1.a` is junk after `1.`
+        }
+    }
+    if matches!(chars.get(end), Some('e' | 'E')) {
+        let sign = usize::from(matches!(chars.get(end + 1), Some('+' | '-')));
+        if let Some((exp, _)) = scan_digits(chars, end + 1 + sign, 10) {
+            return (exp, NumberShape::Other);
+        }
+    }
+    (
+        end,
+        if other {
+            NumberShape::Other
+        } else {
+            NumberShape::Plain
+        },
+    )
+}
+
 pub fn lex(input: &str) -> Result<Vec<Token>, ParseError> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = input.chars().collect();
@@ -95,20 +183,31 @@ pub fn lex(input: &str) -> Result<Vec<Token>, ParseError> {
         }
 
         if c.is_ascii_digit() {
-            let start = i;
-            while i < chars.len() && chars[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i < chars.len()
-                && chars[i] == '.'
-                && chars.get(i + 1).is_some_and(char::is_ascii_digit)
-            {
-                i += 1;
-                while i < chars.len() && chars[i].is_ascii_digit() {
-                    i += 1;
+            let (end, shape) = scan_number(&chars, i);
+            let number: String = chars[i..end].iter().collect();
+            // Postgres (15+) refuses a number directly followed by an
+            // identifier character ("trailing junk after numeric literal"),
+            // so `1AND`, `1e3AND` and `1.a` are refused, not read as a number
+            // and a word.
+            if chars.get(end).is_some_and(|ch| is_ident_start(*ch)) {
+                let mut stop = end;
+                while stop < chars.len()
+                    && (is_ident_start(chars[stop])
+                        || chars[stop].is_ascii_digit()
+                        || chars[stop] == '$')
+                {
+                    stop += 1;
                 }
+                return Err(ParseError::NumericTrailingJunk {
+                    number,
+                    junk: chars[end..stop].iter().collect(),
+                });
             }
-            tokens.push(Token::Number(chars[start..i].iter().collect()));
+            if shape != NumberShape::Plain {
+                return Err(ParseError::UnsupportedNumericForm { text: number });
+            }
+            i = end;
+            tokens.push(Token::Number(number));
             continue;
         }
 

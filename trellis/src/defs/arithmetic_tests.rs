@@ -679,3 +679,117 @@ fn an_operator_run_without_an_operator_is_refused_whole() {
         }
     }
 }
+
+/// Postgres's `scan.l` (15 to 18) refuses a number directly followed by an
+/// identifier character: the `integer_junk`, `numeric_junk` and `real_junk`
+/// rules (`{number}{identifier}`, where an identifier may continue with
+/// digits and `$`), and `realfail` (`1e`, `1e+`). Every case is refused by
+/// Postgres 15, 17 and 18; each pins the number and the junk the message
+/// names.
+#[test]
+fn a_number_directly_followed_by_a_word_is_refused_as_trailing_junk() {
+    let junk: &[(&str, &str, &str)] = &[
+        // integer_junk
+        ("a>1AND b<2", "1", "AND"),
+        ("CASE WHEN a>1THEN 2 ELSE 3 END", "1", "THEN"),
+        ("CASE WHEN a>1 THEN 2ELSE 3 END", "2", "ELSE"),
+        ("CASE WHEN a>1 THEN 2 ELSE 3END", "3", "END"),
+        ("1IS NULL", "1", "IS"),
+        ("a+1AS x", "1", "AS"),
+        ("1a", "1", "a"),
+        ("1_a", "1", "_a"),
+        ("1ab2", "1", "ab2"),
+        ("12abc", "12", "abc"),
+        ("1a$b", "1", "a$b"),
+        ("1\u{e4}", "1", "\u{e4}"),
+        ("1_", "1", "_"),
+        ("1__0", "1", "__0"),
+        // numeric_junk, `1.` included
+        ("1.5AND a", "1.5", "AND"),
+        ("1.5a", "1.5", "a"),
+        ("1.AND a", "1.", "AND"),
+        ("1.a", "1.", "a"),
+        // real_junk
+        ("1e3AND a", "1e3", "AND"),
+        ("1e3a", "1e3", "a"),
+        ("1e5e5", "1e5", "e5"),
+        // realfail: an exponent without digits
+        ("1e", "1", "e"),
+        ("1e+", "1", "e"),
+        ("1e-", "1", "e"),
+        ("1.5e", "1.5", "e"),
+        ("1.e", "1.", "e"),
+        // radix prefixes that do not complete (PG17 reads some of these as
+        // hexfail/octfail/binfail; all are refused)
+        ("0x", "0", "x"),
+        ("0b2", "0", "b2"),
+        ("0o8", "0", "o8"),
+        ("0x1Fg", "0x1F", "g"),
+        ("0x1F_", "0x1F", "_"),
+        ("0xAND", "0xA", "ND"),
+    ];
+    for (text, number, junk) in junk {
+        match parse_err(text) {
+            ParseError::NumericTrailingJunk { number: n, junk: j } => {
+                assert_eq!((n.as_str(), j.as_str()), (*number, *junk), "`{text}`")
+            }
+            other => panic!("`{text}`: expected trailing junk, got {other:?}"),
+        }
+    }
+    let message = parse_err("a>1AND b<2").to_string();
+    assert!(
+        message.contains("'AND'") && message.contains("'1'") && message.contains("space"),
+        "{message}"
+    );
+}
+
+/// Forms Postgres reads as one number (the `real` rule's exponent; from 16,
+/// `hexinteger`/`octinteger`/`bininteger` and `_` digit separators) that the
+/// grammar does not implement are refused by name, never read as a number
+/// and a word. Postgres 15 refuses the 16+ forms as junk; the grammar
+/// refuses them on every supported major.
+#[test]
+fn numeric_forms_the_grammar_does_not_implement_are_refused_by_name() {
+    for text in [
+        "1e3", "1E+3", "1e-3", "1.5e3", "1.e3", "0x1F", "0X1F", "0o7", "0b1", "0x_1F", "1_000",
+        "1_000.5", "1.5_0", "1e1_0",
+    ] {
+        match parse_err(text) {
+            ParseError::UnsupportedNumericForm { text: t } => {
+                assert_eq!(t, text, "`{text}`");
+            }
+            other => panic!("`{text}`: expected an unsupported form, got {other:?}"),
+        }
+    }
+}
+
+/// What the lexer still reads: a number ended by whitespace or punctuation
+/// (the junk rules need an identifier character directly after the number),
+/// and `1..2`-style dots, which `numericfail` leaves to the grammar.
+#[test]
+fn numbers_ended_by_space_or_punctuation_still_parse() {
+    for text in [
+        "a>1 AND b<2",
+        "a+1",
+        "a+1.5",
+        "(1)",
+        "ROUND(a,2)",
+        "1 IS NULL",
+        "CASE WHEN a>1 THEN 2 ELSE 3 END",
+        "12",
+        "-1",
+        "a-1",
+        "(a>1)AND b<2",
+    ] {
+        expr_of(text);
+    }
+    for text in ["1..2", "1.2.3", "1..", "1.5.", "1)"] {
+        assert!(
+            !matches!(
+                parse_err(text),
+                ParseError::NumericTrailingJunk { .. } | ParseError::UnsupportedNumericForm { .. }
+            ),
+            "`{text}`"
+        );
+    }
+}

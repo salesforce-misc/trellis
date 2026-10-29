@@ -67,6 +67,13 @@ pub enum ParseError {
     SplitOperator { found: String, joined: String },
     /// Two adjacent `-` characters, which start a comment in SQL.
     DoubleMinus,
+    /// A number directly followed by an identifier character (`1AND`, `1e`,
+    /// `1.a`, `12abc`): Postgres 15+ refuses it as trailing junk after a
+    /// numeric literal. `number` is the literal, `junk` the text after it.
+    NumericTrailingJunk { number: String, junk: String },
+    /// A numeric literal Postgres reads but this grammar does not: an
+    /// exponent (`1e3`), a `0x`/`0o`/`0b` integer, or `_` digit separators.
+    UnsupportedNumericForm { text: String },
     /// `a < b < c`, `a = b = c` and the like: Postgres's comparisons (and
     /// `IS [NOT] DISTINCT FROM`) are non-associative, so a second one at the
     /// same level is a syntax error there and here.
@@ -252,6 +259,16 @@ impl fmt::Display for ParseError {
                 f,
                 "'--' starts a comment in SQL, and comments are not supported: separate the \
                  two minuses with a space or parentheses (a - -1, -(-a))"
+            ),
+            ParseError::NumericTrailingJunk { number, junk } => write!(
+                f,
+                "trailing junk after numeric literal: '{junk}' directly follows the number \
+                 '{number}'; put a space between them, or fix the literal"
+            ),
+            ParseError::UnsupportedNumericForm { text } => write!(
+                f,
+                "the numeric literal '{text}' is not supported: write plain digits with an \
+                 optional fraction (12, 1.5), or a typed literal"
             ),
             ParseError::UnsupportedCastOperator => write!(
                 f,

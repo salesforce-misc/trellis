@@ -1107,6 +1107,39 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
                 needles: vec![needle.to_string()],
             });
         }
+        // Numeric literals lexed as Postgres's `scan.l` does: a number
+        // directly followed by an identifier character is trailing junk
+        // (refused by 15 and later), and the forms Postgres reads that the
+        // grammar does not implement are refused by name.
+        for text in [
+            format!("{a} > 1AND {b} < 2"),
+            format!("CASE WHEN {a} > 1THEN 2 ELSE 3 END"),
+            "1IS NULL".to_string(),
+            format!("{a} + 1AS x"),
+            format!("{a} + 1.5AND {b}"),
+            format!("{a} + 1.a"),
+            format!("{a} + 1e"),
+            format!("{a} + 1e3AND {b}"),
+            format!("{a} + 12abc"),
+        ] {
+            out.push(NearMiss {
+                kind: "numeric-literal",
+                text,
+                needles: vec!["trailing junk".to_string()],
+            });
+        }
+        for text in [
+            format!("{a} + 1e3"),
+            format!("{a} + 1.5E-3"),
+            format!("{a} + 0x1F"),
+            format!("{a} + 1_000"),
+        ] {
+            out.push(NearMiss {
+                kind: "numeric-literal",
+                text,
+                needles: vec!["numeric literal".to_string()],
+            });
+        }
         for name in UNADMITTED_FUNCTIONS {
             if registry::lookup_function(name).is_some() {
                 continue;

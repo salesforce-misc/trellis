@@ -51,13 +51,12 @@ Each rule the expression grammar has is the rule Postgres's `scan.l` and
   operator is one token only when its characters are adjacent (`<=`, `<>`,
   `!=`, `>=`); `a < = b` is two operators, which Postgres refuses, so Trellis
   refuses it by name. String quoting and numeric literals lex as Postgres
-  lexes them, and a lexical form Trellis doesn't implement (`1e3`, `.5`,
-  `1_000`, `0x1F`, `E'...'`, a `/* */` or `--` comment) is refused, never read
-  as something else.
-  [OPEN: a number directly followed by a letter (`a>1AND b<2`, `1IS NULL`,
-  `a+1AS x`) lexes as the number and then a word, though PostgreSQL 15 and
-  later reject it as trailing junk after a numeric literal; the 0.1.0-alpha
-  accepted `a+1AS x`. Recommendation: refuse it, as Postgres does.]
+  lexes them. A number directly followed by an identifier character (`1AND`,
+  `1e`, `1.a`, `12abc`) is refused as trailing junk after a numeric literal,
+  as Postgres 15 and later refuse it, so `a>1AND b<2`, `1IS NULL` and
+  `a+1AS x` need a space. A lexical form Trellis doesn't implement (`1e3`,
+  `.5`, `1_000`, `0x1F`, `E'...'`, a `/* */` or `--` comment) is refused,
+  never read as something else.
 - **Precedence and associativity.** Each operator sits at Postgres's tier and
   associates as Postgres's does, including non-associativity: the comparisons
   don't chain (`a < b < c` is refused), `NOT` binds looser than the comparisons
