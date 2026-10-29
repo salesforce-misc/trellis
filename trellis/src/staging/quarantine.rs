@@ -4661,7 +4661,9 @@ async fn reset_ordering_state(
     }
     let hidden = super::group_basis::hidden_table_ident(schema, id);
     let mut floors = vec![target.to_string(), hidden];
-    floors.extend(crate::defs::join_one_to_one::HiddenTable::floor_keys(schema, id));
+    floors.extend(crate::defs::join_one_to_one::HiddenTable::floor_keys(
+        schema, id,
+    ));
     floors.extend(crate::defs::join::HiddenTable::ALL.iter().map(|table| {
         format!(
             "{}.{}",
