@@ -113,6 +113,11 @@ impl HiddenTable {
         format!("join1_{id}_{}", self.part())
     }
 
+    /// [`Self::name`] as SQL, over the definition id expression `id`.
+    pub(crate) fn name_sql(self, id: &str) -> String {
+        format!("('join1_' || {id} || '_{}')", self.part())
+    }
+
     /// The `ledger_truncate_floor` keys of the two hidden ledgers of
     /// definition `id`: their quoted, qualified idents, as a `JOIN`'s `P`
     /// and `M` floors are keyed.

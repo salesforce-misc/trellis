@@ -680,7 +680,10 @@ pub(crate) async fn rebuildable(
 /// of each per definition, so the call stays fast whatever the table's size.
 /// A group-basis definition (one with a hidden group table,
 /// `super::group_basis`, or a `JOIN`'s hidden tables) gets the sweep job
-/// alone, which recomputes its groups in place ([`run_group_rebuild`]).
+/// alone, which recomputes its groups in place ([`run_group_rebuild`]). A
+/// 1-1 `JOIN` gets the plan job alone: its build re-derives every entry and
+/// turns the ones whose rows are gone into tombstones
+/// (`super::join_one_to_one::build`).
 ///
 /// The definition applies throughout (B1), as it did before the call. The
 /// caller holds each definition's row `for update`, and calls
@@ -721,10 +724,17 @@ pub(crate) async fn start_rebuilds(
                        where c.relname in ({hidden}, {join_hidden}) \
                          and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
                                                where oid = 'transform_definitions'::regclass))) \
+                   and ($2 <> '{sweep}' or not exists ( \
+                       select 1 from pg_catalog.pg_class c \
+                       where c.relname = {join1_hidden} \
+                         and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
+                                               where oid = 'transform_definitions'::regclass))) \
                  order by id",
                 sweep = chunk_queue::KIND_SWEEP,
                 hidden = super::group_basis::hidden_table_name_sql("d.id"),
                 join_hidden = crate::defs::join::HiddenTable::TruncateLock.name_sql("d.id"),
+                join1_hidden =
+                    crate::defs::join_one_to_one::HiddenTable::TruncateLock.name_sql("d.id"),
             ),
             &[&ids, &kind],
         )
@@ -1798,8 +1808,9 @@ async fn run_plan(
         )
         .await;
     }
-    // A 1-1 `JOIN`'s fresh build or resume is its whole build, the minimal
-    // one: `M`, `R`, `J` and the target in one transaction (ADR-0021).
+    // A 1-1 `JOIN`'s fresh build, resume or rebuild is its whole build, the
+    // minimal one: `M`, `R`, `J` and the target in one transaction
+    // (ADR-0021).
     if crate::defs::join::is_one_to_one(&definition.def) {
         if chunk.fields.is_some() {
             return Err(build_error(ApplyError::GroupBasisUnsupported {

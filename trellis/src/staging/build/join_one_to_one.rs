@@ -1,9 +1,10 @@
 //! A 1-1 `JOIN` definition's build (ADR-0021): the minimal one.
 //!
-//! A fresh build or `RESUME` fills `M`, `R`, `J` and the target in one
-//! `READ COMMITTED` transaction, held under the pair's lock row `FOR UPDATE`
-//! ([`crate::staging::join_one_to_one::build`]), then completes the
-//! definition. Pages wait on the lock row for the whole transaction, which at
+//! A fresh build, a `RESUME` or a rebuild in place fills `M`, `R`, `J` and
+//! the target in one `READ COMMITTED` transaction, held under the pair's lock
+//! row `FOR UPDATE` ([`crate::staging::join_one_to_one::build`]), then
+//! completes the definition. A rebuild has no sweep job: the build itself
+//! turns the entries whose rows are gone into tombstones. Pages wait on the lock row for the whole transaction, which at
 //! 100M `a` rows is minutes (#1375 Y3); the chunked build that replaces it is
 //! #1400.
 

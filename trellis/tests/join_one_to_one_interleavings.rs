@@ -505,14 +505,28 @@ async fn total(d: &Driver, kind: Kind, id: i32) -> Option<i32> {
         .map(|row| row.get(0))
 }
 
-/// Writes `sql` without capture, as a migration tool would
-/// (`session_replication_role = replica`).
+/// Runs `sql` on `a` with its capture triggers disabled, in one transaction:
+/// a change no entry will ever hear about. (Capture triggers are `ENABLE
+/// ALWAYS`, so `session_replication_role = replica` doesn't skip them.)
 async fn write_uncaptured(d: &Driver, sql: &str) {
-    write(
-        d,
-        &format!("set session_replication_role = replica; {sql}; reset session_replication_role"),
-    )
-    .await;
+    let toggle = |action: &str| {
+        format!(
+            "do $$ declare t text; begin \
+                 for t in select tgname from pg_trigger \
+                          where tgrelid = 'public.a'::regclass and not tgisinternal loop \
+                     execute format('alter table public.a {action} trigger %I', t); \
+                 end loop; \
+             end $$;"
+        )
+    };
+    d.ctl
+        .batch_execute(&format!(
+            "begin; {} {sql}; {} commit;",
+            toggle("disable"),
+            toggle("enable always")
+        ))
+        .await
+        .expect("write past capture");
 }
 
 /// A Re-derive of a row that has no `R` entry reads its live key before the
@@ -569,7 +583,9 @@ async fn a_rederive_whose_row_moved_keys_after_the_unlocked_read_retries() {
             )
             .await;
         page.reached(PausePoint::BeforeJoin1Lock).await;
-        write_uncaptured(&d, "update public.a set k = 20 where id = 1").await;
+        // Captured, into a later batch: the frozen page's read of `a` would
+        // block a trigger toggle.
+        write(&d, "update public.a set k = 20 where id = 1").await;
         d.release(&mut page, PausePoint::BeforeJoin1Lock).await;
         page.finish().await;
         assert_eq!(

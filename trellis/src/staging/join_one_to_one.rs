@@ -53,8 +53,9 @@
 //!
 //! # A build ([`build`])
 //!
-//! A fresh build or `RESUME` fills `M`, `R`, `J` and the target in one
-//! transaction under the lock row `FOR UPDATE`; the chunked build replaces it
+//! A fresh build, a `RESUME` or a rebuild in place (`request_backfill`, a
+//! catch-up) fills `M`, `R`, `J` and the target in one transaction under the
+//! lock row `FOR UPDATE`, and has no sweep job; the chunked build replaces it
 //! (#1400).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -1124,9 +1125,11 @@ pub(crate) async fn joined_primary_key(
 /// Each ledger table is filled by one statement that reads its table with
 /// `pg_current_snapshot()`, which becomes every entry's basis, so a change
 /// that statement's snapshot saw is refused by I2 and one it didn't is
-/// applied. An entry a page already wrote keeps its applied position. The
-/// target is then written from `R` and `M` as a page writes it, and a target
-/// row no entry backs is deleted.
+/// applied. An entry a page already wrote keeps its applied position, and one
+/// whose row is gone (a rebuild in place keeps the ledgers) becomes a
+/// tombstone by a second statement, whose snapshot is its basis. The target is
+/// then written from `R` and `M` as a page writes it, and a target row no
+/// entry backs is deleted.
 pub(crate) async fn build(
     txn: &Transaction<'_>,
     shape: &JoinShape,
@@ -1137,11 +1140,19 @@ pub(crate) async fn build(
     let key = quote_ident(schema::KEY_COLUMN);
     let basis = quote_ident(schema::BASIS_COLUMN);
     let tombstone = quote_ident(schema::TOMBSTONE_COLUMN);
-    for (ledger, columns, table, pk) in [
-        (&shape.m.ident, &shape.m_columns, &shape.joined_table, m_pk),
+    let seg = quote_ident(schema::APPLIED_SEG_COLUMN);
+    for (ledger, columns, key_columns, table, pk) in [
+        (
+            &shape.m.ident,
+            &shape.m_columns,
+            shape.m_key.clone(),
+            &shape.joined_table,
+            m_pk,
+        ),
         (
             &shape.r.ident,
             &shape.r_columns,
+            shape.key.iter().map(|c| c.name.clone()).collect(),
             &shape.source_table,
             &shape.pk[..],
         ),
@@ -1170,6 +1181,39 @@ pub(crate) async fn build(
                 key_expr = ddl::pk_key_sql_expr(pk, Some("t")),
                 table = ddl::qualified_source_table(table),
                 sets = sets.join(", "),
+            ),
+            &[],
+        )
+        .await?;
+        // An entry whose row is gone (a rebuild in place keeps the
+        // ledgers) is re-derived as gone: a tombstone whose basis is this
+        // statement's snapshot, its key cleared so it matches nothing, and
+        // stamped with the newest segment, as every Re-derive's tombstone is
+        // (`super::retire::collect_tombstones`).
+        let cleared: Vec<String> = key_columns
+            .iter()
+            .map(|c| format!("{} = null", quote_ident(c)))
+            .chain([
+                format!("{basis} = pg_catalog.pg_current_snapshot()"),
+                format!("{tombstone} = true"),
+                format!(
+                    "{seg} = {}",
+                    schema::tombstone_seg_sql(
+                        Some(&format!("l.{seg}")),
+                        "true",
+                        "coalesce((select max(seg_seq) from segments), 0)",
+                    )
+                ),
+            ])
+            .collect();
+        txn.execute(
+            &format!(
+                "update {ledger} l set {cleared} \
+                 where not l.{tombstone} \
+                   and not exists (select 1 from {table} t where {key_expr} = l.{key})",
+                cleared = cleared.join(", "),
+                key_expr = ddl::pk_key_sql_expr(pk, Some("t")),
+                table = ddl::qualified_source_table(table),
             ),
             &[],
         )

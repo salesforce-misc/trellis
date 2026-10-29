@@ -1067,3 +1067,76 @@ async fn a_resume_refuses_a_reader_whose_source_became_a_one_to_one_join_target(
         Some(TransformStatus::Paused)
     );
 }
+
+/// A rebuild of a live 1-1 JOIN in place (`request_backfill`, which also
+/// starts a rebuild after an uncaptured change) re-derives every entry and
+/// turns the ones whose rows are gone into tombstones: the target ends equal
+/// to the live join, and the definition goes live again with no sweep job.
+#[tokio::test]
+async fn a_rebuild_in_place_drops_the_entries_whose_rows_are_gone() {
+    let _knob = with_knob(true).await;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(TABLES).await.expect("seed");
+    let trellis = define_only(db.dsn()).await;
+    trellis.apply(LEFT_JOIN).await.expect("define the 1-1 JOIN");
+    pass(&mut raw, &db.pool).await;
+    pass(&mut raw, &db.pool).await;
+    trellis::staging::build::settle_builds(&db.pool).await;
+    // Changes capture never saw, on both sides.
+    let toggle = |action: &str| {
+        format!(
+            "do $$ declare t record; begin \
+                 for t in select tgrelid::regclass::text as tab, tgname from pg_trigger \
+                          where tgrelid in ('public.orders'::regclass, \
+                                            'public.customers'::regclass) \
+                            and not tgisinternal loop \
+                     execute format('alter table %s {action} trigger %I', t.tab, t.tgname); \
+                 end loop; \
+             end $$;"
+        )
+    };
+    raw.batch_execute(&format!(
+        "begin; {} \
+         delete from public.orders where id = 3; \
+         update public.customers set name = 'zed' where id = 1; \
+         delete from public.customers where id = 2; \
+         {} commit;",
+        toggle("disable"),
+        toggle("enable always")
+    ))
+    .await
+    .expect("write without capture");
+    trellis
+        .request_backfill("public.orders")
+        .await
+        .expect("request a rebuild");
+    assert_eq!(
+        status(&trellis, "order_view").await,
+        Some(TransformStatus::Backfilling)
+    );
+    trellis::staging::build::settle_builds(&db.pool).await;
+    drain(&mut raw, &db.pool).await;
+    assert_eq!(
+        status(&trellis, "order_view").await,
+        Some(TransformStatus::Live)
+    );
+    assert_eq!(
+        raw.query(
+            "select id::text || ' ' || coalesce(who, '-') || ' ' || tier \
+             from public.order_view order by id",
+            &[]
+        )
+        .await
+        .expect("the target")
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>(),
+        ["1 zed gold", "2 - none"],
+    );
+    let diverging = trellis::staging::one_to_one_join_diverging_keys(&db.pool, "public.order_view")
+        .await
+        .expect("compare with the live join");
+    assert!(diverging.is_empty(), "{diverging:?}");
+}
