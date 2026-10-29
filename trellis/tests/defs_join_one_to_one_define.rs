@@ -975,9 +975,6 @@ async fn a_change_reaching_the_drain_halts_a_one_to_one_join_rather_than_apply_i
     }
 }
 
-/// No transform reads a 1-1 JOIN target, however it came to: a reader whose
-/// source was dropped while it was paused, and whose source's name a 1-1
-/// JOIN's target then took, is refused at `RESUME` as at define.
 /// A restored 1-1 JOIN's `RESUME` recreates `R` and `M` (empty, no basis)
 /// and `J`, keeps the target's rows, and drops the truncate floors the dump
 /// carried. The reset of the ledgers' ordering columns is not needed on top
@@ -1112,7 +1109,10 @@ async fn a_resume_waits_out_an_in_flight_chunk_before_recreating_the_hidden_tabl
         let pool = db.pool.clone();
         async move { trellis::staging::quarantine::resume_transform(&pool, "order_view").await }
     });
-    // The resume is queued on the claim row.
+    // The resume is queued on the claim row. It reaches the wait in a few
+    // statements; the bound only turns a resume that never gets there into
+    // a failure rather than a hang.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let queued: bool = raw
             .query_one(
@@ -1126,6 +1126,15 @@ async fn a_resume_waits_out_an_in_flight_chunk_before_recreating_the_hidden_tabl
         if queued {
             break;
         }
+        assert!(
+            !resume.is_finished(),
+            "the resume ended without waiting for the chunk: {:?}",
+            resume.await
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the resume never queued on the claim row"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     // It has not yet taken `ACCESS EXCLUSIVE` on the hidden ledger.
@@ -1143,6 +1152,9 @@ async fn a_resume_waits_out_an_in_flight_chunk_before_recreating_the_hidden_tabl
     );
 }
 
+/// No transform reads a 1-1 JOIN target, however it came to: a reader whose
+/// source was dropped while it was paused, and whose source's name a 1-1
+/// JOIN's target then took, is refused at `RESUME` as at define.
 #[tokio::test]
 async fn a_resume_refuses_a_reader_whose_source_became_a_one_to_one_join_target() {
     let _knob = with_knob(true).await;
