@@ -256,15 +256,18 @@ impl fmt::Display for ParseError {
                         f,
                         "'{name}' is a literal in Postgres, and this grammar doesn't support the \
                          true, false and null literals yet; a column named '{name}' can't be \
-                         referenced either, since Postgres needs it quoted and this grammar has no \
-                         quoted identifiers, so rename the column"
+                         named bare either, since Postgres needs it quoted and this grammar has no \
+                         quoted identifiers: read a source column of that name qualified with its \
+                         table (`<table>.{lower}`), as Postgres allows, or rename the column or \
+                         field"
                     )
                 } else {
                     write!(
                         f,
                         "'{name}' is a reserved word in Postgres, so it can't be a column name \
-                         without quotes, and this grammar has no quoted identifiers; rename the \
-                         column"
+                         without quotes, and this grammar has no quoted identifiers: read a \
+                         source column of that name qualified with its table \
+                         (`<table>.{lower}`), as Postgres allows, or rename the column or field"
                     )
                 }
             }

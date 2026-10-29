@@ -67,8 +67,9 @@ Each rule the expression grammar has is the rule Postgres's `scan.l` and
   name Postgres itself accepts as an unquoted column name. The words
   `pg_get_keywords()` reports with category `R` (reserved) or `T` (reserved as a
   type or function name) are not: Trellis refuses a bare identifier equal to one
-  of them, by name, with the remedy to rename the column, since it has no quoted
-  identifiers. `NOT` and `CASE` are keywords before every operand the grammar
+  of them, by name, since it has no quoted identifiers. The remedy is the one
+  Postgres offers without quotes: a source column qualified with its table
+  (`orders.order`), or renaming the column or field. `NOT` and `CASE` are keywords before every operand the grammar
   has, `-` included: `not - 1` is `NOT (-1)`, as in Postgres. The refusal covers
   `not AS c`, `not + 1`, `case * b`, `end + 1` and `and + 1`, which Postgres
   reads differently or rejects, and `true`, `false` and `null`, which are
@@ -177,7 +178,8 @@ Postgres.
 
 - The grammar is stricter than Postgres in places a SQL user will notice: the
   refusals in the transforms table, and no quoted identifiers, so a column whose
-  name Postgres reserves can't be referenced.
+  name Postgres reserves is read only qualified with its table, and a field
+  whose label Postgres reserves can't be read by another field.
 - The oracle is every supported Postgres version, PostgreSQL 15 or later. Where
   majors differ (PostgreSQL 16 and later read `1_000` as 1000 and `0x1F` as
   31; 15 rejects both as trailing junk), Trellis accepts only what every

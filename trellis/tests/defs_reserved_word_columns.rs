@@ -89,7 +89,7 @@ async fn a_source_column_named_like_a_reserved_word_does_not_block_a_definition(
 }
 
 /// Naming a reserved-word column in an expression is refused at define with
-/// the rename remedy, and nothing is created; a reserved word as the label after `AS` is still fine.
+/// the qualify-or-rename remedy, and nothing is created; a reserved word as the label after `AS` is still fine.
 #[tokio::test]
 async fn naming_a_reserved_word_column_in_an_expression_is_refused_at_define() {
     let cluster = TestCluster::start();
@@ -108,7 +108,9 @@ async fn naming_a_reserved_word_column_in_an_expression_is_refused_at_define() {
         .expect_err("a reserved word is not a column name");
         let text = err.to_string();
         assert!(
-            text.contains("reserved word") && text.contains("rename the column"),
+            text.contains("reserved word")
+                && text.contains("qualified with its table")
+                && text.contains("rename the column"),
             "{expr}: {text}"
         );
     }
@@ -129,4 +131,69 @@ async fn naming_a_reserved_word_column_in_an_expression_is_refused_at_define() {
     )
     .await
     .expect("a reserved word is a fine field name");
+}
+
+/// The remedy the refusal names: a reserved-word source column read qualified
+/// with its table (`rw_src.order`, which Postgres accepts unquoted too) defines,
+/// builds and computes from that column, in a 1-1 field, an aggregate's
+/// argument and a `GROUP BY` key.
+#[tokio::test]
+async fn a_reserved_word_column_is_read_qualified_with_its_table() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = connect(db.dsn()).await;
+    client.batch_execute(CREATE).await.expect("create rw_src");
+
+    install_definition(
+        &db.pool,
+        "TRANSFORM rw_q FROM rw_src SELECT rw_src.order + 1 AS next_order, \
+         public.rw_src.user AS who, val AS limit",
+        &source_columns(),
+        "public",
+    )
+    .await
+    .expect("qualified reserved-word columns in a 1-1 definition");
+    install_definition(
+        &db.pool,
+        "TRANSFORM rw_q_totals FROM rw_src GROUP BY rw_src.group WITHOUT SOURCE INDEX \
+         SELECT SUM(rw_src.order) AS total",
+        &source_columns(),
+        "public",
+    )
+    .await
+    .expect("a qualified reserved-word column as an aggregate's argument and key");
+    harness::start_registered_builds(&db.pool)
+        .await
+        .expect("dispatch the builds");
+    trellis::staging::build::settle_builds(&db.pool).await;
+
+    let rows: Vec<(i32, i32, i32)> = client
+        .query(
+            "select next_order, who, \"limit\" from public.rw_q order by id",
+            &[],
+        )
+        .await
+        .expect("read rw_q")
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(rows, [(11, 20, 5), (12, 21, 7), (13, 22, 9)]);
+    let totals: Vec<(i32, String)> = client
+        .query(
+            "select \"group\", total::text from public.rw_q_totals order by 1",
+            &[],
+        )
+        .await
+        .expect("read rw_q_totals")
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(
+        totals,
+        [
+            (30, "10".to_string()),
+            (31, "11".to_string()),
+            (32, "12".to_string())
+        ]
+    );
 }

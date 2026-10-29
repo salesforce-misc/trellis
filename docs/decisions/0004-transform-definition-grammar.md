@@ -89,9 +89,9 @@ column name. `NOT` and `CASE` are keywords wherever an operand follows them (a
 name other than `AS`, `IS`, `AND`, `OR`, `WHEN`, `THEN`, `ELSE` or `END`, a
 number, a string, a `(` or a `-`), so `NOT -x > 0` is `NOT ((-x) > 0)`. A bare
 identifier is never a word Postgres reserves (`not`, `case`, `end`, `order`,
-`user`, `true`...): the grammar has no quoted identifiers, so such a column
-can't be named, and the refusal says to rename it
-([ADR-0022](0022-grammar-mirrors-postgres.md)). `AT TIME ZONE`
+`user`, `true`...): the grammar has no quoted identifiers, so such a source
+column is read qualified with its table (`orders.order`), as Postgres allows,
+and the refusal says so ([ADR-0022](0022-grammar-mirrors-postgres.md)). `AT TIME ZONE`
 binds tighter than `*` and looser than prefix `-`. Values
 carry a Postgres type (the ones [type support](../type-support.md) lists), and
 every operator/function's argument and return types are type-checked at

@@ -433,6 +433,39 @@ fn a_reserved_word_before_a_paren_is_not_refused_as_a_column() {
     }
 }
 
+/// Postgres's column-name keywords (`pg_get_keywords()` category `C`) and
+/// unreserved keywords are legal unquoted column names there (`select
+/// extract, values, between from t` reads three columns), so they stay
+/// columns here, bare and beside an operator.
+#[test]
+fn a_column_name_or_unreserved_keyword_is_still_a_column() {
+    for word in [
+        "extract",
+        "position",
+        "values",
+        "between",
+        "coalesce",
+        "nullif",
+        "char",
+        "overlay",
+        "trim",
+        "substring",
+        "interval",
+        "timestamp",
+        "time",
+        "year",
+        "zone",
+        "at",
+    ] {
+        for text in [word.to_string(), format!("{word} + 1")] {
+            let def = parse_text(&text).unwrap_or_else(|e| panic!("`{text}` should parse: {e}"));
+            let mut columns = Vec::new();
+            super::validate::collect_columns(&def.fields[0].expr, &mut columns);
+            assert_eq!(columns, [word], "`{text}`: {:?}", def.fields[0].expr);
+        }
+    }
+}
+
 /// `true`, `false` and `null` are literals in Postgres, which this grammar
 /// doesn't have yet; the refusal says so.
 #[test]
