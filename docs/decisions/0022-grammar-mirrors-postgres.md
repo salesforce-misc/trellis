@@ -62,20 +62,23 @@ Each rule the expression grammar has is the rule Postgres's `scan.l` and
   don't chain (`a < b < c` is refused), `NOT` binds looser than the comparisons
   and `IS`, and `AT TIME ZONE` binds tighter than `*` and looser than prefix
   `-`.
-- **Keywords.** `NOT` and `CASE`, which Postgres reserves, are keywords
-  before every operand the grammar has, `-` included: `not - 1` is `NOT (-1)`, as in
-  Postgres. Trellis has no quoted identifiers, so a source column named `not`
-  or `case` can't be referenced before an operand; Postgres would need
-  `"not"` there.
-  [OPEN: whether every word Postgres reserves is a keyword everywhere. A
-  reserved word with no operand after it, or one the grammar has no use for,
-  reads as a column name today: `not AS c`, `not + 1` (which Postgres reads as
-  `NOT (+1)`), `case * b`, `end + 1`, and `true`, `false` and `null`, which
-  are literals in Postgres. Each resolves only to a source column of that
-  name, which Postgres would need quoted, and is refused as an unresolved
-  column otherwise. The 0.1.0-alpha read `not AS c`, `not + 1` and `true AS c`
-  this way. Recommendation: the rule covers the keywords the grammar uses, not
-  every reserved word.]
+- **Keywords and identifiers.** A bare identifier in expression position is a
+  name Postgres itself accepts as an unquoted column name. The words
+  `pg_get_keywords()` reports with category `R` (reserved) or `T` (reserved as a
+  type or function name) are not: Trellis refuses a bare identifier equal to one
+  of them, by name, since it has no quoted identifiers. The remedy is the one
+  Postgres offers without quotes: a source column qualified with its table
+  (`orders.order`), or renaming the column or field. `NOT` and `CASE` are keywords before every operand the grammar
+  has, `-` included: `not - 1` is `NOT (-1)`, as in Postgres. The refusal covers
+  `not AS c`, `not + 1`, `case * b`, `end + 1` and `and + 1`, which Postgres
+  reads differently or rejects, and `true`, `false` and `null`, which are
+  literals in Postgres that Trellis doesn't have yet (the message says so). The
+  list is static, in the registry, and a test compares it with a live server's
+  `pg_get_keywords()`, failing on drift. Non-reserved and column-name keywords
+  (`extract`, `position`, `values`, `between`, `coalesce`, `nullif`, `char`) stay
+  legal identifiers, and are constructs only before a `(`. After a `.`
+  (`t.order`), and as the label after `AS`, Postgres accepts any keyword, so
+  qualified names and field names are unaffected.
 - **Spellings.** An alternative spelling is accepted only where Postgres
   accepts it, and means what it means there. `CAST(x AS int)` (and `int4`,
   `int8`, `decimal`) is accepted because Postgres spells those types so; `!=`
@@ -164,11 +167,11 @@ which binds looser than prefix `-`, exactly as Postgres parses it.
 once stored, it keeps its meaning across upgrades, and a change in meaning bumps
 the grammar version with a compatibility rule. This ADR says which way the
 grammar may move: toward Postgres. Admitting a Postgres form that was refused is
-additive and needs no bump. Refusing a form Postgres refuses that the grammar
-accepted (a number directly followed by a word) gives no stored text a new
-meaning, so it needs no bump either; a stored definition with that form pauses
-at attach. Correcting a rule that read accepted text
-differently from Postgres changes what that text means, so it is a bump under
+additive and needs no bump. Refusing accepted text that Postgres rejects or
+reads differently needs no bump either: a stored definition that uses it pauses
+when the new binary attaches, its `capture_failure` naming the refusal, and is
+defined again. Correcting a rule so that accepted text stays accepted with
+Postgres's meaning changes what that text means, so it is a bump under
 ADR-0018, and its compatibility rule keeps each stored definition on the meaning
 it was built with. Neither ADR permits a change that moves the grammar away from
 Postgres.
@@ -177,7 +180,8 @@ Postgres.
 
 - The grammar is stricter than Postgres in places a SQL user will notice: the
   refusals in the transforms table, and no quoted identifiers, so a column whose
-  name Postgres reserves can't be referenced.
+  name Postgres reserves is read only qualified with its table, and a field
+  whose label Postgres reserves can't be read by another field.
 - The oracle is every supported Postgres version, PostgreSQL 15 or later. Where
   majors differ (PostgreSQL 16 and later read `1_000` as 1000 and `0x1F` as
   31; 15 rejects both as trailing junk), Trellis accepts only what every

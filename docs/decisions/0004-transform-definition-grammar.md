@@ -84,11 +84,14 @@ SELECT <expr> AS <field> [, <expr> AS <field> ...]
 `func(args)` syntax). Operators lex and bind as Postgres's do
 ([ADR-0022](0022-grammar-mirrors-postgres.md)). `AND`, `OR`, `IS` and `AT` are
 operators only after a complete operand, `END` only closes a `CASE`, and
-`EXTRACT` is a keyword only before a `(`; elsewhere each of those words is a
+`EXTRACT` is a keyword only before a `(`; elsewhere that word is a
 column name. `NOT` and `CASE` are keywords wherever an operand follows them (a
 name other than `AS`, `IS`, `AND`, `OR`, `WHEN`, `THEN`, `ELSE` or `END`, a
-number, a string, a `(` or a `-`), so `NOT -x > 0` is `NOT ((-x) > 0)`; where
-none follows (`not AS c`, `not + 1`) the word is a column name. `AT TIME ZONE`
+number, a string, a `(` or a `-`), so `NOT -x > 0` is `NOT ((-x) > 0)`. A bare
+identifier is never a word Postgres reserves (`not`, `case`, `end`, `order`,
+`user`, `true`...): the grammar has no quoted identifiers, so such a source
+column is read qualified with its table (`orders.order`), as Postgres allows,
+and the refusal says so ([ADR-0022](0022-grammar-mirrors-postgres.md)). `AT TIME ZONE`
 binds tighter than `*` and looser than prefix `-`. Values
 carry a Postgres type (the ones [type support](../type-support.md) lists), and
 every operator/function's argument and return types are type-checked at
@@ -162,7 +165,8 @@ worth naming:
 * No `unknown`-typed literal: a quoted literal is always `Text`, so
   `COALESCE(<numeric>, '0')` is a type mismatch here. Write `COALESCE(<numeric>, 0)`.
 * No `NULL` literal at all, so `COALESCE(x, NULL)` isn't expressible; bare `NULL`
-  parses as a column reference and is rejected as unresolved.
+  is refused as a reserved word, with a message saying the literal isn't
+  supported yet.
 
 Each gap is pinned by a divergence test.
 

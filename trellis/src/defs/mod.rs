@@ -731,31 +731,17 @@ mod tests {
         // DIVERGENCE from Postgres (tracked toward full compatibility):
         // Postgres's most idiomatic COALESCE form takes a bare `NULL` literal
         // (e.g. `COALESCE(NULL, default)`), but this grammar has no NULL
-        // literal (`ast.rs` has no such `Expr`/`Value` variant). `NULL` is
-        // therefore parsed as an ordinary column reference and rejected at
-        // validation as an unresolved column, rather than behaving as SQL
-        // NULL.
-        let def = parse("TRANSFORM t FROM s SELECT COALESCE(a, NULL) AS x").unwrap();
-        assert_eq!(
-            def.fields[0].expr,
-            Expr::FunctionCall {
-                name: "COALESCE".to_string(),
-                args: vec![
-                    Expr::Column("a".to_string()),
-                    Expr::Column("NULL".to_string()),
-                ],
-            }
-        );
-        let source_columns =
-            std::collections::HashMap::from([("a".to_string(), ValueType::Numeric)]);
-        let err = validate(&def, &source_columns).unwrap_err();
+        // literal (`ast.rs` has no such `Expr`/`Value` variant). `NULL` is a
+        // reserved word in Postgres, so it can't be a column name either; the
+        // parser refuses it by name and says the literal isn't supported.
+        let err = parse("TRANSFORM t FROM s SELECT COALESCE(a, NULL) AS x").unwrap_err();
         assert_eq!(
             err,
-            ValidationError::UnresolvedColumn {
-                field: "x".to_string(),
-                column: "NULL".to_string(),
+            ParseError::ReservedWord {
+                name: "NULL".to_string()
             }
         );
+        assert!(err.to_string().contains("literals yet"), "{err}");
     }
 
     #[test]

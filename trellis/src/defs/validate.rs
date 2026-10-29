@@ -910,23 +910,11 @@ impl fmt::Display for ValidationError {
                  column is in the target without it), or give it a name that isn't a key \
                  column's (e.g. `{field} AS source_{field}`)"
             ),
-            ValidationError::UnresolvedColumn { field, column } => {
-                write!(
-                    f,
-                    "calculated field '{field}' references '{column}', which is neither a \
-                     source column nor another calculated field on this target"
-                )?;
-                if column.eq_ignore_ascii_case("not") || column.eq_ignore_ascii_case("case") {
-                    write!(
-                        f,
-                        "; {} reads as a column name here because no operand follows it (an \
-                         operand starts with a name, a number, a string, '(' or '-'); write \
-                         the operand right after the keyword",
-                        column.to_uppercase()
-                    )?;
-                }
-                Ok(())
-            }
+            ValidationError::UnresolvedColumn { field, column } => write!(
+                f,
+                "calculated field '{field}' references '{column}', which is neither a \
+                 source column nor another calculated field on this target"
+            ),
             ValidationError::Cycle { cycle } => {
                 write!(f, "cycle among calculated columns: {}", cycle.join(" -> "))
             }

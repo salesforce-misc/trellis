@@ -11,9 +11,9 @@ use super::ast::TransformDef;
 use super::parser::parse;
 
 /// The grammar version this binary writes. Grammar 1 is the grammar when the
-/// marker was introduced. A change that makes some accepted text parse,
-/// resolve or evaluate differently bumps it (ADR-0018); one that only refuses
-/// it doesn't, and attaching pauses the stored definitions it refuses.
+/// marker was introduced. A change that keeps some accepted text accepted but
+/// makes it parse, resolve or evaluate differently bumps it; one that refuses
+/// text Postgres rejects or reads differently doesn't (ADR-0018).
 pub const CURRENT_GRAMMAR_VERSION: i32 = 1;
 
 /// The oldest grammar version this binary reads. A version below it is outside
@@ -79,8 +79,9 @@ pub(crate) fn load_in(
 
 /// The attach-time check (ADR-0018) against an explicit window: refuses when
 /// any stored definition is newer than `current`, naming them, and pauses each
-/// transform older than `oldest`, or whose text the current grammar refuses,
-/// with the reason in its `capture_failure`. Returns how many it paused.
+/// transform older than `oldest`, or whose text this binary refuses, with the
+/// reason in its `capture_failure`.
+/// Returns how many it paused.
 pub(crate) async fn check_stored_versions_in(
     client: &mut tokio_postgres::Client,
     oldest: i32,
@@ -112,36 +113,54 @@ pub(crate) async fn check_stored_versions_in(
         )));
     }
     let txn = client.transaction().await?;
-    let stored_rows = txn
+    let too_old = txn
         .query(
-            "select id, source_table, grammar_version, definition_text \
-             from transform_definitions order by id",
-            &[],
+            "select id, source_table, grammar_version from transform_definitions \
+             where grammar_version < $1 order by id",
+            &[&oldest],
         )
         .await?;
     let mut paused = 0;
-    for row in &stored_rows {
-        let (id, source, stored, text): (i64, String, i32, String) =
-            (row.get(0), row.get(1), row.get(2), row.get(3));
-        let reason = match load_in(&text, stored, oldest, current) {
-            Ok(_) => continue,
-            Err(e @ ParseError::GrammarVersionTooOld { .. }) => e.to_string(),
-            // A grammar change that refuses text (toward Postgres, ADR-0022)
-            // needs no bump: text this binary refuses pauses here, so no
-            // other read meets it on a live transform.
-            Err(e) => format!(
-                "this binary's grammar refuses the stored definition text: {e}; drop the \
-                 transform and define it again with the text corrected (after a downgrade, \
-                 run the binary that wrote it and RESUME the transform instead)"
-            ),
-        };
+    for row in &too_old {
+        let (id, source, stored): (i64, String, i32) = (row.get(0), row.get(1), row.get(2));
+        let reason = ParseError::GrammarVersionTooOld { stored, oldest }.to_string();
         super::lifecycle::pause_for_grammar_version(&txn, id, &source, &reason)
             .await
             .map_err(|e| crate::Error::IncompatibleInstance(e.to_string()))?;
         paused += 1;
     }
+    // Stored text inside the window that this release refuses (a form a newer
+    // release narrowed toward Postgres, ADR-0022) pauses the same way, naming
+    // the refusal, rather than failing every reader of the catalog.
+    let in_window = txn
+        .query(
+            "select id, source_table, target_table, definition_text, grammar_version \
+             from transform_definitions where grammar_version >= $1 order by id",
+            &[&oldest],
+        )
+        .await?;
+    for row in &in_window {
+        let (id, source, target): (i64, String, String) = (row.get(0), row.get(1), row.get(2));
+        if let Err(e) = load_in(row.get(3), row.get(4), oldest, current) {
+            let reason = unparsable_stored_text_reason(&target, &e);
+            if super::lifecycle::pause_for_grammar_version(&txn, id, &source, &reason)
+                .await
+                .map_err(|e| crate::Error::IncompatibleInstance(e.to_string()))?
+            {
+                paused += 1;
+            }
+        }
+    }
     txn.commit().await?;
     Ok(paused)
+}
+
+/// The `capture_failure` of a transform whose stored text this release refuses.
+pub(crate) fn unparsable_stored_text_reason(target: &str, error: &ParseError) -> String {
+    format!(
+        "the stored definition of transform {target} is refused by this release: {error}; \
+         drop the transform and define it again in the current grammar"
+    )
 }
 
 /// [`check_stored_versions_in`] against this binary's window.

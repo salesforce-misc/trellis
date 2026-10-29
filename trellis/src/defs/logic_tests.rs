@@ -105,16 +105,7 @@ fn columns() -> HashMap<String, ValueType> {
         ("tm", ValueType::Other(PgType::Time)),
         ("tt", ValueType::Other(PgType::TimeTz)),
         ("j", ValueType::Other(PgType::Jsonb)),
-        // Names that are also keywords (ADR-0018).
-        ("not", B),
-        ("case", I4),
-        ("end", I4),
-        ("and", B),
-        ("or", B),
-        ("is", B),
-        ("when", I4),
-        ("then", I4),
-        ("else", I4),
+        // A name that is also a keyword but not a reserved word (ADR-0022).
         ("nullif", I4),
     ] {
         map.insert(name.to_string(), ty);
@@ -331,16 +322,6 @@ fn not_and_case_before_a_minus_are_the_keywords() {
     ));
 }
 
-/// `NOT` or `CASE` with no operand after it reads as a column name; where no
-/// column has that name the message says why the word was not the keyword.
-#[test]
-fn an_unresolved_not_or_case_column_says_why_it_is_a_column() {
-    for name in ["NOT", "CASE"] {
-        assert_refused(&format!("{name} AND b"), "no operand follows it");
-        assert_refused(&format!("{name} + i4 > 0"), "no operand follows it");
-    }
-}
-
 #[test]
 fn nullif_takes_two_arguments() {
     assert_grouping("NULLIF(a, 0)", "(nullif a 0)");
@@ -353,52 +334,149 @@ fn nullif_takes_two_arguments() {
     }
 }
 
-/// ADR-0018: a keyword added to the grammar must not change what the
-/// grammar accepted before. `AND`, `OR` and `IS` are infix, `END` only closes
-/// a `CASE`, `NOT` and `CASE` are prefix and count as keywords only where an
-/// operand follows. A column of each name still resolves.
+/// ADR-0022: the words the grammar uses as keywords (`NOT`, `CASE`, `AND`...)
+/// are reserved in Postgres, so none can be a column in an expression, and
+/// the keyword rules keep working around them. A non-reserved keyword name
+/// (`nullif`) is still a column.
 #[test]
-fn a_column_named_like_a_keyword_is_still_a_column() {
+fn a_keyword_is_never_read_as_a_column() {
     for name in [
-        "not", "case", "end", "and", "or", "is", "when", "then", "else", "nullif",
+        "not", "case", "end", "and", "or", "is", "when", "then", "else",
     ] {
-        let def = parse(&format!("TRANSFORM t FROM s SELECT {name} AS c"))
-            .unwrap_or_else(|e| panic!("`SELECT {name} AS c`: {e}"));
+        for text in [
+            name.to_string(),
+            format!("{name} + 1"),
+            format!("1 + {name}"),
+            format!("{name} IS NULL"),
+            format!("{name} * i4"),
+        ] {
+            let err = parse_text(&text);
+            assert!(err.is_err(), "`{text}` should be refused");
+        }
+        let err = parse_text(name).unwrap_err();
         assert!(
-            matches!(&def.fields[0].expr, Expr::Column(found) if found == name),
-            "{name}: {:?}",
-            def.fields[0].expr
+            matches!(&err, ParseError::ReservedWord { name: n } if n == name),
+            "{name}: {err:?}"
         );
     }
-    // Where an operand cannot follow, a prefix keyword is a column too.
-    assert_grouping("not + 1", "(+ not 1)");
-    assert_grouping("case * end", "(* case end)");
-    assert_grouping("not = and", "(= not and)");
-    assert_grouping("case IS NULL", "(isnull case)");
-    assert_grouping("not IS NULL", "(isnull not)");
-    assert_grouping("not AND or", "(AND not or)");
-    assert_grouping("not OR not", "(OR not not)");
-    assert_grouping("end + case", "(+ end case)");
-    // And a keyword is a keyword where an operand follows, whatever its case.
-    assert_grouping("not not", "(not not)");
-    assert_grouping("NOT not AND is", "(AND (not not) is)");
-    assert_grouping(
-        "case WHEN not THEN end ELSE else END",
-        "(case [not end] else else)",
-    );
-    assert_grouping(
-        "CASE WHEN end = 1 THEN case ELSE when END",
-        "(case [(= end 1) case] else when)",
-    );
-    assert_grouping("nullif(nullif, end)", "(nullif nullif end)");
-    assert_type("not", B);
-    assert_type("case", I4);
-    assert_type("NOT not", B);
-    assert_type("end + case", I4);
-    assert_type("CASE WHEN and THEN end ELSE case END", I4);
-    assert_type("not AND or", B);
-    assert_type("is IS NULL", B);
-    assert_type("when = then", B);
+    // Text Postgres reads as the keyword is unchanged.
+    assert_grouping("NOT i4 > 0", "(not (> i4 0))");
+    assert_grouping("NOT -i4 > 0", "(not (> (neg i4) 0))");
+    assert_grouping("CASE WHEN b THEN i4 END", "(case [b i4])");
+    assert_grouping("b AND b2 OR b", "(OR (AND b b2) b)");
+    assert_grouping("i4 IS NULL", "(isnull i4)");
+    assert_grouping("i4 IS NOT NULL", "(notnull i4)");
+    assert_grouping("nullif(nullif, i4)", "(nullif nullif i4)");
+    assert_type("nullif", I4);
+    assert_type("nullif + 1", I4);
+}
+
+/// ADR-0022: every word Postgres reserves (generated from
+/// `registry::RESERVED_WORDS`, which a live-server test keeps in step with
+/// `pg_get_keywords()`) is refused as a bare identifier in expression
+/// position, and only there: after a `.`, after `AS`, and before `(` the same
+/// word is a label or a call, as in Postgres.
+#[test]
+fn every_reserved_word_is_refused_as_a_bare_identifier() {
+    use super::registry::RESERVED_WORDS;
+    for word in RESERVED_WORDS {
+        for text in [
+            word.to_string(),
+            word.to_uppercase(),
+            format!("{word} + 1"),
+            format!("1 + {word}"),
+            format!("({word})"),
+            format!("{word} IS NULL"),
+            format!("abs({word})"),
+            format!("CASE WHEN b THEN {word} END"),
+            // The head of a qualified name is a column-position identifier too.
+            format!("{word}.i4"),
+        ] {
+            match parse_text(&text) {
+                Err(ParseError::ReservedWord { name }) => {
+                    assert!(name.eq_ignore_ascii_case(word), "`{text}`: {name}");
+                }
+                // `current_date` and its kin keep the error that names the
+                // immutability rule.
+                Err(ParseError::NonImmutableConstruct { .. }) => {}
+                other => panic!("`{text}` should be refused as a reserved word: {other:?}"),
+            }
+        }
+        // After a dot, and as the label after AS, any keyword is a name.
+        let qualified = parse_text(&format!("s.{word}"))
+            .unwrap_or_else(|e| panic!("`s.{word}` should parse: {e}"));
+        assert!(
+            matches!(&qualified.fields[0].expr, Expr::SourceColumn { column, .. } if column == word),
+            "s.{word}: {:?}",
+            qualified.fields[0].expr
+        );
+        parse(&format!("TRANSFORM t FROM s SELECT i4 AS {word}"))
+            .unwrap_or_else(|e| panic!("`AS {word}` should parse: {e}"));
+    }
+}
+
+/// Before `(` a reserved word is a function or construct name, never a
+/// column: `left(...)` and `right(...)` are Postgres functions, so they are
+/// not refused as reserved words (the registry decides whether they exist).
+#[test]
+fn a_reserved_word_before_a_paren_is_not_refused_as_a_column() {
+    for text in [
+        "left(t, 1)",
+        "right(t, 1)",
+        "LEFT(t, 1)",
+        "CAST(i4 AS bigint)",
+    ] {
+        assert!(
+            !matches!(parse_text(text), Err(ParseError::ReservedWord { .. })),
+            "`{text}`"
+        );
+    }
+}
+
+/// Postgres's column-name keywords (`pg_get_keywords()` category `C`) and
+/// unreserved keywords are legal unquoted column names there (`select
+/// extract, values, between from t` reads three columns), so they stay
+/// columns here, bare and beside an operator.
+#[test]
+fn a_column_name_or_unreserved_keyword_is_still_a_column() {
+    for word in [
+        "extract",
+        "position",
+        "values",
+        "between",
+        "coalesce",
+        "nullif",
+        "char",
+        "overlay",
+        "trim",
+        "substring",
+        "interval",
+        "timestamp",
+        "time",
+        "year",
+        "zone",
+        "at",
+    ] {
+        for text in [word.to_string(), format!("{word} + 1")] {
+            let def = parse_text(&text).unwrap_or_else(|e| panic!("`{text}` should parse: {e}"));
+            let mut columns = Vec::new();
+            super::validate::collect_columns(&def.fields[0].expr, &mut columns);
+            assert_eq!(columns, [word], "`{text}`: {:?}", def.fields[0].expr);
+        }
+    }
+}
+
+/// `true`, `false` and `null` are literals in Postgres, which this grammar
+/// doesn't have yet; the refusal says so.
+#[test]
+fn the_boolean_and_null_literals_are_refused_with_the_not_supported_yet_message() {
+    for word in ["true", "false", "null", "NULL", "True"] {
+        let err = parse_text(word).unwrap_err();
+        assert!(err.to_string().contains("literals yet"), "{word}: {err}");
+    }
+    let err = parse_text("order").unwrap_err();
+    assert!(err.to_string().contains("rename the column"), "{err}");
+    assert!(!err.to_string().contains("literals yet"), "{err}");
 }
 
 #[test]
@@ -848,14 +926,14 @@ fn a_field_chain_through_logic_nodes_is_bounded_too() {
 #[test]
 fn a_boolean_field_is_a_column_and_an_input_of_another_field() {
     let def = parse(
-        "TRANSFORM t FROM s SELECT i4 > 0 AS positive, positive AND b AS both, \
-         CASE WHEN both THEN i4 END AS v, NOT positive AS neg, both IS NULL AS unknown",
+        "TRANSFORM t FROM s SELECT i4 > 0 AS positive, positive AND b AS pos_and_b, \
+         CASE WHEN pos_and_b THEN i4 END AS v, NOT positive AS neg, pos_and_b IS NULL AS unknown",
     )
     .unwrap();
     validate(&def, &columns()).unwrap();
     let types = super::validate::infer_field_types(&def, &columns()).unwrap();
     assert_eq!(types["positive"], B);
-    assert_eq!(types["both"], B);
+    assert_eq!(types["pos_and_b"], B);
     assert_eq!(types["v"], I4);
     assert_eq!(types["neg"], B);
     assert_eq!(types["unknown"], B);

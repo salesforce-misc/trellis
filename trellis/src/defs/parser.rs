@@ -40,7 +40,7 @@ use super::ast::{
 use super::error::ParseError;
 use super::lexer::{Token, lex};
 use super::registry::{
-    AGGREGATE_FUNCTIONS, NON_IMMUTABLE_NAMES, cast_target, function_overloads,
+    AGGREGATE_FUNCTIONS, NON_IMMUTABLE_NAMES, cast_target, function_overloads, is_reserved_word,
     lookup_aggregate_function, lookup_operator, operator_spec,
 };
 use super::typed_literal::lookup_typed_literal;
@@ -1211,6 +1211,15 @@ impl Parser {
                         value_type: spec.value_type,
                         text,
                     });
+                }
+
+                // A reserved word is not a column name: Postgres needs it
+                // quoted, and this grammar has no quoted identifiers
+                // (ADR-0022). Before `(` it is a construct or function name
+                // (`left(...)`), after a `.` it is a label (read by
+                // `parse_dotted_reference`), neither of which reaches here.
+                if is_reserved_word(&upper) && !self.peek_is_symbol('(') {
+                    return Err(ParseError::ReservedWord { name });
                 }
 
                 if self.peek_is_symbol('.') {

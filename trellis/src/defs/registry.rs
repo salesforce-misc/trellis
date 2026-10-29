@@ -890,6 +890,124 @@ pub const NON_IMMUTABLE_NAMES: &[&str] = &[
     "TRANSACTION_TIMESTAMP",
 ];
 
+/// The words Postgres cannot take as an unquoted column name: those
+/// `pg_get_keywords()` reports with category `R` (reserved) or `T` (reserved
+/// as a type or function name), sorted. A bare identifier equal to one is
+/// refused in expression position (ADR-0022); the same word after a `.`,
+/// after `AS`, or before `(` is not a bare identifier and is unaffected. A
+/// test compares this list with a live server's and fails when they drift.
+/// `system_user` is reserved from PostgreSQL 16; 15 doesn't reserve it, and
+/// Trellis refuses it there too.
+pub const RESERVED_WORDS: &[&str] = &[
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "authorization",
+    "binary",
+    "both",
+    "case",
+    "cast",
+    "check",
+    "collate",
+    "collation",
+    "column",
+    "concurrently",
+    "constraint",
+    "create",
+    "cross",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_schema",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "false",
+    "fetch",
+    "for",
+    "foreign",
+    "freeze",
+    "from",
+    "full",
+    "grant",
+    "group",
+    "having",
+    "ilike",
+    "in",
+    "initially",
+    "inner",
+    "intersect",
+    "into",
+    "is",
+    "isnull",
+    "join",
+    "lateral",
+    "leading",
+    "left",
+    "like",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "natural",
+    "not",
+    "notnull",
+    "null",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "outer",
+    "overlaps",
+    "placing",
+    "primary",
+    "references",
+    "returning",
+    "right",
+    "select",
+    "session_user",
+    "similar",
+    "some",
+    "symmetric",
+    "system_user",
+    "table",
+    "tablesample",
+    "then",
+    "to",
+    "trailing",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "variadic",
+    "verbose",
+    "when",
+    "where",
+    "window",
+    "with",
+];
+
+/// Whether `word` is one Postgres will not take as an unquoted column name.
+pub fn is_reserved_word(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    RESERVED_WORDS.binary_search(&lower.as_str()).is_ok()
+}
+
 /// Looks up an operator by its concrete-syntax symbol.
 pub fn lookup_operator(symbol: &str) -> Option<Operator> {
     // `!=` is Postgres's second spelling of `<>`.
@@ -903,6 +1021,10 @@ pub fn lookup_operator(symbol: &str) -> Option<Operator> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reserved words PostgreSQL 15 lacks, so the drift test can compare
+    /// the list with a 15 server.
+    const RESERVED_WORDS_ABSENT_IN_15: &[&str] = &["system_user"];
 
     /// Every aggregate maps a float argument to a float result and an exact
     /// argument to an exact one.
@@ -1132,5 +1254,69 @@ mod tests {
         assert_eq!(cast_target("TIMESTAMP"), Some(TS));
         assert_eq!(cast_target("timestamptz"), None);
         assert_eq!(cast_target("date"), None);
+    }
+
+    /// The list is sorted, lower-case and without repeats, which
+    /// `is_reserved_word`'s binary search needs.
+    #[test]
+    fn the_reserved_word_list_is_sorted_lower_case_and_unique() {
+        assert!(
+            RESERVED_WORDS.windows(2).all(|pair| pair[0] < pair[1]),
+            "RESERVED_WORDS must be sorted with no repeats"
+        );
+        assert!(
+            RESERVED_WORDS
+                .iter()
+                .all(|word| word.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+        );
+        assert!(is_reserved_word("ORDER"));
+        assert!(is_reserved_word("order"));
+        assert!(!is_reserved_word("extract"));
+        assert!(!is_reserved_word("orders"));
+    }
+
+    /// `RESERVED_WORDS` is exactly the words a live server's `pg_get_keywords()`
+    /// reports as `R` or `T`, less the ones an older supported major lacks
+    /// (PostgreSQL 15 has no `system_user`). When a newer Postgres reserves a
+    /// word, this fails: update `RESERVED_WORDS` (and
+    /// `RESERVED_WORDS_ABSENT_IN_15` if a major earlier than 16 lacks it), then
+    /// rerun the checks ADR-0022 lists.
+    #[tokio::test]
+    async fn the_reserved_word_list_matches_the_servers_keywords() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_empty_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let version: i32 = client
+            .query_one("select current_setting('server_version_num')::int", &[])
+            .await
+            .expect("version")
+            .get(0);
+        let live: Vec<String> = client
+            .query(
+                "select word from pg_get_keywords() where catcode in ('R', 'T') order by 1",
+                &[],
+            )
+            .await
+            .expect("keywords")
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect();
+        let expected: Vec<&str> = RESERVED_WORDS
+            .iter()
+            .copied()
+            .filter(|word| version >= 160_000 || !RESERVED_WORDS_ABSENT_IN_15.contains(word))
+            .collect();
+        let live: Vec<&str> = live.iter().map(String::as_str).collect();
+        assert_eq!(
+            live, expected,
+            "the server (version_num {version}) reserves different words than \
+             RESERVED_WORDS in defs/registry.rs: update the list to match pg_get_keywords() \
+             (category R or T)"
+        );
     }
 }
