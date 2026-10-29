@@ -178,8 +178,8 @@ pub struct SweepOutcome {
     /// The live entries among them the build hadn't re-derived, which the
     /// batch re-derived.
     pub rederived: usize,
-    /// The last entry key it read past: the next batch's cursor. `None`
-    /// when it read none.
+    /// The next batch's cursor, past the last ledger entry or orphan it
+    /// read (`one_to_one::SweepCursor`). `None` when it read none.
     pub next: Option<String>,
     /// It read fewer than it was allowed: the sweep is done.
     pub finished: bool,
