@@ -168,8 +168,11 @@ which binds looser than prefix `-`, exactly as Postgres parses it.
 once stored, it keeps its meaning across upgrades, and a change in meaning bumps
 the grammar version with a compatibility rule. This ADR says which way the
 grammar may move: toward Postgres. Admitting a Postgres form that was refused is
-additive and needs no bump. Correcting a rule that read accepted text
-differently from Postgres changes what that text means, so it is a bump under
+additive and needs no bump. Refusing accepted text that Postgres rejects or
+reads differently needs no bump either: a stored definition that uses it pauses
+when the new binary attaches, its `capture_failure` naming the refusal, and is
+defined again. Correcting a rule so that accepted text stays accepted with
+Postgres's meaning changes what that text means, so it is a bump under
 ADR-0018, and its compatibility rule keeps each stored definition on the meaning
 it was built with. Neither ADR permits a change that moves the grammar away from
 Postgres.

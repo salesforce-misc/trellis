@@ -16,9 +16,9 @@ the parsed tree on their own.
 
 So a stored definition means whatever the binary reading it says it means. If a
 release changes what accepted text means (how a name resolves, what an
-expression evaluates to, whether it is accepted at all), every stored definition
-containing that text silently takes the new meaning on its next load, while its
-target still holds rows computed under the old one.
+expression evaluates to), every stored definition containing that text silently
+takes the new meaning on its next load, while its target still holds rows
+computed under the old one.
 
 This ADR settles how a stored definition keeps its meaning across grammar
 changes. The definition version of
@@ -42,20 +42,27 @@ statement.
 Because only a write stamps it, reading a definition can never move it to rules
 it wasn't written under.
 
-### A change in meaning bumps the version; additive syntax doesn't
+### A change in meaning bumps the version; additive syntax and refusals don't
 
-A change bumps the version when some text the current version accepts would
-parse, resolve or evaluate differently, or be refused. A new keyword that was a
-valid identifier is such a change. A change that only accepts text the current
-version refuses, such as a new function under
+A change bumps the version when some text the current version accepts stays
+accepted but would parse, resolve or evaluate differently. A new keyword that
+was a valid identifier, and still reads where the identifier did, is such a
+change. A change that only accepts text the current version refuses, such as a
+new function under
 [ADR-0004's growth policy](0004-transform-definition-grammar.md#growth-policy),
 needs no bump: every stored text keeps its meaning, and an older binary refuses
 the new text rather than misreading it.
 
+A change that refuses text Postgres rejects, or reads differently
+([ADR-0022](0022-grammar-mirrors-postgres.md)), needs no bump either. No stored
+definition takes a new meaning: one whose text the release refuses is paused
+when the binary attaches, its `capture_failure` naming the refusal and the fix
+(drop the transform and define it again), and its target keeps the rows it
+has. The release notes list the forms such a release newly refuses.
+
 A bump that retires a meaning gives it a spelling in the new grammar, so every
 older text can be translated. A bump ships only in a release semver allows to
-break compatibility (a 0.x minor before 1.0, a major after), because it refuses
-text the previous release accepted.
+break compatibility (a 0.x minor before 1.0, a major after).
 
 [OPEN: whether a fix that makes evaluation match what the documentation already
 says is a change in meaning. Recommendation: no; it ships with the definitions
@@ -77,7 +84,8 @@ text and its version and returns the definition in the current grammar's terms:
   `RESUME` refuses; `DROP TRANSFORM` works without reading the text.
 - **Newer than the binary knows:** refused, and the definition is neither read
   nor written. Text that fails to parse at a known version fails the same way,
-  which is how a downgrade past an additive change shows up.
+  which is how a downgrade past an additive change shows up, and is how a load
+  outside an attach sees text this release refuses.
 
 Nothing after the entry point sees a version. Names are resolved in several
 places after the parse; translating once keeps every one of them on the current
@@ -85,10 +93,12 @@ rules, lets an older definition pass a resume's re-validation, and gives
 rewriting the same code.
 
 Attaching (`migrate`) checks every stored definition's version before anything
-else runs. It pauses each one outside the window, and refuses the attach if any
-is newer, naming those definitions. The load-time check stands on its own, since
-a process can connect without attaching and a newer binary can write after the
-attach.
+else runs. It refuses the attach if any is newer, naming those definitions,
+and pauses each one outside the window and each one inside it whose text this
+release refuses. A paused definition of either kind reads nothing until it is
+dropped, so the rest of the instance runs beside it. The load-time check stands
+on its own, since a process can connect without attaching and a newer binary
+can write after the attach.
 
 Too old pauses and too new refuses because the fixes differ: the operator can
 fix a too-old definition here by redefining it, while a too-new one means the
@@ -142,6 +152,8 @@ to the same tree. (Grammar 1 already reads names the new way; see
 - A meaning change to the grammar costs a breaking release, a version bump, a
   compatibility rule for the version it replaces, and fixtures, all carried for
   two majors.
+- A refusal toward Postgres costs no bump, but a stored definition that uses
+  the refused form pauses at the upgrade until its operator redefines it.
 - Upgrades may skip one major. Skipping more without rewriting in between pauses
   the definitions written before the window.
 - A downgrade across a grammar change is refused rather than run on

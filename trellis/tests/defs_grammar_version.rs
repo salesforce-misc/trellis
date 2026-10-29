@@ -190,3 +190,117 @@ async fn attaching_pauses_a_definition_older_than_the_window_and_names_the_fix()
         .await
         .expect("capture keeps working beside the paused definition");
 }
+
+/// Stored text inside the window that this release refuses (written by an
+/// earlier release that accepted it, here a bare reserved word, ADR-0022)
+/// pauses that one transform at attach (`migrate`) with a `capture_failure` naming the
+/// refusal and the fix. The other transforms keep running, `RESUME` refuses
+/// with the same refusal, and `DROP TRANSFORM` clears it.
+#[tokio::test]
+async fn stored_text_this_release_refuses_pauses_that_transform_naming_the_fix() {
+    use trellis::{TransformStatus, Trellis, TrellisOptions};
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.rw_src (id integer primary key, val integer, \"order\" integer); \
+         insert into public.rw_src values (1, 5, 10)",
+    )
+    .await
+    .unwrap();
+    let config = Config::from_dsn(db.dsn().to_string()).unwrap();
+    let definer = Trellis::connect(config.clone(), TrellisOptions::default())
+        .await
+        .expect("connect");
+    definer
+        .apply("TRANSFORM healthy FROM rw_src SELECT val AS v")
+        .await
+        .expect("define healthy");
+    definer
+        .apply("TRANSFORM legacy FROM rw_src SELECT rw_src.order + 1 AS o")
+        .await
+        .expect("define legacy");
+    definer.shutdown().await.expect("shutdown definer");
+    // The text an earlier release accepted and stored.
+    raw.execute(
+        "update transform_definitions \
+         set definition_text = 'TRANSFORM legacy FROM rw_src SELECT order + 1 AS o' \
+         where target_table = 'public.legacy'",
+        &[],
+    )
+    .await
+    .unwrap();
+    // The upgraded binary attaches before it runs.
+    trellis::migrate(&db.pool, &config)
+        .await
+        .expect("an unreadable definition pauses; it doesn't refuse the attach");
+
+    let running = Trellis::connect(
+        config.clone(),
+        TrellisOptions {
+            staging: true,
+            drain_threads: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("one unreadable definition doesn't stop the instance");
+    let legacy = running
+        .status("legacy")
+        .await
+        .expect("status")
+        .expect("legacy is registered");
+    assert_eq!(legacy.status, TransformStatus::Paused);
+    let failure = legacy.capture_failure.expect("a capture failure says why");
+    assert!(
+        failure.error.contains("public.legacy")
+            && failure.error.contains("'order' is a reserved word")
+            && failure
+                .error
+                .contains("drop the transform and define it again"),
+        "{}",
+        failure.error
+    );
+
+    raw.execute("insert into public.rw_src values (2, 7, 11)", &[])
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let status = running.status("healthy").await.unwrap().unwrap().status;
+        if status == TransformStatus::Live {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "healthy never went live: {status:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let token = running.watermark_token().await.expect("token");
+    running
+        .await_converged(token, std::time::Duration::from_secs(30))
+        .await
+        .expect("the other transform keeps converging");
+    let values: Vec<i32> = raw
+        .query("select v from public.healthy order by id", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(values, [5, 7]);
+
+    let err = running
+        .apply("RESUME TRANSFORM legacy")
+        .await
+        .expect_err("RESUME can't read the stored text");
+    assert!(err.to_string().contains("reserved word"), "{err}");
+    running
+        .apply("DROP TRANSFORM legacy")
+        .await
+        .expect("a paused, unreadable transform drops");
+    assert!(running.status("legacy").await.unwrap().is_none());
+    running.shutdown().await.expect("shutdown");
+}
