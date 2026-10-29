@@ -459,7 +459,8 @@ fn one_to_one_join(name: &str, formula: &str) -> String {
 }
 
 /// What each test installs against, per key space.
-const KEY_SPACES: [(&str, fn(&str, &str) -> String); 2] =
+type BuildJoin = fn(&str, &str) -> String;
+const KEY_SPACES: [(&str, BuildJoin); 2] =
     [("aggregate", aggregate_join), ("1-1", one_to_one_join)];
 
 /// Every covered read of a nondeterministic column of either side is refused
