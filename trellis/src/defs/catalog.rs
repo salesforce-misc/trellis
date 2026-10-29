@@ -3544,10 +3544,11 @@ pub(crate) struct CaptureReaderRow {
 /// Definitions in every status count. A table is captured from the moment
 /// something registers a reader of it, before that reader builds, and a
 /// paused or quarantined reader still needs its columns when it resumes.
-/// The exception is a definition older than the grammar window (ADR-0018):
-/// attaching paused it, it never resumes, and its fix is a drop and a fresh
-/// define, so it reads nothing and is left out. A definition newer than the
-/// window fails the read, since its columns can't be known.
+/// The exception is a definition older than the grammar window, or whose text
+/// the current grammar refuses (ADR-0018): attaching paused it, it never
+/// resumes, and its fix is a drop and a fresh define, so it reads nothing and
+/// is left out. A definition newer than the window fails the read, since its
+/// columns can't be known.
 pub(crate) async fn capture_readers(
     client: &impl GenericClient,
 ) -> Result<Vec<CaptureReaderRow>, CatalogError> {
@@ -3570,8 +3571,8 @@ pub(crate) async fn capture_readers(
                 target: row.get(4),
                 join: row.get(6),
             })),
-            Err(ParseError::GrammarVersionTooOld { .. }) => None,
-            Err(e) => Some(Err(e.into())),
+            Err(e @ ParseError::GrammarVersionTooNew { .. }) => Some(Err(e.into())),
+            Err(_) => None,
         })
         .collect::<Result<Vec<_>, CatalogError>>()
 }

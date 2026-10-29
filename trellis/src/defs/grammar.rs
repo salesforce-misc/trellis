@@ -12,7 +12,8 @@ use super::parser::parse;
 
 /// The grammar version this binary writes. Grammar 1 is the grammar when the
 /// marker was introduced. A change that makes some accepted text parse,
-/// resolve or evaluate differently, or be refused, bumps it (ADR-0018).
+/// resolve or evaluate differently bumps it (ADR-0018); one that only refuses
+/// it doesn't, and attaching pauses the stored definitions it refuses.
 pub const CURRENT_GRAMMAR_VERSION: i32 = 1;
 
 /// The oldest grammar version this binary reads. A version below it is outside
@@ -78,8 +79,8 @@ pub(crate) fn load_in(
 
 /// The attach-time check (ADR-0018) against an explicit window: refuses when
 /// any stored definition is newer than `current`, naming them, and pauses each
-/// transform older than `oldest` with the reason in its `capture_failure`.
-/// Returns how many it paused.
+/// transform older than `oldest`, or whose text the current grammar refuses,
+/// with the reason in its `capture_failure`. Returns how many it paused.
 pub(crate) async fn check_stored_versions_in(
     client: &mut tokio_postgres::Client,
     oldest: i32,
@@ -111,17 +112,29 @@ pub(crate) async fn check_stored_versions_in(
         )));
     }
     let txn = client.transaction().await?;
-    let too_old = txn
+    let stored_rows = txn
         .query(
-            "select id, source_table, grammar_version from transform_definitions \
-             where grammar_version < $1 order by id",
-            &[&oldest],
+            "select id, source_table, grammar_version, definition_text \
+             from transform_definitions order by id",
+            &[],
         )
         .await?;
     let mut paused = 0;
-    for row in &too_old {
-        let (id, source, stored): (i64, String, i32) = (row.get(0), row.get(1), row.get(2));
-        let reason = ParseError::GrammarVersionTooOld { stored, oldest }.to_string();
+    for row in &stored_rows {
+        let (id, source, stored, text): (i64, String, i32, String) =
+            (row.get(0), row.get(1), row.get(2), row.get(3));
+        let reason = match load_in(&text, stored, oldest, current) {
+            Ok(_) => continue,
+            Err(e @ ParseError::GrammarVersionTooOld { .. }) => e.to_string(),
+            // A grammar change that refuses text (toward Postgres, ADR-0022)
+            // needs no bump: text this binary refuses pauses here, so no
+            // other read meets it on a live transform.
+            Err(e) => format!(
+                "this binary's grammar refuses the stored definition text: {e}; drop the \
+                 transform and define it again with the text corrected (after a downgrade, \
+                 run the binary that wrote it and RESUME the transform instead)"
+            ),
+        };
         super::lifecycle::pause_for_grammar_version(&txn, id, &source, &reason)
             .await
             .map_err(|e| crate::Error::IncompatibleInstance(e.to_string()))?;

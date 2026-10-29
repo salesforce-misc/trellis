@@ -190,3 +190,95 @@ async fn attaching_pauses_a_definition_older_than_the_window_and_names_the_fix()
         .await
         .expect("capture keeps working beside the paused definition");
 }
+
+/// A grammar change that refuses text Postgres also refuses needs no bump
+/// (ADR-0018): a stored definition whose text the current grammar refuses
+/// pauses at attach, naming the refusal, and capture keeps working for the
+/// others instead of failing on it.
+#[tokio::test]
+async fn attaching_pauses_a_definition_whose_text_the_grammar_now_refuses() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    raw.batch_execute("create table s (id bigint primary key, a numeric)")
+        .await
+        .unwrap();
+    for text in [
+        "TRANSFORM t FROM s SELECT a + 1 AS x",
+        "TRANSFORM healthy FROM s SELECT a AS a",
+    ] {
+        install_definition(&db.pool, text, &cols(&["a"]), "public")
+            .await
+            .expect("define");
+    }
+    // Text an earlier release accepted: a number directly followed by a word.
+    raw.execute(
+        "update transform_definitions \
+         set definition_text = 'TRANSFORM t FROM s SELECT a+1AS x' \
+         where target_table = 'public.t'",
+        &[],
+    )
+    .await
+    .unwrap();
+
+    let config = Config::from_dsn(db.dsn().to_string()).unwrap();
+    trellis::migrate(&db.pool, &config)
+        .await
+        .expect("refused text pauses; it doesn't refuse the attach");
+
+    let statuses: Vec<(String, String)> = raw
+        .query(
+            "select target_table, status from transform_definitions order by id",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(statuses[0], ("public.t".to_string(), "paused".to_string()));
+    assert_ne!(statuses[1].1, "paused", "{statuses:?}");
+    let error: String = raw
+        .query_one("select error from capture_failures", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        error.contains("trailing junk after numeric literal")
+            && error.contains("'AS' directly follows the number '1'")
+            && error.contains("drop the transform and define it again"),
+        "{error}"
+    );
+    match trellis::defs::catalog::definition_by_target(&db.pool, "t").await {
+        Err(CatalogError::Parse(ParseError::NumericTrailingJunk { number, junk })) => {
+            assert_eq!((number.as_str(), junk.as_str()), ("1", "AS"));
+        }
+        other => panic!("expected NumericTrailingJunk, got {other:?}"),
+    }
+    let catalog = trellis::dev::capture::load_catalog(&raw)
+        .await
+        .expect("capture keeps working beside the paused definition");
+    let readers: Vec<&str> = catalog
+        .definitions
+        .iter()
+        .map(|d| d.target.as_str())
+        .collect();
+    assert_eq!(readers, ["public.healthy"]);
+    let trellis = trellis::Trellis::connect(config, trellis::TrellisOptions::default())
+        .await
+        .expect("a second attach over the paused definition succeeds");
+    let refused = trellis
+        .apply("RESUME TRANSFORM t")
+        .await
+        .expect_err("RESUME re-reads the refused text");
+    assert!(
+        refused
+            .to_string()
+            .contains("trailing junk after numeric literal"),
+        "{refused}"
+    );
+    trellis
+        .apply("DROP TRANSFORM t")
+        .await
+        .expect("DROP doesn't need the text to parse");
+}

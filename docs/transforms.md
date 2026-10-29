@@ -629,7 +629,10 @@ keeps reading the older one under its old rules, so an upgrade never
 re-interprets a stored definition. Each major version reads every grammar
 version the previous two majors wrote. A transform written under an older
 version than that is paused until you drop it and define it again, and a version
-newer than the binary knows, from a downgrade, is refused. A stored definition
+newer than the binary knows, from a downgrade, is refused. A release that
+refuses text Postgres also refuses doesn't bump the version: a stored definition
+with that text is paused at attach, naming the refusal, until you drop it and
+define it again with the text corrected. A stored definition
 can be rewritten to the current version without a rebuild. The rules are in
 [0018-grammar-versioning](decisions/0018-grammar-versioning.md).
 
