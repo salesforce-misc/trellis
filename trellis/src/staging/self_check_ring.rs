@@ -167,14 +167,13 @@ impl Ring<'_> {
     /// against its live source row.
     ///
     /// A change the page that applies it would refuse (ADR-0002's I2, against
-    /// the key's entry on `target`'s ledger, `target` being the target's
-    /// qualified identity) never reaches the target, so it is no unapplied
+    /// the key's entry on `ledger`) never reaches the target, so it is no unapplied
     /// change here: one at or below the entry's `applied_lsn` (a later batch
     /// of the key drained first), one its `basis` saw (a Re-derive read the
     /// live row after it), and one at or below the target's truncate floor.
     /// The changes I2 refuses are always a prefix of a key's in `lsn` order,
     /// so the earliest one it doesn't is the first the target hasn't applied.
-    pub(super) fn one_to_one_ctes(&self, target: &str) -> String {
+    pub(super) fn one_to_one_ctes(&self, ledger: &super::one_to_one_ledger::LedgerRef) -> String {
         let rows = self.cte("rows");
         let pend = self.cte("pend");
         let q = |c: &str| quote_ident(c);
@@ -200,11 +199,11 @@ impl Ring<'_> {
             rows_sql = self.rows_sql(),
             id = self.transform_id,
             src = quote_literal(self.src_table),
-            ledger = super::one_to_one_ledger::ledger_ident(target),
+            ledger = ledger.ident,
             key_col = q(ledger_schema::KEY_COLUMN),
             basis = q(ledger_schema::BASIS_COLUMN),
             applied = q(ledger_schema::APPLIED_LSN_COLUMN),
-            floor = quote_literal(target),
+            floor = quote_literal(&ledger.floor_key),
         )
     }
 

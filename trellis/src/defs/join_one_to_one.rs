@@ -111,6 +111,16 @@ impl HiddenTable {
         format!("join1_{id}_{}", self.part())
     }
 
+    /// The `ledger_truncate_floor` keys of the two hidden ledgers of
+    /// definition `id`: their quoted, qualified idents, as a `JOIN`'s `P`
+    /// and `M` floors are keyed.
+    pub(crate) fn floor_keys(catalog_schema: &str, id: i64) -> Vec<String> {
+        HiddenTable::LEDGERS
+            .iter()
+            .map(|table| table.qualified(catalog_schema, id))
+            .collect()
+    }
+
     /// The table, schema-qualified and quoted, for definition `id` in
     /// `catalog_schema`.
     pub(crate) fn qualified(self, catalog_schema: &str, id: i64) -> String {

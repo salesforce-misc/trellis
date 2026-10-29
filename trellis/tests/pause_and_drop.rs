@@ -528,6 +528,26 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
         "precondition: the target was built"
     );
 
+    // A 1-1 JOIN's hidden ledgers (`R`, `M`) and their floors, made by hand:
+    // the drop takes both with the definition.
+    let id: i64 = raw
+        .query_one(
+            "select id from transform_definitions where target_table like '%order_rollup'",
+            &[],
+        )
+        .await
+        .expect("the definition's id")
+        .get(0);
+    for side in ["r", "m"] {
+        raw.batch_execute(&format!(
+            r#"create table "{DEFAULT_SCHEMA}"."join1_{id}_{side}" ("__from_key" text primary key);
+               insert into ledger_truncate_floor
+                   values ('"{DEFAULT_SCHEMA}"."join1_{id}_{side}"', '0/10');"#
+        ))
+        .await
+        .expect("hand-made hidden ledger");
+    }
+
     trellis
         .apply("PAUSE TRANSFORM order_rollup")
         .await
@@ -540,6 +560,17 @@ async fn dropping_takes_the_target_table_and_its_data_with_it() {
         persisted_status(&raw, "order_rollup").await,
         None,
         "the definition row is gone"
+    );
+    for side in ["r", "m"] {
+        assert!(
+            !table_exists(&raw, DEFAULT_SCHEMA, &format!("join1_{id}_{side}")).await,
+            "the drop takes hidden ledger {side}"
+        );
+    }
+    assert_eq!(
+        count(&raw, "select count(*) from ledger_truncate_floor").await,
+        0,
+        "...and their floors"
     );
     assert!(
         !table_exists(&raw, DEFAULT_TARGET_SCHEMA, "order_rollup").await,

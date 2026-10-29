@@ -117,11 +117,11 @@ impl PgLogCursor {
 }
 
 /// `pg_total_relation_size` over every table whose name ends in `__ledger`,
-/// in any schema.
+/// in any schema, and every 1-1 `JOIN` hidden ledger (`join1_{id}_{r|m}`).
 pub async fn ledger_bytes(raw: &RawClient) -> i64 {
     raw.query_one(
         "select coalesce(sum(pg_total_relation_size(c.oid)), 0)::bigint from pg_class c \
-         where c.relkind in ('r', 'p') and c.relname like '%\\_\\_ledger'",
+         where c.relkind in ('r', 'p') and (c.relname like '%\\_\\_ledger' or c.relname ~ '^join1_[0-9]+_[rm]$')",
         &[],
     )
     .await
@@ -135,7 +135,8 @@ pub async fn ledger_updates(raw: &RawClient) -> (i64, i64) {
     let row = raw
         .query_one(
             "select coalesce(sum(n_tup_upd), 0)::bigint, coalesce(sum(n_tup_hot_upd), 0)::bigint \
-             from pg_stat_user_tables where relname like '%\\_\\_ledger'",
+             from pg_stat_user_tables \
+             where relname like '%\\_\\_ledger' or relname ~ '^join1_[0-9]+_[rm]$'",
             &[],
         )
         .await
