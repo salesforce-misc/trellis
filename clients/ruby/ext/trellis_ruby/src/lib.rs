@@ -1231,6 +1231,20 @@ fn statement_kinds() -> Vec<&'static str> {
         .collect()
 }
 
+/// The process-wide metrics registry in Prometheus text exposition format:
+/// `trellis::Metrics::render_prometheus`, the series of every handle in this
+/// process. It needs no handle.
+///
+/// The registry sits behind a lock the engine's threads take, so a process
+/// forked while its parent had an engine running may have inherited it held:
+/// rendering there raises `Trellis::ForkedHandleError`, as [`connect`] does,
+/// rather than risk the hang. Rendering is a short walk of the registry,
+/// so it keeps the GVL.
+fn render_prometheus(ruby: &Ruby) -> Result<String, Error> {
+    engine::check().map_err(|err| forked_handle_error(ruby, forked_while_running(&err)))?;
+    Ok(trellis::Metrics::new().render_prometheus())
+}
+
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
     // Interns every symbol a result can carry up front, from the closed
@@ -1252,6 +1266,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     native.define_module_function("capture_failure_kinds", function!(capture_failure_kinds, 0))?;
     native.define_module_function("index_roles", function!(index_roles, 0))?;
     native.define_module_function("statement_kinds", function!(statement_kinds, 0))?;
+    native.define_module_function("render_prometheus", function!(render_prometheus, 0))?;
 
     let handle = native.define_class("Handle", ruby.class_object())?;
     handle.define_method("owner_pid", method!(Handle::owner_pid, 0))?;

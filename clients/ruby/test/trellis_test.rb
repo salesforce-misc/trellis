@@ -37,6 +37,12 @@ class TrellisTest < Minitest::Test
     eventually_value("the new source row to reach widget_prices",
                      ->(rows) { rows == [[1, 5], [2, 7]] }) { rows(pg) }
 
+    # The apply shows up in the process-wide registry. The drain records it
+    # just after its transaction commits, so the row can be visible first.
+    applied = /^trellis_changes_applied_total\{trellis_instance="[^"]+",transform="[^"]*widget_prices"\} \d+$/
+    eventually_value("widget_prices' applied changes to reach the metrics",
+                     ->(metrics) { metrics.match?(applied) }) { Trellis::Metrics.render_prometheus }
+
     assert_nil Trellis.shutdown
     refute Trellis.connected?
   ensure
