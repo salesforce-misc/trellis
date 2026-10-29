@@ -416,6 +416,7 @@ async fn explain_range(
 /// deleted. Once the ledger is read to its end, each batch also takes up to
 /// `scan` target rows with no live entry ([`orphan_keys`]) and re-derives
 /// them with the rest, and the sweep is finished when a batch finds fewer.
+/// Later batches walk the orphans on by key cursor ([`ORPHAN_CURSOR_PREFIX`]).
 pub async fn sweep_batch(
     txn: &Transaction<'_>,
     plan: &OneToOnePlan,
@@ -426,6 +427,10 @@ pub async fn sweep_batch(
     let key = quote_ident(crate::defs::ledger::KEY_COLUMN);
     let tombstone = quote_ident(crate::defs::ledger::TOMBSTONE_COLUMN);
     let basis = quote_ident(crate::defs::ledger::BASIS_COLUMN);
+    // A cursor in the orphan walk skips the ledger, which is already read.
+    if let Some(after) = cursor.and_then(|c| c.strip_prefix(ORPHAN_CURSOR_PREFIX)) {
+        return orphan_batch(txn, plan, Some(after), scan).await;
+    }
     let after = if cursor.is_some() {
         format!("where {key} > $3")
     } else {
@@ -461,6 +466,7 @@ pub async fn sweep_batch(
     let next: Option<String> = row.get(1);
     let mut keys: Vec<String> = row.get(2);
     let mut finished = scanned < scan;
+    let mut orphan_next: Option<String> = None;
     if finished {
         // The ledger is read to its end. Target rows with no live entry
         // are in no ledger page: walk
@@ -468,8 +474,11 @@ pub async fn sweep_batch(
         // before any entry is locked and locked with the page's keys in one
         // ordered batch, so the batch holds no lock across the target scan
         // and takes its locks in the one key order a page takes them in.
-        let orphans = orphan_keys(txn, plan, scan).await?;
+        let orphans = orphan_keys(txn, plan, None, scan).await?;
         finished = i64::try_from(orphans.len()).is_ok_and(|n| n < scan);
+        if !finished {
+            orphan_next = orphans.last().map(|k| format!("{ORPHAN_CURSOR_PREFIX}{k}"));
+        }
         keys.extend(orphans);
         keys.sort_unstable();
         keys.dedup();
@@ -487,22 +496,58 @@ pub async fn sweep_batch(
     Ok(SweepOutcome {
         scanned,
         rederived,
+        next: orphan_next.or(next),
+        finished,
+    })
+}
+
+/// A sweep cursor in the orphan walk (the target rows with no live entry,
+/// after the ledger is read to its end) is this prefix and the last orphan
+/// key read. Ledger cursors are bare keys; no key starts with this, since
+/// it begins with a control character.
+const ORPHAN_CURSOR_PREFIX: &str = "\u{1}orphans\u{1}";
+
+/// One batch of the orphan walk, after the key `after`: it re-derives up to
+/// `scan` orphans and returns the cursor past them.
+async fn orphan_batch(
+    txn: &Transaction<'_>,
+    plan: &OneToOnePlan,
+    after: Option<&str>,
+    scan: i64,
+) -> Result<SweepOutcome, ApplyError> {
+    let keys = orphan_keys(txn, plan, after, scan).await?;
+    let finished = i64::try_from(keys.len()).is_ok_and(|n| n < scan);
+    let next = keys.last().map(|k| format!("{ORPHAN_CURSOR_PREFIX}{k}"));
+    let outcome = rederive_keys(txn, plan, &keys).await?;
+    crate::instance_log::debug!(
+        target_table = %plan.target,
+        rederived = keys.len(),
+        written = outcome.written,
+        deleted = outcome.deleted,
+        "1-1 re-derive build sweep batch re-derived orphans"
+    );
+    Ok(SweepOutcome {
+        scanned: 0,
+        rederived: keys.len(),
         next,
         finished,
     })
 }
 
-/// Up to `limit` keys of target rows that have no live ledger entry (no
+/// Up to `limit` keys, greater than `after` when given, of target rows that
+/// have no live ledger entry (no
 /// entry, or a tombstone) and aren't quarantined: rows nothing in the source
 /// backs, which someone added or re-keyed in the target, or whose
 /// source row exists but the ledger never learned. Every writer of a target
 /// row writes its entry in the same transaction, so a committed target row
 /// without a live entry is one nobody wrote through Trellis. A key
 /// [`rederive_keys`] takes comes back with a live entry, or its row
-/// deleted, so a repeated call makes progress.
-async fn orphan_keys(
+/// deleted. The walk pages by key cursor: each batch passes the last key of
+/// the one before, so the sweep reads the target once, not once per batch.
+pub(crate) async fn orphan_keys(
     txn: &Transaction<'_>,
     plan: &OneToOnePlan,
+    after: Option<&str>,
     limit: i64,
 ) -> Result<Vec<String>, ApplyError> {
     let target = ddl::qualified_target_table_ident(&plan.target);
@@ -514,7 +559,8 @@ async fn orphan_keys(
                 "select array(select t.__k from ( \
                      select {k_tgt} as __k from {target} t \
                  ) t \
-                 where not exists (select 1 from {ledger} l \
+                 where ($4::text is null or t.__k > $4) \
+                   and not exists (select 1 from {ledger} l \
                                    where l.{key} = t.__k and not l.{tombstone}) \
                    and not exists (select 1 from poison p \
                                    join transform_definitions d on d.id = p.transform_id \
@@ -525,7 +571,7 @@ async fn orphan_keys(
                 key = quote_ident(crate::defs::ledger::KEY_COLUMN),
                 tombstone = quote_ident(crate::defs::ledger::TOMBSTONE_COLUMN),
             ),
-            &[&limit, &plan.source_table, &plan.target],
+            &[&limit, &plan.source_table, &plan.target, &after],
         )
         .await?;
     metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());

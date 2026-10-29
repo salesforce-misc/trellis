@@ -978,6 +978,171 @@ async fn a_change_reaching_the_drain_halts_a_one_to_one_join_rather_than_apply_i
 /// No transform reads a 1-1 JOIN target, however it came to: a reader whose
 /// source was dropped while it was paused, and whose source's name a 1-1
 /// JOIN's target then took, is refused at `RESUME` as at define.
+/// A restored 1-1 JOIN's `RESUME` recreates `R` and `M` (empty, no basis)
+/// and `J`, keeps the target's rows, and drops the truncate floors the dump
+/// carried. The reset of the ledgers' ordering columns is not needed on top
+/// of the recreate.
+#[tokio::test]
+async fn a_restored_one_to_one_joins_resume_recreates_its_ledgers_and_keeps_the_target() {
+    let _knob = with_knob(true).await;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(TABLES).await.expect("seed");
+    let trellis = define_only(db.dsn()).await;
+    trellis.apply(LEFT_JOIN).await.expect("define the 1-1 JOIN");
+    let id = definition_id(&raw, "order_view").await;
+    trellis
+        .apply("PAUSE TRANSFORM order_view")
+        .await
+        .expect("pause");
+    // The dump's state: ledgers holding the original database's positions,
+    // floors for the target and the hidden tables, rows in the target.
+    let schema = DEFAULT_SCHEMA;
+    for side in ["r", "m"] {
+        raw.batch_execute(&format!(
+            "insert into {schema}.join1_{id}_{side} (__from_key, __applied_lsn, __basis) \
+                 values ('1', '0/10', '10:20:');
+             insert into ledger_truncate_floor values \
+                 ('\"{schema}\".\"join1_{id}_{side}\"', '0/10')"
+        ))
+        .await
+        .expect("restored hidden ledger");
+    }
+    raw.batch_execute(
+        "insert into ledger_truncate_floor values ('public.order_view', '0/10'), \
+             ('public.other', '0/10');
+         insert into public.order_view (id) values (1)",
+    )
+    .await
+    .expect("a target row");
+    raw.batch_execute(
+        "insert into capture_failures (transform_id, source_table, columns, error, kind, restored) \
+         select id, 'public.orders', '{}', 'restored', 'capture', true \
+         from transform_definitions where split_part(target_table, '.', 2) = 'order_view' \
+         on conflict (transform_id) do update set restored = true",
+    )
+    .await
+    .expect("mark restored");
+    assert_eq!(
+        count(&raw, "select count(*) from public.order_view").await,
+        1
+    );
+
+    trellis
+        .apply("RESUME TRANSFORM order_view")
+        .await
+        .expect("resume");
+
+    for side in ["r", "m"] {
+        assert_eq!(
+            count(
+                &raw,
+                &format!("select count(*) from {schema}.join1_{id}_{side}")
+            )
+            .await,
+            0,
+            "{side} is recreated empty"
+        );
+    }
+    assert_eq!(
+        count(&raw, "select count(*) from public.order_view").await,
+        1,
+        "the target keeps its rows"
+    );
+    let floors: Vec<String> = raw
+        .query("select target_table from ledger_truncate_floor", &[])
+        .await
+        .expect("floors")
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(floors, ["public.other"], "the restored floors are dropped");
+}
+
+/// A `RESUME` of a 1-1 JOIN waits out a chunk that still holds its claim row
+/// before it recreates the hidden tables (as for a group-basis aggregate's
+/// partials), so it never holds `ACCESS EXCLUSIVE` on them while it waits
+/// with the definition row: a chunk writing them, which holds the claim row
+/// `for key share`, would otherwise queue behind the resume, which queues
+/// behind the chunk. Here the chunk's session takes a lock on `R` while the
+/// resume is queued on the claim row: it gets it only if the resume hasn't
+/// yet dropped `R`.
+#[tokio::test]
+async fn a_resume_waits_out_an_in_flight_chunk_before_recreating_the_hidden_tables() {
+    let _knob = with_knob(true).await;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(TABLES).await.expect("seed");
+    let trellis = define_only(db.dsn()).await;
+    trellis.apply(LEFT_JOIN).await.expect("define the 1-1 JOIN");
+    let id = definition_id(&raw, "order_view").await;
+    trellis
+        .apply("PAUSE TRANSFORM order_view")
+        .await
+        .expect("pause");
+    let chunk: i64 = raw
+        .query_one(
+            "insert into backfill_chunks (definition_id, kind, lo, hi, claimed_by, claimed_at, \
+                                          fuse_rearmed_at) \
+             select id, 'rederive', null, '9', 'held', now(), fuse_rearmed_at \
+             from transform_definitions where id = $1 returning id",
+            &[&id],
+        )
+        .await
+        .expect("a claimed chunk")
+        .get(0);
+    // The chunk's session, mid-write: its claim row held `for key share`.
+    let mut chunk_session = connect_raw(db.dsn()).await;
+    let pid: i32 = chunk_session
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("pid")
+        .get(0);
+    let txn = chunk_session.transaction().await.expect("begin");
+    txn.execute(
+        "select 1 from backfill_chunks where id = $1 for key share",
+        &[&chunk],
+    )
+    .await
+    .expect("hold the claim row");
+
+    let resume = tokio::spawn({
+        let pool = db.pool.clone();
+        async move { trellis::staging::quarantine::resume_transform(&pool, "order_view").await }
+    });
+    // The resume is queued on the claim row.
+    loop {
+        let queued: bool = raw
+            .query_one(
+                "select exists (select 1 from pg_stat_activity \
+                 where $1 = any(pg_blocking_pids(pid)))",
+                &[&pid],
+            )
+            .await
+            .expect("read pg_stat_activity")
+            .get(0);
+        if queued {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // It has not yet taken `ACCESS EXCLUSIVE` on the hidden ledger.
+    txn.batch_execute(&format!(
+        "set local lock_timeout = '2s'; \
+         lock table {DEFAULT_SCHEMA}.join1_{id}_r in access share mode"
+    ))
+    .await
+    .expect("the resume holds no lock on R while it waits for the chunk");
+    txn.commit().await.expect("the chunk's write commits");
+    resume.await.expect("task").expect("resume");
+    assert_eq!(
+        status(&trellis, "order_view").await,
+        Some(TransformStatus::WaitingToBackfill)
+    );
+}
+
 #[tokio::test]
 async fn a_resume_refuses_a_reader_whose_source_became_a_one_to_one_join_target() {
     let _knob = with_knob(true).await;

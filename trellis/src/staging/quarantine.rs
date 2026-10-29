@@ -4400,13 +4400,6 @@ async fn complete_resume(
             empty_if_keyed_by_an_enum(txn, source_table, &definition.target_table).await?;
         }
     }
-    // A JOIN's hidden tables are fully derived, so
-    // the resume drops and recreates them, at the shape define would give
-    // them now, rather than check them.
-    if let Some(sides) = &revalidated.join {
-        catalog::recreate_hidden_tables(txn, schema, id, &definition.def, sides).await?;
-    }
-
     // Discard the definition's leftover unclaimed backfill chunks.
     // The pause only withheld them from `claim_chunks`; unfrozen, they
     // would be handed out again and re-run work the fresh backfill parked
@@ -4438,6 +4431,16 @@ async fn complete_resume(
         &[&id],
     )
     .await?;
+
+    // A JOIN's hidden tables are fully derived, so the resume drops and
+    // recreates them, at the shape define would give them now, rather than
+    // check them. The visible target is kept. After the wait above, for the
+    // same reason as the group table below: a chunk that passed its fence
+    // before the pause commits first, rather than this `ACCESS EXCLUSIVE`
+    // waiting inside the resume while it holds the definition row.
+    if let Some(sides) = &revalidated.join {
+        catalog::recreate_hidden_tables(txn, schema, id, &definition.def, sides).await?;
+    }
 
     // A group-basis aggregate's partials are fully derived, so the
     // resume drops and recreates them at the shape define would give them
@@ -4613,14 +4616,12 @@ async fn empty_if_keyed_by_an_enum(
 /// Resets the ordering state of definition `id` (target `target`, qualified)
 /// that a logical restore left holding the original database's WAL positions
 /// and transaction ids (ADR-0002 I2): the 1-1 ledger's and the group
-/// ledger's `__applied_lsn` and `__basis`, a 1-1 `JOIN`'s hidden ledgers'
-/// (`R`, `M`), and the truncate floors of the target and of the hidden
-/// tables. A group-basis aggregate's and a JOIN's hidden tables are recreated
-/// by the resume itself, with no basis or stamp; a 1-1 `JOIN`'s `R` and `M`
-/// are recreated too, so the reset of their ordering columns is redundant
-/// there, kept so the function stays correct for any caller that does not
-/// recreate them. Entries keep their other columns, so the rebuild still
-/// diffs each key against what it contributed.
+/// ledger's `__applied_lsn` and `__basis`, and the truncate floors of the
+/// target and of the hidden tables. A group-basis aggregate's and a JOIN's
+/// hidden tables (a 1-1 `JOIN`'s `R` and `M` included) are recreated by the
+/// resume itself, with no basis or stamp, so only their floors are deleted
+/// here. Entries keep their other columns, so the rebuild still diffs each
+/// key against what it contributed.
 async fn reset_ordering_state(
     txn: &Transaction<'_>,
     schema: &str,
@@ -4642,22 +4643,6 @@ async fn reset_ordering_state(
             ledger = ddl::regclass_arg(&ledger),
         ))
         .await?;
-    }
-    // A 1-1 JOIN's hidden ledgers (`R`, `M`) carry the same ordering state
-    // as the target's.
-    for table in crate::defs::join_one_to_one::HiddenTable::LEDGERS {
-        let ident = table.qualified(schema, id);
-        let exists: bool = txn
-            .query_one("select pg_catalog.to_regclass($1) is not null", &[&ident])
-            .await?
-            .get(0);
-        if exists {
-            txn.batch_execute(&format!(
-                "update {ident} set \"__applied_lsn\" = null, \"__basis\" = null \
-                 where \"__applied_lsn\" is not null or \"__basis\" is not null"
-            ))
-            .await?;
-        }
     }
     let hidden = super::group_basis::hidden_table_ident(schema, id);
     let mut floors = vec![target.to_string(), hidden];
@@ -8908,62 +8893,5 @@ mod unit_tests {
             assert_eq!(cancels_of(&raw, id).await, None, "{timeout_cancel}");
         }
         assert_eq!(status_of(&raw).await, "waiting_to_backfill");
-    }
-
-    /// A logical restore's reset nulls the ordering state of a 1-1 `JOIN`'s
-    /// hidden ledgers `R` and `M` and drops their floors, as it does the
-    /// target's ledger, and leaves their other columns and every other
-    /// floor alone.
-    #[tokio::test]
-    async fn reset_ordering_state_clears_a_one_to_one_joins_hidden_ledgers() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let mut raw = connect_raw(&db).await;
-        let schema = crate::config::DEFAULT_SCHEMA;
-        let id = 7;
-        for side in ["r", "m"] {
-            raw.batch_execute(&format!(
-                r#"create table "{schema}"."join1_{id}_{side}" (
-                       "__from_key" text primary key, "__applied_lsn" pg_lsn,
-                       "__applied_seg" bigint, "__basis" pg_snapshot,
-                       "__tombstone" boolean not null default false);
-                   insert into "{schema}"."join1_{id}_{side}"
-                       values ('k', '0/10', 3, '10:20:', false);
-                   insert into ledger_truncate_floor values
-                       ('"{schema}"."join1_{id}_{side}"', '0/10');"#
-            ))
-            .await
-            .expect("hand-made hidden ledger");
-        }
-        raw.batch_execute("insert into ledger_truncate_floor values ('public.other', '0/10')")
-            .await
-            .expect("another target's floor");
-        let txn = raw.transaction().await.expect("begin");
-        reset_ordering_state(&txn, schema, id, "public.joined")
-            .await
-            .expect("reset");
-        txn.commit().await.expect("commit");
-        for side in ["r", "m"] {
-            let row = raw
-                .query_one(
-                    &format!(
-                        r#"select "__applied_lsn" is null, "__basis" is null, "__applied_seg"
-                           from "{schema}"."join1_{id}_{side}""#
-                    ),
-                    &[],
-                )
-                .await
-                .expect("read the entry");
-            assert!(row.get::<_, bool>(0) && row.get::<_, bool>(1), "{side}");
-            assert_eq!(row.get::<_, i64>(2), 3, "{side}: other columns stay");
-        }
-        let floors: Vec<String> = raw
-            .query("select target_table from ledger_truncate_floor", &[])
-            .await
-            .expect("floors")
-            .into_iter()
-            .map(|r| r.get(0))
-            .collect();
-        assert_eq!(floors, ["public.other"]);
     }
 }

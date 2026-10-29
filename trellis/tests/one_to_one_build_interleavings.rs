@@ -430,6 +430,60 @@ async fn the_chunk_plan_setting_ends_with_its_statement() {
     txn.commit().await.expect("commit the sweep batch");
 }
 
+/// The sweep's orphan walk pages by key cursor: with more orphans (target
+/// rows no live entry backs, whose source rows are gone) than one batch
+/// takes, every batch returns a cursor past the last orphan it took, the
+/// cursors strictly increase, the walk ends on the first short batch, and no
+/// orphan is left.
+#[tokio::test]
+async fn the_orphan_walk_pages_by_key_cursor_and_removes_every_orphan() {
+    let (d, plan) = start_build(&[(1, 1, 1)]).await;
+    let orphans: Vec<String> = (101..=107).map(|id| format!("({id}, 1, 2)")).collect();
+    d.ctl
+        .batch_execute(&format!(
+            "insert into public.one (id, g, dbl) values {}",
+            orphans.join(", ")
+        ))
+        .await
+        .expect("seven orphans");
+    let mut client = d.pool().get().await.expect("a connection");
+    let mut cursor: Option<String> = None;
+    let mut seen: Vec<String> = Vec::new();
+    let mut batches = 0;
+    loop {
+        batches += 1;
+        assert!(batches <= 10, "the walk must end");
+        let txn = client.transaction().await.expect("begin");
+        let out =
+            one_to_one::sweep_batch(&txn, &plan, "18446744073709551615", cursor.as_deref(), 3)
+                .await
+                .expect("sweep batch");
+        txn.commit().await.expect("commit");
+        let next = out.next.clone().or(cursor.clone());
+        if !out.finished {
+            let next = next.clone().expect("an unfinished batch has a cursor");
+            assert!(
+                seen.last().is_none_or(|last| *last < next),
+                "the cursor advances: {seen:?} then {next:?}"
+            );
+            seen.push(next);
+        }
+        if out.finished {
+            break;
+        }
+        cursor = next;
+    }
+    // 7 orphans in batches of 3: two full batches, then a short one.
+    assert_eq!(batches, 3, "the cursors: {seen:?}");
+    let left: i64 = d
+        .ctl
+        .query_one("select count(*) from public.one where id > 100", &[])
+        .await
+        .expect("count")
+        .get(0);
+    assert_eq!(left, 0, "every orphan is removed");
+}
+
 // ------------------------------------------------------- chunk lock waits
 
 /// A chunk frozen after its entry lock holds an existing key's entry (the
