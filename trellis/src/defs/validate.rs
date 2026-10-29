@@ -564,7 +564,14 @@ pub(crate) struct CollationRefusingRead {
     /// The source column read, directly or through `COALESCE` or another
     /// calculated field.
     pub column: String,
+    /// The table qualifier the column was written with (`posts.author`), for
+    /// a `JOIN` to resolve against the side it names; `None` for a bare
+    /// name, which reads the `FROM` table.
+    pub qualifier: Option<QualifiedColumn>,
 }
+
+/// A column an expression reads, with the qualifier it was written with.
+type ReadColumn = (Option<QualifiedColumn>, String);
 
 /// Every column an argument of a `STRPOS`/`REGEXP_COUNT` call in `def`'s
 /// fields reads, for the catalog to check each
@@ -616,11 +623,16 @@ fn collect_refusing_calls(
                 for arg in args {
                     collect_text_columns(arg, field, fields_by_name, &mut visited, &mut columns);
                 }
-                out.extend(columns.into_iter().map(|column| CollationRefusingRead {
-                    field: field.to_string(),
-                    function: name.clone(),
-                    column,
-                }));
+                out.extend(
+                    columns
+                        .into_iter()
+                        .map(|(qualifier, column)| CollationRefusingRead {
+                            field: field.to_string(),
+                            function: name.clone(),
+                            column,
+                            qualifier,
+                        }),
+                );
             }
             for arg in args {
                 collect_refusing_calls(arg, field, fields_by_name, out);
@@ -671,11 +683,16 @@ fn collect_text_comparison(
     for operand in operands {
         collect_value_columns(operand, field, fields_by_name, &mut visited, &mut columns);
     }
-    out.extend(columns.into_iter().map(|column| CollationRefusingRead {
-        field: field.to_string(),
-        function: construct.to_string(),
-        column,
-    }));
+    out.extend(
+        columns
+            .into_iter()
+            .map(|(qualifier, column)| CollationRefusingRead {
+                field: field.to_string(),
+                function: construct.to_string(),
+                column,
+                qualifier,
+            }),
+    );
 }
 
 /// The columns whose values `expr` can return as its own value: a column, a
@@ -687,7 +704,7 @@ fn collect_value_columns<'a>(
     field: &str,
     fields_by_name: &HashMap<&str, &'a FieldDef>,
     visited: &mut HashSet<&'a str>,
-    out: &mut Vec<String>,
+    out: &mut Vec<ReadColumn>,
 ) {
     match expr {
         Expr::Column(name) => match fields_by_name.get(name.as_str()) {
@@ -696,9 +713,20 @@ fn collect_value_columns<'a>(
                     collect_value_columns(&other.expr, &other.name, fields_by_name, visited, out);
                 }
             }
-            _ => out.push(name.clone()),
+            _ => out.push((None, name.clone())),
         },
-        Expr::SourceColumn { column, .. } => out.push(column.clone()),
+        Expr::SourceColumn {
+            schema,
+            table,
+            column,
+        } => out.push((
+            Some(QualifiedColumn {
+                schema: schema.clone(),
+                table: table.clone(),
+                column: column.clone(),
+            }),
+            column.clone(),
+        )),
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
             for arg in args {
                 collect_value_columns(arg, field, fields_by_name, visited, out);
@@ -732,7 +760,7 @@ fn collect_text_columns<'a>(
     field: &str,
     fields_by_name: &HashMap<&str, &'a FieldDef>,
     visited: &mut HashSet<&'a str>,
-    out: &mut Vec<String>,
+    out: &mut Vec<ReadColumn>,
 ) {
     match expr {
         Expr::Column(name) => match fields_by_name.get(name.as_str()) {
@@ -741,9 +769,20 @@ fn collect_text_columns<'a>(
                     collect_text_columns(&other.expr, &other.name, fields_by_name, visited, out);
                 }
             }
-            _ => out.push(name.clone()),
+            _ => out.push((None, name.clone())),
         },
-        Expr::SourceColumn { column, .. } => out.push(column.clone()),
+        Expr::SourceColumn {
+            schema,
+            table,
+            column,
+        } => out.push((
+            Some(QualifiedColumn {
+                schema: schema.clone(),
+                table: table.clone(),
+                column: column.clone(),
+            }),
+            column.clone(),
+        )),
         Expr::FunctionCall { args, .. } => {
             for arg in args {
                 collect_text_columns(arg, field, fields_by_name, visited, out);
@@ -763,6 +802,43 @@ fn collect_text_columns<'a>(
         }
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
     }
+}
+
+/// Refuses a `JOIN` definition whose field reads, in a `STRPOS`/
+/// `REGEXP_COUNT` call or a text comparison, a column with a nondeterministic
+/// collation ([`collation_refusing_function_reads`]). Each read resolves
+/// against the side its table qualifier names, so a joined-table column is
+/// checked against the joined table, whatever the `FROM` table holds. A read
+/// that doesn't resolve passes: the validators own that error. Shared by the
+/// aggregate and the 1-1 `JOIN` validators, so define and every resume (which
+/// re-run them over the live columns) apply it alike.
+pub(crate) fn check_join_collation_reads(
+    def: &TransformDef,
+    join: &JoinSpec,
+    left: &HashMap<String, JoinColumnInfo>,
+    right: &HashMap<String, JoinColumnInfo>,
+) -> Result<(), ValidationError> {
+    let resolve = join_resolver(def, join, left, right);
+    for read in collation_refusing_function_reads(def) {
+        let Some(qualifier) = &read.qualifier else {
+            continue;
+        };
+        let Ok((_, info)) = resolve(qualifier) else {
+            continue;
+        };
+        if !info.collation_deterministic {
+            return Err(ValidationError::NondeterministicCollationTextFunction(
+                Box::new(NondeterministicCollationTextFunction {
+                    field: read.field,
+                    function: read.function,
+                    table: qualifier.table.clone(),
+                    column: read.column,
+                    collation: info.collation.clone().unwrap_or_default(),
+                }),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Payload of [`ValidationError::AmbiguousColumnReference`], boxed out of
@@ -2109,6 +2185,7 @@ pub fn validate_join(
         // is renamed apart by side, since the two tables may share names.
         join_field_value_type(def, field, left, right)?;
     }
+    check_join_collation_reads(def, join, left, right)?;
     Ok(())
 }
 
@@ -7158,7 +7235,24 @@ mod tests {
         CollationRefusingRead {
             field: field.to_string(),
             function: function.to_string(),
+            qualifier: None,
             column,
+        }
+    }
+
+    fn qualified_read(
+        field: &str,
+        function: &str,
+        table: &str,
+        column: &str,
+    ) -> CollationRefusingRead {
+        CollationRefusingRead {
+            qualifier: Some(QualifiedColumn {
+                schema: None,
+                table: table.to_string(),
+                column: column.to_string(),
+            }),
+            ..read(field, function, column.to_string())
         }
     }
 
@@ -7185,7 +7279,7 @@ mod tests {
                 read("direct", "STRPOS", source("title")),
                 read("via_field", "REGEXP_COUNT", source("title")),
                 read("via_field", "REGEXP_COUNT", source("body")),
-                read("via_qualified", "STRPOS", source("author")),
+                qualified_read("via_qualified", "STRPOS", "s", "author"),
                 read("via_qualified", "STRPOS", source("title")),
                 read("twice", "STRPOS", source("title")),
             ]
@@ -7607,6 +7701,53 @@ mod tests {
         cols.iter()
             .map(|(name, info)| (name.to_string(), info.clone()))
             .collect()
+    }
+
+    /// A `JOIN` read resolves against the side its qualifier names, also when
+    /// it reaches the call through another field: `items.note` is checked
+    /// against `items`, though `orders` has no `note`, and `orders.region`
+    /// against `orders`.
+    #[test]
+    fn join_collation_reads_resolve_against_the_qualified_side_through_fields() {
+        let (mut left, mut right) = tables();
+        let def = parse_text(
+            "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+             SELECT items.note AS n, orders.region AS r, \
+                    STRPOS(n, 'a') AS pos, r = 'x' AS same",
+        )
+        .unwrap();
+        let KeySpace::JoinOneToOne(join) = &def.key_space else {
+            panic!("a join without GROUP BY");
+        };
+        assert_eq!(
+            check_join_collation_reads(&def, join, &left, &right),
+            Ok(())
+        );
+        let ci = |info: &mut JoinColumnInfo| {
+            info.collation_deterministic = false;
+            info.collation = Some("ci".to_string());
+        };
+        ci(right.get_mut("note").unwrap());
+        let refused = |err: Result<(), ValidationError>| match err {
+            Err(ValidationError::NondeterministicCollationTextFunction(refused)) => (
+                refused.field,
+                refused.function,
+                refused.table,
+                refused.column,
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert_eq!(
+            refused(check_join_collation_reads(&def, join, &left, &right)),
+            ("pos".into(), "STRPOS".into(), "items".into(), "note".into())
+        );
+        ci(right.get_mut("sku").unwrap());
+        ci(left.get_mut("region").unwrap());
+        right.remove("note");
+        assert_eq!(
+            refused(check_join_collation_reads(&def, join, &left, &right)),
+            ("same".into(), "=".into(), "orders".into(), "region".into())
+        );
     }
 
     /// orders(id, region text, total numeric(10,2)) and

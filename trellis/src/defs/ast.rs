@@ -310,7 +310,7 @@ pub enum JoinKind {
 
 /// A column reference as written in a `JOIN` definition: always qualified
 /// with its table, optionally with the schema too.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QualifiedColumn {
     pub schema: Option<String>,
     pub table: String,

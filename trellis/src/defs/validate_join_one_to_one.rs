@@ -15,9 +15,8 @@ use std::collections::{HashMap, HashSet};
 use super::ast::{Expr, KeySpace, QualifiedColumn, TransformDef};
 use super::join::Side;
 use super::validate::{
-    JoinColumnInfo, JoinSide, NondeterministicCollationTextFunction, RESERVED_COLUMN_PREFIX,
-    ValidationError, collation_refusing_function_reads, is_deferred_aggregate_name,
-    join_field_value_type, join_resolver, rename_join_columns, validate_join_tables_and_on,
+    JoinColumnInfo, JoinSide, RESERVED_COLUMN_PREFIX, ValidationError, is_deferred_aggregate_name,
+    join_field_value_type, join_resolver, validate_join_tables_and_on,
 };
 
 /// Validates a [`KeySpace::JoinOneToOne`] definition against the live columns
@@ -70,42 +69,8 @@ pub fn validate(
         // The field's type over both tables' columns, as define gives its
         // target column.
         join_field_value_type(def, field, left, right)?;
-
-        // `STRPOS`, `REGEXP_COUNT` and text comparisons are refused by
-        // Postgres under a nondeterministic collation while Trellis computes
-        // them from the exact text.
-        let mut renamed = field.expr.clone();
-        rename_join_columns(&mut renamed, &def.source, left, right, &mut HashMap::new());
-        let single = TransformDef {
-            fields: vec![super::ast::FieldDef {
-                name: field.name.clone(),
-                expr: renamed,
-            }],
-            ..def.clone()
-        };
-        for read in collation_refusing_function_reads(&single) {
-            let (side_columns, table) = match read.column.split_once('\u{1}') {
-                Some(("l", column)) => (left, (&def.source, column)),
-                Some((_, column)) => (right, (&join.right, column)),
-                None => continue,
-            };
-            let (table_name, column) = table;
-            let Some(info) = side_columns.get(column) else {
-                continue;
-            };
-            if !info.collation_deterministic {
-                return Err(ValidationError::NondeterministicCollationTextFunction(
-                    Box::new(NondeterministicCollationTextFunction {
-                        field: read.field,
-                        function: read.function,
-                        table: table_name.clone(),
-                        column: column.to_string(),
-                        collation: info.collation.clone().unwrap_or_default(),
-                    }),
-                ));
-            }
-        }
     }
+    super::validate::check_join_collation_reads(def, join, left, right)?;
     Ok(())
 }
 

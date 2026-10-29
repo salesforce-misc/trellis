@@ -10,11 +10,14 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
+use tokio::sync::{Mutex, MutexGuard};
+use trellis::defs::join_one_to_one::set_enabled;
 use trellis::defs::{
     CatalogError, KeyColumnRole, NondeterministicCollationTextFunction,
     NondeterministicKeyCollation, Statement, ValidationError, ValueType, alter_transform,
     install_definition, parse_statement,
 };
+use trellis::{Config, TransformStatus, Trellis, TrellisOptions};
 
 /// Only ICU provides nondeterministic collations. Every test cluster's
 /// default collation is ICU `en-US`, so a server without ICU can't run
@@ -393,4 +396,264 @@ async fn text_comparisons_on_a_nondeterministic_column_are_refused() {
     )
     .await
     .expect("non-text values, a deterministic column and IS NULL need no deterministic collation");
+}
+
+// ---------------------------------------------------------------------------
+// JOIN definitions: a read resolves against the side its table qualifier
+// names.
+// ---------------------------------------------------------------------------
+
+/// The 1-1 JOIN knob is process-wide and these tests share a process: each
+/// 1-1 test takes this for its whole body.
+static KNOB: Mutex<()> = Mutex::const_new(());
+
+async fn with_knob(on: bool) -> MutexGuard<'static, ()> {
+    let guard = KNOB.lock().await;
+    set_enabled(on);
+    guard
+}
+
+/// Every text function and comparison the check covers, over `column`: the
+/// formula and the function name the refusal reports.
+fn text_reads(column: &str) -> Vec<(String, &'static str)> {
+    vec![
+        (format!("STRPOS({column}, 'a') > 0"), "STRPOS"),
+        (format!("REGEXP_COUNT({column}, 'a') > 0"), "REGEXP_COUNT"),
+        (format!("{column} = 'a'"), "="),
+        (format!("{column} <> 'a'"), "<>"),
+        (format!("'a' != {column}"), "<>"),
+        (format!("{column} IS DISTINCT FROM 'a'"), "IS DISTINCT FROM"),
+        (
+            format!("{column} IS NOT DISTINCT FROM 'a'"),
+            "IS NOT DISTINCT FROM",
+        ),
+        (format!("NULLIF({column}, 'a') IS NULL"), "NULLIF"),
+    ]
+}
+
+/// `post_tags` (the `FROM` table, `a`) and `posts` (joined, `b`). `author` is
+/// on both, `note` only on `post_tags`, `title` only on `posts`; the
+/// nondeterministic collation is on `posts.author` and `post_tags.note`, so
+/// `post_tags.author` and `posts.title` are the deterministic controls.
+const JOIN_TABLES: &str = "create table posts (id bigint primary key, \
+                                author text collate case_insensitive, title text);
+     create table post_tags (id bigint primary key, post bigint, tag text, \
+                             author text, note text collate case_insensitive);
+     create index on post_tags (post);";
+
+/// The aggregate JOIN counting rows where `formula` holds.
+fn aggregate_join(name: &str, formula: &str) -> String {
+    format!(
+        "TRANSFORM {name} FROM post_tags JOIN posts ON post_tags.post = posts.id \
+         GROUP BY post_tags.tag WITHOUT SOURCE INDEX \
+         SELECT post_tags.tag AS tag, COUNT(CASE WHEN {formula} THEN 1 END) AS n"
+    )
+}
+
+/// The 1-1 JOIN selecting `formula`.
+fn one_to_one_join(name: &str, formula: &str) -> String {
+    format!(
+        "TRANSFORM {name} FROM post_tags JOIN posts ON post_tags.post = posts.id \
+         SELECT {formula} AS n"
+    )
+}
+
+/// What each test installs against, per key space.
+const KEY_SPACES: [(&str, fn(&str, &str) -> String); 2] =
+    [("aggregate", aggregate_join), ("1-1", one_to_one_join)];
+
+/// Every covered read of a nondeterministic column of either side is refused
+/// at define in both key spaces, naming that side's table and column, and
+/// registers nothing. The same reads of the deterministic columns install,
+/// including `post_tags.author` while `posts.author` is nondeterministic (the
+/// same column name on the other side) and the `FROM` table's reads.
+#[tokio::test]
+async fn join_text_reads_of_a_nondeterministic_column_are_refused_on_either_side() {
+    let _knob = with_knob(true).await;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_case_insensitive_collation(&db.pool).await;
+    batch(&db.pool, JOIN_TABLES).await;
+    let none = HashMap::new();
+
+    for (space, build) in KEY_SPACES {
+        let mut n = 0;
+        for (table, column) in [("posts", "author"), ("post_tags", "note")] {
+            for (formula, function) in text_reads(&format!("{table}.{column}")) {
+                n += 1;
+                let name = format!("refused_{}_{n}", space.replace('-', ""));
+                let err = install_definition(&db.pool, &build(&name, &formula), &none, "public")
+                    .await
+                    .expect_err(&format!("{space}: {formula}"));
+                assert_text_function_refused(err, "n", function, table, column);
+                assert_no_target(&db.pool, &name).await;
+            }
+        }
+        // Through COALESCE and a CASE result, and in the second operand.
+        for (formula, function) in [
+            ("COALESCE(posts.title, posts.author) = 'a'", "="),
+            (
+                "CASE WHEN posts.title = 'x' THEN posts.author ELSE posts.title END = 'a'",
+                "=",
+            ),
+            ("posts.title = posts.author", "="),
+        ] {
+            let name = format!("nested_{}", space.replace('-', ""));
+            let err = install_definition(&db.pool, &build(&name, formula), &none, "public")
+                .await
+                .expect_err(formula);
+            assert_text_function_refused(err, "n", function, "posts", "author");
+            assert_no_target(&db.pool, &name).await;
+        }
+        // Deterministic columns, the same-named column of the other side, and
+        // reads that need no collation install.
+        for (n, formula) in [
+            "STRPOS(post_tags.author, 'a') > 0",
+            "posts.title = 'a'",
+            "post_tags.author <> post_tags.tag",
+            "CHAR_LENGTH(posts.author) = 3",
+            "posts.author IS NULL",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            install_definition(
+                &db.pool,
+                &build(&format!("fine_{}_{n}", space.replace('-', "")), formula),
+                &none,
+                "public",
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{space}: {formula}: {err}"));
+        }
+    }
+    set_enabled(false);
+}
+
+/// A joined column the `FROM` table has no column of is checked (it was
+/// skipped as "doesn't exist" against the wrong table), and the `FROM`
+/// table's own column of a shared name is not mistaken for it: the refusal
+/// names the joined table.
+#[tokio::test]
+async fn join_text_reads_of_a_column_only_the_joined_table_has_are_refused() {
+    let _knob = with_knob(true).await;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_case_insensitive_collation(&db.pool).await;
+    batch(
+        &db.pool,
+        "create table posts (id bigint primary key, slug text collate case_insensitive);
+         create table post_tags (id bigint primary key, post bigint, tag text);
+         create index on post_tags (post);",
+    )
+    .await;
+    for (space, build) in KEY_SPACES {
+        let err = install_definition(
+            &db.pool,
+            &build(
+                &format!("only_b_{}", space.replace('-', "")),
+                "posts.slug = 'a'",
+            ),
+            &HashMap::new(),
+            "public",
+        )
+        .await
+        .expect_err(space);
+        assert_text_function_refused(err, "n", "=", "posts", "slug");
+    }
+    set_enabled(false);
+}
+
+async fn define_only(dsn: &str) -> Trellis {
+    Trellis::connect(
+        Config::from_dsn(dsn.to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a define-only Trellis")
+}
+
+/// A resume re-validates a JOIN against the live columns: re-collating a
+/// read column to a nondeterministic collation while the transform is paused
+/// refuses the resume, naming that side's table and column, and re-collating
+/// it back lets the resume through.
+#[tokio::test]
+async fn resuming_a_join_whose_read_column_became_nondeterministic_is_refused() {
+    let _knob = with_knob(true).await;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    create_case_insensitive_collation(&db.pool).await;
+    batch(
+        &db.pool,
+        "create table posts (id bigint primary key, author text, title text);
+         create table post_tags (id bigint primary key, post bigint, tag text, \
+                                 author text, note text);
+         create index on post_tags (post);",
+    )
+    .await;
+    let trellis = define_only(db.dsn()).await;
+    let mut n = 0;
+    for (space, build) in KEY_SPACES {
+        for (table, column) in [("posts", "author"), ("post_tags", "note")] {
+            for (formula, function) in text_reads(&format!("{table}.{column}")) {
+                n += 1;
+                let name = format!("resumed_{n}");
+                trellis
+                    .apply(&build(&name, &formula))
+                    .await
+                    .unwrap_or_else(|err| panic!("{space}: {formula}: {err}"));
+                trellis
+                    .apply(&format!("PAUSE TRANSFORM {name}"))
+                    .await
+                    .expect("pause");
+                batch(
+                    &db.pool,
+                    &format!(
+                        "alter table {table} alter column {column} type text \
+                         collate case_insensitive"
+                    ),
+                )
+                .await;
+                let err = trellis
+                    .apply(&format!("RESUME TRANSFORM {name}"))
+                    .await
+                    .expect_err(&format!("{space}: {formula}"));
+                let message = err.to_string();
+                assert!(
+                    message.contains("can't resume")
+                        && message.contains(&format!("{function} reads {table}.{column}")),
+                    "{space}: {formula}: {message}"
+                );
+                assert_eq!(
+                    trellis
+                        .status(&name)
+                        .await
+                        .expect("status")
+                        .map(|status| status.status),
+                    Some(TransformStatus::Paused),
+                    "{space}: {formula}"
+                );
+                batch(
+                    &db.pool,
+                    &format!(
+                        "alter table {table} alter column {column} type text collate \"default\""
+                    ),
+                )
+                .await;
+                trellis
+                    .apply(&format!("RESUME TRANSFORM {name}"))
+                    .await
+                    .unwrap_or_else(|err| panic!("{space}: {formula}: {err}"));
+                trellis
+                    .apply(&format!("PAUSE TRANSFORM {name}"))
+                    .await
+                    .expect("pause again");
+                trellis
+                    .apply(&format!("DROP TRANSFORM {name}"))
+                    .await
+                    .expect("drop");
+            }
+        }
+    }
+    set_enabled(false);
 }
