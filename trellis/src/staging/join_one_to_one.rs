@@ -34,7 +34,7 @@
 //!    `J` row.
 //! 5. **Re-derive read.** One statement reads the live `a` rows and
 //!    `pg_current_snapshot()`; a key it reads outside K rolls the page back
-//!    the same way [`join1_snapshot_after_read`, `join1_brd_no_key`].
+//!    the same way [`join1_snapshot_after_read`].
 //! 6. **I2.** The entries are updated by ADR-0002's I2 (an Apply must not be
 //!    in the entry's basis, must be past its applied position and above the
 //!    floor) [`join1_vis_only`, `join1_lsn_only`]; a Re-derive sets the basis
@@ -292,7 +292,11 @@ impl JoinShape {
 
     /// The row of `R`'s entry `r` and the newest live `M` entry on its key
     /// `b` (a `LEFT JOIN LATERAL`), and the lateral row `s` the fields read.
-    /// `from` is the relation that supplies `r`.
+    /// `from` is the relation that supplies `r`. Newest is by applied
+    /// position, an entry no Apply has written (a build's or a Re-derive's)
+    /// last, then by `b`'s key, as the #1375 model reads it. Two live entries
+    /// share a key only while a hand-off between `b` rows is applied out of
+    /// order, and the later of its two changes recomputes the key.
     fn joined_sql(&self, from: &str) -> String {
         let on: Vec<String> = self
             .m_key
@@ -313,7 +317,8 @@ impl JoinShape {
         format!(
             "{from} \
              left join lateral (select m.* from {m} m where {on} and not m.{tomb} \
-                                order by m.{applied} desc, m.{key} collate \"C\" desc \
+                                order by m.{applied} desc nulls last, \
+                                         m.{key} collate \"C\" desc \
                                 limit 1) b on true \
              cross join lateral {s}",
             m = self.m.ident,

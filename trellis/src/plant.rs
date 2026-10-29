@@ -190,8 +190,8 @@ pub enum Plant {
     Join1NoRecheck,
     /// ADR-0002's I2 on a 1-1 `JOIN`'s hidden ledger keeps only its
     /// applied-position check (`staging::one_to_one_ledger::update_entries`):
-    /// an Apply the entry's basis already saw is applied again. A NULL-keyed
-    /// row, which only the entry lock orders, ends on a stale value.
+    /// an Apply the entry's basis already saw is applied again, so an older
+    /// change drained after a Re-derive read a newer one puts its value back.
     ///
     /// Pinned by `join_one_to_one_interleavings`'s
     /// `r17_a_stale_apply_after_a_rederive_is_refused`.

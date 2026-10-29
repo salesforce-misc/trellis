@@ -638,13 +638,13 @@ Two structural notes for when faults enter the stream:
   (§6). A plant in the tier's `known_misses` is run and reported but doesn't fail
   the sweep when uncaught, and one in `not_gated` (with its reason) is left out
   of `GENERATIVE_PLANTS=all`. Each plant breaks one apply path (the group basis,
-  a `JOIN`, a 1-1 target), and a tier leaves out the plants of paths its
-  programs never take: the concurrent tier draws no `JOIN`, and the `JOIN` tier
-  nothing else. `early_tombstone_gc` and `chunk_without_entry_lock` are left to
+  a `JOIN`, a 1-1 target, a 1-1 `JOIN`), and a tier leaves out the plants of
+  paths its programs never take: the concurrent tier draws no `JOIN`, the
+  `JOIN` tier nothing else, and no tier draws a 1-1 `JOIN`. `early_tombstone_gc` and `chunk_without_entry_lock` are left to
   their deterministic pins too: on a 1-1 target no tier's schedule makes either
   diverge (each tier's `not_gated` says what was measured). Each group-basis,
-  1-1 and `JOIN` plant is pinned by a deterministic interleaving test that fails
-  with it armed, named in its doc comment.
+  1-1, `JOIN` and 1-1 `JOIN` plant is pinned by a deterministic interleaving
+  test that fails with it armed, named in its doc comment.
 - Document how to run one property alone on a clean database; every property
   bootstraps what it reads, so it never depends on run order.
 

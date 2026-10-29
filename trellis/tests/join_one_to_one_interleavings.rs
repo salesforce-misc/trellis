@@ -721,3 +721,26 @@ async fn a_row_whose_field_overflows_is_isolated_and_the_rest_apply() {
         .await;
     assert_eq!(held, ["(public.a,5)"]);
 }
+
+/// Two live `M` entries on one key (a hand-off between `b` rows applied out of
+/// order, #1397's): the recompute reads the one an Apply wrote over one only a
+/// build or Re-derive wrote (no applied position), as the #1375 model orders
+/// them (`applied desc nulls last`). The second entry is written by hand, as
+/// a `b` page would leave it.
+#[tokio::test]
+async fn the_newest_m_entry_on_a_key_is_the_applied_one() {
+    let _serial = serial().await;
+    let mut d = start_kinds(&[Kind::Left], A_ROWS, B_ROWS).await;
+    let id = definition_id(&d, Kind::Left.target()).await;
+    let schema = trellis::config::DEFAULT_SCHEMA;
+    // `b` row 1 holds key 10 from the build, with no applied position.
+    d.ctl
+        .batch_execute(&format!(
+            "insert into {schema}.join1_{id}_m (__from_key, k, w, tag, __applied_lsn) \
+             values ('9', 10, 5000, 'handed', '0/1')"
+        ))
+        .await
+        .expect("a second live M entry on key 10");
+    step(&mut d, "update public.a set x = 2 where id = 1").await;
+    assert_eq!(total(&d, Kind::Left, 1).await, Some(2 + 5000));
+}
