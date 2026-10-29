@@ -167,7 +167,7 @@ async fn composed_fields_and_numerics_converge_without_divergence() {
 async fn an_aggregate_field_reading_another_field_by_name_converges() {
     let mut d = start_with(
         "TRANSFORM agg FROM public.src GROUP BY g \
-        WITHOUT SOURCE INDEX SELECT SUM(m) AS total, COUNT(*) AS n, total + n AS both, both AS again",
+        WITHOUT SOURCE INDEX SELECT SUM(m) AS total, COUNT(*) AS n, total + n AS sum_n, sum_n AS again",
         "create table public.src (id integer primary key, g integer, m numeric(10, 2)); \
          create index on public.src (g)",
         &[("id", int4()), ("g", int4()), ("m", ValueType::Numeric)],

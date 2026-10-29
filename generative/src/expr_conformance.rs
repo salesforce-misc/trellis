@@ -453,6 +453,22 @@ impl Fixture {
         }
     }
 
+    /// The outcome of `create table (<word> integer)` with the word unquoted,
+    /// which Postgres refuses for a word it reserves: the oracle
+    /// behind the grammar's reserved-word refusal.
+    pub async fn unquoted_column_name(&self, word: &str) -> Result<(), String> {
+        self.client
+            .batch_execute(&format!(
+                "create temp table reserved_probe ({word} integer)"
+            ))
+            .await
+            .map_err(|e| code_of(&e))?;
+        self.client
+            .batch_execute("drop table reserved_probe")
+            .await
+            .map_err(|e| code_of(&e))
+    }
+
     /// The first column of every row, as text, or the SQLSTATE.
     async fn rows(&self, sql: &str) -> Result<Vec<Option<String>>, String> {
         match self.client.query(sql, &[]).await {

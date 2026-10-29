@@ -1538,6 +1538,46 @@ fn operator_lexing_near_misses_are_refused() {
     });
 }
 
+/// A word Postgres reserves is refused as a column in an expression, and
+/// Postgres itself refuses it as an unquoted column name: the live server is
+/// the oracle for every word on the list, and a non-reserved keyword is not
+/// refused.
+#[test]
+fn reserved_word_near_misses_are_refused_and_postgres_agrees() {
+    let misses: Vec<_> = near_misses(&columns())
+        .into_iter()
+        .filter(|m| m.kind == "reserved-word")
+        .collect();
+    assert!(misses.len() >= 200, "only {} misses", misses.len());
+    HARNESS.with(|h| {
+        for miss in &misses {
+            if let Err(d) = h.fixture.check_refusal(miss) {
+                panic!("{d}");
+            }
+        }
+        for word in trellis::dev::defs::registry::RESERVED_WORDS {
+            let outcome = h.runtime.block_on(h.fixture.unquoted_column_name(word));
+            // `system_user` is reserved from PostgreSQL 16; 15 takes it.
+            if *word == "system_user" && outcome.is_ok() {
+                continue;
+            }
+            // A syntax error, or for `like` (which starts a LIKE clause) a
+            // missing table: never a created column.
+            assert!(
+                outcome.is_err(),
+                "Postgres should refuse `{word}` as an unquoted column name"
+            );
+        }
+        for word in [
+            "extract", "position", "values", "between", "coalesce", "nullif", "char",
+        ] {
+            h.runtime
+                .block_on(h.fixture.unquoted_column_name(word))
+                .unwrap_or_else(|e| panic!("Postgres accepts `{word}` as a column name: {e}"));
+        }
+    });
+}
+
 /// The types the conformance table's columns carry are the ones the
 /// generator reasons about (a new column type needs a generator entry).
 #[test]

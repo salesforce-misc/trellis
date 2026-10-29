@@ -82,7 +82,6 @@ fn columns() -> HashMap<String, ValueType> {
         ("extract", I4),
         ("date_trunc", I4),
         ("year", I4),
-        ("from", I4),
     ] {
         map.insert(name.to_string(), ty);
     }
@@ -234,15 +233,7 @@ fn date_expressions_round_trip_through_their_rendering() {
 /// ZONE`; `EXTRACT` only before `(`, where it was an unknown function.
 #[test]
 fn a_column_named_like_a_date_word_is_still_a_column() {
-    for name in [
-        "at",
-        "time",
-        "zone",
-        "extract",
-        "date_trunc",
-        "year",
-        "from",
-    ] {
+    for name in ["at", "time", "zone", "extract", "date_trunc", "year"] {
         let def = parse(&format!("TRANSFORM t FROM s SELECT {name} AS c"))
             .unwrap_or_else(|e| panic!("`SELECT {name} AS c`: {e}"));
         assert!(
@@ -254,12 +245,12 @@ fn a_column_named_like_a_date_word_is_still_a_column() {
     assert_grouping("at + time", "(+ at time)");
     assert_grouping("at - zone", "(- at zone)");
     assert_grouping("extract + year", "(+ extract year)");
-    assert_grouping("year * from", "(* year from)");
+    assert_grouping("year * extract", "(* year extract)");
     assert_grouping("at AT TIME ZONE 'UTC'", "(AT TIME ZONE at 'UTC')");
     assert_grouping("(at) AT TIME ZONE 'UTC'", "(AT TIME ZONE at 'UTC')");
     assert_type("at + time", I4);
     assert_type("extract + year + zone", I4);
-    assert_type("at - from", I4);
+    assert_type("at - zone", I4);
     // After an operand, `AT` without `TIME ZONE` is the error it always was.
     for text in ["a AT b", "a AT TIME b", "a AT TIME", "a AT"] {
         parse_err(text);

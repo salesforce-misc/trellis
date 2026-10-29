@@ -1119,6 +1119,17 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
         }
     }
     date_near_misses(columns, &mut out);
+    // A word Postgres reserves is no column name (ADR-0022), in the position
+    // an operand takes and next to an operator. The needle is the word.
+    for word in registry::RESERVED_WORDS {
+        for text in [word.to_string(), format!("{word} + 1")] {
+            out.push(NearMiss {
+                kind: "reserved-word",
+                text,
+                needles: vec![word.to_string()],
+            });
+        }
+    }
     // Typed literals in a spelling Postgres accepts and define refuses.
     for (keyword, text) in NONCANONICAL_LITERALS {
         if TYPED_LITERALS.iter().any(|s| s.keyword == *keyword) {

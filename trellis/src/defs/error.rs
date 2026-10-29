@@ -61,6 +61,11 @@ pub enum ParseError {
     UnsupportedCastTarget { name: String },
     /// A run of prefix `-` operators longer than the parser keeps.
     PrefixMinusChainTooLong { max: usize },
+    /// A bare identifier equal to a word Postgres reserves (`order`, `not`,
+    /// `end`, `user`...), which Postgres can't take as an unquoted column
+    /// name. `true`, `false` and `null` are literals in Postgres, and Trellis
+    /// has no literal for them yet.
+    ReservedWord { name: String },
     /// A two-character comparison split by whitespace (`a < = b`, `a ! = b`).
     /// Postgres lexes `<=`, `>=`, `<>` and `!=` only when adjacent, so the
     /// split form is a syntax error there and here.
@@ -244,6 +249,25 @@ impl fmt::Display for ParseError {
                 f,
                 "expression nested too deeply: an expression may nest at most {limit} levels (a chain of {limit} operands joined by operators, or fewer nested parentheses or calls); split it into calculated fields"
             ),
+            ParseError::ReservedWord { name } => {
+                let lower = name.to_ascii_lowercase();
+                if matches!(lower.as_str(), "true" | "false" | "null") {
+                    write!(
+                        f,
+                        "'{name}' is a literal in Postgres, and this grammar doesn't support the \
+                         true, false and null literals yet; a column named '{name}' can't be \
+                         referenced either, since Postgres needs it quoted and this grammar has no \
+                         quoted identifiers, so rename the column"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "'{name}' is a reserved word in Postgres, so it can't be a column name \
+                         without quotes, and this grammar has no quoted identifiers; rename the \
+                         column"
+                    )
+                }
+            }
             ParseError::SplitOperator { found, joined } => write!(
                 f,
                 "'{found}' is not an operator: the characters of a two-character operator must be adjacent, as in Postgres; write '{joined}'"

@@ -62,7 +62,7 @@ fn columns() -> HashMap<String, ValueType> {
         ("trunc", ValueType::Numeric),
         ("round", ValueType::Numeric),
         ("abs", ValueType::Integer(IntWidth::Int4)),
-        ("cast", ValueType::Integer(IntWidth::Int4)),
+        ("castx", ValueType::Integer(IntWidth::Int4)),
         // Type-name aliases that are also valid column names (#1455).
         ("int", ValueType::Integer(IntWidth::Int2)),
         ("int4", ValueType::Integer(IntWidth::Int2)),
@@ -190,12 +190,12 @@ fn two_adjacent_minuses_are_refused_as_a_sql_comment() {
 fn a_function_name_is_a_column_where_it_is_not_called() {
     assert_eq!(sexp(&expr_of("trunc")), "trunc");
     assert_eq!(sexp(&expr_of("round - 1")), "(- round 1)");
-    assert_eq!(sexp(&expr_of("abs * cast")), "(* abs cast)");
+    assert_eq!(sexp(&expr_of("abs * castx")), "(* abs castx)");
     assert_eq!(sexp(&expr_of("trunc(round)")), "(trunc round)");
     assert_eq!(sexp(&expr_of("round(round, 2)")), "(round round 2)");
     assert_type("trunc", N);
     assert_type("round - 1", N);
-    assert_type("abs * cast", I4);
+    assert_type("abs * castx", I4);
     assert_type("trunc(round)", N);
 }
 

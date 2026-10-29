@@ -63,20 +63,22 @@ Each rule the expression grammar has is the rule Postgres's `scan.l` and
   don't chain (`a < b < c` is refused), `NOT` binds looser than the comparisons
   and `IS`, and `AT TIME ZONE` binds tighter than `*` and looser than prefix
   `-`.
-- **Keywords.** `NOT` and `CASE`, which Postgres reserves, are keywords
-  before every operand the grammar has, `-` included: `not - 1` is `NOT (-1)`, as in
-  Postgres. Trellis has no quoted identifiers, so a source column named `not`
-  or `case` can't be referenced before an operand; Postgres would need
-  `"not"` there.
-  [OPEN: whether every word Postgres reserves is a keyword everywhere. A
-  reserved word with no operand after it, or one the grammar has no use for,
-  reads as a column name today: `not AS c`, `not + 1` (which Postgres reads as
-  `NOT (+1)`), `case * b`, `end + 1`, and `true`, `false` and `null`, which
-  are literals in Postgres. Each resolves only to a source column of that
-  name, which Postgres would need quoted, and is refused as an unresolved
-  column otherwise. The 0.1.0-alpha read `not AS c`, `not + 1` and `true AS c`
-  this way. Recommendation: the rule covers the keywords the grammar uses, not
-  every reserved word.]
+- **Keywords and identifiers.** A bare identifier in expression position is a
+  name Postgres itself accepts as an unquoted column name. The words
+  `pg_get_keywords()` reports with category `R` (reserved) or `T` (reserved as a
+  type or function name) are not: Trellis refuses a bare identifier equal to one
+  of them, by name, with the remedy to rename the column, since it has no quoted
+  identifiers. `NOT` and `CASE` are keywords before every operand the grammar
+  has, `-` included: `not - 1` is `NOT (-1)`, as in Postgres. The refusal covers
+  `not AS c`, `not + 1`, `case * b`, `end + 1` and `and + 1`, which Postgres
+  reads differently or rejects, and `true`, `false` and `null`, which are
+  literals in Postgres that Trellis doesn't have yet (the message says so). The
+  list is static, in the registry, and a test compares it with a live server's
+  `pg_get_keywords()`, failing on drift. Non-reserved and column-name keywords
+  (`extract`, `position`, `values`, `between`, `coalesce`, `nullif`, `char`) stay
+  legal identifiers, and are constructs only before a `(`. After a `.`
+  (`t.order`), and as the label after `AS`, Postgres accepts any keyword, so
+  qualified names and field names are unaffected.
 - **Spellings.** An alternative spelling is accepted only where Postgres
   accepts it, and means what it means there. `CAST(x AS int)` (and `int4`,
   `int8`, `decimal`) is accepted because Postgres spells those types so; `!=`

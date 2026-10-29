@@ -215,7 +215,8 @@ Postgres, over a throwaway table of random rows (`NULL`, extremes, `NaN`,
    function (a call no overload of the name accepts), prefix `-` over a
    non-numeric operand, a `CAST` the registry does not admit and a target it has
    no spelling for, a constant zero divisor, a chained comparison, a simple
-   `CASE`, an `IS TRUE`-style test, a `CASE` whose condition or results have
+   `CASE`, an `IS TRUE`-style test, each word Postgres reserves used as a
+   column (the live server also refuses each as an unquoted column name), a `CASE` whose condition or results have
    the wrong type, a `NULLIF` whose first argument Postgres casts, a
    literal-only or integer-literal-only argument given a column, relative or
    non-canonical typed literals, and the operators and functions the registry
