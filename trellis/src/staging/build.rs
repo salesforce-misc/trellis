@@ -165,6 +165,7 @@ use crate::pool::{Pool, quote_ident};
 use super::apply::ApplyError;
 use super::quarantine;
 
+mod join_one_to_one;
 pub mod one_to_one;
 
 /// How long a plan job waits before it looks at its fence again (F6).
@@ -557,22 +558,13 @@ async fn start(
         txn.rollback().await?;
         return Ok(None);
     }
-    // A 1-1 JOIN's build (ADR-0021, #1400) doesn't exist yet. Its plan job
-    // would otherwise walk `a` as a plain 1-1 source and write the target
-    // from `a` alone. The caller pauses the definition with this as its
-    // `capture_failure`.
-    if crate::defs::join::is_one_to_one(&definition.def) {
-        txn.rollback().await?;
-        return Err(ApplyError::GroupBasisUnsupported {
-            target: definition.target_table.clone(),
-            what: "a build of a 1-1 JOIN (its build path is not built yet)",
-        });
-    }
     let ledger = ddl::qualified_target_table_ident(&crate::defs::ledger::ledger_table_name(
         &definition.target_table,
     ));
     // A group-basis definition has no ledger, and nothing to sweep.
+    // A 1-1 JOIN has none either: its minimal build fills everything.
     let empty: bool = takes_group_basis(definition)
+        || crate::defs::join::is_one_to_one(&definition.def)
         || txn
             .query_one(&format!("select not exists (select 1 from {ledger})"), &[])
             .await?
@@ -1806,11 +1798,16 @@ async fn run_plan(
         )
         .await;
     }
+    // A 1-1 `JOIN`'s fresh build or resume is its whole build, the minimal
+    // one: `M`, `R`, `J` and the target in one transaction (ADR-0021).
     if crate::defs::join::is_one_to_one(&definition.def) {
-        return Err(build_error(ApplyError::GroupBasisUnsupported {
-            target: definition.target_table.clone(),
-            what: "a build of a 1-1 JOIN (its build path is not built yet)",
-        }));
+        if chunk.fields.is_some() {
+            return Err(build_error(ApplyError::GroupBasisUnsupported {
+                target: definition.target_table.clone(),
+                what: "a field build of a 1-1 JOIN (its schema-change path is not built yet)",
+            }));
+        }
+        return join_one_to_one::run(pool, chunk, claimed_by, &definition, &fence).await;
     }
     // A plain group-basis aggregate's fresh build or resume is its whole
     // build: one absolute write of every group, as a rebuild of a live

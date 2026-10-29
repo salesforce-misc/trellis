@@ -12,11 +12,28 @@ use crate::pool::quote_ident;
 /// `lsn` and `txid`) and the target's truncate floor `fl`: whether an Apply
 /// changes the entry.
 pub(super) fn apply_predicate() -> String {
+    apply_predicate_without(false, false)
+}
+
+/// [`apply_predicate`] without its visibility clause (`no_visibility`) or its
+/// applied-position clause (`no_position`): the 1-1 `JOIN` plants
+/// `join1_lsn_only` and `join1_vis_only`, which each keep only one of ADR-0002's
+/// two checks.
+pub(super) fn apply_predicate_without(no_visibility: bool, no_position: bool) -> String {
     let basis = quote_ident(schema::BASIS_COLUMN);
     let applied = quote_ident(schema::APPLIED_LSN_COLUMN);
+    let visibility = if no_visibility {
+        "true".to_string()
+    } else {
+        format!("(l.{basis} is null or not pg_visible_in_snapshot(v.__txid, l.{basis}))")
+    };
+    let position = if no_position {
+        "true".to_string()
+    } else {
+        format!("(l.{applied} is null or v.__lsn > l.{applied})")
+    };
     format!(
-        "(l.{basis} is null or not pg_visible_in_snapshot(v.__txid, l.{basis})) \
-         and (l.{applied} is null or v.__lsn > l.{applied}) \
+        "{visibility} and {position} \
          and not exists (select 1 from fl where v.__lsn <= fl.floor)"
     )
 }

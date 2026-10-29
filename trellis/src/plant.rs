@@ -172,6 +172,69 @@ pub enum Plant {
     /// Pinned by `join_interleavings`'s
     /// `a_collection_never_takes_a_t_group_from_under_its_page`.
     JoinTSkipLock,
+    /// ADR-0021 (#1375 `join1_no_j_lock`): a 1-1 `JOIN` page inserts its `J`
+    /// rows but doesn't lock them (`staging::join_one_to_one`), so a writer of
+    /// the other table's copy, or of the same key, runs between the page's
+    /// read of `M` and its target write.
+    ///
+    /// Pinned by `join_one_to_one_interleavings`'s
+    /// `an_a_page_holds_its_j_row_until_it_commits`.
+    Join1NoJLock,
+    /// ADR-0021 (#1375 `join1_no_recheck`): a 1-1 `JOIN` page doesn't check
+    /// that the key an `R` entry holds, read again after the entry lock, is
+    /// in the key set it locked. A row that moved keys since the unlocked
+    /// read is then written under a `J` lock it doesn't hold.
+    ///
+    /// Pinned by `join_one_to_one_interleavings`'s
+    /// `a_key_that_moved_under_the_page_rolls_it_back_and_the_retry_locks_both`.
+    Join1NoRecheck,
+    /// ADR-0002's I2 on a 1-1 `JOIN`'s hidden ledger keeps only its
+    /// applied-position check (`staging::one_to_one_ledger::update_entries`):
+    /// an Apply the entry's basis already saw is applied again. A NULL-keyed
+    /// row, which only the entry lock orders, ends on a stale value.
+    ///
+    /// Pinned by `join_one_to_one_interleavings`'s
+    /// `r17_a_stale_apply_after_a_rederive_is_refused`.
+    Join1LsnOnly,
+    /// ADR-0002's I2 on a 1-1 `JOIN`'s hidden ledger keeps only its
+    /// visibility check: an Apply older than the entry's applied position
+    /// whose transaction the basis didn't see overwrites a newer state.
+    ///
+    /// Pinned by `join_one_to_one_interleavings`'s
+    /// `an_older_apply_after_a_newer_one_is_refused`.
+    Join1VisOnly,
+    /// ADR-0021 (#1375 `join1_no_entry_lock`): a 1-1 `JOIN` page reads its
+    /// `R` entries without locking them. The entry lock is the only thing
+    /// ordering two writers of a row with a NULL join key, which has no `J`
+    /// row.
+    ///
+    /// Pinned by `join_one_to_one_interleavings`'s
+    /// `n_two_pages_on_a_null_keyed_row_queue_on_its_entry`.
+    Join1NoEntryLock,
+    /// ADR-0021 (#1375 `join1_old_key_unlocked`): a 1-1 `JOIN` page leaves the
+    /// key its `R` entry holds out of the key set it locks, so a row moving
+    /// off a key does so under no lock on it.
+    ///
+    /// Pinned by `join_one_to_one_interleavings`'s
+    /// `a_row_moving_off_a_key_locks_the_key_it_leaves`.
+    Join1OldKeyUnlocked,
+    /// ADR-0021 (#1375 `join1_snapshot_after_read`, `rd_latesnap`): a 1-1
+    /// `JOIN` Re-derive takes the entry's basis one statement after its read
+    /// of the live row instead of in it, so a change committed between the
+    /// two is in the basis without being in the row, and its Apply is
+    /// refused.
+    ///
+    /// Pinned by `join_one_to_one_interleavings`'s
+    /// `a_change_between_a_rederives_read_and_its_snapshot_is_applied`.
+    Join1SnapshotAfterRead,
+    /// ADR-0021 (#1375 `join1_no_placeholder`): a 1-1 `JOIN` page inserts no
+    /// placeholder for an `R` entry it doesn't find, so a page that finds
+    /// none locks nothing and its change is lost, and two pages on a new row
+    /// don't queue on its insert.
+    ///
+    /// Pinned by `join_one_to_one_interleavings`'s
+    /// `two_pages_on_a_new_row_queue_on_the_placeholder`.
+    Join1NoPlaceholder,
 }
 
 impl Plant {
@@ -189,6 +252,14 @@ impl Plant {
         Plant::JoinOtherSideBeforeJ,
         Plant::JoinDropFlip,
         Plant::JoinTSkipLock,
+        Plant::Join1NoJLock,
+        Plant::Join1NoRecheck,
+        Plant::Join1LsnOnly,
+        Plant::Join1VisOnly,
+        Plant::Join1NoEntryLock,
+        Plant::Join1OldKeyUnlocked,
+        Plant::Join1SnapshotAfterRead,
+        Plant::Join1NoPlaceholder,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -206,6 +277,14 @@ impl Plant {
             Plant::JoinOtherSideBeforeJ => "join_other_side_before_j",
             Plant::JoinDropFlip => "join_drop_flip",
             Plant::JoinTSkipLock => "join_t_skip_lock",
+            Plant::Join1NoJLock => "join1_no_j_lock",
+            Plant::Join1NoRecheck => "join1_no_recheck",
+            Plant::Join1LsnOnly => "join1_lsn_only",
+            Plant::Join1VisOnly => "join1_vis_only",
+            Plant::Join1NoEntryLock => "join1_no_entry_lock",
+            Plant::Join1OldKeyUnlocked => "join1_old_key_unlocked",
+            Plant::Join1SnapshotAfterRead => "join1_snapshot_after_read",
+            Plant::Join1NoPlaceholder => "join1_no_placeholder",
         }
     }
 

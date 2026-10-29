@@ -47,7 +47,7 @@ use crate::integer::IntWidth;
 use crate::pool::quote_ident;
 
 /// Which table of a `JOIN` definition a column or table is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Side {
     /// The `FROM` table.
     From,

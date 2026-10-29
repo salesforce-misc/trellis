@@ -1566,13 +1566,19 @@ const COOLING_BACKFILL_GROUP_BASIS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Why the concurrent tiers don't run a 1-1 `JOIN` plant: no tier draws a 1-1
+/// `JOIN` until milestone 9 (#1404).
+const NO_ONE_TO_ONE_JOIN: &str = "it breaks the 1-1 JOIN path, which no tier draws until \
+     milestone 9 (#1404); `join_one_to_one_interleavings` pins it";
+
 /// A tier's `not_gated`: `listed`, the 1-1 plants no tier gates and the
 /// `JOIN` plants, with their reasons.
 fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
     use generative::plant_sweep::{PlantPath, not_on_path};
     let mut out: Vec<(&'static str, &'static str)> = listed.to_vec();
-    for (plant, why) in
-        not_on_path(&[PlantPath::Join], NO_JOIN).chain(ONE_TO_ONE_PINNED.iter().copied())
+    for (plant, why) in not_on_path(&[PlantPath::Join], NO_JOIN)
+        .chain(not_on_path(&[PlantPath::OneToOneJoin], NO_ONE_TO_ONE_JOIN))
+        .chain(ONE_TO_ONE_PINNED.iter().copied())
     {
         if !out.iter().any(|(listed, _)| *listed == plant) {
             out.push((plant, why));

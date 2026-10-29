@@ -57,6 +57,14 @@
 //! cell write of a side fires [`PausePoint::AfterJoinCellMatch`] between
 //! its match statement and its write.
 //!
+//! A 1-1 `JOIN` target (`super::join_one_to_one`) fires, in order:
+//! `BeforeJoin1Lock` after the pair's lock row and its key set,
+//! `AfterJoin1KeyInsert` after its `J` insert, `AfterJoinLock` after its
+//! sorted `J` lock, `AfterPlaceholders` and `AfterEntryLock` around its `R`
+//! entry lock (labelled by the ledger), `AfterJoin1REntryLock` once it has
+//! checked their held keys, `AfterJoin1Read` after a Re-derive's read,
+//! `BeforeJoin1Recompute` before its target write, and `BeforeCommit`.
+//!
 //! A 1-1 build chunk (`super::build::one_to_one::run_chunk`) fires
 //! `AfterPlaceholders` and `AfterEntryLock` around its entry lock, and
 //! `AfterRederiveRead` directly after its read-and-write statement
@@ -226,6 +234,29 @@ pub enum PausePoint {
     /// On a `JOIN` target, after the page applied its `P` and `M` changes and
     /// locked the `T` groups their product changes, before it writes them.
     AfterJoinTargetLock,
+    /// On a 1-1 `JOIN` target (`super::join_one_to_one`), after the page took
+    /// the pair's lock row and read its key set, before it creates and locks
+    /// its `J` rows.
+    BeforeJoin1Lock,
+    /// On a 1-1 `JOIN` target, after the page's insert of the `J` rows it
+    /// names, before its sorted lock of them.
+    AfterJoin1KeyInsert,
+    /// For a 1-1 `JOIN`'s `R` ledger (labelled by the ledger, not the
+    /// target), after the page locked its `R` entries and checked that each
+    /// held key is in the set it locked. A separate label from
+    /// [`PausePoint::AfterJoin1MEntryLock`], as `PausePoint` is matched by
+    /// label.
+    AfterJoin1REntryLock,
+    /// For a 1-1 `JOIN`'s `M` ledger (labelled by the ledger), after the page
+    /// locked its `M` entries. Fired by the `b` side's page, which locks them.
+    AfterJoin1MEntryLock,
+    /// On a 1-1 `JOIN` target, directly after a Re-derive's one read-and-
+    /// snapshot statement and its check that every key it read is in the
+    /// locked set.
+    AfterJoin1Read,
+    /// On a 1-1 `JOIN` target, after the page wrote its entries, before it
+    /// reads `M` to recompute the target rows.
+    BeforeJoin1Recompute,
     /// After a Re-derive's live read of the source (on a 1-1 ledger, a
     /// forced group recompute).
     AfterRederiveRead,
@@ -401,6 +432,41 @@ impl PauseScope {
             .position(|a| a.point == point && a.target == target)?;
         Some(armings.swap_remove(at))
     }
+}
+
+/// How many [`crate::staging::apply::ApplyError::JoinKeyMoved`] a 1-1 `JOIN`
+/// page has raised in this process.
+static JOIN_KEY_MOVES: AtomicU64 = AtomicU64::new(0);
+
+/// How many of the next 1-1 `JOIN` page's held-key checks raise
+/// `JoinKeyMoved` whatever the keys are ([`force_join_key_moves`]).
+static FORCED_JOIN_KEY_MOVES: AtomicU64 = AtomicU64::new(0);
+
+/// How many times a 1-1 `JOIN` page has found a join key moved under it and
+/// rolled back, in this process: a test reads it before and after a drain to
+/// see that a retry happened, or that none did.
+pub fn join_key_moves() -> u64 {
+    JOIN_KEY_MOVES.load(Ordering::Relaxed)
+}
+
+/// Makes the next `n` held-key checks of 1-1 `JOIN` pages raise
+/// `JoinKeyMoved`, whether or not a key moved: a key that moves on every
+/// attempt, for the test of the retry budget.
+pub fn force_join_key_moves(n: u64) {
+    FORCED_JOIN_KEY_MOVES.store(n, Ordering::Relaxed);
+}
+
+/// Counts a raised `JoinKeyMoved`.
+pub(crate) fn note_join_key_moved() {
+    JOIN_KEY_MOVES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Whether this held-key check is forced to raise `JoinKeyMoved`
+/// ([`force_join_key_moves`]); consumes one.
+pub(crate) fn take_forced_join_key_move() -> bool {
+    FORCED_JOIN_KEY_MOVES
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+        .is_ok()
 }
 
 /// The longest stall, in microseconds; 0 for none. See the module doc's

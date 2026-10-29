@@ -80,6 +80,15 @@ pub(crate) struct OneToOneRender {
 }
 
 impl OneToOneRender {
+    /// A render of no fields over `columns`, for the rows of a hidden ledger
+    /// ([`Self::row_sql`] casts each from a text-valued jsonb image).
+    pub(crate) fn of_columns(columns: Vec<ImageColumn>) -> Self {
+        Self {
+            fields: Vec::new(),
+            columns,
+        }
+    }
+
     /// `def`'s fields but the `paused` ones (already closed over their alias
     /// readers, `quarantine::paused_columns_for`), over the source whose
     /// columns are `source_columns` ([`image_columns`]).

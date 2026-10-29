@@ -5,9 +5,10 @@
 //! one test per site that would otherwise treat the new key space as a plain
 //! 1-1 or an aggregate JOIN without saying so.
 //!
-//! The apply and build paths are later milestones, so a knob-on definition
-//! is held at its build start, not run wrong. Every test is stepped by hand:
-//! no staging worker runs, and nothing polls for convergence.
+//! The `FROM` side's page and the minimal build run (`join_one_to_one_interleavings`
+//! covers them); a change of the joined side and a `TRUNCATE` halt the
+//! definition rather than run wrong. Every test is stepped by hand: no staging
+//! worker runs, and nothing polls for convergence.
 
 use std::collections::HashMap;
 
@@ -719,7 +720,7 @@ async fn define_registers_both_tables_the_target_and_the_hidden_tables() {
 }
 
 #[tokio::test]
-async fn a_build_start_pauses_a_one_to_one_join_rather_than_run_it_as_a_plain_one() {
+async fn a_build_start_runs_the_minimal_build_of_a_one_to_one_join() {
     let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -729,21 +730,51 @@ async fn a_build_start_pauses_a_one_to_one_join_rather_than_run_it_as_a_plain_on
     trellis.apply(LEFT_JOIN).await.expect("define the 1-1 JOIN");
 
     // The first pass installs both captures; the second finds the build ready
-    // and fails its start, which pauses the definition with the reason.
+    // and starts it.
     pass(&mut raw, &db.pool).await;
     pass(&mut raw, &db.pool).await;
-    let reported = trellis
-        .status("order_view")
-        .await
-        .expect("status")
-        .expect("defined");
-    assert_eq!(reported.status, TransformStatus::Paused);
-    let failure = reported.capture_failure.expect("a reason for the pause");
-    assert!(failure.error.contains("1-1 JOIN"), "{failure:?}");
     assert_eq!(
-        count(&raw, "select count(*) from public.order_view").await,
-        0,
-        "nothing was written to the target"
+        status(&trellis, "order_view").await,
+        Some(TransformStatus::Backfilling)
+    );
+    // The job fills the hidden tables and the target in one transaction and
+    // the definition goes live.
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_eq!(
+        status(&trellis, "order_view").await,
+        Some(TransformStatus::Live)
+    );
+    assert_eq!(
+        raw.query(
+            "select id, who, doubled::text, tier from public.order_view order by id",
+            &[]
+        )
+        .await
+        .expect("the target")
+        .iter()
+        .map(|row| (
+            row.get::<_, i32>(0),
+            row.get::<_, Option<String>>(1),
+            row.get::<_, String>(2),
+            row.get::<_, String>(3)
+        ))
+        .collect::<Vec<_>>(),
+        vec![
+            (
+                1,
+                Some("ann".to_string()),
+                "20.00".to_string(),
+                "gold".to_string()
+            ),
+            (
+                2,
+                Some("bob".to_string()),
+                "11.00".to_string(),
+                "tin".to_string()
+            ),
+            (3, None, "2.50".to_string(), "none".to_string()),
+        ],
+        "a LEFT JOIN keeps the order with no customer"
     );
 
     // `self_check` doesn't compare a 1-1 JOIN yet, and says so.
@@ -923,12 +954,10 @@ async fn drain(raw: &mut Client, pool: &trellis::Pool) {
     panic!("the ring did not quiesce within 16 seal/drain rounds");
 }
 
-/// A change to either side that reaches the drain halts the 1-1 JOIN with
-/// the reason, rather than applying it as a plain 1-1 change of `a` (a target
-/// row computed from `a` alone), and a `TRUNCATE` of either side halts it
-/// rather than clearing nothing. The build start pauses a 1-1 JOIN before any
-/// page applies to it, so the definition is marked live by hand here, as a
-/// later milestone's build would leave it.
+/// A change to `a` is applied by the 1-1 JOIN's page. A change to `b` halts
+/// it with the reason, rather than applying it as a plain 1-1 change (a target
+/// row computed from the one table alone), and a `TRUNCATE` of either side
+/// halts it rather than clearing nothing: those are later milestones'.
 #[tokio::test]
 async fn a_change_reaching_the_drain_halts_a_one_to_one_join_rather_than_apply_it() {
     let _knob = with_knob(true).await;
@@ -938,18 +967,35 @@ async fn a_change_reaching_the_drain_halts_a_one_to_one_join_rather_than_apply_i
     raw.batch_execute(TABLES).await.expect("seed");
     let trellis = define_only(db.dsn()).await;
     trellis.apply(LEFT_JOIN).await.expect("define the 1-1 JOIN");
-    make_live(&raw, "order_view").await;
 
-    // The pass installs both captures; a live definition starts no build.
+    // The passes install both captures and start the build, which fills the
+    // target.
     pass(&mut raw, &db.pool).await;
+    pass(&mut raw, &db.pool).await;
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_eq!(
+        status(&trellis, "order_view").await,
+        Some(TransformStatus::Live)
+    );
+
+    // A change of `a` applies.
+    raw.batch_execute("insert into public.orders values (4, 'emea', 3.00, 1, 'w')")
+        .await
+        .expect("change a");
+    drain(&mut raw, &db.pool).await;
+    assert_eq!(
+        status(&trellis, "order_view").await,
+        Some(TransformStatus::Live)
+    );
+    assert_eq!(
+        count(&raw, "select count(*) from public.order_view").await,
+        4,
+        "the new order reached the target"
+    );
     for (change, reason) in [
         (
-            "insert into public.orders values (4, 'emea', 3.00, 1, 'w')",
-            "a change of a 1-1 JOIN side",
-        ),
-        (
             "update public.customers set name = 'bea' where id = 2",
-            "a change of a 1-1 JOIN side",
+            "a change of the joined table of a 1-1 JOIN",
         ),
         ("truncate public.customers", "a TRUNCATE of a 1-1 JOIN side"),
     ] {
@@ -965,7 +1011,7 @@ async fn a_change_reaching_the_drain_halts_a_one_to_one_join_rather_than_apply_i
         assert!(failure.error.contains(reason), "{change}: {failure:?}");
         assert_eq!(
             count(&raw, "select count(*) from public.order_view").await,
-            0,
+            4,
             "nothing was written to the target"
         );
         make_live(&raw, "order_view").await;

@@ -69,6 +69,9 @@ pub(crate) mod holdup;
 #[cfg(any(test, feature = "test-util"))]
 pub mod interleave;
 pub(crate) mod join;
+pub(crate) mod join_one_to_one;
+#[cfg(any(test, feature = "internals"))]
+pub use join_one_to_one::diverging_keys as one_to_one_join_diverging_keys;
 pub(crate) mod join_status;
 pub(crate) mod ledger;
 pub mod liveness;

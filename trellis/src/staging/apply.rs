@@ -133,6 +133,15 @@ pub enum ApplyError {
     /// the lock inside the transaction instead would insert that placeholder
     /// while holding the other keys' locks, out of I5's one order.
     LedgerEntryCollected { target: String },
+    /// A 1-1 `JOIN` page (`super::join_one_to_one`) found, after locking
+    /// its `J` rows, a join key outside the set it locked: the key an `R`
+    /// entry holds, or the one a Re-derive's live read found, moved between
+    /// the unlocked read that chose the locks and the read under them.
+    /// Transient, with its own attempt budget
+    /// ([`super::quarantine::is_join_key_moved`]): the rolled-back page's
+    /// retry reads the keys again, inside its transaction. Taking the late
+    /// key's `J` lock instead would break lock sorting.
+    JoinKeyMoved { target: String },
     /// Downstream propagation would have staged a `Recompute` row past
     /// `MAX_HOP_GEN`. Named rather than silently truncated: an operator
     /// needs to know a wave ran away, and which target tables it ran away
@@ -295,6 +304,7 @@ impl ApplyError {
             | ApplyError::PageAlreadyCommitted
             | ApplyError::VersionFenceMiss { .. }
             | ApplyError::LedgerEntryCollected { .. }
+            | ApplyError::JoinKeyMoved { .. }
             | ApplyError::HopBoundExceeded { .. }
             | ApplyError::GroupBasisUnsupported { .. }
             | ApplyError::GroupLockGap { .. }
@@ -360,6 +370,11 @@ impl fmt::Display for ApplyError {
             ApplyError::LedgerEntryCollected { target } => write!(
                 f,
                 "a ledger entry of '{target}' was collected while its lock was being taken; \
+                 retry the transaction"
+            ),
+            ApplyError::JoinKeyMoved { target } => write!(
+                f,
+                "a join key of '{target}' moved between the page's unlocked read and its locks; \
                  retry the transaction"
             ),
             ApplyError::GroupBasisUnsupported { target, what } => {
@@ -462,6 +477,7 @@ impl std::error::Error for ApplyError {
             | ApplyError::PageAlreadyCommitted
             | ApplyError::VersionFenceMiss { .. }
             | ApplyError::LedgerEntryCollected { .. }
+            | ApplyError::JoinKeyMoved { .. }
             | ApplyError::HopBoundExceeded { .. }
             | ApplyError::GroupBasisUnsupported { .. }
             | ApplyError::GroupLockGap { .. }
@@ -2248,6 +2264,9 @@ pub struct ApplyPlan {
     /// each with this page's ring rows of either table, keyed by the
     /// definition's bare target name, in target order.
     join_targets: BTreeMap<String, super::join::JoinTargetPlan>,
+    /// The 1-1 `JOIN` targets (`super::join_one_to_one`), keyed by the
+    /// definition's bare target name, in target order.
+    join1_targets: BTreeMap<String, super::join_one_to_one::JoinOneToOnePlan>,
     /// Targets to clear in full at Phase 3, keyed by target table name —
     /// the truncate propagation. See [`ClearPlan`].
     clears: HashMap<String, ClearPlan>,
@@ -2615,6 +2634,9 @@ pub(super) async fn compute_page(
     let mut group_targets: BTreeMap<String, super::group_basis::GroupTargetPlan> = BTreeMap::new();
     // `JOIN` targets, in target order too.
     let mut join_targets: BTreeMap<String, super::join::JoinTargetPlan> = BTreeMap::new();
+    // 1-1 `JOIN` targets, in target order too.
+    let mut join1_targets: BTreeMap<String, super::join_one_to_one::JoinOneToOnePlan> =
+        BTreeMap::new();
     // Every `Some(src_changed)` origin timestamp
     // `buffer_transform_apply_metrics` sees below, buffered per consuming
     // target — filtered into `ApplyPlan::end_to_end_origins` only for
@@ -2772,15 +2794,33 @@ pub(super) async fn compute_page(
                 }
                 continue;
             }
-            // A 1-1 JOIN's apply is not built yet (ADR-0021, #1396). Without
-            // this it would fall through to the plain 1-1 plan below and
-            // write `a`'s row with the join's fields evaluated over `a`
-            // alone, so it halts.
+            // A 1-1 JOIN takes each change as it is, routed to the side this
+            // source is; Phase 3 applies them (`super::join_one_to_one`).
+            // Without this it would fall through to the plain 1-1 plan below
+            // and write `a`'s row with the join's fields evaluated over `a`
+            // alone.
             if crate::defs::join::is_one_to_one(&def.def) {
-                return Err(ApplyError::GroupBasisUnsupported {
-                    target: def.def.target.clone(),
-                    what: "a change of a 1-1 JOIN side (its apply path is not built yet)",
-                });
+                let side = if canonical_of(qualified_source) == canonical_of(&def.source_table) {
+                    crate::defs::join::Side::From
+                } else {
+                    crate::defs::join::Side::Joined
+                };
+                let target_plan = match join1_targets.entry(def.def.target.clone()) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(super::join_one_to_one::plan_for(pool, def, pk.clone()).await?)
+                    }
+                };
+                for change in changes.iter() {
+                    target_plan.push(side, change)?;
+                    buffer_transform_apply_metrics(
+                        &def.def.target,
+                        change,
+                        &mut end_to_end_origins,
+                        &mut transform_observations,
+                    );
+                }
+                continue;
             }
             // An aggregate on the group basis takes each change's
             // ring rows as they are; Phase 3 sums their sides
@@ -3069,6 +3109,7 @@ pub(super) async fn compute_page(
     all_targets.extend(clears.keys());
     all_targets.extend(group_targets.keys());
     all_targets.extend(join_targets.keys());
+    all_targets.extend(join1_targets.keys());
     all_targets.extend(aggregate_clears.keys());
     // Only the
     // terminal-filtered subset of `end_to_end_origins` survives into
@@ -3133,6 +3174,7 @@ pub(super) async fn compute_page(
         targets,
         group_targets,
         join_targets,
+        join1_targets,
         clears,
         aggregate_clears,
         poisoned_park,
@@ -4511,6 +4553,20 @@ pub(crate) async fn apply_page(
         keys_deleted += deleted;
     }
 
+    // 3d. 1-1 `JOIN` targets, in target order.
+    for join1_plan in plan.join1_targets.values() {
+        let (written, deleted) = super::join_one_to_one::apply_page(
+            txn,
+            join1_plan,
+            page_first_seg,
+            page_seg,
+            &mut mutations,
+        )
+        .await?;
+        keys_written += written;
+        keys_deleted += deleted;
+    }
+
     // 4. Downstream propagation, with the hop bound checked before staging
     // anything. Every key a write above physically changed, for
     // every target some `live` definition reads, becomes one image-less
@@ -4594,6 +4650,7 @@ pub(crate) async fn apply_page(
         .map(|t| &t.qualified_target)
         .chain(plan.group_targets.values().map(|t| &t.target))
         .chain(plan.join_targets.values().map(|t| &t.target))
+        .chain(plan.join1_targets.values().map(|t| &t.shape.target))
     {
         super::interleave::pause_at(txn, super::interleave::PausePoint::BeforeCommit, target)
             .await?;
@@ -4888,6 +4945,11 @@ pub struct ManyApplyOutcome {
 /// definition churn), rather than retrying forever.
 const MAX_APPLY_ATTEMPTS: u32 = 5;
 
+/// How many times a 1-1 `JOIN` page may roll back on
+/// [`ApplyError::JoinKeyMoved`] before the failure surfaces: its own budget,
+/// apart from [`MAX_APPLY_ATTEMPTS`] (see `retry_or_surface`).
+pub(crate) const JOIN_KEY_MOVED_ATTEMPTS: u32 = 20;
+
 /// How long one page keeps retrying lock timeouts (ADR-0002 I7)
 /// before [`drain_batch`] surfaces the last one and the worker releases the
 /// claim. Each retry holds no transaction; the bound is on how long a worker
@@ -4912,6 +4974,9 @@ struct TransientRetry {
     next: Option<Duration>,
     /// When this page first hit `lock_timeout`.
     first_lock_timeout: Option<std::time::Instant>,
+    /// How many times this page found a join key moved
+    /// ([`ApplyError::JoinKeyMoved`]), against [`JOIN_KEY_MOVED_ATTEMPTS`].
+    key_moved: u32,
 }
 
 impl TransientRetry {
@@ -5716,6 +5781,27 @@ async fn retry_or_surface(
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
+            Ok(())
+        }
+        // A 1-1 JOIN page whose key moved under it
+        // ([`ApplyError::JoinKeyMoved`]): rolled back, and the retry reads
+        // its keys again inside the transaction, so it converges unless
+        // the key moves on every attempt. Its own budget, since a hot key
+        // moving is no failure of the page; it is no attempt at the page
+        // either.
+        quarantine::FailureClass::Transient if quarantine::is_join_key_moved(&err) => {
+            transient.key_moved += 1;
+            if transient.key_moved > JOIN_KEY_MOVED_ATTEMPTS {
+                crate::instance_log::warn!(
+                    seg_seq,
+                    moved = transient.key_moved,
+                    error = %err,
+                    "join key moved on every attempt; surfacing the failure"
+                );
+                return Err(Surface::Plain(err));
+            }
+            crate::instance_log::debug!(seg_seq, error = %err, "join key moved; retrying");
+            *attempts -= 1;
             Ok(())
         }
         // A lock wait that hit `lock_timeout` (ADR-0002 I7):

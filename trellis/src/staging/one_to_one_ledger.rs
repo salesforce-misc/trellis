@@ -83,6 +83,10 @@ pub(crate) struct LedgerRef {
     /// `transform_definitions` row, which holds the build the build-start
     /// rule reads ([`super::ledger::page_may_predate_build`]).
     pub owner_target: String,
+    /// Whether this is a hidden ledger (a 1-1 `JOIN`'s `R` or `M`), which the
+    /// `join1_*` plants reach.
+    #[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
+    pub hidden: bool,
 }
 
 impl LedgerRef {
@@ -93,13 +97,13 @@ impl LedgerRef {
             floor_key: target.to_string(),
             label: target.to_string(),
             owner_target: target.to_string(),
+            hidden: false,
         }
     }
 
     /// The hidden ledger `table` of definition `id` in `catalog_schema`,
-    /// whose target is `owner_target`. The `JOIN`'s page code builds its
-    /// ledgers with it; the tests below exercise it until that lands.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// whose target is `owner_target`. A 1-1 `JOIN`'s page and build
+    /// (`super::join_one_to_one`) work on its ledgers through it.
     pub(crate) fn hidden(
         catalog_schema: &str,
         id: i64,
@@ -112,6 +116,7 @@ impl LedgerRef {
             label: format!("{catalog_schema}.{}", table.name(id)),
             ident,
             owner_target: owner_target.to_string(),
+            hidden: true,
         }
     }
 }
@@ -166,8 +171,17 @@ pub(crate) async fn lock_entries(
     } else {
         "true"
     };
-    let rows = txn
-        .query(
+    // Planted bug: a hidden ledger's page inserts no placeholders. See
+    // `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let no_placeholders =
+        crate::plant::fires(crate::plant::Plant::Join1NoPlaceholder, ledger.hidden);
+    #[cfg(not(any(test, feature = "test-util")))]
+    let no_placeholders = false;
+    let rows = if no_placeholders {
+        Vec::new()
+    } else {
+        txn.query(
             &format!(
                 "with v as ( \
                      select u.__k, u.__lsn::pg_lsn as __lsn, u.__present \
@@ -186,7 +200,8 @@ pub(crate) async fn lock_entries(
             ),
             &[&keys, &lsns, &present, &ledger.floor_key, &seg_seq],
         )
-        .await?;
+        .await?
+    };
     let mut inserted = Inserted::default();
     for row in rows {
         let key: String = row.get(0);
@@ -374,10 +389,22 @@ fn update_statement(ledger: &LedgerRef, predicate: bool) -> String {
         q(schema::APPLIED_SEG_COLUMN),
         q(schema::TOMBSTONE_COLUMN),
     );
-    let predicate = if predicate {
-        super::ledger::apply_predicate()
-    } else {
+    let predicate = if !predicate {
         "true".to_string()
+    } else {
+        // Planted bugs: only one of I2's two checks. See `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        let (no_visibility, no_position) = (
+            crate::plant::fires(crate::plant::Plant::Join1LsnOnly, ledger.hidden),
+            crate::plant::fires(crate::plant::Plant::Join1VisOnly, ledger.hidden),
+        );
+        #[cfg(not(any(test, feature = "test-util")))]
+        let (no_visibility, no_position) = (false, false);
+        if no_visibility || no_position {
+            super::ledger::apply_predicate_without(no_visibility, no_position)
+        } else {
+            super::ledger::apply_predicate()
+        }
     };
     format!(
         "with v as ( \

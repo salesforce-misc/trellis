@@ -29,8 +29,10 @@
 //! `trellis::dev::defs::set_one_to_one_join(true)` before a client starts.
 //! The gate is at define (`super::validate_join_one_to_one`), never at parse,
 //! so a definition stored while the knob was on still loads with it off.
-//! Until the apply and build paths exist, a definition defined with the knob
-//! on is held at its build start, not run wrong.
+//! The `FROM` side's page and a one-transaction build run
+//! (`crate::staging::join_one_to_one`); a change of the joined side, a
+//! `TRUNCATE` of either side and a schema change halt the transform with the
+//! reason rather than run wrong.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};

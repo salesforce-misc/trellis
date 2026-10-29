@@ -85,6 +85,10 @@ pub enum PlantPath {
     GroupBasisWriter,
     /// A `JOIN`.
     Join,
+    /// A 1-1 `JOIN` (ADR-0021): no tier draws one yet, so these plants are
+    /// pinned by `trellis`'s `join_one_to_one_interleavings` until the
+    /// generative tier of milestone 9 (#1404) gates them.
+    OneToOneJoin,
 }
 
 /// The path `plant` breaks.
@@ -103,6 +107,14 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::JoinOtherSideBeforeJ
         | Plant::JoinDropFlip
         | Plant::JoinTSkipLock => PlantPath::Join,
+        Plant::Join1NoJLock
+        | Plant::Join1NoRecheck
+        | Plant::Join1LsnOnly
+        | Plant::Join1VisOnly
+        | Plant::Join1NoEntryLock
+        | Plant::Join1OldKeyUnlocked
+        | Plant::Join1SnapshotAfterRead
+        | Plant::Join1NoPlaceholder => PlantPath::OneToOneJoin,
     }
 }
 
@@ -120,6 +132,7 @@ pub fn plant_reaches(plant: &str, key_space: &KeySpace) -> bool {
         PlantPath::GroupBasis => aggregate,
         PlantPath::GroupBasisWriter => aggregate || join,
         PlantPath::Join => join,
+        PlantPath::OneToOneJoin => matches!(key_space, KeySpace::JoinOneToOne(_)),
     }
 }
 
@@ -617,6 +630,10 @@ mod tests {
                 }
                 PlantPath::OneToOne => {
                     assert!(plant_reaches(name, &one_to_one), "{name}");
+                    assert!(!plant_reaches(name, &group_by), "{name}");
+                }
+                PlantPath::OneToOneJoin => {
+                    assert!(!plant_reaches(name, &one_to_one), "{name}");
                     assert!(!plant_reaches(name, &group_by), "{name}");
                 }
             }

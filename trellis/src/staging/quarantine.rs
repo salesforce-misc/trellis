@@ -168,6 +168,14 @@ pub fn classify(err: &ApplyError) -> FailureClass {
     }
 }
 
+/// Whether `err` is a 1-1 `JOIN` page's [`ApplyError::JoinKeyMoved`]: a
+/// transient failure with its own retry budget (`super::apply`'s
+/// `retry_or_surface`), because a hot key can move on several attempts in a
+/// row without anything being wrong.
+pub(crate) fn is_join_key_moved(err: &ApplyError) -> bool {
+    matches!(innermost_apply_error(err), ApplyError::JoinKeyMoved { .. })
+}
+
 /// The last [`ApplyError`] on `err`'s [`std::error::Error::source`] chain,
 /// `err` itself if it nests none. See [`classify`].
 pub(super) fn innermost_apply_error(err: &ApplyError) -> &ApplyError {
@@ -222,7 +230,9 @@ fn is_transient(err: &ApplyError) -> bool {
 pub(crate) fn is_transient_error(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut link: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(err) = link {
-        if let Some(ApplyError::LedgerEntryCollected { .. }) = err.downcast_ref::<ApplyError>() {
+        if let Some(ApplyError::LedgerEntryCollected { .. } | ApplyError::JoinKeyMoved { .. }) =
+            err.downcast_ref::<ApplyError>()
+        {
             return true;
         }
         if let Some(pg) = err.downcast_ref::<tokio_postgres::Error>() {
@@ -7335,6 +7345,24 @@ mod unit_tests {
         assert_eq!(classify(&wrapped), FailureClass::Transient);
         assert!(is_transient_error(&collected()));
         assert!(is_transient_error(&wrapped));
+    }
+
+    /// A 1-1 JOIN page whose key moved is transient, charges no key, and has
+    /// a retry budget of its own, so `retry_or_surface` can tell it apart.
+    #[test]
+    fn a_moved_join_key_is_transient_with_a_budget_of_its_own() {
+        use crate::defs::backfill::BackfillError;
+        let moved = || ApplyError::JoinKeyMoved {
+            target: "public.jl".to_string(),
+        };
+        let wrapped = ApplyError::Backfill(BackfillError::Propagation(Box::new(moved())));
+        assert_eq!(classify(&moved()), FailureClass::Transient);
+        assert_eq!(classify(&wrapped), FailureClass::Transient);
+        assert!(is_transient_error(&moved()) && is_transient_error(&wrapped));
+        assert!(is_join_key_moved(&moved()) && is_join_key_moved(&wrapped));
+        assert!(!is_join_key_moved(&ApplyError::LedgerEntryCollected {
+            target: "public.jl".to_string()
+        }));
     }
 
     #[test]
