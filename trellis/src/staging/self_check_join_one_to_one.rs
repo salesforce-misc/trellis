@@ -512,15 +512,19 @@ pub(super) async fn compare(
     })
 }
 
-/// The type of each column of `table` as a cast names it.
+/// The type of each column of `table` as a cast names it: the apply's own
+/// rendering of a column's type (`type_sql`, ADR-0020), with no modifier.
 async fn column_types(pool: &Pool, table: &str) -> Result<HashMap<String, String>, SelfCheckError> {
     let client = pool.get().await?;
     let rows = client
         .query(
-            "select a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod) \
-             from pg_catalog.pg_attribute a \
-             where a.attrelid = pg_catalog.to_regclass($1) and a.attnum > 0 \
-               and not a.attisdropped",
+            &format!(
+                "select a.attname::text, {} \
+                 from pg_catalog.pg_attribute a \
+                 where a.attrelid = pg_catalog.to_regclass($1) and a.attnum > 0 \
+                   and not a.attisdropped",
+                crate::defs::copy_type::type_sql("a.atttypid")
+            ),
             &[&ddl::regclass_arg(table)],
         )
         .await?;

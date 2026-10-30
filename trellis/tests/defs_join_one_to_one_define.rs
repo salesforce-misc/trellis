@@ -673,13 +673,17 @@ async fn define_registers_both_tables_the_target_and_the_hidden_tables() {
         status(&trellis, "order_view").await,
         Some(TransformStatus::WaitingToBackfill)
     );
-    // Not an aggregate JOIN: its status carries no hidden-table sizes.
+    // Its status carries the sizes of `R`, `M` and `J`, not an aggregate
+    // JOIN's `P`, `M`, `J` and `T`.
     let reported = trellis
         .status("order_view")
         .await
         .expect("status")
         .expect("defined");
-    assert!(reported.join.is_none(), "{:?}", reported.join);
+    let join = reported.join.expect("a 1-1 JOIN reports its join status");
+    let tables: Vec<_> = join.hidden_tables.iter().map(|t| t.table).collect();
+    assert_eq!(tables, ["R", "M", "J"]);
+    assert_eq!(join.partials_warning, None);
 
     // The catalog row names both tables, and the edges and fences cover both.
     let row = raw
@@ -922,16 +926,17 @@ async fn a_build_start_runs_the_minimal_build_of_a_one_to_one_join() {
         "a LEFT JOIN keeps the order with no customer"
     );
 
-    // `self_check` doesn't compare a 1-1 JOIN yet, and says so.
-    let err = trellis
+    // `self_check` accepts a 1-1 JOIN: it starts the job (its comparison is
+    // `join_one_to_one_self_check.rs`'s).
+    let job = trellis
         .self_check(
             "order_view",
             trellis::SelfCheckMode::Standard,
             std::time::Duration::from_secs(5),
         )
         .await
-        .expect_err("a 1-1 JOIN isn't compared yet");
-    assert!(err.to_string().contains("1-1 JOIN"), "{err}");
+        .expect("a 1-1 JOIN is compared");
+    assert_eq!(job.target, "order_view");
 
     // `ALTER TRANSFORM` doesn't edit one yet, and names what it is.
     let err = trellis
