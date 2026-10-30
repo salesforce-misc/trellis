@@ -91,8 +91,9 @@ number, a string, a `(` or a `-`), so `NOT -x > 0` is `NOT ((-x) > 0)`. A bare
 identifier is never a word Postgres reserves (`not`, `case`, `end`, `order`,
 `user`, `true`...): the grammar has no quoted identifiers, so such a source
 column is read qualified with its table (`orders.order`), as Postgres allows,
-and `orders.order AS order` is the passthrough of that column, as `order AS order`
-would be; the refusal says so ([ADR-0022](0022-grammar-mirrors-postgres.md)). `AT TIME ZONE`
+and the refusal says so ([ADR-0022](0022-grammar-mirrors-postgres.md)).
+`orders.order AS order` passes that column through, as `order AS order`
+would. `AT TIME ZONE`
 binds tighter than `*` and looser than prefix `-`. Values
 carry a Postgres type (the ones [type support](../type-support.md) lists), and
 every operator/function's argument and return types are type-checked at
