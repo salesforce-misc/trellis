@@ -3952,16 +3952,22 @@ fn check_one_to_one_target_width(key_columns: usize, fields: usize) -> Result<()
 ///
 /// A column that is dropped keeps its attribute number (`relnatts` never
 /// shrinks), so it counts against the limit until the table is created again,
-/// and a column an edit drops counts the same from then on. An `ADD` of a
-/// column the target has already creates nothing (`add column if not exists`).
+/// and a column an edit drops counts the same from then on. The edit drops
+/// its columns before it adds any, so an `ADD` creates a column unless the
+/// target still has one of that name once the drops are made (`add column if
+/// not exists`): `DROP z, ADD ... AS z` creates a new `z`.
 fn alter_target_overflow(
     relnatts: usize,
     live: &HashSet<String>,
     drops: &[String],
     adds: &[FieldDef],
 ) -> Option<(usize, usize)> {
-    let new = adds.iter().filter(|f| !live.contains(&f.name)).count();
-    let after_edit = live.len() - drops.iter().filter(|d| live.contains(*d)).count() + new;
+    let kept = live.iter().filter(|c| !drops.contains(*c)).count();
+    let new = adds
+        .iter()
+        .filter(|f| !live.contains(&f.name) || drops.contains(&f.name))
+        .count();
+    let after_edit = kept + new;
     if after_edit > super::validate::TABLE_MAX_COLUMNS {
         return Some((after_edit, 0));
     }
@@ -7549,6 +7555,16 @@ mod alter_target_width_tests {
         assert_eq!(
             alter_target_overflow(1600, &live(1600), &names(&["c0"]), &[field("x")]),
             Some((1601, 1))
+        );
+        // Dropping `c3` and adding it back makes a new `c3`, whose number is
+        // a 1601st attribute.
+        assert_eq!(
+            alter_target_overflow(1600, &live(1600), &names(&["c3"]), &[field("c3")]),
+            Some((1601, 1))
+        );
+        assert_eq!(
+            alter_target_overflow(1599, &live(1599), &names(&["c3"]), &[field("c3")]),
+            None
         );
         // Columns dropped by earlier edits count the same.
         assert_eq!(

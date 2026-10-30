@@ -595,6 +595,17 @@ async fn an_alter_counts_the_columns_postgres_keeps_for_dropped_fields() {
     let trellis = live_wide_target(&db, 1599).await;
     assert_eq!(columns_of(&db.pool, "public.al").await, 1600);
 
+    // Replacing a field in one edit (`DROP z, ADD ... AS z`, the path for a
+    // change of result type) drops its column and adds a new one, so it
+    // needs a 1601st attribute although the name is already there.
+    let err = trellis
+        .apply("ALTER TRANSFORM al DROP f5, ADD v + 5000 AS f5")
+        .await
+        .expect_err("the replacing column needs a 1601st attribute");
+    let (columns, dropped, _) = too_wide_alter(err);
+    assert_eq!((columns, dropped), (1601, 1));
+    assert_eq!(columns_of(&db.pool, "public.al").await, 1600);
+
     // Dropping a field frees no attribute number: the 1600 columns' worth of
     // numbers are still taken, so Postgres refuses the added column.
     trellis
