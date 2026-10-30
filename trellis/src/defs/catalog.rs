@@ -1593,9 +1593,13 @@ pub async fn alter_transform(
         });
     }
     if !matches!(current.def.key_space, KeySpace::OneToOne) {
+        let kind = match current.def.key_space {
+            KeySpace::JoinOneToOne(_) => "a 1-1 JOIN",
+            _ => "an aggregate (GROUP BY) transform",
+        };
         return Err(CatalogError::UnsupportedAlter(format!(
-            "'{}' is an aggregate (GROUP BY) transform; ALTER TRANSFORM only supports 1-1 \
-             transforms in this release",
+            "'{}' is {kind}; ALTER TRANSFORM only supports 1-1 transforms of one table \
+             in this release",
             alter.target
         )));
     }

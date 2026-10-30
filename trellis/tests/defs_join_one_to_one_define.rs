@@ -932,6 +932,20 @@ async fn a_build_start_runs_the_minimal_build_of_a_one_to_one_join() {
         .await
         .expect_err("a 1-1 JOIN isn't compared yet");
     assert!(err.to_string().contains("1-1 JOIN"), "{err}");
+
+    // `ALTER TRANSFORM` doesn't edit one yet, and names what it is.
+    let err = trellis
+        .apply("ALTER TRANSFORM order_view ADD orders.id AS id2")
+        .await
+        .expect_err("a 1-1 JOIN isn't edited yet");
+    assert!(
+        matches!(
+            err,
+            trellis::TrellisError::Catalog(CatalogError::UnsupportedAlter(_))
+        ),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("is a 1-1 JOIN"), "{err}");
 }
 
 #[tokio::test]
