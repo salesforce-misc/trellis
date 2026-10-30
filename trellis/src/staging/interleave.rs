@@ -257,8 +257,13 @@ pub enum PausePoint {
     /// locked set.
     AfterJoin1Read,
     /// On a 1-1 `JOIN` target, after the page wrote its entries, before it
-    /// reads `M` to recompute the target rows.
+    /// reads `M` to recompute the target rows. A build chunk stops here too.
     BeforeJoin1Recompute,
+    /// On a 1-1 `JOIN` target, after a rebuild sweep's orphan pass read a
+    /// batch of target rows no live `R` entry backs, before it locks and
+    /// re-derives them (`super::build`'s sweep job). Nothing of theirs is
+    /// locked here, so a page can apply a change of their rows.
+    AfterJoin1OrphanRead,
     /// After a Re-derive's live read of the source (on a 1-1 ledger, a
     /// forced group recompute).
     AfterRederiveRead,

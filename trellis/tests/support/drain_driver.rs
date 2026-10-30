@@ -351,6 +351,7 @@ impl Driver {
         RunningDrain {
             handle: Some(handle),
             frozen,
+            ended: None,
         }
     }
 
@@ -368,6 +369,7 @@ impl Driver {
         Running {
             handle: Some(handle),
             frozen,
+            ended: None,
         }
     }
 
@@ -521,6 +523,9 @@ pub type RunningDrain = Running<Option<ApplyOutcome>>;
 pub struct Running<T> {
     handle: Option<JoinHandle<Result<T, ApplyError>>>,
     frozen: Vec<Frozen>,
+    /// What the task returned, once [`Running::reached_or_finished`] saw it
+    /// end.
+    ended: Option<Result<T, ApplyError>>,
 }
 
 impl<T> Running<T> {
@@ -551,6 +556,31 @@ impl<T> Running<T> {
         }
     }
 
+    /// Waits until the worker is frozen at `point` (`Some`), or until it
+    /// finishes, or fails, without reaching it (`None`): a worker that rolls
+    /// back and gives up before `point`. [`Self::finish_result`] then returns
+    /// what it returned.
+    #[allow(dead_code)]
+    pub async fn reached_or_finished(&mut self, point: PausePoint) -> Option<Reached> {
+        let frozen = self
+            .frozen
+            .iter_mut()
+            .find(|f| f.point == point)
+            .unwrap_or_else(|| panic!("{point:?} was not armed"));
+        let rx = frozen.reached.take().expect("reached() once per point");
+        let handle = self.handle.as_mut().expect("drain still running");
+        let finished = tokio::select! {
+            reached = rx => match reached {
+                Ok(reached) => return Some(reached),
+                Err(_) => handle.await,
+            },
+            finished = &mut *handle => finished,
+        };
+        self.handle = None;
+        self.ended = Some(finished.expect("task"));
+        None
+    }
+
     /// Whether the task has finished, without waiting for it.
     pub fn is_finished(&self) -> bool {
         self.handle
@@ -578,6 +608,9 @@ impl<T> Running<T> {
             self.frozen.is_empty(),
             "release every armed point before finishing the task"
         );
+        if let Some(ended) = self.ended.take() {
+            return ended;
+        }
         self.handle.take().expect("task").await.expect("task")
     }
 }

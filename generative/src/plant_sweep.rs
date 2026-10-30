@@ -117,7 +117,11 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::Join1RdNoKey
         | Plant::Join1BrdNoKey
         | Plant::Join1NoPlaceholder
-        | Plant::Join1MBeforeJ => PlantPath::OneToOneJoin,
+        | Plant::Join1MBeforeJ
+        | Plant::Join1ChunkNoKey
+        | Plant::Join1NoOrphanPass
+        | Plant::Join1OrphanDelete
+        | Plant::Join1SweepROnly => PlantPath::OneToOneJoin,
     }
 }
 

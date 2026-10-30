@@ -430,13 +430,13 @@ async fn the_chunk_plan_setting_ends_with_its_statement() {
     txn.commit().await.expect("commit the sweep batch");
 }
 
-/// The sweep's orphan walk pages by key cursor: with more orphans (target
-/// rows no live entry backs, whose source rows are gone) than one batch
-/// takes, every batch returns a cursor past the last orphan it took, the
-/// cursors strictly increase, the walk ends on the first short batch, and no
-/// orphan it passed is left. A batch looks only after its cursor: an orphan
-/// planted behind it after the first batch is left to the next sweep, which
-/// removes it.
+/// The sweep's orphan walk pages by key cursor: with more target rows than
+/// one batch reads, and seven orphans among them (target rows no live entry
+/// backs, whose source rows are gone), every batch returns a cursor past the
+/// last target row it read in the target's key order, the cursors strictly
+/// increase, the walk ends on the first short batch, and no orphan it passed
+/// is left. A batch looks only after its cursor: an orphan planted behind it
+/// after the first batch is left to the next sweep, which removes it.
 #[tokio::test]
 async fn the_orphan_walk_pages_by_key_cursor_and_removes_every_orphan() {
     let (d, plan) = start_build(&[(1, 1, 1)]).await;
@@ -476,14 +476,15 @@ async fn the_orphan_walk_pages_by_key_cursor_and_removes_every_orphan() {
         seen.push(next.clone());
         cursor = Some(next);
         if batches == 1 {
-            // Behind the cursor ('100' sorts before '101').
+            // Behind the cursor (100 comes before 102).
             d.ctl
                 .batch_execute("insert into public.one (id, g, dbl) values (100, 1, 2)")
                 .await
                 .expect("an orphan behind the cursor");
         }
     }
-    // 7 orphans in batches of 3: two full batches, then a short one.
+    // 8 target rows (one backed) in batches of 3: two full batches, then a
+    // short one.
     assert_eq!(batches, 3, "the cursors: {seen:?}");
     let left = async || -> Vec<i32> {
         d.ctl

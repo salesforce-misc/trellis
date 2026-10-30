@@ -167,6 +167,7 @@ use super::quarantine;
 
 mod join_one_to_one;
 pub mod one_to_one;
+mod orphans;
 
 /// How long a plan job waits before it looks at its fence again (F6).
 const FENCE_RETRY: Duration = Duration::from_millis(500);
@@ -179,7 +180,7 @@ pub struct SweepOutcome {
     /// The live entries among them the build hadn't re-derived, which the
     /// batch re-derived.
     pub rederived: usize,
-    /// The next batch's cursor, past the last ledger entry or orphan it
+    /// The next batch's cursor, past the last ledger entry or target row it
     /// read (`one_to_one::SweepCursor`). `None` when it read none.
     pub next: Option<String>,
     /// It read fewer than it was allowed: the sweep is done.
@@ -503,7 +504,9 @@ pub(crate) async fn resume_released_dependents(
 /// change committed before it is visible to every chunk's snapshot.
 ///
 /// A definition whose ledger isn't empty (a resumed one, F3) also gets a
-/// sweep job ([`run_sweep`]). Both rows carry the start's transaction id,
+/// sweep job ([`run_sweep`]); a 1-1 `JOIN` gets one whenever its target
+/// isn't empty, since its resume recreates `R` and `M` empty and keeps the
+/// target (`join_one_to_one`). Both rows carry the start's transaction id,
 /// which the sweep's filter reads: every chunk's snapshot is taken after
 /// the start commits, so its `xmax` is past that id.
 ///
@@ -561,14 +564,28 @@ async fn start(
     let ledger = ddl::qualified_target_table_ident(&crate::defs::ledger::ledger_table_name(
         &definition.target_table,
     ));
-    // A group-basis definition has no ledger, and nothing to sweep.
-    // A 1-1 JOIN has none either: its minimal build fills everything.
-    let empty: bool = takes_group_basis(definition)
-        || crate::defs::join::is_one_to_one(&definition.def)
-        || txn
-            .query_one(&format!("select not exists (select 1 from {ledger})"), &[])
-            .await?
-            .get(0);
+    // A group-basis definition has no ledger, and nothing to sweep. A 1-1
+    // JOIN's sweep is needed whenever its target has rows: a resume
+    // recreates `R` and `M` empty and keeps the target, whose rows of `a`
+    // rows deleted while it was paused only the sweep's orphan pass removes.
+    let join1 = crate::defs::join::is_one_to_one(&definition.def);
+    let empty: bool = if join1 {
+        txn.query_one(
+            &format!(
+                "select not exists (select 1 from {})",
+                ddl::qualified_target_table_ident(&definition.target_table)
+            ),
+            &[],
+        )
+        .await?
+        .get(0)
+    } else {
+        takes_group_basis(definition)
+            || txn
+                .query_one(&format!("select not exists (select 1 from {ledger})"), &[])
+                .await?
+                .get(0)
+    };
     txn.execute(
         "update transform_definitions set status = $2, build = $3 where id = $1",
         &[
@@ -600,12 +617,7 @@ async fn start(
     // The start's segment, last, so the share lock that keeps the
     // active segment from sealing until this commits is held only for the
     // commit. See this function's doc.
-    txn.execute(
-        "update transform_definitions set build_seg = p.active_seq \
-         from (select active_seq from segment_pointer for share) p where id = $1",
-        &[&definition.id],
-    )
-    .await?;
+    stamp_rebuild_seg(&txn, &[definition.id]).await?;
     txn.commit().await?;
     crate::instance_log::info!(
         definition_id = definition.id,
@@ -681,9 +693,9 @@ pub(crate) async fn rebuildable(
 /// A group-basis definition (one with a hidden group table,
 /// `super::group_basis`, or a `JOIN`'s hidden tables) gets the sweep job
 /// alone, which recomputes its groups in place ([`run_group_rebuild`]). A
-/// 1-1 `JOIN` gets the plan job alone: its build re-derives every entry and
-/// turns the ones whose rows are gone into tombstones
-/// (`super::join_one_to_one::build`).
+/// 1-1 `JOIN` gets both, as a plain 1-1 target does: its sweep re-derives
+/// the stale entries of `R` and `M` and the target rows no `R` entry backs
+/// (`join_one_to_one`).
 ///
 /// The definition applies throughout (B1), as it did before the call. The
 /// caller holds each definition's row `for update`, and calls
@@ -724,17 +736,10 @@ pub(crate) async fn start_rebuilds(
                        where c.relname in ({hidden}, {join_hidden}) \
                          and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
                                                where oid = 'transform_definitions'::regclass))) \
-                   and ($2 <> '{sweep}' or not exists ( \
-                       select 1 from pg_catalog.pg_class c \
-                       where c.relname = {join1_hidden} \
-                         and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
-                                               where oid = 'transform_definitions'::regclass))) \
                  order by id",
                 sweep = chunk_queue::KIND_SWEEP,
                 hidden = super::group_basis::hidden_table_name_sql("d.id"),
                 join_hidden = crate::defs::join::HiddenTable::TruncateLock.name_sql("d.id"),
-                join1_hidden =
-                    crate::defs::join_one_to_one::HiddenTable::TruncateLock.name_sql("d.id"),
             ),
             &[&ids, &kind],
         )
@@ -756,12 +761,40 @@ pub(crate) async fn start_rebuilds(
 /// [`start`] does for a build it starts. Last, so the share lock that keeps
 /// the active segment from sealing until the transaction commits is held
 /// only for the commit.
+///
+/// A 1-1 `JOIN` among `ids` has its pair's lock row taken `FOR UPDATE` first
+/// (ADR-0021's build start, as the #1375 model starts a build): a page holds
+/// it `FOR SHARE` from before it reads its key set until it commits, so the
+/// start waits out every page in flight on the definition, and a page that
+/// comes after reads the build's segment.
 pub(crate) async fn stamp_rebuild_seg(
     txn: &impl GenericClient,
     ids: &[i64],
 ) -> Result<(), tokio_postgres::Error> {
     if ids.is_empty() {
         return Ok(());
+    }
+    let lock_rows = txn
+        .query(
+            &format!(
+                "select pg_catalog.quote_ident(n.nspname) || '.' \
+                        || pg_catalog.quote_ident(c.relname) \
+                 from transform_definitions d \
+                 join pg_catalog.pg_class c on c.relname = {lock} \
+                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                 where d.id = any($1) \
+                   and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
+                                         where oid = 'transform_definitions'::regclass) \
+                 order by d.id",
+                lock = crate::defs::join_one_to_one::HiddenTable::TruncateLock.name_sql("d.id"),
+            ),
+            &[&ids],
+        )
+        .await?;
+    for row in lock_rows {
+        let lock: String = row.get(0);
+        txn.execute(&format!("select 1 from {lock} for update"), &[])
+            .await?;
     }
     txn.execute(
         "update transform_definitions set build_seg = p.active_seq \
@@ -1366,6 +1399,9 @@ async fn run_rederive(
     // whatever the key's collation is now.
     let key_collations = chunk.key_collations.as_deref();
     let plan = match &chunk.fields {
+        None if crate::defs::join::is_one_to_one(&definition.def) => ChunkPlan::Join(
+            join_one_to_one::JoinPlan::load(pool, &definition, key_collations).await?,
+        ),
         None => {
             let mut plan = one_to_one_plan(pool, &definition).await?;
             plan.pin_key_collations(key_collations);
@@ -1419,6 +1455,7 @@ async fn run_rederive(
                 .map_err(build_error)?;
             outcome.keys
         }
+        ChunkPlan::Join(plan) => join_one_to_one::run_chunk(&txn, plan, lo, hi).await?,
         ChunkPlan::Field(FieldPlan::OneToOne(plan, fields)) => {
             let outcome = one_to_one::run_field_chunk(&txn, plan, fields, lo, hi)
                 .await
@@ -1444,6 +1481,8 @@ async fn run_rederive(
 enum ChunkPlan {
     /// A whole build's chunk.
     Whole(one_to_one::OneToOnePlan),
+    /// A 1-1 `JOIN`'s build chunk.
+    Join(join_one_to_one::JoinPlan),
     /// A field build's chunk.
     Field(FieldPlan),
 }
@@ -1808,9 +1847,8 @@ async fn run_plan(
         )
         .await;
     }
-    // A 1-1 `JOIN`'s fresh build, resume or rebuild is its whole build, the
-    // minimal one: `M`, `R`, `J` and the target in one transaction
-    // (ADR-0021).
+    // A 1-1 `JOIN`'s build re-derives every `b` row before it walks `a`, so
+    // every chunk reads the `M` the build made (`join_one_to_one`).
     if crate::defs::join::is_one_to_one(&definition.def) {
         if chunk.fields.is_some() {
             return Err(build_error(ApplyError::GroupBasisUnsupported {
@@ -1818,7 +1856,10 @@ async fn run_plan(
                 what: "a field build of a 1-1 JOIN (its schema-change path is not built yet)",
             }));
         }
-        return join_one_to_one::run(pool, chunk, claimed_by, &definition, &fence).await;
+        if cursor.is_none() && !join_one_to_one::build_m(pool, &definition, &fence, options).await?
+        {
+            return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
+        }
     }
     // A plain group-basis aggregate's fresh build or resume is its whole
     // build: one absolute write of every group, as a rebuild of a live
@@ -2763,7 +2804,11 @@ async fn run_sweep(
         )
         .await;
     }
-    let plan = one_to_one_plan(pool, &definition).await?;
+    let plan = if crate::defs::join::is_one_to_one(&definition.def) {
+        SweepPlan::Join(join_one_to_one::JoinPlan::load(pool, &definition, None).await?)
+    } else {
+        SweepPlan::OneToOne(one_to_one_plan(pool, &definition).await?)
+    };
     let _heartbeat = chunk_queue::ChunkHeartbeat::spawn(
         pool.clone(),
         chunk.id,
@@ -2804,9 +2849,17 @@ async fn run_sweep(
             return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
         }
         let scan = options.chunk_rows.max(1);
-        let outcome = one_to_one::sweep_batch(&txn, &plan, &start_xid, cursor.as_deref(), scan)
-            .await
-            .map_err(build_error)?;
+        let outcome = match &plan {
+            SweepPlan::OneToOne(plan) => {
+                one_to_one::sweep_batch(&txn, plan, &start_xid, cursor.as_deref(), scan)
+                    .await
+                    .map_err(build_error)?
+            }
+            SweepPlan::Join(plan) => {
+                join_one_to_one::sweep_batch(&txn, plan, &start_xid, cursor.as_deref(), scan)
+                    .await?
+            }
+        };
         let next = outcome.next.clone().or(cursor.clone());
         txn.execute(
             "update backfill_chunks set lo = $2, done = $3, \
@@ -2829,6 +2882,14 @@ async fn run_sweep(
     }
     try_complete(pool, chunk.definition_id).await?;
     Ok(())
+}
+
+/// What a sweep job's batches run ([`run_sweep`]).
+enum SweepPlan {
+    /// A plain 1-1 target's ([`one_to_one::sweep_batch`]).
+    OneToOne(one_to_one::OneToOnePlan),
+    /// A 1-1 `JOIN`'s ([`join_one_to_one::sweep_batch`]).
+    Join(join_one_to_one::JoinPlan),
 }
 
 /// Moves definition `id` `backfilling -> live` once its Re-derive build is
@@ -2931,10 +2992,17 @@ async fn build_done(client: &impl GenericClient, id: i64) -> Result<bool, ChunkQ
 /// with the build still running.
 #[cfg(any(test, feature = "internals"))]
 pub async fn settle_builds(pool: &Pool) {
+    settle_builds_with(pool, DEFAULT_CHUNK_ROWS).await;
+}
+
+/// [`settle_builds`] with chunks (and sweep batches) of `chunk_rows`, so a
+/// test's small source takes several.
+#[cfg(any(test, feature = "internals"))]
+pub async fn settle_builds_with(pool: &Pool, chunk_rows: i64) {
     const CLAIMED_BY: &str = "settle_rederive_builds";
     const STALL: Duration = Duration::from_secs(10);
     let options = WorkerOptions {
-        chunk_rows: DEFAULT_CHUNK_ROWS,
+        chunk_rows,
         drain_batch_cap: usize::MAX,
         heartbeat_interval: Duration::from_secs(5),
         reclaim_ttl: Duration::from_secs(60),

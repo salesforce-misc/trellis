@@ -76,14 +76,17 @@
 //! # A build ([`build`])
 //!
 //! A fresh build, a `RESUME` or a rebuild in place (`request_backfill`, a
-//! catch-up) fills `M`, `R`, `J` and the target in one transaction under the
-//! lock row `FOR UPDATE`, and has no sweep job; the chunked build replaces it
-//! (#1400).
+//! catch-up) is made of pages: Re-derive pages of every `b` row without the
+//! fan-out, then chunks of `a`'s primary key, then a rebuild sweep of the
+//! stale entries and of the target rows no `R` entry backs. Each runs the
+//! steps above, so it orders against the drain's pages as a page does.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use tokio_postgres::Transaction;
 use tokio_postgres::types::{PgLsn, ToSql};
+
+pub(crate) mod build;
 
 use crate::defs::ast::{Expr, JoinKind, TransformDef};
 use crate::defs::ddl::{self, PrimaryKeyColumn};
@@ -308,6 +311,21 @@ impl JoinShape {
         })
     }
 
+    /// The `FROM` table, qualified.
+    pub(crate) fn source_table(&self) -> &str {
+        &self.source_table
+    }
+
+    /// The joined table, qualified.
+    pub(crate) fn joined_table(&self) -> &str {
+        &self.joined_table
+    }
+
+    /// `R`, qualified and quoted.
+    pub(crate) fn r_ident(&self) -> &str {
+        &self.r.ident
+    }
+
     /// `side`'s table, qualified.
     fn table(&self, side: Side) -> &str {
         match side {
@@ -444,6 +462,10 @@ pub(crate) struct JoinOneToOnePlan {
     pub(crate) shape: std::sync::Arc<JoinShape>,
     a: Vec<Record>,
     b: Vec<Record>,
+    /// Whether a changed `M` entry fans out to the `R` entries on its keys.
+    /// Only the build's `M` pass ([`build::m_batch`]) turns it off: the
+    /// build's chunks write every target row after it.
+    fan_out: bool,
 }
 
 impl JoinOneToOnePlan {
@@ -452,6 +474,7 @@ impl JoinOneToOnePlan {
             shape: std::sync::Arc::new(shape),
             a: Vec::new(),
             b: Vec::new(),
+            fan_out: true,
         }
     }
 
@@ -653,7 +676,11 @@ pub(crate) async fn apply_page(
     let mut changed_keys: Vec<&str> = a_changed.iter().map(String::as_str).collect();
     changed_keys.sort_unstable();
     let (written, deleted) = write_target(txn, shape, &changed_keys, mutations).await?;
-    let fan_keys = fan_out_keys(txn, shape, &b_changed, &b_held).await?;
+    let fan_keys = if plan.fan_out {
+        fan_out_keys(txn, shape, &b_changed, &b_held).await?
+    } else {
+        BTreeSet::new()
+    };
     let (fanned, fan_deleted) = fan_out(txn, shape, &fan_keys, &a_changed, mutations).await?;
     if late_j {
         lock_keys(txn, shape, &k).await?;
@@ -1597,210 +1624,6 @@ fn transpose(arity: usize, rows: &[Vec<String>]) -> Vec<Vec<String>> {
     (0..arity)
         .map(|j| rows.iter().map(|row| row[j].clone()).collect())
         .collect()
-}
-
-/// The joined table's primary key, for a build's `M` keys.
-pub(crate) async fn joined_primary_key(
-    pool: &Pool,
-    shape: &JoinShape,
-) -> Result<Vec<PrimaryKeyColumn>, ApplyError> {
-    Ok(ddl::source_primary_key(pool, &shape.joined_table).await?)
-}
-
-/// Fills `M`, `R`, `J` and the target of `shape` from the live tables, in
-/// `txn` (a `READ COMMITTED` build transaction): the minimal build, one
-/// transaction under the lock row `FOR UPDATE`, which the chunked build
-/// replaces (#1400, the module doc). `m_pk` is the joined table's primary key.
-/// Returns how many target rows it wrote and deleted.
-///
-/// Each ledger table is filled by one statement that reads its table with
-/// `pg_current_snapshot()`, which becomes every entry's basis, so a change
-/// that statement's snapshot saw is refused by I2 and one it didn't is
-/// applied. An entry a page already wrote keeps its applied position, and one
-/// whose row is gone (a rebuild in place keeps the ledgers) becomes a
-/// tombstone by a second statement, whose snapshot is its basis. The target is
-/// then written from `R` and `M` as a page writes it, and a target row no
-/// entry backs is deleted.
-pub(crate) async fn build(
-    txn: &Transaction<'_>,
-    shape: &JoinShape,
-    m_pk: &[PrimaryKeyColumn],
-) -> Result<(usize, usize), ApplyError> {
-    txn.execute(&format!("select 1 from {} for update", shape.lock), &[])
-        .await?;
-    let key = quote_ident(schema::KEY_COLUMN);
-    let basis = quote_ident(schema::BASIS_COLUMN);
-    let tombstone = quote_ident(schema::TOMBSTONE_COLUMN);
-    let seg = quote_ident(schema::APPLIED_SEG_COLUMN);
-    for (ledger, columns, key_columns, table, pk) in [
-        (
-            &shape.m.ident,
-            &shape.m_columns,
-            shape.m_key.clone(),
-            &shape.joined_table,
-            m_pk,
-        ),
-        (
-            &shape.r.ident,
-            &shape.r_columns,
-            shape.key.iter().map(|c| c.name.clone()).collect(),
-            &shape.source_table,
-            &shape.pk[..],
-        ),
-    ] {
-        let names: Vec<String> = columns.iter().map(|c| quote_ident(&c.name)).collect();
-        let sets: Vec<String> = names
-            .iter()
-            .map(|n| format!("{n} = excluded.{n}"))
-            .chain([
-                format!("{basis} = excluded.{basis}"),
-                format!("{tombstone} = false"),
-            ])
-            .collect();
-        txn.execute(
-            &format!(
-                "insert into {ledger} ({key}, {basis}, {names}) \
-                 select {key_expr}, pg_catalog.pg_current_snapshot(), {from_t} \
-                 from {table} t \
-                 on conflict ({key}) do update set {sets}",
-                names = names.join(", "),
-                from_t = names
-                    .iter()
-                    .map(|n| format!("t.{n}"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                key_expr = ddl::pk_key_sql_expr(pk, Some("t")),
-                table = ddl::qualified_source_table(table),
-                sets = sets.join(", "),
-            ),
-            &[],
-        )
-        .await?;
-        // An entry whose row is gone (a rebuild in place keeps the
-        // ledgers) is re-derived as gone: a tombstone whose basis is this
-        // statement's snapshot, its key cleared so it matches nothing, and
-        // stamped with the newest segment, as every Re-derive's tombstone is
-        // (`super::retire::collect_tombstones`).
-        let cleared: Vec<String> = key_columns
-            .iter()
-            .map(|c| format!("{} = null", quote_ident(c)))
-            .chain([
-                format!("{basis} = pg_catalog.pg_current_snapshot()"),
-                format!("{tombstone} = true"),
-                format!(
-                    "{seg} = {}",
-                    schema::tombstone_seg_sql(
-                        Some(&format!("l.{seg}")),
-                        "true",
-                        "coalesce((select max(seg_seq) from segments), 0)",
-                    )
-                ),
-            ])
-            .collect();
-        txn.execute(
-            &format!(
-                "update {ledger} l set {cleared} \
-                 where not l.{tombstone} \
-                   and not exists (select 1 from {table} t where {key_expr} = l.{key})",
-                cleared = cleared.join(", "),
-                key_expr = ddl::pk_key_sql_expr(pk, Some("t")),
-                table = ddl::qualified_source_table(table),
-            ),
-            &[],
-        )
-        .await?;
-    }
-    // `J`: every key either side holds.
-    let r_key: Vec<String> = shape
-        .key
-        .iter()
-        .map(|c| format!("r.{}", quote_ident(&c.name)))
-        .collect();
-    let m_key: Vec<String> = shape
-        .m_key
-        .iter()
-        .map(|c| format!("m.{}", quote_ident(c)))
-        .collect();
-    let not_null = |cols: &[String]| {
-        cols.iter()
-            .map(|c| format!("{c} is not null"))
-            .collect::<Vec<_>>()
-            .join(" and ")
-    };
-    let j_cols: Vec<String> = shape.key.iter().map(|c| quote_ident(&c.name)).collect();
-    let ordinals: Vec<String> = (1..=j_cols.len()).map(|i| i.to_string()).collect();
-    txn.execute(
-        &format!(
-            "insert into {j} ({j_cols}) \
-             select * from (select {r_key} from {r} r where {r_ok} \
-                            union select {m_key} from {m} m where {m_ok}) k \
-             order by {ordinals} on conflict do nothing",
-            j = shape.j,
-            j_cols = j_cols.join(", "),
-            r_key = r_key.join(", "),
-            r = shape.r.ident,
-            r_ok = not_null(&r_key),
-            m_key = m_key.join(", "),
-            m = shape.m.ident,
-            m_ok = not_null(&m_key),
-            ordinals = ordinals.join(", "),
-        ),
-        &[],
-    )
-    .await?;
-    let write = write_all_target_rows(txn, shape).await?;
-    let target = ddl::qualified_target_table_ident(&shape.target);
-    let key_expr = ddl::pk_key_sql_expr(&shape.pk, Some("t"));
-    let deleted = txn
-        .execute(
-            &format!(
-                "delete from {target} t where not exists \
-                 (select 1 from {r} r where r.{key} = {key_expr} and {has})",
-                r = shape.r.ident,
-                has = shape.has_target_row_sql(),
-            ),
-            &[],
-        )
-        .await?;
-    Ok((write, deleted as usize))
-}
-
-/// Upserts the target row of every `R` entry that has one, from `R` and the
-/// newest live `M` entry on its key, with the primary key read from `a`.
-async fn write_all_target_rows(
-    txn: &Transaction<'_>,
-    shape: &JoinShape,
-) -> Result<usize, ApplyError> {
-    let target = ddl::qualified_target_table_ident(&shape.target);
-    let pk_cols: Vec<String> = shape.pk.iter().map(|c| quote_ident(&c.name)).collect();
-    let field_cols: Vec<String> = shape.fields.iter().map(|(n, _)| quote_ident(n)).collect();
-    let on_conflict = on_conflict_sql(&target, &pk_cols, &field_cols);
-    let select_cols: Vec<String> = pk_cols
-        .iter()
-        .map(|c| format!("a.{c}"))
-        .chain(shape.fields.iter().map(|(_, sql)| sql.clone()))
-        .collect();
-    let col_list: Vec<String> = pk_cols.iter().chain(field_cols.iter()).cloned().collect();
-    let from = format!(
-        "{r} r join {a} a on {a_key} = r.{key}",
-        r = shape.r.ident,
-        a = ddl::qualified_source_table(&shape.source_table),
-        a_key = ddl::pk_key_sql_expr(&shape.pk, Some("a")),
-        key = quote_ident(schema::KEY_COLUMN),
-    );
-    let sql = format!(
-        "insert into {target} ({cols}) select {select} from {joined} where {has} \
-         order by {ordinals} {on_conflict}",
-        cols = col_list.join(", "),
-        select = select_cols.join(", "),
-        joined = shape.joined_sql(&from),
-        has = shape.has_target_row_sql(),
-        ordinals = (1..=pk_cols.len())
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join(", "),
-    );
-    Ok(txn.execute(&sql, &[]).await? as usize)
 }
 
 /// The `on conflict` clause of a target upsert: a write by text, as every

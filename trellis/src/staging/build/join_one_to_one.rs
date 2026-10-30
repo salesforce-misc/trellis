@@ -1,46 +1,81 @@
-//! A 1-1 `JOIN` definition's build (ADR-0021): the minimal one.
+//! A 1-1 `JOIN` definition's build jobs (ADR-0021): the plan job's `M` pass,
+//! the chunks and the rebuild sweep. What each transaction does is
+//! `crate::staging::join_one_to_one::build`'s; this is the jobs around them.
 //!
-//! A fresh build, a `RESUME` or a rebuild in place fills `M`, `R`, `J` and
-//! the target in one `READ COMMITTED` transaction, held under the pair's lock
-//! row `FOR UPDATE` ([`crate::staging::join_one_to_one::build`]), then
-//! completes the definition. A rebuild has no sweep job: the build itself
-//! turns the entries whose rows are gone into tombstones. Pages wait on the lock row for the whole transaction, which at
-//! 100M `a` rows is minutes (#1375 Y3); the chunked build that replaces it is
-//! #1400.
+//! - **The plan job** runs the `M` pass first ([`build_m`]): `b`'s rows in
+//!   batches of the chunk size, each its own transaction, a page of `b`
+//!   Re-derives without the fan-out. Then it walks `a`'s primary key and
+//!   enqueues `rederive` chunks as for a plain 1-1 target (the parent
+//!   module's `run_plan`), so no chunk runs before `M` is built. A plan job
+//!   that dies during the pass runs it again whole; one that dies during the
+//!   walk resumes it from its cursor.
+//! - **A chunk** ([`run_chunk`]) runs in the transaction that marks it done,
+//!   under [`CHUNK_LOCK_TIMEOUT`] for every lock it takes, so a page waits
+//!   at most one chunk's length behind it, and a chunk that meets a page
+//!   holding a lock gives up and retries.
+//! - **The rebuild sweep** ([`sweep_batch`]) runs after the plan job and
+//!   every chunk, in three passes: `R`'s stale entries, `M`'s, then the
+//!   orphans, target rows no live `R` entry backs. Each batch re-derives what
+//!   it found as a page of Re-derives. A build start enqueues it whenever the
+//!   target has rows (the parent module's `start`): a `RESUME` recreates `R`
+//!   and `M` empty and keeps the target, so the rows of `a` rows deleted
+//!   while the transform was paused are backed by nothing, and only the
+//!   orphan pass removes them (#1481).
 
-use std::time::Instant;
+use std::sync::Arc;
 
-use tokio_postgres::IsolationLevel;
+use tokio_postgres::{IsolationLevel, Transaction};
 
-use super::{CHUNK_APPLICATION_NAME, ChunkQueueError, ClaimFence, ClaimedChunk, Definition, Pool};
-use super::{build_error, metrics, try_complete};
+use crate::defs::ddl::{self, PrimaryKeyColumn};
+use crate::defs::join::Side;
+use crate::staging::join_one_to_one::build as steps;
+use crate::staging::join_one_to_one::{JoinShape, plan_for};
 
-/// Runs a claimed plan job of the 1-1 `JOIN` `definition`: the whole build,
-/// fenced by the claim, and the job's done mark in the same transaction.
-pub(super) async fn run(
-    pool: &Pool,
-    chunk: &ClaimedChunk,
-    claimed_by: &str,
-    definition: &Definition,
-    fence: &ClaimFence<'_>,
-) -> Result<(), ChunkQueueError> {
-    let started = Instant::now();
-    let pk = crate::defs::ddl::source_primary_key(pool, &definition.source_table)
-        .await
-        .map_err(build_error)?;
-    let shape = crate::staging::join_one_to_one::JoinShape::load(
-        pool,
-        definition,
-        pk,
-        &std::collections::HashSet::new(),
-    )
-    .await
-    .map_err(build_error)?;
-    let m_pk = crate::staging::join_one_to_one::joined_primary_key(pool, &shape)
-        .await
-        .map_err(build_error)?;
-    let mut pooled = pool.get().await?;
-    let client: &mut tokio_postgres::Client = &mut pooled;
+use super::orphans::{self, OrphanCursor, OrphanWalk};
+use super::{
+    CHUNK_APPLICATION_NAME, CHUNK_LOCK_TIMEOUT, ChunkQueueError, ClaimFence, Definition, Pool,
+    SweepOutcome, WorkerOptions, build_error,
+};
+
+/// What a 1-1 `JOIN`'s chunk or sweep batch needs: the definition's shape,
+/// `a`'s key as the plan job walked it (with its recorded collations), and
+/// the target's own key, which the orphan pass walks.
+pub(super) struct JoinPlan {
+    shape: Arc<JoinShape>,
+    range_pk: Vec<PrimaryKeyColumn>,
+    target_key: Vec<PrimaryKeyColumn>,
+}
+
+impl JoinPlan {
+    /// The plan of `definition`, a 1-1 `JOIN`, its range read under
+    /// `key_collations` (the chunk's recorded ones).
+    pub(super) async fn load(
+        pool: &Pool,
+        definition: &Definition,
+        key_collations: Option<&[Option<String>]>,
+    ) -> Result<Self, ChunkQueueError> {
+        let pk = ddl::source_primary_key(pool, &definition.source_table)
+            .await
+            .map_err(build_error)?;
+        let mut range_pk = pk.clone();
+        ddl::pin_key_collations(&mut range_pk, key_collations);
+        let target_key = ddl::source_primary_key(pool, &definition.target_table)
+            .await
+            .map_err(build_error)?;
+        let plan = plan_for(pool, definition, Side::From, pk)
+            .await
+            .map_err(build_error)?;
+        Ok(Self {
+            shape: plan.shape,
+            range_pk,
+            target_key,
+        })
+    }
+}
+
+/// Begins one `READ COMMITTED` transaction of a build step, with the chunk's
+/// `application_name` and [`CHUNK_LOCK_TIMEOUT`] for every lock it takes.
+async fn begin(client: &mut tokio_postgres::Client) -> Result<Transaction<'_>, ChunkQueueError> {
     let txn = client
         .build_transaction()
         .isolation_level(IsolationLevel::ReadCommitted)
@@ -50,42 +85,280 @@ pub(super) async fn run(
         "set local application_name = '{CHUNK_APPLICATION_NAME}'"
     ))
     .await?;
-    // The definition row before the job row, as every other build takes
-    // them (`run_group_structure`).
-    fence.arm(&txn).await?;
-    txn.execute(
-        "select 1 from transform_definitions where id = $1 for key share",
-        &[&chunk.definition_id],
-    )
-    .await?;
-    if !fence.hold(&txn).await? {
-        txn.rollback().await?;
-        return crate::defs::chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
-    }
-    let (written, deleted) = crate::staging::join_one_to_one::build(&txn, &shape, &m_pk)
+    crate::locks::set_local_lock_timeout(&txn, CHUNK_LOCK_TIMEOUT).await?;
+    Ok(txn)
+}
+
+/// The plan job's `M` pass (see the module doc), each batch fenced by the
+/// claim. Returns `false`, having rolled back, when the claim no longer
+/// holds: the caller gives the job up as superseded.
+pub(super) async fn build_m(
+    pool: &Pool,
+    definition: &Definition,
+    fence: &ClaimFence<'_>,
+    options: &WorkerOptions,
+) -> Result<bool, ChunkQueueError> {
+    let plan = JoinPlan::load(pool, definition, None).await?;
+    let shape = plan.shape;
+    // `b`'s key once for the whole pass, so every batch walks it under the
+    // same collations.
+    let m_pk = ddl::source_primary_key(pool, shape.joined_table())
         .await
         .map_err(build_error)?;
-    txn.execute(
-        "update backfill_chunks set done = true, claimed_by = null, claimed_at = null \
-         where id = $1",
-        &[&chunk.id],
-    )
-    .await?;
-    #[cfg(any(test, feature = "test-util"))]
-    crate::staging::interleave::pause_at(
-        &txn,
-        crate::staging::interleave::PausePoint::BeforeRebuildCommit,
-        &definition.target_table,
-    )
-    .await?;
-    txn.commit().await?;
-    metrics::record_build_chunk(started.elapsed(), (written + deleted) as u64);
+    let limit = options.chunk_rows.max(1);
+    let mut client = pool.get().await?;
+    let mut after: Option<String> = None;
+    loop {
+        let txn = begin(&mut client).await?;
+        if !fence.hold(&txn).await? {
+            txn.rollback().await?;
+            return Ok(false);
+        }
+        let next = steps::m_batch(&txn, &shape, &m_pk, after.as_deref(), limit)
+            .await
+            .map_err(build_error)?;
+        txn.commit().await?;
+        match next {
+            Some(key) => after = Some(key),
+            None => break,
+        }
+    }
+    let nulls = {
+        let client = pool.get().await?;
+        steps::m_null_keys(&**client, &shape, &m_pk)
+            .await
+            .map_err(build_error)?
+    };
+    for batch in nulls.chunks(usize::try_from(limit).unwrap_or(usize::MAX)) {
+        let txn = begin(&mut client).await?;
+        if !fence.hold(&txn).await? {
+            txn.rollback().await?;
+            return Ok(false);
+        }
+        steps::rederive(&txn, &shape, Side::Joined, batch, false)
+            .await
+            .map_err(build_error)?;
+        txn.commit().await?;
+    }
     crate::instance_log::debug!(
-        definition_id = chunk.definition_id,
-        written,
-        deleted,
-        "1-1 JOIN build filled its hidden tables and its target"
+        definition_id = definition.id,
+        "1-1 JOIN build re-derived every row of its joined table"
     );
-    try_complete(pool, chunk.definition_id).await?;
-    Ok(())
+    Ok(true)
+}
+
+/// One chunk, `(lo, hi]` of `a`'s primary key, in `txn`, the chunk's own
+/// transaction (`super::run_rederive`), which marks it done and commits.
+/// Returns the keys it re-derived.
+pub(super) async fn run_chunk(
+    txn: &Transaction<'_>,
+    plan: &JoinPlan,
+    lo: Option<&str>,
+    hi: &str,
+) -> Result<usize, ChunkQueueError> {
+    crate::locks::set_local_lock_timeout(txn, CHUNK_LOCK_TIMEOUT).await?;
+    let outcome = steps::run_chunk(txn, &plan.shape, &plan.range_pk, lo, hi)
+        .await
+        .map_err(build_error)?;
+    // Test-only pause point: the chunk has written everything and holds its
+    // locks. See `super::super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    super::super::interleave::pause_at(
+        txn,
+        super::super::interleave::PausePoint::BeforeRebuildCommit,
+        &plan.shape.target,
+    )
+    .await?;
+    crate::instance_log::debug!(
+        target_table = %plan.shape.target,
+        keys = outcome.keys,
+        written = outcome.written,
+        deleted = outcome.deleted,
+        "1-1 JOIN build chunk re-derived its range"
+    );
+    Ok(outcome.keys)
+}
+
+/// Where a 1-1 `JOIN`'s rebuild sweep stands (its job's `lo`): in `R`'s or
+/// `M`'s stale pass after an entry key, or in the orphan walk. Each stored
+/// form is U+0001 and a letter, then `:` and the key when there is one; no
+/// stored cursor is the start of `R`'s pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Stage {
+    Stale(Side, Option<String>),
+    Orphans(OrphanCursor),
+}
+
+impl Stage {
+    fn parse(stored: Option<&str>) -> Self {
+        let Some(stored) = stored else {
+            return Stage::Stale(Side::From, None);
+        };
+        let mut chars = stored.chars();
+        let (Some('\u{1}'), Some(tag)) = (chars.next(), chars.next()) else {
+            return Stage::Stale(Side::From, None);
+        };
+        let key = chars.as_str().strip_prefix(':').map(str::to_string);
+        match tag {
+            'm' => Stage::Stale(Side::Joined, key),
+            'o' => Stage::Orphans(OrphanCursor::Keyed(key)),
+            'n' => Stage::Orphans(OrphanCursor::Nulls(key)),
+            _ => Stage::Stale(Side::From, key),
+        }
+    }
+
+    fn encode(&self) -> String {
+        let (tag, key) = match self {
+            Stage::Stale(Side::From, key) => ('r', key),
+            Stage::Stale(Side::Joined, key) => ('m', key),
+            Stage::Orphans(OrphanCursor::Keyed(key)) => ('o', key),
+            Stage::Orphans(OrphanCursor::Nulls(key)) => ('n', key),
+        };
+        match key {
+            Some(key) => format!("\u{1}{tag}:{key}"),
+            None => format!("\u{1}{tag}"),
+        }
+    }
+}
+
+/// One batch of a 1-1 `JOIN`'s rebuild sweep (see the module doc), from
+/// `cursor`, in `txn`, which the caller commits with the cursor's advance.
+/// A stale pass reads up to `scan` entries; the orphan pass, `scan` target
+/// rows. The sweep is finished when the orphan walk is.
+pub(super) async fn sweep_batch(
+    txn: &Transaction<'_>,
+    plan: &JoinPlan,
+    start_xid: &str,
+    cursor: Option<&str>,
+    scan: i64,
+) -> Result<SweepOutcome, ChunkQueueError> {
+    crate::locks::set_local_lock_timeout(txn, CHUNK_LOCK_TIMEOUT).await?;
+    let shape = &plan.shape;
+    let stage = Stage::parse(cursor);
+    // Planted bug: the sweep skips `M`'s stale pass. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let stage = match stage {
+        Stage::Stale(Side::Joined, _)
+            if crate::plant::fires(crate::plant::Plant::Join1SweepROnly, true) =>
+        {
+            Stage::Orphans(OrphanCursor::Keyed(None))
+        }
+        stage => stage,
+    };
+    let (scanned, rederived, next) = match stage {
+        Stage::Stale(side, after) => {
+            let (scanned, last, stale) =
+                steps::stale_entries(txn, shape, side, start_xid, after.as_deref(), scan)
+                    .await
+                    .map_err(build_error)?;
+            steps::rederive(txn, shape, side, &stale, true)
+                .await
+                .map_err(build_error)?;
+            let next = if scanned < scan {
+                match side {
+                    Side::From => Stage::Stale(Side::Joined, None),
+                    Side::Joined => Stage::Orphans(OrphanCursor::Keyed(None)),
+                }
+            } else {
+                Stage::Stale(side, last)
+            };
+            (scanned, stale.len(), Some(next))
+        }
+        Stage::Orphans(cursor) => {
+            // Planted bug: the sweep has no orphan pass. See `crate::plant`.
+            #[cfg(any(test, feature = "test-util"))]
+            if crate::plant::fires(crate::plant::Plant::Join1NoOrphanPass, true) {
+                return Ok(SweepOutcome {
+                    scanned: 0,
+                    rederived: 0,
+                    next: None,
+                    finished: true,
+                });
+            }
+            let walk = OrphanWalk {
+                target: &shape.target,
+                key: &plan.target_key,
+                ledger: shape.r_ident(),
+                source_table: shape.source_table(),
+            };
+            let batch = orphans::orphan_batch(txn, &walk, &cursor, scan)
+                .await
+                .map_err(build_error)?;
+            // Test-only pause point: the orphans are read, none is locked.
+            // See `super::super::interleave`.
+            #[cfg(any(test, feature = "test-util"))]
+            super::super::interleave::pause_at(
+                txn,
+                super::super::interleave::PausePoint::AfterJoin1OrphanRead,
+                &shape.target,
+            )
+            .await?;
+            // Planted bug: the orphans' target rows are deleted by
+            // statement, with no entry lock and no re-read of `a`. See
+            // `crate::plant`.
+            #[cfg(any(test, feature = "test-util"))]
+            let deleted = crate::plant::fires(
+                crate::plant::Plant::Join1OrphanDelete,
+                !batch.orphans.is_empty(),
+            );
+            #[cfg(not(any(test, feature = "test-util")))]
+            let deleted = false;
+            if deleted {
+                txn.execute(
+                    &format!(
+                        "delete from {} t where ({}) = any($1::text[])",
+                        ddl::qualified_target_table_ident(&shape.target),
+                        ddl::pk_key_sql_expr(&plan.target_key, Some("t")),
+                    ),
+                    &[&batch.orphans],
+                )
+                .await?;
+            } else {
+                steps::rederive(txn, shape, Side::From, &batch.orphans, true)
+                    .await
+                    .map_err(build_error)?;
+            }
+            (
+                batch.scanned,
+                batch.orphans.len(),
+                batch.next.map(Stage::Orphans),
+            )
+        }
+    };
+    crate::instance_log::debug!(
+        target_table = %shape.target,
+        scanned,
+        rederived,
+        next = ?next,
+        "1-1 JOIN rebuild sweep batch re-derived what it found"
+    );
+    Ok(SweepOutcome {
+        scanned,
+        rederived,
+        finished: next.is_none(),
+        next: next.map(|stage| stage.encode()),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OrphanCursor, Side, Stage};
+
+    /// Every stage's stored cursor parses back to itself, whatever its key
+    /// holds, and no cursor is the start of `R`'s pass.
+    #[test]
+    fn a_sweep_cursor_round_trips() {
+        for key in [None, Some(""), Some("42"), Some("\u{1}m:7"), Some("a:b")] {
+            let key = key.map(str::to_string);
+            for stage in [
+                Stage::Stale(Side::From, key.clone()),
+                Stage::Stale(Side::Joined, key.clone()),
+                Stage::Orphans(OrphanCursor::Keyed(key.clone())),
+                Stage::Orphans(OrphanCursor::Nulls(key.clone())),
+            ] {
+                assert_eq!(Stage::parse(Some(&stage.encode())), stage, "{key:?}");
+            }
+        }
+        assert_eq!(Stage::parse(None), Stage::Stale(Side::From, None));
+    }
 }

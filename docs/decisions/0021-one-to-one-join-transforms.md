@@ -173,21 +173,47 @@ against 3.8 s. It took about 5x as long overall.
 
 ### A build fills `M`, then `R` and the target
 
-A build re-derives every `b` row into `M` in one transaction, about the size
-of `b`. It then fills `R` and the target in chunks of `a`'s primary-key
-range. Each chunk:
+A build re-derives every `b` row into `M` first, in batches of `b`'s primary
+key. Each batch is a page of `b` Re-derives with its fan-out left out: the
+chunks that follow write every target row, and none starts before the last
+batch commits. It then fills `R` and the target in chunks of `a`'s
+primary-key range. Each chunk:
 
-1. Locks `J` for the live keys in its range plus the keys `R` holds there.
+1. Holds the lock row `FOR SHARE`, and locks `J` for the live keys in its
+   range plus the keys `R` holds for its rows.
 2. Inserts the missing entries in one statement that reads `a` live, with
    `pg_current_snapshot()` as their basis.
 3. Locks and re-derives the remaining entries.
-4. Retries if any read finds a key outside its locked set. Without the retry,
+4. Writes each row's target row from `R` and the newest live `M` entry on its
+   key.
+5. Retries if any read finds a key outside its locked set. Without the retry,
    378 of 1,716 schedules were wrong.
 
-Pages whose segment predates the build re-derive. A one-transaction build is
-not an option: at 100M `a` rows it took 834 s, and a concurrent page waited
-807 s behind it. In 10k-row chunks on 4 workers the build took 446 s, and no
-page waited longer than 0.74 s (#1375 Y3).
+A chunk waits at most a second for a lock a page holds, then gives up and
+retries, so a page is never queued behind a chunk that queues behind another
+page. Pages whose segment predates the build re-derive. A build start takes
+the lock row `FOR UPDATE` as it records that segment, so it waits for the
+pages in flight. A one-transaction build is not an option: at 100M `a` rows
+it took 834 s, and a concurrent page waited 807 s behind it. In 10k-row
+chunks on 4 workers the build took 446 s, and no page waited longer than
+0.74 s (#1375 Y3).
+
+A rebuild in place, and any build whose target has rows, ends with a sweep
+after the last chunk. It re-derives every entry of `R`, then of `M`, whose
+basis is null or older than the build's start, so an entry whose row is gone
+becomes a tombstone and its rows are recomputed. Then its orphan pass walks
+the target in its key order and re-derives, as an `a` Re-derive page, every
+target row no live `R` entry backs. It never deletes one by statement: a row
+re-inserted and applied between the read and the delete would be lost.
+
+### Pause and `RESUME`
+
+`RESUME` recreates `R`, `M`, `J` and the lock row at define's current shape,
+after waiting out the chunks in flight, and keeps the target, so readers see
+every row throughout. The build that follows re-derives `b` and every `a`
+row that exists, and its sweep's orphan pass removes the target rows of `a`
+rows deleted while the transform was paused. Until the sweep reaches them
+those rows stay in the target, and the transform reads `backfilling`.
 
 ## Consequences
 

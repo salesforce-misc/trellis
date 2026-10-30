@@ -65,6 +65,7 @@ use crate::pool::{Pool, quote_ident};
 use super::super::apply::ApplyError;
 use super::super::one_to_one_ledger::{self, EntryChange};
 use super::super::target_mutations::TargetMutations;
+use super::orphans::{self, OrphanCursor, OrphanWalk};
 use super::{CHUNK_LOCK_TIMEOUT, SweepOutcome};
 
 /// What a 1-1 Re-derive build needs to know about its target.
@@ -76,6 +77,9 @@ pub struct OneToOnePlan {
     transform: String,
     source_table: String,
     pk: Vec<PrimaryKeyColumn>,
+    /// The target's own key, with the collations its key index orders by,
+    /// which the sweep's orphan walk pages in (`super::orphans`).
+    target_key: Vec<PrimaryKeyColumn>,
     /// Each field's name and its self-contained SQL over the source's
     /// columns, in definition order.
     fields: Vec<(String, String)>,
@@ -137,11 +141,13 @@ impl OneToOnePlan {
             })
             .collect();
         let pk = ddl::source_primary_key(pool, &definition.source_table).await?;
+        let target_key = ddl::source_primary_key(pool, &definition.target_table).await?;
         Ok(Some(Self {
             target: definition.target_table.clone(),
             transform: definition.def.target.clone(),
             source_table: definition.source_table.clone(),
             pk,
+            target_key,
             fields,
             alias_readers: crate::defs::alias_readers::AliasReaders::of(&definition.def),
         }))
@@ -413,10 +419,11 @@ async fn explain_range(
 /// it locks and re-derives them as a chunk does, reading the source by each
 /// key's typed columns: a key with no row any more (deleted while the
 /// definition was frozen) becomes a tombstone and its target row is
-/// deleted. Once the ledger is read to its end, each batch also takes up to
-/// `scan` target rows with no live entry ([`orphan_keys`]) and re-derives
-/// them with the rest, and the sweep is finished when a batch finds fewer.
-/// Later batches walk the orphans on by key cursor ([`SweepCursor`]).
+/// deleted. Once the ledger is read to its end, the batch also reads the
+/// first `scan` target rows in the target's key order and re-derives, with
+/// the rest, those that have no live entry; later batches walk the target on
+/// from a typed cursor ([`SweepCursor`], `super::orphans`), and the sweep is
+/// finished when the walk is.
 pub async fn sweep_batch(
     txn: &Transaction<'_>,
     plan: &OneToOnePlan,
@@ -430,7 +437,22 @@ pub async fn sweep_batch(
     let cursor = match cursor.map(SweepCursor::parse) {
         // A cursor in the orphan walk skips the ledger, which is already read.
         Some(SweepCursor::Orphans(after)) => {
-            return orphan_batch(txn, plan, Some(after), scan).await;
+            return orphan_batch(
+                txn,
+                plan,
+                OrphanCursor::Keyed(Some(after.to_string())),
+                scan,
+            )
+            .await;
+        }
+        Some(SweepCursor::OrphanNulls(after)) => {
+            return orphan_batch(
+                txn,
+                plan,
+                OrphanCursor::Nulls(after.map(str::to_string)),
+                scan,
+            )
+            .await;
         }
         Some(SweepCursor::Ledger(after)) => Some(after),
         None => None,
@@ -478,12 +500,17 @@ pub async fn sweep_batch(
         // before any entry is locked and locked with the page's keys in one
         // ordered batch, so the batch holds no lock across the target scan
         // and takes its locks in the one key order a page takes them in.
-        let orphans = orphan_keys(txn, plan, None, scan).await?;
-        finished = i64::try_from(orphans.len()).is_ok_and(|n| n < scan);
-        if !finished {
-            orphan_next = orphans.last().map(|k| SweepCursor::Orphans(k).encode());
-        }
-        keys.extend(orphans);
+        let ledger = one_to_one_ledger::ledger_ident(&plan.target);
+        let batch = orphans::orphan_batch(
+            txn,
+            &orphan_walk(plan, &ledger),
+            &OrphanCursor::Keyed(None),
+            scan,
+        )
+        .await?;
+        finished = batch.next.is_none();
+        orphan_next = batch.next.as_ref().map(SweepCursor::of_orphans);
+        keys.extend(batch.orphans);
         keys.sort_unstable();
         keys.dedup();
     }
@@ -506,28 +533,34 @@ pub async fn sweep_batch(
 }
 
 /// Where a 1-1 sweep's cursor (its job's `lo`) stands: in the ledger walk,
-/// after an entry key, or in the orphan walk (the target rows with no live
-/// entry, once the ledger is read to its end), after a target key.
+/// after an entry key, or in the orphan walk (`super::orphans`, once the
+/// ledger is read to its end): after a target key in the target's key
+/// order, or among the target rows with a `NULL` key part, from the start or
+/// after a key text.
 ///
 /// A ledger cursor is stored as the bare key, as a sweep from before the
 /// orphan cursor stored it, unless the key starts with U+0001 (a key a
 /// source text column can hold): then it takes [`LEDGER_CURSOR_PREFIX`]. An
-/// orphan cursor always takes [`ORPHAN_CURSOR_PREFIX`]. So a stored cursor
-/// starting with U+0001 is one of the two prefixed forms, and any other is a
-/// bare ledger key.
+/// orphan cursor always takes [`ORPHAN_CURSOR_PREFIX`] or
+/// [`ORPHAN_NULLS_PREFIX`]. So a stored cursor starting with U+0001 is one
+/// of the prefixed forms, and any other is a bare ledger key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SweepCursor<'a> {
     Ledger(&'a str),
     Orphans(&'a str),
+    OrphanNulls(Option<&'a str>),
 }
 
 const ORPHAN_CURSOR_PREFIX: &str = "\u{1}orphans\u{1}";
+const ORPHAN_NULLS_PREFIX: &str = "\u{1}orphan-nulls\u{1}";
 const LEDGER_CURSOR_PREFIX: &str = "\u{1}ledger\u{1}";
 
 impl<'a> SweepCursor<'a> {
     pub(crate) fn parse(stored: &'a str) -> Self {
         if let Some(key) = stored.strip_prefix(ORPHAN_CURSOR_PREFIX) {
             SweepCursor::Orphans(key)
+        } else if let Some(rest) = stored.strip_prefix(ORPHAN_NULLS_PREFIX) {
+            SweepCursor::OrphanNulls(rest.strip_prefix(':'))
         } else if let Some(key) = stored.strip_prefix(LEDGER_CURSOR_PREFIX) {
             SweepCursor::Ledger(key)
         } else {
@@ -538,86 +571,63 @@ impl<'a> SweepCursor<'a> {
     pub(crate) fn encode(self) -> String {
         match self {
             SweepCursor::Orphans(key) => format!("{ORPHAN_CURSOR_PREFIX}{key}"),
+            SweepCursor::OrphanNulls(None) => ORPHAN_NULLS_PREFIX.to_string(),
+            SweepCursor::OrphanNulls(Some(key)) => format!("{ORPHAN_NULLS_PREFIX}:{key}"),
             SweepCursor::Ledger(key) if key.starts_with('\u{1}') => {
                 format!("{LEDGER_CURSOR_PREFIX}{key}")
             }
             SweepCursor::Ledger(key) => key.to_string(),
         }
     }
+
+    /// The stored form of the orphan walk's next batch.
+    fn of_orphans(cursor: &OrphanCursor) -> String {
+        match cursor {
+            OrphanCursor::Keyed(Some(key)) => SweepCursor::Orphans(key).encode(),
+            // The walk's first batch rides with the ledger's last, so a keyed
+            // cursor always has a key.
+            OrphanCursor::Keyed(None) => SweepCursor::Orphans("").encode(),
+            OrphanCursor::Nulls(key) => SweepCursor::OrphanNulls(key.as_deref()).encode(),
+        }
+    }
 }
 
-/// One batch of the orphan walk, after the key `after`: it re-derives up to
-/// `scan` orphans and returns the cursor past them.
+/// The orphan walk of `plan`'s target: its rows against `ledger`, the 1-1
+/// ledger.
+fn orphan_walk<'a>(plan: &'a OneToOnePlan, ledger: &'a str) -> OrphanWalk<'a> {
+    OrphanWalk {
+        target: &plan.target,
+        key: &plan.target_key,
+        ledger,
+        source_table: &plan.source_table,
+    }
+}
+
+/// One batch of the orphan walk from `cursor`: it re-derives the orphans
+/// among the next `scan` target rows and returns the cursor past them.
 async fn orphan_batch(
     txn: &Transaction<'_>,
     plan: &OneToOnePlan,
-    after: Option<&str>,
+    cursor: OrphanCursor,
     scan: i64,
 ) -> Result<SweepOutcome, ApplyError> {
-    let keys = orphan_keys(txn, plan, after, scan).await?;
-    let finished = i64::try_from(keys.len()).is_ok_and(|n| n < scan);
-    let next = keys.last().map(|k| SweepCursor::Orphans(k).encode());
-    let outcome = rederive_keys(txn, plan, &keys).await?;
+    let ledger = one_to_one_ledger::ledger_ident(&plan.target);
+    let batch = orphans::orphan_batch(txn, &orphan_walk(plan, &ledger), &cursor, scan).await?;
+    let outcome = rederive_keys(txn, plan, &batch.orphans).await?;
     crate::instance_log::debug!(
         target_table = %plan.target,
-        rederived = keys.len(),
+        scanned = batch.scanned,
+        rederived = batch.orphans.len(),
         written = outcome.written,
         deleted = outcome.deleted,
         "1-1 re-derive build sweep batch re-derived orphans"
     );
     Ok(SweepOutcome {
         scanned: 0,
-        rederived: keys.len(),
-        next,
-        finished,
+        rederived: batch.orphans.len(),
+        next: batch.next.as_ref().map(SweepCursor::of_orphans),
+        finished: batch.next.is_none(),
     })
-}
-
-/// Up to `limit` keys, greater than `after` when given, of target rows that
-/// have no live ledger entry (no
-/// entry, or a tombstone) and aren't quarantined: rows nothing in the source
-/// backs, which someone added or re-keyed in the target, or whose
-/// source row exists but the ledger never learned. Every writer of a target
-/// row writes its entry in the same transaction, so a committed target row
-/// without a live entry is one nobody wrote through Trellis. A key
-/// [`rederive_keys`] takes comes back with a live entry, or its row
-/// deleted. The walk pages by key cursor: each batch passes the last key of
-/// the one before and anti-joins and sorts only the target keys after it.
-/// The plan may still read the whole target and ledger in each batch: the
-/// key is text, which the target's own key index orders only for a single
-/// text column.
-pub(crate) async fn orphan_keys(
-    txn: &Transaction<'_>,
-    plan: &OneToOnePlan,
-    after: Option<&str>,
-    limit: i64,
-) -> Result<Vec<String>, ApplyError> {
-    let target = ddl::qualified_target_table_ident(&plan.target);
-    let k_tgt = ddl::pk_key_sql_expr(&plan.pk, Some("t"));
-    let started = Instant::now();
-    let row = txn
-        .query_one(
-            &format!(
-                "select array(select t.__k from ( \
-                     select {k_tgt} as __k from {target} t \
-                 ) t \
-                 where ($4::text is null or t.__k > $4) \
-                   and not exists (select 1 from {ledger} l \
-                                   where l.{key} = t.__k and not l.{tombstone}) \
-                   and not exists (select 1 from poison p \
-                                   join transform_definitions d on d.id = p.transform_id \
-                                   where p.src_table = $2 and p.key = t.__k \
-                                     and d.target_table = $3) \
-                 order by t.__k limit $1)",
-                ledger = one_to_one_ledger::ledger_ident(&plan.target),
-                key = quote_ident(crate::defs::ledger::KEY_COLUMN),
-                tombstone = quote_ident(crate::defs::ledger::TOMBSTONE_COLUMN),
-            ),
-            &[&limit, &plan.source_table, &plan.target, &after],
-        )
-        .await?;
-    metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());
-    Ok(row.get(0))
 }
 
 /// Locks `keys`' entries and re-derives them (the tail of a sweep batch).
@@ -1122,10 +1132,18 @@ mod unit_tests {
             "\u{1}ledger\u{1}42",
             "orphans",
         ] {
-            for cursor in [SweepCursor::Ledger(key), SweepCursor::Orphans(key)] {
+            for cursor in [
+                SweepCursor::Ledger(key),
+                SweepCursor::Orphans(key),
+                SweepCursor::OrphanNulls(Some(key)),
+            ] {
                 assert_eq!(SweepCursor::parse(&cursor.encode()), cursor, "{key:?}");
             }
         }
+        assert_eq!(
+            SweepCursor::parse(&SweepCursor::OrphanNulls(None).encode()),
+            SweepCursor::OrphanNulls(None)
+        );
         assert_eq!(SweepCursor::Ledger("42").encode(), "42");
         assert_eq!(SweepCursor::parse("42"), SweepCursor::Ledger("42"));
     }
