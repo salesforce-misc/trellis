@@ -72,18 +72,25 @@
 //! reads a 1-1 `JOIN` target in v1 (define refuses it), so a page records
 //! nothing for the seam.
 //!
-//! # A `TRUNCATE` ([`truncate_sides`], [`start_rebuild`])
+//! # A `TRUNCATE` ([`truncate_sides`], [`lock_truncated_definitions`], [`start_rebuilds`])
 //!
 //! A page that carries a `TRUNCATE` of either side takes the lock row `FOR
-//! UPDATE` instead (a `TRUNCATE` of `b` takes its definition's row before
-//! it), so it waits for the pages and chunks in flight and every other page
-//! waits for it, and settles the truncate before its changes: the side's
-//! ledger is emptied and its floor raised, and a `TRUNCATE` of `a` empties
-//! the target. `J` keeps its rows. A `TRUNCATE` of `b` changes every target
-//! row, which one transaction would not hold, so the page starts a rebuild
-//! of the target as its last statement and the build's chunks rewrite the
+//! UPDATE` instead, so it waits for the pages and chunks in flight and every
+//! other page waits for it, and settles the truncate before its changes: the
+//! side's ledger is emptied and its floor raised, and a `TRUNCATE` of `a`
+//! empties the target. `J` keeps its rows. The ledger is emptied by `DELETE`,
+//! not `TRUNCATE`: a sweep or `M` pass batch reads `R` or `M` before it takes
+//! the lock row, and a `TRUNCATE`'s `ACCESS EXCLUSIVE` lock would wait for
+//! that read while the batch waited for the lock row. A `TRUNCATE` of `b`
+//! changes every target row, which one transaction would not hold, so the
+//! page starts a rebuild of the target and the build's chunks rewrite the
 //! rows (a `LEFT` row keeps its old `b` columns until the chunk reaches it).
-//! The drain's barrier orders the truncate's batch against every other.
+//! It takes the definitions' rows of every target whose `b` it truncates, in
+//! id order, before its first lock row, as a rebuild's start does
+//! (`super::build::start_rebuilds`), and starts the rebuilds after it has
+//! marked its segments drained, as seal phase 1 takes a segment's row before
+//! the segment pointer. The drain's barrier orders the truncate's batch
+//! against every other.
 //!
 //! # A build ([`build`])
 //!
@@ -509,6 +516,11 @@ impl JoinOneToOnePlan {
         }
     }
 
+    /// Whether the page truncates `b`, so it starts a rebuild of the target.
+    fn truncates_b(&self) -> bool {
+        self.truncate.as_ref().is_some_and(|t| t.joined.is_some())
+    }
+
     /// Adds a `TRUNCATE` of the table on `side`, `change`, whose ring `lsn`
     /// is `lsn`, the floor it raises.
     pub(crate) fn truncate(&mut self, side: Side, lsn: PgLsn, change: &FoldedChange) {
@@ -662,19 +674,17 @@ pub(crate) async fn apply_page(
     };
 
     // 2. The lock row, a truncate's clear, then K over both sides' keys. A
-    // truncate of `b` takes its definition's row before the lock row, as a
-    // rebuild's start does (`super::build::start_rebuilds`), so the two never
-    // each wait for what the other holds.
-    let truncates_b = truncate.is_some_and(|t| t.joined.is_some());
+    // page that truncates `b` holds its definition's row already: the caller
+    // takes it before any lock row ([`lock_truncated_definitions`]).
     // Planted bug: the definition's row comes after the lock row. See
     // `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
-    let def_late = crate::plant::fires(crate::plant::Plant::Join1TruncateDefAfterLock, truncates_b);
+    let def_late = crate::plant::fires(
+        crate::plant::Plant::Join1TruncateDefAfterLock,
+        plan.truncates_b(),
+    );
     #[cfg(not(any(test, feature = "test-util")))]
     let def_late = false;
-    if truncates_b && !def_late {
-        lock_definition(txn, shape).await?;
-    }
     // Planted bug: a truncate's page takes the lock row `FOR SHARE`, so a
     // page of the pair runs beside it. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
@@ -691,8 +701,12 @@ pub(crate) async fn apply_page(
     };
     txn.execute(&format!("select 1 from {} for {mode}", shape.lock), &[])
         .await?;
-    if truncates_b && def_late {
-        lock_definition(txn, shape).await?;
+    if def_late {
+        txn.execute(
+            "select 1 from transform_definitions where id = $1 for update",
+            &[&shape.id],
+        )
+        .await?;
     }
     let cleared = match truncate {
         Some(truncate) => truncate_sides(txn, shape, truncate, mutations).await?,
@@ -771,20 +785,45 @@ pub(crate) async fn apply_page(
     if late_j {
         lock_keys(txn, shape, &k).await?;
     }
-    if truncates_b {
-        start_rebuild(txn, shape).await?;
-    }
     Ok((written + fanned, deleted + fan_deleted + cleared))
 }
 
-/// Locks the definition's row `FOR UPDATE`.
-async fn lock_definition(txn: &Transaction<'_>, shape: &JoinShape) -> Result<(), ApplyError> {
-    txn.execute(
-        "select 1 from transform_definitions where id = $1 for update",
-        &[&shape.id],
-    )
-    .await?;
-    Ok(())
+/// Locks `FOR UPDATE` the definitions' rows of `plans` (one page's) whose
+/// page truncates `b`, in id order, and returns their ids for
+/// [`start_rebuilds`]. The page calls it before its first 1-1 `JOIN` lock
+/// row, since a rebuild's start takes every definition's row it rebuilds, in
+/// id order, before it takes their lock rows (`crate::intake::catch_up`,
+/// `super::build::stamp_rebuild_seg`): a page that held one target's lock
+/// row while it queued on another's definition row would close a cycle with
+/// a start of both.
+pub(crate) async fn lock_truncated_definitions<'a>(
+    txn: &Transaction<'_>,
+    plans: impl IntoIterator<Item = &'a JoinOneToOnePlan>,
+) -> Result<Vec<i64>, ApplyError> {
+    let mut ids: Vec<i64> = plans
+        .into_iter()
+        .filter(|plan| plan.truncates_b())
+        .map(|plan| plan.shape.id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    // Planted bug: each definition's row is taken after its lock row, in
+    // `apply_page`. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let late = crate::plant::fires(
+        crate::plant::Plant::Join1TruncateDefAfterLock,
+        !ids.is_empty(),
+    );
+    #[cfg(not(any(test, feature = "test-util")))]
+    let late = false;
+    if !ids.is_empty() && !late {
+        txn.execute(
+            "select 1 from transform_definitions where id = any($1) order by id for update",
+            &[&ids],
+        )
+        .await?;
+    }
+    Ok(ids)
 }
 
 /// A page's `TRUNCATE` of one side or both, under the lock row held `FOR
@@ -793,7 +832,7 @@ async fn lock_definition(txn: &Transaction<'_>, shape: &JoinShape) -> Result<(),
 /// before it that still reaches a page is refused (ADR-0002 I2); and a
 /// truncated `a` empties the target, through the seam. `J` keeps its rows,
 /// as it keeps every key either table has held. A truncated `b` leaves the
-/// target to the rebuild [`start_rebuild`] starts. Returns how many target
+/// target to the rebuild [`start_rebuilds`] starts. Returns how many target
 /// rows it deleted.
 async fn truncate_sides(
     txn: &Transaction<'_>,
@@ -819,8 +858,12 @@ async fn truncate_sides(
         );
         #[cfg(not(any(test, feature = "test-util")))]
         let (keep, no_floor) = (false, false);
+        // A `DELETE`, not a `TRUNCATE`: a sweep or `M` pass batch reads the
+        // ledger before it takes the lock row this page holds, and would wait
+        // for the page while a `TRUNCATE` waited for its read (the module
+        // doc).
         if !keep {
-            txn.batch_execute(&format!("truncate {}", ledger.ident))
+            txn.batch_execute(&format!("delete from {}", ledger.ident))
                 .await?;
         }
         if !no_floor {
@@ -842,22 +885,29 @@ async fn truncate_sides(
     .await
 }
 
-/// Starts the rebuild of the target after a `TRUNCATE` of `b`, in the page's
-/// transaction (ADR-0021): every target row may hold the `b` side of a row
-/// that is gone, so the build's chunks, not the page, rewrite them. The
-/// definition reads `backfilling` from the commit, and keeps applying; a
-/// `LEFT` row keeps its old `b` columns, and an `INNER` row its place, until
-/// the rebuild reaches it. A definition that doesn't apply any more (paused
-/// since the page read the catalog) is left to its `RESUME`, whose build
-/// recreates `R` and `M` and re-derives every row. The caller holds the
-/// definition's row and the lock row `FOR UPDATE`.
-async fn start_rebuild(txn: &Transaction<'_>, shape: &JoinShape) -> Result<(), ApplyError> {
+/// Starts the rebuilds of the targets `ids` ([`lock_truncated_definitions`])
+/// after a `TRUNCATE` of their `b`, in the page's transaction (ADR-0021):
+/// every target row may hold the `b` side of a row that is gone, so the
+/// build's chunks, not the page, rewrite them. Each definition reads
+/// `backfilling` from the commit, and keeps applying; a `LEFT` row keeps its
+/// old `b` columns, and an `INNER` row its place, until the rebuild reaches
+/// it. A definition that doesn't apply any more (paused since the page read
+/// the catalog) is left to its `RESUME`, whose build recreates `R` and `M`
+/// and re-derives every row. The caller holds the definitions' rows and
+/// their lock rows `FOR UPDATE`, and calls this after it has locked its
+/// segments' rows to mark them drained: the start's segment stamp takes the
+/// segment pointer `FOR SHARE`, and seal phase 1 takes the sealed segment's
+/// predecessor's row before it updates the pointer.
+pub(crate) async fn start_rebuilds(txn: &Transaction<'_>, ids: &[i64]) -> Result<(), ApplyError> {
     // Planted bug: the truncate starts no rebuild. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
-    if crate::plant::fires(crate::plant::Plant::Join1TruncateNoRebuild, true) {
+    if crate::plant::fires(crate::plant::Plant::Join1TruncateNoRebuild, !ids.is_empty()) {
         return Ok(());
     }
-    let ids = super::build::rebuildable(txn, &[shape.id]).await?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let ids = super::build::rebuildable(txn, ids).await?;
     super::build::start_rebuilds(txn, &ids).await?;
     super::build::stamp_rebuild_seg(txn, &ids).await?;
     Ok(())

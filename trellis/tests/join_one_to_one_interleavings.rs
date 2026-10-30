@@ -2475,3 +2475,122 @@ async fn a_truncate_of_b_page_and_a_rebuild_start_take_the_definition_row_first(
     assert!(deadlocks.is_empty(), "{deadlocks:?}");
     assert_rebuilt(&mut d, &[Kind::Left]).await;
 }
+
+/// A `TRUNCATE b` of two 1-1 `JOIN`s over `b` whose ids run against their
+/// target names (`jl` is defined first, `ji` sorts first), against a rebuild
+/// start of both, which takes their definitions' rows in id order and then
+/// their lock rows. The page takes both definitions' rows in id order before
+/// either lock row, so it queues on `jl`'s holding nothing of either pair.
+/// Taking each definition's row as it reached that target, it would hold
+/// `ji`'s row and lock row while it queued, and the start's next lock would
+/// close the cycle.
+#[tokio::test]
+async fn a_truncate_of_b_page_of_two_joins_takes_their_definition_rows_in_id_order() {
+    let _serial = serial().await;
+    let mut d = start_kinds(&[Kind::Left, Kind::Inner], A_ROWS, B_ROWS).await;
+    let left = definition_id(&d, Kind::Left.target()).await;
+    let inner = definition_id(&d, Kind::Inner.target()).await;
+    assert!(left < inner, "jl is defined first");
+    write(&d, "truncate public.b").await;
+    let truncate = d.seal().await;
+    let mut start = d.user().await;
+    let txn = start.transaction().await.expect("begin");
+    let lock_definition = |id: i64| {
+        let txn = &txn;
+        async move {
+            txn.execute(
+                "select 1 from transform_definitions where id = $1 for update",
+                &[&id],
+            )
+            .await
+        }
+    };
+    lock_definition(left).await.expect("jl's definition row");
+    let page = d.drain_frozen(truncate, "truncate", &[]).await;
+    let pid: i32 = txn
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("pid")
+        .get(0);
+    assert!(
+        queued_or_finished(&d, pid, &page).await,
+        "the page didn't queue on jl's definition row"
+    );
+    lock_definition(inner)
+        .await
+        .expect("ji's definition row, with no deadlock");
+    for id in [inner, left] {
+        txn.execute(
+            &format!(
+                "select 1 from {}.join1_{id}_l for update",
+                trellis::config::DEFAULT_SCHEMA
+            ),
+            &[],
+        )
+        .await
+        .expect("the lock rows, with no deadlock");
+    }
+    txn.commit().await.expect("commit the start");
+    page.finish().await;
+    let deadlocks = d.deadlocks_logged();
+    assert!(deadlocks.is_empty(), "{deadlocks:?}");
+    assert_rebuilt(&mut d, &[Kind::Left, Kind::Inner]).await;
+}
+
+/// A `TRUNCATE b` page against seal phase 1 sealing the segment after the
+/// truncate's. Phase 1 updates the truncate's segment row (its `seal_step2`)
+/// and then the segment pointer; the page marks its segment row drained and
+/// stamps the rebuild's segment under a share lock on the pointer. The page
+/// takes them in phase 1's order, its segment row first, so it queues on the
+/// row holding no lock on the pointer, and phase 1 goes on. Phase 1 is played
+/// by hand, once the page has claimed its segment.
+#[tokio::test]
+async fn a_truncate_of_b_page_takes_its_segment_row_before_the_segment_pointer() {
+    let _serial = serial().await;
+    let mut d = start_kinds(&[Kind::Left], A_ROWS, B_ROWS).await;
+    write(&d, "truncate public.b").await;
+    let truncate = d.seal().await;
+    let mut page = d
+        .drain_frozen(
+            truncate,
+            "truncate",
+            &[(PausePoint::BeforeJoin1Recompute, Kind::Left.target())],
+        )
+        .await;
+    page.reached(PausePoint::BeforeJoin1Recompute).await;
+    let mut seal = d.user().await;
+    let txn = seal.transaction().await.expect("begin");
+    txn.execute(
+        &format!(
+            "update {}.segments set seal_step2 = seal_step2 where seg_seq = $1",
+            trellis::config::DEFAULT_SCHEMA
+        ),
+        &[&truncate],
+    )
+    .await
+    .expect("the truncate's segment row");
+    d.release(&mut page, PausePoint::BeforeJoin1Recompute).await;
+    let pid: i32 = txn
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("pid")
+        .get(0);
+    assert!(
+        queued_or_finished(&d, pid, &page).await,
+        "the page didn't queue on its segment row"
+    );
+    txn.execute(
+        &format!(
+            "update {}.segment_pointer set active_seq = active_seq",
+            trellis::config::DEFAULT_SCHEMA
+        ),
+        &[],
+    )
+    .await
+    .expect("the segment pointer, with no deadlock");
+    txn.rollback().await.expect("roll phase 1 back");
+    page.finish().await;
+    let deadlocks = d.deadlocks_logged();
+    assert!(deadlocks.is_empty(), "{deadlocks:?}");
+    assert_rebuilt(&mut d, &[Kind::Left]).await;
+}

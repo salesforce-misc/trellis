@@ -816,6 +816,43 @@ async fn h3_a_row_reinserted_after_the_orphan_read_is_kept() {
     }
 }
 
+/// A `TRUNCATE a` whose page meets the rebuild sweep between its orphan read
+/// and its re-derive. The sweep has read `R` and the target unlocked and
+/// takes the lock row next. The page, holding the lock row `FOR UPDATE`,
+/// empties `R` with a `DELETE`, which waits on nothing the sweep holds, so it
+/// commits and the sweep then re-derives against the emptied `R`. A
+/// `TRUNCATE` of `R` waits for the sweep's read to commit, while the sweep
+/// waits for the lock row: a deadlock.
+#[tokio::test]
+async fn a_truncate_of_a_runs_past_the_sweeps_orphan_read() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(&[kind], true).await;
+        change_while_paused(&mut d, &[kind], "delete from public.a where id = 'a03'").await;
+        run_until_the_sweep(&d).await;
+        write(&d, "truncate public.a").await;
+        let truncate = d.seal().await;
+        let target = kind.target();
+        let mut sweep = d
+            .run_frozen(
+                &[(PausePoint::AfterJoin1OrphanRead, &target)],
+                |pool| async move { Ok(build_step(&pool, "sweep", 3).await) },
+            )
+            .await;
+        let reached = sweep.reached(PausePoint::AfterJoin1OrphanRead).await;
+        let page = d.drain_frozen(truncate, "truncate", &[]).await;
+        assert!(
+            !queued_or_finished(&d, reached.backend_pid, &page).await,
+            "the truncate's page queued behind the sweep's read of R"
+        );
+        page.finish().await;
+        d.release(&mut sweep, PausePoint::AfterJoin1OrphanRead)
+            .await;
+        sweep.finish().await;
+        assert_oracle(&mut d, &[kind], "a truncate of a past the orphan read").await;
+    }
+}
+
 /// The `M` pass over `b` ∪ `M` on a rebuild in place of a live join whose
 /// `b` row 2 (key 20) was deleted, row 1 changed and row 8 inserted (on key
 /// 0), and whose `a01` moved onto 40, all past capture, so `R` and `M` hold

@@ -139,11 +139,13 @@ A page carrying changes and Re-derives of both tables takes one `J` lock
 statement over the union of both sides' key sets. Its lock order is the
 truncate lock row, `J`, then `R` entries, then `M` entries, then target rows,
 each sorted. A truncate page holds the lock row `FOR UPDATE`, empties its
-side's hidden table and raises its floor. ADR-0019's barrier orders it
-against other pages; without the barrier, four of eight truncate families
-were wrong. With both rules, 60 families × 2 join kinds (102,312 schedules per
-version on PG 16.8, 17.10 and 18.2) and 48 soak runs, with builds starting
-mid-run, were exact (#1375).
+side's hidden table and raises its floor. It empties the table with a
+`DELETE`: a build step reads `R` or `M` before it takes the lock row, so a
+`TRUNCATE`, whose lock waits for that read, would deadlock with it.
+ADR-0019's barrier orders the page against other pages; without the
+barrier, four of eight truncate families were wrong. With both rules, 60
+families × 2 join kinds (102,312 schedules per version on PG 16.8, 17.10 and
+18.2) and 48 soak runs, with builds starting mid-run, were exact (#1375).
 
 A page settles its truncate before its changes, so a change after the truncate
 in the same batch applies to the emptied side:
@@ -151,14 +153,17 @@ in the same batch applies to the emptied side:
 - **`TRUNCATE a`** empties `R` and raises its floor, and deletes every target
   row in the page. `M` and `J` are untouched.
 - **`TRUNCATE b`** empties `M` and raises its floor. It changes every target
-  row, so it starts a target rebuild rather than recomputing in the page: the
-  page takes the definition's row `FOR UPDATE`, before the lock row as a
-  rebuild's start does, and ends with the rebuild's start and its segment
-  stamp. From the commit the transform reads `backfilling` and keeps applying.
-  A `LEFT` row keeps the `b` columns it held until the build's chunk reaches
-  it, an `INNER` row stays, and a change of `a` before then joins the emptied
-  `M`. A definition that does not apply (paused since the page began) starts
-  no rebuild, and its `RESUME` re-derives every row.
+  row, so it starts a target rebuild rather than recomputing in the page. A
+  rebuild's start takes the definition rows of everything it rebuilds, in id
+  order, then their lock rows, then the segment pointer. So the page takes
+  the definition rows of every target whose `b` it truncates `FOR UPDATE`, in
+  id order, before its first lock row, and starts the rebuilds after it has
+  marked its segments drained, since seal phase 1 takes a segment's row
+  before the pointer. From the commit the transform reads `backfilling` and
+  keeps applying. A `LEFT` row keeps the `b` columns it held until the
+  build's chunk reaches it, an `INNER` row stays, and a change of `a` before
+  then joins the emptied `M`. A definition that does not apply (paused since
+  the page began) starts no rebuild, and its `RESUME` re-derives every row.
 - A page that truncates both sides does both.
 
 A change of either side that was staged before a truncate and reaches a page
