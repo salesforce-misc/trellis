@@ -994,6 +994,21 @@ async fn plan_job(d: &Driver) -> (Option<String>, Option<String>, bool) {
     (job.get(0), job.get(1), job.get(2))
 }
 
+/// Ends a killed job's session and waits until it has exited.
+/// `pg_terminate_backend` alone only signals the backend, and until it has
+/// rolled back, its fenced transaction still holds the job's claim row `FOR
+/// KEY SHARE` (`ClaimFence::hold`): a claim's `FOR UPDATE SKIP LOCKED` then
+/// skips the row the test freed, and finds nothing to run.
+async fn end_session(d: &Driver, pid: i32) {
+    let ended: bool = d
+        .ctl
+        .query_one("select pg_terminate_backend($1, 60000)", &[&pid])
+        .await
+        .expect("end the job's session")
+        .get(0);
+    assert!(ended, "the job's session {pid} exited");
+}
+
 /// `kind`'s `M` entries' row versions, by key.
 async fn m_versions(d: &Driver, kind: Kind) -> Vec<String> {
     let id = definition_id(d, kind).await;
@@ -1101,10 +1116,7 @@ async fn a_plan_job_killed_after_its_m_pass_resumes_at_the_walk_of_a() {
         let before = m_versions(&d, kind).await;
         assert_eq!(before.len(), 6, "{before:?}");
         planner.kill().await;
-        d.ctl
-            .execute("select pg_terminate_backend($1)", &[&reached.backend_pid])
-            .await
-            .expect("end the plan job's session");
+        end_session(&d, reached.backend_pid).await;
         d.ctl
             .batch_execute(
                 "update backfill_chunks \
@@ -1334,10 +1346,7 @@ async fn a_sweep_killed_in_its_orphan_pass_resumes_from_its_cursor() {
             "the stale pass is done and committed"
         );
         sweep.kill().await;
-        d.ctl
-            .execute("select pg_terminate_backend($1)", &[&reached.backend_pid])
-            .await
-            .expect("end the sweep's session");
+        end_session(&d, reached.backend_pid).await;
         d.ctl
             .batch_execute(
                 "update backfill_chunks \
