@@ -1034,6 +1034,7 @@ pub async fn install_definition(
                 .map_err(CatalogError::Ddl)?;
             let pk_names: Vec<&str> = pk.iter().map(|c| c.name.as_str()).collect();
             reject_primary_key_named_fields(&def.fields, &pk_names)?;
+            check_one_to_one_target_width(pk.len(), def.fields.len())?;
             super::join_one_to_one::target_ddl(
                 &def,
                 &ddl::qualified_target_table(target_schema, &def),
@@ -1052,6 +1053,7 @@ pub async fn install_definition(
                 .await
                 .map_err(CatalogError::Ddl)?;
             reject_unkeyed_source(&**pool.get().await?, &qualified_source, &def).await?;
+            check_one_to_one_target_width(pk.len(), def.fields.len())?;
             ddl::target_table_ddl(
                 pool,
                 &def,
@@ -1828,6 +1830,10 @@ pub async fn alter_transform(
         &real_alters,
     )
     .await?;
+
+    // The edited target must still fit Postgres's column limit, counting the
+    // columns earlier edits dropped. Before any DDL, like the rechecks above.
+    check_alter_target_width(&*txn, &target_ident, &real_adds, &real_drops).await?;
 
     // An added or altered field's `STRPOS`/
     // `REGEXP_COUNT` can't read a nondeterministic-collation column, exactly
@@ -3927,6 +3933,83 @@ async fn reject_fields_named_after_primary_key(
         .map_err(CatalogError::Ddl)?;
     let pk_names: Vec<&str> = pk.iter().map(|c| c.name.as_str()).collect();
     reject_primary_key_named_fields(fields, &pk_names)?;
+    Ok(())
+}
+
+/// Refuses a 1-1 target (of a plain transform or a 1-1 `JOIN`) that would
+/// hold more columns than Postgres allows in a table: the source's primary
+/// key of `key_columns` columns, then one column per field. The key's width is
+/// the source's, which validation doesn't see.
+fn check_one_to_one_target_width(key_columns: usize, fields: usize) -> Result<(), ValidationError> {
+    super::validate::check_table_width(|| "the target table".to_string(), key_columns + fields)
+}
+
+/// How many columns a target of `relnatts` attributes (dropped ones
+/// included) would hold once an `ALTER TRANSFORM` drops `drops` and adds
+/// `adds` fields, when that is more than Postgres allows in a table: the
+/// width and how many of those columns are dropped ones. `live` is the
+/// target's columns now, by name.
+///
+/// A column that is dropped keeps its attribute number (`relnatts` never
+/// shrinks), so it counts against the limit until the table is created again,
+/// and a column an edit drops counts the same from then on. An `ADD` of a
+/// column the target has already creates nothing (`add column if not exists`).
+fn alter_target_overflow(
+    relnatts: usize,
+    live: &HashSet<String>,
+    drops: &[String],
+    adds: &[FieldDef],
+) -> Option<(usize, usize)> {
+    let new = adds.iter().filter(|f| !live.contains(&f.name)).count();
+    let after_edit = live.len() - drops.iter().filter(|d| live.contains(*d)).count() + new;
+    if after_edit > super::validate::TABLE_MAX_COLUMNS {
+        return Some((after_edit, 0));
+    }
+    let attributes = relnatts + new;
+    (attributes > super::validate::TABLE_MAX_COLUMNS)
+        .then_some((attributes, attributes - after_edit))
+}
+
+/// [`alter_target_overflow`] for the target `target_ident` (quoted and
+/// qualified), as it is now: refuses an edit that would give it more columns
+/// than Postgres allows, before the edit changes anything.
+async fn check_alter_target_width(
+    client: &impl GenericClient,
+    target_ident: &str,
+    adds: &[FieldDef],
+    drops: &[String],
+) -> Result<(), CatalogError> {
+    if adds.is_empty() {
+        return Ok(());
+    }
+    let relnatts: i16 = client
+        .query_one(
+            "select relnatts from pg_catalog.pg_class where oid = $1::text::regclass",
+            &[&target_ident],
+        )
+        .await?
+        .get(0);
+    let live: HashSet<String> = client
+        .query(
+            "select attname::text from pg_catalog.pg_attribute \
+             where attrelid = $1::text::regclass and attnum > 0 and not attisdropped",
+            &[&target_ident],
+        )
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    if let Some((columns, dropped)) =
+        alter_target_overflow(usize::try_from(relnatts).unwrap_or(0), &live, drops, adds)
+    {
+        return Err(ValidationError::TableTooWide {
+            table: "the target table".to_string(),
+            columns,
+            limit: super::validate::TABLE_MAX_COLUMNS,
+            dropped,
+        }
+        .into());
+    }
     Ok(())
 }
 
@@ -7415,6 +7498,67 @@ mod grammar_window_tests {
                 .await
                 .expect("an unrelated newer definition and a too-old one don't refuse"),
             Vec::<(String, String)>::new()
+        );
+    }
+}
+
+#[cfg(test)]
+mod alter_target_width_tests {
+    use super::*;
+    use crate::defs::ast::Expr;
+
+    fn field(name: &str) -> FieldDef {
+        FieldDef {
+            name: name.to_string(),
+            expr: Expr::Column("v".to_string()),
+        }
+    }
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    fn live(count: usize) -> HashSet<String> {
+        (0..count).map(|i| format!("c{i}")).collect()
+    }
+
+    /// A target of 1600 live columns takes no more; one short takes one.
+    #[test]
+    fn an_alter_that_adds_past_the_column_limit_overflows() {
+        assert_eq!(
+            alter_target_overflow(1599, &live(1599), &[], &[field("x")]),
+            None
+        );
+        assert_eq!(
+            alter_target_overflow(1600, &live(1600), &[], &[field("x")]),
+            Some((1601, 0))
+        );
+    }
+
+    /// An `ADD` of a column the target already has creates nothing
+    /// (`add column if not exists`), and a drop in the same edit makes room
+    /// for a live column but not an attribute number.
+    #[test]
+    fn an_alter_counts_what_it_creates_and_what_it_drops_by_the_attributes_kept() {
+        assert_eq!(
+            alter_target_overflow(1600, &live(1600), &[], &[field("c3")]),
+            None
+        );
+        // Dropping `c0` then adding `x` leaves 1600 live columns but needs a
+        // 1601st attribute: the dropped column keeps its number.
+        assert_eq!(
+            alter_target_overflow(1600, &live(1600), &names(&["c0"]), &[field("x")]),
+            Some((1601, 1))
+        );
+        // Columns dropped by earlier edits count the same.
+        assert_eq!(
+            alter_target_overflow(1600, &live(1590), &[], &[field("x")]),
+            Some((1601, 10))
+        );
+        // Over the limit by live columns alone, no dropped column is blamed.
+        assert_eq!(
+            alter_target_overflow(1610, &live(1600), &[], &[field("x")]),
+            Some((1601, 0))
         );
     }
 }

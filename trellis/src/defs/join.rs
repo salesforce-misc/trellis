@@ -365,6 +365,64 @@ fn zero_column(arguments: usize) -> String {
     )
 }
 
+/// The columns of a side's hidden partials table after its key columns: the
+/// partials of its `arguments`, the basis, the stamp and the zero flag.
+fn side_partials_tail(arguments: usize) -> Vec<String> {
+    let mut columns = partial_columns(arguments);
+    columns.push("__basis pg_snapshot".to_string());
+    columns.push("__stamp bigint not null default 0".to_string());
+    columns.push(zero_column(arguments));
+    columns
+}
+
+/// The columns of `T` after its group columns: the partials of all the
+/// definition's `arguments`, and the zero flag.
+fn target_partials_tail(arguments: usize) -> Vec<String> {
+    let mut columns = partial_columns(arguments);
+    columns.push(zero_column(arguments));
+    columns
+}
+
+/// The fields of a `JOIN` target that are not one of its `GROUP BY` keys, in
+/// the order written: each of them has a column beside the keys'.
+fn non_key_fields<'a>(
+    def: &'a TransformDef,
+    join: &'a JoinSpec,
+) -> impl Iterator<Item = &'a super::ast::FieldDef> {
+    def.fields
+        .iter()
+        .filter(|field| !join.group_by.iter().any(|key| key.column == field.name))
+}
+
+/// Each table an aggregate `JOIN` definition creates whose width follows its
+/// definition, with the subject a refusal names it by: the visible target,
+/// each side's hidden partials table (`P` and `M`) and `T`. `J` and the
+/// truncate lock are as wide as the join key and two columns, which
+/// `check_index_key_width` bounds. Each width is the length of the column list
+/// the table's DDL is built from, so a limit on it is the table's width.
+pub(crate) fn table_widths(def: &TransformDef) -> Vec<(String, usize)> {
+    let Some(join) = spec(def) else {
+        return Vec::new();
+    };
+    let mut widths = vec![(
+        "the target table".to_string(),
+        join.group_by.len() + non_key_fields(def, join).count(),
+    )];
+    for (side, table) in [(Side::From, &def.source), (Side::Joined, &join.right)] {
+        widths.push((
+            format!("{table}'s hidden partials table"),
+            side_key_columns(def, side).len()
+                + side_partials_tail(side_arguments(def, side).len()).len(),
+        ));
+    }
+    let arguments = side_arguments(def, Side::From).len() + side_arguments(def, Side::Joined).len();
+    widths.push((
+        "the hidden table of the JOIN's group partials".to_string(),
+        join.group_by.len() + target_partials_tail(arguments).len(),
+    ));
+    widths
+}
+
 /// `side`'s key columns in its hidden partials table, in the order of the
 /// table's cell identity: its join key columns, then its `GROUP BY` columns
 /// not already among them. The join key leads so the table's identity index
@@ -405,10 +463,7 @@ pub(crate) fn hidden_tables_ddl(
         let keys = side_key_columns(def, side);
         let arguments = side_arguments(def, side).len();
         let mut body: Vec<String> = keys.iter().map(|c| typed(columns, c)).collect();
-        body.extend(partial_columns(arguments));
-        body.push("__basis pg_snapshot".to_string());
-        body.push("__stamp bigint not null default 0".to_string());
-        body.push(zero_column(arguments));
+        body.extend(side_partials_tail(arguments));
         // The cell identity is the key columns in order, the join key first
         // (`side_key_columns`).
         let identity: Vec<String> = keys.iter().map(|c| quote_ident(c)).collect();
@@ -446,8 +501,7 @@ pub(crate) fn hidden_tables_ddl(
             .collect();
         let arguments =
             side_arguments(def, Side::From).len() + side_arguments(def, Side::Joined).len();
-        body.extend(partial_columns(arguments));
-        body.push(zero_column(arguments));
+        body.extend(target_partials_tail(arguments));
         let groups: Vec<String> = join
             .group_by
             .iter()
@@ -570,10 +624,7 @@ pub(crate) fn target_ddl(
         columns.push(format!("{} {pg_type}", quote_ident(&key.column)));
         keys.push(quote_ident(&key.column));
     }
-    for field in &def.fields {
-        if join.group_by.iter().any(|key| key.column == field.name) {
-            continue;
-        }
+    for field in non_key_fields(def, join) {
         let pg_type = field_pg_type(def, field, from, joined)?;
         columns.push(format!("{} {pg_type}", quote_ident(&field.name)));
     }
@@ -719,6 +770,42 @@ mod tests {
             "drop table if exists \"trellis\".\"join_7_p\", \"trellis\".\"join_7_m\", \
              \"trellis\".\"join_7_j\", \"trellis\".\"join_7_t\", \"trellis\".\"join_7_l\""
         );
+
+        // The widths a definition is checked against are the widths of these
+        // tables.
+        let created = crate::defs::ddl::declared_column_counts(&format!(
+            "{ddl}{}",
+            target_ddl(&def, "\"public\".\"by_region\"", &from, &joined).unwrap()
+        ));
+        let created = |name: &str| {
+            created
+                .iter()
+                .find(|(table, _)| table.ends_with(name))
+                .unwrap_or_else(|| panic!("{name} in {created:?}"))
+                .1
+        };
+        let widths = table_widths(&def);
+        assert_eq!(
+            widths,
+            [
+                ("the target table".to_string(), created("\"by_region\"")),
+                (
+                    "orders's hidden partials table".to_string(),
+                    created("\"join_7_p\"")
+                ),
+                (
+                    "items's hidden partials table".to_string(),
+                    created("\"join_7_m\"")
+                ),
+                (
+                    "the hidden table of the JOIN's group partials".to_string(),
+                    created("\"join_7_t\"")
+                ),
+            ]
+        );
+        // Spelled out: `P` is 3 key columns (id, tenant, region), the row
+        // count, a pair for its one argument, then basis, stamp and zero flag.
+        assert_eq!(widths[1].1, 3 + 1 + 2 + 3);
 
         let target = target_ddl(&def, "\"public\".\"by_region\"", &from, &joined).unwrap();
         assert_eq!(

@@ -514,11 +514,13 @@ pub(crate) fn hidden_table_ident(schema: &str, id: i64) -> String {
     )
 }
 
-/// The statements creating definition `id`'s hidden table in the catalog
-/// schema `schema` (see the module doc) and its zero-group index (see "Zero
-/// groups" there). Created empty with the definition's row, and dropped with
-/// it ([`drop_hidden_table_sql`]).
-pub(crate) fn hidden_table_ddl(schema: &str, id: i64, shape: &GroupShape) -> String {
+/// The columns of the hidden table `shape` gives a definition, in order:
+/// the `GROUP BY` columns, the row count, a non-null count per aggregate
+/// argument and a sum for each a `SUM` or `AVG` reads, then the basis, stamp
+/// and zero-group flag. [`hidden_table_ddl`] creates exactly these (and the
+/// group identity), and [`hidden_table_width`] counts them, so a limit on the
+/// table's width is the width of the table.
+fn hidden_table_columns(shape: &GroupShape) -> Vec<String> {
     let mut columns: Vec<String> = shape
         .group_cols
         .iter()
@@ -541,6 +543,25 @@ pub(crate) fn hidden_table_ddl(schema: &str, id: i64, shape: &GroupShape) -> Str
         "__zero boolean not null generated always as ({}) stored",
         zero.join(" and ")
     ));
+    columns
+}
+
+/// How many columns the hidden table of `shape` has.
+pub(crate) fn hidden_table_width(shape: &GroupShape) -> usize {
+    hidden_table_columns(shape).len()
+}
+
+/// How many columns the visible target of `shape` has.
+pub(crate) fn target_table_width(shape: &GroupShape) -> usize {
+    target_table_columns(shape).len()
+}
+
+/// The statements creating definition `id`'s hidden table in the catalog
+/// schema `schema` (see the module doc) and its zero-group index (see "Zero
+/// groups" there). Created empty with the definition's row, and dropped with
+/// it ([`drop_hidden_table_sql`]).
+pub(crate) fn hidden_table_ddl(schema: &str, id: i64, shape: &GroupShape) -> String {
+    let mut columns = hidden_table_columns(shape);
     let group_cols = quoted(&shape.group_cols).join(", ");
     columns.push(format!("unique nulls not distinct ({group_cols})"));
     let table = hidden_table_ident(schema, id);
@@ -578,10 +599,9 @@ pub(crate) fn drop_hidden_table_sql(schema: &str, id: i64) -> String {
     format!("drop table if exists {}", hidden_table_ident(schema, id))
 }
 
-/// The visible target's `create table` statement for `shape`: the `GROUP BY`
-/// columns, each value field, and the group identity, nothing else (see the
-/// module doc). `target` is the target, quoted and qualified.
-pub(crate) fn target_table_ddl(target: &str, shape: &GroupShape) -> String {
+/// The columns of the visible target of `shape`: the `GROUP BY` columns and
+/// each value field.
+fn target_table_columns(shape: &GroupShape) -> Vec<String> {
     let mut columns: Vec<String> = shape
         .group_cols
         .iter()
@@ -591,6 +611,14 @@ pub(crate) fn target_table_ddl(target: &str, shape: &GroupShape) -> String {
     for (name, pg_type, _) in &shape.fields {
         columns.push(format!("{} {pg_type}", quote_ident(name)));
     }
+    columns
+}
+
+/// The visible target's `create table` statement for `shape`: the `GROUP BY`
+/// columns, each value field, and the group identity, nothing else (see the
+/// module doc). `target` is the target, quoted and qualified.
+pub(crate) fn target_table_ddl(target: &str, shape: &GroupShape) -> String {
+    let mut columns = target_table_columns(shape);
     columns.push(format!(
         "unique nulls not distinct ({})",
         quoted(&shape.group_cols).join(", ")
@@ -3392,6 +3420,40 @@ mod tests {
     fn shape(text: &str) -> Option<GroupShape> {
         let def = crate::defs::parse(text).expect("parses");
         route(&def, &columns())
+    }
+
+    /// The widths a definition is checked against are the widths of the
+    /// tables its DDL creates, whatever mix of arguments it has: a count-only
+    /// argument has no sum column, a repeated argument no second pair.
+    #[test]
+    fn the_checked_widths_are_the_widths_of_the_created_tables() {
+        for text in [
+            "TRANSFORM t FROM s GROUP BY g SELECT COUNT(*) AS n",
+            "TRANSFORM t FROM s GROUP BY g, h SELECT g AS g, COUNT(h) AS n, SUM(a) AS s, AVG(b) AS v",
+            "TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS s, AVG(a) AS v, COUNT(a) AS c",
+            "TRANSFORM t FROM s GROUP BY g SELECT SUM(a + 1) AS s, COUNT(b) AS c, SUM(m) AS d",
+        ] {
+            let shape = shape(text).expect("routes");
+            let hidden =
+                crate::defs::ddl::declared_column_counts(&hidden_table_ddl("trellis", 3, &shape));
+            assert_eq!(
+                hidden.iter().map(|(_, n)| *n).collect::<Vec<_>>(),
+                [hidden_table_width(&shape)],
+                "{text}"
+            );
+            let target = crate::defs::ddl::declared_column_counts(&target_table_ddl("t", &shape));
+            assert_eq!(
+                target.iter().map(|(_, n)| *n).collect::<Vec<_>>(),
+                [target_table_width(&shape)],
+                "{text}"
+            );
+        }
+        // Spelled out once: 2 group columns, the count, 2 columns for `SUM(a)`
+        // and 1 for `COUNT(h)`, then basis, stamp and zero flag.
+        let shape = shape("TRANSFORM t FROM s GROUP BY g, h SELECT COUNT(h) AS n, SUM(a) AS s")
+            .expect("routes");
+        assert_eq!(hidden_table_width(&shape), 2 + 1 + 1 + 2 + 3);
+        assert_eq!(target_table_width(&shape), 2 + 2);
     }
 
     #[test]

@@ -192,6 +192,40 @@ fn typed(columns: &HashMap<String, JoinColumnInfo>, name: &str) -> String {
     format!("{} {pg_type}", quote_ident(name))
 }
 
+/// The columns `side`'s ledger table copies from its source, in order: the
+/// join key, then the other columns the fields read.
+fn read_columns(def: &TransformDef, side: Side) -> Vec<String> {
+    let key = join_key(def, side);
+    let mut read = key.clone();
+    read.extend(
+        side_columns(def, side)
+            .into_iter()
+            .filter(|column| !key.contains(column)),
+    );
+    read
+}
+
+/// Each table a 1-1 `JOIN` definition creates whose width follows its
+/// definition, apart from the target (whose columns are the primary key's and
+/// the fields'): the two ledgers `R` and `M`, with the subject a refusal
+/// names each by. `J` is as wide as the join key and one column, which
+/// `check_index_key_width` bounds. Each width counts the columns the ledger's
+/// DDL ([`hidden_tables_ddl`]) is built from.
+pub(crate) fn ledger_widths(def: &TransformDef) -> Vec<(String, usize)> {
+    let Some(join) = super::join::spec(def) else {
+        return Vec::new();
+    };
+    [(Side::From, &def.source), (Side::Joined, &join.right)]
+        .into_iter()
+        .map(|(side, table)| {
+            (
+                format!("{table}'s hidden ledger table"),
+                1 + super::ledger::ORDERING_STATE_COLUMN_COUNT + read_columns(def, side).len(),
+            )
+        })
+        .collect()
+}
+
 /// Renders the `create table` statements of `def`'s hidden tables
 /// ([`HiddenTable`]) in `catalog_schema`, for definition `id`. `from` and
 /// `joined` are the two sides' live columns, as define read them.
@@ -210,12 +244,7 @@ pub(crate) fn hidden_tables_ddl(
         let name = table.qualified(catalog_schema, id);
         let key = join_key(def, side);
         // The join key leads, then the other columns the fields read.
-        let mut read: Vec<String> = key.clone();
-        read.extend(
-            side_columns(def, side)
-                .into_iter()
-                .filter(|column| !key.contains(column)),
-        );
+        let read = read_columns(def, side);
         let mut body = vec![format!(
             "{} text collate \"C\" primary key",
             quote_ident(super::ledger::KEY_COLUMN)
@@ -504,6 +533,40 @@ pub(crate) mod tests {
             "drop table if exists \"trellis\".\"join1_7_r\", \"trellis\".\"join1_7_m\", \
              \"trellis\".\"join1_7_j\", \"trellis\".\"join1_7_l\""
         );
+    }
+
+    /// The widths a definition is checked against are the widths of the
+    /// ledgers its DDL creates.
+    #[test]
+    fn the_checked_ledger_widths_are_the_widths_of_the_created_ledgers() {
+        let def = parse(DEF).unwrap();
+        let (from, joined) = sides();
+        let created = crate::defs::ddl::declared_column_counts(&hidden_tables_ddl(
+            "trellis", 7, &def, &from, &joined,
+        ));
+        let created = |name: &str| {
+            created
+                .iter()
+                .find(|(table, _)| table.ends_with(name))
+                .unwrap_or_else(|| panic!("{name} in {created:?}"))
+                .1
+        };
+        assert_eq!(
+            ledger_widths(&def),
+            [
+                (
+                    "orders's hidden ledger table".to_string(),
+                    created("join1_7_r\"")
+                ),
+                (
+                    "customers's hidden ledger table".to_string(),
+                    created("join1_7_m\"")
+                ),
+            ]
+        );
+        // The key, four ordering-state columns, then the three columns `a`
+        // reads (cust, tenant, total).
+        assert_eq!(ledger_widths(&def)[0].1, 1 + 4 + 3);
     }
 
     #[test]

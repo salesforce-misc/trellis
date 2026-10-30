@@ -113,15 +113,21 @@ pub(crate) fn qualified_ledger_table(target_schema: &str, target: &str) -> Strin
     )
 }
 
+/// How many ordering-state columns a ledger has ([`ordering_state_columns`]).
+pub(crate) const ORDERING_STATE_COLUMN_COUNT: usize = 4;
+
 /// The ordering-state columns every ledger ends with.
 pub(crate) fn ordering_state_columns() -> String {
-    format!(
-        "{} pg_lsn, {} bigint, {} pg_snapshot, {} boolean not null default false",
-        quote_ident(APPLIED_LSN_COLUMN),
-        quote_ident(APPLIED_SEG_COLUMN),
-        quote_ident(BASIS_COLUMN),
-        quote_ident(TOMBSTONE_COLUMN),
-    )
+    let columns: [String; ORDERING_STATE_COLUMN_COUNT] = [
+        format!("{} pg_lsn", quote_ident(APPLIED_LSN_COLUMN)),
+        format!("{} bigint", quote_ident(APPLIED_SEG_COLUMN)),
+        format!("{} pg_snapshot", quote_ident(BASIS_COLUMN)),
+        format!(
+            "{} boolean not null default false",
+            quote_ident(TOMBSTONE_COLUMN)
+        ),
+    ];
+    columns.join(", ")
 }
 
 /// A 1-1 target's ledger DDL: the key and the ordering state,

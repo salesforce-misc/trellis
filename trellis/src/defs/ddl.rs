@@ -1642,10 +1642,57 @@ pub(crate) fn aggregate_target_table_ddl(
     ))
 }
 
+/// For a test: how many columns each `create table` statement in `sql`
+/// declares, by the table's name as written. A table constraint
+/// (`unique ...`, `primary key (...)`) is no column. Names and column lists
+/// here hold no parenthesis or comma outside a type or constraint.
+#[cfg(test)]
+pub(crate) fn declared_column_counts(sql: &str) -> Vec<(String, usize)> {
+    sql.split("create table ")
+        .skip(1)
+        .map(|statement| {
+            let (name, rest) = statement.split_once(" (").expect("a column list");
+            let mut depth = 0usize;
+            let mut entries = vec![String::new()];
+            for c in rest.chars() {
+                match c {
+                    '(' => depth += 1,
+                    ')' if depth == 0 => break,
+                    ')' => depth -= 1,
+                    ',' if depth == 0 => {
+                        entries.push(String::new());
+                        continue;
+                    }
+                    _ => {}
+                }
+                entries.last_mut().expect("an entry").push(c);
+            }
+            let columns = entries
+                .iter()
+                .map(|entry| entry.trim())
+                .filter(|entry| !entry.starts_with("unique ") && !entry.starts_with("primary key"))
+                .count();
+            (name.to_string(), columns)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::defs::ast::{FieldDef, KeySpace, Operator, Predicate};
+
+    #[test]
+    fn declared_column_counts_counts_columns_and_not_constraints() {
+        let sql = "create table \"s\".\"t\" (a numeric(10,2), b text, \
+                   unique nulls not distinct (a, b)); create index on t (a);\n\
+                   create table u (id boolean primary key default true check (id), \
+                   primary key (id));";
+        assert_eq!(
+            declared_column_counts(sql),
+            [("\"s\".\"t\"".to_string(), 2), ("u".to_string(), 1)]
+        );
+    }
 
     fn def() -> TransformDef {
         TransformDef {

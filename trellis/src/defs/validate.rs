@@ -135,6 +135,19 @@ pub enum ValidationError {
         columns: usize,
         limit: usize,
     },
+    /// A table Trellis creates for a definition would hold more columns than
+    /// Postgres allows in one (`TABLE_MAX_COLUMNS`, 1600): the target, or a
+    /// hidden table that carries columns per field (an aggregate's partials,
+    /// a `JOIN`'s partials or ledgers). `table` names which, as the subject of
+    /// the message; `columns` is the width it would have, counting `dropped`
+    /// columns Postgres still counts (an `ALTER TRANSFORM` that dropped fields
+    /// from a target leaves them behind).
+    TableTooWide {
+        table: String,
+        columns: usize,
+        limit: usize,
+        dropped: usize,
+    },
     /// The two columns of an `ON` term differ in type or collation (a type
     /// modifier never counts, and `text` and `varchar` are one type).
     /// Trellis never casts a join key.
@@ -1003,6 +1016,27 @@ impl fmt::Display for ValidationError {
                 "{clause} has {columns} columns, but Trellis keys a table on them and \
                  Postgres caps an index at {limit} columns; use at most {limit}"
             ),
+            ValidationError::TableTooWide {
+                table,
+                columns,
+                limit,
+                dropped,
+            } => {
+                write!(
+                    f,
+                    "{table} would have {columns} columns, but Postgres caps a table at \
+                     {limit} columns"
+                )?;
+                if *dropped > 0 {
+                    write!(
+                        f,
+                        " (counting {dropped} dropped columns, which Postgres keeps counting \
+                         until the table is created again; drop the transform and define it \
+                         again to reclaim them)"
+                    )?;
+                }
+                write!(f, "; use fewer fields or aggregate arguments")
+            }
             ValidationError::JoinKeyTypeMismatch {
                 lhs,
                 lhs_type,
@@ -1690,7 +1724,36 @@ pub fn validate(
         return Err(ValidationError::FieldExpansionTooLarge);
     }
 
+    if let KeySpace::Aggregate { .. } = &def.key_space {
+        check_aggregate_table_widths(def, source_columns)?;
+    }
+
     Ok(())
+}
+
+/// Refuses an aggregate whose target, or whose hidden table of partials (two
+/// columns per distinct summed argument), would hold more columns than
+/// Postgres allows in a table ([`TABLE_MAX_COLUMNS`]). Both widths are the
+/// ones the tables' DDL creates ([`crate::staging::group_basis`]'s
+/// `hidden_table_width` and `target_table_width`). An aggregate the group
+/// basis doesn't take (one outside the admitted set) creates no table and is
+/// refused where its function is checked.
+fn check_aggregate_table_widths(
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+) -> Result<(), ValidationError> {
+    use crate::staging::group_basis::{hidden_table_width, route, target_table_width};
+    let Some(shape) = route(def, source_columns) else {
+        return Ok(());
+    };
+    check_table_width(
+        || "the target table".to_string(),
+        target_table_width(&shape),
+    )?;
+    check_table_width(
+        || "the hidden table of the aggregate's partial sums".to_string(),
+        hidden_table_width(&shape),
+    )
 }
 
 /// The target-name and field-name rules every key-space shares.
@@ -2243,6 +2306,11 @@ pub fn validate_join(
         join_field_value_type(def, field, left, right)?;
     }
     check_join_collation_reads(def, join, left, right)?;
+    // The target and each hidden table carry columns per field (two per
+    // distinct aggregate argument in the partials).
+    for (table, columns) in super::join::table_widths(def) {
+        check_table_width(|| table, columns)?;
+    }
     Ok(())
 }
 
@@ -2669,6 +2737,31 @@ fn check_index_key_width(
             clause: clause(),
             columns,
             limit: INDEX_MAX_KEYS,
+        });
+    }
+    Ok(())
+}
+
+/// The most columns Postgres allows in one table (`MaxHeapAttributeNumber`,
+/// 1600, a compile-time constant of the server). A dropped column keeps
+/// counting, and a system column does not. Every table Trellis creates for a
+/// definition is held to it: a definition whose target or hidden table would
+/// be wider fails `CREATE TABLE` with `54011`, so it is refused at validation
+/// instead.
+pub const TABLE_MAX_COLUMNS: usize = 1600;
+
+/// Refuses a table of `columns` columns, described by `table`, when it is
+/// wider than [`TABLE_MAX_COLUMNS`].
+pub(crate) fn check_table_width(
+    table: impl FnOnce() -> String,
+    columns: usize,
+) -> Result<(), ValidationError> {
+    if columns > TABLE_MAX_COLUMNS {
+        return Err(ValidationError::TableTooWide {
+            table: table(),
+            columns,
+            limit: TABLE_MAX_COLUMNS,
+            dropped: 0,
         });
     }
     Ok(())
@@ -8483,6 +8576,110 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("32"), "{message}");
+    }
+
+    /// An aggregate of `groups` `GROUP BY` columns (of `g0, g1, ...`) with
+    /// `fields` fields, each `select(i)`.
+    fn wide_aggregate(
+        groups: usize,
+        fields: usize,
+        select: impl Fn(usize) -> String,
+    ) -> Result<(), ValidationError> {
+        let keys: Vec<String> = (0..groups).map(|i| format!("g{i}")).collect();
+        let mut selected: Vec<String> = keys.iter().map(|k| format!("{k} AS {k}")).collect();
+        selected.extend((0..fields).map(select));
+        let mut columns: HashMap<String, ValueType> = keys
+            .iter()
+            .map(|k| (k.clone(), ValueType::Integer(IntWidth::Int4)))
+            .collect();
+        columns.insert("v".to_string(), ValueType::Integer(IntWidth::Int4));
+        let text = format!(
+            "TRANSFORM t FROM s GROUP BY {} SELECT {}",
+            keys.join(", "),
+            selected.join(", ")
+        );
+        validate(&crate::defs::parse(&text).unwrap(), &columns)
+    }
+
+    fn too_wide(table: &str, columns: usize) -> ValidationError {
+        ValidationError::TableTooWide {
+            table: table.to_string(),
+            columns,
+            limit: TABLE_MAX_COLUMNS,
+            dropped: 0,
+        }
+    }
+
+    #[test]
+    fn an_aggregates_hidden_table_is_admitted_at_the_postgres_column_cap_and_refused_past_it() {
+        // Two group columns, the row count, two columns per summed argument,
+        // then basis, stamp and zero flag: 797 arguments are 1600 columns,
+        // and a third group column makes them 1601. (How `COUNT` and a
+        // shared argument count is pinned against the DDL in
+        // `staging::group_basis`.)
+        let sums = |i: usize| format!("SUM(v + {i}) AS s{i}");
+        assert_eq!(wide_aggregate(2, 797, sums), Ok(()));
+        let err = wide_aggregate(3, 797, sums).unwrap_err();
+        assert_eq!(
+            err,
+            too_wide("the hidden table of the aggregate's partial sums", 1601)
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("1601") && message.contains("1600") && message.contains("fewer"),
+            "{message}"
+        );
+        assert!(!message.contains("dropped"), "{message}");
+    }
+
+    #[test]
+    fn an_aggregates_target_is_admitted_at_the_postgres_column_cap_and_refused_past_it() {
+        // `COUNT(*)` fields add target columns and no hidden ones.
+        let counts = |i: usize| format!("COUNT(*) + {i} AS n{i}");
+        assert_eq!(wide_aggregate(1, 1599, counts), Ok(()));
+        assert_eq!(
+            wide_aggregate(1, 1600, counts),
+            Err(too_wide("the target table", 1601))
+        );
+    }
+
+    #[test]
+    fn an_aggregate_join_is_admitted_at_the_postgres_column_cap_and_refused_past_it() {
+        // Each side's tables, not the definition, are measured. `P` is the
+        // `ON` column (`id`, also the group column), the row count, a pair
+        // per argument and three more columns.
+        let join = |from: usize, joined: usize, group: &str| {
+            let mut selected = vec![format!("{group} AS {}", group.split('.').nth(1).unwrap())];
+            selected.extend((0..from).map(|i| format!("SUM(orders.id + {i}) AS f{i}")));
+            selected.extend((0..joined).map(|i| format!("SUM(items.qty + {i}) AS j{i}")));
+            check_text(&format!(
+                "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+                 GROUP BY {group} SELECT {}",
+                selected.join(", ")
+            ))
+        };
+        let from_side = "orders's hidden partials table";
+        let joined_side = "items's hidden partials table";
+        let groups = "the hidden table of the JOIN's group partials";
+        // 1 key + 1 + 2n + 3 = 2n + 5.
+        assert_eq!(join(797, 0, "orders.id"), Ok(()));
+        assert_eq!(join(798, 0, "orders.id"), Err(too_wide(from_side, 1601)));
+        assert_eq!(join(0, 797, "orders.id"), Ok(()));
+        assert_eq!(join(0, 798, "orders.id"), Err(too_wide(joined_side, 1601)));
+        // `T` holds both sides' arguments: 1 group column + 1 + 2n + 1.
+        assert_eq!(join(399, 399, "orders.id"), Ok(()));
+        assert_eq!(join(400, 399, "orders.id"), Err(too_wide(groups, 1601)));
+        // The target has a column per field.
+        let wide_target = |n: usize| {
+            let counts: Vec<String> = (0..n).map(|i| format!("COUNT(*) + {i} AS n{i}")).collect();
+            check_text(&format!(
+                "TRANSFORM t FROM orders JOIN items ON orders.id = items.order_id \
+                 GROUP BY orders.region SELECT orders.region AS region, {}",
+                counts.join(", ")
+            ))
+        };
+        assert_eq!(wide_target(1599), Ok(()));
+        assert_eq!(wide_target(1600), Err(too_wide("the target table", 1601)));
     }
 
     #[test]

@@ -71,6 +71,10 @@ pub fn validate(
         join_field_value_type(def, field, left, right)?;
     }
     super::validate::check_join_collation_reads(def, join, left, right)?;
+    // A ledger copies every column its side's fields read beside its own.
+    for (table, columns) in super::join_one_to_one::ledger_widths(def) {
+        super::validate::check_table_width(|| table, columns)?;
+    }
     Ok(())
 }
 
