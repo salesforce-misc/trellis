@@ -1775,12 +1775,11 @@ async fn run_plan(
     // The walk compares under the collations the job's first batch walked
     // under, and every chunk records them: an `alter column …
     // collate …` between two batches, or between a batch and a chunk, would
-    // otherwise reorder the key under the boundaries already enqueued.
+    // otherwise reorder the key under the boundaries already enqueued. They
+    // are pinned below, once a 1-1 `JOIN`'s `M` pass is done.
     let mut pk = ddl::source_primary_key(pool, &definition.source_table)
         .await
         .map_err(build_error)?;
-    ddl::pin_key_collations(&mut pk, chunk.key_collations.as_deref());
-    let key_collations = ddl::key_collations(&pk);
     let _heartbeat = chunk_queue::ChunkHeartbeat::spawn(
         pool.clone(),
         chunk.id,
@@ -1851,20 +1850,50 @@ async fn run_plan(
         )
         .await;
     }
-    // A 1-1 `JOIN`'s build re-derives every `b` row before it walks `a`, so
-    // every chunk reads the `M` the build made (`join_one_to_one`).
-    if crate::defs::join::is_one_to_one(&definition.def) {
+    // A 1-1 `JOIN`'s build re-derives every key of `b` ∪ `M` before it walks
+    // `a`, so every chunk reads the `M` the build made (`join_one_to_one`).
+    // Its job's cursor names the stage it stands in
+    // ([`join_one_to_one::PlanStage`]); the walk's boundaries are stored in
+    // that form, and the collations recorded during the `M` pass are `b`'s.
+    let join1 = crate::defs::join::is_one_to_one(&definition.def);
+    let mut recorded = chunk.key_collations.as_deref();
+    if join1 {
         if chunk.fields.is_some() {
             return Err(build_error(ApplyError::GroupBasisUnsupported {
                 target: definition.target_table.clone(),
                 what: "a field build of a 1-1 JOIN (its schema-change path is not built yet)",
             }));
         }
-        if cursor.is_none() && !join_one_to_one::build_m(pool, &definition, &fence, options).await?
-        {
-            return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
+        match join_one_to_one::PlanStage::parse(cursor.as_deref()) {
+            join_one_to_one::PlanStage::Walk(after) => cursor = after,
+            stage => {
+                if !join_one_to_one::build_m(
+                    pool,
+                    &definition,
+                    chunk.id,
+                    &fence,
+                    options,
+                    stage,
+                    recorded,
+                )
+                .await?
+                {
+                    return chunk_queue::discard_if_superseded(pool, chunk, claimed_by).await;
+                }
+                cursor = None;
+                recorded = None;
+            }
         }
     }
+    let stored = |next: &Option<String>| {
+        if join1 {
+            Some(join_one_to_one::PlanStage::Walk(next.clone()).encode())
+        } else {
+            next.clone()
+        }
+    };
+    ddl::pin_key_collations(&mut pk, recorded);
+    let key_collations = ddl::key_collations(&pk);
     // A plain group-basis aggregate's fresh build or resume is its whole
     // build: one absolute write of every group, as a rebuild of a live
     // definition is (ADR-0002), run after the seam fence above so its
@@ -1999,13 +2028,13 @@ async fn run_plan(
                 "update backfill_chunks set lo = $2, done = true, claimed_by = null, \
                      claimed_at = null, key_collations = $3 \
                  where id = $1",
-                &[&chunk.id, &next, &key_collations],
+                &[&chunk.id, &stored(&next), &key_collations],
             )
             .await?;
         } else {
             txn.execute(
                 "update backfill_chunks set lo = $2, key_collations = $3 where id = $1",
-                &[&chunk.id, &next, &key_collations],
+                &[&chunk.id, &stored(&next), &key_collations],
             )
             .await?;
         }

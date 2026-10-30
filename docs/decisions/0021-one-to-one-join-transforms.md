@@ -173,11 +173,15 @@ against 3.8 s. It took about 5x as long overall.
 
 ### A build fills `M`, then `R` and the target
 
-A build re-derives every `b` row into `M` first, in batches of `b`'s primary
-key. Each batch is a page of `b` Re-derives with its fan-out left out: the
-chunks that follow write every target row, and none starts before the last
-batch commits. It then fills `R` and the target in chunks of `a`'s
-primary-key range. Each chunk:
+A build re-derives every key of `b` ∪ `M` into `M` first: `b`'s rows in
+batches of its primary key, then `M`'s live entries whose `b` row is gone,
+which become tombstones. Each batch is a page of `b` Re-derives with its
+fan-out left out: the chunks that follow write every target row, none starts
+before the last batch commits, and so none joins an `a` row to a `b` row that
+is gone. Each batch commits with the build's cursor, so a batch that fails
+(a page holding a `J` row longer than the batch waits) or a worker that dies
+resumes from the last batch that committed. It then fills `R` and the target
+in chunks of `a`'s primary-key range. Each chunk:
 
 1. Holds the lock row `FOR SHARE`, and locks `J` for the live keys in its
    range plus the keys `R` holds for its rows.
@@ -200,9 +204,9 @@ chunks on 4 workers the build took 446 s, and no page waited longer than
 0.74 s (#1375 Y3).
 
 A rebuild in place, and any build whose target has rows, ends with a sweep
-after the last chunk. It re-derives every entry of `R`, then of `M`, whose
-basis is null or older than the build's start, so an entry whose row is gone
-becomes a tombstone and its rows are recomputed. Then its orphan pass walks
+after the last chunk. It re-derives every entry of `R` whose basis is null or
+older than the build's start, so an entry whose row is gone becomes a
+tombstone and its target row goes. Then its orphan pass walks
 the target in its key order and re-derives, as an `a` Re-derive page, every
 target row no live `R` entry backs. It never deletes one by statement: a row
 re-inserted and applied between the read and the delete would be lost.

@@ -308,15 +308,16 @@ pub enum Plant {
     /// Pinned by `join_one_to_one_build`'s
     /// `h3_a_row_reinserted_after_the_orphan_read_is_kept`.
     Join1OrphanDelete,
-    /// ADR-0021 (#1400, an `M` build with a rebuild sweep): a 1-1 `JOIN`'s
-    /// rebuild sweep re-derives only `R`'s stale entries, not `M`'s. A `b`
-    /// row deleted while the definition didn't apply keeps its live `M`
-    /// entry: the build's `M` pass reads only the rows `b` has, so the
-    /// chunks join `a` rows to the gone row.
+    /// ADR-0021 (#1400, #1503, the `M` pass over `b` ∪ `M`): a 1-1 `JOIN`
+    /// build's `M` pass walks only the rows `b` has, not `M`'s live entries
+    /// whose `b` row is gone. A `b` row deleted while the definition didn't
+    /// apply (past capture, before a rebuild in place) keeps its live `M`
+    /// entry, so the chunks join `a` rows to the gone row, and nothing later
+    /// in the build re-derives it.
     ///
     /// Pinned by `join_one_to_one_build`'s
-    /// `the_sweep_tombstones_the_m_entries_of_b_rows_gone_before_a_rebuild`.
-    Join1SweepROnly,
+    /// `the_m_pass_tombstones_the_m_entries_of_b_rows_gone_before_a_rebuild`.
+    Join1MPassBOnly,
 }
 
 impl Plant {
@@ -348,7 +349,7 @@ impl Plant {
         Plant::Join1ChunkNoKey,
         Plant::Join1NoOrphanPass,
         Plant::Join1OrphanDelete,
-        Plant::Join1SweepROnly,
+        Plant::Join1MPassBOnly,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -380,7 +381,7 @@ impl Plant {
             Plant::Join1ChunkNoKey => "join1_chunk_no_key",
             Plant::Join1NoOrphanPass => "join1_no_orphan_pass",
             Plant::Join1OrphanDelete => "join1_orphan_delete",
-            Plant::Join1SweepROnly => "join1_sweep_r_only",
+            Plant::Join1MPassBOnly => "join1_m_pass_b_only",
         }
     }
 

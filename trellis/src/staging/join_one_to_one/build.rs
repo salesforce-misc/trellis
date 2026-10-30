@@ -9,10 +9,13 @@
 //! row or an entry, and the one that comes second reads what the first
 //! committed.
 //!
-//! - **`M`** ([`m_batch`]): `b`'s rows in primary-key batches, each a page of
-//!   `b` Re-derives without the fan-out. It is the plan job's first step,
-//!   before it enqueues a chunk, so every chunk reads the `M` the build made.
-//!   The chunks write every target row the fan-out would have.
+//! - **`M`**: every key of `b` ∪ `M` in batches, each a page of `b`
+//!   Re-derives without the fan-out: `b`'s rows in primary-key order
+//!   ([`m_batch`]), those with a `NULL` key part ([`m_null_batch`]), then
+//!   `M`'s live entries whose `b` row is gone ([`m_gone_batch`]). It is the
+//!   plan job's first step, before it enqueues a chunk, so every chunk reads
+//!   the `M` the build made. The chunks write every target row the fan-out
+//!   would have.
 //! - **A chunk** ([`run_chunk`]): `(lo, hi]` of `a`'s primary key.
 //!   1. The lock row `FOR SHARE`. K is the live join keys of the range's `a`
 //!      rows (read unlocked) plus the keys `R` holds for them.
@@ -28,7 +31,7 @@
 //!   [`ApplyError::JoinKeyMoved`], a transient failure its retry gets past
 //!   with the late key in K: the insert's keys, the locked entries' held
 //!   keys and the Re-derive read's keys must each be in K (#1375 C10).
-//! - **A sweep page** ([`rederive`]): a page of Re-derives of one side.
+//! - **A sweep page** ([`rederive`]): a page of `a` Re-derives.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Instant;
@@ -102,8 +105,8 @@ pub(crate) async fn rederive(
 /// Re-derives without the fan-out ([`rederive`]). `m_pk` is `b`'s primary
 /// key, read once for the whole pass, so its collations hold across the
 /// batches. Returns the last key it read, `None` when it read fewer than
-/// `limit` keys: then the pass is done. A key with a `NULL` part is in no
-/// batch's range; [`m_null_keys`] reads those.
+/// `limit` keys: then the walk of `b` is done. A key with a `NULL` part is in
+/// no batch's range; [`m_null_batch`] reads those.
 pub(crate) async fn m_batch(
     txn: &Transaction<'_>,
     shape: &std::sync::Arc<JoinShape>,
@@ -160,36 +163,109 @@ pub(crate) async fn m_batch(
     Ok(if full { keys.last().cloned() } else { None })
 }
 
-/// The keys of `b` with a `NULL` part, which no [`m_batch`] range holds: only
-/// a `b` keyed by a nullable unique index (another transform's target) has
-/// any. Empty for every other `b`.
-pub(crate) async fn m_null_keys(
-    txn: &impl tokio_postgres::GenericClient,
-    shape: &JoinShape,
+/// One batch of the `M` pass over the keys of `b` with a `NULL` part, which
+/// no [`m_batch`] range holds: up to `limit` of them after `after` in their
+/// encoded text's byte order, as a page of `b` Re-derives without the
+/// fan-out. Only a `b` keyed by a nullable unique index (another transform's
+/// target) has any; for every other `b` it reads nothing. Returns the last
+/// key it read, `None` when it read fewer than `limit` keys.
+pub(crate) async fn m_null_batch(
+    txn: &Transaction<'_>,
+    shape: &std::sync::Arc<JoinShape>,
     m_pk: &[PrimaryKeyColumn],
-) -> Result<Vec<String>, ApplyError> {
+    after: Option<&str>,
+    limit: i64,
+) -> Result<Option<String>, ApplyError> {
     let nullable: Vec<String> = m_pk
         .iter()
         .filter(|c| c.nullable)
         .map(|c| format!("t.{} is null", quote_ident(&c.name)))
         .collect();
     if nullable.is_empty() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
-    Ok(txn
+    let k = ddl::pk_key_sql_expr(m_pk, Some("t"));
+    let keys: Vec<String> = txn
         .query(
             &format!(
-                "select ({}) from {} t where {}",
-                ddl::pk_key_sql_expr(m_pk, Some("t")),
-                ddl::qualified_source_table(&shape.joined_table),
-                nullable.join(" or "),
+                "select k from (select ({k}) as k from {b} t where {nullable}) n \
+                 where $2::text is null or k > $2 collate \"C\" \
+                 order by k collate \"C\" limit $1",
+                b = ddl::qualified_source_table(&shape.joined_table),
+                nullable = nullable.join(" or "),
             ),
-            &[],
+            &[&limit, &after],
         )
         .await?
         .into_iter()
         .map(|row| row.get(0))
-        .collect())
+        .collect();
+    rederive(txn, shape, Side::Joined, &keys, false).await?;
+    let full = i64::try_from(keys.len()).is_ok_and(|n| n >= limit);
+    Ok(if full { keys.last().cloned() } else { None })
+}
+
+/// One batch of the `M` pass over `M` itself: up to `limit` live entries
+/// after `after` in key order, and a page of `b` Re-derives without the
+/// fan-out of those whose `b` row is gone, which tombstones them. These are
+/// entries of rows deleted before the build that no captured change will
+/// reach: on a rebuild in place, rows deleted past capture. A row the probe
+/// finds is one the walk of `b` re-derived, or one inserted since, whose
+/// insert is a captured change its own page applies. `m_pk` is `b`'s primary
+/// key, which the probe reads `b` by. Returns the last key it read, `None`
+/// when it read fewer than `limit` entries.
+pub(crate) async fn m_gone_batch(
+    txn: &Transaction<'_>,
+    shape: &std::sync::Arc<JoinShape>,
+    m_pk: &[PrimaryKeyColumn],
+    after: Option<&str>,
+    limit: i64,
+) -> Result<Option<String>, ApplyError> {
+    let key = quote_ident(schema::KEY_COLUMN);
+    let tombstone = quote_ident(schema::TOMBSTONE_COLUMN);
+    let started = Instant::now();
+    let entries: Vec<String> = txn
+        .query(
+            &format!(
+                "select l.{key} from {m} l where not l.{tombstone} {after} \
+                 order by l.{key} limit $1",
+                m = shape.m.ident,
+                after = if after.is_some() {
+                    format!("and l.{key} > $2")
+                } else {
+                    "and $2::text is null".to_string()
+                },
+            ),
+            &[&limit, &after],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    let refs: Vec<&str> = entries.iter().map(String::as_str).collect();
+    let present: HashSet<String> = if refs.is_empty() {
+        HashSet::new()
+    } else {
+        let probe = super::super::apply::live_rows_query(&shape.joined_table, m_pk, &[], &refs)?;
+        super::super::ledger::query_by_entry_key(
+            txn,
+            &format!("select m.k from ({}) m", probe.docs),
+            &probe.params(),
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect()
+    };
+    metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());
+    let gone: Vec<String> = entries
+        .iter()
+        .filter(|key| !present.contains(*key))
+        .cloned()
+        .collect();
+    rederive(txn, shape, Side::Joined, &gone, false).await?;
+    let full = i64::try_from(entries.len()).is_ok_and(|n| n >= limit);
+    Ok(if full { entries.last().cloned() } else { None })
 }
 
 /// Runs one build chunk, `(lo, hi]` of `a`'s primary key (encoded, as
@@ -406,17 +482,16 @@ async fn insert_from_read(
     Ok(rows.iter().map(|row| row.get(0)).collect())
 }
 
-/// Up to `scan` entries of `side`'s ledger after `after` in key order, and
-/// the live ones among them the build hasn't re-derived: whose `basis` is
-/// null (written by an Apply alone) or a snapshot taken before the build's
-/// start, `start_xid`, as a plain 1-1 sweep decides
+/// Up to `scan` entries of `R` after `after` in key order, and the live ones
+/// among them the build hasn't re-derived: whose `basis` is null (written by
+/// an Apply alone) or a snapshot taken before the build's start,
+/// `start_xid`, as a plain 1-1 sweep decides
 /// (`super::super::build::one_to_one::sweep_batch`). A key quarantined for
 /// the definition is left as it is. Returns how many it read, the last key
 /// it read, and the stale keys.
 pub(crate) async fn stale_entries(
     txn: &Transaction<'_>,
     shape: &JoinShape,
-    side: Side,
     start_xid: &str,
     after: Option<&str>,
     scan: i64,
@@ -444,14 +519,20 @@ pub(crate) async fn stale_entries(
                                                 where p.src_table = $4 and p.key = w.k \
                                                   and d.target_table = $5) \
                               order by w.k)",
-                ledger = shape.ledger(side).ident,
+                ledger = shape.r.ident,
                 after = if after.is_some() {
                     format!("where l.{key} > $3")
                 } else {
                     "where $3::text is null".to_string()
                 },
             ),
-            &[&start_xid, &scan, &after, &shape.table(side), &shape.target],
+            &[
+                &start_xid,
+                &scan,
+                &after,
+                &shape.source_table,
+                &shape.target,
+            ],
         )
         .await?;
     metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());
