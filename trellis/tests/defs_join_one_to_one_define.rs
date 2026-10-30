@@ -508,6 +508,114 @@ async fn a_one_to_one_target_side_needs_its_primary_key_and_no_transform_reads_a
     }
 }
 
+/// A chained `a` side may be joined on any columns, since its `ON` columns
+/// carry no uniqueness; a chained `b` side only on columns that include every
+/// primary-key column of that table, however many unique indexes it has.
+#[tokio::test]
+async fn a_one_to_one_target_is_an_a_side_on_any_columns_and_a_b_side_on_columns_containing_its_primary_key()
+ {
+    let _knob = with_knob(true).await;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(TABLES).await.expect("seed");
+    raw.batch_execute(
+        "set search_path to public;
+         create table pairs (x integer, y integer, v text, primary key (x, y));
+         set search_path to trellis, public;",
+    )
+    .await
+    .expect("composite-key table");
+
+    let copy = install_definition(
+        &db.pool,
+        "TRANSFORM cust_copy FROM customers SELECT ext AS ext, name AS name",
+        &HashMap::from([
+            (
+                "ext".to_string(),
+                ValueType::Integer(trellis::dev::defs::IntWidth::Int4),
+            ),
+            ("name".to_string(), ValueType::Text),
+        ]),
+        "public",
+    )
+    .await
+    .expect("define a plain 1-1 target");
+    make_live(&raw, "cust_copy").await;
+    let pairs_copy = install_definition(
+        &db.pool,
+        "TRANSFORM pairs_copy FROM pairs SELECT v AS v",
+        &HashMap::from([("v".to_string(), ValueType::Text)]),
+        "public",
+    )
+    .await
+    .expect("define a plain 1-1 target with a composite key");
+    make_live(&raw, "pairs_copy").await;
+    // Unique on columns that are not (all of) the primary key: they pass the
+    // uniqueness rule, so only the primary-key rule decides.
+    raw.batch_execute(&format!(
+        "create unique index on {} (ext);
+         create unique index on {} (x)",
+        copy.target_table, pairs_copy.target_table
+    ))
+    .await
+    .expect("user-added unique indexes");
+
+    // The `a` side: no rule on its `ON` columns, so a non-key one is fine.
+    install_definition(
+        &db.pool,
+        "TRANSFORM a_side FROM cust_copy LEFT JOIN customers ON cust_copy.ext = customers.ext \
+         SELECT customers.tier AS tier",
+        &HashMap::new(),
+        "public",
+    )
+    .await
+    .expect("a 1-1 target as the a side, joined on a non-key column");
+
+    // The `b` side: its primary key plus another column is accepted.
+    install_definition(
+        &db.pool,
+        "TRANSFORM b_superset FROM orders LEFT JOIN cust_copy \
+         ON orders.cust = cust_copy.id AND orders.code = cust_copy.name \
+         SELECT cust_copy.name AS who",
+        &HashMap::new(),
+        "public",
+    )
+    .await
+    .expect("a 1-1 target as the b side, joined on its primary key and another column");
+    install_definition(
+        &db.pool,
+        "TRANSFORM b_composite FROM orders LEFT JOIN pairs_copy \
+         ON orders.cust = pairs_copy.x AND orders.id = pairs_copy.y \
+         SELECT pairs_copy.v AS v",
+        &HashMap::new(),
+        "public",
+    )
+    .await
+    .expect("a 1-1 target as the b side, joined on its whole composite key");
+
+    // Not on a column that is unique only through an index a user added, and
+    // not on part of a composite primary key.
+    for text in [
+        "TRANSFORM b_uidx FROM orders LEFT JOIN cust_copy ON orders.cust = cust_copy.ext \
+         SELECT cust_copy.name AS who",
+        "TRANSFORM b_subset FROM orders LEFT JOIN pairs_copy ON orders.cust = pairs_copy.x \
+         SELECT pairs_copy.v AS v",
+    ] {
+        let err = define_err(&db.pool, text).await;
+        assert!(
+            matches!(
+                err,
+                CatalogError::Validate(ValidationError::OneToOneJoinUnsupported { .. })
+            ),
+            "{text}: {err:?}"
+        );
+        assert!(err.to_string().contains("primary key"), "{err}");
+    }
+    assert_nothing_registered(&db.pool, "b_uidx").await;
+    assert_nothing_registered(&db.pool, "b_subset").await;
+}
+
 #[tokio::test]
 async fn define_registers_both_tables_the_target_and_the_hidden_tables() {
     let _knob = with_knob(true).await;

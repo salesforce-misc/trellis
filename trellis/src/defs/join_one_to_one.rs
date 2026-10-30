@@ -386,12 +386,16 @@ pub(crate) async fn reject_reader_of_target(
 
 /// The define-time checks of a 1-1 `JOIN` that read the catalog, once its two
 /// tables are resolved (`from` and `joined`, qualified): the joined table's
-/// `ON` columns are unique, and a side that is another transform's 1-1 target
-/// is joined on its primary key.
+/// `ON` columns are unique, and a joined table that is another transform's 1-1
+/// target is joined on columns that include its primary key. Trellis orders
+/// changes per primary-key value only, so the primary key is the one column
+/// set of a target that stays unique at every instant while its upstream
+/// drains; a unique index on any other column can hold transient duplicates.
+/// The `from` side has no such rule: its `ON` columns carry no uniqueness.
 pub(crate) async fn check_define(
     client: &impl GenericClient,
     def: &TransformDef,
-    from: &str,
+    _from: &str,
     joined: &str,
 ) -> Result<(), super::catalog::CatalogError> {
     let on = joined_on_columns(def);
@@ -402,29 +406,24 @@ pub(crate) async fn check_define(
         }
         .into());
     }
-    for (side, table) in [(Side::From, from), (Side::Joined, joined)] {
-        if !matches!(
-            target_key_space(client, table).await?,
-            Some(super::ast::KeySpace::OneToOne)
-        ) {
-            continue;
-        }
-        let mut on_side = join_key(def, side);
-        on_side.sort();
-        let mut pk: Vec<String> = super::ddl::identity_key_columns(client, table)
+    if matches!(
+        target_key_space(client, joined).await?,
+        Some(super::ast::KeySpace::OneToOne)
+    ) {
+        let pk: Vec<String> = super::ddl::identity_key_columns(client, joined)
             .await?
             .into_iter()
             .map(|c| c.name)
             .collect();
-        pk.sort();
-        if on_side != pk {
+        if !pk.iter().all(|column| on.contains(column)) {
             return Err(ValidationError::OneToOneJoinUnsupported {
                 what: format!(
-                    "'{table}', the 1-1 target of another transform, joined on columns other \
-                     than its primary key ({})",
+                    "'{joined}', the 1-1 target of another transform, joined on columns that \
+                     leave out part of its primary key ({})",
                     pk.join(", ")
                 ),
-                remedy: "join on its whole primary key, or join the table that transform reads"
+                remedy: "join on columns that include its primary key, or join the table that \
+                         transform reads"
                     .to_string(),
             }
             .into());
