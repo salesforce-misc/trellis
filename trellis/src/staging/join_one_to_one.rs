@@ -463,7 +463,8 @@ pub(crate) struct JoinOneToOnePlan {
     a: Vec<Record>,
     b: Vec<Record>,
     /// Whether a changed `M` entry fans out to the `R` entries on its keys.
-    /// Only the build's `M` pass ([`build::m_batch`]) turns it off: the
+    /// Only the build's `M` pass ([`build::m_batch`],
+    /// [`build::m_null_batch`], [`build::m_gone_batch`]) turns it off: the
     /// build's chunks write every target row after it.
     fan_out: bool,
 }

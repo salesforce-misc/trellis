@@ -693,8 +693,9 @@ pub(crate) async fn rebuildable(
 /// A group-basis definition (one with a hidden group table,
 /// `super::group_basis`, or a `JOIN`'s hidden tables) gets the sweep job
 /// alone, which recomputes its groups in place ([`run_group_rebuild`]). A
-/// 1-1 `JOIN` gets both, as a plain 1-1 target does: its sweep re-derives
-/// the stale entries of `R` and `M` and the target rows no `R` entry backs
+/// 1-1 `JOIN` gets both, as a plain 1-1 target does: its plan job's `M`
+/// pass re-derives every key of `b` ∪ `M`, and its sweep re-derives the
+/// stale entries of `R` and the target rows no `R` entry backs
 /// (`join_one_to_one`).
 ///
 /// The definition applies throughout (B1), as it did before the call. The

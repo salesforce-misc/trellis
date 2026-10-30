@@ -17,10 +17,13 @@
 //!   paused (with the `tail` and `emptied` cases), and H3, a row re-inserted
 //!   between the orphan pass's read and its re-derive. Also a `RESUME` after
 //!   changes of both sides, and a sweep killed in its orphan pass.
-//! - The `M` pass over `b` ∪ `M` on a rebuild in place, the `M` pass
-//!   resuming from its stored cursor after a failure (#1503), and the build
-//!   start under the lock row (#1400), for one definition and for two whose
-//!   lock rows a page takes in another order than their ids.
+//! - The `M` pass over `b` ∪ `M` on a rebuild in place, a row re-inserted
+//!   between its walk of `M`'s unlocked probe and its locks, and the plan
+//!   job resuming from its stored cursor after a failure in the walk of `b`
+//!   or of `M`, and after a kill between the `M` pass and the walk of `a`
+//!   (#1503). The build start under the lock row (#1400), for one definition
+//!   and for two whose lock rows a page takes in another order than their
+//!   ids.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -877,6 +880,231 @@ async fn a_plan_job_that_fails_in_its_m_pass_resumes_from_its_cursor() {
             "the M pass resumed after row 2, so row 1's entry wasn't re-derived again"
         );
         assert_oracle(&mut d, &[kind], "a resumed M pass").await;
+    }
+}
+
+/// The plan job's stored cursor, its last error, and whether it records no
+/// key collations.
+async fn plan_job(d: &Driver) -> (Option<String>, Option<String>, bool) {
+    let job = d
+        .ctl
+        .query_one(
+            "select lo, last_error, key_collations is null from backfill_chunks \
+             where kind = 'plan'",
+            &[],
+        )
+        .await
+        .expect("the plan job");
+    (job.get(0), job.get(1), job.get(2))
+}
+
+/// `kind`'s `M` entries' row versions, by key.
+async fn m_versions(d: &Driver, kind: Kind) -> Vec<String> {
+    let id = definition_id(d, kind).await;
+    d.rows(&format!(
+        "select __from_key, xmin::text from {DEFAULT_SCHEMA}.join1_{id}_m order by 1"
+    ))
+    .await
+}
+
+/// The walk of `M` resumes from its stored cursor. A rebuild in place of a
+/// live join whose `b` row 3 (key 30) was deleted past capture: the plan job,
+/// in batches of 2, walks `b`, then `M`'s entries 1 and 2 (rows present), then
+/// meets `J[30]` re-deriving entry 3, which a page of an `a03` change frozen
+/// at its commit holds. The batch gives up after the chunk lock timeout, its
+/// cursor after entry 2 stored with no collations (they are `b`'s only
+/// during the walk of `b`). Then `b` changes, each change applied by its
+/// page: row 1 deleted and row 2 moved onto 70 (behind the cursor), row 4
+/// deleted and row 7 inserted (ahead of it). Claimed again, the job resumes
+/// at entry 3 and tombstones it: row 5's entry, which nothing has touched
+/// since the walk of `b`, keeps its version, and the build ends as the live
+/// join.
+#[tokio::test]
+async fn a_plan_job_that_fails_in_its_walk_of_m_resumes_from_its_cursor() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(&[kind], true).await;
+        write_uncaptured(&d, "public.b", "delete from public.b where bid = 3").await;
+        trellis(&d)
+            .await
+            .request_backfill("public.b")
+            .await
+            .expect("request a rebuild");
+        write(&d, "update public.a set r = 55 where id = 'a03'").await;
+        let batch = d.seal().await;
+        let mut page = d
+            .drain_frozen(batch, "page", &[(PausePoint::BeforeCommit, &kind.target())])
+            .await;
+        page.reached(PausePoint::BeforeCommit).await;
+        assert_eq!(build_step(d.pool(), "planner", 2).await, Step::Planned);
+        let (lo, failed, no_collations) = plan_job(&d).await;
+        assert_eq!(
+            lo.as_deref(),
+            Some("\u{1}g:2"),
+            "the walk of b and M's first batch committed"
+        );
+        assert!(
+            failed.as_deref().is_some_and(|e| e.contains("lock")),
+            "the batch gave up on the page's lock: {failed:?}"
+        );
+        assert!(no_collations, "the walk of M records no collations");
+        assert_eq!(pending(&d, &["rederive"]).await, 0, "no chunk yet");
+        d.release(&mut page, PausePoint::BeforeCommit).await;
+        page.finish().await;
+        let untouched = |versions: Vec<String>| -> Vec<String> {
+            versions
+                .into_iter()
+                .filter(|v| v.starts_with("(5,"))
+                .collect()
+        };
+        let before = untouched(m_versions(&d, kind).await);
+        assert_eq!(before.len(), 1, "{before:?}");
+        step(
+            &mut d,
+            "delete from public.b where bid in (1, 4); update public.b set k = 70 where bid = 2; \
+             insert into public.b values (7, 80, 700, 'k7')",
+        )
+        .await;
+        d.ctl
+            .batch_execute("update backfill_chunks set next_attempt_at = null where kind = 'plan'")
+            .await
+            .expect("retry the plan job now");
+        assert_eq!(build_step(d.pool(), "planner", 2).await, Step::Planned);
+        assert_m(&d, kind, "the resumed M pass").await;
+        assert_eq!(
+            untouched(m_versions(&d, kind).await),
+            before,
+            "the M pass resumed in its walk of M, so row 5's entry wasn't re-derived again"
+        );
+        assert_oracle(&mut d, &[kind], "a resumed walk of M").await;
+    }
+}
+
+/// A plan job killed between its `M` pass and its walk of `a` resumes at the
+/// walk. Frozen in the walk's first batch, the job has stored the start of
+/// the walk with no collations (the walk records `a`'s own). Killed there
+/// and claimed again, it walks `a` without running the `M` pass again:
+/// every `M` entry keeps its version, and the build ends as the live join.
+#[tokio::test]
+async fn a_plan_job_killed_after_its_m_pass_resumes_at_the_walk_of_a() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(&[kind], false).await;
+        let target = kind.target();
+        let own = trellis::Pool::new(&Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"))
+            .expect("a pool for the plan job");
+        let mut planner = d
+            .run_frozen(&[(PausePoint::AfterPlanHold, &target)], |_| async move {
+                Ok(build_step(&own, "planner", 3).await)
+            })
+            .await;
+        let reached = planner.reached(PausePoint::AfterPlanHold).await;
+        let (lo, _, no_collations) = plan_job(&d).await;
+        assert_eq!(lo.as_deref(), Some("\u{1}a"), "the M pass committed");
+        assert!(no_collations, "the M pass leaves no collations to the walk");
+        let before = m_versions(&d, kind).await;
+        assert_eq!(before.len(), 6, "{before:?}");
+        planner.kill().await;
+        d.ctl
+            .execute("select pg_terminate_backend($1)", &[&reached.backend_pid])
+            .await
+            .expect("end the plan job's session");
+        d.ctl
+            .batch_execute(
+                "update backfill_chunks \
+                 set claimed_by = null, claimed_at = null, next_attempt_at = null \
+                 where kind = 'plan'",
+            )
+            .await
+            .expect("free the dead worker's claim");
+        assert_eq!(build_step(d.pool(), "planner", 3).await, Step::Planned);
+        assert!(pending(&d, &["rederive"]).await > 0, "the job walked a");
+        assert_eq!(
+            m_versions(&d, kind).await,
+            before,
+            "the resumed job didn't run the M pass again"
+        );
+        assert_oracle(&mut d, &[kind], "a plan job killed after its M pass").await;
+    }
+}
+
+/// A row re-inserted between the walk of `M`'s unlocked probe and its locks.
+/// A rebuild in place of a live join whose `b` rows were all deleted past
+/// capture: the walk of `b` re-derives nothing, and the walk of `M` probes
+/// entries 1 and 2, finds no row for either, and is frozen before it locks
+/// their `J` rows. Then a page applies a re-insert of one of them, and the
+/// batch's Re-derive reads the rows live under its locks:
+///
+/// - `same key`: row 1 on its old key 10, which the batch locked. Its entry
+///   stays live and the walk goes on.
+/// - `moved key`: row 2 on 70, which it didn't. The read of a key outside
+///   the batch's set rolls it back (`JoinKeyMoved`), and the retry, from the
+///   batch's cursor, finds the row and leaves it be.
+///
+/// `M` equals `b` after the plan job, and the build ends as the live join. A
+/// walk that tombstoned what its probe found gone, without the locked
+/// re-read, loses row 1.
+#[tokio::test]
+async fn a_b_row_reinserted_after_the_walk_of_ms_probe_stays_live() {
+    let _serial = SERIAL.lock().await;
+    for (case, row, rolled_back) in [
+        ("same key", "(1, 10, 100, 'k1')", false),
+        ("moved key", "(2, 70, 200, 'k2')", true),
+    ] {
+        for kind in KINDS {
+            let mut d = start(&[kind], true).await;
+            write_uncaptured(&d, "public.b", "delete from public.b").await;
+            trellis(&d)
+                .await
+                .request_backfill("public.b")
+                .await
+                .expect("request a rebuild");
+            let target = kind.target();
+            let mut planner = d
+                .run_frozen(
+                    &[(PausePoint::BeforeJoin1Lock, &target)],
+                    |pool| async move { Ok(build_step(&pool, "planner", 2).await) },
+                )
+                .await;
+            planner.reached(PausePoint::BeforeJoin1Lock).await;
+            let (lo, _, _) = plan_job(&d).await;
+            assert_eq!(
+                lo.as_deref(),
+                Some("\u{1}g"),
+                "{case}: frozen in the walk of M's first batch"
+            );
+            step(&mut d, &format!("insert into public.b values {row}")).await;
+            d.release(&mut planner, PausePoint::BeforeJoin1Lock).await;
+            assert_eq!(planner.finish().await, Step::Planned);
+            let (lo, failed, _) = plan_job(&d).await;
+            if rolled_back {
+                assert_eq!(
+                    lo.as_deref(),
+                    Some("\u{1}g"),
+                    "{case}: the batch rolled back"
+                );
+                assert!(
+                    failed.as_deref().is_some_and(|e| e.contains("moved")),
+                    "{case}: the read of a key outside the set rolled the batch back: {failed:?}"
+                );
+                d.ctl
+                    .batch_execute(
+                        "update backfill_chunks set next_attempt_at = null where kind = 'plan'",
+                    )
+                    .await
+                    .expect("retry the plan job now");
+                assert_eq!(build_step(d.pool(), "planner", 2).await, Step::Planned);
+            } else {
+                assert_eq!(failed, None, "{case}: the batch committed");
+            }
+            assert_eq!(
+                pending(&d, &["plan"]).await,
+                0,
+                "{case}: the plan job is done"
+            );
+            assert_m(&d, kind, case).await;
+            assert_oracle(&mut d, &[kind], case).await;
+        }
     }
 }
 
