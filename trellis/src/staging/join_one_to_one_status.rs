@@ -108,7 +108,7 @@ pub struct FanOutWarning {
     /// The live `R` entries on the key. Exact up to ten times the threshold,
     /// where the count stops.
     pub rows: i64,
-    /// The threshold the group passed ([`fan_out_warning_rows`]).
+    /// The threshold the group passed (`fan_out_warning_rows`).
     pub threshold: i64,
 }
 
