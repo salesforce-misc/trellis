@@ -128,6 +128,8 @@ mod arithmetic_tests;
 #[cfg(test)]
 mod date_tests;
 #[cfg(test)]
+mod literal_tests;
+#[cfg(test)]
 mod logic_tests;
 
 #[cfg(test)]
@@ -727,21 +729,15 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_with_a_null_literal_argument_is_unsupported() {
-        // DIVERGENCE from Postgres (tracked toward full compatibility):
-        // Postgres's most idiomatic COALESCE form takes a bare `NULL` literal
-        // (e.g. `COALESCE(NULL, default)`), but this grammar has no NULL
-        // literal (`ast.rs` has no such `Expr`/`Value` variant). `NULL` is a
-        // reserved word in Postgres, so it can't be a column name either; the
-        // parser refuses it by name and says the literal isn't supported.
-        let err = parse("TRANSFORM t FROM s SELECT COALESCE(a, NULL) AS x").unwrap_err();
+    fn coalesce_takes_a_null_literal_argument() {
+        let def = parse("TRANSFORM t FROM s SELECT COALESCE(a, NULL) AS x").unwrap();
         assert_eq!(
-            err,
-            ParseError::ReservedWord {
-                name: "NULL".to_string()
+            def.fields[0].expr,
+            Expr::FunctionCall {
+                name: "COALESCE".to_string(),
+                args: vec![Expr::Column("a".to_string()), Expr::Null],
             }
         );
-        assert!(err.to_string().contains("literals yet"), "{err}");
     }
 
     #[test]

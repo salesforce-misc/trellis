@@ -41,7 +41,7 @@ use super::error::ParseError;
 use super::lexer::{Token, lex};
 use super::registry::{
     AGGREGATE_FUNCTIONS, NON_IMMUTABLE_NAMES, cast_target, function_overloads, is_reserved_word,
-    lookup_aggregate_function, lookup_operator, operator_spec,
+    lookup_aggregate_function, lookup_operator, null_cast_target, operator_spec,
 };
 use super::typed_literal::lookup_typed_literal;
 use super::validate::is_deferred_aggregate_name;
@@ -1169,6 +1169,16 @@ impl Parser {
                     return self.parse_case_body();
                 }
 
+                // Postgres's three constant keywords. They are reserved, so
+                // never a column; what follows one is read as after any
+                // operand (`null(1)` is refused, as Postgres refuses it).
+                match upper.as_str() {
+                    "TRUE" => return Ok(Expr::BooleanLiteral(true)),
+                    "FALSE" => return Ok(Expr::BooleanLiteral(false)),
+                    "NULL" => return Ok(Expr::Null),
+                    _ => {}
+                }
+
                 if NON_IMMUTABLE_NAMES.contains(&upper.as_str()) {
                     return Err(ParseError::NonImmutableConstruct { name });
                 }
@@ -1491,7 +1501,13 @@ impl Parser {
             self.expect_keyword("AS")?;
             let type_name = self.expect_ident()?;
             let keyword = self.take_type_keyword(&type_name.to_ascii_uppercase());
-            let target = cast_target(&keyword);
+            // `CAST(NULL AS <type>)` converts no value, so it may name any
+            // type the grammar has a value of.
+            let target = if operand == Expr::Null {
+                null_cast_target(&keyword)
+            } else {
+                cast_target(&keyword)
+            };
             if self.peek_is_symbol('(') {
                 // A modifier: `numeric(10,2)`. Consume it so the error is the
                 // only one reported.

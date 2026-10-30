@@ -232,6 +232,8 @@ pub(super) fn render_expr(expr: &Expr) -> String {
         },
         Expr::NumberLiteral(text) => text.clone(),
         Expr::StringLiteral(text) => format!("'{}'", text.replace('\'', "''")),
+        Expr::BooleanLiteral(value) => value.to_string().to_uppercase(),
+        Expr::Null => "NULL".to_string(),
         // A typed literal, rendered in the `<type> '<text>'`
         // spelling rather than `CAST(... AS ...)`. Both re-parse to this
         // same node, so either would round-trip; the typed-literal form is

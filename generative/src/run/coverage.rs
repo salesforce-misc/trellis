@@ -261,6 +261,14 @@ impl Coverage {
                 self.expr_shapes.insert("StringLiteral");
                 1
             }
+            Expr::BooleanLiteral(_) => {
+                self.expr_shapes.insert("BooleanLiteral");
+                1
+            }
+            Expr::Null => {
+                self.expr_shapes.insert("Null");
+                1
+            }
             Expr::TypedLiteral { .. } => {
                 self.expr_shapes.insert("TypedLiteral");
                 1
@@ -347,6 +355,8 @@ fn collect_aggregate_calls(
         | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
         | Expr::TypedLiteral { .. } => {}
     }
 }

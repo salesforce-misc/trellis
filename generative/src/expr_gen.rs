@@ -441,6 +441,30 @@ pub fn literals(ty: ValueType, magnitude: Magnitude) -> Vec<Expr> {
     out
 }
 
+/// The literals a tree can use at `ty` beyond [`literals`]: `TRUE` and
+/// `FALSE` for a `boolean`, and `CAST(NULL AS <ty>)`, which every position of
+/// its type takes. Kept apart from [`literals`] so the deterministic
+/// one-level sweeps, which take the product of every leaf, stay their size;
+/// those sweeps place these one operand at a time instead.
+pub fn constant_keyword_literals(ty: ValueType) -> Vec<Expr> {
+    let mut out = Vec::new();
+    if ty == ValueType::Boolean {
+        out.extend([Expr::BooleanLiteral(true), Expr::BooleanLiteral(false)]);
+    }
+    if registry::NULL_CAST_TARGETS.contains(&ty) || registry::CAST_TARGETS.contains(&ty) {
+        out.push(typed_null(ty));
+    }
+    out
+}
+
+/// `CAST(NULL AS <ty>)`.
+pub fn typed_null(ty: ValueType) -> Expr {
+    Expr::Cast {
+        expr: Box::new(Expr::Null),
+        target: ty,
+    }
+}
+
 /// The number literals a float is compared against.
 pub fn comparison_literals(magnitude: Magnitude) -> Vec<Expr> {
     let mut pool: Vec<&str> = match magnitude {
@@ -575,6 +599,9 @@ fn write_text(expr: &Expr, style: TextStyle, out: &mut String) {
         }
         Expr::NumberLiteral(text) => out.push_str(text),
         Expr::StringLiteral(text) => out.push_str(&format!("'{}'", text.replace('\'', "''"))),
+        Expr::BooleanLiteral(true) => out.push_str(&keyword(style, "TRUE")),
+        Expr::BooleanLiteral(false) => out.push_str(&keyword(style, "FALSE")),
+        Expr::Null => out.push_str(&keyword(style, "NULL")),
         Expr::TypedLiteral { value_type, text } => {
             let keyword = TYPED_LITERALS
                 .iter()
@@ -1154,7 +1181,10 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
     date_near_misses(columns, &mut out);
     // A word Postgres reserves is no column name (ADR-0022), in the position
     // an operand takes and next to an operator. The needle is the word.
-    for word in registry::RESERVED_WORDS {
+    for word in registry::RESERVED_WORDS
+        .iter()
+        .filter(|w| !matches!(**w, "true" | "false" | "null"))
+    {
         for text in [word.to_string(), format!("{word} + 1")] {
             out.push(NearMiss {
                 kind: "reserved-word",
@@ -1163,6 +1193,7 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
             });
         }
     }
+    null_near_misses(columns, &mut out);
     // Typed literals in a spelling Postgres accepts and define refuses.
     for (keyword, text) in NONCANONICAL_LITERALS {
         if TYPED_LITERALS.iter().any(|s| s.keyword == *keyword) {
@@ -1174,6 +1205,58 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
         }
     }
     out
+}
+
+/// The `NULL`s define can't type (Postgres finds them ambiguous, or types
+/// them by candidate rules define doesn't model), each refused with the
+/// `CAST` remedy: both operands of an arithmetic operator, the operand of
+/// prefix `-` and `AT TIME ZONE`, an operand beside a type no operator takes
+/// on both sides, and every argument of every function.
+fn null_near_misses(columns: &[Column], out: &mut Vec<NearMiss>) {
+    let needles = || vec!["cast(null as <type>)".to_string()];
+    let mut push = |kind: &'static str, text: String| {
+        out.push(NearMiss {
+            kind,
+            text,
+            needles: needles(),
+        });
+    };
+    push("untyped-null", "-NULL".to_string());
+    push("untyped-null", "NULL AT TIME ZONE 'UTC'".to_string());
+    let mut types: Vec<ValueType> = columns.iter().map(|(_, t)| *t).collect();
+    types.dedup();
+    for spec in registry::OPERATORS {
+        let op = spec.operator;
+        if op.is_comparison() || matches!(op, Operator::And | Operator::Or) {
+            continue;
+        }
+        push("untyped-null", format!("NULL {} NULL", spec.symbol));
+        for &ty in &types {
+            if registry::operator_result_type(op, ty, ty).is_some() {
+                continue;
+            }
+            if let Some(col) = column_of(columns, ty) {
+                push("untyped-null", format!("{col} {} NULL", spec.symbol));
+                push("untyped-null", format!("NULL {} {col}", spec.symbol));
+            }
+        }
+    }
+    for spec in registry::FUNCTIONS {
+        let args: Option<Vec<String>> = spec
+            .arg_types
+            .iter()
+            .map(|t| column_of(columns, *t).map(str::to_string))
+            .collect();
+        let Some(args) = args else { continue };
+        for i in 0..args.len() {
+            let mut with_null = args.clone();
+            with_null[i] = "NULL".to_string();
+            push(
+                "untyped-null",
+                format!("{}({})", spec.name.to_lowercase(), with_null.join(", ")),
+            );
+        }
+    }
 }
 
 /// The near misses of the date constructs: the traps each one has a named
@@ -1440,6 +1523,10 @@ pub mod strategy {
             if !lits.is_empty() {
                 leaves.push((2, prop::sample::select(lits).boxed()));
             }
+            let keywords = constant_keyword_literals(ty);
+            if !keywords.is_empty() {
+                leaves.push((1, prop::sample::select(keywords).boxed()));
+            }
             leaves
         }
 
@@ -1471,16 +1558,28 @@ pub mod strategy {
                 Rule::Op { op, lhs, rhs, .. } => {
                     let (op, l) = (*op, self.expr(*lhs, depth)?);
                     // The zone of `AT TIME ZONE` is the literal, not a draw.
-                    let r = match LITERAL_RHS_OPERATORS.iter().find(|(o, _)| *o == op) {
+                    let literal_rhs = LITERAL_RHS_OPERATORS.iter().find(|(o, _)| *o == op);
+                    let r = match literal_rhs {
                         Some((_, zone)) => Just(Expr::StringLiteral((*zone).to_string())).boxed(),
                         None => self.expr(*rhs, depth)?,
                     };
+                    // A bare `NULL` takes the other operand's type, so an
+                    // operator over one type on both sides takes it on
+                    // either side.
+                    let nullable = lhs == rhs && literal_rhs.is_none();
                     Some(
-                        (l, r)
-                            .prop_map(move |(lhs, rhs)| Expr::BinaryOp {
-                                op,
-                                lhs: Box::new(lhs),
-                                rhs: Box::new(rhs),
+                        (l, r, 0..8u8)
+                            .prop_map(move |(lhs, rhs, roll)| {
+                                let (lhs, rhs) = match roll {
+                                    0 if nullable => (Expr::Null, rhs),
+                                    1 if nullable => (lhs, Expr::Null),
+                                    _ => (lhs, rhs),
+                                };
+                                Expr::BinaryOp {
+                                    op,
+                                    lhs: Box::new(lhs),
+                                    rhs: Box::new(rhs),
+                                }
                             })
                             .boxed(),
                     )

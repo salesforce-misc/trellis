@@ -133,7 +133,11 @@ fn collect_column_types(expr: &Expr, source: &Table, out: &mut Vec<ValueType>) {
         }
         // A literal carries no *source column* type — including a typed
         // literal, whose type is its own, not a column's.
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
+        | Expr::TypedLiteral { .. } => {}
     }
 }
 

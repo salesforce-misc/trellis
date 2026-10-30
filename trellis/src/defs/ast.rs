@@ -395,6 +395,18 @@ pub enum Expr {
     /// because Postgres gives them no bare literal syntax at all
     /// (`pg_typeof(1.5)` is `numeric`).
     TypedLiteral { value_type: ValueType, text: String },
+    /// `TRUE` or `FALSE`, a `boolean` constant.
+    BooleanLiteral(bool),
+    /// The `NULL` literal. It has no type of its own (Postgres's `unknown`):
+    /// [`super::validate`] types it from its context as Postgres's parser
+    /// does (the other operand of an operator, the other results of a `CASE`
+    /// or arguments of a `COALESCE` or `NULLIF`, `boolean` under `AND`, `OR`,
+    /// `NOT` and a `WHEN`, the target of a `CAST`) and refuses it where
+    /// Postgres's resolution would be ambiguous or this grammar's would
+    /// differ. A field that is only `NULL` is `text`, as `CREATE TABLE AS`
+    /// gives it. Every renderer emits it as a bare `NULL`, so Postgres
+    /// resolves it in the same context.
+    Null,
     /// A source column named through the `FROM` table:
     /// `<table>.<column>` or `<schema>.<table>.<column>`. It always reads the
     /// source column, never a calculated field of the same name, which is how
@@ -755,6 +767,9 @@ pub(crate) fn render_field_expr(expr: &Expr) -> String {
         Expr::Column(name) => name.clone(),
         Expr::NumberLiteral(text) => text.clone(),
         Expr::StringLiteral(text) => format!("'{}'", text.replace('\'', "''")),
+        Expr::BooleanLiteral(true) => "TRUE".to_string(),
+        Expr::BooleanLiteral(false) => "FALSE".to_string(),
+        Expr::Null => "NULL".to_string(),
         Expr::TypedLiteral { value_type, text } => format!(
             "CAST('{}' AS {})",
             text.replace('\'', "''"),

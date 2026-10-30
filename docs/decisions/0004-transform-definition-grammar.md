@@ -72,13 +72,15 @@ SELECT <expr> AS <field> [, <expr> AS <field> ...]
 ```
 
 `<expr>` is a column reference, a numeric or single-quoted string literal,
+`TRUE`, `FALSE`, `NULL`,
 `<expr> + <expr>`, `<expr> - <expr>`, `<expr> * <expr>`, `<expr> / <expr>`,
 `<expr> % <expr>`, `-<expr>`, a comparison (`=`, `<>`, `!=`, `<`, `<=`, `>`,
 `>=`, `IS [NOT] DISTINCT FROM`), `<expr> AND <expr>`, `<expr> OR <expr>`,
 `NOT <expr>`, `<expr> IS [NOT] NULL`, `<expr> AT TIME ZONE 'UTC'`, a searched
 `CASE WHEN <expr> THEN <expr> [WHEN ...] [ELSE <expr>] END`, `CAST(<expr> AS
 <integer, numeric or timestamp type>)` (the target also spelled `int`, `int4`,
-`int8` or `decimal`), `EXTRACT(<field> FROM <expr>)`, or a function call
+`int8` or `decimal`), `CAST(NULL AS <type>)` to any type an expression has a
+value of, `EXTRACT(<field> FROM <expr>)`, or a function call
 (`strpos`, `octet_length`, `char_length`, `regexp_count`, `abs`, `ceil`,
 `floor`, `round`, `trunc`, `date_trunc`, `coalesce`, `nullif`; general
 `func(args)` syntax). Operators lex and bind as Postgres's do
@@ -89,7 +91,7 @@ column name. `NOT` and `CASE` are keywords wherever an operand follows them (a
 name other than `AS`, `IS`, `AND`, `OR`, `WHEN`, `THEN`, `ELSE` or `END`, a
 number, a string, a `(` or a `-`), so `NOT -x > 0` is `NOT ((-x) > 0)`. A bare
 identifier is never a word Postgres reserves (`not`, `case`, `end`, `order`,
-`user`, `true`...): the grammar has no quoted identifiers, so such a source
+`user`...): the grammar has no quoted identifiers, so such a source
 column is read qualified with its table (`orders.order`), as Postgres allows,
 and the refusal says so ([ADR-0022](0022-grammar-mirrors-postgres.md)).
 `orders.order AS order` passes that column through, as `order AS order`
@@ -166,9 +168,8 @@ worth naming:
   and `timestamp`, say) to a common type.
 * No `unknown`-typed literal: a quoted literal is always `Text`, so
   `COALESCE(<numeric>, '0')` is a type mismatch here. Write `COALESCE(<numeric>, 0)`.
-* No `NULL` literal at all, so `COALESCE(x, NULL)` isn't expressible; bare `NULL`
-  is refused as a reserved word, with a message saying the literal isn't
-  supported yet.
+* A `NULL` argument takes the other arguments' type, as in Postgres
+  (`COALESCE(x, NULL)` has `x`'s); one that is all `NULL`s is `text`.
 
 Each gap is pinned by a divergence test.
 
@@ -238,7 +239,9 @@ declares its tier there.
   outside the list is refused until then.
 * The accepted language is narrower than Postgres's in places a SQL user will
   notice: a typed literal must use its type's canonical spelling, `::` casts and
-  a `CAST` other than the integer widenings and `date` to `timestamp` are refused, and `COALESCE` refuses mixed non-numeric argument
-  types and has no `NULL` literal.
+  a `CAST` other than the integer widenings, `date` to `timestamp` and a
+  `NULL`'s are refused, `COALESCE` refuses mixed non-numeric argument types,
+  and a `NULL` is refused where Postgres would type it by its
+  function-candidate rules (a function argument) or find it ambiguous.
 * Precedence lives in our own operator table, so each new operator has to
   declare its tier there correctly.

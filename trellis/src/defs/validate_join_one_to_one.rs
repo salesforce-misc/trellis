@@ -101,7 +101,11 @@ fn check_field_expr<'a>(
             column: column.clone(),
         })
         .map(|_| ()),
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => Ok(()),
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
+        | Expr::TypedLiteral { .. } => Ok(()),
         Expr::BinaryOp { lhs, rhs, .. } => {
             check_field_expr(lhs, field, resolve)?;
             check_field_expr(rhs, field, resolve)

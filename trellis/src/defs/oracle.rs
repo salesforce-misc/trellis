@@ -192,7 +192,11 @@ fn collect_columns(
         Expr::SourceColumn { column, .. } => {
             out.insert(column.clone());
         }
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
+        | Expr::TypedLiteral { .. } => {}
         Expr::BinaryOp { lhs, rhs, .. } => {
             collect_columns(lhs, field_name, field_names, out);
             collect_columns(rhs, field_name, field_names, out);
@@ -225,6 +229,9 @@ pub fn render_expr_sql(expr: &Expr) -> String {
         Expr::Column(name) | Expr::SourceColumn { column: name, .. } => quote_ident(name),
         Expr::NumberLiteral(text) => number_literal_sql(text),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
+        Expr::BooleanLiteral(value) => value.to_string(),
+        // Bare, so Postgres types it from the same context `validate` did.
+        Expr::Null => "null".to_string(),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = super::registry::operator_spec(*op).symbol;
@@ -322,6 +329,9 @@ pub(crate) fn render_qualified_expr_sql(expr: &Expr, source_sql: &str) -> String
         }
         Expr::NumberLiteral(text) => number_literal_sql(text),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
+        Expr::BooleanLiteral(value) => value.to_string(),
+        // Bare, so Postgres types it from the same context `validate` did.
+        Expr::Null => "null".to_string(),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = super::registry::operator_spec(*op).symbol;

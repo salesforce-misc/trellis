@@ -355,6 +355,8 @@ fn render_expr(expr: &Expr) -> String {
         Expr::Column(name) | Expr::SourceColumn { column: name, .. } => quote_ident(name),
         Expr::NumberLiteral(text) => text.clone(),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
+        Expr::BooleanLiteral(value) => value.to_string(),
+        Expr::Null => "null".to_string(),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = registry::operator_spec(*op).symbol;
@@ -701,6 +703,9 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
             true => ValueType::Numeric,
         },
         Expr::StringLiteral(_) => ValueType::Text,
+        Expr::BooleanLiteral(_) => ValueType::Boolean,
+        // The end-to-end generator never draws a bare `NULL`.
+        Expr::Null => panic!("oracle: a bare NULL has no type of its own"),
         Expr::TypedLiteral { value_type, .. } => *value_type,
         // `+`'s result type depends on its operands (`int4 +
         // int4` is `integer`, `int4 + numeric` is `numeric`), so it has to

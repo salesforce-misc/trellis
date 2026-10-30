@@ -379,7 +379,11 @@ fn a_keyword_is_never_read_as_a_column() {
 #[test]
 fn every_reserved_word_is_refused_as_a_bare_identifier() {
     use super::registry::RESERVED_WORDS;
-    for word in RESERVED_WORDS {
+    // `true`, `false` and `null` are the literals (`literal_tests`).
+    for word in RESERVED_WORDS
+        .iter()
+        .filter(|w| !matches!(**w, "true" | "false" | "null"))
+    {
         for text in [
             word.to_string(),
             word.to_uppercase(),
@@ -466,17 +470,11 @@ fn a_column_name_or_unreserved_keyword_is_still_a_column() {
     }
 }
 
-/// `true`, `false` and `null` are literals in Postgres, which this grammar
-/// doesn't have yet; the refusal says so.
+/// A reserved word's refusal names the qualified-name remedy.
 #[test]
-fn the_boolean_and_null_literals_are_refused_with_the_not_supported_yet_message() {
-    for word in ["true", "false", "null", "NULL", "True"] {
-        let err = parse_text(word).unwrap_err();
-        assert!(err.to_string().contains("literals yet"), "{word}: {err}");
-    }
+fn a_reserved_word_refusal_names_the_remedy() {
     let err = parse_text("order").unwrap_err();
     assert!(err.to_string().contains("rename the column"), "{err}");
-    assert!(!err.to_string().contains("literals yet"), "{err}");
 }
 
 #[test]

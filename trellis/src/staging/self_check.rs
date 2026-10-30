@@ -1678,6 +1678,9 @@ pub(super) fn render_leaf(expr: &Expr) -> String {
         Expr::Column(name) | Expr::SourceColumn { column: name, .. } => quote_ident(name),
         Expr::NumberLiteral(text) => number_literal(text),
         Expr::StringLiteral(text) => format!("'{}'::text", text.replace('\'', "''")),
+        Expr::BooleanLiteral(value) => value.to_string(),
+        // Bare, so Postgres types it from the same context `validate` did.
+        Expr::Null => "null".to_string(),
         Expr::TypedLiteral { value_type, text } => typed_literal::render_sql(*value_type, text),
         Expr::BinaryOp { op, lhs, rhs } => {
             let symbol = registry::operator_spec(*op).symbol;
@@ -1948,6 +1951,14 @@ mod tests {
             render_leaf(&Expr::NumberLiteral("1.50".to_string())),
             "1.50::numeric"
         );
+    }
+
+    /// Bare, so Postgres types the `NULL` from the same context define did.
+    #[test]
+    fn render_leaf_renders_the_constant_keywords_bare() {
+        assert_eq!(render_leaf(&Expr::BooleanLiteral(true)), "true");
+        assert_eq!(render_leaf(&Expr::BooleanLiteral(false)), "false");
+        assert_eq!(render_leaf(&Expr::Null), "null");
     }
 
     #[test]

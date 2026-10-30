@@ -231,6 +231,10 @@ fn substitute_field_aliases(
             charge_budget(budget, 1)?;
             Ok(Expr::StringLiteral(text.clone()))
         }
+        Expr::BooleanLiteral(_) | Expr::Null => {
+            charge_budget(budget, 1)?;
+            Ok(expr.clone())
+        }
         Expr::TypedLiteral { value_type, text } => {
             charge_budget(budget, 1)?;
             Ok(Expr::TypedLiteral {
@@ -355,6 +359,8 @@ fn node_count(expr: &Expr) -> usize {
         | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
         | Expr::TypedLiteral { .. } => 1,
         Expr::BinaryOp { lhs, rhs, .. } => 1 + node_count(lhs) + node_count(rhs),
         Expr::Negate(operand) => 1 + node_count(operand),

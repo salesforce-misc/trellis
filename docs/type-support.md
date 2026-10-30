@@ -309,7 +309,26 @@ argument, `COUNT(CASE WHEN c THEN 1 END)` and an integer `SUM(CASE WHEN c THEN
 qty ELSE 0 END)` are admitted; `SUM` or `AVG` of a `CASE` over `numeric(p,s)`
 is not, because the `CASE` has no declared scale
 ([transforms](transforms.md#supported-sources-and-targets)).
-Checked in `trellis/tests/logic_key_spaces.rs`,
+
+`TRUE` and `FALSE` are `boolean`. A `NULL` has no type of its own and takes
+the one Postgres gives it from its context, so the target column has the type
+`CREATE TABLE AS` gives the same text: beside an operand of type `t`, a `NULL`
+is a `t` when an operator takes `t` on both sides (`int_col + NULL` is
+`integer`, `smallint_col + NULL` is `smallint`, `date_col - NULL` is `integer`,
+`text_col = NULL` is `boolean`), and two `NULL`s of a comparison are `text`;
+among `CASE` results and `COALESCE` or `NULLIF` arguments it takes the others'
+type, and `text` when they are all `NULL`; under `AND`, `OR`, `NOT` and as a
+`WHEN` condition it is `boolean`; and `CAST(NULL AS <type>)` gives it any type
+an expression here has a value of (`smallint`, `integer`, `bigint`,
+`numeric`, `real`, `double precision`, `text`, `boolean`, `uuid`, `date`,
+`time`, `timetz`, `timestamp`, `bytea`, `oid`, `inet`, `cidr`, `macaddr`,
+`macaddr8`, `varbit`, `jsonb`). A field that is only `NULL` is a `text`
+column; a field that reads it is computed from the literal, as Postgres
+would read the inlined text (`NULL AS z, COALESCE(z, 1) AS n` makes `n` an
+`integer`). Where Postgres finds a `NULL` ambiguous, or types it by its
+function-candidate rules (a function or aggregate argument), define refuses it
+([transforms](transforms.md#supported-sources-and-targets)).
+Checked in `trellis/tests/logic_key_spaces.rs`, `trellis/tests/null_literal_key_spaces.rs`,
 `trellis/tests/one_to_one_render.rs` and the harness.
 
 ## Dates and times

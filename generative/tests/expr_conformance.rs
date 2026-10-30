@@ -1051,6 +1051,215 @@ fn every_logic_form_over_every_leaf_conforms() {
     });
 }
 
+/// `rule`'s one-level instances over columns only, each with one column
+/// replaced by a `TRUE`, a `FALSE` or a `CAST(NULL AS <its type>)` of its
+/// type ([`expr_gen::constant_keyword_literals`]): every operand position of
+/// every rule takes each, without the product of every leaf.
+fn constant_keyword_instances(rule: &expr_gen::Rule) -> Vec<Expr> {
+    fn column_slots(expr: &Expr) -> usize {
+        match expr {
+            Expr::Column(_) => 1,
+            Expr::BinaryOp { lhs, rhs, .. } => column_slots(lhs) + column_slots(rhs),
+            Expr::FunctionCall { args, .. } => args.iter().map(column_slots).sum(),
+            Expr::Negate(e) | Expr::Cast { expr: e, .. } => column_slots(e),
+            _ => expr.logic_children().into_iter().map(column_slots).sum(),
+        }
+    }
+    /// `expr` with its `slot`th column (in [`column_slots`] order) replaced
+    /// by `with(type)`; the counter runs down as columns pass.
+    fn replace(
+        expr: &Expr,
+        slot: &mut usize,
+        with: &dyn Fn(ValueType) -> Option<Expr>,
+    ) -> Option<Expr> {
+        Some(match expr {
+            Expr::Column(name) => {
+                if *slot == 0 {
+                    *slot = usize::MAX;
+                    let ty = columns()
+                        .into_iter()
+                        .find(|(n, _)| n == name)
+                        .expect("a column of the table")
+                        .1;
+                    return with(ty);
+                }
+                *slot = slot.wrapping_sub(1);
+                expr.clone()
+            }
+            Expr::BinaryOp { op, lhs, rhs } => Expr::BinaryOp {
+                op: *op,
+                lhs: Box::new(replace(lhs, slot, with)?),
+                rhs: Box::new(replace(rhs, slot, with)?),
+            },
+            Expr::FunctionCall { name, args } => Expr::FunctionCall {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|a| replace(a, slot, with))
+                    .collect::<Option<_>>()?,
+            },
+            Expr::Negate(e) => Expr::Negate(Box::new(replace(e, slot, with)?)),
+            Expr::Cast { expr: e, target } => Expr::Cast {
+                expr: Box::new(replace(e, slot, with)?),
+                target: *target,
+            },
+            _ => match expr.map_logic_children(|c| replace(c, slot, with).ok_or(())) {
+                Some(rebuilt) => rebuilt.ok()?,
+                None => expr.clone(),
+            },
+        })
+    }
+    let only_columns = |e: &Expr| {
+        fn leaves_are_columns(e: &Expr) -> bool {
+            match e {
+                Expr::Column(_) => true,
+                Expr::BinaryOp { lhs, rhs, .. } => {
+                    leaves_are_columns(lhs) && leaves_are_columns(rhs)
+                }
+                // A literal-only argument (a pattern, a unit, a scale) stays.
+                Expr::FunctionCall { args, .. } => args.iter().all(|a| {
+                    leaves_are_columns(a)
+                        || matches!(a, Expr::StringLiteral(_) | Expr::NumberLiteral(_))
+                }),
+                Expr::Negate(x) | Expr::Cast { expr: x, .. } => leaves_are_columns(x),
+                _ => e.logic_children().into_iter().all(leaves_are_columns),
+            }
+        }
+        leaves_are_columns(e)
+    };
+    let Some(base) = instances(rule).into_iter().find(only_columns) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for slot in 0..column_slots(&base) {
+        for pick in 0..3 {
+            let with = |ty: ValueType| {
+                expr_gen::constant_keyword_literals(ty)
+                    .into_iter()
+                    .nth(pick)
+            };
+            if let Some(expr) = replace(&base, &mut slot.clone(), &with) {
+                out.push(expr);
+            }
+        }
+    }
+    out
+}
+
+/// Every rule with a `TRUE`, `FALSE` or typed `NULL` in each operand
+/// position, one at a time: type, value and round trip against Postgres.
+#[test]
+fn every_rule_over_each_constant_keyword_conforms() {
+    let mut checked = 0;
+    let mut failures = Vec::new();
+    for rule in expr_gen::rules() {
+        for expr in constant_keyword_instances(&rule) {
+            let text = render_text(&expr, TextStyle::default());
+            checked += 1;
+            if let Err(d) = check_text(&text, Some(&expr)) {
+                failures.push(d.to_string());
+            }
+        }
+    }
+    assert!(checked > 300, "only {checked} expressions");
+    assert!(
+        failures.is_empty(),
+        "{} of {checked} diverge:\n{}",
+        failures.len(),
+        failures[..failures.len().min(10)].join("\n")
+    );
+}
+
+/// A bare `NULL` takes its type from its context, as Postgres types
+/// `unknown` (ADR-0022): beside each operator's operand of every type that
+/// operator takes on both sides, on either side; among `CASE` results and
+/// `COALESCE` and `NULLIF` arguments of every column type, in every slot;
+/// under logic; and alone. Each is checked for its type, its value on every
+/// row and its round trip.
+#[test]
+fn a_bare_null_conforms_in_every_context() {
+    let null = || Expr::Null;
+    let call = |name: &str, args: Vec<Expr>| Expr::FunctionCall {
+        name: name.to_string(),
+        args,
+    };
+    let case = |branches: Vec<(Expr, Expr)>, otherwise: Option<Expr>| Expr::Case {
+        branches,
+        otherwise: otherwise.map(Box::new),
+    };
+    let mut exprs = Vec::new();
+    for rule in expr_gen::rules() {
+        let expr_gen::Rule::Op { op, lhs, rhs, .. } = rule else {
+            continue;
+        };
+        if lhs != rhs || op == Operator::AtTimeZone {
+            continue;
+        }
+        for leaf in leaves(lhs) {
+            exprs.push(bin(op, leaf.clone(), null()));
+            exprs.push(bin(op, null(), leaf));
+        }
+        if op.is_comparison() && lhs == ValueType::Text {
+            exprs.push(bin(op, null(), null()));
+        }
+    }
+    let condition = Expr::Column("ba".to_string());
+    for (name, ty) in columns() {
+        if !name.ends_with('a') {
+            continue;
+        }
+        let col = Expr::Column(name);
+        exprs.extend([
+            case(vec![(condition.clone(), null())], Some(col.clone())),
+            case(vec![(condition.clone(), col.clone())], Some(null())),
+            case(
+                vec![(condition.clone(), null()), (null(), col.clone())],
+                None,
+            ),
+            call("COALESCE", vec![null(), col.clone()]),
+            call("COALESCE", vec![col.clone(), null(), null()]),
+            Expr::IsNull {
+                expr: Box::new(null()),
+                negated: false,
+            },
+        ]);
+        // `NULLIF` resolves as `=`: over the types `=` takes.
+        if registry::comparison_result_type(Operator::Equal, ty, ty).is_some() {
+            exprs.push(call("NULLIF", vec![null(), col.clone()]));
+            exprs.push(call("NULLIF", vec![col, null()]));
+        }
+    }
+    exprs.extend([
+        null(),
+        Expr::BooleanLiteral(true),
+        Expr::BooleanLiteral(false),
+        call("COALESCE", vec![null(), null()]),
+        call("NULLIF", vec![null(), null()]),
+        case(vec![(condition.clone(), null())], None),
+        Expr::Not(Box::new(null())),
+        bin(Operator::And, null(), condition.clone()),
+        bin(Operator::Or, condition.clone(), null()),
+        bin(Operator::And, null(), Expr::BooleanLiteral(false)),
+        bin(Operator::Or, null(), Expr::BooleanLiteral(true)),
+        bin(Operator::IsNotDistinctFrom, null(), null()),
+    ]);
+    let mut failures = Vec::new();
+    for expr in &exprs {
+        let text = render_text(expr, TextStyle::default());
+        if let Err(d) = check_text(&text, Some(expr)) {
+            failures.push(d.to_string());
+        }
+    }
+    assert!(exprs.len() > 200, "only {} expressions", exprs.len());
+    assert!(
+        failures.is_empty(),
+        "{} of {} diverge:\n{}",
+        failures.len(),
+        exprs.len(),
+        failures[..failures.len().min(10)].join("\n")
+    );
+}
+
 /// An expression Postgres folds and rejects for every row is refused at
 /// define, and Postgres raises on the where-false probe: agreement.
 #[test]
@@ -1572,7 +1781,7 @@ fn reserved_word_near_misses_are_refused_and_postgres_agrees() {
         .into_iter()
         .filter(|m| m.kind == "reserved-word")
         .collect();
-    assert!(misses.len() >= 200, "only {} misses", misses.len());
+    assert!(misses.len() >= 190, "only {} misses", misses.len());
     HARNESS.with(|h| {
         for miss in &misses {
             if let Err(d) = h.fixture.check_refusal(miss) {
@@ -1668,6 +1877,12 @@ fn the_generator_reaches_every_registry_entry() {
             Expr::StringLiteral(_) => {
                 seen.insert("string literal".to_string());
             }
+            Expr::BooleanLiteral(_) => {
+                seen.insert("boolean literal".to_string());
+            }
+            Expr::Null => {
+                seen.insert("NULL".to_string());
+            }
             Expr::Column(_) | Expr::SourceColumn { .. } => {
                 seen.insert("column".to_string());
             }
@@ -1695,6 +1910,8 @@ fn the_generator_reaches_every_registry_entry() {
             "NOT".to_string(),
             "IS NULL".to_string(),
             "CASE".to_string(),
+            "boolean literal".to_string(),
+            "NULL".to_string(),
         ])
         .chain(
             registry::CAST_TARGETS

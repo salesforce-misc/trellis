@@ -179,7 +179,9 @@ written by hand, each with a test that fails when it falls behind:
 
 - `COALESCE`, which is variadic and so outside the registry.
 - The literal pools. Every `TYPED_LITERALS` keyword needs canonical samples in
-  `typed_literal_samples`.
+  `typed_literal_samples`. `TRUE`, `FALSE` and `CAST(NULL AS <type>)` are
+  drawn as leaves of their types, and a bare `NULL` as either operand of an
+  operator that takes one type on both sides.
 - A function argument that must be a literal (`LITERAL_ONLY_ARGS`, today
   `REGEXP_COUNT`'s pattern).
 - The unadmitted constructs a near miss names (`UNADMITTED_OPERATORS`,
@@ -216,7 +218,10 @@ Postgres, over a throwaway table of random rows (`NULL`, extremes, `NaN`,
    non-numeric operand, a `CAST` the registry does not admit and a target it has
    no spelling for, a constant zero divisor, a chained comparison, a simple
    `CASE`, an `IS TRUE`-style test, each word Postgres reserves used as a
-   column (the live server also refuses each as an unquoted column name), a `CASE` whose condition or results have
+   column (the live server also refuses each as an unquoted column name), a
+   `NULL` define can't type (both operands of an arithmetic operator, the
+   operand of prefix `-` or `AT TIME ZONE`, an operand beside a type no
+   operator takes on both sides, any function argument), a `CASE` whose condition or results have
    the wrong type, a `NULLIF` whose first argument Postgres casts, a
    literal-only or integer-literal-only argument given a column, relative or
    non-canonical typed literals, and the operators and functions the registry
@@ -253,7 +258,9 @@ Deterministic tests in the same file pin each precedence tier (every pair of
 registry operators, generically) and each refusal by name, and check every
 rule one level deep over every leaf of its types (the table's column and
 each literal in the pool), so a renderer's cast for one literal or one
-refusal's boundary is reached on every run, not by luck. They run in the
+refusal's boundary is reached on every run, not by luck. `TRUE`, `FALSE` and
+a typed `NULL` go into every operand position of every rule one at a time,
+and a bare `NULL` into every context that types it. They run in the
 normal suite, with a small-case-count run of each property from a fixed seed.
 The randomized properties are `#[ignore]`d and draw fresh cases each run:
 `PROPTEST_CASES=2000 cargo test -p generative --test expr_conformance --

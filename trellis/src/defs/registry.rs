@@ -462,6 +462,42 @@ pub fn cast_target(keyword: &str) -> Option<ValueType> {
         })
 }
 
+/// The types `CAST(NULL AS <type>)` can name, beyond the [`CAST_TARGETS`]:
+/// every type the grammar otherwise has a value of (a column type an
+/// operator or function takes, or a typed literal's), spelled as Postgres
+/// prints them. No value is converted, so no cast rule applies.
+pub const NULL_CAST_TARGETS: &[ValueType] = &[
+    ValueType::Integer(IntWidth::Int2),
+    ValueType::Float(FloatWidth::Float4),
+    ValueType::Float(FloatWidth::Float8),
+    ValueType::Text,
+    ValueType::Boolean,
+    ValueType::Uuid,
+    ValueType::Other(PgType::Date),
+    ValueType::Other(PgType::Time),
+    ValueType::Other(PgType::TimeTz),
+    ValueType::Other(PgType::Bytea),
+    ValueType::Other(PgType::Oid),
+    ValueType::Other(PgType::Inet),
+    ValueType::Other(PgType::Cidr),
+    ValueType::Other(PgType::MacAddr),
+    ValueType::Other(PgType::MacAddr8),
+    ValueType::Other(PgType::VarBit),
+    ValueType::Other(PgType::Jsonb),
+];
+
+/// The target `CAST(NULL AS <keyword>)` names: a [`cast_target`], or one of
+/// the [`NULL_CAST_TARGETS`] by its canonical name, matched
+/// case-insensitively.
+pub fn null_cast_target(keyword: &str) -> Option<ValueType> {
+    cast_target(keyword).or_else(|| {
+        NULL_CAST_TARGETS
+            .iter()
+            .copied()
+            .find(|t| t.to_string().eq_ignore_ascii_case(keyword))
+    })
+}
+
 /// The result type of `CAST(<operand> AS <target>)`, or `None` if the cast is
 /// not one of the admitted ones: an integer to a strictly wider integer, any
 /// integer to `numeric`, or a `date` to `timestamp`. Every other cast narrows

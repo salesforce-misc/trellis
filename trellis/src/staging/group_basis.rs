@@ -471,6 +471,8 @@ fn distinct_arguments(
             | Expr::SourceColumn { .. }
             | Expr::NumberLiteral(_)
             | Expr::StringLiteral(_)
+            | Expr::BooleanLiteral(_)
+            | Expr::Null
             | Expr::TypedLiteral { .. } => {}
         }
     }

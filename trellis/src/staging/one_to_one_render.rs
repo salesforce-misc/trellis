@@ -163,7 +163,11 @@ fn collect_columns(expr: &Expr, out: &mut BTreeSet<String>) {
         Expr::Column(name) | Expr::SourceColumn { column: name, .. } => {
             out.insert(name.clone());
         }
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
+        | Expr::TypedLiteral { .. } => {}
         Expr::BinaryOp { lhs, rhs, .. } => {
             collect_columns(lhs, out);
             collect_columns(rhs, out);

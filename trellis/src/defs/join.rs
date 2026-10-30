@@ -216,6 +216,8 @@ fn walk_columns(expr: &Expr, visit: &mut impl FnMut(&QualifiedColumn)) {
         Expr::Column(_)
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
         | Expr::TypedLiteral { .. } => {}
     }
 }

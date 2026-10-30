@@ -294,6 +294,13 @@ pub enum ValidationError {
     /// `double precision`'s range (overflow, or a nonzero value that
     /// underflows to zero). Postgres raises `22003` for it at plan time.
     FloatComparisonLiteralOutOfRange { field: String, text: String },
+    /// A `NULL` literal (or a field that is only one) where its context
+    /// gives it no type: `NULL + NULL`, `-NULL`, a function or aggregate
+    /// argument, an operand whose other side's type has no operator of that
+    /// type on both sides. Postgres either refuses these as ambiguous or
+    /// resolves them by its function-candidate rules, which this grammar
+    /// does not model. `context` names the construct.
+    UntypedNull { field: String, context: String },
     /// A constant argument of a `COALESCE` whose result is a float (a number
     /// literal, or a sum, `COALESCE` or calculated field made only of
     /// literals) lies outside that float type's range (overflow, or a nonzero
@@ -693,6 +700,8 @@ fn collect_refusing_calls(
         | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
         | Expr::TypedLiteral { .. } => {}
     }
 }
@@ -830,7 +839,11 @@ fn collect_text_columns<'a>(
                 collect_text_columns(child, field, fields_by_name, visited, out);
             }
         }
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
+        | Expr::TypedLiteral { .. } => {}
     }
 }
 
@@ -1161,6 +1174,12 @@ impl fmt::Display for ValidationError {
                 f,
                 "calculated field '{field}' compares a float with the literal {text}, which is \
                  out of range for double precision"
+            ),
+            ValidationError::UntypedNull { field, context } => write!(
+                f,
+                "calculated field '{field}' has a NULL in {context}, where nothing gives it a \
+                 type; write CAST(NULL AS <type>) with the type you mean (see \"Supported \
+                 sources and targets\" in docs/transforms.md)"
             ),
             ValidationError::CoalesceLiteralOutOfRange {
                 field,
@@ -2364,7 +2383,11 @@ fn check_join_field_expr<'a>(
                 )),
             }
         }
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => Ok(()),
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
+        | Expr::TypedLiteral { .. } => Ok(()),
         Expr::BinaryOp { lhs, rhs, .. } => {
             check_join_field_expr(
                 lhs,
@@ -2622,6 +2645,8 @@ pub(crate) fn validate_qualified_columns(
             Expr::Column(_)
             | Expr::NumberLiteral(_)
             | Expr::StringLiteral(_)
+            | Expr::BooleanLiteral(_)
+            | Expr::Null
             | Expr::TypedLiteral { .. } => Ok(()),
         }
     }
@@ -2693,6 +2718,8 @@ fn reject_ambiguous_names(
             Expr::SourceColumn { .. }
             | Expr::NumberLiteral(_)
             | Expr::StringLiteral(_)
+            | Expr::BooleanLiteral(_)
+            | Expr::Null
             | Expr::TypedLiteral { .. } => None,
         }
     }
@@ -2833,7 +2860,11 @@ fn validate_aggregate_field_expr(
             }
             Ok(())
         }
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => Ok(()),
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
+        | Expr::TypedLiteral { .. } => Ok(()),
         Expr::BinaryOp { lhs, rhs, .. } => {
             validate_aggregate_field_expr(
                 lhs,
@@ -2901,7 +2932,11 @@ pub(super) fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
         Expr::Column(name) => out.push(name.clone()),
         // Always a source column, never a read of a field.
         Expr::SourceColumn { .. } => {}
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {}
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
+        | Expr::TypedLiteral { .. } => {}
         Expr::BinaryOp { lhs, rhs, .. } => {
             collect_columns(lhs, out);
             collect_columns(rhs, out);
@@ -2936,6 +2971,8 @@ fn has_aggregate_call(expr: &Expr) -> bool {
         | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
         | Expr::TypedLiteral { .. } => false,
     }
 }
@@ -3016,6 +3053,8 @@ pub(crate) fn collect_reads(
         Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
         | Expr::TypedLiteral { .. } => {}
         Expr::BinaryOp { lhs, rhs, .. } => {
             collect_reads(lhs, aggregates, in_aggregate_arg, fields, aggregate_args);
@@ -3390,20 +3429,171 @@ fn infer_field(
         });
     }
     // A field is its own target column, so Postgres plans it whatever reads
-    // it.
-    let t = infer_expr(
-        &field.expr,
-        &field.name,
-        source_columns,
-        fields_by_name,
-        types,
-        in_progress,
-        true,
-    );
+    // it. One that is only `NULL` is `text`, the type `CREATE TABLE AS`
+    // gives an `unknown` column.
+    let t = if is_null_literal(&field.expr, &field.name, source_columns, fields_by_name) {
+        Ok(ValueType::Text)
+    } else {
+        infer_expr(
+            &field.expr,
+            &field.name,
+            source_columns,
+            fields_by_name,
+            types,
+            in_progress,
+            true,
+        )
+    };
     in_progress.remove(&field.name);
     let t = t?;
     types.insert(field.name.clone(), t);
     Ok(t)
+}
+
+/// Whether `expr` is the `NULL` literal, written directly or read through
+/// calculated fields that are each only a name for it. Every renderer
+/// inlines a field it reads, so Postgres sees the literal itself where such
+/// a field is read, and types it from that context, not as the field's own
+/// `text` column.
+fn is_null_literal(
+    expr: &Expr,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
+) -> bool {
+    let (mut expr, mut field_name) = (expr, field_name);
+    // A chain of names visits each field at most once unless it cycles,
+    // which inference refuses on its own.
+    for _ in 0..=fields_by_name.len() {
+        match expr {
+            Expr::Null => return true,
+            Expr::Column(name) => {
+                let is_self_passthrough = name == field_name && source_columns.contains_key(name);
+                let Some(field) = fields_by_name
+                    .get(name.as_str())
+                    .filter(|_| !is_self_passthrough)
+                else {
+                    return false;
+                };
+                (expr, field_name) = (&field.expr, &field.name);
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// [`infer_expr`] for an operand whose context types a `NULL` literal (an
+/// operator's other operand, a `CASE`'s other results, a `COALESCE`'s or
+/// `NULLIF`'s other arguments, `boolean` under logic): `None` for one, as
+/// [`is_null_literal`] finds it, which the caller resolves.
+#[allow(clippy::too_many_arguments)]
+fn infer_operand(
+    expr: &Expr,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
+    types: &mut HashMap<String, ValueType>,
+    in_progress: &mut HashSet<String>,
+    folded: bool,
+) -> Result<Option<ValueType>, ValidationError> {
+    if is_null_literal(expr, field_name, source_columns, fields_by_name) {
+        return Ok(None);
+    }
+    infer_expr(
+        expr,
+        field_name,
+        source_columns,
+        fields_by_name,
+        types,
+        in_progress,
+        folded,
+    )
+    .map(Some)
+}
+
+#[cold]
+#[inline(never)]
+fn untyped_null(field_name: &str, context: &str) -> ValidationError {
+    ValidationError::UntypedNull {
+        field: field_name.to_string(),
+        context: context.to_string(),
+    }
+}
+
+/// The operand types a binary operator is resolved over when either operand
+/// is a `NULL` literal (`None`), as Postgres resolves them: a `NULL` is
+/// taken to be of the other operand's type, and two `NULL`s of a comparison
+/// to be `text`. Two of an arithmetic operator are ambiguous to Postgres,
+/// and `AT TIME ZONE` is a function call to it, whose candidate rules apply
+/// instead; both are refused. Kept out of [`infer_expr`] so its frame, which
+/// every level of an expression stacks, stays small.
+#[inline(never)]
+fn resolve_null_operands(
+    op: super::ast::Operator,
+    lhs_t: Option<ValueType>,
+    rhs_t: Option<ValueType>,
+    field_name: &str,
+) -> Result<(ValueType, ValueType), ValidationError> {
+    if op == super::ast::Operator::AtTimeZone && (lhs_t.is_none() || rhs_t.is_none()) {
+        return Err(untyped_null(field_name, "an operand of AT TIME ZONE"));
+    }
+    match (lhs_t, rhs_t) {
+        (Some(l), Some(r)) => Ok((l, r)),
+        (Some(t), None) | (None, Some(t)) => Ok((t, t)),
+        (None, None) if op.is_comparison() => Ok((ValueType::Text, ValueType::Text)),
+        (None, None) => Err(untyped_null(
+            field_name,
+            &format!(
+                "both operands of {}",
+                super::registry::operator_spec(op).symbol
+            ),
+        )),
+    }
+}
+
+/// The refusal of an operator with a `NULL` operand that no operator takes
+/// with the other operand's type on both sides (or none this grammar
+/// admits): Postgres's pick, if it has one, is not that type.
+#[cold]
+#[inline(never)]
+fn null_operand_refusal(
+    op: super::ast::Operator,
+    other: ValueType,
+    field_name: &str,
+) -> ValidationError {
+    untyped_null(
+        field_name,
+        &format!(
+            "an operand of {} beside a {other}",
+            super::registry::operator_spec(op).symbol
+        ),
+    )
+}
+
+/// The refusal of a function or aggregate call (other than `COALESCE` and
+/// `NULLIF`) with a `NULL` argument. Postgres types such an argument by its
+/// candidate rules (`abs(NULL)` is `double precision`, `sum(NULL)` is
+/// ambiguous), which this grammar does not model.
+#[inline(never)]
+fn null_argument_refusal(
+    name: &str,
+    args: &[Expr],
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
+) -> Option<ValidationError> {
+    (name != "COALESCE"
+        && name != "NULLIF"
+        && args
+            .iter()
+            .any(|arg| is_null_literal(arg, field_name, source_columns, fields_by_name)))
+    .then(|| {
+        untyped_null(
+            field_name,
+            &format!("an argument of {}", name.to_ascii_lowercase()),
+        )
+    })
 }
 
 /// A constant Postgres folds at plan time: an exact value, or a float with
@@ -3612,6 +3802,8 @@ fn fold_constant<'f>(
             .ok()
             .map(|v| Constant::Float(v, *width)),
         Expr::StringLiteral(text) => Some(Constant::Literal(ValueType::Text, text.clone())),
+        Expr::BooleanLiteral(value) => Some(Constant::Bool(*value)),
+        Expr::Null => Some(Constant::Null),
         Expr::TypedLiteral {
             value_type: ValueType::Other(PgType::Date),
             text,
@@ -3851,7 +4043,12 @@ fn reads_no_column<'f>(
         return false;
     }
     match expr {
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => true,
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::TypedLiteral { .. } => true,
+        // The `NULL` constant: no column, but no value either.
+        Expr::Null => false,
         Expr::SourceColumn { .. } => false,
         // Here "constant" means a constant that is not `NULL`: a `COALESCE`
         // skips a `NULL` one. An operator over a `NULL` constant is `NULL`
@@ -4385,7 +4582,8 @@ fn infer_case(
         Ok(())
     };
     for (condition, result) in branches {
-        let condition_t = infer_expr(
+        // A `NULL` condition is a `boolean` one, which never holds.
+        let condition_t = infer_operand(
             condition,
             field_name,
             source_columns,
@@ -4393,7 +4591,8 @@ fn infer_case(
             types,
             in_progress,
             reached,
-        )?;
+        )?
+        .unwrap_or(ValueType::Boolean);
         if condition_t != ValueType::Boolean {
             return Err(ValidationError::CaseConditionNotBoolean {
                 field: field_name.to_string(),
@@ -4407,7 +4606,8 @@ fn infer_case(
         };
         let result_reached =
             reached && !matches!(truth, Truth::Known(false) | Truth::Null | Truth::Unknown);
-        let result_t = infer_expr(
+        // A `NULL` result takes the type of the others.
+        if let Some(result_t) = infer_operand(
             result,
             field_name,
             source_columns,
@@ -4415,15 +4615,16 @@ fn infer_case(
             types,
             in_progress,
             result_reached,
-        )?;
-        unify(result_t)?;
+        )? {
+            unify(result_t)?;
+        }
         results.push((result, result_reached));
         if matches!(truth, Truth::Known(true) | Truth::Unknown) {
             reached = false;
         }
     }
     if let Some(otherwise) = otherwise {
-        let otherwise_t = infer_expr(
+        if let Some(otherwise_t) = infer_operand(
             otherwise,
             field_name,
             source_columns,
@@ -4431,11 +4632,14 @@ fn infer_case(
             types,
             in_progress,
             reached,
-        )?;
-        unify(otherwise_t)?;
+        )? {
+            unify(otherwise_t)?;
+        }
         results.push((otherwise, reached));
     }
-    let common = common.expect("a CASE has at least one branch");
+    // Results that are all `NULL` are `text`, as Postgres resolves a set of
+    // `unknown` inputs.
+    let common = common.unwrap_or(ValueType::Text);
     // Postgres casts each result to the CASE's type and folds a constant one;
     // for an exact result the constant's own type already unifies upward, so
     // only a float result can leave one out of range.
@@ -4581,6 +4785,16 @@ fn infer_expr(
         // (or if fractional) `numeric`.
         Expr::NumberLiteral(text) => Ok(number_literal_type(text)),
         Expr::StringLiteral(_) => Ok(ValueType::Text),
+        Expr::BooleanLiteral(_) => Ok(ValueType::Boolean),
+        // Each construct that types a `NULL` from its context reads its
+        // operands through `infer_operand`; one reaching here has none.
+        Expr::Null => Err(untyped_null(field_name, "this position")),
+        Expr::FunctionCall { name, args }
+            if let Some(refusal) =
+                null_argument_refusal(name, args, field_name, source_columns, fields_by_name) =>
+        {
+            Err(refusal)
+        }
         Expr::TypedLiteral { value_type, text } => {
             // Checked here, not in the parser, for the same reason
             // `regexp_count`'s pattern is (see `validate_regexp_pattern`):
@@ -4617,7 +4831,8 @@ fn infer_expr(
             let decides = matches!(op, super::ast::Operator::Or);
             let mut evaluated = folded;
             for operand in operands {
-                let operand_t = infer_expr(
+                // A `NULL` operand is a `boolean` one.
+                let operand_t = infer_operand(
                     operand,
                     field_name,
                     source_columns,
@@ -4625,7 +4840,8 @@ fn infer_expr(
                     types,
                     in_progress,
                     evaluated,
-                )?;
+                )?
+                .unwrap_or(ValueType::Boolean);
                 if operand_t != ValueType::Boolean {
                     return Err(ValidationError::TypeMismatch {
                         field: field_name.to_string(),
@@ -4650,7 +4866,7 @@ fn infer_expr(
             Ok(ValueType::Boolean)
         }
         Expr::Not(operand) => {
-            let operand_t = infer_expr(
+            let operand_t = infer_operand(
                 operand,
                 field_name,
                 source_columns,
@@ -4658,7 +4874,8 @@ fn infer_expr(
                 types,
                 in_progress,
                 folded,
-            )?;
+            )?
+            .unwrap_or(ValueType::Boolean);
             if operand_t != ValueType::Boolean {
                 return Err(ValidationError::TypeMismatch {
                     field: field_name.to_string(),
@@ -4669,8 +4886,9 @@ fn infer_expr(
             }
             Ok(ValueType::Boolean)
         }
+        // `NULL IS NULL` needs no type.
         Expr::IsNull { expr: operand, .. } => {
-            infer_expr(
+            infer_operand(
                 operand,
                 field_name,
                 source_columns,
@@ -4695,9 +4913,9 @@ fn infer_expr(
             folded,
         ),
         Expr::FunctionCall { name, args } if name == "NULLIF" && args.len() == 2 => {
-            let mut arg_types = [ValueType::Boolean; 2];
+            let mut arg_types = [None; 2];
             for (slot, arg) in arg_types.iter_mut().zip(args) {
-                *slot = infer_expr(
+                *slot = infer_operand(
                     arg,
                     field_name,
                     source_columns,
@@ -4707,7 +4925,13 @@ fn infer_expr(
                     folded,
                 )?;
             }
-            let [lhs_t, rhs_t] = arg_types;
+            // Postgres resolves `NULLIF` as the `=` over its arguments: a
+            // `NULL` one takes the other's type, and two are `text`.
+            let [lhs_t, rhs_t] = match arg_types {
+                [Some(l), Some(r)] => [l, r],
+                [Some(t), None] | [None, Some(t)] => [t, t],
+                [None, None] => [ValueType::Text; 2],
+            };
             comparison_type(
                 super::ast::Operator::Equal,
                 &args[0],
@@ -4750,7 +4974,7 @@ fn infer_expr(
             )
         }
         Expr::BinaryOp { op, lhs, rhs } => {
-            let lhs_t = infer_expr(
+            let lhs_t = infer_operand(
                 lhs,
                 field_name,
                 source_columns,
@@ -4759,7 +4983,7 @@ fn infer_expr(
                 in_progress,
                 folded,
             )?;
-            let rhs_t = infer_expr(
+            let rhs_t = infer_operand(
                 rhs,
                 field_name,
                 source_columns,
@@ -4768,84 +4992,22 @@ fn infer_expr(
                 in_progress,
                 folded,
             )?;
-            // Operand admissibility *and* the result type both
-            // come from `registry::operator_result_type`, which models
-            // Postgres's family of `+`/`>` operators (`int4pl`,
-            // `numeric_add`, and the implicit `int -> numeric` coercion
-            // between them) rather than the single exact signature this used
-            // to compare against. `OperatorSpec::arg_types` survives only as
-            // the canonical shape a `TypeMismatch` names.
-            if let Some(result) = super::registry::operator_result_type(*op, lhs_t, rhs_t) {
-                if *op == super::ast::Operator::AtTimeZone {
-                    check_utc_zone(rhs, field_name)?;
-                }
-                if folded && let Some(kind) = ConstOp::of_operator(*op) {
-                    check_constant_op(
-                        expr,
-                        kind,
-                        &[lhs, rhs],
-                        &[lhs_t, rhs_t],
-                        result,
-                        field_name,
-                        source_columns,
-                        fields_by_name,
-                    )?;
-                    if lhs_t == DATE_TYPE || rhs_t == DATE_TYPE {
-                        check_constant_date_op(
-                            expr,
-                            *op,
-                            lhs,
-                            rhs,
-                            field_name,
-                            source_columns,
-                            fields_by_name,
-                        )?;
-                    }
-                }
-                return Ok(result);
-            }
-            if op.is_comparison() {
-                return comparison_type(*op, lhs, rhs, lhs_t, rhs_t, field_name, folded);
-            }
-            if let Some(refusal) = temporal_operator_refusal(*op, lhs_t, rhs_t, field_name) {
-                return Err(refusal);
-            }
-            if lhs_t.is_numeric_family() && rhs_t.is_numeric_family() {
-                match op {
-                    super::ast::Operator::Divide => {
-                        return Err(ValidationError::IntegerDivision {
-                            field: field_name.to_string(),
-                            lhs: lhs_t,
-                            rhs: rhs_t,
-                        });
-                    }
-                    super::ast::Operator::Modulo => {
-                        return Err(ValidationError::FloatModulo {
-                            field: field_name.to_string(),
-                        });
-                    }
-                    _ => {}
-                }
-            }
-            // Blame the operand that actually isn't admissible. At least one
-            // of them isn't (or resolution above would have succeeded), and
-            // the left one is reported first so the error reads in source
-            // order.
-            let spec = super::registry::operator_spec(*op);
-            let (found, expected) = if lhs_t.is_numeric_family() {
-                (rhs_t, spec.arg_types.1)
-            } else {
-                (lhs_t, spec.arg_types.0)
-            };
-            Err(ValidationError::TypeMismatch {
-                field: field_name.to_string(),
-                operator: spec.symbol,
-                expected,
-                found,
-            })
+            infer_binary_op(
+                expr,
+                *op,
+                lhs,
+                rhs,
+                lhs_t,
+                rhs_t,
+                field_name,
+                source_columns,
+                fields_by_name,
+                folded,
+            )
         }
         Expr::Negate(operand) => {
-            let operand_t = infer_expr(
+            // Postgres finds prefix `-` over `NULL` ambiguous.
+            let operand_t = infer_operand(
                 operand,
                 field_name,
                 source_columns,
@@ -4853,7 +5015,8 @@ fn infer_expr(
                 types,
                 in_progress,
                 folded,
-            )?;
+            )?
+            .ok_or_else(|| untyped_null(field_name, "the operand of prefix -"))?;
             let result = super::registry::negate_result_type(operand_t).ok_or_else(|| {
                 ValidationError::TypeMismatch {
                     field: field_name.to_string(),
@@ -4880,6 +5043,11 @@ fn infer_expr(
             expr: operand,
             target,
         } => {
+            // `CAST(NULL AS <type>)` is a `NULL` of that type, whatever the
+            // type: no value is converted.
+            if is_null_literal(operand, field_name, source_columns, fields_by_name) {
+                return Ok(*target);
+            }
             let operand_t = infer_expr(
                 operand,
                 field_name,
@@ -4930,9 +5098,9 @@ fn infer_expr(
             Ok(result)
         }
         Expr::FunctionCall { name, args } if name == "COALESCE" => {
-            // The planner simplifies the arguments in order and stops at the
-            // first constant one, which is the result (the grammar has no
-            // `NULL`): it drops the rest unevaluated, so no constant in
+            // The planner simplifies the arguments in order, drops a `NULL`
+            // constant one and stops at the first other constant one, which
+            // is the result: it drops the rest unevaluated, so no constant in
             // them raises.
             let planned = if folded {
                 let mut memo = HashMap::new();
@@ -4953,7 +5121,8 @@ fn infer_expr(
             };
             let mut common_type = None;
             for (i, arg) in args.iter().enumerate() {
-                let arg_t = infer_expr(
+                // A `NULL` argument takes the type of the others.
+                let Some(arg_t) = infer_operand(
                     arg,
                     field_name,
                     source_columns,
@@ -4961,7 +5130,10 @@ fn infer_expr(
                     types,
                     in_progress,
                     i < planned,
-                )?;
+                )?
+                else {
+                    continue;
+                };
                 if let Some(ct) = common_type {
                     // `COALESCE`'s arguments used to have to be
                     // the identical `ValueType`. Splitting exact integers
@@ -4988,7 +5160,9 @@ fn infer_expr(
                     common_type = Some(arg_t);
                 }
             }
-            let common_type = common_type.unwrap();
+            // Arguments that are all `NULL` are `text`, as Postgres resolves
+            // a set of `unknown` inputs.
+            let common_type = common_type.unwrap_or(ValueType::Text);
             // Postgres casts each argument to the COALESCE's resolved type,
             // and folds a constant one (a number literal, or a sum, COALESCE
             // or calculated field made only of them) at plan time. For an
@@ -5178,6 +5352,109 @@ fn infer_expr(
             Ok(spec.return_type)
         }
     }
+}
+
+/// The type of `lhs <op> rhs` (an operator other than `AND` and `OR`) from
+/// its operands' types, `None` for a `NULL` literal operand. Kept out of
+/// [`infer_expr`] so its frame, which every level of an expression stacks,
+/// stays small.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn infer_binary_op(
+    expr: &Expr,
+    op: super::ast::Operator,
+    lhs: &Expr,
+    rhs: &Expr,
+    lhs_t: Option<ValueType>,
+    rhs_t: Option<ValueType>,
+    field_name: &str,
+    source_columns: &HashMap<String, ValueType>,
+    fields_by_name: &HashMap<&str, &super::ast::FieldDef>,
+    folded: bool,
+) -> Result<ValueType, ValidationError> {
+    let null_operand = lhs_t.is_none() || rhs_t.is_none();
+    let (lhs_t, rhs_t) = resolve_null_operands(op, lhs_t, rhs_t, field_name)?;
+    // Operand admissibility *and* the result type both
+    // come from `registry::operator_result_type`, which models
+    // Postgres's family of `+`/`>` operators (`int4pl`,
+    // `numeric_add`, and the implicit `int -> numeric` coercion
+    // between them) rather than the single exact signature this used
+    // to compare against. `OperatorSpec::arg_types` survives only as
+    // the canonical shape a `TypeMismatch` names.
+    if let Some(result) = super::registry::operator_result_type(op, lhs_t, rhs_t) {
+        if op == super::ast::Operator::AtTimeZone {
+            check_utc_zone(rhs, field_name)?;
+        }
+        if folded && let Some(kind) = ConstOp::of_operator(op) {
+            check_constant_op(
+                expr,
+                kind,
+                &[lhs, rhs],
+                &[lhs_t, rhs_t],
+                result,
+                field_name,
+                source_columns,
+                fields_by_name,
+            )?;
+            if lhs_t == DATE_TYPE || rhs_t == DATE_TYPE {
+                check_constant_date_op(
+                    expr,
+                    op,
+                    lhs,
+                    rhs,
+                    field_name,
+                    source_columns,
+                    fields_by_name,
+                )?;
+            }
+        }
+        return Ok(result);
+    }
+    if op.is_comparison() {
+        return comparison_type(op, lhs, rhs, lhs_t, rhs_t, field_name, folded);
+    }
+    // No operator takes the other operand's type on both sides (or
+    // none this grammar admits), so Postgres's pick, if it has one,
+    // is not this operand's type.
+    if null_operand {
+        return Err(null_operand_refusal(op, lhs_t, field_name));
+    }
+    if let Some(refusal) = temporal_operator_refusal(op, lhs_t, rhs_t, field_name) {
+        return Err(refusal);
+    }
+    if lhs_t.is_numeric_family() && rhs_t.is_numeric_family() {
+        match op {
+            super::ast::Operator::Divide => {
+                return Err(ValidationError::IntegerDivision {
+                    field: field_name.to_string(),
+                    lhs: lhs_t,
+                    rhs: rhs_t,
+                });
+            }
+            super::ast::Operator::Modulo => {
+                return Err(ValidationError::FloatModulo {
+                    field: field_name.to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+    // Blame the operand that actually isn't admissible. At least one
+    // of them isn't (or resolution above would have succeeded), and
+    // the left one is reported first so the error reads in source
+    // order.
+    let spec = super::registry::operator_spec(op);
+    let (found, expected) = if lhs_t.is_numeric_family() {
+        (rhs_t, spec.arg_types.1)
+    } else {
+        (lhs_t, spec.arg_types.0)
+    };
+    Err(ValidationError::TypeMismatch {
+        field: field_name.to_string(),
+        operator: spec.symbol,
+        expected,
+        found,
+    })
 }
 
 const DATE_TYPE: ValueType = ValueType::Other(PgType::Date);
@@ -5635,6 +5912,8 @@ pub(crate) fn regexp_pattern_literals(def: &TransformDef) -> Vec<(String, String
             | Expr::SourceColumn { .. }
             | Expr::NumberLiteral(_)
             | Expr::StringLiteral(_)
+            | Expr::BooleanLiteral(_)
+            | Expr::Null
             | Expr::TypedLiteral { .. } => {}
         }
     }
@@ -5670,6 +5949,8 @@ fn column_depths_in(expr: &Expr, depth: usize, out: &mut HashMap<String, usize>)
         Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
         | Expr::TypedLiteral { .. } => depth,
         Expr::BinaryOp { lhs, rhs, .. } => {
             column_depths_in(lhs, depth + 1, out).max(column_depths_in(rhs, depth + 1, out))

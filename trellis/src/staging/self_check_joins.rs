@@ -249,9 +249,11 @@ fn render(def: &TransformDef, expr: &Expr, from: &str, joined: &str) -> Result<S
             }
             format!("{}({})", name.to_lowercase(), rendered.join(", "))
         }
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {
-            render_leaf(expr)
-        }
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
+        | Expr::TypedLiteral { .. } => render_leaf(expr),
     })
 }
 
@@ -981,9 +983,11 @@ fn render_signed(def: &TransformDef, expr: &Expr, args: &[Expr]) -> Result<Strin
         {
             format!("__g.{}", quote_ident(column))
         }
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => {
-            render_leaf(expr)
-        }
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
+        | Expr::TypedLiteral { .. } => render_leaf(expr),
         _ => {
             return Err(format!(
                 "a field reading {expr:?} outside an aggregate, which a JOIN definition can't \

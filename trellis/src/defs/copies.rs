@@ -530,6 +530,8 @@ fn expr_reads(
         | Expr::SourceColumn { .. }
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
         | Expr::TypedLiteral { .. } => None,
     };
     if let Some(read) = read

@@ -71,8 +71,10 @@ Each rule the expression grammar has is the rule Postgres's `scan.l` and
   (`orders.order`), or renaming the column or field. `NOT` and `CASE` are keywords before every operand the grammar
   has, `-` included: `not - 1` is `NOT (-1)`, as in Postgres. The refusal covers
   `not AS c`, `not + 1`, `case * b`, `end + 1` and `and + 1`, which Postgres
-  reads differently or rejects, and `true`, `false` and `null`, which are
-  literals in Postgres that Trellis doesn't have yet (the message says so). The
+  reads differently or rejects. `true`, `false` and `null` are the literals,
+  as in Postgres, never a column; a `NULL` is typed from its context as
+  Postgres types `unknown`, and refused where Postgres's typing of it is
+  ambiguous or follows function-candidate rules define doesn't model. The
   list is static, in the registry, and a test compares it with a live server's
   `pg_get_keywords()`, failing on drift. Non-reserved and column-name keywords
   (`extract`, `position`, `values`, `between`, `coalesce`, `nullif`, `char`) stay

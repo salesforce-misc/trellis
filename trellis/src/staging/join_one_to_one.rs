@@ -196,7 +196,11 @@ fn qualify(
                 what: "an unqualified column in a 1-1 JOIN field",
             });
         }
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::TypedLiteral { .. } => expr.clone(),
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::Null
+        | Expr::TypedLiteral { .. } => expr.clone(),
         Expr::BinaryOp { op, lhs, rhs } => Expr::BinaryOp {
             op: *op,
             lhs: Box::new(sub(lhs)?),
