@@ -254,8 +254,9 @@ copy hasn't applied yet, as the 1-1 and aggregate checks do (ADR-0013). It audit
   values, and a live entry with no row.
 - **A join key with more than one live `M` entry.** The target reads the newest entry of a key, which
   masks a duplicate, so this is where `b` losing its uniqueness shows before a revalidation pauses
-  the transform. The two entries of a hand-off applied out of order are the same state, so this
-  check is re-checked while `b`'s ring holds an unapplied row.
+  the transform. A hand-off of a key between two `b` rows applied out of order holds two entries
+  for a moment as well, so what this check finds while `b`'s ring holds an unapplied row is
+  re-checked.
 
 It reports and never repairs.
 
