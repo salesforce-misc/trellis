@@ -831,6 +831,26 @@ pub fn as_extract<'e>(name: &str, args: &'e [Expr]) -> Option<(&'e str, &'e Expr
     }
 }
 
+impl Expr {
+    /// Whether this is exactly a read of source column `column`: the bare
+    /// name, or the name qualified with the `FROM` table
+    /// (`s.order`, `public.s.order`), which Postgres reads as the same column.
+    /// The qualified spelling is the only one for a column Postgres reserves
+    /// (ADR-0022), so every check that recognises a column's passthrough
+    /// (`order AS order`) asks this rather than matching [`Expr::Column`].
+    ///
+    /// A [`Expr::SourceColumn`] is taken to name the `FROM` table: the
+    /// validator refuses one that names another table or schema
+    /// ([`super::validate::ValidationError::QualifiedColumnNotFromSource`])
+    /// before any check that asks this.
+    pub(crate) fn reads_source_column(&self, column: &str) -> bool {
+        match self {
+            Expr::Column(name) | Expr::SourceColumn { column: name, .. } => name == column,
+            _ => false,
+        }
+    }
+}
+
 impl FieldDef {
     /// The column this field passes through, if its expression is exactly one
     /// column reference that reads a column rather than another field: a

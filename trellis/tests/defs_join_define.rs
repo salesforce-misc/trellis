@@ -1073,3 +1073,58 @@ async fn a_join_resume_recreates_its_hidden_tables_without_re_typing_them() {
     assert_eq!(column_type(&raw, &j, "code").await, "integer");
     assert_eq!(count(&raw, &format!("select count(*) from {j}")).await, 0);
 }
+
+/// A JOIN reads every column qualified, so a qualified `GROUP BY` key's
+/// field already is its passthrough, reserved-word column or not. The
+/// qualifier names the table that owns the key: the same column name read
+/// from the other table is not the key (`items.group AS group` beside
+/// `GROUP BY orders.group`), as a qualified passthrough of the `FROM`
+/// table's column is not a passthrough of the joined table's.
+#[tokio::test]
+async fn a_join_keys_field_is_the_qualified_read_of_the_keys_own_table() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    batch(
+        &db.pool,
+        "create table public.orders (id integer primary key, \"group\" integer);
+         create table public.items (id integer primary key, order_id integer, \"group\" integer);
+         create index on public.items (order_id);",
+    )
+    .await;
+
+    for (target, key, field) in [
+        ("by_orders_group", "orders.group", "orders.group"),
+        ("by_items_group", "items.group", "items.group"),
+    ] {
+        let text = format!(
+            "TRANSFORM {target} FROM orders JOIN items ON orders.id = items.order_id \
+             GROUP BY {key} WITHOUT SOURCE INDEX SELECT {field} AS group, COUNT(*) AS n"
+        );
+        install_definition(&db.pool, &text, &HashMap::new(), "public")
+            .await
+            .unwrap_or_else(|err| panic!("{text}: {err:?}"));
+    }
+
+    for (key, field) in [
+        ("orders.group", "items.group"),
+        ("items.group", "orders.group"),
+    ] {
+        let err = define_err(
+            &db.pool,
+            &format!(
+                "TRANSFORM crossed FROM orders JOIN items ON orders.id = items.order_id \
+                 GROUP BY {key} WITHOUT SOURCE INDEX SELECT {field} AS group, COUNT(*) AS n"
+            ),
+        )
+        .await;
+        assert!(
+            matches!(
+                &err,
+                CatalogError::Validate(ValidationError::JoinFieldShape { field: named, .. })
+                    if named == "group"
+            ),
+            "key {key}, field {field}: {err:?}"
+        );
+    }
+    assert_nothing_registered(&db.pool, "crossed").await;
+}

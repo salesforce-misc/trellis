@@ -2696,3 +2696,75 @@ async fn altering_a_target_that_is_not_live_is_rejected() {
 
     trellis.shutdown().await.expect("shutdown");
 }
+
+/// A column Postgres reserves is written qualified with its table, so
+/// `ALTER TRANSFORM ... ADD t.order AS order` is the passthrough of `order`
+/// as `ADD order AS order` would be if the grammar could spell it: it adds a
+/// copy of the column with the source's type, builds it, and survives a
+/// `PAUSE` and `RESUME` (which validate the stored text again).
+#[tokio::test]
+async fn an_added_qualified_passthrough_of_a_reserved_word_column_is_a_copy() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.rw (id int primary key, val int, \"order\" bigint, \
+                                 \"group\" varchar(8)); \
+         insert into public.rw select s, s, s * 10, 'g' || s from generate_series(1, 4) s;",
+    )
+    .await
+    .expect("seed");
+
+    let definer = define_only(db.dsn()).await;
+    definer
+        .apply("TRANSFORM edited FROM public.rw SELECT rw.val AS val")
+        .await
+        .expect("define");
+    definer.shutdown().await.expect("shut the definer down");
+
+    let trellis = running(db.dsn()).await;
+    wait_for_live(&raw, "edited").await;
+    trellis
+        .apply("ALTER TRANSFORM edited ADD rw.order AS order, ADD public.rw.group AS group")
+        .await
+        .expect("add the qualified passthroughs");
+    wait_for_live(&raw, "edited").await;
+
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "edited", "order").await,
+        "bigint"
+    );
+    // A copy has no type modifier (ADR-0020).
+    assert_eq!(
+        column_pg_type(&raw, DEFAULT_TARGET_SCHEMA, "edited", "group").await,
+        "character varying"
+    );
+    let copied: Vec<(String, String)> = raw
+        .query(
+            &format!(
+                "select \"order\"::text, \"group\" from {DEFAULT_TARGET_SCHEMA}.edited order by id"
+            ),
+            &[],
+        )
+        .await
+        .expect("read the copy")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    let expected: Vec<(String, String)> = (1..=4)
+        .map(|s| ((s * 10).to_string(), format!("g{s}")))
+        .collect();
+    assert_eq!(copied, expected);
+
+    trellis
+        .apply("PAUSE TRANSFORM edited")
+        .await
+        .expect("pause");
+    trellis
+        .apply("RESUME TRANSFORM edited")
+        .await
+        .expect("resume revalidates the stored qualified passthroughs");
+    wait_for_live(&raw, "edited").await;
+
+    trellis.shutdown().await.expect("shutdown");
+}

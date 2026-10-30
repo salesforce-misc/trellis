@@ -1479,3 +1479,55 @@ async fn a_rebuild_in_place_drops_the_entries_whose_rows_are_gone() {
         .expect("compare with the live join");
     assert!(diverging.is_empty(), "{diverging:?}");
 }
+
+/// A 1-1 JOIN reads every column qualified, so a reserved-word column of
+/// either table is copied under its own name with no special case, and a
+/// qualifier naming neither table is refused.
+#[tokio::test]
+async fn a_qualified_read_of_a_reserved_word_column_is_copied_under_its_name() {
+    let _knob = with_knob(true).await;
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    batch(
+        &db.pool,
+        "create table public.orders (id integer primary key, cust integer, \"order\" integer);
+         create table public.customers (id integer primary key, \"group\" text);",
+    )
+    .await;
+
+    let definition = install_definition(
+        &db.pool,
+        "TRANSFORM both FROM orders LEFT JOIN customers ON orders.cust = customers.id \
+         SELECT orders.order AS order, customers.group AS group",
+        &HashMap::new(),
+        "public",
+    )
+    .await
+    .expect("a qualified reserved-word column of either side is copied under its name");
+    assert_eq!(definition.target_table, "public.both");
+    let client = db.pool.get().await.expect("get connection");
+    let columns: Vec<String> = client
+        .query(
+            "select attname::text from pg_attribute where attrelid = 'public.both'::regclass \
+             and attnum > 0 and not attisdropped order by attnum",
+            &[],
+        )
+        .await
+        .expect("read the target's columns")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(
+        columns.contains(&"order".to_string()) && columns.contains(&"group".to_string()),
+        "{columns:?}"
+    );
+
+    let err = define_err(
+        &db.pool,
+        "TRANSFORM neither FROM orders LEFT JOIN customers ON orders.cust = customers.id \
+         SELECT elsewhere.order AS order",
+    )
+    .await;
+    assert!(err.to_string().contains("elsewhere.order"), "{err}");
+    assert_nothing_registered(&db.pool, "neither").await;
+}

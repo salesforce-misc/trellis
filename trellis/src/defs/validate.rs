@@ -470,7 +470,7 @@ pub enum ValidationError {
     },
     /// An `super::ast::KeySpace::Aggregate` definition has a calculated
     /// field whose name matches one of its grouping columns, but whose
-    /// expression isn't a bare passthrough of that same column (e.g.
+    /// expression isn't a passthrough of that same column (e.g.
     /// `GROUP BY order_id SELECT SUM(order_id) AS order_id`). DDL generation
     /// treats a grouping-column-named field as that column's passthrough and
     /// gives it no separate target column, so a different expression under
@@ -481,7 +481,8 @@ pub enum ValidationError {
     GroupingColumnFieldMustBePassthrough { field: String },
     /// A `KeySpace::OneToOne` definition has a calculated field whose alias
     /// matches the name of a real source column, but whose expression isn't a
-    /// bare passthrough of that same column. Without this guard, a *different*
+    /// passthrough of that same column (bare, or qualified with the `FROM`
+    /// table). Without this guard, a *different*
     /// field referencing that name would resolve it via `fields_by_name`
     /// (inter-field composition) and get the calculated value
     /// instead of the real column, with the alias unconditionally — and
@@ -1403,14 +1404,15 @@ impl fmt::Display for ValidationError {
             ValidationError::GroupingColumnFieldMustBePassthrough { field } => write!(
                 f,
                 "calculated field '{field}' shares its name with a GROUP BY column, so it must \
-                 be a bare passthrough of that column (e.g. `{field}`), not another expression"
+                 be a passthrough of that column (`{field}` or `<table>.{field}`), not another \
+                 expression"
             ),
             ValidationError::CalculatedFieldShadowsSourceColumn { field } => write!(
                 f,
                 "calculated field '{field}' shares its name with a source column, so it must \
-                 be a bare passthrough of that column (e.g. `{field}`), not another expression; \
-                 a different name avoids shadowing the real column for other fields that \
-                 reference it"
+                 be a passthrough of that column (`{field}` or `<table>.{field}`), not another \
+                 expression; a different name avoids shadowing the real column for other \
+                 fields that reference it"
             ),
             ValidationError::NondeterministicKeyCollation(refused) => {
                 let NondeterministicKeyCollation {
@@ -1508,16 +1510,16 @@ pub fn validate(
         KeySpace::OneToOne => {
             for field in &def.fields {
                 // A calculated field aliased to a real source column's name
-                // must be a bare passthrough of it — the same
-                // shape the `Aggregate` arm below enforces for grouping
-                // columns. `is_self_passthrough`'s exemption in `infer_expr`
+                // must be a passthrough of it, bare or qualified
+                // (`Expr::reads_source_column`) — the same shape the
+                // `Aggregate` arm below enforces for grouping columns. `is_self_passthrough`'s exemption in `infer_expr`
                 // only covers a field referencing its *own* name;
                 // without this check here, a different, non-passthrough
                 // field could still claim the column's name, and any *third*
                 // field referencing that name would then silently resolve to
                 // the calculated value instead of the real column.
                 if source_columns.contains_key(&field.name)
-                    && !matches!(&field.expr, Expr::Column(name) if name == &field.name)
+                    && !field.expr.reads_source_column(&field.name)
                 {
                     return Err(ValidationError::CalculatedFieldShadowsSourceColumn {
                         field: field.name.clone(),
@@ -2580,10 +2582,7 @@ fn reject_ambiguous_names(
     let shadowing: HashMap<&str, &FieldDef> = def
         .fields
         .iter()
-        .filter(|f| {
-            source_columns.contains_key(&f.name)
-                && !matches!(&f.expr, Expr::Column(name) if name == &f.name)
-        })
+        .filter(|f| source_columns.contains_key(&f.name) && !f.expr.reads_source_column(&f.name))
         .map(|f| (f.name.as_str(), f))
         .collect();
     if shadowing.is_empty() {
@@ -2688,7 +2687,7 @@ fn check_index_key_width(
 /// key; the catalog calls it at install and for an `ALTER TRANSFORM`'s added
 /// fields, before [`validate`], so this error wins over
 /// [`ValidationError::CalculatedFieldShadowsSourceColumn`], whose advice (use
-/// a bare passthrough) would be wrong for a key column.
+/// a passthrough) would be wrong for a key column.
 pub fn reject_primary_key_named_fields(
     fields: &[FieldDef],
     primary_key: &[&str],
@@ -2795,12 +2794,13 @@ fn validate_aggregate_field_expr(
 
 /// Whether `expr` is exactly the passthrough shape `GROUP BY` key `key`
 /// requires of a field named after it (see
-/// [`ValidationError::GroupingColumnFieldMustBePassthrough`]): a bare
-/// [`Expr::Column`] of the same name — there is no other expression shape
+/// [`ValidationError::GroupingColumnFieldMustBePassthrough`]): a
+/// read of the key's column, bare or qualified with the `FROM` table
+/// ([`Expr::reads_source_column`]) — there is no other expression shape
 /// DDL generation gives a target column of its own for that name, so
 /// anything else is rejected rather than silently dropped.
 fn expr_is_group_by_key_passthrough(expr: &Expr, key: &str) -> bool {
-    matches!(expr, Expr::Column(n) if n == key)
+    expr.reads_source_column(key)
 }
 
 pub(super) fn collect_columns(expr: &Expr, out: &mut Vec<String>) {
@@ -7560,6 +7560,67 @@ mod tests {
         assert_eq!(validate(&d, &numeric_columns(&["grp", "val"])), Ok(()));
         let d = parsed("TRANSFORM t FROM s SELECT val AS val, val + 1 AS bumped");
         assert_eq!(validate(&d, &numeric_columns(&["id", "val"])), Ok(()));
+    }
+
+    /// `s.val AS val` and `app.s.val AS val` are the passthrough of `val`
+    /// as `val AS val` is: a 1-1 field, an aggregate's `GROUP BY` key and the
+    /// reserved-word column that can only be written this way. The stored
+    /// text a rendered `ALTER` re-parses is the same definition.
+    #[test]
+    fn a_qualified_self_named_read_is_the_passthrough() {
+        let columns = numeric_columns(&["id", "val", "grp", "order"]);
+        for text in [
+            "TRANSFORM t FROM s SELECT s.val AS val, val + 1 AS bumped",
+            "TRANSFORM t FROM app.s SELECT app.s.val AS val, s.order AS order",
+            "TRANSFORM t FROM s GROUP BY grp SELECT s.grp AS grp, SUM(val) AS total",
+            "TRANSFORM t FROM s GROUP BY s.order SELECT s.order AS order, SUM(val) AS total",
+        ] {
+            let d = parsed(text);
+            assert_eq!(validate(&d, &columns), Ok(()), "{text}");
+            let again = parsed(&crate::defs::ast::render_definition_text(&d));
+            assert_eq!(again, d, "{text}");
+        }
+    }
+
+    /// Only the field's own column, read through the `FROM` table, is its
+    /// passthrough: another column, an expression, an aggregate or another
+    /// table's column under the name is still the shadow the guard refuses.
+    #[test]
+    fn a_qualified_read_that_is_not_the_passthrough_is_refused() {
+        let columns = numeric_columns(&["id", "val", "grp"]);
+        for text in [
+            "TRANSFORM t FROM s SELECT s.grp AS val",
+            "TRANSFORM t FROM s SELECT (s.val + 1) AS val",
+        ] {
+            assert_eq!(
+                validate(&parsed(text), &columns),
+                Err(ValidationError::CalculatedFieldShadowsSourceColumn {
+                    field: "val".to_string()
+                }),
+                "{text}"
+            );
+        }
+        for text in [
+            "TRANSFORM t FROM s GROUP BY grp SELECT s.val AS grp",
+            "TRANSFORM t FROM s GROUP BY grp SELECT SUM(s.val) AS grp",
+        ] {
+            assert_eq!(
+                validate(&parsed(text), &columns),
+                Err(ValidationError::GroupingColumnFieldMustBePassthrough {
+                    field: "grp".to_string()
+                }),
+                "{text}"
+            );
+        }
+        // Another table's column under the field's name is refused as such,
+        // not taken for the passthrough of the `FROM` table's.
+        assert!(matches!(
+            validate(
+                &parsed("TRANSFORM t FROM s SELECT other.val AS val"),
+                &columns
+            ),
+            Err(ValidationError::QualifiedColumnNotFromSource { .. })
+        ));
     }
 
     /// An aggregate field's name inside another aggregate's argument is
