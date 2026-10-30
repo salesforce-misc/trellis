@@ -187,9 +187,10 @@ async fn fan_out_warning(
     if key.is_empty() {
         return Ok(None);
     }
+    // `0` for an `R` dropped since its size was read: no sample.
     let pages: i64 = client
         .query_one(
-            "select pg_catalog.pg_relation_size($1::text::regclass) \
+            "select coalesce(pg_catalog.pg_relation_size(pg_catalog.to_regclass($1)), 0) \
                     / pg_catalog.current_setting('block_size')::bigint",
             &[&r],
         )
