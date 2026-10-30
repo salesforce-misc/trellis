@@ -128,7 +128,8 @@ pub enum ValidationError {
     /// allows in one (`INDEX_MAX_KEYS`, 32): the target's or a hidden table's
     /// unique key over a `GROUP BY`, a `JOIN`'s `ON` columns, or a `JOIN`
     /// side's `ON` and `GROUP BY` columns together. `clause` says which, as
-    /// the definition writes it; `columns` is the width of the widest index.
+    /// the subject of the message (`GROUP BY`, `each side of ON`, or a
+    /// side's key); `columns` is that key's width.
     IndexKeyTooWide {
         clause: String,
         columns: usize,
@@ -998,7 +999,7 @@ impl fmt::Display for ValidationError {
                 limit,
             } => write!(
                 f,
-                "{clause} spans {columns} columns, but Trellis keys a table on them and \
+                "{clause} has {columns} columns, but Trellis keys a table on them and \
                  Postgres caps an index at {limit} columns; use at most {limit}"
             ),
             ValidationError::JoinKeyTypeMismatch {
@@ -2103,7 +2104,7 @@ pub(crate) fn validate_join_tables_and_on(
     }
     // Each side names every `ON` column once (a repeat is refused above), and
     // the hidden tables key and index a side on its `ON` columns.
-    check_index_key_width(|| "ON".to_string(), join.on.len())?;
+    check_index_key_width(|| "each side of ON".to_string(), join.on.len())?;
 
     Ok(())
 }
@@ -2169,7 +2170,7 @@ pub fn validate_join(
     // `GROUP BY` columns not among them: wider than either clause alone.
     for (side, table) in [(Side::From, &def.source), (Side::Joined, &join.right)] {
         check_index_key_width(
-            || format!("the ON and GROUP BY columns of {table} together"),
+            || format!("{table}'s key, its ON and GROUP BY columns together,"),
             super::join::side_key_columns(def, side).len(),
         )?;
     }

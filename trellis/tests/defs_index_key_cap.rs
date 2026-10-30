@@ -108,7 +108,7 @@ async fn hidden_table_count(pool: &trellis::pool::Pool) -> i64 {
         .query_one(
             "select count(*) from pg_catalog.pg_class c \
              join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
-             where n.nspname = 'trellis' and c.relname ~ '^join1?_[0-9]+_'",
+             where n.nspname = 'trellis' and c.relname ~ '^(join1?_[0-9]+_|agg_[0-9]+$)'",
             &[],
         )
         .await
@@ -116,8 +116,8 @@ async fn hidden_table_count(pool: &trellis::pool::Pool) -> i64 {
         .get(0)
 }
 
-/// Asserts `result` is the typed refusal for `clause` with `columns` columns,
-/// and that its message names the clause and the limit.
+/// Asserts `result` is the typed refusal for exactly `clause` with `columns`
+/// columns, and that its message names the clause and the limit.
 fn assert_too_wide<T: std::fmt::Debug>(
     result: Result<T, CatalogError>,
     clause: &str,
@@ -130,10 +130,7 @@ fn assert_too_wide<T: std::fmt::Debug>(
             columns: count,
             limit,
         }) => {
-            assert!(
-                named.contains(clause),
-                "clause {named:?} should mention {clause:?}"
-            );
+            assert_eq!(named, clause, "{err}");
             assert_eq!((*count, *limit), (columns, 32), "{err}");
         }
         other => panic!("expected IndexKeyTooWide for {clause}, got {other:?}"),
@@ -170,6 +167,8 @@ async fn an_aggregate_group_by_wider_than_an_index_is_refused_at_validation() {
     define(&db.pool, &text("g32", 32), &source_columns)
         .await
         .expect("a 32-column group key is admitted");
+    let hidden = hidden_table_count(&db.pool).await;
+    assert_eq!(hidden, 1, "the admitted aggregate's hidden table");
 
     assert_too_wide(
         define(&db.pool, &text("g33", 33), &source_columns).await,
@@ -183,6 +182,7 @@ async fn an_aggregate_group_by_wider_than_an_index_is_refused_at_validation() {
         40,
     );
     nothing_registered(&db.pool, "g40").await;
+    assert_eq!(hidden_table_count(&db.pool).await, hidden);
 }
 
 /// The `ON` and `GROUP BY` of an aggregate `JOIN` over `orders` (`a*`
@@ -277,7 +277,7 @@ async fn an_aggregate_join_key_wider_than_an_index_is_refused_at_validation() {
             &HashMap::new(),
         )
         .await,
-        "orders",
+        "orders's key, its ON and GROUP BY columns together,",
         33,
     );
     nothing_registered(&db.pool, "js_from").await;
@@ -289,7 +289,7 @@ async fn an_aggregate_join_key_wider_than_an_index_is_refused_at_validation() {
             &HashMap::new(),
         )
         .await,
-        "items",
+        "items's key, its ON and GROUP BY columns together,",
         33,
     );
     nothing_registered(&db.pool, "js_joined").await;
@@ -318,7 +318,7 @@ async fn an_aggregate_join_key_wider_than_an_index_is_refused_at_validation() {
             &HashMap::new(),
         )
         .await,
-        "ON",
+        "each side of ON",
         33,
     );
     nothing_registered(&db.pool, "jo33").await;
@@ -329,7 +329,7 @@ async fn an_aggregate_join_key_wider_than_an_index_is_refused_at_validation() {
             &HashMap::new(),
         )
         .await,
-        "orders",
+        "orders's key, its ON and GROUP BY columns together,",
         33,
     );
     nothing_registered(&db.pool, "jo32_g").await;
@@ -386,7 +386,7 @@ async fn a_one_to_one_join_key_wider_than_an_index_is_refused_at_validation() {
     let hidden = hidden_table_count(&db.pool).await;
     assert_too_wide(
         define(&db.pool, &text("o33", 33), &HashMap::new()).await,
-        "ON",
+        "each side of ON",
         33,
     );
     nothing_registered(&db.pool, "o33").await;

@@ -203,9 +203,10 @@ shape:
   or more equalities joined by `AND`, each between one column of each side
   (either order), with no column named by two terms. Each `GROUP BY` key becomes a
   target column named after its bare column name, so two keys sharing a bare
-  name are refused. A side's `ON` and `GROUP BY` columns together number at most
-  32, Postgres's cap on an index key. An aggregate argument reads one side; one mixing both sides
-  is refused, and the admitted aggregates are ADR-0019's. `WHERE` stays
+  name are refused. The `GROUP BY` columns, the `ON` columns of a side, and a
+  side's `ON` and `GROUP BY` columns together each number at most 32, Postgres's
+  cap on an index key. An aggregate argument reads one side; one mixing both
+  sides is refused, and the admitted aggregates are ADR-0019's. `WHERE` stays
   `TRUE`-only; a future `WHERE` applies after the join, as in SQL, so adding it
   changes nothing a JOIN transform already means. Recognized and refused by
   name: two sides sharing a bare table name (which covers self-joins);
