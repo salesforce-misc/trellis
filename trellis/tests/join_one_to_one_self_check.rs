@@ -957,6 +957,95 @@ async fn a_chained_b_side_is_compared_with_the_images_of_its_upstream() {
     );
 }
 
+// ------------------------------------------- a key of a non-default collation
+
+/// Both tables keyed by a text column of an explicit collation (`und-x-icu`),
+/// which the target key keeps, while `R`'s and `M`'s key text is `"C"`: every
+/// comparison of the two names a collation, so neither the apply nor the check
+/// fails to choose one. The keys sort differently under the two collations
+/// (byte order puts the capitals first), so the pages split them where only the
+/// key's own collation agrees.
+#[tokio::test]
+async fn a_key_of_a_non_default_collation_is_compared_on_every_part() {
+    let _serial = SERIAL.lock().await;
+    set_enabled(true);
+    let mut d = Driver::start(
+        "create table public.a (id text collate \"und-x-icu\" primary key, k integer, \
+             r integer, s text); \
+         create table public.b (bid text collate \"und-x-icu\" primary key, k integer, \
+             img integer, k0 text); \
+         create unique index on public.b (k); \
+         create index on public.a (k); \
+         insert into public.a \
+             select (array['a', 'B', 'c', 'D'])[1 + i % 4] || i, i % 7 * 10, i, 's' || i \
+             from generate_series(1, 24) i; \
+         insert into public.b \
+             select (array['x', 'Y'])[1 + i % 2] || i, i * 10, i * 100, 'k' || i \
+             from generate_series(1, 6) i",
+        &columns(),
+        &[&Kind::Left.definition(), &Kind::Inner.definition()],
+        &["public.a", "public.b"],
+    )
+    .await;
+    // Changes of both sides drain: a moved key, a deleted and an inserted
+    // row each, and a `b` key handed to another row.
+    for sql in [
+        "update public.a set k = 30, r = 0 where id = 'B1'",
+        "delete from public.a where id = 'c2'",
+        "insert into public.a values ('A99', 20, 99, 'x'), ('b98', 40, 98, 'y')",
+        "update public.b set img = 1 where bid = 'x2'",
+        "delete from public.b where bid = 'Y5'",
+        "update public.b set k = 50 where bid = 'x6'",
+    ] {
+        step(&mut d, sql).await;
+    }
+    for kind in KINDS {
+        let first = walk(&d, &kind.target(), 1000).await;
+        assert_eq!(first.divergences, Vec::new(), "{kind:?}");
+        for limit in [1, 3] {
+            let walked = walk(&d, &kind.target(), limit).await;
+            assert_eq!(walked.divergences, Vec::new(), "{kind:?} at {limit}");
+            assert_eq!(walked.compared, first.compared, "{kind:?} at {limit}");
+        }
+        let h = hidden(&d, kind).await;
+        let t = kind.name();
+        // A planted error in the target, in `R` and in `M` is found.
+        write(
+            &d,
+            &format!(
+                "update public.{t} set total = total + 1 where id = 'B1'; \
+                 update {} set r = r + 1 where __from_key = 'D3'; \
+                 update {} set img = img + 1 where __from_key = 'x4'",
+                h.r, h.m
+            ),
+        )
+        .await;
+        assert_found(
+            &d,
+            kind,
+            vec![
+                // B1 is on key 30 (`b`'s Y3, img 300), r = 0.
+                cell("B1", "total", Some("301"), Some("300")),
+                cell("D3", &format!("{}.r", h.r_name), Some("4"), Some("3")),
+                cell("x4", &format!("{}.img", h.m_name), Some("401"), Some("400")),
+            ],
+            "with a planted error on each structure",
+        )
+        .await;
+        write(
+            &d,
+            &format!(
+                "update public.{t} set total = total - 1 where id = 'B1'; \
+                 update {} set r = r - 1 where __from_key = 'D3'; \
+                 update {} set img = img - 1 where __from_key = 'x4'",
+                h.r, h.m
+            ),
+        )
+        .await;
+    }
+    assert_clean(&d, "after the planted errors are undone").await;
+}
+
 // ------------------------------------------------------ through the public job
 
 #[tokio::test]

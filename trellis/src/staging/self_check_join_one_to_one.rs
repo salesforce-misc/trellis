@@ -300,7 +300,7 @@ impl Audit<'_> {
         format!(
             "(select {columns} from {a_applied} a \
               {join} (select x.* from {b_applied} x \
-                      left join {m} mm on mm.{key} = {b_key} and not mm.{tomb} \
+                      left join {m} mm on mm.{key} = ({b_key}) collate \"C\" and not mm.{tomb} \
                       where {on} \
                       order by mm.{applied} desc nulls last, {b_key} collate \"C\" desc \
                       limit 1) b on true) e",
@@ -405,7 +405,7 @@ impl Audit<'_> {
                  persisted as materialized ( \
                      select e.__k{carried_e}, array['{LIVE}', {persisted}]::text[] as __v \
                      from expected e \
-                     join {ledger} r on r.{key_col} = e.__k and not r.{tomb}), ",
+                     join {ledger} r on r.{key_col} = e.__k collate \"C\" and not r.{tomb}), ",
                 ctes = ring.one_to_one_ctes(&side.ledger),
                 persisted = persisted_values.join(", "),
                 ledger = side.ledger.ident,

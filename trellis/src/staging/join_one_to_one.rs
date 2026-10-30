@@ -1786,7 +1786,7 @@ async fn write_target(
     {
         let key_expr = ddl::pk_key_sql_expr(&shape.pk, Some("t"));
         let unbacked = format!(
-            "not exists (select 1 from {r} r where r.{key} = {key_expr} and {has})",
+            "not exists (select 1 from {r} r where r.{key} = ({key_expr}) collate \"C\" and {has})",
             r = shape.r.ident,
             key = quote_ident(schema::KEY_COLUMN),
             has = shape.has_target_row_sql(),
