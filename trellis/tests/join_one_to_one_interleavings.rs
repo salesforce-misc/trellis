@@ -1258,3 +1258,72 @@ async fn a_collated_text_key_applies_both_sides() {
         assert!(diverging.is_empty(), "after {sql}: {diverging:?}");
     }
 }
+
+/// The two sides keyed differently (`a` by text, `b` by `bigint`), with
+/// columns named like the aliases the page's statements give their
+/// relations (`r`, `s`, `b`, `m`, `l`, `doc`, `img`, `k0`). A page whose
+/// first change of the target is a `b` change still writes the target by
+/// `a`'s key, in a `b`-only page, a mixed page and a `b` key move, on both
+/// join kinds.
+#[tokio::test]
+async fn sides_keyed_differently_with_alias_named_columns_apply() {
+    let _serial = serial().await;
+    set_enabled(true);
+    // `Driver::rows` reads its rows as `r`, so the checks below name their
+    // columns apart from it.
+    let mut d = Driver::start(
+        "create table public.o (order_no text primary key, s integer, r integer, l text); \
+         create table public.cu (cust_id bigint primary key, m integer, b integer, doc text, \
+             img text, k0 integer); \
+         create unique index on public.cu (m); \
+         insert into public.o values ('A1', 1, 1, 'x'), ('A2', 1, 2, 'y'), ('A3', 2, 3, 'z'), \
+             ('A4', 3, 4, 'w'); \
+         insert into public.cu values (10, 1, 100, 'd1', 'i1', 7), (20, 2, 200, 'd2', 'i2', 8)",
+        &[
+            ("order_no", ValueType::Text),
+            ("s", int4()),
+            ("r", int4()),
+            ("l", ValueType::Text),
+        ],
+        &[
+            "TRANSFORM ol FROM public.o LEFT JOIN public.cu ON o.s = cu.m \
+             SELECT o.r + COALESCE(cu.b, 0) AS s, cu.doc AS b, cu.img AS r, cu.k0 AS m, o.l AS l",
+            "TRANSFORM oi FROM public.o INNER JOIN public.cu ON o.s = cu.m \
+             SELECT o.r + COALESCE(cu.b, 0) AS s, cu.doc AS b, cu.img AS r, cu.k0 AS m, o.l AS l",
+        ],
+        &["public.o", "public.cu"],
+    )
+    .await;
+    for sql in [
+        "update public.cu set b = 111, doc = 'd1b' where cust_id = 10",
+        "update public.o set r = 5 where order_no = 'A1'; \
+         update public.cu set b = 222, img = 'i2b' where cust_id = 20",
+        "update public.cu set m = 3, k0 = 9 where cust_id = 20; \
+         update public.o set s = 2 where order_no = 'A2'",
+        "insert into public.cu values (30, 2, 300, 'd3', 'i3', 1)",
+        "delete from public.cu where cust_id = 10",
+    ] {
+        step(&mut d, sql).await;
+        d.settle().await;
+        for (target, kind) in [("public.ol", "left"), ("public.oi", "inner")] {
+            let actual = d
+                .rows(&format!(
+                    "select order_no, s as c1, b as c2, r as c3, m as c4, l as c5 \
+                     from {target} order by order_no"
+                ))
+                .await;
+            let expected = d
+                .rows(&format!(
+                    "select o.order_no, o.r + coalesce(cu.b, 0) as c1, cu.doc as c2, cu.img as c3, \
+                     cu.k0 as c4, o.l as c5 \
+                     from public.o o {kind} join public.cu cu on o.s = cu.m order by o.order_no"
+                ))
+                .await;
+            assert_eq!(actual, expected, "{target} after {sql}");
+            let diverging = trellis::staging::one_to_one_join_diverging_keys(d.pool(), target)
+                .await
+                .expect("self_check");
+            assert!(diverging.is_empty(), "{target} after {sql}: {diverging:?}");
+        }
+    }
+}

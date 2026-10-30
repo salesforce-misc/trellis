@@ -484,13 +484,20 @@ impl JoinOneToOnePlan {
     }
 }
 
-/// Loads the plan for `definition` (a 1-1 `JOIN`), `pk` being the `FROM`
-/// table's primary key.
+/// Loads the plan for `definition` (a 1-1 `JOIN`) on a page whose first
+/// change for it is of the table on `side`, `pk` being that table's primary
+/// key. The target is keyed by the `FROM` table's, which a page that reaches
+/// the target through the joined table first reads here.
 pub(crate) async fn plan_for(
     pool: &Pool,
     definition: &Definition,
+    side: Side,
     pk: Vec<PrimaryKeyColumn>,
 ) -> Result<JoinOneToOnePlan, ApplyError> {
+    let pk = match side {
+        Side::From => pk,
+        Side::Joined => ddl::source_primary_key(pool, &definition.source_table).await?,
+    };
     let paused = super::quarantine::paused_columns_for(pool, &definition.def).await?;
     Ok(JoinOneToOnePlan::new(
         JoinShape::load(pool, definition, pk, &paused).await?,

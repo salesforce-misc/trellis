@@ -2819,9 +2819,9 @@ pub(super) async fn compute_page(
                 };
                 let target_plan = match join1_targets.entry(def.def.target.clone()) {
                     std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(super::join_one_to_one::plan_for(pool, def, pk.clone()).await?)
-                    }
+                    std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
+                        super::join_one_to_one::plan_for(pool, def, side, pk.clone()).await?,
+                    ),
                 };
                 for change in changes.iter() {
                     target_plan.push(side, change)?;
