@@ -954,12 +954,13 @@ async fn drain(raw: &mut Client, pool: &trellis::Pool) {
     panic!("the ring did not quiesce within 16 seal/drain rounds");
 }
 
-/// A change to `a` is applied by the 1-1 JOIN's page. A change to `b` halts
-/// it with the reason, rather than applying it as a plain 1-1 change (a target
-/// row computed from the one table alone), and a `TRUNCATE` of either side
-/// halts it rather than clearing nothing: those are later milestones'.
+/// A change to `a` is applied by the 1-1 JOIN's page, and a change to `b` by
+/// its fan-out, rather than either applying as a plain 1-1 change (a target
+/// row computed from the one table alone). A `TRUNCATE` of either side halts
+/// it with the reason rather than clearing nothing: that is a later
+/// milestone's.
 #[tokio::test]
-async fn a_change_reaching_the_drain_halts_a_one_to_one_join_rather_than_apply_it() {
+async fn a_change_of_either_side_applies_and_a_truncate_halts_a_one_to_one_join() {
     let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -992,13 +993,29 @@ async fn a_change_reaching_the_drain_halts_a_one_to_one_join_rather_than_apply_i
         4,
         "the new order reached the target"
     );
-    for (change, reason) in [
-        (
-            "update public.customers set name = 'bea' where id = 2",
-            "a change of the joined table of a 1-1 JOIN",
-        ),
-        ("truncate public.customers", "a TRUNCATE of a 1-1 JOIN side"),
-    ] {
+    // So does a change of `b`, which fans out to its orders.
+    raw.batch_execute("update public.customers set name = 'bea' where id = 2")
+        .await
+        .expect("change b");
+    drain(&mut raw, &db.pool).await;
+    assert_eq!(
+        status(&trellis, "order_view").await,
+        Some(TransformStatus::Live)
+    );
+    assert_eq!(
+        count(
+            &raw,
+            "select count(*) from public.order_view where id = 2 and who = 'bea'"
+        )
+        .await,
+        1,
+        "the customer's new name reached its order"
+    );
+    let diverging = trellis::staging::one_to_one_join_diverging_keys(&db.pool, "public.order_view")
+        .await
+        .expect("self_check");
+    assert!(diverging.is_empty(), "{diverging:?}");
+    for (change, reason) in [("truncate public.customers", "a TRUNCATE of a 1-1 JOIN side")] {
         raw.batch_execute(change).await.expect("change a side");
         drain(&mut raw, &db.pool).await;
         let reported = trellis

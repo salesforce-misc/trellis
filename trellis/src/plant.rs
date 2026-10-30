@@ -201,7 +201,8 @@ pub enum Plant {
     /// whose transaction the basis didn't see overwrites a newer state.
     ///
     /// Pinned by `join_one_to_one_interleavings`'s
-    /// `an_older_apply_after_a_newer_one_is_refused`.
+    /// `an_older_apply_after_a_newer_one_is_refused` (`R`) and
+    /// `an_older_b_apply_after_a_newer_one_is_refused` (`M`).
     Join1VisOnly,
     /// ADR-0021 (#1375 `join1_no_entry_lock`): a 1-1 `JOIN` page reads its
     /// `R` entries without locking them. The entry lock is the only thing
@@ -211,12 +212,15 @@ pub enum Plant {
     /// Pinned by `join_one_to_one_interleavings`'s
     /// `n_two_pages_on_a_null_keyed_row_queue_on_its_entry`.
     Join1NoEntryLock,
-    /// ADR-0021 (#1375 `join1_old_key_unlocked`): a 1-1 `JOIN` page leaves the
-    /// key its `R` entry holds out of the key set it locks, so a row moving
-    /// off a key does so under no lock on it.
+    /// ADR-0021 (#1371 F4/F5, #1375 `join1_old_key_unlocked`): a 1-1 `JOIN`
+    /// page locks only its changes' new keys: it leaves the key its `R` or
+    /// `M` entry holds, and a `b` change's old key from its image, out of the
+    /// key set it locks, so a row moving off a key does so under no lock on
+    /// it.
     ///
     /// Pinned by `join_one_to_one_interleavings`'s
-    /// `a_row_moving_off_a_key_locks_the_key_it_leaves`.
+    /// `a_row_moving_off_a_key_locks_the_key_it_leaves` (the `a` side) and
+    /// `f4_a_b_row_moving_off_a_key_locks_the_key_it_leaves` (the `b` side).
     Join1OldKeyUnlocked,
     /// ADR-0021 (#1375 `join1_snapshot_after_read`, `rd_latesnap`): a 1-1
     /// `JOIN` Re-derive takes the entry's basis one statement after its read
@@ -227,14 +231,25 @@ pub enum Plant {
     /// Pinned by `join_one_to_one_interleavings`'s
     /// `a_change_between_a_rederives_read_and_its_snapshot_is_applied`.
     Join1SnapshotAfterRead,
-    /// ADR-0021 (#1375 `join1_no_placeholder`): a 1-1 `JOIN` page inserts no
-    /// placeholder for an `R` entry it doesn't find, so a page that finds
-    /// none locks nothing and its change is lost, and two pages on a new row
-    /// don't queue on its insert.
+    /// ADR-0021 (#1371 F14/F15, #1375 `join1_no_placeholder`): a 1-1 `JOIN`
+    /// page inserts no placeholder for an `R` or `M` entry it doesn't find,
+    /// so a page that finds none locks nothing and its change is lost, and
+    /// two pages on a new row don't queue on its insert.
     ///
     /// Pinned by `join_one_to_one_interleavings`'s
-    /// `two_pages_on_a_new_row_queue_on_the_placeholder`.
+    /// `two_pages_on_a_new_row_queue_on_the_placeholder` (`R`) and
+    /// `f15_a_new_b_rows_insert_and_update_applied_out_of_order` (`M`).
     Join1NoPlaceholder,
+    /// ADR-0021 (#1371 and #1375 `join1_m_before_j`, `rd_mearly`): a 1-1
+    /// `JOIN` page reads `M` (and `R`, for its fan-out) before it locks `J`:
+    /// it takes its `J` locks only after its recompute and target write. A
+    /// `b` page holding `J[k]` with its `M` write uncommitted is then read
+    /// around, and a row the `b` page's fan-out couldn't see keeps the old
+    /// `b` value.
+    ///
+    /// Pinned by `join_one_to_one_interleavings`'s
+    /// `f1_an_a_page_on_a_key_reads_m_only_after_the_b_page_on_it_commits`.
+    Join1MBeforeJ,
 }
 
 impl Plant {
@@ -260,6 +275,7 @@ impl Plant {
         Plant::Join1OldKeyUnlocked,
         Plant::Join1SnapshotAfterRead,
         Plant::Join1NoPlaceholder,
+        Plant::Join1MBeforeJ,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -285,6 +301,7 @@ impl Plant {
             Plant::Join1OldKeyUnlocked => "join1_old_key_unlocked",
             Plant::Join1SnapshotAfterRead => "join1_snapshot_after_read",
             Plant::Join1NoPlaceholder => "join1_no_placeholder",
+            Plant::Join1MBeforeJ => "join1_m_before_j",
         }
     }
 

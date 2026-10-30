@@ -29,13 +29,14 @@
 //! `trellis::dev::defs::set_one_to_one_join(true)` before a client starts.
 //! The gate is at define (`super::validate_join_one_to_one`), never at parse,
 //! so a definition stored while the knob was on still loads with it off.
-//! The `FROM` side's page and a one-transaction build run
-//! (`crate::staging::join_one_to_one`); a change of the joined side, a
+//! Pages of either side's changes and a one-transaction build run
+//! (`crate::staging::join_one_to_one`); a Re-derive of the joined side, a
 //! `TRUNCATE` of either side and a schema change halt the transform with the
-//! reason rather than run wrong.
+//! reason rather than run wrong. So does a page whose fan-out passes the cap
+//! ([`max_fanout`]) or fails on a row.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use tokio_postgres::GenericClient;
 
@@ -71,6 +72,42 @@ pub fn enabled() -> bool {
 #[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
 pub fn set_enabled(on: bool) {
     KNOB.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+}
+
+/// The environment variable that sets the hard fan-out cap: the most `a` rows
+/// one page's `b` changes may recompute (ADR-0021's v1 limits). A page past it
+/// halts the transform with the reason rather than fan out in one
+/// transaction. Read once, when nothing has set it.
+pub const MAX_FANOUT_ENV: &str = "TRELLIS_ONE_TO_ONE_JOIN_MAX_FANOUT";
+
+/// The fan-out cap when [`MAX_FANOUT_ENV`] isn't set (or isn't a positive
+/// number).
+pub const DEFAULT_MAX_FANOUT: u64 = 5_000_000;
+
+/// 0: not read yet; otherwise the cap.
+static MAX_FANOUT: AtomicU64 = AtomicU64::new(0);
+
+/// The hard fan-out cap ([`MAX_FANOUT_ENV`]).
+pub fn max_fanout() -> u64 {
+    match MAX_FANOUT.load(Ordering::Relaxed) {
+        0 => {
+            let cap = std::env::var(MAX_FANOUT_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|cap| *cap > 0)
+                .unwrap_or(DEFAULT_MAX_FANOUT);
+            MAX_FANOUT.store(cap, Ordering::Relaxed);
+            cap
+        }
+        cap => cap,
+    }
+}
+
+/// Sets the fan-out cap for this process, for tests; `0` reads
+/// [`MAX_FANOUT_ENV`] again on next use.
+#[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
+pub fn set_max_fanout(cap: u64) {
+    MAX_FANOUT.store(cap, Ordering::Relaxed);
 }
 
 /// One hidden table of a 1-1 `JOIN` definition (this module's doc).

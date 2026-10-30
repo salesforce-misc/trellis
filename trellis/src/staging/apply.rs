@@ -142,6 +142,13 @@ pub enum ApplyError {
     /// retry reads the keys again, inside its transaction. Taking the late
     /// key's `J` lock instead would break lock sorting.
     JoinKeyMoved { target: String },
+    /// A 1-1 `JOIN` page (`super::join_one_to_one`) that can't finish its
+    /// `b` changes' fan-out: it reaches more `a` rows than the cap
+    /// (`crate::defs::join_one_to_one::max_fanout`), or a field fails on
+    /// some of them, which the bisection named in `reason`. Like
+    /// [`ApplyError::GroupBasisUnsupported`], every page of the target would
+    /// reproduce it, so it halts the target with the reason.
+    JoinOneToOneHalt { target: String, reason: String },
     /// Downstream propagation would have staged a `Recompute` row past
     /// `MAX_HOP_GEN`. Named rather than silently truncated: an operator
     /// needs to know a wave ran away, and which target tables it ran away
@@ -305,6 +312,7 @@ impl ApplyError {
             | ApplyError::VersionFenceMiss { .. }
             | ApplyError::LedgerEntryCollected { .. }
             | ApplyError::JoinKeyMoved { .. }
+            | ApplyError::JoinOneToOneHalt { .. }
             | ApplyError::HopBoundExceeded { .. }
             | ApplyError::GroupBasisUnsupported { .. }
             | ApplyError::GroupLockGap { .. }
@@ -379,6 +387,9 @@ impl fmt::Display for ApplyError {
             ),
             ApplyError::GroupBasisUnsupported { target, what } => {
                 write!(f, "transform '{target}' can't apply {what}")
+            }
+            ApplyError::JoinOneToOneHalt { target, reason } => {
+                write!(f, "transform '{target}' can't apply {reason}")
             }
             ApplyError::GroupLockGap { target, groups } => write!(
                 f,
@@ -478,6 +489,7 @@ impl std::error::Error for ApplyError {
             | ApplyError::VersionFenceMiss { .. }
             | ApplyError::LedgerEntryCollected { .. }
             | ApplyError::JoinKeyMoved { .. }
+            | ApplyError::JoinOneToOneHalt { .. }
             | ApplyError::HopBoundExceeded { .. }
             | ApplyError::GroupBasisUnsupported { .. }
             | ApplyError::GroupLockGap { .. }

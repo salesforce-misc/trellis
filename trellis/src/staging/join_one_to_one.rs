@@ -1,5 +1,5 @@
-//! A 1-1 `JOIN` transform's apply step (ADR-0021): the `FROM` (`a`) side's
-//! page.
+//! A 1-1 `JOIN` transform's apply step (ADR-0021): a page of either side's
+//! changes.
 //!
 //! A 1-1 `JOIN` keeps one target row per `a` row, joined to at most one `b`
 //! row, over four hidden tables ([`crate::defs::join_one_to_one`]): `R`, an
@@ -10,46 +10,65 @@
 //!
 //! # One page ([`apply_page`])
 //!
-//! A page carries `a` changes and Re-derives, in one transaction under `READ
-//! COMMITTED`, in the model's order (#1375). Each step is a rule an ablation
-//! showed necessary; the plant that removes it is in brackets.
+//! A page carries `a` changes and Re-derives and `b` changes, in one
+//! transaction under `READ COMMITTED`, in the model's order (#1375). Each step
+//! is a rule an ablation showed necessary; the plant that removes it is in
+//! brackets.
 //!
-//! 1. **Fold.** Only the newest change per `a` id goes through I2; a
-//!    Re-derive of an id replaces that id's changes. A page whose segment may
-//!    predate the build re-derives every id
+//! 1. **Fold.** Only the newest change per id of each side goes through I2;
+//!    a Re-derive of an id replaces that id's changes. A page whose segment
+//!    may predate the build re-derives every id
 //!    ([`super::ledger::page_may_predate_build`]).
 //! 2. **Lock row and key set.** The pair's lock row `FOR SHARE`. Then the key
-//!    set K, in one statement: every change's new key, the key `R` holds for
+//!    set K: for the `a` side, every change's new key, the key `R` holds for
 //!    each id, and the live key of each Re-derive row (read unlocked, which
-//!    keeps the retry below rare). A key with a `NULL` part is left out: it
+//!    keeps the retry below rare); for the `b` side, every change's new key,
+//!    its old key from its first change's pre-image, and the key `M` holds
+//!    [`join1_old_key_unlocked`]. A key with a `NULL` part is left out: it
 //!    matches nothing and takes no `J` row.
-//! 3. **`J`.** K inserted sorted `on conflict do nothing`, then locked `FOR
-//!    UPDATE` in one sorted statement [`join1_no_j_lock`].
-//! 4. **Entries.** The `R` placeholders and entry lock
-//!    ([`super::one_to_one_ledger::lock_entries`], I5) [`join1_no_placeholder`,
-//!    `join1_no_entry_lock`]. Then each held key is checked against K: one
-//!    outside it moved after K was read, so the page rolls back with
-//!    [`ApplyError::JoinKeyMoved`] and retries [`join1_no_recheck`]. The
-//!    entry lock also orders the writers of a `NULL`-keyed row, which has no
-//!    `J` row.
+//! 3. **`J`.** K, both sides' keys together, inserted sorted `on conflict do
+//!    nothing`, then locked `FOR UPDATE` in one sorted statement
+//!    [`join1_no_j_lock`]. Nothing reads `M`, or `R` for a fan-out, before
+//!    this [`join1_m_before_j`].
+//! 4. **Entries.** The `R` placeholders and entry lock, then `M`'s
+//!    ([`super::one_to_one_ledger::lock_entries`], I5)
+//!    [`join1_no_placeholder`, `join1_no_entry_lock`]. After each, every
+//!    held key is checked against K: one outside it moved after K was read,
+//!    so the page rolls back with [`ApplyError::JoinKeyMoved`] and retries
+//!    [`join1_no_recheck`]. The entry lock also orders the writers of a
+//!    `NULL`-keyed row, which has no `J` row.
 //! 5. **Re-derive read.** One statement reads the live `a` rows and
 //!    `pg_current_snapshot()`; a key it reads outside K rolls the page back
 //!    the same way [`join1_snapshot_after_read`].
 //! 6. **I2.** The entries are updated by ADR-0002's I2 (an Apply must not be
 //!    in the entry's basis, must be past its applied position and above the
 //!    floor) [`join1_vis_only`, `join1_lsn_only`]; a Re-derive sets the basis
-//!    and leaves the applied position alone. Then `R`'s key and read columns
-//!    are written for the entries that changed; a row that is gone has its
-//!    key cleared, so it matches no `b` change.
-//! 7. **Recompute and write.** Each changed row's target row is rendered from
-//!    `R` and the newest live `M` entry on its key (`LEFT JOIN LATERAL`), read
-//!    only now, after `J` is locked; a row that no longer
-//!    exists, or an `INNER` row with no match, is deleted. Fields are
-//!    rendered SQL, never evaluated in Rust.
+//!    and leaves the applied position alone. Then each side's key and read
+//!    columns are written for the entries that changed; a row that is gone
+//!    has its key cleared, so it matches nothing.
+//! 7. **Recompute and write.** Each changed `a` row's target row is rendered
+//!    from `R` and the newest live `M` entry on its key (`LEFT JOIN
+//!    LATERAL`); a row that no longer exists, or an `INNER` row with no
+//!    match, is deleted. Then the fan-out ([`fan_out`]): every other live `R`
+//!    entry on a key a changed `M` entry held before the page or holds after
+//!    it is recomputed the same way, in sorted keyset batches of 10k, one
+//!    statement each. Fields are rendered SQL, never evaluated in Rust. More
+//!    rows than the cap ([`crate::defs::join_one_to_one::max_fanout`]) halt
+//!    the transform; so does a field that fails on a fan-out row, once a
+//!    bisection under savepoints has named the rows and fields.
 //!
-//! The lock order is the lock row, `J` sorted, `R` entries sorted, target
-//! rows sorted. `b`-side changes and Re-derives, `TRUNCATE` and the fan-out
-//! are later steps (#1397, #1399): a page that carries one halts.
+//! The lock order is the lock row, `J` sorted, `R` entries sorted, `M`
+//! entries sorted, then target rows, sorted within each statement. The
+//! target rows are not locked ahead across statements, and need not be: each
+//! one is written only by a page that holds `J` for the key its `R` entry
+//! has. An `a` page holds `J` for every key its entries hold (the held-key
+//! check), and a `b` page reads the entries it fans out to after locking
+//! their key, which no writer of an entry can leave or reach without the
+//! same lock. So two pages that write one target row queue on a `J` row
+//! before either locks it, whatever order their statements take. Nothing
+//! reads a 1-1 `JOIN` target in v1 (define refuses it), so a page records
+//! nothing for the seam. A Re-derive of `b` and a `TRUNCATE` are later steps
+//! (#1398, #1399): a page that carries one halts.
 //!
 //! # A build ([`build`])
 //!
@@ -290,6 +309,54 @@ impl JoinShape {
         self.r_columns.iter().map(|c| c.name.clone()).collect()
     }
 
+    /// The halt of a page that would re-derive a `b` row, whose path is a
+    /// later step's (#1398).
+    fn b_rederive_unsupported(&self) -> ApplyError {
+        ApplyError::GroupBasisUnsupported {
+            target: self.target.clone(),
+            what: "a Re-derive of the joined table of a 1-1 JOIN (its path is not built yet)",
+        }
+    }
+
+    /// `side`'s hidden ledger: `R` or `M`.
+    fn ledger(&self, side: Side) -> &LedgerRef {
+        match side {
+            Side::From => &self.r,
+            Side::Joined => &self.m,
+        }
+    }
+
+    /// `side`'s join key column names, in `ON` order.
+    fn side_key(&self, side: Side) -> Vec<String> {
+        match side {
+            Side::From => self.key.iter().map(|c| c.name.clone()).collect(),
+            Side::Joined => self.m_key.clone(),
+        }
+    }
+
+    /// The columns `side`'s ledger holds besides its ordering state.
+    fn side_columns(&self, side: Side) -> &[ImageColumn] {
+        match side {
+            Side::From => &self.r_columns,
+            Side::Joined => &self.m_columns,
+        }
+    }
+
+    /// The text of each join key column of `side`'s ledger row `alias`, cast
+    /// to `J`'s type first, so both sides' keys compare as `K`'s texts do.
+    fn key_texts(&self, side: Side, alias: &str) -> Vec<String> {
+        self.key
+            .iter()
+            .zip(self.side_key(side))
+            .map(|(c, name)| {
+                format!(
+                    "({})::text",
+                    cast_to(c, &format!("{alias}.{}", quote_ident(&name)))
+                )
+            })
+            .collect()
+    }
+
     /// The row of `R`'s entry `r` and the newest live `M` entry on its key
     /// `b` (a `LEFT JOIN LATERAL`), and the lateral row `s` the fields read.
     /// `from` is the relation that supplies `r`. Newest is by applied
@@ -351,49 +418,68 @@ impl JoinShape {
     }
 }
 
-/// One `a` change of a page: an Apply of its last change, written from its
-/// image (`None` for a delete), or a Re-derive (`apply` `None`), written
-/// from the row the page reads under the entry lock.
+/// One change of a page, of either side: an Apply of its last change,
+/// written from its image (`None` for a delete), or a Re-derive (`apply`
+/// `None`), written from the row the page reads under the entry lock.
+/// `old_image` is its first change's pre-image, whose key a `b` change locks.
 #[derive(Debug, Clone)]
-pub(crate) struct ARecord {
+pub(crate) struct Record {
     key: String,
     apply: Option<(PgLsn, String, Option<String>)>,
+    old_image: Option<String>,
 }
 
-/// One page's work on one 1-1 `JOIN` target.
+impl Record {
+    /// This record as a Re-derive of its row.
+    fn rederive(&self) -> Self {
+        Record {
+            key: self.key.clone(),
+            apply: None,
+            old_image: self.old_image.clone(),
+        }
+    }
+}
+
+/// One page's work on one 1-1 `JOIN` target: its changes of each side.
 #[derive(Debug, Clone)]
 pub(crate) struct JoinOneToOnePlan {
     pub(crate) shape: std::sync::Arc<JoinShape>,
-    records: Vec<ARecord>,
+    a: Vec<Record>,
+    b: Vec<Record>,
 }
 
 impl JoinOneToOnePlan {
     pub(crate) fn new(shape: JoinShape) -> Self {
         Self {
             shape: std::sync::Arc::new(shape),
-            records: Vec::new(),
+            a: Vec::new(),
+            b: Vec::new(),
         }
     }
 
-    /// Adds `change` of the table on `side`. The `b` side is the next step's
-    /// (#1397): a change of it halts the page rather than run wrong.
+    /// Adds `change` of the table on `side`. A Re-derive of the `b` side is
+    /// a later step's (#1398): it halts the page rather than run wrong.
     pub(crate) fn push(&mut self, side: Side, change: &FoldedChange) -> Result<(), ApplyError> {
-        if side == Side::Joined {
-            return Err(ApplyError::GroupBasisUnsupported {
-                target: self.shape.target.clone(),
-                what: "a change of the joined table of a 1-1 JOIN (its apply path is not built yet)",
-            });
-        }
         let apply = match &change.last_change {
             Some(last) if !change.has_recompute => {
                 Some((last.lsn, last.row_txid.clone(), change.new_image.clone()))
             }
             _ => None,
         };
-        self.records.push(ARecord {
+        let record = Record {
             key: change.key.clone(),
             apply,
-        });
+            old_image: change.old_image.clone(),
+        };
+        match side {
+            Side::From => self.a.push(record),
+            Side::Joined => {
+                if record.apply.is_none() {
+                    return Err(self.shape.b_rederive_unsupported());
+                }
+                self.b.push(record);
+            }
+        }
         Ok(())
     }
 }
@@ -423,35 +509,10 @@ fn key_of(row: &tokio_postgres::Row, first: usize, n: usize) -> Option<KeyText> 
         .collect()
 }
 
-/// Settles one page of `plan` in `txn` (the module doc). Returns how many
-/// target rows it wrote and deleted.
-pub(crate) async fn apply_page(
-    txn: &Transaction<'_>,
-    plan: &JoinOneToOnePlan,
-    first_seg: i64,
-    seg_seq: i64,
-    mutations: &mut TargetMutations,
-) -> Result<(usize, usize), ApplyError> {
-    let shape = &*plan.shape;
-
-    // 1. Fold.
-    let rederived: Vec<ARecord>;
-    let records: &[ARecord] = if plan.records.iter().any(|r| r.apply.is_some())
-        && super::ledger::page_may_predate_build(txn, &shape.r, first_seg).await?
-    {
-        rederived = plan
-            .records
-            .iter()
-            .map(|r| ARecord {
-                key: r.key.clone(),
-                apply: None,
-            })
-            .collect();
-        &rederived
-    } else {
-        &plan.records
-    };
-    let mut by_key: BTreeMap<&str, &ARecord> = BTreeMap::new();
+/// Step 1, the fold: the record each key keeps. A Re-derive of a key
+/// replaces its changes, and of two Applies the later one is kept.
+fn fold(records: &[Record]) -> BTreeMap<&str, &Record> {
+    let mut by_key: BTreeMap<&str, &Record> = BTreeMap::new();
     for record in records {
         by_key
             .entry(&record.key)
@@ -467,7 +528,40 @@ pub(crate) async fn apply_page(
             })
             .or_insert(record);
     }
-    if by_key.is_empty() {
+    by_key
+}
+
+/// Settles one page of `plan` in `txn` (the module doc). Returns how many
+/// target rows it wrote and deleted.
+pub(crate) async fn apply_page(
+    txn: &Transaction<'_>,
+    plan: &JoinOneToOnePlan,
+    first_seg: i64,
+    seg_seq: i64,
+    mutations: &mut TargetMutations,
+) -> Result<(usize, usize), ApplyError> {
+    let shape = &*plan.shape;
+
+    // 1. Fold.
+    let rederived: (Vec<Record>, Vec<Record>);
+    let (a_records, b_records): (&[Record], &[Record]) =
+        if plan.a.iter().chain(&plan.b).any(|r| r.apply.is_some())
+            && super::ledger::page_may_predate_build(txn, &shape.r, first_seg).await?
+        {
+            rederived = (
+                plan.a.iter().map(Record::rederive).collect(),
+                plan.b.iter().map(Record::rederive).collect(),
+            );
+            (&rederived.0, &rederived.1)
+        } else {
+            (&plan.a, &plan.b)
+        };
+    if b_records.iter().any(|r| r.apply.is_none()) {
+        return Err(shape.b_rederive_unsupported());
+    }
+    let a = fold(a_records);
+    let b = fold(b_records);
+    if a.is_empty() && b.is_empty() {
         return Ok((0, 0));
     }
     // Planted bug: apply every change without ADR-0002's I2. See
@@ -475,23 +569,28 @@ pub(crate) async fn apply_page(
     #[cfg(any(test, feature = "test-util"))]
     let predicate = !crate::plant::fires(
         crate::plant::Plant::StaleOneToOneWrite,
-        by_key.values().any(|r| r.apply.is_some()),
+        a.values().chain(b.values()).any(|r| r.apply.is_some()),
     );
     #[cfg(not(any(test, feature = "test-util")))]
     let predicate = true;
 
-    let keys: Vec<&str> = by_key.keys().copied().collect();
-    let rederive_keys: Vec<&str> = by_key
+    let rederive_keys: Vec<&str> = a
         .values()
         .filter(|r| r.apply.is_none())
         .map(|r| r.key.as_str())
         .collect();
 
-    // 2. The lock row, then K.
+    // 2. The lock row, then K over both sides' keys.
     txn.execute(&format!("select 1 from {} for share", shape.lock), &[])
         .await?;
     let live = live_keys(txn, shape, &rederive_keys).await?;
-    let k = key_set(txn, shape, &by_key, &live).await?;
+    let mut k: BTreeSet<KeyText> = BTreeSet::new();
+    if !a.is_empty() {
+        k.extend(key_set(txn, shape, Side::From, &a, &live).await?);
+    }
+    if !b.is_empty() {
+        k.extend(key_set(txn, shape, Side::Joined, &b, &[]).await?);
+    }
     // Test-only pause point. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
@@ -501,35 +600,21 @@ pub(crate) async fn apply_page(
     )
     .await?;
 
-    // 3. `J`.
-    lock_keys(txn, shape, &k).await?;
-
-    // 4. The `R` entries.
-    let to_lock: Vec<EntryChange<'_>> = by_key
-        .values()
-        .map(|r| EntryChange {
-            key: &r.key,
-            apply: r.apply.as_ref().map(|(lsn, txid, _)| (*lsn, txid.as_str())),
-            present: r.apply.as_ref().is_none_or(|(_, _, image)| image.is_some()),
-        })
-        .collect();
-    // Planted bug: the page doesn't lock the entries it reads. See
+    // 3. `J`, one sorted statement over both sides' keys.
+    // Planted bug: the page reads `M` and `R` before it locks `J`. See
     // `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
-    let skip_lock = crate::plant::fires(crate::plant::Plant::Join1NoEntryLock, true);
+    let late_j = crate::plant::fires(crate::plant::Plant::Join1MBeforeJ, !k.is_empty());
     #[cfg(not(any(test, feature = "test-util")))]
-    let skip_lock = false;
-    let inserted =
-        ledger::lock_entries(txn, &shape.r, &to_lock, seg_seq, predicate, skip_lock).await?;
-    check_held_keys(txn, shape, &keys, &k).await?;
-    // Test-only pause point. See `super::interleave`.
-    #[cfg(any(test, feature = "test-util"))]
-    super::interleave::pause_at(
-        txn,
-        super::interleave::PausePoint::AfterJoin1REntryLock,
-        &shape.r.label,
-    )
-    .await?;
+    let late_j = false;
+    if !late_j {
+        lock_keys(txn, shape, &k).await?;
+    }
+
+    // 4. The `R` entries, then the `M` entries.
+    let (a_inserted, _) = lock_side(txn, shape, Side::From, &a, seg_seq, predicate, &k).await?;
+    let (b_inserted, b_held) =
+        lock_side(txn, shape, Side::Joined, &b, seg_seq, predicate, &k).await?;
 
     // 5. The Re-derive read.
     let (mut read, snapshot, entry_seg) = if rederive_keys.is_empty() {
@@ -575,70 +660,33 @@ pub(crate) async fn apply_page(
         .map(|key| (*key, read.remove(*key)))
         .collect();
 
-    // 6. I2, then `R`'s columns.
-    let mut changes: Vec<EntryChange<'_>> = Vec::with_capacity(by_key.len());
-    for record in by_key.values() {
-        if record.apply.is_some() && inserted.keys.contains(&record.key) {
-            continue;
-        }
-        let present = match &record.apply {
-            Some((_, _, image)) => image.is_some(),
-            None => match rederived.get(record.key.as_str()) {
-                Some(row) => row.is_some(),
-                None => continue,
-            },
-        };
-        changes.push(EntryChange {
-            key: &record.key,
-            apply: record
-                .apply
-                .as_ref()
-                .map(|(lsn, txid, _)| (*lsn, txid.as_str())),
-            present,
-        });
-    }
-    let mut changed = ledger::update_entries(
+    // 6. I2, then each side's copied columns.
+    let a_changed = update_side(
         txn,
-        &shape.r,
-        &changes,
+        shape,
+        Side::From,
+        &a,
+        &a_inserted,
+        &rederived,
         snapshot.as_deref(),
         entry_seg,
         predicate,
     )
     .await?;
-    changed.extend(inserted.applied.iter().cloned());
-    let unwritten: Vec<&str> = inserted
-        .keys
-        .iter()
-        .filter(|key| !changed.contains(*key))
-        .map(String::as_str)
-        .collect();
-    ledger::drop_placeholders(txn, &shape.r, &unwritten).await?;
+    let b_changed = update_side(
+        txn,
+        shape,
+        Side::Joined,
+        &b,
+        &b_inserted,
+        &HashMap::new(),
+        None,
+        seg_seq,
+        predicate,
+    )
+    .await?;
 
-    let mut present_keys: Vec<&str> = Vec::new();
-    let mut images: Vec<&str> = Vec::new();
-    let mut gone: Vec<&str> = Vec::new();
-    for record in by_key.values() {
-        if !changed.contains(&record.key) {
-            continue;
-        }
-        let image = match &record.apply {
-            Some((_, _, image)) => image.as_deref(),
-            None => rederived
-                .get(record.key.as_str())
-                .and_then(|row| row.as_deref()),
-        };
-        match image {
-            Some(image) => {
-                present_keys.push(&record.key);
-                images.push(image);
-            }
-            None => gone.push(&record.key),
-        }
-    }
-    write_entries(txn, shape, &present_keys, &images, &gone).await?;
-
-    // 7. Recompute and write.
+    // 7. Recompute and write: the `a` changes' rows, then the fan-out.
     // Test-only pause point. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
@@ -647,9 +695,15 @@ pub(crate) async fn apply_page(
         &shape.target,
     )
     .await?;
-    let mut changed_keys: Vec<&str> = changed.iter().map(String::as_str).collect();
+    let mut changed_keys: Vec<&str> = a_changed.iter().map(String::as_str).collect();
     changed_keys.sort_unstable();
-    write_target(txn, shape, &changed_keys, mutations).await
+    let (written, deleted) = write_target(txn, shape, &changed_keys, mutations).await?;
+    let fan_keys = fan_out_keys(txn, shape, &b_changed, &b_held).await?;
+    let (fanned, fan_deleted) = fan_out(txn, shape, &fan_keys, &a_changed, mutations).await?;
+    if late_j {
+        lock_keys(txn, shape, &k).await?;
+    }
+    Ok((written + fanned, deleted + fan_deleted))
 }
 
 /// The live key of each of `keys`' rows, read unlocked: the third part of
@@ -677,21 +731,36 @@ async fn live_keys(
         .collect())
 }
 
-/// K: every image's new key, the key `R` holds for each of `by_key`, and the
-/// `live` keys, as the sorted set of their texts. A key with a `NULL` part is
-/// left out.
+/// `side`'s part of K: every image's new key, for a `b` change also its old
+/// key from its first change's pre-image, the key the side's entry holds for
+/// each of `records`, and the `live` keys, as the sorted set of their texts.
+/// Each key is cast to `J`'s types. A key with a `NULL` part is left out.
 async fn key_set(
     txn: &Transaction<'_>,
     shape: &JoinShape,
-    by_key: &BTreeMap<&str, &ARecord>,
+    side: Side,
+    records: &BTreeMap<&str, &Record>,
     live: &[KeyText],
 ) -> Result<BTreeSet<KeyText>, ApplyError> {
     let n = shape.key.len();
-    let keys: Vec<&str> = by_key.keys().copied().collect();
-    let images: Vec<Option<&str>> = by_key
+    let names = shape.side_key(side);
+    // Planted bug: only the changes' new keys are locked. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let only_new = crate::plant::fires(crate::plant::Plant::Join1OldKeyUnlocked, true);
+    #[cfg(not(any(test, feature = "test-util")))]
+    let only_new = false;
+    let keys: Vec<&str> = records.keys().copied().collect();
+    let images: Vec<Option<&str>> = records
         .values()
         .map(|r| match &r.apply {
             Some((_, _, Some(image))) => Some(image.as_str()),
+            _ => None,
+        })
+        .collect();
+    let old_images: Vec<Option<&str>> = records
+        .values()
+        .map(|r| match side {
+            Side::Joined if !only_new => r.old_image.as_deref(),
             _ => None,
         })
         .collect();
@@ -700,73 +769,88 @@ async fn key_set(
         .collect();
     let aliases =
         |prefix: &str| -> Vec<String> { (0..n).map(|i| format!("{prefix}{i}")).collect() };
-    let from_image: Vec<String> = shape
-        .key
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            format!(
-                "{} as k{i}",
-                cast_to(c, &format!("ch.img ->> {}", quote_literal(&c.name)))
-            )
-        })
-        .collect();
-    let from_r: Vec<String> = shape
-        .key
-        .iter()
-        .enumerate()
-        .map(|(i, c)| format!("r.{} as k{i}", quote_ident(&c.name)))
-        .collect();
-    let from_live: Vec<String> = shape
-        .key
-        .iter()
-        .enumerate()
-        .map(|(i, c)| format!("{} as k{i}", cast_to(c, &format!("l.c{i}"))))
-        .collect();
-    let live_arrays: Vec<String> = (0..n).map(|i| format!("${}::text[]", 3 + i)).collect();
+    let typed = |expr: &dyn Fn(usize, &str) -> String| -> Vec<String> {
+        shape
+            .key
+            .iter()
+            .zip(&names)
+            .enumerate()
+            .map(|(i, (c, name))| format!("{} as k{i}", cast_to(c, &expr(i, name))))
+            .collect()
+    };
+    let from_image = typed(&|_, name| format!("ch.img ->> {}", quote_literal(name)));
+    let from_held = typed(&|_, name| format!("l.{}", quote_ident(name)));
+    let from_live = typed(&|i, _| format!("lv.c{i}"));
+    let live_arrays: Vec<String> = (0..n).map(|i| format!("${}::text[]", 4 + i)).collect();
     let texts: Vec<String> = aliases("k").iter().map(|k| format!("{k}::text")).collect();
     let present: Vec<String> = aliases("k")
         .iter()
         .map(|k| format!("{k} is not null"))
         .collect();
-    // Planted bug: the key `R` holds isn't part of the key set. See
-    // `crate::plant`.
-    #[cfg(any(test, feature = "test-util"))]
-    let held = if crate::plant::fires(crate::plant::Plant::Join1OldKeyUnlocked, true) {
+    let held = if only_new {
         "$1::text[] = '{}'::text[] and"
     } else {
         ""
     };
-    #[cfg(not(any(test, feature = "test-util")))]
-    let held = "";
     let sql = format!(
-        "with ch as (select u.k, u.img::jsonb as img \
-                     from unnest($1::text[], $2::text[]) as u(k, img) \
+        "with ch as (select u.img::jsonb as img from unnest($2::text[]) as u(img) \
+                     where u.img is not null \
+                     union all \
+                     select u.img::jsonb from unnest($3::text[]) as u(img) \
                      where u.img is not null), \
          cand as ( \
              select {from_image} from ch \
              union \
-             select {from_r} from {r} r where {held} r.{key} = any($1::text[]) \
+             select {from_held} from {ledger} l where {held} l.{key} = any($1::text[]) \
              union \
-             select {from_live} from unnest({live_arrays}) as l({live_names}) \
+             select {from_live} from unnest({live_arrays}) as lv({live_names}) \
          ) \
          select {texts} from cand where {present}",
         from_image = from_image.join(", "),
-        from_r = from_r.join(", "),
+        from_held = from_held.join(", "),
         from_live = from_live.join(", "),
         live_arrays = live_arrays.join(", "),
         live_names = aliases("c").join(", "),
         texts = texts.join(", "),
         present = present.join(" and "),
-        r = shape.r.ident,
+        ledger = shape.ledger(side).ident,
         key = quote_ident(schema::KEY_COLUMN),
     );
-    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&keys, &images];
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&keys, &images, &old_images];
     for column in &live_columns {
         params.push(column);
     }
     let rows = super::ledger::query_by_entry_key(txn, &sql, &params).await?;
     Ok(rows.iter().filter_map(|row| key_of(row, 0, n)).collect())
+}
+
+/// `keys` as one text array per key column, for [`key_unnest`].
+fn key_arrays(n: usize, keys: &BTreeSet<KeyText>) -> Vec<Vec<&str>> {
+    (0..n)
+        .map(|i| keys.iter().map(|key| key[i].as_str()).collect())
+        .collect()
+}
+
+/// The `unnest` of [`key_arrays`] bound from parameter `$1` as `u(c0, ..)`,
+/// and each column cast to its `J` type.
+fn key_unnest(shape: &JoinShape) -> (String, Vec<String>) {
+    let n = shape.key.len();
+    let arrays: Vec<String> = (0..n).map(|i| format!("${}::text[]", i + 1)).collect();
+    let unnest = format!(
+        "unnest({}) as u({})",
+        arrays.join(", "),
+        (0..n)
+            .map(|i| format!("c{i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let casts = shape
+        .key
+        .iter()
+        .enumerate()
+        .map(|(i, c)| cast_to(c, &format!("u.c{i}")))
+        .collect();
+    (unnest, casts)
 }
 
 /// Inserts K into `J` sorted and locks it, in one sorted statement each:
@@ -778,29 +862,10 @@ async fn lock_keys(
     k: &BTreeSet<KeyText>,
 ) -> Result<(), ApplyError> {
     let n = shape.key.len();
-    let columns: Vec<Vec<&str>> = (0..n)
-        .map(|i| k.iter().map(|key| key[i].as_str()).collect())
-        .collect();
-    let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(n);
-    for column in &columns {
-        params.push(column);
-    }
+    let columns = key_arrays(n, k);
+    let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
     let names: Vec<String> = shape.key.iter().map(|c| quote_ident(&c.name)).collect();
-    let casts: Vec<String> = shape
-        .key
-        .iter()
-        .enumerate()
-        .map(|(i, c)| cast_to(c, &format!("u.c{i}")))
-        .collect();
-    let arrays: Vec<String> = (0..n).map(|i| format!("${}::text[]", i + 1)).collect();
-    let unnest = format!(
-        "unnest({}) as u({})",
-        arrays.join(", "),
-        (0..n)
-            .map(|i| format!("c{i}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    let (unnest, casts) = key_unnest(shape);
     let ordinals: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
     if !k.is_empty() {
         txn.execute(
@@ -854,34 +919,84 @@ async fn lock_keys(
     Ok(())
 }
 
-/// Checks that the key each `keys` entry of `R` holds, now that the page has
-/// locked them, is in `k`: one outside it moved after `k` was read.
+/// Step 4 for one side: `records`' placeholders and sorted entry lock
+/// ([`super::one_to_one_ledger::lock_entries`], I5), then the check that each
+/// held key is in `k` ([`check_held_keys`]). Returns the keys whose entry it
+/// inserted, and the key each entry held under the lock.
+async fn lock_side(
+    txn: &Transaction<'_>,
+    shape: &JoinShape,
+    side: Side,
+    records: &BTreeMap<&str, &Record>,
+    seg_seq: i64,
+    predicate: bool,
+    k: &BTreeSet<KeyText>,
+) -> Result<(ledger::Inserted, HashMap<String, KeyText>), ApplyError> {
+    if records.is_empty() {
+        return Ok((ledger::Inserted::default(), HashMap::new()));
+    }
+    let to_lock: Vec<EntryChange<'_>> = records
+        .values()
+        .map(|r| EntryChange {
+            key: &r.key,
+            apply: r.apply.as_ref().map(|(lsn, txid, _)| (*lsn, txid.as_str())),
+            present: r.apply.as_ref().is_none_or(|(_, _, image)| image.is_some()),
+        })
+        .collect();
+    // Planted bug: the page doesn't lock the entries it reads. See
+    // `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let skip_lock = crate::plant::fires(crate::plant::Plant::Join1NoEntryLock, true);
+    #[cfg(not(any(test, feature = "test-util")))]
+    let skip_lock = false;
+    let ledger = shape.ledger(side);
+    let inserted =
+        ledger::lock_entries(txn, ledger, &to_lock, seg_seq, predicate, skip_lock).await?;
+    let keys: Vec<&str> = records.keys().copied().collect();
+    let held = check_held_keys(txn, shape, side, &keys, k).await?;
+    // Test-only pause point. See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_at(
+        txn,
+        match side {
+            Side::From => super::interleave::PausePoint::AfterJoin1REntryLock,
+            Side::Joined => super::interleave::PausePoint::AfterJoin1MEntryLock,
+        },
+        &ledger.label,
+    )
+    .await?;
+    Ok((inserted, held))
+}
+
+/// Checks that the key each `keys` entry of `side`'s ledger holds, now that
+/// the page has locked them, is in `k`: one outside it moved after `k` was
+/// read. Returns each entry's held key (none for a `NULL` part).
 async fn check_held_keys(
     txn: &Transaction<'_>,
     shape: &JoinShape,
+    side: Side,
     keys: &[&str],
     k: &BTreeSet<KeyText>,
-) -> Result<(), ApplyError> {
+) -> Result<HashMap<String, KeyText>, ApplyError> {
     let n = shape.key.len();
-    let texts: Vec<String> = shape
-        .key
-        .iter()
-        .map(|c| format!("r.{}::text", quote_ident(&c.name)))
-        .collect();
     let rows = super::ledger::query_by_entry_key(
         txn,
         &format!(
-            "select {} from {} r where r.{} = any($1::text[])",
-            texts.join(", "),
-            shape.r.ident,
-            quote_ident(schema::KEY_COLUMN)
+            "select l.{key}, {texts} from {ledger} l where l.{key} = any($1::text[])",
+            texts = shape.key_texts(side, "l").join(", "),
+            ledger = shape.ledger(side).ident,
+            key = quote_ident(schema::KEY_COLUMN)
         ),
         &[&keys],
     )
     .await?;
+    let held: HashMap<String, KeyText> = rows
+        .iter()
+        .filter_map(|row| Some((row.get::<_, String>(0), key_of(row, 1, n)?)))
+        .collect();
     // Test-only: a key that moves on every attempt. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
-    if super::interleave::take_forced_join_key_move() {
+    if side == Side::From && super::interleave::take_forced_join_key_move() {
         super::interleave::note_join_key_moved();
         return Err(ApplyError::JoinKeyMoved {
             target: shape.target.clone(),
@@ -892,21 +1007,14 @@ async fn check_held_keys(
     let skip = crate::plant::fires(crate::plant::Plant::Join1NoRecheck, !rows.is_empty());
     #[cfg(not(any(test, feature = "test-util")))]
     let skip = false;
-    if skip {
-        return Ok(());
+    if !skip && held.values().any(|key| !k.contains(key)) {
+        #[cfg(any(test, feature = "test-util"))]
+        super::interleave::note_join_key_moved();
+        return Err(ApplyError::JoinKeyMoved {
+            target: shape.target.clone(),
+        });
     }
-    for row in &rows {
-        if let Some(held) = key_of(row, 0, n)
-            && !k.contains(&held)
-        {
-            #[cfg(any(test, feature = "test-util"))]
-            super::interleave::note_join_key_moved();
-            return Err(ApplyError::JoinKeyMoved {
-                target: shape.target.clone(),
-            });
-        }
-    }
-    Ok(())
+    Ok(held)
 }
 
 /// Checks that the key of each live row a Re-derive read is in `k`.
@@ -943,31 +1051,111 @@ fn check_read_keys(
     Ok(())
 }
 
-/// Writes `R`'s key and read columns for the entries that changed:
+/// Step 6 for one side: `records`' entries updated by I2 (a Re-derive sets
+/// the basis from `snapshot`), the placeholders nothing wrote dropped, then
+/// the side's key and read columns written for the entries that changed: a
+/// present row from its image or the Re-derive's read (`rederived`), and a
+/// gone one with its key cleared, so it matches nothing. Returns the keys
+/// that changed.
+#[allow(clippy::too_many_arguments)]
+async fn update_side(
+    txn: &Transaction<'_>,
+    shape: &JoinShape,
+    side: Side,
+    records: &BTreeMap<&str, &Record>,
+    inserted: &ledger::Inserted,
+    rederived: &HashMap<&str, Option<String>>,
+    snapshot: Option<&str>,
+    entry_seg: i64,
+    predicate: bool,
+) -> Result<HashSet<String>, ApplyError> {
+    if records.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let ledger = shape.ledger(side);
+    let mut changes: Vec<EntryChange<'_>> = Vec::with_capacity(records.len());
+    for record in records.values() {
+        if record.apply.is_some() && inserted.keys.contains(&record.key) {
+            continue;
+        }
+        let present = match &record.apply {
+            Some((_, _, image)) => image.is_some(),
+            None => match rederived.get(record.key.as_str()) {
+                Some(row) => row.is_some(),
+                None => continue,
+            },
+        };
+        changes.push(EntryChange {
+            key: &record.key,
+            apply: record
+                .apply
+                .as_ref()
+                .map(|(lsn, txid, _)| (*lsn, txid.as_str())),
+            present,
+        });
+    }
+    let mut changed =
+        ledger::update_entries(txn, ledger, &changes, snapshot, entry_seg, predicate).await?;
+    changed.extend(inserted.applied.iter().cloned());
+    let unwritten: Vec<&str> = inserted
+        .keys
+        .iter()
+        .filter(|key| !changed.contains(*key))
+        .map(String::as_str)
+        .collect();
+    ledger::drop_placeholders(txn, ledger, &unwritten).await?;
+
+    let mut present_keys: Vec<&str> = Vec::new();
+    let mut images: Vec<&str> = Vec::new();
+    let mut gone: Vec<&str> = Vec::new();
+    for record in records.values() {
+        if !changed.contains(&record.key) {
+            continue;
+        }
+        let image = match &record.apply {
+            Some((_, _, image)) => image.as_deref(),
+            None => rederived
+                .get(record.key.as_str())
+                .and_then(|row| row.as_deref()),
+        };
+        match image {
+            Some(image) => {
+                present_keys.push(&record.key);
+                images.push(image);
+            }
+            None => gone.push(&record.key),
+        }
+    }
+    write_entries(txn, shape, side, &present_keys, &images, &gone).await?;
+    Ok(changed)
+}
+
+/// Writes `side`'s key and read columns for the entries that changed:
 /// `present` ones from their `images`, and the key cleared for the `gone`.
 async fn write_entries(
     txn: &Transaction<'_>,
     shape: &JoinShape,
+    side: Side,
     present: &[&str],
     images: &[&str],
     gone: &[&str],
 ) -> Result<(), ApplyError> {
     let key = quote_ident(schema::KEY_COLUMN);
+    let ledger = &shape.ledger(side).ident;
     if !present.is_empty() {
-        let sets: Vec<String> = shape
-            .r_columns
+        let columns = shape.side_columns(side);
+        let sets: Vec<String> = columns
             .iter()
             .map(|c| format!("{n} = s.{n}", n = quote_ident(&c.name)))
             .collect();
-        let render = OneToOneRender::of_columns(shape.r_columns.clone());
+        let render = OneToOneRender::of_columns(columns.to_vec());
         super::ledger::query_by_entry_key(
             txn,
             &format!(
-                "update {r} r set {sets} \
+                "update {ledger} l set {sets} \
                  from unnest($1::text[], $2::text[]::jsonb[]) as v(__key, __img) \
                       cross join {row} \
-                 where r.{key} = any($1::text[]) and r.{key} = v.__key",
-                r = shape.r.ident,
+                 where l.{key} = any($1::text[]) and l.{key} = v.__key",
                 sets = sets.join(", "),
                 row = render.row_sql("v.__img"),
             ),
@@ -977,15 +1165,14 @@ async fn write_entries(
     }
     if !gone.is_empty() {
         let sets: Vec<String> = shape
-            .key
+            .side_key(side)
             .iter()
-            .map(|c| format!("{} = null", quote_ident(&c.name)))
+            .map(|c| format!("{} = null", quote_ident(c)))
             .collect();
         super::ledger::query_by_entry_key(
             txn,
             &format!(
-                "update {r} r set {sets} where r.{key} = any($1::text[])",
-                r = shape.r.ident,
+                "update {ledger} l set {sets} where l.{key} = any($1::text[])",
                 sets = sets.join(", "),
             ),
             &[&gone],
@@ -995,9 +1182,266 @@ async fn write_entries(
     Ok(())
 }
 
-/// Writes the target rows of `keys` (`R` entries that changed): each live
-/// one with a target row is upserted from `R` and the newest live `M` entry
-/// on its key, and the rest are deleted. The fields are rendered SQL. The
+/// The keys a page's `b` changes fan out on: each changed `M` entry's key
+/// before the page (`held`, read under its entry lock) and after it (read
+/// back from `M`). Every one is in K, so the page holds its `J` lock.
+async fn fan_out_keys(
+    txn: &Transaction<'_>,
+    shape: &JoinShape,
+    changed: &HashSet<String>,
+    held: &HashMap<String, KeyText>,
+) -> Result<BTreeSet<KeyText>, ApplyError> {
+    if changed.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let mut keys: BTreeSet<KeyText> = changed
+        .iter()
+        .filter_map(|k| held.get(k))
+        .cloned()
+        .collect();
+    let changed: Vec<&str> = changed.iter().map(String::as_str).collect();
+    let rows = super::ledger::query_by_entry_key(
+        txn,
+        &format!(
+            "select {texts} from {m} l where l.{key} = any($1::text[]) and not l.{tomb}",
+            texts = shape.key_texts(Side::Joined, "l").join(", "),
+            m = shape.m.ident,
+            key = quote_ident(schema::KEY_COLUMN),
+            tomb = quote_ident(schema::TOMBSTONE_COLUMN),
+        ),
+        &[&changed],
+    )
+    .await?;
+    keys.extend(
+        rows.iter()
+            .filter_map(|row| key_of(row, 0, shape.key.len())),
+    );
+    Ok(keys)
+}
+
+/// The most attempts [`fan_out_failure`]'s bisection makes, as
+/// `super::quarantine::MAX_ISOLATION_PROBES` bounds a page's.
+const MAX_FAN_OUT_PROBES: usize = 256;
+
+/// The most failing rows [`fan_out_failure`] names.
+const MAX_NAMED_FAN_OUT_ROWS: usize = 8;
+
+/// Step 9 of the page order (#1396's body), the fan-out: the target row of
+/// every live `R` entry on `keys` is recomputed from `R` and the newest live
+/// `M` entry on its key, but the `written` ones, which the page's `a` changes
+/// wrote already. The page holds `J` for each of `keys` (they are in K), and
+/// every writer of an `R` entry on a key, or of an `M` entry on it, holds that
+/// key's `J` row too, so the entries read here are the ones the key has until
+/// the page commits.
+///
+/// More entries than the cap ([`crate::defs::join_one_to_one::max_fanout`])
+/// halt the transform with the reason; the entries are read with a `limit`
+/// one past it. The rest are written in sorted keyset batches of
+/// [`WRITE_BATCH`], one statement each ([`write_target`]), under one
+/// savepoint. A data exception rolls the fan-out back to it and bisects the
+/// batches down to the rows whose fields fail ([`fan_out_failure`]).
+async fn fan_out(
+    txn: &Transaction<'_>,
+    shape: &JoinShape,
+    keys: &BTreeSet<KeyText>,
+    written: &HashSet<String>,
+    mutations: &mut TargetMutations,
+) -> Result<(usize, usize), ApplyError> {
+    if keys.is_empty() {
+        return Ok((0, 0));
+    }
+    let cap = crate::defs::join_one_to_one::max_fanout();
+    let columns = key_arrays(shape.key.len(), keys);
+    let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
+    let (unnest, casts) = key_unnest(shape);
+    let qualified: Vec<String> = shape
+        .key
+        .iter()
+        .map(|c| format!("r.{}", quote_ident(&c.name)))
+        .collect();
+    let rows = super::ledger::query_by_entry_key(
+        txn,
+        &format!(
+            "select r.{key} from {r} r \
+             where ({qualified}) in (select {casts} from {unnest}) and not r.{tomb} \
+             limit {limit}",
+            key = quote_ident(schema::KEY_COLUMN),
+            r = shape.r.ident,
+            qualified = qualified.join(", "),
+            casts = casts.join(", "),
+            tomb = quote_ident(schema::TOMBSTONE_COLUMN),
+            limit = cap.saturating_add(1),
+        ),
+        &params,
+    )
+    .await?;
+    if rows.len() as u64 > cap {
+        return Err(ApplyError::JoinOneToOneHalt {
+            target: shape.target.clone(),
+            reason: format!(
+                "a change of {} whose fan-out reaches more than {cap} rows of {} in one page, \
+                 past the fan-out cap ({})",
+                shape.joined_table,
+                shape.source_table,
+                crate::defs::join_one_to_one::MAX_FANOUT_ENV,
+            ),
+        });
+    }
+    let mut entries: Vec<String> = rows
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .filter(|key| !written.contains(key))
+        .collect();
+    if entries.is_empty() {
+        return Ok((0, 0));
+    }
+    entries.sort_unstable();
+    let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
+    txn.batch_execute("savepoint join1_fan_out").await?;
+    let (mut written, mut deleted) = (0, 0);
+    for batch in entries.chunks(WRITE_BATCH) {
+        match write_target(txn, shape, batch, mutations).await {
+            Ok((w, d)) => {
+                written += w;
+                deleted += d;
+            }
+            Err(err) if super::one_to_one_render::is_data_exception(&err) => {
+                txn.batch_execute("rollback to savepoint join1_fan_out")
+                    .await?;
+                return Err(fan_out_failure(txn, shape, &entries, mutations).await?);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    txn.batch_execute("release savepoint join1_fan_out").await?;
+    Ok((written, deleted))
+}
+
+/// A fan-out over `entries` failed with a data exception: bisects them, each
+/// attempt under a savepoint of its own, down to the rows whose fields fail
+/// (within [`MAX_FAN_OUT_PROBES`] attempts, naming at most
+/// [`MAX_NAMED_FAN_OUT_ROWS`]), names each one's failing fields with the
+/// per-field probe ([`failing_fields`]), and returns the halt naming them.
+/// A row the fan-out fails on is to be quarantined, and the `b` change and
+/// the rest of the fan-out applied (ADR-0021); until that is built the
+/// transform halts rather than leave the row stale. Any other failure
+/// propagates.
+async fn fan_out_failure(
+    txn: &Transaction<'_>,
+    shape: &JoinShape,
+    entries: &[&str],
+    mutations: &mut TargetMutations,
+) -> Result<ApplyError, ApplyError> {
+    let mut failing: Vec<&str> = Vec::new();
+    let mut probes = 0;
+    let mut runs = vec![(0, entries.len())];
+    while let Some((lo, hi)) = runs.pop() {
+        if probes >= MAX_FAN_OUT_PROBES || failing.len() >= MAX_NAMED_FAN_OUT_ROWS {
+            break;
+        }
+        probes += 1;
+        txn.batch_execute("savepoint join1_fan_out_probe").await?;
+        match write_target(txn, shape, &entries[lo..hi], mutations).await {
+            Ok(_) => {
+                txn.batch_execute("release savepoint join1_fan_out_probe")
+                    .await?
+            }
+            Err(err) if super::one_to_one_render::is_data_exception(&err) => {
+                txn.batch_execute(
+                    "rollback to savepoint join1_fan_out_probe; \
+                     release savepoint join1_fan_out_probe",
+                )
+                .await?;
+                if hi - lo == 1 {
+                    failing.push(entries[lo]);
+                } else {
+                    let mid = lo + (hi - lo) / 2;
+                    runs.push((mid, hi));
+                    runs.push((lo, mid));
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    let mut named: Vec<String> = Vec::with_capacity(failing.len());
+    for key in &failing {
+        let fields = failing_fields(txn, shape, key).await?;
+        let fields: Vec<String> = fields
+            .iter()
+            .map(|(field, error)| format!("{field}: {error}"))
+            .collect();
+        named.push(format!("{key} ({})", fields.join("; ")));
+    }
+    let more = if runs.is_empty() {
+        ""
+    } else {
+        ", and maybe more"
+    };
+    Ok(ApplyError::JoinOneToOneHalt {
+        target: shape.target.clone(),
+        reason: format!(
+            "a change of {} whose fan-out fails on rows of {}: {}{more} (quarantining a row \
+             a fan-out fails on is not built yet)",
+            shape.joined_table,
+            shape.source_table,
+            if named.is_empty() {
+                "none named".to_string()
+            } else {
+                named.join(", ")
+            },
+        ),
+    })
+}
+
+/// The per-field probe of one fan-out row, the `R` entry `key`: each field
+/// alone over the row and the newest live `M` entry on its key, cast to its
+/// target column's type as the upsert's assignment casts it, each under a
+/// savepoint. Returns the fields that fail with a data exception, each with
+/// its error, in definition order.
+async fn failing_fields(
+    txn: &Transaction<'_>,
+    shape: &JoinShape,
+    key: &str,
+) -> Result<Vec<(String, String)>, ApplyError> {
+    let target_columns = super::one_to_one_render::image_columns(txn, &shape.target).await?;
+    let from = format!("{} r", shape.r.ident);
+    let mut failing = Vec::new();
+    for (name, sql) in &shape.fields {
+        let cast = target_columns
+            .iter()
+            .find(|c| &c.name == name)
+            .map_or_else(String::new, |c| format!("::{}", c.type_sql));
+        let probe = format!(
+            "select (({sql}){cast})::text from {joined} where r.{key_col} = $1",
+            joined = shape.joined_sql(&from),
+            key_col = quote_ident(schema::KEY_COLUMN),
+        );
+        txn.batch_execute("savepoint join1_field_probe").await?;
+        match txn.query(&probe, &[&key]).await {
+            Ok(_) => {
+                txn.batch_execute("release savepoint join1_field_probe")
+                    .await?
+            }
+            Err(err) if super::one_to_one_render::is_data_exception(&err) => {
+                txn.batch_execute(
+                    "rollback to savepoint join1_field_probe; \
+                     release savepoint join1_field_probe",
+                )
+                .await?;
+                let message = err
+                    .as_db_error()
+                    .map_or_else(|| err.to_string(), |db| db.message().to_string());
+                failing.push((name.clone(), message));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(failing)
+}
+
+/// Writes the target rows of `keys` (`R` entries a page changed, or a batch
+/// of its fan-out): each live one with a target row is upserted from `R` and
+/// the newest live `M` entry on its key, and the rest are deleted. The fields are rendered SQL. The
 /// upsert takes its rows sorted by primary key. Returns how many rows it
 /// wrote and deleted.
 async fn write_target(

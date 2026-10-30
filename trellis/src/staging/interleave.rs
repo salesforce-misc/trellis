@@ -62,8 +62,10 @@
 //! `AfterJoin1KeyInsert` after its `J` insert, `AfterJoinLock` after its
 //! sorted `J` lock, `AfterPlaceholders` and `AfterEntryLock` around its `R`
 //! entry lock (labelled by the ledger), `AfterJoin1REntryLock` once it has
-//! checked their held keys, `AfterJoin1Read` after a Re-derive's read,
-//! `BeforeJoin1Recompute` before its target write, and `BeforeCommit`.
+//! checked their held keys, the same three around its `M` entry lock with
+//! `AfterJoin1MEntryLock` last, `AfterJoin1Read` after a Re-derive's read,
+//! `BeforeJoin1Recompute` before its target write and fan-out, and
+//! `BeforeCommit`.
 //!
 //! A 1-1 build chunk (`super::build::one_to_one::run_chunk`) fires
 //! `AfterPlaceholders` and `AfterEntryLock` around its entry lock, and

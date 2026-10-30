@@ -1,26 +1,36 @@
 //! Deterministic interleavings of the drain on 1-1 `JOIN` targets (ADR-0021,
-//! epic #1392), ported from the #1375 model, for the `FROM` (`a`) side:
-//! `a` changes, `J`, `R`, the recompute and the target write, and the
-//! minimal build.
+//! epic #1392), ported from the #1371 and #1375 models: `a` changes, `J`,
+//! `R`, the recompute and the target write, the minimal build, `b` changes
+//! and their fan-out, and mixed pages.
 //!
 //! Every test turns the dev knob on before its driver starts. Each scenario
 //! seeds `a` and `b`, defines the transform (the minimal build fills `M`,
-//! `R`, `J` and the target), writes `a` changes, seals them into batches and
+//! `R`, `J` and the target), writes changes, seals them into batches and
 //! drives the pages by hand (`support/drain_driver.rs`): one page frozen at a
 //! [`PausePoint`] of its apply while another runs, which either queues behind
 //! the frozen page (asserted with `pg_blocking_pids`) or runs through.
 //! Nothing sleeps or polls for convergence. After each scenario the pipeline
 //! settles and the target equals the live join
-//! (`trellis::staging::one_to_one_join_diverging_keys`), and `R` equals `a`.
+//! (`trellis::staging::one_to_one_join_diverging_keys`), `R` equals `a` and
+//! `M` equals `b`.
 //!
 //! A scenario runs on both join kinds, `LEFT` and `INNER`. A test is named
-//! for the #1375 family it ports, where it has one:
+//! for the #1371 or #1375 family it ports, where it has one:
 //!
 //! - `r17_…`: a stale Apply after a Re-derive (R17, the #392 shape).
 //! - `n…`: `NULL` join keys (N1–N6).
+//! - `f1_…` to `f15_…`: #1371's families of an `a` writer against a `b`
+//!   writer, each run with either page frozen at its commit while the other
+//!   queues on `J`: F1 an `a` insert ‖ a `b` insert of its key, F2 ‖ a `b`
+//!   delete of it, F3 an `a` move `k1 → k2` ‖ a `b` update of `k2`, F4 ‖ of
+//!   `k1` (and a `b` row moving off a key), F5 an `a` delete ‖ a `b` update
+//!   of its key, F7/F7b a `b` unique-key hand-off applied out of order, F13 a
+//!   fan-out past one batch, F15 a new `b` row's insert and update applied
+//!   out of order.
+//! - `m…`: #1375's mixed pages (M1–M6): a page holding an `a` key move and
+//!   the `b` change of its new key, racing another mixed page.
 //!
-//! The `b` side's families (M1–M6, the fan-out), Re-derives of `b` and
-//! truncates are #1397 to #1399's.
+//! Re-derives of `b` and truncates are #1398 and #1399's.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -128,7 +138,7 @@ async fn start_kinds(kinds: &[Kind], a_rows: &str, b_rows: &str) -> Driver {
             ("y", ValueType::Text),
         ],
         &definitions,
-        &["public.a"],
+        &["public.a", "public.b"],
     )
     .await
 }
@@ -190,6 +200,16 @@ async fn assert_kind(d: &Driver, kind: Kind) {
         .rows("select id::text, k, x, y from public.a order by id::text")
         .await;
     assert_eq!(held, live, "{kind:?} R (left) differs from a (right)");
+    let m = format!("{}.join1_{id}_m", trellis::config::DEFAULT_SCHEMA);
+    let held = d
+        .rows(&format!(
+            "select __from_key, k, w, tag from {m} where not __tombstone order by 1"
+        ))
+        .await;
+    let live = d
+        .rows("select id::text, k, w, tag from public.b order by id::text")
+        .await;
+    assert_eq!(held, live, "{kind:?} M (left) differs from b (right)");
 }
 
 /// Settles the pipeline and asserts every defined kind's target.
@@ -743,4 +763,498 @@ async fn the_newest_m_entry_on_a_key_is_the_applied_one() {
         .expect("a second live M entry on key 10");
     step(&mut d, "update public.a set x = 2 where id = 1").await;
     assert_eq!(total(&d, Kind::Left, 1).await, Some(2 + 5000));
+}
+
+/// The label a page's `M` pause points carry for `kind`'s definition.
+async fn m_label(d: &Driver, kind: Kind) -> String {
+    let id = definition_id(d, kind.target()).await;
+    format!("{}.join1_{id}_m", trellis::config::DEFAULT_SCHEMA)
+}
+
+/// Drains `first` frozen at its commit, then `second`, which must queue on a
+/// lock the first holds (a `J` row). Lets both finish, asserts nothing
+/// deadlocked, and checks the target.
+async fn race(d: &mut Driver, kind: Kind, first: i64, second: i64) {
+    let mut held = d
+        .drain_frozen(first, "first", &[(PausePoint::BeforeCommit, kind.target())])
+        .await;
+    let reached = held.reached(PausePoint::BeforeCommit).await;
+    let queued = d.drain_frozen(second, "second", &[]).await;
+    d.wait_blocked_behind(reached.backend_pid).await;
+    assert!(!queued.is_finished(), "{kind:?}: the second page queues");
+    d.release(&mut held, PausePoint::BeforeCommit).await;
+    held.finish().await;
+    queued.finish().await;
+    let deadlocks = d.deadlocks_logged();
+    assert!(deadlocks.is_empty(), "{deadlocks:?}");
+    assert_oracle(d, &[kind]).await;
+}
+
+/// Which of a family's two writers drains first, frozen at its commit.
+#[derive(Debug, Clone, Copy)]
+enum First {
+    A,
+    B,
+}
+
+/// One #1371 family: an `a` writer (`a_sql`) against a `b` writer (`b_sql`)
+/// on a key they share, each in its own batch. For both join kinds, the `a`
+/// page frozen at its commit while the `b` page queues, then the other way
+/// round.
+async fn family(a_sql: &str, b_sql: &str) {
+    family_on(A_ROWS, B_ROWS, a_sql, b_sql).await;
+}
+
+async fn family_on(a_rows: &str, b_rows: &str, a_sql: &str, b_sql: &str) {
+    for kind in KINDS {
+        for first in [First::A, First::B] {
+            let mut d = start_kinds(&[kind], a_rows, b_rows).await;
+            write(&d, a_sql).await;
+            let a = d.seal().await;
+            write(&d, b_sql).await;
+            let b = d.seal().await;
+            match first {
+                First::A => race(&mut d, kind, a, b).await,
+                First::B => race(&mut d, kind, b, a).await,
+            }
+        }
+    }
+}
+
+/// `b` changes apply through `M` and the fan-out: an insert matching an `a`
+/// row, an update of a key with several `a` rows, a key move off and onto a
+/// key, a key to `NULL`, a delete and a re-insert.
+#[tokio::test]
+async fn b_changes_insert_update_move_and_delete_rows() {
+    let _serial = serial().await;
+    let mut d = start(A_ROWS, B_ROWS).await;
+    step(&mut d, "insert into public.a values (5, 10, 5, 'five')").await;
+    for sql in [
+        // Row 3's key 30 had no match.
+        "insert into public.b values (4, 30, 300, 'thirty')",
+        // Rows 1 and 5 are on key 10.
+        "update public.b set w = 111, tag = 'TEN' where id = 1",
+        // Off key 20 (row 2 loses its match), then onto it.
+        "update public.b set k = 99 where id = 2",
+        "update public.b set k = 20 where id = 3",
+        "update public.b set k = null where id = 4",
+        "delete from public.b where id = 1",
+        "insert into public.b values (1, 10, 1000, 'back')",
+    ] {
+        step(&mut d, sql).await;
+        assert_oracle(&mut d, &KINDS).await;
+    }
+}
+
+/// A page with several changes to one `b` row applies the newest, and its
+/// fan-out covers the key the row left as well as the one it ends on.
+#[tokio::test]
+async fn a_page_with_several_changes_to_one_b_row_applies_the_newest() {
+    let _serial = serial().await;
+    let mut d = start(A_ROWS, B_ROWS).await;
+    write(&d, "update public.b set k = 30, w = 150 where id = 1").await;
+    write(&d, "update public.b set k = 50, w = 160 where id = 1").await;
+    write(&d, "delete from public.b where id = 2").await;
+    write(&d, "insert into public.b values (2, 10, 170, 'moved')").await;
+    let batch = d.seal().await;
+    d.drain(batch, "w").await;
+    assert_oracle(&mut d, &KINDS).await;
+}
+
+/// F1: an `a` insert on a key no `b` row has ‖ the `b` insert of that key.
+/// The page that runs second queues on `J[30]` and reads the other side's
+/// copy only once it has the lock, so whichever commits first, the other
+/// sees it (`join1_m_before_j`, `join1_no_j_lock`).
+#[tokio::test]
+async fn f1_an_a_page_on_a_key_reads_m_only_after_the_b_page_on_it_commits() {
+    let _serial = serial().await;
+    family(
+        "insert into public.a values (5, 30, 5, 'five')",
+        "insert into public.b values (4, 30, 300, 'thirty')",
+    )
+    .await;
+}
+
+/// F2: an `a` insert ‖ the `b` delete of its key.
+#[tokio::test]
+async fn f2_an_a_insert_races_the_b_delete_of_its_key() {
+    let _serial = serial().await;
+    family(
+        "insert into public.a values (5, 10, 5, 'five')",
+        "delete from public.b where id = 1",
+    )
+    .await;
+}
+
+/// F3: an `a` key move `10 → 20` ‖ a `b` update of `20`.
+#[tokio::test]
+async fn f3_an_a_move_races_a_b_update_of_its_new_key() {
+    let _serial = serial().await;
+    family(
+        "update public.a set k = 20 where id = 1",
+        "update public.b set w = 222 where id = 2",
+    )
+    .await;
+}
+
+/// F4: an `a` key move `10 → 20` ‖ a `b` update of `10`, the key it leaves.
+#[tokio::test]
+async fn f4_an_a_move_races_a_b_update_of_the_key_it_leaves() {
+    let _serial = serial().await;
+    family(
+        "update public.a set k = 20 where id = 1",
+        "update public.b set w = 111 where id = 1",
+    )
+    .await;
+}
+
+/// F4 on the `b` side: a `b` row moving off key 10 locks the key it leaves,
+/// which its `M` entry holds and its image's old key names
+/// (`join1_old_key_unlocked`), so it queues behind an `a` page inserting a
+/// row there, and its fan-out then finds that row.
+#[tokio::test]
+async fn f4_a_b_row_moving_off_a_key_locks_the_key_it_leaves() {
+    let _serial = serial().await;
+    family(
+        "insert into public.a values (5, 10, 5, 'five')",
+        "update public.b set k = 50 where id = 1",
+    )
+    .await;
+}
+
+/// F5: an `a` delete ‖ a `b` update of its key.
+#[tokio::test]
+async fn f5_an_a_delete_races_a_b_update_of_its_key() {
+    let _serial = serial().await;
+    family(
+        "delete from public.a where id = 1",
+        "update public.b set w = 111 where id = 1",
+    )
+    .await;
+}
+
+/// F7: a `b` unique-key hand-off (row 1 leaves key 10, row 2 takes it),
+/// drained in the wrong order, with an `a` insert on the key in the take's
+/// page. While only the take has applied, `M` holds two live entries on key
+/// 10 and the recompute reads the one the newer Apply wrote; the leave then
+/// recomputes the key again.
+#[tokio::test]
+async fn f7_a_b_hand_off_applied_out_of_order() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+        write(&d, "update public.b set k = 60 where id = 1").await;
+        let leave = d.seal().await;
+        write(&d, "update public.b set k = 10 where id = 2").await;
+        write(&d, "insert into public.a values (5, 10, 5, 'five')").await;
+        let take = d.seal().await;
+        d.drain(take, "take").await;
+        assert_eq!(total(&d, kind, 1).await, Some(1 + 200), "{kind:?}");
+        assert_eq!(total(&d, kind, 5).await, Some(5 + 200), "{kind:?}");
+        d.drain(leave, "leave").await;
+        assert_oracle(&mut d, &[kind]).await;
+    }
+}
+
+/// F7b: the two pages of a hand-off racing each other. Both lock key 10, so
+/// the second queues on it.
+#[tokio::test]
+async fn f7b_two_hand_off_pages_race() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        for take_first in [true, false] {
+            let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+            write(&d, "update public.b set k = 60 where id = 1").await;
+            let leave = d.seal().await;
+            write(&d, "update public.b set k = 10 where id = 2").await;
+            let take = d.seal().await;
+            if take_first {
+                race(&mut d, kind, take, leave).await;
+            } else {
+                race(&mut d, kind, leave, take).await;
+            }
+        }
+    }
+}
+
+/// F13: a fan-out past one keyset batch (25,000 `a` rows on key 10, three
+/// batches of 10,000) ‖ an `a` page moving a row onto the key. Either page
+/// frozen at its commit holds `J[10]` and the other queues.
+#[tokio::test]
+async fn f13_a_fan_out_of_several_batches_races_an_a_move_onto_its_key() {
+    let _serial = serial().await;
+    let a_rows = format!(
+        "{A_ROWS}, {}",
+        (100..25_100)
+            .map(|id| format!("({id}, 10, {id}, 'many')"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    family_on(
+        &a_rows,
+        B_ROWS,
+        "update public.a set k = 10 where id = 2",
+        "update public.b set w = 999 where id = 1",
+    )
+    .await;
+}
+
+/// F15: a new `b` row's insert and update drained out of order, the update's
+/// page holding its placeholder: the insert's page queues on it rather than
+/// overwriting it (`join1_no_placeholder`), and is then refused by I2.
+#[tokio::test]
+async fn f15_a_new_b_rows_insert_and_update_applied_out_of_order() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+        let label = m_label(&d, kind).await;
+        write(&d, "insert into public.b values (4, 30, 300, 'thirty')").await;
+        let older = d.seal().await;
+        write(&d, "update public.b set w = 333 where id = 4").await;
+        let newer = d.seal().await;
+        let mut held = d
+            .drain_frozen(newer, "newer", &[(PausePoint::AfterPlaceholders, &label)])
+            .await;
+        let reached = held.reached(PausePoint::AfterPlaceholders).await;
+        let queued = d.drain_frozen(older, "older", &[]).await;
+        d.wait_blocked_behind(reached.backend_pid).await;
+        d.release(&mut held, PausePoint::AfterPlaceholders).await;
+        held.finish().await;
+        queued.finish().await;
+        assert_eq!(total(&d, kind, 3).await, Some(3 + 333), "{kind:?}");
+        assert_oracle(&mut d, &[kind]).await;
+    }
+}
+
+/// An older `b` Apply drained after a newer one is refused by its `M` entry's
+/// applied position (F12 on the `b` side, `join1_vis_only`).
+#[tokio::test]
+async fn an_older_b_apply_after_a_newer_one_is_refused() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+        write(&d, "update public.b set w = 101 where id = 1").await;
+        let older = d.seal().await;
+        write(&d, "update public.b set w = 102 where id = 1").await;
+        let newer = d.seal().await;
+        d.drain(newer, "newer").await;
+        d.drain(older, "older").await;
+        assert_eq!(total(&d, kind, 1).await, Some(1 + 102), "{kind:?}");
+        assert_oracle(&mut d, &[kind]).await;
+    }
+}
+
+/// A mixed page: an `a` row moving onto key 20 and the `b` change of key 20,
+/// in one page. The `a` row is written from the page's own new `M` entry, and
+/// the fan-out recomputes the key's other rows. Then the two changes in two
+/// pages, the `b` change drained before the `a` change and after it.
+#[tokio::test]
+async fn m_a_mixed_page_applies_an_a_move_and_the_b_change_of_its_new_key() {
+    let _serial = serial().await;
+    let a_change = "update public.a set k = 20 where id = 1";
+    let b_change = "update public.b set w = 250 where id = 2";
+    let mut d = start(A_ROWS, B_ROWS).await;
+    write(&d, a_change).await;
+    write(&d, b_change).await;
+    let batch = d.seal().await;
+    d.drain(batch, "mixed").await;
+    assert_oracle(&mut d, &KINDS).await;
+    for b_first in [true, false] {
+        let mut d = start(A_ROWS, B_ROWS).await;
+        write(&d, a_change).await;
+        let a = d.seal().await;
+        write(&d, b_change).await;
+        let b = d.seal().await;
+        let order = if b_first { [b, a] } else { [a, b] };
+        for batch in order {
+            d.drain(batch, "one").await;
+        }
+        assert_oracle(&mut d, &KINDS).await;
+    }
+}
+
+/// Two mixed pages racing (M1–M6): one moves `a` row 1 from 10 to 20 and
+/// changes `b`'s key 20, the other moves `a` row 2 from 20 to 10 and changes
+/// key 10. Each locks both keys in one sorted `J` statement, so the second
+/// queues on the first and neither deadlocks, in either order.
+#[tokio::test]
+async fn m_two_crossing_mixed_pages_queue_on_j_without_deadlock() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        for one_first in [true, false] {
+            let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+            write(&d, "update public.a set k = 20 where id = 1").await;
+            write(&d, "update public.b set w = 250 where id = 2").await;
+            let one = d.seal().await;
+            write(&d, "update public.a set k = 10 where id = 2").await;
+            write(&d, "update public.b set w = 150 where id = 1").await;
+            let two = d.seal().await;
+            if one_first {
+                race(&mut d, kind, one, two).await;
+            } else {
+                race(&mut d, kind, two, one).await;
+            }
+        }
+    }
+}
+
+/// A mixed page racing a `b` page on the key its `a` row moves to and a
+/// page of `a` changes on the key it leaves.
+#[tokio::test]
+async fn m_a_mixed_page_races_pages_of_either_side() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        for (other, a_first) in [
+            ("update public.b set w = 222 where id = 2", true),
+            ("update public.b set w = 222 where id = 2", false),
+            ("insert into public.a values (5, 10, 5, 'five')", true),
+            ("insert into public.a values (5, 10, 5, 'five')", false),
+        ] {
+            let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+            write(&d, "update public.a set k = 20 where id = 1").await;
+            write(&d, "update public.b set w = 111 where id = 1").await;
+            let mixed = d.seal().await;
+            write(&d, other).await;
+            let single = d.seal().await;
+            if a_first {
+                race(&mut d, kind, mixed, single).await;
+            } else {
+                race(&mut d, kind, single, mixed).await;
+            }
+        }
+    }
+}
+
+/// The status and pause reason of `kind`'s definition.
+async fn paused_reason(d: &Driver, kind: Kind) -> (String, Option<String>) {
+    let row = d
+        .ctl
+        .query_one(
+            "select d.status::text, \
+                    (select f.error from capture_failures f where f.transform_id = d.id \
+                     order by f.error limit 1) \
+             from transform_definitions d where d.target_table = $1",
+            &[&kind.target()],
+        )
+        .await
+        .expect("read the definition's status");
+    (row.get(0), row.get(1))
+}
+
+/// A page whose `b` changes would recompute more `a` rows than the fan-out
+/// cap halts the transform with the reason, writing nothing.
+#[tokio::test]
+async fn a_fan_out_past_the_cap_halts_the_transform() {
+    let _serial = serial().await;
+    let mut d = start_kinds(&[Kind::Left], A_ROWS, B_ROWS).await;
+    // Two `a` rows on key 10.
+    step(&mut d, "insert into public.a values (5, 10, 5, 'five')").await;
+    trellis::defs::join_one_to_one::set_max_fanout(1);
+    write(&d, "update public.b set w = 999 where id = 1").await;
+    let batch = d.seal().await;
+    let result = d
+        .drain_frozen(batch, "capped", &[])
+        .await
+        .finish_result()
+        .await;
+    trellis::defs::join_one_to_one::set_max_fanout(0);
+    result.expect("the halt pauses the transform and the drain goes on");
+    let (status, reason) = paused_reason(&d, Kind::Left).await;
+    assert_eq!(status, "paused");
+    let reason = reason.expect("a reason");
+    assert!(
+        reason.contains("more than 1 rows")
+            && reason.contains("TRELLIS_ONE_TO_ONE_JOIN_MAX_FANOUT"),
+        "{reason}"
+    );
+    assert_eq!(
+        total(&d, Kind::Left, 1).await,
+        Some(1 + 100),
+        "nothing written"
+    );
+}
+
+/// A field that fails on one row of a fan-out halts the transform, naming the
+/// row and the field, rather than charging the `b` change: the fan-out's
+/// batches are bisected under savepoints down to the row, whose fields are
+/// probed one by one. Nothing is quarantined, and no other row is written.
+#[tokio::test]
+async fn a_field_failing_on_a_fan_out_row_halts_naming_the_row() {
+    let _serial = serial().await;
+    let mut d = start_kinds(&[Kind::Left], A_ROWS, B_ROWS).await;
+    // Rows 5 to 40 on key 10; row 23 overflows `x + w` once `w` grows.
+    let rows: Vec<String> = (5..=40)
+        .map(|id| {
+            let x = if id == 23 { 2_147_483_000 } else { id };
+            format!("({id}, 10, {x}, 'r')")
+        })
+        .collect();
+    step(
+        &mut d,
+        &format!("insert into public.a values {}", rows.join(", ")),
+    )
+    .await;
+    write(&d, "update public.b set w = 1000 where id = 1").await;
+    let batch = d.seal().await;
+    d.drain(batch, "poisoned").await;
+    let (status, reason) = paused_reason(&d, Kind::Left).await;
+    assert_eq!(status, "paused");
+    let reason = reason.expect("a reason");
+    assert!(
+        reason.contains("fan-out fails")
+            && reason.contains("23 (total: integer out of range)")
+            && !reason.contains("maybe more"),
+        "{reason}"
+    );
+    assert_eq!(
+        total(&d, Kind::Left, 5).await,
+        Some(5 + 100),
+        "nothing written"
+    );
+    let poisoned = d.rows("select key from poison").await;
+    assert!(poisoned.is_empty(), "{poisoned:?}");
+}
+
+/// A text join key with a collation: `K`, the held-key checks and the
+/// fan-out cast each side's key to `J`'s type and collation before comparing
+/// its text.
+#[tokio::test]
+async fn a_collated_text_key_applies_both_sides() {
+    let _serial = serial().await;
+    set_enabled(true);
+    let mut d = Driver::start(
+        "create table public.c (id integer primary key, k text collate \"C\", x integer); \
+         create table public.e (id integer primary key, k text collate \"C\", w integer); \
+         create unique index on public.e (k); \
+         insert into public.c values (1, 'p', 1), (2, 'p', 2), (3, 'q', 3); \
+         insert into public.e values (1, 'p', 100), (2, 'q', 200)",
+        &[("id", int4()), ("k", ValueType::Text), ("x", int4())],
+        &[
+            "TRANSFORM ct FROM public.c LEFT JOIN public.e ON c.k = e.k \
+           SELECT c.x + COALESCE(e.w, 0) AS total",
+        ],
+        &["public.c", "public.e"],
+    )
+    .await;
+    for sql in [
+        "update public.e set w = 111 where id = 1",
+        "update public.c set k = 'q' where id = 1",
+        "update public.e set k = 'r' where id = 2",
+        "update public.e set k = 'q', w = 150 where id = 1",
+    ] {
+        step(&mut d, sql).await;
+        d.settle().await;
+        let actual = d.rows("select id, total from public.ct order by id").await;
+        let expected = d
+            .rows(
+                "select c.id, c.x + coalesce(e.w, 0) from public.c c \
+                 left join public.e e on c.k = e.k order by c.id",
+            )
+            .await;
+        assert_eq!(actual, expected, "after {sql}");
+        let diverging = trellis::staging::one_to_one_join_diverging_keys(d.pool(), "public.ct")
+            .await
+            .expect("self_check");
+        assert!(diverging.is_empty(), "after {sql}: {diverging:?}");
+    }
 }

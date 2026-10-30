@@ -66,8 +66,9 @@ pub mod defs {
     /// turn the grammar on, once, before a client starts. It is removed with
     /// the epic's last milestone.
     pub use crate::defs::join_one_to_one::{
-        KNOB_ENV as ONE_TO_ONE_JOIN_ENV, enabled as one_to_one_join_enabled,
-        set_enabled as set_one_to_one_join,
+        KNOB_ENV as ONE_TO_ONE_JOIN_ENV, MAX_FANOUT_ENV as ONE_TO_ONE_JOIN_MAX_FANOUT_ENV,
+        enabled as one_to_one_join_enabled, set_enabled as set_one_to_one_join,
+        set_max_fanout as set_one_to_one_join_max_fanout,
     };
 
     pub use crate::float::FloatWidth;
