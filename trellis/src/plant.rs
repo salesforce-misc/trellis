@@ -196,7 +196,8 @@ pub enum Plant {
     /// change drained after a Re-derive read a newer one puts its value back.
     ///
     /// Pinned by `join_one_to_one_interleavings`'s
-    /// `r17_a_stale_apply_after_a_rederive_is_refused`.
+    /// `r17_a_stale_apply_after_a_rederive_is_refused` (`R`) and
+    /// `r17_a_stale_b_apply_after_a_b_rederive_is_refused` (`M`).
     Join1LsnOnly,
     /// ADR-0002's I2 on a 1-1 `JOIN`'s hidden ledger keeps only its
     /// visibility check: an Apply older than the entry's applied position
@@ -212,7 +213,9 @@ pub enum Plant {
     /// row.
     ///
     /// Pinned by `join_one_to_one_interleavings`'s
-    /// `n_two_pages_on_a_null_keyed_row_queue_on_its_entry`.
+    /// `n_two_pages_on_a_null_keyed_row_queue_on_its_entry` and
+    /// `n_a_rederive_and_an_apply_of_a_null_keyed_row_queue_on_its_entry`
+    /// (`R` and `M`).
     Join1NoEntryLock,
     /// ADR-0021 (#1371 F4/F5, #1375 `join1_old_key_unlocked`): a 1-1 `JOIN`
     /// page locks only its changes' new keys: it leaves the key its `R` or
@@ -231,8 +234,26 @@ pub enum Plant {
     /// refused.
     ///
     /// Pinned by `join_one_to_one_interleavings`'s
-    /// `a_change_between_a_rederives_read_and_its_snapshot_is_applied`.
+    /// `a_change_between_a_rederives_read_and_its_snapshot_is_applied` (`R`)
+    /// and `a_b_change_between_a_b_rederives_read_and_its_snapshot_is_applied`
+    /// (`M`).
     Join1SnapshotAfterRead,
+    /// ADR-0021 (#1375 R19, `rd_nokey`): a 1-1 `JOIN` page doesn't check that
+    /// the join key its Re-derive read of an `a` row found is in the key set
+    /// it locked. A row that moved onto a key after the page's unlocked read
+    /// of it is then written under no `J` lock on that key, so a `b` page on
+    /// the key reads around it.
+    ///
+    /// Pinned by `join_one_to_one_interleavings`'s
+    /// `r19_an_a_rederive_whose_row_moved_onto_a_held_key_retries`.
+    Join1RdNoKey,
+    /// ADR-0021 (#1375 R18, `brd_nokey`): the same for a Re-derive of a `b`
+    /// row: its `M` entry is written, and its new key fanned out to, under no
+    /// `J` lock on that key, so an `a` page on the key reads around it.
+    ///
+    /// Pinned by `join_one_to_one_interleavings`'s
+    /// `r18_a_b_rederive_whose_row_moved_onto_a_held_key_retries`.
+    Join1BrdNoKey,
     /// ADR-0021 (#1371 F14/F15, #1375 `join1_no_placeholder`): a 1-1 `JOIN`
     /// page inserts no placeholder for an `R` or `M` entry it doesn't find,
     /// so a page that finds none locks nothing and its change is lost, and
@@ -277,6 +298,8 @@ impl Plant {
         Plant::Join1NoEntryLock,
         Plant::Join1OldKeyUnlocked,
         Plant::Join1SnapshotAfterRead,
+        Plant::Join1RdNoKey,
+        Plant::Join1BrdNoKey,
         Plant::Join1NoPlaceholder,
         Plant::Join1MBeforeJ,
     ];
@@ -303,6 +326,8 @@ impl Plant {
             Plant::Join1NoEntryLock => "join1_no_entry_lock",
             Plant::Join1OldKeyUnlocked => "join1_old_key_unlocked",
             Plant::Join1SnapshotAfterRead => "join1_snapshot_after_read",
+            Plant::Join1RdNoKey => "join1_rd_no_key",
+            Plant::Join1BrdNoKey => "join1_brd_no_key",
             Plant::Join1NoPlaceholder => "join1_no_placeholder",
             Plant::Join1MBeforeJ => "join1_m_before_j",
         }

@@ -30,7 +30,12 @@
 //! - `m…`: #1375's mixed pages (M1–M6): a page holding an `a` key move and
 //!   the `b` change of its new key, racing another mixed page.
 //!
-//! Re-derives of `b` and truncates are #1398 and #1399's.
+//! - `r…`: #1375's Re-derives of either side (R1–R19) against a change of
+//!   the same row, of the other side, or a key move: R17 a stale Apply after
+//!   a Re-derive, R18/R19 a row that moved onto a key after the page's
+//!   unlocked read of it, which the page then holds no `J` row for.
+//!
+//! Truncates are #1399's.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -536,15 +541,20 @@ async fn total(d: &Driver, kind: Kind, id: i32) -> Option<i32> {
 }
 
 /// Runs `sql` on `a` with its capture triggers disabled, in one transaction:
-/// a change no entry will ever hear about. (Capture triggers are `ENABLE
-/// ALWAYS`, so `session_replication_role = replica` doesn't skip them.)
+/// a change no entry will ever hear about.
 async fn write_uncaptured(d: &Driver, sql: &str) {
+    write_uncaptured_on(d, "public.a", sql).await;
+}
+
+/// [`write_uncaptured`] on `table`. (Capture triggers are `ENABLE ALWAYS`, so
+/// `session_replication_role = replica` doesn't skip them.)
+async fn write_uncaptured_on(d: &Driver, table: &str, sql: &str) {
     let toggle = |action: &str| {
         format!(
             "do $$ declare t text; begin \
                  for t in select tgname from pg_trigger \
-                          where tgrelid = 'public.a'::regclass and not tgisinternal loop \
-                     execute format('alter table public.a {action} trigger %I', t); \
+                          where tgrelid = '{table}'::regclass and not tgisinternal loop \
+                     execute format('alter table {table} {action} trigger %I', t); \
                  end loop; \
              end $$;"
         )
@@ -1291,23 +1301,63 @@ async fn a_field_failing_on_a_fan_out_row_halts_naming_the_row() {
     assert!(poisoned.is_empty(), "{poisoned:?}");
 }
 
-/// A Re-derive of a `b` row halts the transform with the reason rather than
-/// run a path that isn't built (#1398), and writes nothing: one staged by a
-/// producer, and one the build-start rule makes of a `b` change whose page
-/// predates the build.
+/// A Re-derive of `b` rows repairs changes capture never saw: a `w` update
+/// on a key with an `a` row (its fan-out), a move onto a key, a delete, an
+/// insert onto a `NULL` key and one onto a key no `a` row has.
 #[tokio::test]
-async fn a_rederive_of_a_b_row_halts_the_transform() {
+async fn a_b_rederive_repairs_uncaptured_changes() {
     let _serial = serial().await;
-    let mut d = start_kinds(&[Kind::Left], A_ROWS, B_ROWS).await;
-    d.stage_recomputes("public.b", &["1"]).await;
+    let mut d = start(A_ROWS, B_ROWS).await;
+    for sql in [
+        "update public.b set w = 150 where id = 1",
+        "update public.b set k = 30, tag = 'thirty' where id = 3",
+        "delete from public.b where id = 2",
+        "insert into public.b values (4, null, 4000, 'none')",
+        "insert into public.b values (5, 50, 500, 'fifty')",
+    ] {
+        write_uncaptured_on(&d, "public.b", sql).await;
+    }
+    d.stage_recomputes("public.b", &["1", "2", "3", "4", "5"])
+        .await;
     let batch = d.seal().await;
     d.drain(batch, "rederive b").await;
-    let (status, reason) = paused_reason(&d, Kind::Left).await;
-    assert_eq!(status, "paused");
-    let reason = reason.expect("a reason");
-    assert!(reason.contains("Re-derive of the joined table"), "{reason}");
-    assert_eq!(total(&d, Kind::Left, 1).await, Some(1 + 100));
+    assert_oracle(&mut d, &KINDS).await;
+}
 
+/// A Re-derive of a `b` row with no `M` entry reads its live key before the
+/// `J` lock, so it commits on its first attempt, and its fan-out reaches the
+/// `a` row on the key.
+#[tokio::test]
+async fn a_b_rederive_of_a_row_with_no_entry_commits_on_its_first_attempt() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+        write_uncaptured_on(
+            &d,
+            "public.b",
+            "insert into public.b values (4, 30, 300, 'thirty')",
+        )
+        .await;
+        d.stage_recomputes("public.b", &["4"]).await;
+        let batch = d.seal().await;
+        let moves = trellis::dev::interleave::join_key_moves();
+        d.drain(batch, "rederive b").await;
+        assert_eq!(
+            trellis::dev::interleave::join_key_moves(),
+            moves,
+            "no retry for a row the entry doesn't hold yet"
+        );
+        assert_eq!(total(&d, kind, 3).await, Some(3 + 300), "{kind:?}");
+        assert_oracle(&mut d, &[kind]).await;
+    }
+}
+
+/// A page of `b` changes whose segment predates the build re-derives its
+/// `b` rows (the build-start rule), as an `a` page does: an update, a key
+/// move and a delete.
+#[tokio::test]
+async fn a_b_page_that_predates_the_build_rederives() {
+    let _serial = serial().await;
     set_enabled(true);
     let ddl = format!(
         "{DDL}; insert into public.a values {A_ROWS}; insert into public.b values {B_ROWS}"
@@ -1326,19 +1376,336 @@ async fn a_rederive_of_a_b_row_halts_the_transform() {
     )
     .await;
     write(&d, "update public.b set w = 111 where id = 1").await;
+    write(&d, "update public.b set k = 30 where id = 3").await;
+    write(&d, "delete from public.b where id = 2").await;
     trellis::staging::build::settle_builds(d.pool()).await;
     d.settle().await;
+    assert_kind(&d, Kind::Left).await;
     let (status, reason) = paused_reason(&d, Kind::Left).await;
-    assert_eq!(status, "paused");
-    let reason = reason.expect("a reason");
-    assert!(reason.contains("Re-derive of the joined table"), "{reason}");
+    assert_eq!(status, "live", "{reason:?}");
+}
+
+/// R18 (`brd_nokey`): a `b` row moves onto key 30 after a Re-derive page's
+/// unlocked read of it, while an `a` page inserting a row on 30 holds `J[30]`
+/// uncommitted. The Re-derive's read finds 30 outside its locked set, so it
+/// rolls back and its retry queues on `J[30]`; its fan-out then reaches the
+/// new `a` row. Planted `join1_brd_no_key` writes the `M` entry and fans out
+/// on 30 without the lock, around the `a` row, which keeps no match.
+#[tokio::test]
+async fn r18_a_b_rederive_whose_row_moved_onto_a_held_key_retries() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+        d.stage_recomputes("public.b", &["1"]).await;
+        let rederive = d.seal().await;
+        write(&d, "insert into public.a values (5, 30, 5, 'five')").await;
+        let insert = d.seal().await;
+        let moves = trellis::dev::interleave::join_key_moves();
+        let mut page = d
+            .drain_frozen(
+                rederive,
+                "rederive b",
+                &[(PausePoint::BeforeJoin1Lock, kind.target())],
+            )
+            .await;
+        page.reached(PausePoint::BeforeJoin1Lock).await;
+        // Captured, left for the settle to drain: the Re-derive's basis sees
+        // it, so its Apply is refused.
+        write(&d, "update public.b set k = 30 where id = 1").await;
+        let mut held = d
+            .drain_frozen(insert, "a", &[(PausePoint::BeforeCommit, kind.target())])
+            .await;
+        let reached = held.reached(PausePoint::BeforeCommit).await;
+        d.release(&mut page, PausePoint::BeforeJoin1Lock).await;
+        let blocked = queued_or_finished(&d, reached.backend_pid, &page).await;
+        d.release(&mut held, PausePoint::BeforeCommit).await;
+        held.finish().await;
+        let result = page.finish_result().await;
+        if !blocked {
+            ran_through(&mut d, kind, result, moves).await;
+        }
+        result.expect("the Re-derive page");
+        assert_eq!(
+            trellis::dev::interleave::join_key_moves(),
+            moves + 1,
+            "the Re-derive's read found a key it hadn't locked"
+        );
+        assert_oracle(&mut d, &[kind]).await;
+    }
+}
+
+/// R19 (`rd_nokey`), R18's mirror: an `a` row moves onto key 30 after a
+/// Re-derive page's unlocked read of it, while a `b` page inserting a row on
+/// 30 holds `J[30]` uncommitted. The retry queues on `J[30]` and reads the
+/// new `M` entry. Planted `join1_rd_no_key` writes the row on 30 without the
+/// lock, from `M` as it was before the `b` page.
+#[tokio::test]
+async fn r19_an_a_rederive_whose_row_moved_onto_a_held_key_retries() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+        d.stage_recomputes("public.a", &["1"]).await;
+        let rederive = d.seal().await;
+        write(&d, "insert into public.b values (4, 30, 300, 'thirty')").await;
+        let insert = d.seal().await;
+        let moves = trellis::dev::interleave::join_key_moves();
+        let mut page = d
+            .drain_frozen(
+                rederive,
+                "rederive a",
+                &[(PausePoint::BeforeJoin1Lock, kind.target())],
+            )
+            .await;
+        page.reached(PausePoint::BeforeJoin1Lock).await;
+        write(&d, "update public.a set k = 30 where id = 1").await;
+        let mut held = d
+            .drain_frozen(insert, "b", &[(PausePoint::BeforeCommit, kind.target())])
+            .await;
+        let reached = held.reached(PausePoint::BeforeCommit).await;
+        d.release(&mut page, PausePoint::BeforeJoin1Lock).await;
+        let blocked = queued_or_finished(&d, reached.backend_pid, &page).await;
+        d.release(&mut held, PausePoint::BeforeCommit).await;
+        held.finish().await;
+        let result = page.finish_result().await;
+        if !blocked {
+            ran_through(&mut d, kind, result, moves).await;
+        }
+        result.expect("the Re-derive page");
+        assert_eq!(
+            trellis::dev::interleave::join_key_moves(),
+            moves + 1,
+            "the Re-derive's read found a key it hadn't locked"
+        );
+        assert_eq!(total(&d, kind, 1).await, Some(1 + 300), "{kind:?}");
+        assert_oracle(&mut d, &[kind]).await;
+    }
+}
+
+/// `rd_latesnap` on `M`: a `b` change that commits after a `b` Re-derive's
+/// read statement is not in the row it wrote, so it must not be in the
+/// entry's basis (`join1_snapshot_after_read`): its Apply, drained after the
+/// Re-derive, applies and fans out.
+#[tokio::test]
+async fn a_b_change_between_a_b_rederives_read_and_its_snapshot_is_applied() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+        let label = m_label(&d, kind).await;
+        d.stage_recomputes("public.b", &["1"]).await;
+        let rederive = d.seal().await;
+        let mut page = d
+            .drain_frozen(
+                rederive,
+                "rederive b",
+                &[(PausePoint::AfterRederiveRead, &label)],
+            )
+            .await;
+        page.reached(PausePoint::AfterRederiveRead).await;
+        write(&d, "update public.b set w = 500 where id = 1").await;
+        let change = d.seal().await;
+        d.release(&mut page, PausePoint::AfterRederiveRead).await;
+        page.finish().await;
+        d.drain(change, "change").await;
+        assert_eq!(total(&d, kind, 1).await, Some(1 + 500), "{kind:?}");
+        assert_oracle(&mut d, &[kind]).await;
+    }
+}
+
+/// R17 on `M`: a `b` Re-derive read the row after two changes, then the
+/// older change's Apply arrives. The entry's basis saw it, so it is refused
+/// (`join1_lsn_only`) and the fan-out keeps the re-derived `w`.
+#[tokio::test]
+async fn r17_a_stale_b_apply_after_a_b_rederive_is_refused() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+        write(&d, "update public.b set w = 110 where id = 1").await;
+        let older = d.seal().await;
+        write(&d, "update public.b set w = 120 where id = 1").await;
+        d.stage_recomputes("public.b", &["1"]).await;
+        let rederive = d.seal().await;
+        d.drain(rederive, "rederive").await;
+        assert_eq!(total(&d, kind, 1).await, Some(1 + 120));
+        d.drain(older, "older").await;
+        assert_eq!(total(&d, kind, 1).await, Some(1 + 120), "{kind:?}");
+        assert_oracle(&mut d, &[kind]).await;
+    }
+}
+
+/// One writer of a Re-derive family: a Re-derive of `table`'s `keys`, a
+/// captured change, or both in one page.
+#[derive(Debug, Clone, Copy)]
+enum Writer {
+    Rederive(&'static str, &'static [&'static str]),
+    Change(&'static str),
+    Both(&'static str, &'static [&'static str], &'static str),
+}
+
+impl Writer {
+    async fn seal(self, d: &mut Driver) -> i64 {
+        match self {
+            Writer::Rederive(table, keys) => d.stage_recomputes(table, keys).await,
+            Writer::Change(sql) => write(d, sql).await,
+            Writer::Both(table, keys, sql) => {
+                write(d, sql).await;
+                d.stage_recomputes(table, keys).await;
+            }
+        }
+        d.seal().await
+    }
+}
+
+/// One Re-derive family: two writers on a key they share, each in its own
+/// batch, for both join kinds, with either one's page frozen at its commit
+/// while the other queues.
+async fn rederive_family(first: Writer, second: Writer) {
+    for kind in KINDS {
+        for flip in [false, true] {
+            let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+            let one = first.seal(&mut d).await;
+            let two = second.seal(&mut d).await;
+            if flip {
+                race(&mut d, kind, two, one).await;
+            } else {
+                race(&mut d, kind, one, two).await;
+            }
+        }
+    }
+}
+
+/// Re-derives of either side against a change of the same row, of the other
+/// side on its key, a key move onto or off it, another Re-derive and a mixed
+/// page: each pair queues on a shared `J` row, nothing deadlocks, and the
+/// target is the live join whichever page commits first.
+#[tokio::test]
+async fn r_rederives_race_changes_of_either_side() {
+    let _serial = serial().await;
+    const B1: Writer = Writer::Rederive("public.b", &["1"]);
+    const A1: Writer = Writer::Rederive("public.a", &["1"]);
+    for (first, second) in [
+        // A `b` Re-derive against an `a` insert on its key, an update of the
+        // same row, and the row's move off the key.
+        (
+            B1,
+            Writer::Change("insert into public.a values (5, 10, 5, 'five')"),
+        ),
+        (
+            B1,
+            Writer::Change("update public.b set w = 101 where id = 1"),
+        ),
+        (
+            B1,
+            Writer::Change("update public.b set k = 50 where id = 1"),
+        ),
+        // An `a` Re-derive against a `b` update of its key, a `b` row moving
+        // onto its key, and its own move.
+        (
+            A1,
+            Writer::Change("update public.b set w = 102 where id = 1"),
+        ),
+        (
+            Writer::Rederive("public.a", &["3"]),
+            Writer::Change("update public.b set k = 30 where id = 3"),
+        ),
+        (
+            A1,
+            Writer::Change("update public.a set k = 20 where id = 1"),
+        ),
+        // Re-derives of both sides on one key, and a page with both against
+        // a `b` change of the key.
+        (A1, B1),
+        (
+            Writer::Both("public.b", &["1"], "update public.a set x = 9 where id = 1"),
+            Writer::Change("update public.b set w = 103 where id = 1"),
+        ),
+    ] {
+        rederive_family(first, second).await;
+    }
+}
+
+/// N-family: a row with a `NULL` join key has no `J` row, so only its entry
+/// lock orders a Re-derive of it against an Apply (`join1_no_entry_lock`).
+/// The Re-derive is frozen after its read; the Apply's change commits after
+/// that read and its page queues on the entry, then applies over the
+/// re-derived state. Planted, the Apply runs first and the Re-derive then
+/// writes the older row over it. For both sides: `a` row 4 and a `b` row on
+/// a `NULL` key.
+#[tokio::test]
+async fn n_a_rederive_and_an_apply_of_a_null_keyed_row_queue_on_its_entry() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        for (table, change) in [
+            ("public.a", "update public.a set x = 44 where id = 4"),
+            ("public.b", "update public.b set w = 4400 where id = 4"),
+        ] {
+            let mut d = start_kinds(
+                &[kind],
+                A_ROWS,
+                &format!("{B_ROWS}, (4, null, 4000, 'none')"),
+            )
+            .await;
+            let label = if table == "public.a" {
+                kind.target().to_string()
+            } else {
+                m_label(&d, kind).await
+            };
+            d.stage_recomputes(table, &["4"]).await;
+            let rederive = d.seal().await;
+            let mut page = d
+                .drain_frozen(
+                    rederive,
+                    "rederive",
+                    &[(PausePoint::AfterRederiveRead, &label)],
+                )
+                .await;
+            let reached = page.reached(PausePoint::AfterRederiveRead).await;
+            write(&d, change).await;
+            let batch = d.seal().await;
+            let moves = trellis::dev::interleave::join_key_moves();
+            let apply = d.drain_frozen(batch, "apply", &[]).await;
+            let blocked = queued_or_finished(&d, reached.backend_pid, &apply).await;
+            d.release(&mut page, PausePoint::AfterRederiveRead).await;
+            page.finish().await;
+            let result = apply.finish_result().await;
+            if !blocked {
+                ran_through(&mut d, kind, result, moves).await;
+            }
+            result.expect("the Apply page");
+            assert_oracle(&mut d, &[kind]).await;
+        }
+    }
+}
+
+/// N-family: Re-derives move rows of either side onto and off a `NULL` key
+/// (changes capture never saw), and re-derive a row that stays on one.
+#[tokio::test]
+async fn n_rederives_move_rows_onto_and_off_a_null_key() {
+    let _serial = serial().await;
+    let mut d = start(A_ROWS, &format!("{B_ROWS}, (4, null, 4000, 'none')")).await;
+    write_uncaptured(&d, "update public.a set k = 10 where id = 4").await;
+    write_uncaptured(&d, "update public.a set k = null where id = 2").await;
+    write_uncaptured_on(&d, "public.b", "update public.b set k = 30 where id = 4").await;
+    write_uncaptured_on(&d, "public.b", "update public.b set k = null where id = 1").await;
+    d.stage_recomputes("public.a", &["2", "4"]).await;
+    d.stage_recomputes("public.b", &["1", "3", "4"]).await;
+    let batch = d.seal().await;
+    d.drain(batch, "rederive").await;
+    assert_oracle(&mut d, &KINDS).await;
+    // A row that stays on a `NULL` key re-derives to the same state.
+    write_uncaptured_on(&d, "public.b", "update public.b set w = 1 where id = 1").await;
+    d.stage_recomputes("public.a", &["2"]).await;
+    d.stage_recomputes("public.b", &["1"]).await;
+    let batch = d.seal().await;
+    d.drain(batch, "again").await;
+    assert_oracle(&mut d, &KINDS).await;
 }
 
 /// A `b` side that is another transform's 1-1 target, joined on its primary
 /// key: the upstream's writes reach the join through the target-mutation
 /// seam's image feed as Applies with images, which the `b` page applies like
 /// captured ones (an update, a delete, a re-insert), and an `a` move after
-/// them reads the new `M`.
+/// them reads the new `M`. A Re-derive of the upstream's rows (a seam
+/// `Recompute`) reads the target live.
 #[tokio::test]
 async fn a_chained_b_side_applies_the_seams_images() {
     let _serial = serial().await;
@@ -1404,6 +1771,22 @@ async fn a_chained_b_side_applies_the_seams_images() {
             .await;
         assert_eq!(status, ["(live)", "(live)"], "after {sql}");
     }
+    d.stage_recomputes("public.tb", &["10", "20"]).await;
+    let batch = d.seal().await;
+    d.drain(batch, "rederive tb").await;
+    d.settle().await;
+    let actual = d.rows("select id, total from public.jc order by id").await;
+    let expected = d
+        .rows(
+            "select a.id, a.x + coalesce(b.w, 0) from public.a a \
+             left join public.bsrc b on a.k = b.id order by a.id",
+        )
+        .await;
+    assert_eq!(actual, expected, "after a Re-derive of tb");
+    let status = d
+        .rows("select status::text from transform_definitions order by id")
+        .await;
+    assert_eq!(status, ["(live)", "(live)"], "after a Re-derive of tb");
 }
 
 /// A text join key with a collation: `K`, the held-key checks and the
@@ -1455,7 +1838,8 @@ async fn a_collated_text_key_applies_both_sides() {
 /// relations (`r`, `s`, `b`, `m`, `l`, `doc`, `img`, `k0`). A page whose
 /// first change of the target is a `b` change still writes the target by
 /// `a`'s key, in a `b`-only page, a mixed page and a `b` key move, on both
-/// join kinds.
+/// join kinds. Then Re-derives of either side, alone and in one page, repair
+/// changes capture never saw.
 #[tokio::test]
 async fn sides_keyed_differently_with_alias_named_columns_apply() {
     let _serial = serial().await;
@@ -1496,25 +1880,74 @@ async fn sides_keyed_differently_with_alias_named_columns_apply() {
     ] {
         step(&mut d, sql).await;
         d.settle().await;
-        for (target, kind) in [("public.ol", "left"), ("public.oi", "inner")] {
-            let actual = d
-                .rows(&format!(
-                    "select order_no, s as c1, b as c2, r as c3, m as c4, l as c5 \
-                     from {target} order by order_no"
-                ))
-                .await;
-            let expected = d
-                .rows(&format!(
-                    "select o.order_no, o.r + coalesce(cu.b, 0) as c1, cu.doc as c2, cu.img as c3, \
-                     cu.k0 as c4, o.l as c5 \
-                     from public.o o {kind} join public.cu cu on o.s = cu.m order by o.order_no"
-                ))
-                .await;
-            assert_eq!(actual, expected, "{target} after {sql}");
-            let diverging = trellis::staging::one_to_one_join_diverging_keys(d.pool(), target)
-                .await
-                .expect("self_check");
-            assert!(diverging.is_empty(), "{target} after {sql}: {diverging:?}");
-        }
+        assert_ordered_join(&d, sql).await;
+    }
+    for (table, sql, keys) in [
+        (
+            "public.cu",
+            "update public.cu set b = 333, doc = 'd2c', k0 = 4 where cust_id = 20",
+            &["20"][..],
+        ),
+        (
+            "public.cu",
+            "update public.cu set m = 1, img = 'i3b' where cust_id = 30",
+            &["30"][..],
+        ),
+        (
+            "public.o",
+            "update public.o set s = 1, r = 6, l = 'v' where order_no = 'A4'",
+            &["A4"][..],
+        ),
+    ] {
+        write_uncaptured_on(&d, table, sql).await;
+        d.stage_recomputes(table, keys).await;
+        let batch = d.seal().await;
+        d.drain(batch, "rederive").await;
+        d.settle().await;
+        assert_ordered_join(&d, sql).await;
+    }
+    // Both sides' Re-derives in one page.
+    write_uncaptured_on(
+        &d,
+        "public.cu",
+        "update public.cu set b = 444 where cust_id = 30",
+    )
+    .await;
+    write_uncaptured_on(
+        &d,
+        "public.o",
+        "update public.o set r = 7 where order_no = 'A1'",
+    )
+    .await;
+    d.stage_recomputes("public.cu", &["20", "30"]).await;
+    d.stage_recomputes("public.o", &["A1", "A3"]).await;
+    let batch = d.seal().await;
+    d.drain(batch, "rederive both").await;
+    d.settle().await;
+    assert_ordered_join(&d, "a mixed Re-derive page").await;
+}
+
+/// [`sides_keyed_differently_with_alias_named_columns_apply`]'s check: each
+/// target equals its live join and self_check finds nothing, after `step`.
+async fn assert_ordered_join(d: &Driver, step: &str) {
+    for (target, kind) in [("public.ol", "left"), ("public.oi", "inner")] {
+        let actual = d
+            .rows(&format!(
+                "select order_no, s as c1, b as c2, r as c3, m as c4, l as c5 \
+                 from {target} order by order_no"
+            ))
+            .await;
+        let expected = d
+            .rows(&format!(
+                "select o.order_no, o.r + coalesce(cu.b, 0) as c1, cu.doc as c2, cu.img as c3, \
+                 cu.k0 as c4, o.l as c5 \
+                 from public.o o {kind} join public.cu cu on o.s = cu.m order by o.order_no"
+            ))
+            .await;
+        assert_eq!(actual, expected, "{target} after {step}");
+        let diverging = trellis::staging::one_to_one_join_diverging_keys(d.pool(), target)
+            .await
+            .expect("self_check");
+        assert!(diverging.is_empty(), "{target} after {step}: {diverging:?}");
     }
 }

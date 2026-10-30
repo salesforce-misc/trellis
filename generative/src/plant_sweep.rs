@@ -114,6 +114,8 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::Join1NoEntryLock
         | Plant::Join1OldKeyUnlocked
         | Plant::Join1SnapshotAfterRead
+        | Plant::Join1RdNoKey
+        | Plant::Join1BrdNoKey
         | Plant::Join1NoPlaceholder
         | Plant::Join1MBeforeJ => PlantPath::OneToOneJoin,
     }

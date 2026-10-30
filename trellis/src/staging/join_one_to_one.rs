@@ -20,10 +20,10 @@
 //!    may predate the build re-derives every id
 //!    ([`super::ledger::page_may_predate_build`]).
 //! 2. **Lock row and key set.** The pair's lock row `FOR SHARE`. Then the key
-//!    set K: for the `a` side, every change's new key, the key `R` holds for
-//!    each id, and the live key of each Re-derive row (read unlocked, which
-//!    keeps the retry below rare); for the `b` side, every change's new key,
-//!    its old key from its first change's pre-image, and the key `M` holds
+//!    set K: for each side, every change's new key, the key its entry (`R`
+//!    or `M`) holds for each id, and the live key of each Re-derive row (read
+//!    unlocked from its table, which keeps the retry below rare); for the `b`
+//!    side also each change's old key from its first change's pre-image
 //!    [`join1_old_key_unlocked`]. A key with a `NULL` part is left out: it
 //!    matches nothing and takes no `J` row.
 //! 3. **`J`.** K, both sides' keys together, inserted sorted `on conflict do
@@ -37,9 +37,13 @@
 //!    so the page rolls back with [`ApplyError::JoinKeyMoved`] and retries
 //!    [`join1_no_recheck`]. The entry lock also orders the writers of a
 //!    `NULL`-keyed row, which has no `J` row.
-//! 5. **Re-derive read.** One statement reads the live `a` rows and
-//!    `pg_current_snapshot()`; a key it reads outside K rolls the page back
-//!    the same way [`join1_snapshot_after_read`].
+//! 5. **Re-derive read.** For each side, one statement reads its Re-derive
+//!    rows live and `pg_current_snapshot()`, which becomes those entries'
+//!    basis [`join1_snapshot_after_read`]. A key it reads outside K (the row
+//!    moved after the unlocked read) rolls the page back the same way
+//!    [`join1_rd_no_key`, `join1_brd_no_key`]: taking that key's `J` late
+//!    would break the lock order. A `b` Re-derive's entry fans out like a
+//!    `b` change's.
 //! 6. **I2.** The entries are updated by ADR-0002's I2 (an Apply must not be
 //!    in the entry's basis, must be past its applied position and above the
 //!    floor) [`join1_vis_only`, `join1_lsn_only`]; a Re-derive sets the basis
@@ -67,8 +71,8 @@
 //! same lock. So two pages that write one target row queue on a `J` row
 //! before either locks it, whatever order their statements take. Nothing
 //! reads a 1-1 `JOIN` target in v1 (define refuses it), so a page records
-//! nothing for the seam. A Re-derive of `b` and a `TRUNCATE` are later steps
-//! (#1398, #1399): a page that carries one halts.
+//! nothing for the seam. A `TRUNCATE` is a later step (#1399): a page that
+//! carries one halts.
 //!
 //! # A build ([`build`])
 //!
@@ -305,16 +309,11 @@ impl JoinShape {
         })
     }
 
-    fn r_names(&self) -> Vec<String> {
-        self.r_columns.iter().map(|c| c.name.clone()).collect()
-    }
-
-    /// The halt of a page that would re-derive a `b` row, whose path is a
-    /// later step's (#1398).
-    fn b_rederive_unsupported(&self) -> ApplyError {
-        ApplyError::GroupBasisUnsupported {
-            target: self.target.clone(),
-            what: "a Re-derive of the joined table of a 1-1 JOIN (its path is not built yet)",
+    /// `side`'s table, qualified.
+    fn table(&self, side: Side) -> &str {
+        match side {
+            Side::From => &self.source_table,
+            Side::Joined => &self.joined_table,
         }
     }
 
@@ -457,8 +456,7 @@ impl JoinOneToOnePlan {
         }
     }
 
-    /// Adds `change` of the table on `side`. A Re-derive of the `b` side is
-    /// a later step's (#1398): it halts the page rather than run wrong.
+    /// Adds `change` of the table on `side`.
     pub(crate) fn push(&mut self, side: Side, change: &FoldedChange) -> Result<(), ApplyError> {
         let apply = match &change.last_change {
             Some(last) if !change.has_recompute => {
@@ -473,12 +471,7 @@ impl JoinOneToOnePlan {
         };
         match side {
             Side::From => self.a.push(record),
-            Side::Joined => {
-                if record.apply.is_none() {
-                    return Err(self.shape.b_rederive_unsupported());
-                }
-                self.b.push(record);
-            }
+            Side::Joined => self.b.push(record),
         }
         Ok(())
     }
@@ -563,9 +556,6 @@ pub(crate) async fn apply_page(
         } else {
             (&plan.a, &plan.b)
         };
-    if b_records.iter().any(|r| r.apply.is_none()) {
-        return Err(shape.b_rederive_unsupported());
-    }
     let a = fold(a_records);
     let b = fold(b_records);
     if a.is_empty() && b.is_empty() {
@@ -581,22 +571,33 @@ pub(crate) async fn apply_page(
     #[cfg(not(any(test, feature = "test-util")))]
     let predicate = true;
 
-    let rederive_keys: Vec<&str> = a
-        .values()
-        .filter(|r| r.apply.is_none())
-        .map(|r| r.key.as_str())
-        .collect();
+    let rederive_keys = |records: &BTreeMap<&str, &Record>| -> Vec<String> {
+        records
+            .values()
+            .filter(|r| r.apply.is_none())
+            .map(|r| r.key.clone())
+            .collect()
+    };
+    let a_rederive = rederive_keys(&a);
+    let b_rederive = rederive_keys(&b);
+    // `b`'s primary key, which a `b` Re-derive reads its rows by.
+    let m_pk = if b_rederive.is_empty() {
+        Vec::new()
+    } else {
+        ddl::source_primary_key_in_txn(txn, &shape.joined_table).await?
+    };
 
     // 2. The lock row, then K over both sides' keys.
     txn.execute(&format!("select 1 from {} for share", shape.lock), &[])
         .await?;
-    let live = live_keys(txn, shape, &rederive_keys).await?;
     let mut k: BTreeSet<KeyText> = BTreeSet::new();
     if !a.is_empty() {
+        let live = live_keys(txn, shape, Side::From, &shape.pk, &a_rederive).await?;
         k.extend(key_set(txn, shape, Side::From, &a, &live).await?);
     }
     if !b.is_empty() {
-        k.extend(key_set(txn, shape, Side::Joined, &b, &[]).await?);
+        let live = live_keys(txn, shape, Side::Joined, &m_pk, &b_rederive).await?;
+        k.extend(key_set(txn, shape, Side::Joined, &b, &live).await?);
     }
     // Test-only pause point. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
@@ -623,72 +624,20 @@ pub(crate) async fn apply_page(
     let (b_inserted, b_held) =
         lock_side(txn, shape, Side::Joined, &b, seg_seq, predicate, &k).await?;
 
-    // 5. The Re-derive read.
-    let (mut read, snapshot, entry_seg) = if rederive_keys.is_empty() {
-        (HashMap::new(), None, seg_seq)
-    } else {
-        let read = ledger::read_rows(
-            txn,
-            &shape.target,
-            &shape.source_table,
-            &shape.pk,
-            &shape.r_names(),
-            &rederive_keys,
-        )
-        .await?;
-        check_read_keys(shape, &read.rows, &k)?;
-        // Planted bug: the basis is a snapshot taken one statement after the
-        // read. See `crate::plant`.
-        #[cfg(any(test, feature = "test-util"))]
-        let read = if crate::plant::fires(crate::plant::Plant::Join1SnapshotAfterRead, true) {
-            let later: String = txn
-                .query_one("select pg_catalog.pg_current_snapshot()::text", &[])
-                .await?
-                .get(0);
-            ledger::ReadRows {
-                snapshot: later,
-                ..read
-            }
-        } else {
-            read
-        };
-        // Test-only pause point. See `super::interleave`.
-        #[cfg(any(test, feature = "test-util"))]
-        super::interleave::pause_at(
-            txn,
-            super::interleave::PausePoint::AfterJoin1Read,
-            &shape.target,
-        )
-        .await?;
-        (read.rows, Some(read.snapshot), seg_seq.max(read.seg))
-    };
-    let rederived: HashMap<&str, Option<String>> = rederive_keys
-        .iter()
-        .map(|key| (*key, read.remove(*key)))
-        .collect();
+    // 5. The Re-derive reads, one statement per side.
+    let a_read = rederive_read(txn, shape, Side::From, &shape.pk, &a_rederive, &k, seg_seq).await?;
+    let b_read = rederive_read(txn, shape, Side::Joined, &m_pk, &b_rederive, &k, seg_seq).await?;
 
     // 6. I2, then each side's copied columns.
-    let a_changed = update_side(
-        txn,
-        shape,
-        Side::From,
-        &a,
-        &a_inserted,
-        &rederived,
-        snapshot.as_deref(),
-        entry_seg,
-        predicate,
-    )
-    .await?;
+    let a_changed =
+        update_side(txn, shape, Side::From, &a, &a_inserted, &a_read, predicate).await?;
     let b_changed = update_side(
         txn,
         shape,
         Side::Joined,
         &b,
         &b_inserted,
-        &HashMap::new(),
-        None,
-        seg_seq,
+        &b_read,
         predicate,
     )
     .await?;
@@ -713,19 +662,22 @@ pub(crate) async fn apply_page(
     Ok((written + fanned, deleted + fan_deleted))
 }
 
-/// The live key of each of `keys`' rows, read unlocked: the third part of
-/// K. A key is its columns' text; a row with a `NULL` part, or no row,
-/// contributes none.
+/// The live join key of each of `keys`' rows of `side`'s table (whose
+/// primary key is `pk`), read unlocked: the Re-derives' part of K. A key is
+/// its columns' text; a row with a `NULL` part, or no row, contributes none.
 async fn live_keys(
     txn: &Transaction<'_>,
     shape: &JoinShape,
-    keys: &[&str],
+    side: Side,
+    pk: &[PrimaryKeyColumn],
+    keys: &[String],
 ) -> Result<Vec<KeyText>, ApplyError> {
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    let names: Vec<String> = shape.key.iter().map(|c| c.name.clone()).collect();
-    let query = super::apply::live_rows_query(&shape.source_table, &shape.pk, &names, keys)?;
+    let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let names = shape.side_key(side);
+    let query = super::apply::live_rows_query(shape.table(side), pk, &names, &keys)?;
     let cols: Vec<String> = names
         .iter()
         .map(|n| format!("m.doc ->> {}", quote_literal(n)))
@@ -1024,26 +976,112 @@ async fn check_held_keys(
     Ok(held)
 }
 
-/// Checks that the key of each live row a Re-derive read is in `k`.
+/// What one side's Re-derive read found ([`rederive_read`]): each Re-derive
+/// key's live row (`None` for a row that is gone), the snapshot that is
+/// their basis, and the segment their entries are stamped with.
+#[derive(Default)]
+struct Rederived {
+    rows: HashMap<String, Option<String>>,
+    snapshot: Option<String>,
+    seg: i64,
+}
+
+/// Step 5 for one side: one statement reads the live rows of `keys` (the
+/// side's Re-derives) from its table, whose primary key is `pk`, and
+/// `pg_current_snapshot()` ([`super::one_to_one_ledger::read_rows`]). A key
+/// a row has that isn't in `k` moved after the unlocked read, so the page
+/// rolls back with [`ApplyError::JoinKeyMoved`] and retries. No `keys` read
+/// nothing, and the entries are stamped with the page's `seg_seq`.
+async fn rederive_read(
+    txn: &Transaction<'_>,
+    shape: &JoinShape,
+    side: Side,
+    pk: &[PrimaryKeyColumn],
+    keys: &[String],
+    k: &BTreeSet<KeyText>,
+    seg_seq: i64,
+) -> Result<Rederived, ApplyError> {
+    if keys.is_empty() {
+        return Ok(Rederived {
+            seg: seg_seq,
+            ..Rederived::default()
+        });
+    }
+    let names: Vec<String> = shape
+        .side_columns(side)
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    // The `a` side's pause points carry the target's label, the `b` side's
+    // `M`'s.
+    let label = match side {
+        Side::From => shape.target.as_str(),
+        Side::Joined => shape.m.label.as_str(),
+    };
+    let read = ledger::read_rows(txn, label, shape.table(side), pk, &names, &refs).await?;
+    // Planted bugs: the page doesn't check the keys its read of one side
+    // found. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let unchecked = crate::plant::fires(
+        match side {
+            Side::From => crate::plant::Plant::Join1RdNoKey,
+            Side::Joined => crate::plant::Plant::Join1BrdNoKey,
+        },
+        true,
+    );
+    #[cfg(not(any(test, feature = "test-util")))]
+    let unchecked = false;
+    if !unchecked {
+        check_read_keys(shape, side, &read.rows, k)?;
+    }
+    // Planted bug: the basis is a snapshot taken one statement after the
+    // read. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let read = if crate::plant::fires(crate::plant::Plant::Join1SnapshotAfterRead, true) {
+        let later: String = txn
+            .query_one("select pg_catalog.pg_current_snapshot()::text", &[])
+            .await?
+            .get(0);
+        ledger::ReadRows {
+            snapshot: later,
+            ..read
+        }
+    } else {
+        read
+    };
+    // Test-only pause point. See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    super::interleave::pause_at(txn, super::interleave::PausePoint::AfterJoin1Read, label).await?;
+    let mut found = read.rows;
+    Ok(Rederived {
+        rows: keys
+            .iter()
+            .map(|key| (key.clone(), found.remove(key)))
+            .collect(),
+        snapshot: Some(read.snapshot),
+        seg: seg_seq.max(read.seg),
+    })
+}
+
+/// Checks that the join key of each live row of `side` a Re-derive read is
+/// in `k`. Define gives each `ON` pair one type and collation, so a `b`
+/// column's text is the text its `J` key has.
 fn check_read_keys(
     shape: &JoinShape,
+    side: Side,
     rows: &HashMap<String, String>,
     k: &BTreeSet<KeyText>,
 ) -> Result<(), ApplyError> {
+    let names = shape.side_key(side);
     for doc in rows.values() {
         let value: serde_json::Value =
             serde_json::from_str(doc).map_err(|_| ApplyError::JoinKeyMoved {
                 target: shape.target.clone(),
             })?;
-        let key: Option<KeyText> = shape
-            .key
+        let key: Option<KeyText> = names
             .iter()
-            .map(|c| {
-                value
-                    .get(&c.name)
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            })
+            .map(|name| value.get(name).and_then(|v| v.as_str()).map(str::to_string))
             .collect();
         if let Some(key) = key
             && !k.contains(&key)
@@ -1059,26 +1097,24 @@ fn check_read_keys(
 }
 
 /// Step 6 for one side: `records`' entries updated by I2 (a Re-derive sets
-/// the basis from `snapshot`), the placeholders nothing wrote dropped, then
-/// the side's key and read columns written for the entries that changed: a
-/// present row from its image or the Re-derive's read (`rederived`), and a
-/// gone one with its key cleared, so it matches nothing. Returns the keys
-/// that changed.
-#[allow(clippy::too_many_arguments)]
+/// the basis from its read's snapshot), the placeholders nothing wrote
+/// dropped, then the side's key and read columns written for the entries
+/// that changed: a present row from its image or the Re-derive's read
+/// (`read`), and a gone one with its key cleared, so it matches nothing.
+/// Returns the keys that changed.
 async fn update_side(
     txn: &Transaction<'_>,
     shape: &JoinShape,
     side: Side,
     records: &BTreeMap<&str, &Record>,
     inserted: &ledger::Inserted,
-    rederived: &HashMap<&str, Option<String>>,
-    snapshot: Option<&str>,
-    entry_seg: i64,
+    read: &Rederived,
     predicate: bool,
 ) -> Result<HashSet<String>, ApplyError> {
     if records.is_empty() {
         return Ok(HashSet::new());
     }
+    let (rederived, snapshot, entry_seg) = (&read.rows, read.snapshot.as_deref(), read.seg);
     let ledger = shape.ledger(side);
     let mut changes: Vec<EntryChange<'_>> = Vec::with_capacity(records.len());
     for record in records.values() {

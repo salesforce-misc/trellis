@@ -30,9 +30,9 @@
 //! The gate is at define (`super::validate_join_one_to_one`), never at parse,
 //! so a definition stored while the knob was on still loads with it off.
 //! Pages of either side's changes and a one-transaction build run
-//! (`crate::staging::join_one_to_one`); a Re-derive of the joined side, a
-//! `TRUNCATE` of either side and a schema change halt the transform with the
-//! reason rather than run wrong. So does a page whose fan-out passes the cap
+//! (`crate::staging::join_one_to_one`), Re-derives of either side among
+//! them; a `TRUNCATE` of either side and a schema change halt the transform
+//! with the reason rather than run wrong. So does a page whose fan-out passes the cap
 //! ([`max_fanout`]) or fails on a row.
 
 use std::collections::HashMap;
