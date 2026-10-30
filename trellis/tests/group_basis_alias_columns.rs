@@ -123,6 +123,24 @@ const ALIASES: &[&str] = &[
     "__sum_1",
     "__count_1",
     "__trellis_none",
+    // The ring's columns, read beside a populated image.
+    "src_table",
+    "key",
+    "op",
+    "lsn",
+    "old_image",
+    "new_image",
+    "transition_images",
+    "row_txid",
+    "origin_lsn",
+    "src_changed",
+    "img",
+    // The keys of the ring's marker objects (a node truncate's, a schema
+    // change's), which are not images of a source row.
+    "node",
+    "oid",
+    "missing",
+    "key_missing",
 ];
 
 fn ddl() -> String {
@@ -620,7 +638,9 @@ async fn assert_partitioned_matches(d: &Driver, when: &str) {
 
 /// A partitioned source with alias-named columns: the seed through capture, a
 /// leaf's `TRUNCATE` (its correction reads the node), and a `DROP` of another
-/// (its correction reads the ring's images through the ring `s` alias).
+/// (its correction reads the ring's images through the ring `s` alias). The
+/// truncate's ring marker (`{node, oid}`) is no image of a source row: read as
+/// one, it would fill the source's integer `node` column with the leaf's name.
 #[tokio::test]
 async fn a_partitioned_aggregate_over_columns_named_like_generated_aliases_is_corrected() {
     use trellis::capture::reconcile::reconcile;

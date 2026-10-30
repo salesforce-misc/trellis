@@ -310,6 +310,10 @@ async fn routed_groups(
             values("h")
         ));
         let predicate = route_predicate(route, &route_columns_named(&names, recorded, "s"));
+        // Only a change's images are rows of the source. A marker's object
+        // (a node truncate's `{node, oid}`, a schema change's `{missing,
+        // key_missing}`) is not, and populated as one it would fill a source
+        // column of that name.
         for slot in 0..RING_SIZE {
             let ring = ring_table_name(slot).map_err(CorrectionError::Staging)?;
             parts.push(format!(
@@ -317,7 +321,8 @@ async fn routed_groups(
                  cross join lateral (values (r.old_image), (r.new_image), \
                      (r.transition_images -> 'old'), (r.transition_images -> 'new')) as i(img) \
                  cross join lateral jsonb_populate_record(null::{source_row}, i.img) as s \
-                 where r.src_table = $1 and jsonb_typeof(i.img) = 'object' and {predicate}",
+                 where r.src_table = $1 and r.op in ('insert', 'update', 'delete', 'recompute') \
+                   and jsonb_typeof(i.img) = 'object' and {predicate}",
                 o = values("s"),
             ));
         }
