@@ -10,13 +10,16 @@
 //! the live join, `R` equals `a` and `M` equals `b`, self_check clean.
 //!
 //! - `c…`: #1375's build-chunk families (C1–C10): a chunk against a page on
-//!   one of its keys, and C10, a row that moves onto a key after the chunk's
-//!   unlocked read.
+//!   one of its keys, and C10, a row or entry that moves after the chunk's
+//!   unlocked read, one test for each of the chunk's three checks (its
+//!   insert-from-read, its held keys, its Re-derive read).
 //! - `h…`: #1481's `RESUME` families: H1, the rows of `a` rows deleted while
 //!   paused (with the `tail` and `emptied` cases), and H3, a row re-inserted
-//!   between the orphan pass's read and its re-derive.
+//!   between the orphan pass's read and its re-derive. Also a `RESUME` after
+//!   changes of both sides, and a sweep killed in its orphan pass.
 //! - An `M` build with a rebuild sweep, and the build start under the lock
-//!   row (#1400's new families).
+//!   row (#1400's new families), for one definition and for two whose lock
+//!   rows a page takes in another order than their ids.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -430,6 +433,182 @@ async fn c10_a_chunk_whose_row_moved_onto_a_key_it_did_not_lock_retries() {
     }
 }
 
+/// Waits until some backend queues on a lock `pid` holds (`true`), or until
+/// `page` finishes without one having queued (`false`), so a planted run
+/// fails on what it wrote rather than on a timeout.
+async fn queued_or_finished<T>(d: &Driver, pid: i32, page: &drain_driver::Running<T>) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let blocked: bool = d
+            .ctl
+            .query_one(
+                "select exists (select 1 from pg_stat_activity \
+                 where $1 = any(pg_blocking_pids(pid)))",
+                &[&pid],
+            )
+            .await
+            .expect("read pg_stat_activity")
+            .get(0);
+        if blocked {
+            return true;
+        }
+        if page.is_finished() {
+            return false;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no backend queued behind pid {pid}, and the page didn't finish, within 60 s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Starts a rebuild in place of a live join and runs its plan job, so `R`
+/// holds every row on the key it had and the chunks are enqueued.
+async fn rebuild_planned(d: &mut Driver) {
+    // No segment retires while a build runs, so the drained ones go first.
+    d.retire().await;
+    trellis(d)
+        .await
+        .request_backfill("public.a")
+        .await
+        .expect("request a rebuild");
+    assert_eq!(build_step(d.pool(), "planner", 100).await, Step::Planned);
+}
+
+/// C10 on the chunk's Re-derive read: on a rebuild, `a01` has its `R` entry
+/// on key 10, so the chunk re-derives it rather than inserting it. `a01`
+/// moves onto 70 after the chunk's unlocked read; its entry still holds 10,
+/// but the chunk's read of `a` finds 70, which it holds no `J` row for, so
+/// it rolls back and its retry locks 70. Planted `join1_rd_no_key` moves the
+/// entry onto 70 unlocked: the `b` insert's page on 70 fans out around it,
+/// and the move's own Apply is refused (the chunk's read covers it), so the
+/// row keeps no match.
+#[tokio::test]
+async fn c10_a_chunk_whose_rederived_row_moved_onto_a_key_it_did_not_lock_retries() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(&[kind], true).await;
+        rebuild_planned(&mut d).await;
+        // Sealed before the chunk opens (the seal gate refuses while the
+        // chunk's transaction is open).
+        write(&d, "insert into public.b values (7, 70, 700, 'k7')").await;
+        let insert = d.seal().await;
+        let target = kind.target();
+        let moves = trellis::dev::interleave::join_key_moves();
+        let mut chunk = d
+            .run_frozen(
+                &[
+                    (PausePoint::BeforeJoin1Lock, &target),
+                    (PausePoint::BeforeRebuildCommit, &target),
+                ],
+                |pool| async move { Ok(build_step(&pool, "chunk", 100).await) },
+            )
+            .await;
+        chunk.reached(PausePoint::BeforeJoin1Lock).await;
+        write(&d, "update public.a set k = 70 where id = 'a01'").await;
+        d.release(&mut chunk, PausePoint::BeforeJoin1Lock).await;
+        let frozen = chunk
+            .reached_or_finished(PausePoint::BeforeRebuildCommit)
+            .await;
+        d.drain(insert, "b insert").await;
+        d.release(&mut chunk, PausePoint::BeforeRebuildCommit).await;
+        chunk.finish_result().await.expect("the chunk's build step");
+        if frozen.is_none() {
+            assert!(
+                trellis::dev::interleave::join_key_moves() > moves,
+                "the chunk rolled back on the moved key"
+            );
+        }
+        let moved = d.seal().await;
+        d.drain(moved, "the move").await;
+        assert_oracle(&mut d, &[kind], "C10 on the Re-derive read").await;
+    }
+}
+
+/// C10 on the chunk's held keys: on a rebuild, `a01` moves onto 70 and back
+/// onto 10, neither drained, so the chunk reads `a01` on 10 and its `R`
+/// entry on 10, unlocked. While it waits before its `J` lock,
+/// the first move's page moves the entry onto 70. The chunk's read of `a`
+/// finds 10, in its key set, but the entry it locks holds 70, which it holds
+/// no `J` row for, so it rolls back and its retry locks 70. Planted
+/// `join1_no_recheck` moves the entry off 70 unlocked: the `b` insert's page
+/// on 70 reads the entry still on 70 and joins `a01` to the new row, and the
+/// move back's Apply is refused (the chunk's read covers it).
+#[tokio::test]
+async fn c10_a_chunk_whose_entry_moved_off_its_key_set_retries() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(&[kind], true).await;
+        rebuild_planned(&mut d).await;
+        // The build's segment, sealed and drained, so the moves below are
+        // in later segments: their pages apply them rather than re-derive.
+        step(&mut d, "update public.a set s = s where id = 'a20'").await;
+        // Each sealed apart, so each drains alone; the move back is sealed
+        // once the chunk is done (the seal gate refuses while the chunk is
+        // open).
+        write(&d, "update public.a set k = 70 where id = 'a01'").await;
+        let forth = d.seal().await;
+        write(&d, "insert into public.b values (7, 70, 700, 'k7')").await;
+        let insert = d.seal().await;
+        write(&d, "update public.a set k = 10 where id = 'a01'").await;
+        let target = kind.target();
+        let moves = trellis::dev::interleave::join_key_moves();
+        let mut chunk = d
+            .run_frozen(
+                &[
+                    (PausePoint::BeforeJoin1Lock, &target),
+                    (PausePoint::BeforeRebuildCommit, &target),
+                ],
+                |pool| async move {
+                    // Claimed by hand: with two batches sealed and not
+                    // drained, a worker's build step wouldn't claim it.
+                    let claimed = {
+                        let client = pool.get().await.expect("pool");
+                        trellis::defs::chunk_queue::claim_chunks_of(
+                            &**client,
+                            "chunk",
+                            1,
+                            &[trellis::defs::chunk_queue::KIND_REDERIVE],
+                        )
+                        .await
+                        .expect("claim the chunk")
+                    };
+                    let chunk = claimed.into_iter().next().expect("a chunk");
+                    build::run_claimed(&pool, &chunk, "chunk", &options(100)).await;
+                    Ok(())
+                },
+            )
+            .await;
+        let reached = chunk.reached(PausePoint::BeforeJoin1Lock).await;
+        // The chunk holds only the lock row `FOR SHARE` here, so the page
+        // runs through.
+        d.drain(forth, "the move onto 70").await;
+        d.release(&mut chunk, PausePoint::BeforeJoin1Lock).await;
+        let frozen = chunk
+            .reached_or_finished(PausePoint::BeforeRebuildCommit)
+            .await;
+        // Planted, the `b` page's fan-out reaches `a01`'s target row, which
+        // the frozen chunk holds.
+        let page = d.drain_frozen(insert, "b insert", &[]).await;
+        if frozen.is_some() {
+            queued_or_finished(&d, reached.backend_pid, &page).await;
+        }
+        d.release(&mut chunk, PausePoint::BeforeRebuildCommit).await;
+        chunk.finish_result().await.expect("the chunk's build step");
+        page.finish().await;
+        if frozen.is_none() {
+            assert!(
+                trellis::dev::interleave::join_key_moves() > moves,
+                "the chunk rolled back on the moved entry"
+            );
+        }
+        let back = d.seal().await;
+        d.drain(back, "the move back").await;
+        assert_oracle(&mut d, &[kind], "C10 on the held keys").await;
+    }
+}
+
 /// A row whose field fails on its data fails its chunk, which the chunk
 /// queue narrows to that key (`fail_chunk`: split, then quarantine), as for
 /// a plain 1-1 target. The build then goes on without the key, and every
@@ -627,5 +806,121 @@ async fn a_rebuild_start_waits_for_the_page_in_flight_on_its_lock_row() {
             .expect("the rebuild task")
             .expect("request a rebuild");
         assert_oracle(&mut d, &[kind], "a rebuild behind a page").await;
+    }
+}
+
+/// A rebuild of two 1-1 `JOIN`s over one table takes their lock rows in the
+/// order a page takes them, target name order, not definition id order.
+/// `jl` is defined first (the lower id) but `ji` sorts first: a page of an
+/// `a` change frozen with `ji`'s lock row held `FOR SHARE` makes the rebuild
+/// queue on that row before it holds `jl`'s, so the page then takes `jl`'s
+/// and commits. Taken in id order, the rebuild holds `jl`'s `FOR UPDATE`
+/// while it queues on `ji`'s, the page queues on `jl`'s, and the server
+/// breaks the deadlock by failing one of them.
+#[tokio::test]
+async fn a_rebuild_of_two_joins_takes_their_lock_rows_in_a_pages_order() {
+    let _serial = SERIAL.lock().await;
+    let mut d = start(&KINDS, true).await;
+    write(&d, "update public.a set r = 77 where id = 'a04'").await;
+    let batch = d.seal().await;
+    let inner = Kind::Inner.target();
+    let mut page = d
+        .drain_frozen(batch, "page", &[(PausePoint::BeforeJoin1Lock, &inner)])
+        .await;
+    let reached = page.reached(PausePoint::BeforeJoin1Lock).await;
+    let trellis = trellis(&d).await;
+    let rebuild = tokio::spawn(async move { trellis.request_backfill("public.a").await });
+    d.wait_blocked_behind(reached.backend_pid).await;
+    d.release(&mut page, PausePoint::BeforeJoin1Lock).await;
+    page.finish_result().await.expect("the page");
+    rebuild
+        .await
+        .expect("the rebuild task")
+        .expect("request a rebuild");
+    assert_oracle(&mut d, &KINDS, "a rebuild of two joins behind a page").await;
+}
+
+/// A `RESUME` after changes of every kind while paused, on both sides: an
+/// `a` row inserted, one inserted on a `NULL` key, one moved onto a `NULL`
+/// key (its `INNER` row must go, its `LEFT` row lose its match), one moved
+/// onto another key, one deleted; a `b` row deleted, one changed and one
+/// inserted on a key some `a` rows have. `R` and `M` come back empty, so the
+/// chunks rebuild every row from the `M` the plan job made, and the sweep's
+/// orphan pass removes the deleted row's.
+#[tokio::test]
+async fn a_resume_after_changes_of_both_sides_while_paused_rebuilds_the_join() {
+    let _serial = SERIAL.lock().await;
+    let mut d = start(&KINDS, true).await;
+    change_while_paused(
+        &mut d,
+        &KINDS,
+        "insert into public.a values ('a21', 20, 21, 's21'), ('a22', null, 22, 's22'); \
+         update public.a set k = null where id = 'a01'; \
+         update public.a set k = 70 where id = 'a03'; \
+         delete from public.a where id = 'a04'; \
+         delete from public.b where bid = 2; \
+         update public.b set img = 150 where bid = 1; \
+         insert into public.b values (7, 70, 700, 'k7')",
+    )
+    .await;
+    assert_oracle(&mut d, &KINDS, "a resume after changes of both sides").await;
+}
+
+/// A sweep killed in its orphan pass, after `R`'s and `M`'s stale passes
+/// committed their cursors, is claimed again and resumes from its stored
+/// cursor: every orphan of the `a` rows deleted while paused goes, and no
+/// other row does.
+#[tokio::test]
+async fn a_sweep_killed_in_its_orphan_pass_resumes_from_its_cursor() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(&[kind], true).await;
+        change_while_paused(
+            &mut d,
+            &[kind],
+            "delete from public.a where id in ('a02', 'a05', 'a08', 'a11', 'a14', 'a17')",
+        )
+        .await;
+        run_until_the_sweep(&d).await;
+        let target = kind.target();
+        // Its own pool, so the session ended below is no connection the
+        // test's pool hands out again.
+        let own = trellis::Pool::new(&Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"))
+            .expect("a pool for the sweep");
+        let mut sweep = d
+            .run_frozen(
+                &[(PausePoint::AfterJoin1OrphanRead, &target)],
+                |_| async move { Ok(build_step(&own, "sweep", 3).await) },
+            )
+            .await;
+        let reached = sweep.reached(PausePoint::AfterJoin1OrphanRead).await;
+        let stored: Option<String> = d
+            .ctl
+            .query_one(
+                "select lo from backfill_chunks where kind = 'sweep' and not done",
+                &[],
+            )
+            .await
+            .expect("the sweep")
+            .get(0);
+        assert_eq!(
+            stored.as_deref(),
+            Some("\u{1}o"),
+            "the stale passes are done and committed"
+        );
+        sweep.kill().await;
+        d.ctl
+            .execute("select pg_terminate_backend($1)", &[&reached.backend_pid])
+            .await
+            .expect("end the sweep's session");
+        d.ctl
+            .batch_execute(
+                "update backfill_chunks \
+                 set claimed_by = null, claimed_at = null, next_attempt_at = null \
+                 where kind = 'sweep'",
+            )
+            .await
+            .expect("free the dead worker's claim");
+        assert_oracle(&mut d, &[kind], "a killed sweep").await;
     }
 }

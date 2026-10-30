@@ -187,8 +187,12 @@ pub enum Plant {
     /// in the key set it locked. A row that moved keys since the unlocked
     /// read is then written under a `J` lock it doesn't hold.
     ///
+    /// A build chunk runs the same check on the entries it re-derives.
+    ///
     /// Pinned by `join_one_to_one_interleavings`'s
-    /// `a_key_that_moved_under_the_page_rolls_it_back_and_the_retry_locks_both`.
+    /// `a_key_that_moved_under_the_page_rolls_it_back_and_the_retry_locks_both`,
+    /// and in a chunk by `join_one_to_one_build`'s
+    /// `c10_a_chunk_whose_entry_moved_off_its_key_set_retries`.
     Join1NoRecheck,
     /// ADR-0002's I2 on a 1-1 `JOIN`'s hidden ledger keeps only its
     /// applied-position check (`staging::one_to_one_ledger::update_entries`):
@@ -244,8 +248,12 @@ pub enum Plant {
     /// of it is then written under no `J` lock on that key, so a `b` page on
     /// the key reads around it.
     ///
+    /// A build chunk runs the same check on the rows it re-derives.
+    ///
     /// Pinned by `join_one_to_one_interleavings`'s
-    /// `r19_an_a_rederive_whose_row_moved_onto_a_held_key_retries`.
+    /// `r19_an_a_rederive_whose_row_moved_onto_a_held_key_retries`, and in a
+    /// chunk by `join_one_to_one_build`'s
+    /// `c10_a_chunk_whose_rederived_row_moved_onto_a_key_it_did_not_lock_retries`.
     Join1RdNoKey,
     /// ADR-0021 (#1375 R18, `brd_nokey`): the same for a Re-derive of a `b`
     /// row: its `M` entry is written, and its new key fanned out to, under no

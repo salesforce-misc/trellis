@@ -766,7 +766,10 @@ pub(crate) async fn start_rebuilds(
 /// (ADR-0021's build start, as the #1375 model starts a build): a page holds
 /// it `FOR SHARE` from before it reads its key set until it commits, so the
 /// start waits out every page in flight on the definition, and a page that
-/// comes after reads the build's segment.
+/// comes after reads the build's segment. Several are taken in the order a
+/// page takes them, by bare target name in byte order (the drain's
+/// `join1_targets`), so a page on two of them and the start never each hold
+/// one the other waits for.
 pub(crate) async fn stamp_rebuild_seg(
     txn: &impl GenericClient,
     ids: &[i64],
@@ -785,7 +788,8 @@ pub(crate) async fn stamp_rebuild_seg(
                  where d.id = any($1) \
                    and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
                                          where oid = 'transform_definitions'::regclass) \
-                 order by d.id",
+                 order by substr(d.target_table, strpos(d.target_table, '.') + 1) collate \"C\", \
+                          d.id",
                 lock = crate::defs::join_one_to_one::HiddenTable::TruncateLock.name_sql("d.id"),
             ),
             &[&ids],

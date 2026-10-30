@@ -193,8 +193,9 @@ A chunk waits at most a second for a lock a page holds, then gives up and
 retries, so a page is never queued behind a chunk that queues behind another
 page. Pages whose segment predates the build re-derive. A build start takes
 the lock row `FOR UPDATE` as it records that segment, so it waits for the
-pages in flight. A one-transaction build is not an option: at 100M `a` rows
-it took 834 s, and a concurrent page waited 807 s behind it. In 10k-row
+pages in flight. A start of several takes their lock rows in the order a page
+does, by target name. A one-transaction build is not an option: at 100M `a`
+rows it took 834 s, and a concurrent page waited 807 s behind it. In 10k-row
 chunks on 4 workers the build took 446 s, and no page waited longer than
 0.74 s (#1375 Y3).
 

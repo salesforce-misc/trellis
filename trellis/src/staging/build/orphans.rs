@@ -389,4 +389,92 @@ mod tests {
         expected.sort();
         assert_eq!(sorted, expected);
     }
+
+    /// A text key whose index collation orders it otherwise than its bytes
+    /// (the cluster's default, ICU `en-US`), the same key under `"C"`, and an
+    /// `(integer, text)` key: with no ledger entry every row is an orphan, so
+    /// a walk in batches of every size from 1 to 4 must name each row once,
+    /// in the key index's order. Each batch runs on a fresh connection from
+    /// the cursor's stored text, as a sweep resumed by another worker reads
+    /// it. A walk that compares or orders under another collation than the
+    /// index's, drops a key part, or repeats the row at a page boundary
+    /// names a row twice, skips one, or reads them out of order.
+    #[tokio::test]
+    async fn the_walk_pages_a_key_in_its_index_order_from_a_stored_cursor() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = connect(db.dsn()).await;
+        // Byte order puts `-x`, `A`..`Z`, `_x` and `a`..`z` apart; `en-US`
+        // interleaves the cases and puts the punctuation first.
+        let words = "('a'), ('B'), ('b'), ('A'), ('_x'), ('Z'), ('-x'), ('z'), ('ab'), ('aB'), \
+                     ('Ab'), ('AB'), ('é'), ('e'), ('E'), ('f')";
+        client
+            .batch_execute(&format!(
+                "create table public.td (id text primary key); \
+                 insert into public.td values {words}; \
+                 create table public.tc (id text collate \"C\" primary key); \
+                 insert into public.tc values {words}; \
+                 create table public.tm (g integer, h text, primary key (g, h)); \
+                 insert into public.tm select n, td.id from public.td, generate_series(0, 2) n; \
+                 create table public.l (__from_key text collate \"C\" primary key, \
+                     __tombstone boolean not null default false)"
+            ))
+            .await
+            .expect("seed");
+        for (target, order) in [
+            ("public.td", "id"),
+            ("public.tc", "id"),
+            ("public.tm", "g, h"),
+        ] {
+            let key = crate::defs::ddl::source_primary_key_in_txn(&client, target)
+                .await
+                .expect("the target's key");
+            let k = crate::defs::ddl::pk_key_sql_expr(&key, Some("t"));
+            let expected: Vec<String> = client
+                .query(
+                    &format!("select ({k}) from {target} t order by {order}"),
+                    &[],
+                )
+                .await
+                .expect("every row in index order")
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            let walk = OrphanWalk {
+                target,
+                key: &key,
+                ledger: "public.l",
+                source_table: "public.src",
+            };
+            for scan in 1..=4_i64 {
+                let mut stored: Option<String> = None;
+                let mut found: Vec<String> = Vec::new();
+                let mut scanned = 0;
+                for _ in 0..200 {
+                    let mut fresh = connect(db.dsn()).await;
+                    let txn = fresh.transaction().await.expect("begin");
+                    let batch = orphan_batch(&txn, &walk, &OrphanCursor::Keyed(stored), scan)
+                        .await
+                        .expect("a batch");
+                    txn.commit().await.expect("commit");
+                    scanned += batch.scanned;
+                    found.extend(batch.orphans);
+                    match batch.next {
+                        Some(OrphanCursor::Keyed(next)) => stored = next,
+                        Some(OrphanCursor::Nulls(_)) => {
+                            panic!("{target}: no key part is nullable")
+                        }
+                        None => break,
+                    }
+                    assert!(stored.is_some(), "a full batch's cursor has a key");
+                }
+                assert_eq!(found, expected, "{target}, batches of {scan}");
+                assert_eq!(
+                    scanned,
+                    expected.len() as i64,
+                    "{target}, batches of {scan}"
+                );
+            }
+        }
+    }
 }
