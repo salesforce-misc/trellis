@@ -178,7 +178,9 @@ pub enum Plant {
     /// read of `M` and its target write.
     ///
     /// Pinned by `join_one_to_one_interleavings`'s
-    /// `an_a_page_holds_its_j_row_until_it_commits`.
+    /// `an_a_page_holds_its_j_row_until_it_commits`,
+    /// `f3_an_a_move_races_a_b_update_of_its_new_key` and
+    /// `m_two_crossing_mixed_pages_queue_on_j_without_deadlock`.
     Join1NoJLock,
     /// ADR-0021 (#1375 `join1_no_recheck`): a 1-1 `JOIN` page doesn't check
     /// that the key an `R` entry holds, read again after the entry lock, is
@@ -248,7 +250,8 @@ pub enum Plant {
     /// `b` value.
     ///
     /// Pinned by `join_one_to_one_interleavings`'s
-    /// `f1_an_a_page_on_a_key_reads_m_only_after_the_b_page_on_it_commits`.
+    /// `f1_an_a_page_on_a_key_reads_m_only_after_the_b_page_on_it_commits`
+    /// and `m_two_crossing_mixed_pages_queue_on_j_without_deadlock`.
     Join1MBeforeJ,
 }
 

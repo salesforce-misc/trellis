@@ -39,6 +39,7 @@ use drain_driver::Driver;
 use trellis::defs::ValueType;
 use trellis::defs::join_one_to_one::set_enabled;
 use trellis::integer::IntWidth;
+use trellis::staging::ApplyError;
 use trellis::staging::interleave::PausePoint;
 
 const DDL: &str = "create table public.a (id integer primary key, k integer, x integer, \
@@ -331,8 +332,8 @@ impl BWriter {
 
 /// A page on a key a `b`-side writer holds queues on `J` and reads `M` only
 /// once it has the lock (`rd_mearly`): the new row is `x + the writer's w`.
-/// Planted `join1_no_j_lock` leaves the page running through (the wait below
-/// never ends).
+/// Planted `join1_no_j_lock` leaves the page running through, and the row it
+/// wrote keeps the old `w`.
 #[tokio::test]
 async fn an_a_page_holds_its_j_row_until_it_commits() {
     let _serial = serial().await;
@@ -341,11 +342,15 @@ async fn an_a_page_holds_its_j_row_until_it_commits() {
         let b = BWriter::start(&d, kind, 10, 999).await;
         write(&d, "insert into public.a values (5, 10, 5, 'five')").await;
         let batch = d.seal().await;
+        let moves = trellis::dev::interleave::join_key_moves();
         let drain = d.drain_frozen(batch, "page", &[]).await;
-        d.wait_blocked_behind(b.pid).await;
-        assert!(!drain.is_finished(), "the page queues on J[10]");
+        let blocked = queued_or_finished(&d, b.pid, &drain).await;
         b.commit().await;
-        drain.finish().await;
+        let result = drain.finish_result().await;
+        if !blocked {
+            ran_through(&mut d, kind, result, moves).await;
+        }
+        result.expect("the page");
         assert_oracle(&mut d, &[kind]).await;
     }
 }
@@ -360,10 +365,15 @@ async fn a_row_moving_off_a_key_locks_the_key_it_leaves() {
         let b = BWriter::start(&d, kind, 10, 555).await;
         write(&d, "update public.a set k = 20 where id = 1").await;
         let batch = d.seal().await;
+        let moves = trellis::dev::interleave::join_key_moves();
         let drain = d.drain_frozen(batch, "page", &[]).await;
-        d.wait_blocked_behind(b.pid).await;
+        let blocked = queued_or_finished(&d, b.pid, &drain).await;
         b.commit().await;
-        drain.finish().await;
+        let result = drain.finish_result().await;
+        if !blocked {
+            ran_through(&mut d, kind, result, moves).await;
+        }
+        result.expect("the page");
         assert_oracle(&mut d, &[kind]).await;
     }
 }
@@ -771,6 +781,59 @@ async fn m_label(d: &Driver, kind: Kind) -> String {
     format!("{}.join1_{id}_m", trellis::config::DEFAULT_SCHEMA)
 }
 
+/// Waits until some backend queues on a lock `pid` holds (`true`), or until
+/// `page` finishes without one having queued (`false`): a page that should
+/// queue but runs through then fails on what it wrote, or on its error,
+/// rather than on a timeout. Polls as `Driver::wait_blocked_behind` does; a
+/// page that queues can't finish first, since `pid` holds its lock.
+async fn queued_or_finished<T>(d: &Driver, pid: i32, page: &drain_driver::Running<T>) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let blocked: bool = d
+            .ctl
+            .query_one(
+                "select exists (select 1 from pg_stat_activity \
+                 where $1 = any(pg_blocking_pids(pid)))",
+                &[&pid],
+            )
+            .await
+            .expect("read pg_stat_activity")
+            .get(0);
+        if blocked {
+            return true;
+        }
+        if page.is_finished() {
+            return false;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the page neither queued behind pid {pid} nor finished within 60 s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// The end of a race whose second page didn't queue: it fails with what the
+/// page did, the target it left or the error it surfaced.
+async fn ran_through<T>(
+    d: &mut Driver,
+    kind: Kind,
+    result: Result<T, ApplyError>,
+    moves: u64,
+) -> ! {
+    let moved = trellis::dev::interleave::join_key_moves() - moves;
+    if let Err(err) = result {
+        panic!(
+            "{kind:?}: the page ran without queueing on the other's lock and failed \
+             ({moved} key-moved rollbacks): {err}"
+        );
+    }
+    assert_oracle(d, &[kind]).await;
+    panic!(
+        "{kind:?}: the page ran without queueing on the other's lock ({moved} key-moved rollbacks)"
+    );
+}
+
 /// Drains `first` frozen at its commit, then `second`, which must queue on a
 /// lock the first holds (a `J` row). Lets both finish, asserts nothing
 /// deadlocked, and checks the target.
@@ -779,14 +842,18 @@ async fn race(d: &mut Driver, kind: Kind, first: i64, second: i64) {
         .drain_frozen(first, "first", &[(PausePoint::BeforeCommit, kind.target())])
         .await;
     let reached = held.reached(PausePoint::BeforeCommit).await;
+    let moves = trellis::dev::interleave::join_key_moves();
     let queued = d.drain_frozen(second, "second", &[]).await;
-    d.wait_blocked_behind(reached.backend_pid).await;
-    assert!(!queued.is_finished(), "{kind:?}: the second page queues");
+    let blocked = queued_or_finished(d, reached.backend_pid, &queued).await;
     d.release(&mut held, PausePoint::BeforeCommit).await;
     held.finish().await;
-    queued.finish().await;
+    let result = queued.finish_result().await;
     let deadlocks = d.deadlocks_logged();
     assert!(deadlocks.is_empty(), "{deadlocks:?}");
+    if !blocked {
+        ran_through(d, kind, result, moves).await;
+    }
+    result.expect("the second page");
     assert_oracle(d, &[kind]).await;
 }
 
@@ -1073,26 +1140,35 @@ async fn m_a_mixed_page_applies_an_a_move_and_the_b_change_of_its_new_key() {
     }
 }
 
-/// Two mixed pages racing (M1–M6): one moves `a` row 1 from 10 to 20 and
-/// changes `b`'s key 20, the other moves `a` row 2 from 20 to 10 and changes
-/// key 10. Each locks both keys in one sorted `J` statement, so the second
-/// queues on the first and neither deadlocks, in either order.
+/// Two mixed pages racing (M1–M6). In the first pair one moves `a` row 1
+/// from 10 to 20 and changes `b`'s key 20, the other moves `a` row 2 from 20
+/// to 10 and changes key 10. In the second the other page moves row 3 from 30
+/// onto 10 instead, so its own `a` write touches no row the first page wrote,
+/// and only `J[10]` stops its fan-out from reading row 1 on key 10 while the
+/// first page moves it off (`join1_no_j_lock`). Each page locks both its keys
+/// in one sorted `J` statement, so the second queues on the first and
+/// neither deadlocks, in either order.
 #[tokio::test]
 async fn m_two_crossing_mixed_pages_queue_on_j_without_deadlock() {
     let _serial = serial().await;
-    for kind in KINDS {
-        for one_first in [true, false] {
-            let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
-            write(&d, "update public.a set k = 20 where id = 1").await;
-            write(&d, "update public.b set w = 250 where id = 2").await;
-            let one = d.seal().await;
-            write(&d, "update public.a set k = 10 where id = 2").await;
-            write(&d, "update public.b set w = 150 where id = 1").await;
-            let two = d.seal().await;
-            if one_first {
-                race(&mut d, kind, one, two).await;
-            } else {
-                race(&mut d, kind, two, one).await;
+    for other_a in [
+        "update public.a set k = 10 where id = 2",
+        "update public.a set k = 10 where id = 3",
+    ] {
+        for kind in KINDS {
+            for one_first in [true, false] {
+                let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+                write(&d, "update public.a set k = 20 where id = 1").await;
+                write(&d, "update public.b set w = 250 where id = 2").await;
+                let one = d.seal().await;
+                write(&d, other_a).await;
+                write(&d, "update public.b set w = 150 where id = 1").await;
+                let two = d.seal().await;
+                if one_first {
+                    race(&mut d, kind, one, two).await;
+                } else {
+                    race(&mut d, kind, two, one).await;
+                }
             }
         }
     }
@@ -1213,6 +1289,121 @@ async fn a_field_failing_on_a_fan_out_row_halts_naming_the_row() {
     );
     let poisoned = d.rows("select key from poison").await;
     assert!(poisoned.is_empty(), "{poisoned:?}");
+}
+
+/// A Re-derive of a `b` row halts the transform with the reason rather than
+/// run a path that isn't built (#1398), and writes nothing: one staged by a
+/// producer, and one the build-start rule makes of a `b` change whose page
+/// predates the build.
+#[tokio::test]
+async fn a_rederive_of_a_b_row_halts_the_transform() {
+    let _serial = serial().await;
+    let mut d = start_kinds(&[Kind::Left], A_ROWS, B_ROWS).await;
+    d.stage_recomputes("public.b", &["1"]).await;
+    let batch = d.seal().await;
+    d.drain(batch, "rederive b").await;
+    let (status, reason) = paused_reason(&d, Kind::Left).await;
+    assert_eq!(status, "paused");
+    let reason = reason.expect("a reason");
+    assert!(reason.contains("Re-derive of the joined table"), "{reason}");
+    assert_eq!(total(&d, Kind::Left, 1).await, Some(1 + 100));
+
+    set_enabled(true);
+    let ddl = format!(
+        "{DDL}; insert into public.a values {A_ROWS}; insert into public.b values {B_ROWS}"
+    );
+    let mut d = Driver::start_unbuilt(
+        &[],
+        &ddl,
+        &[
+            ("id", int4()),
+            ("k", int4()),
+            ("x", int4()),
+            ("y", ValueType::Text),
+        ],
+        &[&Kind::Left.definition()],
+        &["public.a", "public.b"],
+    )
+    .await;
+    write(&d, "update public.b set w = 111 where id = 1").await;
+    trellis::staging::build::settle_builds(d.pool()).await;
+    d.settle().await;
+    let (status, reason) = paused_reason(&d, Kind::Left).await;
+    assert_eq!(status, "paused");
+    let reason = reason.expect("a reason");
+    assert!(reason.contains("Re-derive of the joined table"), "{reason}");
+}
+
+/// A `b` side that is another transform's 1-1 target, joined on its primary
+/// key: the upstream's writes reach the join through the target-mutation
+/// seam's image feed as Applies with images, which the `b` page applies like
+/// captured ones (an update, a delete, a re-insert), and an `a` move after
+/// them reads the new `M`.
+#[tokio::test]
+async fn a_chained_b_side_applies_the_seams_images() {
+    let _serial = serial().await;
+    set_enabled(true);
+    let mut d = Driver::start(
+        "create table public.a (id integer primary key, k integer, x integer); \
+         create table public.bsrc (id integer primary key, w integer); \
+         insert into public.a values (1, 10, 1), (2, 10, 2), (3, 20, 3); \
+         insert into public.bsrc values (10, 100), (20, 200)",
+        &[("w", int4())],
+        &["TRANSFORM tb FROM public.bsrc SELECT w AS w"],
+        &["public.bsrc"],
+    )
+    .await;
+    // The join can only be defined over a live upstream.
+    trellis::defs::install_definition(
+        d.pool(),
+        "TRANSFORM jc FROM public.a LEFT JOIN public.tb ON a.k = tb.id \
+         SELECT a.x + COALESCE(tb.w, 0) AS total",
+        &std::collections::HashMap::from([("total".to_string(), int4())]),
+        "public",
+    )
+    .await
+    .expect("define the join over the 1-1 target");
+    let catalog = trellis::capture::columns::load_catalog(&d.ctl)
+        .await
+        .expect("load the catalog");
+    let spec = trellis::capture::columns::capture_spec(&d.ctl, &catalog, "public.a")
+        .await
+        .expect("capture spec");
+    match trellis::capture::install::reconcile(
+        &mut d.ctl,
+        trellis::config::DEFAULT_SCHEMA,
+        &spec,
+        None,
+    )
+    .await
+    .expect("capture a")
+    {
+        trellis::capture::install::Progress::Done(_) => {}
+        trellis::capture::install::Progress::Waiting(wait) => panic!("capture waited: {wait}"),
+    }
+    trellis::intake::harness::settle_builds(d.pool()).await;
+    d.settle().await;
+    for sql in [
+        "update public.bsrc set w = 111 where id = 10",
+        "delete from public.bsrc where id = 20",
+        "insert into public.bsrc values (20, 222)",
+        "update public.a set k = 20 where id = 1",
+    ] {
+        step(&mut d, sql).await;
+        d.settle().await;
+        let actual = d.rows("select id, total from public.jc order by id").await;
+        let expected = d
+            .rows(
+                "select a.id, a.x + coalesce(b.w, 0) from public.a a \
+                 left join public.bsrc b on a.k = b.id order by a.id",
+            )
+            .await;
+        assert_eq!(actual, expected, "after {sql}");
+        let status = d
+            .rows("select status::text from transform_definitions order by id")
+            .await;
+        assert_eq!(status, ["(live)", "(live)"], "after {sql}");
+    }
 }
 
 /// A text join key with a collation: `K`, the held-key checks and the
