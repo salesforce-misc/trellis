@@ -20,6 +20,7 @@ enum IntakeError
 enum JoinBuildStep
 enum JoinSide
 enum JoinSidePart
+enum OneToOneBuildStep
 enum ParseError
 enum QuarantineState
 enum QuarantineTarget
@@ -166,6 +167,7 @@ struct CorrectingNode
 struct DefinitionStatus
 struct DefinitionSummary
 struct DrainFailure
+struct FanOutWarning
 struct HeldKeyRetry
 struct HeldKeys
 struct HiddenTableSize
