@@ -163,6 +163,14 @@ fn cast_of_null_names_any_type_the_grammar_has_a_value_of() {
         ("CAST(NULL AS date)", D),
         ("CAST(NULL AS timestamp)", TS),
         ("CAST(NULL AS jsonb)", ValueType::Other(PgType::Jsonb)),
+        (
+            "CAST(NULL AS timestamptz)",
+            ValueType::Other(PgType::TimestampTz),
+        ),
+        (
+            "CAST(NULL AS timestamptz) AT TIME ZONE 'UTC'",
+            ValueType::Other(PgType::Timestamp),
+        ),
         ("CAST((NULL) AS text)", T),
     ] {
         assert_type(text, expected);

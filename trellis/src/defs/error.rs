@@ -63,8 +63,8 @@ pub enum ParseError {
     PrefixMinusChainTooLong { max: usize },
     /// A bare identifier equal to a word Postgres reserves (`order`, `not`,
     /// `end`, `user`...), which Postgres can't take as an unquoted column
-    /// name. `true`, `false` and `null` are literals in Postgres, and Trellis
-    /// has no literal for them yet.
+    /// name. In an expression, `true`, `false` and `null` are the literals
+    /// instead.
     ReservedWord { name: String },
     /// A two-character comparison split by whitespace (`a < = b`, `a ! = b`).
     /// Postgres lexes `<=`, `>=`, `<>` and `!=` only when adjacent, so the

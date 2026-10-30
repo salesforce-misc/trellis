@@ -464,8 +464,8 @@ pub fn cast_target(keyword: &str) -> Option<ValueType> {
 
 /// The types `CAST(NULL AS <type>)` can name, beyond the [`CAST_TARGETS`]:
 /// every type the grammar otherwise has a value of (a column type an
-/// operator or function takes, or a typed literal's), spelled as Postgres
-/// prints them. No value is converted, so no cast rule applies.
+/// operator or function takes, or a typed literal's), each by a name
+/// Postgres gives it. No value is converted, so no cast rule applies.
 pub const NULL_CAST_TARGETS: &[ValueType] = &[
     ValueType::Integer(IntWidth::Int2),
     ValueType::Float(FloatWidth::Float4),
@@ -476,6 +476,7 @@ pub const NULL_CAST_TARGETS: &[ValueType] = &[
     ValueType::Other(PgType::Date),
     ValueType::Other(PgType::Time),
     ValueType::Other(PgType::TimeTz),
+    ValueType::Other(PgType::TimestampTz),
     ValueType::Other(PgType::Bytea),
     ValueType::Other(PgType::Oid),
     ValueType::Other(PgType::Inet),

@@ -3760,8 +3760,8 @@ fn comparison_holds(op: super::ast::Operator, order: std::cmp::Ordering) -> bool
 
 /// The value of `expr` when it is a constant Postgres folds at plan time: a
 /// number literal, a float typed literal, a `+` of two constants, a
-/// `COALESCE` whose first argument is one (the grammar has no `NULL`, so it
-/// is the result), or a calculated field whose expression is one, resolved
+/// `COALESCE` (its first argument that is not the `NULL` constant), the
+/// `TRUE`, `FALSE` and `NULL` literals, or a calculated field whose expression is one, resolved
 /// as [`infer_expr`] resolves a name. `None` for anything that reads a
 /// column (except a strict operator with a `NULL` constant operand, which
 /// the planner folds to `NULL` whatever the other reads), and for a sum

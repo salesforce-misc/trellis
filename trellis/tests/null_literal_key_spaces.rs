@@ -278,7 +278,9 @@ async fn an_aggregate_argument_and_composed_field_compute_the_literals() {
               SUM(a4) IS NOT DISTINCT FROM NULL AS nosum, \
               COALESCE(SUM(a8), NULL, 0) AS total, \
               COUNT(*) > 0 AND TRUE AS anyrows, \
-              TRUE AS yes, NULL AS nothing, CAST(NULL AS bigint) AS nb",
+              TRUE AS yes, NULL AS nothing, CAST(NULL AS bigint) AS nb, \
+              COALESCE(nothing, SUM(a4)) AS ny, SUM(COALESCE(a8, nothing)) AS sn, \
+              CASE WHEN nothing THEN 1 ELSE SUM(a2) END AS cn",
         ],
     )
     .await;
@@ -290,8 +292,8 @@ async fn an_aggregate_argument_and_composed_field_compute_the_literals() {
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
     converge(&trellis).await;
-    let columns =
-        "g, s1, c1, b1, b2, s2, m1, s3, multi, eqnull, nosum, total, anyrows, yes, nothing, nb";
+    let columns = "g, s1, c1, b1, b2, s2, m1, s3, multi, eqnull, nosum, total, anyrows, yes, \
+                   nothing, nb, ny, sn, cn";
     let oracle = "select g, sum(case when b then a4 else null end) as s1, \
                   count(case when b = true then true end) as c1, \
                   count(coalesce(b, true)) as b1, count(c and null) as b2, \
@@ -300,7 +302,9 @@ async fn an_aggregate_argument_and_composed_field_compute_the_literals() {
                   case when count(*) > 1 then sum(a4) else null end as multi, \
                   sum(a4) = null as eqnull, sum(a4) is not distinct from null as nosum, \
                   coalesce(sum(a8), null, 0) as total, count(*) > 0 and true as anyrows, \
-                  true as yes, null as nothing, cast(null as bigint) as nb \
+                  true as yes, null as nothing, cast(null as bigint) as nb, \
+                  coalesce(null, sum(a4)) as ny, sum(coalesce(a8, null)) as sn, \
+                  case when null then 1 else sum(a2) end as cn \
                   from s group by g";
     assert_eq!(differences(&raw, "g", columns, oracle).await, 0);
     assert_types_match(&raw, "g", columns, oracle).await;
@@ -405,8 +409,14 @@ async fn alter_transform_adds_literal_fields() {
     }
     converge(&trellis).await;
     trellis.shutdown().await.expect("shutdown");
-    // A fresh process reads the stored definition back.
+    // A fresh process reads the stored definition back, and a field added
+    // now reads `z`, a `text` column, as the literal it is.
     let trellis = run(db.dsn()).await;
+    wait_live::wait_for_live(&trellis, "t").await;
+    trellis
+        .apply("ALTER TRANSFORM t ADD COALESCE(z, a4) AS za, ADD z + a2 AS z2")
+        .await
+        .expect("add fields reading z");
     wait_live::wait_for_live(&trellis, "t").await;
     for sql in &WORKLOAD[3..] {
         raw.execute(*sql, &[])
@@ -414,11 +424,12 @@ async fn alter_transform_adds_literal_fields() {
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
     converge(&trellis).await;
-    let columns = "id, a4, tn, yes, z, eq, both_ok, pick, zt, nb";
+    let columns = "id, a4, tn, yes, z, eq, both_ok, pick, zt, nb, za, z2";
     let oracle = "select id, a4, coalesce(t, null) as tn, true as yes, null as z, \
                   a4 = null as eq, true and b as both_ok, \
                   case when b then null else a4 end as pick, coalesce(null, t) as zt, \
-                  cast(null as bigint) as nb from s";
+                  cast(null as bigint) as nb, coalesce(null, a4) as za, null + a2 as z2 \
+                  from s";
     assert_eq!(differences(&raw, "t", columns, oracle).await, 0);
     assert_types_match(&raw, "t", columns, oracle).await;
     audit_converges(&trellis, "t").await;

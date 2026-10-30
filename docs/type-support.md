@@ -321,7 +321,7 @@ type, and `text` when they are all `NULL`; under `AND`, `OR`, `NOT` and as a
 `WHEN` condition it is `boolean`; and `CAST(NULL AS <type>)` gives it any type
 an expression here has a value of (`smallint`, `integer`, `bigint`,
 `numeric`, `real`, `double precision`, `text`, `boolean`, `uuid`, `date`,
-`time`, `timetz`, `timestamp`, `bytea`, `oid`, `inet`, `cidr`, `macaddr`,
+`time`, `timetz`, `timestamp`, `timestamptz`, `bytea`, `oid`, `inet`, `cidr`, `macaddr`,
 `macaddr8`, `varbit`, `jsonb`). A field that is only `NULL` is a `text`
 column; a field that reads it is computed from the literal, as Postgres
 would read the inlined text (`NULL AS z, COALESCE(z, 1) AS n` makes `n` an
