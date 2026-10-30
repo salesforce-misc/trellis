@@ -1178,14 +1178,17 @@ impl GroupTargetPlan {
             }
         }
         // A `JOIN`'s `T` has no `Recompute` rows ([`Self::push`]) and no
-        // recompute table.
+        // recompute table. Where the populated source row `s` is in scope a
+        // column is read through its relation's alias (`raw.r`): the row's
+        // columns are the source's own, and a source column named `r` would
+        // make a bare `r` ambiguous.
         let hinted = if !matches!(self.writer, Writer::JoinTarget) {
             format!(
                 "hinted as ( \
                      insert into {recomputed} ({cols}) \
                      select {group_values} from raw \
-                     cross join lateral jsonb_populate_record(null::{src}, r -> 'o') as s \
-                     where r ->> 'op' = 'recompute' and jsonb_typeof(r -> 'o') = 'object' \
+                     cross join lateral jsonb_populate_record(null::{src}, raw.r -> 'o') as s \
+                     where raw.r ->> 'op' = 'recompute' and jsonb_typeof(raw.r -> 'o') = 'object' \
                        and (select __bad from bad) = 0{filter} \
                  ),",
                 filter = self.stage_filter,
