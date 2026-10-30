@@ -299,9 +299,11 @@ impl TestCluster {
     /// and always reads them back as `0` there.
     ///
     /// The port comes from binding `127.0.0.1:0` and letting it go just
-    /// before the server starts, so another process could in principle take
-    /// it in between. The server then fails to start and this panics, like
-    /// any other setup failure here.
+    /// before the server starts, so another process can take it in between.
+    /// When the server then fails to bind (`Address already in use` in its
+    /// log), it is started again on a fresh port, up to [`PORT_ATTEMPTS`]
+    /// times in all; any other startup failure panics at once, like any other
+    /// setup failure here.
     pub fn start_with_tcp() -> Self {
         Self::start_listening(true)
     }
@@ -407,8 +409,23 @@ impl TestCluster {
         parent: &Path,
         tcp: bool,
         source: DataDirSource,
+        settings: Vec<String>,
+        tls: bool,
+    ) -> Self {
+        Self::start_listening_with(parent, tcp, source, settings, tls, &mut free_loopback_port)
+    }
+
+    /// [`TestCluster::start_listening_in`], with the loopback port for a TCP
+    /// listener chosen by `pick_port`, called once per attempt (see
+    /// [`PORT_ATTEMPTS`]) and never for a unix-socket-only cluster. A seam so
+    /// a test can force the first attempt onto a port it holds.
+    fn start_listening_with(
+        parent: &Path,
+        tcp: bool,
+        source: DataDirSource,
         mut settings: Vec<String>,
         tls: bool,
+        pick_port: &mut dyn FnMut() -> u16,
     ) -> Self {
         // The template is built (or found) before taking a permit: building
         // it starts a cluster of its own, and a thread holding a permit while
@@ -447,8 +464,8 @@ impl TestCluster {
         // socket file, which lives in each cluster's own directory. A TCP
         // listener needs a port nobody else holds, picked only now, after
         // `initdb`, so the window in which another process could take it is
-        // milliseconds rather than seconds.
-        let port: u16 = if tcp { free_loopback_port() } else { 5432 };
+        // milliseconds rather than seconds. Not zero: see `PORT_ATTEMPTS`.
+        let port: u16 = if tcp { pick_port() } else { 5432 };
 
         if tls {
             let tls_dir = root.join("tls");
@@ -459,7 +476,9 @@ impl TestCluster {
         let log_path = root.join("postgres.log");
         let server = spawn_server(&data_dir, &socket_dir, port, tcp, &log_path, &settings);
 
-        let cluster = Self {
+        // Built before the wait, so a panic anywhere below drops the cluster,
+        // which stops the server and deletes the directory.
+        let mut cluster = Self {
             root,
             data_dir,
             socket_dir,
@@ -471,11 +490,59 @@ impl TestCluster {
             server: Mutex::new(server),
             _permit: permit,
         };
-        cluster.wait_ready(&log_path);
-        cluster
+        let mut attempt = 1;
+        let mut attempt_log_start = 0;
+        loop {
+            let Err(failure) = cluster.poll_ready() else {
+                return cluster;
+            };
+            // Only what this attempt logged: an earlier attempt's bind
+            // failure must not excuse a different failure of this one.
+            let log = fs::read(&log_path).unwrap_or_default();
+            let attempt_log =
+                String::from_utf8_lossy(&log[attempt_log_start.min(log.len())..]).into_owned();
+            let port_taken = tcp
+                && matches!(failure, ReadyFailure::Exited(_))
+                && attempt_log.contains(ADDRESS_IN_USE);
+            if !port_taken || attempt == PORT_ATTEMPTS {
+                panic!(
+                    "postgres {failure} (port attempt {attempt} of {PORT_ATTEMPTS}); log:\n{}",
+                    String::from_utf8_lossy(&log)
+                );
+            }
+            // The server lost the race for the port and has exited (and been
+            // reaped by `poll_ready`). Start again on a fresh port, in the
+            // same directory: `postgres` binds its TCP port before it writes
+            // `postmaster.pid`, takes a shared-memory segment or creates its
+            // unix socket, so a failed bind leaves nothing to clean up (the
+            // test of this checks the socket directory).
+            attempt += 1;
+            attempt_log_start = log.len();
+            cluster.port = pick_port();
+            *cluster.server.get_mut().unwrap_or_else(|e| e.into_inner()) = spawn_server(
+                &cluster.data_dir,
+                &cluster.socket_dir,
+                cluster.port,
+                tcp,
+                &log_path,
+                &cluster.settings,
+            );
+        }
     }
 
+    /// Waits until the server accepts connections, panicking, with the log,
+    /// if it exits or does not within 15 s.
     fn wait_ready(&self, log_path: &Path) {
+        if let Err(failure) = self.poll_ready() {
+            let log = fs::read_to_string(log_path).unwrap_or_default();
+            panic!("postgres {failure}; log:\n{log}");
+        }
+    }
+
+    /// Polls `pg_isready` until it succeeds, the server exits, or 15 s pass.
+    /// Returns as soon as the server has exited rather than waiting out the
+    /// deadline, reaping it.
+    fn poll_ready(&self) -> Result<(), ReadyFailure> {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let status = Command::new("pg_isready")
@@ -490,12 +557,18 @@ impl TestCluster {
                 .status();
 
             if matches!(status, Ok(s) if s.success()) {
-                return;
+                return Ok(());
             }
 
+            // A server that has exited will never answer: don't wait out the
+            // deadline. Checked after `pg_isready`, so one that came up and
+            // was stopped since still counts as having been ready.
+            let exited = self.server.lock().expect("server lock").try_wait();
+            if let Ok(Some(status)) = exited {
+                return Err(ReadyFailure::Exited(status));
+            }
             if Instant::now() >= deadline {
-                let log = fs::read_to_string(log_path).unwrap_or_default();
-                panic!("postgres did not become ready in time; log:\n{log}");
+                return Err(ReadyFailure::TimedOut);
             }
 
             // Real startup takes ~15 ms; a coarse poll would be the bulk of it.
@@ -975,8 +1048,39 @@ impl StopMode {
     }
 }
 
-/// A loopback TCP port that was free a moment ago. See
-/// [`TestCluster::start_with_tcp`] for the race this leaves open.
+/// How many ports a TCP cluster tries before giving up. A port is picked
+/// ([`free_loopback_port`]) and released before `postgres` binds it, and in
+/// between anything can take it: another cluster that picked the same port,
+/// or the ephemeral port of any outgoing connection (the kernel hands out
+/// both from the same range), of which a loaded `cargo test --workspace`
+/// opens many. When the server then fails to bind,
+/// [`TestCluster::start_listening_with`] starts it again on a fresh port.
+/// Each retry is another independent draw, so a few is plenty.
+const PORT_ATTEMPTS: u32 = 5;
+
+/// What `postgres` logs, from the OS error text, when it cannot bind its
+/// port. The only startup failure retried on a new port; any other panics.
+const ADDRESS_IN_USE: &str = "Address already in use";
+
+/// Why [`TestCluster::poll_ready`] gave up.
+enum ReadyFailure {
+    /// The server process exited (and has been reaped).
+    Exited(std::process::ExitStatus),
+    /// The server was still running but not accepting connections after 15 s.
+    TimedOut,
+}
+
+impl std::fmt::Display for ReadyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadyFailure::Exited(status) => write!(f, "exited ({status}) before becoming ready"),
+            ReadyFailure::TimedOut => write!(f, "did not become ready in time"),
+        }
+    }
+}
+
+/// A loopback TCP port that was free a moment ago. See [`PORT_ATTEMPTS`] for
+/// the race this leaves open.
 fn free_loopback_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|listener| listener.local_addr())
@@ -2004,6 +2108,127 @@ mod tests {
                 "the {what} postmaster must be a direct child of the test process"
             );
         }
+    }
+
+    /// Starts a TCP cluster whose ports come from `ports`, in order, recording
+    /// each pick in `picks`. Past the end of `ports`, a free port is picked.
+    fn start_tcp_on(ports: &[u16], settings: &[&str], picks: &mut Vec<u16>) -> TestCluster {
+        reap_orphans_once();
+        TestCluster::start_listening_with(
+            &std::env::temp_dir(),
+            true,
+            DataDirSource::Template,
+            settings.iter().map(|s| s.to_string()).collect(),
+            false,
+            &mut || {
+                let port = ports
+                    .get(picks.len())
+                    .copied()
+                    .unwrap_or_else(free_loopback_port);
+                picks.push(port);
+                port
+            },
+        )
+    }
+
+    /// A port taken between the pick and the server's bind (here: held by a
+    /// listener, so the first attempt is certain to lose) costs a retry on a
+    /// fresh port, not the test. The first server is gone, not leaked, and
+    /// left nothing in the directory for the second to trip on.
+    #[test]
+    fn a_tcp_cluster_whose_port_is_taken_comes_up_on_another() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+        let taken = held.local_addr().expect("held address").port();
+
+        let mut picks = Vec::new();
+        let cluster = start_tcp_on(&[taken], &[], &mut picks);
+
+        assert_eq!(picks.len(), 2, "one failed attempt, one that came up");
+        assert_eq!(picks[0], taken);
+        assert_ne!(cluster.port(), taken);
+        assert_eq!(cluster.port(), picks[1]);
+        // It serves over TCP on the new port, and its unix socket is named
+        // for it, with nothing left from the attempt on the held port.
+        let isready = Command::new("pg_isready")
+            .args(["-h", "127.0.0.1", "-p"])
+            .arg(cluster.port().to_string())
+            .stdout(Stdio::null())
+            .status()
+            .expect("run pg_isready");
+        assert!(isready.success(), "no TCP listener on the new port");
+        let mut sockets: Vec<String> = fs::read_dir(cluster.socket_dir())
+            .expect("read the socket dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        sockets.sort();
+        let new = cluster.port();
+        assert_eq!(
+            sockets,
+            [format!(".s.PGSQL.{new}"), format!(".s.PGSQL.{new}.lock")]
+        );
+
+        // The log is appended to across attempts: the first server's pid is
+        // on its bind error, and that process has been reaped.
+        let log = fs::read_to_string(cluster.root().join("postgres.log")).expect("read the log");
+        let first_error = log
+            .lines()
+            .find(|line| line.contains(ADDRESS_IN_USE))
+            .unwrap_or_else(|| panic!("no bind error in the log:\n{log}"));
+        let first_pid: i32 = first_error
+            .split(['[', ']'])
+            .nth(1)
+            .and_then(|pid| pid.parse().ok())
+            .unwrap_or_else(|| panic!("no pid on {first_error:?}"));
+        assert_ne!(first_pid as u32, cluster.server_pid());
+        assert!(
+            !process_alive(first_pid),
+            "the failed server was left running"
+        );
+    }
+
+    /// Only a lost port is retried. A server that exits for another reason
+    /// (here a setting it rejects) panics on the first attempt, with its log.
+    #[test]
+    fn a_tcp_cluster_that_fails_for_another_reason_panics_without_retrying() {
+        let mut picks = Vec::new();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            start_tcp_on(&[], &["no_such_setting=1"], &mut picks)
+        }));
+        let message = *outcome
+            .err()
+            .expect("a server that cannot start must panic")
+            .downcast::<String>()
+            .expect("a formatted panic message");
+        assert_eq!(picks.len(), 1, "no retry for a failure other than the port");
+        assert!(message.contains("exited"), "{message}");
+        assert!(
+            message.contains("no_such_setting"),
+            "the log is in it: {message}"
+        );
+    }
+
+    /// The retries are bounded: a port that is never free ends in a panic
+    /// naming the attempts, not a loop.
+    #[test]
+    fn a_tcp_cluster_gives_up_after_a_bounded_number_of_taken_ports() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+        let taken = held.local_addr().expect("held address").port();
+
+        let mut picks = Vec::new();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            start_tcp_on(&[taken; PORT_ATTEMPTS as usize + 1], &[], &mut picks)
+        }));
+        let message = *outcome
+            .err()
+            .expect("a port that is never free must panic")
+            .downcast::<String>()
+            .expect("a formatted panic message");
+        assert_eq!(picks.len(), PORT_ATTEMPTS as usize);
+        assert!(
+            message.contains(&format!("port attempt {PORT_ATTEMPTS} of {PORT_ATTEMPTS}")),
+            "{message}"
+        );
+        assert!(message.contains(ADDRESS_IN_USE), "{message}");
     }
 
     /// A wait on a pool where nothing is ever released panics,
