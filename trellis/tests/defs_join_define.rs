@@ -196,25 +196,41 @@ async fn define_validates_a_join_against_both_tables_then_refuses_it() {
 
     // A column named by two ON terms, on either side, is a typed refusal that
     // names the column, not a raw Postgres error from the hidden-table DDL;
-    // a repeated pair keeps its own refusal.
-    for (text_on, column) in [
+    // a repeated pair keeps its own refusal. The second case is refused before
+    // its second term's types are compared; the third swaps the tables so the
+    // joined side's repeated column pairs with matching types, the shape whose
+    // hidden table would name that column twice in its unique constraint.
+    for (text, column) in [
         (
-            "orders.id = items.order_id AND orders.id = items.qty",
+            on(
+                "orders.id = items.order_id AND orders.id = items.qty",
+                "COUNT(*) AS n",
+            ),
             "orders.id",
         ),
         (
-            "orders.id = items.order_id AND orders.big_id = items.order_id",
+            on(
+                "orders.id = items.order_id AND orders.big_id = items.order_id",
+                "COUNT(*) AS n",
+            ),
             "items.order_id",
         ),
+        (
+            "TRANSFORM by_region FROM items JOIN orders ON items.order_id = orders.id \
+             AND items.qty = orders.id GROUP BY items.sku WITHOUT SOURCE INDEX \
+             SELECT COUNT(*) AS n"
+                .to_string(),
+            "orders.id",
+        ),
     ] {
-        let err = define_err(&db.pool, &on(text_on, "COUNT(*) AS n")).await;
+        let err = define_err(&db.pool, &text).await;
         assert!(
             matches!(
                 &err,
                 CatalogError::Validate(ValidationError::JoinOnRepeatedColumn { column: named, .. })
                     if named == column
             ),
-            "{text_on}: {err:?}"
+            "{text}: {err:?}"
         );
         assert!(err.to_string().contains(column), "{err}");
     }
