@@ -2,7 +2,8 @@
 //! arguments (SQLSTATE 54023), so a row image built by one
 //! `jsonb_build_object('<col>', <col>::text, ...)` call fails for a source or
 //! a target past 50 columns (#1493). Every image builder joins chunks of at
-//! most 50 pairs instead.
+//! most 50 pairs instead, parenthesized so the chain stays one operand where
+//! a statement casts it (`(<image>)::text`).
 //!
 //! 120 columns crosses a second chunk boundary (50 + 50 + 20). Every test
 //! drives the pipeline by hand through `support/drain_driver.rs`; nothing
@@ -16,10 +17,8 @@ use std::time::Duration;
 
 use drain_driver::Driver;
 use trellis::config::Config;
-use trellis::defs::chunk_queue;
 use trellis::defs::{ValueType, install_definition};
 use trellis::integer::IntWidth;
-use trellis::staging::build::{self, WorkerOptions};
 use trellis::staging::self_check::{
     SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page, compare_page,
 };
@@ -27,41 +26,56 @@ use trellis::{Trellis, TrellisOptions};
 
 const WIDTH: usize = 120;
 
-const OPTIONS: WorkerOptions = WorkerOptions {
-    chunk_rows: 1_000,
-    drain_batch_cap: usize::MAX,
-    heartbeat_interval: Duration::from_secs(5),
-    reclaim_ttl: Duration::from_secs(60),
-};
-
-/// A rebuild of `src`'s targets, run by hand.
+/// A rebuild of `src`'s targets, run to completion, and every definition
+/// `live` after it with nothing left queued or quarantined: a rebuild's
+/// statement that fails leaves its job to retry (or its key in `poison`)
+/// rather than failing the call.
 async fn rebuild(d: &Driver, src: &str) {
-    let trellis = Trellis::connect(
+    Trellis::connect(
         Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
         TrellisOptions::default(),
     )
     .await
-    .expect("connect a Trellis");
-    trellis
-        .request_backfill(src)
-        .await
-        .expect("request a rebuild");
-    d.run_frozen(&[], |pool| async move {
-        let claimed = chunk_queue::claim_chunks_of(
-            &**pool.get().await.expect("pool"),
-            "rebuild",
-            1,
-            &[chunk_queue::KIND_SWEEP],
-        )
-        .await
-        .expect("claim the rebuild");
-        assert_eq!(claimed.len(), 1, "one rebuild job to claim");
-        build::run_claimed(&pool, &claimed[0], "rebuild", &OPTIONS).await;
-        Ok(())
-    })
+    .expect("connect a Trellis")
+    .request_backfill(src)
     .await
-    .finish()
-    .await;
+    .expect("request a rebuild");
+    trellis::intake::harness::settle_builds(d.pool()).await;
+    assert_eq!(
+        d.rows("select kind, last_error from trellis.backfill_chunks")
+            .await,
+        [""; 0],
+        "the rebuild's jobs are done"
+    );
+    assert_eq!(
+        d.rows("select key, last_error from trellis.poison").await,
+        [""; 0],
+        "nothing quarantined"
+    );
+    assert_eq!(
+        d.rows("select target_table from trellis.transform_definitions where status <> 'live'")
+            .await,
+        [""; 0],
+        "every definition is live"
+    );
+}
+
+/// The prior images the ring holds for changes to `table`, each as the text
+/// of `fields` read out of it.
+async fn ring_prior_images(d: &Driver, table: &str, fields: &[&str]) -> Vec<String> {
+    let rings: Vec<String> = (0..4)
+        .map(|slot| format!("select src_table, old_image from trellis.seg_{slot}"))
+        .collect();
+    let fields: Vec<String> = fields
+        .iter()
+        .map(|f| format!("r.old_image -> '{f}'"))
+        .collect();
+    d.rows(&format!(
+        "select {} from ({}) r where r.src_table = '{table}' and r.old_image is not null",
+        fields.join(", "),
+        rings.join(" union all ")
+    ))
+    .await
 }
 
 /// The aggregate's `self_check`, one page.
@@ -280,7 +294,77 @@ async fn an_aggregate_with_a_target_wider_than_50_columns_applies_and_re_derives
     );
     assert_eq!(d.rows(&downstream).await, d.rows(&oracle).await);
     assert_aggregate_self_check_clean(&d, "agg").await;
+
+    // A stale visible row for the rebuild to repair (`held_tail_sql`): the
+    // repair's prior image is the row the target held, over all 61 columns.
+    d.user()
+        .await
+        .batch_execute("update public.agg set s55 = -1 where c119 = 5000")
+        .await
+        .expect("make a target row stale");
     rebuild(&d, "w").await;
     assert_eq!(d.rows(&target).await, d.rows(&oracle).await);
+    let prior = ring_prior_images(&d, "public.agg", &["c119", "s55"]).await;
+    assert!(
+        prior.contains(&"(\"\"\"5000\"\"\",\"\"\"-1\"\"\")".to_string()),
+        "the repaired row's prior image: {prior:?}"
+    );
+    if let Some(batch) = d.try_seal().await {
+        d.drain(batch, "after the rebuild").await;
+    }
     assert_eq!(d.rows(&downstream).await, d.rows(&oracle).await);
+}
+
+/// A rebuild of a 1-1 target wider than 50 columns that another transform
+/// reads. The rebuild's statement (`staging::build::one_to_one`) captures
+/// each changed row's prior image over every target column as
+/// `<image>::text`, so a chained image has to be one operand: `a || b::text`
+/// is `jsonb || text`, a text concatenation that the ring then refuses as
+/// JSON, and the build quarantines the key and leaves its row stale.
+#[tokio::test]
+async fn a_rebuild_of_a_read_one_to_one_target_wider_than_50_columns_images_its_prior_rows() {
+    let mut d = start(
+        &[format!(
+            "TRANSFORM wide FROM public.w SELECT {}",
+            select_all()
+        )],
+        &format!("; insert into public.w values {}, {}", row(1, 0), row(2, 0)),
+    )
+    .await;
+    let columns: HashMap<String, ValueType> = columns().into_iter().collect();
+    install_definition(
+        d.pool(),
+        "TRANSFORM down FROM public.wide SELECT c0 AS c0, c60 AS c60, c119 AS c119",
+        &columns,
+        "public",
+    )
+    .await
+    .expect("install the downstream transform");
+    trellis::intake::harness::settle_builds(d.pool()).await;
+    let wide_oracle = format!("select id, {} from public.w order by id", cols().join(", "));
+    let wide_target = format!(
+        "select id, {} from public.wide order by id",
+        cols().join(", ")
+    );
+    let down_oracle = "select id, c0, c60, c119 from public.w order by id";
+    let down_target = "select id, c0, c60, c119 from public.down order by id";
+    assert_eq!(d.rows(down_target).await, d.rows(down_oracle).await);
+
+    // A stale target row, its values past the first chunk, for the rebuild
+    // to repair: the repair changes the row, so its prior image goes to
+    // `down`'s ring.
+    d.user()
+        .await
+        .batch_execute("update public.wide set c60 = -5, c119 = -6 where id = 1")
+        .await
+        .expect("make a target row stale");
+    rebuild(&d, "w").await;
+    assert_eq!(d.rows(&wide_target).await, d.rows(&wide_oracle).await);
+    let prior = ring_prior_images(&d, "public.wide", &["c60", "c119"]).await;
+    assert_eq!(prior, ["(\"\"\"-5\"\"\",\"\"\"-6\"\"\")"]);
+    if let Some(batch) = d.try_seal().await {
+        d.drain(batch, "after the rebuild").await;
+    }
+    assert_eq!(d.rows(down_target).await, d.rows(down_oracle).await);
+    assert_self_check_clean(&d, "down").await;
 }

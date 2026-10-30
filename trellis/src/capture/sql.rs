@@ -68,7 +68,7 @@
 use std::collections::BTreeSet;
 
 use crate::defs::ddl::composite_key_escape_sql;
-use crate::pool::{DETERMINISTIC_TEXT_OUTPUT_GUCS, jsonb_build_object_sql, quote_ident};
+use crate::pool::{DETERMINISTIC_TEXT_OUTPUT_GUCS, jsonb_build_object_calls, quote_ident};
 use crate::staging::append::{
     NODE_TRUNCATE_SENTINEL_KEY, RING_SIZE, SCHEMA_CHANGED_SENTINEL_KEY, TRUNCATE_SENTINEL_KEY,
 };
@@ -1490,13 +1490,20 @@ fn value_text(alias: &str, column: &str) -> String {
 }
 
 /// `alias`'s image: a JSON object of every image column's text.
+///
+/// The calls are joined bare, not parenthesized as
+/// [`crate::pool::jsonb_build_object_sql`] does: every place the image goes
+/// (a select-list item, a `CASE` arm) is one operand already, and an installed
+/// function is current only while its body is byte-identical to this text
+/// (`super::install`), so a change here would re-install every capture of a
+/// table wider than 50 columns.
 fn image_expr(spec: &CaptureSpec, alias: &str) -> String {
     let pairs: Vec<String> = spec
         .columns
         .iter()
         .map(|c| format!("{}, {}", text_expr(c), value_text(alias, c)))
         .collect();
-    jsonb_build_object_sql(&pairs)
+    jsonb_build_object_calls(&pairs).join(" || ")
 }
 
 /// `s` as a SQL text expression that means the same under any
@@ -2193,6 +2200,21 @@ mod tests {
         let image = image_expr(&wide, "n");
         assert_eq!(image.matches("jsonb_build_object(").count(), 3);
         assert_eq!(image.matches(" || jsonb_build_object(").count(), 2);
+        // Bare calls of 50 pairs, byte for byte what installed functions'
+        // bodies hold (see `image_expr`).
+        let expected = wide
+            .columns
+            .chunks(50)
+            .map(|chunk| {
+                let pairs: Vec<String> = chunk
+                    .iter()
+                    .map(|c| format!("{}, {}", text_expr(c), value_text("n", c)))
+                    .collect();
+                format!("jsonb_build_object({})", pairs.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join(" || ");
+        assert_eq!(image, expected);
     }
 
     #[test]

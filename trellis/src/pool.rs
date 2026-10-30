@@ -971,17 +971,30 @@ pub(crate) const MAX_PAIRS_PER_BUILD: usize = 50;
 /// `jsonb_build_object` whose pairs grow with a table's columns goes through
 /// this. An empty `pairs` is the empty object.
 ///
+/// More than one call is parenthesized, so the result is one operand wherever
+/// it is embedded: `::` binds tighter than `||`, and `a || b::text` is
+/// `jsonb || text`, which Postgres resolves to text concatenation
+/// (`{"a": 1}{"b": 2}`), not an error.
+///
 /// Keys are distinct (column names), so `||`'s right-wins merge never drops a
 /// pair.
 pub(crate) fn jsonb_build_object_sql(pairs: &[String]) -> String {
+    match jsonb_build_object_calls(pairs).as_slice() {
+        [one] => one.clone(),
+        calls => format!("({})", calls.join(" || ")),
+    }
+}
+
+/// The `jsonb_build_object` calls [`jsonb_build_object_sql`] joins: one for an
+/// empty `pairs`, else one per [`MAX_PAIRS_PER_BUILD`] pairs.
+pub(crate) fn jsonb_build_object_calls(pairs: &[String]) -> Vec<String> {
     if pairs.is_empty() {
-        return "jsonb_build_object()".to_string();
+        return vec!["jsonb_build_object()".to_string()];
     }
     pairs
         .chunks(MAX_PAIRS_PER_BUILD)
         .map(|chunk| format!("jsonb_build_object({})", chunk.join(", ")))
-        .collect::<Vec<_>>()
-        .join(" || ")
+        .collect()
 }
 
 #[cfg(test)]
@@ -994,6 +1007,13 @@ mod tests {
     /// of `sql`, counting commas outside parentheses and string literals.
     fn call_arities(sql: &str) -> Vec<usize> {
         let mut arities = Vec::new();
+        let chained = sql.contains(" || ");
+        assert_eq!(
+            chained,
+            sql.starts_with('(') && sql.ends_with(')'),
+            "a chain is parenthesized, one call is bare: {sql}"
+        );
+        let sql = if chained { &sql[1..sql.len() - 1] } else { sql };
         for call in sql.split(" || ") {
             let inner = call
                 .strip_prefix("jsonb_build_object(")
