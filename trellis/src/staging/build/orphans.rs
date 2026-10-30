@@ -169,7 +169,8 @@ impl Statement {
                     (select w.__k from w order by w.__n desc limit 1), \
                     array(select w.__k from w \
                           where not exists (select 1 from {ledger} l \
-                                            where l.{key} = w.__k and not l.{tombstone}) \
+                                            where l.{key} = w.__k collate \"C\" \
+                                              and not l.{tombstone}) \
                             and not exists (select 1 from poison p \
                                             join transform_definitions d \
                                               on d.id = p.transform_id \
@@ -233,9 +234,9 @@ mod tests {
 
     /// A walk from a typed cursor reads the target through its key index
     /// from the cursor and probes the ledger by key (#1490), for an integer
-    /// key and a composite one: no batch reads the whole target or the whole
-    /// ledger, as a cursor on the key's text did for any key but a single
-    /// text column.
+    /// key, a composite one and a text key of its own collation: no batch
+    /// reads the whole target or the whole ledger, as a cursor on the key's
+    /// text did for any key but a single text column.
     #[tokio::test]
     async fn a_batch_reads_the_target_by_its_key_index_from_the_cursor() {
         let cluster = testkit::TestCluster::start();
@@ -248,10 +249,12 @@ mod tests {
                  create table public.tc (g integer not null, h text not null, \
                      primary key (g, h)); \
                  insert into public.tc select g / 10, 'h' || g from generate_series(1, 100000) g; \
+                 create table public.tu (id text collate \"und-x-icu\" primary key); \
+                 insert into public.tu select 'k' || g from generate_series(1, 100000) g; \
                  create table public.l (__from_key text collate \"C\" primary key, \
                      __tombstone boolean not null default false); \
                  insert into public.l select g::text from generate_series(1, 80000) g; \
-                 analyze public.ti, public.tc, public.l",
+                 analyze public.ti, public.tc, public.tu, public.l",
             )
             .await
             .expect("seed");
@@ -265,6 +268,16 @@ mod tests {
                 "public.tc",
                 vec![column("g", "integer", false), column("h", "text", false)],
                 "g = 5000 and h = 'h50000'",
+            ),
+            (
+                // A key of its own collation: the ledger's `"C"` text is
+                // compared under `"C"` (#1520), which its index serves.
+                "public.tu",
+                vec![PrimaryKeyColumn {
+                    collation: Some("\"und-x-icu\"".to_string()),
+                    ..column("id", "text", false)
+                }],
+                "id = 'k50000'",
             ),
         ] {
             let after: String = client
@@ -414,6 +427,8 @@ mod tests {
                  insert into public.td values {words}; \
                  create table public.tc (id text collate \"C\" primary key); \
                  insert into public.tc values {words}; \
+                 create table public.tu (id text collate \"und-x-icu\" primary key); \
+                 insert into public.tu values {words}; \
                  create table public.tm (g integer, h text, primary key (g, h)); \
                  insert into public.tm select n, td.id from public.td, generate_series(0, 2) n; \
                  create table public.l (__from_key text collate \"C\" primary key, \
@@ -424,6 +439,7 @@ mod tests {
         for (target, order) in [
             ("public.td", "id"),
             ("public.tc", "id"),
+            ("public.tu", "id collate \"und-x-icu\""),
             ("public.tm", "g, h"),
         ] {
             let key = crate::defs::ddl::source_primary_key_in_txn(&client, target)
