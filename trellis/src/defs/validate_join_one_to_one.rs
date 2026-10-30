@@ -208,6 +208,43 @@ mod tests {
     }
 
     #[test]
+    fn a_column_named_by_two_on_terms_is_refused_on_either_side() {
+        let _lock = KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_enabled(true);
+        let (from, joined) = sides();
+        let on = |on: &str| {
+            let def = parse(&format!(
+                "TRANSFORM v FROM orders LEFT JOIN customers ON {on} SELECT customers.name AS n"
+            ))
+            .unwrap();
+            validate_join(&def, &from, &joined)
+        };
+        // The joined side's column repeated.
+        assert_eq!(
+            on("orders.cust = customers.id AND orders.total = customers.id"),
+            Err(ValidationError::JoinOnRepeatedColumn {
+                term: "orders.total = customers.id".to_string(),
+                column: "customers.id".to_string(),
+            })
+        );
+        // The FROM side's column repeated (the repeat is refused before the
+        // second term's types are compared).
+        assert_eq!(
+            on("orders.cust = customers.id AND customers.name = orders.cust"),
+            Err(ValidationError::JoinOnRepeatedColumn {
+                term: "customers.name = orders.cust".to_string(),
+                column: "orders.cust".to_string(),
+            })
+        );
+        // A repeated pair keeps its own refusal.
+        assert!(matches!(
+            on("orders.cust = customers.id AND customers.id = orders.cust"),
+            Err(ValidationError::JoinOnRepeatedPair { .. })
+        ));
+        set_enabled(false);
+    }
+
+    #[test]
     fn a_field_is_any_expression_over_qualified_columns_of_either_table() {
         let _lock = KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_enabled(true);

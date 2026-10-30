@@ -200,7 +200,7 @@ shape:
   name means a field, and a dotted name whose head isn't a side is an unknown
   table qualifier. `<cond>` is one
   or more equalities joined by `AND`, each between one column of each side
-  (either order), with no column pair repeated. Each `GROUP BY` key becomes a
+  (either order), with no column named by two terms. Each `GROUP BY` key becomes a
   target column named after its bare column name, so two keys sharing a bare
   name are refused. An aggregate argument reads one side; one mixing both sides
   is refused, and the admitted aggregates are ADR-0019's. `WHERE` stays

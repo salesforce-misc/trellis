@@ -119,6 +119,10 @@ pub enum ValidationError {
     /// An `ON` term pairs the same two columns as an earlier one (in either
     /// order).
     JoinOnRepeatedPair { term: String },
+    /// An `ON` term names a column an earlier term already names, paired with
+    /// a different column of the other table. The join key would list that
+    /// column twice, which the hidden tables cannot store.
+    JoinOnRepeatedColumn { term: String, column: String },
     /// The two columns of an `ON` term differ in type or collation (a type
     /// modifier never counts, and `text` and `varchar` are one type).
     /// Trellis never casts a join key.
@@ -970,6 +974,12 @@ impl fmt::Display for ValidationError {
             ValidationError::JoinOnRepeatedPair { term } => write!(
                 f,
                 "ON term '{term}' repeats a column pair an earlier term already joins"
+            ),
+            ValidationError::JoinOnRepeatedColumn { term, column } => write!(
+                f,
+                "ON term '{term}' names {column}, which an earlier term already names; a \
+                 column appears in at most one ON term, so drop the term or join a \
+                 different column"
             ),
             ValidationError::JoinKeyTypeMismatch {
                 lhs,
@@ -2013,6 +2023,10 @@ pub(crate) fn validate_join_tables_and_on(
     };
 
     let mut pairs: HashSet<(&str, &str)> = HashSet::with_capacity(join.on.len());
+    // A column named by two terms, each paired with another column, would
+    // appear twice in a hidden table and in the target's key.
+    let mut left_columns: HashSet<&str> = HashSet::with_capacity(join.on.len());
+    let mut right_columns: HashSet<&str> = HashSet::with_capacity(join.on.len());
     for term in &join.on {
         let (lhs_side, lhs) = resolve(&term.lhs)?;
         let (rhs_side, rhs) = resolve(&term.rhs)?;
@@ -2029,6 +2043,21 @@ pub(crate) fn validate_join_tables_and_on(
             return Err(ValidationError::JoinOnRepeatedPair {
                 term: format!("{} = {}", written(&term.lhs), written(&term.rhs)),
             });
+        }
+        let (left_column, right_column) = match lhs_side {
+            JoinSide::Left => (&term.lhs, &term.rhs),
+            JoinSide::Right => (&term.rhs, &term.lhs),
+        };
+        for (seen, column) in [
+            (&mut left_columns, left_column),
+            (&mut right_columns, right_column),
+        ] {
+            if !seen.insert(column.column.as_str()) {
+                return Err(ValidationError::JoinOnRepeatedColumn {
+                    term: format!("{} = {}", written(&term.lhs), written(&term.rhs)),
+                    column: written(column),
+                });
+            }
         }
         check_key_type(&term.lhs, lhs)?;
         check_key_type(&term.rhs, rhs)?;
@@ -7802,7 +7831,7 @@ mod tests {
         // Both ON orders and a conjunction.
         check_text(
             "TRANSFORM t FROM orders JOIN items ON items.order_id = orders.id AND \
-             items.qty = orders.id GROUP BY orders.region SELECT COUNT(*) AS n",
+             items.sku = orders.region GROUP BY orders.region SELECT COUNT(*) AS n",
         )
         .unwrap();
     }
@@ -8255,6 +8284,49 @@ mod tests {
                 term: "items.order_id = orders.id".to_string()
             })
         );
+    }
+
+    #[test]
+    fn join_refuses_a_column_named_by_two_on_terms_on_either_side() {
+        let on = |on: &str| {
+            check_text(&format!(
+                "TRANSFORM t FROM orders JOIN items ON {on} GROUP BY orders.region \
+                 SELECT COUNT(*) AS n"
+            ))
+        };
+        let repeated = |term: &str, column: &str| {
+            Err(ValidationError::JoinOnRepeatedColumn {
+                term: term.to_string(),
+                column: column.to_string(),
+            })
+        };
+        // The joined table's column repeated, then the FROM table's.
+        assert_eq!(
+            on("orders.id = items.order_id AND orders.region = items.order_id"),
+            repeated("orders.region = items.order_id", "items.order_id")
+        );
+        assert_eq!(
+            on("orders.id = items.order_id AND orders.id = items.qty"),
+            repeated("orders.id = items.qty", "orders.id")
+        );
+        // Either written order of the repeating term.
+        assert_eq!(
+            on("orders.id = items.order_id AND items.qty = orders.id"),
+            repeated("items.qty = orders.id", "orders.id")
+        );
+        // A schema-qualified spelling of the same column is the same column.
+        assert_eq!(
+            on("orders.id = items.order_id AND public.orders.id = items.qty"),
+            repeated("public.orders.id = items.qty", "public.orders.id")
+        );
+        // A repeated pair keeps its own refusal.
+        assert!(matches!(
+            on("orders.id = items.order_id AND items.order_id = orders.id"),
+            Err(ValidationError::JoinOnRepeatedPair { .. })
+        ));
+        // A column reused across the sides is not a repeat: `qty` is on the
+        // joined side and `id` on the FROM side.
+        on("orders.id = items.qty AND orders.region = items.sku").unwrap();
     }
 
     #[test]

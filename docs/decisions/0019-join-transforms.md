@@ -56,7 +56,7 @@ would break a stored definition, which is stored as text and re-parsed.
   `LEFT OUTER JOIN` are `LEFT`, and `a` is the side `LEFT` keeps. A definition
   stores and renders them as `INNER JOIN` and `LEFT JOIN`. Exactly one join.
 - **`ON`.** One or more equalities joined by `AND`, each `a.col = b.col` (in
-  either order) with one column from each side, and no column pair repeated, so
+  either order) with one column from each side, and no column named by two terms, so
   composite keys such as `(tenant_id, id)` are admitted. `P`, `M` and `J` key on
   the tuple of join columns, in `ON` order. A row with a `NULL` in any join-key
   column never matches, so a `LEFT` row with no match lands in the group with a

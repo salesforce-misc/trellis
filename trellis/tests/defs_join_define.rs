@@ -194,6 +194,46 @@ async fn define_validates_a_join_against_both_tables_then_refuses_it() {
         "{err:?}"
     );
 
+    // A column named by two ON terms, on either side, is a typed refusal that
+    // names the column, not a raw Postgres error from the hidden-table DDL;
+    // a repeated pair keeps its own refusal.
+    for (text_on, column) in [
+        (
+            "orders.id = items.order_id AND orders.id = items.qty",
+            "orders.id",
+        ),
+        (
+            "orders.id = items.order_id AND orders.big_id = items.order_id",
+            "items.order_id",
+        ),
+    ] {
+        let err = define_err(&db.pool, &on(text_on, "COUNT(*) AS n")).await;
+        assert!(
+            matches!(
+                &err,
+                CatalogError::Validate(ValidationError::JoinOnRepeatedColumn { column: named, .. })
+                    if named == column
+            ),
+            "{text_on}: {err:?}"
+        );
+        assert!(err.to_string().contains(column), "{err}");
+    }
+    let err = define_err(
+        &db.pool,
+        &on(
+            "orders.id = items.order_id AND items.order_id = orders.id",
+            "COUNT(*) AS n",
+        ),
+    )
+    .await;
+    assert!(
+        matches!(
+            err,
+            CatalogError::Validate(ValidationError::JoinOnRepeatedPair { .. })
+        ),
+        "{err:?}"
+    );
+
     assert_nothing_registered(&db.pool, "by_region").await;
 }
 

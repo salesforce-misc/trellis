@@ -349,6 +349,43 @@ async fn the_accept_and_refuse_matrix() {
         ),
         "{err:?}"
     );
+    // A column named by two ON terms: the joined side's (`id`), the FROM
+    // side's (`cust`), each a typed refusal naming the column and not the
+    // raw error of the hidden-table DDL.
+    for (text_on, column) in [
+        (
+            "orders.cust = customers.id AND orders.id = customers.id",
+            "customers.id",
+        ),
+        (
+            "orders.cust = customers.id AND orders.cust = customers.ext",
+            "orders.cust",
+        ),
+    ] {
+        let err = define_err(&db.pool, &on(text_on)).await;
+        assert!(
+            matches!(
+                &err,
+                CatalogError::Validate(ValidationError::JoinOnRepeatedColumn { column: named, .. })
+                    if named == column
+            ),
+            "{text_on}: {err:?}"
+        );
+        assert!(err.to_string().contains(column), "{err}");
+    }
+    // A repeated pair keeps its own refusal.
+    let err = define_err(
+        &db.pool,
+        &on("orders.cust = customers.id AND customers.id = orders.cust"),
+    )
+    .await;
+    assert!(
+        matches!(
+            err,
+            CatalogError::Validate(ValidationError::JoinOnRepeatedPair { .. })
+        ),
+        "{err:?}"
+    );
     // The ON clause follows the aggregate JOIN's rules: a type mismatch.
     let err = define_err(&db.pool, &on("orders.code = customers.id")).await;
     assert!(
