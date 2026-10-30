@@ -196,14 +196,15 @@ against 3.8 s. It took about 5x as long overall.
 ### A build fills `M`, then `R` and the target
 
 A build re-derives every key of `b` ∪ `M` into `M` first: `b`'s rows in
-batches of its primary key, those whose key has a `NULL` part (a `b` that is an
-aggregate's target, keyed by a nullable group column) in a batch of their own,
-then `M`'s live entries whose `b` row is gone, which become tombstones. Each
-batch is a page of `b` Re-derives with its fan-out left out: the chunks that
-follow write every target row, none starts before the last batch commits, and
-so none joins an `a` row to a `b` row that is gone. Each batch commits with the build's cursor, so a batch that fails
-(a page holding a `J` row longer than the batch waits) or a worker that dies
-resumes from the last batch that committed. It then fills `R` and the target
+batches of its primary key, those whose key has a `NULL` part (a `b` that is
+an aggregate's target, keyed by a nullable group column) in batches of their
+own, then `M`'s live entries whose `b` row is gone, which become tombstones.
+Each batch is a page of `b` Re-derives with its fan-out left out: the chunks
+that follow write every target row, none starts before the last batch
+commits, and so none joins an `a` row to a `b` row that is gone. Each batch
+commits with the build's cursor, so a batch that fails (a page holding a `J`
+row longer than the batch waits) or a worker that dies resumes from the last
+batch that committed. It then fills `R` and the target
 in chunks of `a`'s primary-key range. Each chunk:
 
 1. Holds the lock row `FOR SHARE`, and locks `J` for the live keys in its

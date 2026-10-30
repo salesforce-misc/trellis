@@ -1787,7 +1787,6 @@ async fn write_target(
             key = quote_ident(schema::KEY_COLUMN),
             has = shape.has_target_row_sql(),
         );
-        let target_ident = ddl::qualified_target_table_ident(&shape.target);
         let matched = super::apply::MatchKeys::of(decoded.iter());
         if !matched.plain.is_empty() {
             let columns = super::apply::transpose_pk_parts(arity, &matched.plain);
@@ -1799,7 +1798,6 @@ async fn write_target(
                          where exists (select 1 from {keyset} where {matches}) \
                            and {unbacked} \
                          returning {key_expr}",
-                        target = target_ident,
                         keyset = super::apply::pk_keyset_unnest(&shape.pk, 1),
                         matches = super::apply::pk_keyset_match(&shape.pk, "t"),
                     ),
@@ -1815,7 +1813,7 @@ async fn write_target(
             let rows = txn
                 .query(
                     &format!(
-                        "delete from {target_ident} as t {using} \
+                        "delete from {target} as t {using} \
                          where {matches} and {unbacked} returning {key_expr}"
                     ),
                     &params,

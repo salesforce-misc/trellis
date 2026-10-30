@@ -9,8 +9,12 @@
 //!   A build chunk's range is a row comparison, which is `NULL` wherever a
 //!   `NULL` part decides it, so no chunk reaches such an `a` row: the plan
 //!   job stages a Re-derive of each at its end, and the page writes its
-//!   target row under a `NULL` key. A `b` row keyed that way is read by the
-//!   `M` pass's own batch.
+//!   target row under a `NULL` key. A `b` change fans out to such rows when
+//!   the `ON` leaves out their `NULL` part. A `b` row keyed that way is read
+//!   by the `M` pass's own batch.
+//! - **An upstream's rebuild.** A `RESUME` of the aggregate the join reads
+//!   rewrites its target through the target-mutation seam, and the join
+//!   follows its rows.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -310,6 +314,102 @@ async fn trellis(d: &Driver) -> trellis::Trellis {
     )
     .await
     .expect("connect a Trellis")
+}
+
+/// Two key columns, joined on the first alone: a group keyed `NULL` in its
+/// second part joins a `b` row, so a `b` change fans out to it beside the
+/// groups with no `NULL` part, in one target write.
+fn joined_on_first_column() -> Case {
+    Case {
+        ddl: "create table public.src (id integer primary key, g integer, h integer, \
+                  v integer); \
+              create table public.b (id integer primary key, k integer, w integer); \
+              create unique index on public.b (k); \
+              insert into public.src values \
+                  (1, 1, 1, 10), (2, 1, null, 20), (3, null, 1, 5), (4, null, null, 7), \
+                  (5, 2, null, 1); \
+              insert into public.b values (1, 1, 100), (2, 2, 200)",
+        columns: vec![("g", int4()), ("h", int4()), ("v", int4())],
+        aggregate: "TRANSFORM agg FROM public.src GROUP BY g, h WITHOUT SOURCE INDEX \
+                    SELECT count(*) AS n",
+        on: "agg.g = b.k",
+        key: "agg.g::text, agg.h::text",
+        order: "1, 2",
+        changes: [
+            "insert into public.src values (6, 1, null, 1), (7, null, null, 1)",
+            "delete from public.src where g is null or h is null",
+            "insert into public.src values (8, 1, null, 1), (9, 2, null, 1)",
+        ],
+    }
+}
+
+/// A `b` change fans out to the `a` rows on its key, the ones keyed `NULL` in
+/// a part the `ON` doesn't name among them: an update rewrites their target
+/// rows, a delete removes them (`INNER`) or empties their `b` columns
+/// (`LEFT`), an insert brings them back, and a key's move does both.
+#[tokio::test]
+async fn a_b_change_fans_out_to_the_rows_of_a_keyed_by_null() {
+    let _serial = SERIAL.lock().await;
+    let case = joined_on_first_column();
+    for kind in KINDS {
+        let mut d = start_nullable_a(&case, kind).await;
+        assert_a_oracle(&d, &case, kind, "the build").await;
+        for (sql, what) in [
+            ("update public.b set w = 150 where k = 1", "an update of b"),
+            ("delete from public.b where k = 1", "a delete of b"),
+            ("insert into public.b values (3, 1, 175)", "an insert of b"),
+            ("update public.b set k = 3 where id = 2", "a key's move"),
+            ("update public.b set k = 2 where id = 2", "a move back"),
+        ] {
+            step(&mut d, sql).await;
+            assert_a_oracle(&d, &case, kind, what).await;
+        }
+        nulls_changes(&mut d, &case, kind).await;
+    }
+}
+
+/// [`Case::changes`] in turn, each checked against the live join.
+async fn nulls_changes(d: &mut Driver, case: &Case, kind: Kind) {
+    let [grow, delete, back] = case.changes;
+    step(d, grow).await;
+    assert_a_oracle(d, case, kind, "a NULL-keyed group grows").await;
+    step(d, delete).await;
+    assert_a_oracle(d, case, kind, "the NULL-keyed groups deleted").await;
+    step(d, back).await;
+    assert_a_oracle(d, case, kind, "the NULL-keyed groups back").await;
+}
+
+/// A `RESUME` of the aggregate the join reads as `a`: the aggregate's
+/// rebuild rewrites its target, the groups keyed `NULL` among them, and the
+/// join follows. Every write of the rebuild reaches the join through the
+/// target-mutation seam as the key's new row (or a re-read of it), and a 1-1
+/// `JOIN` replaces its `R` entry with it rather than applying a delta from
+/// the prior image, so the join is exact once the seam's rows drain whether
+/// or not the reader rebuild the aggregate's resume starts
+/// (`intake::catch_up::park_target_catchup_if_read`) has run.
+#[tokio::test]
+async fn an_upstream_resume_is_followed_by_the_join() {
+    let _serial = SERIAL.lock().await;
+    for case in [one_column(), two_columns(), joined_on_first_column()] {
+        for kind in KINDS {
+            let mut d = start_nullable_a(&case, kind).await;
+            let trellis = trellis(&d).await;
+            trellis.apply("PAUSE TRANSFORM agg").await.expect("pause");
+            let [grow, delete, back] = case.changes;
+            step(&mut d, grow).await;
+            step(&mut d, delete).await;
+            trellis.apply("RESUME TRANSFORM agg").await.expect("resume");
+            trellis::intake::harness::start_registered_builds(d.pool())
+                .await
+                .expect("start the resumed build");
+            trellis::staging::build::settle_builds(d.pool()).await;
+            d.settle().await;
+            assert_eq!(status(&d, "public.agg").await, "live");
+            assert_a_oracle(&d, &case, kind, "the aggregate's resume").await;
+            step(&mut d, back).await;
+            assert_a_oracle(&d, &case, kind, "a change after the resume").await;
+        }
+    }
 }
 
 /// A rebuild in place of a live join (`request_backfill` of `b`, after a
