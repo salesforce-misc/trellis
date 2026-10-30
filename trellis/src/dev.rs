@@ -70,6 +70,11 @@ pub mod defs {
         enabled as one_to_one_join_enabled, set_enabled as set_one_to_one_join,
         set_max_fanout as set_one_to_one_join_max_fanout,
     };
+    pub use crate::staging::join_one_to_one_status::{
+        FAN_OUT_WARNING_ENV as ONE_TO_ONE_JOIN_FAN_OUT_WARNING_ENV,
+        fan_out_warning_rows as one_to_one_join_fan_out_warning_rows,
+        set_fan_out_warning_rows as set_one_to_one_join_fan_out_warning_rows,
+    };
 
     pub use crate::float::FloatWidth;
     pub use crate::integer::IntWidth;
@@ -198,8 +203,8 @@ pub mod fixtures {
 
     use crate::{
         BackfillFailure, CaptureFailure, CaptureFailureKind, CaptureWait, CorrectingNode,
-        DefinitionStatus, DefinitionSummary, DrainFailure, HeldKeys, IndexRole, JoinStatus,
-        PoisonEntry, PoisonSample, QuarantineEntry, QuarantineState, QuarantineTarget,
+        DefinitionStatus, DefinitionSummary, DrainFailure, FanOutWarning, HeldKeys, IndexRole,
+        JoinStatus, PoisonEntry, PoisonSample, QuarantineEntry, QuarantineState, QuarantineTarget,
         SelfCheckJob, SelfCheckJobState, SelfCheckMode, SelfCheckOutcome, SelfCheckReport,
         SourceIndexGap, TransformStatus,
     };
@@ -298,10 +303,20 @@ pub mod fixtures {
     }
 
     #[allow(non_snake_case)]
+    pub fn FanOutWarning() -> FanOutWarning {
+        FanOutWarning {
+            key: String::new(),
+            rows: 0,
+            threshold: 0,
+        }
+    }
+
+    #[allow(non_snake_case)]
     pub fn JoinStatus() -> JoinStatus {
         JoinStatus {
             hidden_tables: Vec::new(),
             partials_warning: None,
+            fan_out_warning: None,
             building: None,
         }
     }

@@ -181,7 +181,9 @@ In v1, fan-out runs in one transaction. It is about 3–4 s per million rows
 with the seam, and that key's `a` writers wait for all of it. Three limits
 keep it bounded:
 
-- A `status()` warning names keys with more than 100k `a` rows.
+- A `status()` warning names the join key with the most `a` rows when it holds more than 100k. The
+  count is a sample of `R`'s join-key index, not `pg_stats`, which is stale after a build. The 100k is a
+  placeholder knob that the benchmark of the SQL fan-out sets.
 - A hard cap halts the transform rather than fan out past a configured row
   count.
 - No transform may read a 1-1 JOIN target. The seam holds every changed key's
@@ -240,6 +242,22 @@ tombstone and its target row goes. Then its orphan pass walks
 the target in its key order and re-derives, as an `a` Re-derive page, every
 target row no live `R` entry backs. It never deletes one by statement: a row
 re-inserted and applied between the read and the delete would be lost.
+
+### `self_check` compares the target, both copies and the uniqueness of `b`
+
+`self_check` reads each side as its copy has applied it, which is the source minus the ring rows the
+copy hasn't applied yet, as the 1-1 and aggregate checks do (ADR-0013). It audits, in order:
+
+- **The target**: each row against `a` as `R` has applied it, joined to `b` as `M` has applied it,
+  on the newest live `M` entry of a key when there are several.
+- **`R` and `M`**: each against its source, in both directions: a row with no live entry or other
+  values, and a live entry with no row.
+- **A join key with more than one live `M` entry.** The target reads the newest entry of a key, which
+  masks a duplicate, so this is where `b` losing its uniqueness shows before a revalidation pauses
+  the transform. The two entries of a hand-off applied out of order are the same state, so this
+  check is re-checked while `b`'s ring holds an unapplied row.
+
+It reports and never repairs.
 
 ### Pause and `RESUME`
 

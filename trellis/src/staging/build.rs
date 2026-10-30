@@ -166,6 +166,7 @@ use super::apply::ApplyError;
 use super::quarantine;
 
 mod join_one_to_one;
+pub(crate) use join_one_to_one::{plan_step, sweep_step};
 pub mod one_to_one;
 mod orphans;
 

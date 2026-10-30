@@ -334,6 +334,15 @@ impl Ring<'_> {
         )
     }
 
+    /// True when the ring holds any unapplied row of the source, whether or
+    /// not it can be subtracted, in a statement that has [`Self::one_to_one_ctes`]'s
+    /// CTEs. For a check that cannot subtract (a transient state of a hand-off
+    /// between two rows of the source) and so re-checks whenever the source
+    /// has lag.
+    pub(super) fn unapplied_sql(&self) -> String {
+        format!("exists (select 1 from {})", self.cte("rows"))
+    }
+
     /// True when any unapplied row can't be subtracted: [`Self::global_sql`],
     /// or any row of [`Self::uncertain_images_sql`]'s.
     pub(super) fn any_uncertain_sql(&self) -> String {

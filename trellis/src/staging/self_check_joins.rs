@@ -74,7 +74,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use tokio_postgres::types::PgLsn;
 
-use crate::defs::ast::{Expr, JoinKind, KeySpace, Predicate, TransformDef, as_extract};
+use crate::defs::ast::{Expr, JoinKind, Predicate, TransformDef, as_extract};
 use crate::defs::catalog;
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::join::{self as spec, HiddenTable, Side as JoinSide};
@@ -167,12 +167,10 @@ fn next_cursor(part: Part, page_end: Option<String>) -> Option<String> {
     }
 }
 
-/// `def`'s `JOIN`. Only called on a `JOIN` definition.
+/// `def`'s `JOIN`, of either kind (a 1-1 `JOIN`'s fields are rendered by
+/// [`render`] too). Only called on a `JOIN` definition.
 fn join_of(def: &TransformDef) -> &crate::defs::ast::JoinSpec {
-    match &def.key_space {
-        KeySpace::Join(join) => join,
-        _ => unreachable!("self_check_joins is only reached for a JOIN definition"),
-    }
+    spec::spec(def).expect("self_check_joins is only reached for a JOIN definition")
 }
 
 /// The side `table`, a bare table name as written in the definition, is.
@@ -190,7 +188,12 @@ fn side_of(def: &TransformDef, table: &str) -> Option<JoinSide> {
 /// with every column read through its side's alias (`from` or `joined`).
 /// [`render_leaf`]'s twin for two tables: written fresh here, not shared
 /// with the apply path. `Err` for what a `JOIN` definition can't hold.
-fn render(def: &TransformDef, expr: &Expr, from: &str, joined: &str) -> Result<String, String> {
+pub(super) fn render(
+    def: &TransformDef,
+    expr: &Expr,
+    from: &str,
+    joined: &str,
+) -> Result<String, String> {
     Ok(match expr {
         Expr::SourceColumn { table, column, .. } => {
             let alias = match side_of(def, table) {

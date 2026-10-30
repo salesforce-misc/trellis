@@ -32,6 +32,7 @@ use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::join::Side;
 use crate::staging::join_one_to_one::build as steps;
 use crate::staging::join_one_to_one::{JoinShape, plan_for};
+use crate::staging::join_one_to_one_status::OneToOneBuildStep;
 
 use super::orphans::{self, OrphanCursor, OrphanWalk};
 use super::{
@@ -140,6 +141,24 @@ impl PlanStage {
             Some(key) => format!("\u{1}{tag}:{key}"),
             None => format!("\u{1}{tag}"),
         }
+    }
+}
+
+/// The step `status()` names for a plan job whose stored cursor is `cursor`.
+pub(crate) fn plan_step(cursor: Option<&str>) -> OneToOneBuildStep {
+    match PlanStage::parse(cursor) {
+        PlanStage::B(_) => OneToOneBuildStep::JoinedRows,
+        PlanStage::BNulls(_) => OneToOneBuildStep::JoinedNullKeys,
+        PlanStage::Gone(_) => OneToOneBuildStep::JoinedGone,
+        PlanStage::Walk(_) => OneToOneBuildStep::PlanningChunks,
+    }
+}
+
+/// The step `status()` names for a sweep job whose stored cursor is `cursor`.
+pub(crate) fn sweep_step(cursor: Option<&str>) -> OneToOneBuildStep {
+    match Stage::parse(cursor) {
+        Stage::Stale(_) => OneToOneBuildStep::SweepStale,
+        Stage::Orphans(_) => OneToOneBuildStep::SweepOrphans,
     }
 }
 
@@ -415,7 +434,50 @@ pub(super) async fn sweep_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::{OrphanCursor, PlanStage, Stage};
+    use super::{OneToOneBuildStep, OrphanCursor, PlanStage, Stage, plan_step, sweep_step};
+
+    /// Each stored cursor names the step `status()` reports, and no cursor
+    /// names the first of a job.
+    #[test]
+    fn a_stored_cursor_names_the_step_status_reports() {
+        for (stage, step) in [
+            (
+                PlanStage::B(Some("1".into())),
+                OneToOneBuildStep::JoinedRows,
+            ),
+            (PlanStage::BNulls(None), OneToOneBuildStep::JoinedNullKeys),
+            (
+                PlanStage::Gone(Some("2".into())),
+                OneToOneBuildStep::JoinedGone,
+            ),
+            (PlanStage::Walk(None), OneToOneBuildStep::PlanningChunks),
+            (
+                PlanStage::Walk(Some("a9".into())),
+                OneToOneBuildStep::PlanningChunks,
+            ),
+        ] {
+            assert_eq!(plan_step(Some(&stage.encode())), step);
+        }
+        assert_eq!(plan_step(None), OneToOneBuildStep::JoinedRows);
+        for (stage, step) in [
+            (Stage::Stale(None), OneToOneBuildStep::SweepStale),
+            (
+                Stage::Stale(Some("k".into())),
+                OneToOneBuildStep::SweepStale,
+            ),
+            (
+                Stage::Orphans(OrphanCursor::Keyed(None)),
+                OneToOneBuildStep::SweepOrphans,
+            ),
+            (
+                Stage::Orphans(OrphanCursor::Nulls(Some("x".into()))),
+                OneToOneBuildStep::SweepOrphans,
+            ),
+        ] {
+            assert_eq!(sweep_step(Some(&stage.encode())), step);
+        }
+        assert_eq!(sweep_step(None), OneToOneBuildStep::SweepStale);
+    }
 
     /// Every stage's stored cursor parses back to itself, whatever its key
     /// holds, and no cursor is the start of `R`'s pass.

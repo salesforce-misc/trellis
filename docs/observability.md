@@ -504,7 +504,7 @@ is one field for every target kind. The CLI's `trellis status` prints one warnin
 entry. Which indexes a target needs is in
 [Supported sources and targets](transforms.md#supported-sources-and-targets).
 
-`join` on `DefinitionStatus` is set for a `JOIN` transform and `None` for any
+`join` on `DefinitionStatus` is set for a `JOIN` transform (aggregate or 1-1) and `None` for any
 other. It reports three things, none of which changes the transform's status:
 
 - `hidden_tables`: the estimated rows (`pg_class.reltuples`, 0 before the first
@@ -534,13 +534,36 @@ other. It reports three things, none of which changes the transform's status:
   lock, so a status call neither waits on a running step nor holds one up; it names
   the step after the last one that committed.
 
+A 1-1 `JOIN` ([ADR-0021](decisions/0021-one-to-one-join-transforms.md)) sets `join` as
+well, with these differences:
+
+- `hidden_tables` lists `R`, `M` and `J` (the entries of each side, and a lock row per
+  join key), with the estimates described above. `J` keeps a row for every join key either
+  table has held and never shrinks, so its size only grows; `R` and `M` keep a tombstone
+  for a deleted row until the tombstone collection reaches it.
+- `building` is a `OneToOne` step: `JoinedRows`, `JoinedNullKeys` and `JoinedGone` for the
+  plan job's pass over `M`, `PlanningChunks` while it walks `a`'s primary key,
+  `Chunks { remaining }` while the chunks of that key run, and `SweepStale` and
+  `SweepOrphans` for the two passes of the sweep that ends a rebuild in place. It is read
+  from the jobs' cursors as above.
+- `fan_out_warning` is set when the largest group of live `R` entries on one join key
+  holds more rows than the threshold: a change of the `b` row on that key rewrites all of
+  them in one transaction, while an `a` write on the key waits. It names the key (its
+  columns' values joined by `,`), the group's rows and the threshold. The group is found
+  by sampling `R` (2000 pages of it, all of a smaller `R`) and counting the keys met most
+  often over `R`'s join-key index, not from `pg_stats`, which is stale after a build. A
+  count stops at ten times the threshold. In a very large `R` a group just past the threshold
+  can go unreported until it grows. The threshold is 100,000 by default and
+  `TRELLIS_ONE_TO_ONE_JOIN_FAN_OUT_WARNING` sets another; the benchmark of the SQL fan-out
+  fixes its value.
+
 The `J` lock wait is a metric rather than a status field: the time a `JOIN` page
 spends in its sorted `select … for update` of its `J` rows is the histogram
 `trellis_join_lock_wait_seconds`, labelled by `transform`. It is mostly the wait for
 another page or writer holding one of its join keys, so a rising tail shows
 contention on hot keys.
 `trellis status` prints a `join tables` line, a `join build` line while a build is
-under way, and one warning line per finding.
+under way, and one warning line per finding (a 1-1 `JOIN`'s fan-out included).
 
 ### A build's fence on a seam-fed source
 

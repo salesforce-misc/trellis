@@ -35,7 +35,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use trellis::{
     Config, CorrectingNode, DefinitionSummary, DrainFailure, JoinBuildStep, JoinSide, JoinSidePart,
-    JoinStatus, SourceIndexGap, Trellis, TrellisOptions,
+    JoinStatus, OneToOneBuildStep, SourceIndexGap, Trellis, TrellisOptions,
 };
 
 use super::release::shell_quote;
@@ -302,6 +302,13 @@ fn format_join(join: &JoinStatus) -> String {
             w.partials_rows, w.fact_rows
         ));
     }
+    if let Some(w) = &join.fan_out_warning {
+        out.push_str(&format!(
+            "    warning: {} rows of the FROM table share join key {}, past the {} that one \
+             change of its JOIN row rewrites in a single transaction\n",
+            w.rows, w.key, w.threshold
+        ));
+    }
     out
 }
 
@@ -310,6 +317,20 @@ fn format_join_step(step: &JoinBuildStep) -> String {
     match step {
         JoinBuildStep::Whole => "both sides in one transaction".to_string(),
         JoinBuildStep::Final => "final step (T and the target)".to_string(),
+        JoinBuildStep::OneToOne(step) => match step {
+            OneToOneBuildStep::JoinedRows => "M pass: the JOIN side's rows".to_string(),
+            OneToOneBuildStep::JoinedNullKeys => {
+                "M pass: the JOIN side's rows keyed with a NULL part".to_string()
+            }
+            OneToOneBuildStep::JoinedGone => "M pass: entries of rows that are gone".to_string(),
+            OneToOneBuildStep::PlanningChunks => "planning the FROM side's chunks".to_string(),
+            OneToOneBuildStep::Chunks { remaining } => {
+                format!("FROM side chunks, {remaining} to run")
+            }
+            OneToOneBuildStep::SweepStale => "sweep: stale R entries".to_string(),
+            OneToOneBuildStep::SweepOrphans => "sweep: target rows no R entry backs".to_string(),
+            _ => "an unrecognized step".to_string(),
+        },
         JoinBuildStep::Side { side, part } => {
             let side = match side {
                 JoinSide::From => "FROM side",
@@ -431,6 +452,32 @@ mod tests {
         assert_eq!(
             format_join(&join),
             "    join build final step (T and the target)\n"
+        );
+        join.building = Some(JoinBuildStep::OneToOne(OneToOneBuildStep::Chunks {
+            remaining: 7,
+        }));
+        assert_eq!(
+            format_join(&join),
+            "    join build FROM side chunks, 7 to run\n"
+        );
+    }
+
+    #[test]
+    fn a_fan_out_warning_names_its_key_and_size() {
+        let mut join = trellis::fixture!(JoinStatus {
+            hidden_tables: Vec::new(),
+            partials_warning: None,
+            building: None,
+        });
+        join.fan_out_warning = Some(trellis::fixture!(FanOutWarning {
+            key: "30".to_string(),
+            rows: 120_000,
+            threshold: 100_000,
+        }));
+        assert_eq!(
+            format_join(&join),
+            "    warning: 120000 rows of the FROM table share join key 30, past the 100000 that \
+             one change of its JOIN row rewrites in a single transaction\n"
         );
     }
 

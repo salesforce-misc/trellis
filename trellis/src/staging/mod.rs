@@ -72,6 +72,7 @@ pub(crate) mod join;
 pub(crate) mod join_one_to_one;
 #[cfg(any(test, feature = "internals"))]
 pub use join_one_to_one::diverging_keys as one_to_one_join_diverging_keys;
+pub(crate) mod join_one_to_one_status;
 pub(crate) mod join_status;
 pub(crate) mod ledger;
 pub mod liveness;
@@ -86,6 +87,7 @@ pub mod seal;
 pub mod self_check;
 mod self_check_groups;
 pub mod self_check_job;
+mod self_check_join_one_to_one;
 mod self_check_joins;
 mod self_check_keyset;
 mod self_check_ring;
@@ -133,6 +135,7 @@ pub use seal::{SealConfig, recover_stuck_seals, seal_if_active_nonempty};
 // be unused.
 pub use capture_audit::CaptureFault;
 pub use holdup::DrainFailure;
+pub use join_one_to_one_status::{FanOutWarning, OneToOneBuildStep};
 pub use join_status::{
     HiddenTableSize, JoinBuildStep, JoinSide, JoinSidePart, JoinStatus, PartialsWarning,
 };

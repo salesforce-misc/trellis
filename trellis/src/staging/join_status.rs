@@ -13,6 +13,7 @@
 use tokio_postgres::GenericClient;
 
 use super::build::{self, JoinStepId};
+use super::join_one_to_one_status::{FanOutWarning, OneToOneBuildStep};
 use super::partition_correction;
 use crate::capture::{CaptureError, partitions};
 use crate::defs::ast::TransformDef;
@@ -65,8 +66,14 @@ pub struct JoinStatus {
     /// left out.
     pub hidden_tables: Vec<HiddenTableSize>,
     /// Set when `P`'s estimated rows reach
-    /// `PARTIALS_WARNING_PERCENT` percent of the fact table's.
+    /// `PARTIALS_WARNING_PERCENT` percent of the fact table's. Never set for
+    /// a 1-1 `JOIN`.
     pub partials_warning: Option<PartialsWarning>,
+    /// A 1-1 `JOIN`'s largest group of `a` rows on one join key, when it
+    /// passes the threshold: a change of its `b` row rewrites that many target
+    /// rows in one transaction. Sampled; see [`FanOutWarning`]. Always `None`
+    /// for an aggregate `JOIN`.
+    pub fan_out_warning: Option<FanOutWarning>,
     /// The step the definition's build runs now, or runs next if no worker
     /// holds its job; `None` when no build is under way or the definition
     /// is paused or quarantined.
@@ -96,6 +103,8 @@ pub enum JoinBuildStep {
     /// The final step, which writes `T` and the target and completes the
     /// build.
     Final,
+    /// A step of a 1-1 `JOIN` build.
+    OneToOne(OneToOneBuildStep),
 }
 
 /// What a [`JoinBuildStep::Side`] step builds of its side.
@@ -127,8 +136,12 @@ pub(crate) async fn for_definition(
     join_table: Option<&str>,
     def: &TransformDef,
 ) -> Result<Option<JoinStatus>, tokio_postgres::Error> {
-    // A 1-1 JOIN keeps other hidden tables (`join1_{id}_*`); its status is
-    // the status milestone's (ADR-0021, #1402).
+    // A 1-1 JOIN keeps other hidden tables (`join1_{id}_*`).
+    if spec::is_one_to_one(def) {
+        return Ok(Some(
+            super::join_one_to_one_status::for_definition(client, catalog_schema, id, def).await?,
+        ));
+    }
     if !spec::is_grouped(def) {
         return Ok(None);
     }
@@ -139,22 +152,10 @@ pub(crate) async fn for_definition(
         ("J", HiddenTable::Matches),
         ("T", HiddenTable::TargetPartials),
     ] {
-        let name = table.name(id);
-        let qualified = format!("{catalog_schema}.{name}");
-        let row = client
-            .query_opt(
-                "select c.reltuples::bigint, pg_catalog.pg_total_relation_size(c.oid) \
-                 from pg_catalog.pg_class c where c.oid = pg_catalog.to_regclass($1)",
-                &[&regclass_arg(&qualified)],
-            )
-            .await?;
-        if let Some(row) = row {
-            hidden_tables.push(HiddenTableSize {
-                table: label,
-                name,
-                estimated_rows: row.get::<_, i64>(0).max(0),
-                bytes: row.get(1),
-            });
+        if let Some(size) =
+            hidden_table_size(client, catalog_schema, label, &table.name(id)).await?
+        {
+            hidden_tables.push(size);
         }
     }
     let partials_warning = partials_warning(client, &hidden_tables, source_table).await?;
@@ -162,7 +163,32 @@ pub(crate) async fn for_definition(
     Ok(Some(JoinStatus {
         hidden_tables,
         partials_warning,
+        fan_out_warning: None,
         building,
+    }))
+}
+
+/// The size of the hidden table `name` in `catalog_schema`, labelled `label`,
+/// or `None` if it doesn't exist.
+pub(super) async fn hidden_table_size(
+    client: &impl GenericClient,
+    catalog_schema: &str,
+    label: &'static str,
+    name: &str,
+) -> Result<Option<HiddenTableSize>, tokio_postgres::Error> {
+    let qualified = format!("{catalog_schema}.{name}");
+    let row = client
+        .query_opt(
+            "select c.reltuples::bigint, pg_catalog.pg_total_relation_size(c.oid) \
+             from pg_catalog.pg_class c where c.oid = pg_catalog.to_regclass($1)",
+            &[&regclass_arg(&qualified)],
+        )
+        .await?;
+    Ok(row.map(|row| HiddenTableSize {
+        table: label,
+        name: name.to_string(),
+        estimated_rows: row.get::<_, i64>(0).max(0),
+        bytes: row.get(1),
     }))
 }
 

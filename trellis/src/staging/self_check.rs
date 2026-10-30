@@ -96,7 +96,7 @@
 //! a repair's own transaction moves the definition out of it, so a caller
 //! that polls for `live` and then checks is checking after the repair.
 //!
-//! # Scope: 1-1 targets, group-basis aggregates and JOIN targets
+//! # Scope: 1-1 targets, group-basis aggregates, JOIN targets and 1-1 JOIN targets
 //!
 //! A 1-1 target is compared row by row against its source. An aggregate on
 //! the group basis ([`super::group_basis`]) is
@@ -105,7 +105,9 @@
 //! visible row against the partials. A `JOIN` target
 //! ([`super::join`]) is compared by [`super::self_check_joins`]: its visible
 //! rows and `T`'s partials against the definition's `JOIN … GROUP BY`, and
-//! `P`, `M` and `J` against their tables. Both detect and never repair
+//! `P`, `M` and `J` against their tables. A 1-1 `JOIN` target
+//! ([`super::self_check_join_one_to_one`]) is compared with the live join, and
+//! its `R` and `M` with their sources. All detect and never repair
 //! (ADR-0013).
 //!
 //! # How a page finds its keys
@@ -396,8 +398,8 @@ pub enum Divergence {
 pub enum SelfCheckError {
     /// No transform is registered under this target table name.
     TargetNotFound(String),
-    /// The target is neither 1-1, an aggregate on the group basis nor a
-    /// `JOIN` that applies — see the module doc comment's "Scope" section.
+    /// The target is neither 1-1, an aggregate on the group basis, a
+    /// `JOIN` that applies nor a 1-1 `JOIN` — see the module doc comment's "Scope" section.
     UnsupportedKeySpace {
         target: String,
     },
@@ -617,8 +619,8 @@ impl CheckPageExt for crate::Trellis {
 }
 
 /// The definition registered under `target_table`, if it is one `self_check`
-/// can compare: a 1-1 target, an aggregate on the group basis or a `JOIN`
-/// that applies. Refused with what is wrong otherwise.
+/// can compare: a 1-1 target, an aggregate on the group basis, a `JOIN`
+/// that applies or a 1-1 `JOIN`. Refused with what is wrong otherwise.
 pub(crate) async fn comparable_definition(
     pool: &Pool,
     target_table: &str,
@@ -627,8 +629,10 @@ pub(crate) async fn comparable_definition(
         .await?
         .ok_or_else(|| SelfCheckError::TargetNotFound(target_table.to_string()))?;
 
-    if !matches!(def.def.key_space, KeySpace::OneToOne)
-        && group_shape(&def).is_none()
+    if !matches!(
+        def.def.key_space,
+        KeySpace::OneToOne | KeySpace::JoinOneToOne(_)
+    ) && group_shape(&def).is_none()
         && !joined(&def)
     {
         return Err(SelfCheckError::UnsupportedKeySpace {
@@ -674,6 +678,9 @@ fn joined(def: &Definition) -> bool {
 /// which the comparison would otherwise refuse only once it got that far.
 /// Every other definition renders.
 pub(crate) fn check_renders(def: &Definition) -> Result<(), SelfCheckError> {
+    if crate::defs::join::is_one_to_one(&def.def) {
+        return super::self_check_join_one_to_one::check_renders(def);
+    }
     if group_shape(def).is_none() && joined(def) {
         return super::self_check_joins::check_renders(def);
     }
@@ -1101,6 +1108,17 @@ async fn compare_once(
         return super::self_check_joins::compare(pool, def, pk, scope, paused, checked_through)
             .await;
     }
+    if crate::defs::join::is_one_to_one(&def.def) {
+        return super::self_check_join_one_to_one::compare(
+            pool,
+            def,
+            pk,
+            scope,
+            paused,
+            checked_through,
+        )
+        .await;
+    }
     // The recompute `SELECT` below carries no `WHERE` for the definition's
     // own partial-data predicate, which is sound only because `Predicate`
     // has exactly one variant today. Matched exhaustively (rather than
@@ -1382,14 +1400,14 @@ pub async fn explain_join_page_executed(
 
 /// One side of a [`compare_once`] page: key text to the `::text` value of
 /// each compared column, in `columns` order.
-type Page = BTreeMap<String, Vec<Option<String>>>;
+pub(super) type Page = BTreeMap<String, Vec<Option<String>>>;
 
 /// [`diff_page`]'s result: [`ComparePass`] minus the token.
 #[derive(Debug, PartialEq, Eq)]
-struct PageDiff {
-    rows_compared: i64,
-    next_after: Option<String>,
-    divergences: Vec<Divergence>,
+pub(super) struct PageDiff {
+    pub(super) rows_compared: i64,
+    pub(super) next_after: Option<String>,
+    pub(super) divergences: Vec<Divergence>,
 }
 
 /// The pure half of [`compare_once`]: diffs the recompute page against the
@@ -1397,7 +1415,7 @@ struct PageDiff {
 /// page's value vectors hold them. Both pages are already trimmed to
 /// `page_end`, the page's bound ([`page_sql`]), which becomes the cursor for
 /// the next page.
-fn diff_page(
+pub(super) fn diff_page(
     columns: &[&str],
     recomputed: Page,
     persisted: Page,

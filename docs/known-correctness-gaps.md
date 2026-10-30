@@ -389,6 +389,7 @@ limits belong here:
 |---|---|---|
 | 1-1, including one over another target | compared | — |
 | Aggregate, `JOIN` | compared, hidden tables included | — |
+| 1-1 `JOIN` | compared, `R` and `M` included, and a join key with two live `M` entries reported | — |
 
 * Each audit also reports the definition's held keys and the instance's drain
   holdups. They aren't gaps, but they explain a target that stops short.
