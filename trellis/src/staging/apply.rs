@@ -38,7 +38,7 @@ use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
 use crate::defs::validate::ValidationError;
 use crate::error_code::{self, ErrorCode};
-use crate::pool::{Pool, quote_ident, quote_literal};
+use crate::pool::{Pool, jsonb_build_object_sql, quote_ident, quote_literal};
 
 use super::append;
 use super::claim;
@@ -841,12 +841,16 @@ pub async fn live_row_columns(
 /// has a primary key, so [`live_row_columns`] never returns an empty list for
 /// a real relation) — an empty slice still renders valid SQL
 /// (`jsonb_build_object()`), just an empty object, rather than panicking.
+///
+/// A row wider than 50 columns is several `jsonb_build_object` calls joined
+/// with `||` (see [`jsonb_build_object_sql`]): one call takes at most 100
+/// arguments.
 pub fn row_as_text_jsonb_sql(alias: &str, columns: &[String]) -> String {
     let pairs: Vec<String> = columns
         .iter()
         .map(|col| format!("{}, {alias}.{}::text", quote_literal(col), quote_ident(col)))
         .collect();
-    format!("jsonb_build_object({})", pairs.join(", "))
+    jsonb_build_object_sql(&pairs)
 }
 
 /// Where a propagated change traces back to: its source commit's

@@ -53,7 +53,7 @@ use crate::capture::partitions::{self, PendingCorrection};
 use crate::defs::ddl;
 use crate::defs::join::{self as join_spec, HiddenTable, Side};
 use crate::defs::model::Definition;
-use crate::pool::{Pool, quote_ident, quote_literal};
+use crate::pool::{Pool, jsonb_build_object_sql, quote_ident, quote_literal};
 use crate::staging::append::{RING_SIZE, ring_table_name};
 use crate::staging::group_basis::{self, GroupShape};
 
@@ -294,13 +294,11 @@ async fn routed_groups(
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let object = format!(
-        "jsonb_build_object({})",
-        names
+    let object = jsonb_build_object_sql(
+        &names
             .iter()
             .map(|n| format!("{}, u.{}", quote_literal(n), quote_ident(n)))
-            .collect::<Vec<_>>()
-            .join(", ")
+            .collect::<Vec<_>>(),
     );
     let mut parts: Vec<String> = Vec::new();
     if *route != Route::Unusable {

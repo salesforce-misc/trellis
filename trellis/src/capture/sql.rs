@@ -68,7 +68,7 @@
 use std::collections::BTreeSet;
 
 use crate::defs::ddl::composite_key_escape_sql;
-use crate::pool::{DETERMINISTIC_TEXT_OUTPUT_GUCS, quote_ident};
+use crate::pool::{DETERMINISTIC_TEXT_OUTPUT_GUCS, jsonb_build_object_sql, quote_ident};
 use crate::staging::append::{
     NODE_TRUNCATE_SENTINEL_KEY, RING_SIZE, SCHEMA_CHANGED_SENTINEL_KEY, TRUNCATE_SENTINEL_KEY,
 };
@@ -105,10 +105,6 @@ const RING_COLUMNS: &str =
 /// Postgres truncates a longer identifier, so every generated name stays
 /// within this many bytes.
 const MAX_IDENT_BYTES: usize = 63;
-
-/// `jsonb_build_object` takes at most 100 arguments (`FUNC_MAX_ARGS`), so a
-/// wider image is built from several calls joined with `||`.
-const MAX_PAIRS_PER_BUILD: usize = 50;
 
 /// What one table's capture functions image.
 ///
@@ -1495,17 +1491,12 @@ fn value_text(alias: &str, column: &str) -> String {
 
 /// `alias`'s image: a JSON object of every image column's text.
 fn image_expr(spec: &CaptureSpec, alias: &str) -> String {
-    spec.columns
-        .chunks(MAX_PAIRS_PER_BUILD)
-        .map(|chunk| {
-            let pairs: Vec<String> = chunk
-                .iter()
-                .map(|c| format!("{}, {}", text_expr(c), value_text(alias, c)))
-                .collect();
-            format!("jsonb_build_object({})", pairs.join(", "))
-        })
-        .collect::<Vec<_>>()
-        .join(" || ")
+    let pairs: Vec<String> = spec
+        .columns
+        .iter()
+        .map(|c| format!("{}, {}", text_expr(c), value_text(alias, c)))
+        .collect();
+    jsonb_build_object_sql(&pairs)
 }
 
 /// `s` as a SQL text expression that means the same under any

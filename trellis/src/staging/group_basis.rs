@@ -200,7 +200,7 @@ use crate::defs::ast::{Expr, KeySpace, TransformDef, ValueType, group_by_contain
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::oracle::{render_expr_sql, render_qualified_expr_sql};
 use crate::integer::IntWidth;
-use crate::pool::{quote_ident, quote_literal};
+use crate::pool::{jsonb_build_object_sql, quote_ident, quote_literal};
 
 use super::apply::ApplyError;
 use super::fold::{FoldedChange, earliest_origin};
@@ -2195,8 +2195,8 @@ impl GroupTargetPlan {
                     })
                     .collect();
                 format!(
-                    "case when cur.__tc is not null then jsonb_build_object({})::text end",
-                    pairs.join(", ")
+                    "case when cur.__tc is not null then ({})::text end",
+                    jsonb_build_object_sql(&pairs)
                 )
             }
             None => "null::text".to_string(),
@@ -2384,8 +2384,8 @@ impl GroupTargetPlan {
                     })
                     .collect();
                 format!(
-                    "case when vis.__nn - vis.__dn > 0 then jsonb_build_object({})::text end",
-                    pairs.join(", ")
+                    "case when vis.__nn - vis.__dn > 0 then ({})::text end",
+                    jsonb_build_object_sql(&pairs)
                 )
             }
             None => "null::text".to_string(),
