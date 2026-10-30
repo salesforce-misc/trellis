@@ -222,11 +222,11 @@ async fn assert_clean(d: &Driver, when: &str) {
 
 /// Keys compared by a clean walk: the target's (the `a` rows, or the matched
 /// ones), `R`'s (`a`'s rows, and again for the entries looked up), `M`'s (`b`'s
-/// rows twice), and no key with duplicates.
+/// rows twice), and `M`'s entries once more, by join key, for duplicates.
 fn clean_keys(kind: Kind) -> i64 {
     match kind {
-        Kind::Left => 20 + 20 + 20 + 6 + 6,
-        Kind::Inner => 14 + 20 + 20 + 6 + 6,
+        Kind::Left => 20 + 20 + 20 + 6 + 6 + 6,
+        Kind::Inner => 14 + 20 + 20 + 6 + 6 + 6,
     }
 }
 
@@ -281,6 +281,29 @@ async fn a_clean_walk_compares_every_key_of_every_part_once() {
         assert_eq!(walked.compared, clean_keys(kind), "{kind:?}");
         // One page for each of the six parts, and the walk ends with the last.
         assert_eq!(walked.pages, 6, "{kind:?}");
+        // A page of the duplicates part reads its limit of `M`'s entries
+        // whether or not a key is duplicated: six entries take three full
+        // pages of two, then one that finds the part's end.
+        let mut after = Some("d".to_string());
+        let mut pages = 0;
+        while let Some(cursor) = after.filter(|c| c.starts_with('d')) {
+            let page = check_page(
+                d.pool(),
+                &kind.target(),
+                SelfCheckScope {
+                    after: Some(cursor),
+                    limit: 2,
+                },
+                SelfCheckMode::Standard,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("a page of the duplicates part");
+            assert_eq!(page.outcome, SelfCheckOutcome::Converged, "{kind:?}");
+            pages += 1;
+            after = page.next_after;
+        }
+        assert_eq!(pages, 4, "{kind:?}");
     }
 }
 
@@ -560,6 +583,19 @@ async fn a_key_with_two_live_m_entries_is_reported() {
             "with two duplicated keys",
         )
         .await;
+        // A page that ends between a key's two entries counts the key whole,
+        // once.
+        for limit in [1, 3] {
+            let walked = walk(&d, &kind.target(), limit).await;
+            assert_eq!(
+                walked.divergences,
+                sorted(vec![
+                    cell("20", &col, Some("2"), Some("1")),
+                    cell("30", &col, Some("2"), Some("1")),
+                ]),
+                "{kind:?} at {limit}"
+            );
+        }
     }
 }
 

@@ -14,8 +14,9 @@
 //!    their key text: an entry whose `a` row is gone.
 //! 4. **`M` against `b`** (`m`) and 5. **`M`'s entries with no `b` row**
 //!    (`mo`), the same for the joined side.
-//! 6. **Duplicates** (`d`), a page of `M`'s join keys that hold more than one
-//!    live entry. `b`'s `ON` columns are unique, and the target reads the
+//! 6. **Duplicates** (`d`), a page of `M`'s live entries in join-key order,
+//!    each key among them counted over all of `M`: a key that holds more than
+//!    one live entry. `b`'s `ON` columns are unique, and the target reads the
 //!    newest live entry of a key, which masks a duplicate: this is where
 //!    `b` losing its uniqueness shows, before a revalidation pauses the
 //!    transform.
@@ -60,7 +61,9 @@
 //! index, probing `R` or `M` by their primary key; a page of the target part
 //! probes `b` by its join key, `M` by its primary key. A part driven by the
 //! hidden table (`ro`, `mo`) reads a page of its keys, then looks each up in the
-//! source by primary key, from the key's decoded columns.
+//! source by primary key, from the key's decoded columns. The duplicates part
+//! reads a page of `M`'s entries by its join-key index, and counts each key's
+//! entries over the same index.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -818,7 +821,11 @@ async fn orphan_page(
     })
 }
 
-/// A page of the join keys that hold more than one live `M` entry.
+/// A page of the join keys that hold more than one live `M` entry: the next
+/// `limit` live entries with a key in the key's order, and each key among
+/// them counted over all of `M`, so a key whose entries straddle the page's
+/// end is counted whole on the page it starts on. A page reads `limit`
+/// entries whether or not any key is duplicated.
 async fn duplicate_page(
     pool: &Pool,
     audit: &Audit<'_>,
@@ -834,32 +841,68 @@ async fn duplicate_page(
     let carried = keyset.select_carried(&refs);
     let order = keyset.order_by(&refs);
     let key = ddl::pk_key_sql_expr(keyset.columns(), None);
+    let tomb = quote_ident(schema::TOMBSTONE_COLUMN);
     let not_null: Vec<String> = refs.iter().map(|r| format!("{r} is not null")).collect();
-    let sql = keyset.side(&refs, |cond| {
+    let entries = keyset.side(&refs, |cond| {
         format!(
-            "select {key} as __k{carried}, count(*)::text as __n from {m} \
-             where {cond} and not {tomb} and {not_null} \
-             group by {group} having count(*) > 1 order by {order} limit $1",
-            tomb = quote_ident(schema::TOMBSTONE_COLUMN),
+            "select {key} as __k{carried} from {m} \
+             where {cond} and not {tomb} and {not_null} order by {order} limit $1",
             not_null = not_null.join(" and "),
-            group = refs.join(", "),
         )
     });
+    let carried_columns = keyset.carried(None);
+    let same: Vec<String> = refs
+        .iter()
+        .zip(keyset.carried(Some("g")))
+        .map(|(r, c)| format!("m.{r} = {c}"))
+        .collect();
+    let sql = format!(
+        "with entries as materialized ( \
+             select e.*, row_number() over (order by {carried_order}) as __rn \
+             from ({entries}) e), \
+         groups as ( \
+             select min(__k) as __k, min(__rn) as __rn, {carried_list} \
+             from entries group by {carried_list}) \
+         select 0::int, null::text, count(*)::text, \
+                (select __k from entries order by __rn desc limit 1), 0::bigint \
+         from entries \
+         union all \
+         select 1, g.__k, c.n::text, null, g.__rn from groups g \
+         cross join lateral (select count(*) as n from {m} m \
+                             where {same} and not m.{tomb}) c \
+         where c.n > 1",
+        carried_order = keyset.order_by(&carried_columns),
+        carried_list = carried_columns.join(", "),
+        same = same.join(" and "),
+    );
     let rows = client.query(sql.as_str(), &[&limit]).await?;
-    let mut divergences = Vec::new();
+    let mut entries_read = 0;
     let mut last = None;
+    let mut found = Vec::new();
     for row in &rows {
-        let key: String = row.get(0);
-        let count: String = row.get(row.len() - 1);
-        divergences.push(Divergence::Cell {
-            key: key.clone(),
+        match row.get::<_, i32>(0) {
+            0 => {
+                entries_read = row.get::<_, String>(2).parse::<i64>().unwrap_or(0);
+                last = row.get::<_, Option<String>>(3);
+            }
+            _ => found.push((
+                row.get::<_, i64>(4),
+                row.get::<_, String>(1),
+                row.get::<_, String>(2),
+            )),
+        }
+    }
+    found.sort();
+    let divergences: Vec<Divergence> = found
+        .into_iter()
+        .map(|(_, key, count)| Divergence::Cell {
+            key,
             column: side.divergence_column("live_entries"),
             persisted: Some(count),
             recomputed: Some("1".to_string()),
-        });
-        last = Some(key);
-    }
-    let page_end = (rows.len() as i64 == limit).then_some(last).flatten();
+        })
+        .collect();
+    let page_end = (entries_read == limit).then_some(last).flatten();
     // A hand-off of a join key between two `b` rows holds two entries on it
     // while its two changes are applied out of order: what is found is the
     // ring's, not `M`'s, while `b`'s ring holds an unapplied row.
@@ -881,7 +924,7 @@ async fn duplicate_page(
             .get(0)
     };
     Ok(Pass {
-        rows_compared: rows.len() as i64,
+        rows_compared: entries_read,
         page_end,
         divergences,
         uncertain: Uncertain {
