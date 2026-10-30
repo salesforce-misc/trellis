@@ -704,7 +704,7 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
         },
         Expr::StringLiteral(_) => ValueType::Text,
         Expr::BooleanLiteral(_) => ValueType::Boolean,
-        // The end-to-end generator never draws a bare `NULL`.
+        // The end-to-end profile never draws a bare `NULL` (`Profile::bare_null`).
         Expr::Null => panic!("oracle: a bare NULL has no type of its own"),
         Expr::TypedLiteral { value_type, .. } => *value_type,
         // `+`'s result type depends on its operands (`int4 +
@@ -1023,6 +1023,53 @@ pub async fn check(
 mod tests {
     use super::*;
     use trellis::dev::defs::ast::Operator;
+
+    /// Every expression the end-to-end tiers draw is one this oracle types:
+    /// a bare `NULL`, which only its context types, is never among them,
+    /// while the conformance profile, whose oracle is Postgres, still draws
+    /// it.
+    #[cfg(feature = "proptest")]
+    #[test]
+    fn the_oracle_types_every_end_to_end_draw() {
+        use crate::expr_gen::{Profile, strategy::any_expr};
+        use proptest::strategy::{Strategy, ValueTree};
+        use proptest::test_runner::TestRunner;
+        fn has_bare_null(expr: &Expr) -> bool {
+            match expr {
+                Expr::Null => true,
+                Expr::BinaryOp { lhs, rhs, .. } => has_bare_null(lhs) || has_bare_null(rhs),
+                Expr::FunctionCall { args, .. } => args.iter().any(has_bare_null),
+                Expr::Negate(operand) => has_bare_null(operand),
+                // `CAST(NULL AS <type>)` is typed.
+                Expr::Cast { .. } => false,
+                _ => expr.logic_children().into_iter().any(has_bare_null),
+            }
+        }
+        let slots: Vec<crate::expr_gen::Column> = crate::generate::DERIVED_SLOTS
+            .iter()
+            .map(|(name, ty)| ((*name).to_string(), *ty))
+            .collect();
+        let source_columns: HashMap<String, ValueType> = slots.iter().cloned().collect();
+        let mut runner = TestRunner::deterministic();
+        let mut bare_nulls = |profile: Profile, typed_here: bool| {
+            let strategy = any_expr(&slots, profile);
+            (0..2000)
+                .filter(|_| {
+                    let expr = strategy
+                        .new_tree(&mut runner)
+                        .expect("a draw")
+                        .current()
+                        .expr;
+                    if typed_here {
+                        field_value_type(&expr, &source_columns);
+                    }
+                    has_bare_null(&expr)
+                })
+                .count()
+        };
+        assert_eq!(bare_nulls(Profile::END_TO_END, true), 0);
+        assert!(bare_nulls(Profile::CONFORMANCE, false) > 0);
+    }
 
     /// The SQL oracle reads a qualified name inside an aggregate
     /// as the source column it names.

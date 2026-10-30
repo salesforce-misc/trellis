@@ -180,8 +180,10 @@ written by hand, each with a test that fails when it falls behind:
 - `COALESCE`, which is variadic and so outside the registry.
 - The literal pools. Every `TYPED_LITERALS` keyword needs canonical samples in
   `typed_literal_samples`. `TRUE`, `FALSE` and `CAST(NULL AS <type>)` are
-  drawn as leaves of their types, and a bare `NULL` as either operand of an
-  operator that takes one type on both sides.
+  drawn as leaves of their types, and the conformance properties also draw
+  a bare `NULL` as either operand of an operator that takes one type on both
+  sides (the end-to-end tiers don't: their oracle types an operator from its
+  operands' own types).
 - A function argument that must be a literal (`LITERAL_ONLY_ARGS`, today
   `REGEXP_COUNT`'s pattern).
 - The unadmitted constructs a near miss names (`UNADMITTED_OPERATORS`,

@@ -52,6 +52,11 @@ pub struct Profile {
     /// picks. Off for the end-to-end tiers, whose oracle types a `COALESCE`
     /// as its first argument.
     pub mixed_coalesce: bool,
+    /// Draw a bare `NULL` as either operand of an operator that takes one
+    /// type on both sides, typed from the other operand as Postgres types
+    /// it. Off for the end-to-end tiers, whose oracle types an operator from
+    /// its operands' own types.
+    pub bare_null: bool,
 }
 
 impl Profile {
@@ -60,6 +65,7 @@ impl Profile {
         max_depth: 3,
         magnitude: Magnitude::Extreme,
         mixed_coalesce: true,
+        bare_null: true,
     };
     /// The end-to-end tiers: small literals and depth 2, so a program the
     /// engine accepts also runs.
@@ -67,6 +73,7 @@ impl Profile {
         max_depth: 2,
         magnitude: Magnitude::Small,
         mixed_coalesce: false,
+        bare_null: false,
     };
 }
 
@@ -1566,7 +1573,7 @@ pub mod strategy {
                     // A bare `NULL` takes the other operand's type, so an
                     // operator over one type on both sides takes it on
                     // either side.
-                    let nullable = lhs == rhs && literal_rhs.is_none();
+                    let nullable = self.profile.bare_null && lhs == rhs && literal_rhs.is_none();
                     Some(
                         (l, r, 0..8u8)
                             .prop_map(move |(lhs, rhs, roll)| {
