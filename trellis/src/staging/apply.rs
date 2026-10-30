@@ -138,7 +138,7 @@ pub enum ApplyError {
     /// entry holds, or the one a Re-derive's live read found, moved between
     /// the unlocked read that chose the locks and the read under them.
     /// Transient, with its own attempt budget
-    /// ([`super::quarantine::is_join_key_moved`]): the rolled-back page's
+    /// (`super::quarantine::is_join_key_moved`): the rolled-back page's
     /// retry reads the keys again, inside its transaction. Taking the late
     /// key's `J` lock instead would break lock sorting.
     JoinKeyMoved { target: String },
