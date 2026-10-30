@@ -196,11 +196,12 @@ against 3.8 s. It took about 5x as long overall.
 ### A build fills `M`, then `R` and the target
 
 A build re-derives every key of `b` ∪ `M` into `M` first: `b`'s rows in
-batches of its primary key, then `M`'s live entries whose `b` row is gone,
-which become tombstones. Each batch is a page of `b` Re-derives with its
-fan-out left out: the chunks that follow write every target row, none starts
-before the last batch commits, and so none joins an `a` row to a `b` row that
-is gone. Each batch commits with the build's cursor, so a batch that fails
+batches of its primary key, those whose key has a `NULL` part (a `b` that is an
+aggregate's target, keyed by a nullable group column) in a batch of their own,
+then `M`'s live entries whose `b` row is gone, which become tombstones. Each
+batch is a page of `b` Re-derives with its fan-out left out: the chunks that
+follow write every target row, none starts before the last batch commits, and
+so none joins an `a` row to a `b` row that is gone. Each batch commits with the build's cursor, so a batch that fails
 (a page holding a `J` row longer than the batch waits) or a worker that dies
 resumes from the last batch that committed. It then fills `R` and the target
 in chunks of `a`'s primary-key range. Each chunk:
@@ -214,6 +215,12 @@ in chunks of `a`'s primary-key range. Each chunk:
    key.
 5. Retries if any read finds a key outside its locked set. Without the retry,
    378 of 1,716 schedules were wrong.
+
+A chunk's range is a row comparison, which is `NULL` wherever a `NULL` part
+decides it, so no chunk reaches an `a` row whose primary key has one (an `a`
+that is an aggregate's target). The plan job's last transaction stages a
+Re-derive of each, and the page that drains it writes the row under its `NULL`
+key like any other.
 
 A chunk waits at most a second for a lock a page holds, then gives up and
 retries, so a page is never queued behind a chunk that queues behind another

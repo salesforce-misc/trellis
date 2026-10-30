@@ -1630,10 +1630,11 @@ const NULL_KEYS_CURSOR: &str = "trellis_null_keys_cursor";
 const NULL_KEYS_PAGE: i64 = 10_000;
 
 /// Stages an image-less `Recompute` for every key of `source_table` with a
-/// `NULL` part, for a 1-1 target's build (F6). Only a source keyed by a
-/// nullable unique index has such keys: another aggregate's or `JOIN`'s
-/// target, whose `GROUP BY` columns may be `NULL`. A 1-1 target over such a
-/// source is keyed `unique nulls not distinct` so it holds their rows.
+/// `NULL` part, for a 1-1 target's build (F6), or the `a` of a 1-1 `JOIN`'s.
+/// Only a source keyed by a nullable unique index has such keys: another
+/// aggregate's or `JOIN`'s target, whose `GROUP BY` columns may be `NULL`. A
+/// 1-1 target over such a source is keyed `unique nulls not distinct` so it
+/// holds their rows.
 /// No chunk reaches them. A chunk's range is a row comparison, which is
 /// `NULL` (so the row is out) wherever a `NULL` part decides it, and a
 /// plan's boundaries are keys without one.
@@ -2015,10 +2016,11 @@ async fn run_plan(
             // The keys no range reaches (F6), in the transaction that ends
             // the plan, so a plan that is done has staged them. A 1-1
             // target's field build stages them too: their rows hold the
-            // resumed fields as well.
+            // resumed fields as well. A 1-1 `JOIN` stages those of `a`, as a
+            // Re-derive of `a`; `b`'s are read by the `M` pass.
             let one_to_one = matches!(
                 definition.def.key_space,
-                crate::defs::ast::KeySpace::OneToOne
+                crate::defs::ast::KeySpace::OneToOne | crate::defs::ast::KeySpace::JoinOneToOne(_)
             );
             if one_to_one {
                 stage_null_keys(&txn, &definition.source_table, &pk)

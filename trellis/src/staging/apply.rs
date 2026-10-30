@@ -3520,13 +3520,13 @@ pub(super) fn transpose_pk_parts<'a>(arity: usize, rows: &[Vec<&'a str>]) -> Vec
 /// pattern's statement reaches its rows through the index, as
 /// `staging::target_mutations` matches its.
 #[derive(Default)]
-struct MatchKeys<'a> {
-    plain: Vec<Vec<&'a str>>,
-    patterns: BTreeMap<Vec<bool>, Vec<Vec<&'a str>>>,
+pub(super) struct MatchKeys<'a> {
+    pub(super) plain: Vec<Vec<&'a str>>,
+    pub(super) patterns: BTreeMap<Vec<bool>, Vec<Vec<&'a str>>>,
 }
 
 impl<'a> MatchKeys<'a> {
-    fn of(keys: impl IntoIterator<Item = &'a Vec<Option<String>>>) -> Self {
+    pub(super) fn of(keys: impl IntoIterator<Item = &'a Vec<Option<String>>>) -> Self {
         let mut out = Self::default();
         for key in keys {
             let pattern: Vec<bool> = key.iter().map(Option::is_none).collect();
@@ -3552,7 +3552,7 @@ impl<'a> MatchKeys<'a> {
 /// (`unnest(…) as k(c<i>, …)`, one `text[]` per non-`NULL` column, bound from
 /// `$start`). The keyset is `None` when every part is `NULL`: the pattern is
 /// then one key, matched by its `is null` tests alone.
-fn null_pattern_match(
+pub(super) fn null_pattern_match(
     pk: &[PrimaryKeyColumn],
     pattern: &[bool],
     alias: &str,

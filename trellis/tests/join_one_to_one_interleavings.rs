@@ -1261,6 +1261,44 @@ async fn a_fan_out_past_the_cap_halts_the_transform() {
     );
 }
 
+/// A Re-derive of a `b` row recomputes its key's fan-out, and one that would
+/// recompute more `a` rows than the cap halts the transform with the reason,
+/// as the page of a `b` change does, writing nothing. (A Re-derive page is
+/// what the build's producers stage for `b`: a rebuild's, a catch-up's.)
+#[tokio::test]
+async fn a_b_rederive_past_the_fan_out_cap_halts_the_transform() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+        // Two `a` rows on key 10, and a `b` update capture never saw.
+        step(&mut d, "insert into public.a values (5, 10, 5, 'five')").await;
+        write_uncaptured_on(&d, "public.b", "update public.b set w = 999 where id = 1").await;
+        trellis::defs::join_one_to_one::set_max_fanout(1);
+        d.stage_recomputes("public.b", &["1"]).await;
+        let batch = d.seal().await;
+        let result = d
+            .drain_frozen(batch, "capped", &[])
+            .await
+            .finish_result()
+            .await;
+        trellis::defs::join_one_to_one::set_max_fanout(0);
+        result.expect("the halt pauses the transform and the drain goes on");
+        let (status, reason) = paused_reason(&d, kind).await;
+        assert_eq!(status, "paused", "{kind:?}");
+        let reason = reason.expect("a reason");
+        assert!(
+            reason.contains("more than 1 rows")
+                && reason.contains("TRELLIS_ONE_TO_ONE_JOIN_MAX_FANOUT"),
+            "{kind:?}: {reason}"
+        );
+        assert_eq!(
+            total(&d, kind, 1).await,
+            Some(1 + 100),
+            "{kind:?}: nothing written"
+        );
+    }
+}
+
 /// A field that fails on one row of a fan-out halts the transform, naming the
 /// row and the field, rather than charging the `b` change: the fan-out's
 /// batches are bisected under savepoints down to the row, whose fields are

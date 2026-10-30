@@ -1763,40 +1763,66 @@ async fn write_target(
     let target = ddl::qualified_target_table_ident(&shape.target);
     let pk_cols: Vec<String> = shape.pk.iter().map(|c| quote_ident(&c.name)).collect();
     let field_cols: Vec<String> = shape.fields.iter().map(|(n, _)| quote_ident(n)).collect();
-    let mut decoded: Vec<Vec<String>> = Vec::with_capacity(keys.len());
+    // A key with a `NULL` part is a row of an `a` that is keyed by a nullable
+    // unique index (an aggregate's target), held `unique nulls not distinct`:
+    // the insert's conflict target finds it, and the delete matches it by its
+    // `NULL` pattern, as the 1-1 apply does.
+    let mut decoded: Vec<Vec<Option<String>>> = Vec::with_capacity(keys.len());
     for key in keys {
-        let parts = super::apply::decode_target_pk_parts(&shape.pk, &shape.target, key)?;
-        let parts: Option<Vec<String>> = parts.into_iter().collect();
-        decoded.push(parts.ok_or_else(|| ApplyError::GroupBasisUnsupported {
-            target: shape.target.clone(),
-            what: "a 1-1 JOIN row whose primary key has a NULL part",
-        })?);
+        decoded.push(super::apply::decode_target_pk_parts(
+            &shape.pk,
+            &shape.target,
+            key,
+        )?);
     }
 
     let mut deleted = Vec::new();
     // Rows that have no target row: delete them. The key text compares only
     // for rows the index finds by primary key.
     {
-        let columns = transpose(arity, &decoded);
-        let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
         let key_expr = ddl::pk_key_sql_expr(&shape.pk, Some("t"));
-        let rows = txn
-            .query(
-                &format!(
-                    "delete from {target} as t \
-                     where exists (select 1 from {keyset} where {matches}) \
-                       and not exists (select 1 from {r} r where r.{key} = {key_expr} and {has}) \
-                     returning {key_expr}",
-                    keyset = super::apply::pk_keyset_unnest(&shape.pk, 1),
-                    matches = super::apply::pk_keyset_match(&shape.pk, "t"),
-                    r = shape.r.ident,
-                    key = quote_ident(schema::KEY_COLUMN),
-                    has = shape.has_target_row_sql(),
-                ),
-                &params,
-            )
-            .await?;
-        deleted.extend(rows.into_iter().map(|row| row.get::<_, String>(0)));
+        let unbacked = format!(
+            "not exists (select 1 from {r} r where r.{key} = {key_expr} and {has})",
+            r = shape.r.ident,
+            key = quote_ident(schema::KEY_COLUMN),
+            has = shape.has_target_row_sql(),
+        );
+        let target_ident = ddl::qualified_target_table_ident(&shape.target);
+        let matched = super::apply::MatchKeys::of(decoded.iter());
+        if !matched.plain.is_empty() {
+            let columns = super::apply::transpose_pk_parts(arity, &matched.plain);
+            let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
+            let rows = txn
+                .query(
+                    &format!(
+                        "delete from {target} as t \
+                         where exists (select 1 from {keyset} where {matches}) \
+                           and {unbacked} \
+                         returning {key_expr}",
+                        target = target_ident,
+                        keyset = super::apply::pk_keyset_unnest(&shape.pk, 1),
+                        matches = super::apply::pk_keyset_match(&shape.pk, "t"),
+                    ),
+                    &params,
+                )
+                .await?;
+            deleted.extend(rows.into_iter().map(|row| row.get::<_, String>(0)));
+        }
+        for (pattern, columns) in &matched.patterns {
+            let (keyset, matches) = super::apply::null_pattern_match(&shape.pk, pattern, "t", 1);
+            let using = keyset.map_or_else(String::new, |keyset| format!("using {keyset}"));
+            let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
+            let rows = txn
+                .query(
+                    &format!(
+                        "delete from {target_ident} as t {using} \
+                         where {matches} and {unbacked} returning {key_expr}"
+                    ),
+                    &params,
+                )
+                .await?;
+            deleted.extend(rows.into_iter().map(|row| row.get::<_, String>(0)));
+        }
     }
 
     let mut written = 0;
@@ -1836,7 +1862,12 @@ async fn write_target(
         for start in (0..keys.len()).step_by(WRITE_BATCH) {
             let end = (start + WRITE_BATCH).min(keys.len());
             let mut columns = transpose(arity, &decoded[start..end]);
-            columns.push(keys[start..end].iter().map(|k| k.to_string()).collect());
+            columns.push(
+                keys[start..end]
+                    .iter()
+                    .map(|k| Some(k.to_string()))
+                    .collect(),
+            );
             let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
             written += txn.query(&sql, &params).await?.len();
         }
@@ -1844,8 +1875,8 @@ async fn write_target(
     Ok((written, deleted.len()))
 }
 
-/// `rows` (each `arity` parts) as one array per part.
-fn transpose(arity: usize, rows: &[Vec<String>]) -> Vec<Vec<String>> {
+/// `rows` (each `arity` parts, a `NULL` one `None`) as one array per part.
+fn transpose(arity: usize, rows: &[Vec<Option<String>>]) -> Vec<Vec<Option<String>>> {
     (0..arity)
         .map(|j| rows.iter().map(|row| row[j].clone()).collect())
         .collect()
