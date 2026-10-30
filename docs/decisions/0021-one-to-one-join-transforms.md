@@ -138,15 +138,32 @@ necessary rule was shown necessary by an ablation that removes it (#1371).
 A page carrying changes and Re-derives of both tables takes one `J` lock
 statement over the union of both sides' key sets. Its lock order is the
 truncate lock row, `J`, then `R` entries, then `M` entries, then target rows,
-each sorted. A truncate page holds the lock row `FOR UPDATE`, deletes its
+each sorted. A truncate page holds the lock row `FOR UPDATE`, empties its
 side's hidden table and raises its floor. ADR-0019's barrier orders it
 against other pages; without the barrier, four of eight truncate families
 were wrong. With both rules, 60 families × 2 join kinds (102,312 schedules per
 version on PG 16.8, 17.10 and 18.2) and 48 soak runs, with builds starting
 mid-run, were exact (#1375).
 
-`TRUNCATE b` changes every target row, so it starts a target rebuild rather
-than recomputing in the page.
+A page settles its truncate before its changes, so a change after the truncate
+in the same batch applies to the emptied side:
+
+- **`TRUNCATE a`** empties `R` and raises its floor, and deletes every target
+  row in the page. `M` and `J` are untouched.
+- **`TRUNCATE b`** empties `M` and raises its floor. It changes every target
+  row, so it starts a target rebuild rather than recomputing in the page: the
+  page takes the definition's row `FOR UPDATE`, before the lock row as a
+  rebuild's start does, and ends with the rebuild's start and its segment
+  stamp. From the commit the transform reads `backfilling` and keeps applying.
+  A `LEFT` row keeps the `b` columns it held until the build's chunk reaches
+  it, an `INNER` row stays, and a change of `a` before then joins the emptied
+  `M`. A definition that does not apply (paused since the page began) starts
+  no rebuild, and its `RESUME` re-derives every row.
+- A page that truncates both sides does both.
+
+A change of either side that was staged before a truncate and reaches a page
+after it is below the side's floor and refused, by the same I2 check as a
+change older than an entry's applied position.
 
 ### A `b` change's fan-out is linear in the `a` rows on its key
 

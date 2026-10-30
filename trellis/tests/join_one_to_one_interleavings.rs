@@ -35,7 +35,8 @@
 //!   a Re-derive, R18/R19 a row that moved onto a key after the page's
 //!   unlocked read of it, which the page then holds no `J` row for.
 //!
-//! Truncates are #1399's.
+//! - `t…`: #1375's truncates (T1–T8) of either side or both, alone or with
+//!   later inserts, and the rebuild a `TRUNCATE` of `b` starts (#1399).
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -2012,4 +2013,465 @@ async fn assert_ordered_join(d: &Driver, step: &str) {
             .expect("self_check");
         assert!(diverging.is_empty(), "{target} after {step}: {diverging:?}");
     }
+}
+
+// ------------------------------------------------------------- truncates
+
+/// Runs the builds a `TRUNCATE` of `b` started, then settles the pipeline
+/// and asserts each of `kinds`: the target equals the live join, `R` equals
+/// `a` and `M` equals `b`.
+async fn assert_rebuilt(d: &mut Driver, kinds: &[Kind]) {
+    trellis::staging::build::settle_builds_with(d.pool(), 3).await;
+    assert_oracle(d, kinds).await;
+    let deadlocks = d.deadlocks_logged();
+    assert!(deadlocks.is_empty(), "{deadlocks:?}");
+}
+
+/// The status of `kind`'s definition and the number of build jobs it has
+/// left.
+async fn build_state(d: &Driver, kind: Kind) -> (String, i64) {
+    let row = d
+        .ctl
+        .query_one(
+            "select d.status::text, \
+                    (select count(*) from backfill_chunks c \
+                     where c.definition_id = d.id and not c.done) \
+             from transform_definitions d where d.target_table = $1",
+            &[&kind.target()],
+        )
+        .await
+        .expect("read the definition's status");
+    (row.get(0), row.get(1))
+}
+
+/// A `TRUNCATE a` empties `R` and the target in its page, raises `R`'s floor
+/// and leaves `M` and `J` as they were; the definition keeps reading `live`,
+/// and the rows inserted after it apply.
+#[tokio::test]
+async fn a_truncate_of_a_empties_r_and_the_target_and_later_inserts_apply() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+        let id = definition_id(&d, kind.target()).await;
+        let schema = trellis::config::DEFAULT_SCHEMA;
+        let j_before = d
+            .rows(&format!("select k from {schema}.join1_{id}_j order by 1"))
+            .await;
+        step(&mut d, "truncate public.a").await;
+        assert_eq!(
+            d.rows(&format!("select count(*) from {}", kind.target()))
+                .await,
+            ["(0)"],
+            "{kind:?}: the target is empty"
+        );
+        assert_eq!(
+            d.rows(&format!("select count(*) from {schema}.join1_{id}_r"))
+                .await,
+            ["(0)"],
+            "{kind:?}: R is empty"
+        );
+        assert_eq!(
+            d.rows(&format!("select count(*) from {schema}.join1_{id}_m"))
+                .await,
+            ["(3)"],
+            "{kind:?}: M is untouched"
+        );
+        assert_eq!(
+            d.rows(&format!("select k from {schema}.join1_{id}_j order by 1"))
+                .await,
+            j_before,
+            "{kind:?}: J keeps its rows"
+        );
+        assert_eq!(
+            d.rows(&format!(
+                "select count(*) from ledger_truncate_floor \
+                 where target_table = '\"{schema}\".\"join1_{id}_r\"'"
+            ))
+            .await,
+            ["(1)"],
+            "{kind:?}: R's floor rose"
+        );
+        assert_eq!(
+            build_state(&d, kind).await,
+            ("live".to_string(), 0),
+            "{kind:?}: a TRUNCATE of a starts no rebuild"
+        );
+        step(&mut d, "insert into public.a values (7, 10, 7, 'seven')").await;
+        assert_oracle(&mut d, &[kind]).await;
+    }
+}
+
+/// After a `TRUNCATE a`, a change of `b` fans out to no row: `R` holds none
+/// of the `a` rows that are gone, so the target stays empty.
+#[tokio::test]
+async fn a_truncate_of_a_empties_r_and_a_later_b_change_writes_nothing() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+        step(&mut d, "truncate public.a").await;
+        step(&mut d, "update public.b set w = 999 where id = 1").await;
+        assert_eq!(
+            d.rows(&format!("select count(*) from {}", kind.target()))
+                .await,
+            ["(0)"],
+            "{kind:?}: a b change resurrected the rows of a rows that are gone"
+        );
+        assert_oracle(&mut d, &[kind]).await;
+    }
+}
+
+/// A `TRUNCATE b` empties `M` and raises its floor in its page, and starts a
+/// rebuild of the target: the definition reads `backfilling` with the plan
+/// and sweep jobs queued, and keeps applying. Its rows keep the `b` side they
+/// held until the rebuild reaches them; then a `LEFT` row's is `NULL` and an
+/// `INNER` row is gone.
+#[tokio::test]
+async fn a_truncate_of_b_rebuilds_the_target() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+        let id = definition_id(&d, kind.target()).await;
+        let schema = trellis::config::DEFAULT_SCHEMA;
+        step(&mut d, "truncate public.b").await;
+        assert_eq!(
+            d.rows(&format!("select count(*) from {schema}.join1_{id}_m"))
+                .await,
+            ["(0)"],
+            "{kind:?}: M is empty"
+        );
+        assert_eq!(
+            d.rows(&format!(
+                "select count(*) from ledger_truncate_floor \
+                 where target_table = '\"{schema}\".\"join1_{id}_m\"'"
+            ))
+            .await,
+            ["(1)"],
+            "{kind:?}: M's floor rose"
+        );
+        assert_eq!(
+            build_state(&d, kind).await,
+            ("backfilling".to_string(), 2),
+            "{kind:?}: a plan job and a sweep job are queued"
+        );
+        assert_eq!(
+            d.rows(&format!(
+                "select (build_seg is not null)::text from transform_definitions \
+                 where id = {id}"
+            ))
+            .await,
+            ["(true)"],
+            "{kind:?}: the rebuild recorded its segment"
+        );
+        // The target still holds the old `b` side.
+        let stale = d
+            .rows(&format!(
+                "select count(*) from {} where tag is not null",
+                kind.target()
+            ))
+            .await;
+        assert_eq!(stale, ["(2)"], "{kind:?}: the rows wait for the rebuild");
+        assert_rebuilt(&mut d, &[kind]).await;
+        assert_eq!(
+            build_state(&d, kind).await,
+            ("live".to_string(), 0),
+            "{kind:?}: the rebuild finished"
+        );
+        let expected = match kind {
+            Kind::Left => ["(4)"],
+            Kind::Inner => ["(0)"],
+        };
+        assert_eq!(
+            d.rows(&format!("select count(*) from {}", kind.target()))
+                .await,
+            expected
+        );
+    }
+}
+
+/// After a `TRUNCATE b` and before the rebuild reaches any row, an `a` change
+/// reads the `M` the truncate left, which is empty: a new `a` row on a key
+/// whose `b` row is gone has no `b` side.
+#[tokio::test]
+async fn a_truncate_of_b_empties_m_before_the_rebuild_runs() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+        step(&mut d, "truncate public.b").await;
+        step(&mut d, "insert into public.a values (5, 10, 5, 'five')").await;
+        assert_eq!(
+            d.rows(&format!(
+                "select count(*) from {} where id = 5 and tag is not null",
+                kind.target()
+            ))
+            .await,
+            ["(0)"],
+            "{kind:?}: the new row joined a b row that is gone"
+        );
+        assert_rebuilt(&mut d, &[kind]).await;
+    }
+}
+
+/// A `b` row inserted after the `TRUNCATE b` in the same transaction is in
+/// `M` once the truncate's page has applied it, and the rebuild keeps it.
+#[tokio::test]
+async fn a_truncate_of_b_and_a_later_insert_in_one_transaction() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+        step(
+            &mut d,
+            "begin; truncate public.b; \
+             insert into public.b values (4, 10, 401, 'ten2'), (5, null, 1, 'none'); commit",
+        )
+        .await;
+        assert_eq!(
+            d.rows(&format!(
+                "select count(*) from {}.join1_{}_m where not __tombstone",
+                trellis::config::DEFAULT_SCHEMA,
+                definition_id(&d, kind.target()).await
+            ))
+            .await,
+            ["(2)"],
+            "{kind:?}: the later inserts are in M"
+        );
+        assert_rebuilt(&mut d, &[kind]).await;
+    }
+}
+
+/// The #1375 truncate families (T1 to T8, named there by the group "truncates
+/// of either side or both, alone or with later inserts, under the barrier"),
+/// numbered here in the order of [`TRUNCATE_RACES`]: a `TRUNCATE` of either
+/// side against a page of the other side (T1, T2) and of its own (T3, T4), a
+/// `TRUNCATE` and the inserts after it in one transaction against a page of
+/// the other side (T5, T6), and both sides truncated and refilled (T7). T8 is
+/// [`t8_a_stale_page_after_the_truncate_is_refused`].
+///
+/// Each pair is two batches, sealed in order, and drains in both orders, the
+/// first frozen at its commit: the second must queue on the pair's lock row,
+/// which the truncate's page holds `FOR UPDATE` and every other page `FOR
+/// SHARE`, and then the target equals the live join.
+const TRUNCATE_RACES: [(&str, &str, &str); 8] = [
+    (
+        "t1 truncate a vs b",
+        "truncate public.a",
+        "update public.b set w = 999 where id = 2",
+    ),
+    (
+        // A page of `b` that holds a `NULL` key reads no `R` entry, so it
+        // meets the truncate's page on the lock row alone.
+        "t1 truncate a vs a NULL-keyed b change",
+        "truncate public.a",
+        "insert into public.b values (4, null, 1, 'none')",
+    ),
+    (
+        "t2 truncate b vs a",
+        "truncate public.b",
+        "insert into public.a values (5, 20, 5, 'five')",
+    ),
+    (
+        "t3 a vs truncate a",
+        "update public.a set x = 99 where id = 1; \
+         insert into public.a values (5, 30, 5, 'five')",
+        "truncate public.a",
+    ),
+    (
+        "t4 b vs truncate b",
+        "insert into public.b values (4, 30, 400, 'thirty')",
+        "truncate public.b",
+    ),
+    (
+        "t5 truncate a and insert vs b",
+        "begin; truncate public.a; \
+         insert into public.a values (5, 10, 5, 'five'), (6, null, 6, 'six'); commit",
+        "update public.b set w = 999 where id = 1",
+    ),
+    (
+        "t6 truncate b and insert vs a",
+        "begin; truncate public.b; \
+         insert into public.b values (4, 10, 401, 'ten2'), (5, null, 1, 'none'); commit",
+        "insert into public.a values (5, 20, 5, 'five')",
+    ),
+    (
+        "t7 both truncated and refilled vs b",
+        "begin; truncate public.a; truncate public.b; \
+         insert into public.a values (5, 10, 5, 'five'); \
+         insert into public.b values (4, 10, 400, 'ten3'); commit",
+        "insert into public.b values (6, 50, 1, 'fifty')",
+    ),
+];
+
+#[tokio::test]
+async fn t1_to_t7_a_truncate_races_a_page_of_either_side() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        for (name, x, y) in TRUNCATE_RACES {
+            for first_x in [true, false] {
+                let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+                write(&d, x).await;
+                let sealed_x = d.seal().await;
+                write(&d, y).await;
+                let sealed_y = d.seal().await;
+                let (first, second) = if first_x {
+                    (sealed_x, sealed_y)
+                } else {
+                    (sealed_y, sealed_x)
+                };
+                race_rebuilt(&mut d, kind, name, first, second).await;
+            }
+        }
+    }
+}
+
+/// [`race`] for batches that may hold a `TRUNCATE` of `b`: the builds it
+/// started run before the oracle.
+async fn race_rebuilt(d: &mut Driver, kind: Kind, name: &str, first: i64, second: i64) {
+    let mut held = d
+        .drain_frozen(first, "first", &[(PausePoint::BeforeCommit, kind.target())])
+        .await;
+    let reached = held.reached(PausePoint::BeforeCommit).await;
+    let queued = d.drain_frozen(second, "second", &[]).await;
+    let blocked = queued_or_finished(d, reached.backend_pid, &queued).await;
+    d.release(&mut held, PausePoint::BeforeCommit).await;
+    held.finish().await;
+    let result = queued.finish_result().await;
+    let deadlocks = d.deadlocks_logged();
+    assert!(deadlocks.is_empty(), "{deadlocks:?}");
+    assert!(
+        blocked,
+        "{kind:?} {name}: the second page ran without queueing on the first's lock row: \
+         {result:?}"
+    );
+    result.expect("the second page");
+    assert_rebuilt(d, &[kind]).await;
+}
+
+/// T8: a page of the truncated side from before the truncate, drained after
+/// the truncate's page (the barrier never lets it; the driver claims it out of
+/// order on purpose), is refused by the side's floor, and the ledger and the
+/// target hold nothing of it.
+#[tokio::test]
+async fn t8_a_stale_page_after_the_truncate_is_refused() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        for table in ["public.a", "public.b"] {
+            let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+            let stale = match table {
+                "public.a" => {
+                    "insert into public.a values (9, 20, 9, 'nine'); \
+                     update public.a set x = 99 where id = 1"
+                }
+                _ => {
+                    "insert into public.b values (9, 30, 900, 'thirty'); \
+                     update public.b set w = 99 where id = 1"
+                }
+            };
+            write(&d, stale).await;
+            let earlier = d.seal().await;
+            write(&d, &format!("truncate {table}")).await;
+            let truncate = d.seal().await;
+            d.drain(truncate, "truncate").await;
+            d.drain(earlier, "stale").await;
+            let id = definition_id(&d, kind.target()).await;
+            let ledger = if table == "public.a" { "r" } else { "m" };
+            assert_eq!(
+                d.rows(&format!(
+                    "select count(*) from {}.join1_{id}_{ledger} where not __tombstone",
+                    trellis::config::DEFAULT_SCHEMA
+                ))
+                .await,
+                ["(0)"],
+                "{kind:?} {table}: the stale page wrote an entry"
+            );
+            if table == "public.a" {
+                assert_eq!(
+                    d.rows(&format!("select count(*) from {}", kind.target()))
+                        .await,
+                    ["(0)"],
+                    "{kind:?}: the stale page wrote a target row"
+                );
+            }
+            assert_rebuilt(&mut d, &[kind]).await;
+        }
+    }
+}
+
+/// The barrier: a `TRUNCATE b`, then a later batch with an insert into `a` and
+/// a change of `b` (a mixed page). Nothing past the truncate's batch is
+/// claimable until it drains, so the mixed page can't apply its insert first
+/// and have the rebuild the truncate starts treat it as older than it is.
+#[tokio::test]
+async fn a_batch_after_a_truncate_waits_for_it() {
+    let _serial = serial().await;
+    let mut d = start_kinds(&[Kind::Left], A_ROWS, B_ROWS).await;
+    write(&d, "truncate public.b").await;
+    let truncate = d.seal().await;
+    write(
+        &d,
+        "insert into public.a values (5, 20, 5, 'five'); \
+         insert into public.b values (4, 20, 1, 'again')",
+    )
+    .await;
+    let mixed = d.seal().await;
+    let claimable = || async {
+        trellis::staging::apply::next_claimable_segments(&d.ctl, 1_000_000)
+            .await
+            .expect("next claimable segments")
+    };
+    assert_eq!(claimable().await, [truncate], "the mixed page waits");
+    d.drain(truncate, "truncate").await;
+    assert_eq!(claimable().await, [mixed]);
+    d.drain(mixed, "mixed").await;
+    assert_rebuilt(&mut d, &[Kind::Left]).await;
+    assert_eq!(
+        d.rows("select count(*) from public.b").await,
+        ["(1)"],
+        "the insert survived"
+    );
+}
+
+/// A rebuild's start takes the definition's row and then the pair's lock row.
+/// A `TRUNCATE b` page takes them in that order too, so one that arrives while
+/// a rebuild is starting queues on the definition's row and the two never wait
+/// for each other. The start is played by hand: its transaction holds the row.
+#[tokio::test]
+async fn a_truncate_of_b_page_and_a_rebuild_start_take_the_definition_row_first() {
+    let _serial = serial().await;
+    let mut d = start_kinds(&[Kind::Left], A_ROWS, B_ROWS).await;
+    let id = definition_id(&d, Kind::Left.target()).await;
+    write(&d, "truncate public.b").await;
+    let truncate = d.seal().await;
+    let mut start = d.user().await;
+    let txn = start.transaction().await.expect("begin");
+    txn.execute(
+        "select 1 from transform_definitions where id = $1 for update",
+        &[&id],
+    )
+    .await
+    .expect("the definition row");
+    let page = d.drain_frozen(truncate, "truncate", &[]).await;
+    // The page queues on the definition's row, holding nothing else.
+    let pid: i32 = txn
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("pid")
+        .get(0);
+    assert!(
+        queued_or_finished(&d, pid, &page).await,
+        "the page didn't queue on the definition's row"
+    );
+    // The start goes on to the lock row, which the queued page doesn't hold.
+    txn.execute(
+        &format!(
+            "select 1 from {}.join1_{id}_l for update",
+            trellis::config::DEFAULT_SCHEMA
+        ),
+        &[],
+    )
+    .await
+    .expect("the lock row, with no deadlock");
+    txn.commit().await.expect("commit the start");
+    page.finish().await;
+    let deadlocks = d.deadlocks_logged();
+    assert!(deadlocks.is_empty(), "{deadlocks:?}");
+    assert_rebuilt(&mut d, &[Kind::Left]).await;
 }

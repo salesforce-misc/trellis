@@ -3017,14 +3017,21 @@ pub(super) async fn compute_page(
                     };
                     target_plan.truncate(side, truncate_lsn, change);
                 }
-                // A TRUNCATE of either side of a 1-1 JOIN is the truncate
-                // milestone's (ADR-0021, #1399): until it exists the page
-                // halts rather than clear nothing.
+                // A TRUNCATE of either side of a 1-1 JOIN is settled by the
+                // JOIN's page, under its lock row (`super::join_one_to_one`).
                 KeySpace::JoinOneToOne(_) => {
-                    return Err(ApplyError::GroupBasisUnsupported {
-                        target: def.def.target.clone(),
-                        what: "a TRUNCATE of a 1-1 JOIN side (its apply path is not built yet)",
-                    });
+                    let side = crate::defs::join::side_of_table(&def.def, &change.src_table)
+                        .ok_or_else(|| ApplyError::GroupBasisUnsupported {
+                            target: def.def.target.clone(),
+                            what: "a TRUNCATE of a table that is neither side of a 1-1 JOIN",
+                        })?;
+                    let target_plan = match join1_targets.entry(def.def.target.clone()) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
+                            super::join_one_to_one::plan_for(pool, def, side, pk.clone()).await?,
+                        ),
+                    };
+                    target_plan.truncate(side, truncate_lsn, change);
                 }
                 KeySpace::Aggregate { .. } => {
                     if let Some(existing) = aggregate_clears.get_mut(&def.def.target) {

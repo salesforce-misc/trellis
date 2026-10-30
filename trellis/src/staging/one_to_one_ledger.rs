@@ -549,6 +549,15 @@ pub(crate) async fn truncate(
 ) -> Result<(), ApplyError> {
     txn.batch_execute(&format!("truncate {}", ledger.ident))
         .await?;
+    raise_floor(txn, ledger, lsn).await
+}
+
+/// Raises `ledger`'s truncate floor to `lsn`, if it is below it.
+pub(crate) async fn raise_floor(
+    txn: &Transaction<'_>,
+    ledger: &LedgerRef,
+    lsn: PgLsn,
+) -> Result<(), ApplyError> {
     txn.execute(
         "insert into ledger_truncate_floor (target_table, floor) values ($1, $2) \
          on conflict (target_table) do update \

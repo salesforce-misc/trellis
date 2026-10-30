@@ -93,6 +93,7 @@ pub(crate) async fn rederive(
         shape: shape.clone(),
         a,
         b,
+        truncate: None,
         fan_out,
     };
     // A Re-derive page's segment is its read's; the page's own only stamps

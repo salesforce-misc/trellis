@@ -318,6 +318,52 @@ pub enum Plant {
     /// Pinned by `join_one_to_one_build`'s
     /// `the_m_pass_tombstones_the_m_entries_of_b_rows_gone_before_a_rebuild`.
     Join1MPassBOnly,
+    /// ADR-0021 (#1375 T8, #1399): a 1-1 `JOIN`'s `TRUNCATE` empties the
+    /// side's ledger (`R` or `M`) but doesn't raise its truncate floor, so a
+    /// change of that side from before the truncate, which reaches a page
+    /// after the truncate's, applies over it.
+    ///
+    /// Pinned by `join_one_to_one_interleavings`'s
+    /// `t8_a_stale_page_after_the_truncate_is_refused`.
+    Join1TruncateNoFloor,
+    /// ADR-0021 (#1375 T1 to T7, #1399): a 1-1 `JOIN`'s truncate page takes
+    /// the pair's lock row `FOR SHARE`, as every other page does, instead of
+    /// `FOR UPDATE`, so a page of the pair runs beside the truncate's, which
+    /// the barrier alone doesn't order against a page in flight.
+    ///
+    /// Pinned by `join_one_to_one_interleavings`'s
+    /// `t1_to_t7_a_truncate_races_a_page_of_either_side`.
+    Join1TruncateShareLock,
+    /// ADR-0021 (#1399): a `TRUNCATE a` of a 1-1 `JOIN` raises `R`'s floor but
+    /// leaves its entries. The target is empty, and a later change of `b`
+    /// fans out to those entries and writes the rows of `a` rows that are
+    /// gone.
+    ///
+    /// Pinned by `join_one_to_one_interleavings`'s
+    /// `a_truncate_of_a_empties_r_and_a_later_b_change_writes_nothing`.
+    Join1TruncateKeepsR,
+    /// ADR-0021 (#1399): a `TRUNCATE b` of a 1-1 `JOIN` raises `M`'s floor but
+    /// leaves its entries, so an `a` change before the rebuild reaches its
+    /// key joins the `b` row that is gone.
+    ///
+    /// Pinned by `join_one_to_one_interleavings`'s
+    /// `a_truncate_of_b_empties_m_before_the_rebuild_runs`.
+    Join1TruncateKeepsM,
+    /// ADR-0021 (#1399): a `TRUNCATE b` of a 1-1 `JOIN` starts no rebuild of
+    /// the target, so the rows of `a` keep the `b` side they held, and
+    /// nothing rewrites them.
+    ///
+    /// Pinned by `join_one_to_one_interleavings`'s
+    /// `a_truncate_of_b_rebuilds_the_target`.
+    Join1TruncateNoRebuild,
+    /// ADR-0021 (#1399): a `TRUNCATE b` page of a 1-1 `JOIN` takes its
+    /// definition's row after the pair's lock row, not before it. A rebuild's
+    /// start holds the definition's row and waits for the lock row, so the
+    /// two deadlock.
+    ///
+    /// Pinned by `join_one_to_one_interleavings`'s
+    /// `a_truncate_of_b_page_and_a_rebuild_start_take_the_definition_row_first`.
+    Join1TruncateDefAfterLock,
 }
 
 impl Plant {
@@ -350,6 +396,12 @@ impl Plant {
         Plant::Join1NoOrphanPass,
         Plant::Join1OrphanDelete,
         Plant::Join1MPassBOnly,
+        Plant::Join1TruncateNoFloor,
+        Plant::Join1TruncateShareLock,
+        Plant::Join1TruncateKeepsR,
+        Plant::Join1TruncateKeepsM,
+        Plant::Join1TruncateNoRebuild,
+        Plant::Join1TruncateDefAfterLock,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -382,6 +434,12 @@ impl Plant {
             Plant::Join1NoOrphanPass => "join1_no_orphan_pass",
             Plant::Join1OrphanDelete => "join1_orphan_delete",
             Plant::Join1MPassBOnly => "join1_m_pass_b_only",
+            Plant::Join1TruncateNoFloor => "join1_truncate_no_floor",
+            Plant::Join1TruncateShareLock => "join1_truncate_share_lock",
+            Plant::Join1TruncateKeepsR => "join1_truncate_keeps_r",
+            Plant::Join1TruncateKeepsM => "join1_truncate_keeps_m",
+            Plant::Join1TruncateNoRebuild => "join1_truncate_no_rebuild",
+            Plant::Join1TruncateDefAfterLock => "join1_truncate_def_after_lock",
         }
     }
 

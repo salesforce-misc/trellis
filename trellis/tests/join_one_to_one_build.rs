@@ -397,6 +397,65 @@ async fn c_a_chunk_on_a_pages_key_gives_up_and_retries() {
     }
 }
 
+/// A `TRUNCATE b` in the middle of a build (#1399): the chunks that ran
+/// before it wrote their rows from the `b` side it removed, and the chunks
+/// still to run read the `M` it emptied. The page starts a rebuild of its
+/// own, which re-derives every row, so the target ends as the live join
+/// whichever chunks had run.
+#[tokio::test]
+async fn a_truncate_of_b_in_the_middle_of_a_build_is_rebuilt() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(&[kind], false).await;
+        assert_eq!(build_step(d.pool(), "planner", 3).await, Step::Planned);
+        assert_eq!(build_step(d.pool(), "chunk", 3).await, Step::Chunk);
+        assert_eq!(build_step(d.pool(), "chunk", 3).await, Step::Chunk);
+        write(
+            &d,
+            "truncate public.b; \
+             insert into public.b values (7, 30, 700, 'after')",
+        )
+        .await;
+        let batch = d.seal().await;
+        d.drain(batch, "truncate").await;
+        // The unfinished build and the rebuild's two jobs are all queued.
+        assert!(pending(&d, &["plan", "rederive", "sweep"]).await > 5);
+        assert_oracle(&mut d, &[kind], "a truncate of b mid-build").await;
+    }
+}
+
+/// A `TRUNCATE b` page queues behind a chunk in flight, on the pair's lock
+/// row (the chunk holds it `FOR SHARE` and the page wants it `FOR UPDATE`),
+/// so a chunk never writes rows from the `M` a truncate is emptying; the
+/// chunk's rows are rebuilt after.
+#[tokio::test]
+async fn a_truncate_of_b_queues_behind_a_chunk_in_flight() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(&[kind], false).await;
+        assert_eq!(build_step(d.pool(), "planner", 100).await, Step::Planned);
+        let mut chunk = d
+            .run_frozen(
+                &[(PausePoint::BeforeRebuildCommit, &kind.target())],
+                |pool| async move { Ok(build_step(&pool, "chunk", 100).await) },
+            )
+            .await;
+        let reached = chunk.reached(PausePoint::BeforeRebuildCommit).await;
+        write(&d, "truncate public.b").await;
+        let batch = d.seal().await;
+        let page = d.drain_frozen(batch, "page", &[]).await;
+        d.wait_blocked_behind(reached.backend_pid).await;
+        assert!(
+            !page.is_finished(),
+            "the page queued on the chunk's lock row"
+        );
+        d.release(&mut chunk, PausePoint::BeforeRebuildCommit).await;
+        chunk.finish().await;
+        page.finish().await;
+        assert_oracle(&mut d, &[kind], "a truncate of b behind a chunk").await;
+    }
+}
+
 /// C10 (`chunk_nokey`): row `a01` moves from key 10 onto key 70 after the
 /// chunk's unlocked read of its range, so its insert-from-read finds key 70,
 /// which it holds no `J` row for. It rolls back and its retry locks 70.

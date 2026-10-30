@@ -121,7 +121,13 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::Join1ChunkNoKey
         | Plant::Join1NoOrphanPass
         | Plant::Join1OrphanDelete
-        | Plant::Join1MPassBOnly => PlantPath::OneToOneJoin,
+        | Plant::Join1MPassBOnly
+        | Plant::Join1TruncateNoFloor
+        | Plant::Join1TruncateShareLock
+        | Plant::Join1TruncateKeepsR
+        | Plant::Join1TruncateKeepsM
+        | Plant::Join1TruncateNoRebuild
+        | Plant::Join1TruncateDefAfterLock => PlantPath::OneToOneJoin,
     }
 }
 

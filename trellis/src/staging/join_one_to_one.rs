@@ -70,8 +70,20 @@
 //! same lock. So two pages that write one target row queue on a `J` row
 //! before either locks it, whatever order their statements take. Nothing
 //! reads a 1-1 `JOIN` target in v1 (define refuses it), so a page records
-//! nothing for the seam. A page that carries a `TRUNCATE` of either side
-//! halts (its path is #1399's).
+//! nothing for the seam.
+//!
+//! # A `TRUNCATE` ([`truncate_sides`], [`start_rebuild`])
+//!
+//! A page that carries a `TRUNCATE` of either side takes the lock row `FOR
+//! UPDATE` instead (a `TRUNCATE` of `b` takes its definition's row before
+//! it), so it waits for the pages and chunks in flight and every other page
+//! waits for it, and settles the truncate before its changes: the side's
+//! ledger is emptied and its floor raised, and a `TRUNCATE` of `a` empties
+//! the target. `J` keeps its rows. A `TRUNCATE` of `b` changes every target
+//! row, which one transaction would not hold, so the page starts a rebuild
+//! of the target as its last statement and the build's chunks rewrite the
+//! rows (a `LEFT` row keeps its old `b` columns until the chunk reaches it).
+//! The drain's barrier orders the truncate's batch against every other.
 //!
 //! # A build ([`build`])
 //!
@@ -111,6 +123,8 @@ const WRITE_BATCH: usize = 10_000;
 /// newest live row of `M`.
 #[derive(Debug, Clone)]
 pub(crate) struct JoinShape {
+    /// The definition's id: the key of its `transform_definitions` row.
+    id: i64,
     /// The target, qualified and unquoted: the pause label of its points.
     pub(crate) target: String,
     /// The `FROM` table, qualified.
@@ -283,6 +297,7 @@ impl JoinShape {
         let left = matches!(spec::spec(def).map(|s| s.kind), Some(JoinKind::Left));
         let schema_name = pool.schema();
         Ok(JoinShape {
+            id: definition.id,
             source_table: definition.source_table.clone(),
             joined_table: joined,
             left,
@@ -456,12 +471,26 @@ impl Record {
     }
 }
 
+/// A page's `TRUNCATE` of one side or both ([`JoinOneToOnePlan::truncate`]).
+#[derive(Debug, Clone, Default)]
+struct Truncate {
+    /// Each side's truncate's `lsn`: the floor it raises.
+    from: Option<PgLsn>,
+    joined: Option<PgLsn>,
+    hop_gen: i32,
+    src_changed: Option<std::time::SystemTime>,
+    origin_lsn: Option<PgLsn>,
+}
+
 /// One page's work on one 1-1 `JOIN` target: its changes of each side.
 #[derive(Debug, Clone)]
 pub(crate) struct JoinOneToOnePlan {
     pub(crate) shape: std::sync::Arc<JoinShape>,
     a: Vec<Record>,
     b: Vec<Record>,
+    /// The page's `TRUNCATE` of either side, which it settles before its
+    /// changes (the module doc).
+    truncate: Option<Truncate>,
     /// Whether a changed `M` entry fans out to the `R` entries on its keys.
     /// Only the build's `M` pass ([`build::m_batch`],
     /// [`build::m_null_batch`], [`build::m_gone_batch`]) turns it off: the
@@ -475,8 +504,29 @@ impl JoinOneToOnePlan {
             shape: std::sync::Arc::new(shape),
             a: Vec::new(),
             b: Vec::new(),
+            truncate: None,
             fan_out: true,
         }
+    }
+
+    /// Adds a `TRUNCATE` of the table on `side`, `change`, whose ring `lsn`
+    /// is `lsn`, the floor it raises.
+    pub(crate) fn truncate(&mut self, side: Side, lsn: PgLsn, change: &FoldedChange) {
+        let truncate = self.truncate.get_or_insert_with(|| Truncate {
+            hop_gen: change.hop_gen,
+            src_changed: change.src_changed,
+            origin_lsn: change.origin_lsn,
+            ..Truncate::default()
+        });
+        truncate.hop_gen = truncate.hop_gen.max(change.hop_gen);
+        truncate.src_changed =
+            super::apply::earliest_src_changed(truncate.src_changed, change.src_changed);
+        truncate.origin_lsn = super::fold::earliest_origin(truncate.origin_lsn, change.origin_lsn);
+        let floor = match side {
+            Side::From => &mut truncate.from,
+            Side::Joined => &mut truncate.joined,
+        };
+        *floor = Some(floor.map_or(lsn, |f| f.max(lsn)));
     }
 
     /// Adds `change` of the table on `side`.
@@ -581,7 +631,8 @@ pub(crate) async fn apply_page(
         };
     let a = fold(a_records);
     let b = fold(b_records);
-    if a.is_empty() && b.is_empty() {
+    let truncate = plan.truncate.as_ref();
+    if a.is_empty() && b.is_empty() && truncate.is_none() {
         return Ok((0, 0));
     }
     // Planted bug: apply every change without ADR-0002's I2. See
@@ -610,9 +661,43 @@ pub(crate) async fn apply_page(
         ddl::source_primary_key_in_txn(txn, &shape.joined_table).await?
     };
 
-    // 2. The lock row, then K over both sides' keys.
-    txn.execute(&format!("select 1 from {} for share", shape.lock), &[])
+    // 2. The lock row, a truncate's clear, then K over both sides' keys. A
+    // truncate of `b` takes its definition's row before the lock row, as a
+    // rebuild's start does (`super::build::start_rebuilds`), so the two never
+    // each wait for what the other holds.
+    let truncates_b = truncate.is_some_and(|t| t.joined.is_some());
+    // Planted bug: the definition's row comes after the lock row. See
+    // `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let def_late = crate::plant::fires(crate::plant::Plant::Join1TruncateDefAfterLock, truncates_b);
+    #[cfg(not(any(test, feature = "test-util")))]
+    let def_late = false;
+    if truncates_b && !def_late {
+        lock_definition(txn, shape).await?;
+    }
+    // Planted bug: a truncate's page takes the lock row `FOR SHARE`, so a
+    // page of the pair runs beside it. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let share = crate::plant::fires(
+        crate::plant::Plant::Join1TruncateShareLock,
+        truncate.is_some(),
+    );
+    #[cfg(not(any(test, feature = "test-util")))]
+    let share = false;
+    let mode = if truncate.is_some() && !share {
+        "update"
+    } else {
+        "share"
+    };
+    txn.execute(&format!("select 1 from {} for {mode}", shape.lock), &[])
         .await?;
+    if truncates_b && def_late {
+        lock_definition(txn, shape).await?;
+    }
+    let cleared = match truncate {
+        Some(truncate) => truncate_sides(txn, shape, truncate, mutations).await?,
+        None => 0,
+    };
     let mut k: BTreeSet<KeyText> = BTreeSet::new();
     if !a.is_empty() {
         let live = live_keys(txn, shape, Side::From, &shape.pk, &a_rederive).await?;
@@ -686,7 +771,96 @@ pub(crate) async fn apply_page(
     if late_j {
         lock_keys(txn, shape, &k).await?;
     }
-    Ok((written + fanned, deleted + fan_deleted))
+    if truncates_b {
+        start_rebuild(txn, shape).await?;
+    }
+    Ok((written + fanned, deleted + fan_deleted + cleared))
+}
+
+/// Locks the definition's row `FOR UPDATE`.
+async fn lock_definition(txn: &Transaction<'_>, shape: &JoinShape) -> Result<(), ApplyError> {
+    txn.execute(
+        "select 1 from transform_definitions where id = $1 for update",
+        &[&shape.id],
+    )
+    .await?;
+    Ok(())
+}
+
+/// A page's `TRUNCATE` of one side or both, under the lock row held `FOR
+/// UPDATE`, before the page's changes: each truncated side's ledger is
+/// emptied and its floor raised to the truncate's `lsn`, so a change from
+/// before it that still reaches a page is refused (ADR-0002 I2); and a
+/// truncated `a` empties the target, through the seam. `J` keeps its rows,
+/// as it keeps every key either table has held. A truncated `b` leaves the
+/// target to the rebuild [`start_rebuild`] starts. Returns how many target
+/// rows it deleted.
+async fn truncate_sides(
+    txn: &Transaction<'_>,
+    shape: &JoinShape,
+    truncate: &Truncate,
+    mutations: &mut TargetMutations,
+) -> Result<usize, ApplyError> {
+    for (side, lsn) in [(Side::From, truncate.from), (Side::Joined, truncate.joined)] {
+        let Some(lsn) = lsn else { continue };
+        let ledger = shape.ledger(side);
+        // Planted bugs: the entries stay, or the floor doesn't rise. See
+        // `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        let (keep, no_floor) = (
+            crate::plant::fires(
+                match side {
+                    Side::From => crate::plant::Plant::Join1TruncateKeepsR,
+                    Side::Joined => crate::plant::Plant::Join1TruncateKeepsM,
+                },
+                true,
+            ),
+            crate::plant::fires(crate::plant::Plant::Join1TruncateNoFloor, true),
+        );
+        #[cfg(not(any(test, feature = "test-util")))]
+        let (keep, no_floor) = (false, false);
+        if !keep {
+            txn.batch_execute(&format!("truncate {}", ledger.ident))
+                .await?;
+        }
+        if !no_floor {
+            ledger::raise_floor(txn, ledger, lsn).await?;
+        }
+    }
+    if truncate.from.is_none() {
+        return Ok(0);
+    }
+    super::apply::clear_target(
+        txn,
+        &shape.target,
+        &shape.pk,
+        truncate.hop_gen,
+        truncate.src_changed,
+        truncate.origin_lsn,
+        mutations,
+    )
+    .await
+}
+
+/// Starts the rebuild of the target after a `TRUNCATE` of `b`, in the page's
+/// transaction (ADR-0021): every target row may hold the `b` side of a row
+/// that is gone, so the build's chunks, not the page, rewrite them. The
+/// definition reads `backfilling` from the commit, and keeps applying; a
+/// `LEFT` row keeps its old `b` columns, and an `INNER` row its place, until
+/// the rebuild reaches it. A definition that doesn't apply any more (paused
+/// since the page read the catalog) is left to its `RESUME`, whose build
+/// recreates `R` and `M` and re-derives every row. The caller holds the
+/// definition's row and the lock row `FOR UPDATE`.
+async fn start_rebuild(txn: &Transaction<'_>, shape: &JoinShape) -> Result<(), ApplyError> {
+    // Planted bug: the truncate starts no rebuild. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    if crate::plant::fires(crate::plant::Plant::Join1TruncateNoRebuild, true) {
+        return Ok(());
+    }
+    let ids = super::build::rebuildable(txn, &[shape.id]).await?;
+    super::build::start_rebuilds(txn, &ids).await?;
+    super::build::stamp_rebuild_seg(txn, &ids).await?;
+    Ok(())
 }
 
 /// The live join key of each of `keys`' rows of `side`'s table (whose

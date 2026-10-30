@@ -5,10 +5,10 @@
 //! one test per site that would otherwise treat the new key space as a plain
 //! 1-1 or an aggregate JOIN without saying so.
 //!
-//! The `FROM` side's page and the minimal build run (`join_one_to_one_interleavings`
-//! covers them); a change of the joined side and a `TRUNCATE` halt the
-//! definition rather than run wrong. Every test is stepped by hand: no staging
-//! worker runs, and nothing polls for convergence.
+//! The pages of either side, the build and a `TRUNCATE` of either side run
+//! (`join_one_to_one_interleavings` and `join_one_to_one_build` cover them).
+//! Every test is stepped by hand: no staging worker runs, and nothing polls
+//! for convergence.
 
 use std::collections::HashMap;
 
@@ -1101,11 +1101,10 @@ async fn drain(raw: &mut Client, pool: &trellis::Pool) {
 
 /// A change to `a` is applied by the 1-1 JOIN's page, and a change to `b` by
 /// its fan-out, rather than either applying as a plain 1-1 change (a target
-/// row computed from the one table alone). A `TRUNCATE` of either side halts
-/// it with the reason rather than clearing nothing: that is a later
-/// milestone's.
+/// row computed from the one table alone). A `TRUNCATE` of `b` starts a
+/// rebuild of the target, and one of `a` empties it.
 #[tokio::test]
-async fn a_change_of_either_side_applies_and_a_truncate_halts_a_one_to_one_join() {
+async fn a_change_of_either_side_applies_and_a_truncate_clears_or_rebuilds_a_one_to_one_join() {
     let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -1160,27 +1159,65 @@ async fn a_change_of_either_side_applies_and_a_truncate_halts_a_one_to_one_join(
         .await
         .expect("self_check");
     assert!(diverging.is_empty(), "{diverging:?}");
-    for (change, reason) in [("truncate public.customers", "a TRUNCATE of a 1-1 JOIN side")] {
-        raw.batch_execute(change).await.expect("change a side");
-        drain(&mut raw, &db.pool).await;
-        let reported = trellis
-            .status("order_view")
-            .await
-            .expect("status")
-            .expect("defined");
-        assert_eq!(reported.status, TransformStatus::Paused, "{change}");
-        let failure = reported.capture_failure.expect("a reason for the pause");
-        assert!(failure.error.contains(reason), "{change}: {failure:?}");
-        assert_eq!(
-            count(&raw, "select count(*) from public.order_view").await,
-            4,
-            "nothing was written to the target"
-        );
-        make_live(&raw, "order_view").await;
-        raw.execute("delete from capture_failures", &[])
-            .await
-            .expect("clear the pause record");
-    }
+    // A `TRUNCATE` of `b` starts a rebuild of the target: the definition
+    // reads `backfilling`, not paused, and keeps its rows until the rebuild
+    // reaches them.
+    raw.batch_execute("truncate public.customers")
+        .await
+        .expect("truncate b");
+    drain(&mut raw, &db.pool).await;
+    let reported = trellis
+        .status("order_view")
+        .await
+        .expect("status")
+        .expect("defined");
+    assert_eq!(reported.status, TransformStatus::Backfilling);
+    assert!(
+        reported.capture_failure.is_none(),
+        "a TRUNCATE no longer halts: {:?}",
+        reported.capture_failure
+    );
+    assert_eq!(
+        count(
+            &raw,
+            "select count(*) from public.order_view where who is not null"
+        )
+        .await,
+        3,
+        "the rows keep their b side until the rebuild reaches them"
+    );
+    trellis::staging::build::settle_builds(&db.pool).await;
+    drain(&mut raw, &db.pool).await;
+    assert_eq!(
+        status(&trellis, "order_view").await,
+        Some(TransformStatus::Live)
+    );
+    assert_eq!(
+        count(
+            &raw,
+            "select count(*) from public.order_view where who is not null"
+        )
+        .await,
+        0,
+        "the rebuild cleared the b side"
+    );
+    // A `TRUNCATE` of `a` empties the target in its page.
+    raw.batch_execute("truncate public.orders")
+        .await
+        .expect("truncate a");
+    drain(&mut raw, &db.pool).await;
+    assert_eq!(
+        status(&trellis, "order_view").await,
+        Some(TransformStatus::Live)
+    );
+    assert_eq!(
+        count(&raw, "select count(*) from public.order_view").await,
+        0
+    );
+    let diverging = trellis::staging::one_to_one_join_diverging_keys(&db.pool, "public.order_view")
+        .await
+        .expect("self_check");
+    assert!(diverging.is_empty(), "{diverging:?}");
 }
 
 /// A restored 1-1 JOIN's `RESUME` recreates `R` and `M` (empty, no basis)

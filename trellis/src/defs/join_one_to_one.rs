@@ -29,11 +29,10 @@
 //! `trellis::dev::defs::set_one_to_one_join(true)` before a client starts.
 //! The gate is at define (`super::validate_join_one_to_one`), never at parse,
 //! so a definition stored while the knob was on still loads with it off.
-//! Pages of either side's changes and Re-derives, and a one-transaction
-//! build, run (`crate::staging::join_one_to_one`); a `TRUNCATE` of either
-//! side and a schema change halt the transform with the reason rather than
-//! run wrong. So does a page whose fan-out passes the cap ([`max_fanout`]) or
-//! fails on a row.
+//! Pages of either side's changes, Re-derives and `TRUNCATE`s, and the
+//! chunked build, run (`crate::staging::join_one_to_one`); a schema change
+//! halts the transform with the reason rather than run wrong. So does a page
+//! whose fan-out passes the cap ([`max_fanout`]) or fails on a row.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
