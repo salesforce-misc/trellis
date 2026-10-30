@@ -19,6 +19,7 @@ use super::ast::{
     Expr, FieldDef, JoinSpec, KeySpace, Predicate, QualifiedColumn, TransformDef, ValueType,
     render_field_expr,
 };
+use super::join::Side;
 use super::parser::MAX_EXPRESSION_DEPTH;
 use super::pg_type::PgType;
 use crate::error_code::ErrorCode;
@@ -123,6 +124,16 @@ pub enum ValidationError {
     /// a different column of the other table. The join key would list that
     /// column twice, which the hidden tables cannot store.
     JoinOnRepeatedColumn { term: String, column: String },
+    /// A key Trellis builds an index over spans more columns than Postgres
+    /// allows in one (`INDEX_MAX_KEYS`, 32): the target's or a hidden table's
+    /// unique key over a `GROUP BY`, a `JOIN`'s `ON` columns, or a `JOIN`
+    /// side's `ON` and `GROUP BY` columns together. `clause` says which, as
+    /// the definition writes it; `columns` is the width of the widest index.
+    IndexKeyTooWide {
+        clause: String,
+        columns: usize,
+        limit: usize,
+    },
     /// The two columns of an `ON` term differ in type or collation (a type
     /// modifier never counts, and `text` and `varchar` are one type).
     /// Trellis never casts a join key.
@@ -981,6 +992,15 @@ impl fmt::Display for ValidationError {
                  column appears in at most one ON term, so drop the term or join a \
                  different column"
             ),
+            ValidationError::IndexKeyTooWide {
+                clause,
+                columns,
+                limit,
+            } => write!(
+                f,
+                "{clause} spans {columns} columns, but Trellis keys a table on them and \
+                 Postgres caps an index at {limit} columns; use at most {limit}"
+            ),
             ValidationError::JoinKeyTypeMismatch {
                 lhs,
                 lhs_type,
@@ -1539,6 +1559,9 @@ pub fn validate(
                     });
                 }
             }
+            // Every key resolved and is distinct, so this is the width of the
+            // target's unique key.
+            check_index_key_width(|| "GROUP BY".to_string(), group_by.len())?;
             for field in &def.fields {
                 // DDL generation (`ddl::create_aggregate_target_table`)
                 // treats a field named after a grouping column's target
@@ -2078,6 +2101,9 @@ pub(crate) fn validate_join_tables_and_on(
             });
         }
     }
+    // Each side names every `ON` column once (a repeat is refused above), and
+    // the hidden tables key and index a side on its `ON` columns.
+    check_index_key_width(|| "ON".to_string(), join.on.len())?;
 
     Ok(())
 }
@@ -2135,6 +2161,17 @@ pub fn validate_join(
                 column: key.column.clone(),
             });
         }
+    }
+
+    // The target's and `T`'s unique key.
+    check_index_key_width(|| "GROUP BY".to_string(), join.group_by.len())?;
+    // A side's hidden partials table is keyed by its `ON` columns, then its
+    // `GROUP BY` columns not among them: wider than either clause alone.
+    for (side, table) in [(Side::From, &def.source), (Side::Joined, &join.right)] {
+        check_index_key_width(
+            || format!("the ON and GROUP BY columns of {table} together"),
+            super::join::side_key_columns(def, side).len(),
+        )?;
     }
 
     let mut field_names = HashSet::with_capacity(def.fields.len());
@@ -2613,6 +2650,29 @@ fn reject_ambiguous_names(
 /// The name prefix reserved for the hidden columns Trellis keeps on a target
 /// table. A user field or `GROUP BY` column may not start with it.
 pub const RESERVED_COLUMN_PREFIX: &str = "__";
+
+/// The most columns Postgres allows in one index (`INDEX_MAX_KEYS`, a
+/// compile-time constant of the server that every supported version builds
+/// with its default of 32). Trellis keys its aggregate and `JOIN` tables on a
+/// definition's `GROUP BY` and `ON` columns, so a key wider than this fails
+/// `DefineIndex` with `54011`; it is refused at validation instead.
+pub const INDEX_MAX_KEYS: usize = 32;
+
+/// Refuses an index key of `columns` columns, described by `clause`, when it
+/// is wider than [`INDEX_MAX_KEYS`].
+fn check_index_key_width(
+    clause: impl FnOnce() -> String,
+    columns: usize,
+) -> Result<(), ValidationError> {
+    if columns > INDEX_MAX_KEYS {
+        return Err(ValidationError::IndexKeyTooWide {
+            clause: clause(),
+            columns,
+            limit: INDEX_MAX_KEYS,
+        });
+    }
+    Ok(())
+}
 
 /// Rejects any of a 1-1 definition's `fields` named after one of the
 /// source's `primary_key` columns. The target already carries
@@ -8327,6 +8387,40 @@ mod tests {
         // A column reused across the sides is not a repeat: `qty` is on the
         // joined side and `id` on the FROM side.
         on("orders.id = items.qty AND orders.region = items.sku").unwrap();
+    }
+
+    #[test]
+    fn an_index_key_is_admitted_at_the_postgres_cap_and_refused_past_it() {
+        let wide = |n: usize| {
+            let keys: Vec<String> = (0..n).map(|i| format!("c{i}")).collect();
+            let fields: Vec<String> = keys.iter().map(|k| format!("{k} AS {k}")).collect();
+            let columns: HashMap<String, ValueType> = keys
+                .iter()
+                .map(|k| (k.clone(), ValueType::Numeric))
+                .collect();
+            let text = format!(
+                "TRANSFORM t FROM s GROUP BY {} SELECT {}, COUNT(*) AS n",
+                keys.join(", "),
+                fields.join(", ")
+            );
+            validate(&crate::defs::parse(&text).unwrap(), &columns)
+        };
+        assert_eq!(wide(INDEX_MAX_KEYS), Ok(()));
+        let err = wide(INDEX_MAX_KEYS + 1).unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::IndexKeyTooWide {
+                clause: "GROUP BY".to_string(),
+                columns: 33,
+                limit: 32,
+            }
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("GROUP BY") && message.contains("33"),
+            "{message}"
+        );
+        assert!(message.contains("32"), "{message}");
     }
 
     #[test]
