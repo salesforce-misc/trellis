@@ -10,10 +10,9 @@
 //!
 //! # One page ([`apply_page`])
 //!
-//! A page carries `a` changes and Re-derives and `b` changes, in one
-//! transaction under `READ COMMITTED`, in the model's order (#1375). Each step
-//! is a rule an ablation showed necessary; the plant that removes it is in
-//! brackets.
+//! A page carries changes and Re-derives of either side, in one transaction
+//! under `READ COMMITTED`, in the model's order (#1375). Each step is a rule
+//! an ablation showed necessary; the plant that removes it is in brackets.
 //!
 //! 1. **Fold.** Only the newest change per id of each side goes through I2;
 //!    a Re-derive of an id replaces that id's changes. A page whose segment
@@ -71,8 +70,8 @@
 //! same lock. So two pages that write one target row queue on a `J` row
 //! before either locks it, whatever order their statements take. Nothing
 //! reads a 1-1 `JOIN` target in v1 (define refuses it), so a page records
-//! nothing for the seam. A `TRUNCATE` is a later step (#1399): a page that
-//! carries one halts.
+//! nothing for the seam. A page that carries a `TRUNCATE` of either side
+//! halts (its path is #1399's).
 //!
 //! # A build ([`build`])
 //!

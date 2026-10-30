@@ -1511,6 +1511,68 @@ async fn a_b_change_between_a_b_rederives_read_and_its_snapshot_is_applied() {
     }
 }
 
+/// A page re-deriving rows of both sides reads each side in its own
+/// statement, and each read's snapshot is the basis of its own side's
+/// entries only. Changes of both rows that commit between the `a` read and
+/// the `b` read are in the `b` read's row and snapshot but not the `a`
+/// read's: drained after the page, the `a` change applies and the `b`
+/// change is refused, its row being in `M` already.
+#[tokio::test]
+async fn changes_between_the_two_reads_of_a_page_rederiving_both_sides_apply() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+        d.stage_recomputes("public.a", &["1"]).await;
+        d.stage_recomputes("public.b", &["1"]).await;
+        let rederive = d.seal().await;
+        // The `a` read's pause point carries the target's label, the `b`
+        // read's `M`'s, so the page stops between its two reads.
+        let mut page = d
+            .drain_frozen(
+                rederive,
+                "rederive both",
+                &[(PausePoint::AfterRederiveRead, kind.target())],
+            )
+            .await;
+        page.reached(PausePoint::AfterRederiveRead).await;
+        write(
+            &d,
+            "update public.a set x = 7 where id = 1; update public.b set w = 700 where id = 1",
+        )
+        .await;
+        let change = d.seal().await;
+        d.release(&mut page, PausePoint::AfterRederiveRead).await;
+        page.finish().await;
+        assert_eq!(
+            total(&d, kind, 1).await,
+            Some(1 + 700),
+            "{kind:?}: the a read predates both changes, the b read follows them"
+        );
+        d.drain(change, "change").await;
+        assert_eq!(total(&d, kind, 1).await, Some(7 + 700), "{kind:?}");
+        assert_oracle(&mut d, &[kind]).await;
+    }
+}
+
+/// A Re-derive of either side's rows that finds them as their entries hold
+/// them writes no target row: its fan-out recomputes the `b` row's key, and
+/// the upsert leaves each row whose fields are unchanged as it is.
+#[tokio::test]
+async fn a_rederive_that_changes_nothing_writes_no_target_row() {
+    let _serial = serial().await;
+    for kind in KINDS {
+        let mut d = start_kinds(&[kind], A_ROWS, B_ROWS).await;
+        let versions = format!("select id, xmin::text from {} order by id", kind.target());
+        let before = d.rows(&versions).await;
+        d.stage_recomputes("public.b", &["1", "2", "3"]).await;
+        d.stage_recomputes("public.a", &["1", "2", "3", "4"]).await;
+        let batch = d.seal().await;
+        d.drain(batch, "rederive").await;
+        assert_eq!(d.rows(&versions).await, before, "{kind:?}");
+        assert_oracle(&mut d, &[kind]).await;
+    }
+}
+
 /// R17 on `M`: a `b` Re-derive read the row after two changes, then the
 /// older change's Apply arrives. The entry's basis saw it, so it is refused
 /// (`join1_lsn_only`) and the fan-out keeps the re-derived `w`.

@@ -535,8 +535,16 @@ impl<T> Running<T> {
         let rx = frozen.reached.take().expect("reached() once per point");
         let handle = self.handle.as_mut().expect("drain still running");
         tokio::select! {
-            reached = rx => reached.expect("pause scope dropped"),
-            finished = handle => panic!(
+            reached = rx => match reached {
+                Ok(reached) => reached,
+                // The worker dropped its pause scope: it finished, or failed,
+                // without reaching `point`. Say how.
+                Err(_) => panic!(
+                    "the task finished without reaching {point:?}: {:?}",
+                    handle.await.expect("task").map(|_| ())
+                ),
+            },
+            finished = &mut *handle => panic!(
                 "the task finished without reaching {point:?}: {:?}",
                 finished.expect("task").map(|_| ())
             ),
