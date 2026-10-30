@@ -464,7 +464,8 @@ impl TestCluster {
         // socket file, which lives in each cluster's own directory. A TCP
         // listener needs a port nobody else holds, picked only now, after
         // `initdb`, so the window in which another process could take it is
-        // milliseconds rather than seconds. Not zero: see `PORT_ATTEMPTS`.
+        // milliseconds rather than seconds. Should another process take it
+        // even so, the server starts again on a new one: see `PORT_ATTEMPTS`.
         let port: u16 = if tcp { pick_port() } else { 5432 };
 
         if tls {
@@ -512,10 +513,11 @@ impl TestCluster {
             }
             // The server lost the race for the port and has exited (and been
             // reaped by `poll_ready`). Start again on a fresh port, in the
-            // same directory: `postgres` binds its TCP port before it writes
-            // `postmaster.pid`, takes a shared-memory segment or creates its
-            // unix socket, so a failed bind leaves nothing to clean up (the
-            // test of this checks the socket directory).
+            // same directory: `postgres` binds its TCP port before it takes
+            // a shared-memory segment or creates its unix socket, and the
+            // `postmaster.pid` it wrote before the bind it removes on the way
+            // out, so a failed bind leaves nothing to clean up (the test of
+            // this checks the socket directory).
             attempt += 1;
             attempt_log_start = log.len();
             cluster.port = pick_port();
@@ -2143,10 +2145,13 @@ mod tests {
         let mut picks = Vec::new();
         let cluster = start_tcp_on(&[taken], &[], &mut picks);
 
-        assert_eq!(picks.len(), 2, "one failed attempt, one that came up");
+        // Usually two picks. Not asserted: the free port picked for the
+        // retry can itself be lost to the race this is about, at the odds
+        // any TCP cluster runs, and costs one more.
+        assert!(picks.len() >= 2, "no retry: {picks:?}");
         assert_eq!(picks[0], taken);
         assert_ne!(cluster.port(), taken);
-        assert_eq!(cluster.port(), picks[1]);
+        assert_eq!(Some(&cluster.port()), picks.last());
         // It serves over TCP on the new port, and its unix socket is named
         // for it, with nothing left from the attempt on the held port.
         let isready = Command::new("pg_isready")
@@ -2204,6 +2209,35 @@ mod tests {
         assert!(
             message.contains("no_such_setting"),
             "the log is in it: {message}"
+        );
+    }
+
+    /// A retry is judged on what its own attempt logged. The first attempt
+    /// here loses its port and the second fails for another reason (a port
+    /// number Postgres rejects): that panics at once, rather than the first
+    /// attempt's bind error, still in the shared log, earning it a third.
+    #[test]
+    fn a_retry_that_fails_for_another_reason_panics_despite_the_earlier_bind_error() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+        let taken = held.local_addr().expect("held address").port();
+
+        let mut picks = Vec::new();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            start_tcp_on(&[taken, 0], &[], &mut picks)
+        }));
+        let message = *outcome
+            .err()
+            .expect("a server that cannot start must panic")
+            .downcast::<String>()
+            .expect("a formatted panic message");
+        assert_eq!(picks, [taken, 0], "no retry after the second failure");
+        assert!(
+            message.contains(&format!("port attempt 2 of {PORT_ATTEMPTS}")),
+            "{message}"
+        );
+        assert!(
+            message.contains("outside the valid range"),
+            "the second attempt's error is in it: {message}"
         );
     }
 
