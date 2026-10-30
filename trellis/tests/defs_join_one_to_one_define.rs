@@ -452,7 +452,7 @@ async fn a_one_to_one_target_side_needs_its_primary_key_and_no_transform_reads_a
     .expect("unique index on the copy");
 
     // Joined on its primary key `id`: accepted. On another unique column: the
-    // 1-1 target is a side joined off its primary key, which is refused.
+    // 1-1 target is a `b` side joined off its primary key, which is refused.
     install_definition(
         &db.pool,
         "TRANSFORM by_pk FROM orders LEFT JOIN cust_copy ON orders.cust = cust_copy.id \
@@ -586,13 +586,13 @@ async fn a_one_to_one_target_is_an_a_side_on_any_columns_and_a_b_side_on_columns
     install_definition(
         &db.pool,
         "TRANSFORM b_composite FROM orders LEFT JOIN pairs_copy \
-         ON orders.cust = pairs_copy.x AND orders.id = pairs_copy.y \
+         ON orders.id = pairs_copy.y AND orders.cust = pairs_copy.x \
          SELECT pairs_copy.v AS v",
         &HashMap::new(),
         "public",
     )
     .await
-    .expect("a 1-1 target as the b side, joined on its whole composite key");
+    .expect("a 1-1 target as the b side, joined on its whole composite key in another order");
 
     // Not on a column that is unique only through an index a user added, and
     // not on part of a composite primary key.

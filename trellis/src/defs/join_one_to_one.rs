@@ -384,18 +384,17 @@ pub(crate) async fn reject_reader_of_target(
     Ok(())
 }
 
-/// The define-time checks of a 1-1 `JOIN` that read the catalog, once its two
-/// tables are resolved (`from` and `joined`, qualified): the joined table's
-/// `ON` columns are unique, and a joined table that is another transform's 1-1
+/// The define-time checks of a 1-1 `JOIN` that read the catalog, once its
+/// joined table is resolved (`joined`, qualified): the joined table's `ON`
+/// columns are unique, and a joined table that is another transform's 1-1
 /// target is joined on columns that include its primary key. Trellis orders
 /// changes per primary-key value only, so the primary key is the one column
 /// set of a target that stays unique at every instant while its upstream
 /// drains; a unique index on any other column can hold transient duplicates.
-/// The `from` side has no such rule: its `ON` columns carry no uniqueness.
+/// The `FROM` table has no such rule: its `ON` columns carry no uniqueness.
 pub(crate) async fn check_define(
     client: &impl GenericClient,
     def: &TransformDef,
-    _from: &str,
     joined: &str,
 ) -> Result<(), super::catalog::CatalogError> {
     let on = joined_on_columns(def);

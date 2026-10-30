@@ -444,10 +444,10 @@ table, so `DROP TRANSFORM` takes them with it. A unique index, constraint or
 trigger you add that refuses a row Trellis writes, whether it checks the
 statement or is deferred to the commit, fails that row's key like any value its
 target refuses: the key ends up held in quarantine, and rows that fail only
-together hold their page back as a `drain_failure` (see [Status](#status)). A unique index on a column other than the key is the likely
-case: changes to different keys apply in any order, so it can see two rows
-with one value for a moment even when the source never holds two, and the
-transform fails on the violation.
+together hold their page back as a `drain_failure` (see [Status](#status)).
+A unique index on a column other than the key is the likely case: changes to
+different keys apply in any order, so two rows can hold one value for a moment
+even when the source never does, and the index refuses one of them.
 Another Trellis instance may read
 a 1-1 target keyed by a primary key as a source, exactly as it would any table
 with a primary key. An aggregate target, and a 1-1 target over one, may not be

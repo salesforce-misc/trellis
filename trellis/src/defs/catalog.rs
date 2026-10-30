@@ -2952,8 +2952,7 @@ async fn create_definition_inner(
             let sides = JoinSides::read(&*txn, qualified_source.clone(), joined).await?;
             super::validate::validate_join(&def, &sides.from_columns, &sides.joined_columns)?;
             if super::join::is_one_to_one(&def) {
-                super::join_one_to_one::check_define(&*txn, &def, &sides.from, &sides.joined)
-                    .await?;
+                super::join_one_to_one::check_define(&*txn, &def, &sides.joined).await?;
             }
             Some(sides)
         }
@@ -3969,8 +3968,7 @@ async fn validate_for_define(
         super::validate::validate_join(def, &sides.from_columns, &sides.joined_columns)?;
         if super::join::is_one_to_one(def) {
             let client = pool.get().await?;
-            super::join_one_to_one::check_define(&**client, def, &sides.from, &sides.joined)
-                .await?;
+            super::join_one_to_one::check_define(&**client, def, &sides.joined).await?;
         }
         return Ok(());
     }
@@ -4531,8 +4529,7 @@ async fn revalidate_join(
         // The joined table's `ON` columns are still unique, and the target
         // is still keyed by `a`'s key; a changed key's only repair is to
         // drop and define again, as for a 1-1 target.
-        super::join_one_to_one::check_define(txn, &definition.def, &sides.from, &sides.joined)
-            .await?;
+        super::join_one_to_one::check_define(txn, &definition.def, &sides.joined).await?;
         let target_key: Vec<String> = ddl::identity_key_columns(txn, &definition.target_table)
             .await?
             .into_iter()

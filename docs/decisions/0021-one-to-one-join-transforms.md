@@ -59,16 +59,18 @@ the feed's rows take the place of captured images, and every ordering rule
 below holds for them as it does for a captured side.
 
 - **A plain 1-1 target as `a`** is joined on any `ON` columns. They carry no
-  uniqueness requirement, and the join-key rules (the allowed types, one type
-  and collation on both sides) apply as for a captured table.
+  uniqueness requirement, and the join-key rules (the allowed types, a
+  deterministic collation, one type and collation on both sides) apply as for
+  a captured table.
 - **A plain 1-1 target as `b`** is joined on columns that include every column
   of its primary key. The `b` side's uniqueness relies on that key: Trellis
   orders changes per primary-key value only, so the primary key is the one
   column set of a target that is unique at every instant while its upstream
-  drains. Changes to different keys apply in any order, so any other column,
-  unique index or not, can hold two rows with the same value for a moment.
-  A unique index added to the target never counts for this rule, though it
-  satisfies the uniqueness rule above. A wider `b` gate needs another ordering
+  drains. Changes to different keys apply in any order, so two rows can hold
+  one value of any other column for a moment, and a unique index on that
+  column refuses one of them and makes the upstream fail. A unique index
+  added to the target never counts for this rule, though it satisfies the
+  uniqueness rule above. A wider `b` gate needs another ordering
   mechanism: either the upstream orders changes per join-key value, or the JOIN
   tolerates transient duplicates and weakens its guarantee to "equal once the
   upstream has converged" ([#1489](https://github.com/salesforce-misc/trellis/issues/1489)).
