@@ -121,13 +121,15 @@ pub fn write_pg_error(f: &mut fmt::Formatter<'_>, err: &tokio_postgres::Error) -
     write!(f, "{err}")?;
     if let Some(db_err) = err.as_db_error() {
         write!(f, ": {db_err}")?;
-        // A lock wait that ran out is an ordinary condition, not a fault, and
-        // the server's own text doesn't say what to do about it.
+        // A lock that wasn't granted (a wait that ran out `lock_timeout`, or
+        // a `NOWAIT` refused) is an ordinary condition, not a fault, and the
+        // server's own text, which already says which of the two it was,
+        // doesn't say what to do about it.
         if *db_err.code() == tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE {
             write!(
                 f,
-                " (another transaction held a lock this statement needed for longer than \
-                 the lock timeout; retry once it ends)"
+                " (another transaction held a lock this statement needed; retry once that \
+                 transaction ends)"
             )?;
         }
     }

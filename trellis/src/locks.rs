@@ -845,6 +845,21 @@ mod tests {
         );
     }
 
+    /// A `NOWAIT` refusal that reaches a caller raw is the same retryable
+    /// `timeout` a lock timeout is, and its hint doesn't claim a timeout ran
+    /// out: no wait happened.
+    #[tokio::test]
+    async fn a_raw_nowait_refusal_is_a_retryable_timeout_that_names_no_lock_timeout() {
+        let err = crate::defs::CatalogError::Db(lock_not_available().await);
+        assert_eq!(err.code(), crate::error_code::ErrorCode::Timeout);
+        let message = err.to_string();
+        assert!(
+            message.contains("retry once that transaction ends"),
+            "{message}"
+        );
+        assert!(!message.contains("timeout"), "{message}");
+    }
+
     /// A real `55P03`, from a `NOWAIT` lock another session holds.
     async fn lock_not_available() -> tokio_postgres::Error {
         let cluster = testkit::TestCluster::start();
