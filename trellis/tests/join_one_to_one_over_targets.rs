@@ -29,7 +29,9 @@
 //! over the captured tables, and over the chained tables as they are now, and
 //! `self_check` finds nothing. Where the upstream's target deliberately
 //! differs from its query (a paused column, a held row), the targets are held
-//! to the chained tables alone.
+//! to the chained tables alone. A `JOIN` reading a paused upstream, or a
+//! paused column of one, reports `catching_up`, which `self_check` answers
+//! without comparing.
 //!
 //! The `pin_…` tests are the pins of the 1-1 `JOIN`'s page plants
 //! (`join1_*`, #1396–#1398) from `join_one_to_one_interleavings`, and of its
@@ -321,6 +323,14 @@ async fn reported(trellis: &trellis::Trellis, name: &str) -> (String, Vec<String
 /// Asserts every `JOIN`'s target equals its query over the chained tables as
 /// they are, and `self_check` finds nothing. Settles nothing.
 async fn assert_over_targets(d: &Driver, when: &str) {
+    assert_over_targets_behind(d, when, |_| false).await;
+}
+
+/// [`assert_over_targets`] while an upstream is paused, or a column of one:
+/// each `JOIN` that reads it (`behind`) reports `catching_up`, so
+/// `self_check` answers it with that status and compares nothing. Its target
+/// still equals its query over the chained tables. Settles nothing.
+async fn assert_over_targets_behind(d: &Driver, when: &str, behind: impl Fn(Join) -> bool) {
     for join in JOINS {
         assert_eq!(
             d.rows(&join.actual()).await,
@@ -328,7 +338,11 @@ async fn assert_over_targets(d: &Driver, when: &str) {
             "{when}: {} (left) differs from its query over ta and tb (right)",
             join.name()
         );
-        assert_clean(d, join, when).await;
+        if behind(join) {
+            assert_not_compared(d, join, when).await;
+        } else {
+            assert_clean(d, join, when).await;
+        }
     }
     let deadlocks = d.deadlocks_logged();
     assert!(deadlocks.is_empty(), "{when}: {deadlocks:?}");
@@ -382,6 +396,29 @@ async fn assert_clean(d: &Driver, join: Join, when: &str) {
             return;
         }
     }
+}
+
+/// Asserts `self_check` of `join` answers `catching_up` and compares nothing.
+async fn assert_not_compared(d: &Driver, join: Join, when: &str) {
+    let page = check_page(
+        d.pool(),
+        &join.target(),
+        SelfCheckScope {
+            after: None,
+            limit: 3,
+        },
+        SelfCheckMode::Standard,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("a page of the check");
+    assert_eq!(
+        page.outcome,
+        SelfCheckOutcome::NotLive(trellis::TransformStatus::CatchingUp),
+        "{when}: {}",
+        join.name()
+    );
+    assert_eq!(page.rows_compared, 0, "{when}: {}", join.name());
 }
 
 // ------------------------------------------------------------------- S1
@@ -745,8 +782,9 @@ async fn s5_an_upstream_resume_reaches_the_join() {
             .await
             .expect("pause the upstream");
         step(&mut d, sql).await;
-        // The paused upstream's target is as it was; the `JOIN`s follow it.
-        assert_over_targets(&d, &format!("{upstream} paused")).await;
+        // The paused upstream's target is as it was; the `JOIN`s follow it,
+        // and each reports `catching_up`, so `self_check` compares none.
+        assert_over_targets_behind(&d, &format!("{upstream} paused"), |_| true).await;
         let segs = join_build_segs(&d).await;
         quarantine::resume_transform(d.pool(), upstream)
             .await
@@ -941,7 +979,9 @@ async fn s6_a_join_defined_while_an_upstream_writer_is_in_flight_does_not_miss_i
 /// the non-key `ON` column of `ta`. Each `JOIN` reading it reports
 /// `catching_up` and names it, and one that doesn't is unaffected. Meanwhile
 /// the `JOIN`s apply over the frozen column and follow the chained tables as
-/// they are (`self_check` excludes nothing of theirs and finds nothing). The
+/// they are. `self_check` answers each `JOIN` that reads it with
+/// `catching_up` and compares nothing, and finds nothing in one that
+/// doesn't. The
 /// column's resume writes the upstream's rows through the seam, so the
 /// `JOIN`s are exact again with no rebuild: for `ta.k`, every row whose key
 /// moved meanwhile moves in the `JOIN`s that join on it.
@@ -988,7 +1028,10 @@ async fn s7_a_paused_upstream_column_the_join_reads() {
             );
         }
         step(&mut d, sql).await;
-        assert_over_targets(&d, &format!("{column} paused")).await;
+        assert_over_targets_behind(&d, &format!("{column} paused"), |join| {
+            table == "tb" || join.reads_a(name)
+        })
+        .await;
         let stale = JOINS
             .iter()
             .filter(|join| table == "tb" || join.reads_a(name));
