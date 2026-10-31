@@ -251,7 +251,7 @@ impl KeyShape {
 
     /// The join key a draw of `raw` names, or `None` (`NULL`) for the top
     /// few draws.
-    fn key(self, raw: u8) -> Option<u8> {
+    pub fn key(self, raw: u8) -> Option<u8> {
         if raw >= 250 {
             return None;
         }
@@ -697,10 +697,10 @@ pub fn join_case(
 }
 
 #[cfg(feature = "proptest")]
-pub use strategy::join_case_strategy;
+pub use strategy::{COMMIT_STALL_MS, MAX_OPS, RACING_COMMIT_STALL_MS, join_case_strategy};
 
 #[cfg(feature = "proptest")]
-mod strategy {
+pub(crate) mod strategy {
     use super::*;
     use proptest::prelude::*;
 
@@ -752,7 +752,7 @@ mod strategy {
     /// rest anywhere in the stream's first 95%, so most build over rows),
     /// up to four pauses and re-reads, and (a quarter of the cases) a settle
     /// over the empty tables before the first op.
-    fn builds() -> impl Strategy<Value = JoinBuildDraws> {
+    pub(crate) fn builds() -> impl Strategy<Value = JoinBuildDraws> {
         (
             proptest::collection::vec(prop_oneof![1 => Just(0u16), 2 => 1u16..=950], 3),
             proptest::collection::vec(action(), 0..=4),
