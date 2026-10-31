@@ -291,7 +291,8 @@ columns Trellis created from them with a type that comes from the source
 (`defs::copies`: a 1-1 target's key, passthrough and calculated columns, an
 aggregate's `GROUP BY` columns in its target and its field columns, a `JOIN`'s
 `GROUP BY` and `ON` columns in its target and hidden tables and its field
-columns). A column typed by an expression is compared
+columns, and a 1-1 `JOIN`'s key and field columns and the columns of its
+hidden tables). A column typed by an expression is compared
 with the type define's inference gives the expression over the live
 schema. Before
 it regenerates anything, it pauses the definition, with its

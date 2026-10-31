@@ -29,6 +29,8 @@ wrong rows, on the targets it compares
 | **Schema changes Trellis can't tell from routine work** | | |
 | [A column's values rewritten in place by `ALTER COLUMN TYPE`](#a-columns-values-rewritten-in-place-by-alter-column-type) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study) |
 | [An enum label renamed and added again](#an-enum-label-renamed-and-added-again) | `self_check` | documented |
+| **Schema changes Trellis doesn't check yet** | | |
+| [`b`'s unique key dropped under a 1-1 `JOIN`](#bs-unique-key-dropped-under-a-1-1-join) | `self_check` | [#1536](https://github.com/salesforce-misc/trellis/issues/1536) (study done) |
 | **Writes capture never sees** | | |
 | [Capture disrupted and restored between two passes](#capture-disrupted-and-restored-between-two-passes) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study), otherwise documented |
 | [An unlogged source emptied by a crash or failover](#an-unlogged-source-emptied-by-a-crash-or-failover) | `self_check` | documented |
@@ -70,6 +72,9 @@ while every rule holds.
   ([below](#a-merge-that-moves-a-row-to-another-partition)).
 * **Repair after DDL that rewrites a read column's values** in one of the
   shapes [listed below](#a-columns-values-rewritten-in-place-by-alter-column-type).
+* **Keep a 1-1 `JOIN`'s `b` unique on its `ON` columns:** create a replacement
+  unique index before you drop the old one
+  ([below](#bs-unique-key-dropped-under-a-1-1-join)).
 
 ## Schema changes Trellis can't tell from routine work
 
@@ -146,6 +151,40 @@ no error. Without the re-add, the label fails to cast and the key is held
 **Repair:** `request_backfill` the table.
 
 **Ends with:** documented.
+
+## Schema changes Trellis doesn't check yet
+
+### `b`'s unique key dropped under a 1-1 `JOIN`
+
+**When:** the unique key a 1-1 `JOIN`'s `b` `ON` columns rest on (its primary
+key, a unique constraint or a unique index) is dropped while the transform
+runs, and `b` then takes two rows on one join key:
+
+```sql
+DROP INDEX b_k_unique;
+INSERT INTO b (bid, k) VALUES (9, 10);  -- a second row on k = 10
+CREATE UNIQUE INDEX CONCURRENTLY b_k_unique ON b (k);  -- fails: k = 10 twice
+```
+
+Define checks the key, and `RESUME` refuses while it is gone, but nothing
+checks it while the transform runs: dropping an index fires no trigger and
+changes no column the reconcile pass compares.
+
+**What goes wrong:** each `a` row on that key joins the newest of the `b`
+rows on it, where the join gives one row per pair. The target stays keyed by
+`a`'s primary key and holds one of them.
+
+**Detected by:** `self_check`, which reports a join key with more than one
+live `b` entry.
+
+**Repair:** remove the duplicates, create the unique key again, then `PAUSE`
+and `RESUME` the transform.
+
+**Ends with:** [#1536](https://github.com/salesforce-misc/trellis/issues/1536):
+the capture pass checks the key as define does and pauses the transform. Its
+false-positive study found no routine operation that trips it, only a swap
+that drops the old index before the new one exists, during which `b` really
+has no unique key.
 
 ## Writes capture never sees
 

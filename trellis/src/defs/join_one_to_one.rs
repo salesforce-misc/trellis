@@ -194,7 +194,7 @@ fn typed(columns: &HashMap<String, JoinColumnInfo>, name: &str) -> String {
 
 /// The columns `side`'s ledger table copies from its source, in order: the
 /// join key, then the other columns the fields read.
-fn read_columns(def: &TransformDef, side: Side) -> Vec<String> {
+pub(crate) fn read_columns(def: &TransformDef, side: Side) -> Vec<String> {
     let key = join_key(def, side);
     let mut read = key.clone();
     read.extend(

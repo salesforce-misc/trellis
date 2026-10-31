@@ -13,13 +13,18 @@
 //!   hidden `T` table, typed as the column of the side each comes from, and
 //!   each side's hidden partials table's `GROUP BY` and join-key columns and
 //!   the hidden `J` table's join key, typed as that side's columns
-//!   ([`super::join::hidden_tables_ddl`]), each with its collation.
+//!   ([`super::join::hidden_tables_ddl`]), each with its collation;
+//! - a 1-1 `JOIN` target's key columns, typed as `a`'s primary key, and its
+//!   fields that name one column of either table, typed as that column, and
+//!   the columns of its hidden `R`, `M` and `J`, typed as the side's column
+//!   each holds ([`super::join_one_to_one::hidden_tables_ddl`]).
 //!
 //! Others are typed by an expression over source columns, as define's type
 //! inference ([`super::validate::infer_field_types`]) gives it from the
 //! source's column types:
 //!
-//! - a 1-1 target's calculated field (`qty + 1`);
+//! - a 1-1 target's calculated field (`qty + 1`), and a 1-1 `JOIN` target's
+//!   (`a.r + b.img`), typed from both tables;
 //! - an aggregate or `JOIN` target's field column (`SUM(qty)`, `COUNT(*)`).
 //!
 //! A copy has its source column's type with no type modifier, and the
@@ -40,8 +45,8 @@
 //! `staging::schema_change::pause_readers_of_retyped`). A resume brings
 //! every column whose type differs from define's to it
 //! ([`retype_statements`]), keeping its collation, before it rebuilds,
-//! except a `JOIN`'s hidden tables, which it drops and creates again at the
-//! live types ([`CopyKind::recreated_by_resume`]).
+//! except a `JOIN`'s or a 1-1 `JOIN`'s hidden tables, which it drops and
+//! creates again at the live types ([`CopyKind::recreated_by_resume`]).
 //!
 //! Trellis never re-types a column on its own. A narrowing, or a change to
 //! another type family, pauses nothing here and is re-typed only by a
@@ -66,26 +71,28 @@ use crate::pool::quote_ident;
 /// What a [`TypedCopy`] is a copy of, and where it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CopyKind {
-    /// A 1-1 target's key column.
+    /// A 1-1 target's key column, or a 1-1 `JOIN` target's.
     TargetKey,
-    /// A 1-1 target's bare passthrough field.
+    /// A 1-1 target's bare passthrough field, or a 1-1 `JOIN` target's.
     Passthrough,
     /// An aggregate target's `GROUP BY` column.
     GroupBy,
-    /// A 1-1 target's calculated field, typed by its expression.
+    /// A 1-1 target's calculated field, or a 1-1 `JOIN` target's, typed by
+    /// its expression.
     Field,
     /// An aggregate target's field column, typed by its expression.
     AggregateField,
     /// A `JOIN` target's `GROUP BY` column, typed as its side's column.
     JoinGroupBy,
-    /// A `JOIN`'s hidden-table column (`P`, `M`, `J` or `T`), typed as the
-    /// side's column it holds.
+    /// A `JOIN`'s hidden-table column (`P`, `M`, `J` or `T`), or a 1-1
+    /// `JOIN`'s (`R`, `M` or `J`), typed as the side's column it holds.
     JoinHidden,
 }
 
 impl CopyKind {
     /// Whether a resume drops and recreates the copy's table at the live
-    /// types (a `JOIN`'s hidden tables), so it re-types nothing there:
+    /// types (a `JOIN`'s or a 1-1 `JOIN`'s hidden tables), so it re-types
+    /// nothing there:
     /// `J` keeps every key it has seen, so a narrowed key column's
     /// `ALTER` could fail on a key whose rows are gone.
     pub(crate) fn recreated_by_resume(self) -> bool {
@@ -171,9 +178,9 @@ pub(crate) async fn typed_copies(
         };
     match &def.key_space {
         KeySpace::Join(_) => return join_copies(client, schema, def, source, target).await,
-        // A 1-1 JOIN's drift is the schema-change milestone's (#1403): it
-        // has no typed copies until the staging worker re-types them.
-        KeySpace::JoinOneToOne(_) => return Ok(Vec::new()),
+        KeySpace::JoinOneToOne(_) => {
+            return join_one_to_one_copies(client, schema, def, source, target).await;
+        }
         KeySpace::OneToOne => {
             let source_columns: HashSet<String> = client
                 .query(
@@ -241,7 +248,8 @@ pub(crate) async fn typed_copies(
 /// ([`super::join::hidden_tables_ddl`], in `schema`, the catalog schema),
 /// and its target's other fields, typed by
 /// [`super::join::field_pg_type`] from both sides' live columns. A field
-/// is left out while the definition doesn't validate against them, as
+/// is left out while the definition doesn't validate against them, or while
+/// it reads a column either table no longer has ([`reads_live`]), as
 /// [`inferred_copies`] leaves one out.
 async fn join_copies(
     client: &impl GenericClient,
@@ -337,13 +345,14 @@ async fn join_copies(
         if group_by.contains(&field.name) {
             continue;
         }
-        let reads: Vec<(String, String)> = super::join::expr_columns(def, &field.expr)
+        let sided = super::join::expr_columns(def, &field.expr);
+        if sided.is_empty() || !reads_live(&sided, &sides) {
+            continue;
+        }
+        let reads: Vec<(String, String)> = sided
             .into_iter()
             .map(|(side, column)| (side_table(side), column))
             .collect();
-        if reads.is_empty() {
-            continue;
-        }
         let Ok(inferred) =
             super::join::field_pg_type(def, field, &sides.from_columns, &sides.joined_columns)
         else {
@@ -361,17 +370,159 @@ async fn join_copies(
     Ok(copies)
 }
 
+/// [`typed_copies`] for a 1-1 `JOIN` definition, `def`, reading `source` (its
+/// `FROM` table, `a`, qualified) into `target` (qualified), as
+/// [`super::join_one_to_one::target_ddl`] and
+/// [`super::join_one_to_one::hidden_tables_ddl`] create them: the target's
+/// key, a copy of `a`'s primary key; each field, a copy of the column of
+/// either table it names alone, or else typed by
+/// [`super::join::field_pg_type`] from both tables' live columns; and the
+/// columns of `R`, `M` and `J` (in `schema`, the catalog schema), each a copy
+/// of its side's column, which a resume creates again rather than re-types.
+/// A field is left out while the definition doesn't validate against the
+/// live columns, or while it reads a column either table no longer has
+/// ([`reads_live`]), as [`inferred_copies`] leaves one out.
+async fn join_one_to_one_copies(
+    client: &impl GenericClient,
+    schema: &str,
+    def: &TransformDef,
+    source: &str,
+    target: &str,
+) -> Result<Vec<TypedCopy>, tokio_postgres::Error> {
+    use super::join::Side;
+    use super::join_one_to_one::HiddenTable;
+    let Some(row) = client
+        .query_opt(
+            "select id, join_table from transform_definitions \
+             where target_table = $1 and join_table is not null",
+            &[&target],
+        )
+        .await?
+    else {
+        return Ok(Vec::new());
+    };
+    let (id, joined): (i64, String) = (row.get(0), row.get(1));
+    let side_table = |side: Side| match side {
+        Side::From => source.to_string(),
+        Side::Joined => joined.clone(),
+    };
+    let hidden = |table: HiddenTable| {
+        (
+            table.qualified(schema, id),
+            format!("{schema}.{}", table.name(id)),
+        )
+    };
+    let target_table = (
+        super::ddl::qualified_target_table_ident(target),
+        target.to_string(),
+    );
+    let copy = |kind, (table, table_name): (String, String), side: Side, column: &str| TypedCopy {
+        kind,
+        table,
+        table_name,
+        column: column.to_string(),
+        reads: vec![(side_table(side), column.to_string())],
+        inferred: None,
+    };
+    let mut copies: Vec<TypedCopy> = Vec::new();
+    for key in super::ddl::identity_key_columns(client, target).await? {
+        copies.push(copy(
+            CopyKind::TargetKey,
+            target_table.clone(),
+            Side::From,
+            &key.name,
+        ));
+    }
+    for (side, table) in [
+        (Side::From, HiddenTable::FromEntries),
+        (Side::Joined, HiddenTable::JoinedEntries),
+    ] {
+        for column in super::join_one_to_one::read_columns(def, side) {
+            copies.push(copy(CopyKind::JoinHidden, hidden(table), side, &column));
+        }
+    }
+    // `J` is typed from the `FROM` side's join key, as its DDL is.
+    for column in super::join::join_key(def, Side::From) {
+        copies.push(copy(
+            CopyKind::JoinHidden,
+            hidden(HiddenTable::Keys),
+            Side::From,
+            &column,
+        ));
+    }
+    let sides =
+        match super::catalog::JoinSides::read(client, source.to_string(), joined.clone()).await {
+            Ok(sides) => sides,
+            Err(super::catalog::CatalogError::Db(err)) => return Err(err),
+            Err(_) => return Ok(copies),
+        };
+    for field in &def.fields {
+        let reads: Vec<(Side, String)> = super::join::expr_columns(def, &field.expr);
+        // A bare column of either table is a copy of it.
+        if let (Expr::SourceColumn { .. }, [(side, column)]) = (&field.expr, reads.as_slice()) {
+            let columns = match side {
+                Side::From => &sides.from_columns,
+                Side::Joined => &sides.joined_columns,
+            };
+            if columns.contains_key(column) {
+                copies.push(TypedCopy {
+                    kind: CopyKind::Passthrough,
+                    table: target_table.0.clone(),
+                    table_name: target_table.1.clone(),
+                    column: field.name.clone(),
+                    reads: vec![(side_table(*side), column.clone())],
+                    inferred: None,
+                });
+                continue;
+            }
+        }
+        if reads.is_empty() || !reads_live(&reads, &sides) {
+            continue;
+        }
+        let Ok(inferred) =
+            super::join::field_pg_type(def, field, &sides.from_columns, &sides.joined_columns)
+        else {
+            continue;
+        };
+        copies.push(TypedCopy {
+            kind: CopyKind::Field,
+            table: target_table.0.clone(),
+            table_name: target_table.1.clone(),
+            column: field.name.clone(),
+            reads: reads
+                .into_iter()
+                .map(|(side, column)| (side_table(side), column))
+                .collect(),
+            inferred: Some(inferred),
+        });
+    }
+    Ok(copies)
+}
+
+/// Whether every column of either table `reads` names is still a live column
+/// of that table in `sides`. A field that reads a column that is gone has no
+/// type define would give it now (the missing-column check pauses its
+/// definition, naming the column), so [`join_copies`] and
+/// [`join_one_to_one_copies`] leave it out rather than type it without one.
+fn reads_live(reads: &[(super::join::Side, String)], sides: &super::catalog::JoinSides) -> bool {
+    reads.iter().all(|(side, column)| match side {
+        super::join::Side::From => sides.from_columns.contains_key(column),
+        super::join::Side::Joined => sides.joined_columns.contains_key(column),
+    })
+}
+
 /// Every relation [`typed_copies`] and [`inspect`] read for `def`, which
 /// reads `source` (qualified) into `target` (qualified), as SQL resolves
-/// them (`to_regclass` text): the source and the target. For a `JOIN`, `join`
-/// is its definition id and its joined table (qualified), which adds that
-/// table and the hidden tables.
+/// them (`to_regclass` text): the source and the target. For a `JOIN` or a
+/// 1-1 `JOIN`, `join` is its definition id and its joined table (qualified),
+/// which adds that table and the definition's hidden tables.
 /// A superset of the tables the copies are in and read from: the capture
 /// pass fingerprints these to skip the comparison while none changed
 /// (`staging::drift_memo`). A table `typed_copies` starts reading
 /// belongs here.
 pub(crate) fn inputs(
     schema: &str,
+    def: &TransformDef,
     source: &str,
     target: &str,
     join: Option<(i64, &str)>,
@@ -382,11 +533,19 @@ pub(crate) fn inputs(
     ];
     if let Some((id, joined)) = join {
         names.push(super::ddl::regclass_arg(joined));
-        names.extend(
-            super::join::HiddenTable::ALL
-                .iter()
-                .map(|table| format!("{}.{}", quote_ident(schema), quote_ident(&table.name(id)))),
-        );
+        if super::join::is_one_to_one(def) {
+            names.extend(
+                super::join_one_to_one::HiddenTable::ALL
+                    .iter()
+                    .map(|table| table.qualified(schema, id)),
+            );
+        } else {
+            names.extend(
+                super::join::HiddenTable::ALL.iter().map(|table| {
+                    format!("{}.{}", quote_ident(schema), quote_ident(&table.name(id)))
+                }),
+            );
+        }
     }
     names.sort();
     names.dedup();
@@ -1122,5 +1281,57 @@ mod tests {
             "bigint",
         )];
         assert!(retype_statements(&states).is_empty());
+    }
+
+    /// The relations the drift memo fingerprints for a `JOIN` are its own
+    /// hidden tables: a 1-1 `JOIN`'s `join1_<id>_*`, an aggregate `JOIN`'s
+    /// `join_<id>_*`, beside both tables and the target.
+    #[test]
+    fn a_join_s_inputs_name_its_own_hidden_tables() {
+        let one_to_one = crate::defs::parser::parse(
+            "TRANSFORM v FROM a LEFT JOIN b ON a.k = b.k SELECT b.x AS x",
+        )
+        .unwrap();
+        let aggregate = crate::defs::parser::parse(
+            "TRANSFORM v FROM a LEFT JOIN b ON a.k = b.k GROUP BY a.k \
+             WITHOUT SOURCE INDEX SELECT a.k AS k, COUNT(*) AS n",
+        )
+        .unwrap();
+        let names = |def: &TransformDef| {
+            inputs(
+                "trellis",
+                def,
+                "public.a",
+                "public.v",
+                Some((7, "public.b")),
+            )
+        };
+        let hidden = |names: Vec<String>| -> Vec<String> {
+            names
+                .into_iter()
+                .filter(|n| n.starts_with("\"trellis\""))
+                .collect()
+        };
+        assert_eq!(
+            hidden(names(&one_to_one)),
+            [
+                "\"trellis\".\"join1_7_j\"",
+                "\"trellis\".\"join1_7_l\"",
+                "\"trellis\".\"join1_7_m\"",
+                "\"trellis\".\"join1_7_r\"",
+            ]
+        );
+        assert!(
+            hidden(names(&aggregate))
+                .iter()
+                .all(|n| n.starts_with("\"trellis\".\"join_7_")),
+            "{:?}",
+            names(&aggregate)
+        );
+        assert!(
+            names(&one_to_one).contains(&"\"public\".\"b\"".to_string()),
+            "{:?}",
+            names(&one_to_one)
+        );
     }
 }

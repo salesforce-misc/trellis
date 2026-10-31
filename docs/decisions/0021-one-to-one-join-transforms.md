@@ -44,7 +44,9 @@ scope.
 - **`b`'s `ON` columns are unique**: `b`'s primary key, a unique constraint,
   or the group key of an upstream aggregate or JOIN target. A non-unique `b`
   would give one row per pair, keyed by both sides, which is a different
-  target. Losing that uniqueness after define pauses the transform.
+  target. `RESUME` refuses a `b` that has lost that uniqueness since define;
+  nothing checks it while the transform runs
+  ([known correctness gaps](../known-correctness-gaps.md#bs-unique-key-dropped-under-a-1-1-join)).
 - **Fields** are any expression the 1-1 path admits, over `a`'s row and the
   matched `b` row, of any type a 1-1 field admits (floats and text included).
   A row is recomputed from its current inputs and never maintained by deltas,
@@ -283,8 +285,8 @@ copy hasn't applied yet, as the 1-1 and aggregate checks do (ADR-0013). It audit
 - **`R` and `M`**: each against its source, in both directions: a row with no live entry or other
   values, and a live entry with no row.
 - **A join key with more than one live `M` entry.** The target reads the newest entry of a key, which
-  masks a duplicate, so this is where `b` losing its uniqueness shows before a revalidation pauses
-  the transform. A hand-off of a key between two `b` rows applied out of order holds two entries
+  masks a duplicate, so this is where `b` losing its uniqueness shows while the transform runs. A
+  hand-off of a key between two `b` rows applied out of order holds two entries
   for a moment as well, so what this check finds while `b`'s ring holds an unapplied row is
   re-checked.
 
@@ -298,6 +300,35 @@ every row throughout. The build that follows re-derives `b` and every `a`
 row that exists, and its sweep's orphan pass removes the target rows of `a`
 rows deleted while the transform was paused. Until the sweep reaches them
 those rows stay in the target, and the transform reads `backfilling`.
+
+### A schema change of either table pauses the whole transform
+
+A 1-1 `JOIN` takes an aggregate `JOIN`'s schema-change rules
+([ADR-0019](0019-join-transforms.md)) on both tables. The staging worker's
+pass, or the drain on a write that marks a missing column, pauses the whole
+transform with a `capture_failure` naming the table and the column when:
+
+- a column the fields or `ON` read from either table is dropped or renamed;
+- a key column of either table (`a`'s primary key, an `ON` column) is
+  retyped so the keys Trellis stored render differently, or one column of an
+  `ON` pair is retyped so the pair no longer has one type;
+- a column is retyped to a type the fields evaluate as another type
+  (`text` to `integer`);
+- a column Trellis keeps a typed copy of widens past the copy
+  ([ADR-0020](0020-type-identity.md)). The copies are the target's key (`a`'s
+  primary key), a field that names one column (typed as that column, with no
+  modifier), a calculated field (typed by inference from both tables), and the
+  columns of `R`, `M` and `J` (typed as the side's column). Nothing records an
+  expression's input types, so a field over both tables is reported by the
+  pass of whichever table finds it first, naming every column it is typed
+  from with its type now.
+
+Either table dropped, renamed away, swapped or joining a hierarchy pauses it
+too, as for any source. `RESUME` re-validates both tables as define would
+and refuses while define would. Otherwise the staging worker re-types the
+target's drifted copies first, and the resume then creates `R`, `M` and `J`
+again at the types define gives them now, so `J` takes an `ON` pair's new
+type, and rebuilds as above.
 
 ## Consequences
 

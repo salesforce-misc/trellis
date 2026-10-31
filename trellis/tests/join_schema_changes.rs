@@ -1,7 +1,7 @@
 //! A live `JOIN` target across a schema change of either table (ADR-0019): its copies of a
 //! `varchar(n)` column are unbounded, so a widening needs no re-type and no value waits for the
 //! staging worker's pass. No table a `JOIN` or a group-basis aggregate creates holds a bounded
-//! `varchar`.
+//! `varchar`. A column dropped under a field over both tables pauses the `JOIN` for that column.
 //!
 //! The pipeline and the pass are stepped by hand
 //! (`support/drain_driver.rs`), and nothing polls for convergence.
@@ -235,4 +235,42 @@ async fn no_table_a_join_or_group_basis_creates_holds_a_bounded_varchar() {
             "{hidden} holds copies: {columns:?}"
         );
     }
+}
+
+/// A field over both tables (`SUM(a.x) + SUM(b.y)`) whose `b` column is
+/// dropped pauses the `JOIN` for the dropped column, naming `public.b` and
+/// `y`, whichever table's pass runs first: the pass of `a` leaves the field
+/// out of the copies it compares rather than type it without `y`.
+#[tokio::test]
+async fn a_dropped_column_of_a_field_over_both_tables_pauses_naming_it() {
+    let mut d = Driver::start(
+        DDL,
+        &[
+            ("id", ValueType::Integer(IntWidth::Int4)),
+            ("g", ValueType::Text),
+            ("k", ValueType::Text),
+            ("x", ValueType::Integer(IntWidth::Int4)),
+        ],
+        &[
+            "TRANSFORM both FROM public.a LEFT JOIN public.b ON a.k = b.k GROUP BY a.g \
+           WITHOUT SOURCE INDEX SELECT a.g AS g, SUM(a.x) + SUM(b.y) AS s",
+        ],
+        &["public.a", "public.b"],
+    )
+    .await;
+    write(
+        &d,
+        "insert into public.a values (1, 'g1', 'k1', 1); insert into public.b values (1, 'k1', 'h1', 10)",
+    )
+    .await;
+    d.settle().await;
+    d.ctl
+        .batch_execute("alter table public.b drop column y")
+        .await
+        .expect("drop y");
+    pass(&mut d).await;
+    let failure = d
+        .rows("select f.source_table, f.columns::text from capture_failures f")
+        .await;
+    assert_eq!(failure, ["(public.b,{y})"]);
 }

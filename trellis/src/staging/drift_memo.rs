@@ -131,6 +131,7 @@ impl Fingerprints {
 fn inputs_of(schema: &str, reader: &CaptureReader) -> Vec<String> {
     copies::inputs(
         schema,
+        &reader.def,
         &reader.source,
         &reader.target,
         reader.join.as_deref().map(|joined| (reader.id, joined)),

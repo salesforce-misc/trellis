@@ -71,6 +71,9 @@ visible target, which its rebuild rewrites; its build rebuilds the target's
 readers likewise. A field resume
 (`RESUME TRANSFORM <target>.<column>`) runs define's validation and the
 source-key check, and refuses a field whose capture is still being widened.
+It also refuses while the definition is paused, so when one field's failures
+trip both its column fuse and the whole-transform fuse, run `RESUME TRANSFORM
+<target>` first and then `RESUME TRANSFORM <target>.<column>`.
 
 **What a resume changes.**
 

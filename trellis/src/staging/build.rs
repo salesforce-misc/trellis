@@ -1861,10 +1861,15 @@ async fn run_plan(
     let join1 = crate::defs::join::is_one_to_one(&definition.def);
     let mut recorded = chunk.key_collations.as_deref();
     if join1 {
+        // Nothing starts one: `ALTER TRANSFORM` refuses a 1-1 `JOIN`, a
+        // column's resume rebuilds it in place (`quarantine::resume_column`),
+        // and a schema change's resume rebuilds it once its copies are
+        // re-typed (`quarantine::complete_resume`), as for a `JOIN`.
         if chunk.fields.is_some() {
             return Err(build_error(ApplyError::GroupBasisUnsupported {
                 target: definition.target_table.clone(),
-                what: "a field build of a 1-1 JOIN (its schema-change path is not built yet)",
+                what: "a field build of a 1-1 JOIN (ALTER TRANSFORM takes only a 1-1 target, \
+                       and a column resume rebuilds a 1-1 JOIN in place)",
             }));
         }
         match join_one_to_one::PlanStage::parse(cursor.as_deref()) {
