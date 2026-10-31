@@ -6,7 +6,8 @@
 //! (`pg_upgrade`, a physical copy, `CREATE DATABASE ... TEMPLATE`) pause
 //! nothing.
 //!
-//! The original is a 1-1, a group-basis aggregate and a `JOIN`, all `live`,
+//! The original is a 1-1, a group-basis aggregate, an aggregate `JOIN` and a
+//! 1-1 `JOIN` (behind its dev knob), all `live`,
 //! in a cluster whose WAL and transaction counter were advanced before the
 //! definitions applied anything, so their ledgers and groups hold positions
 //! ahead of a fresh cluster's. Nothing polls for convergence; every step is an
@@ -39,6 +40,8 @@ async fn connect(dsn: &str) -> Client {
 }
 
 async fn definer(dsn: &str) -> Trellis {
+    // The 1-1 `JOIN` is behind a process-wide dev knob (ADR-0021).
+    trellis::dev::defs::set_one_to_one_join(true);
     Trellis::connect(
         Config::from_dsn(dsn.to_string()).expect("valid dsn"),
         TrellisOptions::default(),
@@ -160,7 +163,7 @@ fn run(command: &mut Command) {
     );
 }
 
-const TARGETS: [&str; 3] = ["one", "gsum", "jl"];
+const TARGETS: [&str; 4] = ["one", "gsum", "jl", "jo"];
 
 /// Each target against the query that defines it, over the sources now.
 async fn assert_oracle(raw: &Client, when: &str, only: &[&str]) {
@@ -181,6 +184,12 @@ async fn assert_oracle(raw: &Client, when: &str, only: &[&str]) {
             "select k::text, n::text, sy::text from public.jl order by 1",
             "select ja.k::text, count(*)::text, sum(jb.y)::text from public.ja \
              left join public.jb on ja.k = jb.k group by ja.k order by 1",
+        ),
+        (
+            "jo",
+            "select id::text, w, x::text from public.jo order by 1",
+            "select oa.id::text, ob.w, oa.x::text from public.oa \
+             join public.ob on oa.ob_id = ob.id order by 1",
         ),
     ] {
         if !only.contains(&target) {
@@ -228,6 +237,8 @@ async fn original(cluster: &TestCluster) -> Original {
          create table public.g (id int primary key, grp int not null, amt int); \
          create table public.ja (id int primary key, k varchar(5), x int); \
          create table public.jb (id int primary key, k varchar(5), y int); \
+         create table public.oa (id int primary key, ob_id int, x int); \
+         create table public.ob (id int primary key, w text); \
          create index on public.g (grp); \
          create index on public.ja (k); \
          create index on public.jb (k)",
@@ -240,6 +251,8 @@ async fn original(cluster: &TestCluster) -> Original {
          COUNT(*) AS n",
         "TRANSFORM jl FROM public.ja LEFT JOIN public.jb ON ja.k = jb.k \
          GROUP BY ja.k WITHOUT SOURCE INDEX SELECT ja.k AS k, COUNT(*) AS n, SUM(jb.y) AS sy",
+        "TRANSFORM jo FROM public.oa JOIN public.ob ON oa.ob_id = ob.id \
+         SELECT ob.w AS w, oa.x AS x",
     ] {
         trellis.apply(text).await.expect(text);
     }
@@ -248,7 +261,9 @@ async fn original(cluster: &TestCluster) -> Original {
         "insert into public.s1 select i, i * 10 from generate_series(1, 6) i; \
          insert into public.g select i, i % 3, i from generate_series(1, 8) i; \
          insert into public.ja values (1, 'a', 1), (2, 'a', 2), (3, 'b', 3), (4, 'c', 4); \
-         insert into public.jb values (1, 'a', 5), (2, 'a', 10), (3, 'b', 15), (4, 'd', 20)",
+         insert into public.jb values (1, 'a', 5), (2, 'a', 10), (3, 'b', 15), (4, 'd', 20); \
+         insert into public.ob values (1, 'p'), (2, 'q'); \
+         insert into public.oa values (1, 1, 10), (2, 2, 20), (3, 1, 30), (4, null, 40)",
     )
     .await
     .expect("seed");
@@ -264,7 +279,9 @@ async fn original(cluster: &TestCluster) -> Original {
          update public.s1 set v = v + 1 where id <= 3; \
          update public.g set amt = amt + 100 where id <= 3; \
          update public.ja set x = x + 1 where id <= 2; \
-         update public.jb set y = y + 1 where id = 1",
+         update public.jb set y = y + 1 where id = 1; \
+         update public.oa set x = x + 1 where id <= 2; \
+         update public.ob set w = 'pp' where id = 1",
     )
     .await
     .expect("changes");
@@ -280,7 +297,7 @@ async fn original(cluster: &TestCluster) -> Original {
             && count(&raw, "select count(*) from ledger_truncate_floor").await > 0,
         "the 1-1 ledger and its floor hold the cluster's positions"
     );
-    let (agg, join) = hidden_ids(&raw).await;
+    let (agg, join, join1) = hidden_ids(&raw).await;
     // A group-basis rebuild stamps every group it recomputes with a
     // snapshot and the segment it read; the steady state leaves both null.
     raw.batch_execute(&format!(
@@ -300,6 +317,11 @@ async fn original(cluster: &TestCluster) -> Original {
     assert!(
         count(&raw, &format!("select count(*) from join_{join}_p")).await > 0,
         "the JOIN's hidden tables hold state"
+    );
+    assert!(
+        count(&raw, &format!("select count(*) from join1_{join1}_r")).await > 0
+            && count(&raw, &format!("select count(*) from join1_{join1}_m")).await > 0,
+        "the 1-1 JOIN's hidden tables hold state"
     );
 
     // Pending in the ring at dump time, with a copy of each staged change that
@@ -374,23 +396,24 @@ async fn assert_paused_by_the_restore(raw: &Client, trellis: &Trellis) {
     );
 }
 
-/// The ids the group-basis aggregate's and the `JOIN`'s hidden tables are
-/// named by.
-async fn hidden_ids(raw: &Client) -> (i64, i64) {
+/// The ids the group-basis aggregate's, the `JOIN`'s and the 1-1 `JOIN`'s
+/// hidden tables are named by.
+async fn hidden_ids(raw: &Client) -> (i64, i64, i64) {
     let id = |target: &str| {
         let sql =
             format!("select id from transform_definitions where target_table = 'public.{target}'");
         async move { raw.query_one(&sql, &[]).await.expect("id").get::<_, i64>(0) }
     };
-    (id("gsum").await, id("jl").await)
+    (id("gsum").await, id("jl").await, id("jo").await)
 }
 
-/// The resumes of the group-basis aggregate and the `JOIN` reset their
+/// The resumes of the group-basis aggregate and both `JOIN`s reset their
 /// ordering state before the rebuild: each drops and recreates its hidden
-/// tables. Both builds run in the passes that follow.
+/// tables, the lock row of each pair's `l` table inserted again. The builds
+/// run in the passes that follow.
 async fn resume_groups_and_check_the_reset(raw: &Client, trellis: &Trellis) {
-    let (agg, join) = hidden_ids(raw).await;
-    for target in ["gsum", "jl"] {
+    let (agg, join, join1) = hidden_ids(raw).await;
+    for target in ["gsum", "jl", "jo"] {
         trellis
             .apply(&format!("RESUME TRANSFORM {target}"))
             .await
@@ -408,6 +431,20 @@ async fn resume_groups_and_check_the_reset(raw: &Client, trellis: &Trellis) {
             "the JOIN's {part} is recreated"
         );
     }
+    for part in ["r", "m", "j"] {
+        assert_eq!(
+            count(raw, &format!("select count(*) from join1_{join1}_{part}")).await,
+            0,
+            "the 1-1 JOIN's {part} is recreated"
+        );
+    }
+    for lock in [format!("join_{join}_l"), format!("join1_{join1}_l")] {
+        assert_eq!(
+            count(raw, &format!("select count(*) from {lock}")).await,
+            1,
+            "{lock} is recreated with its lock row"
+        );
+    }
 }
 
 /// RESUME the 1-1, bring it live, then an update, a delete and an insert of
@@ -415,6 +452,23 @@ async fn resume_groups_and_check_the_reset(raw: &Client, trellis: &Trellis) {
 /// query's.
 async fn resume_and_write(raw: &mut Client, trellis: &Trellis, pool: &trellis::Pool) {
     resume_groups_and_check_the_reset(raw, trellis).await;
+    // The 1-1 `JOIN`'s resume rebuilt its tables, keeping its target: zero
+    // diff, and later changes on either side apply.
+    bring_live_only(raw, pool, "jo").await;
+    assert_oracle(raw, "the 1-1 JOIN after the resume", &["jo"]).await;
+    raw.batch_execute(
+        "update public.oa set x = x + 5 where id = 1; \
+         update public.ob set w = 'qq' where id = 2; \
+         delete from public.ob where id = 1; \
+         insert into public.ob values (10, 'z'); \
+         update public.oa set ob_id = 10 where id = 3; \
+         delete from public.oa where id = 2; \
+         insert into public.oa values (10, 10, 1)",
+    )
+    .await
+    .expect("1-1 join writes");
+    drain_to_quiescence(pool, raw).await;
+    assert_oracle(raw, "the 1-1 JOIN after writes", &["jo"]).await;
     // The `JOIN`'s resume rebuilt both its tables, keeping its target:
     // zero diff, and later changes on either side apply, among them a flip.
     bring_live_only(raw, pool, "jl").await;

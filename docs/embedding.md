@@ -811,9 +811,11 @@ append the `schema_migrations` rows.
 `dump_definitions_sql` (Rust `Trellis` and `BlockingTrellis`, Ruby
 `Trellis::Instance#dump_definitions_sql`) returns them as SQL: Trellis's
 migration history, the instance marker, the transform
-definitions and the seed rows capture needs. Runtime state (the 1-1 ledgers, ring,
-build chunks, quarantine, claims and statuses) is never in it, because it
-describes source and target rows a schema-only dump doesn't carry. Loading
+definitions, the seed rows capture needs and the one lock row of each `JOIN`'s
+hidden lock table. Runtime state (the 1-1 ledgers, the hidden tables of an
+aggregate or a `JOIN`, ring, build chunks, quarantine, claims and statuses) is
+never in it, because it describes source and target rows a schema-only dump
+doesn't carry. Loading
 the file needs no Trellis step: every definition loads as
 `waiting_to_backfill`, as a `define` leaves it, and the worker builds it from
 the source rows.
