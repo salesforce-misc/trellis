@@ -8,8 +8,8 @@
 //! copies to the types define would give them now (the target's through the
 //! staging worker, `R`, `M` and `J` created again) and rebuilds, after which
 //! the target equals the live join. Over plain tables (`LEFT` and `INNER`), a
-//! chained 1-1 `a` side, and an aggregate's target as `a` keyed by a nullable
-//! group column.
+//! chained 1-1 `a` side, a chained 1-1 `b` side, and an aggregate's target as
+//! `a` keyed by a nullable group column.
 //!
 //! Every test drives the pipeline and the staging worker's pass by hand
 //! through `support/drain_driver.rs`; nothing polls or sleeps.
@@ -857,6 +857,113 @@ async fn chained_exact(d: &Driver, kind: Kind) {
         .await
         .expect("self_check");
     assert!(diverging.is_empty(), "{kind:?}: {diverging:?}");
+}
+
+// ------------------------------------------------ a chained 1-1 side as `b`
+
+/// `tb` (a 1-1 target of `bsrc`) as `b`, joined on its primary key. A
+/// widening of `bsrc.w` outgrows `tb.w`, so `tb` pauses; its `RESUME` re-types
+/// `tb.w`, which outgrows the join's copies of it (`M.w` and the passthrough
+/// `w`), read from `tb` alone: the join is paused with `tb`'s resume as its
+/// cause and resumes on its own once `tb` is live. A field over both tables
+/// (`a.r + tb.w`) may instead be found by the pass of `a`, whose pause records
+/// no cause (#1539), so the join waits for its own `RESUME`. Either way it
+/// rebuilds equal to the join, and a value past `integer` lands.
+#[tokio::test]
+async fn a_widening_under_a_chained_b_side_follows_its_upstream_resume() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        for (select, oracle, follows) in [
+            ("tb.w AS w", "b.w", true),
+            (
+                "a.r + COALESCE(tb.w, 0) AS w",
+                "a.r + coalesce(b.w, 0)",
+                false,
+            ),
+        ] {
+            set_enabled(true);
+            let mut d = Driver::start(
+                "create table public.a (id integer primary key, bid integer, r integer); \
+                 create table public.bsrc (bid integer primary key, w integer); \
+                 create index on public.a (bid); \
+                 insert into public.a select i, i % 4, i from generate_series(1, 10) i; \
+                 insert into public.bsrc select i, i * 100 from generate_series(1, 3) i",
+                &[("w", int4())],
+                &["TRANSFORM tb FROM public.bsrc SELECT w AS w"],
+                &["public.a", "public.bsrc"],
+            )
+            .await;
+            trellis::defs::install_definition(
+                d.pool(),
+                &format!(
+                    "TRANSFORM jn FROM public.a {} JOIN public.tb ON a.bid = tb.bid \
+                     SELECT {select}",
+                    kind.word()
+                ),
+                &HashMap::from([("w".to_string(), int4())]),
+                "public",
+            )
+            .await
+            .expect("define the join over tb");
+            pass(&mut d).await;
+            trellis::intake::harness::settle_builds(d.pool()).await;
+            d.settle().await;
+            let actual = "select t.id::text, t.w::text from public.jn t order by t.id";
+            let expected = format!(
+                "select a.id::text, ({oracle})::text from public.a a {} join public.bsrc b \
+                 on a.bid = b.bid order by a.id",
+                kind.word()
+            );
+            assert_eq!(d.rows(actual).await, d.rows(&expected).await, "{kind:?}");
+
+            write(&d, "alter table public.bsrc alter column w type bigint").await;
+            pass(&mut d).await;
+            assert_eq!(status(&d, "public.tb").await, "paused");
+            assert_eq!(status(&d, "public.jn").await, "live");
+            resume(&d, "tb").await;
+            for _ in 0..3 {
+                pass(&mut d).await;
+                trellis::staging::build::settle_builds_with(d.pool(), 3).await;
+                d.settle().await;
+            }
+            assert_eq!(status(&d, "public.tb").await, "live", "{kind:?} {select}");
+            if follows {
+                assert_eq!(status(&d, "public.jn").await, "live", "{kind:?} {select}");
+            } else if status(&d, "public.jn").await == "paused" {
+                let causes = d
+                    .rows(
+                        "select f.source_table, f.caused_by is null from capture_failures f \
+                         join transform_definitions d on d.id = f.transform_id \
+                         where d.target_table = 'public.jn'",
+                    )
+                    .await;
+                assert_eq!(causes, ["(public.a,t)"], "{kind:?}");
+                resume(&d, "jn").await;
+                for _ in 0..3 {
+                    pass(&mut d).await;
+                    trellis::staging::build::settle_builds_with(d.pool(), 3).await;
+                    d.settle().await;
+                }
+            }
+            assert_eq!(status(&d, "public.jn").await, "live", "{kind:?} {select}");
+            assert_eq!(column_type(&d, "public.jn", "w").await, "bigint");
+            assert_eq!(hidden_type(&d, "public.jn", "m", "w").await, "bigint");
+            step(
+                &mut d,
+                "update public.bsrc set w = 3000000000 where bid = 1",
+            )
+            .await;
+            assert_eq!(
+                d.rows(actual).await,
+                d.rows(&expected).await,
+                "{kind:?} {select}"
+            );
+            let diverging = trellis::staging::one_to_one_join_diverging_keys(d.pool(), "public.jn")
+                .await
+                .expect("self_check");
+            assert!(diverging.is_empty(), "{kind:?}: {diverging:?}");
+        }
+    }
 }
 
 // ------------------------------- an aggregate's target as `a`, keyed by NULL

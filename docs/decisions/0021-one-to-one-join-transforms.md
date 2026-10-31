@@ -321,7 +321,11 @@ transform with a `capture_failure` naming the table and the column when:
   columns of `R`, `M` and `J` (typed as the side's column). Nothing records an
   expression's input types, so a field over both tables is reported by the
   pass of whichever table finds it first, naming every column it is typed
-  from with its type now.
+  from with its type now. When the widened column is an upstream target's,
+  re-typed by that upstream's `RESUME`, and the other table's pass finds the
+  field first, the pause records no upstream cause, so the transform waits
+  for its own `RESUME` rather than resuming after the upstream
+  ([#1539](https://github.com/salesforce-misc/trellis/issues/1539)).
 
 Either table dropped, renamed away, swapped or joining a hierarchy pauses it
 too, as for any source. `RESUME` re-validates both tables as define would
