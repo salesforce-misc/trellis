@@ -934,3 +934,74 @@ async fn a_column_resume_rebuilds_the_rows_written_while_it_was_paused() {
         assert!(deadlocks.is_empty(), "{deadlocks:?}");
     }
 }
+
+/// A column the fan-out's held rows paused (the column fuse, #1513) resumes
+/// through the same in-place rebuild a hand-paused one does. The column's
+/// fuse counts failures (four held rows, released, then a fifth row failing
+/// alone, so the whole-transform fuse, which counts keys held now, stays
+/// untripped and the definition stays `live`). While the column is paused a
+/// `b` page, an `a` page and an insert leave `total` as it was; the held key
+/// is released (its Re-derive writes every column but the paused one), and
+/// the resume rebuilds the target, so every row has its `total` and nothing
+/// is left held. LEFT and INNER.
+#[tokio::test]
+async fn a_column_the_fuse_paused_resumes_through_the_in_place_rebuild() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(kind, A_ROWS, B_ROWS).await;
+        seed_key_10(&mut d, &[11, 12, 13, 14, 15]).await;
+        // Row 15 overflows only from `w` 2000 on, the others from 1000.
+        step(&mut d, "update public.a set x = 2147482000 where id = 15").await;
+        step(&mut d, "update public.b set w = 1000 where id = 1").await;
+        assert_eq!(
+            d.rows("select deaths from column_deaths where column_name = 'total'")
+                .await,
+            ["(4)"],
+            "{kind:?}"
+        );
+        // The four held rows are fixed and released; their failures stay
+        // counted.
+        step(&mut d, "update public.b set w = 100 where id = 1").await;
+        step(
+            &mut d,
+            "update public.a set x = 11 where id between 11 and 14",
+        )
+        .await;
+        for key in 11..=14 {
+            release(&mut d, kind, "public.a", &key.to_string()).await;
+        }
+        assert!(d.rows("select key from poison").await.is_empty());
+        assert_eq!(status(&d, &kind.target()).await, "live", "{kind:?}");
+        step(&mut d, "update public.b set w = 2000 where id = 1").await;
+        assert_eq!(status(&d, &kind.target()).await, "live", "{kind:?}");
+        let paused = d
+            .rows("select transform_table, column_name, local_fuse from column_status")
+            .await;
+        assert_eq!(paused, [format!("({},total,t)", kind.name())], "{kind:?}");
+        assert_eq!(d.rows("select key from poison").await, ["(15)"]);
+
+        // The cause goes, and the pages of both tables run past the paused
+        // column: `total` keeps the value it held.
+        step(&mut d, "update public.b set w = 100 where id = 1").await;
+        step(&mut d, "update public.a set x = 7 where id = 6").await;
+        step(&mut d, "insert into public.a values (50, 20, 5, 'new')").await;
+        step(&mut d, "update public.b set w = 300 where id = 2").await;
+        assert_eq!(total(&d, kind, 6).await, Some(6 + 2000), "{kind:?}: paused");
+        assert_eq!(total(&d, kind, 2).await, Some(2 + 200), "{kind:?}: paused");
+        step(&mut d, "update public.a set x = 15 where id = 15").await;
+        release(&mut d, kind, "public.a", "15").await;
+
+        let resumed = quarantine::resume_column(d.pool(), kind.name(), "total")
+            .await
+            .expect("resume the column");
+        assert_eq!(resumed, [(kind.name().to_string(), "total".to_string())]);
+        assert_eq!(status(&d, &kind.target()).await, "backfilling", "{kind:?}");
+        trellis::staging::build::settle_builds_with(d.pool(), 3).await;
+        assert_exact(&mut d, kind, "the fuse-paused column's resume").await;
+        assert!(d.rows("select 1 from column_status").await.is_empty());
+        assert!(d.rows("select 1 from column_deaths").await.is_empty());
+        assert!(d.rows("select 1 from column_failures").await.is_empty());
+        let deadlocks = d.deadlocks_logged();
+        assert!(deadlocks.is_empty(), "{deadlocks:?}");
+    }
+}
