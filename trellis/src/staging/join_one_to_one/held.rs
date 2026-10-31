@@ -12,7 +12,9 @@
 //!   transaction, so the row is held exactly when the `b` change commits.
 //!   The row was reproduced in that transaction, on the `R` and `M` it
 //!   commits with, so it is held on its first failure, as a build chunk
-//!   holds a key (`super::super::quarantine::evict_build_key`). The parked
+//!   holds a key (`super::super::quarantine::evict_build_key`). `poison`'s
+//!   foreign key takes the definition's row `FOR KEY SHARE`, which the page
+//!   took before its lock row ([`super::lock_definitions`]). The parked
 //!   Re-derive carries the earliest origin of the page's `b` changes, so it
 //!   holds back every watermark token those changes do (`converge`'s
 //!   condition 4).

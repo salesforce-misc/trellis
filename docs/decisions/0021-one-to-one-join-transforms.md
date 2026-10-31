@@ -204,6 +204,10 @@ holds each such row in quarantine in its own transaction, as a key whose own
 change fails is held, and writes every other row, so the `b` change commits
 and `M` advances.
 
+- The hold's `poison` row takes the definition row `FOR KEY SHARE` through
+  its foreign key, so a page that fans out takes that lock before its first
+  lock row, as a `TRUNCATE b` page takes the row `FOR UPDATE`: a rebuild's
+  start holds it `FOR UPDATE` while it waits for the lock row.
 - A row is held on its first failure, as a build chunk holds a key: the
   page reproduced it on the `R` and `M` it commits with. Each failing field
   counts the row toward its column's fuse, and the held rows count toward

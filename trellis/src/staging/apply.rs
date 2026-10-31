@@ -4578,11 +4578,11 @@ pub(crate) async fn apply_page(
     }
 
     // 3d. 1-1 `JOIN` targets, in target order, after the definition rows of
-    // those whose `b` the page truncates, in id order: a rebuild's start
-    // takes them before any lock row (`join_one_to_one`'s module doc).
+    // those whose `b` the page truncates or fans out over, in id order: a
+    // rebuild's start takes them before any lock row (`join_one_to_one`'s
+    // module doc).
     let join1_rebuilds =
-        super::join_one_to_one::lock_truncated_definitions(txn, plan.join1_targets.values())
-            .await?;
+        super::join_one_to_one::lock_definitions(txn, plan.join1_targets.values()).await?;
     for join1_plan in plan.join1_targets.values() {
         let (written, deleted) = super::join_one_to_one::apply_page(
             txn,

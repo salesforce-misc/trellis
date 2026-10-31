@@ -63,7 +63,10 @@
 //!    held already is left out of the fan-out.
 //!
 //! The lock order is the lock row, `J` sorted, `R` entries sorted, `M`
-//! entries sorted, then target rows, sorted within each statement. The
+//! entries sorted, then target rows, sorted within each statement. A page
+//! whose fan-out may hold rows of `a` in quarantine takes its definition's row
+//! `FOR KEY SHARE` before the lock row ([`lock_definitions`]), as a rebuild's
+//! start takes it before the lock row. The
 //! target rows are not locked ahead across statements, and need not be: each
 //! one is written only by a page that holds `J` for the key its `R` entry
 //! has. An `a` page holds `J` for every key its entries hold (the held-key
@@ -74,7 +77,7 @@
 //! reads a 1-1 `JOIN` target in v1 (define refuses it), so a page records
 //! nothing for the seam.
 //!
-//! # A `TRUNCATE` ([`truncate_sides`], [`lock_truncated_definitions`], [`start_rebuilds`])
+//! # A `TRUNCATE` ([`truncate_sides`], [`lock_definitions`], [`start_rebuilds`])
 //!
 //! A page that carries a `TRUNCATE` of either side takes the lock row `FOR
 //! UPDATE` instead, so it waits for the pages and chunks in flight and every
@@ -693,7 +696,7 @@ pub(crate) async fn apply_page(
 
     // 2. The lock row, a truncate's clear, then K over both sides' keys. A
     // page that truncates `b` holds its definition's row already: the caller
-    // takes it before any lock row ([`lock_truncated_definitions`]).
+    // takes it before any lock row ([`lock_definitions`]).
     // Planted bug: the definition's row comes after the lock row. See
     // `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
@@ -807,25 +810,37 @@ pub(crate) async fn apply_page(
     Ok((written + fanned, deleted + fan_deleted + cleared))
 }
 
-/// Locks `FOR UPDATE` the definitions' rows of `plans` (one page's) whose
-/// page truncates `b`, in id order, and returns their ids for
-/// [`start_rebuilds`]. The page calls it before its first 1-1 `JOIN` lock
-/// row, since a rebuild's start takes every definition's row it rebuilds, in
-/// id order, before it takes their lock rows (`crate::intake::catch_up`,
-/// `super::build::stamp_rebuild_seg`): a page that held one target's lock
-/// row while it queued on another's definition row would close a cycle with
-/// a start of both.
-pub(crate) async fn lock_truncated_definitions<'a>(
+/// Locks the definitions' rows of `plans` (one page's) before the page's
+/// first 1-1 `JOIN` lock row, in id order, and returns the ids of those whose
+/// page truncates `b` for [`start_rebuilds`]. A rebuild's start takes every
+/// definition's row it rebuilds `FOR UPDATE`, in id order, before it takes
+/// their lock rows (`crate::intake::catch_up`,
+/// `super::build::stamp_rebuild_seg`): a page that held one target's lock row
+/// while it queued on a definition's row would close a cycle with a start.
+///
+/// - A page that truncates `b` takes its definition's row `FOR UPDATE`.
+/// - A page whose fan-out may hold a row of `a` (it has `b` records and fans
+///   out) takes it `FOR KEY SHARE`, the lock `poison`'s foreign key takes
+///   when [`held::hold`] writes it, so the hold, after the lock row, never
+///   waits for it.
+pub(crate) async fn lock_definitions<'a>(
     txn: &Transaction<'_>,
     plans: impl IntoIterator<Item = &'a JoinOneToOnePlan>,
 ) -> Result<Vec<i64>, ApplyError> {
-    let mut ids: Vec<i64> = plans
-        .into_iter()
-        .filter(|plan| plan.truncates_b())
-        .map(|plan| plan.shape.id)
+    // Each id with whether the page truncates its `b`; a truncate's
+    // `FOR UPDATE` covers a hold's `FOR KEY SHARE`.
+    let mut locks: BTreeMap<i64, bool> = BTreeMap::new();
+    for plan in plans {
+        let truncates = plan.truncates_b();
+        if truncates || (plan.fan_out && !plan.b.is_empty()) {
+            *locks.entry(plan.shape.id).or_default() |= truncates;
+        }
+    }
+    let ids: Vec<i64> = locks
+        .iter()
+        .filter(|(_, truncates)| **truncates)
+        .map(|(id, _)| *id)
         .collect();
-    ids.sort_unstable();
-    ids.dedup();
     // Planted bug: each definition's row is taken after its lock row, in
     // `apply_page`. See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
@@ -835,10 +850,14 @@ pub(crate) async fn lock_truncated_definitions<'a>(
     );
     #[cfg(not(any(test, feature = "test-util")))]
     let late = false;
-    if !ids.is_empty() && !late {
+    for (id, truncates) in &locks {
+        if *truncates && late {
+            continue;
+        }
+        let mode = if *truncates { "update" } else { "key share" };
         txn.execute(
-            "select 1 from transform_definitions where id = any($1) order by id for update",
-            &[&ids],
+            &format!("select 1 from transform_definitions where id = $1 for {mode}"),
+            &[id],
         )
         .await?;
     }
@@ -904,7 +923,7 @@ async fn truncate_sides(
     .await
 }
 
-/// Starts the rebuilds of the targets `ids` ([`lock_truncated_definitions`])
+/// Starts the rebuilds of the targets `ids` ([`lock_definitions`])
 /// after a `TRUNCATE` of their `b`, in the page's transaction (ADR-0021):
 /// every target row may hold the `b` side of a row that is gone, so the
 /// build's chunks, not the page, rewrite them. Each definition reads

@@ -790,3 +790,60 @@ async fn capture(d: &mut Driver, table: &str) {
         trellis::capture::install::Progress::Waiting(wait) => panic!("capture waited: {wait}"),
     }
 }
+
+/// A rebuild's start takes the definition's row `FOR UPDATE` and then the
+/// pair's lock row. A `b` page whose fan-out holds a row writes `poison`,
+/// whose foreign key takes the definition's row `FOR KEY SHARE`, so the page
+/// takes that lock before its lock row: taken only by the hold, a start that
+/// arrived while the page ran would hold the definition's row and queue on
+/// the lock row while the page queued on the definition's row. The start is
+/// played by hand, as in the interleavings' truncate test, and queues behind
+/// the page.
+#[tokio::test]
+async fn a_fan_out_that_holds_a_row_and_a_rebuild_start_never_deadlock() {
+    let _serial = SERIAL.lock().await;
+    let kind = Kind::Left;
+    let mut d = start(kind, A_ROWS, B_ROWS).await;
+    seed_key_10(&mut d, &[23]).await;
+    let id = definition_id(&d, &kind.target()).await;
+    write(&d, "update public.b set w = 1000 where id = 1").await;
+    let batch = d.seal().await;
+    let target = kind.target();
+    let mut page = d
+        .drain_frozen(
+            batch,
+            "page",
+            &[(PausePoint::BeforeJoin1Recompute, &target)],
+        )
+        .await;
+    let reached = page.reached(PausePoint::BeforeJoin1Recompute).await;
+    // The start: the definition's row, then the lock row.
+    let start = d.user().await;
+    let lock = format!("select 1 from {DEFAULT_SCHEMA}.join1_{id}_l for update");
+    let start_lock = tokio::spawn(async move {
+        start.batch_execute("begin").await?;
+        start
+            .execute(
+                "select 1 from transform_definitions where id = $1 for update",
+                &[&id],
+            )
+            .await?;
+        start.execute(&lock, &[]).await?;
+        start.batch_execute("commit").await
+    });
+    d.wait_blocked_behind(reached.backend_pid).await;
+    d.release(&mut page, PausePoint::BeforeJoin1Recompute).await;
+    let page_result = page.finish_result().await;
+    let start_result = start_lock.await.expect("the start task");
+    let deadlocks = d.deadlocks_logged();
+    assert!(
+        deadlocks.is_empty(),
+        "page {:?}, start {start_result:?}: {deadlocks:?}",
+        page_result.as_ref().map(|_| ())
+    );
+    page_result.expect("the page");
+    start_result.expect("the start");
+    let deadlocks = d.deadlocks_logged();
+    assert!(deadlocks.is_empty(), "{deadlocks:?}");
+    assert_eq!(d.rows("select key from poison").await, ["(23)"]);
+}
