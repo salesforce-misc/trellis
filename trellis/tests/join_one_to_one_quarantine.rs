@@ -847,3 +847,90 @@ async fn a_fan_out_that_holds_a_row_and_a_rebuild_start_never_deadlock() {
     assert!(deadlocks.is_empty(), "{deadlocks:?}");
     assert_eq!(d.rows("select key from poison").await, ["(23)"]);
 }
+
+/// A held row across a `TRUNCATE b` and the rebuild it starts: the rebuild's
+/// chunks and sweep leave the row as it was (an `INNER` row stays though its
+/// `b` row is gone), every other row is rebuilt, and the release re-derives
+/// the row from the rebuilt `M`.
+#[tokio::test]
+async fn a_held_row_stays_through_a_rebuild_and_its_release_re_derives_it() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(kind, A_ROWS, B_ROWS).await;
+        seed_key_10(&mut d, &[23]).await;
+        step(&mut d, "update public.b set w = 1000 where id = 1").await;
+        let before = d
+            .rows(&format!(
+                "select total, tag from {} where id = 23",
+                kind.target()
+            ))
+            .await;
+        step(
+            &mut d,
+            "truncate public.b; insert into public.b values (1, 10, 0, 'zero')",
+        )
+        .await;
+        trellis::staging::build::settle_builds_with(d.pool(), 3).await;
+        assert_eq!(status(&d, &kind.target()).await, "live", "{kind:?}");
+        assert_join_but(&d, kind, &[23], "the rebuild").await;
+        assert_eq!(
+            d.rows(&format!(
+                "select total, tag from {} where id = 23",
+                kind.target()
+            ))
+            .await,
+            before,
+            "{kind:?}: the held row stays as it was"
+        );
+        release(&mut d, kind, "public.a", "23").await;
+        assert_exact(&mut d, kind, "the release").await;
+        assert_eq!(total(&d, kind, 23).await, Some(2_147_483_000), "{kind:?}");
+        let deadlocks = d.deadlocks_logged();
+        assert!(deadlocks.is_empty(), "{deadlocks:?}");
+    }
+}
+
+/// An `INNER` row whose `b` row is deleted while it is held stays, as every
+/// held row does, and its release deletes it.
+#[tokio::test]
+async fn an_inner_held_row_whose_b_row_goes_is_deleted_by_its_release() {
+    let _serial = SERIAL.lock().await;
+    let kind = Kind::Inner;
+    let mut d = start(kind, A_ROWS, B_ROWS).await;
+    seed_key_10(&mut d, &[23]).await;
+    step(&mut d, "update public.b set w = 1000 where id = 1").await;
+    step(&mut d, "delete from public.b where id = 1").await;
+    assert_join_but(&d, kind, &[23], "the delete").await;
+    assert_eq!(total(&d, kind, 23).await, Some(2_147_483_000 + 100));
+    release(&mut d, kind, "public.a", "23").await;
+    assert_exact(&mut d, kind, "the release").await;
+    assert_eq!(total(&d, kind, 23).await, None);
+}
+
+/// A resume of a 1-1 `JOIN`'s paused column rebuilds the target in place,
+/// since the pages of either table left the column as it was while it was
+/// paused: the rows a `b` change reached then, and an `a` change, get the
+/// column back. A 1-1 `JOIN` has no field build of its own.
+#[tokio::test]
+async fn a_column_resume_rebuilds_the_rows_written_while_it_was_paused() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(kind, A_ROWS, B_ROWS).await;
+        quarantine::pause_column(d.pool(), kind.name(), "total")
+            .await
+            .expect("pause the column");
+        step(&mut d, "update public.b set w = 500 where id = 1").await;
+        step(&mut d, "update public.a set x = 7 where id = 2").await;
+        assert_eq!(total(&d, kind, 1).await, Some(1 + 100), "{kind:?}: paused");
+        assert_eq!(total(&d, kind, 2).await, Some(2 + 200), "{kind:?}: paused");
+        let resumed = quarantine::resume_column(d.pool(), kind.name(), "total")
+            .await
+            .expect("resume the column");
+        assert_eq!(resumed, [(kind.name().to_string(), "total".to_string())]);
+        assert_eq!(status(&d, &kind.target()).await, "backfilling", "{kind:?}");
+        trellis::staging::build::settle_builds_with(d.pool(), 3).await;
+        assert_exact(&mut d, kind, "the column's resume").await;
+        let deadlocks = d.deadlocks_logged();
+        assert!(deadlocks.is_empty(), "{deadlocks:?}");
+    }
+}

@@ -220,8 +220,10 @@ and `M` advances.
   `J` lock, before it deletes the hold, and stages a `Recompute` as well. A
   `b` change on its key that drained before the `Recompute` would otherwise
   read the `R` entry the hold left, and hold the row again.
-- A pause of a field, by hand or by its fuse, bumps both tables' version
-  fences, since the pages of either side write the fields.
+- A pause of a field, by hand or by its fuse, and its resume bump both
+  tables' version fences, since the pages of either side write the fields.
+  A 1-1 `JOIN` has no field build, so the resume rebuilds the target in
+  place, which writes the field on the rows its pages left as they were.
 
 ### A build fills `M`, then `R` and the target
 

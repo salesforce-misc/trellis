@@ -3465,22 +3465,23 @@ pub(crate) async fn resume_pairs(
             .await?;
             txn.commit().await?;
         }
+        let fence = pause_fence(pool, &t).await?;
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
         // The unpause and the field build's registration commit together:
         // the column applies from this commit, and the build's
         // chunks rewrite it under the keys' entry lock, so nothing needs a
-        // catch-up. See this function's doc comment. The version fence
-        // keeps a page that read the column paused from applying after this
-        // commit (`super::build::bump_version_fence`). The bump is this
+        // catch-up. See this function's doc comment. The version fences
+        // keep a page that read the column paused from applying after this
+        // commit (`super::build::bump_version_fence`), both tables' for a
+        // 1-1 `JOIN`, in name order ([`pause_fence`]). The bump is this
         // transaction's first lock: it waits for the pages in flight, and
         // one of them can be waiting on a transaction that wants the
         // definition row, so holding that row here would close a cycle.
         // A rollback below takes the bump back with it.
         let one_to_one = matches!(def.def.key_space, KeySpace::OneToOne);
-        if one_to_one {
-            super::build::bump_version_fence(&*txn, &def.source_table).await?;
-        }
+        let join1 = matches!(def.def.key_space, KeySpace::JoinOneToOne(_));
+        bump_pause_fence(&*txn, &fence).await?;
         // The column-pause lock, exclusive, after the fence and before the
         // definition row, as every write of pause state takes it: this
         // deletes `t`'s rows one by one, in walk order, and a define or
@@ -3646,6 +3647,14 @@ pub(crate) async fn resume_pairs(
                 .map(|f| f.name.clone())
                 .collect();
             super::build::start_field_build(&*txn, def.id, status, &fields).await?;
+        }
+        // A 1-1 `JOIN` has no field build: it is rebuilt in place, which
+        // writes every field that isn't paused, under the definition row
+        // taken above and then its lock row ([`super::build::stamp_rebuild_seg`],
+        // last), as a rebuild's start takes them.
+        if join1 && !unbuilt {
+            super::build::start_rebuilds(&*txn, &[def.id]).await?;
+            super::build::stamp_rebuild_seg(&*txn, &[def.id]).await?;
         }
         txn.commit().await?;
         resumed.extend(released.into_iter().map(|field| (t.clone(), field)));

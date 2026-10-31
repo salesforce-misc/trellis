@@ -152,7 +152,9 @@ resume (the table dropped and created again with another key, or a key column
 renamed) is refused, since the target is keyed by the source's key. An
 `ALTER TRANSFORM`
 that adds columns, and a column resume, run a field build: background chunks
-that rewrite just those columns from one snapshot.
+that rewrite just those columns from one snapshot. A 1-1 `JOIN` has no field
+build, so its column resume rebuilds the target in place
+([ADR-0021](decisions/0021-one-to-one-join-transforms.md#a-row-a-fan-out-fails-on-is-held-not-the-b-change)).
 
 ### An aggregate's or a `JOIN`'s build
 

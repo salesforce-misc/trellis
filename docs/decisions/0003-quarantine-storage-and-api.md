@@ -244,7 +244,7 @@ Settled parameters:
 * **Propagation** — tripping either fuse cascades the pause to 1-1 downstream
   transforms reading the paused column, so no downstream reader silently consumes
   a frozen value. The column-level fuse only ever freezes a column of a 1-1
-  transform, and the cascade stops at every other reader kind (an aggregate, a
+  transform, a 1-1 `JOIN`'s among them, and the cascade stops at every other reader kind (an aggregate, a
   `JOIN`): it keeps applying over the column's frozen values, exact against the
   upstream target, and the pause propagates to it as reported status. A `live`
   definition reading a paused column of an upstream 1-1 target reports
