@@ -235,6 +235,26 @@ fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+/// `template` with each placeholder of `values` replaced by its value, in
+/// one pass over the template, so a value that has a placeholder's text in
+/// it (a schema named `a{t}`) is left as it is.
+fn fill(template: &str, values: &[(&str, &str)]) -> String {
+    let mut filled = String::with_capacity(template.len());
+    let mut rest = template;
+    'next: while let Some(c) = rest.chars().next() {
+        for (placeholder, value) in values {
+            if let Some(after) = rest.strip_prefix(placeholder) {
+                filled.push_str(value);
+                rest = after;
+                continue 'next;
+            }
+        }
+        filled.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    filled
+}
+
 /// The SQL that loads this instance's definitions into a database whose
 /// Trellis schema has just been created from a schema-only dump. Append it
 /// after the `pg_dump` output.
@@ -286,12 +306,13 @@ pub async fn dump_definitions_sql(pool: &Pool, config: &Config) -> Result<String
                 } else {
                     vec![quote_ident(table)]
                 };
+                let schema_lit = schema.replace('\'', "''");
                 for table in tables {
                     for statement in *statements {
-                        let statement = statement
-                            .replace("{s_lit}", &schema.replace('\'', "''"))
-                            .replace("{s}", &schema)
-                            .replace("{t}", &table);
+                        let statement = fill(
+                            statement,
+                            &[("{s_lit}", &schema_lit), ("{s}", &schema), ("{t}", &table)],
+                        );
                         sql.push_str(&format!("{statement};\n"));
                     }
                 }

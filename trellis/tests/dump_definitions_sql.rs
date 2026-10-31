@@ -640,6 +640,75 @@ async fn a_schema_name_with_percent_and_quote_dumps() {
     );
 }
 
+/// A schema name with a seed statement's placeholder text in it (`{t}`,
+/// `{s}`, `{s_lit}`) is the schema's name and nothing else: the appendix
+/// loads, every seed row included, and the `JOIN`'s lock row with them.
+#[tokio::test]
+async fn a_schema_name_with_placeholder_text_loads() {
+    let cluster = TestCluster::start();
+    let source = cluster.create_empty_database().await;
+    let schema = "dump{t}{s}{s_lit}'x";
+    let t = Trellis::connect(
+        Config::with_schema(source.dsn().to_string(), schema).expect("valid schema"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    t.migrate().await.expect("migrate");
+    let raw = connect_raw(source.dsn()).await;
+    raw.batch_execute(
+        "create table public.cats (id bigint primary key, name text); \
+         create table public.orders (id bigint primary key, cat_id bigint)",
+    )
+    .await
+    .expect("source ddl");
+    t.apply(
+        "TRANSFORM oc FROM orders JOIN cats ON orders.cat_id = cats.id GROUP BY cats.name \
+         WITHOUT SOURCE INDEX SELECT cats.name AS name, COUNT(*) AS n",
+    )
+    .await
+    .expect("oc");
+    let schema_sql = run(
+        Command::new("pg_dump")
+            .args(["--schema-only", "--no-owner", "--schema"])
+            .arg(format!("\"{schema}\""))
+            .args(["--schema", "public"])
+            .arg(source.dsn()),
+        "pg_dump",
+    );
+    let appendix = t.dump_definitions_sql().await.expect("dump definitions");
+    let loaded = cluster.create_empty_database().await;
+    load(loaded.dsn(), &schema_sql, &appendix);
+    let after = connect_raw(loaded.dsn()).await;
+    let quoted = format!("\"{}\"", schema.replace('"', "\"\""));
+    for (table, want) in [
+        ("halting_stops", 1),
+        ("segment_pointer", 1),
+        ("segments", 1),
+        ("transform_definitions", 1),
+    ] {
+        assert_eq!(
+            count(&after, &format!("select count(*) from {quoted}.{table}")).await,
+            want,
+            "{table}"
+        );
+    }
+    let id = count(
+        &after,
+        &format!("select id from {quoted}.transform_definitions"),
+    )
+    .await;
+    assert_eq!(
+        count(
+            &after,
+            &format!("select count(*) from {quoted}.\"join_{id}_l\"")
+        )
+        .await,
+        1,
+        "the JOIN's lock row loads"
+    );
+}
+
 /// Every table in the Trellis schema is classified, the hidden tables of the
 /// definitions included: the source has one definition of each kind that owns
 /// any (an aggregate, an aggregate `JOIN` and a 1-1 `JOIN`), so a family that
