@@ -214,7 +214,11 @@ alone over the record's row (its new image, or for a Re-derive its live
 source row), each in its own statement outside any transaction and taking no
 lock. Every field that fails is one `column_failures` row for its
 `(transform, column)`, unless a field it reads by alias fails too: that
-field's pause pauses it with it. A poisoned record costs about `2·log2(n)`
+field's pause pauses it with it. A row of a 1-1 `JOIN` that a change of its
+joined table fails on is named by that page's own bisection and probe, and
+held by it
+([ADR-0021](0021-one-to-one-join-transforms.md#a-row-a-fan-out-fails-on-is-held-not-the-b-change)).
+A poisoned record costs about `2·log2(n)`
 failed probes of a page of `n` records, about 34 at the default
 `drain_batch_cap` of 10^5, plus one probe per field, and the column fuse bounds
 how often that recurs. A field is never wrapped to turn an error into `NULL`,

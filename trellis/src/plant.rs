@@ -364,6 +364,22 @@ pub enum Plant {
     /// Pinned by `join_one_to_one_interleavings`'s
     /// `a_truncate_of_b_page_and_a_rebuild_start_take_the_definition_row_first`.
     Join1TruncateDefAfterLock,
+    /// ADR-0021 (#1513): a 1-1 `JOIN`'s fan-out writes the target rows of the
+    /// `a` rows the definition holds in quarantine, so a `b` change rewrites
+    /// a row the release has yet to re-derive, and a field that still fails
+    /// on it is charged again.
+    ///
+    /// Pinned by `join_one_to_one_quarantine`'s
+    /// `a_fan_out_leaves_a_held_row_as_it_was`.
+    Join1FanOutHeldRow,
+    /// ADR-0021 (#1513): a release of a held row of a 1-1 `JOIN`'s `a`
+    /// leaves its Re-derive to the `Recompute` it stages, so a `b` change on
+    /// its key that drains first fans out over the `R` entry the hold left
+    /// and holds the row again.
+    ///
+    /// Pinned by `join_one_to_one_quarantine`'s
+    /// `a_release_before_a_pending_fan_out_of_its_key_stays_released`.
+    Join1ReleaseNoRederive,
 }
 
 impl Plant {
@@ -402,6 +418,8 @@ impl Plant {
         Plant::Join1TruncateKeepsM,
         Plant::Join1TruncateNoRebuild,
         Plant::Join1TruncateDefAfterLock,
+        Plant::Join1FanOutHeldRow,
+        Plant::Join1ReleaseNoRederive,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -440,6 +458,8 @@ impl Plant {
             Plant::Join1TruncateKeepsM => "join1_truncate_keeps_m",
             Plant::Join1TruncateNoRebuild => "join1_truncate_no_rebuild",
             Plant::Join1TruncateDefAfterLock => "join1_truncate_def_after_lock",
+            Plant::Join1FanOutHeldRow => "join1_fan_out_held_row",
+            Plant::Join1ReleaseNoRederive => "join1_release_no_rederive",
         }
     }
 

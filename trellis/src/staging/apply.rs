@@ -145,7 +145,8 @@ pub enum ApplyError {
     /// A 1-1 `JOIN` page (`super::join_one_to_one`) that can't finish its
     /// `b` changes' fan-out: it reaches more `a` rows than the cap
     /// (`crate::defs::join_one_to_one::max_fanout`), or a field fails on
-    /// some of them, which the bisection named in `reason`. Like
+    /// more of them than the bisection can name, which holds each row it
+    /// names in quarantine otherwise (`super::join_one_to_one::held`). Like
     /// [`ApplyError::GroupBasisUnsupported`], every page of the target would
     /// reproduce it, so it halts the target with the reason.
     JoinOneToOneHalt { target: String, reason: String },
@@ -5648,6 +5649,13 @@ async fn drain_batch(
                 // `compute` itself, which the loop above may have called
                 // more than once for this same `folded` input.
                 flush_apply_metrics(&plan);
+                // The fuses of the rows a 1-1 `JOIN`'s fan-out held, which
+                // take locks of their own (`super::join_one_to_one::held`).
+                super::join_one_to_one::held::charge_after_commit(
+                    pool,
+                    plan.join1_targets.values(),
+                )
+                .await;
                 return Ok(outcome);
             }
             Err(err) => {

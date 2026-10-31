@@ -1299,47 +1299,6 @@ async fn a_b_rederive_past_the_fan_out_cap_halts_the_transform() {
     }
 }
 
-/// A field that fails on one row of a fan-out halts the transform, naming the
-/// row and the field, rather than charging the `b` change: the fan-out's
-/// batches are bisected under savepoints down to the row, whose fields are
-/// probed one by one. Nothing is quarantined, and no other row is written.
-#[tokio::test]
-async fn a_field_failing_on_a_fan_out_row_halts_naming_the_row() {
-    let _serial = serial().await;
-    let mut d = start_kinds(&[Kind::Left], A_ROWS, B_ROWS).await;
-    // Rows 5 to 40 on key 10; row 23 overflows `x + w` once `w` grows.
-    let rows: Vec<String> = (5..=40)
-        .map(|id| {
-            let x = if id == 23 { 2_147_483_000 } else { id };
-            format!("({id}, 10, {x}, 'r')")
-        })
-        .collect();
-    step(
-        &mut d,
-        &format!("insert into public.a values {}", rows.join(", ")),
-    )
-    .await;
-    write(&d, "update public.b set w = 1000 where id = 1").await;
-    let batch = d.seal().await;
-    d.drain(batch, "poisoned").await;
-    let (status, reason) = paused_reason(&d, Kind::Left).await;
-    assert_eq!(status, "paused");
-    let reason = reason.expect("a reason");
-    assert!(
-        reason.contains("fan-out fails")
-            && reason.contains("23 (total: integer out of range)")
-            && !reason.contains("maybe more"),
-        "{reason}"
-    );
-    assert_eq!(
-        total(&d, Kind::Left, 5).await,
-        Some(5 + 100),
-        "nothing written"
-    );
-    let poisoned = d.rows("select key from poison").await;
-    assert!(poisoned.is_empty(), "{poisoned:?}");
-}
-
 /// A Re-derive of `b` rows repairs changes capture never saw: a `w` update
 /// on a key with an `a` row (its fan-out), a move onto a key, a delete, an
 /// insert onto a `NULL` key and one onto a key no `a` row has.

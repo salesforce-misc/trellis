@@ -482,7 +482,7 @@ impl HeldKey {
 /// [`HeldKey::merge`] does, plus the union of `agg_groups`, which it leaves
 /// out. Every right-hand side reads `h` as it was before the update, so
 /// `old_image` compares the old `seg_seq`.
-const MERGE_HELD_ROW: &str = "on conflict (transform_id, src_table, key) do update set \
+pub(crate) const MERGE_HELD_ROW: &str = "on conflict (transform_id, src_table, key) do update set \
          seg_seq = least(h.seg_seq, excluded.seg_seq), \
          old_image = case when excluded.seg_seq < h.seg_seq \
                           then excluded.old_image else h.old_image end, \
@@ -2251,6 +2251,21 @@ pub(crate) async fn trip_build_fuse(pool: &Pool, definition_id: i64) -> Result<b
     Ok(tripped)
 }
 
+/// Checks definition `definition_id`'s whole-transform fuse after a drain's
+/// page held keys of it in its own transaction (a 1-1 `JOIN`'s fan-out,
+/// `super::join_one_to_one::held`), in a transaction of its own once the
+/// page has committed, as [`trip_build_fuse`] does for a build: the gate is
+/// never taken under the page's locks. Freezes it from any state that isn't
+/// frozen, as a drain's eviction does. Returns whether it was quarantined.
+pub(crate) async fn trip_drain_fuse(pool: &Pool, definition_id: i64) -> Result<bool, ApplyError> {
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    take_fuse_gate(&txn, definition_id).await?;
+    let tripped = quarantine_if_crossed(&txn, definition_id, &not_frozen_sql()).await?;
+    txn.commit().await?;
+    Ok(tripped)
+}
+
 /// Quarantines definition `id` if the keys poisoned for it have crossed
 /// [`DEFAULT_TRANSFORM_DEATH_THRESHOLD`]. Returns whether it did.
 ///
@@ -2321,7 +2336,8 @@ async fn quarantine_if_crossed(
 // batch (`paused_columns_for`, called from [`super::apply::compute`]).
 //
 // **Scope, stated up front**: this tier only ever activates for
-// [`crate::defs::ast::KeySpace::OneToOne`] definitions.
+// [`crate::defs::ast::KeySpace::OneToOne`] definitions, and for a 1-1
+// `JOIN`'s rows its fan-out holds (`super::join_one_to_one::held`).
 // [`crate::defs::ast::KeySpace::Aggregate`] fields
 // are never attributed here and can never be paused by the automatic fuse —
 // the group basis (`staging::group_basis`) has no notion of "skip this one
@@ -2433,7 +2449,7 @@ async fn attribute_column_failure(
 /// The Re-derive build's chunks need this same exclusion for the same reason
 /// (a (re-)executed chunk must not overwrite a column live CDC has since
 /// paused).
-pub(super) async fn paused_columns_for(
+pub(crate) async fn paused_columns_for(
     pool: &Pool,
     def: &TransformDef,
 ) -> Result<HashSet<String>, ApplyError> {
@@ -2466,7 +2482,7 @@ pub(super) async fn paused_columns_for(
 /// [`DEFAULT_COLUMN_DEATH_THRESHOLD`], and again on a row charged already
 /// while the count is still there, since only a trip that failed leaves it
 /// there.
-async fn charge_column_failure(
+pub(crate) async fn charge_column_failure(
     pool: &Pool,
     transform: &str,
     column: &str,
@@ -2554,7 +2570,7 @@ async fn trip_column_fuse(
     let fence = pause_fence(pool, transform).await?;
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
-    bump_pause_fence(&*txn, fence.as_deref()).await?;
+    bump_pause_fence(&*txn, &fence).await?;
     crate::locks::lock_column_pauses(
         &*txn,
         pool.schema(),
@@ -2584,20 +2600,32 @@ async fn trip_column_fuse(
     cascade_pause(pool, transform, column, &mark, None).await
 }
 
-/// The source whose version fence a `column_status` pause of `transform`
-/// bumps ([`bump_pause_fence`]): its definition's, when it is a 1-1
-/// definition, since only a 1-1 plan holds a paused column out of its writes
-/// (`super::apply::compute`). `None` for an aggregate's column, or a target
-/// no definition has.
-async fn pause_fence(pool: &Pool, transform: &str) -> Result<Option<String>, ApplyError> {
-    Ok(catalog::definition_by_target(pool, transform)
-        .await?
-        .filter(|def| matches!(def.def.key_space, KeySpace::OneToOne))
-        .map(|def| def.source_table))
+/// The sources whose version fences a `column_status` pause of `transform`
+/// bumps ([`bump_pause_fence`]), in name order: its definition's, when it is
+/// a 1-1 definition, and both tables of a 1-1 `JOIN`, whose pages of either
+/// side write its fields, since only those plans hold a paused column out of
+/// their writes (`super::apply::compute`, `super::join_one_to_one::plan_for`).
+/// None for an aggregate's column, or a target no definition has.
+async fn pause_fence(pool: &Pool, transform: &str) -> Result<Vec<String>, ApplyError> {
+    let Some(def) = catalog::definition_by_target(pool, transform).await? else {
+        return Ok(Vec::new());
+    };
+    let mut sources = match def.def.key_space {
+        KeySpace::OneToOne => vec![def.source_table],
+        KeySpace::JoinOneToOne(_) => {
+            let client = pool.get().await?;
+            let joined = catalog::join_table_of(&**client, def.id).await?;
+            std::iter::once(def.source_table).chain(joined).collect()
+        }
+        _ => Vec::new(),
+    };
+    sources.sort();
+    sources.dedup();
+    Ok(sources)
 }
 
-/// Bumps `source`'s version fence (`super::build::bump_version_fence`), when
-/// there is one, in the transaction that writes a `column_status` pause:
+/// Bumps each of `sources`' version fences (`super::build::bump_version_fence`),
+/// in the order given, in the transaction that writes a `column_status` pause:
 /// [`pause_column`], [`trip_column_fuse`] and each pair [`cascade_pause`]
 /// reaches. The pause holds the column out of every write from
 /// its commit on, not just out of the writers that start after it:
@@ -2616,11 +2644,8 @@ async fn pause_fence(pool: &Pool, transform: &str) -> Result<Option<String>, App
 /// the transaction's first lock, as for a column resume: it
 /// waits for the writers in flight, and holding anything they might wait on
 /// meanwhile could close a cycle.
-async fn bump_pause_fence(
-    txn: &impl GenericClient,
-    source: Option<&str>,
-) -> Result<(), ApplyError> {
-    if let Some(source) = source {
+async fn bump_pause_fence(txn: &impl GenericClient, sources: &[String]) -> Result<(), ApplyError> {
+    for source in sources {
         super::build::bump_version_fence(txn, source).await?;
     }
     Ok(())
@@ -2778,8 +2803,9 @@ async fn cascaded_already(
 
 /// One pair of [`cascade_pause`]: records the edge from `upstream` and
 /// pauses `downstream`, in a transaction whose first lock bumps
-/// `downstream`'s definition's source fence ([`bump_pause_fence`]), so no
-/// transaction holds two sources' fences. It then takes the column-pause lock
+/// `downstream`'s definition's source fences ([`bump_pause_fence`]; two, in
+/// name order, for a 1-1 `JOIN`, as a page takes them), so no transaction
+/// holds the fences of two definitions. It then takes the column-pause lock
 /// exclusive ([`crate::locks::lock_column_pauses`]), as every write of a
 /// pause does, so a definition being defined or edited to read
 /// `downstream`'s column either reads this pause or commits before the walk
@@ -2803,7 +2829,7 @@ async fn pause_dependent(
     if let Some(timeout) = lock_timeout {
         crate::locks::set_local_lock_timeout(&*txn, timeout).await?;
     }
-    bump_pause_fence(&*txn, fence.as_deref()).await?;
+    bump_pause_fence(&*txn, &fence).await?;
     // Test-only pause point. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::interleave::pause_at(
@@ -3041,7 +3067,7 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
         let fence = pause_fence(pool, transform).await?;
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
-        bump_pause_fence(&*txn, fence.as_deref()).await?;
+        bump_pause_fence(&*txn, &fence).await?;
         crate::locks::lock_column_pauses(
             &*txn,
             pool.schema(),
@@ -5746,6 +5772,12 @@ async fn release_key_as(
         }
     }
 
+    // A held row of a 1-1 `JOIN`'s `FROM` table is re-derived here, under
+    // its `J` lock, before its rows are deleted.
+    if let Some(definition) = catalog::definition_by_id_in(&*txn, transform_id).await? {
+        super::join_one_to_one::held::release(&txn, pool, &definition, transform, &names[0], key)
+            .await?;
+    }
     let marked = txn
         .query(
             "delete from poison \

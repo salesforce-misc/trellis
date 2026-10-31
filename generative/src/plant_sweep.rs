@@ -127,7 +127,9 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::Join1TruncateKeepsR
         | Plant::Join1TruncateKeepsM
         | Plant::Join1TruncateNoRebuild
-        | Plant::Join1TruncateDefAfterLock => PlantPath::OneToOneJoin,
+        | Plant::Join1TruncateDefAfterLock
+        | Plant::Join1FanOutHeldRow
+        | Plant::Join1ReleaseNoRederive => PlantPath::OneToOneJoin,
     }
 }
 

@@ -195,6 +195,30 @@ later. In the model (#1375 Y5) it was exact under worker kills and a second
 `b` change mid-way, and it bounded an `a` writer's wait to one chunk: 0.13 s
 against 3.8 s. It took about 5x as long overall.
 
+### A row a fan-out fails on is held, not the `b` change
+
+A field that fails with a data exception on one row of a fan-out is that
+`a` row's failure. The fan-out's batches are bisected under savepoints down
+to the rows that fail, and the per-field probe names their fields. The page
+holds each such row in quarantine in its own transaction, as a key whose own
+change fails is held, and writes every other row, so the `b` change commits
+and `M` advances.
+
+- A row is held on its first failure, as a build chunk holds a key: the
+  page reproduced it on the `R` and `M` it commits with. Each failing field
+  counts the row toward its column's fuse, and the held rows count toward
+  the whole-transform fuse, both checked once the page has committed.
+- A bisection that can't name every failing row within its attempts halts
+  the transform rather than commit with a row unwritten.
+- A held row is left out of later fan-outs and of the build, and its own
+  changes are parked, so its target row stays as it was.
+- Its release re-derives the row in the release's transaction, under its
+  `J` lock, before it deletes the hold, and stages a `Recompute` as well. A
+  `b` change on its key that drained before the `Recompute` would otherwise
+  read the `R` entry the hold left, and hold the row again.
+- A pause of a field, by hand or by its fuse, bumps both tables' version
+  fences, since the pages of either side write the fields.
+
 ### A build fills `M`, then `R` and the target
 
 A build re-derives every key of `b` ∪ `M` into `M` first: `b`'s rows in
