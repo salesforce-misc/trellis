@@ -380,6 +380,17 @@ pub enum Plant {
     /// Pinned by `join_one_to_one_quarantine`'s
     /// `a_release_before_a_pending_fan_out_of_its_key_stays_released`.
     Join1ReleaseNoRederive,
+    /// ADR-0002 "Multi-hop" (#1482's `token_early`): a drain page reads the
+    /// target-mutation seam's write token when it begins
+    /// (`staging::target_mutations`), before its row locks, rather than after
+    /// its last write. A page that began first but locked a key after
+    /// another page committed it stages the newer image under the older
+    /// token, so a reader of the target (a 1-1 `JOIN` side) keeps the older
+    /// state.
+    ///
+    /// Pinned by `join_one_to_one_over_targets`'s
+    /// `s2_seam_rows_of_one_key_order_by_their_writers_commits`.
+    SeamTokenEarly,
 }
 
 impl Plant {
@@ -420,6 +431,7 @@ impl Plant {
         Plant::Join1TruncateDefAfterLock,
         Plant::Join1FanOutHeldRow,
         Plant::Join1ReleaseNoRederive,
+        Plant::SeamTokenEarly,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -460,6 +472,7 @@ impl Plant {
             Plant::Join1TruncateDefAfterLock => "join1_truncate_def_after_lock",
             Plant::Join1FanOutHeldRow => "join1_fan_out_held_row",
             Plant::Join1ReleaseNoRederive => "join1_release_no_rederive",
+            Plant::SeamTokenEarly => "seam_token_early",
         }
     }
 

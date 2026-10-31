@@ -401,6 +401,11 @@ fn join_sweep_tier() -> SweepTier {
         "it breaks the 1-1 JOIN path, which no tier draws until milestone 9 (#1404); \
              `join_one_to_one_interleavings` pins it",
     ));
+    not_gated.extend(not_on_path(
+        &[PlantPath::Chain],
+        "it breaks a target's feed to a definition reading it, and no tier draws a \
+             chain in one instance until #1488; `join_one_to_one_over_targets` pins it",
+    ));
     SweepTier {
         name: generative::baseline_quarantine::JOIN_TIER,
         known_misses: &["join_no_j_lock", "join_t_skip_lock", "gb_early_zero_gc"],

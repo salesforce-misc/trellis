@@ -4487,6 +4487,10 @@ pub(crate) async fn apply_page(
     // `staging::target_mutations` — no writer hands its keys back to this
     // function, so none can skip propagation.
     let mut mutations = TargetMutations::new();
+    // Planted bug: the write token read here, before any row lock. See
+    // `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    mutations.plant_early_token(txn).await?;
 
     // 2. Truncate clears, before this target's own upsert/delete below —
     // see this function's doc comment on why "clear, then write" is safe

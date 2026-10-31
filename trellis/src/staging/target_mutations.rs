@@ -93,8 +93,8 @@
 //!   the previous row's new image.
 //! - **`row_txid`** is the writer's transaction, as for any ring row, which
 //!   orders the change against a group-basis reader's bases.
-//! - **`origin_lsn`** stays `None`, as for a `Recompute` (see "The write
-//!   token").
+//! - **`origin_lsn`** is the earliest source commit behind the key's writes,
+//!   as for a `Recompute`.
 //!
 //! Every target without such a reader keeps the image-less `Recompute`, and
 //! a terminal target stages nothing. An aggregate target qualifies like any
@@ -115,6 +115,19 @@
 //! waits on its fence (`staging::build`'s "Seam-fed sources") until every
 //! such writer has ended, so it reads their writes. The group basis' build
 //! runs after that fence, in the plan job.
+//!
+//! # The write token
+//!
+//! A seam row's `lsn` is `pg_current_wal_insert_lsn()`, read once per
+//! transaction in [`TargetMutations::into_staged`], after every row lock and
+//! write the transaction took. Writers of one key serialize on its row lock
+//! (on a 1-1 target, on its ledger entry first), and each reads its token
+//! after taking it, so the later committer has the higher token and one key's
+//! seam rows order by their writers' commits. A token read before the lock
+//! would not: a writer that began first but locked the key after another
+//! committed it would stage the newer image under the older token, and a
+//! reader would keep the older state (the `seam_token_early` plant). So no
+//! writer takes a row lock on a target after reading the token.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
@@ -224,6 +237,10 @@ pub struct TargetMutations {
     /// writer against a bare database with no Trellis schema in it.
     #[cfg(test)]
     assume_readers: Option<bool>,
+    /// Planted bug `seam_token_early`: the write token read when the page
+    /// began ([`Self::plant_early_token`]). See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    early_token: Option<PgLsn>,
 }
 
 /// [`TargetMutations::into_staged`]'s output: the downstream rows to append,
@@ -309,6 +326,20 @@ impl TargetMutations {
             );
         }
         Ok(&self.targets[target])
+    }
+
+    /// Planted bug `seam_token_early`: reads the write token now, before
+    /// the page takes any row lock, for [`Self::into_staged`] to stage with
+    /// instead of the token read after the last write. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) async fn plant_early_token(
+        &mut self,
+        txn: &Transaction<'_>,
+    ) -> Result<(), ApplyError> {
+        if crate::plant::armed() == Some(crate::plant::Plant::SeamTokenEarly) {
+            self.early_token = Some(read_write_token(txn).await?);
+        }
+        Ok(())
     }
 
     /// The SQL expression (over `alias`) that renders one of `target`'s rows
@@ -414,6 +445,20 @@ impl TargetMutations {
                 Some(token) => token,
                 None => {
                     let token = read_write_token(txn).await?;
+                    // Planted bug: stage with the token read when the page
+                    // began. See `crate::plant`.
+                    #[cfg(any(test, feature = "test-util"))]
+                    let token = match self.early_token {
+                        Some(early)
+                            if crate::plant::fires(
+                                crate::plant::Plant::SeamTokenEarly,
+                                early != token,
+                            ) =>
+                        {
+                            early
+                        }
+                        _ => token,
+                    };
                     propagation.write_token = Some(token);
                     token
                 }

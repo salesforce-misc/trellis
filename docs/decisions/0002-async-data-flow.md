@@ -1060,13 +1060,15 @@ A group-basis or JOIN reader needs exact images, as capture gives a source.
   consumes the images exactly as it consumes captured ones; the image chain
   (I3) holds because the upstream writes a row only under its lock, in
   write-token order.
-- **Must:** a write that never reaches the seam (an upstream's own build or
-  rebuild, at a resume or by its own Re-derive build) rebuilds its readers,
-  which read `backfilling` until the rebuild is done, so `live` holds along a
-  chain. A `RESUME` build rebuilds them even though it writes through the
-  seam: it starts from hidden state the resume emptied, while its target
-  keeps the earlier rows, so the images a page or the build stages meanwhile
-  can carry prior values that match no row the readers hold. The reader's
+- **Must:** a write that never reaches the seam rebuilds its readers, which
+  read `backfilling` until the rebuild is done, so `live` holds along a
+  chain. An upstream's own builds write through the seam, at a resume and in
+  a rebuild in place alike. A group-basis `RESUME` build rebuilds its readers
+  all the same: it starts from partials the resume emptied, while its
+  target keeps the earlier rows, so the images a page or the build stages
+  meanwhile can carry prior values that match no row the readers hold. A 1-1
+  `RESUME` build stages, as every 1-1 writer does, the row its target held
+  as the prior image, so its readers follow it without a rebuild. The reader's
   rebuild overwrites whatever they did, and a rebuild in place of a `live`
   definition rebuilds nothing, because its hidden state matches its target. The
   rebuild is started in the transaction that completes the whole build, once: on a
