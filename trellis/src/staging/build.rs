@@ -3038,6 +3038,7 @@ pub async fn settle_builds(pool: &Pool) {
 pub async fn settle_builds_with(pool: &Pool, chunk_rows: i64) {
     const CLAIMED_BY: &str = "settle_rederive_builds";
     const STALL: Duration = Duration::from_secs(10);
+    const RETRY_STALL: Duration = Duration::from_secs(30);
     let options = WorkerOptions {
         chunk_rows,
         drain_batch_cap: usize::MAX,
@@ -3045,6 +3046,7 @@ pub async fn settle_builds_with(pool: &Pool, chunk_rows: i64) {
         reclaim_ttl: Duration::from_secs(60),
     };
     let mut last_progress = Instant::now();
+    let mut last_retry: Option<Instant> = None;
     // A field build's plan job that gave its claim back to wait on capture
     // is tried again now, once: the capture pass that may have readied it
     // ran before this call, not on the job's backoff.
@@ -3094,6 +3096,9 @@ pub async fn settle_builds_with(pool: &Pool, chunk_rows: i64) {
             let retried = failures.0 != failures_before.0
                 && failures.1 == failures_before.1
                 && backing_off(pool, chunk).await;
+            if retried {
+                last_retry = Some(Instant::now());
+            }
             progressed |= !retried && !deferred(pool, chunk).await;
         }
         for id in &building {
@@ -3104,9 +3109,14 @@ pub async fn settle_builds_with(pool: &Pool, chunk_rows: i64) {
         } else if only_capture_waits(pool).await {
             return;
         } else {
+            // A run of retries gets longer than `STALL`: a few lock timeouts
+            // in a row behind a slow page are not a stall, and the backoff
+            // between two retries alone reaches `REDERIVE_RETRY_CAP` (5s).
+            let retrying = last_retry.is_some_and(|at| at.elapsed() < STALL);
+            let stall = if retrying { RETRY_STALL } else { STALL };
             assert!(
-                last_progress.elapsed() < STALL,
-                "the running re-derive builds {building:?} made no progress for {STALL:?} \
+                last_progress.elapsed() < stall,
+                "the running re-derive builds {building:?} made no progress for {stall:?} \
                  (a chunk that fails and retries every time is no progress)"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
