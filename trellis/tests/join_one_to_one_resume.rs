@@ -305,9 +305,10 @@ async fn a_resume_after_every_kind_of_change_to_both_tables_is_exact() {
             at_pause,
             "{kind:?}: the resume keeps the target, readable and as it was"
         );
+        let resumed = target_rows(&d, kind).await;
         for gone in ["a04", "a06"] {
             assert!(
-                at_pause
+                resumed
                     .iter()
                     .any(|row| row.starts_with(&format!("({gone},"))),
                 "{kind:?}: {gone} is in the target the orphan pass is yet to reach"
@@ -405,7 +406,7 @@ async fn a_refused_resume_leaves_the_definition_paused_and_untouched() {
             .expect_err("the resume checks a's key");
         let message = err.to_string();
         assert!(
-            message.contains("public.a") && message.contains('s'),
+            message.contains("primary key of public.a is now (id, s)"),
             "{kind:?}: {message}"
         );
         assert_eq!(status(&d, &kind.target()).await, "paused", "{kind:?}");
