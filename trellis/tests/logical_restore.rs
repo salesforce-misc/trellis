@@ -387,7 +387,8 @@ async fn hidden_ids(raw: &Client) -> (i64, i64) {
 
 /// The resumes of the group-basis aggregate and the `JOIN` reset their
 /// ordering state before the rebuild: each drops and recreates its hidden
-/// tables. Both builds run in the passes that follow.
+/// tables (the JOIN's lock table with its one lock row). Both builds run in
+/// the passes that follow.
 async fn resume_groups_and_check_the_reset(raw: &Client, trellis: &Trellis) {
     let (agg, join) = hidden_ids(raw).await;
     for target in ["gsum", "jl"] {
@@ -408,6 +409,11 @@ async fn resume_groups_and_check_the_reset(raw: &Client, trellis: &Trellis) {
             "the JOIN's {part} is recreated"
         );
     }
+    assert_eq!(
+        count(raw, &format!("select count(*) from join_{join}_l")).await,
+        1,
+        "the JOIN's lock table is recreated with its lock row"
+    );
 }
 
 /// RESUME the 1-1, bring it live, then an update, a delete and an insert of

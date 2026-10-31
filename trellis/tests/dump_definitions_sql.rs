@@ -6,7 +6,8 @@
 //! engine functions the drain worker calls.
 //!
 //! - the dump plus the appendix loads into a fresh database as "defined, not
-//!   built", with every runtime table empty
+//!   built", with every runtime table empty and each `JOIN`'s lock table
+//!   holding its one row
 //!   (`a_dump_loads_as_defined_not_built`)
 //! - the staging worker's reconcile pass starts the loaded definitions'
 //!   builds, which build from the source rows and get the same targets
@@ -14,13 +15,15 @@
 //! - every table in the Trellis schema is classified
 //!   (`every_trellis_table_is_classified`)
 //! - a schema name with `%` or `'` in it dumps
-//!   (`a_schema_name_with_percent_and_quote_dumps`)
+//!   (`a_schema_name_with_percent_and_quote_dumps`), and one with a seed
+//!   statement's placeholder text in it loads
+//!   (`a_schema_name_with_placeholder_text_loads`)
 
 use std::process::Command;
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
-use trellis::dump::{CLASSIFICATION, Class};
+use trellis::dump::{CLASSIFICATION, Class, ID_PLACEHOLDER, names_table};
 use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 use trellis::{Config, Trellis, TrellisOptions};
 
@@ -136,8 +139,9 @@ const SOURCE_DDL: &str = "\
     insert into public.cats values (1, 'tom'), (2, 'kit'); \
     insert into public.orders values (1, 1, 10, 1, 'calm'), (2, 1, 20, 2, 'loud'), (3, 2, 30, 1, 'calm')";
 
-/// A 1-1 transform, an aggregate chained off it, and a `JOIN` of `orders` to
-/// `cats`, all built, with the capture triggers installed.
+/// A 1-1 transform, an aggregate chained off it, and an aggregate `JOIN` of
+/// `orders` to `cats`, all built, with the capture triggers installed. Every
+/// family of hidden tables a definition owns exists afterwards.
 async fn define_and_build(t: &Trellis, raw: &mut Client) {
     raw.batch_execute(SOURCE_DDL).await.expect("source ddl");
     t.apply("TRANSFORM o1 FROM orders SELECT g AS g, a + 1 AS b, m AS m")
@@ -162,48 +166,71 @@ async fn define_and_build(t: &Trellis, raw: &mut Client) {
     build_everything(t.pool()).await;
 }
 
-/// `tot`'s group partials (the group basis's hidden table, `agg_<id>` in the
-/// Trellis schema) are the aggregate's runtime state; they must exist in the
-/// source for the "never dumped" assertions to mean anything.
-async fn tot_partials_table(raw: &Client) -> String {
-    let id = count(
+/// The tables in the Trellis schema, by name.
+async fn schema_tables(raw: &Client) -> Vec<String> {
+    let mut tables: Vec<String> = rows_json(
         raw,
-        "select id from transform_definitions where target_table = 'public.tot'",
-    )
-    .await;
-    format!("{SCHEMA}.agg_{id}")
-}
-
-async fn tot_partial_rows(raw: &Client) -> i64 {
-    let table = tot_partials_table(raw).await;
-    count(raw, &format!("select count(*) from {table}")).await
-}
-
-/// The rows in `oc`'s hidden tables (`join_<id>_*` in the Trellis schema),
-/// the `JOIN`'s runtime state.
-async fn oc_hidden_rows(raw: &Client) -> i64 {
-    let id = count(
-        raw,
-        "select id from transform_definitions where target_table = 'public.oc'",
-    )
-    .await;
-    let tables: Vec<String> = raw
-        .query(
+        &format!(
             "select c.relname::text from pg_class c join pg_namespace n on n.oid = c.relnamespace \
-             where n.nspname = $1 and c.relname like $2 and c.relkind = 'r'",
-            &[&SCHEMA, &format!("join\\_{id}\\_%")],
-        )
-        .await
-        .expect("list oc's hidden tables")
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
-    assert!(!tables.is_empty(), "oc has hidden tables");
+             where n.nspname = '{SCHEMA}' and c.relkind in ('r', 'p') order by 1"
+        ),
+    )
+    .await;
+    tables.sort();
+    tables
+}
+
+/// The tables in the Trellis schema that no [`CLASSIFICATION`] entry names
+/// exactly: the hidden tables of the definitions, covered by an entry with an
+/// id placeholder.
+async fn per_definition_tables(raw: &Client) -> Vec<String> {
+    let mut tables = Vec::new();
+    for table in schema_tables(raw).await {
+        let exact = CLASSIFICATION.iter().any(|(entry, _)| *entry == table);
+        if !exact {
+            tables.push(table);
+        }
+    }
+    tables
+}
+
+/// The id of the definition whose target is `public.<target>`.
+async fn definition_id(raw: &Client, target: &str) -> i64 {
+    count(
+        raw,
+        &format!("select id from transform_definitions where target_table = 'public.{target}'"),
+    )
+    .await
+}
+
+/// The rows in the hidden tables of the definition targeting `public.<target>`
+/// whose names are `prefix` and `<id>` followed by one of `suffixes`: its
+/// runtime state, which must exist in the source for the "never dumped"
+/// assertions to mean anything. Every table of the family must exist.
+async fn hidden_rows(raw: &Client, target: &str, prefix: &str, suffixes: &[&str]) -> i64 {
+    let id = definition_id(raw, target).await;
     let mut rows = 0;
-    for table in tables {
-        rows += count(raw, &format!("select count(*) from {SCHEMA}.{table}")).await;
+    for suffix in suffixes {
+        let table = format!("{SCHEMA}.{prefix}{id}{suffix}");
+        let exists = count(
+            raw,
+            &format!("select (to_regclass('{table}') is not null)::int::bigint"),
+        )
+        .await;
+        assert_eq!(exists, 1, "{table} exists");
+        rows += count(raw, &format!("select count(*) from {table}")).await;
     }
     rows
+}
+
+/// `tot`'s group partials (the group basis's hidden table, `agg_<id>`).
+async fn tot_partial_rows(raw: &Client) -> i64 {
+    hidden_rows(raw, "tot", "agg_", &[""]).await
+}
+
+/// `oc`'s hidden tables (`join_<id>_*`), the aggregate `JOIN`'s state.
+async fn oc_hidden_rows(raw: &Client) -> i64 {
+    hidden_rows(raw, "oc", "join_", &["_p", "_m", "_j", "_t", "_l"]).await
 }
 
 /// The Elixir client replaces an earlier appendix in a structure file only
@@ -371,7 +398,7 @@ async fn a_dump_loads_as_defined_not_built() {
 
     // Every runtime table is empty, and the seed rows match a migrated database.
     for (table, class) in CLASSIFICATION {
-        if matches!(class, Class::Runtime) {
+        if matches!(class, Class::Runtime) && !table.contains(ID_PLACEHOLDER) {
             assert_eq!(
                 count(&after, &format!("select count(*) from {SCHEMA}.{table}")).await,
                 0,
@@ -394,15 +421,32 @@ async fn a_dump_loads_as_defined_not_built() {
         0,
         "tot's partials load empty"
     );
-    assert_eq!(
-        oc_hidden_rows(&after).await,
-        0,
-        "oc's hidden tables load empty"
+    // Every hidden table loads empty, but the lock row of each `JOIN`: a
+    // define inserts it, so the loaded definition is "defined" with it, and a
+    // page or build start that takes it takes a row.
+    let hidden = per_definition_tables(&after).await;
+    assert!(
+        hidden.len() >= 6,
+        "the source's definitions own hidden tables: {hidden:?}"
+    );
+    for table in &hidden {
+        let rows = count(&after, &format!("select count(*) from {SCHEMA}.{table}")).await;
+        let is_lock = table.ends_with("_l");
+        assert_eq!(
+            rows,
+            i64::from(is_lock),
+            "{table} loads with {} row(s)",
+            i64::from(is_lock)
+        );
+    }
+    assert!(
+        hidden.iter().any(|table| table.ends_with("_l")),
+        "the source has a JOIN lock table: {hidden:?}"
     );
     let fresh = cluster.create_isolated_database().await;
     let fresh = connect_raw(fresh.dsn()).await;
     for (table, class) in CLASSIFICATION {
-        if matches!(class, Class::Seed { .. }) {
+        if matches!(class, Class::Seed { .. }) && !table.contains(ID_PLACEHOLDER) {
             let sql = format!("select to_jsonb(t) - 'created_at' from {SCHEMA}.{table} t");
             assert_eq!(
                 rows_json(&after, &sql).await,
@@ -510,6 +554,23 @@ async fn a_loaded_database_builds_its_definitions() {
         got.sort();
         assert_eq!(got, want, "{sql}");
     }
+    // The builds filled the hidden tables, and each `JOIN`'s lock still holds
+    // the one row that serializes its pages, truncates and build start.
+    assert!(tot_partial_rows(&after).await > 0, "tot's partials built");
+    assert!(oc_hidden_rows(&after).await > 0, "oc's hidden tables built");
+    let locks: Vec<String> = per_definition_tables(&after)
+        .await
+        .into_iter()
+        .filter(|table| table.ends_with("_l"))
+        .collect();
+    assert!(!locks.is_empty(), "the loaded database has a JOIN lock");
+    for table in locks {
+        assert_eq!(
+            count(&after, &format!("select count(*) from {SCHEMA}.{table}")).await,
+            1,
+            "{table} keeps its one row"
+        );
+    }
 }
 
 /// Two reads of unchanged definitions give the same SQL, even when a runtime
@@ -568,27 +629,138 @@ async fn a_schema_name_with_percent_and_quote_dumps() {
     );
 }
 
+/// A schema name with a seed statement's placeholder text in it (`{t}`,
+/// `{s}`, `{s_lit}`) is the schema's name and nothing else: the appendix
+/// loads, every seed row included, and the `JOIN`'s lock row with them.
+#[tokio::test]
+async fn a_schema_name_with_placeholder_text_loads() {
+    let cluster = TestCluster::start();
+    let source = cluster.create_empty_database().await;
+    let schema = "dump{t}{s}{s_lit}'x";
+    let t = Trellis::connect(
+        Config::with_schema(source.dsn().to_string(), schema).expect("valid schema"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    t.migrate().await.expect("migrate");
+    let raw = connect_raw(source.dsn()).await;
+    raw.batch_execute(
+        "create table public.cats (id bigint primary key, name text); \
+         create table public.orders (id bigint primary key, cat_id bigint)",
+    )
+    .await
+    .expect("source ddl");
+    t.apply(
+        "TRANSFORM oc FROM orders JOIN cats ON orders.cat_id = cats.id GROUP BY cats.name \
+         WITHOUT SOURCE INDEX SELECT cats.name AS name, COUNT(*) AS n",
+    )
+    .await
+    .expect("oc");
+    let schema_sql = run(
+        Command::new("pg_dump")
+            .args(["--schema-only", "--no-owner", "--schema"])
+            .arg(format!("\"{schema}\""))
+            .args(["--schema", "public"])
+            .arg(source.dsn()),
+        "pg_dump",
+    );
+    let appendix = t.dump_definitions_sql().await.expect("dump definitions");
+    let loaded = cluster.create_empty_database().await;
+    load(loaded.dsn(), &schema_sql, &appendix);
+    let after = connect_raw(loaded.dsn()).await;
+    let quoted = format!("\"{}\"", schema.replace('"', "\"\""));
+    for (table, want) in [
+        ("halting_stops", 1),
+        ("segment_pointer", 1),
+        ("segments", 1),
+        ("transform_definitions", 1),
+    ] {
+        assert_eq!(
+            count(&after, &format!("select count(*) from {quoted}.{table}")).await,
+            want,
+            "{table}"
+        );
+    }
+    let id = count(
+        &after,
+        &format!("select id from {quoted}.transform_definitions"),
+    )
+    .await;
+    assert_eq!(
+        count(
+            &after,
+            &format!("select count(*) from {quoted}.\"join_{id}_l\"")
+        )
+        .await,
+        1,
+        "the JOIN's lock row loads"
+    );
+}
+
+/// Every table in the Trellis schema is classified, the hidden tables of the
+/// definitions included: the source has one definition of each kind that owns
+/// any (an aggregate and an aggregate `JOIN`), so a family that no entry
+/// covers is a table no entry names. And every entry names a table: an entry
+/// for a family nothing creates any more is stale.
 #[tokio::test]
 async fn every_trellis_table_is_classified() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
-    let mut actual: Vec<String> = rows_json(
-        &raw,
-        &format!(
-            "select c.relname::text from pg_class c join pg_namespace n on n.oid = c.relnamespace \
-             where n.nspname = '{SCHEMA}' and c.relkind in ('r', 'p') order by 1"
-        ),
-    )
-    .await;
-    actual.sort();
-    let mut classified: Vec<String> = CLASSIFICATION.iter().map(|(t, _)| t.to_string()).collect();
-    classified.sort();
-    assert_eq!(
-        actual, classified,
+    let mut raw = connect_raw(db.dsn()).await;
+    let t = facade(db.dsn()).await;
+    define_and_build(&t, &mut raw).await;
+    let actual = schema_tables(&raw).await;
+
+    let unclassified: Vec<&String> = actual
+        .iter()
+        .filter(|table| {
+            !CLASSIFICATION
+                .iter()
+                .any(|(entry, _)| names_table(entry, table))
+        })
+        .collect();
+    assert!(
+        unclassified.is_empty(),
         "every table in the Trellis schema is listed in trellis::dump::CLASSIFICATION as a \
-         definition, a seed or runtime state, and no listed table is gone"
+         definition, a seed or runtime state (a hidden table of a definition as a name with \
+         {ID_PLACEHOLDER} for its id); these are not: {unclassified:?}"
     );
+    let stale: Vec<&str> = CLASSIFICATION
+        .iter()
+        .map(|(entry, _)| *entry)
+        .filter(|entry| !actual.iter().any(|table| names_table(entry, table)))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "no table in CLASSIFICATION is gone from the Trellis schema: {stale:?}"
+    );
+    // One entry covers each table: a table two entries cover would be
+    // classified twice, differently if the entries differ.
+    for table in &actual {
+        let covering = CLASSIFICATION
+            .iter()
+            .filter(|(entry, _)| names_table(entry, table))
+            .count();
+        assert_eq!(covering, 1, "{table} is covered by one entry");
+    }
+}
+
+/// `names_table` reads the id placeholder as digits and nothing else.
+#[test]
+fn an_id_placeholder_covers_a_definition_id_and_nothing_else() {
+    assert!(names_table("agg_<id>", "agg_7"));
+    assert!(names_table("agg_<id>", "agg_1234"));
+    assert!(!names_table("agg_<id>", "agg_"));
+    assert!(!names_table("agg_<id>", "agg_7x"));
+    assert!(!names_table("agg_<id>", "agg_7_p"));
+    assert!(!names_table("agg_<id>", "xagg_7"));
+    assert!(names_table("join_<id>_p", "join_12_p"));
+    assert!(!names_table("join_<id>_p", "join_12_m"));
+    assert!(!names_table("join_<id>_p", "join1_12_p"));
+    assert!(!names_table("join_<id>_p", "join_a_p"));
+    assert!(names_table("segments", "segments"));
+    assert!(!names_table("segments", "segments_1"));
 }
 
 fn tempfile_dir() -> std::path::PathBuf {

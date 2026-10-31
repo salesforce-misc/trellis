@@ -15,12 +15,27 @@
 //! decides, in the same change, whether it loads.
 //!
 //! * [`Class::Definition`] tables load with their rows.
-//! * [`Class::Seed`] tables load with the one row a migration inserts into
-//!   them. Their later rows are runtime state.
+//! * [`Class::Seed`] tables load with the one row a migration (or, for a
+//!   definition's hidden table, a define) inserts into them. Their later rows
+//!   are runtime state.
 //! * [`Class::Runtime`] tables load empty. Their rows describe source and
 //!   target rows that a schema-only dump doesn't carry, so loading them
 //!   would contradict the empty tables: a ledger row saying a key
 //!   contributes to a group row that doesn't exist, for one.
+//!
+//! A definition of some kinds owns hidden tables in the Trellis schema, named
+//! by its id: an aggregate's `agg_<id>` and an aggregate `JOIN`'s
+//! `join_<id>_*`. [`CLASSIFICATION`] lists each family as one entry whose name
+//! has `<id>` where the id goes ([`names_table`]). They are runtime state,
+//! derived from the source rows: the schema-only dump carries their DDL, so
+//! they load empty, and the build the loaded definition starts fills them. The exception is a `JOIN`'s lock row table (`_l`): a
+//! define inserts its one row, which is what a page or a build start takes
+//! `FOR SHARE` or `FOR UPDATE`, and nothing but a define or a `RESUME` (which
+//! the loaded definition never takes) inserts it again, so it is a seed, and
+//! the appendix inserts the row for each lock table the dumped instance has.
+//! A logical restore (`pg_dump` with data) carries their rows, and the
+//! restore's pause of every definition is what covers them: a `RESUME` drops
+//! and recreates each, so none of the restored rows is read.
 //!
 //! A loaded definition is "defined, not built": the state a define commits.
 //! The worker that starts on the loaded database builds it.
@@ -37,16 +52,38 @@ pub enum Class {
     Definition { reset: &'static str },
     /// What its migration seeds loads: these statements, which are that
     /// migration's own, with `{s}` standing for the quoted schema name and
-    /// `{s_lit}` for the same inside a string literal.
+    /// `{s_lit}` for the same inside a string literal. For an entry whose
+    /// name has [`ID_PLACEHOLDER`], they are run once for each table the
+    /// entry covers that the dumped instance has, with `{t}` standing for
+    /// the table's quoted name.
     Seed { statements: &'static [&'static str] },
     /// Nothing loads.
     Runtime,
 }
 
+/// The placeholder in a [`CLASSIFICATION`] name for the id of the definition
+/// that owns the table.
+pub const ID_PLACEHOLDER: &str = "<id>";
+
+/// Whether the [`CLASSIFICATION`] entry named `entry` covers the table
+/// `table`: the same name, or, for an entry with [`ID_PLACEHOLDER`] in it, a
+/// name that has a definition id (one or more decimal digits) in its place.
+pub fn names_table(entry: &str, table: &str) -> bool {
+    let Some((before, after)) = entry.split_once(ID_PLACEHOLDER) else {
+        return entry == table;
+    };
+    table
+        .strip_prefix(before)
+        .and_then(|rest| rest.strip_suffix(after))
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+}
+
 const NONE: &str = "{}";
 
 /// Every table in the Trellis schema, in the order the appendix inserts the
-/// definition rows (a table after the ones it references).
+/// definition rows (a table after the ones it references). A name with
+/// [`ID_PLACEHOLDER`] stands for one table per definition that owns the
+/// family ([`names_table`]).
 pub const CLASSIFICATION: &[(&str, Class)] = &[
     // Definitions.
     ("refinery_schema_history", Class::Definition { reset: NONE }),
@@ -122,6 +159,22 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
     ("transform_fuse_gate", Class::Runtime),
     ("upstream_releases", Class::Runtime),
     ("worker_registry", Class::Runtime),
+    // The hidden tables of one definition each, derived from its source rows.
+    // A group-basis aggregate's partials.
+    ("agg_<id>", Class::Runtime),
+    // An aggregate `JOIN`'s: the `FROM` side's partials, the joined side's,
+    // the join keys' match counts, the target groups' partials, and the lock
+    // table, whose one row `TRUNCATE`, pages and a build start take.
+    ("join_<id>_p", Class::Runtime),
+    ("join_<id>_m", Class::Runtime),
+    ("join_<id>_j", Class::Runtime),
+    ("join_<id>_t", Class::Runtime),
+    (
+        "join_<id>_l",
+        Class::Seed {
+            statements: &["insert into {s}.{t} default values"],
+        },
+    ),
 ];
 
 /// Statements the appendix ends with, `{s}` standing for the quoted schema
@@ -170,6 +223,26 @@ fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+/// `template` with each placeholder of `values` replaced by its value, in
+/// one pass over the template, so a value that has a placeholder's text in
+/// it (a schema named `a{t}`) is left as it is.
+fn fill(template: &str, values: &[(&str, &str)]) -> String {
+    let mut filled = String::with_capacity(template.len());
+    let mut rest = template;
+    'next: while let Some(c) = rest.chars().next() {
+        for (placeholder, value) in values {
+            if let Some(after) = rest.strip_prefix(placeholder) {
+                filled.push_str(value);
+                rest = after;
+                continue 'next;
+            }
+        }
+        filled.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    filled
+}
+
 /// The SQL that loads this instance's definitions into a database whose
 /// Trellis schema has just been created from a schema-only dump. Append it
 /// after the `pg_dump` output.
@@ -191,16 +264,45 @@ pub async fn dump_definitions_sql(pool: &Pool, config: &Config) -> Result<String
         "-- Trellis definitions (trellis::dump::dump_definitions_sql). Append to a\n\
          -- schema-only pg_dump of the Trellis schema and the schemas it maintains.\n",
     );
+    // The tables of the Trellis schema in this snapshot: the hidden tables of
+    // the definitions it holds are the ones a placeholder entry covers.
+    let hidden_tables: Vec<String> = txn
+        .query(
+            "select c.relname::text from pg_catalog.pg_class c \
+             where c.relnamespace = $1::text::regnamespace and c.relkind in ('r', 'p') \
+             order by c.relname::text collate \"C\"",
+            &[&schema],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
     for (table, class) in CLASSIFICATION {
         let qualified = format!("{schema}.{}", quote_ident(table));
         match class {
             Class::Runtime => {}
             Class::Seed { statements } => {
-                for statement in *statements {
-                    let statement = statement
-                        .replace("{s_lit}", &schema.replace('\'', "''"))
-                        .replace("{s}", &schema);
-                    sql.push_str(&format!("{statement};\n"));
+                // A name with the id placeholder seeds each of its tables the
+                // instance has, in the order of their names; any other seeds
+                // its one table.
+                let tables: Vec<String> = if table.contains(ID_PLACEHOLDER) {
+                    hidden_tables
+                        .iter()
+                        .filter(|name| names_table(table, name))
+                        .map(|name| quote_ident(name))
+                        .collect()
+                } else {
+                    vec![quote_ident(table)]
+                };
+                let schema_lit = schema.replace('\'', "''");
+                for table in tables {
+                    for statement in *statements {
+                        let statement = fill(
+                            statement,
+                            &[("{s_lit}", &schema_lit), ("{s}", &schema), ("{t}", &table)],
+                        );
+                        sql.push_str(&format!("{statement};\n"));
+                    }
                 }
             }
             Class::Definition { reset } => {
