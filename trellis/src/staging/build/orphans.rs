@@ -404,8 +404,9 @@ mod tests {
     }
 
     /// A text key whose index collation orders it otherwise than its bytes
-    /// (the cluster's default, ICU `en-US`), the same key under `"C"`, and an
-    /// `(integer, text)` key: with no ledger entry every row is an orphan, so
+    /// (the cluster's default, ICU `en-US`), the same key under `"C"` and
+    /// under `und-x-icu`, an `(integer, text)` key, and a key of an ICU and a
+    /// `"POSIX"` part: with no ledger entry every row is an orphan, so
     /// a walk in batches of every size from 1 to 4 must name each row once,
     /// in the key index's order. Each batch runs on a fresh connection from
     /// the cursor's stored text, as a sweep resumed by another worker reads
@@ -431,6 +432,10 @@ mod tests {
                  insert into public.tu values {words}; \
                  create table public.tm (g integer, h text, primary key (g, h)); \
                  insert into public.tm select n, td.id from public.td, generate_series(0, 2) n; \
+                 create table public.tx (g text collate \"und-x-icu\", \
+                     h text collate \"POSIX\", primary key (g, h)); \
+                 insert into public.tx select a.id, b.id from public.td a, public.td b \
+                     where length(a.id) = 1; \
                  create table public.l (__from_key text collate \"C\" primary key, \
                      __tombstone boolean not null default false)"
             ))
@@ -441,6 +446,9 @@ mod tests {
             ("public.tc", "id"),
             ("public.tu", "id collate \"und-x-icu\""),
             ("public.tm", "g, h"),
+            // Parts of two non-default collations: the key text is `"C"`
+            // (#1522), the walk still pages in the index's order.
+            ("public.tx", "g collate \"und-x-icu\", h collate \"POSIX\""),
         ] {
             let key = crate::defs::ddl::source_primary_key_in_txn(&client, target)
                 .await

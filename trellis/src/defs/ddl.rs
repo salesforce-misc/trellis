@@ -1004,7 +1004,29 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
         // column, and `defs::backfill` inserts that column straight across),
         // so it must equal the column's own text exactly.
         1 => parts.into_iter().next().unwrap(),
+        _ if mixes_collations(pk) => format!(
+            "(array_to_string(array[{}], chr(31)) collate \"C\")",
+            parts.join(", ")
+        ),
         _ => format!("array_to_string(array[{}], chr(31))", parts.join(", ")),
+    }
+}
+
+/// Whether `pk`'s parts carry two different collations other than the
+/// database's default, which leaves their joined text with no collation
+/// Postgres can choose: every comparison of it would fail. Such a key's text
+/// is compared under `"C"`, the collation the ledger holds a key's text under;
+/// any other key's text keeps the collation its parts share, or the one
+/// non-default collation among them, which the existing statements compare
+/// and order by (#1522).
+fn mixes_collations(pk: &[PrimaryKeyColumn]) -> bool {
+    let mut collations = pk
+        .iter()
+        .filter_map(|c| c.collation.as_deref())
+        .filter(|c| *c != "pg_catalog.\"default\"");
+    match collations.next() {
+        Some(first) => collations.any(|c| c != first),
+        None => false,
     }
 }
 
@@ -1794,6 +1816,58 @@ mod tests {
                 composite_key_escape_sql(&null_key_escape_sql("t.\"warehouse\"::text")),
                 composite_key_escape_sql(&null_key_escape_sql("t.\"sku\"::text")),
             )
+        );
+    }
+
+    /// A composite key whose parts carry two collations other than the
+    /// default renders its text under `"C"` (#1522): joined, they have no
+    /// collation Postgres can choose. A key of one shared collation, of one
+    /// non-default collation beside the default or a type with none, and a
+    /// single column of any collation render as they did.
+    #[test]
+    fn a_composite_key_of_two_non_default_collations_renders_under_c() {
+        let collated = |parts: &[(&str, Option<&str>)]| -> Vec<PrimaryKeyColumn> {
+            parts
+                .iter()
+                .map(|(name, collation)| PrimaryKeyColumn {
+                    collation: collation.map(str::to_string),
+                    ..not_null_pk(&[name]).remove(0)
+                })
+                .collect()
+        };
+        let icu = Some("pg_catalog.\"und-x-icu\"");
+        let posix = Some("pg_catalog.\"POSIX\"");
+        let c = Some("pg_catalog.\"C\"");
+        let default = Some("pg_catalog.\"default\"");
+        let plain = format!(
+            "array_to_string(array[{}, {}], chr(31))",
+            composite_key_escape_sql("t.\"a\"::text"),
+            composite_key_escape_sql("t.\"b\"::text"),
+        );
+        for (a, b) in [(icu, posix), (c, posix), (posix, c), (icu, c)] {
+            assert_eq!(
+                pk_key_sql_expr(&collated(&[("a", a), ("b", b)]), Some("t")),
+                format!("({plain} collate \"C\")"),
+                "{a:?} and {b:?}"
+            );
+        }
+        for (a, b) in [
+            (icu, icu),
+            (icu, default),
+            (default, posix),
+            (icu, None),
+            (default, default),
+            (None, None),
+        ] {
+            assert_eq!(
+                pk_key_sql_expr(&collated(&[("a", a), ("b", b)]), Some("t")),
+                plain,
+                "{a:?} and {b:?}"
+            );
+        }
+        assert_eq!(
+            pk_key_sql_expr(&collated(&[("a", icu)]), Some("t")),
+            "t.\"a\"::text"
         );
     }
 

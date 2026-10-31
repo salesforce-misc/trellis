@@ -10,6 +10,11 @@
 //! collation, or of `"C"`, was unaffected, as was any key whose text kept no
 //! collation of its own.
 //!
+//! A composite key whose parts carry two collations other than the default
+//! renders its text under `"C"` (#1522): joined, the parts' texts had no
+//! collation Postgres could choose, and the definition's first build failed
+//! on every chunk.
+//!
 //! Each test steps the build by hand (`build::work_once`) to idle and asserts
 //! where the definition ended: no test waits on convergence.
 
@@ -22,6 +27,7 @@ use trellis::defs::ValueType;
 use trellis::defs::join_one_to_one::set_enabled;
 use trellis::integer::IntWidth;
 use trellis::staging::build::{self, Step, WorkerOptions};
+use trellis::staging::self_check::{SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page};
 use trellis::{Trellis, TrellisOptions};
 
 /// The `JOIN` tests turn the dev knob on, which is process-wide.
@@ -89,9 +95,10 @@ fn int4() -> ValueType {
 
 // ------------------------------------------------------------------ plain 1-1
 
-/// A rebuild of a plain 1-1 target whose key columns are `key` (declared as
-/// the column list of `create table public.a (...)`), with `names` the key
-/// columns, finishes and removes the target row no source row backs.
+/// A plain 1-1 target whose key columns are `key` (declared as the column
+/// list of `create table public.a (...)`), with `names` the key columns,
+/// builds, applies changes, and is checked with no divergence; a rebuild of it
+/// finishes and removes the target row no source row backs.
 async fn plain_rebuild_removes_the_orphan(
     case: &str,
     key_columns: &str,
@@ -102,7 +109,7 @@ async fn plain_rebuild_removes_the_orphan(
     let mut columns: Vec<(&str, ValueType)> = names.iter().map(|n| (*n, ValueType::Text)).collect();
     columns.push(("v", int4()));
     let key_list = names.join(", ");
-    let d = Driver::start(
+    let mut d = Driver::start(
         &format!(
             "create table public.a ({key_columns}, v integer, primary key ({key_list})); \
              insert into public.a values {source_rows}"
@@ -112,11 +119,26 @@ async fn plain_rebuild_removes_the_orphan(
         &["public.a"],
     )
     .await;
+    d.user()
+        .await
+        .batch_execute("update public.a set v = v + 100; delete from public.a where v = 102")
+        .await
+        .expect("changes to apply");
+    d.settle().await;
     let expected = d
         .rows(&format!(
             "select {key_list}, v from public.a order by {key_list}"
         ))
         .await;
+    assert_eq!(
+        d.rows(&format!(
+            "select {key_list}, total from public.t order by {key_list}"
+        ))
+        .await,
+        expected,
+        "{case}: the changes apply"
+    );
+    assert_converged(&d, "public.t", case).await;
     d.ctl
         .batch_execute(&format!(
             "insert into public.t ({key_list}, total) values {orphan}"
@@ -143,6 +165,34 @@ async fn plain_rebuild_removes_the_orphan(
     assert_eq!(actual, expected, "{case}: the orphan is gone");
 }
 
+/// A walk of `target`'s check, a page of one key and of every key, finds no
+/// divergence.
+async fn assert_converged(d: &Driver, target: &str, case: &str) {
+    for limit in [1, 1000] {
+        let mut after = None;
+        loop {
+            let page = check_page(
+                d.pool(),
+                target,
+                SelfCheckScope { after, limit },
+                SelfCheckMode::Standard,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{case}: a page of {target}'s check: {e}"));
+            assert_eq!(
+                page.outcome,
+                SelfCheckOutcome::Converged,
+                "{case}: {target} at {limit}"
+            );
+            after = page.next_after;
+            if after.is_none() {
+                break;
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_rebuild_of_a_key_of_a_non_default_collation_removes_its_orphan() {
     let rows = "('a', 1), ('B', 2), ('c', 3), ('D', 4)";
@@ -164,7 +214,8 @@ async fn a_rebuild_of_a_key_of_a_non_default_collation_removes_its_orphan() {
 }
 
 /// A composite key: the key text is the parts' texts joined, so it takes their
-/// collation when they share one.
+/// collation when they share one, the one non-default collation beside the
+/// default, and `"C"` when two non-default ones meet (#1522).
 #[tokio::test]
 async fn a_rebuild_of_a_composite_key_of_a_non_default_collation_removes_its_orphan() {
     let rows = "('a', 'x', 1), ('B', 'y', 2), ('c', 'X', 3), ('D', 'Y', 4)";
@@ -172,6 +223,8 @@ async fn a_rebuild_of_a_composite_key_of_a_non_default_collation_removes_its_orp
         ("icu and default", "und-x-icu", "default"),
         ("icu twice", "und-x-icu", "und-x-icu"),
         ("POSIX twice", "POSIX", "POSIX"),
+        ("icu and POSIX", "und-x-icu", "POSIX"),
+        ("C and icu", "C", "und-x-icu"),
     ] {
         plain_rebuild_removes_the_orphan(
             case,
@@ -279,4 +332,88 @@ async fn a_resume_of_a_join_keyed_by_a_non_default_collation_removes_its_orphans
         .await
         .expect("start the resumed builds");
     assert_the_join_is_rebuilt(&d, "resume").await;
+}
+
+/// A 1-1 `JOIN` whose tables are each keyed by two parts of two non-default
+/// collations (#1522): it builds, applies changes of both sides, is checked
+/// with no divergence, and a rebuild and a `RESUME` remove its orphans.
+#[tokio::test]
+async fn a_join_keyed_by_parts_of_two_non_default_collations_builds_and_rebuilds() {
+    let _serial = SERIAL.lock().await;
+    set_enabled(true);
+    let mut d = Driver::start(
+        "create table public.a (id1 text collate \"und-x-icu\", id2 text collate \"POSIX\", \
+             k integer, r integer, primary key (id1, id2)); \
+         create table public.b (b1 text collate \"POSIX\", b2 text collate \"und-x-icu\", \
+             k integer, img integer, k0 text, primary key (b1, b2)); \
+         create unique index on public.b (k); \
+         create index on public.a (k); \
+         insert into public.a \
+             select (array['a', 'B', 'c', 'D'])[1 + i % 4] || i, (array['x', 'Y'])[1 + i % 2], \
+                    i % 4 * 10, i \
+             from generate_series(1, 12) i; \
+         insert into public.b select (array['p', 'Q'])[1 + i % 2], 'z' || i, i * 10, i * 100, \
+             'k' || i from generate_series(1, 3) i",
+        &[
+            ("id1", ValueType::Text),
+            ("id2", ValueType::Text),
+            ("k", int4()),
+            ("r", int4()),
+        ],
+        &[
+            "TRANSFORM jm FROM public.a LEFT JOIN public.b ON a.k = b.k \
+           SELECT a.r + COALESCE(b.img, 0) AS total, b.k0 AS k0",
+        ],
+        &["public.a", "public.b"],
+    )
+    .await;
+    let actual = "select id1, id2, total, k0 from public.jm \
+                  order by id1 collate \"C\", id2 collate \"C\"";
+    let expected = "select a.id1, a.id2, a.r + coalesce(b.img, 0), b.k0 \
+                    from public.a a left join public.b b on a.k = b.k \
+                    order by a.id1 collate \"C\", a.id2 collate \"C\"";
+    assert_eq!(d.rows(actual).await, d.rows(expected).await, "built");
+    d.user()
+        .await
+        .batch_execute(
+            "update public.a set k = 30, r = 0 where id1 = 'B1'; \
+             delete from public.a where id1 = 'c2'; \
+             insert into public.a values ('A99', 'q', 20, 99); \
+             update public.b set img = 1 where b2 = 'z2'; \
+             delete from public.b where b2 = 'z3'",
+        )
+        .await
+        .expect("changes of both sides");
+    d.settle().await;
+    assert_eq!(d.rows(actual).await, d.rows(expected).await, "applied");
+    assert_converged(&d, "public.jm", "join").await;
+    d.ctl
+        .batch_execute("insert into public.jm (id1, id2, total, k0) values ('zz', 'zz', 1, 'k')")
+        .await
+        .expect("an orphan the source does not back");
+    let trellis = trellis(&d).await;
+    trellis
+        .request_backfill("public.a")
+        .await
+        .expect("request a rebuild");
+    work_to_idle(&d).await;
+    let (status, error) = status_and_error(&d, "public.jm").await;
+    assert_eq!((status.as_str(), error), ("live", None), "rebuilt");
+    assert_eq!(d.rows(actual).await, d.rows(expected).await, "rebuilt");
+    trellis.apply("PAUSE TRANSFORM jm").await.expect("pause");
+    d.user()
+        .await
+        .batch_execute("delete from public.a where id1 in ('D3', 'a4')")
+        .await
+        .expect("delete while paused");
+    d.settle().await;
+    trellis.apply("RESUME TRANSFORM jm").await.expect("resume");
+    trellis::intake::harness::start_registered_builds(d.pool())
+        .await
+        .expect("start the resumed builds");
+    work_to_idle(&d).await;
+    let (status, error) = status_and_error(&d, "public.jm").await;
+    assert_eq!((status.as_str(), error), ("live", None), "resumed");
+    assert_eq!(d.rows(actual).await, d.rows(expected).await, "resumed");
+    assert_converged(&d, "public.jm", "join, resumed").await;
 }
