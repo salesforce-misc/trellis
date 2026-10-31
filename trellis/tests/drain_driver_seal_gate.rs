@@ -70,6 +70,7 @@ async fn seal_fails_naming_a_transaction_that_never_commits() {
         .await
         .expect_err("the gate stays blocked while the holder is open");
     assert!(err.contains(&format!("pid {pid} ")), "{err}");
+    assert!(err.contains("predecessor fence xmax "), "{err}");
     holder.batch_execute("commit").await.expect("commit");
     d.seal().await;
 }

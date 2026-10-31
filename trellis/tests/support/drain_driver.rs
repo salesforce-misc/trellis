@@ -238,7 +238,7 @@ impl Driver {
     ///
     /// The seal gate holds while a transaction that was in flight at the
     /// previous batch's fence is still open. That is backpressure, which the
-    /// engine's own sealer retries; here the holder is usually a server
+    /// engine's own sealer retries; here the likely holder is a server
     /// process finishing on a loaded box (autovacuum's analyze, say, which
     /// takes an xid for its statistics writes). So this waits up to
     /// [`SEAL_GATE_WAIT`] for it. A holder the test itself leaves open never
@@ -259,12 +259,38 @@ impl Driver {
             }
             if Instant::now() >= deadline {
                 return Err(format!(
-                    "the seal gate stayed blocked for {wait:?}; transactions holding an xid: {}",
+                    "the seal gate stayed blocked for {wait:?} ({}); transactions holding an xid: {}",
+                    self.gate_state().await,
                     self.xid_holders().await
                 ));
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// The two sides of the seal gate's comparison: the current snapshot's
+    /// `xmin` (the oldest xid running now) and the predecessor fence's
+    /// `xmax`, or that the predecessor has no fence, which holds the gate
+    /// whatever is running. A holder blocks only if its xid is below that
+    /// `xmax`.
+    async fn gate_state(&self) -> String {
+        let row = self
+            .ctl
+            .query_one(
+                "select pg_snapshot_xmin(pg_current_snapshot())::text, \
+                        (select coalesce(pg_snapshot_xmax(s.fence_snapshot)::text, 'unfenced') \
+                         from segments s, segment_pointer p \
+                         where s.seg_seq = p.active_seq - 1)",
+                &[],
+            )
+            .await
+            .expect("read the seal gate's state");
+        format!(
+            "snapshot xmin {}, predecessor fence xmax {}",
+            row.get::<_, String>(0),
+            row.get::<_, Option<String>>(1)
+                .unwrap_or_else(|| "none (no predecessor)".to_string())
+        )
     }
 
     /// Every session (and prepared transaction) holding an xid open, one per
