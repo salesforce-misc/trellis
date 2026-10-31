@@ -4027,271 +4027,232 @@ fn date_constant_op(
     })
 }
 
-/// Whether `expr` reads no column (directly or through a calculated field)
-/// and no aggregate: an expression the planner folds to a constant.
-/// `memo` holds each calculated field already resolved.
-fn reads_no_column<'f>(
+/// What the planner makes of an expression, as far as this check can tell.
+/// `Unknown` over-approximates: it covers every expression the planner might
+/// fold to a constant that [`fold_constant`] cannot compute, so treating it
+/// as "maybe a constant" never refuses what Postgres plans.
+#[derive(Clone)]
+enum Folding {
+    /// It folds to this value.
+    Known(Constant),
+    /// It may fold to a constant this check cannot compute: it reads no
+    /// column (`STRPOS('a', 'a')`), or a constant it cannot compute may
+    /// decide it whatever its columns read (`STRPOS('a', 'a') = 2 AND x >
+    /// 0`). `maybe_null` is whether that constant can be `NULL`.
+    Unknown { maybe_null: bool },
+    /// It reads a column the planner keeps, so it is never a constant.
+    Variable,
+}
+
+impl Folding {
+    fn is_variable(&self) -> bool {
+        matches!(self, Folding::Variable)
+    }
+
+    /// Whether it is, or may be, the `NULL` constant.
+    fn maybe_null(&self) -> bool {
+        matches!(
+            self,
+            Folding::Known(Constant::Null) | Folding::Unknown { maybe_null: true }
+        )
+    }
+}
+
+/// How the planner folds `expr`: to a value [`fold_constant`] computes, to a
+/// constant it cannot compute, or not at all (it reads a column). The rules
+/// are `eval_const_expressions`': a strict operator or function is `NULL` when
+/// an input is the `NULL` constant, whatever the others read; `AND` and `OR`
+/// are decided by one constant operand; a `CASE` is its first branch whose
+/// condition is constant true, past those constant false or `NULL`; a
+/// `COALESCE` is its first argument that is a constant other than `NULL`;
+/// `NULLIF` and `IS [NOT] DISTINCT FROM` fold only over constants. Every
+/// function the grammar admits is immutable and strict, so a call over
+/// constants folds. `memo` holds each calculated field already classified,
+/// `fold_memo` each one already folded.
+#[allow(clippy::too_many_arguments)]
+fn folding<'f>(
     expr: &Expr,
     field_name: &str,
     source_columns: &HashMap<String, ValueType>,
     fields_by_name: &HashMap<&'f str, &'f super::ast::FieldDef>,
-    memo: &mut HashMap<&'f str, bool>,
+    memo: &mut HashMap<&'f str, Folding>,
+    fold_memo: &mut HashMap<&'f str, Option<Constant>>,
     depth: usize,
-) -> bool {
+) -> Folding {
     // Inference has already refused a cycle; this bounds a hand-built one.
     if depth > fields_by_name.len() + 64 {
-        return false;
+        return Folding::Variable;
     }
+    if let Some(value) = fold_constant(
+        expr,
+        field_name,
+        source_columns,
+        fields_by_name,
+        fold_memo,
+        depth,
+    ) {
+        return Folding::Known(value);
+    }
+    if let Expr::Column(name) = expr {
+        let is_self_passthrough = name == field_name && source_columns.contains_key(name);
+        let Some(calc_field) = fields_by_name
+            .get(name.as_str())
+            .filter(|_| !is_self_passthrough)
+            .copied()
+        else {
+            return Folding::Variable;
+        };
+        if let Some(found) = memo.get(calc_field.name.as_str()) {
+            return found.clone();
+        }
+        let found = folding(
+            &calc_field.expr,
+            &calc_field.name,
+            source_columns,
+            fields_by_name,
+            memo,
+            fold_memo,
+            depth + 1,
+        );
+        memo.insert(calc_field.name.as_str(), found.clone());
+        return found;
+    }
+    let mut of = |e: &Expr| {
+        folding(
+            e,
+            field_name,
+            source_columns,
+            fields_by_name,
+            memo,
+            fold_memo,
+            depth + 1,
+        )
+    };
+    // A strict node: `NULL` if an input may be the `NULL` constant, a
+    // constant if every input is one, otherwise kept.
+    let strict = |inputs: &[Folding]| {
+        if inputs.iter().any(Folding::maybe_null) {
+            Folding::Unknown { maybe_null: true }
+        } else if inputs.iter().all(|f| !f.is_variable()) {
+            Folding::Unknown { maybe_null: false }
+        } else {
+            Folding::Variable
+        }
+    };
+    // A node that folds only when every input is a constant.
+    let over_constants = |inputs: &[Folding], maybe_null: bool| {
+        if inputs.iter().any(Folding::is_variable) {
+            Folding::Variable
+        } else {
+            Folding::Unknown { maybe_null }
+        }
+    };
     match expr {
+        // A calculated field is resolved above.
+        Expr::Column(_) | Expr::SourceColumn { .. } => Folding::Variable,
+        // A literal this check cannot read (one inference refuses).
         Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::BooleanLiteral(_)
-        | Expr::TypedLiteral { .. } => true,
-        // The `NULL` constant: no column, but no value either.
-        Expr::Null => false,
-        Expr::SourceColumn { .. } => false,
-        // Here "constant" means a constant that is not `NULL`: a `COALESCE`
-        // skips a `NULL` one. An operator over a `NULL` constant is `NULL`
-        // (so not constant here) unless it decides regardless (`false AND
-        // NULL`, `NULL IS NULL`), which the fold knows.
-        Expr::BinaryOp { op, lhs, rhs } => {
-            // `IS [NOT] DISTINCT FROM` takes `NULL` as a value, so it is a
-            // constant whenever both sides are constants, `NULL` included.
-            if matches!(
-                op,
-                super::ast::Operator::IsDistinctFrom | super::ast::Operator::IsNotDistinctFrom
-            ) && [lhs, rhs].into_iter().all(|side| {
-                constant_even_if_null(
-                    side,
-                    field_name,
-                    source_columns,
-                    fields_by_name,
-                    memo,
-                    depth,
-                )
-            }) {
-                return true;
+        | Expr::TypedLiteral { .. }
+        | Expr::Null => Folding::Unknown { maybe_null: false },
+        Expr::BinaryOp {
+            op: super::ast::Operator::And | super::ast::Operator::Or,
+            lhs,
+            rhs,
+        } => {
+            let inputs = [of(lhs), of(rhs)];
+            if !inputs.iter().any(Folding::is_variable) {
+                Folding::Unknown {
+                    maybe_null: inputs.iter().any(Folding::maybe_null),
+                }
+            } else if inputs.iter().any(|f| matches!(f, Folding::Unknown { .. })) {
+                // A constant operand this check cannot compute may decide
+                // it (`false AND x`), never to `NULL`.
+                Folding::Unknown { maybe_null: false }
+            } else {
+                Folding::Variable
             }
-            (reads_no_column(
-                lhs,
-                field_name,
-                source_columns,
-                fields_by_name,
-                memo,
-                depth + 1,
-            ) && reads_no_column(
-                rhs,
-                field_name,
-                source_columns,
-                fields_by_name,
-                memo,
-                depth + 1,
-            )) || folds_to_a_value(expr, field_name, source_columns, fields_by_name, depth)
         }
-        Expr::Not(operand) => reads_no_column(
-            operand,
-            field_name,
-            source_columns,
-            fields_by_name,
-            memo,
-            depth + 1,
-        ),
-        Expr::IsNull { expr: operand, .. } => constant_even_if_null(
-            operand,
-            field_name,
-            source_columns,
-            fields_by_name,
-            memo,
-            depth,
-        ),
-        // A `CASE` or `NULLIF` is constant when the planner folds it to a
-        // value; one it folds to `NULL` is not, and one this check cannot
-        // evaluate is constant if everything under it is.
-        Expr::Case { .. } => nullable_is_constant(
-            expr,
-            expr.logic_children(),
-            field_name,
-            source_columns,
-            fields_by_name,
-            memo,
-            depth,
-        ),
-        Expr::FunctionCall { name, args } if name == "NULLIF" => nullable_is_constant(
-            expr,
-            args.iter().collect(),
-            field_name,
-            source_columns,
-            fields_by_name,
-            memo,
-            depth,
-        ),
-        Expr::Negate(operand) => reads_no_column(
-            operand,
-            field_name,
-            source_columns,
-            fields_by_name,
-            memo,
-            depth + 1,
-        ),
-        Expr::Cast { expr, .. } => reads_no_column(
-            expr,
-            field_name,
-            source_columns,
-            fields_by_name,
-            memo,
-            depth + 1,
-        ),
-        // The planner reduces a `COALESCE` led by a constant to that
-        // constant and drops the rest unevaluated, so what follows the first
-        // argument does not matter.
-        Expr::FunctionCall { name, args } if name == "COALESCE" => {
-            // A `NULL` constant argument is dropped; the first other one
-            // decides.
-            for arg in args {
-                let null = matches!(
-                    fold_constant(
-                        arg,
-                        field_name,
-                        source_columns,
-                        fields_by_name,
-                        &mut HashMap::new(),
-                        depth + 1,
-                    ),
-                    Some(Constant::Null)
-                );
-                if !null {
-                    return reads_no_column(
-                        arg,
-                        field_name,
-                        source_columns,
-                        fields_by_name,
-                        memo,
-                        depth + 1,
-                    );
+        Expr::BinaryOp {
+            op: super::ast::Operator::IsDistinctFrom | super::ast::Operator::IsNotDistinctFrom,
+            lhs,
+            rhs,
+        } => over_constants(&[of(lhs), of(rhs)], false),
+        Expr::BinaryOp { lhs, rhs, .. } => strict(&[of(lhs), of(rhs)]),
+        Expr::Not(operand) | Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
+            strict(&[of(operand)])
+        }
+        Expr::IsNull { expr: operand, .. } => over_constants(&[of(operand)], false),
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            // Whether some outcome of the conditions this check cannot
+            // compute makes the `CASE` a constant.
+            let mut possible = false;
+            for (condition, result) in branches {
+                let decided = match of(condition) {
+                    // The planner keeps a condition that reads a column, so
+                    // the `CASE` is kept unless an earlier one decided it.
+                    Folding::Variable => {
+                        return if possible {
+                            Folding::Unknown { maybe_null: true }
+                        } else {
+                            Folding::Variable
+                        };
+                    }
+                    Folding::Known(Constant::Bool(false) | Constant::Null) => continue,
+                    Folding::Known(Constant::Bool(true)) => true,
+                    _ => false,
+                };
+                possible |= !of(result).is_variable();
+                if decided {
+                    return if possible {
+                        Folding::Unknown { maybe_null: true }
+                    } else {
+                        Folding::Variable
+                    };
                 }
             }
-            false
-        }
-        Expr::FunctionCall { name, args } => {
-            super::registry::lookup_aggregate_function(name).is_none()
-                && args.iter().all(|arg| {
-                    reads_no_column(
-                        arg,
-                        field_name,
-                        source_columns,
-                        fields_by_name,
-                        memo,
-                        depth + 1,
-                    )
-                })
-        }
-        Expr::Column(name) => {
-            let is_self_passthrough = name == field_name && source_columns.contains_key(name);
-            let Some(calc_field) = fields_by_name
-                .get(name.as_str())
-                .filter(|_| !is_self_passthrough)
-                .copied()
-            else {
-                return false;
-            };
-            if let Some(&constant) = memo.get(calc_field.name.as_str()) {
-                return constant;
+            possible |= otherwise
+                .as_deref()
+                .is_none_or(|otherwise| !of(otherwise).is_variable());
+            if possible {
+                Folding::Unknown { maybe_null: true }
+            } else {
+                Folding::Variable
             }
-            let constant = reads_no_column(
-                &calc_field.expr,
-                &calc_field.name,
-                source_columns,
-                fields_by_name,
-                memo,
-                depth + 1,
-            );
-            memo.insert(calc_field.name.as_str(), constant);
-            constant
+        }
+        Expr::FunctionCall { name, args } if name == "COALESCE" => {
+            for arg in args {
+                match of(arg) {
+                    Folding::Known(Constant::Null) => {}
+                    Folding::Known(_) => return Folding::Unknown { maybe_null: false },
+                    found @ (Folding::Unknown { .. } | Folding::Variable) => return found,
+                }
+            }
+            Folding::Unknown { maybe_null: true }
+        }
+        // `NULLIF(a, NULL)` is `a`; otherwise it may be `NULL`.
+        Expr::FunctionCall { name, args } if name == "NULLIF" => {
+            let inputs: Vec<Folding> = args.iter().map(&mut of).collect();
+            let maybe_null = match inputs.as_slice() {
+                [a, Folding::Known(Constant::Null)] => a.maybe_null(),
+                _ => true,
+            };
+            over_constants(&inputs, maybe_null)
+        }
+        Expr::FunctionCall { name, .. }
+            if super::registry::lookup_aggregate_function(name).is_some() =>
+        {
+            Folding::Variable
+        }
+        Expr::FunctionCall { args, .. } => {
+            let inputs: Vec<Folding> = args.iter().map(&mut of).collect();
+            strict(&inputs)
         }
     }
-}
-
-/// [`reads_no_column`] for a node that can fold to `NULL` (`CASE`,
-/// `NULLIF`), whose `children` are the expressions under it.
-fn nullable_is_constant<'f>(
-    expr: &Expr,
-    children: Vec<&Expr>,
-    field_name: &str,
-    source_columns: &HashMap<String, ValueType>,
-    fields_by_name: &HashMap<&'f str, &'f super::ast::FieldDef>,
-    memo: &mut HashMap<&'f str, bool>,
-    depth: usize,
-) -> bool {
-    match fold_constant(
-        expr,
-        field_name,
-        source_columns,
-        fields_by_name,
-        &mut HashMap::new(),
-        depth + 1,
-    ) {
-        Some(Constant::Null) => false,
-        Some(_) => true,
-        None => children.into_iter().all(|child| {
-            reads_no_column(
-                child,
-                field_name,
-                source_columns,
-                fields_by_name,
-                memo,
-                depth + 1,
-            )
-        }),
-    }
-}
-
-/// Whether `expr` is a constant, a `NULL` one included.
-fn constant_even_if_null<'f>(
-    expr: &Expr,
-    field_name: &str,
-    source_columns: &HashMap<String, ValueType>,
-    fields_by_name: &HashMap<&'f str, &'f super::ast::FieldDef>,
-    memo: &mut HashMap<&'f str, bool>,
-    depth: usize,
-) -> bool {
-    fold_constant(
-        expr,
-        field_name,
-        source_columns,
-        fields_by_name,
-        &mut HashMap::new(),
-        depth + 1,
-    )
-    .is_some()
-        || reads_no_column(
-            expr,
-            field_name,
-            source_columns,
-            fields_by_name,
-            memo,
-            depth + 1,
-        )
-}
-
-/// Whether the planner folds `expr` to a value that is not `NULL`.
-fn folds_to_a_value<'f>(
-    expr: &Expr,
-    field_name: &str,
-    source_columns: &HashMap<String, ValueType>,
-    fields_by_name: &HashMap<&'f str, &'f super::ast::FieldDef>,
-    depth: usize,
-) -> bool {
-    !matches!(
-        fold_constant(
-            expr,
-            field_name,
-            source_columns,
-            fields_by_name,
-            &mut HashMap::new(),
-            depth + 1,
-        ),
-        None | Some(Constant::Null)
-    )
 }
 
 /// [`fold_constant`] restricted to an exact value.
@@ -4492,11 +4453,12 @@ enum Truth {
     /// It folds to `NULL`: a `CASE` skips it like a false one, an `AND` or
     /// `OR` is not decided by it.
     Null,
-    /// It reads no column, but this check cannot compute its value (so what
-    /// the planner skips after it is unknown, and nothing after it is
-    /// refused).
+    /// It may be a constant this check cannot compute ([`Folding::Unknown`]),
+    /// so what the planner skips after it is unknown, and nothing after it
+    /// is refused.
     Unknown,
-    /// It reads a column: the planner evaluates what follows.
+    /// It reads a column the planner keeps: the planner simplifies what
+    /// follows.
     Variable,
 }
 
@@ -4506,29 +4468,19 @@ fn classify_condition<'f>(
     source_columns: &HashMap<String, ValueType>,
     fields_by_name: &HashMap<&'f str, &'f super::ast::FieldDef>,
 ) -> Truth {
-    match fold_constant(
+    match folding(
         expr,
         field_name,
         source_columns,
         fields_by_name,
         &mut HashMap::new(),
-        0,
-    ) {
-        Some(Constant::Bool(value)) => return Truth::Known(value),
-        Some(Constant::Null) => return Truth::Null,
-        _ => {}
-    }
-    if reads_no_column(
-        expr,
-        field_name,
-        source_columns,
-        fields_by_name,
         &mut HashMap::new(),
         0,
     ) {
-        Truth::Unknown
-    } else {
-        Truth::Variable
+        Folding::Known(Constant::Bool(value)) => Truth::Known(value),
+        Folding::Known(Constant::Null) => Truth::Null,
+        Folding::Known(_) | Folding::Unknown { .. } => Truth::Unknown,
+        Folding::Variable => Truth::Variable,
     }
 }
 
@@ -4548,8 +4500,10 @@ fn flatten_logic<'a>(expr: &'a Expr, op: super::ast::Operator, out: &mut Vec<&'a
 /// order and stops at the first one that is constant true; a branch whose
 /// condition is constant false is dropped with its result unevaluated; every
 /// other result is simplified, so a constant in it that raises (`CASE WHEN x
-/// > 0 THEN 1 / 0 END`) fails every row, whatever `x` is. `folded` is whether
-/// the planner reaches the `CASE` at all.
+/// > 0 THEN 1 / 0 END`) fails every row, whatever `x` is. What follows a
+/// condition the planner may fold to a value this check cannot compute
+/// ([`Truth::Unknown`]) may be dropped, so nothing there is refused. `folded`
+/// is whether the planner reaches the `CASE` at all.
 #[allow(clippy::too_many_arguments)]
 fn infer_case(
     branches: &[(Expr, Expr)],
@@ -4736,10 +4690,10 @@ fn comparison_type(
 }
 
 /// `folded` is whether Postgres's planner simplifies `expr`, so that a
-/// constant in it out of range for its type raises at plan time: false only
-/// under a `COALESCE` argument after a constant one, which the planner drops
-/// unevaluated (`COALESCE(5, 2147483647 + 1)` is `5`). The type rules hold
-/// either way; only the plan-time range refusals are skipped.
+/// constant in it out of range for its type raises at plan time: false under
+/// a `COALESCE` argument, `CASE` result or `AND`/`OR` operand the planner may
+/// drop unevaluated (`COALESCE(5, 2147483647 + 1)` is `5`). The type rules
+/// hold either way; only the plan-time range refusals are skipped.
 #[allow(clippy::too_many_arguments)]
 fn infer_expr(
     expr: &Expr,
@@ -5102,18 +5056,24 @@ fn infer_expr(
             // constant one and stops at the first other constant one, which
             // is the result: it drops the rest unevaluated, so no constant in
             // them raises.
+            // An argument that may be a constant this check cannot compute
+            // may stop it, so nothing after one is refused.
             let planned = if folded {
-                let mut memo = HashMap::new();
+                let (mut memo, mut fold_memo) = (HashMap::new(), HashMap::new());
                 args.iter()
                     .position(|arg| {
-                        reads_no_column(
+                        match folding(
                             arg,
                             field_name,
                             source_columns,
                             fields_by_name,
                             &mut memo,
+                            &mut fold_memo,
                             0,
-                        )
+                        ) {
+                            Folding::Known(Constant::Null) | Folding::Variable => false,
+                            Folding::Known(_) | Folding::Unknown { .. } => true,
+                        }
                     })
                     .map_or(args.len(), |first_constant| first_constant + 1)
             } else {

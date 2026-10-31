@@ -994,3 +994,144 @@ fn the_sql_renderers_spell_the_new_nodes_alike() {
         "(case when s.\"b\" then s.\"i4\" end)"
     );
 }
+
+/// A constant guard define cannot compute (a call over constants, which it
+/// has no value for) leaves what it guards unchecked: the planner may drop
+/// it. A guard that reads a column the planner keeps does not, nor one
+/// define computes. Each verdict is Postgres 15, 17 and 18's on `SELECT
+/// (<text>) FROM t WHERE false` (#1471).
+#[test]
+fn a_branch_after_a_constant_define_cannot_compute_is_not_refused() {
+    for (text, ty) in [
+        // The issue's three: `STRPOS('', '')` is 1 and `DATE_TRUNC(..)` the
+        // timestamp, so both `CASE` conditions are `NULL` and the `COALESCE`
+        // stops at its first argument, 1.
+        (
+            "CASE WHEN (STRPOS('','') <= NULLIF(-2147483649, -2147483649)) \
+             THEN ((9223372036854775807 % -9223372036854775808) * 2) ELSE (REAL '0') END",
+            F4,
+        ),
+        (
+            "CASE WHEN (NULLIF(TIMESTAMP '2024-02-29 12:00:00', TIMESTAMP '2024-02-29 12:00:00') \
+             = DATE_TRUNC('microseconds', TIMESTAMP '2024-02-29 12:00:00')) \
+             THEN COALESCE(-1 + -9223372036854775808) ELSE REAL '0' END",
+            F4,
+        ),
+        (
+            "COALESCE(NULLIF(STRPOS('', ''), NULLIF(9223372036854775807, 9223372036854775807)), \
+             (9223372036854775807 * 2147483648) - DOUBLE PRECISION '0')",
+            F8,
+        ),
+        // A `NULL` under a node define cannot fold does not make the guard
+        // read a column.
+        (
+            "COALESCE(NULLIF(STRPOS('a', 'a'), NULL), 2147483647 + 1)",
+            I4,
+        ),
+        (
+            "COALESCE(COALESCE(NULLIF(STRPOS('a', 'a'), NULL), 5), 2147483647 + 1)",
+            I4,
+        ),
+        (
+            "CASE WHEN NULLIF(STRPOS('a','a'), NULL) = 2 THEN 2147483647 + 1 ELSE 0 END",
+            I4,
+        ),
+        (
+            "CASE WHEN STRPOS('a','a') = 2 OR NULL THEN 2147483647 + 1 ELSE 0 END",
+            I4,
+        ),
+        (
+            "NULLIF(STRPOS('a','a'), NULL) = 2 AND 2147483647 + 1 > 0",
+            B,
+        ),
+        // A constant define cannot compute may decide a node that reads a
+        // column: `false AND x`, a strict `NULL + x`, a `CASE` it selects.
+        (
+            "CASE WHEN STRPOS('a','a') = 2 AND i4 > 0 THEN 2147483647 + 1 ELSE 0 END",
+            I4,
+        ),
+        (
+            "CASE WHEN NULLIF(STRPOS('a','a'), 1) + i4 > 0 THEN 2147483647 + 1 ELSE 0 END",
+            I4,
+        ),
+        (
+            "CASE WHEN (CASE WHEN STRPOS('a','a') = 2 THEN i4 > 0 ELSE FALSE END) \
+             THEN 2147483647 + 1 ELSE 0 END",
+            I4,
+        ),
+        (
+            "CASE WHEN (CASE WHEN STRPOS('a','a') = 2 THEN i4 > 0 END) \
+             THEN 2147483647 + 1 ELSE 0 END",
+            I4,
+        ),
+        // A constant that may be `NULL` makes a strict node `NULL`.
+        (
+            "CASE WHEN ((STRPOS('a','a') = 2 OR NULL) = b) THEN 2147483647 + 1 ELSE 0 END",
+            I4,
+        ),
+        (
+            "CASE WHEN -NULLIF(STRPOS('a','a'), 1) = i4 THEN 2147483647 + 1 ELSE 0 END",
+            I4,
+        ),
+        (
+            "CASE WHEN NOT (NULLIF(STRPOS('a','a'), 1) = 1) THEN 2147483647 + 1 ELSE 0 END",
+            I4,
+        ),
+        (
+            "CASE WHEN NULLIF(STRPOS('a','a'), 1) IS NULL THEN 0 ELSE 2147483647 + 1 END",
+            I4,
+        ),
+        (
+            "CASE WHEN COALESCE(NULLIF(1, 1), STRPOS('a','a')) = 2 \
+             THEN 2147483647 + 1 ELSE 0 END",
+            I4,
+        ),
+        (
+            "CASE WHEN STRPOS(t, NULLIF('a', 'a')) = 1 THEN 2147483647 + 1 ELSE 0 END",
+            I4,
+        ),
+        (
+            "COALESCE(CASE WHEN STRPOS('a','a') = 1 THEN 5 ELSE i4 END, 2147483647 + 1)",
+            I4,
+        ),
+        // Through a calculated field.
+        (
+            "NULLIF(STRPOS('a','a'), NULL) AS g, \
+             CASE WHEN g = 2 THEN 2147483647 + 1 ELSE 0 END",
+            I4,
+        ),
+    ] {
+        assert_type(text, ty);
+    }
+    // Postgres simplifies these: the guard reads a column whatever the
+    // constant is, define computes it, or the overflow is not behind it.
+    for text in [
+        "CASE WHEN i4 > 0 THEN 2147483647 + 1 ELSE 0 END",
+        "CASE WHEN NULLIF(STRPOS('a','a'), NULL) = i4 THEN 2147483647 + 1 ELSE 0 END",
+        "CASE WHEN STRPOS('a','a') + i4 > 0 THEN 2147483647 + 1 ELSE 0 END",
+        "CASE WHEN STRPOS('a','a') IS DISTINCT FROM i4 THEN 2147483647 + 1 ELSE 0 END",
+        "CASE WHEN STRPOS('a','a') = i4 OR b THEN 2147483647 + 1 ELSE 0 END",
+        "COALESCE(i4, 2147483647 + 1)",
+        "COALESCE(NULLIF(i4, NULL), 2147483647 + 1)",
+        "COALESCE(STRPOS('a','a') + i4, 2147483647 + 1)",
+        "COALESCE(NULLIF(1, 1), 2147483647 + 1)",
+        "COALESCE(CASE WHEN i4 > 0 THEN STRPOS('a','a') END, 2147483647 + 1)",
+        "COALESCE(CASE WHEN 1 = 1 THEN i4 WHEN STRPOS('a','a') = 1 THEN 5 END, 2147483647 + 1)",
+        "COALESCE(CASE WHEN 1 = 2 THEN STRPOS('a','a') ELSE i4 END, 2147483647 + 1)",
+        "COALESCE(COALESCE(i4, STRPOS('a','a')), 2147483647 + 1)",
+        "CASE WHEN i4 > 0 AND b THEN 2147483647 + 1 ELSE 0 END",
+        "CASE WHEN STRPOS(t, 'a') = 1 THEN 2147483647 + 1 ELSE 0 END",
+        "CASE WHEN ((NULLIF(STRPOS('a','a'), 1) = 1 AND i4 > 0) = b) \
+         THEN 2147483647 + 1 ELSE 0 END",
+        "CASE WHEN (STRPOS('a','a') + i4) IS NULL THEN 2147483647 + 1 ELSE 0 END",
+        "STRPOS('a','a') AS g, CASE WHEN g + i4 > 0 THEN 2147483647 + 1 ELSE 0 END",
+        "CASE WHEN 1 = 1 THEN 2147483647 + 1 ELSE 0 END",
+        "CASE WHEN 1 = 2 THEN 0 ELSE 2147483647 + 1 END",
+        "CASE WHEN NULLIF(1, 1) = 1 THEN 0 ELSE 2147483647 + 1 END",
+        // The guard's own constants are simplified, whatever it is.
+        "CASE WHEN STRPOS('a','a') = 2147483647 + 1 THEN 0 ELSE 1 END",
+        "COALESCE(STRPOS('a','a') + 2147483647 * 2, 0)",
+    ] {
+        assert_refused(text, "out of range");
+    }
+}

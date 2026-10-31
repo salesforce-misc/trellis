@@ -671,6 +671,11 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
         "NULLIF(i4a, 2147483647 + 1)",
         "NULLIF(1.5 / 0, na)",
         "i4a IS NULL OR 1.5 / 0 = 1",
+        // A guard over a constant call define cannot compute, beside a
+        // column the planner keeps whatever the call's value (#1471).
+        "CASE WHEN STRPOS('a', 'a') + i4a > 0 THEN 2147483647 + 1 ELSE 0 END",
+        "CASE WHEN NULLIF(STRPOS('a', 'a'), NULL) = i4a THEN 2147483647 + 1 ELSE 0 END",
+        "COALESCE(STRPOS('a', 'a') + i4a, 2147483647 + 1)",
     ];
     for text in refused {
         match check_text(text, None) {
@@ -694,6 +699,18 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
         "NOT (1 = 2 AND 1.5 / 0 = 1)",
         "(1 = 2 AND 1.5 / 0 = 1) OR ba",
         "COALESCE(i4a, CASE WHEN 1 = 1 THEN 1 ELSE 1.5 / 0 END)",
+        // Behind a constant define cannot compute, which the planner folds
+        // so that it drops the branch or the later argument (#1471).
+        "CASE WHEN (STRPOS('','') <= NULLIF(-2147483649, -2147483649)) \
+         THEN ((9223372036854775807 % -9223372036854775808) * 2) ELSE (REAL '0') END",
+        "CASE WHEN (NULLIF(TIMESTAMP '2024-02-29 12:00:00', TIMESTAMP '2024-02-29 12:00:00') \
+         = DATE_TRUNC('microseconds', TIMESTAMP '2024-02-29 12:00:00')) \
+         THEN COALESCE(-1 + -9223372036854775808) ELSE REAL '0' END",
+        "COALESCE(NULLIF(STRPOS('', ''), NULLIF(9223372036854775807, 9223372036854775807)), \
+         (9223372036854775807 * 2147483648) - DOUBLE PRECISION '0')",
+        "COALESCE(COALESCE(NULLIF(STRPOS('a', 'a'), NULL), 5), 2147483647 + 1)",
+        "CASE WHEN STRPOS('a', 'a') = 2 AND i4a > 0 THEN 2147483647 + 1 ELSE 0 END",
+        "CASE WHEN NULLIF(STRPOS('a', 'a'), 1) + i4a > 0 THEN 2147483647 + 1 ELSE 0 END",
         // A runtime divisor is left to the rows.
         "CASE WHEN i4a > 0 THEN na / i4a END",
         "i4a <> 0 AND na / i4a > 1",
@@ -1291,6 +1308,12 @@ fn a_range_overflow_around_a_constant_call_is_a_known_gap() {
         "2147483647 + CHAR_LENGTH('abc')",
         "9223372036854775807 + REGEXP_COUNT('a', 'a*')",
         "CHAR_LENGTH('abc') + 2147483647",
+        // A branch behind a guard over such a call, which define leaves
+        // unchecked since the planner may drop it (#1471).
+        "CASE WHEN NULLIF(STRPOS('a', 'a'), NULL) = 1 THEN 2147483647 + 1 ELSE 0 END",
+        "CASE WHEN NULLIF(STRPOS('a', 'a'), NULL) = 2 THEN 0 ELSE 2147483647 + 1 END",
+        "CASE WHEN STRPOS('a', 'a') = 1 AND i4a > 0 THEN 2147483647 + 1 ELSE 0 END",
+        "COALESCE(NULLIF(STRPOS('a', 'a'), 1), 2147483647 + 1)",
     ] {
         match check_text(text, None) {
             Ok(Agreement::KnownGap(_)) => {}
