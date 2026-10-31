@@ -1571,6 +1571,11 @@ const COOLING_BACKFILL_GROUP_BASIS: &[(&str, &str)] = &[
 const NO_ONE_TO_ONE_JOIN: &str = "it breaks the 1-1 JOIN path, which no tier draws until \
      milestone 9 (#1404); `join_one_to_one_interleavings` pins it";
 
+/// Why the concurrent tiers don't run a plant of a target's feed to its
+/// readers: no tier draws a chain in one instance until #1488.
+const NO_CHAIN: &str = "it breaks a target's feed to a definition reading it, and no tier \
+     draws a chain in one instance until #1488; `join_one_to_one_over_targets` pins it";
+
 /// A tier's `not_gated`: `listed`, the 1-1 plants no tier gates and the
 /// `JOIN` plants, with their reasons.
 fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
@@ -1578,6 +1583,7 @@ fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'st
     let mut out: Vec<(&'static str, &'static str)> = listed.to_vec();
     for (plant, why) in not_on_path(&[PlantPath::Join], NO_JOIN)
         .chain(not_on_path(&[PlantPath::OneToOneJoin], NO_ONE_TO_ONE_JOIN))
+        .chain(not_on_path(&[PlantPath::Chain], NO_CHAIN))
         .chain(ONE_TO_ONE_PINNED.iter().copied())
     {
         if !out.iter().any(|(listed, _)| *listed == plant) {

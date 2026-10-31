@@ -89,6 +89,10 @@ pub enum PlantPath {
     /// pinned by `trellis`'s `join_one_to_one_interleavings` until the
     /// generative tier of milestone 9 (#1404) gates them.
     OneToOneJoin,
+    /// The target-mutation seam's feed to a definition reading another's
+    /// target: no tier draws a chain in one instance yet (#1488), so these
+    /// plants are pinned by `trellis`'s `join_one_to_one_over_targets`.
+    Chain,
 }
 
 /// The path `plant` breaks.
@@ -130,6 +134,7 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::Join1TruncateDefAfterLock
         | Plant::Join1FanOutHeldRow
         | Plant::Join1ReleaseNoRederive => PlantPath::OneToOneJoin,
+        Plant::SeamTokenEarly => PlantPath::Chain,
     }
 }
 
@@ -148,6 +153,8 @@ pub fn plant_reaches(plant: &str, key_space: &KeySpace) -> bool {
         PlantPath::GroupBasisWriter => aggregate || join,
         PlantPath::Join => join,
         PlantPath::OneToOneJoin => matches!(key_space, KeySpace::JoinOneToOne(_)),
+        // A reader of a target can be of any kind.
+        PlantPath::Chain => true,
     }
 }
 
@@ -650,6 +657,10 @@ mod tests {
                 PlantPath::OneToOneJoin => {
                     assert!(!plant_reaches(name, &one_to_one), "{name}");
                     assert!(!plant_reaches(name, &group_by), "{name}");
+                }
+                PlantPath::Chain => {
+                    assert!(plant_reaches(name, &one_to_one), "{name}");
+                    assert!(plant_reaches(name, &group_by), "{name}");
                 }
             }
         }

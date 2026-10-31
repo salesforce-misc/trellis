@@ -78,6 +78,11 @@ below holds for them as it does for a captured side.
   upstream has converged" ([#1489](https://github.com/salesforce-misc/trellis/issues/1489)).
 - **An aggregate or JOIN target** as a side is held to the uniqueness rule
   alone.
+- A target is never truncated as a change of its own: a `TRUNCATE` of its
+  upstream's source reaches the JOIN as a delete of every row, in one
+  upstream transaction. For a `b` side that is a change of `b` like any
+  other, so it starts no rebuild, and its fan-out over every `a` row those
+  rows match counts toward the cap below.
 
 ### Each side keeps a Trellis-owned copy, ordered by ADR-0002's 1-1 ledger
 
