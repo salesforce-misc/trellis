@@ -445,6 +445,7 @@ pub fn chain_off(program: &Program) -> Option<Program> {
             pk_col: source.pk_col.clone(),
             columns,
             unique_cols: Vec::new(),
+            unique_sets: Vec::new(),
             partitioning: None,
         });
     }

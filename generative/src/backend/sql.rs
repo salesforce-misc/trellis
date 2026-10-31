@@ -357,7 +357,8 @@ pub(super) fn assignment(
 /// Creates `table` as a source table: one column per [`Column`], the primary
 /// key declared from its own [`crate::model::PRIMARY_KEY_VALUE_TYPE`]
 /// (`bigint`), a single-column `UNIQUE` constraint
-/// on every column named in `table.unique_cols`.
+/// on every column named in `table.unique_cols`, and a composite one on
+/// every set in `table.unique_sets`.
 ///
 /// `schema` qualifies the table's name (`None` leaves it to the session's
 /// `search_path`, which is the instance schema): a source table that more than
@@ -394,6 +395,16 @@ pub(super) async fn create_source_table(
             }
         }
     }
+    for set in &table.unique_sets {
+        sql.push_str(", unique (");
+        sql.push_str(
+            &set.iter()
+                .map(|c| quote_ident(c))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        sql.push(')');
+    }
     sql.push(')');
     raw.batch_execute(&sql).await?;
     Ok(())
@@ -405,8 +416,8 @@ pub(super) async fn create_source_table(
 /// `DEFAULT` leaf).
 fn partitioned_source_ddl(name: &str, table: &Table, partitioning: &Partitioning) -> String {
     assert!(
-        table.unique_cols.is_empty(),
-        "a partitioned table can't carry a single-column UNIQUE constraint — a generator bug"
+        table.unique_cols.is_empty() && table.unique_sets.is_empty(),
+        "a partitioned table can't carry a UNIQUE constraint — a generator bug"
     );
     let key = quote_ident(&partitioning.column);
     let mut columns: Vec<String> = table
@@ -1129,6 +1140,7 @@ mod tests {
                 },
             ],
             unique_cols: Vec::new(),
+            unique_sets: Vec::new(),
             partitioning: None,
         };
         let ddl = |strategy| {

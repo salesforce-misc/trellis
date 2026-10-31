@@ -30,6 +30,12 @@ pub struct Table {
     /// primary key — see `pk_col`). The generator's tables leave it empty;
     /// a hand-built pin sets it to give a source a unique column.
     pub unique_cols: Vec<String>,
+    /// Column sets that carry a composite `UNIQUE` constraint (a set of one
+    /// column is [`Table::unique_cols`]'s). Every column must appear in
+    /// `columns`. A row with a `NULL` in the set conflicts with nothing, as
+    /// Postgres has it. The generator's tables leave it empty; the 1-1 JOIN
+    /// tier's joined table sets it, so a composite `ON` is unique.
+    pub unique_sets: Vec<Vec<String>>,
     /// How the table is partitioned (ADR-0017), or `None` for a plain table.
     /// A partitioned table's primary key is `(pk_col, column)`, the
     /// partition column is `NOT NULL`, and it has no `UNIQUE` constraint
@@ -103,6 +109,7 @@ impl Table {
             pk_col,
             columns,
             unique_cols: Vec::new(),
+            unique_sets: Vec::new(),
             partitioning: None,
         }
     }

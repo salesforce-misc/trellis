@@ -2366,6 +2366,7 @@ pub fn noise_table(name: &str, pk_col: &str, extra_col: &str, extra_type: ValueT
         ],
         unique_cols: Vec::new(),
         partitioning: None,
+        unique_sets: Vec::new(),
     }
 }
 

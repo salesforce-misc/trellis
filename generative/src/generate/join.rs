@@ -81,6 +81,7 @@ pub fn join_tables() -> Vec<Table> {
         }))
         .collect(),
         unique_cols: Vec::new(),
+        unique_sets: Vec::new(),
         partitioning: None,
     };
     vec![

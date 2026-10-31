@@ -1109,6 +1109,7 @@ fn pin_table(
             })
             .collect(),
         unique_cols: unique.iter().map(|c| c.to_string()).collect(),
+        unique_sets: Vec::new(),
         partitioning: None,
     }
 }
