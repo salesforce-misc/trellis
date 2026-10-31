@@ -290,7 +290,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { platform: arm64-darwin, runner: macos-14 }
+          - { platform: arm64-darwin, runner: macos-15 }
           - { platform: x86_64-darwin, runner: macos-15-intel }
     steps:
       - uses: actions/checkout@v4
