@@ -1,6 +1,6 @@
 [package]
 name = "trellis_ruby"
-version = "0.1.0-gamma"
+version = "0.1.0"
 edition.workspace = true
 publish = false
 
