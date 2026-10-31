@@ -5,9 +5,10 @@
 //! (C5). The driver seals both phases itself, and drains one batch at a time
 //! with `drain_once` on a worker name the test picks, optionally frozen at a
 //! [`PausePoint`] (`trellis::staging::interleave`). Nothing here waits for
-//! convergence. The one wait, [`Driver::wait_blocked_behind`], waits
-//! for a backend to queue on a lock a frozen worker holds, which the test has
-//! forced; it is not a race.
+//! convergence. The waits are [`Driver::wait_blocked_behind`], for a backend
+//! to queue on a lock a frozen worker holds, which the test has forced, and
+//! [`Driver::seal`], for the seal gate's backpressure to clear; neither is a
+//! race.
 
 #![allow(dead_code)]
 
@@ -32,6 +33,11 @@ use trellis::staging::{
 };
 
 pub const WAKE: &str = "interleave_wake";
+
+/// How long [`Driver::seal`] waits for the seal gate: long enough for a
+/// server process stalled on a loaded box, short enough that a transaction
+/// the test itself left open fails the test in one timeout.
+pub const SEAL_GATE_WAIT: Duration = Duration::from_secs(60);
 
 /// Splits `ddl` into its schema statements and its `insert into …` seed rows.
 /// A group-basis aggregate over a partitioned source is defined while the
@@ -229,10 +235,82 @@ impl Driver {
 
     /// Seals both phases and returns the sealed batch. Retires every drained
     /// segment it can first, so a test never runs the four-slot ring full.
+    ///
+    /// The seal gate holds while a transaction that was in flight at the
+    /// previous batch's fence is still open. That is backpressure, which the
+    /// engine's own sealer retries; here the holder is usually a server
+    /// process finishing on a loaded box (autovacuum's analyze, say, which
+    /// takes an xid for its statistics writes). So this waits up to
+    /// [`SEAL_GATE_WAIT`] for it. A holder the test itself leaves open never
+    /// goes away, and the panic names every open xid-holding session.
     pub async fn seal(&mut self) -> i64 {
-        self.try_seal()
+        self.seal_within(SEAL_GATE_WAIT)
             .await
-            .expect("seal phase 1: the seal gate is blocked")
+            .unwrap_or_else(|held| panic!("seal phase 1: {held}"))
+    }
+
+    /// [`Self::seal`], waiting at most `wait` for the seal gate; `Err` names
+    /// the sessions holding an xid open when it ran out.
+    pub async fn seal_within(&mut self, wait: Duration) -> Result<i64, String> {
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(batch) = self.try_seal().await {
+                return Ok(batch);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "the seal gate stayed blocked for {wait:?}; transactions holding an xid: {}",
+                    self.xid_holders().await
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Every session (and prepared transaction) holding an xid open, one per
+    /// line: what a blocked seal gate is waiting on.
+    async fn xid_holders(&self) -> String {
+        let sessions = self
+            .ctl
+            .query(
+                "select pid, state, backend_xid::text, backend_type, \
+                        coalesce(left(query, 120), '') \
+                 from pg_stat_activity \
+                 where backend_xid is not null and pid <> pg_backend_pid()",
+                &[],
+            )
+            .await
+            .expect("read pg_stat_activity");
+        let prepared = self
+            .ctl
+            .query("select gid, transaction::text from pg_prepared_xacts", &[])
+            .await
+            .expect("read pg_prepared_xacts");
+        let mut lines: Vec<String> = sessions
+            .iter()
+            .map(|row| {
+                format!(
+                    "pid {} ({}, {}) xid {}: {}",
+                    row.get::<_, i32>(0),
+                    row.get::<_, String>(3),
+                    row.get::<_, Option<String>>(1).unwrap_or_default(),
+                    row.get::<_, String>(2),
+                    row.get::<_, String>(4)
+                )
+            })
+            .collect();
+        lines.extend(prepared.iter().map(|row| {
+            format!(
+                "prepared {} xid {}",
+                row.get::<_, String>(0),
+                row.get::<_, String>(1)
+            )
+        }));
+        if lines.is_empty() {
+            "none".to_string()
+        } else {
+            lines.join("; ")
+        }
     }
 
     /// [`Self::seal`], or `None` when the seal gate refuses it: a
