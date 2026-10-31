@@ -507,6 +507,11 @@ async fn orphan_keys(
 ) -> Result<Vec<String>, ApplyError> {
     let target = ddl::qualified_target_table_ident(&plan.target);
     let k_tgt = ddl::pk_key_sql_expr(&plan.pk, Some("t"));
+    // The ledger's key text is `text collate "C"`, and a target key keeps its
+    // source key's collation (`und-x-icu`, say): compared bare, the two
+    // implicit collations conflict and Postgres chooses none. Naming `"C"` on
+    // the target's side leaves the ledger column bare, so its primary-key
+    // index serves the probe (#1520).
     let started = Instant::now();
     let row = txn
         .query_one(
@@ -515,7 +520,8 @@ async fn orphan_keys(
                      select {k_tgt} as __k from {target} t \
                  ) t \
                  where not exists (select 1 from {ledger} l \
-                                   where l.{key} = t.__k and not l.{tombstone}) \
+                                   where l.{key} = t.__k collate \"C\" \
+                                     and not l.{tombstone}) \
                    and not exists (select 1 from poison p \
                                    join transform_definitions d on d.id = p.transform_id \
                                    where p.src_table = $2 and p.key = t.__k \
