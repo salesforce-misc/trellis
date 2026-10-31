@@ -897,6 +897,56 @@ pub fn render_join_select(def: &TransformDef) -> String {
     )
 }
 
+/// The SQL oracle of a 1-1 `JOIN` definition (ADR-0021): the definition's own
+/// `select … from a [left] join b on …` with no `GROUP BY`, `a`'s primary key
+/// first as text, then every field as text. One row per `FROM` row that the
+/// join keeps: every one for a `LEFT` join, only the matched ones for an
+/// `INNER` join.
+///
+/// # Panics
+///
+/// If `def` isn't a 1-1 `JOIN`.
+pub fn render_join_one_to_one_select(def: &TransformDef, pk_column: &str) -> String {
+    let KeySpace::JoinOneToOne(join) = &def.key_space else {
+        panic!(
+            "render_join_one_to_one_select: {:?} is not a 1-1 JOIN",
+            def.target
+        );
+    };
+    let column =
+        |table: &str, column: &str| format!("{}.{}", quote_ident(table), quote_ident(column));
+    let mut select = vec![format!("{}::text", column(&def.source, pk_column))];
+    for field in &def.fields {
+        select.push(format!(
+            "({})::text as {}",
+            render_join_expr(&field.expr),
+            quote_ident(&field.name)
+        ));
+    }
+    let on: Vec<String> = join
+        .on
+        .iter()
+        .map(|on| {
+            format!(
+                "{} = {}",
+                column(&on.lhs.table, &on.lhs.column),
+                column(&on.rhs.table, &on.rhs.column)
+            )
+        })
+        .collect();
+    format!(
+        "select {} from {} {} {} on {}",
+        select.join(", "),
+        quote_ident(&def.source),
+        match join.kind {
+            trellis::dev::defs::ast::JoinKind::Inner => "join",
+            trellis::dev::defs::ast::JoinKind::Left => "left join",
+        },
+        quote_ident(&join.right),
+        on.join(" and "),
+    )
+}
+
 /// A searched `CASE` as SQL, each part rendered by `render`.
 fn render_case(
     branches: &[(Expr, Expr)],
@@ -992,6 +1042,33 @@ async fn join_sql_oracle(pool: &Pool, def: &TransformDef) -> Result<Rows, Oracle
     Ok(rows)
 }
 
+/// Runs [`render_join_one_to_one_select`] and keys its rows the way
+/// [`crate::backend::Backend::snapshot`] keys a 1-1 target's: by `a`'s primary
+/// key as text, holding the fields only.
+async fn join_one_to_one_sql_oracle(
+    pool: &Pool,
+    def: &TransformDef,
+    pk_column: &str,
+) -> Result<Rows, OracleError> {
+    let client = pool.get().await?;
+    let db_rows = client
+        .query(render_join_one_to_one_select(def, pk_column).as_str(), &[])
+        .await?;
+    let mut rows: Rows = BTreeMap::new();
+    for db_row in db_rows {
+        let pk: Option<String> = db_row.get(0);
+        let pk = pk.expect("primary key column is never NULL");
+        let by_column = def
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(i, field)| (field.name.clone(), db_row.get::<_, Option<String>>(i + 1)))
+            .collect();
+        rows.insert(pk, by_column);
+    }
+    Ok(rows)
+}
+
 /// Runs the comparison for `def`: reads the SQL oracle from `pool`, strips
 /// the pk column from the caller-supplied persisted `target` rows (as read back
 /// by [`crate::backend::Backend::snapshot`]), and diffs them.
@@ -1009,6 +1086,16 @@ pub async fn check(
         let sql = join_sql_oracle(pool, def).await?;
         return Ok(OracleReport {
             target_vs_sql: diff(&def.target, &sql, target, &|_| Comparison::Exact),
+            program: format!("{program:#?}"),
+        });
+    }
+    // A 1-1 `JOIN`'s is its own query without `GROUP BY`, compared byte for
+    // byte: its fields are Postgres's own expressions over both tables.
+    if matches!(def.key_space, KeySpace::JoinOneToOne(_)) {
+        let sql = join_one_to_one_sql_oracle(pool, def, pk_column).await?;
+        let target = target_fields(target, pk_column);
+        return Ok(OracleReport {
+            target_vs_sql: diff(&def.target, &sql, &target, &|_| Comparison::Exact),
             program: format!("{program:#?}"),
         });
     }

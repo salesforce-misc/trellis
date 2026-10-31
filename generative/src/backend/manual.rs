@@ -1182,10 +1182,9 @@ impl super::Backend for ManualBackend {
                     sql::read_aggregate_table(&self.raw, &qualified, &group_by_names, &def.fields)
                         .await?
                 }
-                KeySpace::JoinOneToOne(_) => {
-                    unreachable!("the generator never produces a 1-1 JOIN definition")
-                }
-                KeySpace::OneToOne => {
+                // The 1-1 JOIN tier: a target keyed by `a`'s primary key,
+                // read as a 1-1 target is.
+                KeySpace::JoinOneToOne(_) | KeySpace::OneToOne => {
                     // `source_primary_key` accepts an arbitrary-arity source
                     // primary key, and the
                     // engine's own 1-1 target DDL mirrors a composite key in
