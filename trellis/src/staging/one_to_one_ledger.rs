@@ -171,8 +171,11 @@ pub(crate) async fn lock_entries(
     } else {
         "true"
     };
-    // Planted bug: a hidden ledger's page inserts no placeholders. See
-    // `crate::plant`.
+    // Planted bug: a hidden ledger's page inserts no placeholders, and the
+    // entry-count check below is skipped for it, so the page locks the
+    // entries there are and takes no lock for a key with none. (With the
+    // check, the page would retry forever instead of losing its change.)
+    // See `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
     let no_placeholders =
         crate::plant::fires(crate::plant::Plant::Join1NoPlaceholder, ledger.hidden);
@@ -231,7 +234,7 @@ pub(crate) async fn lock_entries(
         )
         .await?
         .len();
-        if locked < existing.len() {
+        if locked < existing.len() && !no_placeholders {
             return Err(ApplyError::LedgerEntryCollected {
                 target: ledger.label.clone(),
             });

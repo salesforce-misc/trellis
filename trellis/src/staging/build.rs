@@ -3083,8 +3083,18 @@ pub async fn settle_builds_with(pool: &Pool, chunk_rows: i64) {
             .expect("claim build work")
         };
         for chunk in &claimed {
+            let failures_before = failures_of(pool, chunk).await;
             run_claimed(pool, chunk, CLAIMED_BY, &options).await;
-            progressed |= !deferred(pool, chunk).await;
+            // A chunk that failed and was released for a retry after a
+            // backoff, without a charge, is not progress: a transient
+            // failure is retried forever, so a chunk that fails that way
+            // every time would otherwise keep this loop alive. (A charged
+            // failure ends in a pause, and a narrowing is released at once.)
+            let failures = failures_of(pool, chunk).await;
+            let retried = failures.0 != failures_before.0
+                && failures.1 == failures_before.1
+                && backing_off(pool, chunk).await;
+            progressed |= !retried && !deferred(pool, chunk).await;
         }
         for id in &building {
             progressed |= try_complete(pool, *id).await.expect("complete a build");
@@ -3096,11 +3106,43 @@ pub async fn settle_builds_with(pool: &Pool, chunk_rows: i64) {
         } else {
             assert!(
                 last_progress.elapsed() < STALL,
-                "the running re-derive builds {building:?} made no progress for {STALL:?}"
+                "the running re-derive builds {building:?} made no progress for {STALL:?} \
+                 (a chunk that fails and retries every time is no progress)"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+}
+
+/// The failures `chunk`'s row has recorded and how many were charged
+/// (`(0, 0)` once the row is gone).
+#[cfg(any(test, feature = "internals"))]
+async fn failures_of(pool: &Pool, chunk: &ClaimedChunk) -> (i32, i32) {
+    let client = pool.get().await.expect("acquire a connection");
+    client
+        .query_opt(
+            "select attempts, charged from backfill_chunks where id = $1",
+            &[&chunk.id],
+        )
+        .await
+        .expect("read a build row")
+        .map_or((0, 0), |row| (row.get(0), row.get(1)))
+}
+
+/// Whether `chunk`'s row waits out a retry backoff, unclaimed.
+#[cfg(any(test, feature = "internals"))]
+async fn backing_off(pool: &Pool, chunk: &ClaimedChunk) -> bool {
+    let client = pool.get().await.expect("acquire a connection");
+    client
+        .query_one(
+            "select exists (select 1 from backfill_chunks \
+             where id = $1 and not done and claimed_by is null \
+               and last_error is not null and next_attempt_at > now())",
+            &[&chunk.id],
+        )
+        .await
+        .expect("read a build row")
+        .get(0)
 }
 
 /// Whether `chunk`, just run, gave its claim back to wait on capture or on
