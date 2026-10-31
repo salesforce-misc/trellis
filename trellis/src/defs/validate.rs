@@ -3777,8 +3777,10 @@ fn fold_constant<'f>(
     memo: &mut HashMap<&'f str, Option<Constant>>,
     depth: usize,
 ) -> Option<Constant> {
-    // Inference has already refused a cycle; this bounds a hand-built one.
-    if depth > fields_by_name.len() + 64 {
+    // Inference has already refused a cycle; this bounds a hand-built one. A
+    // definition's expression, its fields inlined, is at most
+    // `MAX_EXPRESSION_DEPTH` high, so the bound never cuts a real one short.
+    if depth > fields_by_name.len() + MAX_EXPRESSION_DEPTH {
         return None;
     }
     let mut recurse = |expr: &Expr, field_name: &str| {
@@ -4058,8 +4060,9 @@ impl Folding {
     }
 }
 
-/// How the planner folds `expr`: to a value [`fold_constant`] computes, to a
-/// constant it cannot compute, or not at all (it reads a column). The rules
+/// How the planner folds `expr`: to a value [`fold_constant`] computes (or
+/// `NULL`, for a strict node over a `NULL` input), to a constant it cannot
+/// compute, or not at all (it reads a column). The rules
 /// are `eval_const_expressions`': a strict operator or function is `NULL` when
 /// an input is the `NULL` constant, whatever the others read; `AND` and `OR`
 /// are decided by one constant operand; a `CASE` is its first branch whose
@@ -4079,8 +4082,9 @@ fn folding<'f>(
     fold_memo: &mut HashMap<&'f str, Option<Constant>>,
     depth: usize,
 ) -> Folding {
-    // Inference has already refused a cycle; this bounds a hand-built one.
-    if depth > fields_by_name.len() + 64 {
+    // Inference has already refused a cycle; this bounds a hand-built one
+    // (and, as in `fold_constant`, never a real one).
+    if depth > fields_by_name.len() + MAX_EXPRESSION_DEPTH {
         return Folding::Variable;
     }
     if let Some(value) = fold_constant(
@@ -4128,10 +4132,17 @@ fn folding<'f>(
             depth + 1,
         )
     };
-    // A strict node: `NULL` if an input may be the `NULL` constant, a
-    // constant if every input is one, otherwise kept.
+    // A strict node: `NULL` if an input is the `NULL` constant (the planner
+    // replaces a strict call with a `NULL` input by `NULL` whatever its other
+    // inputs read: `STRPOS(NULLIF('a', 'a'), t)`), maybe `NULL` if an input
+    // may be, a constant if every input is one, otherwise kept.
     let strict = |inputs: &[Folding]| {
-        if inputs.iter().any(Folding::maybe_null) {
+        if inputs
+            .iter()
+            .any(|f| matches!(f, Folding::Known(Constant::Null)))
+        {
+            Folding::Known(Constant::Null)
+        } else if inputs.iter().any(Folding::maybe_null) {
             Folding::Unknown { maybe_null: true }
         } else if inputs.iter().all(|f| !f.is_variable()) {
             Folding::Unknown { maybe_null: false }

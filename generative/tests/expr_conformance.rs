@@ -676,6 +676,10 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
         "CASE WHEN STRPOS('a', 'a') + i4a > 0 THEN 2147483647 + 1 ELSE 0 END",
         "CASE WHEN NULLIF(STRPOS('a', 'a'), NULL) = i4a THEN 2147483647 + 1 ELSE 0 END",
         "COALESCE(STRPOS('a', 'a') + i4a, 2147483647 + 1)",
+        // A strict call with a `NULL` constant input folds to `NULL`, so the
+        // planner goes on past it.
+        "COALESCE(STRPOS(NULLIF('a', 'a'), ta), 2147483647 + 1)",
+        "CASE WHEN STRPOS(NULLIF('a', 'a'), ta) = 1 THEN 0 ELSE 2147483647 + 1 END",
     ];
     for text in refused {
         match check_text(text, None) {
@@ -711,6 +715,7 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
         "COALESCE(COALESCE(NULLIF(STRPOS('a', 'a'), NULL), 5), 2147483647 + 1)",
         "CASE WHEN STRPOS('a', 'a') = 2 AND i4a > 0 THEN 2147483647 + 1 ELSE 0 END",
         "CASE WHEN NULLIF(STRPOS('a', 'a'), 1) + i4a > 0 THEN 2147483647 + 1 ELSE 0 END",
+        "COALESCE(CASE WHEN STRPOS('a', 'a') = 1 THEN 5 WHEN i4a > 0 THEN 6 END, 2147483647 + 1)",
         // A runtime divisor is left to the rows.
         "CASE WHEN i4a > 0 THEN na / i4a END",
         "i4a <> 0 AND na / i4a > 1",

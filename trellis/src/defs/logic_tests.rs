@@ -1094,6 +1094,23 @@ fn a_branch_after_a_constant_define_cannot_compute_is_not_refused() {
             "COALESCE(CASE WHEN STRPOS('a','a') = 1 THEN 5 ELSE i4 END, 2147483647 + 1)",
             I4,
         ),
+        // A `CASE` the first condition may decide before one that reads a
+        // column.
+        (
+            "COALESCE(CASE WHEN STRPOS('a','a') = 1 THEN 5 WHEN i4 > 0 THEN 6 END, \
+             2147483647 + 1)",
+            I4,
+        ),
+        (
+            "CASE WHEN (CASE WHEN STRPOS('a','a') = 1 THEN NULL WHEN i4 > 0 THEN TRUE END) \
+             THEN 2147483647 + 1 ELSE 0 END",
+            I4,
+        ),
+        // A strict call with a `NULL` constant input is `NULL`.
+        (
+            "CASE WHEN STRPOS(NULLIF('a', 'a'), t) = 1 THEN 2147483647 + 1 ELSE 0 END",
+            I4,
+        ),
         // Through a calculated field.
         (
             "NULLIF(STRPOS('a','a'), NULL) AS g, \
@@ -1128,10 +1145,40 @@ fn a_branch_after_a_constant_define_cannot_compute_is_not_refused() {
         "CASE WHEN 1 = 1 THEN 2147483647 + 1 ELSE 0 END",
         "CASE WHEN 1 = 2 THEN 0 ELSE 2147483647 + 1 END",
         "CASE WHEN NULLIF(1, 1) = 1 THEN 0 ELSE 2147483647 + 1 END",
+        // A strict call with a `NULL` constant input is `NULL`, so the
+        // planner goes on past it, though it reads a column.
+        "COALESCE(STRPOS(NULLIF('a', 'a'), t), 2147483647 + 1)",
+        "COALESCE(CHAR_LENGTH(NULLIF('a', 'a')) + i4, 2147483647 + 1)",
+        "CASE WHEN STRPOS(NULLIF('a', 'a'), t) = 1 THEN 0 ELSE 2147483647 + 1 END",
         // The guard's own constants are simplified, whatever it is.
         "CASE WHEN STRPOS('a','a') = 2147483647 + 1 THEN 0 ELSE 1 END",
         "COALESCE(STRPOS('a','a') + 2147483647 * 2, 0)",
     ] {
         assert_refused(text, "out of range");
+    }
+}
+
+/// A guard is classified at any height the parser admits: a constant one
+/// nested near the limit still leaves what it guards unchecked.
+#[test]
+fn a_deeply_nested_constant_guard_is_still_a_constant() {
+    let nots = "NOT ".repeat(96);
+    for text in [
+        format!("CASE WHEN {nots}(1 = 2) THEN 2147483647 + 1 ELSE 0 END"),
+        format!("CASE WHEN {nots}(STRPOS('a', 'a') = 2) THEN 2147483647 + 1 ELSE 0 END"),
+        format!(
+            "COALESCE({}STRPOS('a', 'a'){}, 2147483647 + 1)",
+            "ABS(".repeat(96),
+            ")".repeat(96)
+        ),
+    ] {
+        assert_type(&text, I4);
+    }
+    // A constant one define computes still selects what it guards.
+    for text in [
+        format!("CASE WHEN {nots}(i4 = 2) THEN 2147483647 + 1 ELSE 0 END"),
+        format!("CASE WHEN {nots}(1 = 2) THEN 0 ELSE 2147483647 + 1 END"),
+    ] {
+        assert_refused(&text, "out of range");
     }
 }
