@@ -22,9 +22,10 @@ defmodule Trellis.Error do
   - `:timeout`: a bounded wait ran out before its condition held (for
     example, the target hadn't caught up within the timeout you gave, or
     `Trellis.release_key/4` waited out the lock timeout for the pages in
-    flight on its table), or a call ran out of its 30-second deadline (the
-    server stopped what the call started and rolled it back). Expected, not
-    a bug: retry, or allow longer.
+    flight on its table, or a define, `ALTER` or `DROP` waited out the lock
+    timeout behind another transaction's lock), or a call ran out of its
+    30-second deadline (the server stopped what the call started and rolled
+    it back). Expected, not a bug: retry, or allow longer.
   - `:internal`: a Trellis bug or an unexpected database failure.
   - `:unknown`: a code newer than this binding.
   """

@@ -60,14 +60,16 @@ pub enum ErrorCode {
     /// nothing and succeeds on a retry once they commit, and a column pause,
     /// resume, define, `ALTER` or `DROP TRANSFORM` waiting out the lock
     /// timeout for the column-pause lock, which is the same
-    /// kind of wait. It is also any public call running out of its deadline
+    /// kind of wait. So is any other lock wait that runs out the lock timeout
+    /// (`55P03`), whichever statement waited: a define, `ALTER` or `DROP
+    /// TRANSFORM` behind a drain page holding its source's version fence,
+    /// say. It is also any public call running out of its deadline
     /// ([`crate::TrellisError::CallTimeout`], issue #599): the server stopped
     /// what the call started and rolled it back. Kept apart from
     /// `Internal` so a host can tell it from a bug. Not every
     /// timeout is this: a pool checkout timing out before the call's deadline
-    /// is `Connectivity`, and any other Postgres statement or lock timeout
-    /// that fires before it is classified by its SQLSTATE like any other
-    /// server error.
+    /// is `Connectivity`, and a Postgres `statement_timeout` that fires
+    /// before it is classified by its SQLSTATE like any other server error.
     Timeout,
     /// Anything else: engine-internal failures, "should not happen"
     /// invariants, IO failures, and Postgres errors with no more specific
@@ -160,6 +162,7 @@ pub(crate) use assert_all_is_every_variant;
 /// classified by its `SqlState` where this crate's call sites can actually
 /// hit one with an obvious category (`unique_violation`/`foreign_key_violation`
 /// -> [`ErrorCode::Conflict`], `undefined_table` -> [`ErrorCode::NotFound`],
+/// `lock_not_available` -> [`ErrorCode::Timeout`],
 /// matching the same SQLSTATEs [`crate::staging::quarantine`] already keys
 /// off of for its own classification), and [`ErrorCode::Internal`]
 /// otherwise — most other server-side failures at this crate's call sites
@@ -197,6 +200,8 @@ fn classify_sqlstate(code: &tokio_postgres::error::SqlState) -> ErrorCode {
         ErrorCode::Conflict
     } else if *code == SqlState::UNDEFINED_TABLE {
         ErrorCode::NotFound
+    } else if *code == SqlState::LOCK_NOT_AVAILABLE {
+        ErrorCode::Timeout
     } else {
         ErrorCode::Internal
     }
@@ -264,6 +269,13 @@ mod tests {
         assert_eq!(
             classify_sqlstate(&SqlState::UNDEFINED_TABLE),
             ErrorCode::NotFound
+        );
+        // A lock that wasn't granted before `lock_timeout` (or a `NOWAIT`
+        // lock that was refused) is an ordinary wait another transaction
+        // caused, retryable, like the named lock timeouts.
+        assert_eq!(
+            classify_sqlstate(&SqlState::LOCK_NOT_AVAILABLE),
+            ErrorCode::Timeout
         );
         // Same `57` class as admin shutdown, but a cancelled statement, not a
         // lost connection.

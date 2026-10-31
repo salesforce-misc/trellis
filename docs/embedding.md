@@ -651,7 +651,7 @@ behaves in four ways you might not expect:
   migration is waiting for Trellis meanwhile, and Postgres sees an idle
   transaction and a waiting one, not a deadlock. What ends the wait is the
   `lock_timeout` every Trellis connection is capped at (30 seconds): the
-  call fails with a lock timeout and changes nothing.
+  call fails with a lock timeout, a `timeout` error, and changes nothing.
 
 So keep Trellis out of the host's transaction, in this order:
 

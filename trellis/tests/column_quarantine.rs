@@ -5076,6 +5076,101 @@ async fn a_pause_behind_a_held_column_pause_lock_times_out_retryably() {
     assert!(column_status_row(&client, "sib", "total").await.is_some());
 }
 
+/// `source`'s version fence's current version.
+async fn fence_version(client: &Client, source: &str) -> i64 {
+    client
+        .query_one(
+            "select version from source_table_versions where source_table = $1",
+            &[&source],
+        )
+        .await
+        .expect("read the fence")
+        .get(0)
+}
+
+/// A define, an `ALTER TRANSFORM` and a `DROP TRANSFORM` each bump their
+/// source's version fence as their first lock, and a page holding the fence
+/// past the transaction's `lock_timeout` makes the bump fail with
+/// `55P03`. That is an ordinary, retryable wait, so each call reports
+/// [`trellis::ErrorCode::Timeout`] (not `Internal`), its message says to
+/// retry, and it changes nothing: the same call succeeds once the page is
+/// gone. The statements' session has a 100 ms `lock_timeout` (a setting
+/// shorter than Trellis's 30 s cap is kept), so the test waits on nothing but
+/// each statement's own timeout.
+#[tokio::test]
+async fn a_catalog_statement_that_waits_out_the_fence_bump_is_a_retryable_timeout() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    seed_items_transform(&db, &client, "price + tax AS total").await;
+    let impatient = Trellis::connect(
+        Config::from_dsn(format!("{} options='-c lock_timeout=100'", db.dsn())).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    let items = qualify_fixture_table("items");
+    let before = fence_version(&client, &items).await;
+
+    // A page's hold on the fence: `for share` from its first lock to its
+    // commit.
+    let page = client.transaction().await.expect("begin");
+    page.query_one(
+        "select version from source_table_versions where source_table = $1 for share",
+        &[&items],
+    )
+    .await
+    .expect("hold the fence");
+    // The page's connection is `client`, so the checks below read through a
+    // second connection.
+    let reader = connect_raw(db.dsn()).await;
+
+    for (call, statement) in [
+        (
+            "define",
+            "TRANSFORM sib_two FROM items SELECT price + 1 AS p1",
+        ),
+        ("alter", "ALTER TRANSFORM sib ADD bonus + 1 AS bonus_total"),
+        ("drop", "DROP TRANSFORM sib"),
+    ] {
+        let err = impatient
+            .apply(statement)
+            .await
+            .expect_err("the fence is held past the lock timeout");
+        assert!(
+            matches!(
+                &err,
+                trellis::TrellisError::Catalog(trellis::defs::CatalogError::Db(pg))
+                    if trellis::locks::is_lock_not_available(pg)
+            ),
+            "{call}: {err:?}"
+        );
+        assert_eq!(err.code(), trellis::ErrorCode::Timeout, "{call}: {err}");
+        let message = err.to_string();
+        assert!(message.contains("retry"), "{call}: {message}");
+        assert!(message.contains("lock timeout"), "{call}: {message}");
+        assert_eq!(
+            fence_version(&reader, &items).await,
+            before,
+            "{call}: the refusal rolled its bump back"
+        );
+    }
+    page.rollback().await.expect("end the page");
+
+    impatient
+        .apply("ALTER TRANSFORM sib ADD bonus + 1 AS bonus_total")
+        .await
+        .expect("the retried alter succeeds");
+    impatient
+        .apply("PAUSE TRANSFORM sib")
+        .await
+        .expect("a drop needs the transform paused");
+    impatient
+        .apply("DROP TRANSFORM sib")
+        .await
+        .expect("the retried drop succeeds");
+}
+
 /// A resume of a column that stays paused with a sibling it reads
 /// clears the column's own reason (`local_fuse`) under the column-pause lock.
 /// A resume of that sibling decides whether to release the column from that
