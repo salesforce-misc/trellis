@@ -2343,8 +2343,9 @@ dependencies = [
 
 [[package]]
 name = "trellis"
-version = "0.1.0-alpha"
+version = "0.1.0-gamma"
 dependencies = [
+ "deadpool",
  "deadpool-postgres",
  "getrandom 0.4.3",
  "metrics",
@@ -2371,7 +2372,7 @@ dependencies = [
 
 [[package]]
 name = "trellis-cli"
-version = "0.1.0-alpha"
+version = "0.1.0-gamma"
 dependencies = [
  "tokio",
  "trellis",
@@ -2379,7 +2380,7 @@ dependencies = [
 
 [[package]]
 name = "trellis-embed"
-version = "0.1.0-alpha"
+version = "0.1.0-gamma"
 dependencies = [
  "proptest",
  "tracing",
@@ -2388,7 +2389,7 @@ dependencies = [
 
 [[package]]
 name = "trellis_nif"
-version = "0.1.0-alpha"
+version = "0.1.0-gamma"
 dependencies = [
  "rustler",
  "tokio",
@@ -2398,7 +2399,7 @@ dependencies = [
 
 [[package]]
 name = "trellis_ruby"
-version = "0.1.0-alpha"
+version = "0.1.0-gamma"
 dependencies = [
  "magnus",
  "rb-sys",

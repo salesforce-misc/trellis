@@ -25,7 +25,9 @@ pub enum StagingError {
     InvalidRingSlot(i16),
     /// A second producer session tried to start while another holds the
     /// singleton lock. Two concurrent producers would double-append every
-    /// change.
+    /// change. The background client treats it as "stand by" and never
+    /// returns it from a connect; it surfaces only to callers that open a
+    /// `ProducerSession` themselves.
     ProducerAlreadyRunning,
     /// A seal would lap a ring slot that still holds a live registry row.
     /// A retirement pass is run and the seal retried once (see
@@ -51,8 +53,8 @@ pub enum StagingError {
     /// `super::converge::await_converged` exhausted its timeout budget
     /// without `converged_through(token)` ever returning true. Named rather
     /// than a generic "values not stabilizing" message
-    /// (docs/staging-and-claiming/07-convergence-and-await.md, "A round did
-    /// no work"): that framing implies a schema cycle, which is not what
+    /// (docs/staging-and-claiming/07-convergence-and-await.md, "What the
+    /// await waits for"): that framing implies a schema cycle, which is not what
     /// this is — it just means the token hasn't cleared yet, and the caller
     /// should widen its budget or investigate the drain, not the schema.
     ConvergenceTimeout { token: PgLsn, waited: Duration },

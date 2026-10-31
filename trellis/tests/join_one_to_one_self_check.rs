@@ -23,7 +23,7 @@ use trellis::staging::self_check::{
     CheckPageExt, Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page,
     compare_page,
 };
-use trellis::{Config, Trellis, TrellisOptions};
+use trellis::{Config, TransformStatus, Trellis, TrellisOptions};
 
 const DDL: &str = "create table public.a (id text primary key, k integer, r integer, s text); \
                    create table public.b (bid bigint primary key, k integer, img integer, \
@@ -888,9 +888,9 @@ async fn an_a_keyed_by_null_parts_is_compared_on_every_part() {
 
 // ---------------------------------------------------- a chained 1-1 target side
 
-#[tokio::test]
-async fn a_chained_b_side_is_compared_with_the_images_of_its_upstream() {
-    let _serial = SERIAL.lock().await;
+/// `jc`, a `LEFT` 1-1 `JOIN` whose `b` side is `tb`, a 1-1 target over
+/// `public.bsrc`, built and settled.
+async fn start_chained() -> Driver {
     set_enabled(true);
     let mut d = Driver::start(
         "create table public.a (id integer primary key, k integer, x integer); \
@@ -926,6 +926,13 @@ async fn a_chained_b_side_is_compared_with_the_images_of_its_upstream() {
     }
     trellis::intake::harness::settle_builds(d.pool()).await;
     d.settle().await;
+    d
+}
+
+#[tokio::test]
+async fn a_chained_b_side_is_compared_with_the_images_of_its_upstream() {
+    let _serial = SERIAL.lock().await;
+    let mut d = start_chained().await;
     let clean = |d: &Driver, when: &'static str| {
         let pool = d.pool().clone();
         async move {
@@ -991,6 +998,69 @@ async fn a_chained_b_side_is_compared_with_the_images_of_its_upstream() {
         page.outcome,
         SelfCheckOutcome::Diverged(vec![cell("3", "total", Some("226"), Some("225"))])
     );
+}
+
+/// A stored-`live` 1-1 `JOIN` whose `b` side is the target of a paused
+/// definition reports `catching_up`, and `self_check` answers with that
+/// reported status instead of comparing a target its upstream no longer
+/// maintains.
+#[tokio::test]
+async fn a_join_over_a_paused_upstream_reports_catching_up_and_is_not_compared() {
+    let _serial = SERIAL.lock().await;
+    let d = start_chained().await;
+    let trellis = Trellis::connect(
+        Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a Trellis");
+    let reported = || async {
+        trellis
+            .status("jc")
+            .await
+            .expect("status")
+            .expect("jc")
+            .status
+    };
+    let check = || async {
+        check_page(
+            d.pool(),
+            "public.jc",
+            SelfCheckScope {
+                after: None,
+                limit: 1000,
+            },
+            SelfCheckMode::Standard,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("a page")
+    };
+    assert_eq!(reported().await, TransformStatus::Live);
+    assert_eq!(check().await.outcome, SelfCheckOutcome::Converged);
+
+    trellis
+        .apply("PAUSE TRANSFORM tb")
+        .await
+        .expect("pause the upstream");
+    let stored: String = d
+        .ctl
+        .query_one(
+            "select status from transform_definitions where target_table = 'public.jc'",
+            &[],
+        )
+        .await
+        .expect("jc's row")
+        .get(0);
+    assert_eq!(stored, "live", "catching_up is reported, never stored");
+    assert_eq!(reported().await, TransformStatus::CatchingUp);
+    let page = check().await;
+    assert_eq!(
+        page.outcome,
+        SelfCheckOutcome::NotLive(TransformStatus::CatchingUp)
+    );
+    assert_eq!(page.rows_compared, 0, "nothing was compared");
+    trellis.shutdown().await.expect("shutdown");
 }
 
 // ------------------------------------------- a key of a non-default collation

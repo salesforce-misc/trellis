@@ -41,7 +41,7 @@ pub enum ErrorCode {
     Validation,
     /// Reaching or using Postgres failed at the connection/transport/pool
     /// layer, including a pool checkout that waited out
-    /// `pool_wait_timeout` for a free connection.
+    /// `call_pool_wait_timeout` for a free connection.
     Connectivity,
     /// The operation collides with existing state: a name already declared,
     /// a uniqueness violation, a singleton lock already held, an instance

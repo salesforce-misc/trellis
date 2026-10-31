@@ -32,7 +32,7 @@
 //! | [`trellis::SelfCheckJob`] | id + target + mode and state words + progress + the report once done + the error | [`PlainSelfCheckJob`] |
 //! | [`trellis::SelfCheckReport`] | fields + outcome word + divergences tagged by kind word + held keys + drain failures | [`PlainSelfCheckReport`] |
 //! | [`trellis::SelfCheckMode`] (an argument) | its word | [`self_check_mode`] |
-//! | [`trellis::Config`] | its fields but the DSN (which can carry a password), the pool timeout in milliseconds | [`PlainConfig`] |
+//! | [`trellis::Config`], with the handle's call pool | its fields but the DSN (which can carry a password), the call pool's size and its wait in milliseconds | [`PlainConfig`] |
 //!
 //! | a `tracing` event | level word + target + message | [`PlainLogRecord`] |
 //!

@@ -179,11 +179,10 @@ pub enum Op {
         pk: String,
         expect: OpOutcome,
     },
-    /// Clears every row of `table` in one statement (improvement-plan task
-    /// E6). Rendered by [`crate::backend::ManualBackend::apply`] as a plain
-    /// `TRUNCATE TABLE`, **not** trusted for its own affected-row count:
-    /// Postgres's `TRUNCATE` command tag always reports `0` regardless of how
-    /// many rows existed, so the backend synthesizes a real count itself (a
+    /// Clears every row of `table` in one statement. Rendered by
+    /// [`crate::backend::ManualBackend::apply`] as a plain `TRUNCATE TABLE`, **not** trusted for
+    /// its own affected-row count: Postgres's `TRUNCATE` command tag always reports `0` regardless
+    /// of how many rows existed, so the backend synthesizes a real count itself (a
     /// `SELECT count(*)` in the same transaction, before issuing the
     /// `TRUNCATE`) rather than letting `tokio_postgres::Client::execute`'s
     /// raw return value flow into `run_convergence`'s
@@ -195,7 +194,7 @@ pub enum Op {
     /// swallowed" invariant the whole run loop is built on.
     Truncate { table: String, expect: OpOutcome },
     /// Inserts every row of `rows` in a single `INSERT ... VALUES (...),
-    /// (...), ...` statement (improvement-plan task E6's bulk-insert
+    /// (...), ...` statement (the bulk-insert
     /// dimension) rather than [`Op::Insert`]'s one-row-per-statement shape.
     /// Every entry of `rows` must carry the same columns, in the same order,
     /// as every other entry — [`crate::backend::ManualBackend::apply`] takes
@@ -300,12 +299,10 @@ pub struct Program {
     pub tables: Vec<Table>,
     pub defs: Vec<TransformDef>,
     /// `def_install_after_op[i]` is how many of `ops` must already have been
-    /// applied before `defs[i]` is installed (improvement-plan task E2):
-    /// `0` — every existing program's default, drawn by every strategy that
-    /// predates E2 — means "install up front, alongside every table, before
-    /// any op runs" (today's only behavior, and [`crate::run::run_convergence`]'s
-    /// default). A nonzero value `N` means "install this definition only once
-    /// `ops[0..N]` have already been applied" — real rows can already exist
+    /// applied before `defs[i]` is installed:
+    /// `0` (the default) means "install up front, alongside every table,
+    /// before any op runs". A nonzero value `N` means "install this
+    /// definition only once `ops[0..N]` have already been applied" — real rows can already exist
     /// in `defs[i].source` by then, exercising the build
     /// over pre-existing rows (the same path
     /// `generative/tests/backfill.rs` exercises by hand, now reachable from
@@ -319,16 +316,15 @@ pub struct Program {
     /// rather than silently dropping the install).
     pub def_install_after_op: Vec<usize>,
     pub ops: Vec<Op>,
-    /// Op indices (improvement-plan task E3) after which
+    /// Op indices after which
     /// [`crate::run::run_convergence`] calls [`crate::backend::Backend::restart`]
     /// on the backend — simulating an in-process engine client crash-and-restart
     /// mid-stream (see that trait method's doc comment). Entries must satisfy
     /// `1 <= n < ops.len()` (see [`crate::generate::schedule_restart`], the one
     /// supported way to add one) for the same "never after the last op" reason
-    /// `def_install_after_op` documents. Empty for every program that predates
-    /// E3.
+    /// `def_install_after_op` documents. Empty unless the program schedules a restart.
     pub restart_after_ops: Vec<usize>,
-    /// Op indices (improvement-plan task E3) after which
+    /// Op indices after which
     /// [`crate::run::run_convergence`] calls [`crate::backend::Backend::scale_out`]
     /// on the backend — starting an additional application-worker-only engine
     /// client alongside the existing one(s). Same index contract as
@@ -336,7 +332,7 @@ pub struct Program {
     pub scale_out_after_ops: Vec<usize>,
 }
 
-/// One action against a workstream-E, task-E1 "noise" table: a table
+/// One action against a "noise" table: a table
 /// [`crate::backend::ManualBackend::install_noise_table`] creates (a real
 /// Postgres table, so DDL/DML against it behaves exactly like against any
 /// other) but never registers as tracked — never in a [`Program`]'s own
@@ -359,8 +355,7 @@ pub enum NoiseAction {
     Delete {
         pk: i64,
     },
-    /// `ALTER TABLE ... ADD COLUMN` — DDL noise, not just DML (task E1's
-    /// "ideally also some DDL" ask).
+    /// `ALTER TABLE ... ADD COLUMN`: DDL noise, alongside the DML noise.
     AddColumn {
         name: String,
         value_type: ValueType,
@@ -372,8 +367,8 @@ pub enum NoiseAction {
 }
 
 /// What a [`NoiseEvent`] fires: either a [`NoiseAction`] against the
-/// [`NoisePlan`]'s own noise table (task E1), or a bare administrative SQL
-/// statement with no table involved at all (task E5, e.g. `"CHECKPOINT"`).
+/// [`NoisePlan`]'s own noise table, or a bare administrative SQL
+/// statement with no table involved at all (e.g. `"CHECKPOINT"`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum NoiseEventKind {
     Table(NoiseAction),
@@ -394,10 +389,9 @@ pub struct NoiseEvent {
     pub kind: NoiseEventKind,
 }
 
-/// A full noise/administration schedule for one program run (workstream E,
-/// tasks E1 and E5): an optional untracked table to create once at install
-/// time (`None` for an administration-only schedule, e.g. a `CHECKPOINT`-only
-/// plan that needs no table at all — task E5), plus the [`NoiseEvent`]s to
+/// A full noise/administration schedule for one program run: an optional untracked table to create
+/// once at install time (`None` for an administration-only schedule, e.g. a `CHECKPOINT`-only
+/// plan that needs no table at all), plus the [`NoiseEvent`]s to
 /// fire against it (or standalone) as the real op stream plays out.
 ///
 /// Deliberately never checked against the oracle, and — by construction,
@@ -653,7 +647,7 @@ pub struct RestorePlan {
 }
 
 /// The composite row-key convention for an [`trellis::dev::defs::ast::KeySpace::Aggregate`]
-/// target (improvement-plan task B4): every row in a `GROUP BY` target is
+/// target: every row in a `GROUP BY` target is
 /// keyed by its grouping column(s)' rendered text values, but unlike a 1-1
 /// target's primary key (never `NULL`, enforced by the source table's own
 /// `primary key` constraint), a grouping column genuinely can be `NULL` —

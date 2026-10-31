@@ -72,15 +72,18 @@ defmodule Trellis do
   per request. The handle is shut down when `shutdown/1` is called, or, as a
   backstop, when it is garbage collected.
 
-  Each handle pays for itself. It owns a connection pool of up to 20
-  connections and a small Rust runtime (`:worker_threads` threads). A handle
-  with `staging: true` or `drain_threads` above `0` also owns a second runtime
-  and pool of the same size, plus connections outside both pools: one for the
-  staging worker, and for each drain thread a `LISTEN` connection and up to two
-  more while it drains.
+  Each handle pays for itself. It owns a call pool of up to 20 connections
+  (`:max_call_pool_size`; they close after 60 idle seconds) and a small Rust
+  runtime (`:worker_threads` threads). A handle with `staging: true` or
+  `drain_threads` above `0` also owns a second runtime and a background pool
+  sized by those roles (`2N + 5` for a worker at `drain_threads: N`), plus
+  connections outside both pools: one for the staging worker while it leads,
+  one `LISTEN` shared by its drain threads, and a claim keep-alive and a paged
+  drain's session while they are needed.
   Handles share no budget, so size all of them together against the server's
-  `max_connections`. Each instance has its own staging worker, so set
-  `staging: true` in one process of the fleet per instance.
+  `max_connections`. Each instance has one staging worker at a time: any number
+  of processes may set `staging: true`, and one leads while the rest stand by
+  (see `docs/embedding.md`, "Rolling deploys").
 
   In an application, let a supervisor own each handle: `{Trellis, options}` in
   the supervision tree starts a process that connects the handle as it starts
@@ -178,14 +181,21 @@ defmodule Trellis do
     Default `"public"`.
   - `:staging`: whether this connection runs the staging worker, which
     installs change capture on the source tables and starts each new
-    transform's backfill. Exactly one connection of each instance in a fleet
-    should. Default `false`.
+    transform's backfill. Any number of connections of an instance may set it:
+    one takes the producer lock and leads, the rest stand by and take over when
+    it goes away, so a rolling deploy needs no operator step. Default `false`.
   - `:drain_threads`: how many threads apply staged changes to the targets.
     Default `0`.
   - `:worker_threads`: the worker threads of each Rust runtime a handle owns
     (its calls', and its background client's). Default `2`; the
     work is IO, so a small count is enough, and the BEAM has already sized
     its own schedulers to the cores.
+  - `:max_call_pool_size`: the most connections the handle's call pool (its
+    API calls) opens at once. They open as calls need them and close after 60
+    seconds idle. The background client's pool is sized by `:staging` and
+    `:drain_threads`, not by this. Default `20`.
+  - `:call_pool_wait_timeout_ms`: how long a call waits for a free call-pool
+    connection before failing with a `:connectivity` error. Default `30_000`.
 
   The defaults (`staging: false, drain_threads: 0`) run nothing in the
   background, which is right for a web process or a migration run. Some
@@ -199,6 +209,8 @@ defmodule Trellis do
           | {:staging, boolean()}
           | {:drain_threads, non_neg_integer()}
           | {:worker_threads, pos_integer()}
+          | {:max_call_pool_size, pos_integer()}
+          | {:call_pool_wait_timeout_ms, non_neg_integer()}
 
   # The largest `limit` and `timeout_ms` the engine takes (an `i64` and a
   # `u64` millisecond count); anything larger is refused as `:validation`
@@ -212,7 +224,9 @@ defmodule Trellis do
     target_schema: "public",
     staging: false,
     drain_threads: 0,
-    worker_threads: 2
+    worker_threads: 2,
+    max_call_pool_size: 20,
+    call_pool_wait_timeout_ms: 30_000
   }
 
   @doc """
@@ -245,9 +259,9 @@ defmodule Trellis do
   rather than calling this directly.
 
   Returns `{:error, %Trellis.Error{}}` if the connect fails, so the
-  supervisor's start fails with the reason. A second `staging: true`
-  process for the same instance fails that way (`:conflict`) while the first
-  is alive: in a rolling deploy, stop the old one before the new one starts.
+  supervisor's start fails with the reason. A `staging: true` process whose
+  instance already has a staging worker does not fail: it stands by and takes
+  over when the first goes away, so a rolling deploy needs no ordering.
 
   The process only keeps the handle's lifecycle. A call made through its
   name asks it for the handle and then runs in the caller's own process, so
@@ -757,6 +771,19 @@ defmodule Trellis do
         not (is_integer(options.worker_threads) and options.worker_threads >= 1) ->
           invalid(
             ":worker_threads must be a positive integer, got: #{inspect(options.worker_threads)}"
+          )
+
+        not (is_integer(options.max_call_pool_size) and options.max_call_pool_size >= 1) ->
+          invalid(
+            ":max_call_pool_size must be a positive integer, got: " <>
+              inspect(options.max_call_pool_size)
+          )
+
+        not (is_integer(options.call_pool_wait_timeout_ms) and
+                 options.call_pool_wait_timeout_ms in 0..@max_timeout_ms) ->
+          invalid(
+            ":call_pool_wait_timeout_ms must be a non-negative integer, got: " <>
+              inspect(options.call_pool_wait_timeout_ms)
           )
 
         true ->

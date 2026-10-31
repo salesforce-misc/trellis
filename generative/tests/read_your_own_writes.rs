@@ -1,4 +1,4 @@
-//! Improvement-plan task D3, negative control.
+//! Negative control for the read-your-own-writes property.
 //!
 //! `generative::run::run_convergence` already does read-your-own-writes
 //! (RYOW), asserted incrementally: apply → quiesce → snapshot → compare,
@@ -35,8 +35,7 @@
 //! possible on the fixed-300ms-tick design described above.
 //!
 //! That said: this is still fundamentally a race, observing a timing window
-//! rather than a structural guarantee, so — per this task's own instructions
-//! — it's built to fail loudly rather than flake quietly if that
+//! rather than a structural guarantee, so it's built to fail loudly rather than flake quietly if that
 //! expectation is ever wrong: it retries the same check against several
 //! independent updates (a fresh, distinct value each time) and only requires
 //! staleness to be observed on **at least one** of them, not every one. The

@@ -34,7 +34,7 @@ use tracing_subscriber::registry::LookupSpan;
 
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
-use trellis::defs::{TransformStatus, create_definition, create_target_table, install_definition};
+use trellis::defs::{create_definition, create_target_table, install_definition};
 use trellis::staging::apply;
 use trellis::staging::{FoldedChange, IsolationOutcome, LastChange, isolate_and_evict};
 
@@ -633,7 +633,7 @@ async fn backfill_status_transitions(transform: &str) -> Vec<(String, String)> {
     let def = install_definition(&db.pool, transform, &cols, "public")
         .await
         .expect("install_definition defers instead of racing the fence");
-    assert_eq!(def.status, TransformStatus::WaitingToBackfill);
+    assert_eq!(def.status, trellis::defs::StoredStatus::WaitingToBackfill);
 
     straggler.commit().await;
 

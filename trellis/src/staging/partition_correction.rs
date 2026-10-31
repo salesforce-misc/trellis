@@ -105,7 +105,7 @@ use tokio_postgres::GenericClient;
 use crate::capture::partitions::{self, Key, PendingCorrection, Recorded};
 use crate::defs::catalog;
 use crate::defs::chunk_queue::{self, ChunkQueueError, ClaimFence, ClaimedChunk};
-use crate::defs::model::{APPLYING_SQL, Definition, TransformStatus};
+use crate::defs::model::{APPLYING_SQL, Definition, StoredStatus};
 use crate::pool::{Pool, quote_ident};
 
 use super::apply::ApplyError;
@@ -698,8 +698,8 @@ async fn enqueue(
              where id = $1 and (status = $2 or (status = $3 and build = $4)) for update",
             &[
                 &definition_id,
-                &TransformStatus::Live.as_str(),
-                &TransformStatus::Backfilling.as_str(),
+                &StoredStatus::Live.as_str(),
+                &StoredStatus::Backfilling.as_str(),
                 &build::BUILD_REDERIVE,
             ],
         )
@@ -728,13 +728,13 @@ async fn enqueue(
         ],
     )
     .await?;
-    let flipped = status == TransformStatus::Live.as_str();
+    let flipped = status == StoredStatus::Live.as_str();
     if flipped {
         txn.execute(
             "update transform_definitions set status = $2, build = $3 where id = $1",
             &[
                 &definition_id,
-                &TransformStatus::Backfilling.as_str(),
+                &StoredStatus::Backfilling.as_str(),
                 &build::BUILD_REDERIVE,
             ],
         )
@@ -745,8 +745,8 @@ async fn enqueue(
         crate::instance_log::info!(
             definition_id,
             correction_id,
-            from = %TransformStatus::Live.as_str(),
-            to = %TransformStatus::Backfilling.as_str(),
+            from = %StoredStatus::Live.as_str(),
+            to = %StoredStatus::Backfilling.as_str(),
             "transform status transition: a partition correction started"
         );
     }

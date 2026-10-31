@@ -169,10 +169,7 @@ mod tests {
     /// the same way.
     #[test]
     fn a_config_error_crosses_as_validation() {
-        let err = trellis::Config::from_dsn("host=localhost")
-            .unwrap()
-            .with_pool_max_size(0)
-            .unwrap_err();
+        let err = trellis::Config::with_schema("host=localhost", "").unwrap_err();
         let message = err.to_string();
 
         let plain = PlainError::from(err);

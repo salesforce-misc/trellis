@@ -262,13 +262,16 @@ async fn a_define_that_times_out_registers_nothing() {
 async fn the_wait_for_a_pooled_connection_counts() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let config = Config::from_dsn(db.dsn().to_string())
-        .expect("dsn")
-        .with_pool_max_size(1)
-        .expect("pool size");
-    let trellis = Trellis::connect(config, options(DEADLINE))
-        .await
-        .expect("connect");
+    let config = Config::from_dsn(db.dsn().to_string()).expect("dsn");
+    let trellis = Trellis::connect(
+        config,
+        TrellisOptions {
+            max_call_pool_size: 1,
+            ..options(DEADLINE)
+        },
+    )
+    .await
+    .expect("connect");
     let only = trellis
         .pool()
         .get()
@@ -316,13 +319,16 @@ async fn the_wait_for_a_pooled_connection_counts() {
 async fn a_pooled_connection_comes_back_without_the_calls_timeout() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let config = Config::from_dsn(db.dsn().to_string())
-        .expect("dsn")
-        .with_pool_max_size(1)
-        .expect("pool size");
-    let trellis = Trellis::connect(config, options(Duration::from_secs(30)))
-        .await
-        .expect("connect");
+    let config = Config::from_dsn(db.dsn().to_string()).expect("dsn");
+    let trellis = Trellis::connect(
+        config,
+        TrellisOptions {
+            max_call_pool_size: 1,
+            ..options(Duration::from_secs(30))
+        },
+    )
+    .await
+    .expect("connect");
 
     // Runs on the pool's connection, under the call's deadline.
     trellis.definitions().await.expect("definitions");

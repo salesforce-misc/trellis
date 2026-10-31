@@ -243,7 +243,10 @@ async fn the_accept_and_refuse_matrix() {
             .await
             .unwrap_or_else(|err| panic!("{text}: {err:?}"));
         assert_eq!(definition.target_table, format!("public.{target}"));
-        assert_eq!(definition.status, TransformStatus::WaitingToBackfill);
+        assert_eq!(
+            definition.status,
+            trellis::defs::StoredStatus::WaitingToBackfill
+        );
     }
 
     let unique = |err: &CatalogError| {

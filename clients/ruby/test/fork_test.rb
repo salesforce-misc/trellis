@@ -89,8 +89,8 @@ class ForkTest < Minitest::Test
 
   # The whole life of a forking server's workers, in a script of its own so
   # every process exits normally, running its at_exit hooks and freeing its
-  # handles. A child forked while the parent's handle runs can't use it or
-  # connect its own; a worker forked after the parent shut down
+  # handles. A child forked while the parent's handle runs can't use it,
+  # connect its own or render the metrics; a worker forked after the parent shut down
   # connects its own, uses it, and exits; the parent connects again.
   def test_a_child_connects_only_if_its_parent_shut_down_before_forking
     script = File.expand_path("support/fork_worker.rb", __dir__)
@@ -106,10 +106,12 @@ class ForkTest < Minitest::Test
     assert_equal <<~OUT, output
       child: Trellis::ForkedHandleError
       child: connect Trellis::ForkedHandleError, forked while running: true
+      child: render_prometheus Trellis::ForkedHandleError
       child: connected? false
       child exit: 0
       worker: own handle status nil
       worker: connected? true
+      worker: metrics name its instance true
       worker exit: 0
       parent: status nil
     OUT

@@ -6,38 +6,31 @@
 //! [`EngineClient`] runs). Drives the real engine as far as its current
 //! 1-1/numeric-`+` subset allows — a real [`EngineClient`] (one staging
 //! worker, one *or more* application workers — see
-//! [`ManualBackend::connect_with_workers`]/[`ManualBackend::connect_with_options`],
-//! improvement-plan task D4) against a real, already-migrated Postgres
+//! [`ManualBackend::connect_with_workers`]/[`ManualBackend::connect_with_options`])
+//! against a real, already-migrated Postgres
 //! database, reached only over raw source DML (never an application-level
 //! notify API), matching the production ingestion path
 //! (`docs/data-flow.md#capture-by-triggers`).
 //!
-//! **D4's "second runtime" is this same type, just started with more than one
-//! application worker** — not a separate `ConcurrentBackend` type. Nothing in
-//! `ManualBackend` (DDL rendering, DML rendering, `quiesce`, `snapshot`)
-//! assumes a single worker; the worker count only ever mattered to one line
-//! inside [`Backend::install`] that hardcoded `application_threads: 1`. A
-//! second type would have had to duplicate this module's substantial
-//! rendering logic for zero behavioral difference; a parameterized
-//! constructor shares all of it and keeps exactly one implementation of the
-//! seam's DDL/DML/read-back logic to maintain. See
-//! `generative/tests/concurrent_convergence.rs` for the new, separate
-//! property/test file this constructor is meant to be driven from.
+//! **The concurrent runtime is this same type, started with more than one
+//! application worker** — there is no separate `ConcurrentBackend`. Nothing
+//! in `ManualBackend` (DDL rendering, DML rendering, `quiesce`, `snapshot`)
+//! assumes a single worker; the worker count only sets `application_threads`
+//! in [`Backend::install`]. A parameterized constructor shares the rendering
+//! logic and keeps exactly one implementation of the seam's DDL/DML/read-back
+//! logic. See `generative/tests/concurrent_convergence.rs` for the tests that
+//! drive it.
 //!
-//! **Update**: that same DDL/DML/read-back rendering logic
+//! The DDL/DML/read-back rendering logic
 //! (`render_definition`/`render_expr`/`create_source_table`/`apply_op`/
 //! `read_table`/`read_aggregate_table`, none of which cares whether the
-//! engine driving the ring is in-process or a real subprocess) has since
-//! moved to [`super::sql`], a module shared with
-//! [`super::SubprocessBackend`] — the second `Backend` impl this doc comment
-//! used to argue against, but for a genuinely different reason than D4's
-//! worker count: a subprocess-supervised engine that `testkit::CrashGuard`
-//! can `SIGKILL` mid-drain. What differs between `ManualBackend` and
-//! `SubprocessBackend` is *only* how the engine itself is started, stopped,
-//! and restarted — never the DDL/DML/read-back shape, which is why sharing
-//! [`super::sql`] rather than duplicating it keeps exactly one
-//! implementation of the seam's rendering logic, same as this doc comment's
-//! original D4 argument.
+//! engine driving the ring is in-process or a real subprocess) lives in
+//! [`super::sql`], shared with [`super::SubprocessBackend`], whose engine is
+//! a subprocess `testkit::CrashGuard` can `SIGKILL` mid-drain. What differs
+//! between `ManualBackend` and `SubprocessBackend` is *only* how the engine
+//! itself is started, stopped, and restarted — never the DDL/DML/read-back
+//! shape, so there is exactly one implementation of the seam's rendering
+//! logic.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -105,71 +98,30 @@ const _: () = assert!(SERVER_STOP_RECLAIM_TTL.as_secs() * 3 <= QUIESCE_TIMEOUT.a
 /// needs any of those keeps a real interval.
 pub const SEAL_ON_DEMAND_INTERVAL: Duration = Duration::from_secs(3600);
 
-/// [`ManualBackend::restart`]'s bounded retry budget for the
-/// residual `ProducerAlreadyRunning` window `trellis::Client::shutdown`
-/// alone doesn't close: up to this many *retries* (so up to
-/// `RESTART_PRODUCER_RETRY_ATTEMPTS + 1` total attempts to start the
-/// replacement client) before giving up and propagating the error for
-/// real. Bounded, not infinite, specifically so a genuinely stuck lock
-/// (a real second producer, not just a not-yet-noticed dead connection)
-/// still surfaces as an error rather than hanging `restart` forever.
-const RESTART_PRODUCER_RETRY_ATTEMPTS: u32 = 8;
+/// How long [`ManualBackend::restart`] waits for the old client's
+/// staging-worker singleton to read free before starting the replacement.
+const PRODUCER_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The first retry's delay in [`RESTART_PRODUCER_RETRY_ATTEMPTS`]'s bounded
-/// backoff; each subsequent retry doubles, capped at
-/// [`RESTART_PRODUCER_RETRY_MAX_DELAY`]. Short: the gap this is absorbing is
-/// "Postgres hasn't yet been scheduled to notice a closed socket," normally
-/// sub-millisecond and only stretched into the tens-of-milliseconds range by
-/// genuinely heavy CPU contention (confirmed empirically — see `restart`'s
-/// own doc comment) — not a multi-second outage this needs to tolerate.
-const RESTART_PRODUCER_RETRY_BASE_DELAY: Duration = Duration::from_millis(10);
-
-/// Cap on [`RESTART_PRODUCER_RETRY_BASE_DELAY`]'s exponential growth, so the
-/// last few retries in a worst-case run don't balloon the total wait.
-const RESTART_PRODUCER_RETRY_MAX_DELAY: Duration = Duration::from_millis(320);
-
-/// Whether `err` is the producer-singleton-lock conflict
-/// (`trellis::StagingError::ProducerAlreadyRunning`) [`ManualBackend::restart`]'s
-/// bounded retry specifically targets — recognized in both
-/// shape it reaches a fresh [`EngineClient::start_with_config`] call
-/// through: `setup_staging`'s producer session, inside
-/// `ClientError::Staging`. Every other `ClientError` variant is a real
-/// failure `restart` should surface immediately, not retry.
-fn is_producer_already_running(err: &ClientError) -> bool {
-    matches!(
-        err,
-        ClientError::Staging(StagingError::ProducerAlreadyRunning)
-    )
-}
-
-/// [`ManualBackend::restart`]'s layer-2 fix: starts a fresh
-/// `EngineClient`, retrying with a short bounded backoff
-/// ([`RESTART_PRODUCER_RETRY_ATTEMPTS`]/[`RESTART_PRODUCER_RETRY_BASE_DELAY`]/
-/// [`RESTART_PRODUCER_RETRY_MAX_DELAY`]) specifically when
-/// `EngineClient::start_with_config` fails with
-/// [`is_producer_already_running`] — the residual window between the old
-/// client's `shutdown()` returning and Postgres actually noticing the
-/// closed connection and releasing the advisory lock. Any other
-/// `ClientError` (including a `ProducerAlreadyRunning` that's still there
-/// after every retry — a genuinely stuck lock, not just a slow one) is
-/// returned immediately, unretried.
-async fn start_with_producer_retry(
-    config: Config,
-    options: ClientOptions,
-) -> Result<EngineClient, ClientError> {
-    let mut delay = RESTART_PRODUCER_RETRY_BASE_DELAY;
-    let mut retries_left = RESTART_PRODUCER_RETRY_ATTEMPTS;
-    loop {
-        match EngineClient::start_with_config(config.clone(), options.clone()) {
-            Ok(client) => return Ok(client),
-            Err(err) if retries_left > 0 && is_producer_already_running(&err) => {
-                retries_left -= 1;
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(RESTART_PRODUCER_RETRY_MAX_DELAY);
-            }
-            Err(err) => return Err(err),
-        }
+/// Waits, bounded by [`PRODUCER_RELEASE_TIMEOUT`], until no session holds this
+/// instance's staging-worker singleton.
+///
+/// `trellis::Client::shutdown` tears this process's connection down, but the
+/// Postgres backend serving it releases the advisory lock only once it is
+/// scheduled to read the closed socket, which under heavy CPU contention can
+/// trail by tens of milliseconds. A replacement that asks for the lock first
+/// would come up as a standby and poll for it every few seconds; waiting here
+/// makes the release happen before the replacement's acquire. A lock still
+/// held at the timeout (a genuinely live second producer) is left to the
+/// replacement, which stands by.
+async fn wait_for_producer_release(config: &Config) -> Result<(), ManualBackendError> {
+    let trellis =
+        trellis::Trellis::connect(config.clone(), trellis::TrellisOptions::default()).await?;
+    let deadline = tokio::time::Instant::now() + PRODUCER_RELEASE_TIMEOUT;
+    while trellis.has_live_staging_worker().await? && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    trellis.shutdown().await?;
+    Ok(())
 }
 
 /// Opens the backend's own raw session: `search_path` pinned to the instance
@@ -203,7 +155,7 @@ pub enum ManualBackendError {
     UnnamedTarget,
     /// [`ManualBackend::restart`] was called before [`ManualBackend::install`]
     /// ever started a primary engine client — nothing to restart. A generator
-    /// bug (improvement-plan task E3's `restart_after_ops` is only ever
+    /// bug (`restart_after_ops` is only ever
     /// nonzero on a program that also has at least one table, so `install`
     /// always starts a client before any restart point is reached), not a
     /// condition a caller should need to handle gracefully.
@@ -295,7 +247,7 @@ impl From<sql::QuiesceError> for ManualBackendError {
 }
 
 /// Renders one [`NoiseAction`] to the SQL text [`ManualBackend::fire_noise_event`]
-/// runs directly (task E1) — the noise-table analog of [`render_definition`]/
+/// runs directly — the noise-table analog of [`render_definition`]/
 /// [`render_expr`], but for plain DDL/DML rather than a `TRANSFORM`
 /// definition. `Insert`/`Update` target `table.columns[1]` by name (falling
 /// back to the pk column if `table` is somehow columnless) — the one non-pk
@@ -384,12 +336,12 @@ pub struct ManualBackend {
     raw: tokio_postgres::Client,
     engine_client: Option<EngineClient>,
     /// The options the primary `engine_client` was started with — remembered
-    /// so [`ManualBackend::restart`] (improvement-plan task E3) can start a
+    /// so [`ManualBackend::restart`] can start a
     /// fresh client against the exact same target rather than needing the
     /// caller to hand the options back in.
     client_options: Option<ClientOptions>,
     /// Additional application-worker-only clients started by
-    /// [`ManualBackend::scale_out`] (improvement-plan task E3). Kept alive for
+    /// [`ManualBackend::scale_out`]. Kept alive for
     /// the backend's own lifetime (dropped, and so best-effort-signalled to
     /// stop, only when `self` is) — nothing here ever reads back out of this
     /// list, it exists purely so these clients keep running and aren't
@@ -398,9 +350,9 @@ pub struct ManualBackend {
     tables: HashMap<String, Table>,
     defs: Vec<TransformDef>,
     /// How many application-worker tasks [`Backend::install`] starts the
-    /// underlying [`EngineClient`] with (improvement-plan task D4). `1` for
-    /// every existing single-worker caller (unchanged default via
-    /// [`ManualBackend::connect`]); `>1` is the "second runtime"
+    /// underlying [`EngineClient`] with. `1` for
+    /// a single-worker caller (the default via
+    /// [`ManualBackend::connect`]); `>1` is the concurrent runtime
     /// `generative/tests/concurrent_convergence.rs` drives.
     application_threads: usize,
     /// How often the underlying `EngineClient`'s maintenance loop
@@ -410,7 +362,7 @@ pub struct ManualBackend {
     /// hand-built pin can widen it comfortably past how long a large burst of
     /// raw DML takes to apply, guaranteeing every row of that burst lands in
     /// the *same* sealed batch instead of splitting across an arbitrary
-    /// number of 300ms-apart maintenance ticks (see the D4 hand-built
+    /// number of 300ms-apart maintenance ticks (see the hand-built
     /// "genuinely exceeds `MIN_ROWS_TO_SPLIT`" pin in
     /// `generative/tests/concurrent_convergence.rs`).
     maintenance_interval: Duration,
@@ -477,7 +429,7 @@ impl ManualBackend {
 
     /// Like [`ManualBackend::connect`], but starts the underlying
     /// [`EngineClient`] with `application_threads` app-worker tasks instead
-    /// of a hardcoded `1` (improvement-plan task D4's "second runtime" —
+    /// of a hardcoded `1` (the concurrent runtime —
     /// same `Backend` seam, same DDL/DML/quiesce/snapshot code, a real
     /// multi-worker pool underneath). The engine's default maintenance
     /// cadence is unchanged; see [`ManualBackend::connect_with_options`] if a
@@ -710,9 +662,8 @@ impl ManualBackend {
         Ok(rows.iter().map(|row| row.get(0)).collect())
     }
 
-    /// Diagnostic-only (improvement-plan task D4): the largest `bucket_count`
-    /// across every segment sealed so far, straight from
-    /// the engine's own `staging::claim` partition decision (`segments.bucket_count`,
+    /// Diagnostic-only: the largest `bucket_count` across every segment sealed so far, straight
+    /// from the engine's own `staging::claim` partition decision (`segments.bucket_count`,
     /// fixed at seal time from row count alone — see
     /// `staging::claim::MIN_ROWS_TO_SPLIT`/`SEG_BUCKETS`). `0` if no
     /// segment has sealed yet.
@@ -930,7 +881,7 @@ impl ManualBackend {
     }
 
     /// Creates a table with the exact same DDL shape [`ManualBackend::install`]
-    /// gives a real source table (task E1: untracked-object noise), so it is
+    /// gives a real source table (untracked-object noise), so it is
     /// indistinguishable from a real one at the DDL level, but never
     /// registers it in `self.tables`, and no definition reads it, so the
     /// engine never captures it (the engine captures exactly the tables
@@ -949,7 +900,7 @@ impl ManualBackend {
 
     /// Runs one arbitrary SQL statement directly against this backend's own
     /// connection, bypassing [`ManualBackend::apply`]'s op-shaped DML
-    /// entirely (task E1 noise DDL/DML; task E5's `CHECKPOINT`). Returns the
+    /// entirely (noise DDL/DML and `CHECKPOINT`). Returns the
     /// statement's affected-row count (`0` for a DDL statement or
     /// `CHECKPOINT`, same as any other statement that doesn't affect table
     /// rows).
@@ -963,7 +914,7 @@ impl ManualBackend {
     /// are swallowed (logged to stderr, never returned) — noise/
     /// administration is deliberately allowed to fail (e.g. a `DROP COLUMN`
     /// on a column an earlier event already dropped) without that ever
-    /// counting as a run failure; the whole point of tasks E1/E5 is that
+    /// counting as a run failure; the whole point of noise events is that
     /// nothing here can affect the tracked convergence check regardless of
     /// whether it succeeds.
     pub async fn fire_noise_event(&self, table: Option<&Table>, event: &NoiseEvent) {
@@ -1042,14 +993,15 @@ impl ManualBackend {
     }
 
     /// Starts a primary engine client with the options [`Backend::install`]
-    /// remembered, after [`Self::stop_engine`]. Same producer-lock retry as
+    /// remembered, after [`Self::stop_engine`]. Same producer-lock wait as
     /// [`Backend::restart`].
     pub async fn start_engine(&mut self) -> Result<(), ManualBackendError> {
         let options = self
             .client_options
             .clone()
             .ok_or(ManualBackendError::NoClientStarted)?;
-        let client = start_with_producer_retry(self.config.clone(), options).await?;
+        wait_for_producer_release(&self.config).await?;
+        let client = EngineClient::start_with_config(self.config.clone(), options)?;
         self.engine_client = Some(client);
         Ok(())
     }
@@ -1158,7 +1110,7 @@ impl super::Backend for ManualBackend {
             }
             let client = EngineClient::start_with_config(self.config.clone(), options.clone())?;
             self.engine_client = Some(client);
-            // Remembered so `restart` (improvement-plan task E3) can start an
+            // Remembered so `restart` can start an
             // equivalent replacement client without the caller needing to
             // hand these options back in.
             self.client_options = Some(options);
@@ -1182,7 +1134,7 @@ impl super::Backend for ManualBackend {
     }
 
     async fn quiesce(&mut self) -> Result<(), ManualBackendError> {
-        // Improvement-plan workstream C, task C1: opt-in per-call timing
+        // Opt-in per-call timing
         // around the whole quiesce (the settle and partition
         // waits as well as the watermark -> converge round trip), to test the
         // hypothesis that the convergence property's wall-clock variance came
@@ -1271,53 +1223,27 @@ impl super::Backend for ManualBackend {
         Ok(snapshot)
     }
 
-    /// Improvement-plan task E3: tears down the current primary
+    /// Tears down the current primary
     /// `trellis::Client` and starts a fresh one against the same dsn/options
     /// [`ManualBackend::install`] remembered. The ring is durable Postgres
     /// state untouched by any of this, so the new client resumes exactly
     /// where the old one left off.
     ///
-    /// Two layers of fix:
+    /// Two steps keep the replacement from racing the old producer's lock:
     ///
-    /// 1. This used to just drop the old `Option<Client>` and rely on
-    ///    `Client`'s `Drop` impl (a best-effort shutdown signal with no
-    ///    join) to tear it down, then immediately start the replacement.
-    ///    `Drop` never waits for the background thread to exit, so the old
-    ///    producer's `pg_try_advisory_lock`-held session could still be open
-    ///    when the very next line's producer tried to acquire that same
-    ///    lock — a real, sporadic `ProducerAlreadyRunning` race (see the CI
-    ///    observed CI failure). Awaiting `trellis::Client::shutdown` on
-    ///    the outgoing client first — which sends the same signal *and*
-    ///    joins the thread — makes the old lock's release happen-before the
-    ///    new client's *thread* fully exiting, closing the client-side half
-    ///    of the race.
-    /// 2. That alone still narrows rather than closes the window:
-    ///    `shutdown` guarantees this process's connection object is torn
-    ///    down, not that the Postgres backend serving it has actually been
-    ///    scheduled to notice the closed socket and release the advisory
-    ///    lock — a kernel/Postgres-scheduling gap, not anything this
-    ///    process's own state can observe or wait on directly. Confirmed by
-    ///    direct measurement: under sustained heavy CPU contention (dozens
-    ///    of runs of the regression test below against real artificial
-    ///    load), layer 1 alone still hit `ProducerAlreadyRunning` in roughly
-    ///    1 of every 8 restarts — a large reduction from pre-fix, not an
-    ///    elimination. [`start_with_producer_retry`] closes that residual
-    ///    gap the only way available from this side of the socket: retry
-    ///    `EngineClient::start_with_config` with a short bounded backoff
-    ///    ([`RESTART_PRODUCER_RETRY_ATTEMPTS`]) specifically when it fails
-    ///    with exactly this conflict ([`is_producer_already_running`]),
-    ///    rather than propagating it immediately. Bounded so a *genuinely*
-    ///    stuck lock (an actual second producer, not just a not-yet-noticed
-    ///    dead connection) still surfaces as a real error rather than
-    ///    hanging forever.
+    /// 1. The outgoing client is shut down with `trellis::Client::shutdown`
+    ///    (which joins its background thread), not dropped: `Drop` only
+    ///    signals.
+    /// 2. [`wait_for_producer_release`] waits for the singleton to read free
+    ///    in `pg_locks`. `shutdown` tears down this process's connection,
+    ///    but the Postgres backend serving it releases the advisory lock only
+    ///    once it is scheduled to read the closed socket. A replacement that
+    ///    asked first would come up as a standby and take the lock at its
+    ///    next poll, seconds later.
     ///
-    /// Matches [`super::SubprocessBackend::restart`]'s own explicit
-    /// `kill`-then-`wait` (never just letting its `CrashGuard` drop) for the
-    /// identical layer-1 reason. The process's exit doesn't close layer 2's
-    /// gap either: the killed engine's backend still has to be scheduled to
-    /// read the EOF. `SubprocessBackend` waits for the singleton
-    /// to read free in `pg_locks` before spawning instead of retrying, since
-    /// a failed start there is a dead subprocess, not a typed error.
+    /// Matches [`super::SubprocessBackend::restart`], which kills its engine
+    /// process, waits for it to exit and then waits for the singleton to read
+    /// free before spawning.
     async fn restart(&mut self) -> Result<(), ManualBackendError> {
         let options = self
             .client_options
@@ -1330,14 +1256,15 @@ impl super::Backend for ManualBackend {
         if let Some(old_client) = self.engine_client.take() {
             old_client.shutdown().await?;
         }
-        // Layer 2: retry through the residual window `shutdown` alone can't
-        // close (see this method's own doc comment).
-        let client = start_with_producer_retry(self.config.clone(), options).await?;
+        // Layer 2: wait out the residual window `shutdown` alone can't close
+        // (see this method's own doc comment).
+        wait_for_producer_release(&self.config).await?;
+        let client = EngineClient::start_with_config(self.config.clone(), options)?;
         self.engine_client = Some(client);
         Ok(())
     }
 
-    /// Improvement-plan task E3: starts an additional, application-worker-only
+    /// Starts an additional, application-worker-only
     /// (`staging_worker: false`) `trellis::Client` against the same dsn,
     /// alongside whatever primary client `install` already started —
     /// confirming multiple clients can coexist draining the same ring (the
@@ -1495,7 +1422,8 @@ impl super::ConcurrentBackend for ManualBackend {
                             self.strict_audits_converged += 1;
                         }
                         // Not a verdict on correctness: a definition an
-                        // operator action left paused is checked by the
+                        // operator action left paused, or one reading it
+                        // (reported `catching_up`), is checked by the
                         // run's end-of-run `live` check.
                         trellis::SelfCheckOutcome::NotLive(_) => {}
                         _ => failures.push(format!("{target}: {report:#?}")),

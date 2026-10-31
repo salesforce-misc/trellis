@@ -1549,11 +1549,9 @@ async fn no_page_table_outlives_a_drain_call_or_reaches_a_pooled_connection() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     setup_copy(&db, &client).await;
-    let config = trellis::Config::from_dsn(db.dsn().to_string())
-        .expect("valid dsn")
-        .with_pool_max_size(1)
-        .expect("pool size");
-    let pool = trellis::Pool::new(&config).expect("one-connection pool");
+    let config = trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let pool = trellis::Pool::with_limits(&config, 1, Duration::from_secs(30))
+        .expect("one-connection pool");
     let (backend, has_table) = pooled_session(&pool).await;
     assert!(!has_table);
 
@@ -1642,12 +1640,9 @@ async fn isolation_can_check_out_the_connection_its_failed_page_held() {
         .batch_execute("alter table item_copy add constraint not_13 check (id <> 13)")
         .await
         .expect("add the failing check");
-    let config = trellis::Config::from_dsn(db.dsn().to_string())
-        .expect("valid dsn")
-        .with_pool_max_size(1)
-        .expect("pool size")
-        .with_pool_wait_timeout(Duration::from_secs(2));
-    let pool = trellis::Pool::new(&config).expect("one-connection pool");
+    let config = trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let pool = trellis::Pool::with_limits(&config, 1, Duration::from_secs(2))
+        .expect("one-connection pool");
 
     stage_copy_keys(&client, &(1..=20).collect::<Vec<_>>()).await;
     let seg = seal(&mut client).await;

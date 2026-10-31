@@ -68,7 +68,7 @@ pub(crate) mod validate_join_one_to_one;
 pub use ast::{AlterTransform, DefinitionRef, Statement, StatementKind, TransformRef, ValueType};
 pub use catalog::{CatalogError, alter_transform, install_definition, tables_to_capture};
 pub use error::ParseError;
-pub use model::TransformStatus;
+pub use model::{StoredStatus, TransformStatus};
 pub use parser::{MAX_EXPRESSION_DEPTH, parse_statement, statement_kind};
 // Stored text loads through `grammar::load`; the integration tests parse
 // fresh text directly.

@@ -735,7 +735,7 @@ async fn a_plain_one_to_one_definition_backfills_via_running_drain_workers() {
     .expect("install_definition records the definition and returns");
     assert_eq!(
         def.status,
-        TransformStatus::WaitingToBackfill,
+        trellis::defs::StoredStatus::WaitingToBackfill,
         "install_definition must return before its build is even dispatched"
     );
     // No staging worker here (`staging_worker: false`): stand in for its
@@ -842,7 +842,7 @@ async fn a_drain_only_client_reclaims_a_stale_chunk_claim_with_no_staging_worker
     )
     .await
     .expect("install_definition records the definition and returns");
-    assert_eq!(def.status, TransformStatus::WaitingToBackfill);
+    assert_eq!(def.status, trellis::defs::StoredStatus::WaitingToBackfill);
     // No staging worker here (`staging_worker: false`): stand in for its
     // reconcile pass, which starts the Re-derive build.
     trellis::intake::harness::start_registered_builds(&db.pool)
@@ -975,7 +975,7 @@ async fn a_running_client_backfills_a_reclaimed_composite_key_chunk() {
     )
     .await
     .expect("install_definition records the definition and returns");
-    assert_eq!(def.status, TransformStatus::WaitingToBackfill);
+    assert_eq!(def.status, trellis::defs::StoredStatus::WaitingToBackfill);
     // No staging worker here (`staging_worker: false`): stand in for its
     // reconcile pass, which starts the Re-derive build.
     trellis::intake::harness::start_registered_builds(&db.pool)
@@ -1100,9 +1100,9 @@ async fn drain_workers_waiting_an_hour_still_build_and_drain_on_notifications_al
     };
     let client = TrellisClient::start(db.dsn(), options).expect("client start");
 
-    // Both workers' `LISTEN`s and the `self_check` worker's are in place (the
-    // last statement of a wake listener's session), so a notification from
-    // here on reaches them.
+    // The client's one `LISTEN`, shared by both drain workers and the
+    // `self_check` worker, is in place (the last statement of a wake
+    // listener's session), so a notification from here on reaches them.
     poll_until(
         Duration::from_secs(20),
         Duration::from_millis(20),
@@ -1117,7 +1117,7 @@ async fn drain_workers_waiting_an_hour_still_build_and_drain_on_notifications_al
                 .await
                 .expect("count listeners")
                 .get(0);
-            listening == 3
+            listening == 1
         },
     )
     .await;

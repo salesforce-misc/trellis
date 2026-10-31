@@ -1,6 +1,6 @@
 //! A green run is currently a single bit: nobody can see that a `Delete` op
 //! stopped being drawn, or that a run drew zero mutates, or that the
-//! op-outcome paths added in A1 (`OpOutcome::Fails`/`AffectsNoRows`) stopped
+//! op-outcome paths (`OpOutcome::Fails`/`AffectsNoRows`) stopped
 //! occurring at all (`docs/generative-test-suite.md` §3, "Generator coverage
 //! meta-tests").
 //! [`Coverage`] is the accumulator that makes a run report what it actually
@@ -34,7 +34,7 @@ pub struct Coverage {
     /// `"Insert"` / `"Update"` / `"Delete"`, tallied from [`crate::model::Op`].
     pub ops_by_kind: HashMap<&'static str, usize>,
     /// `"Succeeds"` / `"Fails"` / `"AffectsNoRows"` / `"AnyOf"`, tallied from
-    /// each op's [`Op::expect`] (added in A1).
+    /// each op's [`Op::expect`].
     pub ops_by_outcome: HashMap<&'static str, usize>,
     /// Which [`Expr`] variant names appear across every `FieldDef.expr` on
     /// every def, walked recursively.
@@ -45,10 +45,9 @@ pub struct Coverage {
     /// Which function names (the [`Expr::FunctionCall`] `name` field, one of
     /// `trellis::dev::defs::registry::FUNCTIONS`/`AGGREGATE_FUNCTION_SPECS`'s
     /// canonical uppercased names) appear across every `FieldDef.expr` on
-    /// every def, walked recursively alongside `expr_shapes` (improvement-plan
-    /// task B2). An unrecognized function name is tallied as `"Other"` rather
-    /// than panicking — this accumulator has no failure mode of its own, it
-    /// just can't name what it's never been told about.
+    /// every def, walked recursively alongside `expr_shapes`. An unrecognized function name is
+    /// tallied as `"Other"` rather than panicking — this accumulator has no failure mode of its
+    /// own, it just can't name what it's never been told about.
     pub functions: HashSet<&'static str>,
     /// Which [`ValueType`] names appear on any column of any table.
     pub types_exercised: HashSet<&'static str>,
@@ -56,7 +55,7 @@ pub struct Coverage {
     pub key_spaces: HashMap<&'static str, usize>,
     /// The deepest `Expr` tree seen across every `FieldDef.expr` on every
     /// def, a leaf (`Column`/`NumberLiteral`/`StringLiteral`/a `JOIN`'s
-    /// `<table>.<column>` path) counting as depth 1 (improvement-plan task B2):
+    /// `<table>.<column>` path) counting as depth 1:
     /// the floor a nested, multi-level expression (e.g. `STRPOS(t, 'x') > 0`,
     /// depth 3) needs to prove itself against, distinct from `expr_shapes`
     /// (which shapes appear at all) since a program could draw both
@@ -65,17 +64,17 @@ pub struct Coverage {
     pub max_expr_depth: usize,
     /// Number of definitions, across every recorded program, whose
     /// [`Program::def_install_after_op`] entry is nonzero — i.e. actually
-    /// deferred mid-stream rather than installed up front (improvement-plan
-    /// task E2). A floor test over [`crate::generate::program_with_mid_stream_def_install`]
-    /// asserts this is nonzero across enough samples: a coverage bit for "a
-    /// mid-stream install was actually drawn", not just "the strategy exists".
+    /// deferred mid-stream rather than installed up front. A floor test over
+    /// [`crate::generate::program_with_mid_stream_def_install`] asserts this is nonzero across
+    /// enough samples: a coverage bit for "a mid-stream install was actually drawn", not just "the
+    /// strategy exists".
     pub mid_stream_def_installs: usize,
     /// Total [`Program::restart_after_ops`] entries across every recorded
-    /// program (improvement-plan task E3) — how many scheduled client
+    /// program — how many scheduled client
     /// restarts were actually drawn.
     pub client_restarts: usize,
     /// Total [`Program::scale_out_after_ops`] entries across every recorded
-    /// program (improvement-plan task E3) — how many scheduled scale-outs
+    /// program — how many scheduled scale-outs
     /// were actually drawn.
     pub client_scale_outs: usize,
     /// How many recorded programs (cases, not fields) contain each aggregate
@@ -91,7 +90,7 @@ pub struct Coverage {
     /// side), or `"expr"` (anything else).
     pub aggregate_call_cases: HashMap<(&'static str, &'static str, &'static str), usize>,
     /// The largest [`Op::BulkInsert`] row count seen across every recorded
-    /// program (improvement-plan task E6) — a floor test asserts this
+    /// program — a floor test asserts this
     /// actually gets large across enough samples of
     /// [`crate::generate::bulk_insert_program`], not just that a small one
     /// occasionally shows up.
@@ -178,16 +177,16 @@ impl Coverage {
             }
         }
 
-        // Improvement-plan task E2.
+        // Deferred definition installs.
         self.mid_stream_def_installs += program
             .def_install_after_op
             .iter()
             .filter(|&&at| at != 0)
             .count();
-        // Improvement-plan task E3.
+        // Scheduled client restarts and scale-outs.
         self.client_restarts += program.restart_after_ops.len();
         self.client_scale_outs += program.scale_out_after_ops.len();
-        // Improvement-plan task E6.
+        // Bulk inserts.
         for op in &program.ops {
             if let Op::BulkInsert { rows, .. } = op {
                 self.max_bulk_insert_rows = self.max_bulk_insert_rows.max(rows.len());

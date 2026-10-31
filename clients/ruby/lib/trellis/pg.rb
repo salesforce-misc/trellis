@@ -24,6 +24,7 @@ else
 end
 
 require_relative "instance"
+require_relative "metrics"
 
 # Embedded Trellis for Ruby apps: a native extension over the `trellis`
 # crate's BlockingTrellis, so a Rails app can define and run streaming
@@ -48,6 +49,7 @@ require_relative "instance"
 # - Operations: request_backfill, detect_capture_disruptions, has_live_drain_workers?,
 #   has_live_staging_worker?, watermark_token, await_converged, self_check,
 #   self_check_job.
+# - Metrics: Trellis::Metrics.render_prometheus, which needs no handle.
 #
 #   # A deploy's migration step: the defaults run nothing in the background.
 #   Trellis.connect(url: "host=localhost dbname=app")

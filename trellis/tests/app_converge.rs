@@ -282,13 +282,16 @@ async fn await_converged_times_out_on_a_blocked_poll_and_leaves_the_pool_usable(
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
 
-    let config = Config::from_dsn(db.dsn().to_string())
-        .expect("valid dsn")
-        .with_pool_max_size(1)
-        .expect("pool size");
-    let trellis = Trellis::connect(config, TrellisOptions::default())
-        .await
-        .expect("connect");
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let trellis = Trellis::connect(
+        config,
+        TrellisOptions {
+            max_call_pool_size: 1,
+            ..TrellisOptions::default()
+        },
+    )
+    .await
+    .expect("connect");
 
     let token = trellis.watermark_token().await.expect("watermark_token");
     let raw = connect_raw(db.dsn()).await;

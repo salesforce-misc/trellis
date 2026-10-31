@@ -49,7 +49,7 @@ use crate::defs::chunk_queue::{KIND_PLAN, KIND_REDERIVE, KIND_SWEEP};
 use crate::defs::join::{self as spec, Side};
 use crate::defs::join_one_to_one::HiddenTable;
 use crate::defs::ledger as schema;
-use crate::defs::model::TransformStatus;
+use crate::defs::model::StoredStatus;
 use crate::pool::quote_ident;
 
 /// The environment variable that sets the fan-out warning threshold: the most
@@ -259,7 +259,7 @@ async fn building(
             &[
                 &id,
                 &[KIND_PLAN, KIND_REDERIVE, KIND_SWEEP].as_slice(),
-                &TransformStatus::dispatchable(),
+                &StoredStatus::dispatchable(),
             ],
         )
         .await?;

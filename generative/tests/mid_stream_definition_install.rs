@@ -1,11 +1,9 @@
-//! Improvement-plan task E2 (rescoped): definition lifecycle — installing a
+//! Definition lifecycle — installing a
 //! new [`TransformDef`] mid-stream, after some ops have already run against
 //! its source table, rather than every definition installing up front
-//! alongside every table (`generative::run::run_convergence`'s only behavior
-//! before this task).
+//! alongside every table.
 //!
-//! **Explicitly out of scope, per the rescoping** (improvement-plan
-//! workstream E): "redefine" (altering an existing definition) and "remove"
+//! **Explicitly out of scope:** "redefine" (altering an existing definition) and "remove"
 //! (dropping one) are not attempted here.
 //! `defs::catalog` has no drop/alter-definition API today — only
 //! `create_definition`/`create_definition_without_backfill`/`install_definition`
@@ -90,7 +88,7 @@ fn run_one(program: &generative::model::Program) -> Result<(), TestCaseError> {
 proptest! {
     #![proptest_config(proptest_config())]
 
-    /// Define-then-load vs. load-then-define equivalence (this task's whole
+    /// Define-then-load vs. load-then-define equivalence (this file's whole
     /// point): a definition installed after some of its own source table's
     /// rows already exist must still converge exactly like every other
     /// definition, i.e. must correctly backfill those preexisting rows and
@@ -160,7 +158,7 @@ async fn a_definition_installed_after_preexisting_rows_backfills_and_keeps_conve
 /// `staging::converge::converged_through`'s condition 3 — see
 /// `generative/tests/client_lifecycle.rs`'s module doc comment for the full
 /// writeup) on a table whose definition was *just* installed? Neither of
-/// this task's own properties/pins above ever combine with a restart, and
+/// this file's own properties/pins above ever combine with a restart, and
 /// `client_lifecycle.rs`'s restart pin only ever exercises definitions that
 /// were already installed up front — so nothing on this branch previously
 /// drove "install a definition, then immediately have a restart's extra

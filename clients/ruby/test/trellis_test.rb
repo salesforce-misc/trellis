@@ -37,6 +37,12 @@ class TrellisTest < Minitest::Test
     eventually_value("the new source row to reach widget_prices",
                      ->(rows) { rows == [[1, 5], [2, 7]] }) { rows(pg) }
 
+    # The apply shows up in the process-wide registry. The drain records it
+    # just after its transaction commits, so the row can be visible first.
+    applied = /^trellis_changes_applied_total\{trellis_instance="[^"]+",transform="[^"]*widget_prices"\} \d+$/
+    eventually_value("widget_prices' applied changes to reach the metrics",
+                     ->(metrics) { metrics.match?(applied) }) { Trellis::Metrics.render_prometheus }
+
     assert_nil Trellis.shutdown
     refute Trellis.connected?
   ensure
@@ -82,13 +88,15 @@ class TrellisTest < Minitest::Test
     # The test cluster trusts every local connection, so the password is
     # accepted and ignored: it's here to be looked for in the output.
     password = "s3cret-hunter2"
-    Trellis.connect(url: "#{TestCluster.dsn} password=#{password}", target_schema: "reporting")
+    Trellis.connect(url: "#{TestCluster.dsn} password=#{password}", target_schema: "reporting",
+                    max_call_pool_size: 7, call_pool_wait_timeout_ms: 2_500)
     config = Trellis.config
     assert_instance_of Trellis::Config, config
     assert_equal "trellis", config.schema
     assert_equal "reporting", config.target_schema
-    assert_operator config.pool_max_size, :>=, 1
-    assert_operator config.pool_wait_timeout_ms, :>=, 1
+    # The call pool as the handle built it, not the defaults.
+    assert_equal 7, config.max_call_pool_size
+    assert_equal 2_500, config.call_pool_wait_timeout_ms
 
     # A config is the kind of value that gets logged whole.
     refute_includes config.to_h.keys, :url
@@ -150,7 +158,9 @@ class TrellisTest < Minitest::Test
       [{ url: TestCluster.dsn, target_schema: 1 }, "target_schema must be a String"],
       [{ url: TestCluster.dsn, staging: "yes" }, "staging must be true or false"],
       [{ url: TestCluster.dsn, drain_threads: -1 }, "drain_threads must be a non-negative"],
-      [{ url: TestCluster.dsn, worker_threads: 0 }, "worker_threads must be a positive"]
+      [{ url: TestCluster.dsn, worker_threads: 0 }, "worker_threads must be a positive"],
+      [{ url: TestCluster.dsn, max_call_pool_size: 0 }, "max_call_pool_size must be a positive"],
+      [{ url: TestCluster.dsn, call_pool_wait_timeout_ms: -1 }, "call_pool_wait_timeout_ms must be a non-negative"]
     ].each do |options, message|
       error = assert_raises(Trellis::ValidationError, options.inspect) { Trellis.connect(**options) }
       assert_match message, error.message

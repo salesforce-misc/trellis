@@ -20,7 +20,7 @@ use crate::defs::ast::TransformDef;
 use crate::defs::chunk_queue::{KIND_PLAN, KIND_SWEEP};
 use crate::defs::ddl::regclass_arg;
 use crate::defs::join::{self as spec, HiddenTable, Side};
-use crate::defs::model::TransformStatus;
+use crate::defs::model::StoredStatus;
 
 /// `P` is reported once its estimated rows reach this share of the fact
 /// table's, as a percentage: past it the partials no longer compress the
@@ -220,7 +220,7 @@ async fn building(
             &[
                 &id,
                 &[KIND_PLAN, KIND_SWEEP].as_slice(),
-                &TransformStatus::dispatchable(),
+                &StoredStatus::dispatchable(),
             ],
         )
         .await?

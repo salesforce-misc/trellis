@@ -157,7 +157,7 @@ use tokio_postgres::types::Type;
 use tokio_postgres::{GenericClient, IsolationLevel, Transaction};
 
 use crate::defs::chunk_queue::{self, ChunkQueueError, ChunkWork, ClaimFence, ClaimedChunk};
-use crate::defs::model::{Definition, TransformStatus};
+use crate::defs::model::{Definition, StoredStatus};
 use crate::defs::{catalog, ddl};
 use crate::metrics::{self, BuildStatement};
 use crate::pool::{Pool, quote_ident};
@@ -256,7 +256,7 @@ pub async fn start_ready_builds(
         let Some(definition) = catalog::definition_by_id(pool, id).await? else {
             continue;
         };
-        if definition.status != TransformStatus::WaitingToBackfill {
+        if definition.status != StoredStatus::WaitingToBackfill {
             continue;
         }
         // A JOIN's plan job builds both structures
@@ -558,7 +558,7 @@ async fn start(
         )
         .await?
         .map(|row| row.get(0));
-    if status.as_deref() != Some(TransformStatus::WaitingToBackfill.as_str()) {
+    if status.as_deref() != Some(StoredStatus::WaitingToBackfill.as_str()) {
         txn.rollback().await?;
         return Ok(None);
     }
@@ -591,7 +591,7 @@ async fn start(
         "update transform_definitions set status = $2, build = $3 where id = $1",
         &[
             &definition.id,
-            &TransformStatus::Backfilling.as_str(),
+            &StoredStatus::Backfilling.as_str(),
             &BUILD_REDERIVE,
         ],
     )
@@ -623,8 +623,8 @@ async fn start(
     crate::instance_log::info!(
         definition_id = definition.id,
         target = %definition.target_table,
-        from = %TransformStatus::WaitingToBackfill.as_str(),
-        to = %TransformStatus::Backfilling.as_str(),
+        from = %StoredStatus::WaitingToBackfill.as_str(),
+        to = %StoredStatus::Backfilling.as_str(),
         rebuild = !empty,
         "transform status transition: re-derive build started"
     );
@@ -647,8 +647,8 @@ pub(crate) async fn rebuild_candidates(
              order by id",
             &[
                 &tables,
-                &TransformStatus::Live.as_str(),
-                &TransformStatus::Backfilling.as_str(),
+                &StoredStatus::Live.as_str(),
+                &StoredStatus::Backfilling.as_str(),
                 &BUILD_REDERIVE,
             ],
         )
@@ -673,8 +673,8 @@ pub(crate) async fn rebuildable(
              order by id",
             &[
                 &ids,
-                &TransformStatus::Live.as_str(),
-                &TransformStatus::Backfilling.as_str(),
+                &StoredStatus::Live.as_str(),
+                &StoredStatus::Backfilling.as_str(),
                 &BUILD_REDERIVE,
             ],
         )
@@ -718,9 +718,9 @@ pub(crate) async fn start_rebuilds(
              where id = any($1) and status = $4 returning id",
             &[
                 &ids,
-                &TransformStatus::Backfilling.as_str(),
+                &StoredStatus::Backfilling.as_str(),
                 &BUILD_REDERIVE,
-                &TransformStatus::Live.as_str(),
+                &StoredStatus::Live.as_str(),
             ],
         )
         .await?
@@ -750,8 +750,8 @@ pub(crate) async fn start_rebuilds(
     if !moved.is_empty() {
         crate::instance_log::info!(
             ids = ?moved,
-            from = %TransformStatus::Live.as_str(),
-            to = %TransformStatus::Backfilling.as_str(),
+            from = %StoredStatus::Live.as_str(),
+            to = %StoredStatus::Backfilling.as_str(),
             "transform status transition: re-derive rebuild started"
         );
     }
@@ -815,9 +815,9 @@ pub(crate) async fn stamp_rebuild_seg(
 /// build ([`start_field_build`]): one that applies. That is a
 /// `live` one, or a `backfilling` one under a Re-derive build, which the field
 /// build joins. A frozen definition doesn't apply.
-pub(crate) fn takes_field_build(status: TransformStatus, build: Option<&str>) -> bool {
-    status == TransformStatus::Live
-        || (status == TransformStatus::Backfilling && build == Some(BUILD_REDERIVE))
+pub(crate) fn takes_field_build(status: StoredStatus, build: Option<&str>) -> bool {
+    status == StoredStatus::Live
+        || (status == StoredStatus::Backfilling && build == Some(BUILD_REDERIVE))
 }
 
 /// Starts a field build of `fields` on definition `id` in `txn`, the
@@ -833,13 +833,13 @@ pub(crate) fn takes_field_build(status: TransformStatus, build: Option<&str>) ->
 pub(crate) async fn start_field_build(
     txn: &impl GenericClient,
     id: i64,
-    status: TransformStatus,
+    status: StoredStatus,
     fields: &[String],
 ) -> Result<(), tokio_postgres::Error> {
-    if status == TransformStatus::Live {
+    if status == StoredStatus::Live {
         txn.execute(
             "update transform_definitions set status = $2, build = $3 where id = $1",
-            &[&id, &TransformStatus::Backfilling.as_str(), &BUILD_REDERIVE],
+            &[&id, &StoredStatus::Backfilling.as_str(), &BUILD_REDERIVE],
         )
         .await?;
     }
@@ -850,8 +850,8 @@ pub(crate) async fn start_field_build(
         &[&id, &chunk_queue::KIND_PLAN, &fields],
     )
     .await?;
-    let to = if status == TransformStatus::Live {
-        TransformStatus::Backfilling
+    let to = if status == StoredStatus::Live {
+        StoredStatus::Backfilling
     } else {
         status
     };
@@ -1232,7 +1232,7 @@ fn building_predicate() -> &'static str {
 }
 
 fn building_params() -> (&'static str, &'static str) {
-    (BUILD_REDERIVE, TransformStatus::Backfilling.as_str())
+    (BUILD_REDERIVE, StoredStatus::Backfilling.as_str())
 }
 
 /// What [`work_probe`] found.
@@ -1282,7 +1282,7 @@ pub async fn work_probe(pool: &Pool) -> Result<WorkProbe, ChunkQueueError> {
     );
     let statement = client.prepare_cached(&sql).await?;
     let params = building_params();
-    let dispatchable = TransformStatus::dispatchable();
+    let dispatchable = StoredStatus::dispatchable();
     let row = client
         .query_one(&statement, &[&params.0, &params.1, &dispatchable])
         .await?;
@@ -2976,7 +2976,7 @@ pub async fn try_complete(pool: &Pool, id: i64) -> Result<bool, ChunkQueueError>
     .await?;
     txn.execute(
         "update transform_definitions set status = $2, build = null where id = $1",
-        &[&id, &TransformStatus::Live.as_str()],
+        &[&id, &StoredStatus::Live.as_str()],
     )
     .await?;
     // The rebuild repaired what its readers may have held keys for
@@ -2986,8 +2986,8 @@ pub async fn try_complete(pool: &Pool, id: i64) -> Result<bool, ChunkQueueError>
     txn.commit().await?;
     crate::instance_log::info!(
         definition_id = id,
-        from = %TransformStatus::Backfilling.as_str(),
-        to = %TransformStatus::Live.as_str(),
+        from = %StoredStatus::Backfilling.as_str(),
+        to = %StoredStatus::Live.as_str(),
         "transform status transition: re-derive build finished"
     );
     Ok(true)
@@ -3010,7 +3010,7 @@ async fn build_done(client: &impl GenericClient, id: i64) -> Result<bool, ChunkQ
             ),
             &[
                 (&id, Type::INT8),
-                (&TransformStatus::Backfilling.as_str(), Type::TEXT),
+                (&StoredStatus::Backfilling.as_str(), Type::TEXT),
                 (&BUILD_REDERIVE, Type::TEXT),
             ],
         )
@@ -3315,7 +3315,7 @@ mod tests {
                 .expect("status")
                 .expect("the definition exists")
         };
-        assert_eq!(status().await.status, TransformStatus::Backfilling);
+        assert_eq!(status().await.status, crate::TransformStatus::Backfilling);
 
         let options = WorkerOptions {
             chunk_rows: 100,
@@ -3342,7 +3342,7 @@ mod tests {
             failure.last_error
         );
         let status = status().await;
-        assert_eq!(status.status, TransformStatus::Live);
+        assert_eq!(status.status, crate::TransformStatus::Live);
         assert_eq!(status.backfill_failure, None);
         let target = raw
             .query_one(

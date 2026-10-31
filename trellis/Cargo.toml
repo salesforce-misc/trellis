@@ -1,6 +1,6 @@
 [package]
 name = "trellis"
-version = "0.1.0-alpha"
+version = "0.1.0-gamma"
 edition.workspace = true
 # Published to crates.io as `trellis-pg` (`trellis` is taken there), with its
 # library still named `trellis`; .github/scripts/publish-packages.sh renames
@@ -18,6 +18,8 @@ keywords = ["postgres", "postgresql", "streaming", "materialized-view", "increme
 categories = ["database"]
 
 [dependencies]
+# `QueueMode` is not re-exported by deadpool-postgres.
+deadpool = { version = "0.12", default-features = false, features = ["managed"] }
 deadpool-postgres = "0.14.1"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }

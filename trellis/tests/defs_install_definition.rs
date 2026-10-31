@@ -21,7 +21,7 @@ use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::CatalogError;
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
-use trellis::defs::{TransformStatus, ValueType, install_definition};
+use trellis::defs::{StoredStatus, ValueType, install_definition};
 use trellis::staging::apply;
 use trellis::staging::{has_pending, retire_drained_segments};
 
@@ -437,7 +437,7 @@ async fn install_definition_fast_path_ends_up_live() {
     // right here.
     assert_eq!(
         def.status,
-        TransformStatus::WaitingToBackfill,
+        StoredStatus::WaitingToBackfill,
         "install_definition must return before the build is dispatched"
     );
     let rows = client
@@ -1095,7 +1095,7 @@ async fn registration_reads_no_source_rows() {
         }
     };
     let plain = register("TRANSFORM t FROM s SELECT a + a AS x".to_string()).await;
-    assert_eq!(plain.status, TransformStatus::WaitingToBackfill);
+    assert_eq!(plain.status, StoredStatus::WaitingToBackfill);
     locker
         .batch_execute("commit")
         .await
@@ -1273,7 +1273,7 @@ async fn a_registration_that_fails_partway_leaves_no_target_and_can_be_retried()
         .await
         .expect("the retry registers under the same target name");
     assert_eq!(def.target_table, "public.t");
-    assert_eq!(def.status, TransformStatus::WaitingToBackfill);
+    assert_eq!(def.status, StoredStatus::WaitingToBackfill);
     assert!(relation_exists(&client, "public", "t").await);
 }
 

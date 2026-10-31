@@ -181,9 +181,9 @@ pub enum RunError {
         expected: OpOutcome,
         actual: OpOutcome,
     },
-    /// A scheduled [`Backend::restart`] (improvement-plan task E3) failed.
+    /// A scheduled [`Backend::restart`] failed.
     Restart(String),
-    /// A scheduled [`Backend::scale_out`] (improvement-plan task E3) failed.
+    /// A scheduled [`Backend::scale_out`] failed.
     ScaleOut(String),
     /// Carrying out a database-administration action failed
     /// (the harness's side of it: restarting the server and reconnecting).
@@ -252,19 +252,19 @@ pub async fn run_convergence<B: Backend>(
     pool: &Pool,
     program: &Program,
 ) -> Result<Outcome, RunError> {
-    // Improvement-plan workstream C, task C2: opt-in per-call timing around
+    // Opt-in per-call timing around
     // each phase of the loop below, to find out where the suite's wall-clock
     // time actually goes (install, apply, snapshot, oracle recompute) rather
-    // than guessing: measure before tuning. Same convention as C1's
+    // than guessing: measure before tuning. Same convention as
     // `GENERATIVE_QUIESCE_TIMING` in
     // `crate::backend::manual::ManualBackend::quiesce`: an independent env
     // var (`GENERATIVE_COST_TIMING`), checked once per call site, silent and
     // free unless set.
     let timing_enabled = std::env::var_os("GENERATIVE_COST_TIMING").is_some();
 
-    // Improvement-plan task E2: only the definitions due at op index `n`
-    // (`def_install_after_op[i] == n`) — `n == 0` is every pre-E2 program's
-    // only value, so this reduces to "every definition" for those.
+    // Only the definitions due at op index `n`
+    // (`def_install_after_op[i] == n`) — `n == 0` is the only value for a program
+    // that installs everything up front, so this reduces to "every definition" for those.
     let due_defs = |n: usize| -> Vec<TransformDef> {
         program
             .defs
@@ -293,14 +293,14 @@ pub async fn run_convergence<B: Backend>(
     install_result.map_err(|e| RunError::Install(format!("{e:?}")))?;
     // Definitions actually installed so far, in the order they were
     // installed — checked against the oracle below instead of blindly
-    // `program.defs` (task E2's whole point: a deferred definition must not
+    // `program.defs` (a deferred definition must not
     // be checked, or even looked up in the snapshot, before its own install
     // point is reached).
     let mut installed_defs = initial_defs;
 
     for (op_index, op) in program.ops.iter().enumerate() {
         if op_index > 0 {
-            // Improvement-plan task E2: install whatever became due right
+            // Install whatever became due right
             // before this op runs.
             let due = due_defs(op_index);
             if !due.is_empty() {
@@ -317,7 +317,7 @@ pub async fn run_convergence<B: Backend>(
                     .map_err(|e| RunError::Install(format!("{e:?}")))?;
                 installed_defs.extend(due);
             }
-            // Improvement-plan task E3: a scheduled restart/scale-out fires
+            // A scheduled restart/scale-out fires
             // right before the op it's anchored to, same as a deferred
             // definition install above.
             if program.restart_after_ops.contains(&op_index) {
@@ -335,7 +335,7 @@ pub async fn run_convergence<B: Backend>(
         }
 
         apply_and_check_outcome(backend, op_index, op, timing_enabled).await?;
-        // Improvement-plan task E2: only the definitions installed so far are
+        // Only the definitions installed so far are
         // checked — a deferred definition must not be looked up in the
         // snapshot (or checked against the oracle) before its own install
         // point is reached.
@@ -410,7 +410,7 @@ fn check_op_outcome<E>(
 /// between the two.
 ///
 /// `defs` is taken explicitly, rather than always checking `program.defs` in
-/// full, because of improvement-plan task E2: [`run_convergence`] passes only
+/// full, because [`run_convergence`] passes only
 /// the definitions installed *so far* (a deferred definition must not be
 /// checked — or even looked up in the snapshot — before its own install
 /// point is reached), while [`run_convergence_bursty`] (which does not
@@ -447,7 +447,7 @@ async fn quiesce_snapshot_and_check<B: Backend>(
     Ok(())
 }
 
-/// Improvement-plan task D4 ("a second runtime"): like [`run_convergence`],
+/// The concurrent runtime: like [`run_convergence`],
 /// but applies `program`'s ops in fixed-size **bursts** of up to `burst_size`
 /// ops back-to-back, with no [`Backend::quiesce`] call between them within a
 /// burst — quiescing, snapshotting, and running the oracle check
@@ -589,10 +589,9 @@ fn bursts(program: &Program, burst_size: usize) -> Vec<&[Op]> {
 /// the divergence — proving it tells green from red (design doc §6/§7).
 ///
 /// A thin wrapper around [`check_defs`] for `program.defs` in full — every
-/// caller that predates improvement-plan task E2 (every definition installs
-/// up front) wants exactly that. [`run_convergence`] itself calls
-/// [`check_defs`] directly with only the definitions installed *so far*,
-/// since a deferred definition (task E2) must not be checked — or even
+/// caller whose definitions all install up front wants exactly that. [`run_convergence`] itself
+/// calls [`check_defs`] directly with only the definitions installed *so far*,
+/// since a deferred definition must not be checked — or even
 /// looked up in the snapshot — before its own install point is reached.
 pub async fn check_program(
     pool: &Pool,
@@ -602,7 +601,7 @@ pub async fn check_program(
     check_defs(pool, program, &program.defs, snapshot).await
 }
 
-/// [`check_program`]'s general form (improvement-plan task E2): runs the
+/// [`check_program`]'s general form: runs the
 /// oracle check for every definition in `defs` (not necessarily all
 /// of `program.defs` — see [`run_convergence`]'s use of this for a partially-
 /// installed program) against `snapshot`, returning every `(target, report)`

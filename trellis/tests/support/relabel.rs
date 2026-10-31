@@ -195,7 +195,7 @@ impl H {
             .await
             .expect("read status")
             .get(0);
-        TransformStatus::from_persisted(&text).expect("known status")
+        trellis::defs::StoredStatus::from_row(&text).into()
     }
 
     /// What `status()` reports as the definition's `capture_failure`.

@@ -1,15 +1,14 @@
-//! Improvement-plan Workstream E, tasks E1 (untracked-object noise) and E5
-//! (cluster-administration noise — `CHECKPOINT` only, see below) — growing
-//! the generative suite's action space past DML without changing what a
-//! converged run is supposed to look like: both tasks are "bucket 1" (the
-//! plan's own term), meaning `generative::oracle` needs zero changes. This
+//! Untracked-object noise and cluster-administration noise (`CHECKPOINT`
+//! only, see below) extend the generative suite's action space past DML
+//! without changing what a converged run is supposed to look like: neither
+//! needs any change to `generative::oracle`. This
 //! file's whole job is to prove that claim empirically, not just assert it:
 //! [`generative::run::run_convergence_with_noise`] reuses
 //! [`generative::run::check_program`] completely unchanged, and this file
 //! interleaves increasingly adversarial noise/administration around a real
 //! generated program's ops and asserts convergence still holds throughout.
 //!
-//! # E5 scope cut: `CHECKPOINT` only, not a full Postgres restart
+//! # Administration noise scope: `CHECKPOINT` only, not a full Postgres restart
 //!
 //! A full `TestCluster` restart was deliberately **not** built here, when
 //! the engine had no reconnect story for one. `CHECKPOINT` is a plain SQL
@@ -98,7 +97,7 @@ fn run_one(program: &Program, noise: &NoisePlan) -> Result<(), TestCaseError> {
     })
 }
 
-/// Pairs a drawn [`Program`] with an E1 noise plan sized to its own op count,
+/// Pairs a drawn [`Program`] with an untracked-table noise plan sized to its own op count,
 /// via `prop_flat_map` (the same "draw the dependency, then draw off of it"
 /// idiom `generative::generate`'s own `table_spec`/`def_shape_and_derived`
 /// strategies use), so proptest's integrated shrinking can shrink the noise
@@ -111,7 +110,7 @@ fn program_with_noise_plan() -> impl Strategy<Value = (Program, NoisePlan)> {
     })
 }
 
-/// The E5 counterpart of [`program_with_noise_plan`]: pairs a drawn
+/// The administration-noise counterpart of [`program_with_noise_plan`]: pairs a drawn
 /// [`Program`] with a `CHECKPOINT`-only administration plan sized to its own
 /// op count.
 fn program_with_checkpoint_plan() -> impl Strategy<Value = (Program, NoisePlan)> {
@@ -124,7 +123,7 @@ fn program_with_checkpoint_plan() -> impl Strategy<Value = (Program, NoisePlan)>
 proptest! {
     #![proptest_config(proptest_config())]
 
-    /// E1's property: arbitrary DML/DDL noise against an untracked table,
+    /// Untracked-table noise property: arbitrary DML/DDL noise against an untracked table,
     /// interleaved throughout a real generated program's op stream, must
     /// never perturb the tracked convergence check.
     #[test]
@@ -133,7 +132,7 @@ proptest! {
         run_one(&program, &noise)?;
     }
 
-    /// E5's property: interleaved `CHECKPOINT`s must never perturb the
+    /// Administration noise property: interleaved `CHECKPOINT`s must never perturb the
     /// tracked convergence check either.
     #[test]
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
@@ -142,7 +141,7 @@ proptest! {
     }
 }
 
-/// The named "first end-to-end green" for E1: a fully-worked, hand-built
+/// The named "first end-to-end green" for untracked-table noise: a fully-worked, hand-built
 /// convergent program with untracked-table noise interleaved throughout,
 /// including the deliberately adversarial [`adversarial_noise_table`] (pk
 /// column named `"c0"`, extra column named `"total"` — both names a real
@@ -234,7 +233,7 @@ async fn noise_on_an_adversarially_shaped_untracked_table_never_perturbs_converg
     assert!(outcome.as_pass(), "run did not pass: {outcome}");
 }
 
-/// E5's hand-built pin: a `CHECKPOINT` fired before, between, and after every
+/// Administration noise hand-built pin: a `CHECKPOINT` fired before, between, and after every
 /// real op in a small hand-built program — a direct, legible demonstration
 /// that `quiesce()`/convergence tolerate a real Postgres checkpoint at any
 /// point in the run, not just the property happening to draw one sometimes.
