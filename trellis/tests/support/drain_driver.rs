@@ -7,8 +7,8 @@
 //! [`PausePoint`] (`trellis::staging::interleave`). Nothing here waits for
 //! convergence. The waits are [`Driver::wait_blocked_behind`], for a backend
 //! to queue on a lock a frozen worker holds, which the test has forced, and
-//! [`Driver::seal`], for the seal gate's backpressure to clear; neither is a
-//! race.
+//! [`Driver::seal`], for the seal gate's or a full ring's backpressure to
+//! clear; neither is a race.
 
 #![allow(dead_code)]
 
@@ -28,8 +28,8 @@ use trellis::intake::harness;
 
 use trellis::staging::interleave::{PausePoint, PauseScope, Reached, with_scope};
 use trellis::staging::{
-    ApplyError, ApplyOutcome, StagedChange, append, apply, collect_tombstones, has_pending,
-    retire_drained_segments, seal,
+    ApplyError, ApplyOutcome, StagedChange, StagingError, append, apply, collect_tombstones,
+    has_pending, retire_drained_segments, seal,
 };
 
 pub const WAKE: &str = "interleave_wake";
@@ -240,29 +240,42 @@ impl Driver {
     /// previous batch's fence is still open. That is backpressure, which the
     /// engine's own sealer retries; here the likely holder is a server
     /// process finishing on a loaded box (autovacuum's analyze, say, which
-    /// takes an xid for its statistics writes). So this waits up to
-    /// [`SEAL_GATE_WAIT`] for it. A holder the test itself leaves open never
-    /// goes away, and the panic names every open xid-holding session.
+    /// takes an xid for its statistics writes). A full ring is backpressure
+    /// too: the retirement pass skips a slot another session is reading at
+    /// that instant ([`Self::seal_once`]). So this waits up to
+    /// [`SEAL_GATE_WAIT`] for either to clear. A holder the test itself
+    /// leaves open never goes away, and the panic names every open
+    /// xid-holding session, or the ring's slots and their lock holders.
     pub async fn seal(&mut self) -> i64 {
         self.seal_within(SEAL_GATE_WAIT)
             .await
             .unwrap_or_else(|held| panic!("seal phase 1: {held}"))
     }
 
-    /// [`Self::seal`], waiting at most `wait` for the seal gate; `Err` names
-    /// the sessions holding an xid open when it ran out.
+    /// [`Self::seal`], waiting at most `wait` for the seal gate or a full
+    /// ring; `Err` names what still held it when it ran out: the sessions
+    /// holding an xid open, or the ring's registry rows and the locks held
+    /// on its slots.
     pub async fn seal_within(&mut self, wait: Duration) -> Result<i64, String> {
         let deadline = Instant::now() + wait;
         loop {
-            if let Some(batch) = self.try_seal().await {
-                return Ok(batch);
-            }
+            let refused = match self.seal_once().await {
+                Ok(batch) => return Ok(batch),
+                Err(refused) => refused,
+            };
             if Instant::now() >= deadline {
-                return Err(format!(
-                    "the seal gate stayed blocked for {wait:?} ({}); transactions holding an xid: {}",
-                    self.gate_state().await,
-                    self.xid_holders().await
-                ));
+                return Err(match refused {
+                    StagingError::RingFull { ring_slot } => format!(
+                        "the ring stayed full for {wait:?}: ring slot {ring_slot} still holds a \
+                         live registry row; {}",
+                        self.ring_state().await
+                    ),
+                    _ => format!(
+                        "the seal gate stayed blocked for {wait:?} ({}); transactions holding an xid: {}",
+                        self.gate_state().await,
+                        self.xid_holders().await
+                    ),
+                });
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -339,21 +352,66 @@ impl Driver {
         }
     }
 
-    /// [`Self::seal`], or `None` when the seal gate refuses it: a
-    /// transaction that may still write into the active segment's
-    /// predecessor is open (backpressure, which a test running other
-    /// transactions concurrently can meet).
+    /// The registry rows and every lock another session holds on a ring
+    /// slot's table: what a `RingFull` refusal is waiting on.
+    async fn ring_state(&self) -> String {
+        let segments = self
+            .rows("select seg_seq, ring_slot, state::text from segments order by seg_seq")
+            .await;
+        let locks = self
+            .rows(
+                "select l.pid, c.relname::text, l.mode, l.granted, \
+                        coalesce(left(a.query, 120), '') \
+                 from pg_locks l join pg_class c on c.oid = l.relation \
+                 left join pg_stat_activity a on a.pid = l.pid \
+                 where c.relname in ('seg_0', 'seg_1', 'seg_2', 'seg_3') \
+                   and l.pid <> pg_backend_pid()",
+            )
+            .await;
+        format!(
+            "segments (seg_seq, ring_slot, state): {}; ring slot locks held: {}",
+            segments.join(", "),
+            if locks.is_empty() {
+                "none".to_string()
+            } else {
+                locks.join("; ")
+            }
+        )
+    }
+
+    /// [`Self::seal`], or `None` when the seal is refused as backpressure:
+    /// the seal gate (a transaction that may still write into the active
+    /// segment's predecessor is open) or a full ring (see
+    /// [`Self::seal_once`]), either of which a test running other sessions
+    /// concurrently can meet.
     pub async fn try_seal(&mut self) -> Option<i64> {
+        self.seal_once().await.ok()
+    }
+
+    /// One retirement pass and one seal; `Err` is `seal_phase1`'s
+    /// backpressure refusal, `SealGateBlocked` or `RingFull`.
+    ///
+    /// `RingFull` is backpressure here as it is to the engine's sealer,
+    /// which retries it on its next tick: the slot the seal needs can hold a
+    /// drained, retirable segment that this pass skipped, because
+    /// retirement takes the slot's table `ACCESS EXCLUSIVE ... NOWAIT` and a
+    /// concurrent reader of the ring held it at that instant (a convergence
+    /// wait's poll reads every slot, so a `self_check` running alongside the
+    /// drain is one). Work that is not drained keeps the ring full until the
+    /// test drains it, and [`Self::seal_within`] fails naming the slots.
+    async fn seal_once(&mut self) -> Result<i64, StagingError> {
         self.retire().await;
         let outcome = match seal::seal_phase1(&mut self.ctl).await {
             Ok(outcome) => outcome,
-            Err(trellis::staging::StagingError::SealGateBlocked) => return None,
+            Err(refused @ (StagingError::SealGateBlocked | StagingError::RingFull { .. })) => {
+                return Err(refused);
+            }
             Err(err) => panic!("seal phase 1: {err}"),
         };
         seal::seal_phase2(&self.ctl, outcome.sealed_seg_seq, WAKE)
             .await
             .expect("seal phase 2");
-        Some(outcome.sealed_seg_seq)
+        Ok(outcome.sealed_seg_seq)
     }
 
     /// Stages an image-less `Recompute` (today's Re-derive request) for each
