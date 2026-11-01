@@ -338,6 +338,11 @@ fn one_to_one_join_config(args: &[String]) -> one_to_one_join::OneToOneJoin {
         cfg.fan_outs.iter().all(|f| *f >= 2),
         "--fan-outs must be at least 2"
     );
+    // The idle probe changes the first row off the hot key.
+    assert!(
+        cfg.background_rows >= 1,
+        "--background-rows must be at least 1"
+    );
     assert!(
         cfg.poisoned
             .iter()
