@@ -408,6 +408,47 @@ beside them run on every `cargo test`.
   (5 s by default, which the harness doesn't set). Their deterministic pins
   gate all three. `gb_lsn_not_visibility` is not drawn here, as its writers are
   single statements.
+- **1-1 JOIN convergence** (`tests/join_one_to_one_convergence.rs`, ADR-0021).
+  Two tables (`ja`, `jb`), one to three `LEFT` or `INNER` 1-1 `JOIN`
+  definitions over them with no `GROUP BY` (one target row per `ja` row,
+  keyed by its primary key, with fields that read either table), and inserts,
+  updates and deletes on both tables. `jb`'s `ON` columns hold a unique key,
+  and each definition joins on one of seven `ON` shapes: `a` on its primary key
+  or on a plain column, `b` on its primary key or a unique column, a second
+  plain column beside the key, a composite unique key `(c1, c2)`, and a text
+  key. A key is `NULL` now and then, or only the second column of the pair, and
+  a `jb` row never shares its key with another live `jb` row. All of a burst's
+  `jb` ops are issued from one lane (two lanes could race two rows for a key
+  one is about to free) and the `ja` ops are spread over the others. Key
+  shapes, builds, pauses and resumes, re-reads, commit stalls and the
+  `racing` shape are the aggregate `JOIN` tier's, with `racing` two cases in
+  seven. Every other shape but `wide` writes in short bursts (30 to 150 ops),
+  each checked once it settles, with two to six pauses (each with its
+  `RESUME`, a rebuild in place) and re-reads after the first burst, and in
+  three cases in four a `TRUNCATE` of either table now and then, with two to
+  four more in the last few ops of a burst: the planted bugs of a truncate, a
+  rebuild's orphan pass and its `M` pass leave a target wrong only until later
+  writes repair it, so the check has to come soon after. The
+  oracle is the definition's own query without the `GROUP BY`
+  (`render_join_one_to_one_select`), compared byte for byte; every burst is
+  also audited by a `Strict` `self_check`, which reads the hidden ledgers.
+  The tier turns the `TRELLIS_DEV_ONE_TO_ONE_JOIN` knob on. A side that is
+  another transform's target is not drawn (the seam-fed families S1 to S9 live in
+  `trellis/tests/join_one_to_one_over_targets.rs`; the draw dimension is #1488),
+  nor is a value that makes a field fail (a held row:
+  `join_one_to_one_quarantine`). Run it with `cargo test -p generative --test
+  join_one_to_one_convergence -- --ignored`. Its planted-bug sweep,
+  `one_to_one_join_planted_bugs_are_caught` (run with
+  `GENERATIVE_PLANT_CASES=6`: 24 cases catch every gated plant, and the
+  default twelve take hours), gates the plants it catches in about one
+  case in five or more: `join1_no_placeholder`, `join1_old_key_unlocked`,
+  `join1_no_orphan_pass`, `join1_truncate_keeps_r` and `join1_m_before_j`.
+  The other `Join1*` plants are narrow interleavings, or leave a target that
+  the rest of the build or the next writes repair before the burst settles:
+  the tier runs fourteen of them as known misses, with their measured rates
+  in its `ONE_TO_ONE_KNOWN_MISSES`, and leaves four out, each with why (a held
+  row, a write past capture, a page the barrier never lets drain late). Their
+  deterministic pins gate all of them.
 - **Partitioned-source convergence** *(ADR-0017)*. The first table of a
   generated program is a partitioned source: `HASH` over one to four leaves,
   `LIST` with a leaf per grain value or fewer and a `DEFAULT`, or `RANGE` over
@@ -501,7 +542,8 @@ generator refactors. Three artifact kinds:
 The planted-bug sweep (`generative::plant_sweep`; `planted_bugs_are_caught` in
 `generative/tests/concurrent_convergence.rs` for the concurrent tier,
 `join_planted_bugs_are_caught` in `generative/tests/join_convergence.rs` for the
-`JOIN` tier) runs a tier's seeded cases once unplanted, as the baseline, then
+`JOIN` tier, `one_to_one_join_planted_bugs_are_caught` in
+`generative/tests/join_one_to_one_convergence.rs` for the 1-1 `JOIN` tier) runs a tier's seeded cases once unplanted, as the baseline, then
 once per planted bug, and judges each plant only on cases the baseline passed.
 **No unknown failure is accepted in a generative case**: the baseline passes
 only with **zero failures outside the quarantine list**,
@@ -641,7 +683,8 @@ Two structural notes for when faults enter the stream:
   has redrawn a listed case, so that change redoes the tier's entries.)
 - **Planted-bug sweeps and their baseline.** The sweeps (`generative::plant_sweep`:
   the concurrent tier's `planted_bugs_are_caught`, the `JOIN` tier's
-  `join_planted_bugs_are_caught`) re-run generated cases with a deliberate bug
+  `join_planted_bugs_are_caught`, the 1-1 `JOIN` tier's
+  `one_to_one_join_planted_bugs_are_caught`) re-run generated cases with a deliberate bug
   planted (`trellis/src/plant.rs`) and check the tier catches it, against an
   unplanted baseline that must have zero failures outside the quarantine list
   (§6). A plant in the tier's `known_misses` is run and reported but doesn't fail
@@ -649,7 +692,7 @@ Two structural notes for when faults enter the stream:
   of `GENERATIVE_PLANTS=all`. Each plant breaks one apply path (the group basis,
   a `JOIN`, a 1-1 target, a 1-1 `JOIN`), and a tier leaves out the plants of
   paths its programs never take: the concurrent tier draws no `JOIN`, the
-  `JOIN` tier nothing else, and no tier draws a 1-1 `JOIN`. `early_tombstone_gc` and `chunk_without_entry_lock` are left to
+  `JOIN` tier nothing else, and only the 1-1 `JOIN` tier draws a 1-1 `JOIN`. `early_tombstone_gc` and `chunk_without_entry_lock` are left to
   their deterministic pins too: on a 1-1 target no tier's schedule makes either
   diverge (each tier's `not_gated` says what was measured). Each group-basis,
   1-1, `JOIN` and 1-1 `JOIN` plant is pinned by a deterministic interleaving

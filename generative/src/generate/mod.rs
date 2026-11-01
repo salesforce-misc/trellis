@@ -128,6 +128,7 @@
 //! [`Strategy`]: proptest::strategy::Strategy
 
 pub mod join;
+pub mod join_one_to_one;
 pub mod partition;
 
 use std::collections::HashMap;
@@ -2365,6 +2366,7 @@ pub fn noise_table(name: &str, pk_col: &str, extra_col: &str, extra_type: ValueT
             },
         ],
         unique_cols: Vec::new(),
+        unique_sets: Vec::new(),
         partitioning: None,
     }
 }

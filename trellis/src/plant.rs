@@ -50,7 +50,8 @@
 //!    <test>`) in its doc comment.
 //! 4. Run the sweep of a tier that reaches it (`generative::plant_sweep`:
 //!    the concurrent tier's `planted_bugs_are_caught`, the `JOIN` tier's
-//!    `join_planted_bugs_are_caught`), list it in the `not_gated` of the
+//!    `join_planted_bugs_are_caught`, the 1-1 `JOIN` tier's
+//!    `one_to_one_join_planted_bugs_are_caught`), list it in the `not_gated` of the
 //!    tiers that don't, and record its catch rate.
 //!
 //! A plant is never "fixed": it is the regression the tier exists to catch.

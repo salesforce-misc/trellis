@@ -85,9 +85,10 @@ pub enum PlantPath {
     GroupBasisWriter,
     /// A `JOIN`.
     Join,
-    /// A 1-1 `JOIN` (ADR-0021): no tier draws one yet, so these plants are
-    /// pinned by `trellis`'s `join_one_to_one_interleavings` until the
-    /// generative tier of milestone 9 (#1404) gates them.
+    /// A 1-1 `JOIN` (ADR-0021): the 1-1 `JOIN` tier
+    /// (`join_one_to_one_convergence.rs`) draws these, and no other tier does.
+    /// `trellis`'s `join_one_to_one_interleavings` (and the build,
+    /// quarantine and over-targets tests) pin them deterministically.
     OneToOneJoin,
     /// The target-mutation seam's feed to a definition reading another's
     /// target: no tier draws a chain in one instance yet (#1488), so these

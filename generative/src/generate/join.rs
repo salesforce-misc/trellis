@@ -81,6 +81,7 @@ pub fn join_tables() -> Vec<Table> {
         }))
         .collect(),
         unique_cols: Vec::new(),
+        unique_sets: Vec::new(),
         partitioning: None,
     };
     vec![
@@ -250,7 +251,7 @@ impl KeyShape {
 
     /// The join key a draw of `raw` names, or `None` (`NULL`) for the top
     /// few draws.
-    fn key(self, raw: u8) -> Option<u8> {
+    pub fn key(self, raw: u8) -> Option<u8> {
         if raw >= 250 {
             return None;
         }
@@ -696,7 +697,7 @@ pub fn join_case(
 }
 
 #[cfg(feature = "proptest")]
-pub use strategy::join_case_strategy;
+pub use strategy::{COMMIT_STALL_MS, MAX_OPS, RACING_COMMIT_STALL_MS, join_case_strategy};
 
 #[cfg(feature = "proptest")]
 mod strategy {

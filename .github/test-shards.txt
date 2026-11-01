@@ -29,6 +29,7 @@ test:unchanged_toast_images 11.3
 test:backend_seam 10.8
 test:coverage 10.5
 test:backfill 10.4
+test:join_one_to_one_convergence 10.0
 test:one_to_one_build_interleavings 9.9
 test:capture_install 9.7
 test:capture_disruption 9.6

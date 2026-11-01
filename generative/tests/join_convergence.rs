@@ -398,8 +398,8 @@ fn join_sweep_tier() -> SweepTier {
     ));
     not_gated.extend(not_on_path(
         &[PlantPath::OneToOneJoin],
-        "it breaks the 1-1 JOIN path, which no tier draws until milestone 9 (#1404); \
-             `join_one_to_one_interleavings` pins it",
+        "it breaks the 1-1 JOIN path, which only the 1-1 JOIN tier \
+             (join_one_to_one_convergence.rs, one_to_one_join_planted_bugs_are_caught) draws",
     ));
     not_gated.extend(not_on_path(
         &[PlantPath::Chain],
