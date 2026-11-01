@@ -1,27 +1,36 @@
-//! The rows of `a` a 1-1 `JOIN`'s fan-out holds in quarantine (ADR-0021).
+//! The rows of `a` a 1-1 `JOIN`'s page holds in quarantine (ADR-0021).
 //!
-//! A `b` change recomputes every target row on its key ([`super::fan_out`]).
-//! A field that fails on one of those rows with a data exception is the `a`
-//! row's failure, not the `b` change's: the fan-out's bisection names the row
-//! and the per-field probe its fields, and the page holds that row the way a
-//! drain holds a key whose own change fails ([`hold`]), then commits the `b`
-//! change and the rest of the fan-out, so `M` advances.
+//! A page writes the target rows of its `a` changes
+//! ([`super::write_a_changes`]), then a `b` change recomputes every other
+//! target row on its key ([`super::fan_out`]). A field that fails on a row of
+//! either write with a data exception is that `a` row's failure: the write's
+//! bisection names the row and the per-field probe its fields, and the page
+//! holds that row the way a drain holds a key whose own change fails
+//! ([`hold`]), then commits every other change and row, so `R` and `M`
+//! advance. An `a` row whose change fails only against the page's `b` change
+//! is held so too; probed alone against the committed state, as the drain's
+//! isolation probes a record, it would not fail.
 //!
 //! - **Held in the page.** The `poison` row, a death, and a parked
 //!   image-less Re-derive in `poison_held` are written in the page's
-//!   transaction, so the row is held exactly when the `b` change commits.
-//!   The row was reproduced in that transaction, on the `R` and `M` it
-//!   commits with, so it is held on its first failure, as a build chunk
-//!   holds a key (`super::super::quarantine::evict_build_key`). `poison`'s
-//!   foreign key takes the definition's row `FOR KEY SHARE`, which the page
-//!   took before its lock row ([`super::lock_definitions`]). The parked
-//!   Re-derive carries the earliest origin of the page's `b` changes, so it
-//!   holds back every watermark token those changes do (`converge`'s
-//!   condition 4).
+//!   transaction, so the row is held exactly when the page commits. The row
+//!   was reproduced in that transaction, on the `R` and `M` it commits with,
+//!   so it is held on its first failure, as a build chunk holds a key
+//!   (`super::super::quarantine::evict_build_key`), not after the drain's
+//!   isolation has charged it to its death threshold. `poison`'s foreign key
+//!   takes the definition's row `FOR KEY SHARE`, which the page took before
+//!   its lock row ([`super::lock_definitions`]). The parked Re-derive carries
+//!   the earliest origin of the page's changes it holds back, so it holds
+//!   back every watermark token those changes do (`converge`'s condition 4):
+//!   the `b` changes for a fan-out's row; for an `a` change's row, the row's
+//!   own changes and the page's `b` changes, since its target row reflects
+//!   neither.
 //! - **Left out after.** A held row's own changes are parked by the drain
 //!   (`super::super::apply::compute`), a later fan-out leaves it out
 //!   ([`not_held_sql`]), and so do the build's chunks and sweep. Its target
-//!   row stays as it was.
+//!   row stays as it was. A row held in its own change's page keeps that
+//!   change in its `R` entry, which nothing writes a target row from until
+//!   the release.
 //! - **Released by a Re-derive.** `release_key` (and the automatic retry)
 //!   re-derives the `a` row in its own transaction ([`release`]), as a page
 //!   of one `a` Re-derive: `R`'s entry from the live row, then the target
@@ -58,7 +67,7 @@ use super::super::fold::FoldedChange;
 use super::super::quarantine;
 use super::{JoinOneToOnePlan, JoinShape};
 
-/// One row of `a` a fan-out failed on: its `R` key, the error the row's
+/// One row of `a` a page's write failed on: its `R` key, the error the row's
 /// write failed with alone, and each field the per-field probe found failing,
 /// with its error.
 #[derive(Debug, Clone)]
@@ -70,8 +79,10 @@ pub(crate) struct HeldRow {
 }
 
 /// The origin a page's held rows are parked with: the earliest origin and
-/// source-change time of the page's `b` changes, and their deepest `hop_gen`,
-/// merged as a park merges a key's changes (`quarantine::HeldKey::merge`).
+/// source-change time of the page's changes a row holds back (its `b`
+/// changes for a fan-out's rows; a row's own changes and the page's `b`
+/// changes for an `a` change's), and their deepest `hop_gen`, merged as a
+/// park merges a key's changes (`quarantine::HeldKey::merge`).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HeldOrigin {
     seen: bool,
@@ -81,7 +92,7 @@ pub(crate) struct HeldOrigin {
 }
 
 impl HeldOrigin {
-    /// Adds a `b` change of the page.
+    /// Adds a change of the page.
     pub(super) fn add(&mut self, change: &FoldedChange) {
         if self.seen {
             self.origin_lsn =
@@ -96,6 +107,33 @@ impl HeldOrigin {
                 src_changed: change.src_changed,
                 hop_gen: change.hop_gen,
             };
+        }
+    }
+
+    /// An origin no change gave: unknown, which gates every token as an
+    /// unknown origin does.
+    pub(super) fn unknown() -> Self {
+        HeldOrigin {
+            seen: true,
+            ..HeldOrigin::default()
+        }
+    }
+
+    /// This origin merged with `other`'s, as [`HeldOrigin::add`] merges a
+    /// change: what a row parks with when it holds back the changes of both.
+    pub(super) fn merged(&self, other: &HeldOrigin) -> HeldOrigin {
+        match (self.seen, other.seen) {
+            (_, false) => self.clone(),
+            (false, true) => other.clone(),
+            (true, true) => HeldOrigin {
+                seen: true,
+                origin_lsn: super::super::fold::earliest_origin(self.origin_lsn, other.origin_lsn),
+                src_changed: super::super::apply::earliest_src_changed(
+                    self.src_changed,
+                    other.src_changed,
+                ),
+                hop_gen: self.hop_gen.max(other.hop_gen),
+            },
         }
     }
 }
@@ -158,34 +196,49 @@ pub(super) async fn holds_any(
 
 /// Holds `rows` of `a` in quarantine for `shape`'s definition, in the page's
 /// transaction (the module doc): a `poison` row each, a death, and a parked
-/// Re-derive in `poison_held` with the page's `seg_seq` and `origin`. Each
-/// statement takes its rows in key order, as a park does
-/// (`quarantine::park_batch_contribution`). A key held already is held again
-/// with this failure, keeping the retry count its last release left.
+/// Re-derive in `poison_held` with the page's `seg_seq` and the row's
+/// origin. `side` is the table whose changes' write failed on them: `b` for
+/// a fan-out, `a` for the page's `a` changes. Each statement takes its rows
+/// in key order, as a park does (`quarantine::park_batch_contribution`). A
+/// key held already is held again with this failure, keeping the retry
+/// count its last release left.
 pub(super) async fn hold(
     txn: &Transaction<'_>,
     shape: &JoinShape,
     seg_seq: i64,
-    origin: &HeldOrigin,
-    rows: &[HeldRow],
+    side: Side,
+    rows: &[(&HeldRow, &HeldOrigin)],
 ) -> Result<(), ApplyError> {
     if rows.is_empty() {
         return Ok(());
     }
-    let mut rows: Vec<&HeldRow> = rows.iter().collect();
-    rows.sort_by(|a, b| a.key.cmp(&b.key));
-    let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
-    let errors: Vec<&str> = rows.iter().map(|r| r.error.as_str()).collect();
-    let codes: Vec<Option<&str>> = rows.iter().map(|r| r.sqlstate.as_deref()).collect();
-    for row in &rows {
-        crate::instance_log::warn!(
-            transform = %shape.target,
-            src_table = %shape.source_table,
-            key = %row.key,
-            last_error = %row.error,
-            "holding a row of a 1-1 JOIN's FROM table in quarantine: a field fails on it in the \
-             fan-out of a change of the joined table, which applies to every other row"
-        );
+    let mut rows: Vec<(&HeldRow, &HeldOrigin)> = rows.to_vec();
+    rows.sort_by(|a, b| a.0.key.cmp(&b.0.key));
+    let keys: Vec<&str> = rows.iter().map(|(r, _)| r.key.as_str()).collect();
+    let errors: Vec<&str> = rows.iter().map(|(r, _)| r.error.as_str()).collect();
+    let codes: Vec<Option<&str>> = rows.iter().map(|(r, _)| r.sqlstate.as_deref()).collect();
+    let origin_lsns: Vec<Option<PgLsn>> = rows.iter().map(|(_, o)| o.origin_lsn).collect();
+    let src_changed: Vec<Option<SystemTime>> = rows.iter().map(|(_, o)| o.src_changed).collect();
+    let hop_gens: Vec<i32> = rows.iter().map(|(_, o)| o.hop_gen).collect();
+    for (row, _) in &rows {
+        match side {
+            Side::Joined => crate::instance_log::warn!(
+                transform = %shape.target,
+                src_table = %shape.source_table,
+                key = %row.key,
+                last_error = %row.error,
+                "holding a row of a 1-1 JOIN's FROM table in quarantine: a field fails on it in \
+                 the fan-out of a change of the joined table, which applies to every other row"
+            ),
+            Side::From => crate::instance_log::warn!(
+                transform = %shape.target,
+                src_table = %shape.source_table,
+                key = %row.key,
+                last_error = %row.error,
+                "holding a row of a 1-1 JOIN's FROM table in quarantine: a field fails on the \
+                 row its change writes; the page applies every other change"
+            ),
+        }
     }
     let unnest = "unnest($3::text[], $4::text[], $5::text[]) as u(key, error, code)";
     txn.execute(
@@ -222,9 +275,11 @@ pub(super) async fn hold(
         &format!(
             "insert into poison_held as h \
                  (transform_id, src_table, key, seg_seq, origin_lsn, src_changed, hop_gen) \
-             select $1::bigint, $2::text, u.key, $4::bigint, $5::pg_lsn, $6::timestamptz, \
-                    $7::integer \
-             from unnest($3::text[]) as u(key) order by u.key collate \"C\" \
+             select $1::bigint, $2::text, u.key, $4::bigint, u.origin_lsn, u.src_changed, \
+                    u.hop_gen \
+             from unnest($3::text[], $5::pg_lsn[], $6::timestamptz[], $7::integer[]) \
+                  as u(key, origin_lsn, src_changed, hop_gen) \
+             order by u.key collate \"C\" \
              {merge}",
             merge = quarantine::MERGE_HELD_ROW,
         ),
@@ -233,9 +288,9 @@ pub(super) async fn hold(
             &shape.source_table,
             &keys,
             &seg_seq,
-            &origin.origin_lsn,
-            &origin.src_changed,
-            &origin.hop_gen,
+            &origin_lsns,
+            &src_changed,
+            &hop_gens,
         ],
     )
     .await?;
@@ -260,8 +315,7 @@ pub(crate) async fn charge_after_commit<'a>(
             crate::instance_log::warn!(
                 transform = %plan.shape.target,
                 error = %err,
-                "could not charge the fuses for the rows a 1-1 JOIN's fan-out held; they stay \
-                 held"
+                "could not charge the fuses for the rows a 1-1 JOIN's page held; they stay held"
             );
         }
     }

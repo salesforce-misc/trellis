@@ -52,21 +52,23 @@
 //! 7. **Recompute and write.** Each changed `a` row's target row is rendered
 //!    from `R` and the newest live `M` entry on its key (`LEFT JOIN
 //!    LATERAL`); a row that no longer exists, or an `INNER` row with no
-//!    match, is deleted. Then the fan-out ([`fan_out`]): every other live `R`
-//!    entry on a key a changed `M` entry held before the page or holds after
-//!    it is recomputed the same way, in sorted keyset batches of 10k, one
-//!    statement each. Fields are rendered SQL, never evaluated in Rust. More
-//!    rows than the cap ([`crate::defs::join_one_to_one::max_fanout`]) halt
-//!    the transform. A field that fails on a fan-out row holds that row of
-//!    `a` in quarantine, once a bisection under savepoints has named the
-//!    rows and fields, and the rest of the page commits ([`held`]); a row
-//!    held already is left out of the fan-out.
+//!    match, is deleted ([`write_a_changes`]). Then the fan-out
+//!    ([`fan_out`]): every other live `R` entry on a key a changed `M` entry
+//!    held before the page or holds after it is recomputed the same way, in
+//!    sorted keyset batches of 10k, one statement each. Fields are rendered
+//!    SQL, never evaluated in Rust. More rows than the cap
+//!    ([`crate::defs::join_one_to_one::max_fanout`]) halt the transform. A
+//!    field that fails on a row of either write holds that row of `a` in
+//!    quarantine on this first failure, once a bisection under savepoints
+//!    has named the rows and fields, and the rest of the page commits
+//!    ([`held`]); a row held already is left out of the fan-out.
 //!
 //! The lock order is the lock row, `J` sorted, `R` entries sorted, `M`
 //! entries sorted, then target rows, sorted within each statement. A page
-//! whose fan-out may hold rows of `a` in quarantine takes its definition's row
-//! `FOR KEY SHARE` before the lock row ([`lock_definitions`]), as a rebuild's
-//! start takes it before the lock row. The
+//! that may hold rows of `a` in quarantine (one with `a` records, or whose
+//! fan-out may hold rows) takes its definition's row `FOR KEY SHARE` before
+//! the lock row ([`lock_definitions`]), as a rebuild's start takes it before
+//! the lock row. The
 //! target rows are not locked ahead across statements, and need not be: each
 //! one is written only by a page that holds `J` for the key its `R` entry
 //! has. An `a` page holds `J` for every key its entries hold (the held-key
@@ -514,9 +516,18 @@ pub(crate) struct JoinOneToOnePlan {
     /// build's chunks write every target row after it.
     fan_out: bool,
     /// What the rows a fan-out holds are parked with: the page's `b`
-    /// changes' origin ([`held::HeldOrigin`]).
+    /// changes' origin ([`held::HeldOrigin`]). An `a` row the page holds
+    /// parks with it too, merged with its own changes' ([`write_a_changes`]).
     held_origin: held::HeldOrigin,
-    /// The rows the page's fan-out held, for the fuses once it commits
+    /// Whether a field that fails on the row of one of the page's `a`
+    /// changes holds that row in the page ([`write_a_changes`]): a drain's
+    /// page. A build's pages and a release's Re-derive ([`build::rederive`])
+    /// leave the failure to their callers.
+    holds_a: bool,
+    /// The origin of the page's changes of each `a` row, by its key, which
+    /// the row parks with if the page holds it.
+    a_origins: HashMap<String, held::HeldOrigin>,
+    /// The rows the page held, for the fuses once it commits
     /// ([`held::charge_after_commit`]).
     held: held::Held,
 }
@@ -530,6 +541,8 @@ impl JoinOneToOnePlan {
             truncate: None,
             fan_out: true,
             held_origin: held::HeldOrigin::default(),
+            holds_a: true,
+            a_origins: HashMap::new(),
             held: held::Held::default(),
         }
     }
@@ -573,7 +586,13 @@ impl JoinOneToOnePlan {
             old_image: change.old_image.clone(),
         };
         match side {
-            Side::From => self.a.push(record),
+            Side::From => {
+                self.a_origins
+                    .entry(change.key.clone())
+                    .or_default()
+                    .add(change);
+                self.a.push(record);
+            }
             Side::Joined => {
                 self.held_origin.add(change);
                 self.b.push(record);
@@ -796,7 +815,7 @@ pub(crate) async fn apply_page(
     .await?;
     let mut changed_keys: Vec<&str> = a_changed.iter().map(String::as_str).collect();
     changed_keys.sort_unstable();
-    let (written, deleted) = write_target(txn, shape, &changed_keys, mutations).await?;
+    let (written, deleted) = write_a_changes(txn, plan, &changed_keys, seg_seq, mutations).await?;
     let fan_keys = if plan.fan_out {
         fan_out_keys(txn, shape, &b_changed, &b_held).await?
     } else {
@@ -819,10 +838,11 @@ pub(crate) async fn apply_page(
 /// while it queued on a definition's row would close a cycle with a start.
 ///
 /// - A page that truncates `b` takes its definition's row `FOR UPDATE`.
-/// - A page whose fan-out may hold a row of `a` (it has `b` records and fans
-///   out) takes it `FOR KEY SHARE`, the lock `poison`'s foreign key takes
-///   when [`held::hold`] writes it, so the hold, after the lock row, never
-///   waits for it.
+/// - A page that may hold a row of `a` takes it `FOR KEY SHARE`, the lock
+///   `poison`'s foreign key takes when [`held::hold`] writes it, so the hold,
+///   after the lock row, never waits for it: a page with `a` records (a
+///   drain's, [`write_a_changes`]), and one whose fan-out may hold a row (it
+///   has `b` records and fans out).
 pub(crate) async fn lock_definitions<'a>(
     txn: &Transaction<'_>,
     plans: impl IntoIterator<Item = &'a JoinOneToOnePlan>,
@@ -832,7 +852,8 @@ pub(crate) async fn lock_definitions<'a>(
     let mut locks: BTreeMap<i64, bool> = BTreeMap::new();
     for plan in plans {
         let truncates = plan.truncates_b();
-        if truncates || (plan.fan_out && !plan.b.is_empty()) {
+        let may_hold = (plan.holds_a && !plan.a.is_empty()) || (plan.fan_out && !plan.b.is_empty());
+        if truncates || may_hold {
             *locks.entry(plan.shape.id).or_default() |= truncates;
         }
     }
@@ -1558,6 +1579,64 @@ const MAX_FAN_OUT_PROBES: usize = 256;
 /// The most failing rows a halt of [`fan_out_failure`] names.
 const MAX_NAMED_FAN_OUT_ROWS: usize = 8;
 
+/// Step 7's write of the `a` changes' rows `keys` ([`write_target`]), under
+/// a savepoint in a drain's page ([`JoinOneToOnePlan::holds_a`]), as the
+/// fan-out writes under one. A data exception rolls the write back to it and
+/// bisects the rows down to those whose fields fail ([`fan_out_failure`]):
+/// the page holds each in quarantine on this first failure ([`held::hold`]),
+/// parked with the earliest origin of the page's changes of that row and its
+/// `b` changes, and writes every other row. Step 6 has written the held row's change into `R`; its target
+/// row stays as it was, since nothing writes a held row's target from its
+/// `R` entry, until its release re-derives both from the live row ([`held`]).
+/// A bisection that can't name every failing row within
+/// [`MAX_FAN_OUT_PROBES`] attempts halts the transform. A build's page writes
+/// without the savepoint and leaves a failure to its caller.
+async fn write_a_changes(
+    txn: &Transaction<'_>,
+    plan: &JoinOneToOnePlan,
+    keys: &[&str],
+    seg_seq: i64,
+    mutations: &mut TargetMutations,
+) -> Result<(usize, usize), ApplyError> {
+    let shape = &*plan.shape;
+    if !plan.holds_a || keys.is_empty() {
+        return write_target(txn, shape, keys, mutations).await;
+    }
+    txn.batch_execute("savepoint join1_a_write").await?;
+    match write_target(txn, shape, keys, mutations).await {
+        Ok(counts) => {
+            txn.batch_execute("release savepoint join1_a_write").await?;
+            Ok(counts)
+        }
+        Err(err) if super::one_to_one_render::is_data_exception(&err) => {
+            txn.batch_execute("rollback to savepoint join1_a_write")
+                .await?;
+            let (written, deleted, rows) =
+                fan_out_failure(txn, shape, Side::From, keys, mutations).await?;
+            // The row's target row reflects neither its own changes nor the
+            // page's `b` changes, which `M` now holds: it parks with the
+            // earliest origin of both, so a token after a `b` change its row
+            // lacks doesn't converge.
+            let origins: Vec<held::HeldOrigin> = rows
+                .iter()
+                .map(|row| {
+                    plan.a_origins
+                        .get(&row.key)
+                        .cloned()
+                        .unwrap_or_else(held::HeldOrigin::unknown)
+                        .merged(&plan.held_origin)
+                })
+                .collect();
+            let held: Vec<_> = rows.iter().zip(&origins).collect();
+            held::hold(txn, shape, seg_seq, Side::From, &held).await?;
+            plan.held.record(rows);
+            txn.batch_execute("release savepoint join1_a_write").await?;
+            Ok((written, deleted))
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Step 9 of the page order (#1396's body), the fan-out: the target row of
 /// every live `R` entry on `keys` is recomputed from `R` and the newest live
 /// `M` entry on its key, but the `written` ones, which the page's `a` changes
@@ -1667,8 +1746,9 @@ async fn fan_out(
                 txn.batch_execute("rollback to savepoint join1_fan_out")
                     .await?;
                 let (written, deleted, rows) =
-                    fan_out_failure(txn, shape, &entries, mutations).await?;
-                held::hold(txn, shape, seg_seq, &plan.held_origin, &rows).await?;
+                    fan_out_failure(txn, shape, Side::Joined, &entries, mutations).await?;
+                let held: Vec<_> = rows.iter().map(|row| (row, &plan.held_origin)).collect();
+                held::hold(txn, shape, seg_seq, Side::Joined, &held).await?;
                 plan.held.record(rows);
                 txn.batch_execute("release savepoint join1_fan_out").await?;
                 return Ok((written, deleted));
@@ -1680,18 +1760,21 @@ async fn fan_out(
     Ok((written, deleted))
 }
 
-/// A fan-out over `entries` failed with a data exception: bisects them, each
-/// attempt under a savepoint of its own, down to the rows whose fields fail,
-/// within [`MAX_FAN_OUT_PROBES`] attempts, and names each one's failing
-/// fields with the per-field probe ([`failing_fields`]). An attempt that
-/// succeeds keeps its writes, so once every failing row is named every other
-/// row is written. Returns the rows and deletes written, and the failing rows
-/// for the page to hold ([`held::hold`]). A bisection that runs out of
-/// attempts first is the halt that names the rows it found, at most
+/// A write of the target rows of `entries` failed with a data exception: the
+/// fan-out of the page's changes of `side`'s table (`b`), or the write of its
+/// `a` changes' rows ([`write_a_changes`]). Bisects them, each attempt under
+/// a savepoint of its own, down to the rows whose fields fail, within
+/// [`MAX_FAN_OUT_PROBES`] attempts, and names each one's failing fields with
+/// the per-field probe ([`failing_fields`]). An attempt that succeeds keeps
+/// its writes, so once every failing row is named every other row is
+/// written. Returns the rows and deletes written, and the failing rows for
+/// the page to hold ([`held::hold`]). A bisection that runs out of attempts
+/// first is the halt that names the rows it found, at most
 /// [`MAX_NAMED_FAN_OUT_ROWS`]. Any other failure propagates.
 async fn fan_out_failure(
     txn: &Transaction<'_>,
     shape: &JoinShape,
+    side: Side,
     entries: &[&str],
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize, Vec<held::HeldRow>), ApplyError> {
@@ -1756,19 +1839,26 @@ async fn fan_out_failure(
             format!("{} ({})", row.key, fields.join("; "))
         })
         .collect();
+    let named = if named.is_empty() {
+        "none named".to_string()
+    } else {
+        named.join(", ")
+    };
+    let reason = match side {
+        Side::Joined => format!(
+            "a change of {} whose fan-out fails on more rows of {} than {MAX_FAN_OUT_PROBES} \
+             attempts to isolate them name: {named}, and maybe more",
+            shape.joined_table, shape.source_table,
+        ),
+        Side::From => format!(
+            "changes of {} that fail on more of its rows than {MAX_FAN_OUT_PROBES} attempts \
+             to isolate them name: {named}, and maybe more",
+            shape.source_table,
+        ),
+    };
     Err(ApplyError::JoinOneToOneHalt {
         target: shape.target.clone(),
-        reason: format!(
-            "a change of {} whose fan-out fails on more rows of {} than {MAX_FAN_OUT_PROBES} \
-             attempts to isolate them name: {}, and maybe more",
-            shape.joined_table,
-            shape.source_table,
-            if named.is_empty() {
-                "none named".to_string()
-            } else {
-                named.join(", ")
-            },
-        ),
+        reason,
     })
 }
 

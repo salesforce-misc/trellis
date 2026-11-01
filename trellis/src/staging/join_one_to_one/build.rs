@@ -96,6 +96,8 @@ pub(crate) async fn rederive(
         truncate: None,
         fan_out,
         held_origin: Default::default(),
+        holds_a: false,
+        a_origins: Default::default(),
         held: Default::default(),
     };
     // A Re-derive page's segment is its read's; the page's own only stamps

@@ -249,6 +249,48 @@ async fn build_step(pool: &trellis::Pool, worker: &str, chunk_rows: i64) -> Step
         .expect("a build step")
 }
 
+/// Runs one build step that gives up on a lock of `page`, a page of an `a`
+/// change frozen at its commit (`reached`), and returns it once the page has
+/// committed. The page holds its definition's row `FOR KEY SHARE`, as every
+/// page that may hold a row of `a` in quarantine takes it before its lock
+/// row, so the step's record of its failure, which takes the row `FOR
+/// UPDATE`, queues behind the page: the step runs in its own task, and the
+/// page is released once that record has queued.
+async fn step_behind_frozen_page(
+    d: &Driver,
+    page: &mut drain_driver::RunningDrain,
+    reached: &trellis::staging::interleave::Reached,
+    worker: &'static str,
+    chunk_rows: i64,
+) -> Step {
+    let pool = d.pool().clone();
+    let step = tokio::spawn(async move { build_step(&pool, worker, chunk_rows).await });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let queued: bool = d
+            .ctl
+            .query_one(
+                "select exists (select 1 from pg_stat_activity \
+                 where $1 = any(pg_blocking_pids(pid)) \
+                   and query like '%transform_definitions%for update%')",
+                &[&reached.backend_pid],
+            )
+            .await
+            .expect("read pg_stat_activity")
+            .get(0);
+        if queued {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the step's failure never queued on the definition's row"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    d.release(page, PausePoint::BeforeCommit).await;
+    step.await.expect("the build step's task")
+}
+
 /// How many of the definitions' plan and chunk rows are still to run.
 async fn pending(d: &Driver, kinds: &[&str]) -> i64 {
     let kinds: Vec<String> = kinds.iter().map(|k| k.to_string()).collect();
@@ -376,8 +418,12 @@ async fn c_a_chunk_on_a_pages_key_gives_up_and_retries() {
         let mut page = d
             .drain_frozen(batch, "page", &[(PausePoint::BeforeCommit, &kind.target())])
             .await;
-        page.reached(PausePoint::BeforeCommit).await;
-        assert_eq!(build_step(d.pool(), "chunk", 100).await, Step::Chunk);
+        let reached = page.reached(PausePoint::BeforeCommit).await;
+        assert_eq!(
+            step_behind_frozen_page(&d, &mut page, &reached, "chunk", 100).await,
+            Step::Chunk
+        );
+        page.finish().await;
         let failed: Option<String> = d
             .ctl
             .query_one(
@@ -391,8 +437,6 @@ async fn c_a_chunk_on_a_pages_key_gives_up_and_retries() {
             failed.as_deref().is_some_and(|e| e.contains("lock")),
             "the chunk gave up on the page's lock: {failed:?}"
         );
-        d.release(&mut page, PausePoint::BeforeCommit).await;
-        page.finish().await;
         assert_oracle(&mut d, &[kind], "a chunk behind a page").await;
     }
 }
@@ -924,8 +968,12 @@ async fn a_plan_job_that_fails_in_its_m_pass_resumes_from_its_cursor() {
         let mut page = d
             .drain_frozen(batch, "page", &[(PausePoint::BeforeCommit, &kind.target())])
             .await;
-        page.reached(PausePoint::BeforeCommit).await;
-        assert_eq!(build_step(d.pool(), "planner", 2).await, Step::Planned);
+        let reached = page.reached(PausePoint::BeforeCommit).await;
+        assert_eq!(
+            step_behind_frozen_page(&d, &mut page, &reached, "planner", 2).await,
+            Step::Planned
+        );
+        page.finish().await;
         let job = d
             .ctl
             .query_one(
@@ -949,8 +997,6 @@ async fn a_plan_job_that_fails_in_its_m_pass_resumes_from_its_cursor() {
             0,
             "no chunk before the M pass is done"
         );
-        d.release(&mut page, PausePoint::BeforeCommit).await;
-        page.finish().await;
         let id = definition_id(&d, kind).await;
         let version =
             format!("select xmin::text from {DEFAULT_SCHEMA}.join1_{id}_m where __from_key = '1'");
@@ -1046,8 +1092,12 @@ async fn a_plan_job_that_fails_in_its_walk_of_m_resumes_from_its_cursor() {
         let mut page = d
             .drain_frozen(batch, "page", &[(PausePoint::BeforeCommit, &kind.target())])
             .await;
-        page.reached(PausePoint::BeforeCommit).await;
-        assert_eq!(build_step(d.pool(), "planner", 2).await, Step::Planned);
+        let reached = page.reached(PausePoint::BeforeCommit).await;
+        assert_eq!(
+            step_behind_frozen_page(&d, &mut page, &reached, "planner", 2).await,
+            Step::Planned
+        );
+        page.finish().await;
         let (lo, failed, no_collations) = plan_job(&d).await;
         assert_eq!(
             lo.as_deref(),
@@ -1060,8 +1110,6 @@ async fn a_plan_job_that_fails_in_its_walk_of_m_resumes_from_its_cursor() {
         );
         assert!(no_collations, "the walk of M records no collations");
         assert_eq!(pending(&d, &["rederive"]).await, 0, "no chunk yet");
-        d.release(&mut page, PausePoint::BeforeCommit).await;
-        page.finish().await;
         let untouched = |versions: Vec<String>| -> Vec<String> {
             versions
                 .into_iter()

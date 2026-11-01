@@ -2337,7 +2337,7 @@ async fn quarantine_if_crossed(
 //
 // **Scope, stated up front**: this tier only ever activates for
 // [`crate::defs::ast::KeySpace::OneToOne`] definitions, and for a 1-1
-// `JOIN`'s rows its fan-out holds (`super::join_one_to_one::held`).
+// `JOIN`'s rows its pages hold (`super::join_one_to_one::held`).
 // [`crate::defs::ast::KeySpace::Aggregate`] fields
 // are never attributed here and can never be paused by the automatic fuse —
 // the group basis (`staging::group_basis`) has no notion of "skip this one
