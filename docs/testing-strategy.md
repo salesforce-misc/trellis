@@ -236,6 +236,14 @@ passed; `ci` is the one required status check. Each shard builds and runs its ow
 binaries, one at a time, with `cargo test --workspace --features benchmark/engine-access
 --no-fail-fast` narrowed to them, the flags `verify` uses.
 
+Each shard runs twice, in parallel: once against the newest PostgreSQL on the runner
+image, and once against PostgreSQL 15, the oldest supported version, installed from the
+PGDG apt repository (built with libxml, which the XML tests need). The harness finds its
+server binaries through `PATH`, so the PostgreSQL 15 leg puts that version's `bin`
+directory first and checks that the tools resolve there. A construct only the newer
+grammar accepts fails that leg on the PR that adds it. Locally, `ASDF_POSTGRES_VERSION=15.x`
+does the same for an asdf install, though one built without libxml fails the XML tests.
+
 `.github/scripts/test-shards.py` assigns the binaries. It lists them from `cargo
 metadata`, so a new test file joins a shard with no edit, and balances them by the
 seconds in `.github/test-shards.txt`, one `unit seconds` line per binary. A binary the
