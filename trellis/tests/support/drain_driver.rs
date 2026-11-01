@@ -241,11 +241,13 @@ impl Driver {
     /// engine's own sealer retries; here the likely holder is a server
     /// process finishing on a loaded box (autovacuum's analyze, say, which
     /// takes an xid for its statistics writes). A full ring is backpressure
-    /// too: the retirement pass skips a slot another session is reading at
-    /// that instant ([`Self::seal_once`]). So this waits up to
-    /// [`SEAL_GATE_WAIT`] for either to clear. A holder the test itself
-    /// leaves open never goes away, and the panic names every open
-    /// xid-holding session, or the ring's slots and their lock holders.
+    /// too, while the slot the seal needs holds a drained segment: the
+    /// retirement pass skips a slot another session is reading at that
+    /// instant ([`Self::seal_once`]). So this waits up to [`SEAL_GATE_WAIT`]
+    /// for either to clear. A holder the test itself leaves open never goes
+    /// away, and the panic names every open xid-holding session, and for a
+    /// full ring the ring's slots and their lock holders. A ring full of
+    /// work not yet drained panics at once.
     pub async fn seal(&mut self) -> i64 {
         self.seal_within(SEAL_GATE_WAIT)
             .await
@@ -267,8 +269,10 @@ impl Driver {
                 return Err(match refused {
                     StagingError::RingFull { ring_slot } => format!(
                         "the ring stayed full for {wait:?}: ring slot {ring_slot} still holds a \
-                         live registry row; {}",
-                        self.ring_state().await
+                         drained segment that retirement skipped; {}; transactions holding an \
+                         xid: {}",
+                        self.ring_state().await,
+                        self.xid_holders().await
                     ),
                     _ => format!(
                         "the seal gate stayed blocked for {wait:?} ({}); transactions holding an xid: {}",
@@ -379,11 +383,28 @@ impl Driver {
         )
     }
 
+    /// Whether `ring_slot`'s segment stays unretirable until the test drains
+    /// more: it, its successor, or a segment older than it is not drained.
+    /// That is retirement's eligibility less its lock and its `xmin`
+    /// condition, the two that clear on their own.
+    async fn undrained_work_holds(&self, ring_slot: i16) -> bool {
+        self.ctl
+            .query_one(
+                "select exists (select 1 from segments o join segments s \
+                                  on s.seg_seq <= o.seg_seq + 1 \
+                                where o.ring_slot = $1 and s.state <> 'drained')",
+                &[&ring_slot],
+            )
+            .await
+            .expect("read the ring slot's occupant")
+            .get(0)
+    }
+
     /// [`Self::seal`], or `None` when the seal is refused as backpressure:
     /// the seal gate (a transaction that may still write into the active
-    /// segment's predecessor is open) or a full ring (see
-    /// [`Self::seal_once`]), either of which a test running other sessions
-    /// concurrently can meet.
+    /// segment's predecessor is open) or a full ring whose needed slot holds
+    /// a drained segment (see [`Self::seal_once`]), either of which a test
+    /// running other sessions concurrently can meet.
     pub async fn try_seal(&mut self) -> Option<i64> {
         self.seal_once().await.ok()
     }
@@ -392,18 +413,27 @@ impl Driver {
     /// backpressure refusal, `SealGateBlocked` or `RingFull`.
     ///
     /// `RingFull` is backpressure here as it is to the engine's sealer,
-    /// which retries it on its next tick: the slot the seal needs can hold a
-    /// drained, retirable segment that this pass skipped, because
-    /// retirement takes the slot's table `ACCESS EXCLUSIVE ... NOWAIT` and a
-    /// concurrent reader of the ring held it at that instant (a convergence
-    /// wait's poll reads every slot, so a `self_check` running alongside the
-    /// drain is one). Work that is not drained keeps the ring full until the
-    /// test drains it, and [`Self::seal_within`] fails naming the slots.
+    /// which retries it on its next tick, when the slot the seal needs holds
+    /// a drained segment this pass could not retire: retirement takes the
+    /// slot's table `ACCESS EXCLUSIVE ... NOWAIT` and skips it while a
+    /// concurrent reader of the ring holds it (a convergence wait's poll
+    /// reads every slot, so a `self_check` running alongside the drain is
+    /// one), and holds it back while a session holding an xid from before
+    /// the successor's seal is open. Work that is not drained keeps the ring
+    /// full until the test drains it, which it cannot do while it waits
+    /// here, so that panics at once, naming the slots.
     async fn seal_once(&mut self) -> Result<i64, StagingError> {
         self.retire().await;
         let outcome = match seal::seal_phase1(&mut self.ctl).await {
             Ok(outcome) => outcome,
-            Err(refused @ (StagingError::SealGateBlocked | StagingError::RingFull { .. })) => {
+            Err(refused @ StagingError::SealGateBlocked) => return Err(refused),
+            Err(refused @ StagingError::RingFull { ring_slot }) => {
+                if self.undrained_work_holds(ring_slot).await {
+                    panic!(
+                        "seal phase 1: {refused}; work not yet drained holds it: {}",
+                        self.ring_state().await
+                    );
+                }
                 return Err(refused);
             }
             Err(err) => panic!("seal phase 1: {err}"),

@@ -143,3 +143,14 @@ async fn seal_fails_naming_a_reader_that_never_ends() {
     reader.batch_execute("commit").await.expect("commit");
     d.seal().await;
 }
+
+/// A ring full of work not yet drained is not waited out: nothing but the
+/// test can drain it, so the seal panics at once, without its wait.
+#[tokio::test]
+#[should_panic(expected = "work not yet drained holds it")]
+async fn seal_panics_at_once_on_a_ring_full_of_undrained_work() {
+    let mut d = start().await;
+    for _ in 0..4 {
+        d.seal().await;
+    }
+}

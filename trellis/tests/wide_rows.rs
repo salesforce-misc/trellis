@@ -309,9 +309,8 @@ async fn an_aggregate_with_a_target_wider_than_50_columns_applies_and_re_derives
         prior.contains(&"(\"\"\"5000\"\"\",\"\"\"-1\"\"\")".to_string()),
         "the repaired row's prior image: {prior:?}"
     );
-    if let Some(batch) = d.try_seal().await {
-        d.drain(batch, "after the rebuild").await;
-    }
+    let batch = d.seal().await;
+    d.drain(batch, "after the rebuild").await;
     assert_eq!(d.rows(&downstream).await, d.rows(&oracle).await);
 }
 
@@ -362,9 +361,8 @@ async fn a_rebuild_of_a_read_one_to_one_target_wider_than_50_columns_images_its_
     assert_eq!(d.rows(&wide_target).await, d.rows(&wide_oracle).await);
     let prior = ring_prior_images(&d, "public.wide", &["c60", "c119"]).await;
     assert_eq!(prior, ["(\"\"\"-5\"\"\",\"\"\"-6\"\"\")"]);
-    if let Some(batch) = d.try_seal().await {
-        d.drain(batch, "after the rebuild").await;
-    }
+    let batch = d.seal().await;
+    d.drain(batch, "after the rebuild").await;
     assert_eq!(d.rows(down_target).await, d.rows(down_oracle).await);
     assert_self_check_clean(&d, "down").await;
 }
