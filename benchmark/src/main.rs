@@ -28,6 +28,12 @@
 //! # against its same-session per-fact control (B0)
 //! cargo run -p benchmark --features engine-access --release -- join
 //! cargo run -p benchmark --features engine-access --release -- join --datasets d1 --facts 1000000 --hot-pages 0
+//! # a 1-1 JOIN's b change fanning out to many rows of a (cost per row against a
+//! # set-based control), a fan-out with failing rows, and the seam's cost to an
+//! # upstream that a 1-1 JOIN reads (add --disk for the NVMe numbers)
+//! cargo run -p benchmark --features engine-access --release -- one-to-one-join-fan-out --fan-outs 1000,100000,1000000
+//! cargo run -p benchmark --features engine-access --release -- one-to-one-join-poison --poison-rows 100000 --poisoned 0,1,4,8
+//! cargo run -p benchmark --features engine-access --release -- one-to-one-join-seam --variants none,a,b,ab --rate 5000
 //! # the write-path tax and the capture ceiling, and V-IDLE
 //! cargo run -p benchmark --features engine-access --release -- write-tax --shapes 1x1,1000x16,orm100x1 --reps 3
 //! cargo run -p benchmark --features engine-access --release -- write-tax --variants none,trigger --shapes orm100x16+hold

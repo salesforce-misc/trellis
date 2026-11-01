@@ -221,7 +221,7 @@ pub async fn run(
 
 /// Creates `pg_stat_statements` (if needed) and zeroes it. Panics with the
 /// settings to pass if the cluster did not preload the library.
-async fn reset_statements(raw: &RawClient) {
+pub(crate) async fn reset_statements(raw: &RawClient) {
     let preload: String = raw
         .query_one("show shared_preload_libraries", &[])
         .await

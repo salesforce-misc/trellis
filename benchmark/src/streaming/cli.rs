@@ -12,7 +12,8 @@ use crate::streaming::tuning::EngineTuning;
 use crate::streaming::write_tax::{self, CellOptions, ProbeMode, Shape, Variant};
 use crate::streaming::{
     build_under_load, capture_ceiling, disk_tier, fold_in, generator_reach, hop_latency, idle_cost,
-    join, load, one_to_one_apply, self_check_walk, ssi_tax, throughput,
+    join, load, one_to_one_apply, one_to_one_join, one_to_one_join_seam, self_check_walk, ssi_tax,
+    throughput,
 };
 
 /// Every scenario name this module handles, for `main.rs`'s usage message.
@@ -32,6 +33,9 @@ pub const SCENARIOS: &[&str] = &[
     "join",
     "self-check-walk",
     "one-to-one-apply",
+    "one-to-one-join-fan-out",
+    "one-to-one-join-poison",
+    "one-to-one-join-seam",
 ];
 
 /// The latency ladder's defaults: a low offered rate (10
@@ -301,6 +305,79 @@ fn join_tuning(args: &[String]) -> EngineTuning {
     )
 }
 
+/// `one-to-one-join-fan-out` and `one-to-one-join-poison`'s knobs (see
+/// [`one_to_one_join`]'s module doc): `--fan-outs` (1,000, 10,000, 100,000 and
+/// 1,000,000 rows of `a` on the hot key), `--reps` (3), `--probe-reps` (2),
+/// `--shape light|wide` (`light`), `--poisoned` (0, 1, 2, 4, 8, 16 failing
+/// rows), `--poison-rows` (100,000), `--timeout-secs` (3,600) and `--statements`
+/// (print the busiest statements; for a `--reps 1 --probe-reps 0` run),
+/// `--background-rows` (1,000 rows of `a` off the hot key) and `--analyze-hidden`.
+fn one_to_one_join_config(args: &[String]) -> one_to_one_join::OneToOneJoin {
+    let list = |name: &str, default: &[i64]| -> Vec<i64> {
+        number_list(args, name).map_or_else(
+            || default.to_vec(),
+            |v| v.into_iter().map(|n| n as i64).collect(),
+        )
+    };
+    let count = |name: &str, default: usize| number(args, name).map_or(default, |v| v as usize);
+    let cfg = one_to_one_join::OneToOneJoin {
+        fan_outs: list("--fan-outs", &[1_000, 10_000, 100_000, 1_000_000]),
+        reps: count("--reps", 3),
+        probe_reps: count("--probe-reps", 2),
+        shape: flag(args, "--shape").unwrap_or("light").to_string(),
+        poisoned: list("--poisoned", &[0, 1, 2, 4, 8, 16]),
+        poison_rows: number(args, "--poison-rows").map_or(100_000, |v| v as i64),
+        timeout: secs(args, "--timeout-secs").unwrap_or(Duration::from_secs(3_600)),
+        statements: args.iter().any(|a| a == "--statements"),
+        background_rows: number(args, "--background-rows")
+            .map_or(one_to_one_join::BACKGROUND_ROWS, |v| v as i64),
+        analyze_hidden: args.iter().any(|a| a == "--analyze-hidden"),
+    };
+    assert!(cfg.reps >= 1, "--reps must be at least 1");
+    assert!(
+        cfg.fan_outs.iter().all(|f| *f >= 2),
+        "--fan-outs must be at least 2"
+    );
+    assert!(
+        cfg.poisoned
+            .iter()
+            .all(|p| *p == 0 || (*p <= cfg.poison_rows && cfg.poison_rows % p == 0)),
+        "--poisoned must divide --poison-rows"
+    );
+    cfg
+}
+
+/// `one-to-one-join-seam`'s knobs (see [`one_to_one_join_seam`]'s module doc):
+/// `--variants none,a,b,ab`, `--rows` (500,000), `--rate` (20,000 rows/s),
+/// `--commit-rows` (20), `--connections` (4), `--duration-secs` (30),
+/// `--idle-secs` (5) and `--timeout-secs` (600).
+fn one_to_one_join_seam_config(args: &[String]) -> one_to_one_join_seam::Seam {
+    let cfg = one_to_one_join_seam::Seam {
+        variants: flag(args, "--variants").map_or_else(
+            || {
+                one_to_one_join_seam::VARIANTS
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect()
+            },
+            |raw| raw.split(',').map(str::to_string).collect(),
+        ),
+        rows: number(args, "--rows").map_or(500_000, |v| v as i64),
+        rate: number(args, "--rate").unwrap_or(20_000.0),
+        commit_rows: number(args, "--commit-rows").map_or(20, |v| v as i64),
+        connections: number(args, "--connections").map_or(4, |v| v as usize),
+        duration: secs(args, "--duration-secs").unwrap_or(Duration::from_secs(30)),
+        idle: secs(args, "--idle-secs").unwrap_or(Duration::from_secs(5)),
+        timeout: secs(args, "--timeout-secs").unwrap_or(Duration::from_secs(600)),
+    };
+    assert!(cfg.rate > 0.0 && cfg.commit_rows >= 1 && cfg.connections >= 1);
+    assert!(
+        cfg.rows % cfg.commit_rows == 0,
+        "--commit-rows must divide --rows, so a commit's ids never wrap"
+    );
+    cfg
+}
+
 fn throughput_tuning(args: &[String]) -> EngineTuning {
     tuning(
         args,
@@ -566,6 +643,32 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
                     .iter()
                     .all(|r| r.drained && r.oracle_mismatches == 0),
             )
+        }
+
+        "one-to-one-join-fan-out" => {
+            let cfg = one_to_one_join_config(args);
+            let tuning = join_tuning(args);
+            let results = runtime().block_on(one_to_one_join::run_fan_outs(&cfg, &tuning));
+            Some(results.iter().all(|r| r.landed && r.oracle_mismatches == 0))
+        }
+
+        "one-to-one-join-poison" => {
+            let cfg = one_to_one_join_config(args);
+            let tuning = join_tuning(args);
+            let results = runtime().block_on(one_to_one_join::run_poisons(&cfg, &tuning));
+            // A halt is a measurement (where the bisection gives up), not a failure;
+            // what must hold is that a committed page holds exactly the failing
+            // rows and leaves every other row right.
+            Some(results.iter().all(|r| {
+                r.outcome != "committed" || (r.held == r.poisoned && r.mismatches == r.poisoned)
+            }))
+        }
+
+        "one-to-one-join-seam" => {
+            let cfg = one_to_one_join_seam_config(args);
+            let tuning = join_tuning(args);
+            let results = runtime().block_on(one_to_one_join_seam::run(&cfg, &tuning));
+            Some(results.iter().all(|r| r.oracle_mismatches == 0))
         }
 
         // The JOIN scenario, with its per-fact control.
@@ -947,6 +1050,71 @@ mod tests {
         assert_eq!(cfg.loaders, 8);
         assert_eq!(cfg.build_timeout, Duration::from_secs(3_600));
         assert!(!cfg.build_only && !cfg.rebuild);
+    }
+
+    #[test]
+    fn one_to_one_join_defaults_span_a_thousand_to_a_million_rows() {
+        let cfg = one_to_one_join_config(&argv(&["one-to-one-join-fan-out"]));
+        assert_eq!(cfg.fan_outs, [1_000, 10_000, 100_000, 1_000_000]);
+        assert_eq!(cfg.poisoned, [0, 1, 2, 4, 8, 16]);
+        assert_eq!(cfg.poison_rows, 100_000);
+        assert_eq!(cfg.shape, "light");
+        assert!(!cfg.statements && !cfg.analyze_hidden);
+        assert_eq!(
+            cfg.background_rows,
+            one_to_one_join::BACKGROUND_ROWS,
+            "the hot key is the only large group unless asked"
+        );
+    }
+
+    #[test]
+    fn one_to_one_join_reads_its_flags() {
+        let cfg = one_to_one_join_config(&argv(&[
+            "one-to-one-join-poison",
+            "--fan-outs",
+            "5000000",
+            "--reps",
+            "1",
+            "--probe-reps",
+            "0",
+            "--poison-rows",
+            "1000000",
+            "--poisoned",
+            "0,1,4",
+            "--background-rows",
+            "250000",
+            "--statements",
+            "--analyze-hidden",
+        ]));
+        assert_eq!(cfg.fan_outs, [5_000_000]);
+        assert_eq!((cfg.reps, cfg.probe_reps), (1, 0));
+        assert_eq!(cfg.poison_rows, 1_000_000);
+        assert_eq!(cfg.poisoned, [0, 1, 4]);
+        assert_eq!(cfg.background_rows, 250_000);
+        assert!(cfg.statements && cfg.analyze_hidden);
+    }
+
+    #[test]
+    #[should_panic(expected = "--poisoned must divide --poison-rows")]
+    fn a_poison_count_that_does_not_divide_the_rows_is_refused() {
+        // The poisoned rows are spread by a whole stride.
+        one_to_one_join_config(&argv(&["one-to-one-join-poison", "--poisoned", "3"]));
+    }
+
+    #[test]
+    fn the_seam_scenario_runs_every_variant_unless_told() {
+        let cfg = one_to_one_join_seam_config(&argv(&["one-to-one-join-seam"]));
+        assert_eq!(cfg.variants, ["none", "a", "b", "ab"]);
+        assert_eq!((cfg.rows, cfg.commit_rows), (500_000, 20));
+        let cfg = one_to_one_join_seam_config(&argv(&[
+            "one-to-one-join-seam",
+            "--variants",
+            "none,ab",
+            "--rate",
+            "5000",
+        ]));
+        assert_eq!(cfg.variants, ["none", "ab"]);
+        assert_eq!(cfg.rate, 5000.0);
     }
 
     #[test]
