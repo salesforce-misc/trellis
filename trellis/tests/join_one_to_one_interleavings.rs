@@ -1077,6 +1077,77 @@ async fn f13_a_fan_out_of_several_batches_races_an_a_move_onto_its_key() {
     .await;
 }
 
+/// A batch of a fan-out drives its upsert: each entry is a probe of `R`'s
+/// primary key, so the batch costs the same whatever `R`'s size, and never a
+/// pass over all of `R` (#1580). Seeded with a hot key of 10,000 rows among
+/// 30,000 and analyzed, so the plan is chosen on cost: as a plain join of the
+/// batch to `R`, the planner hashes the whole of `R` here, once per batch.
+#[tokio::test]
+async fn a_fan_out_batch_probes_r_by_its_key_and_never_scans_it_whole() {
+    let _serial = serial().await;
+    set_enabled(true);
+    let ddl = format!(
+        "{DDL}; insert into public.a \
+             select g, case when g <= 10000 then 10 else 20 + g % 50 end, g, 'many' \
+             from generate_series(1, 30000) g; \
+         insert into public.b values {B_ROWS}"
+    );
+    let definitions: Vec<String> = KINDS.iter().map(|k| k.definition()).collect();
+    let definitions: Vec<&str> = definitions.iter().map(String::as_str).collect();
+    let d = Driver::start(
+        &ddl,
+        &[
+            ("id", int4()),
+            ("k", int4()),
+            ("x", int4()),
+            ("y", ValueType::Text),
+        ],
+        &definitions,
+        &["public.a", "public.b"],
+    )
+    .await;
+    let keys: Vec<String> = d
+        .ctl
+        .query(
+            "select id::text from public.a where k = 10 order by id::text collate \"C\"",
+            &[],
+        )
+        .await
+        .expect("the hot key's rows")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+    assert_eq!(keys.len(), 10_000);
+    let schema = trellis::config::DEFAULT_SCHEMA;
+    for kind in KINDS {
+        let id = definition_id(&d, kind.target()).await;
+        let r = format!("join1_{id}_r");
+        // Statistics, so the plan does not depend on whether autovacuum has
+        // analyzed the tables yet.
+        d.ctl
+            .batch_execute(&format!(
+                "analyze {schema}.{r}; analyze {schema}.join1_{id}_m; analyze {}",
+                kind.target()
+            ))
+            .await
+            .expect("analyze");
+        let plan =
+            trellis::staging::one_to_one_join_explain_target_write(d.pool(), kind.target(), &keys)
+                .await
+                .expect("explain the batch's upsert");
+        assert!(
+            !plan.contains(&format!("Seq Scan on {r} ")),
+            "{kind:?}: the batch does not scan R whole:\n{plan}"
+        );
+        assert!(
+            plan.contains(&format!("Index Scan using {r}_pkey on {r} "))
+                || plan.contains(&format!("Bitmap Index Scan on {r}_pkey ")),
+            "{kind:?}: each entry is a probe of R's primary key:\n{plan}"
+        );
+    }
+}
+
 /// F15: a new `b` row's insert and update drained out of order, the update's
 /// page holding its placeholder: the insert's page queues on it rather than
 /// overwriting it (`join1_no_placeholder`), and is then refused by I2.

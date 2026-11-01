@@ -72,6 +72,8 @@ pub(crate) mod join;
 pub(crate) mod join_one_to_one;
 #[cfg(any(test, feature = "internals"))]
 pub use join_one_to_one::diverging_keys as one_to_one_join_diverging_keys;
+#[cfg(any(test, feature = "internals"))]
+pub use join_one_to_one::explain_target_write as one_to_one_join_explain_target_write;
 pub(crate) mod join_one_to_one_status;
 pub(crate) mod join_status;
 pub(crate) mod ledger;
