@@ -515,6 +515,22 @@ async fn drain_once_ok(d: &Driver, batch: i64, kind: Kind) {
         .unwrap_or_else(|err| panic!("{kind:?}: the page failed: {err:?}"));
 }
 
+/// The WAL position now, a read-your-writes token for every write before it.
+async fn wal_lsn(d: &Driver) -> trellis::PgLsn {
+    d.ctl
+        .query_one("select pg_current_wal_lsn()", &[])
+        .await
+        .expect("read the WAL position")
+        .get(0)
+}
+
+/// Whether the pipeline has converged through `token`.
+async fn converged(d: &Driver, token: trellis::PgLsn) -> bool {
+    trellis::staging::converge::converged_through(&d.ctl, token)
+        .await
+        .expect("converged_through")
+}
+
 /// The `origin_lsn` of the newest ring row of `key` of `table`.
 async fn ring_origin(d: &Driver, table: &str, key: &str) -> Vec<String> {
     d.rows(&format!(
@@ -570,9 +586,11 @@ async fn self_check_walk(
 /// change (each fits alone: `2147483000 + 100` and `13 + 1132`) holds that
 /// `a` row in the page, as the fan-out holds a row: the write of the `a`
 /// changes' rows is bisected down to row 13, which is held on this first
-/// failure under a parked Re-derive with the `a` change's own origin, and
-/// the page commits on its first attempt with `M` advanced and every other
-/// row exact. The row counts toward `total`'s fuse.
+/// failure, and the page commits on its first attempt with `M` advanced and
+/// every other row exact. Row 13's target row reflects neither change, so
+/// its parked Re-derive carries the earlier origin of the two, the `b`
+/// change's here, and a token after the `b` change doesn't converge. The row
+/// counts toward `total`'s fuse.
 #[tokio::test]
 async fn an_a_change_failing_against_the_pages_b_change_is_held_in_the_page() {
     let _serial = SERIAL.lock().await;
@@ -580,11 +598,18 @@ async fn an_a_change_failing_against_the_pages_b_change_is_held_in_the_page() {
         let mut d = start(kind, A_ROWS, B_ROWS).await;
         seed_key_10(&mut d, &[]).await;
         // Two transactions, the `b` one first, so the two changes' origins
-        // differ and the parked Re-derive's names the `a` change's.
+        // differ. Row 13's target row misses both.
+        let before = wal_lsn(&d).await;
         write(&d, "update public.b set w = 1132 where id = 1").await;
+        let after_b = wal_lsn(&d).await;
         write(&d, "update public.a set x = 2147483000 where id = 13").await;
         let batch = d.seal().await;
         drain_once_ok(&d, batch, kind).await;
+        assert!(converged(&d, before).await, "{kind:?}: nothing held back");
+        assert!(
+            !converged(&d, after_b).await,
+            "{kind:?}: row 13 lacks the b change, so a token after it doesn't converge"
+        );
         assert_eq!(status(&d, &kind.target()).await, "live", "{kind:?}");
         assert_join_but(&d, kind, &[13], "the page").await;
         assert_eq!(
@@ -607,9 +632,9 @@ async fn an_a_change_failing_against_the_pages_b_change_is_held_in_the_page() {
                 .await,
             [format!(
                 "(public.a,13,{})",
-                ring_origin(&d, "public.a", "13").await[0].trim_matches(|c| c == '(' || c == ')')
+                ring_origin(&d, "public.b", "1").await[0].trim_matches(|c| c == '(' || c == ')')
             )],
-            "{kind:?}: parked with the a change's origin"
+            "{kind:?}: parked with the earlier origin, the b change's"
         );
         assert_eq!(
             d.rows("select transform_table, column_name, key from column_failures")
@@ -651,6 +676,15 @@ async fn an_a_change_failing_alone_is_held_on_its_first_failure() {
             d.rows("select src_table, key from poison").await,
             ["(public.a,1)"],
             "{kind:?}"
+        );
+        assert_eq!(
+            d.rows("select key, origin_lsn::text from poison_held")
+                .await,
+            [format!(
+                "(1,{})",
+                ring_origin(&d, "public.a", "1").await[0].trim_matches(|c| c == '(' || c == ')')
+            )],
+            "{kind:?}: a page of a changes alone parks the row with its own origin"
         );
     }
 }

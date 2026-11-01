@@ -516,15 +516,16 @@ pub(crate) struct JoinOneToOnePlan {
     /// build's chunks write every target row after it.
     fan_out: bool,
     /// What the rows a fan-out holds are parked with: the page's `b`
-    /// changes' origin ([`held::HeldOrigin`]).
+    /// changes' origin ([`held::HeldOrigin`]). An `a` row the page holds
+    /// parks with it too, merged with its own changes' ([`write_a_changes`]).
     held_origin: held::HeldOrigin,
     /// Whether a field that fails on the row of one of the page's `a`
     /// changes holds that row in the page ([`write_a_changes`]): a drain's
     /// page. A build's pages and a release's Re-derive ([`build::rederive`])
     /// leave the failure to their callers.
     holds_a: bool,
-    /// What each `a` row the page holds is parked with: the origin of the
-    /// page's changes of that row, by its key.
+    /// The origin of the page's changes of each `a` row, by its key, which
+    /// the row parks with if the page holds it.
     a_origins: HashMap<String, held::HeldOrigin>,
     /// The rows the page held, for the fuses once it commits
     /// ([`held::charge_after_commit`]).
@@ -1583,8 +1584,8 @@ const MAX_NAMED_FAN_OUT_ROWS: usize = 8;
 /// fan-out writes under one. A data exception rolls the write back to it and
 /// bisects the rows down to those whose fields fail ([`fan_out_failure`]):
 /// the page holds each in quarantine on this first failure ([`held::hold`]),
-/// parked with the origin of the page's changes of that row, and writes every
-/// other row. Step 6 has written the held row's change into `R`; its target
+/// parked with the earliest origin of the page's changes of that row and its
+/// `b` changes, and writes every other row. Step 6 has written the held row's change into `R`; its target
 /// row stays as it was, since nothing writes a held row's target from its
 /// `R` entry, until its release re-derives both from the live row ([`held`]).
 /// A bisection that can't name every failing row within
@@ -1612,11 +1613,21 @@ async fn write_a_changes(
                 .await?;
             let (written, deleted, rows) =
                 fan_out_failure(txn, shape, Side::From, keys, mutations).await?;
-            let unknown = held::HeldOrigin::default();
-            let held: Vec<_> = rows
+            // The row's target row reflects neither its own changes nor the
+            // page's `b` changes, which `M` now holds: it parks with the
+            // earliest origin of both, so a token after a `b` change its row
+            // lacks doesn't converge.
+            let origins: Vec<held::HeldOrigin> = rows
                 .iter()
-                .map(|row| (row, plan.a_origins.get(&row.key).unwrap_or(&unknown)))
+                .map(|row| {
+                    plan.a_origins
+                        .get(&row.key)
+                        .cloned()
+                        .unwrap_or_else(held::HeldOrigin::unknown)
+                        .merged(&plan.held_origin)
+                })
                 .collect();
+            let held: Vec<_> = rows.iter().zip(&origins).collect();
             held::hold(txn, shape, seg_seq, Side::From, &held).await?;
             plan.held.record(rows);
             txn.batch_execute("release savepoint join1_a_write").await?;

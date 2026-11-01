@@ -231,8 +231,10 @@ fails, so isolation would charge nothing and the page would fail forever.
   rows count toward the whole-transform fuse, both checked once the page has
   committed.
 - The held row's parked Re-derive carries the earliest origin of the page's
-  changes it holds back: the `b` changes for a fan-out's row, the row's own
-  changes for an `a` change's.
+  changes it holds back, so no watermark token past one of them converges
+  while the row is held: the `b` changes for a fan-out's row; for an `a`
+  change's row, its own changes and the page's `b` changes, since its target
+  row reflects neither.
 - A bisection that can't name every failing row within its attempts halts
   the transform rather than commit with a row unwritten.
 - A held row is left out of later fan-outs and of the build, and its own

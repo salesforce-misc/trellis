@@ -20,10 +20,11 @@
 //!   isolation has charged it to its death threshold. `poison`'s foreign key
 //!   takes the definition's row `FOR KEY SHARE`, which the page took before
 //!   its lock row ([`super::lock_definitions`]). The parked Re-derive carries
-//!   the earliest origin of the page's changes it holds back (the `b`
-//!   changes for a fan-out's row, the row's own changes for an `a` change's),
-//!   so it holds back every watermark token those changes do (`converge`'s
-//!   condition 4).
+//!   the earliest origin of the page's changes it holds back, so it holds
+//!   back every watermark token those changes do (`converge`'s condition 4):
+//!   the `b` changes for a fan-out's row; for an `a` change's row, the row's
+//!   own changes and the page's `b` changes, since its target row reflects
+//!   neither.
 //! - **Left out after.** A held row's own changes are parked by the drain
 //!   (`super::super::apply::compute`), a later fan-out leaves it out
 //!   ([`not_held_sql`]), and so do the build's chunks and sweep. Its target
@@ -79,9 +80,9 @@ pub(crate) struct HeldRow {
 
 /// The origin a page's held rows are parked with: the earliest origin and
 /// source-change time of the page's changes a row holds back (its `b`
-/// changes for a fan-out's rows, a row's own changes for an `a` change's),
-/// and their deepest `hop_gen`, merged as a park merges a key's changes
-/// (`quarantine::HeldKey::merge`).
+/// changes for a fan-out's rows; a row's own changes and the page's `b`
+/// changes for an `a` change's), and their deepest `hop_gen`, merged as a
+/// park merges a key's changes (`quarantine::HeldKey::merge`).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HeldOrigin {
     seen: bool,
@@ -106,6 +107,33 @@ impl HeldOrigin {
                 src_changed: change.src_changed,
                 hop_gen: change.hop_gen,
             };
+        }
+    }
+
+    /// An origin no change gave: unknown, which gates every token as an
+    /// unknown origin does.
+    pub(super) fn unknown() -> Self {
+        HeldOrigin {
+            seen: true,
+            ..HeldOrigin::default()
+        }
+    }
+
+    /// This origin merged with `other`'s, as [`HeldOrigin::add`] merges a
+    /// change: what a row parks with when it holds back the changes of both.
+    pub(super) fn merged(&self, other: &HeldOrigin) -> HeldOrigin {
+        match (self.seen, other.seen) {
+            (_, false) => self.clone(),
+            (false, true) => other.clone(),
+            (true, true) => HeldOrigin {
+                seen: true,
+                origin_lsn: super::super::fold::earliest_origin(self.origin_lsn, other.origin_lsn),
+                src_changed: super::super::apply::earliest_src_changed(
+                    self.src_changed,
+                    other.src_changed,
+                ),
+                hop_gen: self.hop_gen.max(other.hop_gen),
+            },
         }
     }
 }
