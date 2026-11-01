@@ -57,6 +57,12 @@ pub struct Profile {
     /// it. Off for the end-to-end tiers, whose oracle types an operator from
     /// its operands' own types.
     pub bare_null: bool,
+    /// Draw a tree define refuses for a constant zero divisor
+    /// (`ConstantDivisorZero`: `x / 0`, `x % (0 * 5)`, a divisor a `CASE`
+    /// folds to zero, ...). Off for the end-to-end tiers, whose programs must
+    /// install; the conformance properties draw them, since
+    /// `expr_conformance` checks that define and Postgres both refuse.
+    pub constant_zero_divisor: bool,
 }
 
 impl Profile {
@@ -66,6 +72,7 @@ impl Profile {
         magnitude: Magnitude::Extreme,
         mixed_coalesce: true,
         bare_null: true,
+        constant_zero_divisor: true,
     };
     /// The end-to-end tiers: small literals and depth 2, so a program the
     /// engine accepts also runs.
@@ -74,6 +81,7 @@ impl Profile {
         magnitude: Magnitude::Small,
         mixed_coalesce: false,
         bare_null: false,
+        constant_zero_divisor: false,
     };
 }
 
@@ -341,6 +349,34 @@ const HUGE_NUMBER_LITERAL: &str = concat!(
     "0000000000000000000000000000000000000000000000000000000000000000000000000000000000",
     "000000000000000000000000000000000000000000000000000000000000"
 );
+
+/// Whether define refuses `expr` for a constant zero divisor
+/// (`ValidationError::ConstantDivisorZero`), over source `columns`.
+///
+/// This asks define itself rather than restating its folding (`0 * 5`,
+/// `CAST('0' AS REAL)`, a `CASE` or `COALESCE` that picks a zero, a divisor
+/// folded through a comparison, ...), so the generator is never laxer than
+/// define: whatever define learns to fold, this follows. Only that one
+/// refusal counts; any other refusal is left for the property that draws the
+/// tree to report.
+pub fn has_constant_zero_divisor(expr: &Expr, columns: &[Column]) -> bool {
+    use std::collections::HashMap;
+    use trellis::dev::defs::{ValidationError, parse, validate};
+
+    let mut source_columns: HashMap<String, ValueType> = columns.iter().cloned().collect();
+    source_columns
+        .entry("id".to_string())
+        .or_insert(ValueType::Integer(IntWidth::Int4));
+    // The tree goes into a parsed one-field definition as an AST, not as
+    // text: the end-to-end slots (`$c1`) are not spellable.
+    let mut def = parse("TRANSFORM tgt FROM src SELECT 1 AS v")
+        .expect("the one-field definition template parses");
+    def.fields[0].expr = expr.clone();
+    matches!(
+        validate(&def, &source_columns),
+        Err(ValidationError::ConstantDivisorZero { .. })
+    )
+}
 
 /// Canonical spellings per typed-literal keyword. A keyword with no entry
 /// fails `every_typed_literal_has_samples`, so a new allowlist row cannot
@@ -1814,7 +1850,11 @@ pub mod strategy {
             }
         }
         // Boxed trees hold no `Rc`; the builder is dropped here.
+        let columns = columns.to_vec();
         (Union::new(strategies), text_style())
+            .prop_filter("a tree define admits", move |(expr, _)| {
+                profile.constant_zero_divisor || !has_constant_zero_divisor(expr, &columns)
+            })
             .prop_map(|(expr, style)| Draw { expr, style })
             .boxed()
     }
@@ -1828,9 +1868,14 @@ pub mod strategy {
             profile,
             cache: RefCell::new(Vec::new()),
         });
+        let columns = columns.to_vec();
         builder
             .expr(ty, profile.max_depth)
             .unwrap_or_else(|| panic!("nothing produces {ty} over these columns"))
+            .prop_filter("a tree define admits", move |expr| {
+                profile.constant_zero_divisor || !has_constant_zero_divisor(expr, &columns)
+            })
+            .boxed()
     }
 
     /// A near miss over `columns`.
@@ -1903,6 +1948,210 @@ mod tests {
                 .unwrap_or_else(|| panic!("{keyword} is not a typed literal"));
             assert!((spec.canonical)(text).is_err(), "{keyword} '{text}'");
         }
+    }
+
+    /// The slots the end-to-end tiers draw over.
+    fn slot_columns() -> Vec<Column> {
+        vec![
+            ("$c1".to_string(), ValueType::Numeric),
+            ("$c2".to_string(), ValueType::Numeric),
+            ("$text".to_string(), ValueType::Text),
+            ("$flag".to_string(), ValueType::Boolean),
+        ]
+    }
+
+    fn float4_literal(text: &str) -> Expr {
+        Expr::TypedLiteral {
+            value_type: ValueType::Float(FloatWidth::Float4),
+            text: text.to_string(),
+        }
+    }
+
+    fn number(text: &str) -> Expr {
+        Expr::NumberLiteral(text.to_string())
+    }
+
+    fn column(name: &str) -> Expr {
+        Expr::Column(name.to_string())
+    }
+
+    fn binary(op: Operator, lhs: Expr, rhs: Expr) -> Expr {
+        Expr::BinaryOp {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
+    /// `has_constant_zero_divisor` flags every spelling of a constant zero
+    /// divisor define refuses, and nothing define admits: a zero dividend or
+    /// operand, a `NULL` divisor, a column divisor.
+    #[test]
+    fn a_constant_zero_divisor_is_recognised_the_way_define_refuses_it() {
+        let columns = slot_columns();
+        let zero = || number("0");
+        let refused = [
+            // The issue's draw: `REAL '0' / REAL '0'`.
+            binary(Operator::Divide, float4_literal("0"), float4_literal("0")),
+            binary(Operator::Divide, column("$c1"), zero()),
+            binary(Operator::Modulo, column("$c1"), zero()),
+            // A divisor that folds to zero.
+            binary(
+                Operator::Divide,
+                column("$c1"),
+                binary(Operator::Multiply, zero(), number("5")),
+            ),
+            binary(
+                Operator::Modulo,
+                column("$c1"),
+                binary(Operator::Subtract, number("7"), number("7")),
+            ),
+            binary(
+                Operator::Divide,
+                column("$c1"),
+                Expr::Case {
+                    branches: vec![(Expr::BooleanLiteral(true), zero())],
+                    otherwise: Some(Box::new(column("$c2"))),
+                },
+            ),
+            binary(
+                Operator::Divide,
+                column("$c1"),
+                Expr::FunctionCall {
+                    name: "COALESCE".to_string(),
+                    args: vec![zero(), column("$c2")],
+                },
+            ),
+            // In a branch no row reaches: the planner folds it anyway.
+            Expr::Case {
+                branches: vec![(
+                    Expr::BinaryOp {
+                        op: Operator::GreaterThan,
+                        lhs: Box::new(column("$c1")),
+                        rhs: Box::new(zero()),
+                    },
+                    number("1"),
+                )],
+                otherwise: Some(Box::new(binary(Operator::Divide, number("1.5"), zero()))),
+            },
+        ];
+        for expr in &refused {
+            assert!(
+                has_constant_zero_divisor(expr, &columns),
+                "{} should be flagged",
+                render_text(expr, TextStyle::default())
+            );
+        }
+        let admitted = [
+            // Zero as a dividend, an addend, a comparison operand.
+            binary(Operator::Divide, zero(), column("$c1")),
+            binary(Operator::Divide, zero(), number("2")),
+            binary(Operator::Add, column("$c1"), zero()),
+            binary(Operator::Multiply, column("$c1"), zero()),
+            binary(Operator::Modulo, zero(), number("7")),
+            binary(Operator::Divide, column("$c1"), column("$c2")),
+            binary(Operator::Divide, column("$c1"), number("2")),
+            // `NULLIF(1, 1)` is `NULL`, not zero, and a strict operator by
+            // `NULL` is `NULL`.
+            binary(
+                Operator::Divide,
+                column("$c1"),
+                Expr::FunctionCall {
+                    name: "NULLIF".to_string(),
+                    args: vec![number("1"), number("1")],
+                },
+            ),
+            binary(Operator::Divide, column("$c1"), Expr::Null),
+        ];
+        for expr in &admitted {
+            assert!(
+                !has_constant_zero_divisor(expr, &columns),
+                "{} should be admitted",
+                render_text(expr, TextStyle::default())
+            );
+        }
+    }
+
+    /// Draws `count` trees of `profile` from the deterministic runner (the
+    /// one the issue's probe used), over the end-to-end slots.
+    fn draws(profile: Profile, count: usize) -> Vec<Expr> {
+        use proptest::strategy::{Strategy, ValueTree};
+        use proptest::test_runner::TestRunner;
+        let columns = slot_columns();
+        let strategy = strategy::any_expr(&columns, profile);
+        let mut runner = TestRunner::deterministic();
+        (0..count)
+            .map(|_| {
+                strategy
+                    .new_tree(&mut runner)
+                    .expect("a draw")
+                    .current()
+                    .expr
+            })
+            .collect()
+    }
+
+    /// The end-to-end profile never draws a tree define refuses for a
+    /// constant zero divisor (#1575: `REAL '0' / REAL '0'` failed a property
+    /// at install, about 0.1% of derived fields), and still draws zero
+    /// elsewhere. The conformance profile still draws one, since
+    /// `expr_conformance` checks the refusal.
+    #[test]
+    fn the_end_to_end_profile_never_draws_a_constant_zero_divisor() {
+        let columns = slot_columns();
+        let end_to_end = draws(Profile::END_TO_END, 50_000);
+        let flagged: Vec<String> = end_to_end
+            .iter()
+            .filter(|e| has_constant_zero_divisor(e, &columns))
+            .take(5)
+            .map(|e| render_text(e, TextStyle::default()))
+            .collect();
+        assert!(flagged.is_empty(), "constant zero divisors: {flagged:?}");
+
+        // Nothing else define refuses either, and no coverage is lost: a
+        // literal zero is still drawn as a dividend.
+        let source_columns: std::collections::HashMap<String, ValueType> = columns
+            .iter()
+            .cloned()
+            .chain([("id".to_string(), ValueType::Integer(IntWidth::Int4))])
+            .collect();
+        for expr in &end_to_end {
+            let mut def = trellis::dev::defs::parse("TRANSFORM tgt FROM src SELECT 1 AS v")
+                .expect("the template parses");
+            def.fields[0].expr = expr.clone();
+            if let Err(e) = trellis::dev::defs::validate(&def, &source_columns) {
+                panic!(
+                    "define refuses an end-to-end draw `{}`: {e}",
+                    render_text(expr, TextStyle::default())
+                );
+            }
+        }
+        fn zero_dividend(expr: &Expr) -> bool {
+            let children: Vec<&Expr> = match expr {
+                Expr::BinaryOp { lhs, rhs, .. } => vec![lhs, rhs],
+                Expr::FunctionCall { args, .. } => args.iter().collect(),
+                Expr::Negate(operand) => vec![operand],
+                _ => expr.logic_children(),
+            };
+            let zero_over = matches!(
+                expr,
+                Expr::BinaryOp { op: Operator::Divide | Operator::Modulo, lhs, .. }
+                    if matches!(&**lhs, Expr::NumberLiteral(t) | Expr::TypedLiteral { text: t, .. } if t == "0")
+            );
+            zero_over || children.into_iter().any(zero_dividend)
+        }
+        assert!(
+            end_to_end.iter().any(zero_dividend),
+            "zero is no longer drawn as a dividend"
+        );
+
+        let conformance = draws(Profile::CONFORMANCE, 20_000);
+        assert!(
+            conformance
+                .iter()
+                .any(|e| has_constant_zero_divisor(e, &columns)),
+            "the conformance profile no longer draws a constant zero divisor"
+        );
     }
 
     /// The literal pools hold only what they claim to.
