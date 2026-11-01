@@ -381,7 +381,11 @@ async fn routed_groups(
 }
 
 /// The exact type (`format_type`) of each of `columns` of the hidden table
-/// `bare` in `schema`, in `columns`' order.
+/// `bare` in `schema`, in `columns`' order, each followed by ` collate <name>`
+/// when the column has a collation. Read after `::`, it makes a value of the
+/// hidden column's type and collation: a source column re-collated after
+/// define (a change between deterministic collations pauses nothing) then
+/// unions and deduplicates with the hidden table's own cells.
 async fn hidden_column_types(
     client: &impl tokio_postgres::GenericClient,
     schema: &str,
@@ -391,7 +395,10 @@ async fn hidden_column_types(
     let rows = client
         .query(
             &format!(
-                "select {} \
+                "select {} || coalesce(' collate ' || (select pg_catalog.format('%I.%I', n.nspname, co.collname) \
+                                    from pg_catalog.pg_collation co \
+                                    join pg_catalog.pg_namespace n on n.oid = co.collnamespace \
+                                    where co.oid = a.attcollation), '') \
                  from unnest($3::text[]) with ordinality as c(name, ord) \
                  join pg_catalog.pg_attribute a \
                    on a.attrelid = pg_catalog.to_regclass(pg_catalog.format('%I.%I', $1::text, $2::text)) \

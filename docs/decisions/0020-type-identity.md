@@ -162,6 +162,19 @@ afterwards. A pause driven by that comparison must first be shown not to fire on
 routine maintenance and migrations, and must not need superuser. This ADR adds
 no such detector.
 
+A `JOIN` aggregate's group and key columns therefore live in three places that
+can disagree on collation after a re-collation: the source (live), the hidden
+tables with the session tables made from them, and the visible target. An
+aggregate's are the database default in every place Trellis creates, so only
+the source can differ, and any other collation overrides the default. A
+statement over a `JOIN`'s columns that meets two of the places moves one side's
+values to the other's collation, and does so only where the two differ. A value
+read from the source or the target enters the session tables under the hidden
+table's collation, which is the working one and the order locks are taken in. A
+probe of the source's or the target's index compares under that table's
+collation, so the index serves it. Equality is byte equality in each, so which
+collation a comparison runs under changes no result.
+
 ## A 1-1 copy holds the source's text
 
 A type's `=` can be coarser than its text: `numeric` `1.25` and `1.2500`,

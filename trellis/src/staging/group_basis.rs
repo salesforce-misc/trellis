@@ -652,6 +652,118 @@ pub(super) enum Writer {
     JoinTarget,
 }
 
+/// Where the values of a group's columns live. A `JOIN`'s group and key
+/// columns exist in three populations, each with the collation its column had
+/// when the table was created: the source table's (live: a column can be
+/// re-collated at any time), the hidden table's and its session tables', and
+/// the visible target's. A change between deterministic collations pauses
+/// nothing, so after one the populations disagree, and a statement that
+/// compares, deduplicates or unions two of them would find no collation
+/// Postgres can choose. See [`GroupCollations`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Population {
+    Source,
+    Hidden,
+    Target,
+}
+
+/// A table's collatable columns' collations, by column: each a quoted,
+/// qualified name ready to interpolate after `collate`
+/// (`"pg_catalog"."POSIX"`). A column with no collation has no entry.
+pub(crate) type ColumnCollations = HashMap<String, String>;
+
+/// The collation of every collatable column of `table` (a name `to_regclass`
+/// resolves), at the time of the call.
+pub(crate) async fn column_collations(
+    client: &impl tokio_postgres::GenericClient,
+    table: &str,
+) -> Result<ColumnCollations, tokio_postgres::Error> {
+    Ok(client
+        .query(
+            "select a.attname::text, \
+                    pg_catalog.format('%I.%I', n.nspname, co.collname) \
+             from pg_catalog.pg_attribute a \
+             join pg_catalog.pg_collation co on co.oid = a.attcollation \
+             join pg_catalog.pg_namespace n on n.oid = co.collnamespace \
+             where a.attrelid = pg_catalog.to_regclass($1) \
+               and a.attnum > 0 and not a.attisdropped",
+            &[&ddl::regclass_arg(table)],
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect())
+}
+
+/// The collations of a `JOIN` structure's group columns, in each population
+/// ([`Population`]), aligned with its [`GroupShape::group_cols`]. A column
+/// with no collation (an integer), and a plan with none recorded (every
+/// plain aggregate's: its hidden table, target and session tables are the
+/// database's default collation, which any other collation overrides), has
+/// `None`.
+///
+/// Equality under any deterministic collation is byte equality, so which
+/// collation a comparison runs under changes no result; it decides only
+/// whether Postgres can choose one, and which index a probe can use. The
+/// hidden table's collation is the working one: every session table is
+/// created from it, so values read from the source or the target are moved
+/// to it ([`Self::coerce`]) where they enter, and a probe of the source's or
+/// the target's index moves the working value to the indexed table's. Moved
+/// only where the collations differ, so a definition no column of which was
+/// re-collated runs the statements it always has.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GroupCollations {
+    source: Vec<Option<String>>,
+    hidden: Vec<Option<String>>,
+    target: Vec<Option<String>>,
+}
+
+impl GroupCollations {
+    /// The collations of `columns`, from each population's table (`source`
+    /// and `target` are absent for a structure with none).
+    pub(crate) fn of(
+        columns: &[String],
+        source: Option<&ColumnCollations>,
+        hidden: &ColumnCollations,
+        target: Option<&ColumnCollations>,
+    ) -> Self {
+        let pick = |from: Option<&ColumnCollations>| -> Vec<Option<String>> {
+            columns
+                .iter()
+                .map(|c| from.and_then(|m| m.get(c)).cloned())
+                .collect()
+        };
+        Self {
+            source: pick(source),
+            hidden: pick(Some(hidden)),
+            target: pick(target),
+        }
+    }
+
+    fn of_population(&self, population: Population, column: usize) -> Option<&str> {
+        let collations = match population {
+            Population::Source => &self.source,
+            Population::Hidden => &self.hidden,
+            Population::Target => &self.target,
+        };
+        collations.get(column)?.as_deref()
+    }
+
+    /// `expr`, the value of group column `column` in population `from`, as
+    /// a value of population `to`'s collation: `expr collate <to's>` when
+    /// the two differ, `expr` as is when they are the same or either is
+    /// unknown.
+    fn coerce(&self, expr: &str, column: usize, from: Population, to: Population) -> String {
+        match (
+            self.of_population(from, column),
+            self.of_population(to, column),
+        ) {
+            (Some(from), Some(to)) if from != to => format!("{expr} collate {to}"),
+            _ => expr.to_string(),
+        }
+    }
+}
+
 /// One page's work on one group-basis target ([`apply_group_target`]), or
 /// on one of a `JOIN`'s structures ([`Writer`]).
 #[derive(Debug, Clone)]
@@ -694,6 +806,9 @@ pub(crate) struct GroupTargetPlan {
     /// More conditions, over the populated image `s`, a side must meet to
     /// be staged: ` and …` (with its leading space), or empty.
     stage_filter: String,
+    /// The collations of the group columns in each population; empty for a
+    /// plain aggregate ([`GroupCollations`]).
+    collations: GroupCollations,
 }
 
 /// The columns of a plan's staging table, as DDL.
@@ -789,6 +904,7 @@ impl GroupTargetPlan {
             writer: Writer::Aggregate,
             floor_key: Some(target.to_string()),
             stage_filter: String::new(),
+            collations: GroupCollations::default(),
         }
     }
 
@@ -844,7 +960,15 @@ impl GroupTargetPlan {
             writer,
             floor_key,
             stage_filter,
+            collations: GroupCollations::default(),
         }
+    }
+
+    /// This plan with the collations of its group columns
+    /// ([`GroupCollations`]).
+    pub(super) fn with_collations(mut self, collations: GroupCollations) -> Self {
+        self.collations = collations;
+        self
     }
 
     /// This plan with the ring's segment tables, whose old images a build's
@@ -931,17 +1055,29 @@ impl GroupTargetPlan {
 
     /// `s.<group col>::<type> as <group col>`, for each `GROUP BY` column.
     /// A `JOIN` side's key columns are the image's own columns, at the
-    /// hidden table's types, so they need no cast.
+    /// hidden table's types, so they need no cast; at the hidden table's
+    /// collation too ([`GroupCollations`]), so a source column re-collated
+    /// after define still unions, deduplicates and matches with the cells
+    /// the hidden table holds.
     fn group_values(&self) -> Vec<String> {
         self.shape
             .group_cols
             .iter()
             .zip(&self.shape.group_types)
-            .map(|(c, t)| {
+            .enumerate()
+            .map(|(i, (c, t))| {
                 let c = quote_ident(c);
                 match self.writer {
                     Writer::Aggregate => format!("s.{c}::{t} as {c}"),
-                    Writer::JoinPartials { .. } | Writer::JoinTarget => format!("s.{c} as {c}"),
+                    Writer::JoinPartials { .. } | Writer::JoinTarget => format!(
+                        "{} as {c}",
+                        self.collations.coerce(
+                            &format!("s.{c}"),
+                            i,
+                            Population::Source,
+                            Population::Hidden
+                        )
+                    ),
                 }
             })
             .collect()
@@ -959,6 +1095,24 @@ impl GroupTargetPlan {
             }
         }
         columns
+    }
+
+    /// The visible target's group columns, `<col> as <col>` each, at the
+    /// hidden table's collation ([`GroupCollations`]), for a select that
+    /// unions them with the hidden table's own.
+    fn target_group_values(&self) -> String {
+        quoted(&self.shape.group_cols)
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                format!(
+                    "{} as {c}",
+                    self.collations
+                        .coerce(c, i, Population::Target, Population::Hidden)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// The `create` of a `JOIN` working table `table` (quoted,
@@ -1043,11 +1197,24 @@ impl GroupTargetPlan {
     /// index serves it: each page naming a group with a `NULL` would scan
     /// the whole table. Past [`MAX_NULL_PATTERN_COLUMNS`] group columns the
     /// patterns get too many, and a group with a `NULL` takes that scan.
-    fn group_lookup(&self, table: &str, alias: &str, columns: &str) -> String {
+    fn group_lookup(
+        &self,
+        table: &str,
+        population: Population,
+        alias: &str,
+        columns: &str,
+    ) -> String {
         let cols = quoted(&self.shape.group_cols);
+        // `alias`' group is the working collation's; the probe runs under
+        // `table`'s, the collation its index is on.
+        let probe = |i: usize, c: &str| {
+            self.collations
+                .coerce(&format!("{alias}.{c}"), i, Population::Hidden, population)
+        };
         let equal: Vec<String> = cols
             .iter()
-            .map(|c| format!("x.{c} = {alias}.{c}"))
+            .enumerate()
+            .map(|(i, c)| format!("x.{c} = {}", probe(i, c)))
             .collect();
         let mut branches = vec![format!(
             "select {columns} from {table} x where {}",
@@ -1064,21 +1231,21 @@ impl GroupTargetPlan {
                         format!("{alias}.{c} is {not}null")
                     })
                     .collect();
-                let probe: Vec<String> = cols
+                let matches: Vec<String> = cols
                     .iter()
                     .enumerate()
                     .map(|(i, c)| {
                         if is_null(i) {
                             format!("x.{c} is null")
                         } else {
-                            format!("x.{c} = {alias}.{c}")
+                            format!("x.{c} = {}", probe(i, c))
                         }
                     })
                     .collect();
                 branches.push(format!(
                     "select {columns} from {table} x where ({}) and {}",
                     guard.join(" and "),
-                    probe.join(" and ")
+                    matches.join(" and ")
                 ));
             }
         } else {
@@ -1088,7 +1255,8 @@ impl GroupTargetPlan {
                 .collect();
             let same: Vec<String> = cols
                 .iter()
-                .map(|c| format!("x.{c} is not distinct from {alias}.{c}"))
+                .enumerate()
+                .map(|(i, c)| format!("x.{c} is not distinct from {}", probe(i, c)))
                 .collect();
             branches.push(format!(
                 "select {columns} from {table} x where ({}) and {}",
@@ -1535,6 +1703,7 @@ impl GroupTargetPlan {
             },
             lookup_hidden = self.group_lookup(
                 &self.hidden_ident,
+                Population::Hidden,
                 "pg",
                 if matches!(self.writer, Writer::JoinTarget) {
                     "x.ctid, null::pg_snapshot"
@@ -1590,11 +1759,31 @@ impl GroupTargetPlan {
     /// source once per such group.
     fn probe_rows_sql(&self) -> String {
         let cols = quoted(&self.shape.group_cols);
-        let equal: Vec<String> = cols.iter().map(|c| format!("s.{c} = rg.{c}")).collect();
+        // `rg`'s group is the working collation's; the probe runs under the
+        // source column's, the collation its index is on.
+        let rg = |i: usize, c: &str| {
+            self.collations.coerce(
+                &format!("rg.{c}"),
+                i,
+                Population::Hidden,
+                Population::Source,
+            )
+        };
+        let equal: Vec<String> = cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("s.{c} = {}", rg(i, c)))
+            .collect();
         let has_null: Vec<String> = cols.iter().map(|c| format!("rg.{c} is null")).collect();
         let same: Vec<String> = cols
             .iter()
-            .map(|c| format!("(s.{c} = rg.{c} or (rg.{c} is null and s.{c} is null))"))
+            .enumerate()
+            .map(|(i, c)| {
+                format!(
+                    "(s.{c} = {} or (rg.{c} is null and s.{c} is null))",
+                    rg(i, c)
+                )
+            })
             .collect();
         format!(
             "select s.* from {src} s where {equal} \
@@ -1666,6 +1855,7 @@ impl GroupTargetPlan {
         let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
         let lookup_hidden = self.group_lookup(
             &self.hidden_ident,
+            Population::Hidden,
             "rg",
             &format!("x.ctid, {}", old.join(", ")),
         );
@@ -1982,7 +2172,8 @@ impl GroupTargetPlan {
         let target_branch = match self.writer {
             Writer::JoinPartials { .. } => String::new(),
             _ => format!(
-                " union all select {cols} from {} t{target_filter}",
+                " union all select {} from {} t{target_filter}",
+                self.target_group_values(),
                 self.target_ident
             ),
         };
@@ -2043,7 +2234,8 @@ impl GroupTargetPlan {
         let positions: Vec<String> = (1..=cols.len()).map(|p| p.to_string()).collect();
         let matched = self.group_match("a", "rg");
         let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
-        let lookup_hidden = self.group_lookup(&self.hidden_ident, "rg", "x.ctid");
+        let lookup_hidden =
+            self.group_lookup(&self.hidden_ident, Population::Hidden, "rg", "x.ctid");
         let r = match read {
             #[cfg(any(test, feature = "test-util"))]
             RebuildRead::Early(early) => format!(
@@ -2260,7 +2452,12 @@ impl GroupTargetPlan {
                     .collect::<Vec<_>>()
                     .join(", ")
             },
-            lookup_target = self.group_lookup(&self.target_ident, "nv", &lookup_columns.join(", ")),
+            lookup_target = self.group_lookup(
+                &self.target_ident,
+                Population::Target,
+                "nv",
+                &lookup_columns.join(", ")
+            ),
             lookup_names = lookup_names.join(", "),
             target = self.target_ident,
             field_list = field_names
@@ -2309,7 +2506,12 @@ impl GroupTargetPlan {
             staged = self.staged,
             up_groups = up_groups.join(", "),
             up_values = up_values.join(", "),
-            lookup_hidden = self.group_lookup(&self.hidden_ident, "rg", &columns.join(", ")),
+            lookup_hidden = self.group_lookup(
+                &self.hidden_ident,
+                Population::Hidden,
+                "rg",
+                &columns.join(", ")
+            ),
             names = names.join(", "),
             tail = self.held_tail_sql(image_columns),
         )
@@ -2344,12 +2546,13 @@ impl GroupTargetPlan {
         format!(
             "insert into {staged} ({cols}, {insert}) \
              select {cols}, {zeros} from ( \
-                 select {cols} from {hidden} union select {cols} from {target} \
+                 select {cols} from {hidden} union select {target_cols} from {target} \
              ) as g",
             staged = self.staged,
             insert = insert.join(", "),
             zeros = zeros.join(", "),
             hidden = self.hidden_ident,
+            target_cols = self.target_group_values(),
             target = self.target_ident,
         )
     }
@@ -2469,7 +2672,8 @@ impl GroupTargetPlan {
                 .map(|f| format!(", {f}"))
                 .collect::<String>(),
             vis_new = vis_new.iter().map(|f| format!(", {f}")).collect::<String>(),
-            lookup_target = self.group_lookup(&self.target_ident, "vis", "x.ctid"),
+            lookup_target =
+                self.group_lookup(&self.target_ident, Population::Target, "vis", "x.ctid"),
             key = ddl::pk_key_sql_expr(&self.identity, Some("vis")),
             applied = applied.join(", "),
         )
@@ -3422,6 +3626,89 @@ mod tests {
     fn shape(text: &str) -> Option<GroupShape> {
         let def = crate::defs::parse(text).expect("parses");
         route(&def, &columns())
+    }
+
+    /// A `JOIN` side whose group column was re-collated after define: a value
+    /// read from the source enters under the hidden table's collation, the
+    /// source's index is probed under the source's, and the visible target's
+    /// groups meet the hidden table's under the hidden table's. Where the
+    /// collations agree, or a column has none, the statements are untouched.
+    #[test]
+    fn a_join_columns_move_to_another_collation_only_where_they_differ() {
+        let icu = "\"pg_catalog\".\"und-x-icu\"".to_string();
+        let posix = "\"pg_catalog\".\"POSIX\"".to_string();
+        let shape = shape("TRANSFORM t FROM s GROUP BY g, h SELECT g AS g, h AS h, COUNT(*) AS n")
+            .expect("admitted");
+        let side = |source: &[Option<&String>],
+                    hidden: &[Option<&String>],
+                    target: &[Option<&String>]| {
+            let owned = |c: &[Option<&String>]| c.iter().map(|c| c.cloned()).collect::<Vec<_>>();
+            GroupTargetPlan::for_join(
+                "public.t",
+                hidden_table_ident("trellis", 7),
+                "staged",
+                Some(("public.s", "recomputed", Vec::new())),
+                Vec::new(),
+                shape.clone(),
+                Writer::JoinPartials {
+                    deltas: "pg_temp.\"d\"".to_string(),
+                },
+                None,
+                String::new(),
+            )
+            .with_collations(GroupCollations {
+                source: owned(source),
+                hidden: owned(hidden),
+                target: owned(target),
+            })
+        };
+        let plain = side(&[None, None], &[None, None], &[None, None]);
+        let agree = side(
+            &[None, Some(&icu)],
+            &[None, Some(&icu)],
+            &[None, Some(&icu)],
+        );
+        for same in [&plain, &agree] {
+            assert!(!same.group_values().join(", ").contains("collate"));
+            assert!(!same.probe_rows_sql().contains("collate"));
+            assert!(!same.target_group_values().contains("collate"));
+            assert!(
+                !same
+                    .group_lookup(&same.target_ident, Population::Target, "nv", "x.ctid")
+                    .contains("collate")
+            );
+        }
+        // The integer column never takes a collation; the text one does.
+        let moved = side(
+            &[None, Some(&posix)],
+            &[None, Some(&icu)],
+            &[None, Some(&posix)],
+        );
+        assert_eq!(
+            moved.group_values(),
+            [
+                "s.\"g\" as \"g\"".to_string(),
+                format!("s.\"h\" collate {icu} as \"h\""),
+            ]
+        );
+        let probe = moved.probe_rows_sql();
+        assert!(
+            probe.contains(&format!("s.\"h\" = rg.\"h\" collate {posix}")),
+            "{probe}"
+        );
+        assert!(probe.contains("s.\"g\" = rg.\"g\" "), "{probe}");
+        assert_eq!(
+            moved.target_group_values(),
+            format!("\"g\" as \"g\", \"h\" collate {icu} as \"h\"")
+        );
+        let lookup = moved.group_lookup(&moved.target_ident, Population::Target, "nv", "x.ctid");
+        assert!(
+            lookup.contains(&format!("x.\"h\" = nv.\"h\" collate {posix}")),
+            "{lookup}"
+        );
+        // The hidden table's own lookups are under its own collation.
+        let hidden = moved.group_lookup(&moved.hidden_ident, Population::Hidden, "rg", "x.ctid");
+        assert!(!hidden.contains("collate"), "{hidden}");
     }
 
     /// The widths a definition is checked against are the widths of the

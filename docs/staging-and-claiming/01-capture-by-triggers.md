@@ -341,9 +341,12 @@ holds, a change to a column read only as a field that every column typed
 from it still holds (a `varchar` widening under a calculated field, whose
 column is `text`), and a change between deterministic collations (byte
 equality is unchanged, even across a join pair; define and a resume still
-require a pair's collations to match). A change to a column read as a field
-that isn't a pure widening, a narrowing included, is the next section's: it
-rebuilds the readers, or pauses the ones it leaves invalid.
+require a pair's collations to match; a `JOIN`'s hidden tables and target keep
+the collation they were created with, and a statement that meets two
+collations compares under one, so a rebuild and a resume still run). A change
+to a column read as a field that isn't a pure widening, a narrowing included, is
+the next section's: it rebuilds the readers, or pauses the ones it leaves
+invalid.
 
 A resume re-validates the definition as define would and refuses while the
 first two hold, naming the columns and what to change. Otherwise, if any

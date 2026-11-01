@@ -174,7 +174,9 @@ use crate::pool::quote_ident;
 
 use super::apply::ApplyError;
 use super::fold::{FoldedChange, earliest_origin};
-use super::group_basis::{self, Arg, GroupShape, GroupTargetPlan, Writer};
+use super::group_basis::{
+    self, Arg, ColumnCollations, GroupCollations, GroupShape, GroupTargetPlan, Writer,
+};
 use super::target_mutations::TargetMutations;
 
 /// Whether `def` is a `JOIN`, which always applies.
@@ -343,12 +345,14 @@ impl JoinTargetPlan {
     /// tables' column lists ([`hidden_table_columns`]), `identity` the
     /// target's group identity, and `source_pks` each side's row identity
     /// (`FROM`, joined), which an image-less change's key names.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         catalog_schema: &str,
         definition: &Definition,
         joined: &(String, HashMap<String, ValueType>),
         field_types: &HashMap<String, String>,
         hidden_columns: &HashMap<String, String>,
+        collations: &JoinCollations,
         identity: Vec<PrimaryKeyColumn>,
         source_pks: [Vec<PrimaryKeyColumn>; 2],
     ) -> Result<Self, ApplyError> {
@@ -459,6 +463,15 @@ impl JoinTargetPlan {
                         .collect(),
                 };
                 let hidden = hidden_ident(catalog_schema, id, table);
+                let group_collations = GroupCollations::of(
+                    &key_cols,
+                    Some(match side {
+                        Side::From => &collations.from,
+                        Side::Joined => &collations.joined,
+                    }),
+                    collations.hidden(table),
+                    None,
+                );
                 let deltas = format!(
                     "pg_temp.{}",
                     quote_ident(&working(&format!("d{tag}"), table))
@@ -485,7 +498,8 @@ impl JoinTargetPlan {
                         Some(hidden),
                         stage_filter,
                     )
-                    .with_ring(catalog_schema),
+                    .with_ring(catalog_schema)
+                    .with_collations(group_collations),
                     join_cols,
                     deltas,
                     recompute: false,
@@ -518,6 +532,12 @@ impl JoinTargetPlan {
             joined_pk,
             "m",
         );
+        let t_collations = GroupCollations::of(
+            &t_shape.group_cols,
+            None,
+            collations.hidden(HiddenTable::TargetPartials),
+            Some(&collations.target),
+        );
         let t = GroupTargetPlan::for_join(
             target,
             hidden_ident(catalog_schema, id, HiddenTable::TargetPartials),
@@ -528,7 +548,8 @@ impl JoinTargetPlan {
             Writer::JoinTarget,
             None,
             String::new(),
-        );
+        )
+        .with_collations(t_collations);
         Ok(Self {
             target: target.to_string(),
             identity,
@@ -1407,6 +1428,27 @@ async fn clear(
     Ok(deleted)
 }
 
+/// The collations of the tables a `JOIN`'s group and key columns live in
+/// ([`GroupCollations`]), read when its plan is: the two source tables, the
+/// visible target, and the hidden tables. The columns of each that have a
+/// collation, by name.
+#[derive(Debug, Default)]
+pub(crate) struct JoinCollations {
+    from: ColumnCollations,
+    joined: ColumnCollations,
+    target: ColumnCollations,
+    hidden: HashMap<HiddenTable, ColumnCollations>,
+}
+
+impl JoinCollations {
+    fn hidden(&self, table: HiddenTable) -> &ColumnCollations {
+        static NONE: std::sync::OnceLock<ColumnCollations> = std::sync::OnceLock::new();
+        self.hidden
+            .get(&table)
+            .unwrap_or_else(|| NONE.get_or_init(ColumnCollations::new))
+    }
+}
+
 /// A `JOIN`'s plan for definition `definition`, with every catalog read it
 /// needs ([`JoinTargetPlan::new`]).
 pub(crate) async fn plan_for(
@@ -1427,12 +1469,28 @@ pub(crate) async fn plan_for(
         ddl::identity_key_columns(client, &definition.source_table).await?,
         ddl::identity_key_columns(client, &joined.0).await?,
     ];
+    let mut collations = JoinCollations {
+        from: group_basis::column_collations(client, &definition.source_table).await?,
+        joined: group_basis::column_collations(client, &joined.0).await?,
+        target: group_basis::column_collations(client, &definition.target_table).await?,
+        hidden: HashMap::new(),
+    };
+    for table in [
+        HiddenTable::FromPartials,
+        HiddenTable::JoinedPartials,
+        HiddenTable::TargetPartials,
+    ] {
+        let name = format!("{catalog_schema}.{}", table.name(definition.id));
+        let columns = group_basis::column_collations(client, &name).await?;
+        collations.hidden.insert(table, columns);
+    }
     JoinTargetPlan::new(
         catalog_schema,
         definition,
         &joined,
         &field_types,
         &hidden_columns,
+        &collations,
         identity,
         source_pks,
     )
