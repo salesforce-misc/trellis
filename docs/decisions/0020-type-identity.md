@@ -155,6 +155,18 @@ new one: a page boundary, a chunk bound, a range predicate, a `MIN` or `MAX`
 over text. So ordering-dependent work reads the key's collation when it runs,
 and never relies on an order recorded under an earlier one.
 
+A re-collation also leaves a source's key columns and its target's at
+different collations, and a 1-1 definition renders the source's key over the
+target's rows. So a composite key's encoded text (its parts' texts joined) is
+always `"C"`, whatever its parts' collations: joined parts of two non-default
+collations have no collation Postgres can choose. Under deterministic
+collations, equality under `"C"` is the same byte equality, so the text
+matches the same keys. Its order is byte order, and every statement that
+orders by it (pairing a list of keys with their images, paging the keys with a
+`NULL` part) compares both sides under `"C"`; paging and chunking otherwise
+compare the typed key columns. A single-column key's text is the column's
+own, of the column's collation.
+
 A collation can change with no trigger firing: by an `ALTER COLUMN … COLLATE`
 that rewrites nothing, or by a collation library upgrade that changes no
 catalog row at all. Trellis can see such a change only by comparing the catalog

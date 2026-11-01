@@ -906,6 +906,26 @@ pub(crate) fn decode_key_part(part: &str) -> Option<Cow<'_, str>> {
 /// [`COMPOSITE_KEY_SEPARATOR`] via `chr(31)` (U+001F's code point) since SQL
 /// has no literal syntax for an unprintable control character that survives
 /// every driver/encoding path as reliably as the numeric `chr()` form.
+///
+/// # A composite key's text is `"C"`
+///
+/// A multi-arity key's text is wrapped `(... collate "C")`, whatever its
+/// parts' collations, and the rendering never reads
+/// [`PrimaryKeyColumn::collation`]. The joined text of parts of two
+/// collations other than the default has no collation Postgres can choose,
+/// and callers render one table's key over another table's rows (a 1-1
+/// definition renders the source's key over the target's): once a source key
+/// part is re-collated after define, the two tables' parts disagree. One
+/// fixed collation keeps every such statement resolvable. Key collations are
+/// deterministic (a nondeterministic one is refused and pauses), so two key
+/// texts are equal under `"C"` exactly when they are equal under any of
+/// them: `=`, `= any`, joins, hashing and the ledger's `"C"` key probe match
+/// the same rows. Only the order of composite key text is `"C"`'s, byte
+/// order, the order Rust sorts the same strings in; no statement depends on
+/// another (paging and chunking compare the typed key columns, and
+/// composite key text is never indexed). A single column keeps its own
+/// text and collation: its text is the target's key value.
+///
 /// `alias`, when given, qualifies every column reference (`{alias}."{col}"`
 /// — a bare, unquoted alias, since every real caller passes a fixed SQL
 /// alias literal like `"t"`, never user input) — needed once the surrounding
@@ -1004,29 +1024,10 @@ pub(crate) fn pk_key_sql_expr(pk: &[PrimaryKeyColumn], alias: Option<&str>) -> S
         // column, and `defs::backfill` inserts that column straight across),
         // so it must equal the column's own text exactly.
         1 => parts.into_iter().next().unwrap(),
-        _ if mixes_collations(pk) => format!(
+        _ => format!(
             "(array_to_string(array[{}], chr(31)) collate \"C\")",
             parts.join(", ")
         ),
-        _ => format!("array_to_string(array[{}], chr(31))", parts.join(", ")),
-    }
-}
-
-/// Whether `pk`'s parts carry two different collations other than the
-/// database's default, which leaves their joined text with no collation
-/// Postgres can choose: every comparison of it would fail. Such a key's text
-/// is compared under `"C"`, the collation the ledger holds a key's text under;
-/// any other key's text keeps the collation its parts share, or the one
-/// non-default collation among them, which the existing statements compare
-/// and order by (#1522).
-fn mixes_collations(pk: &[PrimaryKeyColumn]) -> bool {
-    let mut collations = pk
-        .iter()
-        .filter_map(|c| c.collation.as_deref())
-        .filter(|c| *c != "pg_catalog.\"default\"");
-    match collations.next() {
-        Some(first) => collations.any(|c| c != first),
-        None => false,
     }
 }
 
@@ -1812,20 +1813,19 @@ mod tests {
         assert_eq!(
             pk_key_sql_expr(&pk(&["warehouse", "sku"]), Some("t")),
             format!(
-                "array_to_string(array[{}, {}], chr(31))",
+                "(array_to_string(array[{}, {}], chr(31)) collate \"C\")",
                 composite_key_escape_sql(&null_key_escape_sql("t.\"warehouse\"::text")),
                 composite_key_escape_sql(&null_key_escape_sql("t.\"sku\"::text")),
             )
         );
     }
 
-    /// A composite key whose parts carry two collations other than the
-    /// default renders its text under `"C"` (#1522): joined, they have no
-    /// collation Postgres can choose. A key of one shared collation, of one
-    /// non-default collation beside the default or a type with none, and a
-    /// single column of any collation render as they did.
+    /// Every composite key renders its text under `"C"`, whatever its parts'
+    /// collations: the rendering never reads them, so one table's key renders
+    /// alike over another table's rows of other collations (#1522, #1537). A
+    /// single column renders as its own text, of its own collation.
     #[test]
-    fn a_composite_key_of_two_non_default_collations_renders_under_c() {
+    fn every_composite_key_renders_under_c() {
         let collated = |parts: &[(&str, Option<&str>)]| -> Vec<PrimaryKeyColumn> {
             parts
                 .iter()
@@ -1839,19 +1839,16 @@ mod tests {
         let posix = Some("pg_catalog.\"POSIX\"");
         let c = Some("pg_catalog.\"C\"");
         let default = Some("pg_catalog.\"default\"");
-        let plain = format!(
-            "array_to_string(array[{}, {}], chr(31))",
+        let under_c = format!(
+            "(array_to_string(array[{}, {}], chr(31)) collate \"C\")",
             composite_key_escape_sql("t.\"a\"::text"),
             composite_key_escape_sql("t.\"b\"::text"),
         );
-        for (a, b) in [(icu, posix), (c, posix), (posix, c), (icu, c)] {
-            assert_eq!(
-                pk_key_sql_expr(&collated(&[("a", a), ("b", b)]), Some("t")),
-                format!("({plain} collate \"C\")"),
-                "{a:?} and {b:?}"
-            );
-        }
         for (a, b) in [
+            (icu, posix),
+            (c, posix),
+            (posix, c),
+            (icu, c),
             (icu, icu),
             (icu, default),
             (default, posix),
@@ -1861,14 +1858,98 @@ mod tests {
         ] {
             assert_eq!(
                 pk_key_sql_expr(&collated(&[("a", a), ("b", b)]), Some("t")),
-                plain,
+                under_c,
                 "{a:?} and {b:?}"
             );
         }
-        assert_eq!(
-            pk_key_sql_expr(&collated(&[("a", icu)]), Some("t")),
-            "t.\"a\"::text"
+        for a in [icu, posix, default, None] {
+            assert_eq!(
+                pk_key_sql_expr(&collated(&[("a", a)]), Some("t")),
+                "t.\"a\"::text"
+            );
+        }
+    }
+
+    /// The statements that meet a key rendered from one table's key columns
+    /// over another table's rows, whose parts carry other collations (a
+    /// source key re-collated after define, #1537): a composite key's text
+    /// compares (`=`, `= any`, a join), hashes (`group by`, `distinct`),
+    /// orders, and probes a `"C"` ledger key, for every pairing of the
+    /// collations a part moves between, rendered from either table's key.
+    #[tokio::test]
+    async fn a_key_rendered_over_rows_of_other_collations_compares_hashes_and_orders() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let collations = ["default", "C", "POSIX", "und-x-icu"];
+        let mut ddl = String::from(
+            "create table public.l (__from_key text collate \"C\" primary key); \
+             insert into public.l values ('a' || chr(31) || 'x'), ('B' || chr(31) || 'y'); ",
         );
+        for (i, a) in collations.iter().enumerate() {
+            for (j, b) in collations.iter().enumerate() {
+                ddl.push_str(&format!(
+                    "create table public.k{i}{j} (id1 text collate \"{a}\", \
+                         id2 text collate \"{b}\", primary key (id1, id2)); \
+                     insert into public.k{i}{j} values ('a', 'x'), ('B', 'y'), ('c', 'X'); "
+                ));
+            }
+        }
+        client.batch_execute(&ddl).await.expect("the tables");
+        let n = collations.len();
+        let tables: Vec<String> = (0..n)
+            .flat_map(|i| (0..n).map(move |j| format!("public.k{i}{j}")))
+            .collect();
+        for rendered_from in &tables {
+            let key = source_primary_key_in_txn(&client, rendered_from)
+                .await
+                .expect("the key");
+            for over in &tables {
+                for other in &tables {
+                    let other_key = source_primary_key_in_txn(&client, other)
+                        .await
+                        .expect("the key");
+                    let k = pk_key_sql_expr(&key, Some("t"));
+                    let ko = pk_key_sql_expr(&other_key, Some("o"));
+                    let case = format!("{rendered_from}'s key over {over}, against {other}");
+                    let row = client
+                        .query_one(
+                            &format!(
+                                "with w as (select {k} as __k from {over} t) \
+                                     select (select count(*) from w join {other} o \
+                                                 on w.__k = {ko}), \
+                                            (select count(*) from {over} t \
+                                                 where {k} = any($1::text[])), \
+                                            (select count(*) from (select __k from w \
+                                                 union select {ko} from {other} o) u), \
+                                            (select count(distinct __k) from w), \
+                                            (select count(*) from w where exists \
+                                                 (select 1 from public.l l \
+                                                  where l.__from_key = w.__k)), \
+                                            array(select __k from w order by __k)"
+                            ),
+                            &[&vec!["a\u{1f}x".to_string(), "a".to_string()]],
+                        )
+                        .await
+                        .unwrap_or_else(|e| panic!("{case}: {e}"));
+                    let (joined, any, union, distinct, probed): (i64, i64, i64, i64, i64) =
+                        (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
+                    assert_eq!((joined, any, union, distinct), (3, 1, 3, 3), "{case}");
+                    assert_eq!(probed, 2, "{case}");
+                    let ordered: Vec<String> = row.get(5);
+                    assert_eq!(
+                        ordered,
+                        ["B\u{1f}y", "a\u{1f}x", "c\u{1f}X"],
+                        "{case}: by bytes"
+                    );
+                }
+            }
+        }
     }
 
     /// The other half of that contract, which guards against data corruption
@@ -1891,7 +1972,7 @@ mod tests {
         assert_eq!(
             pk_key_sql_expr(&not_null_pk(&["warehouse", "sku"]), Some("t")),
             format!(
-                "array_to_string(array[{}, {}], chr(31))",
+                "(array_to_string(array[{}, {}], chr(31)) collate \"C\")",
                 composite_key_escape_sql("t.\"warehouse\"::text"),
                 composite_key_escape_sql("t.\"sku\"::text"),
             ),
@@ -1943,7 +2024,7 @@ mod tests {
         assert_eq!(
             pk_key_sql_expr(&mixed, Some("t")),
             format!(
-                "array_to_string(array[{}, {}], chr(31))",
+                "(array_to_string(array[{}, {}], chr(31)) collate \"C\")",
                 composite_key_escape_sql("t.\"warehouse\"::text"),
                 composite_key_escape_sql(&null_key_escape_sql("t.\"sku\"::text")),
             )
@@ -2290,7 +2371,7 @@ mod tests {
         assert_eq!(
             pk_key_sql_expr(&not_null_pk(&["warehouse", "sku"]), Some("t")),
             format!(
-                "array_to_string(array[{}, {}], chr(31))",
+                "(array_to_string(array[{}, {}], chr(31)) collate \"C\")",
                 composite_key_escape_sql("t.\"warehouse\"::text"),
                 composite_key_escape_sql("t.\"sku\"::text"),
             )
@@ -2338,7 +2419,7 @@ mod tests {
         assert_eq!(
             pk_key_sql_expr(&mixed, Some("t")),
             format!(
-                "array_to_string(array[{}, {}], chr(31))",
+                "(array_to_string(array[{}, {}], chr(31)) collate \"C\")",
                 composite_key_escape_sql("t.\"warehouse\"::text"),
                 composite_key_escape_sql(&null_key_escape_sql("t.\"sku\"::text")),
             )
