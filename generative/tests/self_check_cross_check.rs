@@ -51,6 +51,7 @@ use generative::run::run_convergence;
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
 use testkit::TestCluster;
+use trellis::dev::defs::PgType;
 use trellis::dev::defs::ast::{
     Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType,
 };
@@ -380,17 +381,21 @@ fn corrupted_field_value_type(def: &TransformDef, field_index: usize, source: &T
 /// corruption) by picking between two fixed literals per type and returning
 /// whichever one's rendering doesn't already equal `current`.
 ///
-/// **Design choice: corruption is scoped to `Numeric`/`Boolean`/`Text`/`Uuid`
-/// fields** — the full set of [`ValueType`] variants
-/// `trivial_one_to_one_program_with` ever attaches to a `OneToOne` field
-/// (see [`corrupted_field_value_type`]) — **not every possible corruption
-/// shape** (e.g. corrupting the primary key column itself, or a schema-level
-/// change). Bucket 6 is "detection-focused": the property's job is proving
-/// `self_check` catches an arbitrary *value* tamper on an arbitrary
-/// calculated field, which this covers across all four field types this
-/// generator produces; corrupting the key column would change *which row*
-/// is being audited rather than what value it holds, a different (also
-/// legitimate) bucket-6 question left for a follow-up.
+/// **Design choice: corruption covers every [`ValueType`] the expression
+/// generator can type a field as** ([`generative::expr_gen::universe`] and
+/// every rule's output type; the
+/// `every_type_the_generator_can_produce_has_a_tamper_value` test below
+/// pins that, so a type added to the generator without a tamper value here
+/// fails that test instead of panicking mid-property). Each type has two
+/// fixed literals; the one whose `::text` rendering differs from the cell's
+/// current reading is used, so the corruption is never a no-op. It is **not**
+/// every possible corruption shape (e.g. corrupting the primary key column
+/// itself, or a schema-level change). Bucket 6 is "detection-focused": the
+/// property's job is proving `self_check` catches an arbitrary *value*
+/// tamper on an arbitrary calculated field; corrupting the key column
+/// would change *which row* is being audited rather than what value it
+/// holds, a different (also legitimate) bucket-6 question left for a
+/// follow-up.
 fn corruption_literal(value_type: ValueType, current: &Option<String>) -> (String, String) {
     use generative::expr_gen::{Magnitude, typed_literal_samples};
     use trellis::dev::defs::typed_literal::TYPED_LITERALS;
@@ -420,6 +425,17 @@ fn corruption_literal(value_type: ValueType, current: &Option<String>) -> (Strin
             "'00000000-0000-0000-0000-0000000000b2'::uuid".to_string(),
             "00000000-0000-0000-0000-0000000000b2".to_string(),
         ),
+        // The one generated type with no typed literal (its canonical form is
+        // not yet checkable, see `TYPED_LITERALS`), so spelled here. The
+        // connection pins `TimeZone = 'UTC'`, so `::text` renders as
+        // `YYYY-MM-DD HH:MM:SS[.f]+00`; the two instants are far from any
+        // value the generator draws.
+        ValueType::Other(PgType::TimestampTz) => (
+            "'1999-12-31 23:59:59+00'::timestamptz".to_string(),
+            "1999-12-31 23:59:59+00".to_string(),
+            "'2001-02-03 04:05:06.5+00'::timestamptz".to_string(),
+            "2001-02-03 04:05:06.5+00".to_string(),
+        ),
         // A type only a typed literal produces: two of its canonical
         // spellings, whose text is the spelling itself.
         ValueType::Other(_) => {
@@ -427,7 +443,10 @@ fn corruption_literal(value_type: ValueType, current: &Option<String>) -> (Strin
                 .iter()
                 .find(|spec| spec.value_type == value_type)
                 .unwrap_or_else(|| {
-                    panic!("corruption_literal: no typed literal produces {value_type}")
+                    panic!(
+                        "corruption_literal: no tamper value for {value_type}; add one to \
+                         corruption_literal (or exclude the type from generation, saying why)"
+                    )
                 });
             let samples = typed_literal_samples(spec.keyword, Magnitude::Small);
             let sql_type = spec.keyword.to_lowercase();
@@ -443,6 +462,35 @@ fn corruption_literal(value_type: ValueType, current: &Option<String>) -> (Strin
         (b_sql, b_text)
     } else {
         (a_sql, a_text)
+    }
+}
+
+/// Every type the expression generator can type a field as has a tamper
+/// value, and that value differs from the cell's current reading whichever
+/// of the two fixed literals that reading equals. A type the generator
+/// gains without a tamper value here fails this test, rather than
+/// panicking inside the (ignored, slow) tampering property.
+#[test]
+fn every_type_the_generator_can_produce_has_a_tamper_value() {
+    use generative::expr_gen::{rules, universe};
+    let mut types = universe();
+    for rule in rules() {
+        let out = rule.out();
+        if !types.contains(&out) {
+            types.push(out);
+        }
+    }
+    assert!(
+        types.contains(&ValueType::Other(PgType::TimestampTz)),
+        "the generator no longer emits timestamptz; the regression this test pins is gone"
+    );
+    for ty in types {
+        let (first_sql, first_text) = corruption_literal(ty, &None);
+        assert!(!first_sql.is_empty(), "{ty}: empty tamper literal");
+        // A cell already holding the first literal gets the second.
+        let (second_sql, second_text) = corruption_literal(ty, &Some(first_text.clone()));
+        assert_ne!(first_text, second_text, "{ty}: tamper is a no-op");
+        assert_ne!(first_sql, second_sql, "{ty}: tamper literal repeats");
     }
 }
 
