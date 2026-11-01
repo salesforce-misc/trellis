@@ -16,7 +16,10 @@
 //! fan-out, a rebuild in place, a `PAUSE` and `RESUME`), for `LEFT` and
 //! `INNER`. Each cell applies changes after the re-collation, compares the
 //! target to the join over the source tables with the text compared by its
-//! bytes, and then rebuilds in place and resumes.
+//! bytes, and then rebuilds in place and resumes. Keys of other shapes have
+//! cells of their own: an `ON` column that is its table's primary key, a
+//! two-column `ON` and a composite primary key, and a re-collation between
+//! the steps of a build. Their texts sort differently under `C` and ICU.
 //!
 //! `self_check` runs the definition's own `JOIN ... ON` over the two source
 //! tables, which meets the re-collated pair itself (#1564), so a cell that
@@ -688,4 +691,297 @@ async fn a_held_row_is_released_after_a_text_primary_key_is_re_collated() {
         realign: vec![],
     })
     .await;
+}
+
+// ------------------------------------------------- keys of other shapes
+
+/// Builds `ddl` with `definition`, runs `recollate`, applies `rounds` of
+/// changes (each `a`'s then `b`'s), rebuilds in place from each side, then
+/// pauses, runs `realign`, resumes and checks. `target` and `oracle` read the
+/// target and the join over the sources, the text compared by its bytes.
+#[allow(clippy::too_many_arguments)]
+async fn run_keys_cell(
+    case: &str,
+    ddl: &str,
+    columns: &[(&str, ValueType)],
+    definition: &str,
+    recollate: &[String],
+    rounds: &[(String, String)],
+    realign: &[String],
+    target: &str,
+    oracle: &str,
+) {
+    set_enabled(true);
+    let mut d = Driver::start(ddl, columns, &[definition], &["public.a", "public.b"]).await;
+    assert_eq!(d.rows(target).await, d.rows(oracle).await, "{case}: built");
+    for stmt in recollate {
+        d.ctl
+            .batch_execute(stmt)
+            .await
+            .unwrap_or_else(|e| panic!("{case}: {stmt}: {e}"));
+    }
+    for (i, (a, b)) in rounds.iter().enumerate() {
+        apply(&mut d, case, a).await;
+        assert_eq!(d.rows(target).await, d.rows(oracle).await, "{case}: a {i}");
+        apply(&mut d, case, b).await;
+        assert_eq!(d.rows(target).await, d.rows(oracle).await, "{case}: b {i}");
+    }
+    let trellis = trellis(&d).await;
+    for side in ["public.a", "public.b"] {
+        trellis
+            .request_backfill(side)
+            .await
+            .unwrap_or_else(|e| panic!("{case}: rebuild from {side}: {e}"));
+        work_to_idle(&d).await;
+        d.settle().await;
+        let (status, error) = status_and_error(&d, "public.t").await;
+        assert_eq!((status.as_str(), error), ("live", None), "{case}: {side}");
+        assert_eq!(d.rows(target).await, d.rows(oracle).await, "{case}: {side}");
+    }
+    if realign.is_empty() {
+        assert_converged(&d, "public.t", case).await;
+    }
+    trellis
+        .apply("PAUSE TRANSFORM t")
+        .await
+        .unwrap_or_else(|e| panic!("{case}: pause: {e}"));
+    for stmt in realign {
+        d.ctl
+            .batch_execute(stmt)
+            .await
+            .unwrap_or_else(|e| panic!("{case}: {stmt}: {e}"));
+    }
+    trellis
+        .apply("RESUME TRANSFORM t")
+        .await
+        .unwrap_or_else(|e| panic!("{case}: resume: {e}"));
+    trellis::intake::harness::start_registered_builds(d.pool())
+        .await
+        .expect("start the resumed builds");
+    work_to_idle(&d).await;
+    d.settle().await;
+    let (status, error) = status_and_error(&d, "public.t").await;
+    assert_eq!((status.as_str(), error), ("live", None), "{case}: resumed");
+    assert_eq!(
+        d.rows(target).await,
+        d.rows(oracle).await,
+        "{case}: resumed"
+    );
+    assert_converged(&d, "public.t", case).await;
+}
+
+/// The `ON` column of each table is its text primary key too, with keys that
+/// sort differently under `C` and ICU: a page's `R` entry key, its `J` key
+/// and its target key are one text.
+#[tokio::test]
+async fn an_on_column_that_is_its_tables_primary_key_re_collated() {
+    let _serial = SERIAL.lock().await;
+    let ddl = "create table public.a (kt text collate \"und-x-icu\" primary key, v integer); \
+         create table public.b (kt text collate \"und-x-icu\" primary key, y integer); \
+         insert into public.a select k, i \
+             from unnest(array['é1', 'Z2', 'a3', 'É4', 'b5', 'ß6', 'z7', 'A8']) \
+             with ordinality u(k, i); \
+         insert into public.b select k, i * 10 \
+             from unnest(array['é1', 'a3', 'É4', 'ß6', 'A8', 'q9']) with ordinality u(k, i)";
+    let columns = [
+        ("kt", ValueType::Text),
+        ("v", ValueType::Integer(IntWidth::Int4)),
+        ("y", ValueType::Integer(IntWidth::Int4)),
+    ];
+    let rounds: Vec<(String, String)> = (1..=2)
+        .map(|r| {
+            (
+                format!(
+                    "update public.a set v = v + {r}00; \
+                     update public.a set kt = kt || 'x' where kt in ('Z2', 'z7'); \
+                     delete from public.a where kt = 'b5'; \
+                     insert into public.a values ('Ω{r}', {r}), ('q9', 90{r}) \
+                         on conflict do nothing"
+                ),
+                format!(
+                    "update public.b set y = y + {r}; \
+                     update public.b set kt = 'Ω{r}' where kt = 'É4'; \
+                     delete from public.b where kt = 'ß6'; \
+                     insert into public.b values ('Z2x', 7{r}) on conflict do nothing"
+                ),
+            )
+        })
+        .collect();
+    let to = |table: &str, collation: &str| alter(table, "kt", collation);
+    let cells: [(&str, Vec<String>, Vec<String>); 4] = [
+        ("a.kt to C", vec![to("a", "C")], vec![to("b", "C")]),
+        (
+            "a.kt to C, b.kt to POSIX",
+            vec![to("a", "C"), to("b", "POSIX")],
+            vec![to("b", "C")],
+        ),
+        (
+            "both to the default",
+            vec![to("a", "default"), to("b", "default")],
+            vec![],
+        ),
+        ("b.kt to C", vec![to("b", "C")], vec![to("a", "C")]),
+    ];
+    for kind in ["", "LEFT"] {
+        for (name, recollate, realign) in &cells {
+            run_keys_cell(
+                &format!("{name} ({kind})"),
+                ddl,
+                &columns,
+                &format!(
+                    "TRANSFORM t FROM public.a {kind} JOIN public.b ON a.kt = b.kt \
+                     SELECT a.v AS v, b.y AS y"
+                ),
+                recollate,
+                &rounds,
+                realign,
+                "select kt, v, y from public.t order by kt collate \"C\"",
+                &format!(
+                    "select a.kt, a.v, b.y from public.a a {kind} join public.b b \
+                     on a.kt = b.kt collate \"C\" order by a.kt collate \"C\""
+                ),
+            )
+            .await;
+        }
+    }
+}
+
+/// A two-column `ON` (one pair ICU, one `C`) and a composite primary key of
+/// `a` with a text part, each re-collated, the `ON` pairs to two collations.
+#[tokio::test]
+async fn a_composite_on_and_a_composite_primary_key_re_collated() {
+    let _serial = SERIAL.lock().await;
+    let ddl = "create table public.a (p1 text collate \"und-x-icu\", p2 integer, \
+             k1 text collate \"und-x-icu\", k2 text collate \"C\", v integer, \
+             primary key (p1, p2)); \
+         create table public.b (id integer primary key, k1 text collate \"und-x-icu\", \
+             k2 text collate \"C\", y integer, unique (k1, k2)); \
+         insert into public.a select (array['é', 'Z', 'a', 'É'])[1 + i % 4], i, \
+             (array['é', 'Z', 'a'])[1 + i % 3], (array['x', 'Y'])[1 + i % 2], i \
+             from generate_series(1, 14) i; \
+         insert into public.b select i, (array['é', 'Z', 'a'])[1 + i % 3], \
+             (array['x', 'Y'])[1 + i / 3 % 2], i * 10 from generate_series(0, 5) i";
+    let columns = [
+        ("p1", ValueType::Text),
+        ("p2", ValueType::Integer(IntWidth::Int4)),
+        ("v", ValueType::Integer(IntWidth::Int4)),
+        ("y", ValueType::Integer(IntWidth::Int4)),
+    ];
+    let rounds: Vec<(String, String)> = (1..=2)
+        .map(|r| {
+            (
+                format!(
+                    "update public.a set v = v + {r}00 where p2 % 2 = 0; \
+                     update public.a set k1 = 'a', k2 = 'Y' where p2 % 5 = 1; \
+                     update public.a set p1 = p1 || '{r}' where p2 = 3; \
+                     delete from public.a where p2 = 8; \
+                     insert into public.a values ('Ω', {r}, 'Z', 'x', 5{r})"
+                ),
+                format!(
+                    "update public.b set y = y + {r}; \
+                     update public.b set k2 = 'q{r}' where id = 1; \
+                     delete from public.b where id = 2; \
+                     insert into public.b values (10{r}, 'é', 'q{r}x', 9{r})"
+                ),
+            )
+        })
+        .collect();
+    for kind in ["", "LEFT"] {
+        run_keys_cell(
+            &format!("composite ({kind})"),
+            ddl,
+            &columns,
+            &format!(
+                "TRANSFORM t FROM public.a {kind} JOIN public.b \
+                 ON a.k1 = b.k1 AND a.k2 = b.k2 SELECT a.v AS v, b.y AS y"
+            ),
+            &[
+                alter("a", "k1", "POSIX"),
+                alter("a", "k2", ICU),
+                alter("b", "k2", "POSIX"),
+                alter("a", "p1", "C"),
+            ],
+            &rounds,
+            &[alter("b", "k1", "POSIX"), alter("b", "k2", ICU)],
+            "select p1, p2, v, y from public.t order by p1 collate \"C\", p2",
+            &format!(
+                "select a.p1, a.p2, a.v, b.y from public.a a {kind} join public.b b \
+                 on a.k1 = b.k1 collate \"C\" and a.k2 = b.k2 collate \"C\" \
+                 order by a.p1 collate \"C\", a.p2"
+            ),
+        )
+        .await;
+    }
+}
+
+/// `a`'s text primary key and `ON` column re-collated between the steps of
+/// its build, with changes of both tables applied before the build finishes:
+/// the chunks after the change lock `J` under the collation it was created
+/// with.
+#[tokio::test]
+async fn the_from_tables_keys_re_collated_during_its_build() {
+    let _serial = SERIAL.lock().await;
+    for kind in ["", "LEFT"] {
+        set_enabled(true);
+        let ddl = "create table public.a (id text collate \"und-x-icu\" primary key, \
+                 kt text collate \"und-x-icu\", v integer); \
+             create table public.b (id integer primary key, \
+                 kt text collate \"und-x-icu\" unique, y integer); \
+             insert into public.a \
+                 select (array['é', 'Z', 'a', 'É', 'b', 'ß'])[1 + i % 6] || i, \
+                     (array['é', 'Z', 'a', 'ß'])[1 + i % 4], i from generate_series(1, 40) i; \
+             insert into public.b select i, (array['é', 'Z', 'a', 'ß'])[1 + i], i * 10 \
+                 from generate_series(0, 3) i";
+        let mut d = Driver::start_unbuilt(
+            &[],
+            ddl,
+            &[
+                ("id", ValueType::Text),
+                ("v", ValueType::Integer(IntWidth::Int4)),
+                ("y", ValueType::Integer(IntWidth::Int4)),
+            ],
+            &[&format!(
+                "TRANSFORM t FROM public.a {kind} JOIN public.b ON a.kt = b.kt \
+                 SELECT a.v AS v, b.y AS y"
+            )],
+            &["public.a", "public.b"],
+        )
+        .await;
+        // The plan job's `M` pass and walk, and the first chunks.
+        for _ in 0..4 {
+            build::work_once(d.pool(), "builder", &options())
+                .await
+                .expect("a build step");
+        }
+        d.ctl
+            .batch_execute(&format!(
+                "{}; {}",
+                alter("a", "id", "C"),
+                alter("a", "kt", "C")
+            ))
+            .await
+            .expect("re-collate");
+        d.user()
+            .await
+            .batch_execute(
+                "update public.a set v = v + 1000 where v % 3 = 0; \
+                 update public.b set y = y + 1",
+            )
+            .await
+            .expect("changes during the build");
+        work_to_idle(&d).await;
+        d.settle().await;
+        let (status, error) = status_and_error(&d, "public.t").await;
+        assert_eq!((status.as_str(), error), ("live", None), "{kind}: built");
+        assert_eq!(
+            d.rows("select id, v, y from public.t order by id collate \"C\"")
+                .await,
+            d.rows(&format!(
+                "select a.id, a.v, b.y from public.a a {kind} join public.b b \
+                 on a.kt = b.kt collate \"C\" order by a.id collate \"C\""
+            ))
+            .await,
+            "{kind}: built"
+        );
+    }
 }
