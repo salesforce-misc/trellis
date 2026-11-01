@@ -392,51 +392,57 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
     ),
 ];
 
-/// Plants the tier draws the shape of but catches rarely or not at all, with
-/// what the 24 cases of seeds 1 to 4 measured (caught, and fired in). Each is
-/// a narrow interleaving (a row moving keys between a read and its lock, two
-/// writers of one row, a truncate racing a page or a rebuild's start) or a
-/// target the rest of the build or the next writes repair before the burst
-/// settles; its deterministic pin gates it.
+/// Plants the tier draws the shape of but catches rarely or not at all. Each
+/// is a narrow interleaving (a row moving keys between a read and its lock,
+/// two writers of one row or key, a truncate racing a page or a rebuild's
+/// start) or leaves a target that the rest of the build or the next writes
+/// repair before the burst settles; its deterministic pin gates it. Rates are
+/// caught and fired in, of 48 cases: the 24 of seeds 1 to 4 (six each), run
+/// twice. A plant caught in one case in twelve is listed here too: a 24-case
+/// sweep would miss it about one time in eight.
 ///
-/// - `join1_brd_no_key`: caught 1, fired 24.
-/// - `join1_chunk_no_key`: caught 0, fired 16.
-/// - `join1_lsn_only`: caught 0, fired 24.
-/// - `join1_no_entry_lock`: caught 0, fired 24.
-/// - `join1_no_recheck`: caught 0, fired 24.
-/// - `join1_orphan_delete`: caught 0, fired 12.
-/// - `join1_rd_no_key`: caught 0, fired 24 (once in 12 cases of an earlier,
-///   racing-heavy draw).
-/// - `join1_snapshot_after_read`: caught 0, fired 24 (once in 12 of the
-///   racing-heavy draw).
-/// - `join1_truncate_def_after_lock`: caught 0, fired 7 (its failure is a
+/// - `join1_no_j_lock`: caught 4, fired 48 (as the aggregate tier's
+///   `join_no_j_lock`, a known miss there).
+/// - `join1_truncate_no_rebuild`: caught 4, fired 14 (it needs a `TRUNCATE
+///   jb` late in its burst, with no `jb` write after it on its keys).
+/// - `join1_brd_no_key`: caught 1, fired 48.
+/// - `join1_no_recheck`: caught 1, fired 48.
+/// - `join1_vis_only`: caught 1, fired 48.
+/// - `join1_chunk_no_key`: caught 0, fired 31.
+/// - `join1_lsn_only`: caught 0, fired 48.
+/// - `join1_no_entry_lock`: caught 0, fired 48.
+/// - `join1_orphan_delete`: caught 0, fired 24.
+/// - `join1_rd_no_key`: caught 0, fired 48.
+/// - `join1_snapshot_after_read`: caught 0, fired 48.
+/// - `join1_truncate_def_after_lock`: caught 0, fired 14 (its failure is a
 ///   deadlock Postgres breaks, which its pin reads from the server log; the
 ///   tier checks the targets).
-/// - `join1_truncate_keeps_m`: caught 0, fired 7 (its pin checks the target
+/// - `join1_truncate_keeps_m`: caught 0, fired 14 (its pin checks the target
 ///   before the rebuild a `TRUNCATE b` starts reaches the row).
-/// - `join1_truncate_share_lock`: caught 0, fired 9.
-/// - `join1_vis_only`: caught 0, fired 24 (twice in 12 of a draw with seven
-///   `racing` cases).
+/// - `join1_truncate_share_lock`: caught 0, fired 18.
 const ONE_TO_ONE_KNOWN_MISSES: &[&str] = &[
+    "join1_no_j_lock",
+    "join1_truncate_no_rebuild",
     "join1_brd_no_key",
+    "join1_no_recheck",
+    "join1_vis_only",
     "join1_chunk_no_key",
     "join1_lsn_only",
     "join1_no_entry_lock",
-    "join1_no_recheck",
     "join1_orphan_delete",
     "join1_rd_no_key",
     "join1_snapshot_after_read",
     "join1_truncate_def_after_lock",
     "join1_truncate_keeps_m",
     "join1_truncate_share_lock",
-    "join1_vis_only",
 ];
 
-/// The 1-1 `JOIN` tier's sweep: it gates the `Join1*` plants it catches
-/// (`join1_no_placeholder`, `join1_old_key_unlocked`, `join1_no_orphan_pass`,
-/// `join1_truncate_keeps_r`, `join1_m_before_j`, `join1_no_j_lock`,
-/// `join1_truncate_no_rebuild`), runs and reports [`ONE_TO_ONE_KNOWN_MISSES`],
-/// and leaves out [`ONE_TO_ONE_NOT_GATED`] and every plant of another path.
+/// The 1-1 `JOIN` tier's sweep: it gates the `Join1*` plants it catches in
+/// one case in five or more (of 48: `join1_no_placeholder` 46,
+/// `join1_old_key_unlocked` 44, `join1_no_orphan_pass` 24,
+/// `join1_truncate_keeps_r` 10, `join1_m_before_j` 9), runs and reports
+/// [`ONE_TO_ONE_KNOWN_MISSES`], and leaves out [`ONE_TO_ONE_NOT_GATED`] and
+/// every plant of another path.
 fn one_to_one_sweep_tier() -> SweepTier {
     use generative::plant_sweep::{PlantPath, not_on_path};
     let mut not_gated: Vec<(&'static str, &'static str)> = ONE_TO_ONE_NOT_GATED.to_vec();

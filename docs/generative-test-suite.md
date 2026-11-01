@@ -440,14 +440,14 @@ beside them run on every `cargo test`.
   join_one_to_one_convergence -- --ignored`. Its planted-bug sweep,
   `one_to_one_join_planted_bugs_are_caught` (run with
   `GENERATIVE_PLANT_CASES=6`: 24 cases catch every gated plant, and the
-  default twelve take hours), gates `join1_no_placeholder`,
-  `join1_old_key_unlocked`, `join1_no_orphan_pass`, `join1_truncate_keeps_r`,
-  `join1_m_before_j`, `join1_no_j_lock` and `join1_truncate_no_rebuild`. The
-  other `Join1*` plants are narrow interleavings, or leave a target that the
-  rest of the build or the next writes repair before the burst settles: the
-  tier runs twelve of them as known misses, with their measured rates in its
-  `ONE_TO_ONE_KNOWN_MISSES`, and leaves four out, each with why (a held row,
-  a write past capture, a page the barrier never lets drain late). Their
+  default twelve take hours), gates the plants it catches in one case in
+  five or more: `join1_no_placeholder`, `join1_old_key_unlocked`,
+  `join1_no_orphan_pass`, `join1_truncate_keeps_r` and `join1_m_before_j`.
+  The other `Join1*` plants are narrow interleavings, or leave a target that
+  the rest of the build or the next writes repair before the burst settles:
+  the tier runs fourteen of them as known misses, with their measured rates
+  in its `ONE_TO_ONE_KNOWN_MISSES`, and leaves four out, each with why (a held
+  row, a write past capture, a page the barrier never lets drain late). Their
   deterministic pins gate all of them.
 - **Partitioned-source convergence** *(ADR-0017)*. The first table of a
   generated program is a partitioned source: `HASH` over one to four leaves,
