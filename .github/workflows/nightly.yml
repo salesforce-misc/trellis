@@ -2,6 +2,9 @@ name: Nightly
 
 # The deep half of the fast/deep split ci.yml's PR-time job can't afford:
 #
+# - the whole workspace test suite against each supported PostgreSQL major
+#   (`pg-versions`); PR-time CI tests only the newest the runner image has.
+#
 # - the generative crate's own expensive property
 #   (`property_convergence_holds_for_trivial_programs`), at a much higher case count
 #   than its 16-case default. Every property is `#[ignore]`d, so PR-time CI
@@ -58,3 +61,120 @@ jobs:
         run: cargo test -p generative --test convergence property_convergence_holds_for_trivial_programs -- --ignored
         env:
           PROPTEST_CASES: "200"
+
+  pg-versions:
+    # The workspace test suite (what ci.yml's `test` shards cover, in one job)
+    # against each PostgreSQL major Trellis supports. PR-time CI runs only the
+    # newest PostgreSQL the runner image has; SQL that only some versions accept
+    # is rare enough that a nightly check is enough. One job per version
+    # (`fail-fast: false`) so one version's break does not hide another's.
+    name: tests (pg ${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    # A safety net for a hung test or runner, not a budget: the whole suite
+    # takes about 40 minutes on one job.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      # As in ci.yml: line tables keep file:line in backtraces without the
+      # multi-gigabyte cost of full debug info.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["15", "16", "17", "18"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        id: toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: "1.98.0"
+
+      - name: Restore Cargo dependency cache
+        # The entry ci.yml's `lint` job saves on main; restore-only here.
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-deps-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-line-tables-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-deps-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-line-tables-
+
+      - name: Install PostgreSQL ${{ matrix.pg }} server binaries
+        # The harness finds its binaries through PATH alone (see
+        # testkit/src/cluster.rs), so the version under test is whichever bin
+        # directory comes first there. The runner image has only its newest
+        # PostgreSQL; this installs the matrix version from the PGDG apt
+        # repository (postgresql-common ships the script that configures it).
+        #
+        # The PGDG packages are built --with-libxml, which the XML tests need
+        # (a source build without it fails them with "unsupported XML
+        # feature"); the check below fails the job if that ever changes. They
+        # also include contrib, which the suite uses.
+        #
+        # No cluster is wanted: the package would otherwise create and start
+        # a `main` cluster on the default port, and the tests start their own.
+        env:
+          PG_MAJOR: ${{ matrix.pg }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo sed -i 's/^#\?create_main_cluster *=.*/create_main_cluster = false/' /etc/postgresql-common/createcluster.conf
+          apt-cache policy "postgresql-${PG_MAJOR}"
+          sudo apt-get install -y "postgresql-${PG_MAJOR}"
+          pg_bin="/usr/lib/postgresql/${PG_MAJOR}/bin"
+          "$pg_bin/postgres" --version
+          "$pg_bin/pg_config" --configure | grep -q -e '--with-libxml' ||
+            { echo "::error::postgresql-${PG_MAJOR} was built without libxml"; exit 1; }
+          echo "using PostgreSQL server binaries from: $pg_bin"
+          echo "$pg_bin" >> "$GITHUB_PATH"
+
+      - name: Check the PostgreSQL on PATH is the one under test
+        # A bin directory ahead of this one on PATH (or a failed PATH update)
+        # would run the whole job on the wrong server without any error.
+        env:
+          PG_MAJOR: ${{ matrix.pg }}
+        run: |
+          set -euo pipefail
+          for tool in postgres initdb pg_ctl createdb pg_config; do
+            test "$(command -v "$tool")" = "/usr/lib/postgresql/${PG_MAJOR}/bin/$tool" ||
+              { echo "::error::$tool on PATH is $(command -v "$tool"), not PostgreSQL ${PG_MAJOR}'s"; exit 1; }
+          done
+          postgres --version | grep -q -e "(PostgreSQL) ${PG_MAJOR}\\." ||
+            { echo "::error::postgres --version is not PostgreSQL ${PG_MAJOR}"; postgres --version; exit 1; }
+          pg_config --configure | grep -q -e '--with-libxml' ||
+            { echo "::error::pg_config on PATH reports no libxml"; exit 1; }
+          postgres --version
+
+      - name: Generate a non-default locale
+        # The lc_monetary pinning tests need a locale whose `money` rendering
+        # differs from `C`'s; see testkit/src/locale.rs and the same step in
+        # ci.yml.
+        run: |
+          set -euo pipefail
+          if [ ! -x /usr/sbin/locale-gen ]; then
+            sudo apt-get update
+            sudo apt-get install -y locales
+          fi
+          sudo locale-gen de_DE.UTF-8
+          if ! locale -a | grep -ix 'de_DE\.utf-\?8' >/dev/null; then
+            echo "::error::de_DE.UTF-8 was not generated; installed locales:"
+            locale -a
+            exit 1
+          fi
+
+      - name: Test the workspace
+        # The flags test-shards.py passes (its CARGO_FLAGS) and `verify` uses;
+        # `cargo test` with no target selector runs the doc tests too, as the
+        # shards' `--doc` run does. `--no-fail-fast` so one run shows every
+        # failure. The throwaway clusters run with `jit=off`, as in ci.yml.
+        env:
+          TRELLIS_TESTKIT_PG_OPTIONS: jit=off
+        run: cargo test --workspace --features benchmark/engine-access --no-fail-fast

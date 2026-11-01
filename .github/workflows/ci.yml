@@ -125,13 +125,7 @@ jobs:
     # seconds in .github/test-shards.txt and fails the shard if cargo built
     # anything other than its assignment. Refresh the file as
     # docs/testing-strategy.md describes.
-    #
-    # Every shard runs against two servers: the newest PostgreSQL the runner
-    # image has (`latest`) and PostgreSQL 15, the oldest version Trellis
-    # supports, so SQL that only a newer grammar accepts fails the PR that adds
-    # it instead of a release. The legs run in parallel, so a PR waits no longer
-    # than before; it uses twice the runner minutes.
-    name: test (shard ${{ matrix.shard }}, pg ${{ matrix.pg }})
+    name: test (shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
     # A safety net for a hung test or runner, not a budget: a shard takes about
     # 10 minutes, and the default would let a hang burn six hours.
@@ -143,9 +137,6 @@ jobs:
       matrix:
         # Exactly 1..TEST_SHARDS; `lint` checks it.
         shard: [1, 2, 3, 4]
-        # `latest` installs nothing new (see the first PostgreSQL step); a
-        # number is the major version installed from the PGDG apt repository.
-        pg: [latest, "15"]
     steps:
       - uses: actions/checkout@v4
 
@@ -174,7 +165,6 @@ jobs:
         # instances for trellis's (and other crates') integration tests.
         # Prefer PostgreSQL server binaries already present on the runner (not
         # necessarily on PATH); fall back to installing the distro package.
-        if: matrix.pg == 'latest'
         run: |
           set -euo pipefail
           pg_bin="$(find /usr/lib/postgresql -maxdepth 2 -type d -name bin 2>/dev/null | sort -V | tail -n1 || true)"
@@ -185,52 +175,6 @@ jobs:
           fi
           echo "using PostgreSQL server binaries from: $pg_bin"
           echo "$pg_bin" >> "$GITHUB_PATH"
-
-      - name: Install PostgreSQL ${{ matrix.pg }} server binaries
-        # The harness finds its binaries through PATH alone, so the version
-        # under test is whichever bin directory comes first there. The runner
-        # image has only its newest PostgreSQL; this installs the matrix
-        # version from the PGDG apt repository (postgresql-common ships the
-        # script that configures it, and it does nothing if the image already
-        # has the repository) and puts that bin directory ahead on PATH.
-        #
-        # The PGDG packages are built --with-libxml, which the XML tests need
-        # (a source build without it fails them with "unsupported XML
-        # feature"); the check below fails the leg if that ever changes.
-        # They also include contrib, which the suite uses.
-        #
-        # No cluster is wanted: the package would otherwise create and start
-        # a `main` cluster on the default port, and the tests start their own.
-        if: matrix.pg != 'latest'
-        env:
-          PG_MAJOR: ${{ matrix.pg }}
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y postgresql-common
-          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo sed -i 's/^#\?create_main_cluster *=.*/create_main_cluster = false/' /etc/postgresql-common/createcluster.conf
-          sudo apt-get install -y "postgresql-${PG_MAJOR}"
-          pg_bin="/usr/lib/postgresql/${PG_MAJOR}/bin"
-          "$pg_bin/postgres" --version
-          "$pg_bin/pg_config" --configure | grep -q -e '--with-libxml' ||
-            { echo "::error::postgresql-${PG_MAJOR} was built without libxml"; exit 1; }
-          echo "using PostgreSQL server binaries from: $pg_bin"
-          echo "$pg_bin" >> "$GITHUB_PATH"
-
-      - name: Check the PostgreSQL on PATH is the one under test
-        # A bin directory ahead of this one on PATH (or a failed PATH update)
-        # would run the whole leg on the wrong server without any error.
-        if: matrix.pg != 'latest'
-        env:
-          PG_MAJOR: ${{ matrix.pg }}
-        run: |
-          set -euo pipefail
-          for tool in postgres initdb pg_ctl createdb; do
-            test "$(command -v "$tool")" = "/usr/lib/postgresql/${PG_MAJOR}/bin/$tool" ||
-              { echo "::error::$tool on PATH is $(command -v "$tool"), not PostgreSQL ${PG_MAJOR}'s"; exit 1; }
-          done
-          postgres --version
 
       - name: Generate a non-default locale
         # The lc_monetary pinning tests need a locale whose

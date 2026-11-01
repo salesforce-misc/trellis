@@ -236,14 +236,6 @@ passed; `ci` is the one required status check. Each shard builds and runs its ow
 binaries, one at a time, with `cargo test --workspace --features benchmark/engine-access
 --no-fail-fast` narrowed to them, the flags `verify` uses.
 
-Each shard runs twice, in parallel: once against the newest PostgreSQL on the runner
-image, and once against PostgreSQL 15, the oldest supported version, installed from the
-PGDG apt repository (built with libxml, which the XML tests need). The harness finds its
-server binaries through `PATH`, so the PostgreSQL 15 leg puts that version's `bin`
-directory first and checks that the tools resolve there. A construct only the newer
-grammar accepts fails that leg on the PR that adds it. Locally, `ASDF_POSTGRES_VERSION=15.x`
-does the same for an asdf install, though one built without libxml fails the XML tests.
-
 `.github/scripts/test-shards.py` assigns the binaries. It lists them from `cargo
 metadata`, so a new test file joins a shard with no edit, and balances them by the
 seconds in `.github/test-shards.txt`, one `unit seconds` line per binary. A binary the
@@ -258,6 +250,18 @@ of one full CI run (`gh run view <id> --log > log`, or a local `cargo test --wor
 weights <log> > .github/test-shards.txt`. `test-shards.py plan -v` prints the resulting
 balance. Refresh when the warnings name many unlisted binaries or one shard runs
 noticeably longer than the others; a stale file costs balance, never coverage.
+
+The PR-time shards run against the newest PostgreSQL on the runner image. The
+`pg-versions` job in `nightly.yml` runs the whole workspace suite (the shards' `cargo
+test` flags and `jit=off`, doc tests included) every night against PostgreSQL 15, 16, 17
+and 18, each installed from the PGDG apt repository (built with libxml, which the XML
+tests need), one job per version, so one version's failure does not hide another's. It
+runs nightly rather than per PR because SQL that only some versions accept is rare; a
+construct the oldest or newest grammar rejects shows up the next morning. The harness
+finds its server binaries through `PATH`, so each job puts that version's `bin`
+directory on `PATH` and fails if `postgres` or `pg_config` is not the matrix version's.
+Locally, `ASDF_POSTGRES_VERSION=15.x` does the same for an asdf install, though one built
+without libxml fails the XML tests.
 
 ## How the tiers compose
 
