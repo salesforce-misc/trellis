@@ -12,7 +12,7 @@ The Hex package is `trellis_pg` (Hex's `trellis` is taken); the modules are
 
 ```elixir
 def deps do
-  [{:trellis_pg, "0.1.0-alpha"}]
+  [{:trellis_pg, "~> 0.1.0"}]
 end
 ```
 
@@ -145,7 +145,7 @@ no definition ever reaches `:live`. Any number of connections may set
 `staging: true`: one takes the producer lock and leads, the rest stand by and
 take over when it goes away, so a rolling deploy needs no operator step and
 the application boots even when the old worker is still running (see
-[Rolling deploys](../../docs/embedding.md#rolling-deploys)).
+[Rolling deploys](https://github.com/salesforce-misc/trellis/blob/main/docs/embedding.md#rolling-deploys)).
 
 ### Resources
 
@@ -161,7 +161,7 @@ its peak. `:max_call_pool_size` lowers the 20 (the background pool is sized by
 the handle's roles, not by an option), and `:worker_threads` sets the threads.
 Every handle (each `{Trellis, name: ...}` child) costs this again. The full
 accounting is in
-[`docs/embedding.md`](../../docs/embedding.md#what-a-handle-uses).
+[`docs/embedding.md`](https://github.com/salesforce-misc/trellis/blob/main/docs/embedding.md#what-a-handle-uses).
 
 ### Conventions
 
@@ -376,7 +376,7 @@ the Ruby suite runs too, so the two bindings can't drift apart unnoticed
 ## Releasing
 
 `trellis_pg` is released with the rest of Trellis, from one `v<version>` tag
-([docs/releasing.md](../../docs/releasing.md)). `@version` in `mix.exs` and
+([docs/releasing.md](https://github.com/salesforce-misc/trellis/blob/main/docs/releasing.md)). `@version` in `mix.exs` and
 the NIF crate's version (`native/trellis_nif/Cargo.toml`) are the release's.
 `.github/workflows/release.yml` builds the NIF for each target above and
 attaches them to the tag's GitHub release, where `lib/trellis/native.ex`

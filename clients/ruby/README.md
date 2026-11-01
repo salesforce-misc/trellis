@@ -18,11 +18,8 @@ as `trellis/pg`. The module is still `Trellis`.
 
 ```ruby
 # Gemfile
-gem "trellis-pg", "0.1.0.pre.alpha"
+gem "trellis-pg", "~> 0.1.0"
 ```
-
-A prerelease is installed by naming it: `gem install trellis-pg --pre`, or the
-version above in a Gemfile.
 
 `Bundler.require`, which a Rails app's `config/application.rb` runs,
 requires it by itself. Anywhere else, `require "trellis/pg"`.
