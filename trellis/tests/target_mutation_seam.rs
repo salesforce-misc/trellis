@@ -167,8 +167,19 @@ async fn reported(trellis: &trellis::Trellis, target: &str) -> TransformStatus {
         .status
 }
 
-/// `target`'s persisted status.
+/// `target`'s persisted status. Also samples the whole catalog: `catching_up`
+/// is reported, never stored, so no row may ever hold it, whatever the
+/// definitions around it are doing.
 async fn stored(raw: &Client, target: &str) -> String {
+    let catching_up: i64 = raw
+        .query_one(
+            "select count(*) from transform_definitions where status = 'catching_up'",
+            &[],
+        )
+        .await
+        .expect("sample the persisted statuses")
+        .get(0);
+    assert_eq!(catching_up, 0, "catching_up is never persisted");
     raw.query_one(
         "select status from transform_definitions where split_part(target_table, '.', 2) = $1",
         &[&target],
@@ -767,7 +778,11 @@ async fn a_chained_reader_reports_catching_up_until_its_resumed_upstream_is_live
         .expect("pause the upstream");
     assert_eq!(reported(&trellis, "t").await, TransformStatus::Paused);
     assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
-    assert_eq!(stored(&raw, "d").await, "live", "d keeps applying");
+    assert_eq!(
+        stored(&raw, "d").await,
+        "live",
+        "reported, not stored: d keeps applying"
+    );
     let listed: Vec<(String, TransformStatus)> = trellis
         .definitions()
         .await
@@ -808,6 +823,7 @@ async fn a_chained_reader_reports_catching_up_until_its_resumed_upstream_is_live
         TransformStatus::WaitingToBackfill
     );
     assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
+    assert_eq!(stored(&raw, "d").await, "live", "reported, not stored");
 
     // The rebuild finishes: `t` is live, and `d` with it, since the
     // rebuild wrote through the seam.
@@ -849,6 +865,7 @@ async fn a_chained_reader_reports_catching_up_while_its_upstream_rederives() {
         .await
         .expect("pause the upstream");
     assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
+    assert_eq!(stored(&raw, "d").await, "live", "reported, not stored");
     raw.execute("update public.src set v = 100 where id = 1", &[])
         .await
         .expect("update the source while paused");
@@ -861,6 +878,7 @@ async fn a_chained_reader_reports_catching_up_while_its_upstream_rederives() {
         TransformStatus::WaitingToBackfill
     );
     assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
+    assert_eq!(stored(&raw, "d").await, "live", "reported, not stored");
 
     // The start: `t` rebuilds under the Re-derive build.
     harness::start_registered_builds(&db.pool)
@@ -880,7 +898,11 @@ async fn a_chained_reader_reports_catching_up_while_its_upstream_rederives() {
         "precondition: the Re-derive build runs t's rebuild"
     );
     assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
-    assert_eq!(stored(&raw, "d").await, "live", "d keeps applying");
+    assert_eq!(
+        stored(&raw, "d").await,
+        "live",
+        "reported, not stored: d keeps applying"
+    );
 
     trellis::staging::build::settle_builds(&db.pool).await;
     assert_eq!(stored(&raw, "t").await, "live");
@@ -924,6 +946,7 @@ async fn a_chained_reader_reports_catching_up_while_its_upstream_builds_a_field(
     assert_eq!(stored(&raw, "t").await, "backfilling");
     assert_eq!(stored(&raw, "d").await, "live", "nothing was parked for d");
     assert_eq!(reported(&trellis, "d").await, TransformStatus::CatchingUp);
+    assert_eq!(stored(&raw, "d").await, "live", "reported, not stored");
 
     trellis::staging::build::settle_builds(&db.pool).await;
     assert_eq!(reported(&trellis, "t").await, TransformStatus::Live);

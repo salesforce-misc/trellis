@@ -222,16 +222,16 @@ async fn a_definition_entering_a_build_state_announces_itself() {
     f.sql("update transform_definitions set status = 'backfilling'")
         .await;
     assert_eq!(f.listener.heard().await, 1, "paused -> backfilling");
-    f.sql("update transform_definitions set status = 'catching_up'")
+    f.sql("update transform_definitions set status = 'live'")
         .await;
-    assert_eq!(f.listener.heard().await, 1, "backfilling -> catching_up");
+    assert_eq!(f.listener.heard().await, 1, "backfilling -> live");
     f.sql("update transform_definitions set build = 'rederive'")
         .await;
     assert_eq!(f.listener.heard().await, 1, "build changed");
     // Every status a chunk is handed out in announces entering it (a resume
     // or an unfreeze makes the definition's existing chunks claimable
     // without touching a chunk row); a frozen status is no edge.
-    for status in trellis::defs::TransformStatus::ALL {
+    for status in trellis::defs::StoredStatus::ALL {
         f.sql("update transform_definitions set status = 'paused'")
             .await;
         f.listener.heard().await;

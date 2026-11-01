@@ -21,13 +21,11 @@
 //! transform a potential name collision with Trellis's own future
 //! catalog/state objects.
 //!
-//! [`crate::Pool`]'s sizing/timeout is configured the same
-//! way: `TRELLIS_POOL_MAX_SIZE` (default [`DEFAULT_POOL_MAX_SIZE`]) caps how
-//! many physical connections the pool opens, and
-//! `TRELLIS_POOL_WAIT_TIMEOUT_SECS` (default [`DEFAULT_POOL_WAIT_TIMEOUT`])
-//! bounds how long [`crate::Pool::get`] waits for one to free up before
-//! failing with a typed error, instead of deadpool's own defaults (a
-//! box-size-dependent `max_size` and no wait timeout at all).
+//!
+//! Pool sizing is not part of a [`Config`]: a handle's call pool is sized by
+//! [`crate::TrellisOptions::max_call_pool_size`] and
+//! [`crate::TrellisOptions::call_pool_wait_timeout`], and its background pool
+//! by its roles (see [`crate::Pool::background`]).
 
 use crate::error::Error;
 use std::fmt;
@@ -52,43 +50,32 @@ pub const DEFAULT_SCHEMA: &str = "trellis";
 /// Trellis grows its own catalog/state tables in that schema.
 pub const DEFAULT_TARGET_SCHEMA: &str = "public";
 
-/// The default cap on how many physical connections [`crate::Pool`] will
-/// ever open at once.
+/// The default cap on a handle's call pool
+/// ([`crate::TrellisOptions::max_call_pool_size`]): how many physical
+/// connections the handle's API calls (`status`, `apply`, `define`, ...) open
+/// at once. Calls hold one connection each, two or three when a call nests
+/// (`resume_column`), so the default leaves room for a few concurrent
+/// callers. The background client's pool is sized by role instead
+/// ([`crate::Pool::background`]).
 ///
-/// `deadpool_postgres`'s own default (`2 * num_cpus`, per `deadpool`'s
-/// `get_default_pool_max_size`) scales with the box this happens to run on,
-/// not with this engine's actual concurrency pattern, and — paired with no
-/// wait timeout — is how a handful of
-/// concurrent evictions each needing a *second* pool connection while their
-/// own transaction holds a first (`trip_transform_fuse_if_crossed`,
-/// `crate::staging::quarantine`) could exhaust a small box's pool and hang
-/// every drain thread involved forever. This fixed floor is sized well
-/// above the concurrency any single [`crate::Trellis::connect`] connection
-/// drives today (one staging worker plus a handful of `drain_threads`, each
-/// normally holding at most one connection and occasionally a second),
-/// with generous headroom for that occasional double-acquisition to happen
-/// several times over without contending — while still being small enough
-/// that exhausting it is a real, actionable signal rather than something
-/// that only happens after hundreds of runaway workers. Override via
-/// `TRELLIS_POOL_MAX_SIZE` if an operator's own `drain_threads` count needs
-/// more.
-///
-/// It isn't every connection a client opens: Trellis's dedicated sessions
-/// (producer, maintenance loop, heartbeat daemon, wake listener) sit outside
-/// it, and so does each paged drain's `TEMP`-table session (see
-/// `ClientOptions::drain_batch_cap`), up to one per drain thread while
-/// oversized shares page.
-pub const DEFAULT_POOL_MAX_SIZE: usize = 20;
+/// Neither pool counts Trellis's dedicated sessions (the producer session, the
+/// `LISTEN` connection, the claim keep-alive) or each paged drain's
+/// `TEMP`-table session (see `ClientOptions::drain_batch_cap`), up to one per
+/// drain thread while oversized shares page.
+pub const DEFAULT_CALL_POOL_MAX_SIZE: usize = 20;
 
 /// The default timeout [`crate::Pool::get`] waits for a free connection
 /// before failing with a typed [`crate::Error::Pool`] error, instead of
 /// deadpool's default of waiting forever. Long enough that a
-/// normal, brief load spike (a burst of concurrent evictions, a slow
-/// query holding a connection a bit longer than usual) doesn't spuriously
-/// fail, but bounded so a genuinely exhausted pool surfaces as a loud,
-/// diagnosable error within a bounded amount of time instead of a silent,
-/// permanent stall. Override via `TRELLIS_POOL_WAIT_TIMEOUT_SECS`.
-pub const DEFAULT_POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// normal, brief load spike doesn't spuriously fail, but bounded so a
+/// genuinely exhausted pool surfaces as a loud, diagnosable error instead of
+/// a silent, permanent stall. The call pool's value is
+/// [`crate::TrellisOptions::call_pool_wait_timeout`].
+pub const DEFAULT_CALL_POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a pooled connection may sit unused before the pool closes it
+/// (both pools; not configurable).
+pub const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Resolved connection configuration.
 ///
@@ -111,12 +98,6 @@ pub struct Config {
     /// The schema transform target tables are created under. See
     /// [`DEFAULT_TARGET_SCHEMA`].
     target_schema: String,
-    /// The cap on physical connections [`crate::Pool`] opens. See
-    /// [`DEFAULT_POOL_MAX_SIZE`].
-    pool_max_size: usize,
-    /// How long [`crate::Pool::get`] waits for a free connection before
-    /// failing. See [`DEFAULT_POOL_WAIT_TIMEOUT`].
-    pool_wait_timeout: Duration,
 }
 
 impl Config {
@@ -138,30 +119,18 @@ impl Config {
 
         let schema = std::env::var("TRELLIS_SCHEMA").unwrap_or_else(|_| DEFAULT_SCHEMA.to_string());
         let target_schema = target_schema_from_env();
-        let pool_max_size = pool_max_size_from_env()?;
-        let pool_wait_timeout = pool_wait_timeout_from_env()?;
-        Ok(Self::with_schema(dsn, schema)?
-            .with_target_schema(target_schema)?
-            .with_pool_max_size(pool_max_size)?
-            .with_pool_wait_timeout(pool_wait_timeout))
+        Self::with_schema(dsn, schema)?.with_target_schema(target_schema)
     }
 
     /// Builds a [`Config`] from an explicit DSN, bypassing environment
     /// resolution entirely (the schema and target schema are still resolved
     /// from `TRELLIS_SCHEMA`/`DEFAULT_SCHEMA` and
-    /// `TRELLIS_TARGET_SCHEMA`/`DEFAULT_TARGET_SCHEMA`, and validated —
-    /// likewise the pool sizing/timeout, from `TRELLIS_POOL_MAX_SIZE`/
-    /// `DEFAULT_POOL_MAX_SIZE` and `TRELLIS_POOL_WAIT_TIMEOUT_SECS`/
-    /// `DEFAULT_POOL_WAIT_TIMEOUT`). Useful for tests.
+    /// `TRELLIS_TARGET_SCHEMA`/`DEFAULT_TARGET_SCHEMA`, and validated).
+    /// Useful for tests.
     pub fn from_dsn(dsn: impl Into<String>) -> Result<Self, Error> {
         let schema = std::env::var("TRELLIS_SCHEMA").unwrap_or_else(|_| DEFAULT_SCHEMA.to_string());
         let target_schema = target_schema_from_env();
-        let pool_max_size = pool_max_size_from_env()?;
-        let pool_wait_timeout = pool_wait_timeout_from_env()?;
-        Ok(Self::with_schema(dsn, schema)?
-            .with_target_schema(target_schema)?
-            .with_pool_max_size(pool_max_size)?
-            .with_pool_wait_timeout(pool_wait_timeout))
+        Self::with_schema(dsn, schema)?.with_target_schema(target_schema)
     }
 
     /// Builds a [`Config`] from an explicit DSN and schema, validating the
@@ -178,8 +147,6 @@ impl Config {
             dsn: dsn.into(),
             schema,
             target_schema: DEFAULT_TARGET_SCHEMA.to_string(),
-            pool_max_size: DEFAULT_POOL_MAX_SIZE,
-            pool_wait_timeout: DEFAULT_POOL_WAIT_TIMEOUT,
         })
     }
 
@@ -191,32 +158,6 @@ impl Config {
         validate_schema_name(&target_schema)?;
         self.target_schema = target_schema;
         Ok(self)
-    }
-
-    /// Returns `self` with its connection pool's `max_size` overridden — see
-    /// `DEFAULT_POOL_MAX_SIZE`. Rejects `0`: a pool that can never open a single
-    /// connection isn't a smaller pool, it's a broken one, and letting it through here
-    /// would only surface as a confusing wait-timeout on every single
-    /// [`crate::Pool::get`] call instead of a clear configuration error now.
-    pub fn with_pool_max_size(mut self, pool_max_size: usize) -> Result<Self, Error> {
-        if pool_max_size == 0 {
-            return Err(Error::Config(
-                "pool_max_size must be at least 1".to_string(),
-            ));
-        }
-        self.pool_max_size = pool_max_size;
-        Ok(self)
-    }
-
-    /// Returns `self` with its connection pool's wait timeout overridden
-    /// — see `DEFAULT_POOL_WAIT_TIMEOUT`. Unlike
-    /// [`Config::with_pool_max_size`], every [`Duration`] (including
-    /// [`Duration::ZERO`], which just makes [`crate::Pool::get`] fail
-    /// immediately when no connection is already free — a legitimate, if
-    /// unusual, choice) is a coherent value, so there is nothing to reject.
-    pub fn with_pool_wait_timeout(mut self, pool_wait_timeout: Duration) -> Self {
-        self.pool_wait_timeout = pool_wait_timeout;
-        self
     }
 
     /// The Postgres connection string this instance was configured with.
@@ -234,18 +175,6 @@ impl Config {
     /// `DEFAULT_TARGET_SCHEMA`.
     pub fn target_schema(&self) -> &str {
         &self.target_schema
-    }
-
-    /// The cap [`crate::Pool`] places on physical connections. See
-    /// `DEFAULT_POOL_MAX_SIZE`.
-    pub fn pool_max_size(&self) -> usize {
-        self.pool_max_size
-    }
-
-    /// How long [`crate::Pool::get`] waits for a free connection before
-    /// failing. See `DEFAULT_POOL_WAIT_TIMEOUT`.
-    pub fn pool_wait_timeout(&self) -> Duration {
-        self.pool_wait_timeout
     }
 
     fn dsn_from_env() -> String {
@@ -327,15 +256,11 @@ impl fmt::Debug for Config {
             dsn,
             schema,
             target_schema,
-            pool_max_size,
-            pool_wait_timeout,
         } = self;
         f.debug_struct("Config")
             .field("dsn", &RedactedDsn(dsn))
             .field("schema", schema)
             .field("target_schema", target_schema)
-            .field("pool_max_size", pool_max_size)
-            .field("pool_wait_timeout", pool_wait_timeout)
             .finish()
     }
 }
@@ -469,40 +394,6 @@ fn validate_schema_name(name: &str) -> Result<(), Error> {
 /// [`Config::from_dsn`] read this env var, so they can't drift.
 fn target_schema_from_env() -> String {
     std::env::var("TRELLIS_TARGET_SCHEMA").unwrap_or_else(|_| DEFAULT_TARGET_SCHEMA.to_string())
-}
-
-/// Resolves the pool's `max_size` from `TRELLIS_POOL_MAX_SIZE`, defaulting
-/// to [`DEFAULT_POOL_MAX_SIZE`] — the one place both
-/// [`Config::resolve`] and [`Config::from_dsn`] read this env var, so they
-/// can't drift.
-fn pool_max_size_from_env() -> Result<usize, Error> {
-    match std::env::var("TRELLIS_POOL_MAX_SIZE") {
-        Ok(raw) => raw.trim().parse::<usize>().map_err(|err| {
-            Error::Config(format!(
-                "TRELLIS_POOL_MAX_SIZE {raw:?} is not a valid positive integer: {err}"
-            ))
-        }),
-        Err(_) => Ok(DEFAULT_POOL_MAX_SIZE),
-    }
-}
-
-/// Resolves the pool's wait timeout from `TRELLIS_POOL_WAIT_TIMEOUT_SECS` (whole
-/// seconds), defaulting to [`DEFAULT_POOL_WAIT_TIMEOUT`] — the one place both
-/// [`Config::resolve`] and [`Config::from_dsn`] read this env var, so they can't
-/// drift.
-fn pool_wait_timeout_from_env() -> Result<Duration, Error> {
-    match std::env::var("TRELLIS_POOL_WAIT_TIMEOUT_SECS") {
-        Ok(raw) => {
-            let secs: u64 = raw.trim().parse().map_err(|err| {
-                Error::Config(format!(
-                    "TRELLIS_POOL_WAIT_TIMEOUT_SECS {raw:?} is not a valid non-negative integer \
-                     number of seconds: {err}"
-                ))
-            })?;
-            Ok(Duration::from_secs(secs))
-        }
-        Err(_) => Ok(DEFAULT_POOL_WAIT_TIMEOUT),
-    }
 }
 
 /// Test fixtures: DSNs that fail to parse and carry a
@@ -732,45 +623,6 @@ mod tests {
         ));
     }
 
-    // Deliberately not testing `TRELLIS_POOL_MAX_SIZE`/
-    // `TRELLIS_POOL_WAIT_TIMEOUT_SECS` themselves below: every other test in
-    // this module already assumes `TRELLIS_SCHEMA`/`TRELLIS_TARGET_SCHEMA`
-    // are unset in the test environment rather than mutating process-global
-    // env state (which `cargo test`'s multi-threaded default would race
-    // across tests) — these two follow the same convention.
-    #[test]
-    fn pool_sizing_and_timeout_default_when_unset() {
-        let config = Config::from_dsn("postgresql://example/db").unwrap();
-        assert_eq!(config.pool_max_size(), DEFAULT_POOL_MAX_SIZE);
-        assert_eq!(config.pool_wait_timeout(), DEFAULT_POOL_WAIT_TIMEOUT);
-    }
-
-    #[test]
-    fn with_pool_max_size_overrides_the_default() {
-        let config = Config::from_dsn("postgresql://example/db")
-            .unwrap()
-            .with_pool_max_size(7)
-            .unwrap();
-        assert_eq!(config.pool_max_size(), 7);
-    }
-
-    #[test]
-    fn zero_pool_max_size_is_rejected() {
-        let err = Config::from_dsn("postgresql://example/db")
-            .unwrap()
-            .with_pool_max_size(0)
-            .unwrap_err();
-        assert!(matches!(err, Error::Config(_)));
-    }
-
-    #[test]
-    fn with_pool_wait_timeout_overrides_the_default() {
-        let config = Config::from_dsn("postgresql://example/db")
-            .unwrap()
-            .with_pool_wait_timeout(Duration::from_millis(250));
-        assert_eq!(config.pool_wait_timeout(), Duration::from_millis(250));
-    }
-
     /// Neither `{:?}` nor `{}` on a [`Config`] may print the
     /// DSN's password, whichever form carries it.
     #[test]
@@ -798,7 +650,6 @@ mod tests {
             assert!(debug.contains("dsn: <redacted>"), "{debug}");
             // The rest of the configuration stays visible.
             assert!(debug.contains(r#"schema: "app_trellis""#), "{debug}");
-            assert!(debug.contains("pool_max_size"), "{debug}");
         }
     }
 

@@ -16,7 +16,7 @@ same database:
   migrations. These connect at `drain_threads: 0`: no staging worker, no
   drain workers. Cheap to run in every web dyno/pod without each one
   competing to drain the same work.
-* **One dedicated worker process** — runs the live pipeline: capture
+* **A dedicated worker process** (one is enough; a second stands by) — runs the live pipeline: capture
   install + ring maintenance (`staging: true`) and one or more drain workers
   (`drain_threads: N`) that actually apply staged changes into target
   tables.
@@ -34,16 +34,18 @@ nothing in the background.
 |---|---|---|
 | Migration run (`rails db:migrate`, `mix ecto.migrate`, a release task) | `false` | `0` |
 | Web process, console, background job | `false` | `0` |
-| The dedicated Trellis worker, exactly one per fleet and instance | `true` | `N` (at least 1) |
+| The dedicated Trellis worker (a second one stands by, see below) | `true` | `N` (at least 1) |
 | Extra drain capacity, if the worker's threads can't keep up | `false` | `N` |
 
 Four rules sit behind that table, and they hold for each instance separately:
 
-* **Exactly one process sets `staging: true` for each instance.** The staging
-  worker holds a lock for as long as it runs, and a second `staging: true`
-  connect to the same instance fails with a `conflict` error while the first
-  is alive. In a rolling deploy, stop the old worker before the new one
-  connects, or retry the new one's connect until the old one has gone.
+* **At least one process sets `staging: true` for each instance; any number
+  may.** The staging worker holds a lock for as long as it runs. A
+  `staging: true` connect that cannot take the lock does not fail: it returns a
+  working handle that stands by. Its calls and drain threads run normally, and
+  it tries the lock every 5 seconds on a short-lived connection (so a standby
+  holds no connection for it), taking over with a capture pass at once when the
+  holder goes away ([rolling deploys](#rolling-deploys)).
 * **At least one process runs drain threads for each instance.** Drain threads
   take their work from a queue in the database, so any number of processes can
   run them; the dedicated worker's own are usually enough.
@@ -83,25 +85,109 @@ each handle is its own `{Trellis, name: ..., schema: ...}` child. Connect the
 handles once, at boot, never per request. One `Trellis.Metrics.render_prometheus/0`
 route covers all of them ([observability](observability.md#several-instances-in-one-process)).
 
-A third option, `worker_threads`, is unrelated to either: it caps the worker
-threads of each Tokio runtime a handle owns, which is the runtime a
-`BlockingTrellis` or binding handle services its calls on and the runtime of
-the background client a `staging` or `drain_threads` handle starts. The
-bindings default it to 2; Rust's `TrellisOptions` leaves it at one thread per
-core unless you set it. The cap is per runtime and per handle, and no budget is
-shared between handles: a handle that runs a client holds up to `2 * worker_threads`
-worker threads, and a process with H such handles holds up to `2 * worker_threads * H`.
-Size it for the handles you open. It caps worker threads only, not every
-thread a handle starts: each runtime also has a thread driving it and a
-blocking pool Tokio grows on demand (for DNS lookups, for one).
+### Rolling deploys
 
-Connections follow the same rule. A handle's calls draw on a pool of up to 20
-connections, and a handle that runs a client has a second pool of up to 20.
-The client also opens connections outside both pools: the staging worker holds
-one for as long as it runs, and each drain thread holds a `LISTEN` connection,
-plus up to two more while it drains (one that keeps its claims alive, and one
-while it pages through an oversized share). A process with several handles
-holds the sum, so add them up against the server's `max_connections`.
+A new worker connects with `staging: true` while the old one still runs, with
+no step for the operator: the new one stands by, and the old one releases the
+lock when it shuts down. Takeover takes at most one 5-second poll after a clean
+shutdown or a killed process, because the server frees the lock as soon as it
+sees the connection close. A host or network that vanishes without closing its
+connections holds the lock until the server's TCP keepalives notice, about 25
+seconds, plus one poll. Capture itself never pauses: the triggers keep staging
+changes in the application's own transactions, and only sealing, reclaim and
+backfill dispatch wait for the new leader.
+
+A leader that loses its own session (the database restarted, a backend was
+terminated) retries the lock after about 0.5, 1 and 2 seconds, then falls back
+to the 5-second poll. `has_live_staging_worker` is `true` only while some worker
+holds the lock, so a standby does not count; a rolling deploy shows `false`
+only if the old worker goes before the new one's next poll.
+
+A preforking server such as Puma, started with `TRELLIS_WORKER=1`, connects
+once per forked worker, so every worker after the first is a standby. That is
+harmless; each one polls every 5 seconds.
+
+### What a handle uses
+
+A handle's connections, threads and memory depend on its options. Nothing is
+shared between handles: a process holds the sum over the handles it opens,
+and a fleet holds the sum over its processes (Puma workers, BEAM nodes), so
+add them up against the server's `max_connections`.
+
+**Connections.** A handle has two pools. The *call pool* serves its API calls
+(`status`, `apply`, `define`, `migrate`, ...). The *background pool* serves its
+background client: staging maintenance, the drain threads, `self_check`, and the
+worker's upkeep, registration and gauge tasks. Calls never use the background
+pool. Both close connections that sit idle for 60 seconds, and both reuse their
+most recently used connection first, so a burst's extra connections close once
+it is over.
+
+| Holder | Count | Held |
+|---|---|---|
+| The call pool | up to `max_call_pool_size` (20) | opened as calls need them, closed after 60 s idle |
+| The background pool, when `staging` or `drain_threads` starts a client | `2N + 5` with both, `2N + 4` with drain threads only, `1` with staging only (`N` = `drain_threads`) | opened as the workers need them, closed after 60 s idle |
+| The staging worker's session (`staging: true`, while leading) | 1 | as long as it leads |
+| The `LISTEN` connection (`drain_threads` at least 1) | 1, shared by the drain threads and `self_check` | as long as the client runs |
+| The claim keep-alive (`drain_threads` at least 1) | up to 1, shared by the drain threads | while a claim outlives one heartbeat interval |
+| A paged drain's session per drain thread | up to `drain_threads` | while it pages through a share larger than its batch |
+| The attach session | 1 | during `connect` and `migrate` |
+
+The background pool is sized by the handle's roles and has no option: each
+drain thread holds at most two pooled connections at once (debug builds fail a
+test that exceeds it), and the rest of the client adds a fixed few. A standby
+holds no staging session; it opens a connection for a moment every 5 seconds to
+try the lock.
+
+A worker handle with `staging: true, drain_threads: 2` therefore holds a
+background pool of up to 9, and two connections that stay open for as long as
+it runs: the staging session and the `LISTEN`. When the work stops, the
+background pool shrinks to the one or two connections the idle drain threads'
+polls keep in use. On top of those come a heartbeat connection while a claim
+runs long, a session for each paged drain, and a call pool that empties when
+idle. Its worst case is 35 connections (20 + 9 + 1 + 1 + 1 + 2 + 1: call pool,
+background pool, session, `LISTEN`, keep-alive, two paged drains, attach); idle,
+it holds three or four.
+A handle at the defaults uses at most `max_call_pool_size`, plus one while it
+connects. A call pool of one connection still runs, but a few calls hold two or
+three connections while they run and would wait on themselves until
+`call_pool_wait_timeout`: keep it at 3 or more.
+
+**Threads.** A drain thread is a task on the background client's runtime,
+not an OS thread. The OS threads are each runtime's:
+
+| Runtime | Threads |
+|---|---|
+| The one a `BlockingTrellis` or binding handle services its calls on | 1 driving it + `worker_threads` |
+| The background client's, when `staging` or `drain_threads` starts one | 1 driving it + `worker_threads` |
+
+Rust's async `Trellis::connect` builds no runtime for its calls: they run on
+the caller's. `worker_threads` defaults to 2 in the bindings and to one per
+core in Rust's `TrellisOptions`. It also bounds how many of the client's
+staging and drain workers compute at once, however large `drain_threads` is,
+and since their work is I/O a small count is enough. So a binding handle at
+the defaults has 3 threads and a binding worker handle has 6, at any
+`drain_threads`. Each runtime also has Tokio's blocking pool, which starts
+threads on demand (DNS lookups while connecting, the client's shutdown) and
+ends them after 10 idle seconds. The bindings add a few of their own: the
+Elixir NIF starts one reply thread for the VM when it loads, and the Ruby
+binding runs each `connect` on a thread of its own until it returns, and a
+shutdown that was interrupted, or of a handle garbage-collected while
+connected, on another.
+
+**Memory.** Nothing caps a handle's memory in bytes. Its largest buffers
+belong to the drain threads, and each is capped by a count of rows:
+
+* a drain batch holds at most 100,000 folded changes, each with its row's old
+  and new images as text; a larger share is paged through in batches of
+  that size;
+* a build chunk covers at most 10,000 source rows;
+* a write to a target goes to the database in statements of at most 4,096
+  rows and 4 MiB.
+
+A worker handle's peak is therefore roughly `drain_threads` × 100,000 ×
+twice the average captured row's size, and more when a batch holds rows with large
+`jsonb` or `text` values. That is an estimate, not a bound. A handle at the
+defaults buffers only what one of its calls reads.
 
 ### What the staging worker needs from the database
 
@@ -260,18 +346,29 @@ own options, reads no environment variable. A value is read once, when the
 | `PGSSLMODE`, `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY` | TLS options for the connection string assembled from the `PG*` variables only; a connection string given explicitly is used as written ([TLS to Postgres](#tls-to-postgres)). | unset |
 | `TRELLIS_SCHEMA` | The schema holding the instance's catalog, ring and bookkeeping tables ([instance identity](instance-identity.md)). | `trellis` |
 | `TRELLIS_TARGET_SCHEMA` | The schema transform target tables are created in. It is independent of `TRELLIS_SCHEMA`, so a target never collides with a catalog object. | `public` |
-| `TRELLIS_POOL_MAX_SIZE` | The most physical connections the pool opens, as a positive integer. The producer, maintenance loop, heartbeat daemon, wake listener and a paged drain's `TEMP`-table session are dedicated connections outside the pool. | `20` |
-| `TRELLIS_POOL_WAIT_TIMEOUT_SECS` | Whole seconds a call waits for a free pooled connection before failing with a typed pool error rather than waiting forever. | `30` |
 
-A value that does not parse (`TRELLIS_POOL_MAX_SIZE=many`), or a schema name
-that is empty, holds a NUL byte or is over 63 bytes, is a configuration error at startup; it is not
+The call pool is not configured by environment variable. It is a handle option,
+next to `staging` and `drain_threads`:
+
+| Option | Meaning | Default |
+|---|---|---|
+| `max_call_pool_size` | The most physical connections the handle's call pool opens, at least 1. The background pool is sized by the handle's roles, not by this; the staging session, the `LISTEN`, the claim keep-alive and a paged drain's session are outside both pools ([what a handle uses](#what-a-handle-uses)). | `20` |
+| `call_pool_wait_timeout` (`call_pool_wait_timeout_ms` in Ruby and Elixir) | How long a call waits for a free call-pool connection before failing with a connectivity error rather than waiting forever. A call's own 30-second deadline can cut the wait short. | 30 seconds |
+
+In Rust they are `TrellisOptions::max_call_pool_size` and
+`TrellisOptions::call_pool_wait_timeout`; Ruby's `Trellis.connect` and
+`Trellis::Instance.connect` take `max_call_pool_size:` and
+`call_pool_wait_timeout_ms:`, and Elixir's `Trellis.connect` takes
+`:max_call_pool_size` and `:call_pool_wait_timeout_ms`.
+
+A schema name that is empty, holds a NUL byte or is over 63 bytes, is a configuration error at startup; it is not
 ignored. An empty connection string, passed or in `TRELLIS_DATABASE_URL`, fails
 at startup naming the variables it looked for.
 
 ## TLS to Postgres
 
 Every connection Trellis opens to Postgres (both pools, the `LISTEN`
-connections, the staging worker's and the drain threads' own) uses TLS as
+connection, the staging worker's and the drain threads' own) uses TLS as
 the connection string asks. The options go in the string you pass as
 `--database-url` or `Config::from_dsn`, in either form: `key=value` pairs or
 a `postgres://` URL with the options as query parameters (percent-encode

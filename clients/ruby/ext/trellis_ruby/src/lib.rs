@@ -388,18 +388,21 @@ impl Handle {
     }
 
     /// The configuration the handle connected with, all but the connection
-    /// string (see [`PlainConfig`]).
+    /// string, and its call pool's limits (see [`PlainConfig`]).
     fn config(ruby: &Ruby, rb_self: &Self) -> Result<RHash, Error> {
-        let config = rb_self.with_engine(ruby, |trellis| PlainConfig::from(trellis.config()))?;
+        let config = rb_self.with_engine(ruby, |trellis| PlainConfig::from(trellis))?;
         record(
             ruby,
             [
                 ("schema", ruby.into_value(config.schema)),
                 ("target_schema", ruby.into_value(config.target_schema)),
-                ("pool_max_size", ruby.into_value(config.pool_max_size)),
                 (
-                    "pool_wait_timeout_ms",
-                    ruby.into_value(config.pool_wait_timeout_ms),
+                    "max_call_pool_size",
+                    ruby.into_value(config.max_call_pool_size),
+                ),
+                (
+                    "call_pool_wait_timeout_ms",
+                    ruby.into_value(config.call_pool_wait_timeout_ms),
                 ),
             ],
         )
@@ -433,6 +436,10 @@ impl Handle {
 ///
 /// Raises `Trellis::ForkedHandleError`, before starting anything, in a
 /// process forked while its parent had an engine running.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "`function!` binds each Ruby argument to its own parameter"
+)]
 fn connect(
     ruby: &Ruby,
     url: String,
@@ -441,6 +448,8 @@ fn connect(
     staging: bool,
     drain_threads: usize,
     worker_threads: usize,
+    max_call_pool_size: usize,
+    call_pool_wait_timeout_ms: u64,
 ) -> Result<Handle, Error> {
     engine::check().map_err(|err| forked_handle_error(ruby, forked_while_running(&err)))?;
     // Connecting can wait on the database (a staging worker installs its
@@ -460,6 +469,8 @@ fn connect(
                     staging,
                     drain_threads,
                     worker_threads: Some(worker_threads),
+                    max_call_pool_size,
+                    call_pool_wait_timeout: Duration::from_millis(call_pool_wait_timeout_ms),
                     ..Default::default()
                 };
                 // Can't fail after `check` passed (a process's answer never
@@ -1220,6 +1231,20 @@ fn statement_kinds() -> Vec<&'static str> {
         .collect()
 }
 
+/// The process-wide metrics registry in Prometheus text exposition format:
+/// `trellis::Metrics::render_prometheus`, the series of every handle in this
+/// process. It needs no handle.
+///
+/// The registry sits behind a lock the engine's threads take, so a process
+/// forked while its parent had an engine running may have inherited it held:
+/// rendering there raises `Trellis::ForkedHandleError`, as [`connect`] does,
+/// rather than risk the hang. Rendering is a short walk of the registry,
+/// so it keeps the GVL.
+fn render_prometheus(ruby: &Ruby) -> Result<String, Error> {
+    engine::check().map_err(|err| forked_handle_error(ruby, forked_while_running(&err)))?;
+    Ok(trellis::Metrics::new().render_prometheus())
+}
+
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
     // Interns every symbol a result can carry up front, from the closed
@@ -1229,7 +1254,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     }
 
     let native = ruby.define_module("Trellis")?.define_module("Native")?;
-    native.define_module_function("connect", function!(connect, 6))?;
+    native.define_module_function("connect", function!(connect, 8))?;
     native.define_module_function("error_codes", function!(error_codes, 0))?;
     native.define_module_function("status_names", function!(status_names, 0))?;
     native.define_module_function("quarantine_states", function!(quarantine_states, 0))?;
@@ -1241,6 +1266,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     native.define_module_function("capture_failure_kinds", function!(capture_failure_kinds, 0))?;
     native.define_module_function("index_roles", function!(index_roles, 0))?;
     native.define_module_function("statement_kinds", function!(statement_kinds, 0))?;
+    native.define_module_function("render_prometheus", function!(render_prometheus, 0))?;
 
     let handle = native.define_class("Handle", ruby.class_object())?;
     handle.define_method("owner_pid", method!(Handle::owner_pid, 0))?;

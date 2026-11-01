@@ -44,15 +44,14 @@ fn sorted_value_types(types: impl IntoIterator<Item = ValueType>) -> Vec<&'stati
 /// Every **value** column's scalar type appears both as a plain column and
 /// via a derivation.
 ///
-/// Improvement-plan task B1 widened the generator's whole type surface past
-/// Numeric-only (design doc §3): every table now also gets one `Text`, one
-/// `Boolean`, and one `Uuid` column, each with its own identity-passthrough
+/// The generator's type surface goes past Numeric-only (design doc §3):
+/// every table also gets one `Text`, one `Boolean`, and one `Uuid` column, each with its own identity-passthrough
 /// field (`SELECT <col> AS <col>`) on every def sourced from that table — see
 /// `generate::build_program_multi`'s doc comment. This test's whole point is
 /// to fail loudly the day a scalar type is added to the generated schema
 /// without a matching derivation landing alongside it — exactly the
 /// "coverage that silently drops out" the design doc warns about — so its
-/// expected-surface assertion is widened here, not weakened or dropped.
+/// expected surface grows with the schema, never weakened or dropped.
 ///
 /// The **primary-key** column is excluded, and that exclusion is the
 /// assertion's shape, not a hole in it: the pk exists to be a *key*, and its
@@ -80,7 +79,7 @@ fn every_column_scalar_type_appears_via_a_derivation() {
     assert_eq!(
         def.fields.len(),
         4,
-        "expected `total` plus one passthrough field per new column (task B1)"
+        "expected `total` plus one passthrough field per new column"
     );
     let mut derivation_types_raw = Vec::new();
     for field in &def.fields {
@@ -142,12 +141,11 @@ fn collect_column_types(expr: &Expr, source: &Table, out: &mut Vec<ValueType>) {
 }
 
 /// `build_program`'s fixed `total = c1 + c2` field (unaffected by
-/// improvement-plan task B2's new "derived" field — see
+/// the "derived" field — see
 /// `generate::build_program_multi_with_derived`'s doc comment, which layers
 /// on top of `build_program_multi` rather than changing its output) still
-/// draws exactly `Operator::Add` over `Numeric, Numeric`, unchanged from
-/// before task B2. `Operator::GreaterThan` is drawn too now, but only by the
-/// proptest strategy's independent `derived` field — see
+/// draws exactly `Operator::Add` over `Numeric, Numeric`.
+/// `Operator::GreaterThan` is drawn too, but only by the proptest strategy's independent `derived` field — see
 /// `trivial_program_sometimes_draws_greater_than` below for that floor.
 #[test]
 fn every_supported_operator_appears_over_every_supported_argument_type() {
@@ -183,7 +181,7 @@ fn every_supported_operator_appears_over_every_supported_argument_type() {
 
 /// `table`'s grain column name in `program`, if `table` is one of
 /// `program`'s tables. Every table gets a grain column unconditionally
-/// (improvement-plan task B4) at a fixed position (`Table::new`'s
+/// at a fixed position (`Table::new`'s
 /// `columns[6]` — see `generate::build_program_multi_with_shapes`'s doc
 /// comment on that index), and `generate::strategy::grain_value` draws an
 /// occasional `NULL` for it *unconditionally*, independent of the
@@ -202,7 +200,7 @@ fn grain_column(program: &Program, table: &str) -> Option<String> {
 /// [`grain_column`] — it draws `NULL` unconditionally, independent of
 /// `awkward_values`, so it isn't part of what this helper's callers are
 /// checking). Ignores `Op::Delete`/`Op::Truncate` (neither carries a field
-/// value — improvement-plan task E6's `Truncate` is exactly as value-free as
+/// value — the `Truncate` is exactly as value-free as
 /// `Delete` here).
 fn all_op_values(program: &generative::model::Program) -> Vec<Option<String>> {
     let not_grain = |table: &str, name: &str| grain_column(program, table).as_deref() != Some(name);
@@ -281,7 +279,7 @@ fn awkward_values_on_sometimes_draws_null() {
     );
 }
 
-/// A grouping (grain) value's `NULL` draw (improvement-plan task B4)
+/// A grouping (grain) value's `NULL` draw
 /// actually appears, and does so **regardless of `awkward_values`** —
 /// unlike every other awkward-value column, `generate::strategy::grain_value`
 /// is not gated by the flag (see `trivial_program_with`'s doc comment), so
@@ -343,7 +341,7 @@ fn trivial_program_sometimes_draws_a_duplicate_pk_insert() {
 }
 
 /// Whether any table in `program` has two inserts at the same pk. Keyed by
-/// `(table name, pk)`, not pk alone: since B3 (improvement-plan), a program
+/// `(table name, pk)`, not pk alone: a program
 /// can draw multiple tables, and every table's seeded pks independently
 /// start at 1 (see `generate::tests::pk_liveness_multi_table`) — table A's
 /// pk 1 and table B's pk 1 are two different rows, not a duplicate, so
@@ -447,9 +445,9 @@ fn duplicate_insert_is_a_distinct_mutate_from_update_and_delete() {
     assert!(matches!(program.ops[1], Op::Insert { .. }));
 }
 
-/// Improvement-plan task A2: the [`Coverage`] accumulator's floors — no
+/// The [`Coverage`] accumulator's floors — no
 /// database, no `Harness`, just the default strategy sampled many times, same
-/// as every other test in this file. This is the fast half of A2's payoff: if
+/// as every other test in this file. This is the fast half of the coverage accumulator's payoff: if
 /// the generator's own machinery ever stopped drawing one of these shapes (a
 /// `Delete`, a genuinely-failing op, a zero-row no-op, `+`, a numeric column, a
 /// `OneToOne` def), this test would catch it in milliseconds, without ever
@@ -468,7 +466,7 @@ fn a_real_run_of_the_default_strategy_meets_its_coverage_floors() {
             .expect("strategy must produce a value")
             .current();
 
-        // Improvement-plan task B1: unlike NULL/duplicate-insert (genuinely
+        // Unlike NULL/duplicate-insert (genuinely
         // probabilistic, checked only in aggregate below), every table
         // always gets one Text/Boolean/Uuid column — so this is checked on
         // *every* sampled program, not just "at least one of 500", the
@@ -516,7 +514,7 @@ fn a_real_run_of_the_default_strategy_meets_its_coverage_floors() {
         );
     }
 
-    // Improvement-plan task B1: every table always gets one Text, one
+    // Every table always gets one Text, one
     // Boolean, and one Uuid column (not a probabilistically-drawn shape like
     // NULL/duplicate-insert above), so these are an unconditional floor —
     // "every single sample", not "at least one of 500" — over 500 samples of
@@ -546,14 +544,13 @@ fn a_real_run_of_the_default_strategy_meets_its_coverage_floors() {
     );
 }
 
-/// Improvement-plan task B3: the default strategy must sometimes draw more
+/// The default strategy must sometimes draw more
 /// than one source table — sampled the same way as
 /// `awkward_values_on_sometimes_draws_null`/
-/// `trivial_program_sometimes_draws_a_duplicate_pk_insert` above. Before B3
-/// this was structurally impossible (`build_program` always built exactly
-/// one table); this is the coverage meta-test that would catch B3's widening
-/// silently regressing back to always-one (design doc §3 "coverage that
-/// silently drops out").
+/// `trivial_program_sometimes_draws_a_duplicate_pk_insert` above. A single-table
+/// generator could never draw this; this is the coverage meta-test that would
+/// catch the multi-table widening silently regressing back to always-one (design doc §3 "coverage
+/// that silently drops out").
 #[test]
 fn trivial_program_sometimes_draws_more_than_one_table() {
     let mut runner = TestRunner::default();
@@ -571,7 +568,7 @@ fn trivial_program_sometimes_draws_more_than_one_table() {
     );
 }
 
-/// The definition-count half of B3's coverage floor: the default strategy
+/// The definition-count half of the multi-table coverage floor: the default strategy
 /// must sometimes draw more than one definition in the same program
 /// (whether or not those definitions share a source table — this test only
 /// asserts the count, not the fan-out shape).
@@ -593,7 +590,7 @@ fn trivial_program_sometimes_draws_more_than_one_definition() {
 }
 
 /// Both "two defs sharing one source table" and "defs spread across
-/// different source tables" must be reachable — B3's stated goal is that
+/// different source tables" must be reachable — the goal is that
 /// neither shape is forced out by the other. Sampled together (rather than
 /// as two separate single-shape tests) so a single 500-sample run has to
 /// produce both, matching how the strategy actually draws (independently,
@@ -636,7 +633,7 @@ fn trivial_program_sometimes_draws_defs_sharing_a_source_and_sometimes_draws_def
     );
 }
 
-/// Improvement-plan task B2: the default strategy's new "derived" field
+/// The default strategy's new "derived" field
 /// (`generate::DerivedShape`) must sometimes draw `Operator::GreaterThan` —
 /// sampled the same way as every other genuinely-probabilistic floor above
 /// (many samples, not every sample: which expression a def draws is random).
@@ -691,7 +688,7 @@ fn trivial_program_draws_every_scalar_function_at_least_once() {
     }
 }
 
-/// Improvement-plan task B2: the default strategy must sometimes draw a
+/// The default strategy must sometimes draw a
 /// nested (depth >= 3) expression tree — e.g. `(c1 + c2) > c1` or
 /// `STRPOS(text_col, 'x') > 0` — not just the single-operator/single-function
 /// leaves a shallow draw (and `total`) gives. `Coverage::max_expr_depth` is the accumulator this asserts
@@ -787,9 +784,9 @@ fn trivial_program_draws_exactly_the_admitted_aggregate_set() {
     }
 }
 
-/// The key-space half of B4's coverage floor: the default strategy must
+/// The key-space half of the aggregate coverage floor: the default strategy must
 /// sometimes draw a `KeySpace::Aggregate` definition at all (not just
-/// `OneToOne`, the only shape before this task) — sampled the same way as
+/// `OneToOne`) — sampled the same way as
 /// `trivial_program_sometimes_draws_more_than_one_table` above.
 #[test]
 fn trivial_program_sometimes_draws_an_aggregate_key_space() {
@@ -883,7 +880,7 @@ fn program_has_null_first_row_sum_avg_arg(program: &Program) -> bool {
     false
 }
 
-/// Workstream E, task E1: `noise_plan_for` must sometimes draw a non-empty
+/// `noise_plan_for` must sometimes draw a non-empty
 /// plan at all (as opposed to always drawing zero events, which would make
 /// `tests/noise.rs`'s property vacuous) — sampled at a representative op
 /// count (4, `generate::MAX_MUTATES`'s own ceiling) the same way every other
@@ -905,14 +902,13 @@ fn noise_plan_for_sometimes_draws_at_least_one_event() {
     );
 }
 
-/// E1: every [`NoiseAction`] variant — both DML (`Insert`/`Update`/`Delete`)
+/// Every [`NoiseAction`] variant — both DML (`Insert`/`Update`/`Delete`)
 /// and DDL (`AddColumn`/`DropColumn`) — must be reachable across enough
 /// samples, matching this suite's own "every shape reachable across a
 /// bounded number of samples" convention (e.g.
 /// `trivial_program_draws_every_scalar_function_at_least_once` above). If
-/// `AddColumn`/`DropColumn` silently stopped being drawn, the DDL half of
-/// E1's "ideally also some DDL" ask would quietly regress to DML-only noise
-/// without any test noticing.
+/// `AddColumn`/`DropColumn` silently stopped being drawn, the noise would
+/// quietly regress to DML-only without any test noticing.
 #[test]
 fn noise_plan_for_draws_every_action_variant_across_enough_samples() {
     let mut runner = TestRunner::default();
@@ -965,7 +961,7 @@ fn noise_plan_for_draws_every_action_variant_across_enough_samples() {
     );
 }
 
-/// E1: `noise_plan_for` must sometimes draw an event at position `0` (fires
+/// `noise_plan_for` must sometimes draw an event at position `0` (fires
 /// before any real op) and sometimes at the last legal position (`op_count`,
 /// fires after the very last real op) — both ends of the interleaving range
 /// need real coverage, not just the middle.
@@ -1001,10 +997,10 @@ fn noise_plan_for_sometimes_fires_at_both_ends_of_the_op_stream() {
     );
 }
 
-/// Workstream E, task E5: `checkpoint_plan_for` must sometimes draw at least
+/// `checkpoint_plan_for` must sometimes draw at least
 /// one `CHECKPOINT` event (not always zero, which would make
 /// `tests/noise.rs`'s checkpoint property vacuous), and every drawn event
-/// must actually be the `CHECKPOINT` admin statement (task E5's whole
+/// must actually be the `CHECKPOINT` admin statement (the whole
 /// point), never a `Table(..)` event (this plan never installs a table at
 /// all).
 #[test]
@@ -1042,7 +1038,7 @@ fn checkpoint_plan_for_sometimes_draws_at_least_one_checkpoint() {
     );
 }
 
-/// Improvement-plan task E2's coverage floor: `program_with_mid_stream_def_install`
+/// The coverage floor: `program_with_mid_stream_def_install`
 /// must actually draw a deferred install (a nonzero `def_install_after_op`
 /// entry) across enough samples — sampled the same way as
 /// `trivial_program_sometimes_draws_more_than_one_table` above, via the
@@ -1067,7 +1063,7 @@ fn mid_stream_def_installs_actually_get_drawn() {
     );
 }
 
-/// Improvement-plan task E3's coverage floor, restart half:
+/// The coverage floor, restart half:
 /// `program_with_client_restart` must actually schedule a restart across
 /// enough samples.
 #[test]
@@ -1089,7 +1085,7 @@ fn client_restarts_actually_get_drawn() {
     );
 }
 
-/// Improvement-plan task E3's coverage floor, scale-out half: same shape as
+/// The coverage floor, scale-out half: same shape as
 /// `client_restarts_actually_get_drawn` above, over `program_with_scale_out`.
 #[test]
 fn client_scale_outs_actually_get_drawn() {
@@ -1110,7 +1106,7 @@ fn client_scale_outs_actually_get_drawn() {
     );
 }
 
-/// Improvement-plan task E6's coverage floor, TRUNCATE half: the *default*
+/// The coverage floor, TRUNCATE half: the *default*
 /// strategy (`trivial_program`, not a dedicated one — `Mutate::Truncate` is
 /// drawn by the same shared `mutate()` strategy every other `Mutate` variant
 /// is) must sometimes draw a `Truncate` op across enough samples.
@@ -1132,7 +1128,7 @@ fn trivial_program_sometimes_draws_a_truncate() {
     );
 }
 
-/// Improvement-plan task E6's coverage floor, bulk-insert half:
+/// The coverage floor, bulk-insert half:
 /// `bulk_insert_program`'s row-count dimension must actually get
 /// meaningfully large (not just "sometimes more than 1") across its shrink
 /// range — sampled the same way as the other floor tests above, checking

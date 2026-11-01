@@ -105,7 +105,7 @@ use crate::capture::{CaptureError, partitions};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::regclass_arg;
 use crate::defs::hierarchy::{self, Hierarchy};
-use crate::defs::model::{Definition, TransformStatus};
+use crate::defs::model::{Definition, StoredStatus};
 use crate::defs::row_security::{self, RowSecurity};
 use crate::defs::subscription::{self, Subscribed};
 use crate::staging::append::RING_SIZE;
@@ -286,10 +286,7 @@ pub async fn audit(
     schema: &str,
     def: &Definition,
 ) -> Result<Vec<CaptureFault>, CatalogError> {
-    if !matches!(
-        def.status,
-        TransformStatus::Backfilling | TransformStatus::CatchingUp | TransformStatus::Live
-    ) {
+    if !matches!(def.status, StoredStatus::Backfilling | StoredStatus::Live) {
         return Ok(Vec::new());
     }
     let mut faults = Vec::new();

@@ -60,25 +60,23 @@ made outside a drain) stay `NULL`.
 > path that sets `origin_lsn` higher than the oldest un-reflected trigger — i.e.
 > forgets the LEAST-merge — silently breaks read-your-writes.
 
-## The trap: do not consult the summary band
+## The trap: no per-batch summary band
 
-The seal computes a per-batch summary band (`min_origin_lsn`, `max_lsn`) in its
-phase-1 flip. Using it in the predicate is the obvious optimization — one indexed
-comparison per batch instead of a scan — and it is **wrong**. The band is aggregated
-*inside* the flip transaction, so it describes the rows *that transaction* could see,
-not the slot. Two writers land outside it:
+The ring keeps no per-batch summary of origin positions (a `min_origin_lsn`,
+`max_lsn` pair). A predicate built on one is the obvious optimization — one indexed
+comparison per batch instead of a scan — and it is **wrong**. A band aggregated in
+the seal's phase-1 flip would run *inside* the flip transaction, so it would describe
+the rows *that transaction* could see, not the slot. Two writers land outside it:
 
 - a **straddler** — invisible in `S_k`, claimed by batch *k+1*
   ([03](03-sealing-and-the-fence.md));
 - a **phase-gap writer** — commits between the flip's commit and the later snapshot
   capture, so it *is* visible in `S_k` and batch *k* claims it.
 
-Each surfaces as a false `converged`. Condition 3 **asks the slot**, so it replaces
-the whole pile and cannot disagree with the other pending readers.
-
-Nothing reads the band: it is not an observability surface. Finalizing it at
-snapshot capture wouldn't make it honest either: a snapshot-time aggregate still
-can't see a straddler, so it would sit *beside* a straddler term — the shape that leaked.
+Each would surface as a false `converged`. Condition 3 **asks the slot**, so it needs
+no band and cannot disagree with the other pending readers. A band finalized at
+snapshot capture would not be honest either: a snapshot-time aggregate still can't see
+a straddler, so it would sit *beside* a straddler term — the shape that leaks.
 
 **"Narrowing condition 3" is a recurring, unsound temptation** — drained-only,
 straddler-only, band-only all admit a false `converged`. Buy the honest question back
@@ -115,50 +113,51 @@ crosses. The two conditions get there differently, both load-bearing:
 | Question | Shape | Cost | Use |
 |---|---|---|---|
 | "has my token converged?" | the four conditions, one statement | cheap — index-served | the await poll |
-| "is anything pending at all?" | `EXISTS`, short-circuits on first pending row | cheapest | any polled gate |
+| "is anything pending at all?" | `EXISTS`, short-circuits on first pending row | cheapest | a polled gate (`has_pending`, test and harness builds) |
 | "how much is pending?" | `count(*)` over every slot plus quarantine | expensive — full scan | observability only, **never polled** |
 
 `pending_count` is linear in the ring and no index helps — there is no predicate to
-index away. It stays **off the polling path**: every polled consumer wants the
-sign, not the number, so the sign is its own question. One asymmetry in the
-`EXISTS` form: `true` short-circuits, `false` does not — it is a gate ("has my work
-drained?"), not a work-arrival poll.
+index away. It stays **off the polling path**: the engine's await polls the token
+predicate, and a polled consumer wants the sign, not the number, so the sign is its
+own question. One asymmetry in the `EXISTS` form: `true` short-circuits, `false` does
+not — it is a gate ("has my work drained?"), not a work-arrival poll.
 
-## "A round did no work" is not the same question
+## What the await waits for
 
-A loop that drains until a round claims nothing is ambiguous: a zero-work round means
-*idle*, **or** the claim was **refused** — seal-gate backpressure
-([03](03-sealing-and-the-fence.md)), a lost seal race, or a sealed batch another
-worker holds. The idle sweep makes no progress in the refused cases, so "claimed
-nothing and the sweep did nothing" is not convergence. Split it:
+`await_converged(client, token, timeout)` polls the predicate on the caller's
+connection, with a backoff that starts at 5 ms and doubles to a 250 ms ceiling. It
+drains nothing and claims nothing: the engine's workers do that, and the poll only
+reads. Each poll runs under a server-side `statement_timeout` of the remaining budget
+(never less than a floor, so a zero timeout still makes one real check), so a poll
+that blocks on a lock cannot overrun the deadline by more than the floor. The poll
+returns when the predicate reads `true`; anything else, including a result it cannot
+read, means "not yet".
 
-| Zero round | Meaning | Action |
-|---|---|---|
-| nothing drainable pending anywhere | converged | return |
-| the sweep freed something | more to do | loop |
-| pending **and** sealable here | this connection's seal is refused | wait in short steps against a bounded budget, then a **named backpressure error** — never a generic "values are not stabilizing", which would point at a schema cycle that does not exist |
-| pending and not sealable here | a peer holds the batch | wait; bounded by the peer finishing, or the claim TTL if it died. Timing out names the *holder*, not a cycle |
+A poll that does not converge in time ends in `ConvergenceTimeout`, carrying the token
+and how long it waited, and it is a timeout (retryable), not a verdict about the
+schema. It does not say *why* the token has not cleared. The predicate does not
+distinguish an idle ring from a refused or contended one: while a row at or below the
+token is un-applied it reads "not yet", whether the batch is waiting for a seal, held
+by a worker that is applying it, or held by a worker that died and awaits the reclaim
+TTL ([06](06-cleanup-and-reclaim.md)). It is the caller's budget that bounds the wait.
 
-**Convergence is cluster-wide**, deliberately: the check reads the registry and every
-slot and does not care which worker holds a claim. A peer that *stalls* makes this
-wait; a peer that *dies* is bounded by the reclaim TTL. Chosen over the cheaper "this
-connection drained what it could claim" because the production caller is backfill,
-whose contract *is* cluster-wide.
+**Convergence is cluster-wide**, deliberately: the predicate reads the pointer and
+every slot and does not care which worker holds a claim. A peer that *stalls* makes the
+wait longer; a peer that *dies* is bounded by the reclaim TTL.
 
-**The one exclusion is parked quarantine work, reported rather than swallowed.**
-Parked work is un-applied work no worker will ever claim — only an operator release
-or the transform's resume clears it — so a gate that waited on it would hang with no peer to finish it,
-turning a quarantine into a wedge. It is dropped as a whole **arm**, never by
-narrowing the shared row predicate, and the outstanding count is carried back so the
-result is explicitly partial. Note the asymmetry: the *drain-to-convergence helper*
-excludes parked work so it can terminate, while `has_pending` and the await predicate
-**still count it**, because a quarantined key must keep blocking a caller waiting on
-its band.
+**Parked quarantine work is counted.** Condition 4 holds the wait for a parked row at
+or below the token, because that work is un-applied: a quarantined key keeps blocking
+a caller waiting on its band until an operator release or the transform's resume
+clears it. `await_converged_for` narrows condition 4 to one transform's held keys,
+since a key another transform holds is applied by this one as usual. The ring's pending
+rows (conditions 2 and 3) count in full either way.
 
-## An observability view, distinct from the fenced read
+## No loose view feeds the predicate
 
-Exposing "every pending row" is useful — Trellis uses it for its self-check auditor's
-exemption map and its overdue-work battery. That view is a **read view, not a fenced
-one**: it can include a straggler the fold will attribute to a later batch.
-Over-exempting and over-reporting are both conservative here. Keep it clearly separate
-from the fenced claim path so nobody wires the loose one into the strict one.
+A read of "every pending ring row" that is not fenced can include a straggler the fold
+will attribute to a later batch. Over-exempting and over-reporting are both
+conservative for a consumer that subtracts or reports unapplied rows, so
+`self_check` reads the source's unapplied ring rows with its own predicate to subtract
+them from a comparison (ADR-0013, "Quiescence"). That read is never wired into
+`converged_through` or any other fenced read: the strict predicate above and a loose
+view stay separate.

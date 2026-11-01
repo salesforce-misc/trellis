@@ -38,6 +38,7 @@ function Applied::into_transform
 function ApplyError::code
 function BlockingTrellis::apply
 function BlockingTrellis::await_converged
+function BlockingTrellis::call_pool_wait_timeout
 function BlockingTrellis::config
 function BlockingTrellis::connect
 function BlockingTrellis::definitions
@@ -45,6 +46,7 @@ function BlockingTrellis::detect_capture_disruptions
 function BlockingTrellis::dump_definitions_sql
 function BlockingTrellis::has_live_drain_workers
 function BlockingTrellis::has_live_staging_worker
+function BlockingTrellis::max_call_pool_size
 function BlockingTrellis::metrics
 function BlockingTrellis::migrate
 function BlockingTrellis::poisoned_since
@@ -87,13 +89,9 @@ function ClientError::code
 function ClientOptions::wake_channel_for
 function Config::dsn
 function Config::from_dsn
-function Config::pool_max_size
-function Config::pool_wait_timeout
 function Config::resolve
 function Config::schema
 function Config::target_schema
-function Config::with_pool_max_size
-function Config::with_pool_wait_timeout
 function Config::with_schema
 function Config::with_target_schema
 function DdlError::code
@@ -107,8 +105,13 @@ function Metrics::new
 function Metrics::render_prometheus
 function ParseError::code
 function PendingCall::wait
+function Pool::close_idle
+function Pool::counts
 function Pool::get
+function Pool::max_size
 function Pool::new
+function Pool::wait_timeout
+function Pool::with_limits
 function PooledClient::build_transaction
 function PooledClient::transaction
 function QuarantineState::as_str
@@ -127,7 +130,6 @@ function TransactionBuilder::isolation_level
 function TransactionBuilder::read_only
 function TransactionBuilder::start
 function TransformStatus::as_str
-function TransformStatus::from_persisted
 function TransformStatus::is_frozen
 function Trellis::apply
 function Trellis::await_converged

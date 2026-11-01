@@ -68,7 +68,7 @@ pub trait Backend {
     fn snapshot(&mut self) -> impl Future<Output = Result<Snapshot, Self::Error>> + Send;
 
     /// Simulates an ungraceful crash-and-restart of the backend's primary
-    /// engine client (improvement-plan task E3): tears down whatever is
+    /// engine client: tears down whatever is
     /// currently running it and starts a fresh one against the same target.
     /// The ring is durable Postgres state, not in-memory, so a fresh client
     /// is expected to pick back up exactly where the crashed one left off:
@@ -79,7 +79,7 @@ pub trait Backend {
     /// dropping it — `Drop`'s shutdown signal is best-effort and doesn't
     /// join the background thread, so a bare drop-then-restart could race
     /// the old producer's advisory-lock release against the new producer's
-    /// acquire and spuriously fail with `ProducerAlreadyRunning`; no
+    /// acquire and come up as a standby, taking the lock only at its next poll; no
     /// subprocess/`SIGKILL` machinery is needed there either way.
     /// [`SubprocessBackend`] does the real thing: `SIGKILL`s the
     /// actual OS process, *waits for it to actually exit* and then for
@@ -92,7 +92,7 @@ pub trait Backend {
     /// running, application-worker-only (never a second staging worker —
     /// see `trellis::client`'s module doc comment: exactly one staging worker
     /// per fleet), demonstrating multiple clients can coexist draining the
-    /// same ring (improvement-plan task E3).
+    /// same ring.
     fn scale_out(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 

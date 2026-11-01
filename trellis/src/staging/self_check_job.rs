@@ -368,8 +368,8 @@ async fn report_of(
                 .get::<_, Option<&str>>(7)
                 .expect("a not_live job saved the status it found");
             SelfCheckOutcome::NotLive(
-                TransformStatus::from_persisted(status)
-                    .expect("self_check_jobs.not_live_status held a status"),
+                TransformStatus::from_word(status)
+                    .expect("a not_live job saved a reported status word"),
             )
         }
         other => panic!("a done self_check job held outcome {other:?}"),
@@ -938,7 +938,7 @@ mod tests {
     fn a_page_that_is_not_a_comparison_ends_the_walk_without_a_verdict() {
         for stopped in [
             SelfCheckOutcome::NotCaughtUp,
-            SelfCheckOutcome::NotLive(TransformStatus::Paused),
+            SelfCheckOutcome::NotLive(crate::defs::TransformStatus::Paused),
         ] {
             let mut progress = Progress::default();
             let finish = finished(fold_page(

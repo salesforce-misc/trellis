@@ -1,4 +1,4 @@
-//! Improvement-plan task D2: order-insensitivity over commuting ops.
+//! Order-insensitivity over commuting ops.
 //!
 //! `generative::generate`'s commutation analysis (`ops_commute`/
 //! `commute_groups`/`reordered_by_commute_groups`, see that module's doc
@@ -117,7 +117,7 @@ fn run_one(program: &Program) -> Result<(), TestCaseError> {
 proptest! {
     #![proptest_config(proptest_config())]
 
-    /// D2's property: reordering ops across distinct target keys must not
+    /// The property: reordering ops across distinct target keys must not
     /// change the converged state.
     #[test]
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
@@ -126,7 +126,7 @@ proptest! {
     }
 }
 
-/// Improvement-plan task D2 item 3: a coverage floor confirming the generator
+/// A coverage floor confirming the generator
 /// actually produces programs where `reordered_by_commute_groups` does
 /// something non-trivial often enough for the property above to be non-vacuous.
 /// If every generated program had only one op, or every op shared one target
@@ -154,7 +154,7 @@ fn trivial_program_sometimes_has_ops_with_genuinely_distinct_target_keys() {
     );
 }
 
-/// D2 item 4: a hand-built pin. Two independent ops on two different pks of
+/// A hand-built pin. Two independent ops on two different pks of
 /// the same table — a `Delete` of pk 1 and an `Update` of pk 2 — applied in
 /// reverse relative order, must converge identically. Built directly (not
 /// through `reordered_by_commute_groups`) so this is a legible, from-first-

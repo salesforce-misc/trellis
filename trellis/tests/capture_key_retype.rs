@@ -135,13 +135,11 @@ async fn run_backfill_chunks(pool: &trellis::Pool) {
     trellis::staging::build::settle_builds(pool).await;
 }
 
-/// Whether `status` is a rebuild's: the Re-derive build's own, or a reader's
-/// of a rebuilding upstream (reported `catching_up`).
+/// Whether a stored `status` is a rebuild's: the Re-derive build's own. (A
+/// reader of a rebuilding upstream stays stored `live`; it only reports
+/// `catching_up`.)
 fn rebuilding(status: TransformStatus) -> bool {
-    matches!(
-        status,
-        TransformStatus::CatchingUp | TransformStatus::Backfilling
-    )
+    status == TransformStatus::Backfilling
 }
 
 async fn status(raw: &Client, target: &str) -> TransformStatus {
@@ -153,7 +151,7 @@ async fn status(raw: &Client, target: &str) -> TransformStatus {
         .await
         .expect("read status")
         .get(0);
-    TransformStatus::from_persisted(&text).expect("known status")
+    trellis::defs::StoredStatus::from_row(&text).into()
 }
 
 /// Alternates staging-worker passes and drains until every one of

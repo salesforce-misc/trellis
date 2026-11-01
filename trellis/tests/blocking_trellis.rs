@@ -164,6 +164,33 @@ fn define_returns_before_backfill_completes() {
     trellis.shutdown().expect("shutdown (sync)");
 }
 
+/// The call pool's limits read back as the handle built its pool, not as
+/// the defaults: what the bindings' `config` reports.
+#[test]
+fn the_call_pool_limits_read_back_as_connected() {
+    let cluster = TestCluster::start();
+    let setup_runtime = tokio::runtime::Runtime::new().expect("build scratch setup runtime");
+    let db = setup_runtime.block_on(cluster.create_empty_database());
+    drop(setup_runtime);
+
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let trellis = BlockingTrellis::connect(
+        config,
+        TrellisOptions {
+            max_call_pool_size: 7,
+            call_pool_wait_timeout: Duration::from_millis(2_500),
+            ..TrellisOptions::default()
+        },
+    )
+    .expect("connect (sync)");
+    assert_eq!(trellis.max_call_pool_size(), 7);
+    assert_eq!(
+        trellis.call_pool_wait_timeout(),
+        Duration::from_millis(2_500)
+    );
+    trellis.shutdown().expect("shutdown (sync)");
+}
+
 /// A `BlockingTrellis` method called from a thread that already has a
 /// `tokio` runtime entered must return
 /// [`TrellisError::CalledFromAsyncContext`] rather than panicking —

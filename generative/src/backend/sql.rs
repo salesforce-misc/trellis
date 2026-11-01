@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use trellis::dev::defs::TransformStatus;
+use trellis::dev::defs::StoredStatus;
 use trellis::dev::defs::ast::{
     Expr, FieldDef, JoinKind, KeySpace, Operator, Predicate, QualifiedColumn, TransformDef,
     ValueType,
@@ -694,7 +694,7 @@ async fn apply_write(
             raw.execute(&sql, &[pk]).await?
         }
         Op::Truncate { table, .. } => {
-            // Improvement-plan task E6's load-bearing gotcha: Postgres's
+            // The load-bearing gotcha: Postgres's
             // `TRUNCATE` command tag always reports `0` rows affected,
             // regardless of how many rows actually existed — trusting that
             // raw count into `run_convergence`'s `Ok(0) => AffectsNoRows`
@@ -916,9 +916,7 @@ async fn unsettled_definitions(
             continue;
         };
         let status_text: String = row.get(0);
-        let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-            panic!("transform_definitions.status held unrecognized value '{status_text}'")
-        });
+        let status = StoredStatus::from_row(&status_text);
         // `Paused` joins the terminal set for the same reason `Quarantined`
         // is in it: a frozen definition never progresses on its
         // own, so waiting for it to settle any further is waiting forever.
@@ -926,7 +924,7 @@ async fn unsettled_definitions(
         // ever does, the wait fails its assertion rather than hanging.
         if !matches!(
             status,
-            TransformStatus::Live | TransformStatus::Quarantined | TransformStatus::Paused
+            StoredStatus::Live | StoredStatus::Quarantined | StoredStatus::Paused
         ) {
             unsettled.push(def.target.clone());
         }

@@ -13,9 +13,12 @@
 //! Two independent knobs, per the constructor contract:
 //!
 //! - `staging_worker: bool` — whether this client also owns capture
-//!   installation and ring maintenance. Exactly one client in a fleet should
-//!   set this; every other client (any number of them, across any number of
-//!   processes) sets only `application_threads`.
+//!   installation and ring maintenance. Any number of clients may set it:
+//!   one takes the instance's producer lock and leads, the rest stand by,
+//!   polling for the lock every few seconds, and take over when the leader
+//!   goes away. A fleet needs at least one; the clients that only drain
+//!   (any number, across any number of processes) set only
+//!   `application_threads`.
 //! - `application_threads: usize` — how many app-worker tasks this client
 //!   runs, each independently claiming and draining sealed batches. Zero is
 //!   legal: a staging-only client stages and seals but drains nothing.
@@ -75,8 +78,9 @@ use crate::staging::{
 #[derive(Debug, Clone)]
 pub struct ClientOptions {
     /// Whether this client owns capture installation and ring maintenance
-    /// (seal/recover/reclaim). Exactly one client in a fleet should set
-    /// this.
+    /// (seal/recover/reclaim). Any number of clients may set this: one
+    /// takes the producer lock and leads, the rest stand by and take over
+    /// when it goes away. A fleet needs at least one.
     pub staging_worker: bool,
     /// How many independent application-worker tasks this client runs.
     /// Zero is legal — a staging-only client.
@@ -189,7 +193,7 @@ pub struct ClientOptions {
     /// A share over the cap is folded once into a session `TEMP` table on a
     /// Postgres connection the drain opens outside the pool and closes when
     /// it finishes, so while paging a client holds up to
-    /// `application_threads` connections beyond `pool_max_size`. Leave that
+    /// `application_threads` connections beyond its pools. Leave that
     /// headroom under the server's `max_connections`: without it, an
     /// oversized share fails to connect, is released, and retries each poll.
     pub drain_batch_cap: usize,
@@ -581,7 +585,13 @@ impl Client {
                         return;
                     }
                 };
-                runtime.block_on(run(dsn, config, options, shutdown_rx, ready_tx));
+                runtime.block_on(crate::pool::count_background_connections(run(
+                    dsn,
+                    config,
+                    options,
+                    shutdown_rx,
+                    ready_tx,
+                )));
             })
             .map_err(ClientError::Spawn)?;
 
@@ -725,7 +735,11 @@ async fn run(
     mut shutdown_rx: watch::Receiver<bool>,
     ready_tx: std::sync::mpsc::Sender<Result<(), ClientError>>,
 ) {
-    let pool = match Pool::new(&config) {
+    // Sized by this client's roles (see `crate::pool::background_pool_size`).
+    let pool_size =
+        crate::pool::background_pool_size(options.staging_worker, options.application_threads)
+            .unwrap_or(1);
+    let pool = match Pool::background(&config, pool_size) {
         Ok(pool) => pool,
         Err(err) => {
             let _ = ready_tx.send(Err(err.into()));
@@ -734,12 +748,16 @@ async fn run(
     };
 
     let mut staging_session = None;
+    let mut staging_standby = false;
     // One resolved name for every notify and every idle worker's `LISTEN`.
     let wake_channel = options.wake_channel_for(config.schema());
 
     if options.staging_worker {
         match setup_staging(&dsn, &config, &pool).await {
-            Ok(session) => staging_session = Some(session),
+            Ok(session) => {
+                staging_standby = session.is_none();
+                staging_session = session;
+            }
             Err(err) => {
                 let _ = ready_tx.send(Err(err));
                 return;
@@ -748,12 +766,13 @@ async fn run(
     }
 
     let mut maintenance_task = None;
-    if let Some(session) = staging_session {
+    if options.staging_worker {
         let maintenance_config = MaintenanceConfig {
             dsn: dsn.clone(),
             schema: config.schema().to_string(),
             pool: pool.clone(),
-            session,
+            session: staging_session,
+            standby: staging_standby,
             wake_channel: wake_channel.clone(),
             interval: options.maintenance_interval,
             housekeeping_interval: options.housekeeping_interval,
@@ -763,9 +782,8 @@ async fn run(
             held_key_retry: options.held_key_retry,
             drain_batch_cap: options.drain_batch_cap,
         };
-        maintenance_task = Some(tokio::spawn(maintenance_loop(
-            maintenance_config,
-            shutdown_rx.clone(),
+        maintenance_task = Some(tokio::spawn(crate::pool::count_background_connections(
+            maintenance_loop(maintenance_config, shutdown_rx.clone()),
         )));
     }
 
@@ -797,18 +815,42 @@ async fn run(
         let _ = staging::register_drainers(&**conn, &drainer_ids).await;
     }
 
+    // One keep-alive connection for every drain thread's claims (lazy
+    // connect, idle exit): `HeartbeatDaemon` refreshes any number of claims
+    // in one statement.
+    let heartbeat = Arc::new(HeartbeatDaemon::spawn(
+        dsn.clone(),
+        config.schema().to_string(),
+        options.heartbeat.clone(),
+    ));
+    // One `LISTEN` connection for every drain thread and `self_check`.
+    let wake_hub = (options.application_threads > 0).then(|| {
+        WakeHub::spawn(
+            dsn.clone(),
+            config.schema().to_string(),
+            wake_channel.clone(),
+            options.application_threads,
+        )
+    });
+    let (drain_wakes, self_check_wake) = match wake_hub {
+        Some(hub) => (hub.drains, Some(hub.self_check)),
+        None => (Vec::new(), None),
+    };
+    let mut drain_wakes = drain_wakes.into_iter();
     let live_workers = LiveWorkers::default();
     let mut app_worker_tasks = Vec::with_capacity(options.application_threads + 1);
     for claimed_by in drainer_ids {
         let alive = live_workers.enter(claimed_by.clone());
         let worker_config = AppWorkerConfig {
             pool: pool.clone(),
-            dsn: dsn.clone(),
-            schema: config.schema().to_string(),
             claimed_by,
             wake_channel: wake_channel.clone(),
+            wake: drain_wakes
+                .next()
+                .expect("one wake subscriber per drain thread"),
             drainer_window: options.drainer_window,
-            heartbeat_config: options.heartbeat.clone(),
+            heartbeat: heartbeat.clone(),
+            chunk_heartbeat_interval: options.heartbeat.interval,
             poll_interval: options.poll_interval,
             idle_wake_cap: options.idle_wake_cap,
             reclaim_ttl: options.reclaim_ttl,
@@ -816,9 +858,8 @@ async fn run(
             drain_batch_cap: options.drain_batch_cap,
             build_chunk_rows: options.build_chunk_rows.max(1),
         };
-        app_worker_tasks.push(tokio::spawn(app_worker_loop(
-            worker_config,
-            shutdown_rx.clone(),
+        app_worker_tasks.push(tokio::spawn(crate::pool::count_background_connections(
+            app_worker_loop(worker_config, shutdown_rx.clone()),
         )));
     }
 
@@ -829,25 +870,29 @@ async fn run(
         let pool = pool.clone();
         let worker_id = client_id.clone();
         let reclaim_ttl = options.reclaim_ttl;
-        tokio::spawn(worker_upkeep_loop(
-            upkeep_interval(reclaim_ttl),
-            live_workers.clone(),
-            shutdown_rx.clone(),
-            async move || worker_upkeep_pass(&pool, &worker_id, reclaim_ttl).await,
+        tokio::spawn(crate::pool::count_background_connections(
+            worker_upkeep_loop(
+                upkeep_interval(reclaim_ttl),
+                live_workers.clone(),
+                shutdown_rx.clone(),
+                async move || worker_upkeep_pass(&pool, &worker_id, reclaim_ttl).await,
+            ),
         ))
     });
 
     // `self_check` jobs run beside the drain workers, never in their
     // loop (see `self_check_loop`), wherever drain workers run.
-    if options.application_threads > 0 {
-        app_worker_tasks.push(tokio::spawn(self_check_loop(
-            pool.clone(),
-            WakeListener::spawn_work_only(dsn.clone(), config.schema().to_string()),
-            format!("{client_id}-self-check"),
-            options.reclaim_ttl,
-            options.poll_interval,
-            options.idle_wake_cap,
-            shutdown_rx.clone(),
+    if let Some(self_check_wake) = self_check_wake {
+        app_worker_tasks.push(tokio::spawn(crate::pool::count_background_connections(
+            self_check_loop(
+                pool.clone(),
+                self_check_wake,
+                format!("{client_id}-self-check"),
+                options.reclaim_ttl,
+                options.poll_interval,
+                options.idle_wake_cap,
+                shutdown_rx.clone(),
+            ),
         )));
     }
 
@@ -856,11 +901,13 @@ async fn run(
     let registration_task = (options.application_threads > 0).then(|| {
         let pool = pool.clone();
         let workers = live_workers.clone();
-        tokio::spawn(worker_upkeep_loop(
-            drainer_registration_interval(options.drainer_window),
-            live_workers.clone(),
-            shutdown_rx.clone(),
-            async move || drainer_registration_pass(&pool, &workers).await,
+        tokio::spawn(crate::pool::count_background_connections(
+            worker_upkeep_loop(
+                drainer_registration_interval(options.drainer_window),
+                live_workers.clone(),
+                shutdown_rx.clone(),
+                async move || drainer_registration_pass(&pool, &workers).await,
+            ),
         ))
     });
 
@@ -1034,16 +1081,17 @@ mod worker_id_tests {
 // Staging setup: the staging-worker singleton and the first capture pass
 // ---------------------------------------------------------------------
 
-/// Takes the staging-worker singleton and runs one capture reconcile pass
-/// ([`capture::reconcile::reconcile`]) and starts the build
-/// of every definition the pass finds ready.
+/// Tries to take the staging-worker singleton and, if it gets it, runs one
+/// capture reconcile pass ([`capture::reconcile::reconcile`]) and starts the
+/// build of every definition the pass finds ready.
 ///
-/// Returns the [`ProducerSession`] that holds the singleton. The
-/// maintenance loop runs every step on it, and re-takes the singleton when it
-/// reconnects, so the lock is held for as long as the staging worker runs and
-/// `liveness::has_live_staging_worker` reads it from `pg_locks`. A second
-/// staging worker for the same instance fails here with
-/// [`StagingError::ProducerAlreadyRunning`].
+/// Returns the [`ProducerSession`] that holds the singleton, or `None` when
+/// another staging worker of this instance holds it: this client then starts
+/// as a standby, and [`maintenance_loop`] takes over when the lock frees. The
+/// maintenance loop runs every step on the session, and re-takes the
+/// singleton when it reconnects, so the lock is held for as long as the
+/// staging worker leads and `liveness::has_live_staging_worker` reads it from
+/// `pg_locks`.
 ///
 /// A table whose capture can't be installed yet (a lock held on it, a
 /// missing primary key) doesn't fail the start: the pass logs it, and every
@@ -1052,15 +1100,19 @@ mod worker_id_tests {
 /// A pass that fails as a whole releases the singleton before this returns,
 /// as the maintenance loop does when it stops. Dropping the session
 /// would free it only once the server noticed the closed connection, so a
-/// client restarted at once could fail with `ProducerAlreadyRunning`.
+/// client restarted at once could find the lock still held and stand by.
 async fn setup_staging(
     dsn: &str,
     config: &Config,
     pool: &Pool,
-) -> Result<ProducerSession, ClientError> {
-    let mut session = ProducerSession::connect(dsn, config.schema()).await?;
+) -> Result<Option<ProducerSession>, ClientError> {
+    let mut session = match ProducerSession::connect(dsn, config.schema()).await {
+        Ok(session) => session,
+        Err(StagingError::ProducerAlreadyRunning) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
     match first_capture_pass(&mut session, config, pool).await {
-        Ok(()) => Ok(session),
+        Ok(()) => Ok(Some(session)),
         Err(err) => {
             release_singleton(Some(session)).await;
             Err(err)
@@ -1150,9 +1202,13 @@ struct MaintenanceConfig {
     dsn: String,
     schema: String,
     pool: Pool,
-    /// The staging-worker singleton [`setup_staging`] took; the loop's own
-    /// connection.
-    session: ProducerSession,
+    /// The staging-worker singleton [`setup_staging`] took, the loop's own
+    /// connection; `None` when another worker holds it and this one stands by.
+    session: Option<ProducerSession>,
+    /// The singleton was held elsewhere when the client started (so the
+    /// loop polls at the standby cadence from the start), as opposed to a
+    /// leader that lost its session.
+    standby: bool,
     wake_channel: String,
     interval: Duration,
     /// [`ClientOptions::housekeeping_interval`], before the clamp under
@@ -1182,15 +1238,20 @@ struct MaintenanceConfig {
 /// Holds one dedicated connection across ticks (reconnecting lazily on error)
 /// rather than opening a fresh one every tick. That connection is a
 /// [`ProducerSession`]: it holds the staging-worker singleton, and a reconnect
-/// takes it again. While another session holds it (this worker's previous backend,
-/// until the server notices it is gone, or another staging worker that took over),
-/// the reconnect fails and is retried every tick.
+/// takes it again.
+///
+/// A worker without the singleton stands by: it tries to take it on a
+/// short-lived connection every [`STANDBY_POLL`] (connect, `pg_try_advisory_lock`,
+/// disconnect if refused), so a standby keeps no connection open, and becomes
+/// the leader the first time it gets it, running a capture pass at once. A
+/// leader that loses its session retries sooner first ([`LockSchedule`]).
 async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Receiver<bool>) {
     let MaintenanceConfig {
         dsn,
         schema,
         pool,
         session,
+        standby,
         wake_channel,
         interval,
         housekeeping_interval: housekeeping_interval_option,
@@ -1203,20 +1264,33 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
 
     let seal_config = SealConfig::default();
     // The capture pass rate-limits its logs in memory under the instance's
-    // database and schema; the loop forgets them when it stops.
-    let database: Option<String> = session
-        .client()
-        .query_one("select pg_catalog.current_database()::text", &[])
-        .await
-        .ok()
-        .map(|row| row.get(0));
-    let stop = async |session: Option<ProducerSession>| {
+    // database and schema; the loop forgets them when it stops. Read from the
+    // first session this loop leads on (a standby has none yet).
+    async fn database_of(session: &ProducerSession) -> Option<String> {
+        session
+            .client()
+            .query_one("select pg_catalog.current_database()::text", &[])
+            .await
+            .ok()
+            .map(|row| row.get(0))
+    }
+    let mut database: Option<String> = match &session {
+        Some(session) => database_of(session).await,
+        None => None,
+    };
+    let stop = async |database: Option<String>, session: Option<ProducerSession>| {
         if let Some(database) = &database {
             capture::reconcile::forget_instance(database, &schema);
         }
         release_singleton(session).await;
     };
-    let mut session: Option<ProducerSession> = Some(session);
+    let mut session: Option<ProducerSession> = session;
+    // When the next attempt at the singleton is due, while there is no session.
+    let mut lock_schedule = if standby {
+        LockSchedule::standby(Instant::now())
+    } else {
+        LockSchedule::lost(Instant::now())
+    };
     let mut failures = StepFailures::default();
     let mut housekeeping = HousekeepingSchedule::new(housekeeping_interval(
         housekeeping_interval_option,
@@ -1233,13 +1307,31 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
 
     loop {
         if *shutdown_rx.borrow() {
-            stop(session).await;
+            stop(database, session).await;
             return;
         }
 
-        if session.is_none() {
-            let connected = ProducerSession::connect(&dsn, &schema).await;
-            session = failures.check("connect", connected).ok();
+        if session.is_none() && lock_schedule.due(Instant::now()) {
+            match ProducerSession::connect(&dsn, &schema).await {
+                Ok(taken) => {
+                    let _ = failures.check("connect", Ok::<_, StagingError>(()));
+                    crate::instance_log::info!("took the staging-worker lock; leading");
+                    if database.is_none() {
+                        database = database_of(&taken).await;
+                    }
+                    session = Some(taken);
+                    // A new leader's first pass is a capture pass, at once.
+                    next_reconcile = Instant::now();
+                }
+                // Another worker leads: not a failure of this one.
+                Err(StagingError::ProducerAlreadyRunning) => {
+                    lock_schedule.refused(Instant::now());
+                }
+                Err(err) => {
+                    let _ = failures.check("connect", Err::<(), _>(err));
+                    lock_schedule.refused(Instant::now());
+                }
+            }
         }
 
         if let Some(held) = session.as_mut() {
@@ -1326,10 +1418,16 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                         }
                     }
                 }
-                if !failed && let Some(policy) = &held_key_retry {
+                if !failed
+                    && !c.is_closed()
+                    && let Some(policy) = &held_key_retry
+                {
                     // Its own pool connections, and a failure is logged
                     // and tried again at the next housekeeping, not a reason
-                    // to reconnect this session.
+                    // to reconnect this session. Skipped once the session has
+                    // closed: the lock is gone, and the next leader's pass
+                    // does this step (it is safe to overlap with ours, but
+                    // there's no point starting it).
                     if let Err(err) =
                         staging::quarantine::retry_held_keys(&pool, policy, drain_batch_cap, None)
                             .await
@@ -1368,16 +1466,82 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 // connection still works, so the reconnect can take it again
                 // at once.
                 release_singleton(session.take()).await;
+                lock_schedule = LockSchedule::lost(Instant::now());
             }
         }
 
+        // Without the singleton, sleep until the next attempt at it rather
+        // than tick.
+        let wait = if session.is_none() {
+            lock_schedule.until_due(Instant::now())
+        } else {
+            interval
+        };
         tokio::select! {
             _ = shutdown_rx.changed() => {
-                stop(session).await;
+                stop(database, session).await;
                 return;
             }
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(wait) => {}
         }
+    }
+}
+
+/// How often a standby tries to take the staging-worker singleton.
+const STANDBY_POLL: Duration = Duration::from_secs(5);
+
+/// How soon a leader that lost its session retries the singleton, then again,
+/// before it falls back to [`STANDBY_POLL`]. Its lock frees as soon as the
+/// server sees the session go, so the retry usually wins it straight back.
+const LOST_LEADER_RETRIES: [Duration; 3] = [
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
+
+/// When [`maintenance_loop`] next tries to take the singleton while it has no
+/// session.
+#[derive(Debug)]
+struct LockSchedule {
+    /// How many attempts have been refused since the schedule began.
+    refused: usize,
+    next: Instant,
+}
+
+impl LockSchedule {
+    /// A standby: its first attempt (at client start) was refused, so the next
+    /// is a poll away.
+    fn standby(now: Instant) -> Self {
+        Self {
+            refused: LOST_LEADER_RETRIES.len(),
+            next: now + STANDBY_POLL,
+        }
+    }
+
+    /// A leader that just lost its session.
+    fn lost(now: Instant) -> Self {
+        Self {
+            refused: 0,
+            next: now + LOST_LEADER_RETRIES[0],
+        }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        now >= self.next
+    }
+
+    fn until_due(&self, now: Instant) -> Duration {
+        self.next.saturating_duration_since(now)
+    }
+
+    /// An attempt was refused (or failed): the next waits one step longer.
+    fn refused(&mut self, now: Instant) {
+        self.refused += 1;
+        let delay = LOST_LEADER_RETRIES
+            .get(self.refused)
+            .copied()
+            .unwrap_or(STANDBY_POLL);
+        self.next = now + delay;
     }
 }
 
@@ -1737,6 +1901,13 @@ async fn reconcile_source_tables(
     let desired = defs::tables_to_capture(pool).await?;
     let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
     let outcome = capture::reconcile::reconcile(client, schema, &desired, deadline).await?;
+    // The steps below run on the pool, not the session. Once the session has
+    // closed the lock is gone and the next leader's pass does them: each is
+    // safe to overlap with another leader's, so this only skips work that is
+    // no longer ours.
+    if client.is_closed() {
+        return Ok(());
+    }
     release_retyped_keys(pool).await;
     release_upstream_rebuilt_keys(pool).await;
     complete_pause_cascades(pool).await;
@@ -1752,6 +1923,9 @@ async fn reconcile_source_tables(
         );
     }
     // A ready definition's Re-derive build starts here.
+    if client.is_closed() {
+        return Ok(());
+    }
     staging::build::start_ready_builds(client, pool, &outcome.ready).await?;
     Ok(())
 }
@@ -1783,12 +1957,15 @@ async fn connect_plain(
 /// these fields are grouped.
 struct AppWorkerConfig {
     pool: Pool,
-    dsn: String,
-    schema: String,
     claimed_by: String,
     wake_channel: String,
+    /// This thread's end of the client's one `LISTEN`.
+    wake: WakeListener,
     drainer_window: Duration,
-    heartbeat_config: HeartbeatDaemonConfig,
+    /// The client's one claim keep-alive, shared by every drain thread.
+    heartbeat: Arc<HeartbeatDaemon>,
+    /// Interval a build chunk's claim heartbeats at (the daemon's own).
+    chunk_heartbeat_interval: Duration,
     poll_interval: Duration,
     /// [`ClientOptions::idle_wake_cap`].
     idle_wake_cap: Duration,
@@ -1889,12 +2066,12 @@ async fn wait_out_restore(
 async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiver<bool>) {
     let AppWorkerConfig {
         pool,
-        dsn,
-        schema,
         claimed_by,
         wake_channel,
+        wake,
         drainer_window,
-        heartbeat_config,
+        heartbeat,
+        chunk_heartbeat_interval,
         poll_interval,
         idle_wake_cap,
         reclaim_ttl,
@@ -1903,18 +2080,15 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         build_chunk_rows,
     } = config;
 
-    // Captured before `heartbeat_config` is moved into `HeartbeatDaemon::spawn`
-    // below: a build chunk's claim heartbeats at the same margin under
+    // A build chunk's claim heartbeats at the same margin under
     // `reclaim_ttl` as a segment drain.
-    let chunk_heartbeat_interval = heartbeat_config.interval;
     let build_options = staging::build::WorkerOptions {
         chunk_rows: build_chunk_rows,
         drain_batch_cap,
         heartbeat_interval: chunk_heartbeat_interval,
         reclaim_ttl,
     };
-    let heartbeat = HeartbeatDaemon::spawn(dsn.clone(), schema.clone(), heartbeat_config);
-    let mut wake = WakeListener::spawn(dsn.clone(), schema.clone(), wake_channel.clone());
+    let mut wake = wake;
 
     let mut drain_failures = DrainFailures::default();
     let mut backoff = IdleBackoff::new(poll_interval, idle_wake_cap);
@@ -2189,7 +2363,7 @@ async fn self_check_loop(
         }
         // Wakes already heard are answered by the claim below; one that
         // arrives after this drain is kept for the wait.
-        while wake.rx.try_recv().is_ok() {}
+        wake.clear();
         let ran = self_check_step(&pool, &claimed_by, reclaim_ttl, &mut shutdown_rx).await;
         if *shutdown_rx.borrow() {
             break;
@@ -2426,26 +2600,18 @@ async fn drainer_registration_pass(pool: &Pool, workers: &LiveWorkers) {
 /// Waits for a wake notification, the poll-interval floor, or shutdown —
 /// whichever comes first.
 ///
-/// A closed wake channel is *not* a wake. It used to be read as
-/// one — `recv()` on a closed channel returns `None` immediately — so an idle
-/// worker whose `LISTEN` connection had died looped at full speed with no
-/// sleep at all. [`WakeListener`] now reopens its own connection and never
-/// closes the channel while it is alive, so `None` here only means its
-/// supervisor task is gone. Then the wait falls back to the poll floor, the
-/// same as a worker that never had a listener.
+/// A dead `LISTEN` connection is *not* a wake: the hub reopens it in the
+/// background, and until then the wait sits out the poll floor.
 async fn wait_for_wake(
     wake: &mut WakeListener,
     shutdown_rx: &mut watch::Receiver<bool>,
     wait: Duration,
 ) -> WakeEnd {
-    let notified = async {
-        if wake.rx.recv().await.is_none() {
-            std::future::pending::<()>().await;
-        }
-    };
+    let WakeListener { wake, up, .. } = wake;
+    let notified = wake.notified();
     let listener_changed = async {
         // A sender that is gone changes nothing: it must not read as a change.
-        if wake.up.changed().await.is_err() {
+        if up.changed().await.is_err() {
             std::future::pending::<()>().await;
         }
     };
@@ -2479,51 +2645,151 @@ const WAKE_REOPEN_BACKOFF_BASE: Duration = Duration::from_millis(250);
 /// down for a long time costs one connection attempt per this interval.
 const WAKE_REOPEN_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-/// A self-healing `LISTEN` on the wake channel, delivering one `()` per
-/// notification to [`wait_for_wake`].
+/// The client's one self-healing `LISTEN` connection, fanned out to its
+/// tasks.
 ///
-/// A background task owns the connection. When the connection closes, or
-/// can't be opened in the first place, the task backs off and reopens it
-/// (see [`keep_listening`]); meanwhile the worker polls on its
-/// `poll_interval` floor alone. The channel therefore stays open for as long
-/// as this struct lives, and a dead backend never looks like a wake.
+/// A single background task owns the connection (the engine's wake channel and
+/// the database's work channel). Each notification wakes every drain task
+/// (each claim sizes its share by the live drainers, so every thread must look)
+/// and, when it arrived on the work channel, the `self_check` task. A burst
+/// coalesces into one pending wake per task: a task that is busy hears one wake
+/// when it next waits, however many notifications came in.
 ///
-/// Dropping this aborts the task, which drops the connection's
-/// `tokio_postgres::Client` and so closes the connection.
+/// When the connection closes, or can't be opened in the first place, the task
+/// backs off and reopens it (see [`keep_listening`]); meanwhile the tasks poll
+/// on their `poll_interval` floor alone. One up/down flag is shared by every
+/// subscriber, and every successful open wakes all of them.
+///
+/// The supervisor is aborted, and its connection closed, when the last
+/// [`WakeListener`] subscriber is dropped.
+struct WakeHub {
+    /// One per drain task, in the order asked for.
+    drains: Vec<WakeListener>,
+    /// For `self_check`, which hears the work channel alone.
+    self_check: WakeListener,
+}
+
+/// One task's end of a [`WakeHub`].
 struct WakeListener {
-    rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    wake: Arc<tokio::sync::Notify>,
     /// Whether a `LISTEN` is in place right now. An idle worker lengthens its
     /// wait only while it is (#273): a notification sent while it is down is
     /// lost.
     up: watch::Receiver<bool>,
-    task: tokio::task::JoinHandle<()>,
+    _hub: Arc<HubTask>,
 }
 
-impl WakeListener {
-    /// Hears the engine's `channel` (seals, applies) and the
-    /// database's work channel.
-    fn spawn(dsn: String, schema: String, channel: String) -> Self {
-        Self::spawn_on(dsn, schema, Some(channel))
+/// Aborts the hub's supervisor when its last subscriber goes.
+struct HubTask(tokio::task::JoinHandle<()>);
+
+impl Drop for HubTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The notification side of a [`WakeHub`]: the supervisor's sink.
+#[derive(Clone)]
+struct WakeFanout {
+    /// Woken by every notification.
+    drains: Arc<[Arc<tokio::sync::Notify>]>,
+    /// Woken by work-channel notifications only.
+    self_check: Arc<tokio::sync::Notify>,
+}
+
+/// Where a [`keep_listening`] session delivers its wakes.
+trait WakeSink: Clone {
+    /// A notification on `channel`, of the two a session listens on
+    /// (`work_channel` being the work one).
+    fn notification(&self, channel: &str, work_channel: &str);
+    /// Every subscriber looks once (a fresh `LISTEN` lost what came before it).
+    fn wake_all(&self);
+    /// No subscriber is left to wake.
+    fn is_closed(&self) -> bool;
+}
+
+impl WakeSink for WakeFanout {
+    fn notification(&self, channel: &str, work_channel: &str) {
+        for drain in self.drains.iter() {
+            drain.notify_one();
+        }
+        if channel == work_channel {
+            self.self_check.notify_one();
+        }
     }
 
-    /// Hears the work channel alone: for a worker whose work no seal,
-    /// or apply makes claimable, so a steady stream of those would
-    /// only wake it to find nothing (the `self_check` worker).
-    fn spawn_work_only(dsn: String, schema: String) -> Self {
-        Self::spawn_on(dsn, schema, None)
+    fn wake_all(&self) {
+        for drain in self.drains.iter() {
+            drain.notify_one();
+        }
+        self.self_check.notify_one();
     }
 
-    fn spawn_on(dsn: String, schema: String, channel: Option<String>) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    fn is_closed(&self) -> bool {
+        // The supervisor is aborted with its last subscriber.
+        false
+    }
+}
+
+impl WakeHub {
+    /// Listens on `channel` (seals, applies) and the database's work channel,
+    /// for `drain_tasks` drain tasks and one `self_check` task.
+    fn spawn(dsn: String, schema: String, channel: String, drain_tasks: usize) -> Self {
+        let drain_notifies: Arc<[Arc<tokio::sync::Notify>]> = (0..drain_tasks)
+            .map(|_| Arc::new(tokio::sync::Notify::new()))
+            .collect();
+        let self_check = Arc::new(tokio::sync::Notify::new());
+        let sink = WakeFanout {
+            drains: drain_notifies.clone(),
+            self_check: self_check.clone(),
+        };
         let (up_tx, up) = watch::channel(false);
-        let task = tokio::spawn(keep_listening(
-            move |tx| open_wake_session(dsn.clone(), schema.clone(), channel.clone(), tx),
-            tx,
+        let task = Arc::new(HubTask(tokio::spawn(keep_listening(
+            move |sink| open_wake_session(dsn.clone(), schema.clone(), channel.clone(), sink),
+            sink,
             up_tx,
             WAKE_REOPEN_BACKOFF_BASE,
             WAKE_REOPEN_BACKOFF_MAX,
-        ));
-        Self { rx, up, task }
+        ))));
+        let listener = |wake: Arc<tokio::sync::Notify>| WakeListener {
+            wake,
+            up: up.clone(),
+            _hub: task.clone(),
+        };
+        Self {
+            drains: drain_notifies.iter().cloned().map(listener).collect(),
+            self_check: listener(self_check),
+        }
+    }
+}
+
+/// A single drain subscriber of a fresh hub on `channel`, for tests.
+#[cfg(test)]
+fn test_listener(dsn: &str, channel: &str) -> WakeListener {
+    WakeHub::spawn(
+        dsn.to_string(),
+        crate::config::DEFAULT_SCHEMA.to_string(),
+        channel.to_string(),
+        1,
+    )
+    .drains
+    .remove(0)
+}
+
+impl WakeListener {
+    /// Resolves once a wake is pending (and takes it).
+    #[cfg(test)]
+    async fn notified(&self) {
+        self.wake.notified().await;
+    }
+
+    /// Takes a pending wake, if there is one.
+    fn clear(&self) {
+        use std::future::Future;
+        let mut notified = std::pin::pin!(self.wake.notified());
+        let _ = notified
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
     }
 
     fn is_up(&self) -> bool {
@@ -2531,46 +2797,41 @@ impl WakeListener {
     }
 }
 
-impl Drop for WakeListener {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-/// [`WakeListener`]'s supervisor. Opens a listening session with `open`,
+/// [`WakeHub`]'s supervisor. Opens a listening session with `open`,
 /// runs it until its connection closes, and opens a new one, sleeping between
 /// attempts so a session that keeps dying or a database that keeps refusing
 /// connections can't spin: the sleep starts at `base` after a session ends,
 /// and doubles (capped at `max`) for each consecutive open that fails.
 ///
-/// Every successful open sends one wake. Any `NOTIFY` sent while no `LISTEN`
-/// was active is lost, including the ones before the very first open, so the
-/// worker has to take one look at the queue once the `LISTEN` is in place.
-/// That wake is sent only after the `LISTEN` has committed, so a commit that
-/// lands between the two is still caught by its own notification.
+/// Every successful open wakes every subscriber. Any `NOTIFY` sent while no
+/// `LISTEN` was active is lost, including the ones before the very first open,
+/// so each task has to take one look at the queue once the `LISTEN` is in
+/// place. That wake is sent only after the `LISTEN` has committed, so a commit
+/// that lands between the two is still caught by its own notification.
 ///
 /// `up` is true from the moment an open succeeds until its session ends.
 ///
-/// Returns once the receiving side is gone.
-async fn keep_listening<Open, OpenFut, Session, E>(
+/// Returns once the sink has no subscriber left.
+async fn keep_listening<Sink, Open, OpenFut, Session, E>(
     mut open: Open,
-    tx: tokio::sync::mpsc::UnboundedSender<()>,
+    sink: Sink,
     up: watch::Sender<bool>,
     base: Duration,
     max: Duration,
 ) where
-    Open: FnMut(tokio::sync::mpsc::UnboundedSender<()>) -> OpenFut,
+    Sink: WakeSink,
+    Open: FnMut(Sink) -> OpenFut,
     OpenFut: std::future::Future<Output = Result<Session, E>>,
     Session: std::future::Future<Output = ()>,
     E: fmt::Display,
 {
     let mut delay = base;
-    while !tx.is_closed() {
-        match open(tx.clone()).await {
+    while !sink.is_closed() {
+        match open(sink.clone()).await {
             Ok(session) => {
                 delay = base;
                 up.send_replace(true);
-                let _ = tx.send(());
+                sink.wake_all();
                 session.await;
                 up.send_replace(false);
                 crate::instance_log::warn!(
@@ -2592,23 +2853,31 @@ async fn keep_listening<Open, OpenFut, Session, E>(
     }
 }
 
-/// Opens one `LISTEN` session on `channel` for [`keep_listening`]: connects,
-/// starts forwarding notifications to `tx`, and issues the `LISTEN`. The
-/// returned future resolves when the connection closes. It holds the
-/// `tokio_postgres::Client` until then, because dropping the client would
-/// close the connection it is waiting on.
-async fn open_wake_session(
+/// Opens one `LISTEN` session on `channel` and the work channel for
+/// [`keep_listening`]: connects, starts routing notifications to `sink` by the
+/// channel they arrived on, and issues the `LISTEN`s. The returned future
+/// resolves when the connection closes. It holds the `tokio_postgres::Client`
+/// until then, because dropping the client would close the connection it is
+/// waiting on.
+async fn open_wake_session<Sink: WakeSink + Send + 'static>(
     dsn: String,
     schema: String,
-    channel: Option<String>,
-    tx: tokio::sync::mpsc::UnboundedSender<()>,
+    channel: String,
+    sink: Sink,
 ) -> Result<impl std::future::Future<Output = ()>, crate::error::Error> {
     let (client, mut connection) = crate::pool::connect_dedicated(&dsn).await?;
+
+    // The database announces build work on a channel of its own
+    // (`work_wake_channel()`), beside the one the engine notifies. Its name is
+    // set before the `LISTEN`, so before any notification the driver routes.
+    let work_name = Arc::new(std::sync::OnceLock::<String>::new());
+    let driver_name = work_name.clone();
     let driver = tokio::spawn(async move {
         loop {
             match std::future::poll_fn(|cx| connection.poll_message(cx)).await {
-                Some(Ok(tokio_postgres::AsyncMessage::Notification(_))) => {
-                    let _ = tx.send(());
+                Some(Ok(tokio_postgres::AsyncMessage::Notification(note))) => {
+                    let work_channel = driver_name.get().map_or("", String::as_str);
+                    sink.notification(note.channel(), work_channel);
                 }
                 Some(Ok(_)) => continue,
                 _ => break,
@@ -2616,9 +2885,6 @@ async fn open_wake_session(
         }
     });
 
-    // The database announces build work on a channel of its own
-    // (`work_wake_channel()`), beside the one the engine
-    // notifies.
     let listening = async {
         client
             .batch_execute(&crate::pool::dedicated_session_setup(&schema))
@@ -2627,14 +2893,12 @@ async fn open_wake_session(
             .query_one("select work_wake_channel()", &[])
             .await?
             .get(0);
-        let listen = match &channel {
-            Some(channel) => format!(
-                "listen {}; listen {}",
-                quote_ident(channel),
-                quote_ident(&work_channel)
-            ),
-            None => format!("listen {}", quote_ident(&work_channel)),
-        };
+        let listen = format!(
+            "listen {}; listen {}",
+            quote_ident(&channel),
+            quote_ident(&work_channel)
+        );
+        let _ = work_name.set(work_channel);
         client.batch_execute(&listen).await
     };
     if let Err(err) = listening.await {
@@ -2649,28 +2913,77 @@ async fn open_wake_session(
 }
 
 #[cfg(test)]
+mod lock_schedule_tests {
+    use super::*;
+
+    /// A leader that lost its session retries at 0.5 s, 1 s and 2 s, then
+    /// polls every 5 s; a standby polls every 5 s from the start.
+    #[test]
+    fn a_lost_leader_retries_quickly_then_polls_like_a_standby() {
+        let ms = Duration::from_millis;
+        let start = Instant::now();
+
+        let mut lost = LockSchedule::lost(start);
+        let mut at = start;
+        let mut gaps = Vec::new();
+        for _ in 0..5 {
+            let gap = lost.until_due(at);
+            assert!(!lost.due(at) || gap.is_zero());
+            at += gap;
+            assert!(lost.due(at));
+            lost.refused(at);
+            gaps.push(gap);
+        }
+        assert_eq!(gaps, [ms(500), ms(1000), ms(2000), ms(5000), ms(5000)]);
+        assert_eq!(lost.until_due(at), STANDBY_POLL);
+
+        let standby = LockSchedule::standby(start);
+        assert!(!standby.due(start));
+        assert_eq!(standby.until_due(start), STANDBY_POLL);
+        let mut standby = standby;
+        standby.refused(start + STANDBY_POLL);
+        assert_eq!(standby.until_due(start + STANDBY_POLL), STANDBY_POLL);
+    }
+}
+
+#[cfg(test)]
 mod wake_listener_tests {
     //! A dead `LISTEN` connection must neither read as a wake nor
     //! be reopened in a tight loop. Paused-clock tests, no Postgres.
 
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
-    /// Regression: `recv()` on a closed channel returns `None` at once, and
-    /// `wait_for_wake` used to count that as a wake, so every call returned
-    /// immediately and the idle worker loop spun with no sleep.
-    #[tokio::test(start_paused = true)]
-    async fn a_closed_wake_channel_waits_out_the_poll_floor() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        drop(tx);
-        let (_up_tx, up) = watch::channel(false);
-        let mut wake = WakeListener {
-            rx,
+    impl WakeSink for tokio::sync::mpsc::UnboundedSender<()> {
+        fn notification(&self, _channel: &str, _work_channel: &str) {
+            let _ = self.send(());
+        }
+        fn wake_all(&self) {
+            let _ = self.send(());
+        }
+        fn is_closed(&self) -> bool {
+            tokio::sync::mpsc::UnboundedSender::is_closed(self)
+        }
+    }
+
+    /// A subscriber with no hub behind it, for the wait tests.
+    fn bare_listener() -> (WakeListener, Arc<tokio::sync::Notify>, watch::Sender<bool>) {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let (up_tx, up) = watch::channel(false);
+        let listener = WakeListener {
+            wake: wake.clone(),
             up,
-            task: tokio::spawn(async {}),
+            _hub: Arc::new(HubTask(tokio::spawn(async {}))),
         };
+        (listener, wake, up_tx)
+    }
+
+    /// With no notification, each wait sits out the full poll floor, however
+    /// many times it is asked (a dead `LISTEN` must not spin the worker).
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_listener_waits_out_the_poll_floor() {
+        let (mut wake, _notify, _up_tx) = bare_listener();
         let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let poll_interval = Duration::from_millis(200);
 
@@ -2684,21 +2997,15 @@ mod wake_listener_tests {
         assert_eq!(
             started.elapsed(),
             poll_interval * 3,
-            "each wait on a closed listener must sit out the full poll floor"
+            "each wait on a silent listener must sit out the full poll floor"
         );
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_notification_still_ends_the_wait_early() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        let (_up_tx, up) = watch::channel(false);
-        let mut wake = WakeListener {
-            rx,
-            up,
-            task: tokio::spawn(async {}),
-        };
+        let (mut wake, notify, _up_tx) = bare_listener();
         let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        tx.send(()).unwrap();
+        notify.notify_one();
 
         let started = tokio::time::Instant::now();
         assert_eq!(
@@ -2706,6 +3013,75 @@ mod wake_listener_tests {
             WakeEnd::Notified
         );
         assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// A burst of notifications while a task is busy is one wake, not one per
+    /// notification: the task looks once when it next waits.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_notifications_is_one_wake() {
+        let (mut wake, notify, _up_tx) = bare_listener();
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        for _ in 0..5 {
+            notify.notify_one();
+        }
+        assert_eq!(
+            wait_for_wake(&mut wake, &mut shutdown_rx, Duration::from_secs(60)).await,
+            WakeEnd::Notified
+        );
+        assert_eq!(
+            wait_for_wake(&mut wake, &mut shutdown_rx, Duration::from_secs(60)).await,
+            WakeEnd::Elapsed,
+            "the burst left a second wake behind"
+        );
+        // `clear` takes a pending wake without waiting.
+        notify.notify_one();
+        wake.clear();
+        assert_eq!(
+            wait_for_wake(&mut wake, &mut shutdown_rx, Duration::from_millis(5)).await,
+            WakeEnd::Elapsed
+        );
+    }
+
+    /// The fan-out: an engine-channel notification wakes every drain task and
+    /// not `self_check`; a work-channel one wakes all of them; a reopen wakes
+    /// all of them.
+    #[tokio::test(start_paused = true)]
+    async fn notifications_fan_out_by_channel() {
+        let notifies: Vec<_> = (0..3)
+            .map(|_| Arc::new(tokio::sync::Notify::new()))
+            .collect();
+        let self_check = Arc::new(tokio::sync::Notify::new());
+        let sink = WakeFanout {
+            drains: notifies.iter().cloned().collect(),
+            self_check: self_check.clone(),
+        };
+        let pending = async |n: &Arc<tokio::sync::Notify>| {
+            tokio::time::timeout(Duration::from_millis(1), n.notified())
+                .await
+                .is_ok()
+        };
+
+        sink.notification("engine", "work");
+        for n in &notifies {
+            assert!(
+                pending(n).await,
+                "every drain task hears the engine channel"
+            );
+        }
+        assert!(
+            !pending(&self_check).await,
+            "self_check does not hear the engine channel"
+        );
+
+        sink.notification("work", "work");
+        for n in notifies.iter().chain([&self_check]) {
+            assert!(pending(n).await, "every task hears the work channel");
+        }
+
+        sink.wake_all();
+        for n in notifies.iter().chain([&self_check]) {
+            assert!(pending(n).await, "every task is woken by a reopen");
+        }
     }
 
     /// The idle wait doubles from the floor to the cap, restarts on a reset,
@@ -2846,16 +3222,11 @@ mod wake_listener_tests {
         let hang_guard = Duration::from_secs(30);
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
-        let mut wake = WakeListener::spawn(
-            db.dsn().to_string(),
-            DEFAULT_SCHEMA.to_string(),
-            CHANNEL.to_string(),
-        );
-        let mut next_wake = async || {
-            tokio::time::timeout(hang_guard, wake.rx.recv())
+        let wake = test_listener(db.dsn(), CHANNEL);
+        let next_wake = async || {
+            tokio::time::timeout(hang_guard, wake.notified())
                 .await
                 .expect("a wake before the hang guard")
-                .expect("the wake channel stays open")
         };
 
         next_wake().await; // the first open's catch-up wake
@@ -3176,9 +3547,12 @@ mod maintenance_failure_tests {
             dsn: db.dsn().to_string(),
             schema: "no_trellis_here".to_string(),
             pool,
-            session: ProducerSession::connect(db.dsn(), "no_trellis_here")
-                .await
-                .expect("take the staging-worker singleton"),
+            standby: false,
+            session: Some(
+                ProducerSession::connect(db.dsn(), "no_trellis_here")
+                    .await
+                    .expect("take the staging-worker singleton"),
+            ),
             wake_channel: "wake".to_string(),
             interval: Duration::from_millis(20),
             housekeeping_interval: Duration::from_secs(5),
@@ -3256,9 +3630,12 @@ mod maintenance_failure_tests {
             dsn: db.dsn().to_string(),
             schema: schema.to_string(),
             pool,
-            session: ProducerSession::connect(db.dsn(), schema)
-                .await
-                .expect("take the staging-worker singleton"),
+            standby: false,
+            session: Some(
+                ProducerSession::connect(db.dsn(), schema)
+                    .await
+                    .expect("take the staging-worker singleton"),
+            ),
             wake_channel: "wake".to_string(),
             interval: Duration::from_millis(20),
             housekeeping_interval: Duration::from_secs(5),
@@ -3353,9 +3730,12 @@ mod maintenance_failure_tests {
             dsn: db.dsn().to_string(),
             schema: schema.to_string(),
             pool,
-            session: ProducerSession::connect(db.dsn(), schema)
-                .await
-                .expect("take the staging-worker singleton"),
+            standby: false,
+            session: Some(
+                ProducerSession::connect(db.dsn(), schema)
+                    .await
+                    .expect("take the staging-worker singleton"),
+            ),
             wake_channel: "wake".to_string(),
             interval: Duration::from_millis(20),
             housekeeping_interval: Duration::from_secs(3600),
@@ -3807,7 +4187,7 @@ mod reconcile_tests {
 
     /// A `setup_staging` whose first capture pass fails releases the
     /// staging-worker singleton before it returns, so a restart right
-    /// after doesn't fail with `ProducerAlreadyRunning`. Here the pass can't
+    /// after finds it free (and doesn't stand by). Here the pass can't
     /// read the catalog: the schema has no Trellis tables.
     ///
     /// Dropping the session isn't enough: its connection task only closes the
@@ -3986,16 +4366,11 @@ mod wake_channel_tests {
             .expect("connect");
         for schema in ["InstA", "Inst \"B\" é"] {
             let channel = default_wake_channel(schema);
-            let mut wake = WakeListener::spawn(
-                db.dsn().to_string(),
-                DEFAULT_SCHEMA.to_string(),
-                channel.clone(),
-            );
-            let mut next_wake = async || {
-                tokio::time::timeout(hang_guard, wake.rx.recv())
+            let wake = test_listener(db.dsn(), &channel);
+            let next_wake = async || {
+                tokio::time::timeout(hang_guard, wake.notified())
                     .await
                     .unwrap_or_else(|_| panic!("a wake on {channel:?} before the hang guard"))
-                    .expect("the wake channel stays open")
             };
             // The catch-up wake, sent once the `LISTEN` has committed.
             next_wake().await;
@@ -4025,26 +4400,20 @@ mod work_channel_tests {
         let notifier = connect_plain(db.dsn(), DEFAULT_SCHEMA)
             .await
             .expect("connect");
-        let mut wake = WakeListener::spawn(
-            db.dsn().to_string(),
-            DEFAULT_SCHEMA.to_string(),
-            default_wake_channel(DEFAULT_SCHEMA),
-        );
+        let wake = test_listener(db.dsn(), &default_wake_channel(DEFAULT_SCHEMA));
         assert!(!wake.is_up(), "down until the LISTEN commits");
         // The catch-up wake, sent once the LISTENs have committed.
-        tokio::time::timeout(hang_guard, wake.rx.recv())
+        tokio::time::timeout(hang_guard, wake.notified())
             .await
-            .expect("the catch-up wake")
-            .expect("open");
+            .expect("the catch-up wake");
         assert!(wake.is_up());
         notifier
             .execute("select pg_notify(work_wake_channel(), '')", &[])
             .await
             .expect("notify");
-        tokio::time::timeout(hang_guard, wake.rx.recv())
+        tokio::time::timeout(hang_guard, wake.notified())
             .await
-            .expect("a wake from the work channel")
-            .expect("open");
+            .expect("a wake from the work channel");
     }
 
     /// The `self_check` worker's listener hears the work channel
@@ -4063,12 +4432,16 @@ mod work_channel_tests {
         let notifier = connect_plain(db.dsn(), DEFAULT_SCHEMA)
             .await
             .expect("connect");
-        let mut wake =
-            WakeListener::spawn_work_only(db.dsn().to_string(), DEFAULT_SCHEMA.to_string());
-        tokio::time::timeout(hang_guard, wake.rx.recv())
+        let hub = WakeHub::spawn(
+            db.dsn().to_string(),
+            DEFAULT_SCHEMA.to_string(),
+            default_wake_channel(DEFAULT_SCHEMA),
+            1,
+        );
+        let wake = hub.self_check;
+        tokio::time::timeout(hang_guard, wake.notified())
             .await
-            .expect("the catch-up wake")
-            .expect("open");
+            .expect("the catch-up wake");
         assert!(wake.is_up());
         notifier
             .execute(
@@ -4081,12 +4454,11 @@ mod work_channel_tests {
             .execute("select pg_notify(work_wake_channel(), '')", &[])
             .await
             .expect("notify the work channel");
-        tokio::time::timeout(hang_guard, wake.rx.recv())
+        tokio::time::timeout(hang_guard, wake.notified())
             .await
-            .expect("a wake from the work channel")
-            .expect("open");
+            .expect("a wake from the work channel");
         assert!(
-            tokio::time::timeout(Duration::from_millis(500), wake.rx.recv())
+            tokio::time::timeout(Duration::from_millis(500), wake.notified())
                 .await
                 .is_err(),
             "the engine channel's notification woke the work-only listener"
@@ -4777,12 +5149,16 @@ mod restore_gate_tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let config = AppWorkerConfig {
             pool: pool.clone(),
-            dsn: db.dsn().to_string(),
-            schema: DEFAULT_SCHEMA.to_string(),
             claimed_by: "gate-test-app-0".to_string(),
             wake_channel: "wake".to_string(),
+            wake: test_listener(db.dsn(), "wake"),
             drainer_window: staging::DEFAULT_DRAINER_WINDOW,
-            heartbeat_config: HeartbeatDaemonConfig::default(),
+            heartbeat: Arc::new(HeartbeatDaemon::spawn(
+                db.dsn().to_string(),
+                DEFAULT_SCHEMA,
+                HeartbeatDaemonConfig::default(),
+            )),
+            chunk_heartbeat_interval: HeartbeatDaemonConfig::default().interval,
             poll_interval: Duration::from_secs(3600),
             idle_wake_cap: Duration::from_secs(3600),
             reclaim_ttl: staging::DEFAULT_RECLAIM_TTL,

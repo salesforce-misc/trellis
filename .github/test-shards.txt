@@ -180,3 +180,4 @@ test:qualified_target_names 0.0
 bin:trellis-testkit 1.0  # not in the log (no tests ran, or the log is partial)
 test:capture_ssi 1.0  # not in the log (no tests ran, or the log is partial)
 test:pg_partman 1.0  # not in the log (no tests ran, or the log is partial)
+test:standby_staging 8.0

@@ -135,7 +135,7 @@ The column-pause lock was the same trap again, found by review:
 
 * **The producer singleton is keyed by schema.** Postgres advisory locks are
   keyed by `(database, key)` — a session's `search_path` is not part of the
-  lock tag. So the "exactly one staging worker" guard
+  lock tag. So the one-leader staging-worker guard
   (`staging::session`) must derive its key from the instance schema, as
   `staging::session::producer_singleton_lock_key` now does; a global constant
   made the guard fire across instances.

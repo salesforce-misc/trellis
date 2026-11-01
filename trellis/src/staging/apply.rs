@@ -191,8 +191,8 @@ pub enum ApplyError {
     ColumnNotPaused { transform: String, column: String },
     /// `super::quarantine::resume_column` was asked to resume a column
     /// whose owning definition is not currently applying
-    /// (`live` or
-    /// `catching_up`) — most concretely, a definition still `Backfilling`
+    /// (`live`, which may
+    /// report `catching_up`) — most concretely, a definition still `Backfilling`
     /// behind an in-flight `backfill_chunks` queue nothing is draining. `resume_column`
     /// takes one snapshot of the *source* table and only clears
     /// `column_status` after writing it back, so any row a still-running
@@ -5655,6 +5655,11 @@ async fn drain_batch(
                 flush_apply_metrics(&plan);
                 // The fuses of the rows a 1-1 `JOIN`'s fan-out held, which
                 // take locks of their own (`super::join_one_to_one::held`).
+                // The page's connection goes back first: a fuse trip takes
+                // two pooled connections of its own, and a drain thread
+                // never holds more than two at once
+                // (`crate::pool::MAX_BACKGROUND_HELD`).
+                drop(client);
                 super::join_one_to_one::held::charge_after_commit(
                     pool,
                     plan.join1_targets.values(),

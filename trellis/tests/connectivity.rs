@@ -159,8 +159,8 @@ async fn terminated_backend_classifies_as_connectivity() {
 /// A pool with no `max_size`/`wait_timeout` configured lets a
 /// caller that shows up once every slot is already checked out wait
 /// forever — silently, with no error and no log line, ever. Configures a
-/// deliberately tiny `max_size` (2, via [`Config::with_pool_max_size`]) and
-/// a short `wait_timeout` (via [`Config::with_pool_wait_timeout`]) so
+/// deliberately tiny `max_size` (2, via [`Pool::with_limits`](trellis::Pool::with_limits)) and
+/// a short `wait_timeout` so
 /// exhaustion is trivial to trigger without spinning up dozens of real
 /// connections, then proves a third caller gets back a typed, bounded
 /// failure — never a hang — once every slot is held.
@@ -169,12 +169,9 @@ async fn pool_exhaustion_times_out_with_a_typed_error_instead_of_hanging() {
     let cluster = TestCluster::start();
     let db = cluster.create_empty_database().await;
 
-    let config = Config::from_dsn(db.dsn().to_string())
-        .expect("valid schema")
-        .with_pool_max_size(2)
-        .expect("2 is a valid pool size")
-        .with_pool_wait_timeout(std::time::Duration::from_millis(300));
-    let pool = trellis::Pool::new(&config).expect("pool builds lazily; DSN is well-formed");
+    let config = Config::from_dsn(db.dsn().to_string()).expect("valid schema");
+    let pool = trellis::Pool::with_limits(&config, 2, std::time::Duration::from_millis(300))
+        .expect("pool builds lazily; DSN is well-formed");
 
     // Check out every slot the pool has and hold onto the guards — dropping
     // either would return its connection to the pool and defeat the point

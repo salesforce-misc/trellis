@@ -89,9 +89,12 @@
 //! resume, an `ALTER TRANSFORM`, a capture re-install) does its work in
 //! background jobs the ring knows nothing about. A comparison made while the
 //! definition is being built would therefore agree or disagree with a state
-//! the build is about to change. So `self_check` compares only a `live`
-//! definition, and reports any other as [`SelfCheckOutcome::NotLive`] with
-//! its status, after the capture audit and before the wait. `live` is strict:
+//! the build is about to change. So `self_check` compares only a definition
+//! that reports `live` (`Trellis::status`), and reports any other as
+//! [`SelfCheckOutcome::NotLive`] with its status, after the capture audit and
+//! before the wait. A `live` definition reading an upstream that is being
+//! rebuilt reports `catching_up` and isn't compared either: that upstream's
+//! rebuild is about to change its target too. `live` is strict:
 //! every job of a rebuild is done before the definition reads it again, and
 //! a repair's own transaction moves the definition out of it, so a caller
 //! that polls for `live` and then checks is checking after the repair.
@@ -162,7 +165,7 @@ use tokio_postgres::types::PgLsn;
 use crate::defs::ast::{Expr, FieldDef, KeySpace, Predicate, as_extract};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::ddl::{self, DdlError, PrimaryKeyColumn};
-use crate::defs::model::{Definition, TransformStatus};
+use crate::defs::model::{Definition, StoredStatus, TransformStatus};
 use crate::defs::registry;
 use crate::defs::typed_literal;
 use crate::error_code::{self, ErrorCode};
@@ -338,9 +341,11 @@ pub enum SelfCheckOutcome {
     /// A stable divergence — present, and (under [`SelfCheckMode::Standard`])
     /// still present after a fresh re-check.
     Diverged(Vec<Divergence>),
-    /// The definition isn't [`TransformStatus::Live`]: it is being
-    /// built or rebuilt, catching up, paused or quarantined, with the
-    /// carried status. Nothing was compared and nothing was awaited.
+    /// The definition isn't [`TransformStatus::Live`] as an operator reads it
+    /// (`Trellis::status`): it is being built or rebuilt, catching up (a
+    /// `live` definition reading an upstream that isn't `live`, or a paused
+    /// column of one), paused or quarantined, with the carried reported
+    /// status. Nothing was compared and nothing was awaited.
     /// **Not a verdict on correctness**, like
     /// [`SelfCheckOutcome::NotCaughtUp`]; poll the definition's status until
     /// it is `live` and check again. A rebuild a repair starts
@@ -775,14 +780,31 @@ pub(crate) async fn audit(
     // wait and the comparison, which a definition that is being built would
     // pass or fail for reasons that have nothing to do with its steady
     // state.
-    if def.status != TransformStatus::Live {
+    //
+    // `live` here is the status an operator reads (`Trellis::status`), not the
+    // stored one: a stored-`live` definition behind a not-live upstream
+    // reports `catching_up` and is not compared either. Only a stored-`live`
+    // definition can report otherwise, so any other skips the catalog read
+    // (one query over the definitions, plus one per paused column).
+    let reported = if def.status == StoredStatus::Live {
+        let client = pool.get().await?;
+        catalog::reported_statuses(&**client)
+            .await?
+            .get(&def.id)
+            .copied()
+            // Dropped since `def` was read: the status it was read with.
+            .unwrap_or_else(|| def.status.into())
+    } else {
+        def.status.into()
+    };
+    if reported != TransformStatus::Live {
         let client = pool.get().await?;
         return Ok(SelfCheckPage {
             target: target_table.to_string(),
             checked_through: converge::watermark_token(&**client).await?,
             rows_compared: 0,
             next_after: scope.after.clone(),
-            outcome: SelfCheckOutcome::NotLive(def.status),
+            outcome: SelfCheckOutcome::NotLive(reported),
             held_keys: None,
             drain_failures: Vec::new(),
         });

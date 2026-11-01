@@ -47,7 +47,7 @@ use crate::capture::CaptureError;
 use crate::capture::columns::{CaptureCatalog, load_catalog, read_columns, readers_of};
 use crate::capture::install::{Installed, installed};
 use crate::defs::catalog::CatalogError;
-use crate::defs::model::TransformStatus;
+use crate::defs::model::StoredStatus;
 use crate::defs::validate::ValidationError;
 use crate::defs::{copies, key_types};
 use crate::pool::Pool;
@@ -888,8 +888,8 @@ pub(crate) async fn pause_readers_of_retyped(
                     &[&pause.id],
                 )
                 .await?
-                .and_then(|row| TransformStatus::from_persisted(row.get(0)))
-                .is_some_and(TransformStatus::is_frozen);
+                .and_then(|row| StoredStatus::from_persisted(row.get(0)))
+                .is_some_and(StoredStatus::is_frozen);
             if !frozen {
                 error = caused_error(table, &cause, &pause);
                 caused_by = Some(cause.upstream);

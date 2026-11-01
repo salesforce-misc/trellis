@@ -121,8 +121,10 @@ module Trellis
       # - target_schema: the schema a bare target table name is created in.
       # - staging: whether this process runs the instance's staging worker,
       #   which installs change capture on the source tables and starts each
-      #   new transform's backfill. Exactly one process in a fleet should,
-      #   per instance.
+      #   new transform's backfill. Any number of processes may set it: one
+      #   takes the instance's producer lock and leads, the rest stand by and
+      #   take over when it goes away, so a rolling deploy needs no
+      #   operator step.
       # - drain_threads: how many threads apply staged changes to the targets.
       #   Some process must run at least one per instance, or no definition
       #   reaches :live.
@@ -130,13 +132,20 @@ module Trellis
       #   instance owns (its calls', and its background client's), invisible
       #   to Ruby's own thread sizing, so kept small and explicit. Each
       #   instance has its own; nothing is shared between instances.
+      # - max_call_pool_size: the most connections this instance's call pool
+      #   (its API calls) opens at once. Connections open as calls need them
+      #   and close after 60 seconds idle. The background client's pool is
+      #   sized by staging and drain_threads, not by this.
+      # - call_pool_wait_timeout_ms: how long a call waits for a free call-pool
+      #   connection before failing with a ConnectivityError.
       #
       # The defaults (staging: false, drain_threads: 0) run nothing in the
       # background, which is what a migration step or a console wants. The
       # staging worker reads Trellis's tables as it starts, so a staging: true
       # connect to an unmigrated schema fails: migrate first.
       def connect(url:, schema: "trellis", target_schema: "public", staging: false,
-                  drain_threads: 0, worker_threads: 2)
+                  drain_threads: 0, worker_threads: 2, max_call_pool_size: 20,
+                  call_pool_wait_timeout_ms: 30_000)
         string_option!(:url, url)
         string_option!(:schema, schema)
         string_option!(:target_schema, target_schema)
@@ -152,7 +161,19 @@ module Trellis
                 "worker_threads must be a positive Integer, got: #{worker_threads.inspect}"
         end
 
-        handle = Native.connect(url, schema, target_schema, staging, drain_threads, worker_threads)
+        unless max_call_pool_size.is_a?(Integer) && max_call_pool_size >= 1
+          raise ValidationError,
+                "max_call_pool_size must be a positive Integer, got: #{max_call_pool_size.inspect}"
+        end
+        unless call_pool_wait_timeout_ms.is_a?(Integer) &&
+               call_pool_wait_timeout_ms.between?(0, MAX_TIMEOUT_MS)
+          raise ValidationError,
+                "call_pool_wait_timeout_ms must be a non-negative Integer, got: " \
+                "#{call_pool_wait_timeout_ms.inspect}"
+        end
+
+        handle = Native.connect(url, schema, target_schema, staging, drain_threads, worker_threads,
+                                max_call_pool_size, call_pool_wait_timeout_ms)
         instance = new(handle, schema)
         register(instance)
         instance

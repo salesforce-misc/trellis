@@ -343,7 +343,7 @@ fn tampering_proptest_config() -> ProptestConfig {
 /// `self_check`'s own documented, deliberate scope boundary instead of on a
 /// real tampering-detection question. `trivial_one_to_one_program_with`
 /// already exists, restricted to exactly that same boundary, for the
-/// unrelated E3 client-restart property — reused here rather than
+/// unrelated client-restart property — reused here rather than
 /// duplicated.
 ///
 /// **Design choice: the corruption target is selected post-settle, by index

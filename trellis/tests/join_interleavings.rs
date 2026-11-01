@@ -1071,7 +1071,7 @@ async fn family6_key_changes() {
     key_changes(Key::Single).await;
 }
 
-/// J1 family 6 (and R7): one batch of 900 changes over four keys,
+/// Family 6: one batch of 900 changes over four keys,
 /// of both tables, split into buckets and drained by eight workers at once.
 /// Every page locks most keys: none deadlocks, and the result is exact.
 #[tokio::test]
@@ -3053,7 +3053,7 @@ impl Lab {
     }
 }
 
-/// Test 1: a fresh build over seeded tables, on every kind and both key
+/// A fresh build over seeded tables, on every kind and both key
 /// shapes, ends `live` with the oracle's rows and hidden structures.
 async fn fresh_build(key: Key) {
     let mut lab = seeded(key, &SIX, BUILD_SEED).await;
@@ -3149,7 +3149,7 @@ fn at_or_after(point: PausePoint, from: Option<PausePoint>) -> bool {
     })
 }
 
-/// Test 2 (F2, G2): changes committed before the build starts and drained
+/// Changes committed before the build starts and drained
 /// after it, and a page drained while the build is frozen at each step,
 /// whether it queues behind the build's locks or runs through; the build's
 /// commit leaves the oracle's rows either way.
@@ -3431,7 +3431,7 @@ async fn request_rebuild(lab: &Lab, table: &str) {
         .expect("request a rebuild");
 }
 
-/// Test 3 (rule 3): a page creates a `P` cell on an enumerated key after the
+/// A page creates a `P` cell on an enumerated key after the
 /// enumeration, before the build's `J` lock. The build's `M` changes that
 /// key, so the product has a `T` group for the new cell that the
 /// enumeration did not name: it is locked with the product's groups, and its
@@ -3466,7 +3466,7 @@ async fn build_t_lock_set_covers_a_cell_created_after_the_enumeration() {
     lab.check("a cell created after the enumeration").await;
 }
 
-/// Test 5 (rule 5): the build writes the cells it enumerated. A key first
+/// The build writes the cells it enumerated. A key first
 /// seen after the enumeration is left to its page, though the build's
 /// snapshot sees its row; the page applies it once.
 #[tokio::test]
@@ -3674,7 +3674,7 @@ async fn a_build_write_never_meets_a_collected_cells_reused_ctid() {
         .await;
 }
 
-/// Test 6 (R8): a cell whose only row moved out, undrained, before the build
+/// A cell whose only row moved out, undrained, before the build
 /// is a zero cell with a basis, so the later `-1` of the move is refused.
 #[tokio::test]
 async fn build_enumerates_the_cell_an_undrained_old_image_names() {
@@ -3719,7 +3719,7 @@ async fn drift(lab: &Lab) {
     .await;
 }
 
-/// Test 13: a `request_backfill` of the `FROM` table and of the joined table
+/// A `request_backfill` of the `FROM` table and of the joined table
 /// each rebuild the `JOIN` in place (a sweep job alone), repairing what
 /// drifted from the tables, and the `JOIN` stays built once every build is
 /// settled.
@@ -3770,7 +3770,7 @@ async fn build_rebuild_in_place_inner_pair_key() {
     rebuild_in_place(Key::Pair, I).await;
 }
 
-/// Test 10 (rule 8, G6): a reader of the target sees the old rows, hand edit
+/// A reader of the target sees the old rows, hand edit
 /// and all, until the build's one commit, whichever step it is frozen at, and
 /// the oracle's rows after.
 #[tokio::test]
@@ -3803,7 +3803,7 @@ async fn build_readers_see_the_old_target_until_the_commit() {
     assert_ne!(lab.d.rows(&L.actual()).await, old);
 }
 
-/// Test 9 (rule 7): a `TRUNCATE` whose page drains after the build wipes what
+/// A `TRUNCATE` whose page drains after the build wipes what
 /// the build wrote, and the barrier reapplies what follows it.
 #[tokio::test]
 async fn build_truncates_committed_before_the_build_drain_after_it() {
@@ -3825,7 +3825,7 @@ async fn build_truncates_committed_before_the_build_drain_after_it() {
     }
 }
 
-/// Test 9 (rule 7): a `TRUNCATE` statement issued while the build holds its
+/// A `TRUNCATE` statement issued while the build holds its
 /// tables queues behind the build's `ACCESS SHARE` and runs after its commit;
 /// its page then clears what the build wrote.
 #[tokio::test]
@@ -3857,7 +3857,7 @@ async fn build_a_truncate_statement_queues_behind_the_build() {
     );
 }
 
-/// Test 9 (rule 7): a page carrying a `TRUNCATE` holds the lock row `FOR
+/// A page carrying a `TRUNCATE` holds the lock row `FOR
 /// UPDATE`, so a build that starts meanwhile waits for it, then builds from
 /// the emptied table.
 #[tokio::test]
@@ -3906,7 +3906,7 @@ async fn resume(lab: &Lab, kind: Kind) {
     assert_eq!(reader_status(lab, kind.name).await, ["(backfilling)"]);
 }
 
-/// Test 11: a `RESUME` keeps the visible target, recreates the hidden tables
+/// A `RESUME` keeps the visible target, recreates the hidden tables
 /// and builds them. The definition was paused through writes on both sides (a
 /// group emptied among them) and a hand edit of the target and of `T`; frozen
 /// before its commit, a reader sees the old rows, and after it the oracle's:
@@ -3983,7 +3983,7 @@ async fn build_resume_over_two_empty_tables_removes_the_old_rows() {
     lab.check("a resume over empty tables").await;
 }
 
-/// Test 14: a job that dies before its commit leaves nothing and runs again
+/// A job that dies before its commit leaves nothing and runs again
 /// whole; a `PAUSE` and `DROP TRANSFORM` meanwhile wait for it and log no
 /// deadlock.
 #[tokio::test]
@@ -4049,7 +4049,7 @@ async fn build_job_lifecycle() {
     assert_eq!(lab.d.deadlocks_logged(), Vec::<String>::new());
 }
 
-/// Test 15: a page that holds a key past the build's `lock_timeout` makes its
+/// A page that holds a key past the build's `lock_timeout` makes its
 /// `J` statement fail with `55P03`; the job is released for a retry, the
 /// definition stays `backfilling`, and the retry converges.
 #[tokio::test]
@@ -4098,7 +4098,7 @@ async fn build_a_lock_timeout_is_retried() {
     lab.check("a lock timeout").await;
 }
 
-/// Test 17: what stays refused. A field build of a `JOIN` (nothing can ask
+/// What stays refused. A field build of a `JOIN` (nothing can ask
 /// for one: `ALTER TRANSFORM` takes only a 1-1 target), here forged on the
 /// job, fails it rather than walk a primary key.
 #[tokio::test]
@@ -4257,7 +4257,7 @@ async fn build_the_second_reader_of_a_resumed_join_converges_without_being_rebui
     a_chained_reader_is_rebuilt(true).await;
 }
 
-/// Test 9 (rule 7): the build holds the lock row `FOR SHARE`, so a page that
+/// The build holds the lock row `FOR SHARE`, so a page that
 /// carries a `TRUNCATE` (the row `FOR UPDATE`) waits for its commit, then
 /// clears what the build wrote.
 #[tokio::test]
@@ -4282,7 +4282,7 @@ async fn build_holds_the_lock_row_against_a_truncate_page() {
     lab.check("a truncate page behind the build").await;
 }
 
-/// Rule 1 on a rebuild in place, where every `J` row exists already: the
+/// On a rebuild in place, where every `J` row exists already: the
 /// build's one sorted `FOR UPDATE` of the union of both sides' keys makes a
 /// page that names an enumerated key, of either side, wait for the commit,
 /// while a key the enumeration didn't see runs through.
@@ -4327,7 +4327,7 @@ async fn build_in_place_holds_the_j_rows_of_both_sides_keys() {
     lab.check("pages around a rebuild in place").await;
 }
 
-/// Rule 1 (`twoJ`): the build's `J` lock is one sorted statement over the
+/// The build's `J` lock is one sorted statement over the
 /// union of both sides' keys. A page that names a key only the joined side
 /// has (9) and a `FROM` side key above it (20) queues behind the build on the
 /// lower key, holding nothing the build waits on. Had the build locked one
@@ -4368,7 +4368,7 @@ async fn build_locks_both_sides_keys_in_one_statement() {
     lab.check("a page on both sides' keys").await;
 }
 
-/// Test 14: a `PAUSE` and `RESUME` while a resumed definition's build is
+/// A `PAUSE` and `RESUME` while a resumed definition's build is
 /// frozen after it took its job row, before it read a hidden table. The
 /// `JOIN`'s resume drops and recreates the hidden tables the build is about
 /// to read, and only then waits on the build's job row. The build holds the definition row from before its
@@ -4847,7 +4847,7 @@ async fn family9_a_recompute_between_two_steps_of_a_join_build_is_exact() {
     }
 }
 
-/// `T`-level R8 is the final step's: a visible group no contribution backs
+/// Removing a visible group is the final step's: a visible group no contribution backs
 /// any more (a group of the earlier life that the source lost while paused)
 /// stays through every side and leaf step and is removed by the final one.
 #[tokio::test]

@@ -1,4 +1,4 @@
-//! Improvement-plan task D4 ("a second runtime"): the *concurrent* runtime —
+//! The *concurrent* runtime —
 //! the same generated [`Program`]s, the same three-way oracle
 //! (`generative::oracle`), driven through the same
 //! [`generative::run::run_convergence`]/[`run_convergence_bursty`] machinery
@@ -15,7 +15,7 @@
 //! # The properties
 //!
 //! [`property_convergence_holds_under_the_concurrent_backend`] is the
-//! original D4 tier: `trivial_program`'s small programs, applied **in the
+//! original tier: `trivial_program`'s small programs, applied **in the
 //! exact order `Program::ops` generated them**, one at a time from one
 //! harness task, with only the quiesce points changed (the burst-batching
 //! knob below). Its programs never come near the engine's split threshold.
@@ -194,7 +194,7 @@
 //!
 //! # Shrink-trust convention
 //!
-//! Per the improvement plan's own caveat: **a proptest shrink under this
+//! **A proptest shrink under this
 //! property is advisory, not a trusted minimal repro.** Two independent
 //! sources of nondeterminism sit between "this program failed" and "this
 //! program is a minimal concurrency bug": which of N workers actually claims
@@ -649,7 +649,7 @@ async fn a_hand_built_program_converges_under_the_concurrent_backend() {
     assert!(outcome.as_pass(), "run did not pass: {outcome}");
 }
 
-/// The non-negotiable D4 pin: a batch that **genuinely exceeds** the engine's
+/// The non-negotiable pin: a batch that **genuinely exceeds** the engine's
 /// real split threshold (`staging::claim::MIN_ROWS_TO_SPLIT`, 256 as
 /// of this writing — not imported here, per the backend seam's "nothing
 /// outside `generative::backend` may import `trellis::staging`" rule; see
@@ -781,8 +781,8 @@ async fn a_batch_that_exceeds_the_split_threshold_converges_across_workers() {
 /// never drives it through this file's genuinely-concurrent, more-than-one-
 /// application-worker runtime at the same time as a restart/scale-out —
 /// i.e. nothing on this branch previously confirmed the fix holds when the
-/// *other* source of timing perturbation (D4's real multi-worker draining)
-/// is layered on top of E3's lifecycle events rather than exercised alone.
+/// *other* source of timing perturbation (real multi-worker draining)
+/// is layered on top of the lifecycle events rather than exercised alone.
 /// This pin closes that gap directly: the same restart-then-scale-out
 /// sequence as `client_lifecycle.rs`'s
 /// `a_restart_and_a_scale_out_interleaved_mid_stream_still_converge`

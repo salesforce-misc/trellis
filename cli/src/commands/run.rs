@@ -58,11 +58,9 @@ Options:
                              exclusive with --staging.
   --drain-threads <N>        Number of drain (application) worker threads to
                              run. Must be a non-negative integer. Default: 2.
-                             Each worker borrows from a connection pool capped
-                             at TRELLIS_POOL_MAX_SIZE (default 20); raise that
-                             alongside a large --drain-threads, or acquiring a
-                             connection fails after
-                             TRELLIS_POOL_WAIT_TIMEOUT_SECS (default 30).
+                             The workers' connection pool is sized from this
+                             (2N + 5 with the staging worker, 2N + 4
+                             without) and closes connections idle for 60s.
   --prometheus-bind <ADDR>  host:port to serve this process's metrics
                              registry as Prometheus text exposition on,
                              alongside the pipeline, until interrupted. Not

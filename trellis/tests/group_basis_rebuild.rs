@@ -195,7 +195,7 @@ async fn a_rebuild_replaces_every_group_in_place() {
     assert_oracle(&mut d).await;
 }
 
-/// Pages keep applying around a rebuild (rule 3). A change committed before
+/// Pages keep applying around a rebuild. A change committed before
 /// the rebuild and drained after it is refused by its group's basis; a page
 /// of a locked group, drained while the rebuild holds the lock, waits for
 /// the commit and its change, which the rebuild's snapshot saw, is refused
@@ -336,7 +336,7 @@ async fn a_group_that_disappears_and_one_only_an_old_image_names() {
     assert_oracle(&mut d).await;
 }
 
-/// Rule 4: until the rebuild commits, a reader sees the old values, every
+/// Until the rebuild commits, a reader sees the old values, every
 /// group of them, and the definition reads `backfilling`; from the commit,
 /// the new ones and `live`. The target is never empty or partly rebuilt.
 #[tokio::test]

@@ -91,13 +91,29 @@ and shared rather than connected per request.
   a process's default instance.
 
 **Each handle pays for itself.** A handle owns the runtime its calls run on and
-a pool of up to 20 connections (`pool_max_size`). A handle that runs a
-background client (`staging` or `drain_threads`) also owns a second runtime and
-a second pool of up to 20, plus dedicated connections outside the pools,
-including one `LISTEN` connection for each drain thread. A process with *N*
-handles that run clients therefore holds up to *2N* runtimes and *2N* pools, and
-the host sizes that sum against the server's `max_connections` and its own
-thread count.
+a *call pool* of up to `max_call_pool_size` connections (20 by default; a handle
+option, with `call_pool_wait_timeout`) that serves its API calls. A handle that
+runs a background client (`staging` or `drain_threads`) also owns a second
+runtime and a *background pool* for that client, sized by its roles, not by an
+option: `2N + 5` for a worker at `drain_threads: N`, `2N + 4` drain-only, `1`
+staging-only. Calls never use the background pool, so drain work cannot starve
+them. Each drain thread holds at most two pooled connections at once, which a
+debug-build assertion enforces. Both pools hand out their most recently used
+connection first and close connections idle for 60 seconds, so a burst's extra
+connections close once it is over.
+
+Outside the pools a client keeps few dedicated connections: the staging
+session while it leads, one `LISTEN` connection shared by every drain thread
+and `self_check` (a notification wakes all drain threads, coalesced, and
+`self_check` hears the work channel alone), and one claim keep-alive shared by
+the drain threads, which connects only while a claim outlives a heartbeat
+interval. A `staging: true` handle that cannot take the producer lock comes up
+as a standby: its calls and drain threads run, and it polls the lock every 5
+seconds on a short-lived connection, so a rolling deploy needs no operator step.
+
+A process with *N* handles that run clients therefore holds up to *2N*
+runtimes and *2N* pools, and the host sizes that sum against the server's
+`max_connections` and its own thread count.
 
 **Every call stays off the host's scheduler and GVL while it waits**, because each
 method blocks on a database round trip — far past what either host VM tolerates on a
@@ -144,8 +160,7 @@ runtime and per handle, with no budget shared between handles, so a handle that
 runs a client holds up to twice `worker_threads` worker threads. The cap counts
 worker threads only: the two threads that drive the runtimes, each runtime's
 blocking pool (which Tokio grows on demand, for work such as DNS lookups), and
-each pool's connections (`pool_max_size`, one pool for the calls and one for
-the client) are outside it.
+each pool's connections (a call pool and a background pool) are outside it.
 
 **A handle does not survive `fork`.** Puma, Unicorn, Passenger, and Resque all
 fork; Rust threads do not cross `fork`, so a child inherits each handle and its

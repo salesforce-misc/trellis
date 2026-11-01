@@ -101,7 +101,7 @@ async fn status(raw: &Client, target: &str) -> TransformStatus {
         .await
         .expect("read status")
         .get(0);
-    TransformStatus::from_persisted(&text).expect("known status")
+    trellis::defs::StoredStatus::from_row(&text).into()
 }
 
 /// `Some(true)` when `table` has a capture gate, `None` when it has none.

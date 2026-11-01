@@ -9,10 +9,8 @@
 //! the summary band, or that treats a missing progress row or a NULL
 //! `origin_lsn` as "not pending".
 //!
-//! Deliberately out of scope: the doc's "a round did no work" classification
-//! (refused-seal backpressure, peer-holds-claim) is a worker-side
-//! drain-to-convergence helper that depends on claiming/sweeping,
-//! which aren't built yet — not tested here.
+//! The caller-side poll drains nothing, so these tests hold the predicate and
+//! the poll to the doc; the engine's workers are what make a token clear.
 
 use std::time::Duration;
 

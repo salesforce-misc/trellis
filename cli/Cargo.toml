@@ -1,6 +1,6 @@
 [package]
 name = "trellis-cli"
-version = "0.1.0-alpha"
+version = "0.1.0"
 edition.workspace = true
 description = "The trellis command-line tool: define streaming SQL transforms, run the pipeline and check status"
 license = "Apache-2.0"

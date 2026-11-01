@@ -28,6 +28,18 @@ defmodule Trellis.OptionsTest do
     assert {:error, %Error{code: :validation}} = Trellis.connect(url: @url, drain_threads: -1)
   end
 
+  test "the call pool must allow a connection, and its wait is a count of milliseconds" do
+    assert {:error, %Error{code: :validation, message: message}} =
+             Trellis.connect(url: @url, max_call_pool_size: 0)
+
+    assert message =~ ":max_call_pool_size"
+
+    assert {:error, %Error{code: :validation, message: message}} =
+             Trellis.connect(url: @url, call_pool_wait_timeout_ms: -1)
+
+    assert message =~ ":call_pool_wait_timeout_ms"
+  end
+
   test "an invalid schema name is the engine's validation error" do
     assert {:error, %Error{code: :validation}} =
              Trellis.connect(url: @url, schema: "   ")

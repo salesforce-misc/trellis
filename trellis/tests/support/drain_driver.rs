@@ -439,19 +439,24 @@ impl Driver {
         points: &[(PausePoint, &str)],
     ) -> RunningDrain {
         let (scope, frozen) = self.arm(points).await;
-        let pool = self.db.pool.clone();
+        // Counted as a drain thread's checkouts are: a drain that holds more
+        // than `MAX_BACKGROUND_HELD` connections at once aborts the test.
+        let pool = self.db.pool.counting_as_background();
         let worker = worker.to_string();
         // Claims again until the claim wins nothing, so a worker whose peers
         // finished first picks up any bucket left over.
-        let handle = tokio::spawn(with_scope(scope, async move {
-            let mut last = None;
-            while let Some(outcome) =
-                apply::drain_once(&pool, batch, &worker, live_workers, WAKE).await?
-            {
-                last = Some(outcome);
-            }
-            Ok(last)
-        }));
+        let handle = tokio::spawn(with_scope(
+            scope,
+            trellis::pool::count_background_connections_in(async move {
+                let mut last = None;
+                while let Some(outcome) =
+                    apply::drain_once(&pool, batch, &worker, live_workers, WAKE).await?
+                {
+                    last = Some(outcome);
+                }
+                Ok(last)
+            }),
+        ));
         RunningDrain {
             handle: Some(handle),
             frozen,

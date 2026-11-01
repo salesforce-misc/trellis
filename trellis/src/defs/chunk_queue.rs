@@ -30,7 +30,7 @@ use crate::pool::Pool;
 
 use super::backfill::{self, BackfillError};
 use super::catalog::CatalogError;
-use super::model::TransformStatus;
+use super::model::StoredStatus;
 
 /// Why claiming, executing, or completing a durable backfill chunk failed.
 /// Composes [`BackfillError`] (the actual chunk write) and [`CatalogError`]
@@ -360,7 +360,7 @@ impl<'a> ClaimFence<'a> {
 }
 
 /// SQL over a `backfill_chunks bc` row: its definition is in a status a
-/// chunk may be handed out in (`param` binds [`TransformStatus::dispatchable`]
+/// chunk may be handed out in (`param` binds [`StoredStatus::dispatchable`]
 /// as a `text[]`). One predicate for the claim ([`claim_chunks_of`]) and for
 /// the idle probe (`staging::build::work_probe`), so the probe stays a
 /// superset of the claim and the two cannot drift.
@@ -387,8 +387,8 @@ pub async fn claim_chunks_of(
         return Ok(Vec::new());
     }
     // The allowlist, derived from the enum rather than spelled into the SQL
-    // — see [`TransformStatus::dispatchable`].
-    let dispatchable = TransformStatus::dispatchable();
+    // — see [`StoredStatus::dispatchable`].
+    let dispatchable = StoredStatus::dispatchable();
     let rows = client
         .query_typed(
             // The `exists` gate is ADR-0014's: the pause is what
@@ -406,8 +406,8 @@ pub async fn claim_chunks_of(
             // not: this gate used to read `status <> 'paused'`,
             // which would have silently re-opened dispatch to any
             // frozen-but-not-`paused` status added later. The allowlist is
-            // computed from [`TransformStatus::ALL`] minus
-            // [`TransformStatus::is_frozen`], the single predicate the
+            // computed from [`StoredStatus::ALL`] minus
+            // [`StoredStatus::is_frozen`], the single predicate the
             // pause/resume/drop preconditions ask too, so a future frozen
             // state closes this gate by existing.
             //
@@ -874,15 +874,15 @@ async fn pause_for_build_failure(
             "update transform_definitions set status = $2 where id = $1 and status = any($3)",
             &[
                 &id,
-                &TransformStatus::Paused.as_str(),
-                &TransformStatus::dispatchable(),
+                &StoredStatus::Paused.as_str(),
+                &StoredStatus::dispatchable(),
             ],
         )
         .await?;
     if paused == 1 {
         crate::instance_log::warn!(
             definition_id = id,
-            to = %TransformStatus::Paused.as_str(),
+            to = %StoredStatus::Paused.as_str(),
             "transform status transition: its build kept failing; paused"
         );
     }

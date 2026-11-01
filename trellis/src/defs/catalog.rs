@@ -100,7 +100,7 @@ use super::error::ParseError;
 use super::grammar::{self, CURRENT_GRAMMAR_VERSION};
 #[cfg(any(test, feature = "internals"))]
 use super::model::SchemaEdge;
-use super::model::{Definition, EdgeKind, NodeKind, SchemaNode, TransformStatus};
+use super::model::{Definition, EdgeKind, NodeKind, SchemaNode, StoredStatus, TransformStatus};
 use super::parser::parse;
 use super::pg_type::PgType;
 use super::validate::{
@@ -827,7 +827,7 @@ pub async fn create_definition(
         pool,
         source_text,
         source_columns,
-        TransformStatus::WaitingToBackfill,
+        StoredStatus::WaitingToBackfill,
         pool.target_schema(),
         None,
     )
@@ -841,7 +841,7 @@ pub async fn create_definition(
     )
     .await?;
     txn.commit().await?;
-    definition.status = TransformStatus::Live;
+    definition.status = StoredStatus::Live;
     Ok(definition)
 }
 
@@ -864,7 +864,7 @@ pub async fn create_definition_without_backfill(
         pool,
         source_text,
         source_columns,
-        TransformStatus::Live,
+        StoredStatus::Live,
         pool.target_schema(),
         None,
     )
@@ -907,7 +907,7 @@ fn refuse_join_fixture(source_text: &str) {
 ///
 /// **Why nothing is folded into a target still being built.**
 /// [`dependents_of`]/[`transforms_for_source`] filter to applying
-/// definitions ([`TransformStatus::is_applying`]), so no build path can have
+/// definitions ([`StoredStatus::is_applying`]), so no build path can have
 /// a live CDC delta folded into it before its build has started. From the
 /// start the definition applies, and the build's chunks and the pages agree
 /// through the ledger entry's `basis`: a delta for a commit a chunk's
@@ -1094,15 +1094,15 @@ pub async fn install_definition(
         pool,
         source_text,
         source_columns,
-        TransformStatus::WaitingToBackfill,
+        StoredStatus::WaitingToBackfill,
         target_schema,
         Some(&target_ddl),
     )
     .await
 }
 
-/// Every applying definition (`live` or `catching_up`) that reads `table`
-/// ([`tables_read_by`]), in id order: the readers a rewrite of `table`
+/// Every applying definition (stored `live`, whatever it reports) that
+/// reads `table` ([`tables_read_by`]), in id order: the readers a rewrite of `table`
 /// outside the target-mutation seam has to rebuild
 /// (`intake::catch_up::park_target_catchup_if_read`).
 pub(crate) async fn applying_readers(
@@ -1113,7 +1113,7 @@ pub(crate) async fn applying_readers(
         .query(
             "select id, source_table, join_table \
              from transform_definitions where status = any($1) order by id",
-            &[&TransformStatus::applying()],
+            &[&StoredStatus::applying()],
         )
         .await?;
     let mut readers = Vec::new();
@@ -1130,7 +1130,7 @@ pub(crate) async fn applying_readers(
 
 /// Whether any definition that isn't frozen reads `table`
 /// ([`tables_read_by`]):
-/// every status in [`TransformStatus::dispatchable`], so one still waiting
+/// every status in [`StoredStatus::dispatchable`], so one still waiting
 /// for its build, or under any build, counts as well as one that applies.
 ///
 /// The drain asks this only when `table`'s primary key can't be used
@@ -1149,7 +1149,7 @@ pub(crate) async fn has_unfrozen_reader(
         .query(
             "select source_table, join_table \
              from transform_definitions where status = any($1) order by id",
-            &[&TransformStatus::dispatchable()],
+            &[&StoredStatus::dispatchable()],
         )
         .await?;
     for row in rows {
@@ -1248,14 +1248,12 @@ async fn status_nodes(client: &impl GenericClient) -> Result<Vec<StatusNode>, Ca
     let mut nodes = Vec::with_capacity(rows.len());
     for row in rows {
         let status_text: String = row.get(3);
-        let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-            panic!("transform_definitions.status held unrecognized value '{status_text}'")
-        });
+        let status = StoredStatus::from_row(&status_text);
         let source: String = row.get(2);
         // Only a `live` definition's reported status can differ from its
         // persisted one, so only its reads are needed.
         let mut reads = Vec::new();
-        if status == TransformStatus::Live {
+        if status == StoredStatus::Live {
             reads = tables_read_by(source, row.get(4));
         }
         nodes.push(StatusNode {
@@ -1308,7 +1306,7 @@ async fn add_paused_column_causes(
                 // A reader with several fields (or a `GROUP BY` key) reading
                 // the column is listed once per field.
                 if let Some(&i) = by_bare.get(&dep.0)
-                    && nodes[i].status == TransformStatus::Live
+                    && nodes[i].status == StoredStatus::Live
                     && !nodes[i].paused_columns.contains(&cause)
                 {
                     nodes[i].paused_columns.push(cause);
@@ -1325,7 +1323,7 @@ struct StatusNode {
     /// Its qualified target table.
     target: String,
     /// Its persisted status.
-    status: TransformStatus,
+    status: StoredStatus,
     /// Every table it reads, qualified (needed only when `status` is `live`).
     reads: Vec<String>,
     /// The paused columns (`target.column`) of upstream 1-1 targets it
@@ -1354,7 +1352,7 @@ fn derive_reported(
 ) -> (HashMap<i64, TransformStatus>, HashMap<i64, Vec<String>>) {
     let owner: HashMap<&str, i64> = nodes.iter().map(|n| (n.target.as_str(), n.id)).collect();
     let mut reported: HashMap<i64, TransformStatus> =
-        nodes.iter().map(|n| (n.id, n.status)).collect();
+        nodes.iter().map(|n| (n.id, n.status.into())).collect();
     loop {
         let mut moved = false;
         for node in nodes {
@@ -1367,7 +1365,7 @@ fn derive_reported(
                     .is_some_and(|up| *up != node.id && reported[up] != TransformStatus::Live)
             });
             if upstream_not_live || !node.paused_columns.is_empty() {
-                reported.insert(node.id, TransformStatus::CatchingUp);
+                reported.insert(node.id, node.status.reported(true));
                 moved = true;
             }
         }
@@ -1435,9 +1433,7 @@ async fn reject_non_live_upstream(
         return Ok(());
     };
     let status_text: String = row.get(1);
-    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-        panic!("transform_definitions.status held unrecognized value '{status_text}'")
-    });
+    let status = StoredStatus::from_row(&status_text);
     // A `catching_up` upstream's build has finished: every write to its
     // target goes through the seam now.
     if status.is_applying() {
@@ -1445,7 +1441,7 @@ async fn reject_non_live_upstream(
     }
     Err(CatalogError::TransformNotLive {
         transform: row.get(0),
-        status,
+        status: status.into(),
     })
 }
 
@@ -1586,10 +1582,10 @@ pub async fn alter_transform(
     };
     let alter = &normalized;
     // Re-checked under the row lock below, with the definition's build.
-    if !current.status.is_applying() && current.status != TransformStatus::Backfilling {
+    if !current.status.is_applying() && current.status != StoredStatus::Backfilling {
         return Err(CatalogError::TransformNotLive {
             transform: alter.target.clone(),
-            status: current.status,
+            status: current.status.into(),
         });
     }
     if !matches!(current.def.key_space, KeySpace::OneToOne) {
@@ -1767,9 +1763,7 @@ pub async fn alter_transform(
         });
     };
     let status_text: String = row.get(0);
-    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-        panic!("transform_definitions.status held unrecognized value '{status_text}'")
-    });
+    let status = StoredStatus::from_row(&status_text);
     // A field build needs a definition that applies
     // (`staging::build::takes_field_build`): `live`, or
     // already under a Re-derive build, which it joins. An edit that only
@@ -1779,7 +1773,7 @@ pub async fn alter_transform(
     if !crate::staging::build::takes_field_build(status, build.as_deref()) {
         return Err(CatalogError::TransformNotLive {
             transform: alter.target.clone(),
-            status,
+            status: status.into(),
         });
     }
     let old_version: i64 = row.get(1);
@@ -2878,7 +2872,7 @@ async fn create_definition_inner(
     pool: &Pool,
     source_text: &str,
     source_columns: &HashMap<String, ValueType>,
-    status: TransformStatus,
+    status: StoredStatus,
     target_schema: &str,
     target_ddl: Option<&str>,
 ) -> Result<Definition, CatalogError> {
@@ -5599,7 +5593,7 @@ struct PendingDefinition {
     source_version: i64,
     text: String,
     grammar_version: i32,
-    status: TransformStatus,
+    status: StoredStatus,
     source_columns: HashMap<String, ValueType>,
     source_table: String,
     target_table: String,
@@ -5623,8 +5617,8 @@ struct PendingDefinition {
 /// come back with zero entries, not disappear from the result entirely.
 ///
 /// **Applying definitions only** ([`super::model::APPLYING_SQL`]:
-/// `live` or `catching_up`, or `backfilling` under a Re-derive build, which
-/// applies from its start; ADR-0002): a `waiting_to_backfill`
+/// `live`, which may report `catching_up`, or `backfilling` under a
+/// Re-derive build, which applies from its start; ADR-0002): a `waiting_to_backfill`
 /// or `quarantined` definition's target may not reflect every pre-existing
 /// source row, so a live CDC delta folded into it now — via
 /// [`transforms_for_source`], the apply path's read of this function — could
@@ -5691,9 +5685,7 @@ async fn dependents_via(
         let pending = by_id.entry(id).or_insert_with(|| {
             order.push(id);
             let status_text: String = row.get(3);
-            let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-                panic!("transform_definitions.status held unrecognized value '{status_text}'")
-            });
+            let status = StoredStatus::from_row(&status_text);
             PendingDefinition {
                 source_version: row.get(1),
                 text: row.get(2),
@@ -5959,9 +5951,7 @@ pub(crate) async fn definition_by_id_in(
     let status_text: String = rows[0].get(2);
     let source_table: String = rows[0].get(3);
     let target_table: String = rows[0].get(4);
-    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-        panic!("transform_definitions.status held unrecognized value '{status_text}'")
-    });
+    let status = StoredStatus::from_row(&status_text);
     let def = grammar::load(&text, rows[0].get(7))?;
 
     let mut source_columns = HashMap::new();
@@ -6066,9 +6056,7 @@ pub async fn definition_by_target(
     let status_text: String = rows[0].get(3);
     let source_table: String = rows[0].get(4);
     let qualified_target_table: String = rows[0].get(5);
-    let status = TransformStatus::from_persisted(&status_text).unwrap_or_else(|| {
-        panic!("transform_definitions.status held unrecognized value '{status_text}'")
-    });
+    let status = StoredStatus::from_row(&status_text);
     let def = grammar::load(&text, rows[0].get(8))?;
 
     let mut source_columns = HashMap::new();
@@ -7163,7 +7151,12 @@ mod value_type_codec_tests {
 mod reported_status_tests {
     use super::{StatusNode, TransformStatus, derive_reported, derive_reported_statuses};
 
-    fn node(id: i64, target: &str, status: TransformStatus, reads: &[&str]) -> StatusNode {
+    fn node(
+        id: i64,
+        target: &str,
+        status: crate::defs::StoredStatus,
+        reads: &[&str],
+    ) -> StatusNode {
         StatusNode {
             id,
             target: target.to_string(),
@@ -7175,21 +7168,20 @@ mod reported_status_tests {
 
     #[test]
     fn a_reader_of_a_non_live_upstream_reports_catching_up() {
-        use TransformStatus::*;
-        for upstream in [
-            Paused,
-            Quarantined,
-            WaitingToBackfill,
-            Backfilling,
-            CatchingUp,
-        ] {
+        use super::StoredStatus::*;
+        let catching_up = TransformStatus::CatchingUp;
+        for upstream in [Paused, Quarantined, WaitingToBackfill, Backfilling] {
             let reported = derive_reported_statuses(&[
                 node(1, "public.u", upstream, &["public.s"]),
                 node(2, "public.d", Live, &["public.u"]),
             ]);
-            assert_eq!(reported[&1], upstream, "the upstream reports what it is");
             assert_eq!(
-                reported[&2], CatchingUp,
+                reported[&1],
+                TransformStatus::from(upstream),
+                "the upstream reports what it is"
+            );
+            assert_eq!(
+                reported[&2], catching_up,
                 "a reader of a {upstream:?} upstream"
             );
         }
@@ -7197,43 +7189,46 @@ mod reported_status_tests {
 
     #[test]
     fn a_reader_of_a_live_upstream_stays_live() {
-        use TransformStatus::*;
+        use super::StoredStatus::*;
         let reported = derive_reported_statuses(&[
             node(1, "public.u", Live, &["public.s"]),
             node(2, "public.d", Live, &["public.u", "public.other"]),
         ]);
-        assert_eq!(reported[&2], Live);
+        assert_eq!(reported[&2], TransformStatus::Live);
     }
 
     #[test]
     fn a_joined_table_is_an_upstream_too() {
-        use TransformStatus::*;
+        use super::StoredStatus::*;
+        let catching_up = TransformStatus::CatchingUp;
         // `public.r` reads its own source and, as its `JOIN` table, the
         // target `public.u`.
         let reported = derive_reported_statuses(&[
             node(1, "public.u", Paused, &["public.s"]),
             node(2, "public.r", Live, &["public.reports", "public.u"]),
         ]);
-        assert_eq!(reported[&2], CatchingUp);
+        assert_eq!(reported[&2], catching_up);
     }
 
     #[test]
     fn the_rule_is_transitive_down_a_chain() {
-        use TransformStatus::*;
+        use super::StoredStatus::*;
+        let catching_up = TransformStatus::CatchingUp;
         // Listed downstream-first so a single pass can't get it right.
         let reported = derive_reported_statuses(&[
             node(3, "public.c", Live, &["public.b"]),
             node(2, "public.b", Live, &["public.a"]),
-            node(1, "public.a", CatchingUp, &["public.s"]),
+            node(1, "public.a", Paused, &["public.s"]),
         ]);
-        assert_eq!(reported[&1], CatchingUp);
-        assert_eq!(reported[&2], CatchingUp);
-        assert_eq!(reported[&3], CatchingUp);
+        assert_eq!(reported[&1], TransformStatus::Paused);
+        assert_eq!(reported[&2], catching_up);
+        assert_eq!(reported[&3], catching_up);
     }
 
     #[test]
     fn a_reader_of_a_paused_column_reports_catching_up_and_names_it_down_the_chain() {
-        use TransformStatus::*;
+        use super::StoredStatus::*;
+        let catching_up = TransformStatus::CatchingUp;
         let mut reader = node(2, "public.agg", Live, &["public.t"]);
         reader.paused_columns = vec!["t.col".to_string()];
         let (reported, causes) = derive_reported(&[
@@ -7242,10 +7237,18 @@ mod reported_status_tests {
             node(3, "public.chained", Live, &["public.agg"]),
             node(4, "public.unrelated", Live, &["public.t"]),
         ]);
-        assert_eq!(reported[&1], Live, "the paused column's own definition");
-        assert_eq!(reported[&2], CatchingUp);
-        assert_eq!(reported[&3], CatchingUp, "a reader of the reader");
-        assert_eq!(reported[&4], Live, "reads no paused column");
+        assert_eq!(
+            reported[&1],
+            TransformStatus::Live,
+            "the paused column's own definition"
+        );
+        assert_eq!(reported[&2], catching_up);
+        assert_eq!(reported[&3], catching_up, "a reader of the reader");
+        assert_eq!(
+            reported[&4],
+            TransformStatus::Live,
+            "reads no paused column"
+        );
         assert_eq!(causes[&2], ["t.col"]);
         assert_eq!(causes[&3], ["t.col"], "names the root cause");
         assert!(!causes.contains_key(&4));
@@ -7253,14 +7256,14 @@ mod reported_status_tests {
 
     #[test]
     fn only_a_live_status_is_ever_changed() {
-        use TransformStatus::*;
+        use super::StoredStatus::*;
         let reported = derive_reported_statuses(&[
             node(1, "public.u", Paused, &["public.s"]),
             node(2, "public.d", Paused, &["public.u"]),
             node(3, "public.e", Backfilling, &["public.u"]),
         ]);
-        assert_eq!(reported[&2], Paused);
-        assert_eq!(reported[&3], Backfilling);
+        assert_eq!(reported[&2], TransformStatus::Paused);
+        assert_eq!(reported[&3], TransformStatus::Backfilling);
     }
 }
 

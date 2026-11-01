@@ -103,6 +103,9 @@ Nothing in the binding uses it.
   and `self_check_job` returns `nil` for the replaced job or one whose
   transform was dropped. With no drain worker anywhere in the fleet a job
   stays `:queued`.
+- `Trellis::Metrics.render_prometheus`: the process-wide metrics registry as
+  Prometheus text, for a `/metrics` route the app already serves (the
+  binding opens no port; see [Metrics](#metrics)). It needs no handle.
 
 ```ruby
 require "trellis/pg"
@@ -144,10 +147,59 @@ Trellis.shutdown
 | `staging:` | `false` | run the staging worker (installs change capture, starts backfills) here |
 | `drain_threads:` | `0` | threads applying staged changes to the targets |
 | `worker_threads:` | `2` | the threads of each Rust runtime a handle owns (its calls', and its background client's), invisible to Ruby's own sizing |
+| `max_call_pool_size:` | `20` | the most connections the handle's call pool opens; the background pool is sized by `staging:` and `drain_threads:` |
+| `call_pool_wait_timeout_ms:` | `30_000` | how long a call waits for a free call-pool connection before a `ConnectivityError` |
 
-The defaults run nothing in the background. Exactly one process in a fleet
-should set `staging: true`, and some process must run drain threads, or no
-definition ever reaches `:live`.
+The defaults run nothing in the background. Some process in a fleet must set
+`staging: true` and some process must run drain threads, or no definition ever
+reaches `:live`. Any number of processes may set `staging: true`: one takes the
+producer lock and leads, the rest stand by and take over when it goes away, so a
+rolling deploy needs no operator step. Under a preforking Puma with
+`TRELLIS_WORKER=1`, every Puma worker connects with `staging: true`, so all but
+one stand by; that is harmless, and each polls the lock every 5 seconds (see
+[Rolling deploys](../../docs/embedding.md#rolling-deploys)).
+
+### Resources
+
+At the defaults, a handle holds up to 20 Postgres connections (its call pool,
+opened as calls need them and closed after 60 seconds idle) and 3 threads. A
+worker handle (`staging: true, drain_threads: N`) also owns a background pool
+of up to `2N + 5` connections (`2N + 4` without staging, `1` with staging
+alone), closed after 60 seconds idle, and two connections that stay open: the
+staging session and one `LISTEN` shared by its drain threads. It holds 6
+threads: drain threads are tasks on its runtime, not OS threads. Its memory is
+bounded by row counts, not bytes: about `N` × 100,000 changed rows' images at
+its peak. `max_call_pool_size:` lowers the 20 (the background pool is sized by
+the handle's roles, not by an option), and `worker_threads:` sets the threads.
+Every handle (each `Trellis::Instance` too) costs this again. The full
+accounting is in
+[`docs/embedding.md`](../../docs/embedding.md#what-a-handle-uses).
+
+### Metrics
+
+The engine's metrics live in one registry per process, holding the series of
+every handle in it; `Trellis::Metrics.render_prometheus` renders them in
+Prometheus's text format. Every series carries a `trellis_instance` label
+(`<database>/<catalog schema>`), so instances in one process stay apart, and
+`trellis_instance_up` is 1 while an instance's handle runs and 0 after it
+shuts down. The metrics themselves are listed in
+[`docs/observability.md`](../../docs/observability.md).
+
+The binding opens no port, so serve the text from a route of the app's own:
+
+```ruby
+# config/routes.rb
+get "/metrics", to: proc {
+  [200, { "content-type" => "text/plain; version=0.0.4" }, [Trellis::Metrics.render_prometheus]]
+}
+```
+
+Under a forking server each worker process has its own registry, holding
+only its own handles' series, so Prometheus scrapes each worker (or the
+worker handle, `staging: true`, runs in a process of its own that it
+scrapes). A process forked while its parent had a handle running can't
+render the registry, as it can't connect: it raises
+`Trellis::ForkedHandleError` (see [Forking servers](#forking-servers)).
 
 ### Several instances
 
@@ -501,6 +553,7 @@ source rows; a test database has none, so that is immediate. Runtime state
 ## Layout
 
 - `lib/`: the `Trellis` module and `Trellis::Instance`, its error classes and its `Data` values,
+  `Trellis::Metrics`,
   the Rails integration (`trellis/railtie.rb`, `trellis/migration.rb`),
   loaded only in an app that has Rails, and the test helpers
   (`trellis/test_support.rb`), loaded only when required.

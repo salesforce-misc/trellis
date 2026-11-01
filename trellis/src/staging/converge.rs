@@ -4,8 +4,8 @@
 //! polled) observability count, and the caller-side await poll, in that
 //! order below.
 //!
-//! **Condition 4, the quarantine/poison band** (doc section "the one
-//! exclusion is parked quarantine work"): the `poison_held` table is
+//! **Condition 4, the quarantine/poison band** (doc section "What the
+//! await waits for", "Parked quarantine work is counted"): the `poison_held` table is
 //! what this term reads — not `poison` (the marker; a poisoned key with
 //! nothing parked yet has nothing pending) and not `key_deaths` (a pure
 //! counter, no origin position of its own). A row parked in `poison_held`
@@ -15,23 +15,16 @@
 //! replays it back onto the active batch and it drains for real. This is
 //! what makes convergence never report "converged" across a parked key.
 //!
-//! **Not built here:** the doc's "a round did no work" classification
-//! table (refused-seal backpressure, peer-holds-batch) describes a
-//! *worker-side drain-to-convergence helper*, which Trellis doesn't have.
-//! This module builds only the caller-side poll ([`await_converged`]) the
-//! doc's "Watermark tokens" section describes.
-//!
-//! **The trap this module exists to avoid:** the design doc's per-batch
-//! summary band (`min_origin_lsn`/`max_lsn`, aggregated inside the seal's
-//! phase-1 flip transaction) is the obvious optimization for condition 3 —
+//! **The trap this module exists to avoid:** a per-batch summary band
+//! (`min_origin_lsn`/`max_lsn`, aggregated inside the seal's phase-1 flip
+//! transaction) is the obvious optimization for condition 3 —
 //! one indexed comparison per batch instead of a scan — and it is wrong: a
 //! band aggregated inside the flip describes what that transaction could
 //! see, not the slot, so a straddler or a phase-gap writer
 //! (docs/staging-and-claiming/03-sealing-and-the-fence.md) can each land in
-//! the slot outside it and produce a false `converged`. Nothing in
-//! `segments` even carries those two columns
-//! today — they are vestigial in the doc, not a real surface to restore a
-//! reader for. Condition 3 below asks the slot directly instead.
+//! the slot outside it and produce a false `converged`. `segments` carries
+//! no such band (the doc's "The trap: no per-batch summary band"), and
+//! condition 3 below asks the slot directly instead.
 
 use std::time::{Duration, Instant};
 
@@ -87,7 +80,7 @@ pub(crate) fn per_ring_table(sep: &str, f: impl Fn(i16, &str) -> String) -> Stri
 ///   `super::seal::seal_phase2`), so the planner has real statistics to seek
 ///   with. Deliberately **not** narrowed to "buckets not drained" or
 ///   "band-only" — a part-drained batch's whole slot counts as pending, the
-///   safe over-report the doc's "Never narrow condition 3" section demands.
+///   safe over-report the doc's "The trap" section demands.
 /// - **Condition 4** — the quarantine/poison band: no `poison_held` row for
 ///   this `origin_lsn is null or origin_lsn <= $1`. Same NULL-gates-old
 ///   reasoning as condition 2/3 below, since a parked recompute-shaped row
@@ -577,12 +570,10 @@ async fn poll_within_deadline(
 // --- Boundary marker: the loose observability view lives on the other side ---
 //
 // A "list every pending row" helper (docs/staging-and-claiming/
-// 07-convergence-and-await.md, "An observability view, distinct from the
-// fenced read") belongs *below this line*, not above it: it is a read view,
-// not a fenced one, and may include a straggler the fold will attribute to a
-// later batch. That's fine for a self-check auditor's exemption map or an
-// overdue-work battery — over-exempting and over-reporting are both
+// 07-convergence-and-await.md, "No loose view feeds the predicate") belongs
+// *below this line*, not above it: it is a read view, not a fenced one, and
+// may include a straggler the fold will attribute to a later batch. That's
+// fine for a consumer that subtracts or reports unapplied rows
+// (`staging::self_check_ring`) — over-exempting and over-reporting are both
 // conservative there — but it must never be wired into [`converged_through`]
-// or any other fenced/strict read above. No such helper exists yet:
-// [`has_pending`]/[`pending_count`] cover this module's own needs, so this
-// marker is left for whichever stage adds one.
+// or any other fenced/strict read above.

@@ -99,6 +99,8 @@ struct ConnectOptions {
     staging: bool,
     drain_threads: usize,
     worker_threads: usize,
+    max_call_pool_size: usize,
+    call_pool_wait_timeout_ms: u64,
 }
 
 /// One connected Trellis instance, owned by the BEAM as a resource.
@@ -620,6 +622,10 @@ fn connect(options: ConnectOptions) -> NifReply<ResourceArc<Handle>> {
             staging: options.staging,
             drain_threads: options.drain_threads,
             worker_threads: Some(options.worker_threads),
+            max_call_pool_size: options.max_call_pool_size,
+            call_pool_wait_timeout: std::time::Duration::from_millis(
+                options.call_pool_wait_timeout_ms,
+            ),
             ..Default::default()
         },
     )
@@ -928,20 +934,20 @@ fn self_check_job<'a>(env: Env<'a>, handle: ResourceArc<Handle>, id: i64) -> Nif
 struct ConfigTerm {
     schema: String,
     target_schema: String,
-    pool_max_size: u64,
-    pool_wait_timeout_ms: u64,
+    max_call_pool_size: u64,
+    call_pool_wait_timeout_ms: u64,
 }
 
 /// The configuration the handle connected with. Read from memory, so it
 /// returns the term itself, on a normal scheduler.
 #[rustler::nif]
 fn config(handle: ResourceArc<Handle>) -> NifReply<ConfigTerm> {
-    let config = handle.with(|trellis| PlainConfig::from(trellis.config()))?;
+    let config = handle.with(|trellis| PlainConfig::from(trellis))?;
     Ok(ConfigTerm {
         schema: config.schema,
         target_schema: config.target_schema,
-        pool_max_size: config.pool_max_size,
-        pool_wait_timeout_ms: config.pool_wait_timeout_ms,
+        max_call_pool_size: config.max_call_pool_size,
+        call_pool_wait_timeout_ms: config.call_pool_wait_timeout_ms,
     })
 }
 

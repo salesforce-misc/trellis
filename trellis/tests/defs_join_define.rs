@@ -107,7 +107,10 @@ async fn define_validates_a_join_against_both_tables_then_refuses_it() {
             .await
             .unwrap_or_else(|err| panic!("{text}: {err:?}"));
         assert_eq!(definition.target_table, format!("public.{target}"));
-        assert_eq!(definition.status, TransformStatus::WaitingToBackfill);
+        assert_eq!(
+            definition.status,
+            trellis::defs::StoredStatus::WaitingToBackfill
+        );
         // The public type keeps naming the `FROM` table.
         assert_eq!(definition.source_table, "public.orders");
     }

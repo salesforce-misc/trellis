@@ -109,7 +109,7 @@ async fn statuses(raw: &Client) -> BTreeMap<String, TransformStatus> {
     .map(|row| {
         (
             row.get(0),
-            TransformStatus::from_persisted(row.get(1)).expect("known status"),
+            trellis::defs::StoredStatus::from_row(row.get(1)).into(),
         )
     })
     .collect()
@@ -235,12 +235,7 @@ async fn run_cases(cases: &[Case]) {
         let statuses = statuses(&raw).await;
         let r = statuses[&format!("r_{}", id.to_lowercase())];
         let s = statuses[&format!("s_{}", id.to_lowercase())];
-        let rebuilding = |status: TransformStatus| {
-            matches!(
-                status,
-                TransformStatus::CatchingUp | TransformStatus::Backfilling
-            )
-        };
+        let rebuilding = |status: TransformStatus| status == TransformStatus::Backfilling;
         let table = format!("public.{t}");
         let rebuilds =
             auto_rebuilds(&table, "value_rewrite") + auto_rebuilds(&table, "column_changed");
@@ -805,14 +800,7 @@ async fn a_same_type_rewrite_rebuilds_its_readers_to_the_new_values() {
     capture_pass(&mut raw, &db.pool).await;
     let statuses = statuses(&raw).await;
     for target in ["wb", "wsum"] {
-        assert!(
-            matches!(
-                statuses[target],
-                TransformStatus::CatchingUp | TransformStatus::Backfilling
-            ),
-            "{target}: {:?}",
-            statuses[target]
-        );
+        assert_eq!(statuses[target], TransformStatus::Backfilling, "{target}");
     }
     assert_eq!(auto_rebuilds("public.w", "value_rewrite"), 1);
 
@@ -874,11 +862,9 @@ async fn a_retyped_field_rebuilds_while_valid_and_pauses_otherwise() {
     capture_pass(&mut raw, &db.pool).await;
     capture_pass(&mut raw, &db.pool).await;
     let statuses_now = statuses(&raw).await;
-    assert!(
-        matches!(
-            statuses_now["fsum"],
-            TransformStatus::CatchingUp | TransformStatus::Backfilling
-        ),
+    assert_eq!(
+        statuses_now["fsum"],
+        TransformStatus::Backfilling,
         "{statuses_now:?}"
     );
     assert_eq!(auto_rebuilds("public.f", "column_changed"), 1);
@@ -927,10 +913,7 @@ async fn a_retyped_field_rebuilds_while_valid_and_pauses_otherwise() {
     .await
     .expect("drop and re-add k");
     capture_pass(&mut raw, &db.pool).await;
-    assert!(matches!(
-        statuses(&raw).await["fk"],
-        TransformStatus::CatchingUp | TransformStatus::Backfilling
-    ));
+    assert_eq!(statuses(&raw).await["fk"], TransformStatus::Backfilling);
     assert_eq!(auto_rebuilds("public.f", "column_changed"), 2);
     bring_live_except(&mut raw, &db.pool, &["fq"]).await;
     assert_eq!(
@@ -1008,10 +991,7 @@ async fn a_same_type_rewrite_of_a_partitioned_source_rebuilds_its_readers() {
         .await
         .expect("rewrite b");
     capture_pass(&mut raw, &db.pool).await;
-    assert!(matches!(
-        statuses(&raw).await["psum"],
-        TransformStatus::CatchingUp | TransformStatus::Backfilling
-    ));
+    assert_eq!(statuses(&raw).await["psum"], TransformStatus::Backfilling);
     assert_eq!(auto_rebuilds("public.p", "value_rewrite"), 1);
     bring_live(&mut raw, &db.pool).await;
     assert_eq!(

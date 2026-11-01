@@ -1,4 +1,4 @@
-//! Improvement-plan task E6: bulk operations (`TRUNCATE`, bulk insert) in the
+//! Bulk operations (`TRUNCATE`, bulk insert) in the
 //! generator's action space.
 //!
 //! **The load-bearing gotcha this file specifically guards against**:
