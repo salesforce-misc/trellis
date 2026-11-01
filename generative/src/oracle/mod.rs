@@ -1064,7 +1064,14 @@ async fn join_one_to_one_sql_oracle(
             .enumerate()
             .map(|(i, field)| (field.name.clone(), db_row.get::<_, Option<String>>(i + 1)))
             .collect();
-        rows.insert(pk, by_column);
+        // `b`'s side of the `ON` holds a unique key, so a `FROM` row joins
+        // at most one `b` row; a second would be lost in the map.
+        let repeated = rows.insert(pk.clone(), by_column).is_some();
+        assert!(
+            !repeated,
+            "{}: the query yields `a` row {pk} twice",
+            def.target
+        );
     }
     Ok(rows)
 }

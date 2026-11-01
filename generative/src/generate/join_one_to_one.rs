@@ -708,11 +708,12 @@ mod strategy {
     ///   every definition live over the empty tables first and no operator
     ///   actions, every page stalled for seconds before its commit.
     /// - A `wide` case draws 120 to 600 ops in bursts of 260 to 600 (past
-    ///   the engine's split threshold, so several workers claim one batch).
+    ///   the engine's split threshold, so several workers claim one batch),
+    ///   with the installs, pauses and re-reads below.
     /// - Every other case draws 120 to 600 ops in short bursts of 30 to 150,
-    ///   each definition installed up front or part way through, one to five
+    ///   each definition installed up front or part way through, two to six
     ///   pauses (each with its `RESUME`) and re-reads in the bursts after
-    ///   the first, so the rebuilds run over rows that the paused stretch
+    ///   the first (a draw that can't apply is dropped), so the rebuilds run over rows that the paused stretch
     ///   deleted, moved and re-inserted, and in about half the cases a commit
     ///   stall of 5 to 40 ms.
     ///
@@ -846,6 +847,48 @@ mod tests {
                 "{spec:?}"
             );
             assert_eq!(def.fields.len(), spec.fields.len());
+        }
+    }
+
+    /// The oracle's query is built from the parsed definition, so a parse
+    /// that dropped an `ON` pair, swapped `LEFT` for `INNER` or misread a
+    /// field would agree with the engine's target. This pins each drawable
+    /// shape's oracle, written out by hand from the text the generator
+    /// emits.
+    #[test]
+    fn the_oracle_of_every_drawable_shape_is_its_own_query() {
+        let on = |shape| match shape {
+            OnShape::PkPk => r#""ja"."id" = "jb"."id""#,
+            OnShape::KeyPk => r#""ja"."k" = "jb"."id""#,
+            OnShape::KeyUnique => r#""ja"."k" = "jb"."u""#,
+            OnShape::PkPlusT => r#""ja"."k" = "jb"."id" and "ja"."t" = "jb"."t""#,
+            OnShape::UniquePlusT => r#""ja"."t" = "jb"."t" and "ja"."k" = "jb"."u""#,
+            OnShape::Composite => r#""ja"."c1" = "jb"."c1" and "ja"."c2" = "jb"."c2""#,
+            OnShape::Text => r#""ja"."s" = "jb"."s""#,
+        };
+        let fields = [
+            r#"("jb"."id")::text as "b_id""#,
+            r#"("jb"."y")::text as "b_y""#,
+            r#"("jb"."w")::text as "b_w""#,
+            r#"("ja"."x")::text as "a_x""#,
+            r#"("ja"."s")::text as "a_s""#,
+            r#"(("ja"."x" + "jb"."y"))::text as "sum_xy""#,
+            r#"(("ja"."x" + coalesce("jb"."y", 0::integer)))::text as "co_xy""#,
+            r#"((case when ("jb"."id" is null) then 'none'::text else "jb"."w" end))::text as "case_w""#,
+            r#"(("jb"."y" - "ja"."x"))::text as "diff_yx""#,
+        ];
+        for spec in every_shape() {
+            let def = one_to_one_definition("j", &spec);
+            assert_eq!(
+                crate::oracle::render_join_one_to_one_select(&def, "id"),
+                format!(
+                    r#"select "ja"."id"::text, {} from "ja" {} "jb" on {}"#,
+                    fields.join(", "),
+                    if spec.left { "left join" } else { "join" },
+                    on(spec.on)
+                ),
+                "{spec:?}"
+            );
         }
     }
 
@@ -1000,5 +1043,101 @@ mod tests {
         }
         seen.sort_unstable();
         assert_eq!(seen, (0..draws.len()).collect::<Vec<_>>());
+    }
+
+    /// Over the strategy's own cases, replayed as one `jb` lane applies them
+    /// (in program order), no `jb` write breaks one of its `UNIQUE`
+    /// constraints as Postgres judges them (a `NULL` in a set conflicts with
+    /// nothing), every update and delete names a live row, and every burst
+    /// keeps its `jb` ops on one lane. This checks the rows the stream
+    /// writes, not the generator's own model of them.
+    #[cfg(feature = "proptest")]
+    #[test]
+    fn drawn_streams_never_break_a_joined_unique_constraint() {
+        use proptest::strategy::Strategy;
+        use std::collections::{BTreeMap, BTreeSet};
+        type Row = BTreeMap<String, Option<String>>;
+        let strategy = one_to_one_case_strategy().boxed();
+        let (mut jb_writes, mut half_null_writes) = (0usize, 0usize);
+        for seed in 1..=8 {
+            for case in crate::plant_sweep::seeded_cases(&strategy, seed, 40) {
+                let mut live: [BTreeMap<String, Row>; 2] = [BTreeMap::new(), BTreeMap::new()];
+                for (index, op) in case.program.ops.iter().enumerate() {
+                    let (table, written) = match op {
+                        Op::Insert { table, row, .. } => {
+                            let side = usize::from(table == JOINED_TABLE);
+                            let row: Row = row.iter().cloned().collect();
+                            let id = row["id"].clone().expect("an id");
+                            assert!(
+                                live[side].insert(id.clone(), row).is_none(),
+                                "op {index} inserts live id {id} into {table}"
+                            );
+                            (table, Some(id))
+                        }
+                        Op::Update {
+                            table, pk, changes, ..
+                        } => {
+                            let side = usize::from(table == JOINED_TABLE);
+                            let row = live[side]
+                                .get_mut(pk)
+                                .unwrap_or_else(|| panic!("op {index} updates dead {table} {pk}"));
+                            row.extend(changes.iter().cloned());
+                            (table, Some(pk.clone()))
+                        }
+                        Op::Delete { table, pk, .. } => {
+                            let side = usize::from(table == JOINED_TABLE);
+                            assert!(
+                                live[side].remove(pk).is_some(),
+                                "op {index} deletes dead {table} {pk}"
+                            );
+                            (table, None)
+                        }
+                        Op::Truncate { table, .. } => {
+                            live[usize::from(table == JOINED_TABLE)].clear();
+                            (table, None)
+                        }
+                        other => panic!("{other:?}"),
+                    };
+                    let Some(id) = written.filter(|_| table == JOINED_TABLE) else {
+                        continue;
+                    };
+                    jb_writes += 1;
+                    let row = &live[1][&id];
+                    half_null_writes += usize::from(row["c1"].is_some() && row["c2"].is_none());
+                    for set in [&["u"][..], &["s"], &["c1", "c2"]] {
+                        let key: Option<Vec<&String>> =
+                            set.iter().map(|c| row[*c].as_ref()).collect();
+                        let Some(key) = key else { continue };
+                        for (other_id, other) in &live[1] {
+                            let theirs: Option<Vec<&String>> =
+                                set.iter().map(|c| other[*c].as_ref()).collect();
+                            assert!(
+                                *other_id == id || theirs.as_ref() != Some(&key),
+                                "seed {seed} op {index}: jb {id} and {other_id} share {set:?}"
+                            );
+                        }
+                    }
+                }
+                for burst in &case.plan.bursts {
+                    let lanes: BTreeSet<usize> = burst
+                        .lanes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, lane)| {
+                            lane.iter().any(|&i| {
+                                matches!(&case.program.ops[i],
+                                    Op::Insert { table, .. } | Op::Update { table, .. }
+                                    | Op::Delete { table, .. } | Op::Truncate { table, .. }
+                                    if table == JOINED_TABLE)
+                            })
+                        })
+                        .map(|(n, _)| n)
+                        .collect();
+                    assert!(lanes.len() <= 1, "seed {seed}: jb ops on lanes {lanes:?}");
+                }
+            }
+        }
+        assert!(jb_writes > 10_000, "{jb_writes}");
+        assert!(half_null_writes > 100, "{half_null_writes}");
     }
 }
