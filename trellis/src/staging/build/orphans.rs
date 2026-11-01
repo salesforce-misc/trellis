@@ -446,8 +446,9 @@ mod tests {
             ("public.tc", "id"),
             ("public.tu", "id collate \"und-x-icu\""),
             ("public.tm", "g, h"),
-            // Parts of two non-default collations: the key text is `"C"`
-            // (#1522), the walk still pages in the index's order.
+            // Parts of two non-default collations: the key text is `"C"`, as
+            // every composite key's is; the walk still pages in the index's
+            // order.
             ("public.tx", "g collate \"und-x-icu\", h collate \"POSIX\""),
         ] {
             let key = crate::defs::ddl::source_primary_key_in_txn(&client, target)

@@ -10,10 +10,9 @@
 //! collation, or of `"C"`, was unaffected, as was any key whose text kept no
 //! collation of its own.
 //!
-//! A composite key whose parts carry two collations other than the default
-//! renders its text under `"C"` (#1522): joined, the parts' texts had no
-//! collation Postgres could choose, and the definition's first build failed
-//! on every chunk.
+//! A composite key whose parts carried two collations other than the default
+//! once had joined text with no collation Postgres could choose, and the
+//! definition's first build failed on every chunk (#1522).
 //!
 //! A source key re-collated after define between deterministic collations
 //! leaves the target's key columns at the collations they were created with
@@ -219,9 +218,8 @@ async fn a_rebuild_of_a_key_of_a_non_default_collation_removes_its_orphan() {
     }
 }
 
-/// A composite key: the key text is the parts' texts joined, so it takes their
-/// collation when they share one, the one non-default collation beside the
-/// default, and `"C"` when two non-default ones meet (#1522).
+/// A composite key: the key text is the parts' texts joined, under `"C"`
+/// whatever the parts' collations, including two non-default ones (#1522).
 #[tokio::test]
 async fn a_rebuild_of_a_composite_key_of_a_non_default_collation_removes_its_orphan() {
     let rows = "('a', 'x', 1), ('B', 'y', 2), ('c', 'X', 3), ('D', 'Y', 4)";
