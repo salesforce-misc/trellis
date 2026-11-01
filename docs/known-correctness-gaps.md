@@ -112,8 +112,8 @@ or a same-type `USING` rewrite of a column that has:
 
 **What goes wrong:** the statement rewrites the table without firing a
 trigger, so every target reading the column keeps the old values. A 1-1
-target's row is repaired when its source row is next written; an aggregate or
-`JOIN` target stays wrong until it's rebuilt.
+target's row is repaired by the next write that changes a column it reads in
+its source row; an aggregate or `JOIN` target stays wrong until it's rebuilt.
 
 **Detected by:** `self_check`.
 
@@ -142,8 +142,9 @@ old values. The reconcile pass doesn't rebuild the readers as it does for a
 same-type rewrite, because the statement also changes the column's expression
 in the catalog, which reads as a metadata change and a rewrite in one interval,
 [a shape above](#a-columns-values-rewritten-in-place-by-alter-column-type)
-that routine work also produces. A 1-1 target's row, a 1-1 `JOIN`'s included,
-is repaired when a source row it is computed from is next written; an
+that routine work also produces. A 1-1 target's row is repaired by the next
+write that changes a column the definition reads in the row of the table that
+holds the generated column (for a 1-1 `JOIN`, not the row joined to it); an
 aggregate or `JOIN` target stays wrong until it's rebuilt.
 
 **Detected by:** `self_check`.

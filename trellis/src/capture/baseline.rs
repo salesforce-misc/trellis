@@ -93,8 +93,9 @@
 //! column added with a constant default: its row keeps that default for the
 //! rows that predate it (`atthasmissing`) until the table is rewritten, and
 //! any rewrite clears it, `VACUUM FULL` included, which is why the hash
-//! can't leave it out. An identity rewrite (`USING
-//! b + 0`), or an identical `SET DEFAULT` re-applied in the same window as a
+//! can't leave it out. So does `SET EXPRESSION` on a stored generated
+//! column, which changes the column's expression as it rewrites the values.
+//! An identity rewrite (`USING b + 0`), or an identical `SET DEFAULT` re-applied in the same window as a
 //! rewrite, rebuilds the readers for nothing, as does a column retyped and
 //! back between two passes (two rewrites that leave the row as it was).
 //!
