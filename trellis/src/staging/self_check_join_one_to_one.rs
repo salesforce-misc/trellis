@@ -82,7 +82,7 @@ use super::one_to_one_ledger::LedgerRef;
 use super::self_check::{ComparePass, Divergence, Page, SelfCheckError, SelfCheckScope, diff_page};
 use super::self_check_groups::Uncertain;
 use super::self_check_joins::render;
-use super::self_check_keyset::Keyset;
+use super::self_check_keyset::{Keyset, recollated_pairs};
 use super::self_check_ring::Ring;
 
 /// One part of the walk (the module doc), in walk order.
@@ -265,22 +265,46 @@ impl Audit<'_> {
         }
     }
 
-    /// The `ON` terms of the join, over the aliases `a` and `x`.
-    fn on(&self) -> String {
+    /// The `ON` terms of the join, over the aliases `a` and `x`: `a`'s
+    /// column read under the collation `on_collations` names for its term
+    /// (the `ON` pairs' [`recollated_pairs`]), `x`'s as it is, so an index on
+    /// `b`'s join key serves the probe.
+    fn on(&self, on_collations: &[Option<String>]) -> String {
         self.a
             .key
             .iter()
             .zip(&self.b.key)
-            .map(|(a, b)| format!("a.{} = x.{}", quote_ident(a), quote_ident(b)))
+            .zip(on_collations)
+            .map(|((a, b), collation)| match collation {
+                Some(collation) => format!(
+                    "a.{} collate {collation} = x.{}",
+                    quote_ident(a),
+                    quote_ident(b)
+                ),
+                None => format!("a.{} = x.{}", quote_ident(a), quote_ident(b)),
+            })
             .collect::<Vec<_>>()
             .join(" and ")
+    }
+
+    /// [`recollated_pairs`] of the join's `ON` terms.
+    async fn on_collations(
+        &self,
+        client: &tokio_postgres::Client,
+    ) -> Result<Vec<Option<String>>, SelfCheckError> {
+        recollated_pairs(
+            client,
+            (&self.a.ident, &self.a.key),
+            (&self.b.ident, &self.b.key),
+        )
+        .await
     }
 
     /// The expected target: each `a` row as `R` has applied it, with the fields
     /// of the `b` row on its key, as `M` has applied it, the newest live entry's
     /// when a key has several (a derived table named `e`, its columns `a`'s
     /// primary key's and `__f<i>` for each field).
-    fn expected_target(&self, pk: &[PrimaryKeyColumn]) -> String {
+    fn expected_target(&self, pk: &[PrimaryKeyColumn], on_collations: &[Option<String>]) -> String {
         let a_ring = self.a.ring(self.id());
         let b_ring = self.b.ring(self.id());
         let mut columns: Vec<String> = pk
@@ -313,19 +337,19 @@ impl Audit<'_> {
             key = quote_ident(schema::KEY_COLUMN),
             tomb = quote_ident(schema::TOMBSTONE_COLUMN),
             applied = quote_ident(schema::APPLIED_LSN_COLUMN),
-            on = self.on(),
+            on = self.on(on_collations),
         )
     }
 
     /// The statement of a page of the target part. `$1` is the page's limit.
     /// Each row is `(side, page_end, key, values)`: side 1 the expected target,
     /// 2 the persisted one, 3 a key the page can't vouch for, 4 every key.
-    fn target_sql(&self, keyset: &Keyset) -> String {
+    fn target_sql(&self, keyset: &Keyset, on_collations: &[Option<String>]) -> String {
         let refs = keyset.refs(None);
         let carried = keyset.select_carried(&refs);
         let order = keyset.order_by(&refs);
         let key = ddl::pk_key_sql_expr(keyset.columns(), None);
-        let expected = self.expected_target(keyset.columns());
+        let expected = self.expected_target(keyset.columns(), on_collations);
         let recomputed_values: Vec<String> = (0..self.fields.len())
             .map(|i| format!("__f{i}::text"))
             .collect();
@@ -652,7 +676,7 @@ async fn target_page(
     let client = pool.get().await?;
     let mut keyset = Keyset::resolve(&client, pk).await?;
     keyset.set_cursor(after)?;
-    let sql = audit.target_sql(&keyset);
+    let sql = audit.target_sql(&keyset, &audit.on_collations(&client).await?);
     let rows = client.query(sql.as_str(), &[&limit]).await?;
     let (recomputed, persisted, uncertain, page_end) = read_pages(&rows);
     let columns: Vec<&str> = audit.fields.iter().map(|f| f.name.as_str()).collect();

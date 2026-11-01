@@ -69,7 +69,7 @@ use crate::pool::{Pool, quote_ident};
 use super::group_basis::{self, Agg, GroupShape};
 use super::self_check::{ComparePass, Divergence, SelfCheckError, SelfCheckScope, render_leaf};
 use super::self_check_keyset::{BYTE_ORDER, Keyset};
-use super::self_check_ring::{Lands, Ring, WEIGHT};
+use super::self_check_ring::{Basis, Lands, Ring, WEIGHT};
 
 /// The partials' columns in the order every side lists them: the row count,
 /// then per argument its count and, if summed, its sum. Names are the
@@ -174,7 +174,13 @@ fn page_sql(
     let (src_parts, nonzero) = weighted_partials(&args);
     let lands = Lands {
         floor_key,
-        basis: Some((hidden, &shape.group_cols)),
+        basis: Some(Basis {
+            hidden,
+            columns: &shape.group_cols,
+            // An aggregate's hidden copy of a `GROUP BY` column has the
+            // database's default collation, which pairs with any.
+            collations: &[],
+        }),
         filter: String::new(),
         late_probe: true,
     };

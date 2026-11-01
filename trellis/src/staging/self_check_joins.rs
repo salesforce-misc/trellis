@@ -88,8 +88,8 @@ use super::self_check::{
 use super::self_check_groups::{
     Side, Uncertain, bound, drop_equal_values, partial_text, weighted_partials,
 };
-use super::self_check_keyset::{BYTE_ORDER, Keyset};
-use super::self_check_ring::{Lands, Ring, WEIGHT};
+use super::self_check_keyset::{BYTE_ORDER, Keyset, recollated_pairs};
+use super::self_check_ring::{Basis, Lands, Ring, WEIGHT};
 
 /// One part of the walk (the module doc), in walk order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -472,6 +472,12 @@ struct Audit<'a> {
     joined_args: Vec<Expr>,
     from_summed: Vec<bool>,
     joined_summed: Vec<bool>,
+    /// For each of a side's cell columns, the collation an unapplied
+    /// change's column is read under to find its cell in `P` or `M`
+    /// ([`Basis::collations`]): the hidden copy's, where the source column
+    /// was re-collated after define.
+    from_basis: Vec<Option<String>>,
+    joined_basis: Vec<Option<String>>,
 }
 
 impl Audit<'_> {
@@ -547,9 +553,17 @@ impl Audit<'_> {
                 .map(|c| format!(" and r.{} is not null", quote_ident(c)))
                 .collect(),
         };
+        let collations = match side {
+            JoinSide::From => &self.from_basis,
+            JoinSide::Joined => &self.joined_basis,
+        };
         let lands = Lands {
             floor_key: &hidden,
-            basis: Some((&hidden, &cells)),
+            basis: Some(Basis {
+                hidden: &hidden,
+                columns: &cells,
+                collations,
+            }),
             filter,
             late_probe,
         };
@@ -691,6 +705,7 @@ impl Audit<'_> {
         keyset: &Keyset,
         fields: &[&crate::defs::ast::FieldDef],
         field_types: &HashMap<String, String>,
+        on_collations: &[Option<String>],
     ) -> Result<(String, Vec<String>), SelfCheckError> {
         let join = join_of(self.def);
         let alias = |table: &str| match side_of(self.def, table) {
@@ -758,14 +773,19 @@ impl Audit<'_> {
         let on: Vec<String> = join
             .on
             .iter()
-            .map(|term| {
-                format!(
-                    "{}.{} = {}.{}",
-                    alias(&term.lhs.table),
-                    quote_ident(&term.lhs.column),
-                    alias(&term.rhs.table),
-                    quote_ident(&term.rhs.column)
-                )
+            .zip(on_collations)
+            .map(|(term, collation)| {
+                let operand = |column: &crate::defs::ast::QualifiedColumn| {
+                    let alias = alias(&column.table);
+                    let read = format!("{alias}.{}", quote_ident(&column.column));
+                    match collation {
+                        Some(collation) if alias == "__a" => {
+                            format!("{read} collate {collation}")
+                        }
+                        _ => read,
+                    }
+                };
+                format!("{} = {}", operand(&term.lhs), operand(&term.rhs))
             })
             .collect();
         let groups: Vec<String> = join
@@ -814,7 +834,16 @@ impl Audit<'_> {
             let bn_on: Vec<String> = a_cols
                 .iter()
                 .zip(&b_cols)
-                .map(|(a, b)| format!("__bn.{} = __a.{}", quote_ident(b), quote_ident(a)))
+                .zip(on_collations)
+                .map(|((a, b), collation)| {
+                    let a_read = match collation {
+                        Some(collation) => {
+                            format!("__a.{} collate {collation}", quote_ident(a))
+                        }
+                        None => format!("__a.{}", quote_ident(a)),
+                    };
+                    format!("__bn.{} = {a_read}", quote_ident(b))
+                })
                 .collect();
             ctes.push_str(&format!(
                 "__bn as materialized ( \
@@ -1024,7 +1053,7 @@ async fn build_audit<'a>(
     let joined_args = spec::side_arguments(&def.def, JoinSide::Joined);
     let from_pk = ddl::source_primary_key(pool, &def.source_table).await?;
     let joined_pk = ddl::source_primary_key(pool, joined).await?;
-    Ok(Audit {
+    let mut audit = Audit {
         def: &def.def,
         id: def.id,
         schema: pool.schema().to_string(),
@@ -1039,10 +1068,45 @@ async fn build_audit<'a>(
         joined_summed: summed(&def.def, &joined_args),
         from_args,
         joined_args,
-    })
+        from_basis: Vec::new(),
+        joined_basis: Vec::new(),
+    };
+    let client = pool.get().await?;
+    for side in [JoinSide::From, JoinSide::Joined] {
+        let (source, part) = match side {
+            JoinSide::From => (&audit.from_table, Part::From),
+            JoinSide::Joined => (&audit.joined_table, Part::Joined),
+        };
+        let cells = spec::side_key_columns(audit.def, side);
+        let collations =
+            recollated_pairs(&client, (source, &cells), (&audit.hidden(part), &cells)).await?;
+        match side {
+            JoinSide::From => audit.from_basis = collations,
+            JoinSide::Joined => audit.joined_basis = collations,
+        }
+    }
+    Ok(audit)
 }
 
 impl Audit<'_> {
+    /// For each `ON` term, in `ON` order, the collation its `FROM` column is
+    /// read under in the check's own join of the source tables
+    /// ([`recollated_pairs`]).
+    async fn on_collations(
+        &self,
+        client: &tokio_postgres::Client,
+    ) -> Result<Vec<Option<String>>, SelfCheckError> {
+        recollated_pairs(
+            client,
+            (&self.from_table, &spec::join_key(self.def, JoinSide::From)),
+            (
+                &self.joined_table,
+                &spec::join_key(self.def, JoinSide::Joined),
+            ),
+        )
+        .await
+    }
+
     /// `part`'s page statement after `after`, its partial columns, and
     /// whether the page steers by the source's index ([`Keyset::run`]).
     async fn page_statement(
@@ -1096,7 +1160,10 @@ impl Audit<'_> {
         };
         keyset.set_cursor(after)?;
         let (sql, columns) = match part {
-            Part::Target => audit.target_page(&keyset, &fields, &field_types)?,
+            Part::Target => {
+                let on_collations = audit.on_collations(client).await?;
+                audit.target_page(&keyset, &fields, &field_types, &on_collations)?
+            }
             Part::From => audit.side_page(JoinSide::From, &keyset, steer)?,
             Part::Joined => audit.side_page(JoinSide::Joined, &keyset, steer)?,
             Part::Matches => (

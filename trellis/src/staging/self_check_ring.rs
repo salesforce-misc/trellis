@@ -75,11 +75,10 @@ pub(super) struct Ring<'a> {
 
 /// Where a side of an unapplied change lands, for the page that would apply
 /// it: the `ledger_truncate_floor` key above which it applies, and the
-/// hidden table (quoted, qualified) and its key columns whose row's
-/// `__basis` refuses it, if any.
+/// [`Basis`] that refuses it, if any.
 pub(super) struct Lands<'a> {
     pub(super) floor_key: &'a str,
-    pub(super) basis: Option<(&'a str, &'a [String])>,
+    pub(super) basis: Option<Basis<'a>>,
     /// More conditions a side must meet to apply, over its populated image
     /// `r` (` and …`, or empty): a joined row with a `NULL` join-key part
     /// applies to nothing.
@@ -91,6 +90,20 @@ pub(super) struct Lands<'a> {
     /// page's images, not every page's. One that reads every weighted row,
     /// several times over (`JOIN`'s target part), doesn't.
     pub(super) late_probe: bool,
+}
+
+/// The hidden table (quoted, qualified) whose row's `__basis` refuses an
+/// unapplied change, and its key columns, which carry the source columns'
+/// names.
+pub(super) struct Basis<'a> {
+    pub(super) hidden: &'a str,
+    pub(super) columns: &'a [String],
+    /// For each of `columns`, the collation the change's column is read
+    /// under to find the hidden row, `None` to read it as it is: a source
+    /// column re-collated after define no longer has its hidden copy's
+    /// collation, and equality of the two then has none (`recollated_pairs`
+    /// in `super::self_check_keyset`). Empty for none.
+    pub(super) collations: &'a [Option<String>],
 }
 
 impl Ring<'_> {
@@ -361,29 +374,38 @@ impl Ring<'_> {
 /// `__txid`), populated as `alias`, is unseen by the `__basis` of the row
 /// it lands in (`lands`), or empty when `lands` has no basis.
 fn unseen_by_basis(lands: &Lands<'_>, image: &str, alias: &str) -> String {
-    match lands.basis {
-        Some((hidden, columns)) => format!(
+    match &lands.basis {
+        Some(basis) => format!(
             " and not coalesce(pg_visible_in_snapshot({image}.__txid, {}), false)",
-            basis_probe(hidden, columns, alias)
+            basis_probe(basis, alias)
         ),
         None => String::new(),
     }
 }
 
-/// The `__basis` of the row of `hidden` (quoted, qualified) whose key
-/// columns `columns` equal `alias`'s, `NULL` matching `NULL`, or `NULL` when
-/// there is none. Plain equality first, which the hidden table's key index
-/// serves; only a key with a `NULL` part takes the second lookup, which no
-/// index serves.
-fn basis_probe(hidden: &str, columns: &[String], alias: &str) -> String {
+/// The `__basis` of the row of `basis`'s hidden table whose key columns
+/// equal `alias`'s, `NULL` matching `NULL`, or `NULL` when there is none.
+/// Plain equality first, which the hidden table's key index serves (a
+/// re-collated column of `alias` is read under its hidden copy's collation,
+/// [`Basis::collations`]); only a key with a `NULL` part takes the second
+/// lookup, which no index serves.
+fn basis_probe(basis: &Basis<'_>, alias: &str) -> String {
+    let Basis {
+        hidden, columns, ..
+    } = basis;
     if columns.is_empty() {
         return format!("(select x.__basis from {hidden} x limit 1)");
     }
+    let read = |i: usize, c: &str| match basis.collations.get(i).and_then(Option::as_deref) {
+        Some(collation) => format!("{alias}.{c} collate {collation}"),
+        None => format!("{alias}.{c}"),
+    };
     let equal: Vec<String> = columns
         .iter()
-        .map(|c| {
+        .enumerate()
+        .map(|(i, c)| {
             let c = quote_ident(c);
-            format!("x.{c} = {alias}.{c}")
+            format!("x.{c} = {}", read(i, &c))
         })
         .collect();
     let has_null: Vec<String> = columns
@@ -392,9 +414,10 @@ fn basis_probe(hidden: &str, columns: &[String], alias: &str) -> String {
         .collect();
     let same: Vec<String> = columns
         .iter()
-        .map(|c| {
+        .enumerate()
+        .map(|(i, c)| {
             let c = quote_ident(c);
-            format!("x.{c} is not distinct from {alias}.{c}")
+            format!("x.{c} is not distinct from {}", read(i, &c))
         })
         .collect();
     format!(
