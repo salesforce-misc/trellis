@@ -950,7 +950,22 @@ const GROUP_IS_KEY: &str = "TRANSFORM gk FROM public.a JOIN public.b ON a.k = b.
 /// and the source side a range scan of an index on the source's join columns.
 #[tokio::test]
 async fn a_p_or_m_page_is_a_range_scan_of_the_hidden_index_and_the_source_join_index() {
-    let d = start(&[LEFT_PAIR]).await;
+    let mut d = start(&[LEFT_PAIR]).await;
+    // Rows enough that the plan is chosen on cost, and a cursor near the end of
+    // the key space so the range is a small part of them. On near-empty tables
+    // every index scan costs the same and which one a version of Postgres picks
+    // is arbitrary: PostgreSQL 18 scans `a (k)` whole and sorts, where 17
+    // range-scans `a (t, k)` through a merge append. A range covering most of
+    // the table is no better: 15 and 16 bitmap-scan `k` there. Drained, so the
+    // hidden tables have statistics too.
+    step(
+        &mut d,
+        "insert into public.a select g, g % 50, 1 + g % 3, g % 1000, g \
+             from generate_series(1, 10000) g; \
+         insert into public.b select g, 1 + g % 3, g % 1000, g % 40, g \
+             from generate_series(1, 10000) g",
+    )
+    .await;
     exec(
         &d,
         "create index a_join_idx on public.a (t, k); create index b_join_idx on public.b (t, k)",
@@ -984,7 +999,7 @@ async fn a_p_or_m_page_is_a_range_scan_of_the_hidden_index_and_the_source_join_i
             d.pool(),
             "public.l",
             part,
-            Some("1\u{1f}1\u{1f}1"),
+            Some("3\u{1f}995\u{1f}1"),
             3,
         )
         .await
