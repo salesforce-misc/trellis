@@ -162,11 +162,13 @@ afterwards. A pause driven by that comparison must first be shown not to fire on
 routine maintenance and migrations, and must not need superuser. This ADR adds
 no such detector.
 
-A `JOIN` aggregate's group and key columns therefore live in three places that
-can disagree on collation after a re-collation: the source (live), the hidden
-tables with the session tables made from them, and the visible target. An
-aggregate's are the database default in every place Trellis creates, so only
-the source can differ, and any other collation overrides the default. A
+After a re-collation, a `JOIN` aggregate's group and key columns can sit at
+different collations in the three places that hold them: the source (live),
+the hidden tables with the session tables made from them (at the source's
+collation when define or a `RESUME` created them), and the visible target (at
+the source's collation at define). A plain aggregate's hidden table, target
+and session tables are the database default, which any other collation
+overrides, so only a `JOIN` meets two collations that conflict. A
 statement over a `JOIN`'s columns that meets two of the places moves one side's
 values to the other's collation, and does so only where the two differ. A value
 read from the source or the target enters the session tables under the hidden

@@ -231,49 +231,8 @@ async fn a_re_collated_group_applies_checks_rebuilds_and_resumes(c: Case<'_>) {
     c.assert_matches(&d, "recomputed").await;
 
     let trellis = trellis(&d).await;
-    trellis
-        .request_backfill("public.a")
-        .await
-        .unwrap_or_else(|e| panic!("{name}: request a rebuild: {e}"));
-    work_to_idle(&d).await;
-    let (status, error) = status_and_error(&d, "public.t").await;
-    assert_eq!(
-        (status.as_str(), error),
-        ("live", None),
-        "{name}: the rebuild finishes"
-    );
-    d.settle().await;
-    c.assert_matches(&d, "rebuilt").await;
-
-    trellis
-        .apply("PAUSE TRANSFORM t")
-        .await
-        .unwrap_or_else(|e| panic!("{name}: pause: {e}"));
-    d.user()
-        .await
-        .batch_execute(
-            "delete from public.a where id > 100; update public.a set v = v + 1; \
-             insert into public.a values (200, 'zzz', 'q', 1, 'k1', 5)",
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{name}: changes while paused: {e}"));
-    d.settle().await;
-    trellis
-        .apply("RESUME TRANSFORM t")
-        .await
-        .unwrap_or_else(|e| panic!("{name}: resume: {e}"));
-    trellis::intake::harness::start_registered_builds(d.pool())
-        .await
-        .unwrap_or_else(|e| panic!("{name}: start the resumed build: {e}"));
-    work_to_idle(&d).await;
-    let (status, error) = status_and_error(&d, "public.t").await;
-    assert_eq!(
-        (status.as_str(), error),
-        ("live", None),
-        "{name}: the resume finishes"
-    );
-    d.settle().await;
-    c.assert_matches(&d, "resumed").await;
+    rebuild_in_place(&mut d, &trellis, &c, "rebuilt").await;
+    pause_and_resume(&mut d, &trellis, &c, "resumed").await;
 
     // Changes apply on the resumed hidden tables, and a second rebuild
     // finishes.
@@ -287,19 +246,61 @@ async fn a_re_collated_group_applies_checks_rebuilds_and_resumes(c: Case<'_>) {
         .unwrap_or_else(|e| panic!("{name}: changes after the resume: {e}"));
     d.settle().await;
     c.assert_matches(&d, "applied after the resume").await;
+    rebuild_in_place(&mut d, &trellis, &c, "rebuilt again").await;
+}
+
+/// A rebuild in place finishes, and the target then matches.
+async fn rebuild_in_place(d: &mut Driver, trellis: &Trellis, c: &Case<'_>, stage: &str) {
+    let name = c.name;
     trellis
         .request_backfill("public.a")
         .await
-        .unwrap_or_else(|e| panic!("{name}: request a second rebuild: {e}"));
-    work_to_idle(&d).await;
-    let (status, error) = status_and_error(&d, "public.t").await;
+        .unwrap_or_else(|e| panic!("{name}: {stage}: request a rebuild: {e}"));
+    work_to_idle(d).await;
+    let (status, error) = status_and_error(d, "public.t").await;
     assert_eq!(
         (status.as_str(), error),
         ("live", None),
-        "{name}: the second rebuild finishes"
+        "{name}: {stage}: the rebuild finishes"
     );
     d.settle().await;
-    c.assert_matches(&d, "rebuilt again").await;
+    c.assert_matches(d, stage).await;
+}
+
+/// A `PAUSE`, changes while paused, and a `RESUME` that finishes, which
+/// re-creates the hidden tables at the sources' collations and keeps the
+/// target's; the target then matches.
+async fn pause_and_resume(d: &mut Driver, trellis: &Trellis, c: &Case<'_>, stage: &str) {
+    let name = c.name;
+    trellis
+        .apply("PAUSE TRANSFORM t")
+        .await
+        .unwrap_or_else(|e| panic!("{name}: {stage}: pause: {e}"));
+    d.user()
+        .await
+        .batch_execute(
+            "delete from public.a where id > 100; update public.a set v = v + 1; \
+             insert into public.a values (200, 'zzz', 'q', 1, 'k1', 5)",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{name}: {stage}: changes while paused: {e}"));
+    d.settle().await;
+    trellis
+        .apply("RESUME TRANSFORM t")
+        .await
+        .unwrap_or_else(|e| panic!("{name}: {stage}: resume: {e}"));
+    trellis::intake::harness::start_registered_builds(d.pool())
+        .await
+        .unwrap_or_else(|e| panic!("{name}: {stage}: start the resumed build: {e}"));
+    work_to_idle(d).await;
+    let (status, error) = status_and_error(d, "public.t").await;
+    assert_eq!(
+        (status.as_str(), error),
+        ("live", None),
+        "{name}: {stage}: the resume finishes"
+    );
+    d.settle().await;
+    c.assert_matches(d, stage).await;
 }
 
 fn alter(table: &str, column: &str, collation: &str) -> String {
@@ -458,6 +459,108 @@ async fn a_join_on_column_re_collated_on_both_sides() {
         ],
     })
     .await;
+}
+
+/// The source, the hidden tables and the target at three collations at once:
+/// re-collated, resumed (the hidden tables follow the sources), re-collated
+/// again. Changes, image-less recomputes, a rebuild, and a `TRUNCATE` of each
+/// side (the joined side's refills a `LEFT JOIN`'s unmatched groups) all
+/// meet the three.
+#[tokio::test]
+async fn a_join_whose_source_hidden_tables_and_target_have_three_collations() {
+    for (c, second) in [
+        (
+            Case {
+                name: "three collations, two tables' groups",
+                ddl: ddl("und-x-icu", "default", "default", "und-x-icu"),
+                definition: "TRANSFORM t FROM public.a JOIN public.b ON a.k = b.k \
+                             GROUP BY a.g1, b.h WITHOUT SOURCE INDEX \
+                             SELECT a.g1 AS g1, b.h AS h, COUNT(*) AS n, SUM(b.y) AS sy",
+                captured: BOTH,
+                groups: "g1, h",
+                oracle: "select a.g1, b.h, count(*), sum(b.y) from public.a \
+                         join public.b on a.k = b.k group by a.g1, b.h",
+                values: "n, sy",
+                recollate: &[&alter("a", "g1", "POSIX"), &alter("b", "h", "C")],
+            },
+            [alter("a", "g1", "C"), alter("b", "h", "default")],
+        ),
+        (
+            Case {
+                name: "three collations, LEFT on the grouped ON column",
+                ddl: ddl("default", "default", "und-x-icu", "default"),
+                definition: "TRANSFORM t FROM public.a LEFT JOIN public.b ON a.kt = b.kt \
+                             GROUP BY a.kt WITHOUT SOURCE INDEX \
+                             SELECT a.kt AS kt, COUNT(*) AS n, SUM(b.y) AS sy",
+                captured: BOTH,
+                groups: "kt",
+                oracle: "select * from (select a.kt as kt, count(*), sum(b.y) from public.a \
+                         left join public.b on a.kt = b.kt group by a.kt) as q",
+                values: "n, sy",
+                recollate: &[&alter("a", "kt", "POSIX"), &alter("b", "kt", "POSIX")],
+            },
+            [alter("a", "kt", "C"), alter("b", "kt", "C")],
+        ),
+    ] {
+        let name = c.name;
+        let mut d = Driver::start(&c.ddl, COLUMNS, &[c.definition], c.captured).await;
+        let trellis = trellis(&d).await;
+        c.assert_matches(&d, "built").await;
+        for stmt in c.recollate {
+            d.ctl
+                .batch_execute(stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {stmt}: {e}"));
+        }
+        pause_and_resume(&mut d, &trellis, &c, "resumed").await;
+        for stmt in &second {
+            d.ctl
+                .batch_execute(stmt)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {stmt}: {e}"));
+        }
+        d.user()
+            .await
+            .batch_execute(
+                "update public.a set v = v + 7 where id % 3 = 1; \
+                 insert into public.a select id + 300, g1 || 'n', g2, k, kt, v from public.a \
+                     where id < 4; \
+                 insert into public.b select id + 300, k, kt, y, h || 'n' from public.b \
+                     where id < 3",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{name}: changes: {e}"));
+        d.settle().await;
+        c.assert_matches(&d, "applied").await;
+        d.ctl
+            .batch_execute(
+                "update public.a set v = v + 1000 where id = 2; \
+                 update public.b set y = y + 1000 where id = 1",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{name}: change under the capture: {e}"));
+        d.stage_recomputes("public.a", &["1", "2", "5"]).await;
+        d.stage_recomputes("public.b", &["1", "2"]).await;
+        d.settle().await;
+        c.assert_matches(&d, "recomputed").await;
+        rebuild_in_place(&mut d, &trellis, &c, "rebuilt").await;
+        for truncate in [
+            "truncate public.b; \
+             insert into public.b values (1, 1, 'k1', 10, 'p'), (2, 2, 'k2', 20, 'Q')",
+            "truncate public.a; \
+             insert into public.a values (1, 'a', 'x', 1, 'k1', 1), (2, 'B', 'Y', 2, 'k2', 2), \
+                 (3, 'B', 'Y', 9, 'k9', 3)",
+        ] {
+            d.user()
+                .await
+                .batch_execute(truncate)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {truncate}: {e}"));
+            d.settle().await;
+            c.assert_matches(&d, truncate).await;
+        }
+        rebuild_in_place(&mut d, &trellis, &c, "rebuilt after the truncates").await;
+    }
 }
 
 // ------------------------------------------------------------ plain aggregate
