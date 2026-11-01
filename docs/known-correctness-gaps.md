@@ -28,6 +28,7 @@ wrong rows, on the targets it compares
 |---|---|---|
 | **Schema changes Trellis can't tell from routine work** | | |
 | [A column's values rewritten in place by `ALTER COLUMN TYPE`](#a-columns-values-rewritten-in-place-by-alter-column-type) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study) |
+| [A stored generated column's expression replaced by `SET EXPRESSION`](#a-stored-generated-columns-expression-replaced-by-set-expression) | `self_check` | [#1540](https://github.com/salesforce-misc/trellis/issues/1540) (study) |
 | [An enum label renamed and added again](#an-enum-label-renamed-and-added-again) | `self_check` | documented |
 | **Schema changes Trellis doesn't check yet** | | |
 | [`b`'s unique key dropped under a 1-1 `JOIN`](#bs-unique-key-dropped-under-a-1-1-join) | `self_check` | [#1536](https://github.com/salesforce-misc/trellis/issues/1536) (study done) |
@@ -71,7 +72,9 @@ while every rule holds.
   and between partition maintenance and a `pg_upgrade`
   ([below](#a-merge-that-moves-a-row-to-another-partition)).
 * **Repair after DDL that rewrites a read column's values** in one of the
-  shapes [listed below](#a-columns-values-rewritten-in-place-by-alter-column-type).
+  shapes [listed below](#a-columns-values-rewritten-in-place-by-alter-column-type),
+  or by [`SET EXPRESSION` on a stored generated
+  column](#a-stored-generated-columns-expression-replaced-by-set-expression).
 * **Keep a 1-1 `JOIN`'s `b` unique on its `ON` columns:** create a replacement
   unique index before you drop the old one
   ([below](#bs-unique-key-dropped-under-a-1-1-join)).
@@ -109,8 +112,8 @@ or a same-type `USING` rewrite of a column that has:
 
 **What goes wrong:** the statement rewrites the table without firing a
 trigger, so every target reading the column keeps the old values. A 1-1
-target's row is repaired when its source row is next written; an aggregate or
-`JOIN` target stays wrong until it's rebuilt.
+target's row is repaired by the next write that changes a column it reads in
+its source row; an aggregate or `JOIN` target stays wrong until it's rebuilt.
 
 **Detected by:** `self_check`.
 
@@ -120,6 +123,40 @@ target's row is repaired when its source row is next written; an aggregate or
 a false-positive study of signals that would catch these shapes. Event
 triggers would see every rewrite but need superuser, and logical decoding has
 the same blind spot: `pgoutput` never sends a rewrite's rows.
+
+### A stored generated column's expression replaced by `SET EXPRESSION`
+
+**When:** `ALTER COLUMN … SET EXPRESSION AS (…)` (PostgreSQL 17 and later)
+replaces the generation expression of a stored generated column that a
+definition reads:
+
+```sql
+CREATE TABLE b (bid integer PRIMARY KEY, img integer,
+                g integer GENERATED ALWAYS AS (img * 2) STORED);
+ALTER TABLE b ALTER COLUMN g SET EXPRESSION AS (img * 3);
+```
+
+**What goes wrong:** the statement recomputes and rewrites every value of the
+column without firing a trigger, so every target reading the column keeps the
+old values. The reconcile pass doesn't rebuild the readers as it does for a
+same-type rewrite, because the statement also changes the column's expression
+in the catalog, which reads as a metadata change and a rewrite in one interval,
+[a shape above](#a-columns-values-rewritten-in-place-by-alter-column-type)
+that routine work also produces. A 1-1 target's row is repaired by the next
+write that changes a column the definition reads in the row of the table that
+holds the generated column (for a 1-1 `JOIN`, not the row joined to it); an
+aggregate or `JOIN` target stays wrong until it's rebuilt.
+
+**Detected by:** `self_check`.
+
+**Repair:** right after the `ALTER`, `request_backfill` the table that holds
+the column.
+
+**Ends with:** [#1540](https://github.com/salesforce-misc/trellis/issues/1540),
+a false-positive study of rebuilding the readers when a stored generated
+column's expression changes. Event triggers would see the statement but need
+superuser, and logical decoding has the same blind spot: `pgoutput` never
+sends a rewrite's rows.
 
 ### An enum label renamed and added again
 

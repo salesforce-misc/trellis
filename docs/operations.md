@@ -357,6 +357,9 @@ each one costs and what to expect around it
 * **After an `ALTER COLUMN … TYPE … USING` that changes a read column's
   values,** `request_backfill` the table
   ([known correctness gaps](known-correctness-gaps.md#a-columns-values-rewritten-in-place-by-alter-column-type)).
+* **After an `ALTER COLUMN … SET EXPRESSION` on a stored generated column a
+  definition reads,** `request_backfill` the table
+  ([known correctness gaps](known-correctness-gaps.md#a-stored-generated-columns-expression-replaced-by-set-expression)).
 * **After granting a missing privilege or `BYPASSRLS`:** `RESUME` the paused
   definitions. A drain holdup on a refusal commits on the next pass, which
   clears its `drain_failure`.
