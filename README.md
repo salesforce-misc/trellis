@@ -1,6 +1,6 @@
 # Trellis
 
-> **Version 0.1:** the API may change between 0.x minor releases, before 1.0. A stored definition keeps its meaning across an upgrade; see [grammar versions](docs/transforms.md#grammar-versions).
+> **Version 0.1:** the API may change between 0.x minor releases, before 1.0. An upgrade never re-interprets a stored definition: it keeps its meaning, or is paused with the reason; see [grammar versions](docs/transforms.md#grammar-versions).
 
 A declarative API for creating data transformations in PostgreSQL.
 Correctness and performance are the key design goals.
