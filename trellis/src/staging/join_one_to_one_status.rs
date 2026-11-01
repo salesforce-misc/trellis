@@ -34,9 +34,9 @@
 //! holding one group just over the threshold can go unreported until the group
 //! grows.
 //!
-//! The threshold is the default of a knob ([`FAN_OUT_WARNING_ENV`]) whose value
-//! belongs to the benchmark of the SQL fan-out (#1404, milestone 9), which sets
-//! it from the cost per row there.
+//! The threshold is the default of a knob ([`FAN_OUT_WARNING_ENV`]),
+//! [`DEFAULT_FAN_OUT_WARNING_ROWS`], set from the cost per row of a fan-out
+//! that the benchmark (`one-to-one-join-fan-out`) measures.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 

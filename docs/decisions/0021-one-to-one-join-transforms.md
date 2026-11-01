@@ -185,10 +185,12 @@ seam's images. An `a` change on that key waits for the whole fan-out. Fan-out
 in chunks that each take `J[k]` again was exact.
 
 In v1, fan-out runs in one transaction, and that key's `a` writers wait for
-all of it. The benchmark (`one-to-one-join-fan-out`) measures about 4 µs and
-340 B of WAL per row whatever the size of `R`, since each batch of the upsert
-probes `R`'s primary key once per entry: 0.37 s at 100k rows, 4.2 s at a
-million and 19.5 s at the 5M cap. Three limits keep it bounded:
+all of it. The benchmark (`one-to-one-join-fan-out`) measures a `LEFT` join's
+fan-out at about 4 µs and 340 B of WAL per row whatever the size of `R`, since
+each batch of the upsert probes `R`'s primary key once per entry: 0.37 s at
+100k rows, 4.2 s at a million and 19.5 s at the 5M cap. An `INNER` join's
+fan-out costs more, since each batch also deletes the target rows of entries
+whose key has lost its last live `b` row. Three limits keep it bounded:
 
 - A `status()` warning names the join key with the most `a` rows when it holds more than 250k, a
   key whose `b` change stalls its `a` writers for about a second. The count is a sample of `R`'s

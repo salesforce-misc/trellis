@@ -558,8 +558,8 @@ well, with these differences:
   count stops at ten times the threshold. In a very large `R` a group just past the threshold
   can go unreported until it grows. The threshold is 250,000 by default and
   `TRELLIS_ONE_TO_ONE_JOIN_FAN_OUT_WARNING` sets another. The benchmark
-  (`one-to-one-join-fan-out`) measures a fan-out at about 4 µs per row, so a key past the
-  default stalls its `a` writers for about a second (0.37 s at 100,000 rows).
+  (`one-to-one-join-fan-out`) measures a `LEFT` join's fan-out at about 4 µs per row, so a
+  key past the default stalls its `a` writers for about a second (0.37 s at 100,000 rows).
 
 The `J` lock wait is a metric rather than a status field: the time a `JOIN` page
 spends in its sorted `select … for update` of its `J` rows is the histogram
