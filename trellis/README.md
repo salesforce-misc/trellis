@@ -1,18 +1,17 @@
 # trellis-pg
 
-> **Alpha, pre-release:** the API and stored definitions may change.
+> **Version 0.1:** the API may change between 0.x minor releases, before 1.0. A stored definition keeps its meaning across an upgrade; see [grammar versions](https://github.com/salesforce-misc/trellis/blob/main/docs/transforms.md#grammar-versions).
 
 The engine behind [Trellis](https://github.com/salesforce-misc/trellis): streaming SQL transforms
 (aggregates, `JOIN`s and copies) that are maintained incrementally inside your own PostgreSQL
 database. A target is an ordinary table that stays exactly equal to the query over its source as
 the source changes.
 
-The crate is published as `trellis-pg`; its library is named `trellis`. Name an alpha version
-exactly (for example `"0.1.0-alpha"`), since Cargo never picks a prerelease on its own:
+The crate is published as `trellis-pg`; its library is named `trellis`:
 
 ```toml
 [dependencies]
-trellis-pg = "<version>"
+trellis-pg = "0.1"
 ```
 
 ```rust
