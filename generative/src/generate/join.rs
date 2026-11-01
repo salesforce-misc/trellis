@@ -700,7 +700,7 @@ pub fn join_case(
 pub use strategy::{COMMIT_STALL_MS, MAX_OPS, RACING_COMMIT_STALL_MS, join_case_strategy};
 
 #[cfg(feature = "proptest")]
-pub(crate) mod strategy {
+mod strategy {
     use super::*;
     use proptest::prelude::*;
 
@@ -752,7 +752,7 @@ pub(crate) mod strategy {
     /// rest anywhere in the stream's first 95%, so most build over rows),
     /// up to four pauses and re-reads, and (a quarter of the cases) a settle
     /// over the empty tables before the first op.
-    pub(crate) fn builds() -> impl Strategy<Value = JoinBuildDraws> {
+    fn builds() -> impl Strategy<Value = JoinBuildDraws> {
         (
             proptest::collection::vec(prop_oneof![1 => Just(0u16), 2 => 1u16..=950], 3),
             proptest::collection::vec(action(), 0..=4),

@@ -420,8 +420,15 @@ beside them run on every `cargo test`.
   a `jb` row never shares its key with another live `jb` row. All of a burst's
   `jb` ops are issued from one lane (two lanes could race two rows for a key
   one is about to free) and the `ja` ops are spread over the others. Key
-  shapes, builds, pauses and resumes, re-reads, `TRUNCATE` of either table,
-  commit stalls and the `racing` shape are the aggregate `JOIN` tier's. The
+  shapes, builds, pauses and resumes, re-reads, commit stalls and the
+  `racing` shape are the aggregate `JOIN` tier's, with `racing` two cases in
+  seven. Every other shape but `wide` writes in short bursts (30 to 150 ops),
+  each checked once it settles, with one to five pauses (each with its
+  `RESUME`, a rebuild in place) and re-reads after the first burst, and in
+  three cases in four a `TRUNCATE` of either table now and then, with two to
+  four more in the last few ops of a burst: the planted bugs of a truncate, a
+  rebuild's orphan pass and its `M` pass leave a target wrong only until later
+  writes repair it, so the check has to come soon after. The
   oracle is the definition's own query without the `GROUP BY`
   (`render_join_one_to_one_select`), compared byte for byte; every burst is
   also audited by a `Strict` `self_check`, which reads the hidden ledgers.
@@ -431,7 +438,17 @@ beside them run on every `cargo test`.
   nor is a value that makes a field fail (a held row:
   `join_one_to_one_quarantine`). Run it with `cargo test -p generative --test
   join_one_to_one_convergence -- --ignored`. Its planted-bug sweep,
-  `one_to_one_join_planted_bugs_are_caught`, gates the `Join1*` plants.
+  `one_to_one_join_planted_bugs_are_caught` (run with
+  `GENERATIVE_PLANT_CASES=6`: 24 cases catch every gated plant, and the
+  default twelve take hours), gates `join1_no_placeholder`,
+  `join1_old_key_unlocked`, `join1_no_orphan_pass`, `join1_truncate_keeps_r`,
+  `join1_m_before_j`, `join1_no_j_lock` and `join1_truncate_no_rebuild`. The
+  other `Join1*` plants are narrow interleavings, or leave a target that the
+  rest of the build or the next writes repair before the burst settles: the
+  tier runs twelve of them as known misses, with their measured rates in its
+  `ONE_TO_ONE_KNOWN_MISSES`, and leaves four out, each with why (a held row,
+  a write past capture, a page the barrier never lets drain late). Their
+  deterministic pins gate all of them.
 - **Partitioned-source convergence** *(ADR-0017)*. The first table of a
   generated program is a partitioned source: `HASH` over one to four leaves,
   `LIST` with a leaf per grain value or fewer and a `DEFAULT`, or `RANGE` over

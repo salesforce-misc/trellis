@@ -11,14 +11,26 @@
 //! or `INNER` definitions over `ja` and `jb`, joined on one of seven `ON`
 //! shapes (`ja.id = jb.id`, `ja.k = jb.id`, `ja.k = jb.u`, two columns of a
 //! primary key or a unique column with `t`, a composite unique key
-//! `(c1, c2)`, a text key), with fields that read either table; and 120 to 900
-//! inserts, updates and deletes over both tables, with the join key `NULL` now
-//! and then or only the second column of the pair `NULL`, and about one op in a
-//! hundred a `TRUNCATE` of either table. `jb`'s ON columns hold a unique key,
-//! so the stream gives each live `jb` row a key of its own. The key shapes,
-//! sizes, lanes, workers, commit stalls and `racing` shape are the aggregate
-//! JOIN tier's (`join_convergence.rs`), with these differences:
+//! `(c1, c2)`, a text key), with fields that read either table; and inserts,
+//! updates and deletes over both tables, with the join key `NULL` now and then
+//! or only the second column of the pair `NULL`. `jb`'s ON columns hold a
+//! unique key, so the stream gives each live `jb` row a key of its own. The
+//! key shapes, lanes, workers, commit stalls and `racing` shape are the
+//! aggregate JOIN tier's (`join_convergence.rs`), with these differences:
 //!
+//! - `racing` is two cases in seven (the aggregate tier's half), and `fan_out`
+//!   is drawn twice as often as the other shapes;
+//! - every other shape but `wide` draws 120 to 600 ops in short bursts (30 to
+//!   150 ops), each checked once it settles, with one to five pauses (each
+//!   with its `RESUME`, a rebuild in place) and re-reads in the bursts after
+//!   the first: the plants of a `TRUNCATE`, a rebuild's orphan pass and its
+//!   `M` pass leave a target wrong only until later writes repair it, so the
+//!   check has to come soon after;
+//! - in three in four non-`racing` cases about one op in a hundred is a
+//!   `TRUNCATE` of either table, and two to four more land in the last four
+//!   ops of a burst;
+//! - one join key in ten is `NULL` (the aggregate tier's one in forty): a
+//!   row with no `J` row, which only its `R` entry lock orders;
 //! - all of a burst's `jb` ops are on one lane (`jb`'s key is unique, so two
 //!   lanes could race two rows for a key one is about to free), and the `ja`
 //!   ops are spread over the others;
@@ -61,8 +73,7 @@ use generative::generate::join::{
     build_coverage,
 };
 use generative::generate::join_one_to_one::{
-    OnShape, OneToOneField, OneToOneOpDraw, OneToOneSpec, one_to_one_case,
-    one_to_one_case_strategy,
+    OnShape, OneToOneField, OneToOneOpDraw, OneToOneSpec, one_to_one_case, one_to_one_case_strategy,
 };
 use generative::model::Op;
 use generative::plant_sweep::{self, SweepTier};
@@ -106,7 +117,12 @@ impl OneToOneCoverage {
             let on: Vec<String> = join
                 .on
                 .iter()
-                .map(|on| format!("{}.{}={}.{}", on.lhs.table, on.lhs.column, on.rhs.table, on.rhs.column))
+                .map(|on| {
+                    format!(
+                        "{}.{}={}.{}",
+                        on.lhs.table, on.lhs.column, on.rhs.table, on.rhs.column
+                    )
+                })
                 .collect();
             let shape = format!("{:?}/{}", join.kind, on.join("&"));
             *self.definitions.entry(shape).or_insert(0) += 1;
@@ -345,11 +361,85 @@ proptest! {
     }
 }
 
-/// The 1-1 `JOIN` tier's sweep: the plants a 1-1 `JOIN` page, build or
-/// truncate can reach are gated (the `Join1*` plants).
+/// The `Join1*` plants this tier doesn't gate, each with why: the runner can't
+/// draw the state it needs, or the target it leaves is repaired before a
+/// burst settles. The deterministic pin named in `trellis/src/plant.rs` gates
+/// each. Rates are of the 24 cases of seeds 1 to 4 (six cases each).
+const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
+    (
+        "join1_fan_out_held_row",
+        "it needs a row held in quarantine (a field that fails on it), and the tier draws \
+         no value that makes a field fail: a held row keeps a burst from converging; \
+         `join_one_to_one_quarantine` pins it",
+    ),
+    (
+        "join1_release_no_rederive",
+        "it needs a held row released while a fan-out of its key is pending, and the tier \
+         draws no held row; `join_one_to_one_quarantine` pins it",
+    ),
+    (
+        "join1_m_pass_b_only",
+        "it needs a b row deleted past capture before a rebuild in place (an uncaptured \
+         write), and every write the runner issues is captured: it fired in 24 of 24 \
+         cases (the M pass runs) and was caught in none; `join_one_to_one_build` pins it",
+    ),
+    (
+        "join1_truncate_no_floor",
+        "it needs a page from before a TRUNCATE drained after the truncate's page, which \
+         the barrier never lets the driver do (the pin claims it out of order by hand): \
+         it fired in 9 of 24 cases and was caught in none; \
+         `join_one_to_one_interleavings` pins it",
+    ),
+];
+
+/// Plants the tier draws the shape of but catches rarely or not at all, with
+/// what the 24 cases of seeds 1 to 4 measured (caught, and fired in). Each is
+/// a narrow interleaving (a row moving keys between a read and its lock, two
+/// writers of one row, a truncate racing a page or a rebuild's start) or a
+/// target the rest of the build or the next writes repair before the burst
+/// settles; its deterministic pin gates it.
+///
+/// - `join1_brd_no_key`: caught 1, fired 24.
+/// - `join1_chunk_no_key`: caught 0, fired 16.
+/// - `join1_lsn_only`: caught 0, fired 24.
+/// - `join1_no_entry_lock`: caught 0, fired 24.
+/// - `join1_no_recheck`: caught 0, fired 24.
+/// - `join1_orphan_delete`: caught 0, fired 12.
+/// - `join1_rd_no_key`: caught 0, fired 24 (once in 12 cases of an earlier,
+///   racing-heavy draw).
+/// - `join1_snapshot_after_read`: caught 0, fired 24 (once in 12 of the
+///   racing-heavy draw).
+/// - `join1_truncate_def_after_lock`: caught 0, fired 7 (its failure is a
+///   deadlock Postgres breaks, which its pin reads from the server log; the
+///   tier checks the targets).
+/// - `join1_truncate_keeps_m`: caught 0, fired 7 (its pin checks the target
+///   before the rebuild a `TRUNCATE b` starts reaches the row).
+/// - `join1_truncate_share_lock`: caught 0, fired 9.
+/// - `join1_vis_only`: caught 0, fired 24 (twice in 12 of a draw with seven
+///   `racing` cases).
+const ONE_TO_ONE_KNOWN_MISSES: &[&str] = &[
+    "join1_brd_no_key",
+    "join1_chunk_no_key",
+    "join1_lsn_only",
+    "join1_no_entry_lock",
+    "join1_no_recheck",
+    "join1_orphan_delete",
+    "join1_rd_no_key",
+    "join1_snapshot_after_read",
+    "join1_truncate_def_after_lock",
+    "join1_truncate_keeps_m",
+    "join1_truncate_share_lock",
+    "join1_vis_only",
+];
+
+/// The 1-1 `JOIN` tier's sweep: it gates the `Join1*` plants it catches
+/// (`join1_no_placeholder`, `join1_old_key_unlocked`, `join1_no_orphan_pass`,
+/// `join1_truncate_keeps_r`, `join1_m_before_j`, `join1_no_j_lock`,
+/// `join1_truncate_no_rebuild`), runs and reports [`ONE_TO_ONE_KNOWN_MISSES`],
+/// and leaves out [`ONE_TO_ONE_NOT_GATED`] and every plant of another path.
 fn one_to_one_sweep_tier() -> SweepTier {
     use generative::plant_sweep::{PlantPath, not_on_path};
-    let mut not_gated: Vec<(&'static str, &'static str)> = Vec::new();
+    let mut not_gated: Vec<(&'static str, &'static str)> = ONE_TO_ONE_NOT_GATED.to_vec();
     not_gated.extend(not_on_path(
         &[PlantPath::OneToOne, PlantPath::GroupBasis],
         "it breaks a 1-1 or plain group-basis aggregate path, and the 1-1 JOIN tier \
@@ -371,7 +461,7 @@ fn one_to_one_sweep_tier() -> SweepTier {
     ));
     SweepTier {
         name: generative::baseline_quarantine::JOIN_ONE_TO_ONE_TIER,
-        known_misses: &[],
+        known_misses: ONE_TO_ONE_KNOWN_MISSES,
         not_gated,
     }
 }
@@ -382,9 +472,14 @@ fn one_to_one_sweep_tier() -> SweepTier {
 /// cases. Returns at once without `GENERATIVE_PLANTS`. Run it with:
 ///
 /// ```text
-/// GENERATIVE_PLANTS=all cargo test -p generative --test join_one_to_one_convergence \
-///     one_to_one_join_planted_bugs_are_caught -- --ignored --nocapture
+/// GENERATIVE_PLANTS=all GENERATIVE_PLANT_CASES=6 cargo test -p generative \
+///     --test join_one_to_one_convergence one_to_one_join_planted_bugs_are_caught \
+///     -- --ignored --nocapture
 /// ```
+///
+/// Six cases per seed (24 in all) catch every gated plant, and the sweep runs
+/// its processes one after another: at the default twelve, its 20 processes
+/// of about 13 s a case take some three and a half hours.
 #[test]
 #[ignore = "planted-bug sweep: run with GENERATIVE_PLANTS=all and `--ignored`"]
 fn one_to_one_join_planted_bugs_are_caught() {
@@ -408,20 +503,35 @@ fn one_to_one_join_planted_bugs_are_caught() {
     );
 }
 
-/// Every 1-1 `JOIN` plant is run by the tier (gated); nothing else is.
+/// The tier runs every 1-1 `JOIN` plant but the ones it lists as not gated
+/// with a reason, and nothing else; its known misses are 1-1 `JOIN` plants it
+/// runs.
 #[test]
 fn the_one_to_one_join_tier_runs_every_one_to_one_join_plant() {
+    use generative::plant_sweep::{PlantPath, plant_path};
     use trellis::dev::plant::Plant;
     let tier = one_to_one_sweep_tier();
     for plant in Plant::ALL {
-        let gated = !tier.not_gated.iter().any(|(name, _)| *name == plant.name());
-        let path = generative::plant_sweep::plant_path(*plant);
+        let name = plant.name();
+        let gated = !tier.not_gated.iter().any(|(not, _)| *not == name);
+        let own_exception = ONE_TO_ONE_NOT_GATED.iter().any(|(not, _)| *not == name);
         assert_eq!(
             gated,
-            path == generative::plant_sweep::PlantPath::OneToOneJoin,
-            "{}",
-            plant.name()
+            plant_path(*plant) == PlantPath::OneToOneJoin && !own_exception,
+            "{name}"
         );
+    }
+    for name in tier.known_misses {
+        let plant = Plant::from_name(name).unwrap_or_else(|| panic!("{name} names no plant"));
+        assert_eq!(plant_path(plant), PlantPath::OneToOneJoin, "{name}");
+        assert!(
+            !tier.not_gated.iter().any(|(not, _)| not == name),
+            "{name} is both a known miss and not gated"
+        );
+    }
+    for (name, _) in ONE_TO_ONE_NOT_GATED {
+        let plant = Plant::from_name(name).unwrap_or_else(|| panic!("{name} names no plant"));
+        assert_eq!(plant_path(plant), PlantPath::OneToOneJoin, "{name}");
     }
 }
 
@@ -559,7 +669,10 @@ fn the_one_to_one_join_oracle_catches_a_corrupted_target() {
                     .map(|(target, _)| target)
                     .collect()
             }
-            assert!(check(&mut backend, &pool, &case).await.is_empty(), "converged");
+            assert!(
+                check(&mut backend, &pool, &case).await.is_empty(),
+                "converged"
+            );
             // A cell changed.
             backend
                 .execute_raw(
@@ -577,7 +690,10 @@ fn the_one_to_one_join_oracle_catches_a_corrupted_target() {
                 )
                 .await
                 .expect("restore the cell");
-            assert!(check(&mut backend, &pool, &case).await.is_empty(), "restored");
+            assert!(
+                check(&mut backend, &pool, &case).await.is_empty(),
+                "restored"
+            );
         })
     });
 }

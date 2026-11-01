@@ -549,14 +549,50 @@ pub fn one_to_one_case(
     }
 }
 
+/// A `TRUNCATE` placed near the end of a burst ([`place_tail_truncates`]):
+/// the burst settles and is checked soon after it, before the writes that
+/// follow rewrite what it changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TailTruncate {
+    /// Picks the burst, modulo how many there are.
+    pub burst: usize,
+    /// `jb` rather than `ja`.
+    pub joined: bool,
+    /// How many ops before the burst's last one it lands.
+    pub back: u8,
+}
+
+/// Turns the draws `tails` name into truncates: `back` ops before the end of
+/// the burst `burst` picks, for bursts of `burst_size`. A truncate of a
+/// table with no live rows is resolved as an insert, as any other.
+pub fn place_tail_truncates(
+    draws: &mut [OneToOneOpDraw],
+    burst_size: usize,
+    tails: &[TailTruncate],
+) {
+    if draws.is_empty() || burst_size == 0 {
+        return;
+    }
+    let bursts = draws.len().div_ceil(burst_size);
+    for tail in tails {
+        let burst = tail.burst % bursts;
+        let end = ((burst + 1) * burst_size).min(draws.len());
+        let at = end - 1 - usize::from(tail.back).min(end - 1 - burst * burst_size);
+        draws[at].kind = JoinOpKind::Truncate;
+        draws[at].joined = tail.joined;
+    }
+}
+
 #[cfg(feature = "proptest")]
 pub use strategy::one_to_one_case_strategy;
 
 #[cfg(feature = "proptest")]
 mod strategy {
     use super::*;
-    use crate::generate::join::strategy::builds;
-    use crate::generate::join::{COMMIT_STALL_MS, JoinBuildDraws, MAX_OPS, RACING_COMMIT_STALL_MS};
+    use crate::generate::join::{
+        COMMIT_STALL_MS, JoinActionDraw, JoinActionKind, JoinBuildDraws, MAX_OPS,
+        RACING_COMMIT_STALL_MS,
+    };
     use proptest::prelude::*;
 
     fn spec() -> impl Strategy<Value = OneToOneSpec> {
@@ -566,6 +602,48 @@ mod strategy {
             proptest::sample::subsequence(OneToOneField::ALL.to_vec(), 1..=4),
         )
             .prop_map(|(left, on, fields)| OneToOneSpec { left, on, fields })
+    }
+
+    fn action() -> impl Strategy<Value = JoinActionDraw> {
+        (
+            prop_oneof![
+                4 => Just(JoinActionKind::PauseResume),
+                1 => Just(JoinActionKind::RebuildFrom),
+                1 => Just(JoinActionKind::RebuildJoined),
+            ],
+            any::<usize>(),
+            any::<usize>(),
+            0u16..=600,
+            prop_oneof![1 => Just(1000u16), 1 => 0u16..=1000],
+        )
+            .prop_map(|(kind, burst, target, start, span)| JoinActionDraw {
+                kind,
+                burst,
+                target,
+                start,
+                span,
+            })
+    }
+
+    /// When each of up to three definitions installs (half up front, the
+    /// rest in the stream's first half, so most are live in time for a
+    /// pause), two to six pauses and re-reads (mostly a pause and its
+    /// `RESUME`, which rebuilds the target in place over the rows the
+    /// paused stretch left; half the resumes at the burst's end, so the check
+    /// after the burst sees the rebuild before later writes repair it), and
+    /// (a quarter of the cases) a settle over the empty tables before the
+    /// first op.
+    fn builds() -> impl Strategy<Value = JoinBuildDraws> {
+        (
+            proptest::collection::vec(prop_oneof![1 => Just(0u16), 1 => 1u16..=500], 3),
+            proptest::collection::vec(action(), 2..=6),
+            prop_oneof![3 => Just(false), 1 => Just(true)],
+        )
+            .prop_map(|(installs, actions, settle_after_install)| JoinBuildDraws {
+                installs,
+                actions,
+                settle_after_install,
+            })
     }
 
     /// One op draw. Without `truncating`, a drawn truncate is a delete.
@@ -582,7 +660,9 @@ mod strategy {
                 1 => Just(JoinOpKind::Truncate),
             ],
             any::<usize>(),
-            any::<u8>(),
+            // One key in ten is `NULL` (`KeyShape::key`'s top draws): a row
+            // with no `J` row, which only its entry lock orders.
+            prop_oneof![9 => 0u8..250, 1 => 250u8..=255],
             any::<u8>(),
             any::<u8>(),
             prop_oneof![7 => Just(false), 1 => Just(true)],
@@ -608,39 +688,64 @@ mod strategy {
             )
     }
 
-    /// A 1-1 JOIN tier case: one to three definitions, each installed up
-    /// front or part way through the stream, with pauses, resumes and
-    /// re-reads in the later bursts, a [`KeyShape`], 120 to [`MAX_OPS`] ops
-    /// (about a third on `jb`, half under the shapes whose keys are few or
-    /// many; in half the cases about one in a hundred a `TRUNCATE`), bursts
-    /// of 40 to 600 ops over 2 to 4 lanes, against 2 to 6 drain workers
-    /// sealing every 20 to 200 ms. The shapes, sizes, commit stalls and the
-    /// `racing` shape are the aggregate JOIN tier's
-    /// ([`crate::generate::join::join_case_strategy`]).
+    fn tail_truncate() -> impl Strategy<Value = TailTruncate> {
+        (any::<usize>(), any::<bool>(), 0u8..4).prop_map(|(burst, joined, back)| TailTruncate {
+            burst,
+            joined,
+            back,
+        })
+    }
+
+    /// A 1-1 JOIN tier case: one to three definitions, a [`KeyShape`], and
+    /// writes to both tables (about a third on `jb`, half under the shapes
+    /// whose keys are few or many), against 2 to 6 drain workers sealing
+    /// every 20 to 200 ms over 2 to 4 lanes. Every burst is checked once it
+    /// settles, so a short burst checks soon after what it did.
+    ///
+    /// - A [`KeyShape::Racing`] case (two in seven) is the aggregate JOIN
+    ///   tier's ([`crate::generate::join::join_case_strategy`]): 500 to
+    ///   [`MAX_OPS`] ops in bursts of 600 to 900, paced from the first op,
+    ///   every definition live over the empty tables first and no operator
+    ///   actions, every page stalled for seconds before its commit.
+    /// - A `wide` case draws 120 to 600 ops in bursts of 260 to 600 (past
+    ///   the engine's split threshold, so several workers claim one batch).
+    /// - Every other case draws 120 to 600 ops in short bursts of 30 to 150,
+    ///   each definition installed up front or part way through, one to five
+    ///   pauses (each with its `RESUME`) and re-reads in the bursts after
+    ///   the first, so the rebuilds run over rows that the paused stretch
+    ///   deleted, moved and re-inserted, and in about half the cases a commit
+    ///   stall of 5 to 40 ms.
+    ///
+    /// In three in four non-`racing` cases about one op in a hundred is a
+    /// `TRUNCATE` of either table, and two to four more land in the last few
+    /// ops of a burst ([`place_tail_truncates`]), so the check after the
+    /// burst sees the truncate before later writes repair what it left. One
+    /// join key in ten is `NULL`.
     pub fn one_to_one_case_strategy() -> impl Strategy<Value = JoinCase> {
         prop_oneof![
             1 => Just(KeyShape::Spread),
             1 => Just(KeyShape::HotKey),
-            1 => Just(KeyShape::FanOut),
+            2 => Just(KeyShape::FanOut),
             1 => Just(KeyShape::Wide),
-            4 => Just(KeyShape::Racing)
+            2 => Just(KeyShape::Racing)
         ]
-        .prop_flat_map(|shape| (Just(shape), any::<bool>()))
+        .prop_flat_map(|shape| (Just(shape), prop_oneof![1 => Just(false), 3 => Just(true)]))
         .prop_flat_map(|(shape, truncating)| {
+            let racing = shape == KeyShape::Racing;
+            let truncating = truncating && !racing;
             let joined_weight =
                 if matches!(shape, KeyShape::FanOut | KeyShape::Wide | KeyShape::Racing) {
                     5
                 } else {
                     3
                 };
-            let racing = shape == KeyShape::Racing;
-            let ops = if racing { 500..=MAX_OPS } else { 120..=MAX_OPS };
+            let ops = if racing { 500..=MAX_OPS } else { 120..=600 };
             let burst_size = if racing {
                 600usize..=900
             } else if shape == KeyShape::Wide {
                 260usize..=600
             } else {
-                40usize..=600
+                30usize..=150
             };
             (
                 proptest::collection::vec(spec(), 1..=3),
@@ -653,11 +758,12 @@ mod strategy {
                 proptest::option::of(COMMIT_STALL_MS),
                 RACING_COMMIT_STALL_MS,
                 5_000u64..=10_000,
+                proptest::collection::vec(tail_truncate(), if truncating { 2..=4 } else { 0..=0 }),
             )
                 .prop_map(
                     move |(
                         specs,
-                        draws,
+                        mut draws,
                         burst_size,
                         lanes,
                         workers,
@@ -666,9 +772,11 @@ mod strategy {
                         commit_stall_ms,
                         racing_stall_ms,
                         racing_pace_micros,
+                        tails,
                     )| {
+                        place_tail_truncates(&mut draws, burst_size, &tails);
                         // A `racing` case builds nothing over rows.
-                        let builds = if shape == KeyShape::Racing {
+                        let builds = if racing {
                             JoinBuildDraws {
                                 settle_after_install: true,
                                 ..JoinBuildDraws::default()
@@ -688,7 +796,7 @@ mod strategy {
                         );
                         case.plan.commit_stall =
                             commit_stall_ms.map(std::time::Duration::from_millis);
-                        if shape == KeyShape::Racing {
+                        if racing {
                             case.seal_interval_ms = 20 + case.seal_interval_ms % 21;
                             case.workers = case.workers.max(3);
                             case.plan.commit_stall =
@@ -820,6 +928,37 @@ mod tests {
             };
             assert_eq!(key_of(changes, "u"), Some("2".to_string()));
         }
+    }
+
+    /// A tail truncate lands `back` ops before its burst's last op (the
+    /// stream's last op for a short last burst), and never before the burst.
+    #[test]
+    fn a_tail_truncate_lands_at_the_end_of_its_burst() {
+        let mut draws: Vec<OneToOneOpDraw> = (0..25u8)
+            .map(|i| draw(false, JoinOpKind::Insert, 0, i, i))
+            .collect();
+        let tail = |burst, joined, back| TailTruncate {
+            burst,
+            joined,
+            back,
+        };
+        place_tail_truncates(
+            &mut draws,
+            10,
+            &[tail(0, true, 0), tail(4, false, 2), tail(2, true, 3)],
+        );
+        let truncated: Vec<(usize, bool)> = draws
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.kind == JoinOpKind::Truncate)
+            .map(|(i, d)| (i, d.joined))
+            .collect();
+        // Burst 0 ends at 9; burst 4 % 3 = 1 ends at 19; burst 2 (20..25)
+        // ends at 24.
+        assert_eq!(truncated, [(9, true), (17, false), (21, true)]);
+        let mut short = vec![draw(false, JoinOpKind::Insert, 0, 0, 0); 2];
+        place_tail_truncates(&mut short, 10, &[tail(0, true, 3)]);
+        assert_eq!(short[0].kind, JoinOpKind::Truncate);
     }
 
     /// The plan puts every `jb` op of a burst on one lane, and keeps every
