@@ -174,6 +174,21 @@ afterwards. A pause driven by that comparison must first be shown not to fire on
 routine maintenance and migrations, and must not need superuser. This ADR adds
 no such detector.
 
+After a re-collation, a `JOIN` aggregate's group and key columns can sit at
+different collations in the three places that hold them: the source (live),
+the hidden tables with the session tables made from them (at the source's
+collation when define or a `RESUME` created them), and the visible target (at
+the source's collation at define). A plain aggregate's hidden table, target
+and session tables are the database default, which any other collation
+overrides, so only a `JOIN` meets two collations that conflict. A
+statement over a `JOIN`'s columns that meets two of the places moves one side's
+values to the other's collation, and does so only where the two differ. A value
+read from the source or the target enters the session tables under the hidden
+table's collation, which is the working one and the order locks are taken in. A
+probe of the source's or the target's index compares under that table's
+collation, so the index serves it. Equality is byte equality in each, so which
+collation a comparison runs under changes no result.
+
 ## A 1-1 copy holds the source's text
 
 A type's `=` can be coarser than its text: `numeric` `1.25` and `1.2500`,

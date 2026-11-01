@@ -276,7 +276,7 @@ pub(crate) fn side_arguments(def: &TransformDef, side: Side) -> Vec<Expr> {
 }
 
 /// One hidden table of a `JOIN` definition (this module's doc).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum HiddenTable {
     /// `P`: the `FROM` side's partials.
     FromPartials,
