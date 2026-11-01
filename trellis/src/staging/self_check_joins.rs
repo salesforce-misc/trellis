@@ -89,7 +89,7 @@ use super::self_check_groups::{
     Side, Uncertain, bound, drop_equal_values, partial_text, weighted_partials,
 };
 use super::self_check_keyset::{BYTE_ORDER, Keyset, recollated_pairs};
-use super::self_check_ring::{Lands, Ring, WEIGHT};
+use super::self_check_ring::{Basis, Lands, Ring, WEIGHT};
 
 /// One part of the walk (the module doc), in walk order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -472,6 +472,12 @@ struct Audit<'a> {
     joined_args: Vec<Expr>,
     from_summed: Vec<bool>,
     joined_summed: Vec<bool>,
+    /// For each of a side's cell columns, the collation an unapplied
+    /// change's column is read under to find its cell in `P` or `M`
+    /// ([`Basis::collations`]): the hidden copy's, where the source column
+    /// was re-collated after define.
+    from_basis: Vec<Option<String>>,
+    joined_basis: Vec<Option<String>>,
 }
 
 impl Audit<'_> {
@@ -547,9 +553,17 @@ impl Audit<'_> {
                 .map(|c| format!(" and r.{} is not null", quote_ident(c)))
                 .collect(),
         };
+        let collations = match side {
+            JoinSide::From => &self.from_basis,
+            JoinSide::Joined => &self.joined_basis,
+        };
         let lands = Lands {
             floor_key: &hidden,
-            basis: Some((&hidden, &cells)),
+            basis: Some(Basis {
+                hidden: &hidden,
+                columns: &cells,
+                collations,
+            }),
             filter,
             late_probe,
         };
@@ -1039,7 +1053,7 @@ async fn build_audit<'a>(
     let joined_args = spec::side_arguments(&def.def, JoinSide::Joined);
     let from_pk = ddl::source_primary_key(pool, &def.source_table).await?;
     let joined_pk = ddl::source_primary_key(pool, joined).await?;
-    Ok(Audit {
+    let mut audit = Audit {
         def: &def.def,
         id: def.id,
         schema: pool.schema().to_string(),
@@ -1054,7 +1068,24 @@ async fn build_audit<'a>(
         joined_summed: summed(&def.def, &joined_args),
         from_args,
         joined_args,
-    })
+        from_basis: Vec::new(),
+        joined_basis: Vec::new(),
+    };
+    let client = pool.get().await?;
+    for side in [JoinSide::From, JoinSide::Joined] {
+        let (source, part) = match side {
+            JoinSide::From => (&audit.from_table, Part::From),
+            JoinSide::Joined => (&audit.joined_table, Part::Joined),
+        };
+        let cells = spec::side_key_columns(audit.def, side);
+        let collations =
+            recollated_pairs(&client, (source, &cells), (&audit.hidden(part), &cells)).await?;
+        match side {
+            JoinSide::From => audit.from_basis = collations,
+            JoinSide::Joined => audit.joined_basis = collations,
+        }
+    }
+    Ok(audit)
 }
 
 impl Audit<'_> {

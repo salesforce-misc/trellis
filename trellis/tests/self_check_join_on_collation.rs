@@ -7,11 +7,14 @@
 //! pair of two different non-default collations has no collation Postgres
 //! can choose: every page of the target's check failed with `could not
 //! determine which collation to use`. The 1-1 `JOIN`'s check meets the same
-//! pair. (A rebuild or a change of the `FROM` side of a 1-1 `JOIN` meets it
-//! elsewhere, #1558 and #1567.)
+//! pair, and so does a page that finds a change of the re-collated side not
+//! applied yet in the hidden table it lands in, whose copy of the column
+//! keeps the collation define gave it. (A rebuild or a change of the `FROM`
+//! side of a 1-1 `JOIN` meets it elsewhere, #1558 and #1567.)
 //!
 //! No test waits on convergence: changes are applied by sealing and draining
-//! until nothing is pending.
+//! until nothing is pending, and a page that reads changes not applied yet
+//! is compared without the wait (`compare_page`).
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -20,7 +23,9 @@ use drain_driver::Driver;
 use trellis::defs::ValueType;
 use trellis::defs::join_one_to_one::set_enabled;
 use trellis::integer::IntWidth;
-use trellis::staging::self_check::{SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page};
+use trellis::staging::self_check::{
+    SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page, compare_page,
+};
 
 /// The 1-1 `JOIN` test turns the dev knob on, which is process-wide.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -47,6 +52,31 @@ async fn assert_converged(d: &Driver, target: &str, case: &str) {
             );
             after = page.next_after;
             if after.is_none() {
+                break;
+            }
+        }
+    }
+}
+
+/// One comparison of every page of `target`'s check (`target_part_only`:
+/// of a `JOIN` target's target part, `t`), a page of one key and of every
+/// key, with no convergence wait, whatever the ring holds: it finds no
+/// divergence and can vouch for every key.
+async fn assert_compares_clean(d: &Driver, target: &str, target_part_only: bool, case: &str) {
+    for limit in [1, 1000] {
+        let mut after: Option<String> = None;
+        loop {
+            let page = compare_page(d.pool(), target, SelfCheckScope { after, limit })
+                .await
+                .unwrap_or_else(|e| panic!("{case}: a comparison of {target}: {e}"));
+            assert_eq!(
+                (page.divergences, page.uncertain_keys, page.uncertain_all),
+                (vec![], vec![], false),
+                "{case}: {target} at {limit}"
+            );
+            after = page.next_after;
+            let past = |after: &str| target_part_only && !after.starts_with("t:");
+            if after.as_deref().is_none_or(past) {
                 break;
             }
         }
@@ -253,6 +283,91 @@ async fn a_join_on_written_joined_table_first_with_a_re_collated_column() {
         recollate: &[&alter("a", "kt", "POSIX")],
     })
     .await;
+}
+
+/// Changes to either side not applied yet, after that side's `ON` column (or
+/// a `GROUP BY` column) was re-collated: a page subtracts each from the cell
+/// of `P` or `M` it lands in, found by the column's copy there, which keeps
+/// the collation define gave it. Applying them changes nothing either.
+#[tokio::test]
+async fn changes_not_applied_yet_after_a_re_collation_compare_clean() {
+    for (name, definition, oracle, table, column) in [
+        ("inner, a.kt icu then POSIX", INNER, INNER_ORACLE, "a", "kt"),
+        ("inner, b.kt icu then POSIX", INNER, INNER_ORACLE, "b", "kt"),
+        ("left, a.kt icu then POSIX", LEFT, LEFT_ORACLE, "a", "kt"),
+        ("left, b.kt icu then POSIX", LEFT, LEFT_ORACLE, "b", "kt"),
+        ("left, a.g1 icu then POSIX", LEFT, LEFT_ORACLE, "a", "g1"),
+    ] {
+        let c = Case {
+            name,
+            ddl: ddl("und-x-icu", "und-x-icu", "default", "default")
+                .replace("g1 text,", "g1 text collate \"und-x-icu\","),
+            definition,
+            oracle,
+            recollate: &[],
+        };
+        let mut d = Driver::start(&c.ddl, COLUMNS, &[definition], &["public.a", "public.b"]).await;
+        d.ctl
+            .batch_execute(&alter(table, column, "POSIX"))
+            .await
+            .unwrap_or_else(|e| panic!("{name}: re-collate: {e}"));
+        d.user()
+            .await
+            .batch_execute(
+                "update public.a set v = v + 100 where id % 3 = 0; \
+                 delete from public.a where id = 4; \
+                 insert into public.a values (200, 'zz', 'k1', 'm1', 0, 5); \
+                 insert into public.b values (20, 'k2', 'm2', 0, 7), (21, 'k9', 'm0', 1, 9); \
+                 update public.b set y = y + 1 where id < 3; \
+                 delete from public.b where id = 5",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{name}: changes: {e}"));
+        assert_compares_clean(&d, "public.t", false, name).await;
+        d.settle().await;
+        c.assert_matches(&d, "applied").await;
+    }
+}
+
+/// An `ON` column moved onto a nondeterministic collation, before the
+/// staging worker's next pass pauses the definition for it: the target
+/// part's own join compares the pair by its bytes, as the target was built,
+/// so the key `'K1'` still matches nothing of `'k1'`, and no divergence is
+/// reported that the collation's `=` would make. On one side and on both.
+/// (A page of `M` or `J` fails until the pause: Postgres refuses the
+/// substring search that renders a key's text under that collation.)
+#[tokio::test]
+async fn an_on_column_moved_onto_a_nondeterministic_collation_compares_by_bytes() {
+    for (name, definition, recollate) in [
+        ("inner, b.kt", INNER, &["b"][..]),
+        ("left, b.kt", LEFT, &["b"][..]),
+        ("left, a.kt and b.kt", LEFT, &["a", "b"][..]),
+    ] {
+        let d = Driver::start(
+            &format!(
+                "create collation public.ci (provider = icu, locale = 'und-u-ks-level2', \
+                     deterministic = false); \
+                 {}; \
+                 insert into public.a values (100, 'x', 'K1', 'm1', 0, 1); \
+                 insert into public.b values (100, 'K3', 'm1', 0, 5)",
+                ddl("und-x-icu", "und-x-icu", "default", "default")
+            ),
+            COLUMNS,
+            &[definition],
+            &["public.a", "public.b"],
+        )
+        .await;
+        assert_compares_clean(&d, "public.t", true, name).await;
+        for table in recollate {
+            d.ctl
+                .batch_execute(&format!(
+                    "alter table public.{table} alter column kt type text collate public.ci"
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("{name}: re-collate {table}: {e}"));
+        }
+        assert_compares_clean(&d, "public.t", true, name).await;
+    }
 }
 
 // ---------------------------------------------------------------- 1-1 JOIN

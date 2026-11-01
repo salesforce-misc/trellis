@@ -514,16 +514,23 @@ enum Match {
     Value,
 }
 
-/// For each pair of join columns, `from`'s and `joined`'s (each a quoted,
-/// qualified table and its columns, in `ON` order): the joined column's
-/// collation where the pair's columns carry two different ones, else `None`.
+/// For each pair of columns, `from`'s and `joined`'s (each a quoted,
+/// qualified table and its columns, in pair order): the collation `from`'s
+/// column is read under to compare it with `joined`'s, or `None` to read it
+/// as it is. That is the joined column's collation where the pair's columns
+/// carry two different ones, and `"C"` where the joined column's is
+/// nondeterministic.
 ///
 /// A source column re-collated after define, between deterministic
 /// collations, pauses nothing (byte equality is unchanged), but a check's
-/// own `JOIN ... ON` over the two source tables then meets two implicit
-/// collations, and Postgres chooses neither. Reading the `FROM` column under
-/// the joined one's resolves the pair, keeps an index on the joined column
-/// serviceable and leaves a pair that was never re-collated as it was.
+/// own comparison of it with its `JOIN` pair, or with its copy in a hidden
+/// table, then meets two implicit collations, and Postgres chooses neither.
+/// Reading the `from` column under the joined one's resolves the pair,
+/// keeps an index on the joined column serviceable and leaves a pair that
+/// was never re-collated as it was. A move onto a nondeterministic
+/// collation pauses the definition on the staging worker's next pass; until
+/// then the pair compares by its bytes, as Trellis matches keys, so the
+/// check reports no difference that collation's `=` would make.
 pub(super) async fn recollated_pairs(
     client: &tokio_postgres::Client,
     from: (&str, &[String]),
@@ -535,30 +542,32 @@ pub(super) async fn recollated_pairs(
         .iter()
         .zip(&joined)
         .map(|pair| match pair {
-            (Some(from), Some(joined)) if from != joined => Some(joined.clone()),
+            (_, Some((_, false))) => Some(BYTE_ORDER.to_string()),
+            (Some((from, _)), Some((joined, true))) if from != joined => Some(joined.clone()),
             _ => None,
         })
         .collect())
 }
 
 /// The collations of `table`'s (a quoted, qualified name) `columns`, in
-/// order, each qualified and quoted as `collate` takes it; `None` for a
-/// column of a type with no collation.
+/// order, each qualified and quoted as `collate` takes it and whether it is
+/// deterministic; `None` for a column of a type with no collation.
 async fn column_collations(
     client: &tokio_postgres::Client,
     table: &str,
     columns: &[String],
-) -> Result<Vec<Option<String>>, SelfCheckError> {
+) -> Result<Vec<Option<(String, bool)>>, SelfCheckError> {
     let rows = client
         .query(
-            "select (select pg_catalog.format('%I.%I', n.nspname, co.collname) \
-                     from pg_catalog.pg_collation co \
-                     join pg_catalog.pg_namespace n on n.oid = co.collnamespace \
-                     where co.oid = a.attcollation) \
+            "select case when co.oid is not null \
+                         then pg_catalog.format('%I.%I', n.nspname, co.collname) end, \
+                    co.collisdeterministic \
              from unnest($2::text[]) with ordinality as u(name, ord) \
              join pg_catalog.pg_attribute a \
                on a.attrelid = pg_catalog.to_regclass($1) and a.attname = u.name \
               and not a.attisdropped \
+             left join pg_catalog.pg_collation co on co.oid = a.attcollation \
+             left join pg_catalog.pg_namespace n on n.oid = co.collnamespace \
              order by u.ord",
             &[&table, &columns],
         )
@@ -566,10 +575,17 @@ async fn column_collations(
     if rows.len() != columns.len() {
         return Err(SelfCheckError::UnsupportedExpr {
             target: table.to_string(),
-            detail: format!("the join columns {columns:?} are not all columns of {table}"),
+            detail: format!("the columns {columns:?} are not all columns of {table}"),
         });
     }
-    Ok(rows.iter().map(|row| row.get(0)).collect())
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let name: Option<String> = row.get(0);
+            let deterministic: Option<bool> = row.get(1);
+            name.zip(deterministic)
+        })
+        .collect())
 }
 
 #[cfg(test)]
