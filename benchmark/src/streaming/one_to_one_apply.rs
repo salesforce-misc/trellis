@@ -114,14 +114,14 @@ impl ShapeResult {
 /// The page histogram's cumulative buckets (upper bound in seconds, count),
 /// its sum and its count, summed over every instance in one scrape.
 #[derive(Debug, Clone, Default)]
-struct PageHistogram {
+pub(crate) struct PageHistogram {
     buckets: Vec<(f64, u64)>,
-    sum: f64,
-    count: u64,
+    pub(crate) sum: f64,
+    pub(crate) count: u64,
 }
 
 impl PageHistogram {
-    fn capture(rendered: &str) -> Self {
+    pub(crate) fn capture(rendered: &str) -> Self {
         let mut buckets: Vec<(f64, u64)> = Vec::new();
         let mut sum = 0.0;
         let mut count = 0;
@@ -160,7 +160,7 @@ impl PageHistogram {
         }
     }
 
-    fn since(&self, base: &PageHistogram) -> PageHistogram {
+    pub(crate) fn since(&self, base: &PageHistogram) -> PageHistogram {
         let buckets = self
             .buckets
             .iter()
@@ -181,7 +181,7 @@ impl PageHistogram {
     }
 
     /// The smallest bucket bound holding at least `q` of the samples, in ms.
-    fn quantile_le_ms(&self, q: f64) -> f64 {
+    pub(crate) fn quantile_le_ms(&self, q: f64) -> f64 {
         if self.count == 0 {
             return 0.0;
         }

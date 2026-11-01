@@ -65,6 +65,12 @@
 //!   `VmHWM`, the cgroup's `memory.peak`).
 //! - [`one_to_one_apply`]: a 1-1 target's drain cost per row by field
 //!   shape: rows/s, Postgres CPU and page transaction durations.
+//! - [`one_to_one_join`]: a 1-1 `JOIN`'s `b` change fanning out to many rows
+//!   of `a`: the cost per row against a set-based control, and a fan-out
+//!   with failing rows.
+//! - [`one_to_one_join_seam`]: what a 1-1 `JOIN` that reads an upstream's
+//!   target costs the upstream: its latency and the cluster's WAL with and
+//!   without the reader.
 //! - [`server_cost`]: Postgres CPU, `deadlock detected` log lines, the
 //!   engine's lock-timeout warnings and ledger bytes over a window.
 
@@ -83,6 +89,8 @@ pub mod idle_cost;
 pub mod join;
 pub mod load;
 pub mod one_to_one_apply;
+pub mod one_to_one_join;
+pub mod one_to_one_join_seam;
 pub mod process_memory;
 pub mod rate;
 pub mod scrape;

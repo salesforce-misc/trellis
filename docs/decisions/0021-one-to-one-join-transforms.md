@@ -184,13 +184,15 @@ A `b` change rewrites every target row on its key while holding `J[k]`: about
 seam's images. An `a` change on that key waits for the whole fan-out. Fan-out
 in chunks that each take `J[k]` again was exact.
 
-In v1, fan-out runs in one transaction. It is about 3–4 s per million rows
-with the seam, and that key's `a` writers wait for all of it. Three limits
-keep it bounded:
+In v1, fan-out runs in one transaction, and that key's `a` writers wait for
+all of it. The benchmark (`one-to-one-join-fan-out`) measures about 7 µs per
+row (0.7 s at 100k rows), and up to about 18 µs per row for an `R` of roughly
+0.3M to a few million rows, where each batch of the upsert hashes all of `R`
+(#1580). Three limits keep it bounded:
 
 - A `status()` warning names the join key with the most `a` rows when it holds more than 100k. The
   count is a sample of `R`'s join-key index, not `pg_stats`, which is stale after a build. The 100k is a
-  placeholder knob that the benchmark of the SQL fan-out sets.
+  placeholder knob, set from that benchmark once #1580 settles the cost per row.
 - A hard cap halts the transform rather than fan out past a configured row
   count.
 - No transform may read a 1-1 JOIN target. The seam holds every changed key's
