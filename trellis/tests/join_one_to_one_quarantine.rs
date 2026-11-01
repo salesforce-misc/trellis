@@ -505,6 +505,383 @@ async fn held_fan_out_rows_count_toward_the_fuses() {
     );
 }
 
+/// Drains `batch` once and expects it to apply: a page that holds a row
+/// commits on its first attempt, with no failure for the drain's isolation.
+async fn drain_once_ok(d: &Driver, batch: i64, kind: Kind) {
+    d.drain_frozen(batch, "page", &[])
+        .await
+        .finish_result()
+        .await
+        .unwrap_or_else(|err| panic!("{kind:?}: the page failed: {err:?}"));
+}
+
+/// The `origin_lsn` of the newest ring row of `key` of `table`.
+async fn ring_origin(d: &Driver, table: &str, key: &str) -> Vec<String> {
+    d.rows(&format!(
+        "select max(origin_lsn)::text from ( \
+             select origin_lsn, key, src_table from seg_0 \
+             union all select origin_lsn, key, src_table from seg_1 \
+             union all select origin_lsn, key, src_table from seg_2 \
+             union all select origin_lsn, key, src_table from seg_3 \
+         ) r where src_table = '{table}' and key = '{key}'"
+    ))
+    .await
+}
+
+/// Every page of `self_check` of `kind`'s target, each waiting at most
+/// `timeout` for the pipeline to catch up: the outcomes of the pages that
+/// aren't `Converged`, and the keys the last page says the definition holds.
+async fn self_check_walk(
+    d: &Driver,
+    kind: Kind,
+    timeout: std::time::Duration,
+) -> (Vec<String>, u64) {
+    use trellis::staging::self_check::{
+        SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page,
+    };
+    let mut after = None;
+    let mut outcomes = Vec::new();
+    loop {
+        let page = check_page(
+            d.pool(),
+            &kind.target(),
+            SelfCheckScope {
+                after: after.clone(),
+                limit: 100,
+            },
+            SelfCheckMode::Standard,
+            timeout,
+        )
+        .await
+        .expect("a page of the check");
+        if page.outcome != SelfCheckOutcome::Converged {
+            outcomes.push(format!("{:?}", page.outcome));
+        }
+        let held = page.held_keys.map_or(0, |h| h.count);
+        // A page that didn't catch up compares nothing, and moves no cursor.
+        if page.next_after.is_none() || page.next_after == after {
+            return (outcomes, held);
+        }
+        after = page.next_after;
+    }
+}
+
+/// #1531: a page whose `a` change fails only against the same page's `b`
+/// change (each fits alone: `2147483000 + 100` and `13 + 1132`) holds that
+/// `a` row in the page, as the fan-out holds a row: the write of the `a`
+/// changes' rows is bisected down to row 13, which is held on this first
+/// failure under a parked Re-derive with the `a` change's own origin, and
+/// the page commits on its first attempt with `M` advanced and every other
+/// row exact. The row counts toward `total`'s fuse.
+#[tokio::test]
+async fn an_a_change_failing_against_the_pages_b_change_is_held_in_the_page() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(kind, A_ROWS, B_ROWS).await;
+        seed_key_10(&mut d, &[]).await;
+        // Two transactions, the `b` one first, so the two changes' origins
+        // differ and the parked Re-derive's names the `a` change's.
+        write(&d, "update public.b set w = 1132 where id = 1").await;
+        write(&d, "update public.a set x = 2147483000 where id = 13").await;
+        let batch = d.seal().await;
+        drain_once_ok(&d, batch, kind).await;
+        assert_eq!(status(&d, &kind.target()).await, "live", "{kind:?}");
+        assert_join_but(&d, kind, &[13], "the page").await;
+        assert_eq!(
+            total(&d, kind, 13).await,
+            Some(13 + 100),
+            "{kind:?}: the held row stays as it was"
+        );
+        assert_eq!(
+            d.rows("select src_table, key from poison").await,
+            ["(public.a,13)"],
+            "{kind:?}"
+        );
+        assert_eq!(
+            d.rows("select deaths from key_deaths").await,
+            ["(1)"],
+            "{kind:?}: held on its first failure"
+        );
+        assert_eq!(
+            d.rows("select src_table, key, origin_lsn::text from poison_held")
+                .await,
+            [format!(
+                "(public.a,13,{})",
+                ring_origin(&d, "public.a", "13").await[0].trim_matches(|c| c == '(' || c == ')')
+            )],
+            "{kind:?}: parked with the a change's origin"
+        );
+        assert_eq!(
+            d.rows("select transform_table, column_name, key from column_failures")
+                .await,
+            [format!("({},total,13)", kind.name())],
+            "{kind:?}"
+        );
+    }
+}
+
+/// An `a` change whose field fails on its own (`2147483600 + 100`) is held
+/// in its page on the first failure, not after the drain's isolation has
+/// charged it to its death threshold: one death, the page commits on its
+/// first attempt, and the row's target row stays as it was.
+#[tokio::test]
+async fn an_a_change_failing_alone_is_held_on_its_first_failure() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(kind, A_ROWS, B_ROWS).await;
+        write(
+            &d,
+            "update public.a set x = 2147483600 where id = 1; \
+             update public.a set x = 22 where id = 2",
+        )
+        .await;
+        let batch = d.seal().await;
+        drain_once_ok(&d, batch, kind).await;
+        assert_eq!(status(&d, &kind.target()).await, "live", "{kind:?}");
+        assert_join_but(&d, kind, &[1], "the page").await;
+        assert_eq!(total(&d, kind, 1).await, Some(1 + 100), "{kind:?}");
+        assert_eq!(total(&d, kind, 2).await, Some(22 + 200), "{kind:?}");
+        assert_eq!(
+            d.rows("select src_table, key, deaths from key_deaths")
+                .await,
+            ["(public.a,1,1)"],
+            "{kind:?}"
+        );
+        assert_eq!(
+            d.rows("select src_table, key from poison").await,
+            ["(public.a,1)"],
+            "{kind:?}"
+        );
+    }
+}
+
+/// A page of `a` changes whose failing rows its bisection can't all name
+/// within its attempts halts the transform, as a fan-out's does, naming the
+/// rows it found; nothing is held or written.
+#[tokio::test]
+async fn a_changes_failing_on_more_rows_than_the_bisection_names_halt() {
+    let _serial = SERIAL.lock().await;
+    let kind = Kind::Left;
+    let mut d = start(kind, A_ROWS, B_ROWS).await;
+    step(&mut d, "update public.b set w = 1000 where id = 1").await;
+    let rows: Vec<String> = (41..=400)
+        .map(|id| format!("({id}, 10, 2147483000, 'r')"))
+        .collect();
+    write(
+        &d,
+        &format!(
+            "insert into public.a values {}; update public.a set x = 7 where id = 2",
+            rows.join(", ")
+        ),
+    )
+    .await;
+    let batch = d.seal().await;
+    let _ = d
+        .drain_frozen(batch, "page", &[])
+        .await
+        .finish_result()
+        .await;
+    let row = d
+        .ctl
+        .query_one(
+            "select d.status::text, \
+                    (select f.error from capture_failures f where f.transform_id = d.id \
+                     order by f.error limit 1) \
+             from transform_definitions d where d.target_table = $1",
+            &[&kind.target()],
+        )
+        .await
+        .expect("read the status");
+    let (status, reason): (String, Option<String>) = (row.get(0), row.get(1));
+    assert_eq!(status, "paused");
+    let reason = reason.expect("a reason");
+    assert!(
+        reason.contains("changes of public.a that fail on more of its rows")
+            && reason.contains("(total: integer out of range)")
+            && reason.contains("maybe more"),
+        "{reason}"
+    );
+    assert!(d.rows("select key from poison").await.is_empty());
+    assert_eq!(total(&d, kind, 2).await, Some(2 + 200), "nothing written");
+}
+
+/// #1530's case: the `a` rows whose own changes fail on `total` count toward
+/// `total`'s column fuse, each held in its page on its first failure: four
+/// trip nothing, and a fifth pauses the column.
+#[tokio::test]
+async fn a_changes_failing_on_one_column_trip_its_fuse() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(kind, A_ROWS, B_ROWS).await;
+        step(&mut d, "update public.b set w = 1000 where id = 1").await;
+        let rows = |ids: std::ops::RangeInclusive<i32>| -> String {
+            let rows: Vec<String> = ids
+                .map(|id| format!("({id}, 10, 2147483000, 'big')"))
+                .collect();
+            format!("insert into public.a values {}", rows.join(", "))
+        };
+        write(&d, &rows(11..=14)).await;
+        let batch = d.seal().await;
+        drain_once_ok(&d, batch, kind).await;
+        assert_eq!(
+            d.rows("select key from poison order by key").await,
+            ["(11)", "(12)", "(13)", "(14)"],
+            "{kind:?}"
+        );
+        assert_eq!(
+            d.rows("select transform_table, column_name, key from column_failures order by key")
+                .await,
+            (11..=14)
+                .map(|id| format!("({},total,{id})", kind.name()))
+                .collect::<Vec<_>>(),
+            "{kind:?}"
+        );
+        assert_eq!(
+            d.rows("select deaths from column_deaths where column_name = 'total'")
+                .await,
+            ["(4)"],
+            "{kind:?}"
+        );
+        assert!(
+            d.rows("select 1 from column_status").await.is_empty(),
+            "{kind:?}"
+        );
+        assert_eq!(status(&d, &kind.target()).await, "live", "{kind:?}");
+
+        write(&d, &rows(15..=15)).await;
+        let batch = d.seal().await;
+        drain_once_ok(&d, batch, kind).await;
+        let paused = d
+            .rows("select transform_table, column_name, local_fuse from column_status")
+            .await;
+        assert_eq!(paused, [format!("({},total,t)", kind.name())], "{kind:?}");
+        assert!(
+            d.rows("select 1 from column_deaths").await.is_empty(),
+            "{kind:?}: a trip resets the count"
+        );
+    }
+}
+
+/// `kind`'s target row `id`, as `(total, tag)`.
+async fn row_of(d: &Driver, kind: Kind, id: i32) -> Vec<String> {
+    d.rows(&format!(
+        "select total, tag from {} where id = {id}",
+        kind.target()
+    ))
+    .await
+}
+
+/// A row held in its own `a` change's page keeps its target row while `R`
+/// holds the change: a later `b` change's fan-out and a rebuild's chunks and
+/// sweep leave it out though its fields would compute from that entry,
+/// `self_check` reports nothing diverging (it names the held key), and the
+/// release re-derives `R`'s entry and the target row from the live row.
+#[tokio::test]
+async fn a_row_held_in_its_a_page_stays_until_its_release_re_derives_it() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(kind, A_ROWS, B_ROWS).await;
+        seed_key_10(&mut d, &[]).await;
+        write(&d, "update public.b set w = 1132 where id = 1").await;
+        write(&d, "update public.a set x = 2147483000 where id = 13").await;
+        let batch = d.seal().await;
+        drain_once_ok(&d, batch, kind).await;
+        let before = row_of(&d, kind, 13).await;
+        assert_eq!(before, [format!("({},ten)", 13 + 100)], "{kind:?}");
+
+        // `R` holds `2147483000`, which fits with `w = 1`.
+        step(&mut d, "update public.b set w = 1 where id = 1").await;
+        assert_eq!(
+            row_of(&d, kind, 13).await,
+            before,
+            "{kind:?}: the fan-out left it out"
+        );
+        step(
+            &mut d,
+            "truncate public.b; insert into public.b values (1, 10, 2, 'two')",
+        )
+        .await;
+        trellis::staging::build::settle_builds_with(d.pool(), 3).await;
+        assert_eq!(status(&d, &kind.target()).await, "live", "{kind:?}");
+        assert_join_but(&d, kind, &[13], "the rebuild").await;
+        assert_eq!(
+            row_of(&d, kind, 13).await,
+            before,
+            "{kind:?}: the rebuild left it out"
+        );
+
+        // `self_check` never compares while the definition holds a key: its
+        // parked work holds back the wait, and the page names the held key.
+        let (outcomes, held_keys) =
+            self_check_walk(&d, kind, std::time::Duration::from_millis(500)).await;
+        assert_eq!(outcomes, ["NotCaughtUp"], "{kind:?}");
+        assert_eq!(held_keys, 1, "{kind:?}");
+
+        // The row's fix is parked; the release re-derives `R` from it.
+        step(&mut d, "update public.a set x = 13 where id = 13").await;
+        assert_eq!(row_of(&d, kind, 13).await, before, "{kind:?}: parked");
+        release(&mut d, kind, "public.a", "13").await;
+        assert_exact(&mut d, kind, "the release").await;
+        assert_eq!(total(&d, kind, 13).await, Some(13 + 2), "{kind:?}");
+        let (outcomes, held_keys) =
+            self_check_walk(&d, kind, std::time::Duration::from_secs(30)).await;
+        assert_eq!(outcomes, Vec::<String>::new(), "{kind:?}");
+        assert_eq!(held_keys, 0, "{kind:?}");
+        let deadlocks = d.deadlocks_logged();
+        assert!(deadlocks.is_empty(), "{deadlocks:?}");
+    }
+}
+
+/// A page with only `a` changes that holds a row writes `poison`, whose
+/// foreign key takes the definition's row `FOR KEY SHARE`, so the page takes
+/// that lock before its lock row, as a fan-out's page does: a rebuild's start,
+/// which takes the definition's row `FOR UPDATE` and then the lock row,
+/// queues behind the page instead of closing a cycle with the hold.
+#[tokio::test]
+async fn an_a_page_that_holds_a_row_and_a_rebuild_start_never_deadlock() {
+    let _serial = SERIAL.lock().await;
+    let kind = Kind::Left;
+    let mut d = start(kind, A_ROWS, B_ROWS).await;
+    let id = definition_id(&d, &kind.target()).await;
+    write(&d, "update public.a set x = 2147483600 where id = 1").await;
+    let batch = d.seal().await;
+    let target = kind.target();
+    let mut page = d
+        .drain_frozen(
+            batch,
+            "page",
+            &[(PausePoint::BeforeJoin1Recompute, &target)],
+        )
+        .await;
+    let reached = page.reached(PausePoint::BeforeJoin1Recompute).await;
+    let start = d.user().await;
+    let lock = format!("select 1 from {DEFAULT_SCHEMA}.join1_{id}_l for update");
+    let start_lock = tokio::spawn(async move {
+        start.batch_execute("begin").await?;
+        start
+            .execute(
+                "select 1 from transform_definitions where id = $1 for update",
+                &[&id],
+            )
+            .await?;
+        start.execute(&lock, &[]).await?;
+        start.batch_execute("commit").await
+    });
+    d.wait_blocked_behind(reached.backend_pid).await;
+    d.release(&mut page, PausePoint::BeforeJoin1Recompute).await;
+    let page_result = page.finish_result().await;
+    let start_result = start_lock.await.expect("the start task");
+    let deadlocks = d.deadlocks_logged();
+    assert!(
+        deadlocks.is_empty(),
+        "page {:?}, start {start_result:?}: {deadlocks:?}",
+        page_result.as_ref().map(|_| ())
+    );
+    page_result.expect("the page");
+    start_result.expect("the start");
+    assert_eq!(d.rows("select key from poison").await, ["(1)"]);
+}
+
 /// A pause of a 1-1 `JOIN`'s column bumps both tables' version fences, as
 /// the pages of either side write its fields: a `b` page that planned the
 /// column as live and holds `b`'s fence makes the pause wait for its commit,

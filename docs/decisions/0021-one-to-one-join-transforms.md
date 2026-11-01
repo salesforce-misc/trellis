@@ -202,31 +202,48 @@ later. In the model (#1375 Y5) it was exact under worker kills and a second
 `b` change mid-way, and it bounded an `a` writer's wait to one chunk: 0.13 s
 against 3.8 s. It took about 5x as long overall.
 
-### A row a fan-out fails on is held, not the `b` change
+### A row a page fails to write is held in the page
 
-A field that fails with a data exception on one row of a fan-out is that
-`a` row's failure. The fan-out's batches are bisected under savepoints down
-to the rows that fail, and the per-field probe names their fields. The page
-holds each such row in quarantine in its own transaction, as a key whose own
-change fails is held, and writes every other row, so the `b` change commits
-and `M` advances.
+A field that fails with a data exception on a row a page writes is that `a`
+row's failure, whichever write reaches the row: the write of the page's `a`
+changes' rows, or a `b` change's fan-out. Each write runs under a savepoint.
+A data exception rolls it back to the savepoint and bisects its rows under
+savepoints down to the rows that fail, and the per-field probe names their
+fields. The page holds each such row in quarantine in its own transaction, as
+a key whose own change fails is held, and writes every other row, so the
+page's other changes commit and `R` and `M` advance. An `a` change that fails
+only against the same page's `b` change is held so too: probed alone against
+the committed state, as the drain's isolation probes a record, neither change
+fails, so isolation would charge nothing and the page would fail forever.
 
 - The hold's `poison` row takes the definition row `FOR KEY SHARE` through
-  its foreign key, so a page that fans out takes that lock before its first
-  lock row, as a `TRUNCATE b` page takes the row `FOR UPDATE`: a rebuild's
-  start holds it `FOR UPDATE` while it waits for the lock row.
+  its foreign key, so a page that may hold a row (one with `a` changes, or
+  one that fans out) takes that lock before its first lock row, as a
+  `TRUNCATE b` page takes the row `FOR UPDATE`: a rebuild's start holds it
+  `FOR UPDATE` while it waits for the lock row. A writer that takes the
+  definition row `FOR UPDATE` (a rebuild's start, a build step recording
+  its failure) waits for such a page to commit.
 - A row is held on its first failure, as a build chunk holds a key: the
-  page reproduced it on the `R` and `M` it commits with. Each failing field
-  counts the row toward its column's fuse, and the held rows count toward
-  the whole-transform fuse, both checked once the page has committed.
+  page reproduced it on the `R` and `M` it commits with. An `a` row is not
+  left to the drain's isolation and its death threshold, which a plain 1-1
+  transform's row keeps ([ADR-0003](0003-quarantine-storage-and-api.md)).
+  Each failing field counts the row toward its column's fuse, and the held
+  rows count toward the whole-transform fuse, both checked once the page has
+  committed.
+- The held row's parked Re-derive carries the earliest origin of the page's
+  changes it holds back: the `b` changes for a fan-out's row, the row's own
+  changes for an `a` change's.
 - A bisection that can't name every failing row within its attempts halts
   the transform rather than commit with a row unwritten.
 - A held row is left out of later fan-outs and of the build, and its own
-  changes are parked, so its target row stays as it was.
-- Its release re-derives the row in the release's transaction, under its
-  `J` lock, before it deletes the hold, and stages a `Recompute` as well. A
-  `b` change on its key that drained before the `Recompute` would otherwise
-  read the `R` entry the hold left, and hold the row again.
+  changes are parked, so its target row stays as it was. A row held in its
+  own change's page keeps that change in its `R` entry, and nothing writes
+  the target from that entry until the release.
+- Its release re-derives the row's `R` entry and target row from the live
+  row in the release's transaction, under its `J` lock, before it deletes
+  the hold, and stages a `Recompute` as well. A `b` change on its key that
+  drained before the `Recompute` would otherwise read the `R` entry the hold
+  left, and hold the row again.
 - A pause of a field, by hand or by its fuse, and its resume bump both
   tables' version fences, since the pages of either side write the fields.
   A 1-1 `JOIN` has no field build, so the resume rebuilds the target in
