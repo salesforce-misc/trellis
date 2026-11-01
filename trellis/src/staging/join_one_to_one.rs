@@ -152,14 +152,15 @@ pub(crate) struct JoinShape {
     m: LedgerRef,
     j: String,
     lock: String,
-    /// `a`'s join key columns in `ON` order.
+    /// `a`'s join key columns in `ON` order, at the collation `R` and `J`
+    /// hold them under ([`under_hidden_collations`]).
     key: Vec<ImageColumn>,
     /// `b`'s join key column names in `ON` order.
     m_key: Vec<String>,
     /// The columns `R` holds besides its ledger: the key, then the `a`
-    /// columns the fields read.
+    /// columns the fields read, at `R`'s collations.
     r_columns: Vec<ImageColumn>,
-    /// The columns `M` holds besides its ledger.
+    /// The columns `M` holds besides its ledger, at `M`'s collations.
     m_columns: Vec<ImageColumn>,
     /// Each written field's name and its SQL over the lateral row `s`.
     fields: Vec<(String, String)>,
@@ -242,6 +243,34 @@ fn cast_to(column: &ImageColumn, expr: &str) -> String {
     format!("({expr})::{}{collate}", column.type_sql)
 }
 
+/// `columns`, the source table's, each with the collation of the same-named
+/// column of the hidden table `hidden` (qualified, unquoted) when it has one.
+/// Its type stays the source's.
+///
+/// A source column can be re-collated after define, between deterministic
+/// collations, which pauses nothing, while `R`, `M` and `J` keep the
+/// collation they were created with. A cast of a key text under the source's
+/// collation, compared with a hidden column inside a subquery, then met two
+/// implicit collations and Postgres chose neither (`42P22`); the hidden
+/// table's own is the one every statement over it, and the sort of its lock
+/// order, runs under (#1567).
+async fn under_hidden_collations(
+    client: &impl tokio_postgres::GenericClient,
+    columns: Vec<ImageColumn>,
+    hidden: &str,
+) -> Result<Vec<ImageColumn>, ApplyError> {
+    let held = super::one_to_one_render::image_columns(client, hidden).await?;
+    Ok(columns
+        .into_iter()
+        .map(|mut c| {
+            if let Some(h) = held.iter().find(|h| h.name == c.name) {
+                c.collation = h.collation.clone();
+            }
+            c
+        })
+        .collect())
+}
+
 impl JoinShape {
     /// The shape of `definition`, a 1-1 `JOIN`, with the `paused` fields left
     /// out; `pk` is `a`'s primary key.
@@ -264,6 +293,18 @@ impl JoinShape {
             let a = super::one_to_one_render::image_columns(&**client, &definition.source_table)
                 .await?;
             let b = super::one_to_one_render::image_columns(&**client, &joined).await?;
+            // The hidden tables keep the collations their columns were
+            // created with, and a source column can be re-collated since
+            // (between deterministic collations, which pauses nothing). Every
+            // cast to and comparison with `R`, `M` and `J` runs under the
+            // hidden column's own collation, so two collations never meet.
+            let schema_name = pool.schema();
+            let hidden =
+                |table: HiddenTable| format!("{schema_name}.{}", table.name(definition.id));
+            let a =
+                under_hidden_collations(&**client, a, &hidden(HiddenTable::FromEntries)).await?;
+            let b =
+                under_hidden_collations(&**client, b, &hidden(HiddenTable::JoinedEntries)).await?;
             (joined, a, b)
         };
         let by_name = |columns: &[ImageColumn], names: &[String]| -> Vec<ImageColumn> {
