@@ -21,7 +21,7 @@
 //! - `racing` is two cases in seven (the aggregate tier's half), and `fan_out`
 //!   is drawn twice as often as the other shapes;
 //! - every other shape but `wide` draws 120 to 600 ops in short bursts (30 to
-//!   150 ops), each checked once it settles, with one to five pauses (each
+//!   150 ops), each checked once it settles, with two to six pauses (each
 //!   with its `RESUME`, a rebuild in place) and re-reads in the bursts after
 //!   the first: the plants of a `TRUNCATE`, a rebuild's orphan pass and its
 //!   `M` pass leave a target wrong only until later writes repair it, so the
@@ -415,10 +415,12 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
 /// - `join1_rd_no_key`: caught 0, fired 48.
 /// - `join1_snapshot_after_read`: caught 0, fired 48.
 /// - `join1_truncate_def_after_lock`: caught 0, fired 14 (its failure is a
-///   deadlock Postgres breaks, which its pin reads from the server log; the
-///   tier checks the targets).
+///   deadlock, which its pin fails on directly: the rebuild start's lock read
+///   errors, or the server log records it. The engine retries a deadlocked
+///   transaction, and the tier checks only the targets).
 /// - `join1_truncate_keeps_m`: caught 0, fired 14 (its pin checks the target
-///   before the rebuild a `TRUNCATE b` starts reaches the row).
+///   after an `a` insert drains and before the rebuild a `TRUNCATE b` starts
+///   runs; the tier checks once the rebuild has rewritten the row).
 /// - `join1_truncate_share_lock`: caught 0, fired 18.
 const ONE_TO_ONE_KNOWN_MISSES: &[&str] = &[
     "join1_no_j_lock",
@@ -438,7 +440,7 @@ const ONE_TO_ONE_KNOWN_MISSES: &[&str] = &[
 ];
 
 /// The 1-1 `JOIN` tier's sweep: it gates the `Join1*` plants it catches in
-/// one case in five or more (of 48: `join1_no_placeholder` 46,
+/// about one case in five or more (of 48: `join1_no_placeholder` 46,
 /// `join1_old_key_unlocked` 44, `join1_no_orphan_pass` 24,
 /// `join1_truncate_keeps_r` 10, `join1_m_before_j` 9), runs and reports
 /// [`ONE_TO_ONE_KNOWN_MISSES`], and leaves out [`ONE_TO_ONE_NOT_GATED`] and
@@ -705,9 +707,9 @@ fn the_one_to_one_join_oracle_catches_a_corrupted_target() {
 }
 
 /// The `Strict` audit tells a damaged hidden ledger from a good one, where the
-/// oracle (which reads the visible target) cannot: after a converged run, the
-/// `R` ledger's join key column is changed by hand. The target is as it was,
-/// so the oracle still agrees, and the audit reports the damage.
+/// oracle (which reads the visible target) cannot: after a converged run,
+/// every live `R` entry is deleted by hand. The target is as it was, so the
+/// oracle still agrees, and the audit reports the damage.
 #[test]
 fn the_strict_audit_catches_a_corrupted_one_to_one_join_ledger() {
     let case = hand_built_case(false);
@@ -730,8 +732,7 @@ fn the_strict_audit_catches_a_corrupted_one_to_one_join_ledger() {
             let targets: Vec<String> = case.program.defs.iter().map(|d| d.target.clone()).collect();
             let clean = backend.strict_audit(&targets).await.expect("audit");
             assert!(clean.is_empty(), "{clean:?}");
-            // Drop every live `R` entry's applied position: the entry no
-            // longer matches `ja`.
+            // Delete every live `R` entry: the ledger no longer matches `ja`.
             let tables = backend
                 .execute_raw(
                     "do $$ declare r record; begin \

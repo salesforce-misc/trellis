@@ -423,7 +423,7 @@ beside them run on every `cargo test`.
   shapes, builds, pauses and resumes, re-reads, commit stalls and the
   `racing` shape are the aggregate `JOIN` tier's, with `racing` two cases in
   seven. Every other shape but `wide` writes in short bursts (30 to 150 ops),
-  each checked once it settles, with one to five pauses (each with its
+  each checked once it settles, with two to six pauses (each with its
   `RESUME`, a rebuild in place) and re-reads after the first burst, and in
   three cases in four a `TRUNCATE` of either table now and then, with two to
   four more in the last few ops of a burst: the planted bugs of a truncate, a
@@ -440,8 +440,8 @@ beside them run on every `cargo test`.
   join_one_to_one_convergence -- --ignored`. Its planted-bug sweep,
   `one_to_one_join_planted_bugs_are_caught` (run with
   `GENERATIVE_PLANT_CASES=6`: 24 cases catch every gated plant, and the
-  default twelve take hours), gates the plants it catches in one case in
-  five or more: `join1_no_placeholder`, `join1_old_key_unlocked`,
+  default twelve take hours), gates the plants it catches in about one
+  case in five or more: `join1_no_placeholder`, `join1_old_key_unlocked`,
   `join1_no_orphan_pass`, `join1_truncate_keeps_r` and `join1_m_before_j`.
   The other `Join1*` plants are narrow interleavings, or leave a target that
   the rest of the build or the next writes repair before the burst settles:
