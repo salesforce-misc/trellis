@@ -634,12 +634,36 @@ pub struct PoisonResult {
     pub shape: String,
     pub rep: Rep,
     pub outcome: String,
+    /// Rows of `a` held in quarantine.
     pub held: i64,
+    /// Of those, the rows that hold the failing `x`.
+    pub held_poisoned: i64,
+    /// Rows of the target that differ from the join.
     pub mismatches: i64,
     pub build_secs: f64,
 }
 
+/// [`PoisonResult::outcome`] for a fan-out the bisection gave up on.
+pub const HALTED: &str = "left live: paused";
+
 impl PoisonResult {
+    /// Whether the run's end state is the one its outcome allows. A committed
+    /// page holds exactly the failing rows, which are then the only rows of
+    /// the target left behind; a halt rolls the whole page back, so it holds
+    /// nothing and leaves every row of the fan-out behind. A run that timed out
+    /// or ended any other way fails.
+    pub fn oracle_holds(&self) -> bool {
+        match self.outcome.as_str() {
+            "committed" => {
+                self.held == self.poisoned
+                    && self.held_poisoned == self.poisoned
+                    && self.mismatches == self.poisoned
+            }
+            HALTED => self.held == 0 && self.mismatches == self.rows,
+            _ => false,
+        }
+    }
+
     pub fn to_json(&self) -> String {
         // A page that did not commit has no duration worth reporting.
         let committed = self.outcome == "committed";
@@ -654,7 +678,8 @@ impl PoisonResult {
             "{{\"scenario\":\"one-to-one-join-poison\",\"shape\":\"{}\",\"fan_out\":{},\
              \"poisoned\":{},\"outcome\":\"{}\",\"page_secs\":{},\"wall_secs\":{:.4},\
              \"page_us_per_row\":{},\"wal_bytes_per_row\":{:.1},\"pg_cpu_us_per_row\":{:.3},\
-             \"held_rows\":{},\"target_rows_off\":{},\"build_secs\":{:.2}}}",
+             \"held_rows\":{},\"held_poisoned_rows\":{},\"target_rows_off\":{},\
+             \"oracle_holds\":{},\"build_secs\":{:.2}}}",
             self.shape,
             self.rows,
             self.poisoned,
@@ -665,7 +690,9 @@ impl PoisonResult {
             self.rep.wal_bytes as f64 / self.rows as f64,
             self.rep.pg_cpu_secs * 1e6 / self.rows as f64,
             self.held,
+            self.held_poisoned,
             self.mismatches,
+            self.oracle_holds(),
             self.build_secs,
         )
     }
@@ -708,6 +735,15 @@ pub async fn run_poison(cfg: &OneToOneJoin, tuning: &EngineTuning, poisoned: i64
         .query_one("select count(*) from poison", &[])
         .await
         .map_or(-1, |r| r.get(0));
+    let held_poisoned: i64 = f
+        .raw
+        .query_one(
+            "select count(*) from poison p join public.asrc a on a.id::text = p.key \
+             where a.x = 2147483646",
+            &[],
+        )
+        .await
+        .map_or(-1, |r| r.get(0));
     let off = total_mismatches(&f.raw).await;
     let build_secs = f.build_secs;
     let _ = f.client.shutdown().await;
@@ -723,6 +759,7 @@ pub async fn run_poison(cfg: &OneToOneJoin, tuning: &EngineTuning, poisoned: i64
         },
         outcome,
         held,
+        held_poisoned,
         mismatches: off,
         build_secs,
     }
@@ -737,4 +774,41 @@ pub async fn run_poisons(cfg: &OneToOneJoin, tuning: &EngineTuning) -> Vec<Poiso
         results.push(r);
     }
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(outcome: &str, held: i64, held_poisoned: i64, mismatches: i64) -> PoisonResult {
+        PoisonResult {
+            rows: 100,
+            poisoned: 4,
+            shape: "light".to_string(),
+            rep: Rep::default(),
+            outcome: outcome.to_string(),
+            held,
+            held_poisoned,
+            mismatches,
+            build_secs: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_committed_poisoned_page_must_hold_exactly_the_failing_rows() {
+        assert!(result("committed", 4, 4, 4).oracle_holds());
+        // A good row held in place of a failing one, with the counts unchanged.
+        assert!(!result("committed", 4, 3, 4).oracle_holds());
+        assert!(!result("committed", 5, 4, 4).oracle_holds());
+        assert!(!result("committed", 4, 4, 5).oracle_holds());
+    }
+
+    #[test]
+    fn a_halt_must_roll_the_whole_fan_out_back_and_a_timeout_fails() {
+        assert!(result(HALTED, 0, 0, 100).oracle_holds());
+        assert!(!result(HALTED, 0, 0, 99).oracle_holds());
+        assert!(!result(HALTED, 1, 1, 100).oracle_holds());
+        assert!(!result("timed out", 4, 4, 4).oracle_holds());
+        assert!(!result("left live: failed", 0, 0, 100).oracle_holds());
+    }
 }

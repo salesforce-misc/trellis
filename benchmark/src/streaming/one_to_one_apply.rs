@@ -115,7 +115,7 @@ impl ShapeResult {
 /// its sum and its count, summed over every instance in one scrape.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PageHistogram {
-    pub(crate) buckets: Vec<(f64, u64)>,
+    buckets: Vec<(f64, u64)>,
     pub(crate) sum: f64,
     pub(crate) count: u64,
 }

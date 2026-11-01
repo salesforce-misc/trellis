@@ -656,12 +656,14 @@ pub fn run(name: &str, args: &[String]) -> Option<bool> {
             let cfg = one_to_one_join_config(args);
             let tuning = join_tuning(args);
             let results = runtime().block_on(one_to_one_join::run_poisons(&cfg, &tuning));
-            // A halt is a measurement (where the bisection gives up), not a failure;
-            // what must hold is that a committed page holds exactly the failing
-            // rows and leaves every other row right.
-            Some(results.iter().all(|r| {
-                r.outcome != "committed" || (r.held == r.poisoned && r.mismatches == r.poisoned)
-            }))
+            // A halt is a measurement (where the bisection gives up), not a
+            // failure; see `PoisonResult::oracle_holds` for what each outcome
+            // must leave behind.
+            Some(
+                results
+                    .iter()
+                    .all(one_to_one_join::PoisonResult::oracle_holds),
+            )
         }
 
         "one-to-one-join-seam" => {
