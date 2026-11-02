@@ -151,7 +151,7 @@ it is over.
 | Holder | Count | Held |
 |---|---|---|
 | The call pool | up to `max_call_pool_size` (20) | opened as calls need them, closed after 60 s idle |
-| The background pool, when `staging` or `drain_threads` starts a client | `2N + 5` with both, `2N + 4` with drain threads only, `1` with staging only (`N` = `drain_threads`) | opened as the workers need them, closed after 60 s idle |
+| The background pool, when `staging` or `drain_threads` starts a client | `2N + 6` with both, `2N + 5` with drain threads only, `2` with staging only (`N` = `drain_threads`) | opened as the workers need them, closed after 60 s idle |
 | The staging worker's session (`staging: true`, while leading) | 1 | as long as it leads |
 | The `LISTEN` connection (`drain_threads` at least 1) | 1, shared by the drain threads and `self_check` | as long as the client runs |
 | The claim keep-alive (`drain_threads` at least 1) | up to 1, shared by the drain threads | while a claim outlives one heartbeat interval |
@@ -165,12 +165,12 @@ holds no staging session; it opens a connection for a moment every 5 seconds to
 try the lock.
 
 A worker handle with `staging: true, drain_threads: 2` therefore holds a
-background pool of up to 9, and two connections that stay open for as long as
+background pool of up to 10, and two connections that stay open for as long as
 it runs: the staging session and the `LISTEN`. When the work stops, the
 background pool shrinks to the one or two connections the idle drain threads'
 polls keep in use. On top of those come a heartbeat connection while a claim
 runs long, a session for each paged drain, and a call pool that empties when
-idle. Its worst case is 35 connections (20 + 9 + 1 + 1 + 1 + 2 + 1: call pool,
+idle. Its worst case is 36 connections (20 + 10 + 1 + 1 + 1 + 2 + 1: call pool,
 background pool, session, `LISTEN`, keep-alive, two paged drains, attach); idle,
 it holds three or four.
 A handle at the defaults uses at most `max_call_pool_size`, plus one while it
@@ -784,6 +784,12 @@ So keep Trellis out of the host's transaction, in this order:
 3. The transforms are defined, once each, outside any host transaction.
 4. The dedicated worker starts or restarts. It doesn't need the definitions
    to exist first; it picks each one up on its next pass.
+
+In a deploy that changes the Trellis release, steps 2 and 3 refuse with the
+`version_handover` code while a process of the old release is live: `migrate`
+when the new release carries a migration, and every define, `ALTER`, `PAUSE`,
+`RESUME` and `DROP` ([rolling deploys](#rolling-deploys)). Run them once the
+old release's processes have stopped.
 
 Step 3 can be a deploy step of its own, run after migrations, or a migration
 of its own with the host's transaction turned off (`@disable_ddl_transaction

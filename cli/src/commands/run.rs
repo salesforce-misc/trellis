@@ -69,7 +69,7 @@ Options:
   --drain-threads <N>        Number of drain (application) worker threads to
                              run. Must be a non-negative integer. Default: 2.
                              The workers' connection pool is sized from this
-                             (2N + 5 with the staging worker, 2N + 4
+                             (2N + 6 with the staging worker, 2N + 5
                              without) and closes connections idle for 60s.
   --prometheus-bind <ADDR>  host:port to serve this process's metrics
                              registry as Prometheus text exposition on,

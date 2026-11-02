@@ -76,7 +76,7 @@ defmodule Trellis do
   (`:max_call_pool_size`; they close after 60 idle seconds) and a small Rust
   runtime (`:worker_threads` threads). A handle with `staging: true` or
   `drain_threads` above `0` also owns a second runtime and a background pool
-  sized by those roles (`2N + 5` for a worker at `drain_threads: N`), plus
+  sized by those roles (`2N + 6` for a worker at `drain_threads: N`), plus
   connections outside both pools: one for the staging worker while it leads,
   one `LISTEN` shared by its drain threads, and a claim keep-alive and a paged
   drain's session while they are needed.

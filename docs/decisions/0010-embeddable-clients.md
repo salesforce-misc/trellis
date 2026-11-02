@@ -95,7 +95,7 @@ a *call pool* of up to `max_call_pool_size` connections (20 by default; a handle
 option, with `call_pool_wait_timeout`) that serves its API calls. A handle that
 runs a background client (`staging` or `drain_threads`) also owns a second
 runtime and a *background pool* for that client, sized by its roles, not by an
-option: `2N + 5` for a worker at `drain_threads: N`, `2N + 4` drain-only, `1`
+option: `2N + 6` for a worker at `drain_threads: N`, `2N + 5` drain-only, `2`
 staging-only. Calls never use the background pool, so drain work cannot starve
 them. Each drain thread holds at most two pooled connections at once, which a
 debug-build assertion enforces. Both pools hand out their most recently used

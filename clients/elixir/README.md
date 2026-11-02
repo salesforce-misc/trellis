@@ -152,7 +152,7 @@ the application boots even when the old worker is still running (see
 At the defaults, a handle holds up to 20 Postgres connections (its call pool,
 opened as calls need them and closed after 60 seconds idle) and 3 threads. A
 worker handle (`staging: true, drain_threads: N`) also owns a background pool
-of up to `2N + 5` connections (`2N + 4` without staging, `1` with staging
+of up to `2N + 6` connections (`2N + 5` without staging, `2` with staging
 alone), closed after 60 seconds idle, and two connections that stay open: the
 staging session and one `LISTEN` shared by its drain threads. It holds 6
 threads: drain threads are tasks on its runtime, not OS threads. Its memory is

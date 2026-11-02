@@ -47,16 +47,18 @@ fn close_idle(pool: &DeadpoolPool, idle: Duration) {
 /// those:
 ///
 /// - a worker (`staging` with `N` drain threads): `2N` for the drain threads,
-///   plus `self_check` 2, the upkeep task 1, the staging maintenance loop 1 and
-///   the registration/startup task 1: `2N + 5`;
-/// - drain only: the same without maintenance, `2N + 4`;
-/// - staging only: the maintenance loop's one pooled connection, `1`.
+///   plus `self_check` 2, the upkeep task 1, the staging maintenance loop 1,
+///   the registration/startup task 1 and the handover task 1 (ADR-0023):
+///   `2N + 6`;
+/// - drain only: the same without maintenance, `2N + 5`;
+/// - staging only: the maintenance loop's one pooled connection and the
+///   handover task's, `2`.
 pub(crate) fn background_pool_size(staging: bool, drain_threads: usize) -> Option<usize> {
     match (staging, drain_threads) {
         (false, 0) => None,
-        (true, 0) => Some(1),
-        (true, n) => Some(2 * n + 5),
-        (false, n) => Some(2 * n + 4),
+        (true, 0) => Some(2),
+        (true, n) => Some(2 * n + 6),
+        (false, n) => Some(2 * n + 5),
     }
 }
 
@@ -1872,17 +1874,17 @@ mod tests {
         assert!(printed.contains("db.example.com"), "{printed}");
     }
 
-    /// The background pool is sized by the client's roles: `2N + 5` for a
-    /// worker, `2N + 4` drain-only, `1` staging-only, none otherwise.
+    /// The background pool is sized by the client's roles: `2N + 6` for a
+    /// worker, `2N + 5` drain-only, `2` staging-only, none otherwise.
     #[test]
     fn the_background_pool_is_sized_by_role() {
         assert_eq!(background_pool_size(false, 0), None);
-        assert_eq!(background_pool_size(true, 0), Some(1));
-        assert_eq!(background_pool_size(true, 1), Some(7));
-        assert_eq!(background_pool_size(true, 2), Some(9));
-        assert_eq!(background_pool_size(true, 4), Some(13));
-        assert_eq!(background_pool_size(false, 1), Some(6));
-        assert_eq!(background_pool_size(false, 2), Some(8));
+        assert_eq!(background_pool_size(true, 0), Some(2));
+        assert_eq!(background_pool_size(true, 1), Some(8));
+        assert_eq!(background_pool_size(true, 2), Some(10));
+        assert_eq!(background_pool_size(true, 4), Some(14));
+        assert_eq!(background_pool_size(false, 1), Some(7));
+        assert_eq!(background_pool_size(false, 2), Some(9));
     }
 
     #[test]
