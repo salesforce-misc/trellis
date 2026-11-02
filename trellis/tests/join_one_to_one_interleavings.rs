@@ -3,12 +3,12 @@
 //! `R`, the recompute and the target write, the minimal build, `b` changes
 //! and their fan-out, and mixed pages.
 //!
-//! Every test turns the dev knob on before its driver starts. Each scenario
-//! seeds `a` and `b`, defines the transform (the minimal build fills `M`,
-//! `R`, `J` and the target), writes changes, seals them into batches and
-//! drives the pages by hand (`support/drain_driver.rs`): one page frozen at a
-//! [`PausePoint`] of its apply while another runs, which either queues behind
-//! the frozen page (asserted with `pg_blocking_pids`) or runs through.
+//! Each scenario seeds `a` and `b`, defines the transform (the minimal build
+//! fills `M`, `R`, `J` and the target), writes changes, seals them into
+//! batches and drives the pages by hand (`support/drain_driver.rs`): one page
+//! frozen at a [`PausePoint`] of its apply while another runs, which either
+//! queues behind the frozen page (asserted with `pg_blocking_pids`) or runs
+//! through.
 //! Nothing sleeps or polls for convergence. After each scenario the pipeline
 //! settles and the target equals the live join
 //! (`trellis::staging::one_to_one_join_diverging_keys`), `R` equals `a` and
@@ -43,7 +43,6 @@ mod drain_driver;
 
 use drain_driver::Driver;
 use trellis::defs::ValueType;
-use trellis::defs::join_one_to_one::set_enabled;
 use trellis::integer::IntWidth;
 use trellis::staging::ApplyError;
 use trellis::staging::interleave::PausePoint;
@@ -120,7 +119,6 @@ impl Kind {
 /// A database with `a` seeded with `a_rows` `(id, k, x, y)` and `b` with
 /// `b_rows` `(id, k, w, tag)`, the `kinds` defined and built, `a` captured.
 async fn start_kinds(kinds: &[Kind], a_rows: &str, b_rows: &str) -> Driver {
-    set_enabled(true);
     let ddl = format!(
         "{DDL}; {}{}",
         if a_rows.is_empty() {
@@ -644,7 +642,6 @@ async fn a_rederive_whose_row_moved_keys_after_the_unlocked_read_retries() {
 #[tokio::test]
 async fn a_page_that_predates_the_build_rederives() {
     let _serial = serial().await;
-    set_enabled(true);
     let ddl = format!(
         "{DDL}; insert into public.a values {A_ROWS}; insert into public.b values {B_ROWS}"
     );
@@ -1085,7 +1082,6 @@ async fn f13_a_fan_out_of_several_batches_races_an_a_move_onto_its_key() {
 #[tokio::test]
 async fn a_fan_out_batch_probes_r_by_its_key_and_never_scans_it_whole() {
     let _serial = serial().await;
-    set_enabled(true);
     let ddl = format!(
         "{DDL}; insert into public.a \
              select g, case when g <= 10000 then 10 else 20 + g % 50 end, g, 'many' \
@@ -1427,7 +1423,6 @@ async fn a_b_rederive_of_a_row_with_no_entry_commits_on_its_first_attempt() {
 #[tokio::test]
 async fn a_b_page_that_predates_the_build_rederives() {
     let _serial = serial().await;
-    set_enabled(true);
     let ddl = format!(
         "{DDL}; insert into public.a values {A_ROWS}; insert into public.b values {B_ROWS}"
     );
@@ -1840,7 +1835,6 @@ async fn n_rederives_move_rows_onto_and_off_a_null_key() {
 #[tokio::test]
 async fn a_chained_b_side_applies_the_seams_images() {
     let _serial = serial().await;
-    set_enabled(true);
     let mut d = Driver::start(
         "create table public.a (id integer primary key, k integer, x integer); \
          create table public.bsrc (id integer primary key, w integer); \
@@ -1926,7 +1920,6 @@ async fn a_chained_b_side_applies_the_seams_images() {
 #[tokio::test]
 async fn a_collated_text_key_applies_both_sides() {
     let _serial = serial().await;
-    set_enabled(true);
     let mut d = Driver::start(
         "create table public.c (id integer primary key, k text collate \"C\", x integer); \
          create table public.e (id integer primary key, k text collate \"C\", w integer); \
@@ -1974,7 +1967,6 @@ async fn a_collated_text_key_applies_both_sides() {
 #[tokio::test]
 async fn sides_keyed_differently_with_alias_named_columns_apply() {
     let _serial = serial().await;
-    set_enabled(true);
     // `Driver::rows` reads its rows as `r`, so the checks below name their
     // columns apart from it.
     let mut d = Driver::start(

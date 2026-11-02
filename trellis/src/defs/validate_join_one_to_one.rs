@@ -1,8 +1,6 @@
 //! Define-time validation of a 1-1 `JOIN` definition (ADR-0021): the shared
 //! `JOIN` rules (tables, `ON` terms and their key types), then the rules of a
-//! `JOIN` that keeps one row per `FROM` row. Admitted only while the dev knob
-//! is on ([`super::join_one_to_one::enabled`]); with it off the definition is
-//! refused as a `JOIN` without a `GROUP BY` always was.
+//! `JOIN` that keeps one row per `FROM` row.
 //!
 //! This is the part that needs only the two tables' live columns. The
 //! uniqueness of the joined table's `ON` columns and the refusals that read
@@ -22,7 +20,7 @@ use super::validate::{
 /// Validates a [`KeySpace::JoinOneToOne`] definition against the live columns
 /// of its two tables (`left` is the `FROM` table, `right` the joined one).
 ///
-/// Admitted when the knob is on, and: the tables differ; every column is
+/// Admitted when the tables differ; every column is
 /// qualified and exists; each `ON` term is an equality between one column of
 /// each table, of one type and collation, on the join-key allowlist; no
 /// column a hidden table copies is named like one of its ledger columns; and
@@ -36,9 +34,6 @@ pub fn validate(
     let KeySpace::JoinOneToOne(join) = &def.key_space else {
         return Ok(());
     };
-    if !super::join_one_to_one::enabled() {
-        return Err(ValidationError::OneToOneJoinDisabled);
-    }
     validate_join_tables_and_on(def, join, left, right)?;
     let resolve = join_resolver(def, join, left, right);
 
@@ -136,7 +131,6 @@ fn check_field_expr<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::defs::join_one_to_one::{set_enabled, tests::KNOB_LOCK};
     use crate::defs::parse;
     use crate::defs::validate::validate_join;
     use crate::defs::{PgType, ValueType};
@@ -194,31 +188,49 @@ mod tests {
         validate_join(&def, &from, &joined)
     }
 
+    /// A 1-1 `JOIN` is admitted with no setting: the development knob that
+    /// once gated it is gone, so `TRELLIS_DEV_ONE_TO_ONE_JOIN` set to any
+    /// value, an "off" one included, changes nothing.
     #[test]
-    fn the_knob_gates_a_one_to_one_join_at_validate() {
-        let _lock = KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        set_enabled(false);
-        assert_eq!(
-            check("customers.name AS who"),
-            Err(ValidationError::OneToOneJoinDisabled)
-        );
-        // An aggregate JOIN is not behind the knob.
+    fn a_one_to_one_join_is_admitted_with_no_knob() {
+        assert_eq!(check("customers.name AS who"), Ok(()));
         let def = parse(
-            "TRANSFORM v FROM orders JOIN customers ON orders.cust = customers.id \
-             GROUP BY orders.note SELECT orders.note AS note, COUNT(*) AS n",
+            "TRANSFORM v FROM orders INNER JOIN customers ON orders.cust = customers.id \
+             SELECT customers.name AS who, orders.total AS t",
         )
         .unwrap();
         let (from, joined) = sides();
         assert_eq!(validate_join(&def, &from, &joined), Ok(()));
-        set_enabled(true);
-        assert_eq!(check("customers.name AS who"), Ok(()));
-        set_enabled(false);
+    }
+
+    /// Runs [`a_one_to_one_join_is_admitted_with_no_knob`] in a child process
+    /// whose environment sets the old knob's variable to each value it read as
+    /// off or on. The child sets it before anything runs, so nothing races
+    /// `std::env::set_var` in this process.
+    #[test]
+    fn the_old_knob_variable_changes_nothing() {
+        let exe = std::env::current_exe().expect("the test binary");
+        for value in ["0", "off", "false", "1", "on"] {
+            let out = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "defs::validate_join_one_to_one::tests::a_one_to_one_join_is_admitted_with_no_knob",
+                    "--test-threads=1",
+                ])
+                .env("TRELLIS_DEV_ONE_TO_ONE_JOIN", value)
+                .output()
+                .expect("run the child test");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "TRELLIS_DEV_ONE_TO_ONE_JOIN={value}: {stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 
     #[test]
     fn a_column_named_by_two_on_terms_is_refused_on_either_side() {
-        let _lock = KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        set_enabled(true);
         let (from, joined) = sides();
         let on = |on: &str| {
             let def = parse(&format!(
@@ -249,13 +261,10 @@ mod tests {
             on("orders.cust = customers.id AND customers.id = orders.cust"),
             Err(ValidationError::JoinOnRepeatedPair { .. })
         ));
-        set_enabled(false);
     }
 
     #[test]
     fn a_field_is_any_expression_over_qualified_columns_of_either_table() {
-        let _lock = KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        set_enabled(true);
         for select in [
             "customers.name AS who, orders.note AS note",
             "orders.total + customers.id AS s",
@@ -268,13 +277,10 @@ mod tests {
         ] {
             assert_eq!(check(select), Ok(()), "{select}");
         }
-        set_enabled(false);
     }
 
     #[test]
     fn aggregates_unqualified_and_unknown_columns_are_named_refusals() {
-        let _lock = KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        set_enabled(true);
         // The deferred families parse, so the validator names them.
         for select in ["MAX(customers.id) AS m", "BOOL_AND(orders.total) AS b"] {
             assert!(
@@ -308,13 +314,10 @@ mod tests {
         ));
         // A field that doesn't type is refused by the inference.
         assert!(check("orders.total + customers.name AS bad").is_err());
-        set_enabled(false);
     }
 
     #[test]
     fn a_nondeterministic_collation_under_a_text_function_is_refused() {
-        let _lock = KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        set_enabled(true);
         let def = parse(
             "TRANSFORM v FROM orders LEFT JOIN customers ON orders.cust = customers.id \
              SELECT STRPOS(customers.name, 'a') AS pos, customers.name AS plain",
@@ -329,6 +332,5 @@ mod tests {
             Err(ValidationError::NondeterministicCollationTextFunction(refused))
                 if refused.field == "pos" && refused.table == "customers"
         ));
-        set_enabled(false);
     }
 }

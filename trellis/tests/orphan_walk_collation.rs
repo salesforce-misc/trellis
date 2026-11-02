@@ -29,14 +29,10 @@ mod drain_driver;
 use drain_driver::Driver;
 use trellis::config::Config;
 use trellis::defs::ValueType;
-use trellis::defs::join_one_to_one::set_enabled;
 use trellis::integer::IntWidth;
 use trellis::staging::build::{self, Step, WorkerOptions};
 use trellis::staging::self_check::{SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page};
 use trellis::{Trellis, TrellisOptions};
-
-/// The `JOIN` tests turn the dev knob on, which is process-wide.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn options() -> WorkerOptions {
     WorkerOptions {
@@ -489,7 +485,6 @@ const JOIN: &str = "TRANSFORM jl FROM public.a LEFT JOIN public.b ON a.k = b.k \
                     SELECT a.r + COALESCE(b.img, 0) AS total, b.k0 AS k0, a.s AS s";
 
 async fn start_join() -> Driver {
-    set_enabled(true);
     Driver::start(
         JOIN_DDL,
         &[
@@ -530,7 +525,6 @@ async fn assert_the_join_is_rebuilt(d: &Driver, case: &str) {
 /// orphan pass removes a target row no live `R` entry backs.
 #[tokio::test]
 async fn a_rebuild_of_a_join_keyed_by_a_non_default_collation_removes_its_orphan() {
-    let _serial = SERIAL.lock().await;
     let d = start_join().await;
     d.ctl
         .batch_execute("insert into public.jl (id, total, k0, s) values ('zz', 1, 'k', 's')")
@@ -549,7 +543,6 @@ async fn a_rebuild_of_a_join_keyed_by_a_non_default_collation_removes_its_orphan
 /// those rows' target rows.
 #[tokio::test]
 async fn a_resume_of_a_join_keyed_by_a_non_default_collation_removes_its_orphans() {
-    let _serial = SERIAL.lock().await;
     let mut d = start_join().await;
     let trellis = trellis(&d).await;
     trellis.apply("PAUSE TRANSFORM jl").await.expect("pause");
@@ -572,8 +565,6 @@ async fn a_resume_of_a_join_keyed_by_a_non_default_collation_removes_its_orphans
 /// with no divergence, and a rebuild and a `RESUME` remove its orphans.
 #[tokio::test]
 async fn a_join_keyed_by_parts_of_two_non_default_collations_builds_and_rebuilds() {
-    let _serial = SERIAL.lock().await;
-    set_enabled(true);
     let mut d = Driver::start(
         "create table public.a (id1 text collate \"und-x-icu\", id2 text collate \"POSIX\", \
              k integer, r integer, primary key (id1, id2)); \
@@ -657,8 +648,6 @@ async fn a_join_keyed_by_parts_of_two_non_default_collations_builds_and_rebuilds
 /// is checked with no divergence, and a rebuild and a `RESUME` remove its
 /// orphans.
 async fn a_join_re_collated_after_define(a_key: [&str; 2], b_key: [&str; 2], recollate: &str) {
-    let _serial = SERIAL.lock().await;
-    set_enabled(true);
     let mut d = Driver::start(
         &format!(
             "create table public.a (id1 text collate \"{}\", id2 text collate \"{}\", \

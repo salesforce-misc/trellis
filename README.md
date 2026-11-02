@@ -60,7 +60,7 @@ trellis run      # until interrupted: captures changes and keeps the target curr
 trellis status   # in another shell: each definition's status, warnings and quarantined rows
 ```
 
-`customer_totals` is now an ordinary table. It holds one row per customer, backfilled from the rows already in `orders`, and stays exactly equal to `SELECT customer_id, COUNT(*), SUM(amount) FROM orders GROUP BY customer_id` as `orders` changes. [docs/transforms.md](docs/transforms.md) is the reference for the grammar (1-1, aggregate and `JOIN` transforms) and for which sources and targets are supported, and [docs/known-correctness-gaps.md](docs/known-correctness-gaps.md) lists the ways a target can go stale or wrong without Trellis repairing it.
+`customer_totals` is now an ordinary table. It holds one row per customer, backfilled from the rows already in `orders`, and stays exactly equal to `SELECT customer_id, COUNT(*), SUM(amount) FROM orders GROUP BY customer_id` as `orders` changes. [docs/transforms.md](docs/transforms.md) is the reference for the grammar (1-1, aggregate, `JOIN` and 1-1 `JOIN` transforms) and for which sources and targets are supported, and [docs/known-correctness-gaps.md](docs/known-correctness-gaps.md) lists the ways a target can go stale or wrong without Trellis repairing it.
 
 ## Structure
 

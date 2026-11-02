@@ -211,9 +211,6 @@ impl Drop for Harness {
 
 thread_local! {
     static HARNESS: Harness = {
-        // The 1-1 JOIN is behind a dev knob until #1404; its chained cases
-        // run under it, as the 1-1 JOIN tier's do.
-        trellis::dev::defs::set_one_to_one_join(true);
         Harness {
             runtime: tokio::runtime::Runtime::new().expect("build tokio runtime"),
             cluster: TestCluster::start().long_lived(),

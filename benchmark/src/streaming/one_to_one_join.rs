@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
 use tokio_postgres::Client as RawClient;
-use trellis::dev::defs::{IntWidth, ValueType, install_definition, set_one_to_one_join};
+use trellis::dev::defs::{IntWidth, ValueType, install_definition};
 
 use crate::scenario::connect_raw;
 use crate::streaming::chain::wait_for_live;
@@ -173,7 +173,6 @@ struct Fixture {
 }
 
 async fn fixture(cfg: &OneToOneJoin, tuning: &EngineTuning, fan_out: i64, poison: i64) -> Fixture {
-    set_one_to_one_join(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;

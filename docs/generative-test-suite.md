@@ -433,8 +433,7 @@ beside them run on every `cargo test`.
   oracle is the definition's own query without the `GROUP BY`
   (`render_join_one_to_one_select`), compared byte for byte; every burst is
   also audited by a `Strict` `self_check`, which reads the hidden ledgers.
-  The tier turns the `TRELLIS_DEV_ONE_TO_ONE_JOIN` knob on. A side that is
-  another transform's target is drawn by the chained-reader tier below, not
+  A side that is another transform's target is drawn by the chained-reader tier below, not
   here, nor is a value that makes a field fail (a held row:
   `join_one_to_one_quarantine`). Run it with `cargo test -p generative --test
   join_one_to_one_convergence -- --ignored`. Its planted-bug sweep,
@@ -476,9 +475,8 @@ beside them run on every `cargo test`.
   oracle is its query written over the upstream's query
   (`oracle::chained_relation`), once both have converged, so an upstream that
   went wrong can't hide the `JOIN`'s own divergence; the upstream is checked
-  against its own query, and every target by a `Strict` `self_check`. The
-  1-1 `JOIN` cases run under the `TRELLIS_DEV_ONE_TO_ONE_JOIN` knob, as the
-  1-1 `JOIN` tier's do. Not drawn: a chain of more than one hop, a side that
+  against its own query, and every target by a `Strict` `self_check`. Not
+  drawn: a chain of more than one hop, a side that
   is an aggregate or `JOIN` target, a paused upstream column and a held row
   (`join_over_targets`, `group_basis_chained` and
   `join_one_to_one_over_targets` pin those). Run it with `cargo test -p

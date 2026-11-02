@@ -5,9 +5,9 @@
 //! The two sides are keyed differently (`a` by `text`, `b` by `bigint`) and
 //! name columns like the aliases the build's statements use (`r`, `s`,
 //! `img`, `k0`), so a statement that reads a generated name bare, or keys
-//! the target by the wrong side, fails here. Every test turns the dev knob
-//! on before its driver starts, and ends with the oracle: the target equals
-//! the live join, `R` equals `a` and `M` equals `b`, self_check clean.
+//! the target by the wrong side, fails here. Every test ends with the oracle:
+//! the target equals the live join, `R` equals `a` and `M` equals `b`,
+//! self_check clean.
 //!
 //! - `c…`: #1375's build-chunk families (C1–C10): a chunk against a page on
 //!   one of its keys, and C10, a row or entry that moves after the chunk's
@@ -31,7 +31,6 @@ mod drain_driver;
 use drain_driver::Driver;
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ValueType;
-use trellis::defs::join_one_to_one::set_enabled;
 use trellis::integer::IntWidth;
 use trellis::staging::build::{self, Step, WorkerOptions};
 use trellis::staging::interleave::PausePoint;
@@ -106,7 +105,6 @@ fn columns() -> Vec<(&'static str, ValueType)> {
 /// `kinds` defined over the seeded tables, both captured; built and `live`
 /// when `built`, or with their builds started and left for the test to run.
 async fn start(kinds: &[Kind], built: bool) -> Driver {
-    set_enabled(true);
     let ddl = format!("{DDL}; {SEED}");
     let definitions: Vec<String> = kinds.iter().map(|k| k.definition()).collect();
     let definitions: Vec<&str> = definitions.iter().map(String::as_str).collect();

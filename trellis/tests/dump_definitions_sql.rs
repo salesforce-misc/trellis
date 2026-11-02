@@ -39,9 +39,6 @@ async fn connect_raw(dsn: &str) -> Client {
 }
 
 async fn facade(dsn: &str) -> Trellis {
-    // The 1-1 `JOIN` is behind a process-wide dev knob (ADR-0021): on for
-    // every test here, which only admits one more kind of definition.
-    trellis::dev::defs::set_one_to_one_join(true);
     Trellis::connect(
         Config::from_dsn(dsn.to_string()).expect("valid dsn"),
         TrellisOptions::default(),

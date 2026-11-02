@@ -23,13 +23,9 @@ use std::collections::HashMap;
 
 use drain_driver::Driver;
 use trellis::config::{Config, DEFAULT_SCHEMA};
-use trellis::defs::join_one_to_one::set_enabled;
 use trellis::defs::{TransformStatus, ValueType};
 use trellis::integer::IntWidth;
 use trellis::{Trellis, TrellisError, TrellisOptions};
-
-/// The dev knob is process-wide, so these tests run one at a time.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn int4() -> ValueType {
     ValueType::Integer(IntWidth::Int4)
@@ -227,7 +223,6 @@ const COLUMNS: [(&str, ValueType); 4] = [
 
 /// `kind` over the seeded tables, built and live.
 async fn start(kind: Kind) -> Driver {
-    set_enabled(true);
     let definition = format!(
         "TRANSFORM {} FROM public.a {} JOIN public.b ON a.k = b.k \
          SELECT a.r + COALESCE(b.img, 0) AS total, b.k0 AS k0, a.s AS s",
@@ -295,7 +290,6 @@ async fn assert_exact(d: &mut Driver, kind: Kind, step: &str) {
 /// value past `integer` lands on both sides. A pass after it pauses nothing.
 #[tokio::test]
 async fn a_widened_column_a_field_reads_pauses_and_resume_re_types_the_target() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         for (table, column, big) in [
             (
@@ -362,10 +356,8 @@ async fn a_widened_column_a_field_reads_pauses_and_resume_re_types_the_target() 
 /// lands rather than failing its write.
 #[tokio::test]
 async fn a_widened_column_only_a_hidden_table_copies_pauses_and_resume_creates_it_again() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         for (table, column, part) in [("public.a", "r", "r"), ("public.b", "img", "m")] {
-            set_enabled(true);
             let mut d = Driver::start(
                 &format!("{DDL}; {SEED}"),
                 &COLUMNS,
@@ -429,9 +421,7 @@ async fn a_widened_column_only_a_hidden_table_copies_pauses_and_resume_creates_i
 /// rebuild), and the target keeps the enum.
 #[tokio::test]
 async fn a_copy_of_one_column_keeps_its_type_through_a_resume() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
-        set_enabled(true);
         let mut d = Driver::start(
             "create type public.mood as enum ('sad', 'ok', 'happy'); \
              create table public.a (id integer primary key, k integer, \
@@ -498,7 +488,6 @@ async fn a_copy_of_one_column_keeps_its_type_through_a_resume() {
 /// the target's key and rebuilds, and an `a` row keyed past `integer` joins.
 #[tokio::test]
 async fn a_widened_key_of_a_pauses_and_resume_re_types_the_target_key() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         let target = kind.target();
@@ -528,7 +517,6 @@ async fn a_widened_key_of_a_pauses_and_resume_re_types_the_target_key() {
 /// `integer` join. Either side first.
 #[tokio::test]
 async fn an_on_column_retyped_on_one_side_pauses_until_the_pair_matches_again() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         for (first, second) in [("public.a", "public.b"), ("public.b", "public.a")] {
             let mut d = start(kind).await;
@@ -583,7 +571,6 @@ async fn an_on_column_retyped_on_one_side_pauses_until_the_pair_matches_again() 
 /// re-type) and rebuilds.
 #[tokio::test]
 async fn an_on_pair_widened_on_both_sides_pauses_and_resume_creates_j_again() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         let target = kind.target();
@@ -623,7 +610,6 @@ async fn an_on_pair_widened_on_both_sides_pauses_and_resume_creates_j_again() {
 /// rebuilds.
 #[tokio::test]
 async fn a_column_either_side_reads_renamed_or_dropped_pauses_naming_it() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         let target = kind.target();
@@ -662,7 +648,6 @@ async fn a_column_either_side_reads_renamed_or_dropped_pauses_naming_it() {
 /// rebuilds.
 #[tokio::test]
 async fn a_column_retyped_to_a_type_evaluated_differently_pauses_and_resume_rebuilds() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         let target = kind.target();
@@ -689,7 +674,6 @@ async fn a_column_retyped_to_a_type_evaluated_differently_pauses_and_resume_rebu
 /// table now at that name.
 #[tokio::test]
 async fn either_table_renamed_away_or_dropped_pauses_the_transform() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         for table in ["a", "b"] {
             let mut d = start(kind).await;
@@ -747,7 +731,6 @@ async fn either_table_renamed_away_or_dropped_pauses_the_transform() {
 /// can't see writes through the hierarchy). Detached, `RESUME` rebuilds.
 #[tokio::test]
 async fn a_side_attached_as_a_partition_pauses_the_transform() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         let target = kind.target();
@@ -786,9 +769,7 @@ async fn a_side_attached_as_a_partition_pauses_the_transform() {
 /// `x` and rebuilding from `ta`.
 #[tokio::test]
 async fn a_widening_under_a_chained_a_side_follows_its_upstream_resume() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
-        set_enabled(true);
         let mut d = Driver::start(
             "create table public.asrc (id integer primary key, k integer, x integer); \
              create table public.b (bid integer primary key, k integer, w integer); \
@@ -873,7 +854,6 @@ async fn chained_exact(d: &Driver, kind: Kind) {
 /// rebuilds equal to the join, and a value past `integer` lands.
 #[tokio::test]
 async fn a_widening_under_a_chained_b_side_follows_its_upstream_resume() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         for (select, oracle, follows) in [
             ("tb.w AS w", "b.w", true),
@@ -883,7 +863,6 @@ async fn a_widening_under_a_chained_b_side_follows_its_upstream_resume() {
                 false,
             ),
         ] {
-            set_enabled(true);
             let mut d = Driver::start(
                 "create table public.a (id integer primary key, bid integer, r integer); \
                  create table public.bsrc (bid integer primary key, w integer); \
@@ -978,9 +957,7 @@ async fn a_widening_under_a_chained_b_side_follows_its_upstream_resume() {
 /// row among the rest.
 #[tokio::test]
 async fn a_widened_key_of_an_aggregate_a_side_keeps_its_null_keyed_rows() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
-        set_enabled(true);
         let mut d = Driver::start(
             "create table public.src (id integer primary key, g integer, v integer); \
              create table public.b (id integer primary key, k integer, w integer); \
@@ -1115,7 +1092,6 @@ async fn assert_self_check_converged(d: &Driver, kind: Kind) {
 /// `self_check` finds it converged.
 #[tokio::test]
 async fn dropping_b_s_only_unique_key_pauses_the_transform_until_it_is_back() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         let target = kind.target();
@@ -1147,7 +1123,6 @@ async fn dropping_b_s_only_unique_key_pauses_the_transform_until_it_is_back() {
 /// resume is refused until the duplicate is removed and the index rebuilt.
 #[tokio::test]
 async fn an_invalid_unique_index_as_the_only_key_pauses_the_transform() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         let target = kind.target();
@@ -1188,7 +1163,6 @@ async fn an_invalid_unique_index_as_the_only_key_pauses_the_transform() {
 /// (`ADD CONSTRAINT ... UNIQUE USING INDEX`). The target stays the live join.
 #[tokio::test]
 async fn swaps_that_keep_a_unique_key_in_place_pause_nothing() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         let target = kind.target();
@@ -1221,7 +1195,6 @@ async fn swaps_that_keep_a_unique_key_in_place_pause_nothing() {
 /// pauses the transform.
 #[tokio::test]
 async fn a_drop_between_two_passes_with_no_other_change_is_detected() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         let target = kind.target();
@@ -1256,7 +1229,6 @@ async fn a_drop_between_two_passes_with_no_other_change_is_detected() {
 /// is caught all the same.
 #[tokio::test]
 async fn a_drop_first_swap_with_a_pass_in_between_pauses_until_resumed() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         let target = kind.target();
@@ -1308,7 +1280,6 @@ async fn a_drop_first_swap_with_a_pass_in_between_pauses_until_resumed() {
 #[tokio::test]
 async fn a_duplicate_past_a_deferrable_key_under_replica_is_captured_and_reported() {
     use trellis::staging::self_check::CheckPageExt;
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(kind).await;
         let target = kind.target();

@@ -19,7 +19,6 @@ use std::time::Duration;
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
-use trellis::defs::join_one_to_one::set_enabled;
 use trellis::staging::self_check::CheckPageExt;
 use trellis::{Config, SelfCheckMode, SelfCheckOutcome, Trellis, TrellisOptions};
 
@@ -182,7 +181,6 @@ async fn survey(raw: &Client, trellis: &Trellis) -> (Vec<&'static str>, Vec<&'st
 /// reader. Then the same for `a.ga` and `request_backfill` of `a`.
 #[tokio::test]
 async fn set_expression_on_a_stored_generated_column_is_missed_and_repaired_by_a_backfill() {
-    set_enabled(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;

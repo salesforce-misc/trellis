@@ -21,14 +21,10 @@ mod drain_driver;
 
 use drain_driver::Driver;
 use trellis::defs::ValueType;
-use trellis::defs::join_one_to_one::set_enabled;
 use trellis::integer::IntWidth;
 use trellis::staging::self_check::{
     SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page, compare_page,
 };
-
-/// The 1-1 `JOIN` test turns the dev knob on, which is process-wide.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A walk of `target`'s check, a page of one key and of every key, finds no
 /// divergence.
@@ -377,7 +373,6 @@ async fn an_on_column_moved_onto_a_nondeterministic_collation_compares_by_bytes(
 /// re-collation, which fails for the `FROM` side's (#1567).
 #[tokio::test]
 async fn a_one_to_one_join_on_column_re_collated() {
-    let _serial = SERIAL.lock().await;
     for (name, table, definition, oracle) in [
         (
             "inner, a.kt icu then POSIX",
@@ -395,7 +390,6 @@ async fn a_one_to_one_join_on_column_re_collated() {
              on a.kt = b.kt collate \"C\"",
         ),
     ] {
-        set_enabled(true);
         let d = Driver::start(
             "create table public.a (id integer primary key, kt text collate \"und-x-icu\", \
                  v integer); \

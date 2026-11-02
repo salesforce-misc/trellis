@@ -432,10 +432,8 @@ mod tests {
         assert!(detail.contains("itself"), "{detail}");
     }
 
-    /// A `JOIN` with no `GROUP BY` parses to the 1-1 JOIN key space; whether
-    /// it is admitted is the validator's (the dev knob gates at define, not
-    /// at parse, so a stored definition still loads with the knob off), and
-    /// it renders back without a `GROUP BY`.
+    /// A `JOIN` with no `GROUP BY` parses to the 1-1 JOIN key space, and it
+    /// renders back without a `GROUP BY`.
     #[test]
     fn a_join_without_group_by_parses_as_a_one_to_one_join() {
         let text = "TRANSFORM t FROM s LEFT JOIN other ON s.id = other.id AND s.k = other.k \

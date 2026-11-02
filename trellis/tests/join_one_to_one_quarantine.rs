@@ -3,9 +3,8 @@
 //! release that re-derives them, a held key of `b`, and the column fuse's
 //! fence over both tables.
 //!
-//! Every test turns the dev knob on before its driver starts, seeds `a` and
-//! `b`, defines the transform and drives sealed batches by hand
-//! (`support/drain_driver.rs`). Nothing sleeps or polls for convergence but
+//! Every test seeds `a` and `b`, defines the transform and drives sealed
+//! batches by hand (`support/drain_driver.rs`). Nothing sleeps or polls for convergence but
 //! the page a pause must queue behind.
 
 #[path = "support/drain_driver.rs"]
@@ -16,7 +15,6 @@ use std::collections::HashMap;
 use drain_driver::Driver;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
-use trellis::defs::join_one_to_one::set_enabled;
 use trellis::integer::IntWidth;
 use trellis::staging::interleave::PausePoint;
 use trellis::staging::quarantine;
@@ -28,8 +26,7 @@ const DDL: &str = "create table public.a (id integer primary key, k integer, x i
                    create unique index on public.b (k); \
                    create index on public.a (k)";
 
-/// The dev knob and the process-wide test hooks are shared, so these tests
-/// run one at a time.
+/// The test hooks are process-wide, so these tests run one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn int4() -> ValueType {
@@ -105,7 +102,6 @@ impl Kind {
 /// A database with `a` seeded with `a_rows` `(id, k, x, y)` and `b` with
 /// `b_rows` `(id, k, w, tag)`, `kind` defined and built, both captured.
 async fn start(kind: Kind, a_rows: &str, b_rows: &str) -> Driver {
-    set_enabled(true);
     let ddl = format!(
         "{DDL}; insert into public.a values {a_rows}; insert into public.b values {b_rows}"
     );
@@ -1031,7 +1027,6 @@ async fn a_held_key_of_b_is_released_by_a_rederive_and_its_fan_out() {
 async fn a_held_row_of_a_keyed_by_null_is_released() {
     let _serial = SERIAL.lock().await;
     for (word, sql) in [("LEFT", "left"), ("INNER", "inner")] {
-        set_enabled(true);
         let mut d = Driver::start(
             "create table public.src (id integer primary key, g integer, h integer); \
              create table public.b (id integer primary key, k integer, w bigint); \
@@ -1120,7 +1115,6 @@ async fn a_held_row_of_a_keyed_by_null_is_released() {
 #[tokio::test]
 async fn a_held_row_of_a_chained_a_side_is_released() {
     let _serial = SERIAL.lock().await;
-    set_enabled(true);
     let mut d = Driver::start(
         "create table public.asrc (id integer primary key, k integer, x integer); \
          create table public.b (id integer primary key, k integer, w integer); \

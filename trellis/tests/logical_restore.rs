@@ -7,7 +7,7 @@
 //! nothing.
 //!
 //! The original is a 1-1, a group-basis aggregate, an aggregate `JOIN` and a
-//! 1-1 `JOIN` (behind its dev knob), all `live`,
+//! 1-1 `JOIN`, all `live`,
 //! in a cluster whose WAL and transaction counter were advanced before the
 //! definitions applied anything, so their ledgers and groups hold positions
 //! ahead of a fresh cluster's. Nothing polls for convergence; every step is an
@@ -40,8 +40,6 @@ async fn connect(dsn: &str) -> Client {
 }
 
 async fn definer(dsn: &str) -> Trellis {
-    // The 1-1 `JOIN` is behind a process-wide dev knob (ADR-0021).
-    trellis::dev::defs::set_one_to_one_join(true);
     Trellis::connect(
         Config::from_dsn(dsn.to_string()).expect("valid dsn"),
         TrellisOptions::default(),

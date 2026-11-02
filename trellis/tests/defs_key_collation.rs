@@ -10,8 +10,6 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio::sync::{Mutex, MutexGuard};
-use trellis::defs::join_one_to_one::set_enabled;
 use trellis::defs::{
     CatalogError, KeyColumnRole, NondeterministicCollationTextFunction,
     NondeterministicKeyCollation, Statement, ValidationError, ValueType, alter_transform,
@@ -403,16 +401,6 @@ async fn text_comparisons_on_a_nondeterministic_column_are_refused() {
 // names.
 // ---------------------------------------------------------------------------
 
-/// The 1-1 JOIN knob is process-wide and these tests share a process: each
-/// 1-1 test takes this for its whole body.
-static KNOB: Mutex<()> = Mutex::const_new(());
-
-async fn with_knob(on: bool) -> MutexGuard<'static, ()> {
-    let guard = KNOB.lock().await;
-    set_enabled(on);
-    guard
-}
-
 /// Every text function and comparison the check covers, over `column`: the
 /// formula and the function name the refusal reports.
 fn text_reads(column: &str) -> Vec<(String, &'static str)> {
@@ -470,7 +458,6 @@ const KEY_SPACES: [(&str, BuildJoin); 2] =
 /// same column name on the other side) and the `FROM` table's reads.
 #[tokio::test]
 async fn join_text_reads_of_a_nondeterministic_column_are_refused_on_either_side() {
-    let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_case_insensitive_collation(&db.pool).await;
@@ -528,7 +515,6 @@ async fn join_text_reads_of_a_nondeterministic_column_are_refused_on_either_side
             .unwrap_or_else(|err| panic!("{space}: {formula}: {err}"));
         }
     }
-    set_enabled(false);
 }
 
 /// A joined column the `FROM` table has no column of is checked (it was
@@ -537,7 +523,6 @@ async fn join_text_reads_of_a_nondeterministic_column_are_refused_on_either_side
 /// names the joined table.
 #[tokio::test]
 async fn join_text_reads_of_a_column_only_the_joined_table_has_are_refused() {
-    let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_case_insensitive_collation(&db.pool).await;
@@ -562,7 +547,6 @@ async fn join_text_reads_of_a_column_only_the_joined_table_has_are_refused() {
         .expect_err(space);
         assert_text_function_refused(err, "n", "=", "posts", "slug");
     }
-    set_enabled(false);
 }
 
 async fn define_only(dsn: &str) -> Trellis {
@@ -580,7 +564,6 @@ async fn define_only(dsn: &str) -> Trellis {
 /// it back lets the resume through.
 #[tokio::test]
 async fn resuming_a_join_whose_read_column_became_nondeterministic_is_refused() {
-    let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     create_case_insensitive_collation(&db.pool).await;
@@ -656,7 +639,6 @@ async fn resuming_a_join_whose_read_column_became_nondeterministic_is_refused() 
             }
         }
     }
-    set_enabled(false);
 }
 
 /// An aggregate JOIN's text read is refused wherever the aggregate puts it:

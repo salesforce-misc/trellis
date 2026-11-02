@@ -169,9 +169,6 @@ pub enum ValidationError {
     /// A `JOIN` definition's field is neither a `GROUP BY` key passthrough
     /// nor an admitted aggregate over a single column.
     JoinFieldShape { field: String, detail: String },
-    /// A 1-1 `JOIN` (a `JOIN` with no `GROUP BY`, ADR-0021) was defined while
-    /// the dev knob that admits it is off.
-    OneToOneJoinDisabled,
     /// A 1-1 `JOIN` field calls an aggregate. A 1-1 `JOIN` has one target row
     /// per `FROM` row and no `GROUP BY` to aggregate over.
     OneToOneJoinAggregate { field: String, function: String },
@@ -1082,11 +1079,6 @@ impl fmt::Display for ValidationError {
             ValidationError::JoinFieldShape { field, detail } => {
                 write!(f, "field '{field}' of a JOIN definition: {detail}")
             }
-            ValidationError::OneToOneJoinDisabled => write!(
-                f,
-                "a JOIN aggregates, so it needs a GROUP BY after the ON clause (a JOIN without \
-                 one, a 1-1 JOIN, is not available yet)"
-            ),
             ValidationError::OneToOneJoinAggregate { field, function } => write!(
                 f,
                 "field '{field}' of a 1-1 JOIN calls {function}, an aggregate, but a JOIN \

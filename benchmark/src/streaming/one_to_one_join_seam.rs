@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use testkit::TestCluster;
 use tokio_postgres::Client as RawClient;
-use trellis::dev::defs::{IntWidth, ValueType, install_definition, set_one_to_one_join};
+use trellis::dev::defs::{IntWidth, ValueType, install_definition};
 use trellis::dev::metrics::LATENCY_BUCKETS;
 
 use crate::scenario::connect_raw;
@@ -231,7 +231,6 @@ pub async fn run_variant(cfg: &Seam, tuning: &EngineTuning, variant: &str) -> Se
         VARIANTS.contains(&variant),
         "unknown variant {variant:?}; expected one of {VARIANTS:?}"
     );
-    set_one_to_one_join(true);
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use drain_driver::Driver;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
-use trellis::defs::join_one_to_one::{set_enabled, set_max_fanout};
+use trellis::defs::join_one_to_one::set_max_fanout;
 use trellis::integer::IntWidth;
 use trellis::staging::ApplyError;
 use trellis::staging::interleave::PausePoint;
@@ -36,8 +36,7 @@ const DDL: &str = "create table public.a (id integer primary key, k integer, x i
 /// rows.
 const CAP: i64 = 25;
 
-/// The dev knob and the fan-out cap are process-wide, so these tests run one
-/// at a time.
+/// The fan-out cap is process-wide, so these tests run one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn int4() -> ValueType {
@@ -75,7 +74,6 @@ impl Kind {
 /// `kind` over `CAP` rows of `a` on key 10, one on key 20, and `b` rows on
 /// both keys, built and live, with the fan-out cap at `CAP`.
 async fn start(kind: Kind) -> Driver {
-    set_enabled(true);
     set_max_fanout(CAP as u64);
     let seed = format!(
         "insert into public.a select i, 10, i from generate_series(1, {CAP}) i; \

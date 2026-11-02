@@ -53,15 +53,14 @@ use std::time::Duration;
 use drain_driver::Driver;
 use trellis::defs::ValueType;
 use trellis::defs::chunk_queue;
-use trellis::defs::join_one_to_one::{set_enabled, set_max_fanout};
+use trellis::defs::join_one_to_one::set_max_fanout;
 use trellis::integer::IntWidth;
 use trellis::staging::converge;
 use trellis::staging::interleave::PausePoint;
 use trellis::staging::quarantine;
 use trellis::staging::self_check::{SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page};
 
-/// The dev knob and the fan-out cap are process-wide, so these tests run one
-/// at a time.
+/// The fan-out cap is process-wide, so these tests run one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn int4() -> ValueType {
@@ -246,7 +245,6 @@ async fn settle_all(d: &mut Driver) {
 
 /// The two upstreams live over the seeded sources, no `JOIN` defined.
 async fn upstreams() -> Driver {
-    set_enabled(true);
     Driver::start(
         &format!("{SOURCES}; {A_SEED}; {B_SEED}"),
         &[
@@ -1401,7 +1399,6 @@ const PIN_KINDS: [Kind; 2] = [Kind::Left, Kind::Inner];
 /// `ta` over the seeded `a`, and the `kind` `JOIN` of `ta` and the seeded,
 /// captured `b`, built and live.
 async fn start_pin(kind: Kind) -> Driver {
-    set_enabled(true);
     let mut d = Driver::start(
         &format!(
             "{PIN_DDL}; insert into public.a values {PIN_A_ROWS}; \

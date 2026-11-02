@@ -19,7 +19,6 @@ use testkit::{TestCluster, TestDatabase};
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::TransformStatus;
-use trellis::defs::join_one_to_one::set_enabled;
 use trellis::defs::validate::ValidationError;
 use trellis::staging::apply::ApplyError;
 use trellis::staging::self_check::CheckPageExt;
@@ -231,7 +230,6 @@ async fn app_writes(app: &Client, bid: i32) -> Result<(), tokio_postgres::Error>
 /// a 1-1 `JOIN`. Nothing is registered.
 #[tokio::test]
 async fn define_refuses_a_definition_reading_a_virtual_column() {
-    set_enabled(true);
     let cluster = TestCluster::start();
     let Some(it) = instance(&cluster, "virtual").await else {
         return;
@@ -272,7 +270,6 @@ async fn define_refuses_a_definition_reading_a_virtual_column() {
 /// definition, which a 1-1 transform names other than the column.
 #[tokio::test]
 async fn a_definition_not_reading_a_virtual_column_stays_converged() {
-    set_enabled(true);
     let cluster = TestCluster::start();
     let Some(mut it) = instance(&cluster, "virtual").await else {
         return;
@@ -330,7 +327,6 @@ async fn a_definition_not_reading_a_virtual_column_stays_converged() {
 /// it stays converged throughout. A resume is refused while the column is
 /// virtual, and rebuilds once it is stored again.
 async fn a_read_column_made_virtual_pauses_its_readers(ddl: &str) {
-    set_enabled(true);
     let cluster = TestCluster::start();
     let Some(mut it) = instance(&cluster, "stored").await else {
         return;
@@ -440,7 +436,6 @@ async fn a_virtual_column_renamed_onto_a_read_column_pauses_its_readers() {
 /// `g` is stored again rebuilds them from the source, repairing both.
 #[tokio::test]
 async fn updates_capture_gets_wrong_before_the_pause_are_repaired_by_the_resume() {
-    set_enabled(true);
     let cluster = TestCluster::start();
     let Some(mut it) = instance(&cluster, "stored").await else {
         return;

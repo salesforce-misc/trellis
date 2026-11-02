@@ -22,7 +22,6 @@ use std::collections::HashMap;
 use drain_driver::Driver;
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ValueType;
-use trellis::defs::join_one_to_one::set_enabled;
 use trellis::integer::IntWidth;
 use trellis::{Trellis, TrellisOptions};
 
@@ -41,9 +40,6 @@ const SEED: &str = "insert into public.a \
                         from generate_series(1, 20) i; \
                     insert into public.b select i, i * 10, i * 100, 'k' || i \
                         from generate_series(1, 6) i";
-
-/// The dev knob is process-wide, so these tests run one at a time.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn int4() -> ValueType {
     ValueType::Integer(IntWidth::Int4)
@@ -156,7 +152,6 @@ const COLUMNS: [(&str, ValueType); 4] = [
 
 /// `kinds` over the seeded tables, built and live.
 async fn start(kinds: &[Kind]) -> Driver {
-    set_enabled(true);
     let definitions: Vec<String> = kinds
         .iter()
         .map(|kind| {
@@ -274,7 +269,6 @@ const WHILE_PAUSED: [&str; 8] = [
 /// and resume with nothing in between changes nothing.
 #[tokio::test]
 async fn a_resume_after_every_kind_of_change_to_both_tables_is_exact() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(&[kind]).await;
         assert_exact(&mut d, kind, "the build").await;
@@ -338,7 +332,6 @@ async fn a_resume_after_every_kind_of_change_to_both_tables_is_exact() {
 /// the two builds take the pair's lock rows in one order.
 #[tokio::test]
 async fn a_resume_of_both_joins_over_the_same_tables_is_exact() {
-    let _serial = SERIAL.lock().await;
     let mut d = start(&KINDS).await;
     pause(&d, &KINDS).await;
     for sql in WHILE_PAUSED {
@@ -360,7 +353,6 @@ async fn a_resume_of_both_joins_over_the_same_tables_is_exact() {
 /// found it, cannot follow.
 #[tokio::test]
 async fn a_refused_resume_leaves_the_definition_paused_and_untouched() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start(&[kind]).await;
         let id = definition_id(&d, &kind.target()).await;
@@ -429,7 +421,6 @@ async fn a_refused_resume_leaves_the_definition_paused_and_untouched() {
 /// A 1-1 `JOIN` over two 1-1 targets: `ta` of `asrc` as `a` and `tb` of `bsrc`
 /// as `b`, joined on `ta.k = tb.id` (`tb`'s whole primary key).
 async fn start_chained(kinds: &[Kind]) -> Driver {
-    set_enabled(true);
     let mut d = Driver::start(
         "create table public.asrc (id integer primary key, k integer, x integer); \
          create table public.bsrc (id integer primary key, w integer, tag text); \
@@ -517,7 +508,6 @@ async fn assert_chained_exact(d: &mut Driver, kinds: &[Kind], step: &str) {
 /// of the `a` rows `ta` lost.
 #[tokio::test]
 async fn a_resume_of_a_join_over_two_one_to_one_targets_is_exact() {
-    let _serial = SERIAL.lock().await;
     let mut d = start_chained(&KINDS).await;
     assert_chained_exact(&mut d, &KINDS, "the build").await;
     pause(&d, &KINDS).await;

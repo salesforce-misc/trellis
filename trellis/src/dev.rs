@@ -70,12 +70,10 @@ pub mod defs {
     /// the same reason `registry` is reachable here.
     pub use crate::defs::typed_literal;
 
-    /// The 1-1 JOIN dev knob (ADR-0021, epic #1392): tests and `benchmark`
-    /// turn the grammar on, once, before a client starts. It is removed with
-    /// the epic's last milestone.
+    /// The 1-1 JOIN's fan-out cap and fan-out warning threshold (ADR-0021):
+    /// tests and `benchmark` set them, once, before a client starts.
     pub use crate::defs::join_one_to_one::{
-        KNOB_ENV as ONE_TO_ONE_JOIN_ENV, MAX_FANOUT_ENV as ONE_TO_ONE_JOIN_MAX_FANOUT_ENV,
-        enabled as one_to_one_join_enabled, set_enabled as set_one_to_one_join,
+        MAX_FANOUT_ENV as ONE_TO_ONE_JOIN_MAX_FANOUT_ENV,
         set_max_fanout as set_one_to_one_join_max_fanout,
     };
     pub use crate::staging::join_one_to_one_status::{

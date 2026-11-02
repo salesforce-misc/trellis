@@ -17,7 +17,6 @@ use std::time::Duration;
 use drain_driver::Driver;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
-use trellis::defs::join_one_to_one::set_enabled;
 use trellis::integer::IntWidth;
 use trellis::staging::self_check::{
     CheckPageExt, Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page,
@@ -40,9 +39,6 @@ const SEED: &str = "insert into public.a \
                         from generate_series(1, 20) i; \
                     insert into public.b select i, i * 10, i * 100, 'k' || i \
                         from generate_series(1, 6) i";
-
-/// The dev knob is process-wide.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Kind {
@@ -91,7 +87,6 @@ fn columns() -> Vec<(&'static str, ValueType)> {
 }
 
 async fn start(built: bool) -> Driver {
-    set_enabled(true);
     let ddl = format!("{DDL}; {SEED}");
     let definitions: Vec<String> = KINDS.iter().map(|k| k.definition()).collect();
     let definitions: Vec<&str> = definitions.iter().map(String::as_str).collect();
@@ -232,7 +227,6 @@ fn clean_keys(kind: Kind) -> i64 {
 
 #[tokio::test]
 async fn a_converged_target_reports_no_divergence_at_every_page_size() {
-    let _serial = SERIAL.lock().await;
     let mut d = start(true).await;
     // Key moves, a row that loses its match and one that gains it, deletes and
     // an insert on each side, and a `b` key handed to another row.
@@ -273,7 +267,6 @@ async fn a_converged_target_reports_no_divergence_at_every_page_size() {
 
 #[tokio::test]
 async fn a_clean_walk_compares_every_key_of_every_part_once() {
-    let _serial = SERIAL.lock().await;
     let d = start(true).await;
     for kind in KINDS {
         let walked = walk(&d, &kind.target(), 1000).await;
@@ -320,7 +313,6 @@ async fn planted(d: &Driver, kind: Kind, plant: &str, undo: &str, expected: Vec<
 
 #[tokio::test]
 async fn a_planted_divergence_in_the_target_is_reported_until_it_is_undone() {
-    let _serial = SERIAL.lock().await;
     let d = start(true).await;
     for kind in KINDS {
         let t = kind.name();
@@ -393,7 +385,6 @@ async fn a_planted_divergence_in_the_target_is_reported_until_it_is_undone() {
 
 #[tokio::test]
 async fn a_planted_divergence_in_r_is_reported_until_it_is_undone() {
-    let _serial = SERIAL.lock().await;
     let d = start(true).await;
     for kind in KINDS {
         let h = hidden(&d, kind).await;
@@ -470,7 +461,6 @@ async fn a_planted_divergence_in_r_is_reported_until_it_is_undone() {
 
 #[tokio::test]
 async fn a_planted_divergence_in_m_is_reported_until_it_is_undone() {
-    let _serial = SERIAL.lock().await;
     let d = start(true).await;
     for kind in KINDS {
         let h = hidden(&d, kind).await;
@@ -526,7 +516,6 @@ async fn a_planted_divergence_in_m_is_reported_until_it_is_undone() {
 /// masks the duplicate. The check names the key, and nothing else is wrong.
 #[tokio::test]
 async fn a_key_with_two_live_m_entries_is_reported() {
-    let _serial = SERIAL.lock().await;
     let mut d = start(true).await;
     step(&mut d, "drop index b_k_unique").await;
     step(&mut d, "insert into public.b values (7, 30, 777, 'dup')").await;
@@ -642,7 +631,6 @@ const PENDING: [&str; 8] = [
 
 #[tokio::test]
 async fn changes_not_applied_yet_are_subtracted_on_every_part() {
-    let _serial = SERIAL.lock().await;
     let mut d = start(true).await;
     for sql in PENDING {
         write(&d, sql).await;
@@ -665,7 +653,6 @@ async fn changes_not_applied_yet_are_subtracted_on_every_part() {
 
 #[tokio::test]
 async fn a_planted_error_beside_pending_changes_is_reported_exactly() {
-    let _serial = SERIAL.lock().await;
     let d = start(true).await;
     for sql in PENDING {
         write(&d, sql).await;
@@ -713,7 +700,6 @@ async fn a_planted_error_beside_pending_changes_is_reported_exactly() {
 /// page says so, and `Standard` re-checks what it finds there.
 #[tokio::test]
 async fn a_pending_truncate_touches_every_key() {
-    let _serial = SERIAL.lock().await;
     let d = start(true).await;
     write(&d, "truncate public.b").await;
     for kind in KINDS {
@@ -726,7 +712,6 @@ async fn a_pending_truncate_touches_every_key() {
 /// and named uncertain.
 #[tokio::test]
 async fn a_pending_recompute_of_a_names_its_key_uncertain() {
-    let _serial = SERIAL.lock().await;
     let mut d = start(true).await;
     d.stage_recomputes("public.a", &["a04"]).await;
     for kind in KINDS {
@@ -746,7 +731,6 @@ async fn a_pending_recompute_of_a_names_its_key_uncertain() {
 
 #[tokio::test]
 async fn a_definition_that_is_still_building_is_not_compared() {
-    let _serial = SERIAL.lock().await;
     let d = start(false).await;
     for kind in KINDS {
         let page = check_page(
@@ -775,7 +759,6 @@ async fn a_definition_that_is_still_building_is_not_compared() {
 /// A side that is an aggregate's target, keyed by its nullable `GROUP BY`
 /// column: some groups are keyed `NULL`.
 async fn start_nullable(kind: Kind) -> Driver {
-    set_enabled(true);
     let mut d = Driver::start(
         "create table public.src (id integer primary key, g integer, h integer, v integer); \
          create table public.b (id integer primary key, k integer, m integer, w integer); \
@@ -826,7 +809,6 @@ async fn start_nullable(kind: Kind) -> Driver {
 
 #[tokio::test]
 async fn an_a_keyed_by_null_parts_is_compared_on_every_part() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start_nullable(kind).await;
         for limit in [1, 2, 100] {
@@ -891,7 +873,6 @@ async fn an_a_keyed_by_null_parts_is_compared_on_every_part() {
 /// `jc`, a `LEFT` 1-1 `JOIN` whose `b` side is `tb`, a 1-1 target over
 /// `public.bsrc`, built and settled.
 async fn start_chained() -> Driver {
-    set_enabled(true);
     let mut d = Driver::start(
         "create table public.a (id integer primary key, k integer, x integer); \
          create table public.bsrc (id integer primary key, w integer); \
@@ -931,7 +912,6 @@ async fn start_chained() -> Driver {
 
 #[tokio::test]
 async fn a_chained_b_side_is_compared_with_the_images_of_its_upstream() {
-    let _serial = SERIAL.lock().await;
     let mut d = start_chained().await;
     let clean = |d: &Driver, when: &'static str| {
         let pool = d.pool().clone();
@@ -1006,7 +986,6 @@ async fn a_chained_b_side_is_compared_with_the_images_of_its_upstream() {
 /// maintains.
 #[tokio::test]
 async fn a_join_over_a_paused_upstream_reports_catching_up_and_is_not_compared() {
-    let _serial = SERIAL.lock().await;
     let d = start_chained().await;
     let trellis = Trellis::connect(
         Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
@@ -1073,8 +1052,6 @@ async fn a_join_over_a_paused_upstream_reports_catching_up_and_is_not_compared()
 /// key's own collation agrees.
 #[tokio::test]
 async fn a_key_of_a_non_default_collation_is_compared_on_every_part() {
-    let _serial = SERIAL.lock().await;
-    set_enabled(true);
     let mut d = Driver::start(
         "create table public.a (id text collate \"und-x-icu\" primary key, k integer, \
              r integer, s text); \
@@ -1156,7 +1133,6 @@ async fn a_key_of_a_non_default_collation_is_compared_on_every_part() {
 
 #[tokio::test]
 async fn the_self_check_job_audits_a_1_1_join_target() {
-    let _serial = SERIAL.lock().await;
     let d = start(true).await;
     let trellis = Trellis::connect(
         Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),

@@ -14,7 +14,6 @@ mod drain_driver;
 use drain_driver::Driver;
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ValueType;
-use trellis::defs::join_one_to_one::set_enabled;
 use trellis::dev::defs::set_one_to_one_join_fan_out_warning_rows;
 use trellis::integer::IntWidth;
 use trellis::staging::build::{self, Step, WorkerOptions};
@@ -40,7 +39,7 @@ const SEED: &str = "insert into public.a \
 const DEFINITION: &str = "TRANSFORM jl FROM public.a LEFT JOIN public.b ON a.k = b.k \
                           SELECT a.r + COALESCE(b.img, 0) AS total, b.k0 AS k0";
 
-/// The dev knob and the warning threshold are process-wide.
+/// The warning threshold is process-wide.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn columns() -> Vec<(&'static str, ValueType)> {
@@ -53,7 +52,6 @@ fn columns() -> Vec<(&'static str, ValueType)> {
 }
 
 async fn start(built: bool) -> Driver {
-    set_enabled(true);
     let ddl = format!("{DDL}; {SEED}");
     if built {
         Driver::start(&ddl, &columns(), &[DEFINITION], &["public.a", "public.b"]).await
@@ -249,7 +247,6 @@ async fn status_warns_of_a_join_key_with_more_a_rows_than_the_threshold() {
 #[tokio::test]
 async fn a_composite_join_key_is_named_by_all_its_columns() {
     let _serial = SERIAL.lock().await;
-    set_enabled(true);
     let d = Driver::start(
         "create table public.a (id integer primary key, k integer, m text); \
          create table public.b (id integer primary key, k integer, m text, w integer); \

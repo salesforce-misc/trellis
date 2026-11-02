@@ -16,20 +16,8 @@
 use std::collections::HashMap;
 
 use testkit::TestCluster;
-use tokio::sync::{Mutex, MutexGuard};
-use trellis::defs::join_one_to_one::set_enabled;
 use trellis::defs::{CatalogError, ValidationError, ValueType, install_definition};
 use trellis::integer::IntWidth;
-
-/// The one-to-one `JOIN` knob is process-wide; the test that turns it on holds
-/// this for its whole body.
-static KNOB: Mutex<()> = Mutex::const_new(());
-
-async fn with_knob(on: bool) -> MutexGuard<'static, ()> {
-    let guard = KNOB.lock().await;
-    set_enabled(on);
-    guard
-}
 
 async fn batch(pool: &trellis::pool::Pool, sql: &str) {
     pool.get()
@@ -344,7 +332,6 @@ async fn an_aggregate_join_key_wider_than_an_index_is_refused_at_validation() {
 
 #[tokio::test]
 async fn a_one_to_one_join_key_wider_than_an_index_is_refused_at_validation() {
-    let _knob = with_knob(true).await;
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     // `fb` is keyed by 32 columns (the most Postgres takes) and has more
@@ -391,7 +378,6 @@ async fn a_one_to_one_join_key_wider_than_an_index_is_refused_at_validation() {
     );
     nothing_registered(&db.pool, "o33").await;
     assert_eq!(hidden_table_count(&db.pool).await, hidden);
-    set_enabled(false);
 }
 
 #[tokio::test]

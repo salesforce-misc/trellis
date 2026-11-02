@@ -24,12 +24,7 @@ use std::collections::HashMap;
 use drain_driver::Driver;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
-use trellis::defs::join_one_to_one::set_enabled;
 use trellis::integer::IntWidth;
-
-/// The dev knob and the fan-out cap are process-wide, so these tests run one
-/// at a time.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn int4() -> ValueType {
     ValueType::Integer(IntWidth::Int4)
@@ -200,7 +195,6 @@ fn two_columns() -> Case {
 }
 
 async fn start_nullable_a(case: &Case, kind: Kind) -> Driver {
-    set_enabled(true);
     let mut d = Driver::start(case.ddl, &case.columns, &[case.aggregate], &["public.src"]).await;
     define_join(
         &mut d,
@@ -269,7 +263,6 @@ async fn assert_a_oracle(d: &Driver, case: &Case, kind: Kind, step: &str) {
 /// keyed `NULL`, which no chunk's range does, and the pages that change them
 /// after write and delete their target rows.
 async fn nulls_in_a_are_built_and_kept(case: Case) {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let mut d = start_nullable_a(&case, kind).await;
         assert_a_oracle(&d, &case, kind, "the build").await;
@@ -349,7 +342,6 @@ fn joined_on_first_column() -> Case {
 /// (`LEFT`), an insert brings them back, and a key's move does both.
 #[tokio::test]
 async fn a_b_change_fans_out_to_the_rows_of_a_keyed_by_null() {
-    let _serial = SERIAL.lock().await;
     let case = joined_on_first_column();
     for kind in KINDS {
         let mut d = start_nullable_a(&case, kind).await;
@@ -389,7 +381,6 @@ async fn nulls_changes(d: &mut Driver, case: &Case, kind: Kind) {
 /// (`intake::catch_up::park_target_catchup_if_read`) has run.
 #[tokio::test]
 async fn an_upstream_resume_is_followed_by_the_join() {
-    let _serial = SERIAL.lock().await;
     for case in [one_column(), two_columns(), joined_on_first_column()] {
         for kind in KINDS {
             let mut d = start_nullable_a(&case, kind).await;
@@ -417,7 +408,6 @@ async fn an_upstream_resume_is_followed_by_the_join() {
 /// rest.
 #[tokio::test]
 async fn a_rebuild_in_place_keeps_the_rows_of_a_keyed_by_null() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
         let case = one_column();
         let mut d = start_nullable_a(&case, kind).await;
@@ -456,7 +446,6 @@ async fn a_rebuild_in_place_keeps_the_rows_of_a_keyed_by_null() {
 /// sweep's orphan pass, and a group that came is built.
 #[tokio::test]
 async fn a_resume_after_the_null_keyed_groups_change_while_paused() {
-    let _serial = SERIAL.lock().await;
     for case in [one_column(), two_columns()] {
         for kind in KINDS {
             let mut d = start_nullable_a(&case, kind).await;
@@ -534,9 +523,7 @@ async fn assert_b_oracle(d: &Driver, kind: Kind, step: &str) {
 /// matches), and the pages that change the group leave the target as it was.
 #[tokio::test]
 async fn a_row_of_b_keyed_by_null_is_read_by_the_m_pass() {
-    let _serial = SERIAL.lock().await;
     for kind in KINDS {
-        set_enabled(true);
         let mut d = Driver::start(
             B_DDL,
             &one_column().columns,
