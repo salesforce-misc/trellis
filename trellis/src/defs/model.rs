@@ -45,11 +45,11 @@ pub struct Definition {
     /// — `transform_definitions.target_table` read back verbatim (it is
     /// resolved once, at acceptance time, mirroring `source_table` above;
     /// it is also the exact identity `schema_nodes`'
-    /// target-side node is keyed on, so it doubles as the qualified key
-    /// a caller with only `def.target` (bare) can use to re-enter the
-    /// `schema_nodes`/`schema_edges` graph — see
-    /// `staging::apply::compute`'s `downstream_readers` check for the one
-    /// call site that needs exactly this).
+    /// target-side node is keyed on, so it is the key to use to re-enter
+    /// the `schema_nodes`/`schema_edges` graph from a definition — never
+    /// resolve the bare `def.target` by name for that, which searches the
+    /// schema list and can land on an unrelated table; see
+    /// `staging::apply::compute`'s downstream-reader check).
     pub target_table: String,
 }
 

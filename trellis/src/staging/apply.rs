@@ -576,21 +576,19 @@ impl From<crate::error::Error> for ApplyError {
 /// bare lookup there silently finds nothing rather than erroring).
 ///
 /// A no-op for the common case — `src_table` already contains a `.` — which
-/// covers every real CDC-staged or backfill-enumerated change (the producer
-/// qualifies `change.src_table` unconditionally at the point it's staged).
-/// The one bare shape that still reaches it is a chained definition's own
-/// target, bare as [`crate::defs::ddl::neighbor_table_name`] always returns
-/// it — the bookkeeping key `compute`'s downstream-reader lookup
-/// (terminal-target latency metrics) asks about. That resolves through
-/// [`catalog::resolve_graph_identity`]'s bare-target-suffix fallback (for a
-/// target that isn't on the `search_path`): the name can only be some other
-/// live definition's own target.
+/// covers every row the ring holds: the CDC producer and backfill enumeration
+/// qualify `change.src_table` at the point they stage it, and a propagated
+/// row stages under its target's qualified `target_table`
+/// ([`crate::staging::target_mutations`]). A bare name is a shape only a
+/// hand-staged fixture (or a durable row from before that qualification)
+/// produces; it resolves through [`catalog::resolve_graph_identity`], which
+/// searches the bare-name schema list and then a live definition's target
+/// suffix. That is a search by name, so no caller holding the qualified
+/// identity should come through here.
 ///
-/// This is the canonicalization applied *before* staging: its output is what
-/// those rows carry into the ring in the first place, so a bare `src_table`
-/// reaching `compute` is not something this module itself produces. The
-/// reading side still tolerates a bare name anyway: ring rows are durable,
-/// and this crate's integration-test fixtures stage bare names by hand.
+/// The reading side tolerates a bare name rather than rejecting it: ring
+/// rows are durable, and this crate's integration-test fixtures stage bare
+/// names by hand.
 async fn qualified_schema_node_key(pool: &Pool, src_table: &str) -> Result<String, ApplyError> {
     if src_table.contains('.') {
         return Ok(src_table.to_string());
@@ -1430,6 +1428,173 @@ mod tests {
             Some(1),
             "exactly one end-to-end latency observation must land (target is terminal): \
              {after_flush}"
+        );
+    }
+
+    /// A target defined into an explicit schema (`TRANSFORM other.mid`) is
+    /// recognised as having a downstream reader even when an unrelated
+    /// table of the same bare name sits on the bare-name search list
+    /// (`public`). `compute` asks "does anything read this target" of the
+    /// definition's persisted qualified `target_table`; resolving the bare
+    /// name instead walked that list, found the unrelated `public.<bare>`,
+    /// saw no reader, and counted the intermediate hop as terminal -
+    /// recording a spurious end-to-end latency sample for it (#1591).
+    #[tokio::test]
+    async fn an_explicit_schema_target_with_a_same_named_public_table_is_not_terminal() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!(
+                "set search_path to {}, public; {}",
+                crate::config::DEFAULT_SCHEMA,
+                crate::pool::DETERMINISTIC_TEXT_OUTPUT_GUCS
+            ))
+            .await
+            .expect("set search_path");
+        // Same-crate pool: see `compute_only_buffers_metrics_...` above.
+        let pool_config =
+            crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid schema");
+        let pool = crate::pool::Pool::new(&pool_config).expect("build a same-crate pool");
+
+        let source = "s1591_orders";
+        let mid = "s1591_mid";
+        let last = "s1591_last";
+        let mid_qualified = format!("s1591_other.{mid}");
+        // The decoy: unrelated, in `public` (on the bare-name search list),
+        // and named like the explicit-schema target.
+        client
+            .batch_execute(&format!(
+                "create table {source} (id integer primary key, price numeric); \
+                 create table public.{mid} (id integer primary key); \
+                 create schema s1591_other"
+            ))
+            .await
+            .expect("seed tables");
+
+        let source_columns: HashMap<String, ValueType> = [
+            ("id".to_string(), ValueType::Numeric),
+            ("price".to_string(), ValueType::Numeric),
+        ]
+        .into_iter()
+        .collect();
+        // The fixture entry point registers against a target its caller
+        // already created, so the table comes first (from a hand-built
+        // `TransformDef`, as `tests/end_to_end_latency.rs` does).
+        let mid_text = format!("TRANSFORM {mid_qualified} FROM {source} SELECT price AS p");
+        let mid_def = crate::defs::ast::TransformDef {
+            target: mid.to_string(),
+            source: source.to_string(),
+            key_space: crate::defs::ast::KeySpace::OneToOne,
+            fields: vec![crate::defs::ast::FieldDef {
+                name: "p".to_string(),
+                expr: crate::defs::ast::Expr::Column("price".to_string()),
+            }],
+            predicate: crate::defs::ast::Predicate::True,
+            without_source_index: false,
+            explicit_source_schema: None,
+            explicit_target_schema: Some("s1591_other".to_string()),
+        };
+        let pk = crate::defs::source_primary_key(&pool, source)
+            .await
+            .expect("introspect source primary key");
+        crate::defs::create_target_table(
+            &pool,
+            &mid_def,
+            "s1591_other",
+            &pk,
+            &source_columns,
+            source,
+        )
+        .await
+        .expect("create the explicit-schema target table");
+        let mid_definition = crate::defs::create_definition(&pool, &mid_text, &source_columns)
+            .await
+            .expect("create the explicit-schema target's definition");
+        assert_eq!(mid_definition.target_table, mid_qualified);
+
+        let mid_columns: HashMap<String, ValueType> = [
+            ("id".to_string(), ValueType::Numeric),
+            ("p".to_string(), ValueType::Numeric),
+        ]
+        .into_iter()
+        .collect();
+        let last_def = crate::defs::create_definition(
+            &pool,
+            &format!("TRANSFORM {last} FROM {mid_qualified} SELECT p + p AS q"),
+            &mid_columns,
+        )
+        .await
+        .expect("create the reader chained off the explicit-schema target");
+        crate::defs::create_target_table(
+            &pool,
+            &last_def.def,
+            "public",
+            &pk,
+            &mid_columns,
+            &last_def.source_table,
+        )
+        .await
+        .expect("create the reader's target table");
+
+        // One change to each hop's input: `source` (feeding `mid`, which has
+        // a reader) and `mid` (feeding `last`, which has none).
+        let base = u64::from(testkit::wal_insert_lsn(&client).await);
+        for (offset, src_table, image) in [
+            (1u64, source, r#"{"price":"10.00"}"#),
+            (2, mid_qualified.as_str(), r#"{"p":"10.00"}"#),
+        ] {
+            client
+                .execute(
+                    "insert into seg_0 (src_table, key, op, lsn, old_image, new_image, hop_gen, \
+                     src_changed) \
+                     values ($1, '1', 'insert', $2, null, $3::text::jsonb, 0, now())",
+                    &[&src_table, &PgLsn::from(base + offset), &image],
+                )
+                .await
+                .expect("stage cdc row");
+        }
+
+        let mut seal_client = client;
+        let seal_outcome = crate::staging::seal::seal_phase1(&mut seal_client)
+            .await
+            .expect("seal phase 1");
+        crate::staging::seal::seal_phase2(&seal_client, seal_outcome.sealed_seg_seq, "wake")
+            .await
+            .expect("seal phase 2");
+        let seg_seq = seal_outcome.sealed_seg_seq;
+        let mut phase1_client = pool.get().await.expect("connection");
+        let txn = phase1_client.transaction().await.expect("begin phase 1");
+        claim::claim(&txn, seg_seq, "worker", 1)
+            .await
+            .expect("claim");
+        let share = claim::held_share(&*txn, seg_seq, "worker")
+            .await
+            .expect("held_share");
+        let filter = share.filter(share.buckets());
+        let folded = fold::fold(&txn, seg_seq, filter).await.expect("fold");
+        txn.commit().await.expect("commit phase 1");
+        assert_eq!(folded.len(), 2, "one change per source");
+
+        let plan = compute(&pool, &folded).await.expect("compute");
+        assert_eq!(
+            plan.transform_observations.len(),
+            2,
+            "both hops applied one change: {:?}",
+            plan.transform_observations
+        );
+        let mut terminal: Vec<&str> = plan.end_to_end_origins.keys().map(String::as_str).collect();
+        terminal.sort_unstable();
+        assert_eq!(
+            terminal,
+            vec![last],
+            "only the reader-less hop is terminal; the explicit-schema target has a reader, \
+             whatever else is named like it"
         );
     }
 
@@ -2327,8 +2492,8 @@ pub struct ApplyPlan {
     transform_observations: Vec<TransformObservation>,
     /// The terminal-transform-only counterpart to `transform_observations`,
     /// above: `end_to_end_origins` (the accumulator `compute` builds while
-    /// evaluating every source) filtered down, once `downstream_readers` is
-    /// known, to only the targets with no downstream reader of their own —
+    /// evaluating every source) filtered down, once each target's
+    /// downstream readers are known, to only the targets with no downstream reader of their own —
     /// mirroring exactly what `compute` used to flush directly into
     /// [`crate::metrics::record_end_to_end_latency`] at the end of its
     /// per-target loop. Buffered for the same retry-safety reason.
@@ -2657,10 +2822,17 @@ pub(super) async fn compute_page(
     // Every `Some(src_changed)` origin timestamp
     // `buffer_transform_apply_metrics` sees below, buffered per consuming
     // target — filtered into `ApplyPlan::end_to_end_origins` only for
-    // targets the `downstream_readers` computation at the end of this
+    // targets the downstream-reader check at the end of this
     // function finds terminal (see that call site's comment). Not itself
     // part of `ApplyPlan` — only the terminal-filtered subset is.
     let mut end_to_end_origins: HashMap<String, Vec<std::time::SystemTime>> = HashMap::new();
+    // Each evaluated definition's persisted, fully-qualified `target_table`,
+    // by the bare `def.def.target` every plan map above is keyed on (bare
+    // target suffixes are globally unique, so the pairing is one to one).
+    // The downstream-reader check at the end of this function asks about the
+    // qualified identity; carrying it here means no bare name is ever
+    // resolved back to a node by searching the schema list.
+    let mut qualified_targets: HashMap<String, String> = HashMap::new();
     // Every observation `buffer_transform_apply_metrics` below makes is
     // buffered here and carried out on `ApplyPlan`, flushed post-commit by
     // [`flush_apply_metrics`]. See `buffer_transform_apply_metrics`'s doc
@@ -2718,10 +2890,10 @@ pub(super) async fn compute_page(
         // `schema_nodes`/`schema_edges` key on qualified identity
         // (ADR-0011), so `transforms_for_source` (a thin `dependents_of`
         // wrapper) needs an exact qualified match here. `qualified_source` is
-        // usually already fully-qualified (real CDC/backfill), but a
-        // downstream-propagation hop's `src_table` is a bare target name
-        // this same apply path staged — `qualified_schema_node_key` resolves
-        // that case too; see its own doc comment.
+        // already fully qualified for every real row, including a
+        // downstream-propagation hop's (staged under the upstream target's
+        // `target_table`); `qualified_schema_node_key` only resolves the bare
+        // spelling a hand-staged fixture uses.
         let defs = catalog::transforms_for_source(
             pool,
             &qualified_schema_node_key(pool, qualified_source).await?,
@@ -2784,6 +2956,9 @@ pub(super) async fn compute_page(
             if changes.is_empty() {
                 continue;
             }
+            qualified_targets
+                .entry(def.def.target.clone())
+                .or_insert_with(|| def.target_table.clone());
             // A `JOIN` takes each change's ring rows as they are,
             // routed to the side this source is; Phase 3 applies both sides'
             // (`super::join`).
@@ -2994,6 +3169,9 @@ pub(super) async fn compute_page(
         )
         .await?;
         for def in &defs {
+            qualified_targets
+                .entry(def.def.target.clone())
+                .or_insert_with(|| def.target_table.clone());
             // The floor the clear raises (see the error's doc).
             let truncate_lsn = change.lsn.ok_or_else(|| ApplyError::TruncateWithoutLsn {
                 src_table: change.src_table.clone(),
@@ -3128,7 +3306,6 @@ pub(super) async fn compute_page(
         }
     }
 
-    let mut downstream_readers = HashMap::new();
     let mut all_targets: std::collections::HashSet<&String> = targets.keys().collect();
     all_targets.extend(clears.keys());
     all_targets.extend(group_targets.keys());
@@ -3141,47 +3318,19 @@ pub(super) async fn compute_page(
     // recorded here.
     let mut terminal_end_to_end_origins: HashMap<String, Vec<std::time::SystemTime>> =
         HashMap::new();
-    for target in all_targets {
-        // `target` is bare (`def.def.target`) — `schema_nodes` keys on
-        // qualified identity (ADR-0011), so a bare lookup here
-        // would silently find nothing and permanently disable downstream
-        // propagation for every chained transform.
-        // `qualified_schema_node_key` resolves it the same way it resolves
-        // a bare `Recompute`-staged `src_table` above (this *is* exactly
-        // that case, one step earlier: `target` is about to become such a
-        // row's `src_table` the moment this loop's caller stages it).
-        //
-        // That resolution is now *kept*, not discarded once the
-        // reader question is answered, and Phase 3 stages it verbatim as the
-        // propagated row's `src_table`. Reusing the identity this lookup
-        // already computed is what makes the emitted spelling agree, by
-        // construction, with the one a capture trigger independently stages
-        // for the same physical table (its spec's `intake::qualify`
-        // spelling) — `resolve_graph_identity`'s first step walks
-        // `catalog::bare_name_schemas` (Trellis's schema, the configured
-        // target schema, then `public`) for the real relation, which a
-        // target table in one of them satisfies, and both sides then format
-        // the schema it finds through that same `intake::qualify`, so the
-        // two strings are equal by construction rather than by coincidence.
-        // A target outside those schemas is found by step 2 instead, as the
-        // definition's own persisted `target_table`. (Strictly, step 1
-        // returns the *first* match in that list, so an unrelated relation
-        // of the same bare name in an earlier schema on it would resolve to
-        // the wrong one — a pre-existing property of
-        // `resolve_graph_identity` shared with every other caller, including
-        // the reader lookup on the next line, not something this staging site
-        // introduces: the reader lookup would come back empty for that same
-        // wrong name and propagation would stop rather than misfold.)
-        // Without that agreement, one write to an intermediate hop folds as
-        // two unrelated `(src_table, key)` groups and the downstream target's
-        // batched upsert is handed the same conflict key twice, which
-        // Postgres rejects outright — a permanent live-lock, since every
-        // retry re-derives the identical pair.
-        let qualified_target = qualified_schema_node_key(pool, target).await?;
-        let has_downstream = !catalog::transforms_for_source(pool, &qualified_target)
+    for (target, qualified_target) in &qualified_targets {
+        if !all_targets.contains(target) {
+            continue;
+        }
+        // `schema_nodes` keys on qualified identity (ADR-0011), so the
+        // reader lookup takes the definition's own persisted `target_table`
+        // — the identity Phase 3 stages the propagated rows under (see
+        // `target_mutations`) — not the bare `target`. Resolving the bare
+        // name searches the schema list and can land on an unrelated table
+        // of that name, which has no readers.
+        let has_downstream = !catalog::transforms_for_source(pool, qualified_target)
             .await?
             .is_empty();
-        downstream_readers.insert(target.clone(), has_downstream.then_some(qualified_target));
         // ADR-0009 decision 2: end-to-end latency is only ever
         // recorded for a *terminal* transform — one with no downstream
         // reader of its own — reusing this exact "does anything read

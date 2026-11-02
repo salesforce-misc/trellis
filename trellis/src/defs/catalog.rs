@@ -3753,11 +3753,14 @@ async fn resolve_graph_identity_in_txn(
 /// Pooled (non-transaction) counterpart to [`resolve_graph_identity_in_txn`]
 /// — same two-step resolution (physical [`bare_name_schemas`] lookup, falling back
 /// to a live definition's own bare target-suffix), for callers outside a
-/// catalog-owned transaction. `staging::apply::compute`'s
-/// `qualified_schema_node_key` is one caller: a `Recompute` row's `src_table`
-/// reaching `compute` bare is this same apply path's own
-/// downstream-propagation trigger for a chained definition's target — step 2
-/// here, the bare-target-suffix fallback.
+/// catalog-owned transaction. Step 2 matters to a bare name that is another
+/// definition's target outside the bare-name schemas — a `FROM <target>`
+/// written bare. A caller that already holds a definition's qualified
+/// `target_table` must use it directly rather than resolve its bare suffix
+/// here: step 1 returns the first match on the schema list, which can be an
+/// unrelated table of the same name. (`staging::apply::compute`'s
+/// `qualified_schema_node_key` also routes a bare ring `src_table` through
+/// here; the ring itself holds qualified names.)
 pub(crate) async fn resolve_graph_identity(
     pool: &Pool,
     table: &str,
@@ -4273,8 +4276,7 @@ async fn join_columns_of(
 /// The bare (`None`) branch uses [`resolve_graph_identity`], the same
 /// two-step resolution (with the bare-target-suffix fallback) as
 /// `create_definition_inner`'s own resolution of the exact same bare
-/// `def.source` (its `qualified_source`, above), and the same pooled
-/// resolution `staging::apply::compute`'s `qualified_schema_node_key` reuses.
+/// `def.source` (its `qualified_source`, above).
 /// This function's DDL steps run and can fail *before*
 /// `create_definition_inner` is ever reached, so a bare `FROM <name>`
 /// chained off another definition's target explicitly qualified into a
