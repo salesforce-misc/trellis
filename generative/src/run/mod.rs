@@ -618,16 +618,12 @@ pub async fn check_defs(
 ) -> Result<Vec<(String, OracleReport)>, String> {
     let mut diverged = Vec::new();
     for def in defs {
-        let source = program
-            .tables
-            .iter()
-            .find(|t| t.name == def.source)
-            .unwrap_or_else(|| {
-                panic!(
-                    "program references source table {:?} it does not declare — a generator bug",
-                    def.source
-                )
-            });
+        let source = source_table(program, defs, &def.source).unwrap_or_else(|| {
+            panic!(
+                "program references source table {:?} it does not declare — a generator bug",
+                def.source
+            )
+        });
         let source_columns: HashMap<String, ValueType> = source
             .columns
             .iter()
@@ -641,14 +637,40 @@ pub async fn check_defs(
             )
         })?;
 
-        let report = oracle::check(pool, program, def, &source.pk_col, &source_columns, target)
-            .await
-            .map_err(|e| format!("{e:?}"))?;
+        let report = oracle::check_over(
+            pool,
+            program,
+            defs,
+            def,
+            &source.pk_col,
+            &source_columns,
+            target,
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
         if report.diverged() {
             diverged.push((def.target.clone(), report));
         }
     }
     Ok(diverged)
+}
+
+/// The table `name` a definition reads: one of `program`'s tables, or the
+/// target of a plain 1-1 definition among `defs` that reads one
+/// ([`oracle::one_to_one_target_table`]), as a chained definition reads it.
+pub fn source_table(
+    program: &Program,
+    defs: &[TransformDef],
+    name: &str,
+) -> Option<crate::model::Table> {
+    if let Some(table) = program.tables.iter().find(|t| t.name == name) {
+        return Some(table.clone());
+    }
+    let upstream = defs.iter().find(|d| {
+        d.target == name && matches!(d.key_space, trellis::dev::defs::ast::KeySpace::OneToOne)
+    })?;
+    let source = program.tables.iter().find(|t| t.name == upstream.source)?;
+    Some(oracle::one_to_one_target_table(upstream, source))
 }
 
 #[cfg(test)]

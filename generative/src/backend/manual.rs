@@ -845,14 +845,80 @@ impl ManualBackend {
         Ok(sql::create_source_table(&self.raw, schema, table).await?)
     }
 
+    /// Starts the first engine client (its staging worker included), unless
+    /// one is running: the staging worker captures whatever the registered
+    /// definitions read, straight from the catalog.
+    async fn start_first_engine(&mut self) -> Result<(), ManualBackendError> {
+        if self.engine_client.is_some() {
+            return Ok(());
+        }
+        let mut options = ClientOptions {
+            staging_worker: true,
+            application_threads: self.application_threads,
+            maintenance_interval: self.maintenance_interval,
+            build_chunk_rows: self
+                .build_chunk_rows
+                .unwrap_or_else(|| ClientOptions::default().build_chunk_rows),
+            reconcile_interval: self
+                .reconcile_interval
+                .unwrap_or_else(|| ClientOptions::default().reconcile_interval),
+            ..Default::default()
+        };
+        if let Some(ttl) = self.reclaim_ttl {
+            options.reclaim_ttl = ttl;
+            options.heartbeat.interval = ttl / 3;
+        }
+        let client = EngineClient::start_with_config(self.config.clone(), options.clone())?;
+        self.engine_client = Some(client);
+        // Remembered so `restart` can start an
+        // equivalent replacement client without the caller needing to
+        // hand these options back in.
+        self.client_options = Some(options);
+        Ok(())
+    }
+
+    /// The installed definitions whose target `def` reads, as its source or
+    /// a `JOIN`'s joined table.
+    fn upstreams_of(&self, def: &TransformDef) -> Vec<TransformDef> {
+        let right = match &def.key_space {
+            KeySpace::Join(join) => Some(join.right.as_str()),
+            KeySpace::JoinOneToOne(join) => Some(join.right.as_str()),
+            _ => None,
+        };
+        self.defs
+            .iter()
+            .filter(|d| d.target == def.source || Some(d.target.as_str()) == right)
+            .cloned()
+            .collect()
+    }
+
+    fn reads_installed_target(&self, def: &TransformDef) -> bool {
+        !self.upstreams_of(def).is_empty()
+    }
+
     async fn install_definition(&mut self, def: &TransformDef) -> Result<(), ManualBackendError> {
-        let source_table = self
-            .tables
-            .get(&def.source)
-            .ok_or_else(|| ManualBackendError::UnknownTable {
-                table: def.source.clone(),
-            })?
-            .clone();
+        // A definition reading another's target (a chained side) defines
+        // only once that upstream is `live` (`TransformNotLive` otherwise),
+        // so it first waits for the upstream to settle: right after the
+        // upstream's own install, or while a resume or an `ALTER` of it
+        // rebuilds it.
+        let upstreams = self.upstreams_of(def);
+        if !upstreams.is_empty() {
+            sql::await_settled(&self.raw, &upstreams, QUIESCE_TIMEOUT).await?;
+        }
+        let source_table = match self.tables.get(&def.source) {
+            Some(table) => table.clone(),
+            None => upstreams
+                .iter()
+                .find(|d| d.target == def.source && matches!(d.key_space, KeySpace::OneToOne))
+                .and_then(|upstream| {
+                    let source = self.tables.get(&upstream.source)?;
+                    Some(crate::oracle::one_to_one_target_table(upstream, source))
+                })
+                .ok_or_else(|| ManualBackendError::UnknownTable {
+                    table: def.source.clone(),
+                })?,
+        };
         let source_columns = sql::source_columns(&source_table);
 
         // The engine refuses a GROUP BY or JOIN definition whose
@@ -1085,35 +1151,19 @@ impl super::Backend for ManualBackend {
             self.tables.insert(table.name.clone(), table.clone());
         }
         for def in &program.defs {
+            // A definition reading an earlier one's target waits for it to
+            // build (`install_definition`), which needs the engine running.
+            if self.reads_installed_target(def) {
+                self.start_first_engine().await?;
+            }
             self.install_definition(def).await?;
             self.defs.push(def.clone());
         }
 
         // The staging worker captures whatever the definitions just
         // registered read, straight from the catalog.
-        if !program.tables.is_empty() && self.engine_client.is_none() {
-            let mut options = ClientOptions {
-                staging_worker: true,
-                application_threads: self.application_threads,
-                maintenance_interval: self.maintenance_interval,
-                build_chunk_rows: self
-                    .build_chunk_rows
-                    .unwrap_or_else(|| ClientOptions::default().build_chunk_rows),
-                reconcile_interval: self
-                    .reconcile_interval
-                    .unwrap_or_else(|| ClientOptions::default().reconcile_interval),
-                ..Default::default()
-            };
-            if let Some(ttl) = self.reclaim_ttl {
-                options.reclaim_ttl = ttl;
-                options.heartbeat.interval = ttl / 3;
-            }
-            let client = EngineClient::start_with_config(self.config.clone(), options.clone())?;
-            self.engine_client = Some(client);
-            // Remembered so `restart` can start an
-            // equivalent replacement client without the caller needing to
-            // hand these options back in.
-            self.client_options = Some(options);
+        if !program.tables.is_empty() {
+            self.start_first_engine().await?;
         }
         Ok(())
     }
@@ -1524,6 +1574,19 @@ impl super::ConcurrentBackend for ManualBackend {
             BurstAction::Resume { target, column } => {
                 operator
                     .apply(&format!("RESUME TRANSFORM {}", address(target, column)))
+                    .await?;
+            }
+            BurstAction::Alter { def, field, expr } => {
+                // `ALTER TRANSFORM` refuses a transform that isn't `live`
+                // (`TransformNotLive`): one a resume or an earlier `ALTER` is
+                // still rebuilding waits for it first.
+                sql::await_settled(&self.raw, std::slice::from_ref(&**def), QUIESCE_TIMEOUT)
+                    .await?;
+                operator
+                    .apply(&format!(
+                        "ALTER TRANSFORM {} ALTER {field} AS {expr}",
+                        def.target
+                    ))
                     .await?;
             }
             BurstAction::Install { .. } => unreachable!("handled above"),

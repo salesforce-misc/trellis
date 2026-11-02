@@ -1573,9 +1573,9 @@ const NO_ONE_TO_ONE_JOIN: &str = "it breaks the 1-1 JOIN path, which only the 1-
      (join_one_to_one_convergence.rs, one_to_one_join_planted_bugs_are_caught) draws";
 
 /// Why the concurrent tiers don't run a plant of a target's feed to its
-/// readers: no tier draws a chain in one instance until #1488.
-const NO_CHAIN: &str = "it breaks a target's feed to a definition reading it, and no tier \
-     draws a chain in one instance until #1488; `join_one_to_one_over_targets` pins it";
+/// readers: their programs chain no definition off another's target.
+const NO_CHAIN: &str = "it breaks a target's feed to a definition reading it, which only \
+     the chained-reader tier (join_chained_convergence.rs) draws";
 
 /// A tier's `not_gated`: `listed`, the 1-1 plants no tier gates and the
 /// `JOIN` plants, with their reasons.

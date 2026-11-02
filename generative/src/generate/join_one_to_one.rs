@@ -45,10 +45,11 @@
 //! Builds, pauses, resumes and re-reads are drawn as the aggregate JOIN tier
 //! draws them ([`super::join::JoinBuildDraws`]).
 //!
-//! Not drawn: sides that are another transform's target (the seam-fed
-//! families of `join_one_to_one_over_targets`; the draw dimension is #1488),
-//! partitioned sides, `DDL` between a build's steps, and a value that makes a
-//! field fail (a held row: `join_one_to_one_quarantine` pins it).
+//! Not drawn here: sides that are another transform's target (the
+//! chained-reader tier, [`super::join_chained`], draws them over these
+//! programs), partitioned sides, `DDL` between a build's steps, and a value
+//! that makes a field fail (a held row: `join_one_to_one_quarantine` pins
+//! it).
 
 use trellis::dev::defs::IntWidth;
 use trellis::dev::defs::ast::{TransformDef, ValueType};
@@ -378,7 +379,7 @@ pub fn build_one_to_one_program(
             draw.kind
         };
         let mut insert_id = None;
-        if kind == JoinOpKind::Insert {
+        if matches!(kind, JoinOpKind::Insert | JoinOpKind::Rekey) {
             insert_id = first_free(draw.id, ids, |candidate| {
                 live[side].iter().any(|row| row.id == i64::from(candidate))
             });
@@ -450,6 +451,24 @@ pub fn build_one_to_one_program(
                 live[side].clear();
                 Op::Truncate {
                     table: table.to_string(),
+                    expect: OpOutcome::Succeeds,
+                }
+            }
+            JoinOpKind::Rekey => {
+                let id = i64::from(insert_id.expect("a free id"));
+                let at = draw.pick % live[side].len();
+                let row = live[side][at];
+                live[side][at].id = id;
+                let mut changes = vec![("id".to_string(), Some(id.to_string()))];
+                if draw.columns & 1 != 0 {
+                    let key = key_for(&live[side], Some(id));
+                    live[side][at].key = key;
+                    changes.extend(key_columns(draw.joined, key, draw.half_null));
+                }
+                Op::Update {
+                    table: table.to_string(),
+                    pk: row.id.to_string(),
+                    changes,
                     expect: OpOutcome::Succeeds,
                 }
             }
@@ -587,7 +606,7 @@ pub fn place_tail_truncates(
 pub use strategy::one_to_one_case_strategy;
 
 #[cfg(feature = "proptest")]
-mod strategy {
+pub(crate) mod strategy {
     use super::*;
     use crate::generate::join::{
         COMMIT_STALL_MS, JoinActionDraw, JoinActionKind, JoinBuildDraws, MAX_OPS,
@@ -595,7 +614,7 @@ mod strategy {
     };
     use proptest::prelude::*;
 
-    fn spec() -> impl Strategy<Value = OneToOneSpec> {
+    pub(crate) fn spec() -> impl Strategy<Value = OneToOneSpec> {
         (
             any::<bool>(),
             proptest::sample::select(OnShape::ALL.to_vec()),
@@ -633,7 +652,7 @@ mod strategy {
     /// after the burst sees the rebuild before later writes repair it), and
     /// (a quarter of the cases) a settle over the empty tables before the
     /// first op.
-    fn builds() -> impl Strategy<Value = JoinBuildDraws> {
+    pub(crate) fn builds() -> impl Strategy<Value = JoinBuildDraws> {
         (
             proptest::collection::vec(prop_oneof![1 => Just(0u16), 1 => 1u16..=500], 3),
             proptest::collection::vec(action(), 2..=6),
@@ -647,7 +666,10 @@ mod strategy {
     }
 
     /// One op draw. Without `truncating`, a drawn truncate is a delete.
-    fn draw(joined_weight: u32, truncating: bool) -> impl Strategy<Value = OneToOneOpDraw> {
+    pub(crate) fn draw(
+        joined_weight: u32,
+        truncating: bool,
+    ) -> impl Strategy<Value = OneToOneOpDraw> {
         (
             prop_oneof![
                 10 - joined_weight => Just(false),
@@ -688,7 +710,7 @@ mod strategy {
             )
     }
 
-    fn tail_truncate() -> impl Strategy<Value = TailTruncate> {
+    pub(crate) fn tail_truncate() -> impl Strategy<Value = TailTruncate> {
         (any::<usize>(), any::<bool>(), 0u8..4).prop_map(|(burst, joined, back)| TailTruncate {
             burst,
             joined,

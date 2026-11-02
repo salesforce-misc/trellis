@@ -203,8 +203,17 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
                 });
                 break;
             }
-            if let BurstAction::Install { def } = timed.action {
-                installed.push(program.defs[def].clone());
+            match &timed.action {
+                BurstAction::Install { def } => installed.push(program.defs[*def].clone()),
+                // The oracle checks the definition as the statement left it.
+                BurstAction::Alter { def, .. } => {
+                    let at = installed
+                        .iter()
+                        .position(|d| d.target == def.target)
+                        .expect("an ALTER names an installed definition — a generator bug");
+                    installed[at] = (**def).clone();
+                }
+                _ => {}
             }
         }
 

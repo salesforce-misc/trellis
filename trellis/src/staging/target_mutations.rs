@@ -520,6 +520,23 @@ async fn stage_target(
             });
             continue;
         };
+        // Planted bug: an image-fed key staged with neither image. See
+        // `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        if crate::plant::fires(
+            crate::plant::Plant::SeamImagelessRow,
+            m.prior_image.is_some() || new.image.is_some(),
+        ) {
+            propagation.changes.push(StagedChange::Recompute {
+                src_table: target.to_string(),
+                key,
+                hop_gen: next_hop,
+                src_changed: m.src_changed,
+                prior_image: None,
+                origin_lsn: m.origin_lsn,
+            });
+            continue;
+        }
         let op = match (&m.prior_image, &new.image) {
             (None, None) => continue,
             (None, Some(_)) => CdcOp::Insert,

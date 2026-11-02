@@ -50,7 +50,9 @@
 //! that they happen.
 //!
 //! The tables are unpartitioned and no definition reads another's target;
-//! partitioned sides and chained readers are separate draw dimensions.
+//! partitioned sides are a separate draw dimension, and the chained-reader
+//! tier ([`super::join_chained`]) reads one side through another
+//! definition's target.
 
 use trellis::dev::defs::IntWidth;
 use trellis::dev::defs::ast::{TransformDef, ValueType};
@@ -274,6 +276,11 @@ pub enum JoinOpKind {
     Delete,
     /// A `TRUNCATE` of the draw's table.
     Truncate,
+    /// An update of a row's primary key to an id no live row holds (with
+    /// update bit 0, of its join key too): Postgres captures it as a delete
+    /// of the old id and an insert of the new one. Drawn only by the chained
+    /// tier (`super::join_chained`), on the table an upstream reads.
+    Rekey,
 }
 
 /// One drawn op, before [`build_join_program`] resolves it against the rows
@@ -387,6 +394,23 @@ pub fn build_join_program(
                 live[side].clear();
                 Op::Truncate {
                     table: table.to_string(),
+                    expect: OpOutcome::Succeeds,
+                }
+            }
+            JoinOpKind::Rekey => {
+                let at = draw.pick % live[side].len();
+                let old = live[side][at];
+                let id = next_id[side];
+                next_id[side] += 1;
+                live[side][at] = id;
+                let mut changes = vec![("id".to_string(), Some(id.to_string()))];
+                if draw.columns & 1 != 0 {
+                    changes.push(("k".to_string(), key));
+                }
+                Op::Update {
+                    table: table.to_string(),
+                    pk: old.to_string(),
+                    changes,
                     expect: OpOutcome::Succeeds,
                 }
             }
@@ -584,6 +608,8 @@ pub struct BuildCoverage {
     pub rebuilds_from: usize,
     pub rebuilds_joined: usize,
     pub rebuilds_over_rows: usize,
+    /// `ALTER TRANSFORM`s (each a field build of every row).
+    pub alters: usize,
 }
 
 impl BuildCoverage {
@@ -602,6 +628,7 @@ impl BuildCoverage {
         self.rebuilds_from += other.rebuilds_from;
         self.rebuilds_joined += other.rebuilds_joined;
         self.rebuilds_over_rows += other.rebuilds_over_rows;
+        self.alters += other.alters;
     }
 }
 
@@ -647,6 +674,7 @@ pub fn build_coverage(program: &Program, plan: &ConcurrentPlan) -> BuildCoverage
                     }
                     out.rebuilds_over_rows += usize::from(over_rows);
                 }
+                BurstAction::Alter { .. } => out.alters += 1,
             }
         }
         for &i in &ops {
@@ -700,7 +728,7 @@ pub fn join_case(
 pub use strategy::{COMMIT_STALL_MS, MAX_OPS, RACING_COMMIT_STALL_MS, join_case_strategy};
 
 #[cfg(feature = "proptest")]
-mod strategy {
+pub(crate) mod strategy {
     use super::*;
     use proptest::prelude::*;
 
@@ -708,7 +736,7 @@ mod strategy {
     /// burst size.
     pub const MAX_OPS: usize = 900;
 
-    fn spec() -> impl Strategy<Value = JoinDefSpec> {
+    pub(crate) fn spec() -> impl Strategy<Value = JoinDefSpec> {
         (
             any::<bool>(),
             prop_oneof![Just(JoinKey::Single), Just(JoinKey::Pair)],
@@ -766,7 +794,7 @@ mod strategy {
     }
 
     /// One op draw. Without `truncating`, a drawn truncate is a delete.
-    fn draw(joined_weight: u32, truncating: bool) -> impl Strategy<Value = JoinOpDraw> {
+    pub(crate) fn draw(joined_weight: u32, truncating: bool) -> impl Strategy<Value = JoinOpDraw> {
         (
             prop_oneof![
                 10 - joined_weight => Just(false),

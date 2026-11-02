@@ -745,7 +745,7 @@ fn burst_action_shapes(
                 ConcurrentShape::MidBurstInstall,
                 program.defs.get(*def).map(|d| d.source.as_str()),
             ),
-            BurstAction::Pause { .. } => continue,
+            BurstAction::Pause { .. } | BurstAction::Alter { .. } => continue,
         };
         if table.is_some_and(|table| overlaps(table, timed.after.min(ops.len()))) {
             out.insert(shape);

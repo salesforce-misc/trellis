@@ -917,8 +917,10 @@ async fn unsettled_definitions(
     for def in defs {
         let Some(row) = raw
             .query_opt(
-                "select status from transform_definitions \
-                 where split_part(target_table, '.', 2) = $1",
+                "select d.status, exists (select 1 from resume_requests r \
+                                          where r.transform_id = d.id) \
+                 from transform_definitions d \
+                 where split_part(d.target_table, '.', 2) = $1",
                 &[&def.target],
             )
             .await?
@@ -928,11 +930,18 @@ async fn unsettled_definitions(
         };
         let status_text: String = row.get(0);
         let status = StoredStatus::from_row(&status_text);
+        // A `RESUME` that waits for an upstream to be `live` leaves its
+        // definition paused with a resume request, which the capture pass
+        // completes: still on its way back, so not settled.
+        let resuming: bool = row.get(1);
+        if resuming {
+            unsettled.push(def.target.clone());
+            continue;
+        }
         // `Paused` joins the terminal set for the same reason `Quarantined`
         // is in it: a frozen definition never progresses on its
         // own, so waiting for it to settle any further is waiting forever.
-        // The suite doesn't pause anything today — this is here so that if it
-        // ever does, the wait fails its assertion rather than hanging.
+        // A run that leaves one paused fails its own check instead.
         if !matches!(
             status,
             StoredStatus::Live | StoredStatus::Quarantined | StoredStatus::Paused
@@ -1098,6 +1107,18 @@ pub(super) async fn quiesce(
             return Err(QuiesceError::DefinitionsUnsettled { unsettled, waited });
         }
     }
+}
+
+/// Waits, up to `timeout`, for every one of `defs` to settle (`live`,
+/// `quarantined` or `paused`), without waiting on the ring.
+pub(super) async fn await_settled(
+    raw: &tokio_postgres::Client,
+    defs: &[TransformDef],
+    timeout: Duration,
+) -> Result<(), QuiesceError> {
+    poll_until_empty(Instant::now(), timeout, || unsettled_definitions(raw, defs))
+        .await?
+        .map_err(|(unsettled, waited)| QuiesceError::DefinitionsUnsettled { unsettled, waited })
 }
 
 /// One pass of [`quiesce`]'s two checks, in its order, without waiting on

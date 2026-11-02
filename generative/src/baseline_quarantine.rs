@@ -34,6 +34,9 @@ pub const JOIN_TIER: &str = "join";
 /// The 1-1 `JOIN` tier's sweep tier (`join_one_to_one_convergence.rs`).
 pub const JOIN_ONE_TO_ONE_TIER: &str = "join_one_to_one";
 
+/// The chained-reader tier's sweep tier (`join_chained_convergence.rs`).
+pub const JOIN_CHAINED_TIER: &str = "join_chained";
+
 /// The sweep tiers an entry can name.
 pub const TIERS: &[&str] = &[
     "cooling_key",
@@ -43,6 +46,7 @@ pub const TIERS: &[&str] = &[
     "steady_load",
     JOIN_TIER,
     JOIN_ONE_TO_ONE_TIER,
+    JOIN_CHAINED_TIER,
 ];
 
 /// The repository whose issues the entries name.

@@ -91,8 +91,10 @@ pub enum PlantPath {
     /// quarantine and over-targets tests) pin them deterministically.
     OneToOneJoin,
     /// The target-mutation seam's feed to a definition reading another's
-    /// target: no tier draws a chain in one instance yet (#1488), so these
-    /// plants are pinned by `trellis`'s `join_one_to_one_over_targets`.
+    /// target: the chained-reader tier (`join_chained_convergence.rs`)
+    /// draws these, and no other tier does. `trellis`'s
+    /// `join_one_to_one_over_targets`, `join_over_targets` and
+    /// `group_basis_chained` pin them deterministically.
     Chain,
 }
 
@@ -135,7 +137,7 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::Join1TruncateDefAfterLock
         | Plant::Join1FanOutHeldRow
         | Plant::Join1ReleaseNoRederive => PlantPath::OneToOneJoin,
-        Plant::SeamTokenEarly => PlantPath::Chain,
+        Plant::SeamTokenEarly | Plant::SeamImagelessRow => PlantPath::Chain,
     }
 }
 

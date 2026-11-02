@@ -536,6 +536,17 @@ pub enum BurstAction {
     /// while the burst still writes the source (the shape a
     /// build-under-load divergence needs).
     Install { def: usize },
+    /// `ALTER TRANSFORM <target> ALTER <field> AS <expr>`, a redefinition of
+    /// one of a 1-1 definition's fields (ADR-0015): the transform rewrites
+    /// the field on every row in the background, and applies the new
+    /// expression to every change from the statement's commit. `def` is the
+    /// definition as the statement leaves it (its `target` names the
+    /// transform), which the oracle checks from then on.
+    Alter {
+        def: Box<TransformDef>,
+        field: String,
+        expr: String,
+    },
 }
 
 impl BurstAction {
@@ -562,6 +573,7 @@ impl BurstAction {
                 column: Some(_), ..
             } => "resume_column",
             BurstAction::Install { .. } => "install",
+            BurstAction::Alter { .. } => "alter",
         }
     }
 }

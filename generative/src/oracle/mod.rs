@@ -32,7 +32,7 @@ use trellis::dev::defs::registry;
 use trellis::dev::defs::typed_literal;
 use trellis::dev::defs::{FloatWidth, IntWidth};
 
-use crate::model::{Program, group_key};
+use crate::model::{Column, PRIMARY_KEY_VALUE_TYPE, Program, Table, group_key};
 
 /// Why an oracle read failed: a Postgres query error, or no pooled connection.
 #[derive(Debug)]
@@ -847,6 +847,12 @@ pub fn field_types(
 ///
 /// If `def` isn't a `JOIN`.
 pub fn render_join_select(def: &TransformDef) -> String {
+    render_join_select_over(def, &|table| quote_ident(table))
+}
+
+/// [`render_join_select`] with each side read from `relation(table)`: the
+/// table itself, or a subquery aliased to its name ([`chained_relation`]).
+fn render_join_select_over(def: &TransformDef, relation: &dyn Fn(&str) -> String) -> String {
     let KeySpace::Join(join) = &def.key_space else {
         panic!("render_join_select: {:?} is not a JOIN", def.target);
     };
@@ -886,12 +892,12 @@ pub fn render_join_select(def: &TransformDef) -> String {
     format!(
         "select {} from {} {} {} on {} group by {}",
         select.join(", "),
-        quote_ident(&def.source),
+        relation(&def.source),
         match join.kind {
             trellis::dev::defs::ast::JoinKind::Inner => "join",
             trellis::dev::defs::ast::JoinKind::Left => "left join",
         },
-        quote_ident(&join.right),
+        relation(&join.right),
         on.join(" and "),
         group_by.join(", ")
     )
@@ -907,6 +913,16 @@ pub fn render_join_select(def: &TransformDef) -> String {
 ///
 /// If `def` isn't a 1-1 `JOIN`.
 pub fn render_join_one_to_one_select(def: &TransformDef, pk_column: &str) -> String {
+    render_join_one_to_one_select_over(def, pk_column, &|table| quote_ident(table))
+}
+
+/// [`render_join_one_to_one_select`] with each side read from
+/// `relation(table)`, as [`render_join_select_over`].
+fn render_join_one_to_one_select_over(
+    def: &TransformDef,
+    pk_column: &str,
+    relation: &dyn Fn(&str) -> String,
+) -> String {
     let KeySpace::JoinOneToOne(join) = &def.key_space else {
         panic!(
             "render_join_one_to_one_select: {:?} is not a 1-1 JOIN",
@@ -937,12 +953,12 @@ pub fn render_join_one_to_one_select(def: &TransformDef, pk_column: &str) -> Str
     format!(
         "select {} from {} {} {} on {}",
         select.join(", "),
-        quote_ident(&def.source),
+        relation(&def.source),
         match join.kind {
             trellis::dev::defs::ast::JoinKind::Inner => "join",
             trellis::dev::defs::ast::JoinKind::Left => "left join",
         },
-        quote_ident(&join.right),
+        relation(&join.right),
         on.join(" and "),
     )
 }
@@ -1016,12 +1032,18 @@ fn render_join_expr(expr: &Expr) -> String {
 /// Runs [`render_join_select`] and keys its rows the way
 /// [`crate::backend::Backend::snapshot`] keys a `JOIN` target's: by the
 /// group columns' [`group_key`].
-async fn join_sql_oracle(pool: &Pool, def: &TransformDef) -> Result<Rows, OracleError> {
+async fn join_sql_oracle(
+    pool: &Pool,
+    def: &TransformDef,
+    relation: &dyn Fn(&str) -> String,
+) -> Result<Rows, OracleError> {
     let KeySpace::Join(join) = &def.key_space else {
         unreachable!("join_sql_oracle is only called on a JOIN");
     };
     let client = pool.get().await?;
-    let db_rows = client.query(render_join_select(def).as_str(), &[]).await?;
+    let db_rows = client
+        .query(render_join_select_over(def, relation).as_str(), &[])
+        .await?;
     let fields: Vec<&str> = def
         .fields
         .iter()
@@ -1049,10 +1071,14 @@ async fn join_one_to_one_sql_oracle(
     pool: &Pool,
     def: &TransformDef,
     pk_column: &str,
+    relation: &dyn Fn(&str) -> String,
 ) -> Result<Rows, OracleError> {
     let client = pool.get().await?;
     let db_rows = client
-        .query(render_join_one_to_one_select(def, pk_column).as_str(), &[])
+        .query(
+            render_join_one_to_one_select_over(def, pk_column, relation).as_str(),
+            &[],
+        )
         .await?;
     let mut rows: Rows = BTreeMap::new();
     for db_row in db_rows {
@@ -1087,10 +1113,98 @@ pub async fn check(
     source_columns: &HashMap<String, ValueType>,
     target: &Rows,
 ) -> Result<OracleReport, OracleError> {
+    check_over(pool, program, &[], def, pk_column, source_columns, target).await
+}
+
+/// The plain 1-1 target `def` writes, as a [`Table`]: `source`'s primary key
+/// and a column per field, typed as define types it. What a definition that
+/// reads that target reads.
+pub fn one_to_one_target_table(def: &TransformDef, source: &Table) -> Table {
+    let source_columns: HashMap<String, ValueType> = source
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.value_type))
+        .collect();
+    let mut columns = vec![Column {
+        name: source.pk_col.clone(),
+        value_type: PRIMARY_KEY_VALUE_TYPE,
+    }];
+    columns.extend(
+        field_types(def, &source_columns)
+            .into_iter()
+            .map(|(name, value_type)| Column { name, value_type }),
+    );
+    Table {
+        name: def.target.clone(),
+        pk_col: source.pk_col.clone(),
+        columns,
+        unique_cols: Vec::new(),
+        unique_sets: Vec::new(),
+        partitioning: None,
+    }
+}
+
+/// How a `JOIN`'s oracle reads `table`: the table itself, or, when it is the
+/// target of a plain 1-1 definition in `upstreams`, that definition's own
+/// query over its source, aliased to the target's name. So a `JOIN` over
+/// another definition's target is checked against its query written over the
+/// upstream's query, which holds once both have converged, and an upstream
+/// target that went wrong can't hide the `JOIN`'s own divergence.
+///
+/// # Panics
+///
+/// If an upstream's source isn't one of `program`'s tables: a chain of more
+/// than one hop is outside what the generator draws.
+pub fn chained_relation(program: &Program, upstreams: &[TransformDef], table: &str) -> String {
+    let Some(upstream) = upstreams
+        .iter()
+        .find(|d| d.target == table && matches!(d.key_space, KeySpace::OneToOne))
+    else {
+        return quote_ident(table);
+    };
+    let source = program
+        .tables
+        .iter()
+        .find(|t| t.name == upstream.source)
+        .unwrap_or_else(|| {
+            panic!(
+                "oracle: {:?}'s upstream {:?} reads {:?}, which isn't a source table: the \
+                 generator draws one hop",
+                table, upstream.target, upstream.source
+            )
+        });
+    let mut select = vec![quote_ident(&source.pk_col)];
+    for field in &upstream.fields {
+        select.push(format!(
+            "({}) as {}",
+            render_expr(&field.expr),
+            quote_ident(&field.name)
+        ));
+    }
+    format!(
+        "(select {} from {}) as {}",
+        select.join(", "),
+        quote_ident(&source.name),
+        quote_ident(table)
+    )
+}
+
+/// [`check`] for a definition that may read the target of a plain 1-1
+/// definition in `upstreams` ([`chained_relation`]).
+pub async fn check_over(
+    pool: &Pool,
+    program: &Program,
+    upstreams: &[TransformDef],
+    def: &TransformDef,
+    pk_column: &str,
+    source_columns: &HashMap<String, ValueType>,
+    target: &Rows,
+) -> Result<OracleReport, OracleError> {
+    let relation = |table: &str| chained_relation(program, upstreams, table);
     // A `JOIN`'s oracle is its own `JOIN … GROUP BY` query over the
     // two tables, compared byte for byte.
     if matches!(def.key_space, KeySpace::Join(_)) {
-        let sql = join_sql_oracle(pool, def).await?;
+        let sql = join_sql_oracle(pool, def, &relation).await?;
         return Ok(OracleReport {
             target_vs_sql: diff(&def.target, &sql, target, &|_| Comparison::Exact),
             program: format!("{program:#?}"),
@@ -1099,7 +1213,7 @@ pub async fn check(
     // A 1-1 `JOIN`'s is its own query without `GROUP BY`, compared byte for
     // byte: its fields are Postgres's own expressions over both tables.
     if matches!(def.key_space, KeySpace::JoinOneToOne(_)) {
-        let sql = join_one_to_one_sql_oracle(pool, def, pk_column).await?;
+        let sql = join_one_to_one_sql_oracle(pool, def, pk_column, &relation).await?;
         let target = target_fields(target, pk_column);
         return Ok(OracleReport {
             target_vs_sql: diff(&def.target, &sql, &target, &|_| Comparison::Exact),

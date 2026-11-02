@@ -51,8 +51,9 @@
 //! 4. Run the sweep of a tier that reaches it (`generative::plant_sweep`:
 //!    the concurrent tier's `planted_bugs_are_caught`, the `JOIN` tier's
 //!    `join_planted_bugs_are_caught`, the 1-1 `JOIN` tier's
-//!    `one_to_one_join_planted_bugs_are_caught`), list it in the `not_gated` of the
-//!    tiers that don't, and record its catch rate.
+//!    `one_to_one_join_planted_bugs_are_caught`, the chained-reader tier's
+//!    `chained_join_planted_bugs_are_caught`), list it in the `not_gated` of
+//!    the tiers that don't, and record its catch rate.
 //!
 //! A plant is never "fixed": it is the regression the tier exists to catch.
 //! If the engine code it hooks is rewritten,
@@ -392,6 +393,20 @@ pub enum Plant {
     /// Pinned by `join_one_to_one_over_targets`'s
     /// `s2_seam_rows_of_one_key_order_by_their_writers_commits`.
     SeamTokenEarly,
+    /// ADR-0002 "Multi-hop" (#1488): the target-mutation seam stages each
+    /// changed key of a target on the image feed (one a `JOIN` or a
+    /// group-basis aggregate reads) as a `Recompute` with neither image,
+    /// rather than a CDC-shaped row with its old and new images. A reader
+    /// can then recompute only the cell the row is in now, so a row that
+    /// moves keys or groups in the target leaves its old cell as it was. A
+    /// 1-1 `JOIN` takes such a row as a Re-derive request, which its `R` and
+    /// `M` entries answer, so only an aggregate `JOIN` or a group-basis
+    /// reader goes wrong.
+    ///
+    /// Pinned by `join_over_targets`'s `writes_to_both_upstreams_reach_the_join`
+    /// and `group_basis_chained`'s
+    /// `an_upstream_row_that_moves_group_leaves_its_old_group`.
+    SeamImagelessRow,
 }
 
 impl Plant {
@@ -433,6 +448,7 @@ impl Plant {
         Plant::Join1FanOutHeldRow,
         Plant::Join1ReleaseNoRederive,
         Plant::SeamTokenEarly,
+        Plant::SeamImagelessRow,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -474,6 +490,7 @@ impl Plant {
             Plant::Join1FanOutHeldRow => "join1_fan_out_held_row",
             Plant::Join1ReleaseNoRederive => "join1_release_no_rederive",
             Plant::SeamTokenEarly => "seam_token_early",
+            Plant::SeamImagelessRow => "seam_imageless_row",
         }
     }
 

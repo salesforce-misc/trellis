@@ -54,10 +54,11 @@
 //! pins; `TRUNCATE` and `RESUME` (a pause, then a resume that rebuilds in
 //! place) are drawn in the later bursts, as are re-reads of either table.
 //!
-//! Not drawn: a side that is another transform's target (the seam-fed
-//! families S1 to S9 of `join_one_to_one_over_targets`; the draw dimension is
-//! #1488), and a value that makes a field fail, which holds the row in
-//! quarantine (`join_one_to_one_quarantine` pins it).
+//! Not drawn: a side that is another transform's target (the chained-reader
+//! tier, `join_chained_convergence.rs`, draws it over these programs; the
+//! seam-fed families S1 to S9 of `join_one_to_one_over_targets` pin it), and
+//! a value that makes a field fail, which holds the row in quarantine
+//! (`join_one_to_one_quarantine` pins it).
 //!
 //! Like every property in this crate it is `#[ignore]`d: run it with
 //! `cargo test -p generative --test join_one_to_one_convergence -- --ignored`
@@ -464,8 +465,8 @@ fn one_to_one_sweep_tier() -> SweepTier {
     ));
     not_gated.extend(not_on_path(
         &[PlantPath::Chain],
-        "it breaks a target's feed to a definition reading it, and no tier draws a \
-         chain in one instance until #1488; `join_one_to_one_over_targets` pins it",
+        "it breaks a target's feed to a definition reading it, which only the \
+         chained-reader tier (join_chained_convergence.rs) draws",
     ));
     SweepTier {
         name: generative::baseline_quarantine::JOIN_ONE_TO_ONE_TIER,
