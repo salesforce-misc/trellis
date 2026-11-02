@@ -1646,7 +1646,7 @@ async fn write_a_changes(
     }
 }
 
-/// Step 9 of the page order (#1396's body), the fan-out: the target row of
+/// Step 7's fan-out (the module doc): the target row of
 /// every live `R` entry on `keys` is recomputed from `R` and the newest live
 /// `M` entry on its key, but the `written` ones, which the page's `a` changes
 /// wrote already, and those of the `a` rows the definition holds in
