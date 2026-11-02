@@ -985,6 +985,18 @@ async fn a_one_to_one_whose_source_lost_its_key_fails_through_its_plan_job() {
             .batch_execute("update backfill_chunks set next_attempt_at = now()")
             .await
             .expect("make the plan job due");
+        // The database's clock, read before the job runs: the failing
+        // transaction starts after it, and the failure is due `delay` after
+        // that transaction's `now()`, so the failure can't be due earlier than
+        // this plus `delay`. The check holds however long the job, `status`
+        // and this test take, where a comparison with the wall clock at the
+        // end held only while they took less than the delay.
+        let before: std::time::SystemTime = f
+            .raw
+            .query_one("select clock_timestamp()", &[])
+            .await
+            .expect("the database's clock")
+            .get(0);
         assert_eq!(f.run_chunks_by_hand(1).await, 1, "the plan job is claimed");
         let status = trellis
             .status("one")
@@ -1001,9 +1013,13 @@ async fn a_one_to_one_whose_source_lost_its_key_fails_through_its_plan_job() {
             "the error names the cause, got {:?}",
             failure.last_error
         );
+        // `chunk_queue::retry_delay` with `REDERIVE_RETRY_CAP`, which are
+        // crate-private: a second, a doubling per further failure, at most five.
+        let delay = Duration::from_secs((1u64 << (charge - 1)).min(5));
         assert!(
-            failure.next_attempt_at > std::time::SystemTime::now(),
-            "the retry is backed off"
+            failure.next_attempt_at >= before + delay,
+            "the retry is backed off by at least {delay:?}: due at {:?}, the job began at {before:?}",
+            failure.next_attempt_at
         );
     }
     f.raw
