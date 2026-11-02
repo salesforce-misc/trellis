@@ -221,6 +221,12 @@
     {"op": "apply", "args": ["DROP TRANSFORM parity_sales_by_region"], "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}}}},
 
     {"op": "await_converged", "args": ["parity: not a token"], "opts": {"timeout_ms": 0}, "expect": {"error": "validation"}},
+
+    {"about": "Version handover: a live registry row of another version (a version no build has, with a fresh heartbeat) makes every state-changing call refuse, so two versions never change one instance side by side. This handle runs nothing in the background, so only the row is in the way; the refusal comes before the statement is looked at.", "op": "sql", "args": ["insert into trellis.worker_registry (worker_id, version, staging, drain) values ('parity-other-version', '9.9.9', true, true)"]},
+    {"op": "apply", "args": ["PAUSE TRANSFORM parity_nowhere"], "expect": {"error": "version_handover"}},
+    {"about": "Once that process is gone the same call goes ahead (and finds nothing to pause), so the refusal above was the row's.", "op": "sql", "args": ["delete from trellis.worker_registry where worker_id = 'parity-other-version'"]},
+    {"op": "apply", "args": ["PAUSE TRANSFORM parity_nowhere"], "expect": {"error": "not_found"}},
+
     {"op": "shutdown", "expect": null},
 
     {"about": "A staging worker with no drain workers. connect returns once the worker's first capture pass has installed capture on every defined source, so the write below is captured, and nothing drains it.", "op": "connect", "opts": {"url": {"$dsn": {}}, "staging": true, "drain_threads": 0}, "expect": null},
