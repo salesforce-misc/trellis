@@ -647,10 +647,10 @@ fn a_hand_built_chained_one_to_one_join_case_converges() {
 }
 
 /// The `JOIN`'s oracle reads the upstream's query, not its target: after a
-/// converged run, a cell of the upstream's target changed by hand (a target
-/// isn't captured, so nothing propagates it) makes the upstream diverge and
-/// leaves the `JOIN`s agreeing; a cell of a `JOIN` target changed by hand
-/// makes that `JOIN` diverge.
+/// converged run, the upstream's target changed by hand (a target isn't
+/// captured, so nothing propagates it) in cells a `JOIN` reads makes the
+/// upstream diverge and leaves the `JOIN`s agreeing; a cell of a `JOIN`
+/// target changed by hand makes that `JOIN` diverge.
 #[test]
 fn the_chained_oracle_reads_the_upstreams_query() {
     let case = hand_built_aggregate_case();
@@ -694,15 +694,46 @@ fn the_chained_oracle_reads_the_upstreams_query() {
                 diverged(&mut backend, &pool, &case).await.is_empty(),
                 "converged"
             );
+            // Every row of the upstream's target moved onto a join key of
+            // `ja`, with a value `SUM(ub.y)` reads: cells `j0` reads, which
+            // an oracle reading the target would see. (The run leaves no
+            // row of `ja` matching one of `ub`, so a change of `y` alone
+            // would reach nothing `j0` reads.)
             backend
-                .execute_raw("update public.ub set y = y + 1000 where y is not null")
+                .execute_raw("create table public.ub_saved as select * from public.ub")
+                .await
+                .expect("save the upstream");
+            backend
+                .execute_raw(
+                    "update public.ub set k1 = (select min(k) from ja), \
+                                          y = coalesce(y, 0) + 1000",
+                )
                 .await
                 .expect("corrupt the upstream");
+            let joined: i64 = pool
+                .get()
+                .await
+                .expect("a connection")
+                .query_one(
+                    "select count(*) from ja join public.ub on ja.k = ub.k1",
+                    &[],
+                )
+                .await
+                .expect("count the corrupted rows j0 reads")
+                .get(0);
+            assert!(joined > 0, "the corruption reaches no row j0 reads");
             assert_eq!(diverged(&mut backend, &pool, &case).await, ["ub"]);
             backend
-                .execute_raw("update public.ub set y = y - 1000 where y is not null")
+                .execute_raw(
+                    "update public.ub set k1 = s.k1, y = s.y from public.ub_saved s \
+                     where s.id = ub.id",
+                )
                 .await
                 .expect("restore the upstream");
+            assert!(
+                diverged(&mut backend, &pool, &case).await.is_empty(),
+                "restored"
+            );
             backend
                 .execute_raw("update public.j0 set n = n + 1 where n > 0")
                 .await
