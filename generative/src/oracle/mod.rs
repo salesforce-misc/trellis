@@ -20,8 +20,10 @@
 //! The oracle takes a [`trellis::dev::pool::Pool`] (a connection handle). The oracle
 //! *reads*; it never imports `trellis::client`/`trellis::staging` or otherwise
 //! drives the maintenance pipeline (that seam is [`crate::backend`]'s alone). A
-//! pool connection has its `search_path` pinned, so an unqualified source
-//! table name resolves the same way the engine's reads do.
+//! pool connection has Trellis's schema alone on its `search_path`, so the
+//! oracle names a definition's source and joined table as the catalog
+//! persisted them at define, and computes every expression with the same
+//! built-ins the engine's SQL resolves to.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;

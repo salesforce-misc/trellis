@@ -975,7 +975,9 @@ fn session_setup(schema: &str, detection: DeadPeerDetection) -> String {
 /// on the path would win over the built-in a rendered expression means (and
 /// `IS DISTINCT FROM` looks up `=` through the path and can't be qualified).
 /// With only Trellis's schema listed, only objects in it can compete, and
-/// Trellis creates no functions or operators there.
+/// Trellis creates no operators there and no functions but its own
+/// argument-less trigger and wake-channel functions, none named like a
+/// built-in.
 ///
 /// A bare source name in a definition resolves through
 /// [`crate::defs::catalog::bare_name_schemas`]'s explicit list instead, never

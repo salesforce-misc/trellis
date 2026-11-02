@@ -20,7 +20,7 @@ application does, it does through these — and every definition-changing operat
 enters through a single grammar-driven entrypoint on them (see below).
 
 **Tier 2 — composable primitives.** An embedder may reach these directly: `Config`,
-`Pool`, `migrate`, `Metrics`, `Error`/`ErrorCode`, `statement_kind`, and `otel`
+`migrate`, `Metrics`, `Error`/`ErrorCode`, `statement_kind`, and `otel`
 (behind the `otlp` feature). They are public and stable, re-exported at the crate
 root, and documented as deliberate building blocks rather than incidental leaks. The
 modules that define them are private: the crate root is the whole surface, and

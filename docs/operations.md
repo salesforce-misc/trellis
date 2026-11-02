@@ -245,7 +245,7 @@ know:
   error.
 * **Rotating certificates.** A new server certificate needs nothing from
   Trellis. A new client certificate or CA file needs a restart of the
-  process, or a new `Pool`, because the files are read once.
+  process, or a new `Trellis` or `Client` handle, because the files are read once.
 
 ## Partitioned sources
 

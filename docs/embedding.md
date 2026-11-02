@@ -416,10 +416,11 @@ The rules:
   They are checked like the same options in a connection string. A
   connection string given explicitly is used as written: these variables do
   not add to it.
-* **Files are read when the connection machinery is built**: when a `Pool` is
-  created, and for each dedicated connection when it is opened. A rotated
-  client certificate or CA file takes effect for a new `Pool` (a restart, for
-  the CLI); a rotated server certificate is accepted on the next connect.
+* **Files are read when the connection machinery is built**: when a `Trellis`
+  or `Client` handle builds its connection pools, and for each dedicated
+  connection when it is opened. A rotated client certificate or CA file takes
+  effect for a new handle (a restart, for the CLI); a rotated server
+  certificate is accepted on the next connect.
 * The Ruby and Elixir clients pass the string through, so the same options
   work there.
 
