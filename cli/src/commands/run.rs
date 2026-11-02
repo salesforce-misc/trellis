@@ -47,7 +47,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use trellis::Metrics;
-use trellis::{Config, ErrorCode, Trellis, TrellisOptions};
+use trellis::{Config, ErrorCode, Trellis, TrellisError, TrellisOptions};
 
 /// Help text for `trellis run -h`/`--help`, and prefixed to any
 /// argument-parsing error so a mistake also shows correct usage.
@@ -288,7 +288,12 @@ async fn migrate_once_no_other_version_is_live(migrator: &Trellis) -> Result<boo
             Err(err) if err.code() == ErrorCode::VersionHandover => {
                 if !standing_by {
                     standing_by = true;
-                    println!("trellis standing by: {err}");
+                    match &err {
+                        TrellisError::OtherVersionLive(seen) => {
+                            println!("trellis standing by: {seen}")
+                        }
+                        other => println!("trellis standing by: {other}"),
+                    }
                     println!(
                         "trying again every {} seconds; press Ctrl-C to stop",
                         STANDBY_POLL.as_secs()

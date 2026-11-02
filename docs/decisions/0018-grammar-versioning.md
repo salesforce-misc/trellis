@@ -98,9 +98,11 @@ Attaching (`migrate`) checks every stored definition's version before anything
 else runs. It refuses the attach if any is newer, naming those definitions,
 and pauses each one outside the window and each one inside it whose text this
 release refuses. A paused definition of either kind reads nothing until it is
-dropped, so the rest of the instance runs beside it. The load-time check stands
-on its own, since a process can connect without attaching and a newer binary
-can write after the attach.
+dropped, so the rest of the instance runs beside it. While a process of another
+version is live, the attach pauses nothing: it refuses instead when it would
+pause something ([ADR-0023](0023-version-handover.md)). The load-time check
+stands on its own, since a process can connect without attaching and a newer
+binary can write after the attach.
 
 Too old pauses and too new refuses because the fixes differ: the operator can
 fix a too-old definition here by redefining it, while a too-new one means the

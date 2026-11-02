@@ -154,7 +154,7 @@ running for a manual step.
 
 | Step | What it checks | How |
 |---|---|---|
-| `migrations` | A database the old build created opens under the candidate: no pending migration, no checksum mismatch, the history rows unchanged. Control: with one stored checksum altered the candidate refuses. A candidate with a new migration changes the upgrade path and rules out downgrade: the script reports the difference as `INFO`, and the release notes say so. | Script |
+| `migrations` | A database the old build created opens under the candidate: no checksum mismatch, the old build's history rows unchanged, and only the candidate's new migrations added. The old tag's migration files are byte-identical at the candidate; a file the candidate adds (for `0.2.0`, `V9__worker_versions.sql`) is reported as `INFO`, since it changes the upgrade path and rules out downgrade, and the release notes say so. A changed or removed file of the old tag fails. Control: with one stored checksum altered the candidate refuses. | Script |
 | `definitions` | One of each shape the release supports, built under the old build with writers running and undrained ring segments in flight: a plain 1-1, a chained 1-1, a 1-1 with a paused column, a group-basis aggregate, an aggregate over a `JOIN` (inner and `LEFT`), an aggregate and a `JOIN` over a hash-partitioned source, a 1-1 with a held key, and a paused transform. Under the candidate each resumes, converges and has a clean `self_check`; the held key and the pauses are unchanged; nothing else pauses. A plain recompute of two targets in SQL cross-checks `self_check`. | Script |
 | `grammar` | A definition the old build accepted and the candidate refuses pauses with a reason that names the remedy, not an error loop and not silent staleness, and the remedy works: a bare reserved word as a column name, and an expression nested over 100 levels (as a chain and as parentheses). | Script, plus the manual cases below |
 | `inflight` | Upgrading while a definition is mid-build, mid-rebuild (a `RESUME`), waiting for capture, paused, or holding a key: each continues to `live`, or stays as it was. A held key stands for quarantine: the script does not trip the whole-definition fuse, so no definition is `quarantined` at the upgrade. | Script |
@@ -162,7 +162,7 @@ running for a manual step.
 | `pgrestore` | A `pg_dump` and `pg_restore` of the old database opens under the candidate, pauses every definition with the documented reason ([operations — runbooks](operations.md#runbooks)), and `RESUME` brings each back to `live` with a clean `self_check`. | Script |
 | `basebackup` | A `pg_basebackup` taken while the old build and its writers ran starts as a cluster, and the candidate converges it with no pause and no `RESUME`. | Script |
 | `clients` | The Ruby gem and the Elixir package built from the candidate open a database the predecessor's clients used, with the same options. | Manual |
-| `mixed` | The candidate attached while an old instance is still attached to the database refuses, or pauses the definitions with a reason. | Script |
+| `mixed` | The candidate started while an old instance runs on the database stands by ([version handover](decisions/0023-version-handover.md)): it stays up, says it is standing by naming the old version, runs no migration, and pauses nothing, while the old instance's writes keep converging. Once the old instance stops, the candidate takes over: it migrates, and the writes made since converge with a clean `self_check`. | Script |
 | `downgrade` | What the old build does when pointed at a database the candidate has written. | Script, observed |
 
 ### The manual steps, and what the script expects
@@ -215,11 +215,15 @@ refuses itself are not upgrade cases: a `JOIN` on a repeated column pair, an
 index over more than 32 key columns, and (not tried by the script) a table
 over 1600 columns. Add each new case to the script when you find one.
 
-**Mixed versions (step 7).** No mixed-version combination is supported: stop
-every instance, upgrade, start. The expectation the battery checks is that the
-candidate refuses to attach beside a running old instance, or pauses the
-definitions with a reason. A candidate that attaches without either fails the
-step, and the finding is filed.
+**Mixed versions (step 7).** Two versions never run side by side: a candidate
+started beside a running old instance stands by until the old one stops, then
+takes over ([version handover](decisions/0023-version-handover.md)). The step
+starts the candidate's `trellis run` beside the old build's, expects it to stay
+up and print that it is standing by (its migrations are pending and a process
+is live), with the history unchanged and nothing paused, then stops the old
+build and expects the candidate to migrate and converge. A candidate that runs
+beside the old one, exits, or pauses definitions fails the step, and the
+finding is filed.
 
 **Downgrade (step 8).** Downgrade is not supported. After the candidate has
 attached to a database, the way back is a restore from a backup taken before
@@ -238,9 +242,17 @@ For each release, the notes carry:
   reserved word as a column name (`SELECT order AS o`; write `table.order`),
   and an expression nested over 100 levels (split it into calculated fields).
   Add every case from the manual refusal check.
-- **The upgrade procedure:** stop every instance, upgrade, start; no mixed
-  versions; downgrade by restoring a backup; whether the release adds a
-  migration.
+- **The upgrade procedure:** start the new version beside the old: it stands
+  by, its `status()` shows `version_handover` naming the old version's
+  workers, and its `apply` changes refuse with the `version_handover` code,
+  while the old version runs on. Stop the old version, and the new one takes
+  over within a standby poll (5 seconds; up to the 30-second reclaim TTL after
+  a process killed without a clean shutdown), migrating first when the release
+  adds a migration (`trellis run` does; an embedder runs `migrate` after the old
+  version has stopped, since it refuses while one runs). Say whether the release
+  adds a migration (`0.2.0` adds V9, so `0.1.0` can't open a database `0.2.0`
+  has migrated). Downgrade by restoring a backup
+  ([operations runbooks](operations.md#runbooks)).
 - **For databases that came from a pre-release,** which the battery does not
   start from:
   - a database loaded from a `0.1.0-gamma` `structure.sql` has aggregate

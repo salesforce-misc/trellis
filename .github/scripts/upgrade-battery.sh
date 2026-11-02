@@ -9,7 +9,7 @@
 #   upgrade-battery.sh [options] [step ...]
 #
 # Steps (default: all, in this order):
-#   migrations    1. history rows unchanged; refuses a tampered checksum (control)
+#   migrations    1. the tag's files and history rows unchanged; refuses a tampered checksum (control)
 #   definitions   2. every shape resumes, converges, self_check is clean
 #   grammar       3. definitions the candidate refuses pause with a remedy, and it works
 #   inflight      4. mid-build, mid-rebuild, paused, held key, waiting for capture
@@ -17,7 +17,7 @@
 #   pgrestore     5b. a pg_dump/pg_restore of a v0.1.0 database (documented pauses, then RESUME)
 #   basebackup    5c. a pg_basebackup restore of a running v0.1.0 database
 #   clients       6. Ruby gem and Elixir package (manual)
-#   mixed         7. v0.1.0 and the candidate attached to one database
+#   mixed         7. the candidate stands by beside a live v0.1.0, then takes over
 #   downgrade     8. v0.1.0 pointed at a database the candidate wrote
 #
 # Options:
@@ -526,13 +526,18 @@ if want migrations; then
     # The candidate's files as they are on disk (a directory candidate may hold
     # uncommitted or untracked migrations), against the tag's.
     old_mig_n=$(git -C "$cand_src" ls-tree --name-only "$old_tag" trellis/migrations/ | wc -l | tr -d ' ')
-    mig_untracked=$(git -C "$cand_src" ls-files --others --exclude-standard -- trellis/migrations | sed 's/^/?? /')
+    # Every file the tag shipped must be unchanged; files the candidate adds
+    # are new migrations (for 0.2.0, V9), reported for the release notes.
+    mig_changed=$(git -C "$cand_src" diff --name-status --diff-filter=a "$old_tag" -- trellis/migrations | tr '\t' ' ' | tr '\n' ';')
+    mig_added=$( (git -C "$cand_src" diff --name-only --diff-filter=A "$old_tag" -- trellis/migrations; git -C "$cand_src" ls-files --others --exclude-standard -- trellis/migrations) | grep . | xargs -r -n1 basename | tr '\n' ' ')
     if [ "$old_mig_n" -eq 0 ]; then
       record FAIL migrations "$old_tag has no files in trellis/migrations: the script's migrations path is out of date, so nothing was compared"
-    elif git -C "$cand_src" diff --quiet "$old_tag" -- trellis/migrations && [ -z "$mig_untracked" ]; then
-      record PASS migrations "trellis/migrations at the candidate is byte-identical to $old_tag's ($old_mig_n files)"
+    elif [ -n "$mig_changed" ]; then
+      record FAIL migrations "the candidate changes or removes migrations $old_tag shipped: $mig_changed"
     else
-      record INFO migrations "the candidate changes trellis/migrations since $old_tag: $( (git -C "$cand_src" diff --name-status "$old_tag" -- trellis/migrations; echo "$mig_untracked") | grep . | tr '\n' ';') (the upgrade path runs them; downgrade is ruled out)"
+      record PASS migrations "the $old_mig_n migration files of $old_tag are byte-identical at the candidate"
+      [ -z "$mig_added" ] ||
+        record INFO migrations "the candidate adds migrations: ${mig_added% } (the upgrade path runs them; $old_tag can't open a database they ran on, so downgrade is ruled out)"
     fi
   else
     record SKIP migrations "the candidate checkout does not have tag $old_tag, so its migration files were not compared"
@@ -556,8 +561,9 @@ if want migrations; then
     record FAIL migrations "control: the candidate did not refuse an altered checksum (rc=$ctl_rc): $ctl_out"
   fi
   ctl_ok=$(trellis "$port" ctl "$candidate_bin" apply 'PAUSE TRANSFORM tc' 2>&1) && ctl_ok_rc=0 || ctl_ok_rc=$?
-  if [ "$ctl_ok_rc" -eq 0 ] && [ "$(history "$port" ctl)" = "$pre_ctl_history" ]; then
-    record PASS migrations "the candidate opens an unaltered $old_tag-created database through the CLI and leaves its history alone ($ctl_ok)"
+  ctl_history=$(history "$port" ctl)
+  if [ "$ctl_ok_rc" -eq 0 ] && [ "$(head -n "$(wc -l <<<"$pre_ctl_history")" <<<"$ctl_history")" = "$pre_ctl_history" ]; then
+    record PASS migrations "the candidate opens an unaltered $old_tag-created database through the CLI, leaves its history rows alone and adds $(( $(wc -l <<<"$ctl_history") - $(wc -l <<<"$pre_ctl_history") )) ($ctl_ok)"
   else
     record FAIL migrations "the candidate refused an unaltered database: $ctl_ok"
   fi
@@ -765,20 +771,39 @@ if want mixed; then
   apply_old mixed 'TRANSFORM m_agg FROM m GROUP BY g SELECT g AS g, COUNT(*) AS n'
   run_bg old-mixed "$port" mixed "$old_bin"
   WAIT=120 wait_all "$port" mixed "$old_bin" live m_agg || true
+  pre_mixed_history=$(history "$port" mixed)
   run_bg new-mixed "$port" mixed "$candidate_bin"
   sleep 15
   workers=$(scalar "$port" mixed "select count(*) from trellis.worker_registry where last_seen > now() - interval '30 seconds'")
   paused_n=$(scalar "$port" mixed "select count(*) from trellis.capture_failures")
-  if ! run_alive new-mixed && grep -qi 'version\|older\|newer\|instance' "$logs/run-new-mixed.log"; then
-    record PASS mixed "the candidate refused to attach beside a live $old_tag instance: $(head -c 150 "$logs/run-new-mixed.log")"
-  elif [ "$paused_n" -gt 0 ]; then
-    record PASS mixed "attaching the candidate paused the definitions with a reason: $(scalar "$port" mixed "select error from trellis.capture_failures limit 1" | cut -c1-150)"
+  # ADR-0023: the candidate's `trellis run` stands by, with this message, and
+  # runs no migration while the old instance is live.
+  standby_msg='trellis standing by: migrations are pending and Trellis processes are live on this instance'
+  if run_alive new-mixed && grep -qF "$standby_msg" "$logs/run-new-mixed.log" &&
+     [ "$(history "$port" mixed)" = "$pre_mixed_history" ] && [ "$paused_n" -eq 0 ]; then
+    record PASS mixed "the candidate stands by beside a live $old_tag instance: no migration ran, nothing paused ($(grep -F "$standby_msg" "$logs/run-new-mixed.log" | head -1 | cut -c1-200))"
   else
-    record FAIL mixed "the candidate attached beside a live $old_tag instance: no refusal, no pause ($workers workers registered, candidate process $(run_alive new-mixed && echo running || echo exited), status $(status_lines "$port" mixed "$candidate_bin" | tr '\n' ' '))"
+    record FAIL mixed "the candidate did not stand by beside a live $old_tag instance ($workers workers registered, $paused_n paused, candidate process $(run_alive new-mixed && echo running || echo exited), history $( [ "$(history "$port" mixed)" = "$pre_mixed_history" ] && echo unchanged || echo changed), log: $(tr '\n' ' ' <"$logs/run-new-mixed.log" | cut -c1-300))"
   fi
+  # The old instance keeps the pipeline: the writes made now converge under it.
   sql "$port" mixed -c "insert into m select g, g % 5 from generate_series(201,400) g"
+  # Stopping the old instance hands over: the candidate migrates and takes over.
+  stop_run old-mixed
+  taken=0
+  for _ in $(seq 1 120); do
+    if [ "$(history "$port" mixed | wc -l)" -gt "$(wc -l <<<"$pre_mixed_history")" ] &&
+       grep -q 'migrated, taking over' "$logs/run-new-mixed.log"; then taken=1; break; fi
+    sleep 0.5
+  done
+  if [ "$taken" -eq 1 ] && run_alive new-mixed; then
+    record PASS mixed "once $old_tag stopped, the candidate migrated and took over"
+  else
+    record FAIL mixed "the candidate did not take over within 60 s of $old_tag stopping (process $(run_alive new-mixed && echo running || echo exited), log: $(tail -c 300 "$logs/run-new-mixed.log" | tr '\n' ' '))"
+  fi
+  sql "$port" mixed -c "insert into m select g, g % 5 from generate_series(401,600) g"
+  WAIT=120 wait_all "$port" mixed "$candidate_bin" live m_agg || true
   check_self "$port" mixed mixed m_agg
-  stop_run new-mixed; stop_run old-mixed
+  stop_run new-mixed
 else
   record SKIP mixed "not selected"
 fi
@@ -790,7 +815,7 @@ if want downgrade; then
   run_bg down-shapes "$port" shapes "$old_bin"
   sleep 15
   if run_alive down-shapes; then
-    record INFO downgrade "$old_tag opened a database the candidate wrote (migrations are identical): statuses $(status_lines "$port" shapes "$old_bin" | tr '\n' ' ')"
+    record INFO downgrade "$old_tag opened a database the candidate wrote: statuses $(status_lines "$port" shapes "$old_bin" | tr '\n' ' ')"
   else
     record INFO downgrade "$old_tag refused a database the candidate wrote: $(head -c 200 "$logs/run-down-shapes.log")"
   fi

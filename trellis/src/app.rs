@@ -1526,7 +1526,8 @@ impl Trellis {
     }
 
     /// Whether at least one live drain worker (a connection running with
-    /// `drain_threads > 0`) is registered anywhere in this fleet right now
+    /// `drain_threads > 0` whose drain threads run, and that doesn't stand by
+    /// for another Trellis version) is registered anywhere in this fleet right now
     /// (`docs/decisions/0010-embeddable-clients.md`, decision 3). A single, cheap `exists(...)`
     /// query with no joins — meant to sit behind an application health check
     /// that runs on a timer, not just be called once at boot.

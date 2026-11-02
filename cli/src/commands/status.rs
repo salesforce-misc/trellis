@@ -110,11 +110,16 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
     // or the nodes under correction, so each definition's own status
     // is read for them, by the qualified target name `definitions()` lists.
     let mut listed = Vec::with_capacity(definitions.len());
+    // ADR-0023: set while a process of another Trellis version is live.
+    let mut handover = None;
     for def in definitions {
         let status = trellis
             .status(&def.target_table)
             .await
             .map_err(|err| err.to_string())?;
+        if handover.is_none() {
+            handover = status.as_ref().and_then(|s| s.version_handover.clone());
+        }
         let warnings = status.map_or_else(StatusWarnings::default, |status| StatusWarnings {
             drain_failure: status.drain_failure,
             correcting: status.correcting,
@@ -130,6 +135,9 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
         .map_err(|err| err.to_string())?;
 
     let mut out = String::new();
+    if let Some(seen) = handover {
+        out.push_str(&format!("Standing by: {seen}\n\n"));
+    }
     out.push_str("Transform definitions:\n");
     out.push_str(&format_definitions(&listed));
     out.push('\n');

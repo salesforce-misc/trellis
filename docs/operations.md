@@ -25,6 +25,7 @@ the ways a target can go wrong without a stop, and names the repair for each.
 | `backfill_failure` | A build or correction chunk keeps failing | Fix what the error names; it retries |
 | `capture_wait` | Installing or widening capture is waiting for a table lock | Wait for the lock holder it names |
 | A `self_check` report with divergences | The target differs from a recompute of it | Find the gap in [known correctness gaps](known-correctness-gaps.md) and use its repair |
+| `version_handover`, and state-changing calls refused with the `version_handover` code | A Trellis process of another version is live on the instance: this version's background processes stand by and its changes refuse ([version handover](decisions/0023-version-handover.md)) | Stop the other version's processes; this version takes over within a standby poll (5 seconds), or the reclaim TTL (30 seconds) after a process killed without a clean shutdown ([rolling deploys](embedding.md#rolling-deploys)) |
 
 ## Repair tools
 
@@ -324,6 +325,15 @@ each one costs and what to expect around it
 
 ## Runbooks
 
+* **Upgrading Trellis:** start the new version beside the old one. Its
+  processes stand by, `status()` shows `version_handover` naming the old
+  version's worker ids, and `apply` and the other state-changing calls of the
+  new version refuse with the `version_handover` code; the old version runs
+  on, and capture never stops. Then stop the old version: the new one takes
+  over, running its migrations first (`trellis run` does; an embedder's
+  `migrate` refuses while the old version runs, so run it after). Downgrade by
+  restoring a backup taken before the upgrade
+  ([rolling deploys](embedding.md#rolling-deploys)).
 * **After a table swap, a bulk load with triggers disabled, or a fixture load
   that ends with `ENABLE TRIGGER ALL`:** the readers of the table are paused.
   `RESUME` each one, which rebuilds it

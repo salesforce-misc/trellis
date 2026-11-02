@@ -594,6 +594,20 @@ by ending the pinning transaction (idle-in-transaction connections, long
 analytics queries, `pg_dump`, or workload on another database sharing the
 cluster).
 
+### Another version is live
+
+While a Trellis process of another version is live on the instance (a deploy
+that crosses a release), `status().version_handover` is set: it names this
+binary's version and each live process of the other version by worker id and
+version (`None` for a release before 0.2.0, which records none), and whether a
+staging worker that registers no version holds the staging lock. Meanwhile
+this binary's background processes stage, drain and build nothing, its
+state-changing calls refuse with the `version_handover` error code, and each
+background process logs a warning once when it starts standing by and an info
+line when it takes over ([version handover](decisions/0023-version-handover.md)).
+A process killed without a clean shutdown keeps counting until its registry row
+ages out, up to the reclaim TTL of 30 seconds.
+
 ### A build that keeps failing
 
 A plain 1-1 transform's build runs as

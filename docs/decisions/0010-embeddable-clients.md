@@ -253,4 +253,7 @@ same after `pg_dump`), and Trellis does the same:
 * Because the host can't see Rust's threads (decision 3), a fleet needs a health
   check that some handle runs the background workers: the worker-registry
   heartbeat behind `Trellis::has_live_drain_workers` (see
-  [embedding](../embedding.md)).
+  [embedding](../embedding.md)). [ADR-0023](0023-version-handover.md) extends
+  the registry to every background process, a staging-only one included, with
+  its binary's version and its roles; the health check counts the rows whose
+  drain threads run.

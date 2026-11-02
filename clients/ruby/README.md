@@ -265,7 +265,8 @@ default one included.
   ```
 - **Errors** are raised as a subclass of `Trellis::Error` per error code
   (`ParseError`, `ValidationError`, `ConnectivityError`, `ConflictError`,
-  `NotFoundError`, `InternalError`, `TimeoutError`), each with `#code` (a
+  `NotFoundError`, `InternalError`, `TimeoutError`, `VersionHandoverError`),
+  each with `#code` (a
   symbol) and `#message`. A code newer than the binding arrives as
   `UnknownError`, naming the code in its message. `ForkedHandleError` is a
   `ValidationError`. Raising is Ruby's idiom, so where the Elixir binding

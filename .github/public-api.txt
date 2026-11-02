@@ -103,6 +103,7 @@ function IndexRole::describe
 function IntakeError::code
 function Metrics::new
 function Metrics::render_prometheus
+function OtherVersionLive::other_versions
 function ParseError::code
 function PendingCall::wait
 function QuarantineState::as_str
@@ -161,6 +162,8 @@ struct HeldKeys
 struct HiddenTableSize
 struct JoinStatus
 struct Metrics
+struct OtherProcess
+struct OtherVersionLive
 struct PartialsWarning
 struct PendingCall
 struct PoisonEntry
