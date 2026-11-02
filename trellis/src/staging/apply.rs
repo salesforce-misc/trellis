@@ -3157,14 +3157,17 @@ pub(super) async fn compute_page(
         // already computed is what makes the emitted spelling agree, by
         // construction, with the one a capture trigger independently stages
         // for the same physical table (its spec's `intake::qualify`
-        // spelling) — `resolve_graph_identity`'s first step is a
-        // `search_path` lookup of the real relation, which a target table
-        // satisfies, and both sides then format the schema it finds through
-        // that same `intake::qualify`, so the two strings are equal by
-        // construction rather than by coincidence. (Strictly, step 1 returns
-        // the *first* `current_schemas(false)` match, so an unrelated relation
-        // of the same bare name in an earlier schema on the pinned path would
-        // resolve to the wrong one — a pre-existing property of
+        // spelling) — `resolve_graph_identity`'s first step walks
+        // `catalog::bare_name_schemas` (Trellis's schema, the configured
+        // target schema, then `public`) for the real relation, which a
+        // target table in one of them satisfies, and both sides then format
+        // the schema it finds through that same `intake::qualify`, so the
+        // two strings are equal by construction rather than by coincidence.
+        // A target outside those schemas is found by step 2 instead, as the
+        // definition's own persisted `target_table`. (Strictly, step 1
+        // returns the *first* match in that list, so an unrelated relation
+        // of the same bare name in an earlier schema on it would resolve to
+        // the wrong one — a pre-existing property of
         // `resolve_graph_identity` shared with every other caller, including
         // the reader lookup on the next line, not something this staging site
         // introduces: the reader lookup would come back empty for that same

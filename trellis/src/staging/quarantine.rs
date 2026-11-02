@@ -2387,15 +2387,19 @@ async fn attribute_column_failure(
     };
     let columns = {
         let client = pool.get().await?;
-        super::one_to_one_render::image_columns(&**client, &change.src_table).await?
+        super::one_to_one_render::image_columns(&**client, &qualified).await?
     };
     for def in candidates {
         let paused = paused_columns_for(pool, &def.def).await?;
         let render = super::one_to_one_render::OneToOneRender::new(&def.def, &columns, &paused)?;
         let failing = {
             let client = pool.get().await?;
+            // The qualified target: `def.def.target` is bare, and a bare
+            // name resolves against the session's `search_path`, which is
+            // Trellis's schema alone, so it would find no columns and the
+            // probe would drop the assignment cast it copies.
             let target_columns =
-                super::one_to_one_render::image_columns(&**client, &def.def.target).await?;
+                super::one_to_one_render::image_columns(&**client, &def.target_table).await?;
             super::one_to_one_render::failing_fields(&**client, &render, &target_columns, &image)
                 .await?
         };

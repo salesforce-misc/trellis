@@ -21,17 +21,17 @@ use crate::integer::IntWidth;
 /// 4): `"schema"."table"`, each component quoted independently, when `def`
 /// wrote an explicit `FROM <schema>.<source>`
 /// ([`TransformDef::explicit_source_schema`]); the plain `"table"` quoted
-/// identifier every function here has always rendered, left to the executing
-/// connection's own `search_path`, for the far more common bare case.
+/// identifier for the bare case, which resolves against the executing
+/// connection's own `search_path`.
 ///
 /// Every function in this module is documented test/benchmark-only (see e.g.
-/// [`render_aggregate_select_sql`]'s own doc comment) and every caller runs
-/// its rendered SQL against the same connection/`search_path` the definition
-/// itself was accepted under, so the bare branch can't drift the way the
-/// real backfill/apply/quarantine paths' pinned-`search_path` reads could
-/// (`docs/decisions/0011-fully-qualified-names.md`) — only the
-/// explicit-schema case needed a real fix here, and it needs no database
-/// round trip: the schema is already right on `def`.
+/// [`render_aggregate_select_sql`]'s own doc comment). A bare source doesn't
+/// resolve on a Trellis session, whose `search_path` is Trellis's schema
+/// alone (`docs/decisions/0011-fully-qualified-names.md`), so a caller
+/// running the rendered SQL for a bare definition runs it on a connection
+/// whose `search_path` reaches the source, such as a test's own raw
+/// connection. The explicit-schema case needs no such connection and no
+/// database round trip: the schema is already right on `def`.
 #[cfg(any(test, feature = "test-util"))]
 fn quoted_source_from(def: &TransformDef) -> String {
     match &def.explicit_source_schema {

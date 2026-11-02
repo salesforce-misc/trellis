@@ -711,6 +711,69 @@ async fn an_invalid_regex_trips_its_column_fuse_and_the_rest_applies() {
     );
 }
 
+/// A failure only the upsert's assignment cast raises is still pinned on its
+/// column. The source column is widened to `bigint` while the target copy is
+/// still `integer` (before the capture pass re-types it), and values above
+/// `integer`'s bound arrive in that window: the field `n` itself computes,
+/// so only its cast to the target column's type fails. The per-field probe
+/// copies that cast from the target's columns, which it finds through the
+/// definition's qualified target: a Trellis session's `search_path` is
+/// Trellis's schema alone, so the bare target name resolves to nothing,
+/// the probe drops the cast, no field fails, and the row-level fuse holds
+/// every key instead of pausing the column.
+#[tokio::test]
+async fn an_assignment_cast_failure_trips_its_column_fuse_and_the_rest_applies() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut client = connect_raw(db.dsn()).await;
+    define(
+        &db,
+        &client,
+        "wide",
+        "id integer primary key, n integer",
+        "TRANSFORM wide_out FROM public.wide SELECT n AS n, id + 1 AS next",
+        &[
+            ("id", ValueType::Integer(IntWidth::Int4)),
+            ("n", ValueType::Integer(IntWidth::Int4)),
+        ],
+    )
+    .await;
+    client
+        .batch_execute("alter table public.wide alter column n type bigint")
+        .await
+        .expect("widen the source column");
+    let big = i64::from(i32::MAX) + 1;
+    let rows: Vec<(String, String)> = (1..=200)
+        .map(|id| (id.to_string(), format!(r#"{{"id":"{id}","n":"{big}"}}"#)))
+        .collect();
+    let seg_seq = stage(&mut client, "wide", &rows).await;
+
+    // Room for the row-level fuse to hold the keys, so a miss reads as the
+    // assertions below rather than as a page that never applied.
+    drain_until_applied(&db, seg_seq, DEFAULT_DEATH_THRESHOLD as usize + 1).await;
+    assert!(column_paused(&client, "wide_out", "n").await);
+    assert!(!column_paused(&client, "wide_out", "next").await);
+    assert_eq!(
+        column_failure_keys(&client, "wide_out", "n").await.len(),
+        DEFAULT_COLUMN_DEATH_THRESHOLD as usize,
+        "isolation pins the threshold's worth of distinct rows, and the pause ends it"
+    );
+    assert!(poisoned_keys(&client).await.is_empty());
+    assert_eq!(
+        count(&client, "select count(*) from key_deaths").await,
+        0,
+        "every failure is the column's, so no record is charged"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "select count(*) from public.wide_out where next = id + 1"
+        )
+        .await,
+        200
+    );
+}
+
 /// `REGEXP_COUNT` runs under the column's own collation, as over the source
 /// table (#643): `\w` matches `é` under `"C.utf8"` and not under `"C"`.
 #[tokio::test]

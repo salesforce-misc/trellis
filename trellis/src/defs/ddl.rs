@@ -131,9 +131,11 @@ pub(crate) fn passthrough_source_column<'a>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrimaryKeyColumn {
     pub name: String,
-    /// The column's Postgres type, rendered by `format_type` (e.g.
-    /// `integer`, `text`, `bigint`) — safe to interpolate directly into DDL
-    /// text since it comes from the catalog, not user input.
+    /// The column's Postgres type as a copy declares it, rendered by
+    /// `defs::copy_type::type_sql`: no modifier, and schema-qualified unless
+    /// it is a `pg_catalog` type (e.g. `integer`, `text`, `numeric`) — safe
+    /// to interpolate directly into DDL text since it comes from the
+    /// catalog, not user input.
     pub data_type: String,
     /// Whether this key column can actually hold SQL `NULL` (`not
     /// pg_attribute.attnotnull`), which is what selects between this crate's
