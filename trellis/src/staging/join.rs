@@ -238,15 +238,93 @@ impl SidePlan {
     }
 }
 
-/// A page's `TRUNCATE` of one side or both ([`JoinTargetPlan::truncate`]).
+/// A page's `TRUNCATE` of one side or both, as either kind of `JOIN` records
+/// it ([`JoinTargetPlan::truncate`],
+/// `super::join_one_to_one::JoinOneToOnePlan::truncate`).
 #[derive(Debug, Clone, Default)]
-struct Truncate {
+pub(crate) struct Truncate {
     /// Each side's truncate's `lsn`: the floor it raises.
-    from: Option<PgLsn>,
-    joined: Option<PgLsn>,
-    hop_gen: i32,
-    src_changed: Option<std::time::SystemTime>,
-    origin_lsn: Option<PgLsn>,
+    pub(crate) from: Option<PgLsn>,
+    pub(crate) joined: Option<PgLsn>,
+    pub(crate) hop_gen: i32,
+    pub(crate) src_changed: Option<std::time::SystemTime>,
+    pub(crate) origin_lsn: Option<PgLsn>,
+}
+
+impl Truncate {
+    /// Adds to `truncate` (the page's, `None` before its first) a `TRUNCATE`
+    /// of the table on `side`, `change`, whose ring `lsn` is `lsn`: the floor
+    /// it raises.
+    pub(crate) fn add(
+        truncate: &mut Option<Truncate>,
+        side: Side,
+        lsn: PgLsn,
+        change: &FoldedChange,
+    ) {
+        let truncate = truncate.get_or_insert_with(|| Truncate {
+            hop_gen: change.hop_gen,
+            src_changed: change.src_changed,
+            origin_lsn: change.origin_lsn,
+            ..Truncate::default()
+        });
+        truncate.hop_gen = truncate.hop_gen.max(change.hop_gen);
+        truncate.src_changed =
+            super::apply::earliest_src_changed(truncate.src_changed, change.src_changed);
+        truncate.origin_lsn = earliest_origin(truncate.origin_lsn, change.origin_lsn);
+        let floor = match side {
+            Side::From => &mut truncate.from,
+            Side::Joined => &mut truncate.joined,
+        };
+        *floor = Some(floor.map_or(lsn, |f| f.max(lsn)));
+    }
+}
+
+/// How a writer takes a `JOIN`'s truncate lock row (either kind's): `FOR
+/// SHARE` beside the pair's other writers, or `FOR UPDATE` to wait for them
+/// and keep them waiting (a page that carries a `TRUNCATE`, a rebuild's
+/// start).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockRowMode {
+    Share,
+    Update,
+}
+
+/// The statement that takes `lock`, a `JOIN`'s truncate lock row (quoted and
+/// qualified), in `mode`.
+pub(crate) fn lock_row_sql(lock: &str, mode: LockRowMode) -> String {
+    let mode = match mode {
+        LockRowMode::Share => "share",
+        LockRowMode::Update => "update",
+    };
+    format!("select 1 from {lock} for {mode}")
+}
+
+/// The insert half of `J`'s insert-then-lock (either kind of `JOIN`'s): the
+/// keys `select {select} from {from}` reads, as `J`'s columns `cols` (quoted,
+/// comma-separated), inserted sorted by `order`, `on conflict do nothing`.
+pub(crate) fn j_insert_statement(
+    j: &str,
+    cols: &str,
+    select: &str,
+    from: &str,
+    order: &str,
+) -> String {
+    format!(
+        "insert into {j} ({cols}) select {select} from {from} \
+         order by {order} on conflict do nothing"
+    )
+}
+
+/// The lock half of `J`'s insert-then-lock (either kind of `JOIN`'s): the
+/// `J` rows of the keys `select {select} from {from}` reads, `J`'s columns
+/// being `cols` (quoted), `FOR UPDATE` in one statement sorted by them.
+pub(crate) fn j_lock_statement(j: &str, cols: &[String], select: &str, from: &str) -> String {
+    let j_cols: Vec<String> = cols.iter().map(|c| format!("j.{c}")).collect();
+    format!(
+        "select 1 from {j} j where ({jc}) in (select {select} from {from}) \
+         order by {jc} for update of j",
+        jc = j_cols.join(", "),
+    )
 }
 
 /// One page's work on one `JOIN` target ([`apply_join_target`]).
@@ -327,11 +405,6 @@ fn working_table_name(prefix: &str, id: i64, hidden_columns: &str) -> String {
         "trellis_join_{prefix}_{id}_{:016x}",
         group_basis::shape_hash(hidden_columns)
     )
-}
-
-/// The qualified hidden table `table` of definition `id`, quoted.
-fn hidden_ident(schema: &str, id: i64, table: HiddenTable) -> String {
-    format!("{}.{}", quote_ident(schema), quote_ident(&table.name(id)))
 }
 
 fn quoted(columns: &[String]) -> Vec<String> {
@@ -462,7 +535,7 @@ impl JoinTargetPlan {
                         .map(|c| format!(" and s.{} is not null", quote_ident(c)))
                         .collect(),
                 };
-                let hidden = hidden_ident(catalog_schema, id, table);
+                let hidden = table.qualified(catalog_schema, id);
                 let group_collations = GroupCollations::of(
                     &key_cols,
                     Some(match side {
@@ -540,7 +613,7 @@ impl JoinTargetPlan {
         );
         let t = GroupTargetPlan::for_join(
             target,
-            hidden_ident(catalog_schema, id, HiddenTable::TargetPartials),
+            HiddenTable::TargetPartials.qualified(catalog_schema, id),
             &working("t", HiddenTable::TargetPartials),
             None,
             identity.clone(),
@@ -555,8 +628,8 @@ impl JoinTargetPlan {
             identity,
             truncate: None,
             left,
-            lock_ident: hidden_ident(catalog_schema, id, HiddenTable::TruncateLock),
-            j_ident: hidden_ident(catalog_schema, id, HiddenTable::Matches),
+            lock_ident: HiddenTable::TruncateLock.qualified(catalog_schema, id),
+            j_ident: HiddenTable::Matches.qualified(catalog_schema, id),
             j_cols: spec::join_key(def, Side::From),
             from,
             joined: joined_plan,
@@ -586,21 +659,7 @@ impl JoinTargetPlan {
     /// the page clears what it empties before its other changes (see the
     /// module doc).
     pub(crate) fn truncate(&mut self, side: Side, lsn: PgLsn, change: &FoldedChange) {
-        let truncate = self.truncate.get_or_insert_with(|| Truncate {
-            hop_gen: change.hop_gen,
-            src_changed: change.src_changed,
-            origin_lsn: change.origin_lsn,
-            ..Truncate::default()
-        });
-        truncate.hop_gen = truncate.hop_gen.max(change.hop_gen);
-        truncate.src_changed =
-            super::apply::earliest_src_changed(truncate.src_changed, change.src_changed);
-        truncate.origin_lsn = earliest_origin(truncate.origin_lsn, change.origin_lsn);
-        let floor = match side {
-            Side::From => &mut truncate.from,
-            Side::Joined => &mut truncate.joined,
-        };
-        *floor = Some(floor.map_or(lsn, |f| f.max(lsn)));
+        Truncate::add(&mut self.truncate, side, lsn, change);
         self.t.note(change);
     }
 
@@ -710,26 +769,15 @@ impl JoinTargetPlan {
     /// Step 2's `J` insert: every key the page names that has no row.
     fn j_insert_sql(&self) -> String {
         let cols = quoted(&self.j_cols).join(", ");
-        format!(
-            "insert into {j} ({cols}) select {cols} from ({keys}) k order by {cols} \
-             on conflict do nothing",
-            j = self.j_ident,
-            keys = self.staged_keys_sql(),
-        )
+        let keys = format!("({}) k", self.staged_keys_sql());
+        j_insert_statement(&self.j_ident, &cols, &cols, &keys, &cols)
     }
 
     /// Step 2's `J` lock: the same keys, sorted, `FOR UPDATE`.
     fn j_lock_sql(&self) -> String {
         let cols = quoted(&self.j_cols);
-        let j_cols: Vec<String> = cols.iter().map(|c| format!("j.{c}")).collect();
-        format!(
-            "select 1 from {j} j where ({jc}) in (select {cols} from ({keys}) k) \
-             order by {jc} for update of j",
-            j = self.j_ident,
-            jc = j_cols.join(", "),
-            cols = cols.join(", "),
-            keys = self.staged_keys_sql(),
-        )
+        let keys = format!("({}) k", self.staged_keys_sql());
+        j_lock_statement(&self.j_ident, &cols, &cols.join(", "), &keys)
     }
 
     /// Step 4's statement (see the module doc): stages the product's change
@@ -1225,15 +1273,12 @@ async fn write_locked(
 ) -> Result<(usize, usize), ApplyError> {
     // 2. The pair's lock row, a truncate's clear, `J`, then the cells.
     let mode = if plan.truncate.is_some() {
-        "update"
+        LockRowMode::Update
     } else {
-        "share"
+        LockRowMode::Share
     };
-    txn.execute(
-        &format!("select 1 from {} for {mode}", plan.lock_ident),
-        &[],
-    )
-    .await?;
+    txn.execute(&lock_row_sql(&plan.lock_ident, mode), &[])
+        .await?;
     let mut deleted = 0;
     if let Some(truncate) = &plan.truncate {
         deleted += clear(txn, plan, truncate, mutations).await?;
@@ -1629,7 +1674,7 @@ pub(crate) async fn build(
                 side.recompute = true;
                 side.node = Some(side.plan.source_row().to_string());
             }
-            txn.execute(&format!("select 1 from {} for share", plan.lock_ident), &[])
+            txn.execute(&lock_row_sql(&plan.lock_ident, LockRowMode::Share), &[])
                 .await?;
             for side in [&mut plan.from, &mut plan.joined] {
                 group_basis::enumerate_cells(txn, &mut side.plan, None, &side.cells).await?;
@@ -1647,7 +1692,7 @@ pub(crate) async fn build(
                 Some(scope) if scope.read_node => scope.node.clone(),
                 Some(_) => None,
             };
-            txn.execute(&format!("select 1 from {} for share", plan.lock_ident), &[])
+            txn.execute(&lock_row_sql(&plan.lock_ident, LockRowMode::Share), &[])
                 .await?;
             let side_plan = plan.side_mut(*side);
             group_basis::enumerate_cells(txn, &mut side_plan.plan, *scope, &side_plan.cells)
@@ -1655,7 +1700,7 @@ pub(crate) async fn build(
             write_locked(txn, &plan, &mut mutations, false, true).await?
         }
         BuildWork::Final => {
-            txn.execute(&format!("select 1 from {} for share", plan.lock_ident), &[])
+            txn.execute(&lock_row_sql(&plan.lock_ident, LockRowMode::Share), &[])
                 .await?;
             group_basis::enumerate_target_groups(txn, &plan.t).await?;
             pause!(txn, BeforeJoinTargetLock, &plan.target);

@@ -799,8 +799,11 @@ pub(crate) async fn stamp_rebuild_seg(
         .await?;
     for row in lock_rows {
         let lock: String = row.get(0);
-        txn.execute(&format!("select 1 from {lock} for update"), &[])
-            .await?;
+        txn.execute(
+            &super::join::lock_row_sql(&lock, super::join::LockRowMode::Update),
+            &[],
+        )
+        .await?;
     }
     txn.execute(
         "update transform_definitions set build_seg = p.active_seq \

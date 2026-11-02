@@ -126,6 +126,7 @@ use crate::pool::{Pool, quote_ident, quote_literal};
 
 use super::apply::ApplyError;
 use super::fold::FoldedChange;
+use super::join::{self as spec_join, LockRowMode, Truncate, lock_row_sql};
 use super::one_to_one_ledger::{self as ledger, EntryChange, LedgerRef};
 use super::one_to_one_render::{ImageColumn, OneToOneRender};
 use super::target_mutations::TargetMutations;
@@ -531,17 +532,6 @@ impl Record {
     }
 }
 
-/// A page's `TRUNCATE` of one side or both ([`JoinOneToOnePlan::truncate`]).
-#[derive(Debug, Clone, Default)]
-struct Truncate {
-    /// Each side's truncate's `lsn`: the floor it raises.
-    from: Option<PgLsn>,
-    joined: Option<PgLsn>,
-    hop_gen: i32,
-    src_changed: Option<std::time::SystemTime>,
-    origin_lsn: Option<PgLsn>,
-}
-
 /// One page's work on one 1-1 `JOIN` target: its changes of each side.
 #[derive(Debug, Clone)]
 pub(crate) struct JoinOneToOnePlan {
@@ -596,21 +586,7 @@ impl JoinOneToOnePlan {
     /// Adds a `TRUNCATE` of the table on `side`, `change`, whose ring `lsn`
     /// is `lsn`, the floor it raises.
     pub(crate) fn truncate(&mut self, side: Side, lsn: PgLsn, change: &FoldedChange) {
-        let truncate = self.truncate.get_or_insert_with(|| Truncate {
-            hop_gen: change.hop_gen,
-            src_changed: change.src_changed,
-            origin_lsn: change.origin_lsn,
-            ..Truncate::default()
-        });
-        truncate.hop_gen = truncate.hop_gen.max(change.hop_gen);
-        truncate.src_changed =
-            super::apply::earliest_src_changed(truncate.src_changed, change.src_changed);
-        truncate.origin_lsn = super::fold::earliest_origin(truncate.origin_lsn, change.origin_lsn);
-        let floor = match side {
-            Side::From => &mut truncate.from,
-            Side::Joined => &mut truncate.joined,
-        };
-        *floor = Some(floor.map_or(lsn, |f| f.max(lsn)));
+        Truncate::add(&mut self.truncate, side, lsn, change);
     }
 
     /// Adds `change` of the table on `side`.
@@ -776,12 +752,11 @@ pub(crate) async fn apply_page(
     #[cfg(not(any(test, feature = "test-util")))]
     let share = false;
     let mode = if truncate.is_some() && !share {
-        "update"
+        LockRowMode::Update
     } else {
-        "share"
+        LockRowMode::Share
     };
-    txn.execute(&format!("select 1 from {} for {mode}", shape.lock), &[])
-        .await?;
+    txn.execute(&lock_row_sql(&shape.lock, mode), &[]).await?;
     if def_late {
         txn.execute(
             "select 1 from transform_definitions where id = $1 for update",
@@ -1176,16 +1151,16 @@ async fn lock_keys(
     let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
     let names: Vec<String> = shape.key.iter().map(|c| quote_ident(&c.name)).collect();
     let (unnest, casts) = key_unnest(shape);
+    let casts = casts.join(", ");
     let ordinals: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
     if !k.is_empty() {
         txn.execute(
-            &format!(
-                "insert into {j} ({names}) select {casts} from {unnest} \
-                 order by {ordinals} on conflict do nothing",
-                j = shape.j,
-                names = names.join(", "),
-                casts = casts.join(", "),
-                ordinals = ordinals.join(", "),
+            &spec_join::j_insert_statement(
+                &shape.j,
+                &names.join(", "),
+                &casts,
+                &unnest,
+                &ordinals.join(", "),
             ),
             &params,
         )
@@ -1205,15 +1180,8 @@ async fn lock_keys(
     #[cfg(not(any(test, feature = "test-util")))]
     let skip = false;
     if !k.is_empty() && !skip {
-        let qualified: Vec<String> = names.iter().map(|n| format!("j.{n}")).collect();
         txn.execute(
-            &format!(
-                "select 1 from {j} j where ({qualified}) in (select {casts} from {unnest}) \
-                 order by {qualified} for update of j",
-                j = shape.j,
-                qualified = qualified.join(", "),
-                casts = casts.join(", "),
-            ),
+            &spec_join::j_lock_statement(&shape.j, &names, &casts, &unnest),
             &params,
         )
         .await?;

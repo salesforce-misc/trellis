@@ -354,8 +354,11 @@ pub(crate) async fn run_chunk(
     let records = fold(&records);
 
     // 2. The lock row, K, then `J`.
-    txn.execute(&format!("select 1 from {} for share", shape.lock), &[])
-        .await?;
+    txn.execute(
+        &super::super::join::lock_row_sql(&shape.lock, super::super::join::LockRowMode::Share),
+        &[],
+    )
+    .await?;
     let k = key_set(txn, shape, Side::From, &records, &live).await?;
     // Test-only pause point. See `super::super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
