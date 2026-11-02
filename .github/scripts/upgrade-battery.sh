@@ -316,16 +316,22 @@ if [ -d "$candidate" ] && [ -z "$override_version" ]; then
   cand_src=$(cd "$candidate" && pwd)
   cand_target="$cand_src/target"
 elif [ -d "$candidate" ]; then
-  dir_src=$(cd "$candidate" && pwd)
+  # The checkout's top level, so a subdirectory candidate copies every change.
+  dir_src=$(git -C "$candidate" rev-parse --show-toplevel) || die "$candidate is not a git checkout"
   cand_src="$work/cand-src"
   cand_head=$(git -C "$dir_src" rev-parse HEAD) || die "$dir_src is not a git checkout"
   checkout_at "$cand_src" "$cand_head" || die "cannot check out $cand_head of $dir_src (the candidate directory must be a worktree of $repo)"
   extra_worktrees+=("$cand_src")
-  git -C "$dir_src" diff --binary HEAD >"$work/cand-uncommitted.patch"
+  # A plain patch for git apply, whatever the user's diff settings.
+  git -C "$dir_src" diff --binary --no-color --no-ext-diff --no-textconv --no-relative \
+    --src-prefix=a/ --dst-prefix=b/ HEAD >"$work/cand-uncommitted.patch"
   [ ! -s "$work/cand-uncommitted.patch" ] || git -C "$cand_src" apply --whitespace=nowarn "$work/cand-uncommitted.patch" ||
     die "cannot copy the uncommitted changes of $dir_src"
   git -C "$dir_src" ls-files -z --others --exclude-standard >"$work/cand-untracked.list"
-  [ ! -s "$work/cand-untracked.list" ] || tar --null -T "$work/cand-untracked.list" -C "$dir_src" -cf - | tar -xf - -C "$cand_src"
+  if [ -s "$work/cand-untracked.list" ]; then
+    (cd "$dir_src" && tar -cf - --null -T "$work/cand-untracked.list") | tar -xf - -C "$cand_src" ||
+      die "cannot copy the untracked files of $dir_src"
+  fi
   [ -z "$(git -C "$dir_src" status --porcelain 2>/dev/null)" ] || cand_dirty="+uncommitted changes"
   cand_target="$work/cand-target"
 else
@@ -837,11 +843,15 @@ if want mixed; then
     record FAIL mixed "the candidate did not stand by beside a live $old_tag instance ($workers workers registered, $paused_n paused, candidate process $(run_alive new-mixed && echo running || echo exited), history $( [ "$(history "$port" mixed)" = "$pre_mixed_history" ] && echo unchanged || echo changed), log: $(tr '\n' ' ' <"$logs/run-new-mixed.log" | cut -c1-300))"
   fi
   # The message must name the candidate's exact version and the old build as a
-  # release with no registered version, so the step cannot pass on a mismatch of
-  # some other kind (a candidate built with the old version string, say).
+  # release with no registered version. With migrations pending the candidate
+  # stands by beside a live process of any version, its own included, so the
+  # standby alone does not show a handover between two versions: a candidate
+  # that reports the old build's version string fails here.
   case "$old_tag" in
     v0.1.*)
-      if grep -qF "this binary is version $cand_ver;" "$logs/run-new-mixed.log" &&
+      if [ "$cand_ver" = "${old_version#trellis }" ]; then
+        record FAIL mixed "the candidate reports version $cand_ver, the same string as $old_tag, so this is no handover between two versions: build it as the release version (--candidate-version, default 0.2.0)"
+      elif grep -qF "this binary is version $cand_ver;" "$logs/run-new-mixed.log" &&
          grep -qF 'at a release before 0.2.0' "$logs/run-new-mixed.log"; then
         record PASS mixed "the standby message names this binary's version $cand_ver and $old_tag as a release before 0.2.0 (it registers no version)"
       else
