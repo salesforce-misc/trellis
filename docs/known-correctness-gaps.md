@@ -468,7 +468,9 @@ restoring a backup, and a handle of that release connects without running
 refuses such a database, since 0.2.0 adds a migration it doesn't carry, so
 `trellis run`, `trellis apply`, `bin/rails trellis:migrate`, the migration
 helpers and a release task that migrates all stop with an error. Its connect
-checks nothing.
+checks nothing, and a rollback deploy's `bin/rails db:migrate` or
+`mix ecto.migrate` calls no helper, since every migration of the rolled-back
+application has already run.
 
 **What goes wrong:** the older release runs its pipeline over the definitions
 and state the newer one wrote, with its own rules. Definition text added after

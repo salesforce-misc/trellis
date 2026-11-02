@@ -47,7 +47,8 @@ stage, drain or change state side by side.
    refuses with the error of rule 6, and a background process waits. With
    nothing pending and another version live, `migrate` changes nothing: it
    runs its checks, the catalog floor and refinery's refusal of a changed
-   migration among them ([ADR-0024](0024-compatibility-floors-and-rollback.md)),
+   migration or a gap in the history among them
+   ([ADR-0024](0024-compatibility-floors-and-rollback.md)),
    and succeeds, or refuses when the attach would write (a
    grammar-version pause, [ADR-0018](0018-grammar-versioning.md), or a changed
    marker). A background process never migrates; `trellis run` migrates before

@@ -260,8 +260,8 @@ For each release, the notes carry:
   a process killed without a clean shutdown), migrating first when the release
   adds a migration (`trellis run` does; an embedder runs `migrate` after the old
   version has stopped, since it refuses while one runs). Say whether the release
-  adds a migration (`0.2.0` adds V9, so `0.1.0` can't open a database `0.2.0`
-  has migrated).
+  adds a migration (`0.2.0` adds V9, so `0.1.0`'s `migrate` refuses a database
+  `0.2.0` has migrated).
 - **Compatibility floors:** the floors this release raised (the catalog floor,
   and which features carry a new definition floor) and what that means for
   rolling back to the previous release

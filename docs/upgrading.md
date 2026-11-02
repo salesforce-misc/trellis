@@ -25,12 +25,13 @@ Trellis:
    the 30-second reclaim TTL after a process killed without a clean shutdown.
 3. **Run `migrate`** when the new release carries a migration. `trellis run`
    migrates by itself once the old release has stopped. An embedded fleet runs
-   `migrate` (`bin/rails trellis:migrate`, or a release task that calls
-   `Trellis.migrate!`) in a deploy step after the old processes are gone:
-   `migrate` refuses with the `version_handover` code while one is live and a
-   migration is pending, and the new release's background processes wait for
-   it. With no migration pending, `migrate` beside the old release changes
-   nothing and succeeds.
+   `migrate` (`bin/rails trellis:migrate`, or an Elixir release task that
+   calls `Trellis.migrate!`) in a deploy step after the old processes are
+   gone: `migrate` refuses with the `version_handover` code while one is live
+   and a migration is pending, and the new release's background processes wait
+   for it. With no migration pending, `migrate` beside the old release changes
+   nothing: it succeeds, or refuses with the same code when it would have to
+   pause a definition.
 
 Meanwhile, `status()` carries `version_handover`, naming this binary's version
 and each live process of the old release by worker id
@@ -64,8 +65,11 @@ each one stops with that error. A handle of such a release that connects
 without migrating, such as a worker the application starts at boot, checks
 nothing and runs on the newer database
 ([known correctness gaps](known-correctness-gaps.md#a-release-before-020-started-on-a-database-a-later-release-migrated)).
-Keep `migrate` in your deploy so that a rollback deploy stops at it, and
-restore the backup before starting the older release.
+A rollback deploy's `bin/rails db:migrate` or `mix ecto.migrate` doesn't stop
+it: every migration of the rolled-back application has already run, so no
+helper runs. Keep an explicit Trellis `migrate` step in your deploy, as in
+[Upgrading](#upgrading), so that a rollback deploy stops at it, and restore the
+backup before starting the older release.
 
 ## Embedded applications
 
@@ -77,7 +81,8 @@ made, and the catalog state it wrote, stay in the database, and the rolled-back
 application's Trellis meets them.
 
 Rolling a define migration back is not a way to undo an upgrade. A migration
-written with `Trellis::Migration` or `Trellis.Migration` undoes its define in
-`down` with `PAUSE TRANSFORM` and `DROP TRANSFORM`, so `bin/rails db:rollback`
-or `mix ecto.rollback` of it drops the transform and its target table with
-the target's data. Defining it again builds the target from empty.
+written with `Trellis::Migration` or `Trellis.Migration` undoes its define in a
+`down` that runs `PAUSE TRANSFORM` and `DROP TRANSFORM`, since the helpers
+can't reverse a statement by themselves, so `bin/rails db:rollback` or
+`mix ecto.rollback` of it drops the transform and its target table with the
+target's data. Defining it again builds the target from empty.

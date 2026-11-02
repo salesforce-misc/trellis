@@ -117,16 +117,19 @@ has stopped.
   once the database has changed since the upgrade.
 - **Flyway** ignores applied migrations newer than the binary by default
   (`*:future`), the opposite of refinery's `abort_missing`.
-- **Oban, GoodJob and Que** run older versions on a newer schema: Oban checks
-  only that the schema isn't too old, Que checks nothing, and GoodJob keeps
-  schema changes in minors optional until the next major and detects at runtime
-  which columns exist. Each keeps schema changes additive within a line.
-- **SQLite** reads a database with an older library "as long as the database
-  does not make use of newer features": a floor per feature in use, which is
-  what a definition floor is.
+- **Oban, GoodJob and Que,** job queues whose tables live in the
+  application's database, run older versions on a newer schema by keeping
+  schema changes additive within a line. GoodJob, for one, keeps the
+  migrations of a minor release optional until the next major and detects at
+  runtime which columns exist.
+- **SQLite** lets an older library open a database a newer one wrote, as long
+  as the database uses none of the newer features: a floor per feature in use,
+  which is what a definition floor is.
 - **MongoDB's feature compatibility version and CockroachDB's finalize** record
-  a floor too, but an operator raises it in an explicit step once the new
-  version has burned in. Rejected below.
+  a floor too, but raise it in a separate step once the new version has burned
+  in: an operator's command in MongoDB, an automatic step in CockroachDB that
+  the operator can hold back. Until then the previous version can still run.
+  Rejected below.
 
 ## Rejected
 
