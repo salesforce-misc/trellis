@@ -241,6 +241,14 @@ fn with_keys<T>(f: impl FnOnce(&mut Memo) -> T) -> T {
     f(&mut KEYS.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
+/// Keeps only the key-check entries of `table` for the 1-1 `JOIN`s in `ids`:
+/// a paused or dropped definition's is forgotten.
+pub(crate) fn retain_key_readers(instance: &str, table: &str, ids: &[i64]) {
+    with_keys(|memo| {
+        memo.retain(|(i, t, id), _| i != instance || t != table || ids.contains(id));
+    });
+}
+
 /// Whether `id`'s last key check of `table` found the key at `stamp`.
 pub(crate) fn key_skippable(instance: &str, table: &str, id: i64, stamp: &str) -> bool {
     with_keys(|memo| {

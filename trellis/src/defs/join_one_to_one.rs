@@ -675,8 +675,10 @@ pub(crate) mod tests {
     /// The key rule define, `RESUME` and the capture pass share, over the
     /// catalog: which of `b`'s indexes make its `ON` columns unique. A
     /// deferrable constraint, `NULLS NOT DISTINCT` and an `INCLUDE` column
-    /// keep a key; an `INVALID`, partial or expression index, part of a
-    /// composite key, and a table that doesn't exist don't.
+    /// keep a key, as do `ON` columns that hold a key and more, in any order;
+    /// an `INVALID`, partial or expression index (wholly or in part), part of
+    /// a composite key, a non-unique index, and a table that doesn't exist
+    /// don't.
     #[tokio::test]
     async fn the_key_rule_reads_which_indexes_make_the_on_columns_unique() {
         let cluster = testkit::TestCluster::start();
@@ -690,13 +692,15 @@ pub(crate) mod tests {
         client
             .batch_execute(
                 "create table public.b (bid int primary key, d int, n int, i int, v int, \
-                     p int, e int, c1 int, c2 int); \
+                     p int, e int, c1 int, c2 int, x int, m1 int, m2 int); \
                  alter table public.b add constraint b_d unique (d) deferrable initially deferred; \
                  create unique index b_n on public.b (n) nulls not distinct; \
                  create unique index b_i on public.b (i) include (v); \
                  create unique index b_p on public.b (p) where p is not null; \
                  create unique index b_e on public.b ((e + 0)); \
                  create unique index b_c on public.b (c1, c2); \
+                 create index b_x on public.b (x); \
+                 create unique index b_m on public.b (m1, (m2 + 0)); \
                  insert into public.b (bid, n, v) values (1, 1, 1), (2, 2, 1)",
             )
             .await
@@ -717,10 +721,16 @@ pub(crate) mod tests {
             ("a.k = b.n", true),
             ("a.k = b.i", true),
             ("a.k = b.c1 AND a.j = b.c2", true),
+            ("a.k = b.c2 AND a.j = b.c1", true),
+            ("a.k = b.bid AND a.j = b.v", true),
+            ("a.k = b.c1 AND a.j = b.x AND a.m = b.c2", true),
             ("a.k = b.v", false),
             ("a.k = b.p", false),
             ("a.k = b.e", false),
             ("a.k = b.c1", false),
+            ("a.k = b.c1 AND a.j = b.x", false),
+            ("a.k = b.x", false),
+            ("a.k = b.m1 AND a.j = b.m2", false),
         ] {
             let def = joined(on);
             assert_eq!(

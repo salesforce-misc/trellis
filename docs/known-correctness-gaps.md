@@ -203,12 +203,13 @@ SET session_replication_role = replica;
 INSERT INTO b (bid, k) VALUES (9, 10);  -- a second row on k = 10; it commits
 ```
 
-Postgres checks a deferrable unique constraint with a constraint trigger at
-commit, and under `replica` that trigger doesn't fire, so the duplicate
-commits and the index stays valid. A unique key that isn't deferrable
-rejects it as usual. The capture triggers are `ENABLE ALWAYS`, so they fire
-and the write is captured. The reconcile pass, which pauses the transform
-when `b`'s unique key is gone, finds it in place and pauses nothing.
+Postgres checks a deferrable unique constraint with a constraint trigger, at
+the end of the statement or, when the check is deferred, at commit. Under
+`replica` that trigger doesn't fire, so the duplicate commits and the index
+stays valid. A unique key that isn't deferrable rejects it as usual. The
+capture triggers are `ENABLE ALWAYS`, so they fire and the write is captured.
+The reconcile pass, which pauses the transform when `b`'s unique key is gone,
+finds it in place and pauses nothing.
 
 **What goes wrong:** each `a` row on that key joins the newest of the `b`
 rows on it, where the join gives one row per pair. The target stays keyed by

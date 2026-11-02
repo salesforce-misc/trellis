@@ -548,8 +548,10 @@ fn virtual_column_error(table: &str, column: &str, expression: &str) -> String {
 /// every `pg_index` row's `xmin`, so a drop, a create or a validity change
 /// always forces the check. Reads neither `M` nor `table`'s rows. Runs on
 /// the captured tables only: a joined table that is another definition's
-/// target is keyed by its primary key, which only Trellis writes.
-/// `instance` is the capture pass's key for its database and schema.
+/// target is keyed by the key Trellis created it with (a 1-1 target's primary
+/// key, an aggregate's group key), which no supported operation drops. The
+/// memo forgets a definition once it is paused or dropped. `instance` is the
+/// capture pass's key for its database and schema.
 pub(crate) async fn pause_joins_without_unique_key(
     client: &mut Client,
     instance: &str,
@@ -558,12 +560,19 @@ pub(crate) async fn pause_joins_without_unique_key(
     table: &str,
 ) -> Result<bool, CaptureError> {
     let fingerprint = drift.of(&crate::defs::ddl::regclass_arg(table));
+    let joins: Vec<_> = catalog
+        .definitions
+        .iter()
+        .filter(|r| {
+            !r.capture_failed
+                && r.join.as_deref() == Some(table)
+                && crate::defs::join::is_one_to_one(&r.def)
+        })
+        .collect();
+    let ids: Vec<i64> = joins.iter().map(|r| r.id).collect();
+    drift_memo::retain_key_readers(instance, table, &ids);
     let mut gone: Vec<(i64, Vec<String>)> = Vec::new();
-    for reader in catalog.definitions.iter().filter(|r| {
-        !r.capture_failed
-            && r.join.as_deref() == Some(table)
-            && crate::defs::join::is_one_to_one(&r.def)
-    }) {
+    for reader in joins {
         let on = crate::defs::join_one_to_one::joined_on_columns(&reader.def);
         let stamp = fingerprint.map(|f| format!("{f}|{on:?}"));
         if stamp

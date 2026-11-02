@@ -7,7 +7,9 @@
 //! `capture_failure` naming the table and column, and `RESUME` brings Trellis's
 //! copies to the types define would give them now (the target's through the
 //! staging worker, `R`, `M` and `J` created again) and rebuilds, after which
-//! the target equals the live join. Over plain tables (`LEFT` and `INNER`), a
+//! the target equals the live join. `b`'s unique key on its `ON` columns
+//! dropped, or left `INVALID`, pauses the transform the same way, and `RESUME`
+//! is refused until the key is back. Over plain tables (`LEFT` and `INNER`), a
 //! chained 1-1 `a` side, a chained 1-1 `b` side, and an aggregate's target as
 //! `a` keyed by a nullable group column.
 //!
@@ -1243,5 +1245,199 @@ async fn a_drop_between_two_passes_with_no_other_change_is_detected() {
         pass(&mut d).await;
         assert_eq!(checks(), checked + 1, "{kind:?}: the drop forces the check");
         assert_paused_for_lost_key(&d, &target).await;
+    }
+}
+
+/// A swap that drops the old index before the new one exists pauses the
+/// transform when a pass lands between the two statements, though no
+/// duplicate arrives (the Decision's accepted cost). The pause holds once the
+/// new index is valid, until `RESUME` rebuilds. After the resume the pass
+/// records the key again and skips while `b` is unchanged, and a second drop
+/// is caught all the same.
+#[tokio::test]
+async fn a_drop_first_swap_with_a_pass_in_between_pauses_until_resumed() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        let target = kind.target();
+        let id = definition_id(&d, &target).await;
+        let database: String = d
+            .ctl
+            .query_one("select current_database()::text", &[])
+            .await
+            .expect("the database")
+            .get(0);
+        let checks = || trellis::staging::unique_key_checks(&database, DEFAULT_SCHEMA, id);
+        pass(&mut d).await;
+        write(&d, "drop index public.b_k_unique").await;
+        pass(&mut d).await;
+        assert_paused_for_lost_key(&d, &target).await;
+        write(
+            &d,
+            "create unique index concurrently b_k_unique on public.b (k)",
+        )
+        .await;
+        pass(&mut d).await;
+        assert_paused_for_lost_key(&d, &target).await;
+        resume(&d, kind.name()).await;
+        assert_exact(&mut d, kind, "the resume after the swap").await;
+
+        pass(&mut d).await;
+        let checked = checks();
+        pass(&mut d).await;
+        assert_eq!(checks(), checked, "{kind:?}: skipped after the resume");
+        write(&d, "drop index public.b_k_unique").await;
+        pass(&mut d).await;
+        assert_paused_for_lost_key(&d, &target).await;
+    }
+}
+
+/// The gap entry "A duplicate in `b` past a deferrable key under
+/// `session_replication_role = replica`" in `docs/known-correctness-gaps.md`,
+/// as it says: `b`'s key on `k` is a deferrable constraint (initially
+/// deferred for `LEFT`, initially immediate for `INNER`; put in place by a
+/// create-first swap, which pauses nothing), and a role that is no superuser
+/// but is granted `SET` on `session_replication_role` inserts a second row on
+/// `k = 10` under `replica`. Postgres skips the constraint's recheck, so the row
+/// commits and the key stays valid; the capture triggers fire, so the drain
+/// applies it; the pass finds the key and pauses nothing. The target holds
+/// one row per `a` row on the key where the join gives two, and `self_check`
+/// reports it. Removing the duplicate, then `PAUSE` and `RESUME`, repairs it.
+/// On a server older than 15 (no `GRANT SET ON PARAMETER`) the test returns
+/// without running.
+#[tokio::test]
+async fn a_duplicate_past_a_deferrable_key_under_replica_is_captured_and_reported() {
+    use trellis::staging::self_check::CheckPageExt;
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        let target = kind.target();
+        let version: i32 = d
+            .ctl
+            .query_one("select current_setting('server_version_num')::int", &[])
+            .await
+            .expect("read the server version")
+            .get(0);
+        if version < 150_000 {
+            eprintln!(
+                "skipped: GRANT SET ON PARAMETER needs PostgreSQL 15, the server is {version}"
+            );
+            return;
+        }
+        let initially = match kind {
+            Kind::Left => "deferred",
+            Kind::Inner => "immediate",
+        };
+        for statement in [
+            &format!(
+                "alter table public.b add constraint b_k_d unique (k) \
+                 deferrable initially {initially}"
+            ),
+            "drop index public.b_k_unique",
+        ] {
+            write(&d, statement).await;
+            pass(&mut d).await;
+            assert_eq!(
+                status(&d, &target).await,
+                "live",
+                "{kind:?} after {statement}"
+            );
+        }
+        write(
+            &d,
+            "do $$ begin \
+               if not exists (select from pg_roles where rolname = 'replica_writer') then \
+                 create role replica_writer nosuperuser; \
+               end if; end $$; \
+             grant set on parameter session_replication_role to replica_writer; \
+             grant usage on schema public to replica_writer; \
+             grant insert on public.b to replica_writer",
+        )
+        .await;
+        let user = d.user().await;
+        user.batch_execute("set role replica_writer")
+            .await
+            .expect("set role");
+        user.batch_execute("insert into public.b values (4, 10, 400, 'k4')")
+            .await
+            .expect_err("the recheck refuses it outside replica");
+        user.batch_execute(
+            "set session_replication_role = replica; \
+             insert into public.b values (4, 10, 400, 'k4'); \
+             reset session_replication_role; reset role",
+        )
+        .await
+        .expect("under replica the duplicate commits");
+        drop(user);
+        assert_eq!(
+            d.rows(
+                "select count(*)::text, bool_and(i.indisvalid)::text from public.b, \
+                 pg_catalog.pg_index i where b.k = 10 \
+                 and i.indexrelid = 'public.b_k_d'::regclass"
+            )
+            .await,
+            ["(2,true)"],
+            "two rows on k = 10 under a valid key"
+        );
+        let batch = d.seal().await;
+        d.drain(batch, "the duplicate").await;
+        d.settle().await;
+        let id = definition_id(&d, &target).await;
+        assert_eq!(
+            d.rows(&format!(
+                "select count(*)::text from {DEFAULT_SCHEMA}.join1_{id}_m \
+                 where k = 10 and not __tombstone"
+            ))
+            .await,
+            ["(2)"],
+            "{kind:?}: the duplicate was captured and applied"
+        );
+        pass(&mut d).await;
+        assert_eq!(
+            status(&d, &target).await,
+            "live",
+            "{kind:?}: nothing paused"
+        );
+        let on_key = format!(
+            "select count(*)::text from {target} t join public.a a on a.id = t.id where a.k = 10"
+        );
+        let in_target = d.rows(&on_key).await;
+        let in_join = d
+            .rows(
+                "select count(*)::text from public.a a join public.b b on a.k = b.k where a.k = 10",
+            )
+            .await;
+        let a_rows = d
+            .rows("select count(*)::text from public.a where k = 10")
+            .await;
+        assert_eq!(in_target, a_rows, "{kind:?}: one target row per a row");
+        assert_ne!(in_target, in_join, "{kind:?}: the join gives one per pair");
+        let diverging = trellis::staging::one_to_one_join_diverging_keys(d.pool(), &target)
+            .await
+            .expect("self_check");
+        assert!(!diverging.is_empty(), "{kind:?}: self_check reports it");
+        let report = trellis(&d)
+            .await
+            .self_check_to_end(
+                &target,
+                trellis::SelfCheckMode::Strict,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .expect("self_check");
+        assert!(
+            matches!(report.outcome, trellis::SelfCheckOutcome::Diverged(_)),
+            "{kind:?}: {:?}",
+            report.outcome
+        );
+
+        step(&mut d, "delete from public.b where bid = 4").await;
+        trellis(&d)
+            .await
+            .apply(&format!("PAUSE TRANSFORM {}", kind.name()))
+            .await
+            .expect("pause");
+        resume(&d, kind.name()).await;
+        assert_exact(&mut d, kind, "the duplicate removed, PAUSE and RESUME").await;
     }
 }
