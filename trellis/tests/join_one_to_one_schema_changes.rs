@@ -1061,3 +1061,187 @@ async fn a_widened_key_of_an_aggregate_a_side_keeps_its_null_keyed_rows() {
         assert_eq!(d.rows(actual).await, d.rows(&oracle).await, "{kind:?}");
     }
 }
+
+// ------------------------------------------------- `b`'s unique key (#1536)
+
+/// Asserts `target` is paused because `public.b` has no unique key on `k`,
+/// its `ON` column, with the remedy.
+async fn assert_paused_for_lost_key(d: &Driver, target: &str) {
+    let error = paused_for(d, target, "public.b", &["k"]).await;
+    assert!(
+        error.starts_with("the unique key on the ON columns of public.b (k) is gone")
+            && error.contains("resume the definition to rebuild it"),
+        "{target}: {error}"
+    );
+}
+
+/// Asserts a `RESUME` of `target` is refused because `public.b` has no
+/// unique key on `k`: define's refusal.
+async fn assert_resume_refused_for_lost_key(d: &Driver, target: &str) {
+    let bare = target.split_once('.').map_or(target, |(_, bare)| bare);
+    let refused = resume_refused(d, bare).await;
+    assert!(
+        refused.contains("a 1-1 JOIN needs the ON columns of 'public.b' (k) to be unique"),
+        "{refused}"
+    );
+    assert_eq!(status(d, target).await, "paused", "{target}");
+}
+
+/// Asserts `self_check` finds `kind`'s target converged.
+async fn assert_self_check_converged(d: &Driver, kind: Kind) {
+    use trellis::staging::self_check::CheckPageExt;
+    let report = trellis(d)
+        .await
+        .self_check_to_end(
+            &kind.target(),
+            trellis::SelfCheckMode::Strict,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("self_check {kind:?}: {e}"));
+    assert_eq!(
+        report.outcome,
+        trellis::SelfCheckOutcome::Converged,
+        "{kind:?}"
+    );
+}
+
+/// `b`'s only unique key dropped, with a duplicate on `k = 10` written and
+/// drained before the next pass: that pass pauses the transform, naming `b`
+/// and `k`. `RESUME` is refused while the key is gone. With the duplicate
+/// removed and the index created again, it rebuilds to the live join, and
+/// `self_check` finds it converged.
+#[tokio::test]
+async fn dropping_b_s_only_unique_key_pauses_the_transform_until_it_is_back() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        let target = kind.target();
+        pass(&mut d).await;
+        assert_eq!(status(&d, &target).await, "live", "{kind:?}");
+        write(&d, "drop index public.b_k_unique").await;
+        step(&mut d, "insert into public.b values (4, 10, 400, 'k4')").await;
+        pass(&mut d).await;
+        assert_paused_for_lost_key(&d, &target).await;
+        assert_resume_refused_for_lost_key(&d, &target).await;
+
+        write(
+            &d,
+            "delete from public.b where bid = 4; \
+             create unique index b_k_unique on public.b (k)",
+        )
+        .await;
+        resume(&d, kind.name()).await;
+        assert_exact(&mut d, kind, "the resume once the key is back").await;
+        assert_self_check_converged(&d, kind).await;
+        step(&mut d, "update public.b set img = 9 where bid = 1").await;
+        assert_exact(&mut d, kind, "a change after the resume").await;
+    }
+}
+
+/// A failed `CREATE UNIQUE INDEX CONCURRENTLY` (over a duplicate written
+/// while the old index was gone) leaves an `INVALID` index as `b`'s only
+/// unique key on `k`, which is no key: the pass pauses the transform, and a
+/// resume is refused until the duplicate is removed and the index rebuilt.
+#[tokio::test]
+async fn an_invalid_unique_index_as_the_only_key_pauses_the_transform() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        let target = kind.target();
+        write(&d, "drop index public.b_k_unique").await;
+        step(&mut d, "insert into public.b values (4, 10, 400, 'k4')").await;
+        d.user()
+            .await
+            .batch_execute("create unique index concurrently b_k_unique on public.b (k)")
+            .await
+            .expect_err("k = 10 is duplicated");
+        let valid = d
+            .rows(
+                "select indisvalid::text from pg_catalog.pg_index \
+                 where indexrelid = 'public.b_k_unique'::regclass",
+            )
+            .await;
+        assert_eq!(valid, ["(false)"], "the failed build left an INVALID index");
+        pass(&mut d).await;
+        assert_paused_for_lost_key(&d, &target).await;
+        assert_resume_refused_for_lost_key(&d, &target).await;
+
+        write(
+            &d,
+            "delete from public.b where bid = 4; reindex index public.b_k_unique",
+        )
+        .await;
+        resume(&d, kind.name()).await;
+        assert_exact(&mut d, kind, "the resume once the index is valid").await;
+        assert_self_check_converged(&d, kind).await;
+    }
+}
+
+/// Replacing `b`'s unique key the way that keeps one in place at every
+/// moment pauses nothing, with a pass between every two statements: a swap
+/// that creates the new index first (`CREATE UNIQUE INDEX CONCURRENTLY`,
+/// `DROP INDEX CONCURRENTLY` of the old, rename), a swap in one
+/// transaction, and the index promoted to a constraint
+/// (`ADD CONSTRAINT ... UNIQUE USING INDEX`). The target stays the live join.
+#[tokio::test]
+async fn swaps_that_keep_a_unique_key_in_place_pause_nothing() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        let target = kind.target();
+        for statement in [
+            "create unique index concurrently b_k_new on public.b (k)",
+            "drop index concurrently public.b_k_unique",
+            "alter index public.b_k_new rename to b_k_unique",
+            "begin; drop index public.b_k_unique; \
+             create unique index b_k_unique on public.b (k); commit",
+            "alter table public.b add constraint b_k_unique_c unique using index b_k_unique",
+        ] {
+            write(&d, statement).await;
+            pass(&mut d).await;
+            assert_eq!(
+                status(&d, &target).await,
+                "live",
+                "{kind:?} after {statement}"
+            );
+        }
+        let failures = d.rows("select error from capture_failures").await;
+        assert!(failures.is_empty(), "{kind:?}: {failures:?}");
+        step(&mut d, "update public.b set img = 9 where bid = 1").await;
+        assert_exact(&mut d, kind, "the swaps").await;
+    }
+}
+
+/// The pass skips the key's catalog query while `b`'s fingerprint is the one
+/// its last check found the key at, and a drop with no other change between
+/// two passes still changes the fingerprint: the next pass checks again and
+/// pauses the transform.
+#[tokio::test]
+async fn a_drop_between_two_passes_with_no_other_change_is_detected() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        let target = kind.target();
+        let id = definition_id(&d, &target).await;
+        let database: String = d
+            .ctl
+            .query_one("select current_database()::text", &[])
+            .await
+            .expect("the database")
+            .get(0);
+        let checks = || trellis::staging::unique_key_checks(&database, DEFAULT_SCHEMA, id);
+        pass(&mut d).await;
+        let checked = checks();
+        assert!(checked >= 1, "{kind:?}: the first pass checks the key");
+        pass(&mut d).await;
+        pass(&mut d).await;
+        assert_eq!(checks(), checked, "{kind:?}: skipped while b is unchanged");
+        assert_eq!(status(&d, &target).await, "live", "{kind:?}");
+
+        write(&d, "drop index public.b_k_unique").await;
+        pass(&mut d).await;
+        assert_eq!(checks(), checked + 1, "{kind:?}: the drop forces the check");
+        assert_paused_for_lost_key(&d, &target).await;
+    }
+}

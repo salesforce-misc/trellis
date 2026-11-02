@@ -369,6 +369,23 @@ pub(crate) async fn unique_keys_of(
     Ok(rows.into_iter().map(|row| row.get(0)).collect())
 }
 
+/// Whether `joined` (qualified), `def`'s joined table, has a unique key
+/// within its `ON` columns ([`unique_keys_of`], [`key_is_unique`]): the rule
+/// define and `RESUME` hold a 1-1 `JOIN` to ([`check_define`]), and that the
+/// staging worker's capture pass re-checks while it runs
+/// (`staging::schema_change::pause_joins_without_unique_key`). One catalog
+/// query. A table that doesn't exist has no key.
+pub(crate) async fn joined_key_is_unique(
+    client: &impl GenericClient,
+    def: &TransformDef,
+    joined: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    Ok(key_is_unique(
+        &unique_keys_of(client, joined).await?,
+        &joined_on_columns(def),
+    ))
+}
+
 /// The joined table's `ON` columns of `def`, in `ON` order.
 pub(crate) fn joined_on_columns(def: &TransformDef) -> Vec<String> {
     join_key(def, Side::Joined)
@@ -426,7 +443,7 @@ pub(crate) async fn check_define(
     joined: &str,
 ) -> Result<(), super::catalog::CatalogError> {
     let on = joined_on_columns(def);
-    if !key_is_unique(&unique_keys_of(client, joined).await?, &on) {
+    if !joined_key_is_unique(client, def, joined).await? {
         return Err(ValidationError::OneToOneJoinKeyNotUnique {
             table: joined.to_string(),
             columns: on,
@@ -652,6 +669,73 @@ pub(crate) mod tests {
         assert!(
             !key_is_unique(&[vec![]], &on(&["id"])),
             "an empty key is no key"
+        );
+    }
+
+    /// The key rule define, `RESUME` and the capture pass share, over the
+    /// catalog: which of `b`'s indexes make its `ON` columns unique. A
+    /// deferrable constraint, `NULLS NOT DISTINCT` and an `INCLUDE` column
+    /// keep a key; an `INVALID`, partial or expression index, part of a
+    /// composite key, and a table that doesn't exist don't.
+    #[tokio::test]
+    async fn the_key_rule_reads_which_indexes_make_the_on_columns_unique() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_empty_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create table public.b (bid int primary key, d int, n int, i int, v int, \
+                     p int, e int, c1 int, c2 int); \
+                 alter table public.b add constraint b_d unique (d) deferrable initially deferred; \
+                 create unique index b_n on public.b (n) nulls not distinct; \
+                 create unique index b_i on public.b (i) include (v); \
+                 create unique index b_p on public.b (p) where p is not null; \
+                 create unique index b_e on public.b ((e + 0)); \
+                 create unique index b_c on public.b (c1, c2); \
+                 insert into public.b (bid, n, v) values (1, 1, 1), (2, 2, 1)",
+            )
+            .await
+            .expect("create b");
+        client
+            .batch_execute("create unique index concurrently b_v on public.b (v)")
+            .await
+            .expect_err("v is duplicated, so the build leaves an INVALID index");
+        let joined = |on: &str| {
+            parse(&format!(
+                "TRANSFORM t FROM a LEFT JOIN b ON {on} SELECT a.id AS id"
+            ))
+            .unwrap_or_else(|e| panic!("{on}: {e:?}"))
+        };
+        for (on, unique) in [
+            ("a.k = b.bid", true),
+            ("a.k = b.d", true),
+            ("a.k = b.n", true),
+            ("a.k = b.i", true),
+            ("a.k = b.c1 AND a.j = b.c2", true),
+            ("a.k = b.v", false),
+            ("a.k = b.p", false),
+            ("a.k = b.e", false),
+            ("a.k = b.c1", false),
+        ] {
+            let def = joined(on);
+            assert_eq!(
+                joined_key_is_unique(&client, &def, "public.b")
+                    .await
+                    .expect("read the keys"),
+                unique,
+                "{on}"
+            );
+        }
+        assert!(
+            !joined_key_is_unique(&client, &joined("a.k = b.bid"), "public.nope")
+                .await
+                .expect("read the keys"),
+            "a table that doesn't exist has no key"
         );
     }
 

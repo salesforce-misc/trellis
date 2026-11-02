@@ -31,7 +31,10 @@
 //! ([`crate::staging::schema_change::pause_readers_of_unsupported`]), and
 //! leaves the table for the next pass. It does the same for a definition
 //! that reads a column capture can't image: a virtual generated column
-//! ([`crate::staging::schema_change::pause_readers_of_uncapturable`]). The
+//! ([`crate::staging::schema_change::pause_readers_of_uncapturable`]), and
+//! for a 1-1 `JOIN` whose joined table no longer has a unique key within its
+//! `ON` columns, by define's rule
+//! ([`crate::staging::schema_change::pause_joins_without_unique_key`]). The
 //! row-level security and subscription checks also run on
 //! each table another definition targets, which the pass doesn't capture
 //! (the target-mutation seam feeds it) but its readers still read. There the
@@ -322,6 +325,25 @@ pub async fn reconcile(
         match crate::staging::schema_change::pause_readers_of_uncapturable(
             client,
             &snapshot.catalog,
+            table,
+        )
+        .await
+        {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(err) => {
+                outcome.failed.push((table.clone(), err));
+                continue;
+            }
+        }
+        // A 1-1 `JOIN` whose joined table no longer has a unique key
+        // within its `ON` columns (an index dropped) pauses: the table can
+        // take two rows on one join key now, which the target can't hold.
+        match crate::staging::schema_change::pause_joins_without_unique_key(
+            client,
+            instance,
+            &snapshot.catalog,
+            &drift,
             table,
         )
         .await

@@ -161,6 +161,42 @@ With one, a recompute reads only its groups' rows: about 1.3 ms for a
 each recompute scans the source. Small groups don't need it. An index you
 create or drop changes speed only, never results.
 
+## Keep the indexes a definition relies on
+
+Some definitions need a key or an index on a source at define time. Keep it
+in place for as long as the definition runs. To replace one, create the new
+index first, then drop the old one, then rename the new one if you want its
+name:
+
+```sql
+CREATE UNIQUE INDEX CONCURRENTLY b_k_unique_new ON b (k);
+DROP INDEX CONCURRENTLY b_k_unique;
+ALTER INDEX b_k_unique_new RENAME TO b_k_unique;
+```
+
+A satisfying index then exists at every moment. For a unique index, that is
+also what keeps duplicates out of the table during the swap: between dropping
+the old one and the new one becoming valid, Postgres accepts them. Replacing
+it inside one transaction (`DROP INDEX`, then `CREATE UNIQUE INDEX`, then
+`COMMIT`) works too, but blocks writes to the table while the index builds.
+
+Each requirement, and what dropping it does
+([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)
+has the details):
+
+* **A source's primary key**, or the unique index standing in for one: the
+  transforms that read the source pause.
+* **The unique key on a 1-1 `JOIN`'s `b` `ON` columns:** the staging worker's
+  next reconcile pass pauses the transform, naming `b` and its `ON` columns,
+  whether or not a duplicate arrived. So does a swap that drops the old index
+  before it creates the new one, when a pass runs between the two, which is
+  likely on a large table or beside a long-running transaction. `RESUME`
+  refuses until the key is back, then rebuilds the target from the sources.
+* **The `self_check` source index** of an aggregate or a `JOIN`: nothing
+  pauses. `status()` lists a `source_index_gap`, and `self_check` refuses to
+  walk the definition (unless it was defined `WITHOUT SOURCE INDEX`) until the
+  index is back.
+
 ## Partition large sources
 
 This applies to an aggregate kept on the group basis and to a `JOIN` (see the

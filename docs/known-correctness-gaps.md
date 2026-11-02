@@ -30,8 +30,8 @@ wrong rows, on the targets it compares
 | [A column's values rewritten in place by `ALTER COLUMN TYPE`](#a-columns-values-rewritten-in-place-by-alter-column-type) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study) |
 | [A stored generated column's expression replaced by `SET EXPRESSION`](#a-stored-generated-columns-expression-replaced-by-set-expression) | `self_check` | [#1540](https://github.com/salesforce-misc/trellis/issues/1540) (study) |
 | [An enum label renamed and added again](#an-enum-label-renamed-and-added-again) | `self_check` | documented |
-| **Schema changes Trellis doesn't check yet** | | |
-| [`b`'s unique key dropped under a 1-1 `JOIN`](#bs-unique-key-dropped-under-a-1-1-join) | `self_check` | [#1536](https://github.com/salesforce-misc/trellis/issues/1536) (study done) |
+| **Writes past a unique key** | | |
+| [A duplicate in `b` past a deferrable key under `session_replication_role = replica`](#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica) | `self_check` | documented |
 | **Writes capture never sees** | | |
 | [Capture disrupted and restored between two passes](#capture-disrupted-and-restored-between-two-passes) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study), otherwise documented |
 | [An unlogged source emptied by a crash or failover](#an-unlogged-source-emptied-by-a-crash-or-failover) | `self_check` | documented |
@@ -75,9 +75,9 @@ while every rule holds.
   shapes [listed below](#a-columns-values-rewritten-in-place-by-alter-column-type),
   or by [`SET EXPRESSION` on a stored generated
   column](#a-stored-generated-columns-expression-replaced-by-set-expression).
-* **Keep a 1-1 `JOIN`'s `b` unique on its `ON` columns:** create a replacement
-  unique index before you drop the old one
-  ([below](#bs-unique-key-dropped-under-a-1-1-join)).
+* **Don't write a 1-1 `JOIN`'s `b` under `session_replication_role =
+  replica`** when its key on the `ON` columns is a deferrable constraint
+  ([below](#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica)).
 
 ## Schema changes Trellis can't tell from routine work
 
@@ -189,23 +189,26 @@ no error. Without the re-add, the label fails to cast and the key is held
 
 **Ends with:** documented.
 
-## Schema changes Trellis doesn't check yet
+## Writes past a unique key
 
-### `b`'s unique key dropped under a 1-1 `JOIN`
+### A duplicate in `b` past a deferrable key under `session_replication_role = replica`
 
-**When:** the unique key a 1-1 `JOIN`'s `b` `ON` columns rest on (its primary
-key, a unique constraint or a unique index) is dropped while the transform
-runs, and `b` then takes two rows on one join key:
+**When:** a 1-1 `JOIN`'s `b` `ON` columns rest on a `DEFERRABLE` unique
+constraint, and a role allowed to set `session_replication_role` (a
+superuser, or a role granted `SET` on it) inserts or updates a row of `b`
+under `replica`, putting a second row on one join key:
 
 ```sql
-DROP INDEX b_k_unique;
-INSERT INTO b (bid, k) VALUES (9, 10);  -- a second row on k = 10
-CREATE UNIQUE INDEX CONCURRENTLY b_k_unique ON b (k);  -- fails: k = 10 twice
+SET session_replication_role = replica;
+INSERT INTO b (bid, k) VALUES (9, 10);  -- a second row on k = 10; it commits
 ```
 
-Define checks the key, and `RESUME` refuses while it is gone, but nothing
-checks it while the transform runs: dropping an index fires no trigger and
-changes no column the reconcile pass compares.
+Postgres checks a deferrable unique constraint with a constraint trigger at
+commit, and under `replica` that trigger doesn't fire, so the duplicate
+commits and the index stays valid. A unique key that isn't deferrable
+rejects it as usual. The capture triggers are `ENABLE ALWAYS`, so they fire
+and the write is captured. The reconcile pass, which pauses the transform
+when `b`'s unique key is gone, finds it in place and pauses nothing.
 
 **What goes wrong:** each `a` row on that key joins the newest of the `b`
 rows on it, where the join gives one row per pair. The target stays keyed by
@@ -214,14 +217,10 @@ rows on it, where the join gives one row per pair. The target stays keyed by
 **Detected by:** `self_check`, which reports a join key with more than one
 live `b` entry.
 
-**Repair:** remove the duplicates, create the unique key again, then `PAUSE`
-and `RESUME` the transform.
+**Repair:** remove the duplicate, then `PAUSE` and `RESUME` the transform.
 
-**Ends with:** [#1536](https://github.com/salesforce-misc/trellis/issues/1536):
-the capture pass checks the key as define does and pauses the transform. Its
-false-positive study found no routine operation that trips it, only a swap
-that drops the old index before the new one exists, during which `b` really
-has no unique key.
+**Ends with:** documented. Only a role that may set `session_replication_role`
+can write it.
 
 ## Writes capture never sees
 
@@ -499,7 +498,9 @@ fixes and what it costs:
   a failing build): Trellis reports them, and the target stops short instead
   of going wrong ([operations](operations.md)).
 * **DML under `session_replication_role = replica`.** The capture triggers
-  are `ENABLE ALWAYS`, so they fire.
+  are `ENABLE ALWAYS`, so they fire. Postgres's deferred unique checks don't
+  fire under it, which lets a duplicate into a 1-1 `JOIN`'s `b`
+  ([above](#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica)).
 * **Session settings** (`DateStyle`, `TimeZone`, `extra_float_digits`, …).
   Trellis pins them on its connections and in its capture functions
   ([type support — Text rendering](type-support.md#text-rendering)).

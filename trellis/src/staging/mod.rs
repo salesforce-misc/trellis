@@ -116,6 +116,8 @@ pub use claim::{
 };
 #[cfg(any(test, feature = "internals"))]
 pub use drift_memo::checks as drift_checks;
+#[cfg(any(test, feature = "internals"))]
+pub use drift_memo::key_checks as unique_key_checks;
 pub use error::StagingError;
 pub use liveness::{
     DEFAULT_RECLAIM_TTL, HeartbeatDaemon, HeartbeatDaemonConfig, reclaim_stale, release_segments,

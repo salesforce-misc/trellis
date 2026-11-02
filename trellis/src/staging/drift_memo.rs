@@ -58,6 +58,10 @@
 //!   fingerprint; a repeat of an `xmin` needs a wraparound of the transaction
 //!   counter between two passes.
 //!
+//! The capture pass's re-check of a 1-1 `JOIN`'s unique key on its joined
+//! table skips the same way, on that table's fingerprint alone
+//! ([`key_skippable`]), in a memo of its own.
+//!
 //! Nothing resets the memo for correctness: every input of the comparison is
 //! in the stamp. It is dropped for a definition when its comparison finds a
 //! column drifted, when it is paused (its table is checked without it), and
@@ -124,6 +128,13 @@ impl Fingerprints {
             let _ = write!(stamp, "|{name}={}", self.relations.get(&name)?);
         }
         Some(stamp)
+    }
+
+    /// The [`fingerprint`] of `relation`, named as SQL resolves it
+    /// ([`crate::defs::ddl::regclass_arg`]), when an unpaused definition's
+    /// check reads it.
+    pub(crate) fn of(&self, relation: &str) -> Option<&str> {
+        self.relations.get(relation).map(String::as_str)
     }
 }
 
@@ -207,12 +218,52 @@ pub(crate) fn retain_readers(instance: &str, table: &str, ids: &[i64]) {
 /// Keeps only the entries of `instance` for the tables in `known`.
 pub(crate) fn retain_tables(instance: &str, known: &BTreeSet<&str>) {
     with_memo(|memo| memo.retain(|(i, t, _), _| i != instance || known.contains(t.as_str())));
+    with_keys(|memo| memo.retain(|(i, t, _), _| i != instance || known.contains(t.as_str())));
 }
 
 /// Forgets everything remembered for `instance`: its staging worker in this
 /// process stopped.
 pub(crate) fn forget_instance(instance: &str) {
     with_memo(|memo| memo.retain(|(i, _, _), _| i != instance));
+    with_keys(|memo| memo.retain(|(i, _, _), _| i != instance));
+}
+
+/// The same skip for the capture pass's re-check of a 1-1 `JOIN`'s unique
+/// key (`schema_change::pause_joins_without_unique_key`), which reads only
+/// the joined table's indexes: by capture instance, joined table and
+/// definition id, the stamp (the joined table's [`fingerprint`] and the
+/// `ON` columns) at which the last check found the key. A drop, a create or
+/// a validity change of any index writes a new `pg_index` row version, so
+/// it changes the fingerprint and forces the check.
+static KEYS: Mutex<Memo> = Mutex::new(BTreeMap::new());
+
+fn with_keys<T>(f: impl FnOnce(&mut Memo) -> T) -> T {
+    f(&mut KEYS.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// Whether `id`'s last key check of `table` found the key at `stamp`.
+pub(crate) fn key_skippable(instance: &str, table: &str, id: i64, stamp: &str) -> bool {
+    with_keys(|memo| {
+        memo.get(&(instance.to_string(), table.to_string(), id))
+            .is_some_and(|found| found == stamp)
+    })
+}
+
+/// Records the outcome of one key check of `id` on `table`: `Some` of the
+/// stamp (read before the check) when the key was there, `None` when it
+/// was gone.
+pub(crate) fn record_key(instance: &str, table: &str, id: i64, found: Option<String>) {
+    let key = (instance.to_string(), table.to_string(), id);
+    with_keys(|memo| match found {
+        Some(stamp) => {
+            memo.insert(key, stamp);
+        }
+        None => {
+            memo.remove(&key);
+        }
+    });
+    #[cfg(any(test, feature = "internals"))]
+    probe::count_key(instance, id);
 }
 
 /// How many times the capture pass has run the full comparison for a
@@ -241,6 +292,36 @@ mod probe {
             .copied()
             .unwrap_or(0)
     }
+
+    static KEY_CHECKS: Mutex<BTreeMap<(String, i64), u64>> = Mutex::new(BTreeMap::new());
+
+    pub(super) fn count_key(instance: &str, id: i64) {
+        *KEY_CHECKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry((instance.to_string(), id))
+            .or_default() += 1;
+    }
+
+    pub(super) fn get_key(instance: &str, id: i64) -> u64 {
+        KEY_CHECKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(instance.to_string(), id))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// The number of unique-key checks the capture pass has run for 1-1 `JOIN`
+/// `id` of the instance with schema `schema` in database `database`, for
+/// tests that pin the skip.
+#[cfg(any(test, feature = "internals"))]
+pub fn key_checks(database: &str, schema: &str, id: i64) -> u64 {
+    probe::get_key(
+        &crate::capture::reconcile::instance_key(database, schema),
+        id,
+    )
 }
 
 /// The number of full comparisons the capture pass has run for definition

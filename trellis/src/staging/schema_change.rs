@@ -36,7 +36,9 @@
 //! ([`pause_readers_of_missing`]), and readers of a column that is now a
 //! virtual generated column, which no write marks: its image fails an
 //! insert or a delete, and reads as `NULL` in an update
-//! ([`pause_readers_of_uncapturable`]).
+//! ([`pause_readers_of_uncapturable`]). It pauses a 1-1 `JOIN` whose joined
+//! table no longer has a unique key within the `ON` columns, which no write
+//! marks either ([`pause_joins_without_unique_key`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -515,6 +517,98 @@ fn virtual_column_error(table: &str, column: &str, expression: &str) -> String {
          STORED and resume the definition to rebuild it, or drop the definition and define it \
          again with the expression in place of the column",
         crate::defs::catalog::virtual_column_text(table, column, expression)
+    )
+}
+
+/// The staging worker's capture pass's re-check of the key every 1-1 `JOIN`
+/// rests on: pauses every 1-1 `JOIN` whose joined table is `table`, that
+/// isn't paused for a capture failure yet, and whose `ON` columns no longer
+/// contain a unique key of `table` by define's rule
+/// ([`crate::defs::join_one_to_one::joined_key_is_unique`]: the primary key, a
+/// unique constraint, or a valid, non-partial unique index on plain columns),
+/// recording why in `capture_failures`, with the `ON` columns. Returns
+/// whether it paused any, in which case the caller leaves the table for the
+/// next pass.
+///
+/// Define and `RESUME` refuse such a definition, but dropping an index fires
+/// no trigger and changes no column the other checks compare. While the key
+/// is gone `table` can take two rows on one join key, where the target holds
+/// one row of the pair and the join gives both. The pause comes whether or
+/// not a duplicate arrived: the pass reads only the catalog. A swap that
+/// drops the old index before the new one exists pauses when a pass lands
+/// between the two; one that creates the new index first never does. A
+/// resume re-validates the definition as define would, so it is refused
+/// until the key is back, and then rebuilds the target, `R` and `M`. Nothing
+/// is downstream of the definition: no transform may read a 1-1 `JOIN`'s
+/// target (`defs::join_one_to_one::reject_reader_of_target`).
+///
+/// One catalog query per such definition, skipped while `table`'s
+/// fingerprint (`drift`, read before any check) is the one its last check
+/// found the key at ([`drift_memo::key_skippable`]): the fingerprint covers
+/// every `pg_index` row's `xmin`, so a drop, a create or a validity change
+/// always forces the check. Reads neither `M` nor `table`'s rows. Runs on
+/// the captured tables only: a joined table that is another definition's
+/// target is keyed by its primary key, which only Trellis writes.
+/// `instance` is the capture pass's key for its database and schema.
+pub(crate) async fn pause_joins_without_unique_key(
+    client: &mut Client,
+    instance: &str,
+    catalog: &CaptureCatalog,
+    drift: &Fingerprints,
+    table: &str,
+) -> Result<bool, CaptureError> {
+    let fingerprint = drift.of(&crate::defs::ddl::regclass_arg(table));
+    let mut gone: Vec<(i64, Vec<String>)> = Vec::new();
+    for reader in catalog.definitions.iter().filter(|r| {
+        !r.capture_failed
+            && r.join.as_deref() == Some(table)
+            && crate::defs::join::is_one_to_one(&r.def)
+    }) {
+        let on = crate::defs::join_one_to_one::joined_on_columns(&reader.def);
+        let stamp = fingerprint.map(|f| format!("{f}|{on:?}"));
+        if stamp
+            .as_deref()
+            .is_some_and(|stamp| drift_memo::key_skippable(instance, table, reader.id, stamp))
+        {
+            continue;
+        }
+        let unique =
+            crate::defs::join_one_to_one::joined_key_is_unique(&*client, &reader.def, table)
+                .await?;
+        // The stamp was read before the check, so a change that committed
+        // since it was read is checked again next pass.
+        drift_memo::record_key(instance, table, reader.id, stamp.filter(|_| unique));
+        if !unique {
+            gone.push((reader.id, on));
+        }
+    }
+    if gone.is_empty() {
+        return Ok(false);
+    }
+    let txn = client.transaction().await?;
+    for (id, on) in &gone {
+        let error = unique_key_gone_error(table, on);
+        if crate::defs::lifecycle::pause_for_capture_failure(&txn, *id, table, on, &error, None)
+            .await?
+        {
+            crate::instance_log::warn!(transform_id = *id, table = %table, "definition paused: {error}");
+        }
+    }
+    txn.commit().await?;
+    Ok(true)
+}
+
+/// The `capture_failure` sentence for a 1-1 `JOIN` paused because `table`,
+/// its joined table, no longer has a unique key within its `ON` columns
+/// `on`.
+fn unique_key_gone_error(table: &str, on: &[String]) -> String {
+    format!(
+        "the unique key on the ON columns of {table} ({}) is gone: no primary key, unique \
+         constraint or valid non-partial unique index without expressions on {table} lies \
+         within them any more, so a row of the FROM table can match more than one row of it. \
+         Create the unique index again (remove any duplicates first), then resume the \
+         definition to rebuild it",
+        on.join(", ")
     )
 }
 

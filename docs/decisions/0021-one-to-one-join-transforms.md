@@ -44,9 +44,11 @@ scope.
 - **`b`'s `ON` columns are unique**: `b`'s primary key, a unique constraint,
   or the group key of an upstream aggregate or JOIN target. A non-unique `b`
   would give one row per pair, keyed by both sides, which is a different
-  target. `RESUME` refuses a `b` that has lost that uniqueness since define;
-  nothing checks it while the transform runs
-  ([known correctness gaps](../known-correctness-gaps.md#bs-unique-key-dropped-under-a-1-1-join)).
+  target. The staging worker's reconcile pass checks it by define's rule
+  while the transform runs and pauses the transform when the key is gone, and
+  `RESUME` refuses until it is back
+  ([known correctness gaps](../known-correctness-gaps.md#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica)
+  has the one duplicate it can't see).
 - **Fields** are any expression the 1-1 path admits, over `a`'s row and the
   matched `b` row, of any type a 1-1 field admits (floats and text included).
   A row is recomputed from its current inputs and never maintained by deltas,

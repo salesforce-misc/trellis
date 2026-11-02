@@ -630,6 +630,9 @@ them:
   - a key column retyped or re-collated so define would refuse it, or so the
     stored keys render differently; a `JOIN`'s `ON` columns no longer
     matching; a column Trellis created outgrown by a widening;
+  - a 1-1 `JOIN`'s `b` left with no unique key within its `ON` columns (an
+    index dropped, or left `INVALID` by a failed build), by the pass, which
+    checks it by define's rule;
   - a read column changed so define would refuse a definition reading it, so
     it would evaluate the column as another type, or so a `numeric` column
     Trellis created must be re-typed;
