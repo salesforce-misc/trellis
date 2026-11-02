@@ -2782,7 +2782,7 @@ impl BackgroundProcess {
 /// the first. While this binary's migrations are pending, it registers
 /// nothing (the registry may not have the columns yet).
 async fn handover_pass(process: &BackgroundProcess, drain: bool) -> Result<Verdict, StagingError> {
-    let mut client = process.pool.get().await?;
+    let mut client = process.pool.get().await.map_err(checkout_error)?;
     let pg: &mut tokio_postgres::Client = &mut client;
     let txn = pg.transaction().await?;
     txn.execute(
@@ -2809,6 +2809,20 @@ async fn handover_pass(process: &BackgroundProcess, drain: bool) -> Result<Verdi
     }
     txn.commit().await?;
     Ok(verdict)
+}
+
+/// A pool checkout's failure as the staging session's own connect reports it:
+/// a connection the server refused (no such database or role, a password it
+/// rejects) carries the server's error, its text and its SQLSTATE, where the
+/// pool's wrapper reads only "db error". A staging worker's start fails with
+/// this when its first [`handover_pass`] can't connect.
+fn checkout_error(err: crate::error::Error) -> StagingError {
+    match err {
+        crate::error::Error::Pool(deadpool_postgres::PoolError::Backend(err)) => {
+            StagingError::Db(err)
+        }
+        other => other.into(),
+    }
 }
 
 /// One [`handover_pass`] of a background process registered as `worker_id`
@@ -5133,6 +5147,29 @@ mod worker_upkeep_tests {
         )
         .expect("a drain-only process starts and retries");
         drain.shutdown().await.expect("shutdown");
+    }
+
+    /// A server that refuses the connection says why, and a staging worker's
+    /// failed start carries that, as the staging session's own connect did
+    /// before the handover pass came first.
+    #[tokio::test]
+    async fn a_staging_worker_start_names_the_servers_refusal() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let err = Client::start(
+            format!("{} dbname=trellis_no_such_database", db.dsn()),
+            ClientOptions {
+                staging_worker: true,
+                application_threads: 0,
+                ..ClientOptions::default()
+            },
+        )
+        .expect_err("no such database");
+        assert!(
+            err.to_string()
+                .contains(r#"database "trellis_no_such_database" does not exist"#),
+            "{err}"
+        );
     }
 
     /// A staging worker whose own `reclaim_ttl` is shorter than
