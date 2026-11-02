@@ -3480,23 +3480,7 @@ pub(crate) async fn truncate_groups(
     lsn: PgLsn,
 ) -> Result<(), ApplyError> {
     txn.batch_execute(&format!("truncate {hidden}")).await?;
-    raise_truncate_floor(txn, target, lsn).await
-}
-
-/// Raises the truncate floor `key` names to `lsn`: a staged side at or
-/// below it is refused ([`GroupTargetPlan::apply_sql`]).
-pub(super) async fn raise_truncate_floor(
-    txn: &Transaction<'_>,
-    key: &str,
-    lsn: PgLsn,
-) -> Result<(), ApplyError> {
-    txn.execute(
-        "insert into ledger_truncate_floor (target_table, floor) values ($1, $2) \
-         on conflict (target_table) do update \
-         set floor = greatest(ledger_truncate_floor.floor, excluded.floor)",
-        &[&key, &lsn],
-    )
-    .await?;
+    super::ledger::raise_truncate_floor(txn, target, lsn).await?;
     Ok(())
 }
 

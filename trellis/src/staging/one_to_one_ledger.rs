@@ -561,13 +561,7 @@ pub(crate) async fn raise_floor(
     ledger: &LedgerRef,
     lsn: PgLsn,
 ) -> Result<(), ApplyError> {
-    txn.execute(
-        "insert into ledger_truncate_floor (target_table, floor) values ($1, $2) \
-         on conflict (target_table) do update \
-         set floor = greatest(ledger_truncate_floor.floor, excluded.floor)",
-        &[&ledger.floor_key, &lsn],
-    )
-    .await?;
+    super::ledger::raise_truncate_floor(txn, &ledger.floor_key, lsn).await?;
     Ok(())
 }
 

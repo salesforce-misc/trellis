@@ -1445,7 +1445,7 @@ async fn clear(
         if let Some(lsn) = lsn {
             let hidden = side.plan.hidden();
             txn.batch_execute(&format!("delete from {hidden}")).await?;
-            group_basis::raise_truncate_floor(txn, hidden, lsn).await?;
+            super::ledger::raise_truncate_floor(txn, hidden, lsn).await?;
         }
     }
     if truncate.joined.is_some() {
