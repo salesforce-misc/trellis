@@ -129,6 +129,12 @@ pre-release is not a supported starting point.
 1. takes the predecessor's published CLI from its GitHub release and checks it
    against `SHA256SUMS` (`--build-old` builds the tag instead, which is also
    the fallback when the download fails), and builds the candidate's CLI;
+   the candidate reports the release version string exactly (`0.2.0`;
+   `--candidate-version` changes it, `none` keeps the tree's own), because
+   [version handover](decisions/0023-version-handover.md) compares the exact
+   string. The version is set in a scratch checkout (a directory candidate's
+   `HEAD` plus its uncommitted changes) and never committed; the release
+   process bumps the real version when the release is cut;
 2. builds `upgrade-battery/check`, a small probe over the `trellis` library
    for the two calls the CLI lacks (`self_check` and `dump_definitions_sql`),
    once against the tag and once against the candidate;
@@ -162,7 +168,7 @@ running for a manual step.
 | `pgrestore` | A `pg_dump` and `pg_restore` of the old database opens under the candidate, pauses every definition with the documented reason ([operations — runbooks](operations.md#runbooks)), and `RESUME` brings each back to `live` with a clean `self_check`. | Script |
 | `basebackup` | A `pg_basebackup` taken while the old build and its writers ran starts as a cluster, and the candidate converges it with no pause and no `RESUME`. | Script |
 | `clients` | The Ruby gem and the Elixir package built from the candidate open a database the predecessor's clients used, with the same options. | Manual |
-| `mixed` | The candidate started while an old instance runs on the database stands by ([version handover](decisions/0023-version-handover.md)): it stays up, says it is standing by naming the old version, runs no migration, and pauses nothing, while the old instance's writes keep converging. Once the old instance stops, the candidate takes over: it migrates, and the writes made since converge with a clean `self_check`. | Script |
+| `mixed` | The candidate started while an old instance runs on the database stands by ([version handover](decisions/0023-version-handover.md)): it stays up, says it is standing by naming its own version (the one it was built as) and the old build as a release with no registered version, runs no migration, and pauses nothing, while the old instance's writes keep converging. Once the old instance stops, the candidate takes over: it migrates, its `worker_registry` row carries that version, and the writes made since converge with a clean `self_check`. | Script |
 | `downgrade` | What the old build does when pointed at a database the candidate has written. | Script, observed |
 
 ### The manual steps, and what the script expects

@@ -21,9 +21,14 @@
 #   downgrade     8. v0.1.0 pointed at a database the candidate wrote
 #
 # Options:
-#   --candidate REV|DIR   the release candidate: a directory (built in place) or a
-#                         git revision (built in a scratch worktree). Default: the
-#                         checkout this script is in.
+#   --candidate REV|DIR   the release candidate: a directory or a git revision.
+#                         Default: the checkout this script is in.
+#   --candidate-version V the version string the candidate is built as (default
+#                         0.2.0, the release version: a candidate must report
+#                         exactly it, since version handover compares the exact
+#                         string). It is set in a scratch checkout, never in the
+#                         tree under test, and nothing is committed. `none`
+#                         builds the tree with the version it carries.
 #   --candidate-bin PATH  use this CLI binary; the candidate's source is still
 #                         needed (--candidate) for the library probe
 #   --old-tag TAG         the released version to start from (default v0.1.0)
@@ -36,6 +41,11 @@
 #   --work DIR            scratch directory (default <repo>/target/upgrade-battery)
 #   --keep                keep clusters running and files in place on exit
 #   -h, --help            this text
+#
+# A revision is built in a scratch worktree. A directory is built in place only
+# with --candidate-version none; otherwise it is rebuilt in a scratch worktree
+# of its HEAD with the directory's uncommitted and untracked changes copied in.
+# --candidate-bin is used as it is: its own version is the candidate's.
 #
 # Needs: git, cargo, curl or gh (to download the release), PostgreSQL 15+
 # server binaries (initdb, pg_ctl, psql, pg_dump, pg_restore, pg_basebackup).
@@ -53,6 +63,7 @@ old_bin=""
 build_old=0
 candidate="$repo"
 candidate_bin=""
+cand_ver_req=0.2.0
 pg_bin="${PGBIN:-}"
 port=54920
 work="$repo/target/upgrade-battery"
@@ -66,6 +77,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --candidate) candidate="${2:?--candidate needs a revision or directory}"; shift 2 ;;
     --candidate-bin) candidate_bin="${2:?}"; shift 2 ;;
+    --candidate-version) cand_ver_req="${2:?--candidate-version needs a version or none}"; shift 2 ;;
     --old-tag) old_tag="${2:?}"; shift 2 ;;
     --old-bin) old_bin="${2:?}"; shift 2 ;;
     --build-old) build_old=1; shift ;;
@@ -78,6 +90,8 @@ while [ $# -gt 0 ]; do
     *) steps+=("$1"); shift ;;
   esac
 done
+[ "$cand_ver_req" = none ] || [[ "$cand_ver_req" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] ||
+  die "--candidate-version $cand_ver_req is not a version (want e.g. 0.2.0, or none)"
 all_steps="migrations definitions grammar inflight structure pgrestore basebackup clients mixed downgrade"
 [ ${#steps[@]} -gt 0 ] || read -r -a steps <<< "$all_steps"
 for s in "${steps[@]}"; do
@@ -265,7 +279,7 @@ fi
 # killed run left behind is moved to <rev>, so a re-run never tests a stale tree.
 checkout_at() {
   if [ -f "$1/.git" ]; then
-    git -C "$1" checkout -q --force --detach "$2"
+    git -C "$1" checkout -q --force --detach "$2" && git -C "$1" clean -fdq
   else
     rm -rf "$1"; git -C "$repo" worktree prune
     git -C "$repo" worktree add -q --detach "$1" "$2"
@@ -292,25 +306,62 @@ echo "old: $old_bin ($old_version)"
 
 # ---------------------------------------------------------------- the candidate
 say "building the candidate"
-if [ -d "$candidate" ]; then
+# The version handover compares the exact version string, so a candidate is
+# built reporting the release version, set in a scratch checkout: the tree under
+# test is never touched and nothing is committed.
+override_version=""
+if [ "$cand_ver_req" != none ] && [ -z "$candidate_bin" ]; then override_version=$cand_ver_req; fi
+cand_dirty=""
+if [ -d "$candidate" ] && [ -z "$override_version" ]; then
   cand_src=$(cd "$candidate" && pwd)
   cand_target="$cand_src/target"
+elif [ -d "$candidate" ]; then
+  dir_src=$(cd "$candidate" && pwd)
+  cand_src="$work/cand-src"
+  cand_head=$(git -C "$dir_src" rev-parse HEAD) || die "$dir_src is not a git checkout"
+  checkout_at "$cand_src" "$cand_head" || die "cannot check out $cand_head of $dir_src (the candidate directory must be a worktree of $repo)"
+  extra_worktrees+=("$cand_src")
+  git -C "$dir_src" diff --binary HEAD >"$work/cand-uncommitted.patch"
+  [ ! -s "$work/cand-uncommitted.patch" ] || git -C "$cand_src" apply --whitespace=nowarn "$work/cand-uncommitted.patch" ||
+    die "cannot copy the uncommitted changes of $dir_src"
+  git -C "$dir_src" ls-files -z --others --exclude-standard >"$work/cand-untracked.list"
+  [ ! -s "$work/cand-untracked.list" ] || tar --null -T "$work/cand-untracked.list" -C "$dir_src" -cf - | tar -xf - -C "$cand_src"
+  [ -z "$(git -C "$dir_src" status --porcelain 2>/dev/null)" ] || cand_dirty="+uncommitted changes"
+  cand_target="$work/cand-target"
 else
   cand_src="$work/cand-src"
   checkout_at "$cand_src" "$candidate" || die "cannot check out the candidate $candidate"
   extra_worktrees+=("$cand_src")
   cand_target="$work/cand-target"
 fi
-cand_rev=$(git -C "$cand_src" rev-parse --short HEAD 2>/dev/null || echo unknown)
-cand_dirty=""
-[ -z "$(git -C "$cand_src" status --porcelain 2>/dev/null)" ] || cand_dirty="+uncommitted changes"
+cand_rev=$(git -C "${dir_src:-$cand_src}" rev-parse --short HEAD 2>/dev/null || echo unknown)
+[ -n "${dir_src:-}" ] || [ -z "$(git -C "$cand_src" status --porcelain 2>/dev/null)" ] || cand_dirty="+uncommitted changes"
+if [ -n "$override_version" ]; then
+  # The crates the CLI and the library read their version from, and the
+  # lockfile entries for them (the build is --locked).
+  for f in cli/Cargo.toml trellis/Cargo.toml; do
+    V="$override_version" perl -0pi -e 's/^version = "[^"]*"$/version = "$ENV{V}"/m' "$cand_src/$f"
+  done
+  (cd "$cand_src" && cargo update --workspace --offline --quiet) >"$logs/set-version.log" 2>&1 ||
+    die "setting the candidate's version in the scratch checkout failed (see $logs/set-version.log)"
+  for c in trellis-cli trellis; do
+    got=$(cd "$cand_src" && cargo pkgid -p "$c" --offline | sed 's/.*[#@]//')
+    [ "$got" = "$override_version" ] || die "the scratch checkout's $c is version $got, not $override_version"
+  done
+fi
 if [ -z "$candidate_bin" ]; then
   (cd "$cand_src" && CARGO_TARGET_DIR="$cand_target" cargo build --release -p trellis-cli --locked) >"$logs/build-candidate.log" 2>&1 ||
     die "building the candidate failed (see $logs/build-candidate.log)"
   candidate_bin="$cand_target/release/trellis"
 fi
 cand_version=$("$candidate_bin" --version)
-echo "candidate: $candidate_bin ($cand_version) at $cand_rev$cand_dirty"
+cand_ver=${cand_version#trellis }
+[ -z "$override_version" ] || [ "$cand_ver" = "$override_version" ] ||
+  die "the candidate binary reports version '$cand_ver', not $override_version"
+if [ -n "$override_version" ]; then cand_built="built as version $override_version, set in a scratch checkout, never committed"
+elif [ "$cand_ver_req" != none ]; then cand_built="a prebuilt binary: version $cand_ver as it is (--candidate-version applies to builds)"
+else cand_built="built with the version the tree carries"; fi
+echo "candidate: $candidate_bin ($cand_version) at $cand_rev$cand_dirty, $cand_built"
 
 # build_probe <name> <source tree>: the library probe against that tree.
 build_probe() {
@@ -785,6 +836,19 @@ if want mixed; then
   else
     record FAIL mixed "the candidate did not stand by beside a live $old_tag instance ($workers workers registered, $paused_n paused, candidate process $(run_alive new-mixed && echo running || echo exited), history $( [ "$(history "$port" mixed)" = "$pre_mixed_history" ] && echo unchanged || echo changed), log: $(tr '\n' ' ' <"$logs/run-new-mixed.log" | cut -c1-300))"
   fi
+  # The message must name the candidate's exact version and the old build as a
+  # release with no registered version, so the step cannot pass on a mismatch of
+  # some other kind (a candidate built with the old version string, say).
+  case "$old_tag" in
+    v0.1.*)
+      if grep -qF "this binary is version $cand_ver;" "$logs/run-new-mixed.log" &&
+         grep -qF 'at a release before 0.2.0' "$logs/run-new-mixed.log"; then
+        record PASS mixed "the standby message names this binary's version $cand_ver and $old_tag as a release before 0.2.0 (it registers no version)"
+      else
+        record FAIL mixed "the standby message does not name 'this binary is version $cand_ver;' and 'at a release before 0.2.0': $(head -c 300 "$logs/run-new-mixed.log" | tr '\n' ' ')"
+      fi ;;
+    *) record INFO mixed "$old_tag may register a version, so the standby message's version names were not asserted" ;;
+  esac
   # The old instance keeps the pipeline: the writes made now converge under it.
   sql "$port" mixed -c "insert into m select g, g % 5 from generate_series(201,400) g"
   # Stopping the old instance hands over: the candidate migrates and takes over.
@@ -797,6 +861,10 @@ if want mixed; then
   done
   if [ "$taken" -eq 1 ] && run_alive new-mixed; then
     record PASS mixed "once $old_tag stopped, the candidate migrated and took over"
+    reg=$(scalar "$port" mixed "select count(*) from trellis.worker_registry where version = '$cand_ver' and last_seen > now() - interval '30 seconds'")
+    [ "$reg" -ge 1 ] &&
+      record PASS mixed "the candidate's live worker_registry row carries version $cand_ver" ||
+      record FAIL mixed "no live worker_registry row carries version $cand_ver (versions: $(scalar "$port" mixed "select coalesce(string_agg(distinct coalesce(version, 'none'), ','), '') from trellis.worker_registry where last_seen > now() - interval '30 seconds'"))"
   else
     record FAIL mixed "the candidate did not take over within 60 s of $old_tag stopping (process $(run_alive new-mixed && echo running || echo exited), log: $(tail -c 300 "$logs/run-new-mixed.log" | tr '\n' ' '))"
   fi
@@ -829,7 +897,7 @@ fi
 stop_run new-shapes 2>/dev/null || true; stop_run new-inflight 2>/dev/null || true
 say "summary"
 echo "old:        $old_version ($old_bin)"
-echo "candidate:  $cand_version at $cand_rev$cand_dirty"
+echo "candidate:  $cand_version at $cand_rev$cand_dirty ($cand_built)"
 echo "postgres:   $("$pg_bin/postgres" --version 2>/dev/null || echo "server_version_num $pg_major")"
 est_rows=$((seed_rows + writer_iters * 80))
 echo "rows written (estimate, for the logbook): $est_rows ($seed_rows seeded, $writer_iters writer iterations of about 80)"
