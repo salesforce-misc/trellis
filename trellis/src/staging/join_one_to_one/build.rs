@@ -48,8 +48,8 @@ use crate::pool::quote_ident;
 use super::super::apply::ApplyError;
 use super::super::target_mutations::TargetMutations;
 use super::{
-    JoinOneToOnePlan, JoinShape, KeyText, Record, apply_page, fold, key_of, key_set, lock_keys,
-    lock_side, rederive_read, update_side, write_target,
+    Entries, JoinOneToOnePlan, JoinShape, KeyText, Record, apply_page, fold, key_of, key_set,
+    lock_keys, lock_side, rederive_read, update_side, write_target,
 };
 
 /// What one build chunk did.
@@ -407,8 +407,14 @@ pub(crate) async fn run_chunk(
         .collect();
     written_keys.sort_unstable();
     written_keys.dedup();
-    let (written, deleted) =
-        write_target(txn, shape, &written_keys, &mut TargetMutations::new()).await?;
+    let (written, deleted) = write_target(
+        txn,
+        shape,
+        &written_keys,
+        Entries::Changed,
+        &mut TargetMutations::new(),
+    )
+    .await?;
     Ok(ChunkOutcome {
         keys: records.len(),
         written,

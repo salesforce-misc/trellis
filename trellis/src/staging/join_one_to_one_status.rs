@@ -34,9 +34,9 @@
 //! holding one group just over the threshold can go unreported until the group
 //! grows.
 //!
-//! The threshold is the default of a knob ([`FAN_OUT_WARNING_ENV`]) whose value
-//! belongs to the benchmark of the SQL fan-out (#1404, milestone 9), which sets
-//! it from the cost per row there.
+//! The threshold is the default of a knob ([`FAN_OUT_WARNING_ENV`]),
+//! [`DEFAULT_FAN_OUT_WARNING_ROWS`], set from the cost per row of a fan-out
+//! that the benchmark (`one-to-one-join-fan-out`) measures.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -58,9 +58,11 @@ use crate::pool::quote_ident;
 pub const FAN_OUT_WARNING_ENV: &str = "TRELLIS_ONE_TO_ONE_JOIN_FAN_OUT_WARNING";
 
 /// The fan-out warning threshold when [`FAN_OUT_WARNING_ENV`] isn't set (or
-/// isn't a positive number): a placeholder until milestone 9's benchmark of the
-/// SQL fan-out sets it (#1404). ADR-0021 names 100k.
-pub const DEFAULT_FAN_OUT_WARNING_ROWS: i64 = 100_000;
+/// isn't a positive number): the rows of a join key whose `b` change stalls
+/// that key's `a` writers for about a second. `bench one-to-one-join-fan-out`
+/// measures a fan-out at about 4 µs per row (0.37 s at 100k rows, 4.2 s at a
+/// million), whatever the size of `R`. ADR-0021 names 250k.
+pub const DEFAULT_FAN_OUT_WARNING_ROWS: i64 = 250_000;
 
 /// 0: not read yet; otherwise the threshold.
 static FAN_OUT_WARNING_ROWS: AtomicI64 = AtomicI64::new(0);

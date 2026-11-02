@@ -1641,10 +1641,10 @@ async fn write_a_changes(
 ) -> Result<(usize, usize), ApplyError> {
     let shape = &*plan.shape;
     if !plan.holds_a || keys.is_empty() {
-        return write_target(txn, shape, keys, mutations).await;
+        return write_target(txn, shape, keys, Entries::Changed, mutations).await;
     }
     txn.batch_execute("savepoint join1_a_write").await?;
-    match write_target(txn, shape, keys, mutations).await {
+    match write_target(txn, shape, keys, Entries::Changed, mutations).await {
         Ok(counts) => {
             txn.batch_execute("release savepoint join1_a_write").await?;
             Ok(counts)
@@ -1778,7 +1778,7 @@ async fn fan_out(
     txn.batch_execute("savepoint join1_fan_out").await?;
     let (mut written, mut deleted) = (0, 0);
     for batch in entries.chunks(WRITE_BATCH) {
-        match write_target(txn, shape, batch, mutations).await {
+        match write_target(txn, shape, batch, Entries::FanOut, mutations).await {
             Ok((w, d)) => {
                 written += w;
                 deleted += d;
@@ -1819,6 +1819,10 @@ async fn fan_out_failure(
     entries: &[&str],
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize, Vec<held::HeldRow>), ApplyError> {
+    let written_entries = match side {
+        Side::From => Entries::Changed,
+        Side::Joined => Entries::FanOut,
+    };
     let mut failing: Vec<(&str, String, Option<String>)> = Vec::new();
     let (mut written, mut deleted) = (0, 0);
     let mut probes = 0;
@@ -1830,7 +1834,7 @@ async fn fan_out_failure(
         }
         probes += 1;
         txn.batch_execute("savepoint join1_fan_out_probe").await?;
-        match write_target(txn, shape, &entries[lo..hi], mutations).await {
+        match write_target(txn, shape, &entries[lo..hi], written_entries, mutations).await {
             Ok((w, d)) => {
                 written += w;
                 deleted += d;
@@ -1949,15 +1953,37 @@ async fn failing_fields(
     Ok(failing)
 }
 
+/// Which `R` entries a [`write_target`] writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Entries {
+    /// Entries a page or a build changed, of rows that may be gone.
+    Changed,
+    /// A batch of a fan-out ([`fan_out`]): live entries on the keys of the
+    /// page's `b` changes, read under those keys' `J` locks.
+    FanOut,
+}
+
+impl Entries {
+    /// Whether some of these entries may have no target row, for
+    /// [`write_target`] to look for one to delete. A fan-out's entries are
+    /// live, so under a `LEFT` join each has its target row; under an `INNER`
+    /// join an entry has one only while a live `M` entry is on its key, and a
+    /// fan-out of a `b` delete is what removes them.
+    fn may_delete(self, shape: &JoinShape) -> bool {
+        self == Entries::Changed || !shape.left
+    }
+}
+
 /// Writes the target rows of `keys` (`R` entries a page changed, or a batch
-/// of its fan-out): each live one with a target row is upserted from `R` and
-/// the newest live `M` entry on its key, and the rest are deleted. The fields are rendered SQL. The
-/// upsert takes its rows sorted by primary key. Returns how many rows it
-/// wrote and deleted.
+/// of its fan-out; `entries` says which): each live one with a target row is
+/// upserted from `R` and the newest live `M` entry on its key, and the rest
+/// are deleted. The fields are rendered SQL. The upsert takes its rows sorted
+/// by primary key. Returns how many rows it wrote and deleted.
 async fn write_target(
     txn: &Transaction<'_>,
     shape: &JoinShape,
     keys: &[&str],
+    entries: Entries,
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
     if keys.is_empty() {
@@ -1977,8 +2003,6 @@ async fn write_target(
     }
     let arity = shape.pk.len();
     let target = ddl::qualified_target_table_ident(&shape.target);
-    let pk_cols: Vec<String> = shape.pk.iter().map(|c| quote_ident(&c.name)).collect();
-    let field_cols: Vec<String> = shape.fields.iter().map(|(n, _)| quote_ident(n)).collect();
     // A key with a `NULL` part is a row of an `a` that is keyed by a nullable
     // unique index (an aggregate's target), held `unique nulls not distinct`:
     // the insert's conflict target finds it, and the delete matches it by its
@@ -1995,7 +2019,7 @@ async fn write_target(
     let mut deleted = Vec::new();
     // Rows that have no target row: delete them. The key text compares only
     // for rows the index finds by primary key.
-    {
+    if entries.may_delete(shape) {
         let key_expr = ddl::pk_key_sql_expr(&shape.pk, Some("t"));
         let unbacked = format!(
             "not exists (select 1 from {r} r where r.{key} = ({key_expr}) collate \"C\" and {has})",
@@ -2040,53 +2064,77 @@ async fn write_target(
     }
 
     let mut written = 0;
-    {
-        let on_conflict = on_conflict_sql(&target, &pk_cols, &field_cols);
-        let select_cols: Vec<String> = shape
-            .pk
-            .iter()
-            .enumerate()
-            .map(|(j, c)| format!("v.__p{j}::{}", c.data_type))
-            .chain(shape.fields.iter().map(|(_, sql)| sql.clone()))
-            .collect();
-        let unnest_args: Vec<String> = (1..=arity + 1).map(|j| format!("${j}::text[]")).collect();
-        let unnest_cols: Vec<String> = (0..arity)
-            .map(|j| format!("__p{j}"))
-            .chain(std::iter::once("__key".to_string()))
-            .collect();
-        let ordinals: Vec<String> = (1..=arity).map(|i| i.to_string()).collect();
-        let col_list: Vec<String> = pk_cols.iter().chain(field_cols.iter()).cloned().collect();
-        let returning = ddl::pk_key_sql_expr(&shape.pk, None);
-        let from = format!(
-            "unnest({}) as v({}) join {r} r on r.{key} = v.__key and {has}",
-            unnest_args.join(", "),
-            unnest_cols.join(", "),
-            r = shape.r.ident,
-            key = quote_ident(schema::KEY_COLUMN),
-            has = shape.has_target_row_sql(),
-        );
-        let sql = format!(
-            "insert into {target} ({cols}) select {select} from {joined} \
-             order by {ordinals} {on_conflict} returning {returning} as pk",
-            cols = col_list.join(", "),
-            select = select_cols.join(", "),
-            joined = shape.joined_sql(&from),
-            ordinals = ordinals.join(", "),
-        );
-        for start in (0..keys.len()).step_by(WRITE_BATCH) {
-            let end = (start + WRITE_BATCH).min(keys.len());
-            let mut columns = transpose(arity, &decoded[start..end]);
-            columns.push(
-                keys[start..end]
-                    .iter()
-                    .map(|k| Some(k.to_string()))
-                    .collect(),
-            );
-            let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
-            written += txn.query(&sql, &params).await?.len();
-        }
+    let sql = upsert_sql(shape);
+    for start in (0..keys.len()).step_by(WRITE_BATCH) {
+        let end = (start + WRITE_BATCH).min(keys.len());
+        let columns = upsert_params(arity, &decoded[start..end], &keys[start..end]);
+        let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
+        // The command's row count is the rows the upsert inserted or updated,
+        // as `returning` would list them.
+        written += txn.execute(&sql, &params).await? as usize;
     }
     Ok((written, deleted.len()))
+}
+
+/// [`write_target`]'s upsert of a batch of `R` entries: parameters `$1..` are
+/// the target primary key's parts (one text array each) and the last is the
+/// entries' keys ([`upsert_params`]).
+///
+/// The batch drives the statement: each entry's `R` row is a probe of `R`'s
+/// primary key, in a `LATERAL` subquery that `offset 0` keeps from being
+/// pulled up into a join the planner may reorder. As a plain join, the
+/// planner costs thousands of probes above one pass over `R` and hashes all
+/// of `R` (#1580), once per batch: a fan-out then costs in proportion to
+/// `R`'s size, not its own.
+fn upsert_sql(shape: &JoinShape) -> String {
+    let arity = shape.pk.len();
+    let target = ddl::qualified_target_table_ident(&shape.target);
+    let pk_cols: Vec<String> = shape.pk.iter().map(|c| quote_ident(&c.name)).collect();
+    let field_cols: Vec<String> = shape.fields.iter().map(|(n, _)| quote_ident(n)).collect();
+    let on_conflict = on_conflict_sql(&target, &pk_cols, &field_cols);
+    let select_cols: Vec<String> = shape
+        .pk
+        .iter()
+        .enumerate()
+        .map(|(j, c)| format!("v.__p{j}::{}", c.data_type))
+        .chain(shape.fields.iter().map(|(_, sql)| sql.clone()))
+        .collect();
+    let unnest_args: Vec<String> = (1..=arity + 1).map(|j| format!("${j}::text[]")).collect();
+    let unnest_cols: Vec<String> = (0..arity)
+        .map(|j| format!("__p{j}"))
+        .chain(std::iter::once("__key".to_string()))
+        .collect();
+    let ordinals: Vec<String> = (1..=arity).map(|i| i.to_string()).collect();
+    let col_list: Vec<String> = pk_cols.iter().chain(field_cols.iter()).cloned().collect();
+    let from = format!(
+        "unnest({}) as v({}) cross join lateral \
+         (select r.* from {r} r where r.{key} = v.__key and {has} offset 0) r",
+        unnest_args.join(", "),
+        unnest_cols.join(", "),
+        r = shape.r.ident,
+        key = quote_ident(schema::KEY_COLUMN),
+        has = shape.has_target_row_sql(),
+    );
+    format!(
+        "insert into {target} ({cols}) select {select} from {joined} \
+         order by {ordinals} {on_conflict}",
+        cols = col_list.join(", "),
+        select = select_cols.join(", "),
+        joined = shape.joined_sql(&from),
+        ordinals = ordinals.join(", "),
+    )
+}
+
+/// [`upsert_sql`]'s parameters for the entries `keys`, whose primary keys'
+/// parts are `decoded`.
+fn upsert_params(
+    arity: usize,
+    decoded: &[Vec<Option<String>>],
+    keys: &[&str],
+) -> Vec<Vec<Option<String>>> {
+    let mut columns = transpose(arity, decoded);
+    columns.push(keys.iter().map(|k| Some(k.to_string())).collect());
+    columns
 }
 
 /// `rows` (each `arity` parts, a `NULL` one `None`) as one array per part.
@@ -2129,20 +2177,8 @@ fn on_conflict_sql(target: &str, pk_cols: &[String], field_cols: &[String]) -> S
 /// [`super::self_check_join_one_to_one`]'s.
 #[cfg(any(test, feature = "internals"))]
 pub async fn diverging_keys(pool: &Pool, target_table: &str) -> Result<Vec<String>, ApplyError> {
-    let definition = crate::defs::catalog::definition_by_target(pool, target_table)
-        .await?
-        .ok_or_else(|| ApplyError::TransformNotFound {
-            transform: target_table.to_string(),
-        })?;
-    if !spec::is_one_to_one(&definition.def) {
-        return Err(ApplyError::GroupBasisUnsupported {
-            target: target_table.to_string(),
-            what: "a self_check that is not of a 1-1 JOIN",
-        });
-    }
-    let pk = ddl::source_primary_key(pool, &definition.source_table).await?;
-    let paused = super::quarantine::paused_columns_for(pool, &definition.def).await?;
-    let shape = JoinShape::load(pool, &definition, pk, &paused).await?;
+    let (definition, shape) =
+        shape_of(pool, target_table, "a self_check that is not of a 1-1 JOIN").await?;
     let client = pool.get().await?;
     let target_types =
         super::one_to_one_render::image_columns(&**client, &definition.target_table).await?;
@@ -2219,4 +2255,61 @@ pub async fn diverging_keys(pool: &Pool, target_table: &str) -> Result<Vec<Strin
         .into_iter()
         .map(|row| row.get(0))
         .collect())
+}
+
+/// The definition of the 1-1 `JOIN` `target_table` and its shape, for the
+/// test helpers; `what` is the refusal of a target of another kind.
+#[cfg(any(test, feature = "internals"))]
+async fn shape_of(
+    pool: &Pool,
+    target_table: &str,
+    what: &'static str,
+) -> Result<(Definition, JoinShape), ApplyError> {
+    let definition = crate::defs::catalog::definition_by_target(pool, target_table)
+        .await?
+        .ok_or_else(|| ApplyError::TransformNotFound {
+            transform: target_table.to_string(),
+        })?;
+    if !spec::is_one_to_one(&definition.def) {
+        return Err(ApplyError::GroupBasisUnsupported {
+            target: target_table.to_string(),
+            what,
+        });
+    }
+    let pk = ddl::source_primary_key(pool, &definition.source_table).await?;
+    let paused = super::quarantine::paused_columns_for(pool, &definition.def).await?;
+    let shape = JoinShape::load(pool, &definition, pk, &paused).await?;
+    Ok((definition, shape))
+}
+
+/// The plan (`explain`, not run) of [`write_target`]'s upsert of the target
+/// rows of the `R` entries `keys` of the 1-1 `JOIN` `target_table`, for tests
+/// of its shape.
+#[cfg(any(test, feature = "internals"))]
+pub async fn explain_target_write(
+    pool: &Pool,
+    target_table: &str,
+    keys: &[&str],
+) -> Result<String, ApplyError> {
+    let (_, shape) = shape_of(
+        pool,
+        target_table,
+        "a target write that is not of a 1-1 JOIN",
+    )
+    .await?;
+    let decoded = keys
+        .iter()
+        .map(|key| super::apply::decode_target_pk_parts(&shape.pk, &shape.target, key))
+        .collect::<Result<Vec<_>, _>>()?;
+    let columns = upsert_params(shape.pk.len(), &decoded, keys);
+    let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
+    let client = pool.get().await?;
+    let rows = client
+        .query(&format!("explain {}", upsert_sql(&shape)), &params)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
