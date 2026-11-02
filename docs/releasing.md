@@ -157,7 +157,7 @@ running for a manual step.
 | `migrations` | A database the old build created opens under the candidate: no pending migration, no checksum mismatch, the history rows unchanged. Control: with one stored checksum altered the candidate refuses. A candidate with a new migration changes the upgrade path and rules out downgrade: the script reports the difference as `INFO`, and the release notes say so. | Script |
 | `definitions` | One of each shape the release supports, built under the old build with writers running and undrained ring segments in flight: a plain 1-1, a chained 1-1, a 1-1 with a paused column, a group-basis aggregate, an aggregate over a `JOIN` (inner and `LEFT`), an aggregate and a `JOIN` over a hash-partitioned source, a 1-1 with a held key, and a paused transform. Under the candidate each resumes, converges and has a clean `self_check`; the held key and the pauses are unchanged; nothing else pauses. A plain recompute of two targets in SQL cross-checks `self_check`. | Script |
 | `grammar` | A definition the old build accepted and the candidate refuses pauses with a reason that names the remedy, not an error loop and not silent staleness, and the remedy works: a bare reserved word as a column name, and an expression nested over 100 levels (as a chain and as parentheses). | Script, plus the manual cases below |
-| `inflight` | Upgrading while a definition is mid-build, mid-rebuild (a `RESUME`), waiting for capture, paused, or holding a key: each continues to `live`, or stays as it was. | Script |
+| `inflight` | Upgrading while a definition is mid-build, mid-rebuild (a `RESUME`), waiting for capture, paused, or holding a key: each continues to `live`, or stays as it was. A held key stands for quarantine: the script does not trip the whole-definition fuse, so no definition is `quarantined` at the upgrade. | Script |
 | `structure` | A `structure.sql` made by the old build (a `pg_dump --schema-only` of the Trellis schema and `public`, plus the old build's `dump_definitions_sql`) loads into an empty database and every definition builds. | Script |
 | `pgrestore` | A `pg_dump` and `pg_restore` of the old database opens under the candidate, pauses every definition with the documented reason ([operations — runbooks](operations.md#runbooks)), and `RESUME` brings each back to `live` with a clean `self_check`. | Script |
 | `basebackup` | A `pg_basebackup` taken while the old build and its writers ran starts as a cluster, and the candidate converges it with no pause and no `RESUME`. | Script |
@@ -165,39 +165,44 @@ running for a manual step.
 | `mixed` | The candidate attached while an old instance is still attached to the database refuses, or pauses the definitions with a reason. | Script |
 | `downgrade` | What the old build does when pointed at a database the candidate has written. | Script, observed |
 
-### Manual steps
+### The manual steps, and what the script expects
 
 **Clients (step 6).** Open one database the old clients used from both
 versions, with the same options the old clients were given (the
 connection-budget options, `max_call_pool_size` and
-`call_pool_wait_timeout_ms`, came with `0.1.0`). Run the script with `--keep`
-and the step `clients` to leave a cluster holding a database the old CLI built
-(`postgres://postgres@127.0.0.1:54920/shapes`), then:
+`call_pool_wait_timeout_ms`, came with `0.1.0`).
+`upgrade-battery.sh --candidate <candidate> --keep clients` leaves a cluster
+holding a database the old CLI built and ran and the candidate has not opened
+(`postgres://postgres@127.0.0.1:54920/clients`, at the default `--port`);
+then, from the candidate's checkout:
 
 ```sh
+export DSN=postgres://postgres@127.0.0.1:54920/clients
+tmp=$(mktemp -d)
+cat >"$tmp/open.rb" <<'RUBY'
+require "trellis/pg"
+Trellis.connect(url: ENV.fetch("DSN"), staging: true, drain_threads: 2,
+                max_call_pool_size: 5, call_pool_wait_timeout_ms: 30_000)
+Trellis.migrate
+Trellis.definitions.each { |d| puts "#{d.target_table} #{d.status}" }
+RUBY
 # Ruby: the predecessor's published gem, then the candidate's, from source.
 gh release download v0.1.0 --repo salesforce-misc/trellis -p 'trellis-pg-0.1.0-x86_64-linux.gem' --dir "$tmp"
-gem install --local --no-document --ignore-dependencies --install-dir "$tmp/gems-old" "$tmp"/trellis-pg-0.1.0-x86_64-linux.gem
-GEM_HOME=$tmp/gems-old GEM_PATH=$tmp/gems-old DSN=<url> ruby "$tmp/open.rb"      # old
+(cd clients/ruby && gem install --local --no-document --ignore-dependencies --install-dir "$tmp/gems-old" "$tmp"/trellis-pg-0.1.0-x86_64-linux.gem)
+(cd clients/ruby && GEM_HOME=$tmp/gems-old GEM_PATH=$tmp/gems-old ruby "$tmp/open.rb")  # old
 (cd clients/ruby && bundle install && bundle exec rake compile)
-(cd clients/ruby && DSN=<url> bundle exec ruby -Ilib "$tmp/open.rb")                  # candidate
-```
-
-where `open.rb` connects with `staging: true, drain_threads: 2,
-max_call_pool_size: 5, call_pool_wait_timeout_ms: 30_000`, calls
-`Trellis.migrate` and prints `Trellis.definitions`. Expected: the same
-definitions and statuses from both, no error from `migrate`.
-
-```sh
+(cd clients/ruby && bundle exec ruby -Ilib "$tmp/open.rb")                           # candidate
 # Elixir: the candidate's package, building its NIF from source.
-cd clients/elixir && TRELLIS_PG_BUILD=1 mix run --no-start -e '
-  {:ok, t} = Trellis.connect(url: System.fetch_env!("DSN"), staging: true, drain_threads: 2, max_call_pool_size: 5)
-  IO.inspect(Trellis.definitions(t))'
+(cd clients/elixir && TRELLIS_PG_BUILD=1 mix run --no-start -e '
+  {:ok, t} = Trellis.connect(url: System.fetch_env!("DSN"), staging: true, drain_threads: 2,
+                             max_call_pool_size: 5, call_pool_wait_timeout_ms: 30_000)
+  {:ok, defs} = Trellis.definitions(t)
+  for d <- defs, do: IO.puts("#{d.target_table} #{d.status}")')
 ```
 
-Expected: the same definitions and statuses as the Ruby run. A client that
-cannot open the database, or a gem or package that does not build, is a
-finding.
+The three runs print the same definitions and statuses, and `migrate` raises
+no error. A client that cannot open the database, or a gem or package that
+does not build, is a finding.
 
 **Refusals the script does not build (step 3).** The script constructs the
 refusals it can build with the old CLI. Check the rest by reading the
@@ -239,8 +244,9 @@ For each release, the notes carry:
 - **For databases that came from a pre-release,** which the battery does not
   start from:
   - a database loaded from a `0.1.0-gamma` `structure.sql` has aggregate
-    `JOIN` lock tables with no row until it is dumped again or the transform is
-    paused and resumed;
+    `JOIN` lock tables with no row, so the locks a page or a build takes lock
+    nothing, until the transform is paused and resumed; a `structure.sql`
+    dumped by `0.1.0` or later carries the row;
   - the rebuild or first build of a 1-1 target keyed by an explicitly collated
     text column pauses after five attempts on `0.1.0-gamma`; run `RESUME` after
     upgrading.

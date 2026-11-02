@@ -261,13 +261,23 @@ if [ -z "$old_bin" ]; then
     build_old=1
   fi
 fi
+# checkout_at <dir> <rev>: a scratch worktree at that revision. One a kept or
+# killed run left behind is moved to <rev>, so a re-run never tests a stale tree.
+checkout_at() {
+  if [ -f "$1/.git" ]; then
+    git -C "$1" checkout -q --force --detach "$2"
+  else
+    rm -rf "$1"; git -C "$repo" worktree prune
+    git -C "$repo" worktree add -q --detach "$1" "$2"
+  fi
+}
 old_src=""
 ensure_old_src() {
   [ -n "$old_src" ] && return 0
   git -C "$repo" rev-parse --verify -q "$old_tag^{commit}" >/dev/null ||
     git -C "$repo" fetch -q upstream "refs/tags/$old_tag:refs/tags/$old_tag" ||
     { echo "tag $old_tag is not in this repository and could not be fetched" >&2; return 1; }
-  if [ ! -d "$work/old-src" ]; then git -C "$repo" worktree add -q --detach "$work/old-src" "$old_tag" || return 1; fi
+  checkout_at "$work/old-src" "$old_tag" || return 1
   old_src="$work/old-src"
   extra_worktrees+=("$old_src")
 }
@@ -287,7 +297,7 @@ if [ -d "$candidate" ]; then
   cand_target="$cand_src/target"
 else
   cand_src="$work/cand-src"
-  if [ ! -d "$cand_src" ]; then git -C "$repo" worktree add -q --detach "$cand_src" "$candidate"; fi
+  checkout_at "$cand_src" "$candidate" || die "cannot check out the candidate $candidate"
   extra_worktrees+=("$cand_src")
   cand_target="$work/cand-target"
 fi
@@ -330,13 +340,17 @@ probe() { # <probe-bin> port db args...
 
 # ---------------------------------------------------------------- the cluster
 say "starting a cluster on port $port"
-rm -rf "$work/cluster-a" "$work/cluster-b" "$work/backup"
+# A cluster a kept or killed run left running is stopped before its directory goes.
+for d in "$work/cluster-a/data" "$work/cluster-b/data"; do
+  [ ! -f "$d/postmaster.pid" ] || "$pg_bin/pg_ctl" -D "$d" -m immediate stop >/dev/null 2>&1 || true
+done
+rm -rf "$work/cluster-a" "$work/cluster-b" "$work/cluster-b-data" "$work/backup"
 mkdir -p "$work/cluster-a"
 "$pg_bin/initdb" -D "$work/cluster-a/data" -U postgres --no-sync -A trust >/dev/null
 start_cluster "$work/cluster-a" "$port"
 pg_major=$("$pg_bin/psql" -X -At -h 127.0.0.1 -p "$port" -U postgres -d postgres -c "show server_version_num")
 [ "$pg_major" -ge 150000 ] || die "PostgreSQL 15 or later is required (partitioned sources); this is $pg_major"
-for d in shapes inflight ctl mixed; do sql "$port" postgres -c "create database $d"; done
+for d in shapes inflight ctl mixed clients; do sql "$port" postgres -c "create database $d"; done
 
 # ---------------------------------------------------------------- prep: shapes
 say "building the $old_tag databases"
@@ -454,6 +468,19 @@ sql "$port" ctl -c "create table t(id bigint primary key, v bigint not null)"
 apply_old ctl 'TRANSFORM tc FROM t SELECT v AS v2'
 pre_ctl_history=$(history "$port" ctl)
 
+# clients: built and run by the old CLI only, for the manual client step; the
+# candidate never opens it, so the old client opens it first.
+if want clients; then
+  sql "$port" clients -c "create table c(id bigint primary key, g bigint not null, v bigint not null)" -c "create index on c(g)" \
+    -c "insert into c select g, g % 10, g from generate_series(1,1000) g"
+  seed_rows=$((seed_rows + 1000))
+  apply_old clients 'TRANSFORM c_copy FROM c SELECT v + 1 AS v1'
+  apply_old clients 'TRANSFORM c_agg FROM c GROUP BY g SELECT g AS g, COUNT(*) AS n, SUM(v) AS s'
+  run_bg old-clients "$port" clients "$old_bin"
+  WAIT=120 wait_all "$port" clients "$old_bin" live c_copy c_agg || die "the clients definitions did not go live"
+  stop_run old-clients
+fi
+
 # ---------------------------------------------------------------- the upgrade
 say "upgrading: stop $old_tag, start the candidate (writers keep running)"
 stop_run old-shapes
@@ -496,10 +523,16 @@ missing_status() { # port db bin status names...: the names not at that status
 if want migrations; then
   say "1. migrations"
   if git -C "$cand_src" rev-parse -q --verify "$old_tag^{commit}" >/dev/null 2>&1; then
-    if git -C "$cand_src" diff --quiet "$old_tag" HEAD -- trellis/migrations 2>/dev/null; then
-      record PASS migrations "trellis/migrations at the candidate is byte-identical to $old_tag's ($(ls "$cand_src/trellis/migrations" | wc -l | tr -d ' ') files)"
+    # The candidate's files as they are on disk (a directory candidate may hold
+    # uncommitted or untracked migrations), against the tag's.
+    old_mig_n=$(git -C "$cand_src" ls-tree --name-only "$old_tag" trellis/migrations/ | wc -l | tr -d ' ')
+    mig_untracked=$(git -C "$cand_src" ls-files --others --exclude-standard -- trellis/migrations | sed 's/^/?? /')
+    if [ "$old_mig_n" -eq 0 ]; then
+      record FAIL migrations "$old_tag has no files in trellis/migrations: the script's migrations path is out of date, so nothing was compared"
+    elif git -C "$cand_src" diff --quiet "$old_tag" -- trellis/migrations && [ -z "$mig_untracked" ]; then
+      record PASS migrations "trellis/migrations at the candidate is byte-identical to $old_tag's ($old_mig_n files)"
     else
-      record INFO migrations "the candidate changes trellis/migrations since $old_tag: $(git -C "$cand_src" diff --name-status "$old_tag" HEAD -- trellis/migrations | tr '\n' ';') (the upgrade path runs them; downgrade is ruled out)"
+      record INFO migrations "the candidate changes trellis/migrations since $old_tag: $( (git -C "$cand_src" diff --name-status "$old_tag" -- trellis/migrations; echo "$mig_untracked") | grep . | tr '\n' ';') (the upgrade path runs them; downgrade is ruled out)"
     fi
   else
     record SKIP migrations "the candidate checkout does not have tag $old_tag, so its migration files were not compared"
@@ -537,6 +570,9 @@ fi
 
 if want definitions; then
   say "2. live definitions of every shape"
+  [ "${ring_before:-0}" -gt 0 ] && [ "$writer_iters" -gt 0 ] &&
+    record PASS definitions "the candidate took over $ring_before ring rows $old_tag had not drained, with writers running ($writer_iters writer iterations)" ||
+    record FAIL definitions "precondition: no undrained ring rows ($ring_before) or no writer iterations ($writer_iters) at the upgrade, so the takeover was not exercised"
   bad=$(missing_status "$port" shapes "$candidate_bin" live $live_shapes)
   if [ -z "$bad" ]; then record PASS definitions "live after the upgrade: $live_shapes"
   else record FAIL definitions "not live after the upgrade:$bad"; fi
@@ -562,7 +598,7 @@ if want definitions; then
   check_self "$port" shapes definitions orders_copy chain1 orders_wide cust_totals cust_join cust_join_left tenant_totals tenant_join
   held_out=$(probe "${probe_new:-/nonexistent}" "$port" shapes self-check ledger_ovf 2>&1 || true)
   grep -q 'held_keys=1' <<<"$held_out" &&
-    record PASS definitions "ledger_ovf reports its held key and nothing else ($(head -c 110 <<<"$held_out"))" ||
+    record PASS definitions "ledger_ovf's self_check reports its held key ($(head -c 110 <<<"$held_out"))" ||
     record FAIL definitions "ledger_ovf's self_check does not report the held key: $held_out"
 else
   record SKIP definitions "not selected"
@@ -603,6 +639,13 @@ fi
 if want inflight; then
   say "4. work in flight at the upgrade"
   echo "before: $pre_inflight_status"
+  pre_bad=""
+  for kv in big_agg=backfilling rebuild_me=backfilling wait_agg=waiting_to_backfill paused_t=paused; do
+    case " $pre_inflight_status " in *" $kv "*) ;; *) pre_bad="$pre_bad $kv" ;; esac
+  done
+  [ -z "$pre_bad" ] &&
+    record PASS inflight "before the upgrade: big_agg and rebuild_me mid-build, wait_agg waiting for capture, paused_t paused" ||
+    record FAIL inflight "precondition: before the upgrade, expected$pre_bad; was $pre_inflight_status"
   bad=$(missing_status "$port" inflight "$candidate_bin" live live_ok rebuild_me held_t big_agg wait_agg)
   [ -z "$bad" ] && record PASS inflight "continued to live: big_agg (was mid-build), rebuild_me (was mid-rebuild), wait_agg (waiting for capture), live_ok, held_t" ||
     record FAIL inflight "did not continue to live:$bad"
@@ -663,9 +706,17 @@ if want pgrestore; then
   restored_set="orders_copy chain1 orders_wide cust_totals cust_join cust_join_left tenant_totals tenant_join ord_paused ledger_ovf"
   WAIT=60 wait_all "$port" restored "$candidate_bin" paused $restored_set || true
   not_paused=$(missing_status "$port" restored "$candidate_bin" paused $restored_set)
-  if [ -z "$not_paused" ]; then
+  # The documented reason, on each one that was not already paused before the dump.
+  wrong_reason=""
+  for n in $restored_set; do
+    [ "$n" != ord_paused ] || continue
+    grep -q 'restored from a logical dump' <<<"$(failure_reason "$port" restored "$n")" || wrong_reason="$wrong_reason $n"
+  done
+  if [ -z "$not_paused" ] && [ -z "$wrong_reason" ]; then
     reason=$(failure_reason "$port" restored orders_copy)
     record PASS pgrestore "every definition paused on the restored database, as documented; orders_copy: $(echo "$reason" | cut -c1-120)"
+  elif [ -z "$not_paused" ]; then
+    record FAIL pgrestore "paused, but not for the documented logical-restore reason:$wrong_reason"
   else
     record FAIL pgrestore "documented pause after a logical restore did not happen for:$not_paused"
   fi
@@ -703,7 +754,7 @@ else
 fi
 
 if want clients; then
-  record MANUAL clients "Ruby gem and Elixir package: not automated; run the runbook's commands (docs/releasing.md, The upgrade battery, step 6)"
+  record MANUAL clients "Ruby gem and Elixir package: not automated; run the runbook's commands (docs/releasing.md, The upgrade battery, step 6) against $(url "$port" clients), with --keep"
 else
   record SKIP clients "not selected"
 fi
@@ -763,6 +814,6 @@ for r in "${results[@]}"; do
 done
 echo "PASS=$npass FAIL=$nfail INFO=$ninfo MANUAL=$nman SKIP=$nskip"
 if [ "$keep" -eq 1 ]; then
-  echo "kept: the cluster on port $port ($work/cluster-a/data; databases shapes, inflight, ctl, mixed, loaded, restored) and, if the basebackup step ran, the clone on port '$port_b' stay running; stop with $pg_bin/pg_ctl -D $work/cluster-a/data stop"
+  echo "kept: the cluster on port $port ($work/cluster-a/data; databases shapes, inflight, ctl, mixed, clients, loaded, restored) and, if the basebackup step ran, the clone on port '$port_b' stay running; stop with $pg_bin/pg_ctl -D $work/cluster-a/data stop"
 fi
 [ "$nfail" -eq 0 ] || exit 1
