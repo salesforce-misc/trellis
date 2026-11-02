@@ -1385,50 +1385,77 @@ async fn a_resume_waits_out_an_in_flight_chunk_before_recreating_the_hidden_tabl
     );
 }
 
-/// No transform reads a 1-1 JOIN target, however it came to: a reader whose
-/// source was dropped while it was paused, and whose source's name a 1-1
-/// JOIN's target then took, is refused at `RESUME` as at define.
+/// No transform reads a 1-1 JOIN target, however it came to: a 1-1 JOIN
+/// whose target would take the name of a table another definition reads (its
+/// `FROM` or its joined table, dropped since) is refused at define and
+/// leaves nothing, whether that reader is still running (the staging worker
+/// would never pause it for its dropped source once the name is a target's)
+/// or paused (its `RESUME` would read the target). With the readers dropped,
+/// it defines.
 #[tokio::test]
-async fn a_resume_refuses_a_reader_whose_source_became_a_one_to_one_join_target() {
+async fn a_one_to_one_join_whose_target_takes_the_name_of_a_read_table_is_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
     raw.batch_execute(TABLES).await.expect("seed");
     raw.batch_execute("create table public.shadow (id integer primary key, who text)")
         .await
-        .expect("the reader's source");
+        .expect("the readers' table");
     let trellis = define_only(db.dsn()).await;
     trellis
         .apply("TRANSFORM shadow_copy FROM shadow SELECT who AS who")
         .await
-        .expect("define the reader");
+        .expect("define the FROM reader");
+    trellis
+        .apply(
+            "TRANSFORM by_who FROM orders JOIN shadow ON orders.cust = shadow.id \
+             GROUP BY shadow.who WITHOUT SOURCE INDEX SELECT shadow.who AS who, COUNT(*) AS n",
+        )
+        .await
+        .expect("define the joined-table reader");
+    raw.batch_execute("drop table public.shadow")
+        .await
+        .expect("drop the readers' table");
+    const TAKES_THE_NAME: &str = "TRANSFORM shadow FROM orders LEFT JOIN customers \
+                                  ON orders.cust = customers.id SELECT customers.name AS who";
+    let refused = |reader: &'static str| {
+        move |err: CatalogError| {
+            assert!(
+                matches!(
+                    &err,
+                    CatalogError::Validate(ValidationError::OneToOneJoinTargetHasReader {
+                        target, reader: r,
+                    }) if target == "public.shadow" && r == &format!("public.{reader}")
+                ),
+                "{err:?}"
+            );
+        }
+    };
+
+    refused("shadow_copy")(define_err(&db.pool, TAKES_THE_NAME).await);
+    assert_nothing_registered(&db.pool, "shadow").await;
     trellis
         .apply("PAUSE TRANSFORM shadow_copy")
         .await
-        .expect("pause the reader");
-    raw.batch_execute("drop table public.shadow")
-        .await
-        .expect("drop the reader's source");
+        .expect("pause the FROM reader");
+    refused("shadow_copy")(define_err(&db.pool, TAKES_THE_NAME).await);
     trellis
-        .apply(
-            "TRANSFORM shadow FROM orders LEFT JOIN customers ON orders.cust = customers.id \
-             SELECT customers.name AS who",
-        )
+        .apply("DROP TRANSFORM shadow_copy")
         .await
-        .expect("a 1-1 JOIN whose target takes the dropped source's name");
-    // Live, as a later milestone's build would leave it; a resume otherwise
-    // waits for its upstream to go live, and revalidates then.
-    make_live(&raw, "shadow").await;
-
-    let err = trellis
-        .apply("RESUME TRANSFORM shadow_copy")
+        .expect("drop the FROM reader");
+    refused("by_who")(define_err(&db.pool, TAKES_THE_NAME).await);
+    assert_nothing_registered(&db.pool, "shadow").await;
+    trellis
+        .apply("PAUSE TRANSFORM by_who")
         .await
-        .expect_err("the resumed reader would read a 1-1 JOIN target");
-    assert!(err.to_string().contains("1-1 JOIN"), "{err}");
-    assert_eq!(
-        status(&trellis, "shadow_copy").await,
-        Some(TransformStatus::Paused)
-    );
+        .expect("pause the joined-table reader");
+    trellis
+        .apply("DROP TRANSFORM by_who")
+        .await
+        .expect("drop the joined-table reader");
+    install_definition(&db.pool, TAKES_THE_NAME, &HashMap::new(), "public")
+        .await
+        .expect("with no reader of the name, the 1-1 JOIN defines");
 }
 
 /// A rebuild of a live 1-1 JOIN in place (`request_backfill`, which also

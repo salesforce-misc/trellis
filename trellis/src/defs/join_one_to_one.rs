@@ -395,6 +395,37 @@ pub(crate) async fn reject_reader_of_target(
     Ok(())
 }
 
+/// Refuses a 1-1 `JOIN` whose target, `qualified_target`, names a table
+/// another definition reads, as its `FROM` or joined table, whatever that
+/// definition's status ([`ValidationError::OneToOneJoinTargetHasReader`]).
+/// Such a table was dropped after the reader was defined, so the reader
+/// would go on to read the 1-1 `JOIN`'s target: a running one at once (the
+/// staging worker never pauses it for its dropped source once the name is a
+/// target's), and a paused one on its `RESUME`. The converse of
+/// [`reject_reader_of_target`], which refuses a reader of a 1-1 `JOIN`
+/// target that exists.
+pub(crate) async fn reject_target_with_reader(
+    client: &impl GenericClient,
+    qualified_target: &str,
+) -> Result<(), super::catalog::CatalogError> {
+    let reader: Option<String> = client
+        .query_opt(
+            "select target_table from transform_definitions \
+             where source_table = $1 or join_table = $1 order by id limit 1",
+            &[&qualified_target],
+        )
+        .await?
+        .map(|row| row.get(0));
+    match reader {
+        Some(reader) => Err(ValidationError::OneToOneJoinTargetHasReader {
+            target: qualified_target.to_string(),
+            reader,
+        }
+        .into()),
+        None => Ok(()),
+    }
+}
+
 /// The define-time checks of a 1-1 `JOIN` that read the catalog, once its
 /// joined table is resolved (`joined`, qualified): the joined table's `ON`
 /// columns are unique, and a joined table that is another transform's 1-1

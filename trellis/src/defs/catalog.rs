@@ -3104,6 +3104,11 @@ async fn create_definition_inner(
     // Not in a catalog schema, this instance's or another's. Before
     // any DDL, so nothing is created there.
     reject_target_in_catalog_schema(&*txn, pool.schema(), &qualified_target).await?;
+    // No transform reads a 1-1 JOIN's target (ADR-0021), even one defined
+    // over a table of the target's name that has since been dropped.
+    if super::join::is_one_to_one(&def) {
+        super::join_one_to_one::reject_target_with_reader(&*txn, &qualified_target).await?;
+    }
     // The test-fixture entry points (`target_ddl` is `None`) register against
     // a target their caller already created; `install_definition` creates it
     // below, after every check on the definition itself.
