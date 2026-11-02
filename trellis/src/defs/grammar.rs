@@ -87,6 +87,17 @@ pub(crate) async fn check_stored_versions_in(
     oldest: i32,
     current: i32,
 ) -> Result<usize, crate::Error> {
+    check_stored_versions_window(client, oldest, current, true).await
+}
+
+/// [`check_stored_versions_in`], or with `apply` false the same check rolled
+/// back: how many transforms it would pause, pausing none.
+async fn check_stored_versions_window(
+    client: &mut tokio_postgres::Client,
+    oldest: i32,
+    current: i32,
+    apply: bool,
+) -> Result<usize, crate::Error> {
     let newer = client
         .query(
             "select 'transform ' || target_table, grammar_version from transform_definitions \
@@ -151,7 +162,11 @@ pub(crate) async fn check_stored_versions_in(
             }
         }
     }
-    txn.commit().await?;
+    if apply {
+        txn.commit().await?;
+    } else {
+        txn.rollback().await?;
+    }
     Ok(paused)
 }
 
@@ -171,6 +186,21 @@ pub(crate) async fn check_stored_versions(
         client,
         OLDEST_SUPPORTED_GRAMMAR_VERSION,
         CURRENT_GRAMMAR_VERSION,
+    )
+    .await
+}
+
+/// [`check_stored_versions`] rolled back: refuses as it does, and otherwise
+/// returns how many transforms it would pause, pausing none. `migrate` runs
+/// this while another version is live (ADR-0023), when it may change nothing.
+pub(crate) async fn check_stored_versions_dry_run(
+    client: &mut tokio_postgres::Client,
+) -> Result<usize, crate::Error> {
+    check_stored_versions_window(
+        client,
+        OLDEST_SUPPORTED_GRAMMAR_VERSION,
+        CURRENT_GRAMMAR_VERSION,
+        false,
     )
     .await
 }

@@ -12,6 +12,14 @@
 //! `staging`/`drain_threads` connect runs, so a fresh database doesn't need a
 //! separate `migrate` step any more than `apply` does.
 //!
+//! While a Trellis process of another version is live on the instance and
+//! this binary carries migrations it hasn't run, `migrate` refuses
+//! (ADR-0023, version handover: migrations never run beside a live process),
+//! and `run` stands by instead of exiting: it says why, tries again every 5
+//! seconds, and goes on as soon as the other version's processes have
+//! stopped. Once running, the pipeline itself stands by the same way while
+//! another version is live.
+//!
 //! No definitions need to be registered yet: the staging worker
 //! captures nothing until `trellis apply` registers something, then picks
 //! it up on its next reconcile pass without a restart.
@@ -39,7 +47,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use trellis::Metrics;
-use trellis::{Config, Trellis, TrellisOptions};
+use trellis::{Config, ErrorCode, Trellis, TrellisOptions};
 
 /// Help text for `trellis run -h`/`--help`, and prefixed to any
 /// argument-parsing error so a mistake also shows correct usage.
@@ -50,6 +58,8 @@ Usage: trellis run [--staging|--no-staging] [--drain-threads N]
 Runs the live CDC/apply pipeline (staging worker and/or drain workers) until
 interrupted with Ctrl-C. Migrates the database first if needed. Definitions
 registered later (via `trellis apply`) are picked up without a restart.
+While a Trellis process of another version is live on the database, stands
+by (stages, drains and migrates nothing) and takes over once it has stopped.
 
 Options:
   --staging                  Run the staging worker: installs capture triggers
@@ -189,10 +199,13 @@ pub async fn run(args: Args, database_url: Option<String>) -> Result<String, Str
     let migrator = Trellis::connect(config.clone(), TrellisOptions::default())
         .await
         .map_err(|err| err.to_string())?;
-    let migration_outcome = migrator.migrate().await.map_err(|err| err.to_string());
+    let migration_outcome = migrate_once_no_other_version_is_live(&migrator).await;
     let migrator_shutdown = migrator.shutdown().await.map_err(|err| err.to_string());
-    migration_outcome?;
+    let migrated = migration_outcome?;
     migrator_shutdown?;
+    if !migrated {
+        return Ok("stopped while standing by".to_string());
+    }
 
     let options = TrellisOptions {
         staging: args.staging,
@@ -252,6 +265,43 @@ pub async fn run(args: Args, database_url: Option<String>) -> Result<String, Str
     println!("shutting down...");
     trellis.shutdown().await.map_err(|err| err.to_string())?;
     Ok("shut down cleanly".to_string())
+}
+
+/// How often [`migrate_once_no_other_version_is_live`] tries again: the
+/// standby poll of the pipeline's own handover check.
+const STANDBY_POLL: Duration = Duration::from_secs(5);
+
+/// Runs `migrate`, standing by while it refuses because a process of another
+/// Trellis version is live (ADR-0023, rule 3): says so once, then tries again
+/// every [`STANDBY_POLL`] until it succeeds. `Ok(false)` when Ctrl-C came
+/// first.
+async fn migrate_once_no_other_version_is_live(migrator: &Trellis) -> Result<bool, String> {
+    let mut standing_by = false;
+    loop {
+        match migrator.migrate().await {
+            Ok(()) => {
+                if standing_by {
+                    println!("no other Trellis version is live any more; migrated, taking over");
+                }
+                return Ok(true);
+            }
+            Err(err) if err.code() == ErrorCode::VersionHandover => {
+                if !standing_by {
+                    standing_by = true;
+                    println!("trellis standing by: {err}");
+                    println!(
+                        "trying again every {} seconds; press Ctrl-C to stop",
+                        STANDBY_POLL.as_secs()
+                    );
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(STANDBY_POLL) => {}
+                    _ = tokio::signal::ctrl_c() => return Ok(false),
+                }
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    }
 }
 
 /// Blocks until Ctrl-C. If `listener` is `Some`, also accepts and serves

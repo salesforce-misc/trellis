@@ -42,8 +42,42 @@ mod embedded {
 
 use crate::config::Config;
 use crate::error::Error;
+use crate::handover;
 use crate::identity;
-use crate::pool::Pool;
+use crate::pool::{Pool, quote_ident};
+
+/// Whether some migration this binary carries hasn't run on `schema`'s
+/// instance: refinery's history lacks its version. A schema with no history
+/// has never been migrated, so no process of any version can be running on
+/// it, and reads as nothing pending: `migrate` creates it, and a background
+/// process started before that fails as it reads the catalog. A version the
+/// history has and this binary lacks doesn't count either: refinery refuses
+/// that database when it runs.
+pub(crate) async fn migrations_pending(
+    client: &impl tokio_postgres::GenericClient,
+    schema: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    let history = format!("{}.refinery_schema_history", quote_ident(schema));
+    let carried: Vec<i32> = embedded::migrations::runner()
+        .get_migrations()
+        .iter()
+        .map(|migration| migration.version())
+        .collect();
+    let exists: bool = client
+        .query_one("select to_regclass($1) is not null", &[&history])
+        .await?
+        .get(0);
+    if !exists {
+        return Ok(false);
+    }
+    let applied: std::collections::HashSet<i32> = client
+        .query(&format!("select version from {history}"), &[])
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    Ok(carried.iter().any(|version| !applied.contains(version)))
+}
 
 /// Ensures `config.schema()` exists and is safe to attach to (see
 /// `crate::identity`), then applies any migrations not yet recorded as
@@ -78,6 +112,47 @@ pub async fn migrate_with_pool(pool: &Pool, config: &Config) -> Result<(), Error
 
 async fn attach(pg_client: &mut tokio_postgres::Client, config: &Config) -> Result<(), Error> {
     identity::prepare_attach(pg_client, config).await?;
+
+    // ADR-0023: the handover lock for the rest of the attach, so no background
+    // process registers between the check below and the migrations it allows.
+    // Session-level on the attach's own session, which closes with it.
+    let handover_key = handover::handover_lock_key(config.schema());
+    pg_client
+        .execute("select pg_advisory_lock($1)", &[&handover_key])
+        .await?;
+    let attached = attach_under_handover(pg_client, config).await;
+    let _ = pg_client
+        .execute("select pg_advisory_unlock($1)", &[&handover_key])
+        .await;
+    attached
+}
+
+/// [`attach`] once the handover lock is held. Migrations never run while a
+/// Trellis process is live (ADR-0023, rule 3): one is of an older version
+/// than the migrations. While another version is live and nothing is
+/// pending, the attach changes nothing: it runs its checks, and refuses if
+/// the grammar check would pause a definition or the marker would change.
+async fn attach_under_handover(
+    pg_client: &mut tokio_postgres::Client,
+    config: &Config,
+) -> Result<(), Error> {
+    let observed = handover::observe(&*pg_client, config.schema(), true).await?;
+    let other_version =
+        match handover::decide(config.binary_version(), &observed, handover::Asker::Migrate) {
+            handover::Verdict::TakeOver => None,
+            handover::Verdict::Refuse(seen) if seen.migrations_pending => {
+                return Err(Error::OtherVersionLive(seen));
+            }
+            handover::Verdict::Refuse(seen) => Some(seen),
+            handover::Verdict::StandBy(_) => unreachable!("only a background process stands by"),
+        };
+    if let Some(seen) = other_version {
+        let would_pause = crate::defs::grammar::check_stored_versions_dry_run(pg_client).await?;
+        if would_pause > 0 || identity::marker_would_change(pg_client, config).await? {
+            return Err(Error::OtherVersionLive(seen));
+        }
+        return Ok(());
+    }
 
     run_migrations(pg_client).await?;
 

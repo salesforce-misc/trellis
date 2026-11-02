@@ -98,6 +98,11 @@ pub struct Config {
     /// The schema transform target tables are created under. See
     /// [`DEFAULT_TARGET_SCHEMA`].
     target_schema: String,
+    /// The binary version this handle and its background processes compare
+    /// against the other processes of the instance (ADR-0023):
+    /// [`crate::handover::BINARY_VERSION`] unless a test injected another
+    /// with `Config::with_binary_version`.
+    binary_version: std::borrow::Cow<'static, str>,
 }
 
 impl Config {
@@ -147,6 +152,7 @@ impl Config {
             dsn: dsn.into(),
             schema,
             target_schema: DEFAULT_TARGET_SCHEMA.to_string(),
+            binary_version: std::borrow::Cow::Borrowed(crate::handover::BINARY_VERSION),
         })
     }
 
@@ -175,6 +181,21 @@ impl Config {
     /// `DEFAULT_TARGET_SCHEMA`.
     pub fn target_schema(&self) -> &str {
         &self.target_schema
+    }
+
+    /// The binary version this configuration's handles and background
+    /// processes run as (ADR-0023, version handover).
+    pub(crate) fn binary_version(&self) -> &str {
+        &self.binary_version
+    }
+
+    /// Returns `self` running as binary version `version` instead of this
+    /// build's own, so a test can stand two versions side by side on one
+    /// database (ADR-0023).
+    #[cfg(feature = "internals")]
+    pub fn with_binary_version(mut self, version: impl Into<String>) -> Self {
+        self.binary_version = std::borrow::Cow::Owned(version.into());
+        self
     }
 
     fn dsn_from_env() -> String {
@@ -256,11 +277,13 @@ impl fmt::Debug for Config {
             dsn,
             schema,
             target_schema,
+            binary_version,
         } = self;
         f.debug_struct("Config")
             .field("dsn", &RedactedDsn(dsn))
             .field("schema", schema)
             .field("target_schema", target_schema)
+            .field("binary_version", binary_version)
             .finish()
     }
 }

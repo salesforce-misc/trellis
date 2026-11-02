@@ -149,7 +149,9 @@ pub use self_check::{Divergence, SelfCheckMode, SelfCheckOutcome};
 pub use self_check_job::{SelfCheckJob, SelfCheckJobState, SelfCheckReport};
 pub use session::ProducerSession;
 pub use state::segment_state_counts;
-pub use worker_registry::{deregister_worker, reclaim_stale_workers, register_worker};
+pub use worker_registry::{
+    Registration, clear_staging, deregister_worker, reclaim_stale_workers, register_worker,
+};
 
 // Reached from `crate::dev` (ADR-0012's sanctioned exception) by
 // `generative`'s backend drivers.

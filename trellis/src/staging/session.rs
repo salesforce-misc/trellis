@@ -100,6 +100,9 @@ pub fn producer_singleton_lock_key(schema: &str) -> i64 {
 pub struct ProducerSession {
     client: Client,
     schema: String,
+    /// The backend pid its process's registry row names as `staging_pid`,
+    /// when it was taken by [`ProducerSession::connect_registered`].
+    staging_pid: Option<i32>,
     _connection: tokio::task::JoinHandle<()>,
 }
 
@@ -120,6 +123,11 @@ impl ProducerSession {
     /// so a partitioned producer's lock frees in about 25s rather
     /// than the ~2h the kernel defaults allow. See
     /// `crate::pool::TCP_KEEPALIVE_IDLE` for the numbers.
+    ///
+    /// A client's staging worker takes it with
+    /// [`ProducerSession::connect_registered`]; this is for tests, which hold
+    /// the lock as a process that registers nothing would.
+    #[cfg_attr(not(feature = "internals"), allow(dead_code))]
     pub async fn connect(dsn: &str, schema: &str) -> Result<Self, StagingError> {
         let (client, connection) = crate::pool::connect_dedicated(dsn).await?;
         let handle = tokio::spawn(async move {
@@ -137,8 +145,49 @@ impl ProducerSession {
         Ok(Self {
             client,
             schema: schema.to_string(),
+            staging_pid: None,
             _connection: handle,
         })
+    }
+
+    /// [`ProducerSession::connect`] for the process registered as
+    /// `worker_id` (ADR-0023): names the session as its row's `staging_pid`
+    /// first, then takes the lock, so whoever sees the lock held can match
+    /// it to the row. A process with no row yet doesn't lead: that reads as
+    /// [`StagingError::ProducerAlreadyRunning`], like a lock held elsewhere,
+    /// and is tried again on the next attempt. A refused lock clears the
+    /// claim before the session closes.
+    pub(crate) async fn connect_registered(
+        dsn: &str,
+        schema: &str,
+        worker_id: &str,
+    ) -> Result<Self, StagingError> {
+        let (client, connection) = crate::pool::connect_dedicated(dsn).await?;
+        let handle = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&crate::pool::dedicated_session_setup(schema))
+            .await?;
+        let Some(pid) = super::worker_registry::claim_staging(&client, worker_id).await? else {
+            return Err(StagingError::ProducerAlreadyRunning);
+        };
+        if let Err(err) = acquire_singleton(&client, schema).await {
+            let _ = super::worker_registry::clear_staging(&client, worker_id, pid).await;
+            return Err(err);
+        }
+        Ok(Self {
+            client,
+            schema: schema.to_string(),
+            staging_pid: Some(pid),
+            _connection: handle,
+        })
+    }
+
+    /// The backend pid its registry row names, when the session was taken by
+    /// [`ProducerSession::connect_registered`].
+    pub(crate) fn staging_pid(&self) -> Option<i32> {
+        self.staging_pid
     }
 
     /// Releases the singleton lock on the server, then closes the

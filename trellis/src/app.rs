@@ -385,7 +385,12 @@ impl Trellis {
         self.call(async {
             crate::migrate::migrate_with_pool(&self.pool, &self.config)
                 .await
-                .map_err(TrellisError::Engine)
+                .map_err(|err| match err {
+                    crate::error::Error::OtherVersionLive(seen) => {
+                        TrellisError::OtherVersionLive(seen)
+                    }
+                    err => TrellisError::Engine(err),
+                })
         })
         .await
     }
@@ -473,7 +478,9 @@ impl Trellis {
     /// separately, not a `DROP`.
     pub async fn apply(&self, statement_text: &str) -> Result<Applied, TrellisError> {
         self.call(async {
-            match defs::parse_statement(statement_text)? {
+            let statement = defs::parse_statement(statement_text)?;
+            self.refuse_while_another_version_is_live().await?;
+            match statement {
                 defs::Statement::DefineTransform(parsed) => {
                     let source_columns = self.source_columns(&parsed).await?;
                     // Hands the *text* on rather than the `TransformDef` just
@@ -498,6 +505,26 @@ impl Trellis {
             }
         })
         .await
+    }
+
+    /// ADR-0023, rule 6: a state-changing call refuses while a process of
+    /// another Trellis version is live on the instance, from any handle, a
+    /// define-only one included, so two versions never change one instance's
+    /// state side by side. Read-only calls don't ask.
+    async fn refuse_while_another_version_is_live(&self) -> Result<(), TrellisError> {
+        match self.version_handover().await? {
+            None => Ok(()),
+            Some(seen) => Err(TrellisError::OtherVersionLive(seen)),
+        }
+    }
+
+    /// The live processes of another version that hold this binary back
+    /// (ADR-0023), or `None` when there are none.
+    async fn version_handover(
+        &self,
+    ) -> Result<Option<crate::handover::OtherVersionLive>, TrellisError> {
+        let client = self.pool.get().await?;
+        version_handover_on(&**client, &self.config).await
     }
 
     /// [`Statement::AlterTransform`](defs::Statement::AlterTransform)'s half
@@ -954,6 +981,11 @@ impl Trellis {
                     .await?;
                 }
             }
+            let version_handover = if row.is_some() {
+                version_handover_on(&*txn, &self.config).await?
+            } else {
+                None
+            };
             txn.commit().await?;
             let (capture_wait, stalled) = holdup;
             Ok(row.zip(status).map(|(row, status)| DefinitionStatus {
@@ -975,6 +1007,7 @@ impl Trellis {
                 build_wait: row
                     .get::<_, Option<i64>>("build_fence")
                     .map(|xid| BuildWait::Fence { xid }),
+                version_handover,
             }))
         })
         .await
@@ -992,6 +1025,7 @@ impl Trellis {
     /// definition is still the caller's.
     pub async fn detect_capture_disruptions(&self) -> Result<Vec<String>, TrellisError> {
         self.call(async {
+            self.refuse_while_another_version_is_live().await?;
             let desired = crate::defs::tables_to_capture(&self.pool).await?;
             let mut client = self.pool.get().await?;
             crate::capture::reconcile::detect_disruptions(
@@ -1076,6 +1110,7 @@ impl Trellis {
     /// catalog's, not the triggers'.
     pub async fn request_backfill(&self, source_table: &str) -> Result<(), TrellisError> {
         self.call(async {
+            self.refuse_while_another_version_is_live().await?;
             let mut client = self.pool.get().await?;
             let captured = crate::defs::tables_to_capture(&self.pool).await?;
             let qualified = match resolve_backfill_table(&captured, source_table)? {
@@ -1461,6 +1496,7 @@ impl Trellis {
         key: &str,
     ) -> Result<(), TrellisError> {
         self.call(async {
+            self.refuse_while_another_version_is_live().await?;
             match quarantine::release_key(&self.pool, transform, source_table, key).await {
                 Ok(_) => Ok(()),
                 Err(ApplyError::TransformNotFound { transform }) => {
@@ -1734,6 +1770,7 @@ impl Trellis {
         timeout: Duration,
     ) -> Result<SelfCheckJob, TrellisError> {
         self.call(async {
+            self.refuse_while_another_version_is_live().await?;
             self_check_job::start(&self.pool, target_table, mode, timeout)
                 .await
                 .map_err(TrellisError::SelfCheck)
@@ -1978,6 +2015,21 @@ fn capture_failure(row: &tokio_postgres::Row) -> Option<CaptureFailure> {
         })
 }
 
+/// [`Trellis::version_handover`] on `client`.
+async fn version_handover_on(
+    client: &impl tokio_postgres::GenericClient,
+    config: &Config,
+) -> Result<Option<crate::handover::OtherVersionLive>, TrellisError> {
+    use crate::handover::{self, Asker, Verdict};
+    let observed = handover::observe(client, config.schema(), false).await?;
+    Ok(
+        match handover::decide(config.binary_version(), &observed, Asker::Call) {
+            Verdict::Refuse(seen) => Some(seen),
+            Verdict::TakeOver | Verdict::StandBy(_) => None,
+        },
+    )
+}
+
 /// One registered transform definition's status, as [`Trellis::status`]
 /// reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2139,6 +2191,14 @@ pub struct DefinitionStatus {
     /// than its own work: see [`BuildWait`]. Cleared once the
     /// wait is over.
     pub build_wait: Option<BuildWait>,
+    /// Set while a process of another Trellis version is live on the
+    /// instance (ADR-0023, version handover): this binary's background
+    /// processes stand by (they stage, drain and build nothing) and its
+    /// state-changing calls refuse until it is gone. Names this binary's
+    /// version and the other processes, by worker id with their versions. A
+    /// process killed without a clean shutdown keeps its row live, and so
+    /// delays the takeover, for at most the reclaim TTL (30 seconds).
+    pub version_handover: Option<crate::handover::OtherVersionLive>,
 }
 
 /// Why capture of a table a definition reads is broken; see [`DefinitionStatus::capture_failure`].
@@ -2652,6 +2712,12 @@ pub enum TrellisError {
         /// fires, but the call did not see it happen.
         abandoned: bool,
     },
+    /// Another Trellis version is live on the instance, so this
+    /// state-changing call (or `migrate` with migrations pending) refused and
+    /// changed nothing (ADR-0023, version handover). Read-only calls keep
+    /// working meanwhile. Retry once the other version's processes have
+    /// stopped. [`ErrorCode::VersionHandover`].
+    OtherVersionLive(crate::handover::OtherVersionLive),
 }
 
 impl TrellisError {
@@ -2695,6 +2761,7 @@ impl TrellisError {
             TrellisError::Staging(err) => err.code(),
             TrellisError::SelfCheck(err) => err.code(),
             TrellisError::CallTimeout { .. } => ErrorCode::Timeout,
+            TrellisError::OtherVersionLive(_) => ErrorCode::VersionHandover,
         }
     }
 }
@@ -2782,6 +2849,7 @@ impl std::fmt::Display for TrellisError {
                  the work it started",
                 budget.as_secs_f64()
             ),
+            TrellisError::OtherVersionLive(seen) => write!(f, "refused: {seen}"),
         }
     }
 }
@@ -2807,6 +2875,7 @@ impl std::error::Error for TrellisError {
             TrellisError::TransformNotFound(_) | TrellisError::ColumnNotFound { .. } => None,
             TrellisError::Staging(err) => Some(err),
             TrellisError::SelfCheck(err) => Some(err),
+            TrellisError::OtherVersionLive(seen) => Some(seen),
         }
     }
 }

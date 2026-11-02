@@ -14,7 +14,8 @@ module Trellis
     CODE = nil
 
     # One of :parse, :validation, :connectivity, :conflict, :not_found,
-    # :internal, :timeout, or :unknown for a code newer than this binding.
+    # :internal, :timeout, :version_handover, or :unknown for a code newer
+    # than this binding.
     def code
       self.class::CODE
     end
@@ -70,6 +71,15 @@ module Trellis
     CODE = :timeout
   end
 
+  # A Trellis process of another version is live on the instance, so this
+  # call changed nothing: a state-changing call, or Trellis.migrate with
+  # migrations pending, during a deploy that crosses a version boundary.
+  # Read-only calls keep working. Retry once the other version's processes
+  # have stopped; the message names the versions and their worker ids.
+  class VersionHandoverError < Error
+    CODE = :version_handover
+  end
+
   # An error code newer than this binding. The message names the code.
   class UnknownError < Error
     CODE = :unknown
@@ -99,7 +109,8 @@ module Trellis
       "conflict" => ConflictError,
       "not_found" => NotFoundError,
       "internal" => InternalError,
-      "timeout" => TimeoutError
+      "timeout" => TimeoutError,
+      "version_handover" => VersionHandoverError
     }.freeze
   end
 end

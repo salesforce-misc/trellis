@@ -26,6 +26,12 @@ defmodule Trellis.Error do
     timeout behind another transaction's lock), or a call ran out of its
     30-second deadline (the server stopped what the call started and rolled
     it back). Expected, not a bug: retry, or allow longer.
+  - `:version_handover`: a Trellis process of another version is live on the
+    instance, so this call changed nothing (a state-changing call, or
+    `migrate/1` with migrations pending, during a deploy that crosses a
+    version boundary). Read-only calls keep working. Retry once the other
+    version's processes have stopped; the message names the versions and
+    their worker ids.
   - `:internal`: a Trellis bug or an unexpected database failure.
   - `:unknown`: a code newer than this binding.
   """
@@ -36,6 +42,7 @@ defmodule Trellis.Error do
           | :conflict
           | :not_found
           | :timeout
+          | :version_handover
           | :internal
           | :unknown
 
@@ -53,6 +60,7 @@ defmodule Trellis.Error do
     "conflict" => :conflict,
     "not_found" => :not_found,
     "timeout" => :timeout,
+    "version_handover" => :version_handover,
     "internal" => :internal
   }
 

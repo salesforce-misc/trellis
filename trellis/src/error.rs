@@ -32,6 +32,9 @@ pub enum Error {
     /// pre-existing, non-Trellis schema with no marker at all. See
     /// `crate::identity`.
     IncompatibleInstance(String),
+    /// Another Trellis version is live on the instance, so `migrate` changes
+    /// nothing (ADR-0023, version handover).
+    OtherVersionLive(crate::handover::OtherVersionLive),
 }
 
 impl Error {
@@ -53,6 +56,7 @@ impl Error {
             // A mismatched/incompatible/foreign schema marker is this
             // instance colliding with existing state.
             Error::IncompatibleInstance(_) => ErrorCode::Conflict,
+            Error::OtherVersionLive(_) => ErrorCode::VersionHandover,
         }
     }
 }
@@ -66,6 +70,7 @@ impl fmt::Display for Error {
             Error::Connect(err) => write!(f, "postgres connection error: {err}"),
             Error::Migrate(err) => write!(f, "failed to apply migrations: {err}"),
             Error::IncompatibleInstance(msg) => write!(f, "refusing to attach: {msg}"),
+            Error::OtherVersionLive(seen) => write!(f, "refusing to migrate: {seen}"),
         }
     }
 }
@@ -79,6 +84,7 @@ impl std::error::Error for Error {
             Error::Connect(err) => Some(err),
             Error::Migrate(err) => Some(err),
             Error::IncompatibleInstance(_) => None,
+            Error::OtherVersionLive(seen) => Some(seen),
         }
     }
 }

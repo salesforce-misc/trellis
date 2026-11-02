@@ -49,6 +49,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
@@ -58,6 +59,7 @@ use crate::config::Config;
 use crate::defs::chunk_queue;
 use crate::defs::{self, CatalogError};
 use crate::error_code::{self, ErrorCode};
+use crate::handover::{self, Verdict};
 use crate::intake::IntakeError;
 use crate::pool::{Pool, quote_ident};
 use crate::staging::quarantine::HeldKeyRetry;
@@ -747,13 +749,46 @@ async fn run(
         }
     };
 
+    // Unique across processes and restarts: see `new_worker_id`.
+    let client_id = new_worker_id();
+    let live_workers = LiveWorkers::default();
+    // A client with neither role is no background process: it touches no
+    // database, and registers nowhere.
+    let background = options.staging_worker || options.application_threads > 0;
+    let process = BackgroundProcess {
+        pool: pool.clone(),
+        schema: config.schema().to_string(),
+        worker_id: client_id.clone(),
+        version: config.binary_version().to_string(),
+        staging: options.staging_worker,
+        staging_pid: Arc::new(AtomicI32::new(0)),
+    };
+
+    // ADR-0023 (version handover), and ADR-0010 decision 3: every background
+    // process registers in the worker registry with its version and roles
+    // before it does anything else, a staging-only one included, so a health
+    // check racing `Client::start` sees it as soon as it is real, and so the
+    // first pass decides whether it stages, drains and builds at all, or
+    // stands by while another version is live. Deliberately one row per
+    // `Client` (keyed by `client_id`, not per app-worker task's own
+    // `claimed_by`): the question `Trellis::has_live_drain_workers` answers is
+    // "does a live process exist to drain work," not "how many worker tasks
+    // does it run." The handover task below keeps the row fresh from here on.
+    let mut handover_log = HandoverLog::default();
+    let active = background
+        && handover_log.record(
+            handover_pass(&process, options.application_threads > 0).await,
+            false,
+        );
+    let (active_tx, active_rx) = watch::channel(active);
+
     let mut staging_session = None;
     let mut staging_standby = false;
     // One resolved name for every notify and every idle worker's `LISTEN`.
     let wake_channel = options.wake_channel_for(config.schema());
 
-    if options.staging_worker {
-        match setup_staging(&dsn, &config, &pool).await {
+    if options.staging_worker && active {
+        match setup_staging(&dsn, &config, &process).await {
             Ok(session) => {
                 staging_standby = session.is_none();
                 staging_session = session;
@@ -771,6 +806,8 @@ async fn run(
             dsn: dsn.clone(),
             schema: config.schema().to_string(),
             pool: pool.clone(),
+            process: process.clone(),
+            active: active_rx.clone(),
             session: staging_session,
             standby: staging_standby,
             wake_channel: wake_channel.clone(),
@@ -787,31 +824,18 @@ async fn run(
         )));
     }
 
-    // Unique across processes and restarts: see `new_worker_id`.
-    let client_id = new_worker_id();
-
-    // ADR-0010 decision 3: register this process in the
-    // worker registry the moment it starts running drain workers — before
-    // any app-worker task is even spawned, so a health check racing
-    // `Client::start` sees this worker as soon as it's real. Deliberately
-    // one row per `Client` (keyed by `client_id`, not per app-worker task's
-    // own `claimed_by`): the question `Trellis::has_live_drain_workers`
-    // answers is "does a live process exist to drain work," not "how many
-    // worker tasks does it run." Only when `application_threads > 0` — a
-    // staging-only client (capture + ring maintenance, no app workers)
-    // does no draining, so it must not register as though it did.
-    //
-    // On the same connection, every drain thread becomes a counted drainer
-    // before the first one claims, so its first claim does not size its share
-    // as the only worker. The registration task below keeps the rows fresh
-    // from here on.
+    // On the same connection as the registry, every drain thread becomes a
+    // counted drainer before the first one claims, so its first claim does
+    // not size its share as the only worker. The registration task below
+    // keeps the rows fresh from here on. A process standing by registers
+    // none: it claims nothing, and peers would size their shares around it.
     let drainer_ids: Vec<String> = (0..options.application_threads)
         .map(|i| format!("{client_id}-app-{i}"))
         .collect();
     if !drainer_ids.is_empty()
+        && active
         && let Ok(conn) = pool.get().await
     {
-        let _ = staging::register_worker(&**conn, &client_id).await;
         let _ = staging::register_drainers(&**conn, &drainer_ids).await;
     }
 
@@ -837,7 +861,6 @@ async fn run(
         None => (Vec::new(), None),
     };
     let mut drain_wakes = drain_wakes.into_iter();
-    let live_workers = LiveWorkers::default();
     let mut app_worker_tasks = Vec::with_capacity(options.application_threads + 1);
     for claimed_by in drainer_ids {
         let alive = live_workers.enter(claimed_by.clone());
@@ -855,6 +878,7 @@ async fn run(
             idle_wake_cap: options.idle_wake_cap,
             reclaim_ttl: options.reclaim_ttl,
             alive,
+            active: active_rx.clone(),
             drain_batch_cap: options.drain_batch_cap,
             build_chunk_rows: options.build_chunk_rows.max(1),
         };
@@ -863,21 +887,40 @@ async fn run(
         )));
     }
 
-    // The process's one worker-registry heartbeat and chunk-reclaim sweep
-    // see `worker_upkeep_loop`. A staging-only client has no
-    // workers to be alive for, so it runs none.
+    // The process's one backfill-chunk reclaim sweep: see
+    // `worker_upkeep_loop`. A staging-only client has no workers to be alive
+    // for, so it runs none.
     let upkeep_task = (options.application_threads > 0).then(|| {
         let pool = pool.clone();
-        let worker_id = client_id.clone();
         let reclaim_ttl = options.reclaim_ttl;
+        let active = active_rx.clone();
         tokio::spawn(crate::pool::count_background_connections(
             worker_upkeep_loop(
                 upkeep_interval(reclaim_ttl),
                 live_workers.clone(),
                 shutdown_rx.clone(),
-                async move || worker_upkeep_pass(&pool, &worker_id, reclaim_ttl).await,
+                async move || {
+                    if *active.borrow() {
+                        worker_upkeep_pass(&pool, reclaim_ttl).await;
+                    }
+                },
             ),
         ))
+    });
+
+    // The registry heartbeat and the handover re-check (ADR-0023), one pass
+    // per standby poll for every background process.
+    let handover_task = background.then(|| {
+        let process = process.clone();
+        let workers = live_workers.clone();
+        tokio::spawn(crate::pool::count_background_connections(handover_loop(
+            process,
+            handover_interval(options.reclaim_ttl),
+            workers,
+            handover_log,
+            active_tx,
+            shutdown_rx.clone(),
+        )))
     });
 
     // `self_check` jobs run beside the drain workers, never in their
@@ -887,10 +930,10 @@ async fn run(
             self_check_loop(
                 pool.clone(),
                 self_check_wake,
+                active_rx.clone(),
                 format!("{client_id}-self-check"),
                 options.reclaim_ttl,
-                options.poll_interval,
-                options.idle_wake_cap,
+                IdleBackoff::new(options.poll_interval, options.idle_wake_cap),
                 shutdown_rx.clone(),
             ),
         )));
@@ -901,12 +944,17 @@ async fn run(
     let registration_task = (options.application_threads > 0).then(|| {
         let pool = pool.clone();
         let workers = live_workers.clone();
+        let active = active_rx.clone();
         tokio::spawn(crate::pool::count_background_connections(
             worker_upkeep_loop(
                 drainer_registration_interval(options.drainer_window),
                 live_workers.clone(),
                 shutdown_rx.clone(),
-                async move || drainer_registration_pass(&pool, &workers).await,
+                async move || {
+                    if *active.borrow() {
+                        drainer_registration_pass(&pool, &workers).await;
+                    }
+                },
             ),
         ))
     });
@@ -944,18 +992,19 @@ async fn run(
     if let Some(task) = registration_task {
         let _ = task.await;
     }
+    if let Some(task) = handover_task {
+        let _ = task.await;
+    }
 
-    // Clean-shutdown removal, once every app-worker task this
-    // process registered under `client_id` has actually stopped — the
+    // Clean-shutdown removal, once every task this process registered under
+    // `client_id` has actually stopped — the
     // counterpart to the registration above. An unclean shutdown (a crash,
     // `kill -9`, or a dropped `Client` that never reaches this point at all)
     // leaves the row behind; that's expected, not a bug — see
     // `staging::worker_registry`'s doc comment for how `has_live_workers`
     // and `reclaim_stale_workers` handle that case via the reused reclaim
     // TTL rather than requiring this line to have run.
-    if options.application_threads > 0
-        && let Ok(conn) = pool.get().await
-    {
+    if background && let Ok(conn) = pool.get().await {
         let _ = staging::deregister_worker(&**conn, &client_id).await;
     }
 }
@@ -1104,17 +1153,17 @@ mod worker_id_tests {
 async fn setup_staging(
     dsn: &str,
     config: &Config,
-    pool: &Pool,
+    process: &BackgroundProcess,
 ) -> Result<Option<ProducerSession>, ClientError> {
-    let mut session = match ProducerSession::connect(dsn, config.schema()).await {
+    let mut session = match process.take_singleton(dsn).await {
         Ok(session) => session,
         Err(StagingError::ProducerAlreadyRunning) => return Ok(None),
         Err(err) => return Err(err.into()),
     };
-    match first_capture_pass(&mut session, config, pool).await {
+    match first_capture_pass(&mut session, config, &process.pool).await {
         Ok(()) => Ok(Some(session)),
         Err(err) => {
-            release_singleton(Some(session)).await;
+            release_singleton(Some(session), process).await;
             Err(err)
         }
     }
@@ -1202,6 +1251,12 @@ struct MaintenanceConfig {
     dsn: String,
     schema: String,
     pool: Pool,
+    /// This process's registry identity, which takes and releases the
+    /// singleton.
+    process: BackgroundProcess,
+    /// Whether this process may stage (ADR-0023): while it stands by for
+    /// another version, the loop holds no singleton and does nothing.
+    active: watch::Receiver<bool>,
     /// The staging-worker singleton [`setup_staging`] took, the loop's own
     /// connection; `None` when another worker holds it and this one stands by.
     session: Option<ProducerSession>,
@@ -1250,6 +1305,8 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         dsn,
         schema,
         pool,
+        process,
+        mut active,
         session,
         standby,
         wake_channel,
@@ -1282,7 +1339,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
         if let Some(database) = &database {
             capture::reconcile::forget_instance(database, &schema);
         }
-        release_singleton(session).await;
+        release_singleton(session, &process).await;
     };
     let mut session: Option<ProducerSession> = session;
     // When the next attempt at the singleton is due, while there is no session.
@@ -1311,8 +1368,35 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
             return;
         }
 
+        // ADR-0023: while another version is live, stage nothing. A leader
+        // hands the singleton back first, so the other version's standby can
+        // take it.
+        if !*active.borrow_and_update() {
+            if session.is_some() {
+                crate::instance_log::info!(
+                    "standing by for another Trellis version; released the staging-worker lock"
+                );
+                release_singleton(session.take(), &process).await;
+            }
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    stop(database, session).await;
+                    return;
+                }
+                changed = active.changed() => {
+                    if changed.is_err() {
+                        stop(database, session).await;
+                        return;
+                    }
+                }
+            }
+            // Taking over: try the singleton at once.
+            lock_schedule = LockSchedule::immediately(Instant::now());
+            continue;
+        }
+
         if session.is_none() && lock_schedule.due(Instant::now()) {
-            match ProducerSession::connect(&dsn, &schema).await {
+            match process.take_singleton(&dsn).await {
                 Ok(taken) => {
                     let _ = failures.check("connect", Ok::<_, StagingError>(()));
                     crate::instance_log::info!("took the staging-worker lock; leading");
@@ -1465,7 +1549,7 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                 // latency. The singleton is released first where the
                 // connection still works, so the reconnect can take it again
                 // at once.
-                release_singleton(session.take()).await;
+                release_singleton(session.take(), &process).await;
                 lock_schedule = LockSchedule::lost(Instant::now());
             }
         }
@@ -1518,6 +1602,15 @@ impl LockSchedule {
         }
     }
 
+    /// A process taking over from another version (ADR-0023): its first
+    /// attempt is due now, and a refused one waits a whole poll.
+    fn immediately(now: Instant) -> Self {
+        Self {
+            refused: LOST_LEADER_RETRIES.len(),
+            next: now,
+        }
+    }
+
     /// A leader that just lost its session.
     fn lost(now: Instant) -> Self {
         Self {
@@ -1563,11 +1656,19 @@ pub async fn reconcile_pass(
 /// it and its connection still works, so the next session to ask for it (a
 /// reconnect, a restarted client) gets it at once instead of waiting for the
 /// server to notice the dropped connection.
-async fn release_singleton(session: Option<ProducerSession>) {
-    if let Some(held) = session
-        && !held.client().is_closed()
-    {
+///
+/// Then clears the session from the process's registry row (`staging_pid`),
+/// so its row no longer claims a lock it doesn't hold.
+async fn release_singleton(session: Option<ProducerSession>, process: &BackgroundProcess) {
+    let Some(held) = session else {
+        return;
+    };
+    let pid = held.staging_pid();
+    if !held.client().is_closed() {
         let _ = held.release().await;
+    }
+    if let Some(pid) = pid {
+        process.forget_staging_pid(pid).await;
     }
 }
 
@@ -1982,6 +2083,9 @@ struct AppWorkerConfig {
     /// refreshing its registry row, and this worker's `drainers` row stops
     /// being refreshed once it is gone.
     alive: WorkerAlive,
+    /// Whether this process may drain and build (ADR-0023): false while it
+    /// stands by for another version.
+    active: watch::Receiver<bool>,
     /// [`ClientOptions::drain_batch_cap`]: bounds both how many segments one
     /// drain coalesces and how many folded records one page holds.
     drain_batch_cap: usize,
@@ -2076,6 +2180,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
         idle_wake_cap,
         reclaim_ttl,
         alive: _alive,
+        mut active,
         drain_batch_cap,
         build_chunk_rows,
     } = config;
@@ -2098,7 +2203,7 @@ async fn app_worker_loop(config: AppWorkerConfig, mut shutdown_rx: watch::Receiv
     }
 
     loop {
-        if *shutdown_rx.borrow() {
+        if !wait_while_standing_by(&mut active, &mut shutdown_rx).await {
             break;
         }
 
@@ -2350,15 +2455,14 @@ impl IdleBackoff {
 async fn self_check_loop(
     pool: Pool,
     mut wake: WakeListener,
+    mut active: watch::Receiver<bool>,
     claimed_by: String,
     reclaim_ttl: Duration,
-    poll_interval: Duration,
-    idle_wake_cap: Duration,
+    mut backoff: IdleBackoff,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let mut backoff = IdleBackoff::new(poll_interval, idle_wake_cap);
     loop {
-        if *shutdown_rx.borrow() {
+        if !wait_while_standing_by(&mut active, &mut shutdown_rx).await {
             break;
         }
         // Wakes already heard are answered by the claim below; one that
@@ -2516,27 +2620,20 @@ const MIN_UPKEEP_INTERVAL: Duration = Duration::from_millis(10);
 /// [`crate::app::Trellis::has_live_drain_workers`] reads the registry row
 /// against ([`staging::DEFAULT_RECLAIM_TTL`], which a client's own
 /// `reclaim_ttl` does not change) and the client's `reclaim_ttl` (what a
-/// stale chunk claim waits out). A row therefore stays fresh across two
-/// missed passes, and a stale claim is swept within `reclaim_ttl` plus a
-/// third of it.
+/// stale chunk claim waits out). A stale claim is therefore swept within
+/// `reclaim_ttl` plus a third of it, and [`handover_interval`] keeps a
+/// registry row fresh across two missed passes the same way.
 fn upkeep_interval(reclaim_ttl: Duration) -> Duration {
     (staging::DEFAULT_RECLAIM_TTL.min(reclaim_ttl) / 3).max(MIN_UPKEEP_INTERVAL)
 }
 
-/// A process's worker-registry heartbeat and backfill-chunk reclaim sweep,
-/// run by one task on the client runtime rather than by every drain worker,
-/// since a due-timer inside each worker's loop would make eight workers
-/// upsert one shared row and run the same sweep every ~405 ms, and a process
-/// whose workers were all inside a drain or build chunk longer than
-/// [`staging::DEFAULT_RECLAIM_TTL`] would let its row age out and read
-/// as dead. Both duties are independent of `staging_worker`: a drain-only
-/// fleet has no `maintenance_loop` anywhere to do them.
+/// A process's backfill-chunk reclaim sweep, run by one task on the client
+/// runtime rather than by every drain worker, since a due-timer inside each
+/// worker's loop would make eight workers run the same sweep every ~405 ms.
+/// It is independent of `staging_worker`: a drain-only fleet has no
+/// `maintenance_loop` anywhere to do it.
 ///
-/// The loop stops when no worker loop is left (`live_workers`), so a process
-/// whose workers have all panicked or exited stops refreshing its row and
-/// drops out of `has_live_drain_workers` within the TTL, as the docs promise.
-/// It does not deregister then: the row ages out, the same as a crashed
-/// process's. A clean shutdown deregisters in [`run`].
+/// The loop stops when no worker loop is left (`live_workers`).
 ///
 /// `pass` is [`worker_upkeep_pass`] in production; it is a parameter so a
 /// test can step the loop without waiting on a clock. The drainer
@@ -2560,17 +2657,282 @@ async fn worker_upkeep_loop(
     }
 }
 
-/// One pass of [`worker_upkeep_loop`]: bumps `worker_id`'s
-/// [`staging::worker_registry`] row, then frees any backfill-chunk claim
+/// One pass of [`worker_upkeep_loop`]: frees any backfill-chunk claim
 /// unrefreshed for `reclaim_ttl` (what `maintenance_loop` also does, but only
 /// alongside the staging worker: a stale claim is not a capture concern, and
 /// a crashed drain worker's chunk would otherwise sit at `Backfilling`
-/// forever in a drain-only fleet). Failures are not fatal: the next pass
-/// retries.
-async fn worker_upkeep_pass(pool: &Pool, worker_id: &str, reclaim_ttl: Duration) {
+/// forever in a drain-only fleet). Not run while the process stands by for
+/// another version. Failures are not fatal: the next pass retries.
+async fn worker_upkeep_pass(pool: &Pool, reclaim_ttl: Duration) {
     if let Ok(mut client) = pool.get().await {
-        let _ = staging::register_worker(&**client, worker_id).await;
         let _ = chunk_queue::reclaim_stale_chunks(&mut **client, reclaim_ttl).await;
+    }
+}
+
+/// How often [`handover_loop`] runs: every standby poll, and at least as
+/// often as [`upkeep_interval`], so the registry row stays live across two
+/// missed passes.
+fn handover_interval(reclaim_ttl: Duration) -> Duration {
+    STANDBY_POLL.min(upkeep_interval(reclaim_ttl))
+}
+
+/// A background process's identity in the worker registry: what its
+/// handover passes register, and the session it holds the staging-worker
+/// lock on (ADR-0023).
+#[derive(Clone)]
+struct BackgroundProcess {
+    pool: Pool,
+    schema: String,
+    worker_id: String,
+    /// The binary version it registers and compares
+    /// ([`Config::binary_version`]).
+    version: String,
+    /// It runs the staging worker.
+    staging: bool,
+    /// The backend pid of its staging session, 0 while it holds none.
+    staging_pid: Arc<AtomicI32>,
+}
+
+impl BackgroundProcess {
+    /// Takes the staging-worker singleton on a session its row names
+    /// ([`ProducerSession::connect_registered`]).
+    async fn take_singleton(&self, dsn: &str) -> Result<ProducerSession, StagingError> {
+        let session =
+            ProducerSession::connect_registered(dsn, &self.schema, &self.worker_id).await?;
+        if let Some(pid) = session.staging_pid() {
+            self.staging_pid.store(pid, Ordering::SeqCst);
+        }
+        Ok(session)
+    }
+
+    /// The session `pid` holds the lock no more: clears it from the row.
+    async fn forget_staging_pid(&self, pid: i32) {
+        let _ = self
+            .staging_pid
+            .compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+        if let Ok(conn) = self.pool.get().await {
+            let _ = staging::clear_staging(&**conn, &self.worker_id, pid).await;
+        }
+    }
+}
+
+#[cfg(test)]
+impl BackgroundProcess {
+    /// A staging process of this build's version in `schema`, holding no
+    /// staging session, and registered ([`Self::register_for_test`]), so it
+    /// can take the singleton.
+    async fn for_test(pool: Pool, schema: &str) -> Self {
+        let process = BackgroundProcess {
+            pool,
+            schema: schema.to_string(),
+            worker_id: "test-process".to_string(),
+            version: handover::BINARY_VERSION.to_string(),
+            staging: true,
+            staging_pid: Arc::new(AtomicI32::new(0)),
+        };
+        process.register_for_test().await;
+        process
+    }
+
+    /// Registers the process's row, creating a bare registry first if
+    /// `schema` has none (a schema with no Trellis catalog).
+    async fn register_for_test(&self) {
+        let conn = self.pool.get().await.expect("connection");
+        conn.batch_execute(&format!(
+            "create schema if not exists {schema}; \
+             create table if not exists {schema}.worker_registry ( \
+               worker_id text primary key, registered_at timestamptz not null default now(), \
+               last_seen timestamptz not null default now(), version text, \
+               staging boolean not null default false, drain boolean not null default false, \
+               standby boolean not null default false, staging_pid integer)",
+            schema = quote_ident(&self.schema)
+        ))
+        .await
+        .expect("a registry");
+        conn.execute(
+            &format!(
+                "insert into {}.worker_registry (worker_id, version, staging) values ($1, $2, true) \
+                 on conflict do nothing",
+                quote_ident(&self.schema)
+            ),
+            &[&self.worker_id, &self.version],
+        )
+        .await
+        .expect("register");
+    }
+}
+
+/// One handover pass (ADR-0023): under the instance's handover lock, reads
+/// the registry and the staging lock, decides whether this process takes over
+/// or stands by, and registers its row with that decision, its version and
+/// roles (`drain`: whether drain threads run in it). The lock makes two
+/// processes starting at once decide one after the other, so the second sees
+/// the first. While this binary's migrations are pending, it registers
+/// nothing (the registry may not have the columns yet).
+async fn handover_pass(process: &BackgroundProcess, drain: bool) -> Result<Verdict, StagingError> {
+    let mut client = process.pool.get().await?;
+    let pg: &mut tokio_postgres::Client = &mut client;
+    let txn = pg.transaction().await?;
+    txn.execute(
+        "select pg_advisory_xact_lock($1)",
+        &[&handover::handover_lock_key(&process.schema)],
+    )
+    .await?;
+    let observed = handover::observe(&txn, &process.schema, true).await?;
+    let verdict = handover::decide(&process.version, &observed, handover::Asker::Background);
+    if observed.registry_exists && !observed.migrations_pending {
+        let pid = process.staging_pid.load(Ordering::SeqCst);
+        staging::register_worker(
+            &txn,
+            &staging::Registration {
+                worker_id: &process.worker_id,
+                version: &process.version,
+                staging: process.staging,
+                drain,
+                standby: verdict != Verdict::TakeOver,
+                staging_pid: (pid != 0).then_some(pid),
+            },
+        )
+        .await?;
+    }
+    txn.commit().await?;
+    Ok(verdict)
+}
+
+/// One [`handover_pass`] of a background process registered as `worker_id`
+/// (drain threads only, no staging worker), as its handover task runs it,
+/// under `config`'s binary version: for tests that step version handover by
+/// hand (ADR-0023). Returns whether the process takes over.
+#[cfg(feature = "internals")]
+pub async fn handover_pass_as(
+    pool: &Pool,
+    config: &Config,
+    worker_id: &str,
+) -> Result<bool, String> {
+    let process = BackgroundProcess {
+        pool: pool.clone(),
+        schema: config.schema().to_string(),
+        worker_id: worker_id.to_string(),
+        version: config.binary_version().to_string(),
+        staging: false,
+        staging_pid: Arc::new(AtomicI32::new(0)),
+    };
+    handover_pass(&process, true)
+        .await
+        .map(|verdict| verdict == Verdict::TakeOver)
+        .map_err(|err| err.to_string())
+}
+
+/// What a background process last decided, so the log says when it starts
+/// standing by, why, and when it takes over (ADR-0023, rule 7), once each
+/// rather than every pass.
+#[derive(Default)]
+struct HandoverLog {
+    last: Option<Verdict>,
+    failing: bool,
+}
+
+impl HandoverLog {
+    /// Records one pass and returns whether the process is active. A pass
+    /// that failed keeps `was_active`: the next pass tries again.
+    fn record(&mut self, pass: Result<Verdict, StagingError>, was_active: bool) -> bool {
+        let verdict = match pass {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                if !self.failing {
+                    self.failing = true;
+                    crate::instance_log::warn!(
+                        error = %error,
+                        "couldn't check for another Trellis version or refresh this process's \
+                         registry row; trying again next poll"
+                    );
+                }
+                return was_active;
+            }
+        };
+        self.failing = false;
+        if self.last.as_ref() != Some(&verdict) {
+            match &verdict {
+                Verdict::TakeOver if self.last.is_some() => crate::instance_log::info!(
+                    "no other Trellis version is live any more; taking over"
+                ),
+                Verdict::TakeOver | Verdict::Refuse(_) => {}
+                Verdict::StandBy(handover::StandBy::OtherVersion(seen)) => {
+                    crate::instance_log::warn!(
+                        "standing by: staging, draining and builds wait, and every standby \
+                         poll checks again: {seen}"
+                    )
+                }
+                Verdict::StandBy(handover::StandBy::MigrationsPending) => {
+                    crate::instance_log::warn!(
+                        "standing by: this binary's migrations haven't run on the instance; \
+                         run migrate (`trellis run` and `Trellis::migrate`), and this process \
+                         takes over at its next standby poll"
+                    )
+                }
+            }
+        }
+        let active = verdict == Verdict::TakeOver;
+        self.last = Some(verdict);
+        active
+    }
+}
+
+/// The registry heartbeat and handover re-check of a background process
+/// (ADR-0023): a [`handover_pass`] every `interval` until shutdown,
+/// publishing whether the process is active. Every staging, drain, build and
+/// `self_check` step waits on it while the process stands by. Runs whatever
+/// the drain threads do: a staging-only process registers too, and a process
+/// whose drain threads have all ended registers with `drain` off, so it drops
+/// out of `has_live_drain_workers`.
+async fn handover_loop(
+    process: BackgroundProcess,
+    interval: Duration,
+    live_workers: LiveWorkers,
+    mut log: HandoverLog,
+    active: watch::Sender<bool>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            _ = tokio::time::sleep(interval) => {}
+        }
+        if *shutdown_rx.borrow() {
+            return;
+        }
+        let was_active = *active.borrow();
+        let now_active = log.record(
+            handover_pass(&process, live_workers.any()).await,
+            was_active,
+        );
+        if now_active != was_active {
+            let _ = active.send(now_active);
+        }
+    }
+}
+
+/// Waits while this process stands by for another version (ADR-0023).
+/// Returns `false` when shutdown came first.
+async fn wait_while_standing_by(
+    active: &mut watch::Receiver<bool>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> bool {
+    loop {
+        if *shutdown_rx.borrow() {
+            return false;
+        }
+        if *active.borrow_and_update() {
+            return true;
+        }
+        tokio::select! {
+            _ = shutdown_rx.changed() => {}
+            changed = active.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+            }
+        }
     }
 }
 
@@ -3546,6 +3908,8 @@ mod maintenance_failure_tests {
         let config = MaintenanceConfig {
             dsn: db.dsn().to_string(),
             schema: "no_trellis_here".to_string(),
+            process: BackgroundProcess::for_test(pool.clone(), "no_trellis_here").await,
+            active: watch::channel(true).1,
             pool,
             standby: false,
             session: Some(
@@ -3629,6 +3993,8 @@ mod maintenance_failure_tests {
         let config = MaintenanceConfig {
             dsn: db.dsn().to_string(),
             schema: schema.to_string(),
+            process: BackgroundProcess::for_test(pool.clone(), schema).await,
+            active: watch::channel(true).1,
             pool,
             standby: false,
             session: Some(
@@ -3729,6 +4095,8 @@ mod maintenance_failure_tests {
         let config = MaintenanceConfig {
             dsn: db.dsn().to_string(),
             schema: schema.to_string(),
+            process: BackgroundProcess::for_test(pool.clone(), schema).await,
+            active: watch::channel(true).1,
             pool,
             standby: false,
             session: Some(
@@ -4203,7 +4571,10 @@ mod reconcile_tests {
         let schema = "no_trellis_here";
         let config = Config::with_schema(db.dsn(), schema).expect("valid config");
         let pool = Pool::new(&config).expect("build a same-crate pool");
-        let err = setup_staging(db.dsn(), &config, &pool)
+        // A registry, and this process's row in it, so the setup takes the
+        // singleton and then fails on the catalog that isn't there.
+        let process = BackgroundProcess::for_test(pool.clone(), schema).await;
+        let err = setup_staging(db.dsn(), &config, &process)
             .await
             .expect_err("the pass can't read a catalog that isn't there");
         assert!(err.to_string().contains("does not exist"), "{err}");
@@ -4565,8 +4936,6 @@ mod worker_upkeep_tests {
     //! tests that start a real `Client` await a trigger's notification of
     //! the client's own write instead of polling for it.
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use super::*;
 
     async fn stale_registry_row(raw: &tokio_postgres::Client, worker_id: &str) {
@@ -4579,63 +4948,45 @@ mod worker_upkeep_tests {
         .expect("age the row");
     }
 
-    /// The row is live against `DEFAULT_RECLAIM_TTL`-shaped reads whatever the
-    /// drain threads are doing: its owner (`LiveWorkers` held, no pass from any
-    /// worker loop anywhere in this test) is "inside a long chunk" for as long
-    /// as the guard is held. Each pass finds the row aged past the TTL, as a
-    /// 30 s chunk would have left it, and puts it back; once the last guard is
-    /// dropped (a worker panic, a shutdown) the loop stops, and nothing
-    /// refreshes the row any more.
+    /// The registry row is the handover pass's (ADR-0023): every pass
+    /// refreshes it with the process's version and roles, whatever its drain
+    /// threads are doing, and a process whose drain threads have all ended
+    /// stays registered without the drain role, so it leaves
+    /// `has_live_drain_workers` at once rather than once its row ages out.
     #[tokio::test]
-    async fn the_row_stays_live_while_workers_are_busy_and_stops_when_they_are_gone() {
+    async fn every_pass_refreshes_the_row_and_drain_follows_the_threads() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("config");
         let pool = Pool::new(&config).expect("pool");
         let raw = pool.get().await.expect("connection");
         let ttl = Duration::from_secs(5);
+        let mut process = BackgroundProcess::for_test(pool.clone(), config.schema()).await;
+        process.staging = false;
 
-        staging::register_worker(&**raw, "w")
+        for n in 1..=3 {
+            stale_registry_row(&raw, &process.worker_id).await;
+            let verdict = handover_pass(&process, true).await.expect("pass");
+            assert_eq!(verdict, Verdict::TakeOver);
+            assert!(
+                staging::has_live_workers(&**raw, ttl).await.expect("read"),
+                "pass {n} did not refresh the row"
+            );
+        }
+        handover_pass(&process, false).await.expect("pass");
+        assert!(!staging::has_live_workers(&**raw, ttl).await.expect("read"));
+        let row = raw
+            .query_one(
+                "select version, drain, standby, last_seen > now() - interval '5 seconds' \
+                 from worker_registry where worker_id = $1",
+                &[&process.worker_id],
+            )
             .await
-            .expect("register");
-        let live_workers = LiveWorkers::default();
-        let workers = std::sync::Mutex::new(Some(live_workers.enter("w".to_string())));
-        let passes = AtomicUsize::new(0);
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-
-        tokio::time::timeout(
-            Duration::from_secs(60),
-            worker_upkeep_loop(
-                Duration::from_millis(1),
-                live_workers,
-                shutdown_rx,
-                async || {
-                    let n = passes.fetch_add(1, Ordering::SeqCst) + 1;
-                    stale_registry_row(&raw, "w").await;
-                    assert!(
-                        !staging::has_live_workers(&**raw, ttl).await.expect("read"),
-                        "the row aged out before pass {n}"
-                    );
-                    worker_upkeep_pass(&pool, "w", Duration::from_secs(60)).await;
-                    assert!(
-                        staging::has_live_workers(&**raw, ttl).await.expect("read"),
-                        "pass {n} did not refresh the row"
-                    );
-                    if n == 3 {
-                        // The last worker loop ends.
-                        workers.lock().expect("lock").take();
-                    }
-                },
-            ),
-        )
-        .await
-        .expect("the loop stops once no worker loop is alive");
-
-        assert_eq!(
-            passes.load(Ordering::SeqCst),
-            3,
-            "no pass after the last worker went"
-        );
+            .expect("the row");
+        assert_eq!(row.get::<_, String>(0), handover::BINARY_VERSION);
+        assert!(!row.get::<_, bool>(1));
+        assert!(!row.get::<_, bool>(2));
+        assert!(row.get::<_, bool>(3), "still live");
     }
 
     /// A worker loop that panics drops its entry like one that returns.
@@ -4710,13 +5061,13 @@ mod worker_upkeep_tests {
         (raw, rx)
     }
 
-    /// `run` wires the loop: a started client's upkeep task refreshes its row
-    /// with no maintenance loop (`staging_worker: false`). The startup
-    /// registration inserts the row, so only a pass updates it, and the
-    /// first pass runs as soon as the task starts. The test awaits that
-    /// update; the timeout only bounds a failure.
+    /// `run` wires the loop: a started client's handover task refreshes its
+    /// row with no maintenance loop (`staging_worker: false`). The startup
+    /// pass inserts the row, so only a later pass updates it, one standby poll
+    /// after the start. The test awaits that update; the timeout only bounds
+    /// a failure.
     #[tokio::test]
-    async fn a_started_client_refreshes_its_row_from_the_upkeep_task() {
+    async fn a_started_client_refreshes_its_row_from_the_handover_task() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let (raw, mut updated) = registry_writes(&db, "update").await;
@@ -4732,7 +5083,7 @@ mod worker_upkeep_tests {
 
         let refreshed = tokio::time::timeout(Duration::from_secs(60), updated.recv())
             .await
-            .expect("the upkeep task refreshed the row")
+            .expect("the handover task refreshed the row")
             .expect("listener");
         let registered: String = raw
             .query_one("select worker_id from worker_registry", &[])
@@ -4756,11 +5107,13 @@ mod worker_upkeep_tests {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let (raw, mut deleted) = registry_writes(&db, "delete").await;
-        raw.batch_execute(
-            "insert into worker_registry (worker_id, registered_at, last_seen) values \
-             ('crashed', now() - interval '1 hour', now() - interval '1 hour'), \
-             ('between-refreshes', now() - interval '1 second', now() - interval '1 second')",
-        )
+        raw.batch_execute(&format!(
+            "insert into worker_registry (worker_id, registered_at, last_seen, version) values \
+                 ('crashed', now() - interval '1 hour', now() - interval '1 hour', '{v}'), \
+                 ('between-refreshes', now() - interval '1 second', now() - interval '1 second', \
+                  '{v}')",
+            v = handover::BINARY_VERSION
+        ))
         .await
         .expect("seed the registry");
         let client = Client::start(
@@ -4781,8 +5134,13 @@ mod worker_upkeep_tests {
             .await
             .expect("the maintenance loop swept the registry")
             .expect("listener");
+        // The client's own row is there too: a staging-only process registers.
         let left: Vec<String> = raw
-            .query("select worker_id from worker_registry", &[])
+            .query(
+                "select worker_id from worker_registry \
+                 where worker_id in ('crashed', 'between-refreshes')",
+                &[],
+            )
             .await
             .expect("read the registry")
             .iter()
@@ -5163,6 +5521,7 @@ mod restore_gate_tests {
             idle_wake_cap: Duration::from_secs(3600),
             reclaim_ttl: staging::DEFAULT_RECLAIM_TTL,
             alive: live.enter("gate-test-app-0".to_string()),
+            active: watch::channel(true).1,
             drain_batch_cap: staging::DEFAULT_DRAIN_BATCH_CAP,
             build_chunk_rows: staging::build::DEFAULT_CHUNK_ROWS,
         };

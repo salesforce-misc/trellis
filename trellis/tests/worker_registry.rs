@@ -206,8 +206,8 @@ async fn has_live_staging_worker_needs_a_staging_connection_not_just_drain_worke
 /// drain threads must not count as a live drain worker — `seg_claims`-style
 /// liveness inference would get this right by accident (nothing to claim
 /// without drain workers either), but this asserts the *registry* itself
-/// draws the same line, since a staging-only client never calls
-/// `staging::register_worker` at all.
+/// draws the same line: a staging-only client registers (ADR-0023), without
+/// the drain role.
 #[tokio::test]
 async fn has_live_drain_workers_is_false_for_a_staging_only_connection() {
     let cluster = TestCluster::start();
@@ -279,9 +279,12 @@ async fn staleness_is_read_time_and_needs_no_reclaim_pass() {
     // backdate below is far older than it: no assertion reads the clock.
     let ttl = Duration::from_secs(3600);
 
-    worker_registry::register_worker(&client, "dead-worker")
-        .await
-        .expect("register_worker");
+    worker_registry::register_worker(
+        &client,
+        &worker_registry::Registration::drain_worker("dead-worker"),
+    )
+    .await
+    .expect("register_worker");
     assert!(
         worker_registry::has_live_workers(&client, ttl)
             .await
@@ -329,12 +332,18 @@ async fn reclaim_stale_workers_deletes_only_the_stale_row() {
     // Far longer than the pause between registering "live-worker" and the
     // sweep, and the backdate is older still: no assertion reads the clock.
     let ttl = Duration::from_secs(3600);
-    worker_registry::register_worker(&client, "dead-worker")
-        .await
-        .expect("register dead-worker");
-    worker_registry::register_worker(&client, "live-worker")
-        .await
-        .expect("register live-worker");
+    worker_registry::register_worker(
+        &client,
+        &worker_registry::Registration::drain_worker("dead-worker"),
+    )
+    .await
+    .expect("register dead-worker");
+    worker_registry::register_worker(
+        &client,
+        &worker_registry::Registration::drain_worker("live-worker"),
+    )
+    .await
+    .expect("register live-worker");
 
     client
         .execute(
@@ -503,10 +512,13 @@ async fn two_processes_register_distinct_rows_and_shutdown_removes_only_its_own(
     assert_eq!(worker_registry_row_count(&raw).await, 0);
 }
 
-/// A staging-only `Client` (`application_threads: 0`) must never register at
-/// all — the lower-level mirror of `has_live_drain_workers_is_false_for_a_staging_only_connection`.
+/// A staging-only `Client` (`application_threads: 0`) registers with its
+/// version and the staging role but not the drain role (ADR-0023: every
+/// background process registers), so it never counts as a drain worker — the
+/// lower-level mirror of `has_live_drain_workers_is_false_for_a_staging_only_connection`
+/// — and its clean shutdown removes the row.
 #[tokio::test]
-async fn a_staging_only_client_never_registers_a_worker_row() {
+async fn a_staging_only_client_registers_without_the_drain_role() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -522,10 +534,24 @@ async fn a_staging_only_client_never_registers_a_worker_row() {
     };
     let client = TrellisClient::start(db.dsn(), options).expect("client start");
 
-    assert_eq!(
-        worker_registry_row_count(&raw).await,
-        0,
-        "staging + ring maintenance alone must never write a worker-registry row"
+    let row = raw
+        .query_one(
+            "select version, staging, drain, standby, staging_pid is not null \
+             from worker_registry",
+            &[],
+        )
+        .await
+        .expect("one row");
+    assert_eq!(row.get::<_, String>(0), env!("CARGO_PKG_VERSION"));
+    assert!(row.get::<_, bool>(1), "staging role");
+    assert!(!row.get::<_, bool>(2), "no drain role");
+    assert!(!row.get::<_, bool>(3), "not standing by");
+    assert!(row.get::<_, bool>(4), "names its staging session");
+    assert!(
+        !worker_registry::has_live_workers(&raw, std::time::Duration::from_secs(30))
+            .await
+            .expect("read"),
+        "a staging-only process is no drain worker"
     );
 
     client.shutdown().await.expect("clean shutdown");

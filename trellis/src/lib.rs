@@ -120,6 +120,10 @@ mod float;
 #[cfg(feature = "internals")]
 pub mod float;
 #[cfg(not(feature = "internals"))]
+pub(crate) mod handover;
+#[cfg(feature = "internals")]
+pub mod handover;
+#[cfg(not(feature = "internals"))]
 mod identity;
 #[cfg(feature = "internals")]
 pub mod identity;
@@ -229,6 +233,7 @@ pub use client::{Client, ClientError, ClientOptions};
 pub use config::Config;
 pub use error::Error;
 pub use error_code::ErrorCode;
+pub use handover::{OtherProcess, OtherVersionLive};
 pub use metrics::Metrics;
 pub use migrate::migrate;
 #[cfg(feature = "otlp")]

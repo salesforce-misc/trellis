@@ -183,6 +183,23 @@ pub(crate) async fn seed_marker(
     Ok(())
 }
 
+/// Whether [`seed_marker`] would write: the marker is missing, or records
+/// another target schema than `config`'s.
+pub(crate) async fn marker_would_change(
+    client: &mut tokio_postgres::Client,
+    config: &Config,
+) -> Result<bool, Error> {
+    let unchanged: bool = client
+        .query_one(
+            "select exists(select 1 from trellis_instance \
+             where target_schema is not distinct from $1)",
+            &[&config.target_schema()],
+        )
+        .await?
+        .get(0);
+    Ok(!unchanged)
+}
+
 /// Rules 1 and 2 of [`prepare_attach`], which read only `config`.
 fn check_catalog_schema(config: &Config) -> Result<(), Error> {
     let schema = config.schema();

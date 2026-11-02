@@ -20,13 +20,14 @@ use trellis::{
 /// grows a code this list lacks, so adding one is a deliberate binding change
 /// (a new atom, a new exception subclass) rather than a silent downgrade to
 /// the fallback.
-pub const ERROR_CODES: [&str; 7] = [
+pub const ERROR_CODES: [&str; 8] = [
     "parse",
     "validation",
     "connectivity",
     "conflict",
     "not_found",
     "timeout",
+    "version_handover",
     "internal",
 ];
 

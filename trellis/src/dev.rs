@@ -273,6 +273,7 @@ pub mod fixtures {
             correcting: Vec::new(),
             paused_upstream_columns: Vec::new(),
             build_wait: None,
+            version_handover: None,
         }
     }
 
