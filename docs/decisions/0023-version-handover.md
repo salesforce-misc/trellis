@@ -46,8 +46,9 @@ stage, drain or change state side by side.
    migrations is running: `migrate` (and `trellis apply`, which migrates first)
    refuses with the error of rule 6, and a background process waits. With
    nothing pending and another version live, `migrate` changes nothing: it
-   runs its checks, refinery's refusal of a missing or changed migration
-   among them, and succeeds, or refuses when the attach would write (a
+   runs its checks, the catalog floor and refinery's refusal of a changed
+   migration among them ([ADR-0024](0024-compatibility-floors-and-rollback.md)),
+   and succeeds, or refuses when the attach would write (a
    grammar-version pause, [ADR-0018](0018-grammar-versioning.md), or a changed
    marker). A background process never migrates; `trellis run` migrates before
    it starts its pipeline, and waits on the refusal.
@@ -77,11 +78,12 @@ stage, drain or change state side by side.
    it takes over. A process killed without a clean shutdown leaves its row
    live for up to the reclaim TTL, which delays the takeover by as much; the
    message says so.
-8. **Symmetric.** The rules hold for a downgrade between two releases that both
-   implement them. An older release meets two checks first: refinery refuses a
-   database carrying a migration it lacks (`abort_missing`, which Trellis
-   keeps), so a release before 0.2.0 refuses any database V9 has run on; and
-   ADR-0018's attach check refuses stored grammar versions newer than it reads.
+8. **Symmetric.** The rules hold for a rollback between two releases that both
+   implement them. The older release meets the compatibility floors
+   ([ADR-0024](0024-compatibility-floors-and-rollback.md)) as it attaches: it
+   refuses a catalog whose floor is above its version, and pauses each
+   definition whose floor is. A release before 0.2.0 has no floors; its
+   refinery refuses in `migrate` any database V9 has run on.
 
 A schema that has never been migrated has no history and nothing live on it:
 it reads as nothing pending, so `migrate` creates it, and a background process

@@ -18,7 +18,7 @@
 #   basebackup    5c. a pg_basebackup restore of a running v0.1.0 database
 #   clients       6. Ruby gem and Elixir package (manual)
 #   mixed         7. the candidate stands by beside a live v0.1.0, then takes over
-#   downgrade     8. v0.1.0 pointed at a database the candidate wrote
+#   downgrade     8. v0.1.0 pointed at a database the candidate wrote (rollback, ADR-0024)
 #
 # Options:
 #   --candidate REV|DIR   the release candidate: a directory or a git revision.
@@ -897,7 +897,7 @@ if want downgrade; then
   else
     record INFO downgrade "$old_tag refused a database the candidate wrote: $(head -c 200 "$logs/run-down-shapes.log")"
   fi
-  record INFO downgrade "downgrade is unsupported either way (docs/releasing.md); this observation is what to quote in the release notes"
+  record INFO downgrade "the step asserts nothing: docs/decisions/0024-compatibility-floors-and-rollback.md says what a rollback does, and before 0.2.0 it is a restore from backup (docs/upgrading.md); quote this observation in the release notes"
   stop_run down-shapes
 else
   record SKIP downgrade "not selected"

@@ -331,9 +331,8 @@ each one costs and what to expect around it
   new version refuse with the `version_handover` code; the old version runs
   on, and capture never stops. Then stop the old version: the new one takes
   over, running its migrations first (`trellis run` does; an embedder's
-  `migrate` refuses while the old version runs, so run it after). Downgrade by
-  restoring a backup taken before the upgrade
-  ([rolling deploys](embedding.md#rolling-deploys)).
+  `migrate` refuses while the old version runs, so run it after). Roll back
+  as [upgrading and rolling back](upgrading.md#rolling-back) says.
 * **After a table swap, a bulk load with triggers disabled, or a fixture load
   that ends with `ENABLE TRIGGER ALL`:** the readers of the table are paused.
   `RESUME` each one, which rebuilds it

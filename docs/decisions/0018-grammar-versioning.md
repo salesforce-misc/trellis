@@ -50,8 +50,11 @@ was a valid identifier, and still reads where the identifier did, is such a
 change. A change that only accepts text the current version refuses, such as a
 new function under
 [ADR-0004's growth policy](0004-transform-definition-grammar.md#growth-policy),
-needs no bump: every stored text keeps its meaning, and an older binary refuses
-the new text rather than misreading it.
+needs no bump: every stored text keeps its meaning. It raises the definition
+floor of text that uses it ([ADR-0024](0024-compatibility-floors-and-rollback.md)),
+so an older binary pauses such a definition without parsing it. Parsing it
+could misread it: a grammar without the bare `NULL` literal reads
+`COALESCE(amount, NULL)` as a read of a column named `"NULL"`.
 
 A change that refuses text Postgres rejects, or reads differently
 ([ADR-0022](0022-grammar-mirrors-postgres.md)), needs no bump either. No stored
@@ -82,12 +85,15 @@ text and its version and returns the definition in the current grammar's terms:
   pauses, its `capture_failure` naming the stored version, the oldest version
   this binary reads, and the fix: drop the transform and define it again.
   `RESUME` refuses; `DROP TRANSFORM` works without reading the text.
-- **Newer than the binary knows:** refused, and the definition is neither read
-  nor written. Text that fails to parse at a known version fails the same way,
-  which is how a downgrade past an additive change shows up, and is how a load
-  outside an attach sees text this release refuses. After a downgrade, run the
-  binary that wrote the definition and `RESUME` the transform; for text this
-  release refuses, drop the transform and define it again.
+- **Newer than the binary knows:** not read. The transform pauses, its
+  `capture_failure` naming the stored version and the newest this binary
+  reads, with the remedies of a definition above the running version
+  ([ADR-0024](0024-compatibility-floors-and-rollback.md)): roll forward to a
+  release that reads it and `RESUME` the transform, or drop it and define it
+  again in this grammar. The other definitions keep running.
+- **Text that fails to parse at a known version:** refused, and the definition
+  is neither read nor written. This is how a load outside an attach sees text
+  this release refuses; drop the transform and define it again.
 
 Nothing after the entry point sees a version. Names are resolved in several
 places after the parse; translating once keeps every one of them on the current
@@ -95,18 +101,21 @@ rules, lets an older definition pass a resume's re-validation, and gives
 rewriting the same code.
 
 Attaching (`migrate`) checks every stored definition's version before anything
-else runs. It refuses the attach if any is newer, naming those definitions,
-and pauses each one outside the window and each one inside it whose text this
-release refuses. A paused definition of either kind reads nothing until it is
-dropped, so the rest of the instance runs beside it. While a process of another
-version is live, the attach pauses nothing: it refuses instead when it would
+else runs. It pauses each one newer than this binary reads, each one outside
+the window, and each one inside it whose text this release refuses. A paused
+definition of any of these kinds reads nothing until it is dropped, or resumed
+by a binary that reads it, so the rest of the instance runs beside it. While a
+process of another version is live, the attach pauses nothing: it refuses
+instead when it would
 pause something ([ADR-0023](0023-version-handover.md)). The load-time check
 stands on its own, since a process can connect without attaching and a newer
 binary can write after the attach.
 
-Too old pauses and too new refuses because the fixes differ: the operator can
-fix a too-old definition here by redefining it, while a too-new one means the
-wrong binary is running.
+Too old and too new both pause, each with its own fix in the reason: the
+operator fixes a too-old definition here by redefining it, and a too-new one
+by rolling forward to the release that wrote it, or by redefining it in this
+grammar. Pausing the one definition rather than refusing the attach keeps every
+other definition running after a rollback.
 
 ### Rewriting moves a definition to the current grammar without a rebuild
 
@@ -160,6 +169,8 @@ to the same tree. (Grammar 1 already reads names the new way; see
   the refused form pauses at the upgrade until its operator redefines it.
 - Upgrades may skip one major. Skipping more without rewriting in between pauses
   the definitions written before the window.
-- A downgrade across a grammar change is refused rather than run on
-  re-interpreted definitions, and so is an older binary running beside a newer
-  one once the newer one writes a newer version.
+- A rollback across a grammar change pauses the definitions written in the
+  newer grammar rather than running them re-interpreted, and the rest keep
+  running ([ADR-0024](0024-compatibility-floors-and-rollback.md)). An older
+  binary never runs beside a newer one
+  ([ADR-0023](0023-version-handover.md)).

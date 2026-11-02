@@ -37,7 +37,7 @@ Pick the form that matches how you run it:
 * **Elixir**: the Hex package `trellis_pg`; see [clients/elixir](clients/elixir/README.md).
 * **Ruby**: the gem `trellis-pg`; see [clients/ruby](clients/ruby/README.md).
 
-[docs/embedding.md](docs/embedding.md) is the guide to running Trellis inside an application, and [docs/releasing.md](docs/releasing.md) lists what each release ships.
+[docs/embedding.md](docs/embedding.md) is the guide to running Trellis inside an application, [docs/upgrading.md](docs/upgrading.md) says how to upgrade Trellis and roll it back, and [docs/releasing.md](docs/releasing.md) lists what each release ships.
 
 ## A first transform
 
@@ -68,7 +68,7 @@ This repo is home to a few key components:
 
 * `trellis` is the rust crate that users will download and install into their application code
 * `cli` (package `trellis-cli`) builds the `trellis` operator-facing binary, which wraps the `trellis` library crate for defining transforms, running the live pipeline, and checking status from a shell — run `cargo run -p trellis-cli -- --help` (or `trellis --help` once installed) to see what it can do
-* `docs` outlines the key ideas and decisions this project has taken; [docs/recommendations.md](docs/recommendations.md) is the operator's guide to running Trellis well (WAL and checkpoint tuning, ring sizing, roles and permissions), and [docs/operations.md](docs/operations.md) says what to do when Trellis stops a definition and how each repair behaves, and [docs/releasing.md](docs/releasing.md) says how a release is cut and published
+* `docs` outlines the key ideas and decisions this project has taken; [docs/recommendations.md](docs/recommendations.md) is the operator's guide to running Trellis well (WAL and checkpoint tuning, ring sizing, roles and permissions), [docs/operations.md](docs/operations.md) says what to do when Trellis stops a definition and how each repair behaves, [docs/upgrading.md](docs/upgrading.md) how to upgrade and roll back, and [docs/releasing.md](docs/releasing.md) says how a release is cut and published
 * `clients` holds the Elixir and Ruby bindings for running Trellis inside a host app; [docs/embedding.md](docs/embedding.md) is the guide to embedding it
 * `benchmark` is a harness for measuring throughput, latency and other key-metrics
 * `generative` is a generative test suite that is used to validate correctness under various scenarios and loads

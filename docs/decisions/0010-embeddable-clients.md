@@ -79,9 +79,12 @@ opaque resource.** An instance is one catalog schema in one database
 each instance it uses: a host that serves several databases holds one per
 database, and a host that wants two instances in one database holds one per
 catalog schema. `Trellis::connect`
-runs the instance-identity check, builds the pool, and optionally starts
-background workers — none of it per-call, which is why a handle is created once
-and shared rather than connected per request.
+runs the instance-identity check and the catalog-floor check, builds the pool,
+and optionally starts background workers — none of it per-call, which is why a
+handle is created once and shared rather than connected per request. Every
+handle runs the catalog-floor check, a define-only one included: a binary
+below the floor refuses to connect, whether or not it runs `migrate`
+([ADR-0024](0024-compatibility-floors-and-rollback.md)).
 
 * **Elixir:** a `ResourceArc` owned by a process in the supervision tree, so
   shutdown is a supervisor concern and the destructor is only a backstop. Each

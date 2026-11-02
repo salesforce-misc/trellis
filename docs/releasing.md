@@ -169,7 +169,7 @@ running for a manual step.
 | `basebackup` | A `pg_basebackup` taken while the old build and its writers ran starts as a cluster, and the candidate converges it with no pause and no `RESUME`. | Script |
 | `clients` | The Ruby gem and the Elixir package built from the candidate open a database the predecessor's clients used, with the same options. | Manual |
 | `mixed` | The candidate started while an old instance runs on the database stands by ([version handover](decisions/0023-version-handover.md)): it stays up, says it is standing by naming its own version (the one it was built as; a candidate reporting the old build's version string fails, since with migrations pending it stands by beside its own version too) and the old build as a release with no registered version, runs no migration, and pauses nothing, while the old instance's writes keep converging. Once the old instance stops, the candidate takes over: it migrates, its `worker_registry` row carries that version, and the writes made since converge with a clean `self_check`. | Script |
-| `downgrade` | What the old build does when pointed at a database the candidate has written. | Script, observed |
+| `downgrade` | What the old build does when pointed at a database the candidate has written ([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md) says what it should do). | Script, observed |
 
 ### The manual steps, and what the script expects
 
@@ -231,11 +231,15 @@ build and expects the candidate to migrate and converge. A candidate that runs
 beside the old one, exits, or pauses definitions fails the step, and the
 finding is filed.
 
-**Downgrade (step 8).** Downgrade is not supported. After the candidate has
-attached to a database, the way back is a restore from a backup taken before
-the upgrade. The script records what the old build does when pointed at a
-database the candidate has written, for the release notes; it does not make
-downgrade a supported path.
+**Rollback (step 8).** [ADR-0024](decisions/0024-compatibility-floors-and-rollback.md)
+decides what a rollback does: a release at or above the catalog floor attaches,
+pauses each definition whose floor is above it with a reason naming both
+versions and the remedies, and runs the rest; rolling forward and `RESUME`
+brings the paused ones back. A release before 0.2.0 carries no floors, so
+rolling back to one is a restore from a backup taken before the upgrade
+([upgrading](upgrading.md#rolling-back)). The script records what the old
+build does when pointed at a database the candidate has written, for the
+release notes, and asserts none of the ADR's rules.
 
 ### Release notes checklist
 
@@ -257,8 +261,16 @@ For each release, the notes carry:
   adds a migration (`trellis run` does; an embedder runs `migrate` after the old
   version has stopped, since it refuses while one runs). Say whether the release
   adds a migration (`0.2.0` adds V9, so `0.1.0` can't open a database `0.2.0`
-  has migrated). Downgrade by restoring a backup
-  ([operations runbooks](operations.md#runbooks)).
+  has migrated).
+- **Compatibility floors:** the floors this release raised (the catalog floor,
+  and which features carry a new definition floor) and what that means for
+  rolling back to the previous release
+  ([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md),
+  [upgrading](upgrading.md#rolling-back)). For `0.2.0`: rolling back to `0.1.x`
+  means restoring a backup taken before the upgrade, which also discards the
+  application's writes since, and a `0.1.x` worker started without `migrate`
+  runs unchecked on a database `0.2.0` migrated
+  ([known correctness gaps](known-correctness-gaps.md#a-release-before-020-started-on-a-database-a-later-release-migrated)).
 - **For databases that came from a pre-release,** which the battery does not
   start from:
   - a database loaded from a `0.1.0-gamma` `structure.sql` has aggregate

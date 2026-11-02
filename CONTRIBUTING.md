@@ -65,6 +65,28 @@ what accepted definition text means bumps the grammar version, ships only in a
 breaking release, and brings a compatibility rule for the version it replaces;
 see [ADR-0018](docs/decisions/0018-grammar-versioning.md).
 
+# Compatibility Floors
+
+A release can be rolled back to while the database still holds what a newer
+release wrote, so every persisted format declares the oldest release that can
+read it; see [ADR-0024](docs/decisions/0024-compatibility-floors-and-rollback.md).
+
+- A migration, or a new instance-wide format (the ring's format, an
+  instance-scoped value), declares the catalog floor: the oldest release that
+  can read the catalog after it. One an older release can't read raises the
+  floor. Prefer changes the previous release tolerates: a nullable or
+  defaulted column, a table it ignores.
+- A new grammar feature, key space, hidden-table layout or per-definition
+  stored value carries a definition floor: the release that introduces it.
+  Every write of a definition that uses it stamps that floor. An additive
+  grammar change needs no grammar-version bump, but it does carry a floor.
+- Never default an unknown stored value. An enum-like value a binary doesn't
+  know pauses the definition it belongs to, or refuses the attach for
+  instance-wide state, and never falls through to a default or panics. Writing
+  a new value raises the matching floor.
+- The release notes say which floors a release raised
+  ([releasing](docs/releasing.md#release-notes-checklist)).
+
 # Creating a Pull Request
 
 1. **Ensure the bug/feature was not already reported** by searching on GitHub under Issues.  If none exists, create a new issue so that other contributors can keep track of what you are trying to add/fix and offer suggestions (or let you know if there is already an effort in progress).

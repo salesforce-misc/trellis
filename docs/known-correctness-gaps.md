@@ -42,6 +42,8 @@ wrong rows, on the targets it compares
 | **Changes made outside Trellis to what it owns** | | |
 | [Rows written into a target, a hidden table or Trellis's schema](#rows-written-into-a-target-a-hidden-table-or-trelliss-schema) | `self_check`, except Trellis's schema | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
 | [Part of the database restored from another point in time](#part-of-the-database-restored-from-another-point-in-time) | `self_check` | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
+| **An older release on a newer database** | | |
+| [A release before 0.2.0 started on a database a later release migrated](#a-release-before-020-started-on-a-database-a-later-release-migrated) | `self_check` after rolling forward | documented |
 
 ## Preconditions
 
@@ -78,6 +80,11 @@ while every rule holds.
 * **Don't write a 1-1 `JOIN`'s `b` under `session_replication_role =
   replica`** when its key on the `ON` columns is a deferrable constraint
   ([below](#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica)).
+* **Roll back to a release before 0.2.0 only by restoring a backup** taken
+  before the upgrade. Such a release's `migrate` refuses a database a later
+  release migrated, but a handle of it that connects without migrating runs
+  on one unchecked
+  ([below](#a-release-before-020-started-on-a-database-a-later-release-migrated)).
 
 ## Schema changes Trellis can't tell from routine work
 
@@ -450,6 +457,36 @@ ring held.
 TRANSFORM` and define each affected transform again.
 
 **Ends with:** [#1209](https://github.com/salesforce-misc/trellis/issues/1209).
+
+## An older release on a newer database
+
+### A release before 0.2.0 started on a database a later release migrated
+
+**When:** an application rolls back to a release before 0.2.0 without
+restoring a backup, and a handle of that release connects without running
+`migrate`: a worker the application starts at boot, for one. Its `migrate`
+refuses such a database, since 0.2.0 adds a migration it doesn't carry, so
+`trellis run`, `trellis apply`, `bin/rails trellis:migrate`, the migration
+helpers and a release task that migrates all stop with an error. Its connect
+checks nothing.
+
+**What goes wrong:** the older release runs its pipeline over the definitions
+and state the newer one wrote, with its own rules. Definition text added after
+it can read as something else: a bare `NULL` reads as a column named
+`"NULL"`, so a definition reading `COALESCE(amount, NULL)` computes from that
+column when the source has one. The definition stays `live`.
+
+**Detected by:** `self_check` under the release that migrated the database,
+after rolling forward. The older release's own `self_check` recomputes from
+its own reading of the definition, so it agrees with the target.
+
+**Repair:** stop the older release, roll forward, and `PAUSE` and `RESUME`
+each definition it ran, which rebuilds it; or restore the backup taken before
+the upgrade ([upgrading — rolling back](upgrading.md#to-a-release-before-020)).
+
+**Ends with:** documented. The check has to live in the older release, and no
+release before 0.2.0 carries one
+([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md)).
 
 ## What `self_check` can't see
 

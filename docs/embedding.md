@@ -123,7 +123,9 @@ and `status()` shows `version_handover`, naming the old version's workers. Stop
 the old version, and the new one takes over at its next poll. A process killed
 without a clean shutdown leaves its registry row live for up to the reclaim
 TTL, 30 seconds, which delays the takeover by as much. Versions match exactly:
-any change of release is a handover.
+any change of release is a handover. [Upgrading and rolling back](upgrading.md)
+gives the steps, and what rolling the application back does to its
+definitions.
 
 A release that adds a migration can't run it while any process of the old
 version is live: `migrate` refuses with the same code until the old version
