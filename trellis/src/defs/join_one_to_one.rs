@@ -35,7 +35,9 @@ use tokio_postgres::GenericClient;
 
 use super::ast::{Expr, FieldDef, TransformDef};
 use super::ddl::PrimaryKeyColumn;
-use super::join::{Side, join_key, side_columns};
+use super::join::{
+    Side, column_type, join_key, keys_table_ddl, lock_row_ddl, side_columns, typed_column,
+};
 use super::validate::{JoinColumnInfo, ValidationError};
 use crate::pool::quote_ident;
 
@@ -141,23 +143,6 @@ impl HiddenTable {
     }
 }
 
-/// A column's `create table` type: its type with no modifier, qualified, and
-/// its collation when that isn't the database default, so a value compares in
-/// a hidden table exactly as it does in its source.
-fn column_type(info: &JoinColumnInfo) -> String {
-    match info.copy_collation.as_deref() {
-        Some(collation) => format!("{} collate {collation}", info.copy_type),
-        None => info.copy_type.clone(),
-    }
-}
-
-fn typed(columns: &HashMap<String, JoinColumnInfo>, name: &str) -> String {
-    let pg_type = columns
-        .get(name)
-        .map_or_else(|| "text".to_string(), column_type);
-    format!("{} {pg_type}", quote_ident(name))
-}
-
 /// The columns `side`'s ledger table copies from its source, in order: the
 /// join key, then the other columns the fields read.
 pub(crate) fn read_columns(def: &TransformDef, side: Side) -> Vec<String> {
@@ -216,7 +201,7 @@ pub(crate) fn hidden_tables_ddl(
             quote_ident(super::ledger::KEY_COLUMN)
         )];
         body.push(super::ledger::ordering_state_columns());
-        body.extend(read.iter().map(|column| typed(columns, column)));
+        body.extend(read.iter().map(|column| typed_column(columns, column)));
         let quoted_key: Vec<String> = key.iter().map(|c| quote_ident(c)).collect();
         sql.push_str(&format!(
             "create table {name} ({});\n\
@@ -228,22 +213,14 @@ pub(crate) fn hidden_tables_ddl(
             quote_ident(super::ledger::TOMBSTONE_COLUMN),
         ));
     }
-    // `J` keys on the `FROM` side's join key columns; each pair has one type
-    // and collation (define checks it), and a copy has no modifier, so either
-    // side's would do.
-    let key = join_key(def, Side::From);
-    let mut body: Vec<String> = key.iter().map(|c| typed(from, c)).collect();
-    let quoted: Vec<String> = key.iter().map(|c| quote_ident(c)).collect();
-    body.push(format!("primary key ({})", quoted.join(", ")));
-    sql.push_str(&format!(
-        "create table {} ({});\n",
-        HiddenTable::Keys.qualified(catalog_schema, id),
-        body.join(", ")
+    sql.push_str(&keys_table_ddl(
+        &HiddenTable::Keys.qualified(catalog_schema, id),
+        def,
+        from,
+        &[],
     ));
-    let lock = HiddenTable::TruncateLock.qualified(catalog_schema, id);
-    sql.push_str(&format!(
-        "create table {lock} (id boolean primary key default true check (id));\n\
-         insert into {lock} default values;\n"
+    sql.push_str(&lock_row_ddl(
+        &HiddenTable::TruncateLock.qualified(catalog_schema, id),
     ));
     sql
 }

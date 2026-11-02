@@ -326,17 +326,67 @@ impl HiddenTable {
     pub(crate) fn name_sql(self, id: &str) -> String {
         format!("('join_' || {id} || '_{}')", self.part())
     }
+
+    /// The table, schema-qualified and quoted, for definition `id` in
+    /// `catalog_schema`.
+    pub(crate) fn qualified(self, catalog_schema: &str, id: i64) -> String {
+        format!(
+            "{}.{}",
+            quote_ident(catalog_schema),
+            quote_ident(&self.name(id))
+        )
+    }
 }
 
 /// The `create table` column type of `info`: its type with no modifier,
 /// schema-qualified, and its collation when that isn't the database default,
-/// so a key compares in the hidden table exactly as it does in its source
-/// ([`super::copy_type`]).
-fn column_type(info: &JoinColumnInfo) -> String {
+/// so a value compares in a hidden table exactly as it does in its source
+/// ([`super::copy_type`]). Both kinds of `JOIN` type their hidden columns by
+/// it.
+pub(crate) fn column_type(info: &JoinColumnInfo) -> String {
     match info.copy_collation.as_deref() {
         Some(collation) => format!("{} collate {collation}", info.copy_type),
         None => info.copy_type.clone(),
     }
+}
+
+/// The column `name` of a hidden table, quoted, with its [`column_type`] in
+/// `columns` (a side's live columns, as define read them); `text` for a
+/// column define didn't read.
+pub(crate) fn typed_column(columns: &HashMap<String, JoinColumnInfo>, name: &str) -> String {
+    let pg_type = columns
+        .get(name)
+        .map_or_else(|| "text".to_string(), column_type);
+    format!("{} {pg_type}", quote_ident(name))
+}
+
+/// The `create table` statement of a `JOIN`'s `J` (either kind's), `name`
+/// (quoted and qualified): one row per join key, keyed by the `FROM` side's
+/// join key columns, typed from `from`, then the `extra` columns. Each `ON`
+/// pair has one type (`text` and `varchar` are one) and collation (define
+/// checks it), and a copy has no modifier, so either side's would do.
+pub(crate) fn keys_table_ddl(
+    name: &str,
+    def: &TransformDef,
+    from: &HashMap<String, JoinColumnInfo>,
+    extra: &[&str],
+) -> String {
+    let key = join_key(def, Side::From);
+    let mut body: Vec<String> = key.iter().map(|c| typed_column(from, c)).collect();
+    body.extend(extra.iter().map(|c| c.to_string()));
+    let quoted: Vec<String> = key.iter().map(|c| quote_ident(c)).collect();
+    body.push(format!("primary key ({})", quoted.join(", ")));
+    format!("create table {name} ({});\n", body.join(", "))
+}
+
+/// The statements creating a `JOIN`'s truncate lock row (either kind's),
+/// `lock` (quoted and qualified): a table of one row, which every writer of
+/// the pair takes first.
+pub(crate) fn lock_row_ddl(lock: &str) -> String {
+    format!(
+        "create table {lock} (id boolean primary key default true check (id));\n\
+         insert into {lock} default values;\n"
+    )
 }
 
 /// The partial columns of a hidden table: the row count, then a non-null
@@ -450,13 +500,6 @@ pub(crate) fn hidden_tables_ddl(
     from: &HashMap<String, JoinColumnInfo>,
     joined: &HashMap<String, JoinColumnInfo>,
 ) -> String {
-    let schema = quote_ident(catalog_schema);
-    let typed = |columns: &HashMap<String, JoinColumnInfo>, name: &String| {
-        let pg_type = columns
-            .get(name)
-            .map_or_else(|| "text".to_string(), column_type);
-        format!("{} {pg_type}", quote_ident(name))
-    };
     let mut sql = String::new();
     for (table, side, columns) in [
         (HiddenTable::FromPartials, Side::From, from),
@@ -464,32 +507,26 @@ pub(crate) fn hidden_tables_ddl(
     ] {
         let keys = side_key_columns(def, side);
         let arguments = side_arguments(def, side).len();
-        let mut body: Vec<String> = keys.iter().map(|c| typed(columns, c)).collect();
+        let mut body: Vec<String> = keys.iter().map(|c| typed_column(columns, c)).collect();
         body.extend(side_partials_tail(arguments));
         // The cell identity is the key columns in order, the join key first
         // (`side_key_columns`).
         let identity: Vec<String> = keys.iter().map(|c| quote_ident(c)).collect();
         let identity = identity.join(", ");
         body.push(format!("unique nulls not distinct ({identity})"));
-        let name = format!("{schema}.{}", quote_ident(&table.name(id)));
+        let name = table.qualified(catalog_schema, id);
         sql.push_str(&format!(
             "create table {name} ({});\n\
              create index on {name} ({identity}) where __zero;\n",
             body.join(", ")
         ));
     }
-    // `J` keys on the `FROM` side's join key columns; each pair has one type
-    // (`text` and `varchar` are one) and collation (define checks it), and a
-    // copy has no modifier, so either side's would do.
-    let key = join_key(def, Side::From);
-    let mut body: Vec<String> = key.iter().map(|c| typed(from, c)).collect();
-    body.push("__matches bigint not null default 0".to_string());
-    let quoted: Vec<String> = key.iter().map(|c| quote_ident(c)).collect();
-    body.push(format!("primary key ({})", quoted.join(", ")));
-    sql.push_str(&format!(
-        "create table {schema}.{} ({});\n",
-        quote_ident(&HiddenTable::Matches.name(id)),
-        body.join(", ")
+    // `J`, with each key's count of joined rows.
+    sql.push_str(&keys_table_ddl(
+        &HiddenTable::Matches.qualified(catalog_schema, id),
+        def,
+        from,
+        &["__matches bigint not null default 0"],
     ));
     // `T`: the target's group columns, each typed as its side's column.
     if let Some(join) = spec(def) {
@@ -497,8 +534,8 @@ pub(crate) fn hidden_tables_ddl(
             .group_by
             .iter()
             .map(|key| match side_of_written(def, join, &key.table) {
-                Some(Side::Joined) => typed(joined, &key.column),
-                _ => typed(from, &key.column),
+                Some(Side::Joined) => typed_column(joined, &key.column),
+                _ => typed_column(from, &key.column),
             })
             .collect();
         let arguments =
@@ -511,23 +548,15 @@ pub(crate) fn hidden_tables_ddl(
             .collect();
         let groups = groups.join(", ");
         body.push(format!("unique nulls not distinct ({groups})"));
-        let name = format!(
-            "{schema}.{}",
-            quote_ident(&HiddenTable::TargetPartials.name(id))
-        );
+        let name = HiddenTable::TargetPartials.qualified(catalog_schema, id);
         sql.push_str(&format!(
             "create table {name} ({});\n\
              create index on {name} ({groups}) where __zero;\n",
             body.join(", ")
         ));
     }
-    let lock = format!(
-        "{schema}.{}",
-        quote_ident(&HiddenTable::TruncateLock.name(id))
-    );
-    sql.push_str(&format!(
-        "create table {lock} (id boolean primary key default true check (id));\n\
-         insert into {lock} default values;\n"
+    sql.push_str(&lock_row_ddl(
+        &HiddenTable::TruncateLock.qualified(catalog_schema, id),
     ));
     sql
 }
@@ -535,10 +564,9 @@ pub(crate) fn hidden_tables_ddl(
 /// The statement dropping every hidden table of definition `id` from
 /// `catalog_schema`, any that is already gone included.
 pub(crate) fn drop_hidden_tables_sql(catalog_schema: &str, id: i64) -> String {
-    let schema = quote_ident(catalog_schema);
     let tables: Vec<String> = HiddenTable::ALL
         .iter()
-        .map(|table| format!("{schema}.{}", quote_ident(&table.name(id))))
+        .map(|table| table.qualified(catalog_schema, id))
         .collect();
     format!("drop table if exists {}", tables.join(", "))
 }
