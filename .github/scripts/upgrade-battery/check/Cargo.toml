@@ -1,0 +1,17 @@
+# The two library calls the upgrade battery needs that the `trellis` CLI does
+# not expose (`self_check`, `dump_definitions_sql`). A standalone crate, not a
+# workspace member: `.github/scripts/upgrade-battery.sh` copies it to a scratch
+# directory, points `trellis` at the tree under test (the v0.1.0 tag, then the
+# candidate), takes that tree's Cargo.lock and builds it there.
+[package]
+name = "upgrade-battery-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+# Named `engine` so publish-packages.sh's rename of `trellis = { path = ... }` never matches it.
+engine = { package = "trellis", path = "TRELLIS_PATH" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
