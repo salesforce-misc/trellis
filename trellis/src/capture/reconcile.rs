@@ -29,7 +29,10 @@
 //! table whose row-level security now applies to Trellis's role, or
 //! that a logical-replication subscription now replicates into
 //! ([`crate::staging::schema_change::pause_readers_of_unsupported`]), and
-//! leaves the table for the next pass. Those last two checks also run on
+//! leaves the table for the next pass. It does the same for a definition
+//! that reads a column capture can't image: a virtual generated column
+//! ([`crate::staging::schema_change::pause_readers_of_uncapturable`]). The
+//! row-level security and subscription checks also run on
 //! each table another definition targets, which the pass doesn't capture
 //! (the target-mutation seam feeds it) but its readers still read. There the
 //! pass also pauses the definition that writes the target when its
@@ -304,6 +307,26 @@ pub async fn reconcile(
                 // Neither waiting nor failing: the next pass decides afresh.
                 continue;
             }
+            Err(err) => {
+                outcome.failed.push((table.clone(), err));
+                continue;
+            }
+        }
+        // A read column capture can't image (one dropped and added again as
+        // a virtual generated column, or another renamed onto its name)
+        // pauses its readers before the functions are regenerated: until
+        // then, every write that reaches its image fails. The next pass's
+        // catalog no longer counts them, so it regenerates the functions
+        // without the column.
+        match crate::staging::schema_change::pause_readers_of_uncapturable(
+            client,
+            &snapshot.catalog,
+            table,
+        )
+        .await
+        {
+            Ok(false) => {}
+            Ok(true) => continue,
             Err(err) => {
                 outcome.failed.push((table.clone(), err));
                 continue;

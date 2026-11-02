@@ -33,7 +33,9 @@
 //!
 //! That pass also pauses readers of a missing column itself, before it
 //! regenerates anything, whether or not a write has marked the change yet
-//! ([`pause_readers_of_missing`]).
+//! ([`pause_readers_of_missing`]), and readers of a column that is now a
+//! virtual generated column, which no write can mark: its image fails the
+//! write instead ([`pause_readers_of_uncapturable`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -378,6 +380,140 @@ pub(crate) async fn pause_readers_of_missing(
     pause(&txn, catalog, table, &missing, &readers).await?;
     txn.commit().await?;
     Ok(true)
+}
+
+/// The staging worker's capture pass's check for a column a definition
+/// reads that capture can't image: pauses, before
+/// [`crate::capture::columns::capture_spec`] regenerates `table`'s
+/// functions, every definition that isn't paused for a capture failure yet
+/// and reads a column of `table` that is now a virtual generated column
+/// (PostgreSQL 18), recording why in `capture_failures`. Returns whether it
+/// paused any, in which case the caller leaves the table for the next pass,
+/// whose catalog no longer counts them, so the functions it regenerates no
+/// longer image the column.
+///
+/// Define refuses such a column (`defs::catalog::reject_virtual_generated_reads`,
+/// over the same columns), and no `ALTER` turns a column virtual, but a read
+/// column can be dropped and added again as one, or another column renamed
+/// onto its name. The functions installed before that image the column from
+/// the statement's transition table, which has no value for it, so every
+/// insert, update and delete that reaches the image fails until this pause.
+/// An update that changes no other imaged column reads the column as `NULL`
+/// on both sides and stages nothing: only the readers of the column miss
+/// it, and this pause stops them, so their resume's rebuild repairs it. A
+/// definition that doesn't read the column is left alone.
+///
+/// A definition only frozen keeps its status but gets the record, as for a
+/// missing column; a resume re-validates it as define would, so it is
+/// refused while the column is still virtual.
+///
+/// Costs one catalog query for a table some unpaused definition reads.
+pub(crate) async fn pause_readers_of_uncapturable(
+    client: &mut Client,
+    catalog: &CaptureCatalog,
+    table: &str,
+) -> Result<bool, CaptureError> {
+    let read = read_columns(catalog, table).columns;
+    if read.is_empty() {
+        return Ok(false);
+    }
+    let read: Vec<&str> = read.iter().map(String::as_str).collect();
+    let virtual_columns: crate::defs::catalog::VirtualColumns = client
+        .query_typed(
+            &format!(
+                "select a.attname::text, {} \
+                 from pg_catalog.pg_attribute a \
+                 where a.attrelid = pg_catalog.to_regclass($1) \
+                   and a.attnum > 0 and not a.attisdropped \
+                   and a.attgenerated = 'v' and a.attname::text = any($2)",
+                crate::defs::catalog::VIRTUAL_EXPRESSION_SQL
+            ),
+            &[
+                (&crate::defs::ddl::regclass_arg(table), Type::TEXT),
+                (&read, Type::TEXT_ARRAY),
+            ],
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    let pauses = uncapturable_pauses(catalog, table, &virtual_columns);
+    if pauses.is_empty() {
+        return Ok(false);
+    }
+    let txn = client.transaction().await?;
+    for pause in &pauses {
+        if crate::defs::lifecycle::pause_for_capture_failure(
+            &txn,
+            pause.id,
+            table,
+            &pause.columns,
+            &pause.error,
+            None,
+        )
+        .await?
+        {
+            crate::instance_log::warn!(transform_id = pause.id, table = %table, "definition paused: {}", pause.error);
+        }
+    }
+    txn.commit().await?;
+    Ok(true)
+}
+
+/// One definition [`pause_readers_of_uncapturable`] pauses: the columns of
+/// the table it reads that capture can't image, and its `capture_failure`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UncapturablePause {
+    id: i64,
+    columns: Vec<String>,
+    error: String,
+}
+
+/// Every definition reading `table` that isn't paused for a capture failure
+/// yet and reads one of `virtual_columns` (column to expression), in id
+/// order, with what [`pause_readers_of_uncapturable`] records for it.
+fn uncapturable_pauses(
+    catalog: &CaptureCatalog,
+    table: &str,
+    virtual_columns: &crate::defs::catalog::VirtualColumns,
+) -> Vec<UncapturablePause> {
+    if virtual_columns.is_empty() {
+        return Vec::new();
+    }
+    let mut pauses = Vec::new();
+    for id in unpaused_readers(catalog, table) {
+        let Some(reads) = catalog
+            .definitions
+            .iter()
+            .find(|r| r.id == id)
+            .and_then(|r| r.reads(table))
+        else {
+            continue;
+        };
+        let columns: Vec<String> = virtual_columns
+            .keys()
+            .filter(|c| reads.contains(*c))
+            .cloned()
+            .collect();
+        let Some(first) = columns.first() else {
+            continue;
+        };
+        let error = virtual_column_error(table, first, &virtual_columns[first]);
+        pauses.push(UncapturablePause { id, columns, error });
+    }
+    pauses
+}
+
+/// The `capture_failure` sentence for a definition paused because `column`
+/// of `table`, which it reads, is now a virtual generated column computed
+/// by `expression`.
+fn virtual_column_error(table: &str, column: &str, expression: &str) -> String {
+    format!(
+        "{}; this definition reads it, so its capture now leaves it out. Make the column \
+         STORED and resume the definition to rebuild it, or drop the definition and define it \
+         again with the expression in place of the column",
+        crate::defs::catalog::virtual_column_text(table, column, expression)
+    )
 }
 
 /// The staging worker's capture pass's check for a table Trellis can't read
@@ -1845,5 +1981,101 @@ mod tests {
              would give them now: public.mix.z (integer, now bigint)"
         );
         assert!(!reason.contains("widened"), "{reason}");
+    }
+
+    /// A catalog of `(source, join, text, capture_failed)` definitions,
+    /// numbered from 1.
+    fn catalog(definitions: &[(&str, Option<&str>, &str, bool)]) -> CaptureCatalog {
+        CaptureCatalog {
+            definitions: definitions
+                .iter()
+                .enumerate()
+                .map(|(i, (source, join, text, capture_failed))| {
+                    crate::capture::columns::CaptureReader {
+                        id: i as i64 + 1,
+                        source: source.to_string(),
+                        def: crate::defs::parse(text).unwrap_or_else(|e| panic!("{text}: {e:?}")),
+                        capture_failed: *capture_failed,
+                        target: format!("public.t{}", i + 1),
+                        join: join.map(str::to_string),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// The capture pass pauses exactly the unpaused readers of the virtual
+    /// column, from either table of a `JOIN`, naming the column, its
+    /// expression and the remedy; a definition on the same table that
+    /// doesn't read it, or one already paused, is left alone.
+    #[test]
+    fn only_the_unpaused_readers_of_a_virtual_column_pause() {
+        let catalog = catalog(&[
+            (
+                "public.bv",
+                None,
+                "TRANSFORM p FROM bv SELECT g AS g",
+                false,
+            ),
+            (
+                "public.bv",
+                None,
+                "TRANSFORM q FROM bv SELECT img AS img",
+                false,
+            ),
+            (
+                "public.bv",
+                None,
+                "TRANSFORM s FROM bv GROUP BY grp SELECT grp AS grp, SUM(g) AS total",
+                false,
+            ),
+            ("public.bv", None, "TRANSFORM r FROM bv SELECT g AS g", true),
+            (
+                "public.a",
+                Some("public.bv"),
+                "TRANSFORM j FROM a JOIN bv ON a.k = bv.g GROUP BY a.grp \
+                 SELECT a.grp AS grp, COUNT(*) AS c",
+                false,
+            ),
+            (
+                "public.a",
+                Some("public.bv"),
+                "TRANSFORM k FROM a JOIN bv ON a.k = bv.k GROUP BY a.grp \
+                 SELECT a.grp AS grp, SUM(bv.img) AS total",
+                false,
+            ),
+        ]);
+        let virtual_g = crate::defs::catalog::VirtualColumns::from([(
+            "g".to_string(),
+            "(img * 2)".to_string(),
+        )]);
+        let pauses = super::uncapturable_pauses(&catalog, "public.bv", &virtual_g);
+        let error = "column \"g\" of public.bv is a virtual generated column (GENERATED ALWAYS \
+                     AS (img * 2) VIRTUAL), which Trellis can't capture: a capture trigger can't \
+                     read a value PostgreSQL computes only when a query reads the row; this \
+                     definition reads it, so its capture now leaves it out. Make the column \
+                     STORED and resume the definition to rebuild it, or drop the definition and \
+                     define it again with the expression in place of the column";
+        assert_eq!(
+            pauses,
+            [1, 3, 5]
+                .into_iter()
+                .map(|id| super::UncapturablePause {
+                    id,
+                    columns: vec!["g".to_string()],
+                    error: error.to_string(),
+                })
+                .collect::<Vec<_>>()
+        );
+        // `a` has no virtual column, and no table has before PostgreSQL 18.
+        assert!(super::uncapturable_pauses(&catalog, "public.a", &virtual_g).is_empty());
+        assert!(
+            super::uncapturable_pauses(
+                &catalog,
+                "public.bv",
+                &crate::defs::catalog::VirtualColumns::new()
+            )
+            .is_empty()
+        );
     }
 }

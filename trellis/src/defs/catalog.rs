@@ -80,7 +80,7 @@
 //! into the same [`CatalogError::TargetTableSuffixCollision`] rather than
 //! surfacing as an opaque [`CatalogError::Db`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use crate::error_code::{self, ErrorCode};
@@ -171,6 +171,22 @@ pub enum CatalogError {
         target_key: Vec<String>,
         /// The source's key columns now.
         source_key: Vec<String>,
+    },
+    /// A definition reads a virtual generated column (`GENERATED ALWAYS AS
+    /// (...) VIRTUAL`, PostgreSQL 18), which Trellis can't capture: a
+    /// statement trigger's transition table has no value for it, so a
+    /// capture function imaging it fails the writes to the table (or, for
+    /// an update that changes nothing else it images, stages nothing). Refused
+    /// by define, `ALTER TRANSFORM` and a resume (`revalidate`), for every
+    /// column the definition's capture would image from either table it
+    /// reads. The remedy is to write the column's expression in the
+    /// definition, or to make the column `STORED`.
+    VirtualGeneratedColumn {
+        /// `schema.table`.
+        table: String,
+        column: String,
+        /// The column's generation expression, as `pg_get_expr` prints it.
+        expression: String,
     },
     /// A `GROUP BY` or `JOIN` target's source lacks the index its `self_check`
     /// walk pages by (`super::source_index`). Refused by define and by
@@ -434,6 +450,7 @@ impl CatalogError {
             // `RowSecurityApplies`: the fix is a grant.
             CatalogError::TableNotAccessible { .. } => ErrorCode::Validation,
             CatalogError::SourceKeyChanged { .. } => ErrorCode::Validation,
+            CatalogError::VirtualGeneratedColumn { .. } => ErrorCode::Validation,
             CatalogError::SourceIndexMissing { .. } => ErrorCode::Validation,
             CatalogError::LedgerTableMissing { .. } => ErrorCode::Validation,
             CatalogError::TargetTableMissing { .. } => ErrorCode::Validation,
@@ -569,6 +586,17 @@ impl fmt::Display for CatalogError {
                  is keyed by ({}). Restore the key, or `DROP TRANSFORM` and define it again",
                 source_key.join(", "),
                 target_key.join(", ")
+            ),
+            CatalogError::VirtualGeneratedColumn {
+                table,
+                column,
+                expression,
+            } => write!(
+                f,
+                "{}. Write the expression in the definition in place of the column, where \
+                 Trellis's grammar covers it (in a 1-1 transform, under a field name no source \
+                 column has), or make the column STORED",
+                virtual_column_text(table, column, expression)
             ),
             CatalogError::SourceIndexMissing { target, missing } => {
                 write!(f, "{}", super::source_index::refusal_text(target, missing))
@@ -735,6 +763,7 @@ impl std::error::Error for CatalogError {
             CatalogError::InvalidRegexPattern { .. } => None,
             CatalogError::TableNotAccessible { .. } => None,
             CatalogError::SourceKeyChanged { .. } => None,
+            CatalogError::VirtualGeneratedColumn { .. } => None,
             CatalogError::SourceIndexMissing { .. } => None,
             CatalogError::LedgerTableMissing { .. } => None,
             CatalogError::TargetTableMissing { .. } => None,
@@ -2082,7 +2111,8 @@ async fn validate_edit(
     build_fields: &[String],
     recorded: &HashMap<String, ValueType>,
 ) -> Result<EditedSchema, CatalogError> {
-    let source_columns = live_source_columns(client, source_table).await?;
+    let (source_columns, virtual_columns) =
+        live_source_columns_and_virtual(client, source_table).await?;
     if source_columns.is_empty() {
         return Err(CatalogError::SourceTableNotFound(source_table.to_string()));
     }
@@ -2094,6 +2124,8 @@ async fn validate_edit(
     // comment on why the table-level whole-graph check is deliberately not
     // re-run.
     validate_with_source(merged, &source_columns, source_table)?;
+    // Nor read a virtual generated column, as define refuses.
+    reject_virtual_generated_reads(merged, None, source_table, &virtual_columns)?;
     if let Some(read) = field_over_retyped_column(merged, build_fields, recorded, &source_columns) {
         let target = &merged.target;
         return Err(CatalogError::UnsupportedAlter(format!(
@@ -2955,6 +2987,7 @@ async fn create_definition_inner(
             super::join_one_to_one::reject_reader_of_target(&*txn, &[joined.as_str()]).await?;
             let sides = JoinSides::read(&*txn, qualified_source.clone(), joined).await?;
             super::validate::validate_join(&def, &sides.from_columns, &sides.joined_columns)?;
+            reject_virtual_join_reads(&def, &sides)?;
             if super::join::is_one_to_one(&def) {
                 super::join_one_to_one::check_define(&*txn, &def, &sides.joined).await?;
             }
@@ -4053,6 +4086,7 @@ async fn validate_for_define(
     if let KeySpace::Join(_) | KeySpace::JoinOneToOne(_) = &def.key_space {
         let sides = JoinSides::resolve(pool, def).await?;
         super::validate::validate_join(def, &sides.from_columns, &sides.joined_columns)?;
+        reject_virtual_join_reads(def, &sides)?;
         if super::join::is_one_to_one(def) {
             let client = pool.get().await?;
             super::join_one_to_one::check_define(&**client, def, &sides.joined).await?;
@@ -4085,6 +4119,9 @@ pub(crate) struct JoinSides {
     pub joined: String,
     pub from_columns: HashMap<String, super::validate::JoinColumnInfo>,
     pub joined_columns: HashMap<String, super::validate::JoinColumnInfo>,
+    /// Each table's virtual generated columns, from the same reads.
+    pub from_virtual: VirtualColumns,
+    pub joined_virtual: VirtualColumns,
 }
 
 impl JoinSides {
@@ -4113,13 +4150,15 @@ impl JoinSides {
         from: String,
         joined: String,
     ) -> Result<JoinSides, CatalogError> {
-        let from_columns = join_columns_of(client, &from).await?;
-        let joined_columns = join_columns_of(client, &joined).await?;
+        let (from_columns, from_virtual) = join_columns_of(client, &from).await?;
+        let (joined_columns, joined_virtual) = join_columns_of(client, &joined).await?;
         Ok(JoinSides {
             from,
             joined,
             from_columns,
             joined_columns,
+            from_virtual,
+            joined_virtual,
         })
     }
 
@@ -4155,17 +4194,24 @@ async fn check_aggregate_admitted(
     if !matches!(def.key_space, KeySpace::Aggregate { .. }) {
         return Ok(());
     }
-    let columns = join_columns_of(client, qualified_source).await?;
+    let (columns, _) = join_columns_of(client, qualified_source).await?;
     Ok(super::validate::validate_aggregate_admitted(def, &columns)?)
 }
 
 /// Every column of `qualified` as [`super::validate::validate_join`] reads
 /// it. Like [`live_source_columns`], a column whose type the registry can't
-/// place is left out, so a reference to it is an unresolved column.
+/// place is left out, so a reference to it is an unresolved column. Also,
+/// from the same query, the table's virtual generated columns.
 async fn join_columns_of(
     client: &impl GenericClient,
     qualified: &str,
-) -> Result<HashMap<String, super::validate::JoinColumnInfo>, CatalogError> {
+) -> Result<
+    (
+        HashMap<String, super::validate::JoinColumnInfo>,
+        VirtualColumns,
+    ),
+    CatalogError,
+> {
     let rows = client
         .query(
             &format!(
@@ -4178,7 +4224,8 @@ async fn join_columns_of(
                     coalesce(co.collisdeterministic, true),
                     t.typtype = 'e',
                     {},
-                    {}
+                    {},
+                    {VIRTUAL_EXPRESSION_SQL}
              from pg_attribute a
              join pg_catalog.pg_type t on t.oid = a.atttypid
              left join pg_catalog.pg_collation co on co.oid = a.attcollation
@@ -4200,7 +4247,11 @@ async fn join_columns_of(
         .await?
         .get(0);
     let mut columns = HashMap::with_capacity(rows.len());
+    let mut virtual_columns = VirtualColumns::new();
     for row in rows {
+        if let Some(expression) = row.get::<_, Option<String>>(10) {
+            virtual_columns.insert(row.get(0), expression);
+        }
         let type_oid: u32 = row.get(2);
         let value_type = super::pg_type::value_type_for_oid(client, type_oid).await?;
         if value_type == ValueType::Other(PgType::Unrecognized) {
@@ -4223,7 +4274,7 @@ async fn join_columns_of(
             },
         );
     }
-    Ok(columns)
+    Ok((columns, virtual_columns))
 }
 
 /// The fully-qualified source [`install_definition`]'s own DDL steps read
@@ -4552,11 +4603,12 @@ pub(crate) async fn revalidate(
     if let Some(joined) = joined {
         return revalidate_join(txn, schema, definition, joined).await;
     }
-    let source_columns = live_source_columns(txn, source).await?;
+    let (source_columns, virtual_columns) = live_source_columns_and_virtual(txn, source).await?;
     if source_columns.is_empty() {
         return Err(CatalogError::SourceTableNotFound(source.to_string()));
     }
     validate_with_source(&definition.def, &source_columns, source)?;
+    reject_virtual_generated_reads(&definition.def, None, source, &virtual_columns)?;
     let source_key = validate_live_schema(txn, schema, &definition.def, source).await?;
     if let KeySpace::OneToOne = definition.def.key_space {
         let target_key: Vec<String> = ddl::identity_key_columns(txn, &definition.target_table)
@@ -4611,6 +4663,7 @@ async fn revalidate_join(
         }
     }
     super::validate::validate_join(&definition.def, &sides.from_columns, &sides.joined_columns)?;
+    reject_virtual_join_reads(&definition.def, &sides)?;
     validate_live_join_schema(txn, schema, &definition.def, &sides).await?;
     if super::join::is_one_to_one(&definition.def) {
         // The joined table's `ON` columns are still unique, and the target
@@ -4929,20 +4982,36 @@ pub(crate) async fn live_source_columns(
     client: &impl GenericClient,
     qualified: &str,
 ) -> Result<HashMap<String, ValueType>, CatalogError> {
+    Ok(live_source_columns_and_virtual(client, qualified).await?.0)
+}
+
+/// [`live_source_columns`], and, from the same query, `qualified`'s virtual
+/// generated columns with their expressions ([`VirtualColumns`]), for
+/// [`reject_virtual_generated_reads`].
+pub(crate) async fn live_source_columns_and_virtual(
+    client: &impl GenericClient,
+    qualified: &str,
+) -> Result<(HashMap<String, ValueType>, VirtualColumns), CatalogError> {
     let rows = client
         .query(
-            "select a.attname::text, a.atttypid \
-             from pg_attribute a \
-             where a.attrelid = pg_catalog.to_regclass($1) \
-               and a.attnum > 0 \
-               and not a.attisdropped",
+            &format!(
+                "select a.attname::text, a.atttypid, {VIRTUAL_EXPRESSION_SQL} \
+                 from pg_attribute a \
+                 where a.attrelid = pg_catalog.to_regclass($1) \
+                   and a.attnum > 0 \
+                   and not a.attisdropped"
+            ),
             &[&ddl::regclass_arg(qualified)],
         )
         .await?;
     let mut columns = HashMap::with_capacity(rows.len());
+    let mut virtual_columns = VirtualColumns::new();
     for row in rows {
         let column_name: String = row.get(0);
         let type_oid: u32 = row.get(1);
+        if let Some(expression) = row.get::<_, Option<String>>(2) {
+            virtual_columns.insert(column_name.clone(), expression);
+        }
         match super::pg_type::value_type_for_oid(client, type_oid).await? {
             ValueType::Other(super::PgType::Unrecognized) => {}
             value_type => {
@@ -4950,7 +5019,83 @@ pub(crate) async fn live_source_columns(
             }
         }
     }
-    Ok(columns)
+    Ok((columns, virtual_columns))
+}
+
+/// A table's virtual generated columns (`pg_attribute.attgenerated = 'v'`,
+/// PostgreSQL 18 and later; never present before), each with its
+/// generation expression as `pg_get_expr` prints it.
+pub(crate) type VirtualColumns = BTreeMap<String, String>;
+
+/// A select-list item over `pg_attribute a`: the column's generation
+/// expression when it is a virtual generated column, otherwise `NULL`.
+/// `attgenerated` exists on every supported version; only PostgreSQL 18
+/// sets it to `'v'`.
+pub(crate) const VIRTUAL_EXPRESSION_SQL: &str = "case when a.attgenerated = 'v' then \
+     (select pg_catalog.pg_get_expr(d.adbin, d.adrelid) from pg_catalog.pg_attrdef d \
+      where d.adrelid = a.attrelid and d.adnum = a.attnum) end";
+
+/// Refuses `def` with [`CatalogError::VirtualGeneratedColumn`] when a column
+/// it reads from `table` is one of `virtual_columns`, naming the first by
+/// name. "Reads" is what its capture would image there
+/// ([`crate::capture::columns::columns_read`]): a 1-1 field's column, a
+/// `GROUP BY` key, an aggregate's argument, and from either table of a `JOIN`
+/// (`side`) its `ON` columns and every column its fields read. `side` is
+/// `None` for a definition that isn't a `JOIN`.
+///
+/// Every column read is checked, not only the ones a capture function
+/// would fail on: a transition table holds no value for a virtual column, so
+/// any capture of it is wrong.
+pub(crate) fn reject_virtual_generated_reads(
+    def: &TransformDef,
+    side: Option<super::join::Side>,
+    table: &str,
+    virtual_columns: &VirtualColumns,
+) -> Result<(), CatalogError> {
+    if virtual_columns.is_empty() {
+        return Ok(());
+    }
+    let read = crate::capture::columns::columns_read(def, side);
+    match virtual_columns
+        .iter()
+        .find(|(column, _)| read.contains(*column))
+    {
+        Some((column, expression)) => Err(CatalogError::VirtualGeneratedColumn {
+            table: table.to_string(),
+            column: column.clone(),
+            expression: expression.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// [`reject_virtual_generated_reads`] over both tables of a `JOIN`
+/// definition, `FROM` first.
+fn reject_virtual_join_reads(def: &TransformDef, sides: &JoinSides) -> Result<(), CatalogError> {
+    reject_virtual_generated_reads(
+        def,
+        Some(super::join::Side::From),
+        &sides.from,
+        &sides.from_virtual,
+    )?;
+    reject_virtual_generated_reads(
+        def,
+        Some(super::join::Side::Joined),
+        &sides.joined,
+        &sides.joined_virtual,
+    )
+}
+
+/// The first sentence of both define's refusal of a virtual generated
+/// column ([`CatalogError::VirtualGeneratedColumn`]) and the capture pass's
+/// pause of a definition reading one
+/// (`staging::schema_change::pause_readers_of_uncapturable`).
+pub(crate) fn virtual_column_text(table: &str, column: &str, expression: &str) -> String {
+    format!(
+        "column \"{column}\" of {table} is a virtual generated column (GENERATED ALWAYS AS \
+         {expression} VIRTUAL), which Trellis can't capture: a capture trigger can't read a \
+         value PostgreSQL computes only when a query reads the row"
+    )
 }
 
 /// Refuses a definition if any column the engine matches as one
@@ -7586,6 +7731,132 @@ mod alter_target_width_tests {
         assert_eq!(
             alter_target_overflow(1610, &live(1600), &[], &[field("x")]),
             Some((1601, 0))
+        );
+    }
+}
+
+#[cfg(test)]
+mod virtual_generated_tests {
+    //! The refusal of a virtual generated column, over catalog rows alone:
+    //! every server version runs it, though only PostgreSQL 18 has such
+    //! columns.
+
+    use super::*;
+    use crate::defs::join::Side;
+
+    fn def(text: &str) -> TransformDef {
+        parse(text).unwrap_or_else(|e| panic!("{text}: {e:?}"))
+    }
+
+    /// `g` is virtual, computed as `(img * 2)`.
+    fn virtual_g() -> VirtualColumns {
+        VirtualColumns::from([("g".to_string(), "(img * 2)".to_string())])
+    }
+
+    /// The column `def` is refused for on `table`'s `side`, if any.
+    fn refused(text: &str, side: Option<Side>, table: &str) -> Option<String> {
+        match reject_virtual_generated_reads(&def(text), side, table, &virtual_g()) {
+            Ok(()) => None,
+            Err(CatalogError::VirtualGeneratedColumn {
+                table: refused_table,
+                column,
+                expression,
+            }) => {
+                assert_eq!(refused_table, table);
+                assert_eq!(expression, "(img * 2)");
+                Some(column)
+            }
+            Err(other) => panic!("{text}: unexpected refusal {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_column_capture_would_image_is_refused_when_virtual() {
+        for text in [
+            // A 1-1 passthrough, and a calculated field reading it.
+            "TRANSFORM p FROM bv SELECT g AS g",
+            "TRANSFORM p FROM bv SELECT g + 1 AS h",
+            // A `GROUP BY` key, and an aggregate's argument.
+            "TRANSFORM s FROM bv GROUP BY g SELECT g AS g, COUNT(*) AS c",
+            "TRANSFORM s FROM bv GROUP BY grp SELECT grp AS grp, SUM(g) AS total",
+        ] {
+            assert_eq!(
+                refused(text, None, "public.bv").as_deref(),
+                Some("g"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_join_is_refused_for_either_tables_virtual_column() {
+        // `bv`'s `ON` column, then a field over `bv`, as the joined table.
+        for text in [
+            "TRANSFORM j FROM a JOIN bv ON a.k = bv.g GROUP BY a.grp \
+             SELECT a.grp AS grp, COUNT(*) AS c",
+            "TRANSFORM j FROM a JOIN bv ON a.k = bv.k GROUP BY a.grp \
+             SELECT a.grp AS grp, SUM(bv.g) AS total",
+            "TRANSFORM j FROM a LEFT JOIN bv ON a.k = bv.k SELECT a.r AS r, bv.g AS bg",
+        ] {
+            assert_eq!(
+                refused(text, Some(Side::Joined), "public.bv").as_deref(),
+                Some("g"),
+                "{text}"
+            );
+            // `a` has no `g` read from it.
+            assert_eq!(refused(text, Some(Side::From), "public.a"), None, "{text}");
+        }
+        // The same for the `FROM` table's columns.
+        let text = "TRANSFORM j FROM bv JOIN a ON bv.g = a.k GROUP BY bv.grp \
+                    SELECT bv.grp AS grp, COUNT(*) AS c";
+        assert_eq!(
+            refused(text, Some(Side::From), "public.bv").as_deref(),
+            Some("g")
+        );
+    }
+
+    #[test]
+    fn a_definition_not_reading_the_virtual_column_is_accepted() {
+        for text in [
+            "TRANSFORM p FROM bv SELECT img AS img",
+            "TRANSFORM p FROM bv SELECT img * 2 AS doubled",
+            "TRANSFORM s FROM bv GROUP BY grp SELECT grp AS grp, SUM(img) AS total",
+        ] {
+            assert_eq!(refused(text, None, "public.bv"), None, "{text}");
+        }
+        let text = "TRANSFORM j FROM a JOIN bv ON a.k = bv.k GROUP BY a.grp \
+                    SELECT a.grp AS grp, SUM(bv.img) AS total";
+        assert_eq!(refused(text, Some(Side::Joined), "public.bv"), None);
+        // No virtual column at all: nothing to refuse.
+        assert!(
+            reject_virtual_generated_reads(
+                &def("TRANSFORM p FROM bv SELECT g AS g"),
+                None,
+                "public.bv",
+                &VirtualColumns::new()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_refusal_names_the_table_the_column_its_expression_and_the_remedy() {
+        let err = reject_virtual_generated_reads(
+            &def("TRANSFORM p FROM bv SELECT g AS g"),
+            None,
+            "public.bv",
+            &virtual_g(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Validation);
+        assert!(err.is_define_refusal());
+        assert_eq!(
+            err.to_string(),
+            "column \"g\" of public.bv is a virtual generated column (GENERATED ALWAYS AS \
+             (img * 2) VIRTUAL), which Trellis can't capture: a capture trigger can't read a \
+             value PostgreSQL computes only when a query reads the row. Write the expression \
+             in the definition in place of the column, where Trellis's grammar covers it (in a \
+             1-1 transform, under a field name no source column has), or make the column STORED"
         );
     }
 }

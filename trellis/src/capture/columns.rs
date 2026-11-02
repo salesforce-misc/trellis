@@ -69,9 +69,24 @@ impl CaptureReader {
                 return None;
             }
             return crate::defs::join::side_of_table(&self.def, table)
-                .map(|side| crate::defs::join::side_columns(&self.def, side));
+                .map(|side| columns_read(&self.def, Some(side)));
         }
-        (self.source == table).then(|| own_columns(&self.def))
+        (self.source == table).then(|| columns_read(&self.def, None))
+    }
+}
+
+/// The columns `def` reads from one of its tables, which its capture images
+/// there: from the `JOIN` table on `side`, or, with `None`, from the source
+/// of a definition that isn't a `JOIN`. Define's refusal of a virtual
+/// generated column (`defs::catalog`) reads the same set, so it refuses
+/// exactly the columns capture would image.
+pub(crate) fn columns_read(
+    def: &TransformDef,
+    side: Option<crate::defs::join::Side>,
+) -> BTreeSet<String> {
+    match side {
+        Some(side) => crate::defs::join::side_columns(def, side),
+        None => own_columns(def),
     }
 }
 

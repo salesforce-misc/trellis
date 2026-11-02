@@ -624,6 +624,9 @@ them:
     (the next section);
   - a read column renamed or dropped, or the primary key redefined, by a
     marker, the pass or a drain page;
+  - a read column that is now a virtual generated column (dropped and added
+    again as one, or another renamed onto its name), which a transition
+    table holds no value for, by the pass;
   - a key column retyped or re-collated so define would refuse it, or so the
     stored keys render differently; a `JOIN`'s `ON` columns no longer
     matching; a column Trellis created outgrown by a widening;

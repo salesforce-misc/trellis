@@ -470,9 +470,7 @@ impl Trellis {
         self.call(async {
             match defs::parse_statement(statement_text)? {
                 defs::Statement::DefineTransform(parsed) => {
-                    let source_columns = self
-                        .source_columns(&parsed.source, parsed.explicit_source_schema.as_deref())
-                        .await?;
+                    let source_columns = self.source_columns(&parsed).await?;
                     // Hands the *text* on rather than the `TransformDef` just
                     // parsed: `install_definition` persists `definition_text` as
                     // the definition's own record of itself (every later re-parse
@@ -1791,11 +1789,17 @@ impl Trellis {
     /// target-suffix) — then queries `information_schema.columns` by the
     /// resolved `table_schema`/`table_name` pair directly, rather than
     /// walking `search_path` a second time.
+    ///
+    /// The same read finds the source's virtual generated columns, and a
+    /// definition that isn't a `JOIN` is refused here if it reads one
+    /// ([`defs::catalog::reject_virtual_generated_reads`]). A `JOIN` is
+    /// checked on both tables where define reads them.
     async fn source_columns(
         &self,
-        source_table: &str,
-        explicit_source_schema: Option<&str>,
+        def: &defs::ast::TransformDef,
     ) -> Result<HashMap<String, ValueType>, TrellisError> {
+        let source_table = def.source.as_str();
+        let explicit_source_schema = def.explicit_source_schema.as_deref();
         // A table the role can't use is refused as such, naming
         // the missing privilege, rather than as not found (or, without
         // `USAGE` on a qualified name's schema, as Postgres's own refusal of
@@ -1824,9 +1828,13 @@ impl Trellis {
         // The same introspection a resume re-validates against
         // (`defs::catalog::revalidate`).
         let client = self.pool.get().await?;
-        let columns = defs::catalog::live_source_columns(&**client, &qualified).await?;
+        let (columns, virtual_columns) =
+            defs::catalog::live_source_columns_and_virtual(&**client, &qualified).await?;
         if columns.is_empty() {
             return Err(TrellisError::SourceTableNotFound(source_table.to_string()));
+        }
+        if defs::join::spec(def).is_none() {
+            defs::catalog::reject_virtual_generated_reads(def, None, &qualified, &virtual_columns)?;
         }
         Ok(columns)
     }
@@ -2129,7 +2137,8 @@ pub struct CaptureFailure {
     /// primary-key column went), the old key columns when the key was
     /// redefined, the key columns whose type or collation changed (a type
     /// define would refuse, a re-rendering, a widening of a typed copy, a
-    /// broken join pairing), or the missing column an install names. Empty
+    /// broken join pairing), the read columns that are now virtual generated
+    /// columns, or the missing column an install names. Empty
     /// for a failure that isn't about a column, and for a halt.
     pub columns: Vec<String>,
     /// A sentence naming the cause and, for a pause, what to do.
