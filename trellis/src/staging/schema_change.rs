@@ -34,8 +34,9 @@
 //! That pass also pauses readers of a missing column itself, before it
 //! regenerates anything, whether or not a write has marked the change yet
 //! ([`pause_readers_of_missing`]), and readers of a column that is now a
-//! virtual generated column, which no write can mark: its image fails the
-//! write instead ([`pause_readers_of_uncapturable`]).
+//! virtual generated column, which no write marks: its image fails an
+//! insert or a delete, and reads as `NULL` in an update
+//! ([`pause_readers_of_uncapturable`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -397,11 +398,12 @@ pub(crate) async fn pause_readers_of_missing(
 /// column can be dropped and added again as one, or another column renamed
 /// onto its name. The functions installed before that image the column from
 /// the statement's transition table, which has no value for it, so every
-/// insert, update and delete that reaches the image fails until this pause.
-/// An update that changes no other imaged column reads the column as `NULL`
-/// on both sides and stages nothing: only the readers of the column miss
-/// it, and this pause stops them, so their resume's rebuild repairs it. A
-/// definition that doesn't read the column is left alone.
+/// insert and delete that reaches the image fails until this pause. An
+/// update reads the column as `NULL` on both sides: it stages it so when
+/// another imaged column changed, and stages nothing when none did. Either
+/// way only the readers of the column miss its value, and this pause stops
+/// them, so their resume's rebuild repairs it. A definition that doesn't
+/// read the column is left alone.
 ///
 /// A definition only frozen keeps its status but gets the record, as for a
 /// missing column; a resume re-validates it as define would, so it is
@@ -2045,10 +2047,8 @@ mod tests {
                 false,
             ),
         ]);
-        let virtual_g = crate::defs::catalog::VirtualColumns::from([(
-            "g".to_string(),
-            "(img * 2)".to_string(),
-        )]);
+        let virtual_g =
+            crate::defs::catalog::VirtualColumns::from([("g".to_string(), "img * 2".to_string())]);
         let pauses = super::uncapturable_pauses(&catalog, "public.bv", &virtual_g);
         let error = "column \"g\" of public.bv is a virtual generated column (GENERATED ALWAYS \
                      AS (img * 2) VIRTUAL), which Trellis can't capture: a capture trigger can't \

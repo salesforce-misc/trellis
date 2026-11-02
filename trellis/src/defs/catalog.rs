@@ -175,8 +175,8 @@ pub enum CatalogError {
     /// A definition reads a virtual generated column (`GENERATED ALWAYS AS
     /// (...) VIRTUAL`, PostgreSQL 18), which Trellis can't capture: a
     /// statement trigger's transition table has no value for it, so a
-    /// capture function imaging it fails the writes to the table (or, for
-    /// an update that changes nothing else it images, stages nothing). Refused
+    /// capture function imaging it fails the inserts and deletes on the
+    /// table, and images it as `NULL` in an update. Refused
     /// by define, `ALTER TRANSFORM` and a resume (`revalidate`), for every
     /// column the definition's capture would image from either table it
     /// reads. The remedy is to write the column's expression in the
@@ -185,7 +185,8 @@ pub enum CatalogError {
         /// `schema.table`.
         table: String,
         column: String,
-        /// The column's generation expression, as `pg_get_expr` prints it.
+        /// The column's generation expression, as `pg_get_expr` prints it
+        /// in its pretty form (no outer parentheses: `img * 2`).
         expression: String,
     },
     /// A `GROUP BY` or `JOIN` target's source lacks the index its `self_check`
@@ -5024,7 +5025,8 @@ pub(crate) async fn live_source_columns_and_virtual(
 
 /// A table's virtual generated columns (`pg_attribute.attgenerated = 'v'`,
 /// PostgreSQL 18 and later; never present before), each with its
-/// generation expression as `pg_get_expr` prints it.
+/// generation expression as `pg_get_expr` pretty-prints it (`img * 2`, with
+/// no outer parentheses, which the refusal's text adds).
 pub(crate) type VirtualColumns = BTreeMap<String, String>;
 
 /// A select-list item over `pg_attribute a`: the column's generation
@@ -5032,7 +5034,7 @@ pub(crate) type VirtualColumns = BTreeMap<String, String>;
 /// `attgenerated` exists on every supported version; only PostgreSQL 18
 /// sets it to `'v'`.
 pub(crate) const VIRTUAL_EXPRESSION_SQL: &str = "case when a.attgenerated = 'v' then \
-     (select pg_catalog.pg_get_expr(d.adbin, d.adrelid) from pg_catalog.pg_attrdef d \
+     (select pg_catalog.pg_get_expr(d.adbin, d.adrelid, true) from pg_catalog.pg_attrdef d \
       where d.adrelid = a.attrelid and d.adnum = a.attnum) end";
 
 /// Refuses `def` with [`CatalogError::VirtualGeneratedColumn`] when a column
@@ -5093,7 +5095,7 @@ fn reject_virtual_join_reads(def: &TransformDef, sides: &JoinSides) -> Result<()
 pub(crate) fn virtual_column_text(table: &str, column: &str, expression: &str) -> String {
     format!(
         "column \"{column}\" of {table} is a virtual generated column (GENERATED ALWAYS AS \
-         {expression} VIRTUAL), which Trellis can't capture: a capture trigger can't read a \
+         ({expression}) VIRTUAL), which Trellis can't capture: a capture trigger can't read a \
          value PostgreSQL computes only when a query reads the row"
     )
 }
@@ -7748,9 +7750,9 @@ mod virtual_generated_tests {
         parse(text).unwrap_or_else(|e| panic!("{text}: {e:?}"))
     }
 
-    /// `g` is virtual, computed as `(img * 2)`.
+    /// `g` is virtual, computed as `img * 2`.
     fn virtual_g() -> VirtualColumns {
-        VirtualColumns::from([("g".to_string(), "(img * 2)".to_string())])
+        VirtualColumns::from([("g".to_string(), "img * 2".to_string())])
     }
 
     /// The column `def` is refused for on `table`'s `side`, if any.
@@ -7763,7 +7765,7 @@ mod virtual_generated_tests {
                 expression,
             }) => {
                 assert_eq!(refused_table, table);
-                assert_eq!(expression, "(img * 2)");
+                assert_eq!(expression, "img * 2");
                 Some(column)
             }
             Err(other) => panic!("{text}: unexpected refusal {other:?}"),

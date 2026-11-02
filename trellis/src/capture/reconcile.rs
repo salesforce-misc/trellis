@@ -315,7 +315,8 @@ pub async fn reconcile(
         // A read column capture can't image (one dropped and added again as
         // a virtual generated column, or another renamed onto its name)
         // pauses its readers before the functions are regenerated: until
-        // then, every write that reaches its image fails. The next pass's
+        // then, an insert or a delete that reaches its image fails, and an
+        // update stages it as `NULL`. The next pass's
         // catalog no longer counts them, so it regenerates the functions
         // without the column.
         match crate::staging::schema_change::pause_readers_of_uncapturable(
