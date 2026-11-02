@@ -775,11 +775,23 @@ async fn run(
     // "does a live process exist to drain work," not "how many worker tasks
     // does it run." The handover task below keeps the row fresh from here on.
     let mut handover_log = HandoverLog::default();
-    let active = background
-        && handover_log.record(
-            handover_pass(&process, options.application_threads > 0).await,
-            false,
-        );
+    let active = if background {
+        let first = handover_pass(&process, options.application_threads > 0).await;
+        // A staging worker's start fails when the database can't be reached,
+        // as it did before this pass existed (`setup_staging` below would hit
+        // the same fault); a drain-only process starts regardless and retries
+        // at its next pass.
+        let first = match first {
+            Err(err) if options.staging_worker => {
+                let _ = ready_tx.send(Err(err.into()));
+                return;
+            }
+            other => other,
+        };
+        handover_log.record(first, false)
+    } else {
+        false
+    };
     let (active_tx, active_rx) = watch::channel(active);
 
     let mut staging_session = None;
@@ -5093,6 +5105,34 @@ mod worker_upkeep_tests {
         assert_eq!(refreshed, registered);
 
         client.shutdown().await.expect("shutdown");
+    }
+
+    /// The startup handover pass can't read the database: a staging worker's
+    /// start fails then (it did before the pass existed, through
+    /// `setup_staging`), where a process that only drains starts and retries.
+    #[tokio::test]
+    async fn a_staging_worker_start_fails_when_the_database_is_unreachable() {
+        let dsn = "host=/nonexistent-trellis-start port=1 dbname=trellis";
+        let staging = Client::start(
+            dsn,
+            ClientOptions {
+                staging_worker: true,
+                application_threads: 0,
+                ..ClientOptions::default()
+            },
+        );
+        assert!(staging.is_err(), "a staging worker can't start");
+
+        let drain = Client::start(
+            dsn,
+            ClientOptions {
+                staging_worker: false,
+                application_threads: 1,
+                ..ClientOptions::default()
+            },
+        )
+        .expect("a drain-only process starts and retries");
+        drain.shutdown().await.expect("shutdown");
     }
 
     /// A staging worker whose own `reclaim_ttl` is shorter than
