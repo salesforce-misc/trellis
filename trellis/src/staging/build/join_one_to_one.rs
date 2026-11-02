@@ -33,6 +33,7 @@ use crate::defs::join::Side;
 use crate::staging::join_one_to_one::build as steps;
 use crate::staging::join_one_to_one::{JoinShape, plan_for};
 use crate::staging::join_one_to_one_status::OneToOneBuildStep;
+use crate::staging::one_to_one_ledger;
 
 use super::orphans::{self, OrphanCursor, OrphanWalk};
 use super::{
@@ -342,10 +343,17 @@ pub(super) async fn sweep_batch(
     let stage = Stage::parse(cursor);
     let (scanned, rederived, next) = match stage {
         Stage::Stale(after) => {
-            let (scanned, last, stale) =
-                steps::stale_entries(txn, shape, start_xid, after.as_deref(), scan)
-                    .await
-                    .map_err(build_error)?;
+            let (scanned, last, stale) = one_to_one_ledger::stale_entries(
+                txn,
+                shape.r_ident(),
+                start_xid,
+                after.as_deref(),
+                scan,
+                shape.source_table(),
+                &shape.target,
+            )
+            .await
+            .map_err(build_error)?;
             steps::rederive(txn, shape, Side::From, &stale, true)
                 .await
                 .map_err(build_error)?;

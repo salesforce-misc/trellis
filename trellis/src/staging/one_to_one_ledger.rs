@@ -541,6 +541,72 @@ pub async fn explain_page(
     ])
 }
 
+/// One batch of a rebuild sweep's walk of the ledger `ledger` (quoted and
+/// qualified): up to `scan` entries after `after` in key order, and the live
+/// ones among them the build hasn't re-derived, whose `basis` is null
+/// (written by an Apply alone) or a snapshot taken before the build's start,
+/// `start_xid`. A key quarantined for the definition (its `poison` rows of
+/// `source_table` for `target`) is left as it is. Returns how many it read,
+/// the last key it read, and the stale keys, sorted. A plain 1-1 target's
+/// sweep (`super::build::one_to_one::sweep_batch`) and a 1-1 `JOIN`'s stale
+/// pass over `R` (`super::build::join_one_to_one`) walk their ledgers through
+/// it.
+pub(crate) async fn stale_entries(
+    txn: &Transaction<'_>,
+    ledger: &str,
+    start_xid: &str,
+    after: Option<&str>,
+    scan: i64,
+    source_table: &str,
+    target: &str,
+) -> Result<(i64, Option<String>, Vec<String>), ApplyError> {
+    let started = std::time::Instant::now();
+    let row = txn
+        .query_one(
+            &stale_entries_statement(ledger, after.is_some()),
+            &[&start_xid, &scan, &after, &source_table, &target],
+        )
+        .await?;
+    crate::metrics::record_build_statement(
+        crate::metrics::BuildStatement::ChunkKeys,
+        started.elapsed(),
+    );
+    Ok((row.get(0), row.get(1), row.get(2)))
+}
+
+/// [`stale_entries`]' statement on `ledger`, from the start or (`after`)
+/// after the key `$3`. Binds `$1` the build's start, `$2` the batch size, `$3`
+/// the key it walks on from (`text`, null from the start), `$4` the source
+/// table and `$5` the target.
+pub(crate) fn stale_entries_statement(ledger: &str, after: bool) -> String {
+    let key = quote_ident(schema::KEY_COLUMN);
+    let tombstone = quote_ident(schema::TOMBSTONE_COLUMN);
+    let basis = quote_ident(schema::BASIS_COLUMN);
+    let after = if after {
+        format!("where {key} > $3")
+    } else {
+        "where $3::text is null".to_string()
+    };
+    format!(
+        "with w as ( \
+             select {key} as k, not {tombstone} \
+                    and ({basis} is null \
+                         or pg_catalog.pg_snapshot_xmax({basis}) <= $1::text::xid8) \
+                    as stale \
+             from {ledger} {after} order by {key} limit $2 \
+         ) \
+         select (select count(*) from w), \
+                (select k from w order by k desc limit 1), \
+                array(select k from w where stale \
+                        and not exists (select 1 from poison p \
+                                        join transform_definitions d \
+                                          on d.id = p.transform_id \
+                                        where p.src_table = $4 and p.key = w.k \
+                                          and d.target_table = $5) \
+                      order by k)"
+    )
+}
+
 /// Empties `ledger` for a source `TRUNCATE` and raises its
 /// truncate floor to `lsn`, the truncate's ring `lsn` (the D split's Q6). The caller
 /// clears the target rows. `lsn` is required: a truncate that raised no

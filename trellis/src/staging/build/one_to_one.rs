@@ -431,9 +431,6 @@ pub async fn sweep_batch(
     cursor: Option<&str>,
     scan: i64,
 ) -> Result<SweepOutcome, ApplyError> {
-    let key = quote_ident(crate::defs::ledger::KEY_COLUMN);
-    let tombstone = quote_ident(crate::defs::ledger::TOMBSTONE_COLUMN);
-    let basis = quote_ident(crate::defs::ledger::BASIS_COLUMN);
     let cursor = match cursor.map(SweepCursor::parse) {
         // A cursor in the orphan walk skips the ledger, which is already read.
         Some(SweepCursor::Orphans(after)) => {
@@ -457,40 +454,16 @@ pub async fn sweep_batch(
         Some(SweepCursor::Ledger(after)) => Some(after),
         None => None,
     };
-    let after = if cursor.is_some() {
-        format!("where {key} > $3")
-    } else {
-        "where $3::text is null".to_string()
-    };
-    let started = Instant::now();
-    let row = txn
-        .query_one(
-            &format!(
-                "with w as ( \
-                     select {key} as k, not {tombstone} \
-                            and ({basis} is null \
-                                 or pg_catalog.pg_snapshot_xmax({basis}) <= $1::text::xid8) \
-                            as stale \
-                     from {ledger} {after} order by {key} limit $2 \
-                 ) \
-                 select (select count(*) from w), \
-                        (select k from w order by k desc limit 1), \
-                        array(select k from w where stale \
-                                and not exists (select 1 from poison p \
-                                                join transform_definitions d \
-                                                  on d.id = p.transform_id \
-                                                where p.src_table = $4 and p.key = w.k \
-                                                  and d.target_table = $5) \
-                              order by k)",
-                ledger = one_to_one_ledger::ledger_ident(&plan.target),
-            ),
-            &[&start_xid, &scan, &cursor, &plan.source_table, &plan.target],
-        )
-        .await?;
-    metrics::record_build_statement(BuildStatement::ChunkKeys, started.elapsed());
-    let scanned: i64 = row.get(0);
-    let next: Option<String> = row.get(1);
-    let mut keys: Vec<String> = row.get(2);
+    let (scanned, next, mut keys) = one_to_one_ledger::stale_entries(
+        txn,
+        &one_to_one_ledger::ledger_ident(&plan.target),
+        start_xid,
+        cursor,
+        scan,
+        &plan.source_table,
+        &plan.target,
+    )
+    .await?;
     let mut finished = scanned < scan;
     let mut orphan_next: Option<String> = None;
     if finished {
