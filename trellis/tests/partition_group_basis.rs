@@ -819,7 +819,7 @@ async fn leaf_operation_races_a_page(
     ))
     .await;
     let batch = fx.d.seal().await;
-    let correct = |pool: trellis::Pool| async move {
+    let correct = |pool: trellis::pool::Pool| async move {
         Ok(
             partition_correction::run_pending(&pool, &Options::default())
                 .await
@@ -910,7 +910,7 @@ async fn a_leaf_correction_that_times_out_behind_a_page_runs_again() {
     let marker = fx.d.seal().await;
     assert_eq!(fx.kinds().await, ["truncated"]);
     // A worker whose sessions wait 200 ms for a lock.
-    let impatient = trellis::Pool::new(
+    let impatient = trellis::pool::Pool::new(
         &Config::from_dsn(format!("{} options='-c lock_timeout=200'", fx.d.db.dsn()))
             .expect("valid dsn"),
     )

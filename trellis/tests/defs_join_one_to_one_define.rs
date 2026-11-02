@@ -127,7 +127,7 @@ async fn count(raw: &Client, sql: &str) -> i64 {
     raw.query_one(sql, &[]).await.expect("count").get(0)
 }
 
-async fn pass(raw: &mut Client, pool: &trellis::Pool) {
+async fn pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     trellis::client::reconcile_pass(raw, pool, DEFAULT_SCHEMA)
         .await
         .expect("reconcile pass");
@@ -1094,7 +1094,7 @@ async fn a_one_to_one_join_pauses_resumes_revalidates_and_drops_with_its_hidden_
 
 /// Seals the ring and drains every claimable segment by hand, until nothing
 /// is pending.
-async fn drain(raw: &mut Client, pool: &trellis::Pool) {
+async fn drain(raw: &mut Client, pool: &trellis::pool::Pool) {
     const WAKE: &str = "one_to_one_join_wake";
     for _ in 0..16 {
         trellis::staging::seal_if_active_nonempty(raw, WAKE)

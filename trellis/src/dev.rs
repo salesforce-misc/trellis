@@ -37,6 +37,14 @@ pub mod config {
     pub use crate::config::DEFAULT_SCHEMA;
 }
 
+/// Trellis's connection pool, for the harnesses (`testkit`, `generative`,
+/// `benchmark`) that drive the engine and read its targets on the
+/// connections Trellis itself uses. Not public API: an embedder opens its own
+/// connections (`docs/embedding.md`).
+pub mod pool {
+    pub use crate::pool::{Pool, PooledClient, TransactionBuilder};
+}
+
 /// The latency histogram boundaries and build-statement classes, for
 /// `benchmark`'s scrape of the engine's metrics.
 pub mod metrics {

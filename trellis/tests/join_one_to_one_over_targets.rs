@@ -1134,7 +1134,7 @@ async fn s8_a_row_the_upstream_holds_in_quarantine() {
 // ------------------------------------------------------------------- S9
 
 /// One self-check page of `join`, waiting `timeout` for convergence.
-async fn check(pool: &trellis::Pool, join: Join, timeout: Duration) -> SelfCheckOutcome {
+async fn check(pool: &trellis::pool::Pool, join: Join, timeout: Duration) -> SelfCheckOutcome {
     check_page(
         pool,
         &join.target(),

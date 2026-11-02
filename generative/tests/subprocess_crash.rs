@@ -25,8 +25,9 @@ use generative::model::Program;
 use generative::run::check_program;
 use testkit::TestCluster;
 use tokio_postgres::NoTls;
+use trellis::Config;
+use trellis::dev::pool::Pool;
 use trellis::dev::staging::producer_singleton_lock_key;
-use trellis::{Config, Pool};
 
 /// How long to wait for the primary engine subprocess to reach the
 /// pre-commit pause point after the critical op pair is applied. Generous

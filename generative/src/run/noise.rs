@@ -22,7 +22,7 @@
 //! events are free to fire at the positions it names, interleaved with the real
 //! ops.
 
-use trellis::Pool;
+use trellis::dev::pool::Pool;
 
 use crate::backend::{Backend, ManualBackend};
 use crate::model::{NoisePlan, OpOutcome, Program};

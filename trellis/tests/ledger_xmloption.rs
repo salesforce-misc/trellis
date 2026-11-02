@@ -43,7 +43,7 @@ async fn connect(dsn: &str) -> Client {
 }
 
 /// One whole staging-worker pass: capture, then the start of ready builds.
-async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
+async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     trellis::client::reconcile_pass(raw, pool, SCHEMA)
         .await
         .expect("reconcile pass");
@@ -51,7 +51,7 @@ async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
 
 /// Seals and drains through the engine's own apply path until nothing is
 /// pending anywhere in the ring (as in `capture_schema_change.rs`).
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
@@ -81,7 +81,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 
 /// Claims, runs and finishes every pending backfill chunk (as in
 /// `capture_schema_change.rs`).
-async fn run_backfill_chunks(pool: &trellis::Pool) {
+async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
     trellis::staging::build::settle_builds(pool).await;
 }
 
@@ -132,7 +132,7 @@ async fn an_xml_fragment_applies_to_an_aggregate_under_a_document_xmloption() {
     // Everything Trellis opens from here on starts under `document`:
     // `db.pool`'s connections predate the `ALTER DATABASE`, so a fresh pool.
     let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
-    let pool = trellis::Pool::new(&config).expect("build a pool");
+    let pool = trellis::pool::Pool::new(&config).expect("build a pool");
     let trellis = Trellis::connect(config, TrellisOptions::default())
         .await
         .expect("connect a definer");

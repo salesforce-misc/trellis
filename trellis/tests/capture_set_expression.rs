@@ -38,7 +38,7 @@ async fn connect(dsn: &str) -> Client {
     client
 }
 
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
@@ -68,7 +68,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 
 /// `n` rounds of a whole staging-worker pass (capture, then the start of
 /// ready builds), the builds run, and the ring drained.
-async fn work(raw: &mut Client, pool: &trellis::Pool, n: usize) {
+async fn work(raw: &mut Client, pool: &trellis::pool::Pool, n: usize) {
     for _ in 0..n {
         trellis::client::reconcile_pass(raw, pool, SCHEMA)
             .await

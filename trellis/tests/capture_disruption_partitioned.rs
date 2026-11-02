@@ -43,14 +43,14 @@ async fn definer(dsn: &str) -> Trellis {
 }
 
 /// One whole staging-worker pass: capture, then the start of ready builds.
-async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
+async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     trellis::client::reconcile_pass(raw, pool, SCHEMA)
         .await
         .expect("reconcile pass");
 }
 
 /// The capture half of one pass only.
-async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
+async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     let desired = trellis::defs::tables_to_capture(pool)
         .await
         .expect("read the tables to capture");
@@ -65,7 +65,7 @@ async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
     assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
 }
 
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
@@ -93,7 +93,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     panic!("the ring did not reach quiescence within 16 seal/drain rounds");
 }
 
-async fn run_backfill_chunks(pool: &trellis::Pool) {
+async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
     trellis::staging::build::settle_builds(pool).await;
 }
 
@@ -117,7 +117,7 @@ async fn statuses(raw: &Client) -> BTreeMap<String, TransformStatus> {
 
 /// Alternates staging-worker passes, builds and drains until every
 /// definition is live: a bounded number of explicit steps.
-async fn bring_live(raw: &mut Client, pool: &trellis::Pool) {
+async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool) {
     for _ in 0..10 {
         full_pass(raw, pool).await;
         run_backfill_chunks(pool).await;
@@ -219,7 +219,7 @@ async fn create_case_tables(raw: &Client, trellis: &Trellis, ids: &[String]) {
 /// must give the first's reason.
 async fn settle(
     raw: &mut Client,
-    pool: &trellis::Pool,
+    pool: &trellis::pool::Pool,
     trellis: &Trellis,
     id: &str,
     failures: &mut Vec<String>,

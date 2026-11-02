@@ -51,7 +51,7 @@ async fn connect_trellis(dsn: &str) -> Trellis {
     .expect("connect a define-only Trellis")
 }
 
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, WAKE)
@@ -73,7 +73,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 }
 
 /// Builds every registered definition and drains the ring.
-async fn bring_live(pool: &trellis::Pool, client: &mut Client) {
+async fn bring_live(pool: &trellis::pool::Pool, client: &mut Client) {
     harness::settle_builds(pool).await;
     drain_to_quiescence(pool, client).await;
     let not_live: i64 = client
@@ -219,7 +219,7 @@ async fn rebuild_rows(client: &Client, target: &str) -> (i64, i64, Option<i64>, 
 
 /// Runs every claimable plan job and `rederive` chunk, as a drain worker
 /// would, but no sweep and no merge, so a rebuild is left part way.
-async fn run_plan_and_chunks(pool: &trellis::Pool) {
+async fn run_plan_and_chunks(pool: &trellis::pool::Pool) {
     use trellis::defs::chunk_queue;
     const BY: &str = "table_catch_ups_test_build_worker";
     let options = trellis::staging::build::WorkerOptions {

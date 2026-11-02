@@ -146,7 +146,7 @@ internals = ["test-util"]
 
 [dev-dependencies]
 regex = "1.13"
-testkit = { path = "../testkit" }
+testkit = { path = "../testkit", features = ["engine-access"] }
 # Turns on `internals` (see above) for this crate's own test targets only —
 # `tests/*.rs` are separate compilation units and cannot otherwise see the
 # tier-3 engine modules ADR-0012 made `pub(crate)`. Exactly the self

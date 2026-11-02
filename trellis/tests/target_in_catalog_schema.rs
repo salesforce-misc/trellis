@@ -5,8 +5,10 @@
 //! since become one refuses it the same way. Direct, with no polling.
 
 use testkit::{TestCluster, TestDatabase};
+use trellis::pool::Pool;
 use trellis::{
-    ApplyError, CatalogError, Config, Pool, Trellis, TrellisError, TrellisOptions, config, migrate,
+    ApplyError, CatalogError, Config, Trellis, TrellisError, TrellisOptions, config,
+    migrate::migrate_with_pool,
 };
 
 const SOURCE: &str = "create table public.cat_src (id integer primary key, v integer)";
@@ -96,7 +98,7 @@ async fn a_target_qualified_into_another_instances_catalog_schema_is_refused() {
     raw(&db, SOURCE).await;
     // Another instance attaches, with `instance_b` as its catalog schema.
     let other = Config::with_schema(db.dsn(), "instance_b").expect("valid schema");
-    migrate(&Pool::new(&other).expect("pool"), &other)
+    migrate_with_pool(&Pool::new(&other).expect("pool"), &other)
         .await
         .expect("attach the other instance");
     let trellis = connect(&db).await;
@@ -253,11 +255,11 @@ async fn a_catalog_schema_is_matched_by_its_exact_mixed_case_name() {
     raw(&db, SOURCE).await;
     raw(&db, "create schema cat_mixed; create schema other_mixed").await;
     let other = Config::with_schema(db.dsn(), "Other_Mixed").expect("valid schema");
-    migrate(&Pool::new(&other).expect("pool"), &other)
+    migrate_with_pool(&Pool::new(&other).expect("pool"), &other)
         .await
         .expect("attach the other instance");
     let config = Config::with_schema(db.dsn(), "Cat_Mixed").expect("valid schema");
-    migrate(&Pool::new(&config).expect("pool"), &config)
+    migrate_with_pool(&Pool::new(&config).expect("pool"), &config)
         .await
         .expect("attach this instance");
     let trellis = Trellis::connect(config, TrellisOptions::default())
@@ -323,7 +325,7 @@ async fn a_trellis_instance_table_the_role_cannot_read_is_still_found() {
     assert!(db.dsn().contains("user=postgres"), "{}", db.dsn());
     let config =
         Config::from_dsn(db.dsn().replace("user=postgres", "user=trellis")).expect("valid dsn");
-    migrate(&Pool::new(&config).expect("pool"), &config)
+    migrate_with_pool(&Pool::new(&config).expect("pool"), &config)
         .await
         .expect("attach as the Trellis role");
     let trellis = Trellis::connect(config, TrellisOptions::default())

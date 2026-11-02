@@ -332,7 +332,7 @@ const FOLDED_COLUMNS: &str = "src_table, key, new_image, old_image, src_changed,
 ///
 /// The table is session state, so the caller must hold this session for
 /// every [`read_page`] of the share and must never hand it to anyone else:
-/// the drain runs it on [`crate::Pool::connect_unpooled`]'s connection, and
+/// the drain runs it on [`crate::pool::Pool::connect_unpooled`]'s connection, and
 /// the table goes when that connection closes.
 pub(crate) async fn materialize_share(
     txn: &Transaction<'_>,

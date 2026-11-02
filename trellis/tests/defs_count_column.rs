@@ -168,7 +168,7 @@ async fn stage_bare_recompute(client: &Client, key: &str, src_table: &str) {
         .unwrap_or_else(|e| panic!("stage bare recompute {key} into {table}: {e}"));
 }
 
-async fn drain_sealed(client: &mut Client, pool: &trellis::Pool, worker: &str) {
+async fn drain_sealed(client: &mut Client, pool: &trellis::pool::Pool, worker: &str) {
     let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
     seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
         .await
@@ -232,7 +232,7 @@ fn columns() -> HashMap<String, ValueType> {
     ])
 }
 
-async fn create_schema_and_definition(pool: &trellis::Pool, client: &Client) {
+async fn create_schema_and_definition(pool: &trellis::pool::Pool, client: &Client) {
     client
         .batch_execute("create table events (id integer primary key, grp integer, amount numeric)")
         .await

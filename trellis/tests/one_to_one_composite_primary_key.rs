@@ -34,7 +34,7 @@ use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, Transfor
 use trellis::defs::{create_definition, create_target_table, source_primary_key};
 use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 
-/// Connects directly to `dsn` (bypassing `trellis::Pool`) and pins
+/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`) and pins
 /// `search_path`, matching `client_e2e.rs`'s helper of the same name.
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -84,7 +84,7 @@ async fn stage_cdc(
 
 /// Seals and drains through the engine's own apply path until nothing is
 /// pending: the hand-driven stand-in for a running `Client`'s drain workers.
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     // No live capture stages anything here, so there is no real staged
     // watermark to hold apply back. A saturated one never does.
     for _ in 0..16 {
@@ -152,7 +152,7 @@ fn line_totals_def() -> TransformDef {
 /// `client_e2e.rs`'s `setup_source_and_target` convention: `create_definition`
 /// is the ring-path entry point and never runs target-table DDL itself, so
 /// the caller (here) builds the physical target table separately.
-async fn setup_source_and_target(pool: &trellis::Pool, raw: &Client) {
+async fn setup_source_and_target(pool: &trellis::pool::Pool, raw: &Client) {
     raw.batch_execute(
         "create table order_lines (
              order_id integer,

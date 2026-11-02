@@ -40,7 +40,7 @@ async fn claim_committed(
     Ok(won)
 }
 
-/// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
+/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`), matching
 /// `claims.rs`/`sealing.rs`/`fold.rs`'s convention.
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");

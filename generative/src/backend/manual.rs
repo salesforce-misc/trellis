@@ -40,11 +40,12 @@ use trellis::dev::defs::ast::{KeySpace, TransformDef, ValueType};
 use trellis::dev::defs::{
     CatalogError, DdlError, install_definition, qualified_target_table, source_primary_key,
 };
+use trellis::dev::pool::Pool;
 use trellis::dev::staging::{
     StagingError, has_pending as staging_has_pending, retire_drained_segments,
     seal_if_active_nonempty, seal_phase1, seal_phase2,
 };
-use trellis::{Client as EngineClient, ClientError, ClientOptions, Config, Pool};
+use trellis::{Client as EngineClient, ClientError, ClientOptions, Config};
 
 use super::Snapshot;
 use super::sql::{self, quote_ident};

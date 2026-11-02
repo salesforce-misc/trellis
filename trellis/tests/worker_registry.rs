@@ -22,7 +22,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::worker_registry;
 use trellis::{Client as TrellisClient, ClientOptions, Config, Trellis, TrellisOptions};
 
-/// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
+/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`), matching
 /// `client_e2e.rs`/`liveness.rs`'s own helper of the same name.
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");

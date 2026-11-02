@@ -48,13 +48,13 @@ async fn definer(dsn: &str) -> Trellis {
 }
 
 /// One whole staging-worker pass: capture, then the start of ready builds.
-async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
+async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     trellis::client::reconcile_pass(raw, pool, SCHEMA)
         .await
         .expect("reconcile pass");
 }
 
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
@@ -87,7 +87,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 }
 
 /// Claims, runs and finishes every pending backfill chunk.
-async fn run_backfill_chunks(pool: &trellis::Pool) {
+async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
     trellis::staging::build::settle_builds(pool).await;
 }
 
@@ -105,7 +105,7 @@ async fn status(raw: &Client, target: &str) -> TransformStatus {
 
 /// Alternates staging-worker passes and drains until every one of
 /// `targets` is live: a bounded number of explicit steps, not a timed wait.
-async fn bring_live(raw: &mut Client, pool: &trellis::Pool, targets: &[&str]) {
+async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool, targets: &[&str]) {
     for _ in 0..8 {
         full_pass(raw, pool).await;
         run_backfill_chunks(pool).await;
@@ -130,7 +130,7 @@ async fn bring_live(raw: &mut Client, pool: &trellis::Pool, targets: &[&str]) {
 /// - `roll`: `SUM(p)` per `g` (valid over an integer, refused over a numeric with no scale);
 /// - `cnt`: `COUNT(p)` per `g` (valid over any type);
 /// - `c`: a 1-1 passthrough of `p` (valid).
-async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
+async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::pool::Pool) -> Trellis {
     raw.batch_execute(
         "create table public.src (id int primary key, g int, price int); \
         ",

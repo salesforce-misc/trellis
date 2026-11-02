@@ -438,9 +438,9 @@ undefined ([known correctness gaps — Rows written into a target, a hidden tabl
   it and is exempt unless the table is `FORCE ROW LEVEL SECURITY`. Enabling
   row-level security on a target for your application's readers is fine as
   long as the workers run as the table's owner (or a member of it) or have
-  `BYPASSRLS`. Those readers see their policies only on their own connections:
-  `Trellis::pool()`'s connections also run with `row_security = off`, so a
-  read through them as a role the policies apply to fails instead. See
+  `BYPASSRLS`. Those readers see their policies on their own connections;
+  Trellis keeps its connections, which run with `row_security = off`, to
+  itself. See
   [Supported sources and targets](#supported-sources-and-targets) for what
   happens when that stops holding. A definition is also refused if
   DDL around its target's creation, such as an event trigger that forces

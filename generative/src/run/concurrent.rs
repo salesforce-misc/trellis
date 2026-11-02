@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use trellis::Pool;
 use trellis::dev::defs::ast::TransformDef;
+use trellis::dev::pool::Pool;
 
 use super::{Outcome, RunError, check_op_outcome, quiesce_snapshot_and_check};
 use crate::backend::{ConcurrentBackend, DrainAudit, OpApplier};

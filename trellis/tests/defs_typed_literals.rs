@@ -36,13 +36,13 @@ use std::collections::HashMap;
 use sql_recompute::recompute;
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
-use trellis::Pool;
 use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ast::{Expr, ValueType};
 use trellis::defs::{
     PgType, create_definition, create_target_table, install_definition, parse, render_expr_sql,
     source_primary_key, validate,
 };
+use trellis::pool::Pool;
 use trellis::staging::apply;
 
 // ---------------------------------------------------------------------
@@ -153,7 +153,7 @@ async fn insert_cdc_row(client: &Client, key: &str, new_image: &str) {
 /// `live`, standing in for the staging worker and a running
 /// `application_threads` drain worker (copied from
 /// `defs_install_definition.rs`).
-async fn drain_backfill_chunks(pool: &trellis::Pool) {
+async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
     // ADR-0002: registration only records a definition; the staging
     // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)

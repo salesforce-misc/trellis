@@ -67,7 +67,8 @@ use generative::generate::{Mutate, build_program};
 use generative::model::OpOutcome;
 use generative::run::check_program;
 use testkit::TestCluster;
-use trellis::{Config, Pool};
+use trellis::Config;
+use trellis::dev::pool::Pool;
 
 /// The genuinely non-trivial case: two `Update`s against the same row,
 /// back to back (no quiesce in between, so both deltas can land close

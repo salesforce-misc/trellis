@@ -1460,7 +1460,8 @@ fn partitioned_program_always_reads_a_partitioned_source_and_draws_every_strateg
 async fn drawn_aggregate_definitions_land_on_the_group_basis() {
     use generative::backend::ManualBackend;
     use generative::run::run_convergence;
-    use trellis::{Config, Pool};
+    use trellis::Config;
+    use trellis::dev::pool::Pool;
 
     const PROGRAMS: usize = 4;
     let cluster = testkit::TestCluster::start();

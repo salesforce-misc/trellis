@@ -142,7 +142,8 @@ use generative::run::{
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
 use testkit::{TestCluster, TestDatabase};
-use trellis::{Config, Pool};
+use trellis::Config;
+use trellis::dev::pool::Pool;
 
 struct Harness {
     runtime: tokio::runtime::Runtime,
@@ -245,7 +246,7 @@ async fn stand_up_in(
         .await
         .expect("create target schema");
 
-    trellis::migrate(&pool, &config)
+    trellis::migrate(&config)
         .await
         .expect("migrate instance schema");
 

@@ -23,7 +23,7 @@ fn recompute(src_table: &str, key: &str) -> StagedChange {
     }
 }
 
-/// Connects directly to `dsn` (bypassing `trellis::Pool` and its
+/// Connects directly to `dsn` (bypassing `trellis::pool::Pool` and its
 /// `search_path`-pinning hook), spawns its connection driver, and pins
 /// `search_path` itself so the client sees the migrated tables unqualified.
 async fn connect_raw(dsn: &str) -> Client {

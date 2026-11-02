@@ -114,7 +114,7 @@ async fn define_join_on(
 /// Starts every registered definition's build and runs it to completion,
 /// standing in for the staging worker and a running drain worker (copied
 /// from `defs_typed_literals.rs`).
-async fn drain_backfill_chunks(pool: &trellis::Pool) {
+async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
     // ADR-0002: registration only records a definition; the staging
     // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)

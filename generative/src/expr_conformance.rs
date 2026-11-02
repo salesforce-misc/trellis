@@ -28,6 +28,7 @@ use std::collections::HashMap;
 
 use testkit::TestDatabase;
 use tokio_postgres::{Client, NoTls};
+use trellis::Config;
 use trellis::dev::config::DEFAULT_SCHEMA;
 use trellis::dev::defs::ast::{Expr, Operator, ValueType};
 use trellis::dev::defs::oracle::render_expr_sql;
@@ -36,7 +37,7 @@ use trellis::dev::defs::{
     PgType, ValidationError, create_target_table, parse, render_definition_text,
     render_qualified_expr_sql, source_primary_key, validate,
 };
-use trellis::{Config, Pool};
+use trellis::dev::pool::Pool;
 
 use crate::expr_gen::{Column, NearMiss};
 

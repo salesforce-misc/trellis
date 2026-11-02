@@ -43,10 +43,11 @@ use std::time::{Duration, Instant};
 
 use testkit::crash::CrashGuard;
 use tokio_postgres::NoTls;
+use trellis::Config;
 use trellis::dev::defs::ast::TransformDef;
 use trellis::dev::defs::{CatalogError, DdlError, install_definition};
+use trellis::dev::pool::Pool;
 use trellis::dev::staging::StagingError;
-use trellis::{Config, Pool};
 
 use super::Snapshot;
 use super::sql;

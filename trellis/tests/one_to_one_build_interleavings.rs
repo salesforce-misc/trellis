@@ -1385,7 +1385,7 @@ async fn an_alter_waiting_on_a_page_at_the_fence_holds_nothing() {
 // --------------------------- a chunk planned before an edit, run after it
 
 /// One drain worker's build step, as `work_once` takes it.
-async fn build_step(pool: &trellis::Pool, worker: &str) -> trellis::staging::build::Step {
+async fn build_step(pool: &trellis::pool::Pool, worker: &str) -> trellis::staging::build::Step {
     let options = trellis::staging::build::WorkerOptions {
         chunk_rows: 10_000,
         drain_batch_cap: 10_000,

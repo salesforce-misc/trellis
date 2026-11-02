@@ -2465,7 +2465,7 @@ async fn run_workers_without_the_source_privilege(f: &mut Fixture) {
         .expect("create the unprivileged role");
     let dsn = f.db.dsn().replace("user=postgres", "user=builder");
     let config = Config::from_dsn(dsn).expect("valid dsn");
-    f.db.pool = trellis::Pool::new(&config).expect("pool");
+    f.db.pool = trellis::pool::Pool::new(&config).expect("pool");
 }
 
 /// A `42501` on a `rederive` chunk's read is not narrowed to a key: it is

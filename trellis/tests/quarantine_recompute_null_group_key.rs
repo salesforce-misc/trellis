@@ -59,7 +59,7 @@ async fn connect_raw(dsn: &str) -> Client {
 /// Seals and drains repeatedly until nothing is pending anywhere in the ring
 /// — needed after installing `sku_totals_echo` so its own downstream
 /// propagation settles before this test reaches into `column_status`.
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     use trellis::staging::apply;
     use trellis::staging::seal;
     for _ in 0..16 {

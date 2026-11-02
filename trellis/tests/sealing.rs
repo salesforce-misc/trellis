@@ -17,7 +17,7 @@ use tokio_postgres::{Client, IsolationLevel, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::{StagedChange, StagingError, TRUNCATE_SENTINEL_KEY, seal};
 
-/// Connects directly to `dsn` (bypassing `trellis::Pool`), for tests that
+/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`), for tests that
 /// need a plain `tokio_postgres::Client`/`Transaction` — the type
 /// `trellis::staging::seal`'s functions take, which the pooled
 /// `deadpool_postgres::Client` doesn't satisfy (it has its own, unrelated

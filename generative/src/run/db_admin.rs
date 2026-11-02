@@ -14,7 +14,7 @@
 //! `def_install_after_op`, `restart_after_ops` and `scale_out_after_ops` are
 //! not honoured here, the same as in the noise runner.
 
-use trellis::Pool;
+use trellis::dev::pool::Pool;
 
 use crate::backend::{
     Backend, ClusterControl, ManualBackend, SERVER_STOP_RECLAIM_TTL, await_pool_usable,

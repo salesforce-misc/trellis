@@ -14,7 +14,7 @@ use trellis::defs::{
 /// Starts every registered definition's Re-derive build and runs it to
 /// completion by hand, so a 1-1 target goes `live` without a running drain
 /// worker — a definition can only chain off a live target.
-async fn drain_backfill_chunks(pool: &trellis::Pool) {
+async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
     // ADR-0002: registration only records a definition; the staging
     // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
@@ -883,7 +883,7 @@ async fn a_target_table_colliding_on_bare_suffix_under_a_different_schema_is_rej
         .with_target_schema("custom")
         .expect("valid target schema");
     let custom_pool =
-        trellis::Pool::new(&custom_config).expect("build pool with target_schema=custom");
+        trellis::pool::Pool::new(&custom_config).expect("build pool with target_schema=custom");
 
     let err = create_definition(
         &custom_pool,
@@ -1023,7 +1023,7 @@ async fn a_concurrent_insert_racing_the_target_suffix_index_is_translated_to_a_c
         .with_target_schema("custom")
         .expect("valid target schema");
     let custom_pool =
-        trellis::Pool::new(&custom_config).expect("build pool with target_schema=custom");
+        trellis::pool::Pool::new(&custom_config).expect("build pool with target_schema=custom");
 
     let racing_call = tokio::spawn(async move {
         create_definition(

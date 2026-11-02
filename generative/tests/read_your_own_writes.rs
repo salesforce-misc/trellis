@@ -51,7 +51,8 @@ use generative::generate::join::{
 use generative::model::{Op, OpOutcome, Program, group_key};
 use generative::run::check_program;
 use testkit::TestCluster;
-use trellis::{Config, Pool};
+use trellis::Config;
+use trellis::dev::pool::Pool;
 
 /// How many distinct updates to race against `quiesce()` before concluding
 /// the negative control couldn't demonstrate staleness at all (see the

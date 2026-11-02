@@ -46,7 +46,7 @@ async fn seal_active_segment(client: &mut Client) -> i64 {
     outcome.sealed_seg_seq
 }
 
-async fn drain(pool: &trellis::Pool, seg_seq: i64) {
+async fn drain(pool: &trellis::pool::Pool, seg_seq: i64) {
     while apply::drain_once(pool, seg_seq, "origin_test", 1, "wake")
         .await
         .expect("drain_once")

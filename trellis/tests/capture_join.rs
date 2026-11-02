@@ -50,7 +50,11 @@ async fn definer(dsn: &str) -> Trellis {
 
 /// The capture half of one pass, over the tables the catalog says to
 /// capture, with `budget` for locked tables.
-async fn capture_pass(raw: &mut Client, pool: &trellis::Pool, budget: Duration) -> PassOutcome {
+async fn capture_pass(
+    raw: &mut Client,
+    pool: &trellis::pool::Pool,
+    budget: Duration,
+) -> PassOutcome {
     let desired = trellis::defs::tables_to_capture(pool)
         .await
         .expect("read the tables to capture");
@@ -60,7 +64,7 @@ async fn capture_pass(raw: &mut Client, pool: &trellis::Pool, budget: Duration) 
 }
 
 /// One whole staging-worker pass: capture, then the builds it readies.
-async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
+async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     trellis::client::reconcile_pass(raw, pool, SCHEMA)
         .await
         .expect("reconcile pass");
@@ -118,7 +122,7 @@ async fn gate_exists(raw: &Client, table: &str) -> Option<bool> {
 /// Runs whole passes until `table` has no gate left: the pass that starts the
 /// builds it held releases it. Nothing drains here, so a pass only starts
 /// them; a few passes always suffice.
-async fn settle(raw: &mut Client, pool: &trellis::Pool, table: &str) {
+async fn settle(raw: &mut Client, pool: &trellis::pool::Pool, table: &str) {
     for _ in 0..5 {
         full_pass(raw, pool).await;
         if gate_exists(raw, table).await.is_none() {
@@ -377,7 +381,7 @@ async fn a_table_whose_join_is_blocked_does_not_delay_another_tables_join() {
 /// turns that hang into a failure.
 #[tokio::test]
 async fn a_pass_respects_its_budget_on_locked_tables() {
-    async fn pass(raw: &mut Client, pool: &trellis::Pool, budget: Duration) -> PassOutcome {
+    async fn pass(raw: &mut Client, pool: &trellis::pool::Pool, budget: Duration) -> PassOutcome {
         tokio::time::timeout(Duration::from_secs(60), capture_pass(raw, pool, budget))
             .await
             .expect("a pass stops retrying at its deadline")
@@ -993,7 +997,7 @@ async fn a_nested_rewrite_of_the_same_key_lands_in_the_right_group() {
 /// which its drain worker never claimed. Nothing newer retires past an
 /// undrained segment, so draining only its own seals would leave each round
 /// taking a fresh ring slot until a seal is refused `RingFull`.
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
@@ -1225,13 +1229,13 @@ async fn an_alter_adding_a_field_on_a_new_source_column_waits_for_the_widen() {
 /// Claims, runs and finishes every pending backfill chunk, running every
 /// started build to its end: the hand-driven stand-in for a drain worker's
 /// build half (as in `capture_schema_change.rs`).
-async fn run_backfill_chunks(pool: &trellis::Pool) {
+async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
     trellis::staging::build::settle_builds(pool).await;
 }
 
 /// Alternates staging-worker passes, chunk runs and drains until `target`
 /// is live: a bounded number of explicit steps, not a timed wait.
-async fn bring_live(raw: &mut Client, pool: &trellis::Pool, target: &str) {
+async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool, target: &str) {
     for _ in 0..8 {
         full_pass(raw, pool).await;
         run_backfill_chunks(pool).await;
@@ -1251,7 +1255,7 @@ async fn bring_live(raw: &mut Client, pool: &trellis::Pool, target: &str) {
 async fn edit_held_by_a_writer(
     dsn: &str,
     raw: &mut Client,
-    pool: &trellis::Pool,
+    pool: &trellis::pool::Pool,
 ) -> (Trellis, Client) {
     raw.batch_execute(
         "create table public.u (id int primary key, a int, b int); \

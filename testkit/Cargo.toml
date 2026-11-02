@@ -9,3 +9,20 @@ trellis = { path = "../trellis" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
 tokio-postgres = "0.7.13"
 serde_json = "1"
+
+[features]
+# Turns on `trellis/test-util`, which compiles in `trellis::dev`, whose
+# `pool::Pool` is what [`TestDatabase::pool`] and `fixtures` hand out: the
+# pool is not public API, so `dev` is the only way to name it from here.
+# Off by default and turned on only by the crates that test against the
+# engine (`trellis`'s and this crate's own dev-dependencies, `generative`'s
+# and `benchmark`'s `engine-access`), never on a normal dependency edge:
+# Cargo unifies features across a whole workspace build, so naming it there
+# would compile the engine's test-only hooks into `cli`'s production
+# `trellis` binary (see `trellis/Cargo.toml`'s `test-util` comment). Without
+# it this crate still builds, with no pool on `TestDatabase` and no
+# `fixtures`.
+engine-access = ["trellis/test-util"]
+
+[dev-dependencies]
+testkit = { path = ".", features = ["engine-access"] }

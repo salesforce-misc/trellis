@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use tokio_postgres::Client as RawClient;
-use trellis::Pool;
 use trellis::dev::defs::{ValueType, install_definition};
+use trellis::dev::pool::Pool;
 
 use crate::streaming::scrape::{CHANGES_APPLIED_METRIC, counter_value, scrape};
 

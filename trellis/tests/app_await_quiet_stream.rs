@@ -22,10 +22,12 @@ const BUDGET: Duration = Duration::from_secs(5);
 
 /// A running staging instance with one live 1-1 transform over `widgets`,
 /// plus an uncaptured `audit_log` table.
-async fn running_instance(db: &testkit::TestDatabase) -> (Trellis, trellis::PooledClient) {
+async fn running_instance(db: &testkit::TestDatabase) -> (Trellis, trellis::pool::PooledClient) {
     let config = Config::with_schema(db.dsn().to_string(), "trellis").expect("valid schema");
-    let pool = trellis::Pool::new(&config).expect("pool");
-    trellis::migrate(&pool, &config).await.expect("migrate");
+    let pool = trellis::pool::Pool::new(&config).expect("pool");
+    trellis::migrate::migrate_with_pool(&pool, &config)
+        .await
+        .expect("migrate");
     let conn = pool.get().await.expect("connection");
     conn.batch_execute(
         "create table widgets (id integer primary key, price integer); \
@@ -63,7 +65,7 @@ async fn running_instance(db: &testkit::TestDatabase) -> (Trellis, trellis::Pool
     panic!("widget_prices never went live");
 }
 
-async fn price(conn: &trellis::PooledClient, id: i32) -> Option<i32> {
+async fn price(conn: &trellis::pool::PooledClient, id: i32) -> Option<i32> {
     conn.query_opt(
         "select price from public.widget_prices where id = $1",
         &[&id],

@@ -46,14 +46,14 @@ async fn definer(dsn: &str) -> Trellis {
 }
 
 /// One whole staging-worker pass: capture, then the start of ready builds.
-async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
+async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     trellis::client::reconcile_pass(raw, pool, SCHEMA)
         .await
         .expect("reconcile pass");
 }
 
 /// The capture half of one pass only. Asserts no table failed.
-async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
+async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     let desired = trellis::defs::tables_to_capture(pool)
         .await
         .expect("read the tables to capture");
@@ -68,7 +68,7 @@ async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
     assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
 }
 
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
@@ -100,7 +100,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 /// each failed drain charges the key a death, until it is quarantined and
 /// the drain goes past it. Bounded attempts, not a timed wait. The
 /// quarantined key's held rows keep the ring from quiescence.
-async fn drain_past_failures(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_past_failures(pool: &trellis::pool::Pool, client: &mut Client) {
     use trellis::staging::{apply, retire_drained_segments, seal};
     let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
     seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_key_retype_wake")
@@ -131,7 +131,7 @@ async fn drain_past_failures(pool: &trellis::Pool, client: &mut Client) {
 }
 
 /// Claims, runs and finishes every pending backfill chunk.
-async fn run_backfill_chunks(pool: &trellis::Pool) {
+async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
     trellis::staging::build::settle_builds(pool).await;
 }
 
@@ -156,7 +156,7 @@ async fn status(raw: &Client, target: &str) -> TransformStatus {
 
 /// Alternates staging-worker passes and drains until every one of
 /// `targets` is live: a bounded number of explicit steps, not a timed wait.
-async fn bring_live(raw: &mut Client, pool: &trellis::Pool, targets: &[&str]) {
+async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool, targets: &[&str]) {
     for _ in 0..8 {
         full_pass(raw, pool).await;
         run_backfill_chunks(pool).await;
@@ -269,7 +269,7 @@ async fn assert_retyping(trellis: &Trellis, raw: &Client, target: &str) -> Strin
 ///   handle and its name;
 /// - `post_titles` reads only `posts`;
 /// - `per_kind` counts `posts` per `kind`.
-async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
+async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::pool::Pool) -> Trellis {
     raw.batch_execute(
         "create table public.users (handle varchar(8) primary key, name text); \
          create table public.posts (id int primary key, author varchar(8), title text, \
@@ -393,7 +393,7 @@ async fn changes_no_key_copy_or_pairing_depends_on_pause_nothing() {
 /// target copies the key and passes `name` (`varchar(10)`, an unbounded
 /// `varchar` on the target) and `amount` (`numeric(5,2)`) through,
 /// live.
-async fn items(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
+async fn items(dsn: &str, raw: &mut Client, pool: &trellis::pool::Pool) -> Trellis {
     raw.batch_execute(
         "create table public.items (id int primary key, name varchar(10), qty int, \
                                     amount numeric(5,2)); \
@@ -1536,7 +1536,7 @@ async fn assert_waiting_on(trellis: &Trellis, raw: &Client, target: &str, upstre
 async fn step_until_live(
     trellis: &Trellis,
     raw: &mut Client,
-    pool: &trellis::Pool,
+    pool: &trellis::pool::Pool,
     upstream: &str,
     waiting: &[&str],
 ) {
@@ -1562,7 +1562,7 @@ async fn step_until_live(
 
 /// `public.items` and the chain `item_names` (A) -> `b_names` (B) ->
 /// `c_names` (C), all live.
-async fn chain(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
+async fn chain(dsn: &str, raw: &mut Client, pool: &trellis::pool::Pool) -> Trellis {
     let trellis = items(dsn, raw, pool).await;
     trellis
         .apply("TRANSFORM b_names FROM public.item_names SELECT name AS name")
@@ -1579,7 +1579,7 @@ async fn chain(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
 
 /// Widens `public.items.id`, and has the operator resume A (`item_names`):
 /// the pass re-types its target and pauses B with A as its cause.
-async fn resume_head_of_chain(trellis: &Trellis, raw: &mut Client, pool: &trellis::Pool) {
+async fn resume_head_of_chain(trellis: &Trellis, raw: &mut Client, pool: &trellis::pool::Pool) {
     raw.batch_execute("alter table public.items alter column id type bigint")
         .await
         .expect("widen the key");
@@ -1598,7 +1598,7 @@ async fn resume_head_of_chain(trellis: &Trellis, raw: &mut Client, pool: &trelli
 }
 
 /// `c_names` against its oracle, with a key above 2^31 written first.
-async fn assert_chain_converges(trellis: &Trellis, raw: &mut Client, pool: &trellis::Pool) {
+async fn assert_chain_converges(trellis: &Trellis, raw: &mut Client, pool: &trellis::pool::Pool) {
     bring_live(raw, pool, &["item_names", "b_names", "c_names"]).await;
     raw.batch_execute("insert into public.items values (3000000000, 'big', 3)")
         .await
@@ -1949,7 +1949,7 @@ async fn assert_requested_wait(trellis: &Trellis, raw: &Client, target: &str, up
 async fn step_until_live_requested(
     trellis: &Trellis,
     raw: &mut Client,
-    pool: &trellis::Pool,
+    pool: &trellis::pool::Pool,
     upstream: &str,
     waiting: &[(&str, &str)],
 ) {
@@ -2624,7 +2624,7 @@ async fn changes_no_created_column_outgrows_pause_nothing() {
 async fn widening_fixture(
     dsn: &str,
     raw: &mut Client,
-    pool: &trellis::Pool,
+    pool: &trellis::pool::Pool,
     key: &str,
     value: &str,
 ) {
@@ -3240,7 +3240,7 @@ async fn timeout_cancels(raw: &Client, target: &str) -> Option<i32> {
 
 /// `item_names` paused for a widened key, its re-type gated, and resumed:
 /// the request waits for the staging worker's next pass.
-async fn gated_resume(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
+async fn gated_resume(dsn: &str, raw: &mut Client, pool: &trellis::pool::Pool) -> Trellis {
     let trellis = items(dsn, raw, pool).await;
     gate_item_names_retype(raw).await;
     raw.batch_execute("alter table public.items alter column id type bigint")

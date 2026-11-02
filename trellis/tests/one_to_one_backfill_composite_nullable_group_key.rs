@@ -183,7 +183,7 @@ async fn backfill_across_a_composite_nullable_group_key_writes_the_null_group_wi
 }
 
 /// Seals and drains until nothing is pending anywhere in the ring.
-async fn drain_to_quiescence(pool: &trellis::Pool, dsn: &str) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, dsn: &str) {
     let mut client = connect_raw(dsn).await;
     for _ in 0..16 {
         trellis::staging::seal_if_active_nonempty(&mut client, "nullable_group_key_wake")

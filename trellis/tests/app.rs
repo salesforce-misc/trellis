@@ -183,8 +183,8 @@ async fn the_background_client_runs_in_the_configured_schema_not_the_process_def
 
     let config =
         Config::with_schema(db.dsn().to_string(), "instance_x").expect("test schema name is valid");
-    let pool = trellis::Pool::new(&config).expect("build pool for the configured instance");
-    trellis::migrate(&pool, &config)
+    let pool = trellis::pool::Pool::new(&config).expect("build pool for the configured instance");
+    trellis::migrate::migrate_with_pool(&pool, &config)
         .await
         .expect("migrate the configured instance's schema");
 

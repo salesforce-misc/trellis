@@ -134,13 +134,9 @@ type Submitted = (Instant, Job);
 /// blocking such a thread would deadlock/panic inside `tokio` itself. Use
 /// the async [`Trellis`] directly in that context instead.
 ///
-/// Every public [`Trellis`] method has a twin here except one, left
-/// async-only on purpose: [`Trellis::pool`]. The pool hands out async
-/// connections, which a caller with no `tokio` runtime of its own (the whole
-/// audience of this type) can't drive, and which were never meant to cross
-/// an FFI boundary. A caller that needs its own queries against the target
-/// tables opens its own connection. The `surface_tests` module below checks
-/// that no other method is missing.
+/// Every public [`Trellis`] method has a twin here. A caller that needs its
+/// own queries against the target tables opens its own connection. The
+/// `surface_tests` module below checks that no method is missing.
 pub struct BlockingTrellis {
     job_tx: mpsc::UnboundedSender<Submitted>,
     /// A copy of the configuration the background thread's [`Trellis`]
@@ -879,8 +875,9 @@ impl Calls {
 mod surface_tests {
     use std::path::Path;
 
-    /// Public `Trellis` methods deliberately left async-only; see
-    /// [`super::BlockingTrellis`]'s doc comment for why.
+    /// `pub` `Trellis` methods that need no twin: `pool` is `pub` only under
+    /// the `internals` feature, as this crate's own integration tests'
+    /// accessor, and is not public API.
     const ASYNC_ONLY: &[&str] = &["pool"];
 
     /// Every `.rs` file under `dir`, recursively, as its text.

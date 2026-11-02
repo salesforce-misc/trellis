@@ -15,7 +15,8 @@ use testkit::TestCluster;
 use tokio::sync::mpsc;
 use tokio_postgres::{AsyncMessage, Client, NoTls};
 use trellis::client::default_wake_channel;
-use trellis::{Config, Pool, migrate};
+use trellis::pool::Pool;
+use trellis::{Config, migrate::migrate_with_pool};
 
 const SCHEMA_A: &str = "inst_a";
 const SCHEMA_B: &str = "inst_b";
@@ -50,7 +51,7 @@ async fn a_seal_in_one_instance_does_not_wake_the_other_instances_channel() {
     for schema in [SCHEMA_A, SCHEMA_B] {
         let config = Config::with_schema(db.dsn(), schema).expect("valid schema");
         let pool = Pool::new(&config).expect("pool");
-        migrate(&pool, &config).await.expect("migrate");
+        migrate_with_pool(&pool, &config).await.expect("migrate");
     }
 
     let channel_a = default_wake_channel(SCHEMA_A);

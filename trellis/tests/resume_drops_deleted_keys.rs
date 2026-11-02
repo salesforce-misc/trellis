@@ -46,7 +46,7 @@ async fn define_only(dsn: &str) -> Trellis {
     .expect("connect a define-only Trellis")
 }
 
-async fn drain_backfill_chunks(pool: &trellis::Pool) {
+async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
     // ADR-0002: registration only records a definition; the staging
     // worker's pass starts its build.
     trellis::intake::harness::start_registered_builds(pool)
@@ -57,7 +57,7 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
 
 /// Seals and drains until nothing is pending anywhere in the ring. A bounded
 /// deterministic loop, not a wait-for-convergence poll.
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
@@ -85,7 +85,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 }
 
 /// Builds what `RESUME` left `waiting_to_backfill`, then drains what it staged.
-async fn run_resume_rebuild(pool: &trellis::Pool, client: &mut Client) {
+async fn run_resume_rebuild(pool: &trellis::pool::Pool, client: &mut Client) {
     drain_backfill_chunks(pool).await;
     drain_to_quiescence(pool, client).await;
 }
@@ -295,7 +295,7 @@ async fn resume_drops_a_one_to_one_row_whose_source_row_was_deleted_while_paused
 /// Runs the builds, their chunks and the ring until nothing is left to do: a
 /// rebuild, plus the rebuilds of the readers a build rewrote outside the
 /// seam. A bounded loop, not a convergence wait.
-async fn settle(pool: &trellis::Pool, client: &mut Client) {
+async fn settle(pool: &trellis::pool::Pool, client: &mut Client) {
     for _ in 0..8 {
         drain_backfill_chunks(pool).await;
         drain_to_quiescence(pool, client).await;

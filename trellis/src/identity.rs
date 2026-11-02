@@ -499,7 +499,7 @@ mod tests {
         let attach = tokio::spawn({
             let pool = std::sync::Arc::clone(&pool);
             let config = config.clone();
-            async move { crate::migrate::migrate(&pool, &config).await }
+            async move { crate::migrate::migrate_with_pool(&pool, &config).await }
         });
 
         // Wait until the attach is queued on the lock, then show it has not

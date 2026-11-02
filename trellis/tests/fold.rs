@@ -17,7 +17,7 @@ use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::{BucketFilter, FoldedChange, TRUNCATE_SENTINEL_KEY, fold, seal};
 
-/// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
+/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`), matching
 /// `sealing.rs`/`staging_ring.rs`'s convention.
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");

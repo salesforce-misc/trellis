@@ -13,7 +13,7 @@
 //!
 //! This module names no cluster/harness types (`testkit`) and no generator
 //! (`proptest`): it ties `backend` + `oracle` + `model` together over the
-//! [`Backend`] trait and an [`trellis::Pool`], so any backend and any source of
+//! [`Backend`] trait and an [`trellis::dev::pool::Pool`], so any backend and any source of
 //! programs can reuse it.
 
 mod concurrent;
@@ -36,8 +36,8 @@ pub use two_instance::{
 use std::collections::HashMap;
 use std::fmt;
 
-use trellis::Pool;
 use trellis::dev::defs::ast::{TransformDef, ValueType};
+use trellis::dev::pool::Pool;
 
 use crate::backend::{Backend, Snapshot};
 use crate::model::{BurstAction, DbAdminAction, Op, OpOutcome, Program};

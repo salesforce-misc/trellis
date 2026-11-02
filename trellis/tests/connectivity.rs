@@ -3,7 +3,7 @@
 //! (`testkit::TestCluster`).
 
 use testkit::TestCluster;
-use trellis::{Config, Error, migrate};
+use trellis::{Config, Error, migrate::migrate_with_pool};
 
 /// The number of migration files embedded in the crate. The ledger holds
 /// exactly versions `1..=N`: migrations are numbered contiguously.
@@ -26,7 +26,9 @@ async fn migrate_up_is_idempotent() {
     let db = cluster.create_empty_database().await;
     let config = Config::from_dsn(db.dsn().to_string()).expect("valid schema");
 
-    migrate(&db.pool, &config).await.expect("first migrate run");
+    migrate_with_pool(&db.pool, &config)
+        .await
+        .expect("first migrate run");
 
     let client = db.pool.get().await.expect("acquire connection");
     let first_run: Vec<i32> = client
@@ -48,7 +50,7 @@ async fn migrate_up_is_idempotent() {
     );
 
     // Running again should be a no-op: same ledger, no error.
-    migrate(&db.pool, &config)
+    migrate_with_pool(&db.pool, &config)
         .await
         .expect("second migrate run");
 
@@ -99,7 +101,7 @@ async fn unreachable_dsn_surfaces_a_typed_error_without_panicking() {
         "host=/tmp/trellis-nonexistent-socket-dir port=5432 user=postgres dbname=postgres",
     )
     .expect("valid schema");
-    let pool = trellis::Pool::new(&config).expect("pool builds lazily; DSN is well-formed");
+    let pool = trellis::pool::Pool::new(&config).expect("pool builds lazily; DSN is well-formed");
 
     match pool.get().await {
         Err(Error::Pool(_)) => {}
@@ -159,7 +161,7 @@ async fn terminated_backend_classifies_as_connectivity() {
 /// A pool with no `max_size`/`wait_timeout` configured lets a
 /// caller that shows up once every slot is already checked out wait
 /// forever — silently, with no error and no log line, ever. Configures a
-/// deliberately tiny `max_size` (2, via [`Pool::with_limits`](trellis::Pool::with_limits)) and
+/// deliberately tiny `max_size` (2, via [`Pool::with_limits`](trellis::pool::Pool::with_limits)) and
 /// a short `wait_timeout` so
 /// exhaustion is trivial to trigger without spinning up dozens of real
 /// connections, then proves a third caller gets back a typed, bounded
@@ -170,7 +172,7 @@ async fn pool_exhaustion_times_out_with_a_typed_error_instead_of_hanging() {
     let db = cluster.create_empty_database().await;
 
     let config = Config::from_dsn(db.dsn().to_string()).expect("valid schema");
-    let pool = trellis::Pool::with_limits(&config, 2, std::time::Duration::from_millis(300))
+    let pool = trellis::pool::Pool::with_limits(&config, 2, std::time::Duration::from_millis(300))
         .expect("pool builds lazily; DSN is well-formed");
 
     // Check out every slot the pool has and hold onto the guards — dropping
@@ -212,7 +214,7 @@ async fn failing_migration_rolls_back_without_partial_ledger_entry() {
     let db = cluster.create_empty_database().await;
     let config = Config::from_dsn(db.dsn().to_string()).expect("valid schema");
 
-    migrate(&db.pool, &config)
+    migrate_with_pool(&db.pool, &config)
         .await
         .expect("apply real migrations first");
 

@@ -253,7 +253,8 @@ use generative::run::{
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
 use testkit::TestCluster;
-use trellis::{Config, Pool};
+use trellis::Config;
+use trellis::dev::pool::Pool;
 
 /// How many application-worker tasks the property's `ManualBackend` runs.
 /// Fixed (not drawn) and small: this property's job is proving the

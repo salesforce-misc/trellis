@@ -50,17 +50,17 @@ async fn definer(dsn: &str) -> Trellis {
     .expect("connect a definer")
 }
 
-fn pool_for(dsn: &str) -> trellis::Pool {
-    trellis::Pool::new(&Config::from_dsn(dsn.to_string()).expect("valid dsn")).expect("pool")
+fn pool_for(dsn: &str) -> trellis::pool::Pool {
+    trellis::pool::Pool::new(&Config::from_dsn(dsn.to_string()).expect("valid dsn")).expect("pool")
 }
 
-async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
+async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     trellis::client::reconcile_pass(raw, pool, SCHEMA)
         .await
         .expect("reconcile pass");
 }
 
-async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
+async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     let desired = trellis::defs::tables_to_capture(pool)
         .await
         .expect("read the tables to capture");
@@ -75,7 +75,7 @@ async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
     assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
 }
 
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
@@ -103,7 +103,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     panic!("the ring did not reach quiescence within 16 seal/drain rounds");
 }
 
-async fn run_backfill_chunks(pool: &trellis::Pool) {
+async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
     const CLAIMED_BY: &str = "logical_restore_backfill";
     trellis::staging::build::settle_builds(pool).await;
 }
@@ -125,7 +125,7 @@ async fn statuses(raw: &Client) -> BTreeMap<String, TransformStatus> {
     .collect()
 }
 
-async fn bring_live(raw: &mut Client, pool: &trellis::Pool) {
+async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool) {
     for _ in 0..10 {
         full_pass(raw, pool).await;
         run_backfill_chunks(pool).await;
@@ -450,7 +450,7 @@ async fn resume_groups_and_check_the_reset(raw: &Client, trellis: &Trellis) {
 /// RESUME the 1-1, bring it live, then an update, a delete and an insert of
 /// keys that existed before the dump: all apply, and the target is the
 /// query's.
-async fn resume_and_write(raw: &mut Client, trellis: &Trellis, pool: &trellis::Pool) {
+async fn resume_and_write(raw: &mut Client, trellis: &Trellis, pool: &trellis::pool::Pool) {
     resume_groups_and_check_the_reset(raw, trellis).await;
     // The 1-1 `JOIN`'s resume rebuilt its tables, keeping its target: zero
     // diff, and later changes on either side apply.
@@ -535,7 +535,7 @@ async fn resume_and_write(raw: &mut Client, trellis: &Trellis, pool: &trellis::P
 
 /// Like [`bring_live`], for the one definition `target`: the paused others
 /// are left as they are.
-async fn bring_live_only(raw: &mut Client, pool: &trellis::Pool, target: &str) {
+async fn bring_live_only(raw: &mut Client, pool: &trellis::pool::Pool, target: &str) {
     for _ in 0..10 {
         full_pass(raw, pool).await;
         run_backfill_chunks(pool).await;

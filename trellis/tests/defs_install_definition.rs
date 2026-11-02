@@ -33,7 +33,7 @@ use trellis::staging::{has_pending, retire_drained_segments};
 /// swallowing an error, matching this file's other harness helpers
 /// (`drain_to_quiescence`) — a build failure here means the test itself is
 /// broken, not something to retry past.
-async fn drain_backfill_chunks(pool: &trellis::Pool) {
+async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
     // ADR-0002: registration only records a definition; the staging
     // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
@@ -134,7 +134,7 @@ fn composite_key(parts: &[&str]) -> String {
 }
 
 /// Seals and drains repeatedly until nothing is pending anywhere in the ring.
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     // A throwaway, always-caught-up watermark — this helper
     // has no live capture running, and none of this file's tests exercise guard (a) specifically, so a
     // real watermark would only ever make guard (a) reject spuriously.

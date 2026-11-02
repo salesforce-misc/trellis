@@ -23,15 +23,15 @@ use std::time::Duration;
 use sql_recompute::recompute;
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
-use trellis::Pool;
 use trellis::config::{DEFAULT_SCHEMA, DEFAULT_TARGET_SCHEMA};
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{
     TransformStatus, chunk_queue, create_definition, create_target_table, install_definition,
 };
+use trellis::pool::Pool;
 use trellis::{Client as TrellisClient, ClientOptions};
 
-/// Connects directly to `dsn` (bypassing `trellis::Pool`) and pins
+/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`) and pins
 /// `search_path`, matching `apply.rs`'s helper of the same name.
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");

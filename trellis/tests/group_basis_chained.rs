@@ -784,7 +784,7 @@ async fn build_frozen(d: &Driver, points: &[PausePoint]) -> Running<()> {
     let points: Vec<(PausePoint, &str)> = points.iter().map(|p| (*p, ROLL)).collect();
     let dsn = d.db.dsn().to_string();
     d.run_frozen(&points, |_shared| async move {
-        let pool = trellis::Pool::new(&trellis::config::Config::from_dsn(dsn).expect("dsn"))
+        let pool = trellis::pool::Pool::new(&trellis::config::Config::from_dsn(dsn).expect("dsn"))
             .expect("the build's own pool");
         let claimed = chunk_queue::claim_chunks_of(
             &**pool.get().await.expect("pool"),

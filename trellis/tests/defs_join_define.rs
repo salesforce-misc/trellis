@@ -355,7 +355,7 @@ async fn hidden_tables(raw: &Client, id: i64) -> Vec<String> {
 }
 
 /// One whole staging-worker pass: capture, then the start of ready builds.
-async fn pass(raw: &mut Client, pool: &trellis::Pool) {
+async fn pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     trellis::client::reconcile_pass(raw, pool, DEFAULT_SCHEMA)
         .await
         .expect("reconcile pass");

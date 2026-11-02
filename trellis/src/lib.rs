@@ -21,9 +21,6 @@
 //!
 //! - [`Config`] resolves from CLI args + environment (`Config::resolve`) or
 //!   from a DSN.
-//! - [`Pool`] manages a `deadpool-postgres` connection pool, which
-//!   [`Trellis::pool`] hands back for an embedder's own queries; each
-//!   [`Pool::get`] checks out a [`PooledClient`].
 //! - [`migrate()`] applies Trellis's embedded SQL migrations, after checking
 //!   that the configured schema is safe to attach to — see
 //!   `docs/instance-identity.md`.
@@ -48,6 +45,10 @@
 //!   add to their own subscriber; with the feature off, or with no
 //!   subscriber installed at all, spans/events cost only `tracing`'s own
 //!   near-zero no-subscriber overhead.
+//!
+//! Trellis's connection pool is not among them: an embedder reads targets and
+//! its own tables on its own connections, schema-qualifying target names
+//! (`docs/embedding.md`).
 //!
 //! Tier 3 is the engine — `defs` (parses, validates, and catalogs transform
 //! definitions), `capture` (the triggers that stage each source-table change
@@ -232,7 +233,6 @@ pub use metrics::Metrics;
 pub use migrate::migrate;
 #[cfg(feature = "otlp")]
 pub use otel::OtelError;
-pub use pool::{Pool, PooledClient, TransactionBuilder};
 pub use staging::quarantine::HeldKeyRetry;
 pub use staging::{
     CaptureFault, CorrectingNode, Divergence, DrainFailure, FanOutWarning, HeldKeys,

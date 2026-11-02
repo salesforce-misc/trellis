@@ -49,10 +49,10 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use trellis::Pool;
 use trellis::dev::defs::ast::{
     Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType,
 };
+use trellis::dev::pool::Pool;
 
 use crate::backend::Backend;
 use crate::model::{Column, OpOutcome, PRIMARY_KEY_VALUE_TYPE, Program, Table};

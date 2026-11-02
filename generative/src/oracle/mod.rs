@@ -17,7 +17,7 @@
 //!
 //! # DB access
 //!
-//! The oracle takes a [`trellis::Pool`] (a connection handle). The oracle
+//! The oracle takes a [`trellis::dev::pool::Pool`] (a connection handle). The oracle
 //! *reads*; it never imports `trellis::client`/`trellis::staging` or otherwise
 //! drives the maintenance pipeline (that seam is [`crate::backend`]'s alone). A
 //! pool connection has its `search_path` pinned, so an unqualified source
@@ -26,11 +26,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
-use trellis::Pool;
 use trellis::dev::defs::ast::{Expr, KeySpace, Predicate, TransformDef, ValueType};
 use trellis::dev::defs::registry;
 use trellis::dev::defs::typed_literal;
 use trellis::dev::defs::{FloatWidth, IntWidth};
+use trellis::dev::pool::Pool;
 
 use crate::model::{Column, PRIMARY_KEY_VALUE_TYPE, Program, Table, group_key};
 

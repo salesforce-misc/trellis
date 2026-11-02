@@ -9,8 +9,9 @@
 use testkit::TestCluster;
 use tokio_postgres::GenericClient;
 use trellis::config::DEFAULT_SCHEMA;
+use trellis::pool::Pool;
 use trellis::staging::ProducerSession;
-use trellis::{Config, Error, Pool};
+use trellis::{Config, Error};
 
 const PASSWORD: &str = "pw-must-not-leak";
 

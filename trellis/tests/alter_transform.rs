@@ -65,7 +65,7 @@ use trellis::{
     Applied, CatalogError, Config, TransformStatus, Trellis, TrellisError, TrellisOptions,
 };
 
-/// Connects directly to `dsn` (bypassing `trellis::Pool`) with `search_path`
+/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`) with `search_path`
 /// pinned — the same helper every other integration test in this directory
 /// uses to check Postgres's own view of what the engine did.
 async fn connect_raw(dsn: &str) -> Client {
@@ -898,7 +898,7 @@ async fn combined_add_drop_alter_in_one_statement() {
 /// flipping a freshly-defined 1-1 target to `live` with no running
 /// `Client`. This is the hand-driven stand-in for the staging worker and a
 /// drain worker that `defs_install_definition.rs` uses.
-async fn drain_backfill_chunks(pool: &trellis::Pool) {
+async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
     // ADR-0002: registration only records a definition; the staging
     // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
@@ -948,7 +948,7 @@ fn worker_options() -> trellis::staging::build::WorkerOptions {
 }
 
 /// Claims one build row of `kind` and runs it, as a drain worker does.
-async fn run_one(pool: &trellis::Pool, kind: &str) {
+async fn run_one(pool: &trellis::pool::Pool, kind: &str) {
     const BY: &str = "alter_transform_test_build_worker";
     let claimed = {
         let client = pool.get().await.expect("acquire connection");
@@ -1224,7 +1224,7 @@ async fn stage_orders_update(raw: &Client, id: i64, old_a: i64, new_a: i64) {
 /// pending anywhere in the ring: the hand-driven stand-in for a running
 /// `Client`'s maintenance loop and drain workers (the same helper
 /// `pause_and_drop.rs` uses).
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     // No live capture stages anything here, so there is no real staged
     // watermark to hold apply back. A saturated one never does.
     for _ in 0..16 {

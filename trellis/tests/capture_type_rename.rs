@@ -49,14 +49,14 @@ async fn definer(dsn: &str) -> Trellis {
 
 /// One whole staging-worker pass: capture, the release of the keys a
 /// re-type asked for, and the start of ready builds.
-async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
+async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     trellis::client::reconcile_pass(raw, pool, SCHEMA)
         .await
         .expect("reconcile pass");
 }
 
 /// The capture half of one pass only. Asserts no table failed.
-async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
+async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     let desired = trellis::defs::tables_to_capture(pool)
         .await
         .expect("read the tables to capture");
@@ -71,7 +71,7 @@ async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
     assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
 }
 
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
@@ -102,7 +102,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 /// Drains the active segment, whose rows include keys whose write fails:
 /// each failed drain charges the key a death, until it is held and the
 /// drain goes past it. Bounded attempts, not a timed wait.
-async fn drain_past_failures(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_past_failures(pool: &trellis::pool::Pool, client: &mut Client) {
     use trellis::staging::{apply, retire_drained_segments, seal};
     let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
     seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_type_rename_wake")
@@ -132,7 +132,7 @@ async fn drain_past_failures(pool: &trellis::Pool, client: &mut Client) {
         .expect("retire drained segments");
 }
 
-async fn run_backfill_chunks(pool: &trellis::Pool) {
+async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
     trellis::staging::build::settle_builds(pool).await;
 }
 
@@ -150,7 +150,7 @@ async fn status(raw: &Client, target: &str) -> TransformStatus {
 
 /// Alternates staging-worker passes and drains until every one of
 /// `targets` is live: a bounded number of explicit steps, not a timed wait.
-async fn bring_live(raw: &mut Client, pool: &trellis::Pool, targets: &[&str]) {
+async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool, targets: &[&str]) {
     for _ in 0..8 {
         full_pass(raw, pool).await;
         run_backfill_chunks(pool).await;
@@ -229,7 +229,7 @@ async fn assert_converged(raw: &Client) {
 /// `GROUP BY` aggregate, a 1-1 whose source key is a `tone`, a JOIN grouped
 /// by it, and an aggregate over the passthrough's target (a table no capture
 /// trigger watches, so no baseline of its own).
-async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
+async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::pool::Pool) -> Trellis {
     raw.batch_execute(
         "create schema other; \
          create type public.tone as enum ('calm', 'loud', 'brisk'); \

@@ -65,7 +65,7 @@
 //! method runs outside it: [`Trellis::shutdown`], which ends background work
 //! rather than serving a request. [`Trellis::self_check`], a full comparison
 //! of a target, is inside it because it only starts a background job, which
-//! [`Trellis::self_check_job`] polls. [`Trellis::connect`], [`Trellis::pool`],
+//! [`Trellis::self_check_job`] polls. [`Trellis::connect`],
 //! [`Trellis::config`] and [`Trellis::metrics`] make no call to the database
 //! that could wait.
 //!
@@ -338,14 +338,19 @@ impl Trellis {
         )
     }
 
-    /// The connection pool backing this instance. Exposed for callers that
-    /// need to run their own queries against target tables; not needed for
-    /// anything [`Trellis`]'s own methods already cover. Its connections run
-    /// with `row_security = off`, so a query that row-level
-    /// security would filter for the login role fails instead: read through
-    /// your own connection where you rely on policies to filter. They also
-    /// run with `jit = off`.
+    /// The connection pool backing this instance's calls. Not public API: an
+    /// embedder opens its own connections (`docs/embedding.md`), so nothing
+    /// outside Trellis holds one of these connections, starves the pool, or
+    /// runs its own SQL under Trellis's session settings. This crate's own
+    /// integration tests reach it through the `internals` feature.
+    #[cfg(feature = "internals")]
     pub fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
+    /// The `internals` accessor above, crate-private.
+    #[cfg(not(feature = "internals"))]
+    pub(crate) fn pool(&self) -> &Pool {
         &self.pool
     }
 
@@ -378,7 +383,7 @@ impl Trellis {
     /// every startup.
     pub async fn migrate(&self) -> Result<(), TrellisError> {
         self.call(async {
-            crate::migrate(&self.pool, &self.config)
+            crate::migrate::migrate_with_pool(&self.pool, &self.config)
                 .await
                 .map_err(TrellisError::Engine)
         })

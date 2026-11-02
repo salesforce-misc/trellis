@@ -52,7 +52,7 @@ async fn facade(dsn: &str) -> Trellis {
 
 /// Runs every queued build to completion by hand: the stand-in for a drain
 /// worker (`pause_and_drop.rs`'s helper of the same name).
-async fn build_everything(pool: &trellis::Pool) {
+async fn build_everything(pool: &trellis::pool::Pool) {
     trellis::intake::harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
@@ -81,7 +81,7 @@ fn load(dsn: &str, schema_sql: &str, appendix: &str) {
 
 /// Seals and drains the ring through the engine's own apply path until
 /// nothing is pending: the stand-in for the maintenance loop and drain workers.
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
         seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")

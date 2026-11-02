@@ -925,8 +925,8 @@ async fn a_schema_pre_created_by_another_role_still_captures_writes() {
 
     let config = trellis::Config::with_schema(as_role("cap701_trellis"), DEFAULT_SCHEMA)
         .expect("valid config");
-    let pool = trellis::Pool::new(&config).expect("pool");
-    trellis::migrate(&pool, &config)
+    let pool = trellis::pool::Pool::new(&config).expect("pool");
+    trellis::migrate::migrate_with_pool(&pool, &config)
         .await
         .expect("migrate as the login role");
     let mut installer = connect(&as_role("cap701_trellis")).await;
@@ -1357,7 +1357,7 @@ async fn a_row_staged_while_the_widen_waits_for_its_lock_is_below_the_gate() {
 
 /// Seals and drains until nothing is pending anywhere in the ring. A bounded
 /// deterministic loop, not a wait-for-convergence poll.
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     for _ in 0..16 {
         drain_batch(pool, seal_both_phases(client).await).await;
         retire_drained_segments(client)
@@ -1371,7 +1371,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 }
 
 /// Drains every bucket of `batch`.
-async fn drain_batch(pool: &trellis::Pool, batch: i64) {
+async fn drain_batch(pool: &trellis::pool::Pool, batch: i64) {
     while apply::drain_once(pool, batch, TEST_NAME, 1, WAKE)
         .await
         .expect("drain_once")
@@ -1574,8 +1574,10 @@ async fn a_source_the_role_does_not_own_reports_why_capture_failed() {
         .expect("a source the Trellis role can read but doesn't own");
     let config = trellis::Config::from_dsn(db.dsn().replace("user=postgres", "user=trellis"))
         .expect("valid config");
-    let pool = trellis::Pool::new(&config).expect("pool");
-    trellis::migrate(&pool, &config).await.expect("migrate");
+    let pool = trellis::pool::Pool::new(&config).expect("pool");
+    trellis::migrate::migrate_with_pool(&pool, &config)
+        .await
+        .expect("migrate");
     let trellis = trellis::Trellis::connect(config, trellis::TrellisOptions::default())
         .await
         .expect("connect");

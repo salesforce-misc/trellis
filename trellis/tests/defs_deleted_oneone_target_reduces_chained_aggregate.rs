@@ -42,7 +42,7 @@ use trellis::staging::{has_pending, retire_drained_segments};
 /// mirror, built by chunks) and `customer_totals` (an aggregate, built by
 /// its plan job) need this. Mirrors `defs_install_definition.rs`'s helper of
 /// the same name.
-async fn drain_backfill_chunks(pool: &trellis::Pool) {
+async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
     // ADR-0002: registration only records a definition; the staging
     // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
@@ -115,7 +115,7 @@ async fn stage_cdc(
 }
 
 /// Seals and drains repeatedly until nothing is pending anywhere in the ring.
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     for _ in 0..16 {
         let seg = seal_active_segment(client).await;
         while apply::drain_once(

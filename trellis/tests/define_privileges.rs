@@ -45,7 +45,9 @@ fn as_role(dsn: &str, role: &str) -> String {
 /// `app_owner`, and the instance migrated as `trellis`. `public.customers`
 /// and `app.items` are owned by `other_owner`, which `trellis` isn't a member
 /// of, and `trellis` has no `USAGE` on schema `app`.
-async fn set_up(cluster: &TestCluster) -> (testkit::TestDatabase, Client, trellis::Pool, Trellis) {
+async fn set_up(
+    cluster: &TestCluster,
+) -> (testkit::TestDatabase, Client, trellis::pool::Pool, Trellis) {
     let db = cluster.create_empty_database().await;
     let admin = connect(db.dsn()).await;
     let database = db.name();
@@ -77,8 +79,8 @@ async fn set_up(cluster: &TestCluster) -> (testkit::TestDatabase, Client, trelli
         .expect("valid config")
         .with_target_schema(TARGETS)
         .expect("valid target schema");
-    let pool = trellis::Pool::new(&config).expect("pool");
-    trellis::migrate(&pool, &config)
+    let pool = trellis::pool::Pool::new(&config).expect("pool");
+    trellis::migrate::migrate_with_pool(&pool, &config)
         .await
         .expect("migrate as the Trellis role");
     let trellis = Trellis::connect(config, TrellisOptions::default())

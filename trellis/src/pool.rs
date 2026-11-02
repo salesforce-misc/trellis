@@ -259,6 +259,7 @@ impl<'a> TransactionBuilder<'a> {
     }
 
     /// Whether the transaction is deferrable.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn deferrable(mut self, deferrable: bool) -> Self {
         self.inner = self.inner.deferrable(deferrable);
         self
@@ -538,12 +539,14 @@ impl Pool {
     /// directly. A connection's last-use time is stamped at checkout, so one
     /// held for a long transaction counts as idle the moment it comes back,
     /// and may be closed by the next sweep (one reconnect).
+    #[cfg(any(test, feature = "test-util"))]
     pub fn close_idle(&self, idle: Duration) {
         close_idle(&self.inner, idle);
     }
 
     /// The pool's `(size, available)` connection counts: connections open,
     /// and how many of them are idle.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn counts(&self) -> (usize, usize) {
         let status = self.inner.status();
         (status.size, status.available)
@@ -1053,12 +1056,12 @@ pub(crate) enum DeadPeerDetection {
     /// whose window has stayed shut for the user timeout even though the
     /// peer keeps acknowledging the window probes. On the server end that
     /// kills a pooled connection whose caller streams a large result
-    /// (`query_raw`, `copy_out`) and pauses more than 25s between rows. The
-    /// pool is handed to embedders ([`crate::Trellis::pool`]) and Trellis
-    /// can't bound how they read, so it goes without. A partition that
-    /// strikes a pooled connection with data in flight is then noticed at
-    /// the retransmission timeout (~15 minutes) as before; the idle case,
-    /// the usual one, still drops from about 2h to 25s.
+    /// (`query_raw`, `copy_out`) and pauses more than 25s between rows, so
+    /// the pool goes without (issue #1589 tracks giving it the timeout now
+    /// that only Trellis and its test harnesses read on it). A partition
+    /// that strikes a pooled connection with data in flight is then noticed
+    /// at the retransmission timeout (~15 minutes); the idle case, the usual
+    /// one, drops from about 2h to 25s.
     KeepalivesOnly,
     /// Keepalives plus [`TCP_USER_TIMEOUT`], for Trellis's own dedicated
     /// connections (producer session, maintenance loop, heartbeat daemon,

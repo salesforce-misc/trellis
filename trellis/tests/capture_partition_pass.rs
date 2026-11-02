@@ -90,7 +90,7 @@ async fn instance(cluster: &TestCluster, tree: &str) -> Instance {
 }
 
 /// The capture half of one staging-worker pass.
-async fn pass(raw: &mut Client, pool: &trellis::Pool) -> PassOutcome {
+async fn pass(raw: &mut Client, pool: &trellis::pool::Pool) -> PassOutcome {
     let desired = trellis::defs::tables_to_capture(pool)
         .await
         .expect("read the tables to capture");

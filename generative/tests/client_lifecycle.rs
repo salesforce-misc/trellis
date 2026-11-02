@@ -91,7 +91,8 @@ use generative::run::{RunError, check_program, run_convergence};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
 use testkit::TestCluster;
-use trellis::{Config, Pool};
+use trellis::Config;
+use trellis::dev::pool::Pool;
 
 struct Harness {
     runtime: tokio::runtime::Runtime,

@@ -213,19 +213,19 @@ impl Mode {
 }
 
 /// One whole staging-worker pass: capture, then the start of ready builds.
-async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
+async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     trellis::client::reconcile_pass(raw, pool, SCHEMA)
         .await
         .expect("reconcile pass");
 }
 
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     drain(pool, client, 16, true).await;
 }
 
 /// Up to `rounds` seal/drain rounds; with `strict`, panics unless the ring
 /// ends quiet (a writer running alongside never lets it).
-async fn drain(pool: &trellis::Pool, client: &mut Client, rounds: usize, strict: bool) {
+async fn drain(pool: &trellis::pool::Pool, client: &mut Client, rounds: usize, strict: bool) {
     use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..rounds {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
@@ -256,7 +256,7 @@ async fn drain(pool: &trellis::Pool, client: &mut Client, rounds: usize, strict:
     );
 }
 
-async fn run_backfill_chunks(pool: &trellis::Pool) {
+async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
     trellis::staging::build::settle_builds(pool).await;
 }
 

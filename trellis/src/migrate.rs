@@ -55,10 +55,18 @@ use crate::pool::Pool;
 ///
 /// Deliberately public — a tier-2 composable primitive under ADR-0012, not a
 /// leaked internal. [`crate::Trellis::migrate`] and
-/// [`crate::BlockingTrellis::migrate`] delegate to it, and an embedder (or a
-/// shared test bootstrap such as `testkit`'s) may call it directly to bring a
-/// schema up to date without standing up a facade.
-pub async fn migrate(pool: &Pool, config: &Config) -> Result<(), Error> {
+/// [`crate::BlockingTrellis::migrate`] do the same on their own pool, and an
+/// embedder (or a shared test bootstrap such as `testkit`'s) may call it
+/// directly to bring a schema up to date without standing up a facade. It
+/// opens the one connection it needs from `config` and closes it before
+/// returning.
+pub async fn migrate(config: &Config) -> Result<(), Error> {
+    migrate_with_pool(&Pool::new(config)?, config).await
+}
+
+/// [`migrate`] on `pool`'s connection settings rather than a pool of its own
+/// built from `config`.
+pub async fn migrate_with_pool(pool: &Pool, config: &Config) -> Result<(), Error> {
     // One attach at a time per database: the instance-conflict check reads
     // the markers other attaches write. The attach runs on the lock's own
     // session, so the lock can't end before it. See `identity::AttachLock`.

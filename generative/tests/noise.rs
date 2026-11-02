@@ -72,7 +72,7 @@ fn run_one(program: &Program, noise: &NoisePlan) -> Result<(), TestCaseError> {
             let mut backend = ManualBackend::connect(db.dsn())
                 .await
                 .expect("connect manual backend");
-            let pool = trellis::Pool::new(
+            let pool = trellis::dev::pool::Pool::new(
                 &trellis::Config::from_dsn(db.dsn().to_string()).expect("config"),
             )
             .expect("pool");
@@ -223,9 +223,10 @@ async fn noise_on_an_adversarially_shaped_untracked_table_never_perturbs_converg
     let mut backend = ManualBackend::connect(db.dsn())
         .await
         .expect("connect manual backend");
-    let pool =
-        trellis::Pool::new(&trellis::Config::from_dsn(db.dsn().to_string()).expect("config"))
-            .expect("pool");
+    let pool = trellis::dev::pool::Pool::new(
+        &trellis::Config::from_dsn(db.dsn().to_string()).expect("config"),
+    )
+    .expect("pool");
 
     let outcome = run_convergence_with_noise(&mut backend, &pool, &program, &noise)
         .await
@@ -268,9 +269,10 @@ async fn checkpoints_interleaved_with_every_op_never_perturb_convergence() {
     let mut backend = ManualBackend::connect(db.dsn())
         .await
         .expect("connect manual backend");
-    let pool =
-        trellis::Pool::new(&trellis::Config::from_dsn(db.dsn().to_string()).expect("config"))
-            .expect("pool");
+    let pool = trellis::dev::pool::Pool::new(
+        &trellis::Config::from_dsn(db.dsn().to_string()).expect("config"),
+    )
+    .expect("pool");
 
     let outcome = run_convergence_with_noise(&mut backend, &pool, &program, &noise)
         .await

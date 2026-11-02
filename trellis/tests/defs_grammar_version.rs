@@ -130,7 +130,7 @@ async fn attaching_over_a_newer_definition_is_refused_naming_it() {
     .unwrap();
 
     let config = Config::from_dsn(db.dsn().to_string()).unwrap();
-    let err = trellis::migrate(&db.pool, &config)
+    let err = trellis::migrate::migrate_with_pool(&db.pool, &config)
         .await
         .expect_err("attach must refuse");
     let msg = err.to_string();
@@ -158,7 +158,7 @@ async fn attaching_pauses_a_definition_older_than_the_window_and_names_the_fix()
         .unwrap();
 
     let config = Config::from_dsn(db.dsn().to_string()).unwrap();
-    trellis::migrate(&db.pool, &config)
+    trellis::migrate::migrate_with_pool(&db.pool, &config)
         .await
         .expect("an older definition pauses; it doesn't refuse the attach");
 
@@ -232,7 +232,7 @@ async fn stored_text_this_release_refuses_pauses_that_transform_naming_the_fix()
     .await
     .unwrap();
     // The upgraded binary attaches before it runs.
-    trellis::migrate(&db.pool, &config)
+    trellis::migrate::migrate_with_pool(&db.pool, &config)
         .await
         .expect("an unreadable definition pauses; it doesn't refuse the attach");
 
@@ -336,7 +336,7 @@ async fn attaching_pauses_a_definition_whose_text_the_grammar_now_refuses() {
     .unwrap();
 
     let config = Config::from_dsn(db.dsn().to_string()).unwrap();
-    trellis::migrate(&db.pool, &config)
+    trellis::migrate::migrate_with_pool(&db.pool, &config)
         .await
         .expect("refused text pauses; it doesn't refuse the attach");
 

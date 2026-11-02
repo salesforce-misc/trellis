@@ -36,14 +36,14 @@ pub async fn definer(dsn: &str) -> Trellis {
 }
 
 /// One whole staging-worker pass: capture, then the start of ready builds.
-pub async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
+pub async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     trellis::client::reconcile_pass(raw, pool, SCHEMA)
         .await
         .expect("reconcile pass");
 }
 
 /// The capture half of one pass only.
-pub async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
+pub async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     let desired = trellis::defs::tables_to_capture(pool)
         .await
         .expect("read the tables to capture");
@@ -58,7 +58,7 @@ pub async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
     assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
 }
 
-pub async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+pub async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
@@ -86,7 +86,7 @@ pub async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
     panic!("the ring did not reach quiescence within 16 seal/drain rounds");
 }
 
-pub async fn run_backfill_chunks(pool: &trellis::Pool) {
+pub async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
     const CLAIMED_BY: &str = "resume_key_change_backfill";
     trellis::staging::build::settle_builds(pool).await;
 }
@@ -103,7 +103,7 @@ pub async fn status(trellis: &Trellis, target: &str) -> trellis::DefinitionStatu
 /// live: a bounded number of explicit steps.
 pub async fn bring_live(
     raw: &mut Client,
-    pool: &trellis::Pool,
+    pool: &trellis::pool::Pool,
     trellis: &Trellis,
     targets: &[&str],
 ) {

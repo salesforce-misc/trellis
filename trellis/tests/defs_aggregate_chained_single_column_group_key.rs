@@ -108,7 +108,7 @@ async fn stage_cdc(
 }
 
 /// Seals and drains repeatedly until nothing is pending anywhere in the ring.
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     for _ in 0..16 {
         let seg = seal_active_segment(client).await;
         while apply::drain_once(

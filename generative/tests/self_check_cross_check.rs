@@ -56,10 +56,10 @@ use trellis::dev::defs::ast::{
     Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType,
 };
 use trellis::dev::defs::qualified_target_table;
+use trellis::dev::pool::Pool;
 use trellis::dev::staging::{SelfCheckWorkerOptions, work_self_check_once};
 use trellis::{
-    Config, Divergence, Pool, SelfCheckMode, SelfCheckOutcome, SelfCheckReport, Trellis,
-    TrellisOptions,
+    Config, Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckReport, Trellis, TrellisOptions,
 };
 
 /// `Trellis::self_check` run to its end. The call starts a background job and

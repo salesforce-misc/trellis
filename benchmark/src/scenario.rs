@@ -3,7 +3,7 @@
 use tokio_postgres::{Client as RawClient, NoTls};
 use trellis::dev::config::DEFAULT_SCHEMA;
 
-/// Connects directly to `dsn` (bypassing `trellis::Pool`), matching the
+/// Connects directly to `dsn` (bypassing `trellis::dev::pool::Pool`), matching the
 /// convention `trellis`'s own integration tests use: the scenarios' reference
 /// and correctness queries want a plain `tokio_postgres::Client`, which the
 /// pool's wrapped client doesn't expose, so they go through a raw connection.

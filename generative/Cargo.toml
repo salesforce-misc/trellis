@@ -43,7 +43,7 @@ proptest = ["dep:proptest"]
 # hooks straight into `cli`'s production `trellis` binary. Off by default and
 # turned on for this crate's own tests by the self dev-dependency below,
 # exactly like `proptest`.
-engine-access = ["trellis/test-util"]
+engine-access = ["trellis/test-util", "testkit/engine-access"]
 # Turns on `trellis/test-util`, which compiles in
 # `trellis::staging::apply`'s test-only pre-commit pause hook (see that
 # module for the mechanism) — the thing `backend::subprocess::

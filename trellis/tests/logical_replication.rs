@@ -281,7 +281,7 @@ struct Instance {
     db: testkit::TestDatabase,
     admin: Client,
     raw: Client,
-    pool: trellis::Pool,
+    pool: trellis::pool::Pool,
     trellis: trellis::Trellis,
 }
 
@@ -308,8 +308,8 @@ async fn instance(cluster: &TestCluster) -> Instance {
     assert!(db.dsn().contains("user=postgres"), "{}", db.dsn());
     let dsn = db.dsn().replace("user=postgres", "user=sub_trellis");
     let config = trellis::Config::with_schema(dsn.clone(), SCHEMA).expect("valid config");
-    let pool = trellis::Pool::new(&config).expect("pool");
-    trellis::migrate(&pool, &config)
+    let pool = trellis::pool::Pool::new(&config).expect("pool");
+    trellis::migrate::migrate_with_pool(&pool, &config)
         .await
         .expect("migrate as the login role");
     let raw = connect(&dsn).await;
@@ -396,7 +396,7 @@ async fn defining_refuses_a_table_a_subscription_replicates_into() {
 }
 
 /// The capture half of one staging-worker pass.
-async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
+async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     let desired = trellis::defs::tables_to_capture(pool)
         .await
         .expect("read the tables to capture");

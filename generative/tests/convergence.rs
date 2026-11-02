@@ -31,9 +31,10 @@ use generative::run::{RunError, check_program, run_convergence};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
 use testkit::TestCluster;
+use trellis::Config;
 use trellis::dev::defs::ast::Expr;
 use trellis::dev::defs::qualified_target_table;
-use trellis::{Config, Pool};
+use trellis::dev::pool::Pool;
 
 /// One tokio runtime and one shared, initdb-once cluster for a test thread's
 /// proptest cases. See the module doc comment for why this is thread-local.

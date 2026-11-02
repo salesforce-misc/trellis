@@ -46,7 +46,7 @@ struct Instance {
     _db: testkit::TestDatabase,
     admin: Client,
     raw: Client,
-    pool: trellis::Pool,
+    pool: trellis::pool::Pool,
     trellis: Trellis,
 }
 
@@ -75,8 +75,8 @@ async fn instance(cluster: &TestCluster) -> Instance {
         .expect("a login role owning the tree");
     let dsn = db.dsn().replace("user=postgres", "user=rls_trellis");
     let config = trellis::Config::with_schema(dsn.clone(), SCHEMA).expect("valid config");
-    let pool = trellis::Pool::new(&config).expect("pool");
-    trellis::migrate(&pool, &config)
+    let pool = trellis::pool::Pool::new(&config).expect("pool");
+    trellis::migrate::migrate_with_pool(&pool, &config)
         .await
         .expect("migrate as the login role");
     let raw = connect(&dsn).await;

@@ -78,7 +78,7 @@ impl H {
         h
     }
 
-    pub fn pool(&self) -> &trellis::Pool {
+    pub fn pool(&self) -> &trellis::pool::Pool {
         &self.db.pool
     }
 

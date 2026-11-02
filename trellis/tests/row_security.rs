@@ -293,7 +293,7 @@ struct Instance {
     _db: testkit::TestDatabase,
     admin: Client,
     raw: Client,
-    pool: trellis::Pool,
+    pool: trellis::pool::Pool,
     trellis: trellis::Trellis,
 }
 
@@ -318,8 +318,8 @@ async fn instance(cluster: &TestCluster) -> Instance {
     assert!(db.dsn().contains("user=postgres"), "{}", db.dsn());
     let dsn = db.dsn().replace("user=postgres", "user=rls_trellis");
     let config = trellis::Config::with_schema(dsn.clone(), SCHEMA).expect("valid config");
-    let pool = trellis::Pool::new(&config).expect("pool");
-    trellis::migrate(&pool, &config)
+    let pool = trellis::pool::Pool::new(&config).expect("pool");
+    trellis::migrate::migrate_with_pool(&pool, &config)
         .await
         .expect("migrate as the login role");
     let raw = connect(&dsn).await;
@@ -439,7 +439,7 @@ async fn defining_refuses_a_table_whose_policies_apply_to_the_trellis_role() {
 
 /// The capture half of one staging-worker pass. Returns the waiting
 /// definitions it found ready to build.
-async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) -> Vec<i64> {
+async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) -> Vec<i64> {
     let desired = trellis::defs::tables_to_capture(pool)
         .await
         .expect("read the tables to capture");
@@ -641,7 +641,7 @@ async fn the_capture_pass_pauses_a_reader_of_a_seam_fed_table() {
 /// Seals the ring and drains what it sealed through `pool`, as `pool`'s
 /// role: a bounded stand-in for one drain thread's turn. Returns the drain's
 /// error, if it failed.
-async fn seal_and_drain(raw: &mut Client, pool: &trellis::Pool) -> Result<(), String> {
+async fn seal_and_drain(raw: &mut Client, pool: &trellis::pool::Pool) -> Result<(), String> {
     let sealed = seal::seal_phase1(raw).await.expect("seal phase 1");
     seal::seal_phase2(raw, sealed.sealed_seg_seq, "wake")
         .await
@@ -727,7 +727,7 @@ async fn a_drain_as_an_unchecked_role_pauses_the_writer_instead_of_skipping_rows
         .expect("a member login role the target's policies apply to");
     let dsn = it._db.dsn().replace("user=postgres", "user=rls_worker");
     let config = trellis::Config::with_schema(dsn, SCHEMA).expect("valid config");
-    let worker = trellis::Pool::new(&config).expect("pool");
+    let worker = trellis::pool::Pool::new(&config).expect("pool");
 
     // The catalog checks run as the ring's owner, which is exempt.
     capture_pass(&mut it.raw, &it.pool).await;
@@ -835,7 +835,7 @@ async fn a_refused_read_halts_while_a_key_failure_beside_it_is_held_for_its_defi
         .expect("a member login role p's policies apply to, and a narrow target");
     let dsn = it._db.dsn().replace("user=postgres", "user=rls_worker");
     let config = trellis::Config::with_schema(dsn, SCHEMA).expect("valid config");
-    let worker = trellis::Pool::new(&config).expect("pool");
+    let worker = trellis::pool::Pool::new(&config).expect("pool");
 
     it.admin
         .batch_execute(
@@ -1135,7 +1135,7 @@ async fn a_target_its_writer_owns_is_not_checked_for_the_ring_owner() {
         .expect("a login role that is a member of the ring's owner");
     let dsn = it._db.dsn().replace("user=postgres", "user=rls_worker");
     let config = trellis::Config::with_schema(dsn.clone(), SCHEMA).expect("valid config");
-    let pool = trellis::Pool::new(&config).expect("pool");
+    let pool = trellis::pool::Pool::new(&config).expect("pool");
     let mut raw = connect(&dsn).await;
     raw.batch_execute(&format!("set search_path to {SCHEMA}, public"))
         .await
@@ -1220,7 +1220,7 @@ async fn a_seam_fed_table_its_readers_own_is_not_checked_for_the_ring_owner() {
         .expect("a login role that is a member of the ring's owner");
     let dsn = it._db.dsn().replace("user=postgres", "user=rls_worker");
     let config = trellis::Config::with_schema(dsn.clone(), SCHEMA).expect("valid config");
-    let pool = trellis::Pool::new(&config).expect("pool");
+    let pool = trellis::pool::Pool::new(&config).expect("pool");
     let mut raw = connect(&dsn).await;
     raw.batch_execute(&format!("set search_path to {SCHEMA}, public"))
         .await
@@ -1314,13 +1314,13 @@ async fn a_seam_fed_table_its_readers_own_is_not_checked_for_the_ring_owner() {
 }
 
 /// A pool as `role`, for the drains and builds after the fix.
-fn pool_as(it: &Instance, role: &str) -> trellis::Pool {
+fn pool_as(it: &Instance, role: &str) -> trellis::pool::Pool {
     let dsn = it
         ._db
         .dsn()
         .replace("user=postgres", &format!("user={role}"));
     let config = trellis::Config::with_schema(dsn, SCHEMA).expect("valid config");
-    trellis::Pool::new(&config).expect("pool")
+    trellis::pool::Pool::new(&config).expect("pool")
 }
 
 /// The halt record `target` is paused with, after a refused read of its source.

@@ -19,7 +19,8 @@ use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::{CatalogError, ValueType, install_definition, tables_to_capture};
 use trellis::integer::IntWidth;
-use trellis::{Config, Pool, migrate};
+use trellis::pool::Pool;
+use trellis::{Config, migrate::migrate_with_pool};
 
 const INSTANCE_B: &str = "instance_b";
 
@@ -82,7 +83,7 @@ async fn two_instances(db: &testkit::TestDatabase) -> (Pool, Client) {
 
     let config_b = Config::with_schema(db.dsn(), INSTANCE_B).expect("valid schema");
     let pool_b = Pool::new(&config_b).expect("build instance B's pool");
-    migrate(&pool_b, &config_b)
+    migrate_with_pool(&pool_b, &config_b)
         .await
         .expect("migrate instance B");
     let b = connect_raw(db.dsn(), INSTANCE_B).await;

@@ -327,8 +327,8 @@ async fn the_documented_privileges_run_the_whole_lifecycle() {
         .expect("valid config")
         .with_target_schema(TARGETS)
         .expect("valid target schema");
-    let pool = trellis::Pool::new(&config).expect("pool");
-    trellis::migrate(&pool, &config)
+    let pool = trellis::pool::Pool::new(&config).expect("pool");
+    trellis::migrate::migrate_with_pool(&pool, &config)
         .await
         .expect("migrate as the Trellis role");
     let trellis = Trellis::connect(config.clone(), TrellisOptions::default())

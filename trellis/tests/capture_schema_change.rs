@@ -48,14 +48,14 @@ async fn definer(dsn: &str) -> Trellis {
 }
 
 /// One whole staging-worker pass: capture, then the start of ready builds.
-async fn full_pass(raw: &mut Client, pool: &trellis::Pool) {
+async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     trellis::client::reconcile_pass(raw, pool, SCHEMA)
         .await
         .expect("reconcile pass");
 }
 
 /// The capture half of one pass only.
-async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) -> reconcile::PassOutcome {
+async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) -> reconcile::PassOutcome {
     let desired = trellis::defs::tables_to_capture(pool)
         .await
         .expect("read the tables to capture");
@@ -71,7 +71,7 @@ async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) -> reconcile::Pass
 
 /// Seals and drains through the engine's own apply path until nothing is
 /// pending anywhere in the ring (as in `capture_join.rs`).
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
@@ -113,7 +113,7 @@ async fn status(raw: &Client, target: &str) -> TransformStatus {
 
 /// Alternates staging-worker passes and drains until every one of
 /// `targets` is live: a bounded number of explicit steps, not a timed wait.
-async fn bring_live(raw: &mut Client, pool: &trellis::Pool, targets: &[&str]) {
+async fn bring_live(raw: &mut Client, pool: &trellis::pool::Pool, targets: &[&str]) {
     for _ in 0..8 {
         full_pass(raw, pool).await;
         run_backfill_chunks(pool).await;
@@ -134,7 +134,7 @@ async fn bring_live(raw: &mut Client, pool: &trellis::Pool, targets: &[&str]) {
 
 /// Claims, runs and finishes every pending backfill chunk: the hand-driven
 /// stand-in for a drain worker's build half (as in `alter_transform.rs`).
-async fn run_backfill_chunks(pool: &trellis::Pool) {
+async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
     trellis::staging::build::settle_builds(pool).await;
 }
 
@@ -227,7 +227,7 @@ async fn rows(raw: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
 ///
 /// - `ta` reads `a`, `tb` reads `b`, `tc` reads `c`;
 /// - `tsum` sums `b` per `g`.
-async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
+async fn setup(dsn: &str, raw: &mut Client, pool: &trellis::pool::Pool) -> Trellis {
     raw.batch_execute(
         "create table public.u (id int primary key, g int, a int, b int, c int, spare int); \
          insert into public.u select i, i % 2, i, 10 * i, 100 * i, 0 \
@@ -1190,7 +1190,7 @@ async fn the_release_of_a_field_awaiting_capture_builds_a_reader_added_after_it(
 /// reading `users_copy`: the closure a halt on `users` reaches.
 /// `posts_plain` reads only `posts`, and `public.o` is an unrelated table
 /// whose `o_copy` shares the drain's pages with them. All live.
-async fn halt_closure_setup(dsn: &str, raw: &mut Client, pool: &trellis::Pool) -> Trellis {
+async fn halt_closure_setup(dsn: &str, raw: &mut Client, pool: &trellis::pool::Pool) -> Trellis {
     raw.batch_execute(
         "create table public.users (handle varchar(16) primary key, name text); \
          create table public.posts (id int primary key, author varchar(16)); \
@@ -1268,7 +1268,7 @@ async fn halted_targets(trellis: &Trellis) -> Vec<String> {
     halted
 }
 
-async fn halting_stops(pool: &trellis::Pool) -> i64 {
+async fn halting_stops(pool: &trellis::pool::Pool) -> i64 {
     trellis::staging::halting_stop_stats(pool)
         .await
         .expect("halting_stop_stats")

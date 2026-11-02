@@ -36,14 +36,14 @@ async fn connect_raw(dsn: &str) -> Client {
     client
 }
 
-async fn drain_backfill_chunks(pool: &trellis::Pool) {
+async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
     harness::start_registered_builds(pool)
         .await
         .expect("dispatch registered definitions' builds");
     trellis::staging::build::settle_builds(pool).await;
 }
 
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     use trellis::staging::{apply, seal};
     for _ in 0..16 {
         let outcome = seal::seal_phase1(client).await.expect("seal phase 1");

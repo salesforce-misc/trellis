@@ -36,7 +36,7 @@ struct Instance {
     db: testkit::TestDatabase,
     admin: Client,
     raw: Client,
-    pool: trellis::Pool,
+    pool: trellis::pool::Pool,
     trellis: trellis::Trellis,
 }
 
@@ -68,8 +68,10 @@ async fn instance(cluster: &TestCluster, ddl: &[&str]) -> Instance {
         .expect("a login role owning the application's tables");
     let dsn = db.dsn().replace("user=postgres", "user=holdup_trellis");
     let config = trellis::Config::with_schema(dsn.clone(), SCHEMA).expect("valid config");
-    let pool = trellis::Pool::new(&config).expect("pool");
-    trellis::migrate(&pool, &config).await.expect("migrate");
+    let pool = trellis::pool::Pool::new(&config).expect("pool");
+    trellis::migrate::migrate_with_pool(&pool, &config)
+        .await
+        .expect("migrate");
     let mut raw = connect(&dsn).await;
     raw.batch_execute(&format!("set search_path to {SCHEMA}, public"))
         .await
@@ -109,7 +111,7 @@ fn targets<'a>(ddl: &[&'a str]) -> Vec<&'a str> {
 }
 
 /// The capture half of one staging-worker pass.
-async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
+async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
     let desired = trellis::defs::tables_to_capture(pool)
         .await
         .expect("read the tables to capture");
@@ -127,7 +129,7 @@ async fn capture_pass(raw: &mut Client, pool: &trellis::Pool) {
 /// A drain role, `holdup_worker`, holding every privilege the drain uses on
 /// Trellis's schema and the application's tables. Returns a pool logged in
 /// as it, whose sessions also run with `options`.
-async fn worker(it: &Instance, options: &str) -> trellis::Pool {
+async fn worker(it: &Instance, options: &str) -> trellis::pool::Pool {
     it.admin
         .batch_execute(&format!(
             "do $$ begin \
@@ -147,7 +149,7 @@ async fn worker(it: &Instance, options: &str) -> trellis::Pool {
         dsn = format!("{dsn} options='{options}'");
     }
     let config = trellis::Config::with_schema(dsn, SCHEMA).expect("valid config");
-    trellis::Pool::new(&config).expect("pool")
+    trellis::pool::Pool::new(&config).expect("pool")
 }
 
 /// Seals the ring, both phases, and returns the sealed segment.
@@ -161,7 +163,7 @@ async fn seal(raw: &mut Client) -> i64 {
 
 /// One drain call over `seg_seq` as `pool`'s role: the drain's error, if it
 /// surfaced one.
-async fn drain(pool: &trellis::Pool, seg_seq: i64) -> Result<(), String> {
+async fn drain(pool: &trellis::pool::Pool, seg_seq: i64) -> Result<(), String> {
     apply::drain_once(pool, seg_seq, "holdup_test", 1, "trellis_holdup_test")
         .await
         .map(|_| ())

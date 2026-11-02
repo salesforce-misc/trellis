@@ -25,7 +25,7 @@
 //! Pool sizing is not part of a [`Config`]: a handle's call pool is sized by
 //! [`crate::TrellisOptions::max_call_pool_size`] and
 //! [`crate::TrellisOptions::call_pool_wait_timeout`], and its background pool
-//! by its roles (see [`crate::Pool::background`]).
+//! by its roles (see [`crate::pool::Pool::background`]).
 
 use crate::error::Error;
 use std::fmt;
@@ -56,7 +56,7 @@ pub const DEFAULT_TARGET_SCHEMA: &str = "public";
 /// at once. Calls hold one connection each, two or three when a call nests
 /// (`resume_column`), so the default leaves room for a few concurrent
 /// callers. The background client's pool is sized by role instead
-/// ([`crate::Pool::background`]).
+/// ([`crate::pool::Pool::background`]).
 ///
 /// Neither pool counts Trellis's dedicated sessions (the producer session, the
 /// `LISTEN` connection, the claim keep-alive) or each paged drain's
@@ -64,7 +64,7 @@ pub const DEFAULT_TARGET_SCHEMA: &str = "public";
 /// drain thread while oversized shares page.
 pub const DEFAULT_CALL_POOL_MAX_SIZE: usize = 20;
 
-/// The default timeout [`crate::Pool::get`] waits for a free connection
+/// The default timeout [`crate::pool::Pool::get`] waits for a free connection
 /// before failing with a typed [`crate::Error::Pool`] error, instead of
 /// deadpool's default of waiting forever. Long enough that a
 /// normal, brief load spike doesn't spuriously fail, but bounded so a
@@ -270,7 +270,7 @@ impl fmt::Debug for Config {
 /// Rather than masking the password in place, which would mean
 /// re-implementing the connection-string grammar and getting every quoting
 /// and escaping rule right, this asks [`tokio_postgres::Config`]'s own
-/// parser (the one [`crate::Pool`] connects with) whether the DSN carries a
+/// parser (the one [`crate::pool::Pool`] connects with) whether the DSN carries a
 /// password at all. A DSN that parses and carries none prints as written,
 /// so the host, port, user and database stay visible for debugging. Any
 /// other DSN prints as `<redacted>`. That includes one that fails to parse,

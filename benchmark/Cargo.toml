@@ -34,7 +34,7 @@ tokio-postgres = "0.7.13"
 # its unit tests with `cargo test --workspace --features
 # benchmark/engine-access`: without the feature, `cargo test`
 # skips this binary, and its tests with it, silently.
-engine-access = ["trellis/test-util"]
+engine-access = ["trellis/test-util", "testkit/engine-access"]
 
 [[bin]]
 name = "benchmark"

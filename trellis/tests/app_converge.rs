@@ -33,7 +33,7 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::staging::{StagingError, apply, has_pending, retire_drained_segments, seal};
 use trellis::{BlockingTrellis, Config, ErrorCode, Trellis, TrellisError, TrellisOptions};
 
-/// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
+/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`), matching
 /// `trellis/tests/converge.rs`/`client_e2e.rs`'s own helper of the same name.
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -66,7 +66,7 @@ async fn insert_pending_row(client: &Client, key: &str, origin_lsn: PgLsn) {
 /// path, repeating until nothing is pending: the hand-driven stand-in for a
 /// running `Client`'s drain workers (`self_check.rs`'s helper of the same
 /// name).
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     for _ in 0..16 {
         let sealed = seal_active_segment(client).await;
         drain_segment(pool, sealed).await;
@@ -82,7 +82,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 
 /// Drains every bucket of the sealed segment `seg_seq` through the engine's
 /// own apply path.
-async fn drain_segment(pool: &trellis::Pool, seg_seq: i64) {
+async fn drain_segment(pool: &trellis::pool::Pool, seg_seq: i64) {
     // No live capture stages anything here, so there is no real staged
     // watermark to hold apply back. A saturated one never does.
     while apply::drain_once(

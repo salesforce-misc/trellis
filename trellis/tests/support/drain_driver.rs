@@ -157,7 +157,7 @@ impl Driver {
             // the defaults existed; a fresh pool opens its own after them.
             let config =
                 trellis::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
-            db.pool = trellis::Pool::new(&config).expect("a fresh pool");
+            db.pool = trellis::pool::Pool::new(&config).expect("a fresh pool");
         }
         let mut phases = Vec::new();
         let started = Instant::now();
@@ -224,7 +224,7 @@ impl Driver {
         driver
     }
 
-    pub fn pool(&self) -> &trellis::Pool {
+    pub fn pool(&self) -> &trellis::pool::Pool {
         &self.db.pool
     }
 
@@ -558,7 +558,7 @@ impl Driver {
     pub async fn run_frozen<T, F, Fut>(&self, points: &[(PausePoint, &str)], work: F) -> Running<T>
     where
         T: Send + 'static,
-        F: FnOnce(trellis::Pool) -> Fut,
+        F: FnOnce(trellis::pool::Pool) -> Fut,
         Fut: Future<Output = Result<T, ApplyError>> + Send + 'static,
     {
         let (scope, frozen) = self.arm(points).await;

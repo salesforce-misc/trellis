@@ -176,10 +176,7 @@ fn migrate(dsn: &str) {
                 .expect("build runtime")
                 .block_on(async {
                     let config = Config::from_dsn(dsn.to_string()).expect("valid dsn");
-                    let pool = Pool::new(&config).expect("pool");
-                    super::migrate(&pool, &config)
-                        .await
-                        .expect("migrate the template");
+                    super::migrate(&config).await.expect("migrate the template");
                 });
         });
     });

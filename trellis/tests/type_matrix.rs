@@ -513,7 +513,7 @@ async fn settle_tolerant(d: &mut Driver) -> usize {
 
 /// Claims, runs and finishes every pending backfill chunk, then settles the
 /// builds.
-async fn run_backfill_chunks(pool: &trellis::Pool) {
+async fn run_backfill_chunks(pool: &trellis::pool::Pool) {
     trellis::staging::build::settle_builds(pool).await;
 }
 

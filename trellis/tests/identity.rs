@@ -4,7 +4,8 @@
 //! real, ephemeral Postgres instance via `testkit::TestCluster`.
 
 use testkit::TestCluster;
-use trellis::{Config, Error, Pool, migrate};
+use trellis::pool::Pool;
+use trellis::{Config, Error, migrate::migrate_with_pool};
 
 /// The number of migration files embedded in the crate. The ledger holds
 /// exactly versions `1..=N`: migrations are numbered contiguously.
@@ -52,7 +53,7 @@ async fn schema_exists(db: &testkit::TestDatabase, schema: &str) -> bool {
 /// Attaches `config` through its own pool.
 async fn attach(config: &Config) -> Result<(), Error> {
     let pool = Pool::new(config).expect("build pool");
-    migrate(&pool, config).await
+    migrate_with_pool(&pool, config).await
 }
 
 /// The `IncompatibleInstance` message of a refused attach.
@@ -86,10 +87,10 @@ async fn two_instances_share_a_database_without_interfering() {
     let pool_a = Pool::new(&config_a).expect("build pool for instance a");
     let pool_b = Pool::new(&config_b).expect("build pool for instance b");
 
-    migrate(&pool_a, &config_a)
+    migrate_with_pool(&pool_a, &config_a)
         .await
         .expect("migrate instance a");
-    migrate(&pool_b, &config_b)
+    migrate_with_pool(&pool_b, &config_b)
         .await
         .expect("migrate instance b");
 
@@ -133,10 +134,12 @@ async fn reattaching_to_the_same_instance_is_a_clean_noop() {
     let config = config_for_schema(db.dsn(), "instance_reattach");
     let pool = Pool::new(&config).expect("build pool");
 
-    migrate(&pool, &config).await.expect("first attach");
+    migrate_with_pool(&pool, &config)
+        .await
+        .expect("first attach");
     // A second attach against the same schema/instance must succeed and
     // leave the marker exactly as it was.
-    migrate(&pool, &config)
+    migrate_with_pool(&pool, &config)
         .await
         .expect("re-attach to same instance");
 
@@ -162,7 +165,9 @@ async fn marker_recording_a_different_schema_name_is_refused() {
     let config = config_for_schema(db.dsn(), "instance_mismatch");
     let pool = Pool::new(&config).expect("build pool");
 
-    migrate(&pool, &config).await.expect("initial attach");
+    migrate_with_pool(&pool, &config)
+        .await
+        .expect("initial attach");
 
     // Simulate a marker that was copied/restored under the wrong schema
     // name (e.g. a schema dump renamed on restore).
@@ -176,7 +181,7 @@ async fn marker_recording_a_different_schema_name_is_refused() {
         .expect("corrupt the marker's schema_name");
     drop(client);
 
-    let err = migrate(&pool, &config)
+    let err = migrate_with_pool(&pool, &config)
         .await
         .expect_err("attaching with a mismatched marker must be refused");
     assert!(
@@ -192,7 +197,9 @@ async fn marker_with_a_newer_format_version_is_refused() {
     let config = config_for_schema(db.dsn(), "instance_future");
     let pool = Pool::new(&config).expect("build pool");
 
-    migrate(&pool, &config).await.expect("initial attach");
+    migrate_with_pool(&pool, &config)
+        .await
+        .expect("initial attach");
 
     // Simulate a schema last written by a newer Trellis build.
     let client = pool.get().await.expect("connect");
@@ -205,7 +212,7 @@ async fn marker_with_a_newer_format_version_is_refused() {
         .expect("simulate a newer instance format version");
     drop(client);
 
-    let err = migrate(&pool, &config)
+    let err = migrate_with_pool(&pool, &config)
         .await
         .expect_err("attaching to a newer instance format version must be refused");
     assert!(
@@ -234,7 +241,7 @@ async fn preexisting_foreign_schema_without_a_marker_is_refused() {
     let config = config_for_schema(db.dsn(), "foreign_schema");
     let pool = Pool::new(&config).expect("build pool");
 
-    let err = migrate(&pool, &config)
+    let err = migrate_with_pool(&pool, &config)
         .await
         .expect_err("attaching to a foreign, unmarked schema must be refused");
     assert!(
@@ -261,7 +268,7 @@ async fn preexisting_empty_schema_without_a_marker_is_taken_over_cleanly() {
     let config = config_for_schema(db.dsn(), "instance_preexisting_empty");
     let pool = Pool::new(&config).expect("build pool");
 
-    migrate(&pool, &config)
+    migrate_with_pool(&pool, &config)
         .await
         .expect("attaching to an empty pre-existing schema must succeed");
 }
@@ -273,7 +280,9 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     let config = config_for_schema(db.dsn(), "instance_crash_recovery");
     let pool = Pool::new(&config).expect("build pool");
 
-    migrate(&pool, &config).await.expect("initial attach");
+    migrate_with_pool(&pool, &config)
+        .await
+        .expect("initial attach");
 
     // Simulate a process death between the runner creating
     // `trellis_instance` and `seed_marker` committing: the ledger and
@@ -294,7 +303,7 @@ async fn crash_between_migrations_and_marker_seed_recovers_cleanly() {
     assert_eq!(remaining, 0, "trellis_instance must be empty, not absent");
     drop(client);
 
-    migrate(&pool, &config)
+    migrate_with_pool(&pool, &config)
         .await
         .expect("re-attaching after a crashed first migrate must succeed, not lock us out");
 

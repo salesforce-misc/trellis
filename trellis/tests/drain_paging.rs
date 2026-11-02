@@ -169,7 +169,7 @@ async fn seal(client: &mut Client) -> i64 {
 }
 
 async fn drain(
-    pool: &trellis::Pool,
+    pool: &trellis::pool::Pool,
     seg_seq: i64,
     claimed_by: &str,
     cap: usize,
@@ -178,7 +178,7 @@ async fn drain(
     apply::drain_many_with_hooks(pool, &[seg_seq], claimed_by, 1, WAKE, cap, hooks).await
 }
 
-async fn drain_all(pool: &trellis::Pool, seg_seq: i64, cap: usize) -> ManyApplyOutcome {
+async fn drain_all(pool: &trellis::pool::Pool, seg_seq: i64, cap: usize) -> ManyApplyOutcome {
     drain(pool, seg_seq, "worker", cap, &mut DrainHooks::default())
         .await
         .expect("drain")
@@ -659,7 +659,7 @@ async fn a_key_straddling_two_paged_segments_matches_the_oracle() {
 /// the truncate), the sentinel, then 40 post-truncate inserts (keys 41..=80:
 /// 41..=60 re-inserted, 61..=80 new). The live table ends holding 41..=80.
 /// Keys 1..=40 were seeded by an earlier drain, so the clear has rows to erase.
-async fn stage_truncate_segment(client: &mut Client, pool: &trellis::Pool) -> i64 {
+async fn stage_truncate_segment(client: &mut Client, pool: &trellis::pool::Pool) -> i64 {
     let seed: Vec<i32> = (1..=40).collect();
     insert_items(client, &seed).await;
     let seg = seal(client).await;
@@ -1239,7 +1239,7 @@ async fn cursor_route(client: &Client, seg_seq: i64, bucket: i16) -> Option<i64>
 /// Runs one drain call with a deadline: a page loop that stopped advancing
 /// would hang here rather than finish.
 async fn drain_within(
-    pool: &trellis::Pool,
+    pool: &trellis::pool::Pool,
     seg_seq: i64,
     who: &str,
     cap: usize,
@@ -1443,7 +1443,7 @@ async fn no_page_tables_within(client: &Client, deadline: Duration) {
 
 /// The backend of a pooled connection, and whether that session has a page
 /// table of its own.
-async fn pooled_session(pool: &trellis::Pool) -> (i32, bool) {
+async fn pooled_session(pool: &trellis::pool::Pool) -> (i32, bool) {
     let client = pool.get().await.expect("pooled connection");
     let row = client
         .query_one(
@@ -1550,7 +1550,7 @@ async fn no_page_table_outlives_a_drain_call_or_reaches_a_pooled_connection() {
     let mut client = connect_raw(db.dsn()).await;
     setup_copy(&db, &client).await;
     let config = trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
-    let pool = trellis::Pool::with_limits(&config, 1, Duration::from_secs(30))
+    let pool = trellis::pool::Pool::with_limits(&config, 1, Duration::from_secs(30))
         .expect("one-connection pool");
     let (backend, has_table) = pooled_session(&pool).await;
     assert!(!has_table);
@@ -1641,7 +1641,7 @@ async fn isolation_can_check_out_the_connection_its_failed_page_held() {
         .await
         .expect("add the failing check");
     let config = trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
-    let pool = trellis::Pool::with_limits(&config, 1, Duration::from_secs(2))
+    let pool = trellis::pool::Pool::with_limits(&config, 1, Duration::from_secs(2))
         .expect("one-connection pool");
 
     stage_copy_keys(&client, &(1..=20).collect::<Vec<_>>()).await;
@@ -1708,7 +1708,7 @@ async fn a_drain_waits_out_a_held_lock_outside_its_transaction() {
     let db = cluster.create_isolated_database().await;
     let mut client = connect_raw(db.dsn()).await;
     setup_aggregate(&db, &client).await;
-    let impatient = trellis::Pool::new(
+    let impatient = trellis::pool::Pool::new(
         &trellis::config::Config::from_dsn(format!(
             "{} options='-c lock_timeout={SHORT_LOCK_TIMEOUT_MS}'",
             db.dsn()

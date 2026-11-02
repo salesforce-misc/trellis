@@ -32,7 +32,8 @@ use generative::run::{RunError, run_convergence_with_restore};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
 use testkit::TestCluster;
-use trellis::{Config, Pool};
+use trellis::Config;
+use trellis::dev::pool::Pool;
 
 struct Harness {
     runtime: tokio::runtime::Runtime,

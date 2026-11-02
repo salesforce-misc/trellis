@@ -110,7 +110,7 @@ async fn stage_cdc(
 /// `DdlError::MalformedCompositeKey` raised while decoding the downstream
 /// `Recompute`'s key), so a regression panics right here rather than merely
 /// producing a wrong number further down.
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     for _ in 0..16 {
         let seg = seal_active_segment(client).await;
         while apply::drain_once(

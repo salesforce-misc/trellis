@@ -11,11 +11,12 @@ use generative::backend::{Backend, ManualBackend};
 use generative::model::{NamePool, Op, OpOutcome, Program, Table};
 use generative::oracle::{self, sql_oracle};
 use testkit::TestCluster;
+use trellis::Config;
 use trellis::dev::defs::ast::{
     Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType,
 };
 use trellis::dev::defs::qualified_target_table;
-use trellis::{Config, Pool};
+use trellis::dev::pool::Pool;
 
 /// The same 1-1 numeric-`+` program the backend seam test uses, so the oracle
 /// is exercised against a shape the backend already proves it can maintain.

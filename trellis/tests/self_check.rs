@@ -62,7 +62,7 @@ use trellis::{
     SelfCheckOutcome, TransformStatus, Trellis, TrellisError, TrellisOptions,
 };
 
-/// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
+/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`), matching
 /// `trellis/tests/app_converge.rs`'s own helper of the same name.
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -92,7 +92,7 @@ const LOCKED_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 /// Seals the active segment and drains it through the engine's own apply
 /// path, repeating until nothing is pending — the hand-driven stand-in for a
 /// running `Client`'s drain workers.
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     // Capture triggers stage in the writer's own transaction, so there is
     // no staged watermark to hold apply back. A saturated one never does.
     for _ in 0..16 {

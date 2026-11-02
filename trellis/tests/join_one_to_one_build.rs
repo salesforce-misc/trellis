@@ -243,7 +243,7 @@ fn options(chunk_rows: i64) -> WorkerOptions {
 }
 
 /// One drain worker's build step, as `work_once` takes it.
-async fn build_step(pool: &trellis::Pool, worker: &str, chunk_rows: i64) -> Step {
+async fn build_step(pool: &trellis::pool::Pool, worker: &str, chunk_rows: i64) -> Step {
     build::work_once(pool, worker, &options(chunk_rows))
         .await
         .expect("a build step")
@@ -1150,8 +1150,9 @@ async fn a_plan_job_killed_after_its_m_pass_resumes_at_the_walk_of_a() {
     for kind in KINDS {
         let mut d = start(&[kind], false).await;
         let target = kind.target();
-        let own = trellis::Pool::new(&Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"))
-            .expect("a pool for the plan job");
+        let own =
+            trellis::pool::Pool::new(&Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"))
+                .expect("a pool for the plan job");
         let mut planner = d
             .run_frozen(&[(PausePoint::AfterPlanHold, &target)], |_| async move {
                 Ok(build_step(&own, "planner", 3).await)
@@ -1370,8 +1371,9 @@ async fn a_sweep_killed_in_its_orphan_pass_resumes_from_its_cursor() {
         let target = kind.target();
         // Its own pool, so the session ended below is no connection the
         // test's pool hands out again.
-        let own = trellis::Pool::new(&Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"))
-            .expect("a pool for the sweep");
+        let own =
+            trellis::pool::Pool::new(&Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"))
+                .expect("a pool for the sweep");
         let mut sweep = d
             .run_frozen(
                 &[(PausePoint::AfterJoin1OrphanRead, &target)],

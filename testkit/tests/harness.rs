@@ -250,7 +250,7 @@ async fn a_cold_backup_restores_data_as_of_the_backup() {
 
     let config =
         trellis::Config::from_dsn(restored.database_dsn(db.name())).expect("restored config");
-    let restored_pool = trellis::Pool::new(&config).expect("restored pool");
+    let restored_pool = trellis::dev::pool::Pool::new(&config).expect("restored pool");
     assert_eq!(
         fixtures::read_rows(&restored_pool, "widgets").await,
         vec![(1, "before".to_string())],

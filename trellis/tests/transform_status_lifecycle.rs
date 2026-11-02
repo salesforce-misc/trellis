@@ -118,7 +118,7 @@ async fn insert_cdc_row(
 /// `defs_install_definition.rs` uses. A definition's build reads its source
 /// itself rather than staging it into the ring (ADR-0002), so the
 /// builds run first.
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     drain_backfill_chunks(pool).await;
     // A throwaway, always-caught-up watermark — this helper
     // has no live capture running (these tests stage CDC rows by hand),
@@ -151,7 +151,7 @@ async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
 /// `drain_to_quiescence` would spin for all 16 rounds and panic even though
 /// the one thing this test actually cares about — the target reaching live
 /// again — already happened.
-async fn drain_until_live(pool: &trellis::Pool, client: &mut Client, target: &str) {
+async fn drain_until_live(pool: &trellis::pool::Pool, client: &mut Client, target: &str) {
     // A chunked rebuild goes live from its last chunk (ADR-0002).
     drain_backfill_chunks(pool).await;
     if status_of(client, target).await == TransformStatus::Live {
@@ -180,7 +180,7 @@ async fn drain_until_live(pool: &trellis::Pool, client: &mut Client, target: &st
 /// Starts every registered definition's build and runs it to completion —
 /// the harness stand-in for the staging worker and a running drain worker,
 /// matching `defs_install_definition.rs`'s `drain_backfill_chunks`.
-async fn drain_backfill_chunks(pool: &trellis::Pool) {
+async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
     // ADR-0002: registration only records a definition; the staging
     // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
@@ -192,7 +192,7 @@ async fn drain_backfill_chunks(pool: &trellis::Pool) {
 /// One staging-worker reconcile pass (capture, then the start of ready
 /// builds), with no
 /// time to wait for an unsettled fence.
-async fn reconcile_pass(pool: &trellis::Pool, raw: &mut Client) {
+async fn reconcile_pass(pool: &trellis::pool::Pool, raw: &mut Client) {
     trellis::client::reconcile_pass(raw, pool, DEFAULT_SCHEMA)
         .await
         .expect("reconcile pass");
@@ -220,7 +220,7 @@ async fn status_of(client: &Client, target_table: &str) -> TransformStatus {
 /// used for once a scenario has parked a permanently-unreleasable
 /// `poison_held` row (see [`drain_until_live`]'s own comment on why
 /// `has_pending` never clears then).
-async fn drain_one_round(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_one_round(pool: &trellis::pool::Pool, client: &mut Client) {
     let seg = seal_active_segment(client).await;
     while apply::drain_once(pool, seg, "status_lifecycle_test", 1, "trellis_status_test")
         .await
@@ -241,7 +241,7 @@ async fn drain_one_round(pool: &trellis::Pool, client: &mut Client) {
 /// crossed `DEFAULT_DEATH_THRESHOLD` real failures and been evicted to
 /// `poison`. Asserts exactly that before returning.
 async fn evict_keys_for_real(
-    pool: &trellis::Pool,
+    pool: &trellis::pool::Pool,
     raw: &mut Client,
     src_table: &str,
     keys: &[&str],

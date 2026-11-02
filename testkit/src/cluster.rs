@@ -65,7 +65,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, Once, PoisonError};
 use std::time::{Duration, Instant};
-use trellis::{Config, Pool, migrate};
+#[cfg(feature = "engine-access")]
+use trellis::dev::pool::Pool;
+use trellis::{Config, migrate};
 
 mod template;
 pub mod tls;
@@ -816,21 +818,21 @@ impl TestCluster {
     /// which the handle's `Drop` drops.
     fn test_database(&self, name: String) -> TestDatabase {
         let dsn = self.database_dsn(&name);
-        let config = Config::from_dsn(dsn.clone()).expect("valid schema");
-        let pool = Pool::new(&config).expect("build pool for isolated database");
         TestDatabase {
             socket_dir: self.socket_dir.clone(),
             port: self.port,
             name,
+            #[cfg(feature = "engine-access")]
+            pool: Pool::new(&Config::from_dsn(dsn.clone()).expect("valid schema"))
+                .expect("build pool for isolated database"),
             dsn,
-            pool,
             drop_on_drop: self.long_lived,
         }
     }
 
     async fn migrate(db: &TestDatabase) {
         let config = Config::from_dsn(db.dsn().to_string()).expect("valid schema");
-        migrate(&db.pool, &config)
+        migrate(&config)
             .await
             .expect("apply migrations to isolated database");
     }
@@ -971,6 +973,9 @@ pub struct TestDatabase {
     /// Whether `Drop` drops the database; see
     /// [`TestCluster::long_lived`].
     drop_on_drop: bool,
+    /// A Trellis pool on the database, with Trellis's own session settings
+    /// (`engine-access` only).
+    #[cfg(feature = "engine-access")]
     pub pool: Pool,
 }
 

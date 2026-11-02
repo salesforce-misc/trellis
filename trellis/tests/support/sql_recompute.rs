@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 
-use trellis::Pool;
 use trellis::defs::{TransformDef, render_one_to_one_select_sql};
+use trellis::pool::Pool;
 
 /// Each source row's primary key as text (`"\u{1}"`, the engine's null-key
 /// sentinel, for a `NULL` key) mapped to its calculated fields as text (`None`

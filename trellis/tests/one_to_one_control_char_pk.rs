@@ -15,10 +15,10 @@ use std::collections::HashMap;
 
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
-use trellis::Pool;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ast::{Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType};
 use trellis::defs::{create_definition, create_target_table};
+use trellis::pool::Pool;
 use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 
 async fn connect_raw(dsn: &str) -> Client {

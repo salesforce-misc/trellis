@@ -41,8 +41,10 @@ async fn a_wait_converges_while_an_unrelated_chain_stays_busy() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let config = Config::with_schema(db.dsn().to_string(), "trellis").expect("valid schema");
-    let pool = trellis::Pool::new(&config).expect("pool");
-    trellis::migrate(&pool, &config).await.expect("migrate");
+    let pool = trellis::pool::Pool::new(&config).expect("pool");
+    trellis::migrate::migrate_with_pool(&pool, &config)
+        .await
+        .expect("migrate");
     let conn = pool.get().await.expect("connection");
     conn.batch_execute(
         "create table widgets (id integer primary key, price integer); \

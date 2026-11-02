@@ -56,7 +56,7 @@ use trellis::intake::harness;
 use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
 use trellis::{CatalogError, Config, TransformStatus, Trellis, TrellisError, TrellisOptions};
 
-/// Connects directly to `dsn` (bypassing `trellis::Pool`) with `search_path`
+/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`) with `search_path`
 /// pinned — the same helper every other integration test in this directory
 /// uses to check Postgres's own view of what the engine did.
 async fn connect_raw(dsn: &str) -> Client {
@@ -121,7 +121,7 @@ async fn count(raw: &Client, sql: &str) -> i64 {
 /// hand-driven stand-in for the staging worker and a drain worker
 /// (`alter_transform.rs`'s helper of the same name). A 1-1 target reaches
 /// `live` this way with no running pipeline and nothing to wait for.
-async fn drain_backfill_chunks(pool: &trellis::Pool) {
+async fn drain_backfill_chunks(pool: &trellis::pool::Pool) {
     // ADR-0002: registration only records a definition; the staging
     // worker starts its build.
     trellis::intake::harness::start_registered_builds(pool)
@@ -158,7 +158,7 @@ async fn stage_orders_insert(raw: &Client, id: i64, g: i64, a: i64) {
 /// Seals and drains through the engine's own apply path until nothing is
 /// pending anywhere in the ring: the hand-driven stand-in for a running
 /// `Client`'s maintenance loop and drain workers.
-async fn drain_to_quiescence(pool: &trellis::Pool, client: &mut Client) {
+async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     // No live capture stages anything here, so there is no real staged
     // watermark to hold apply back. A saturated one never does.
     for _ in 0..16 {

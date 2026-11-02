@@ -37,7 +37,7 @@ fn columns(pairs: &[(&str, ValueType)]) -> HashMap<String, ValueType> {
         .collect()
 }
 
-/// Connects directly to `dsn` (bypassing `trellis::Pool`), matching
+/// Connects directly to `dsn` (bypassing `trellis::pool::Pool`), matching
 /// `claims.rs`/`fold.rs`'s convention.
 async fn connect_raw(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
@@ -167,7 +167,7 @@ fn order_totals_def() -> TransformDef {
 /// Runs one full drain attempt against `seg_seq` the same way [`drain_once`]
 /// does, and panics with the underlying error on failure — this test file's
 /// standard "drain and expect it to succeed" step.
-async fn drain(pool: &trellis::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
+async fn drain(pool: &trellis::pool::Pool, seg_seq: i64, claimed_by: &str) -> apply::ApplyOutcome {
     // A throwaway, always-caught-up watermark — no live
     // capture runs in this test file, and it isn't exercising guard (a).
     apply::drain_once(pool, seg_seq, claimed_by, 1, "trellis_apply_test")
@@ -2602,7 +2602,11 @@ async fn out_of_order_fixture(seed: Option<&str>) -> (TestCluster, testkit::Test
 /// Phases 1 and 2 of a drain of `seg_seq` as `worker`: claims every bucket,
 /// folds, commits the claim, and computes the plan, stopping short of
 /// Phase 3 so a test can run other batches before this one applies.
-async fn claim_and_compute(pool: &trellis::Pool, seg_seq: i64, worker: &str) -> apply::ApplyPlan {
+async fn claim_and_compute(
+    pool: &trellis::pool::Pool,
+    seg_seq: i64,
+    worker: &str,
+) -> apply::ApplyPlan {
     let mut phase1_client = pool.get().await.expect("connection");
     let txn = phase1_client.transaction().await.expect("begin phase 1");
     claim::claim(&txn, seg_seq, worker, 1).await.expect("claim");
@@ -2617,7 +2621,7 @@ async fn claim_and_compute(pool: &trellis::Pool, seg_seq: i64, worker: &str) -> 
 
 /// Phase 3 of a drain [`claim_and_compute`] started.
 async fn apply_computed(
-    pool: &trellis::Pool,
+    pool: &trellis::pool::Pool,
     seg_seq: i64,
     worker: &str,
     plan: &apply::ApplyPlan,
@@ -2644,7 +2648,7 @@ async fn order_total(client: &Client, id: i32) -> Option<String> {
 
 /// Drains every sealed segment still claimable, so a test's final assertion
 /// sees a settled target.
-async fn drain_everything_left(pool: &trellis::Pool, client: &Client) {
+async fn drain_everything_left(pool: &trellis::pool::Pool, client: &Client) {
     while let Some(&seg) = apply::next_claimable_segments(client, 1)
         .await
         .expect("next claimable")

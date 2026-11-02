@@ -35,7 +35,8 @@
 //! front; a program's `def_install_after_op`, `restart_after_ops` and
 //! `scale_out_after_ops` are not honoured here.
 
-use trellis::{Config, Pool};
+use trellis::Config;
+use trellis::dev::pool::Pool;
 
 use crate::backend::{
     Backend, BackupRestore, ManualBackend, SERVER_STOP_RECLAIM_TTL, Snapshot, await_pool_usable,

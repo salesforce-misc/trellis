@@ -11,9 +11,10 @@
 
 use testkit::TestCluster;
 use tokio_postgres::GenericClient;
+use trellis::Config;
 use trellis::config::DEFAULT_SCHEMA;
+use trellis::pool::Pool;
 use trellis::staging::ProducerSession;
-use trellis::{Config, Pool};
 
 /// What a dedicated connection should read back: 10s idle, 3 probes 5s
 /// apart, and a 25s `tcp_user_timeout`. `SHOW` prints these without units
