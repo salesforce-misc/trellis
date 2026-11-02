@@ -654,7 +654,9 @@ them:
   detached or the child dropped; a capture function replaced and restored by
   hand; a disruption a restore or `pg_upgrade` records before a pass sees
   it; a subscription that gains the table and loses it; capture changed
-  outside Trellis on a partitioned source.
+  outside Trellis on a partitioned source; a read column's name taken by
+  another column and given back
+  ([known correctness gaps](../known-correctness-gaps.md#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass)).
 
 A few routine operations rebuild for nothing, at the cost of one re-read: a
 rewrite that leaves the values as they were (`USING b + 0`, or a column

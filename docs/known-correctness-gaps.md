@@ -30,7 +30,7 @@ wrong rows, on the targets it compares
 | [A column's values rewritten in place by `ALTER COLUMN TYPE`](#a-columns-values-rewritten-in-place-by-alter-column-type) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study) |
 | [A stored generated column's expression replaced by `SET EXPRESSION`](#a-stored-generated-columns-expression-replaced-by-set-expression) | `self_check` | [#1540](https://github.com/salesforce-misc/trellis/issues/1540) (study) |
 | [An enum label renamed and added again](#an-enum-label-renamed-and-added-again) | `self_check` | documented |
-| [A read column's name swapped with another's and back within one pass](#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass) | `self_check` | documented |
+| [A read column's name swapped with another's and back within one pass](#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass) | `self_check` | [#1586](https://github.com/salesforce-misc/trellis/issues/1586) |
 | **Writes past a unique key** | | |
 | [A duplicate in `b` past a deferrable key under `session_replication_role = replica`](#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica) | `self_check` | documented |
 | **Writes capture never sees** | | |
@@ -76,8 +76,8 @@ while every rule holds.
   shapes [listed below](#a-columns-values-rewritten-in-place-by-alter-column-type),
   or by [`SET EXPRESSION` on a stored generated
   column](#a-stored-generated-columns-expression-replaced-by-set-expression).
-* **Swap a read column's name with another column's only while its
-  transforms are paused**
+* **Let another column take a read column's name only while the
+  transforms that read it are paused**
   ([below](#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass)).
 * **Don't write a 1-1 `JOIN`'s `b` under `session_replication_role =
   replica`** when its key on the `ON` columns is a deferrable constraint
@@ -195,9 +195,9 @@ no error. Without the re-add, the label fails to cast and the key is held
 
 ### A read column's name swapped with another's and back within one pass
 
-**When:** two columns of a source table swap names and swap back before the
-next reconcile pass, a write is made in between, and a definition reads one of
-them:
+**When:** a column a definition reads is renamed away, another column takes
+its name, a write is made, and the names are put back before the next
+reconcile pass:
 
 ```sql
 ALTER TABLE orders RENAME COLUMN amount TO amount_old;
@@ -207,35 +207,35 @@ ALTER TABLE orders RENAME COLUMN amount TO discount;
 ALTER TABLE orders RENAME COLUMN amount_old TO amount;
 ```
 
-The other column can also be a virtual generated column (PostgreSQL 18),
-renamed onto the read column's name and back. A pass that runs while the names
-are swapped sees the read column's position change and rebuilds the readers,
-or, for a virtual column, pauses them
+The other column can also be one added under the read column's name and
+dropped again, or a virtual generated column (PostgreSQL 18) renamed onto it
+and back. A pass that runs while the other column has the name rebuilds the
+readers, as for a column dropped and added again, or, for a virtual column,
+pauses them
 ([capture by triggers — What rebuilds, what pauses, and what's
 missed](staging-and-claiming/01-capture-by-triggers.md#what-rebuilds-what-pauses-and-whats-missed)).
 
 **What goes wrong:** the capture function finds the columns it images by
-name, so while the names are swapped every name is present and it images the
-other column's values under the read column's name. A virtual column has no
-value in a transition table: an insert or a delete that reaches it fails, and
-an update stages `NULL` or nothing, so the change is lost. After the swap back
-the read column has its old position, type and default, so the next pass finds
-nothing changed. The readers stay `live` with the wrong value. A 1-1 target's
-row, and a 1-1 `JOIN`'s, is repaired by the next write that changes a column
-the definition reads in the swapped table's row; an aggregate or `JOIN` target
-stays wrong until it's rebuilt.
+name, so while the other column has the name it images that column's values
+as the read column's. A virtual column has no value in a transition table: an
+insert or a delete fails, and an update stages the read column as `NULL`, or
+stages nothing, so its new value is lost. After the names are put back the
+read column has its old position, type and default, and only the `xmin` of
+its catalog row has moved, as routine work such as `SET STATISTICS` moves it,
+so the next pass acts on nothing. The readers stay `live` with the wrong
+value. A 1-1 target's row, and a 1-1 `JOIN`'s, is repaired by the next write
+that changes a column the definition reads in the row of the table that holds
+the column; an aggregate or `JOIN` target stays wrong until it's rebuilt.
 
 **Detected by:** `self_check`.
 
-**Repair:** `request_backfill` the table, or `PAUSE`/`RESUME` the readers.
-Either rebuilds a 1-1 target, an aggregate, a `JOIN` and a 1-1 `JOIN` from the
-table. To avoid it, swap the names only while the transforms that read the
-table are paused.
+**Repair:** `request_backfill` the table, or `PAUSE`/`RESUME` the transforms
+that read it. To avoid it, let another column take a read column's name only
+while the transforms that read the table are paused.
 
-**Ends with:** documented.
-[#1586](https://github.com/salesforce-misc/trellis/issues/1586) is open on
-whether the capture function should compare a column's position as well as its
-name.
+**Ends with:** [#1586](https://github.com/salesforce-misc/trellis/issues/1586)
+weighs having the capture function check each column's position as well as
+its name.
 
 ## Writes past a unique key
 
