@@ -208,7 +208,7 @@ async fn end_to_end_latency_fires_only_at_the_terminal_transform_in_a_linear_cha
         "public",
         &pk,
         &totals_columns,
-        &summary_def.def.source,
+        &summary_def.source_table,
     )
     .await
     .expect("create chain_summary table");

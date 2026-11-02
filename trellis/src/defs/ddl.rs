@@ -3,8 +3,8 @@
 //! **Neighbor-table convention**: the target table is created under the
 //! literal name `def.target`, in a separately-configurable *target schema*
 //! (`Config::target_schema`) — deliberately decoupled from the
-//! Trellis-managed catalog schema (`Config::schema`) everything else
-//! `crate::pool` points `search_path` at, and defaulting to `public` (the
+//! Trellis-managed catalog schema (`Config::schema`) `crate::pool` points
+//! `search_path` at, and defaulting to `public` (the
 //! same default any other bare `CREATE TABLE` would land in) rather than
 //! the Trellis instance schema: a POC that defaulted target tables into the
 //! Trellis schema found a high chance of future name conflicts as Trellis
@@ -1320,12 +1320,11 @@ pub(crate) async fn field_column_pg_types(
 /// The catalog's own identity column holds the fully-qualified
 /// `schema.table` form (built via `intake::qualify`, at
 /// definition-acceptance time — see `catalog::create_definition_inner`), not
-/// this bare name. Callers that need a live connection (whose `search_path`
-/// already resolves this bare name to the right physical table —
-/// `pool::session_bootstrap` pins `target_schema` onto it) can keep using
-/// this unqualified; callers that need the persisted identity string must
-/// read `transform_definitions.target_table` instead, not reconstruct it
-/// from this function.
+/// this bare name. SQL that names the table uses [`qualified_target_table`]
+/// (no Trellis session has the target schema on its `search_path`); callers
+/// that need the persisted identity string must read
+/// `transform_definitions.target_table` instead, not reconstruct it from
+/// this function.
 pub fn neighbor_table_name(def: &TransformDef) -> &str {
     &def.target
 }
@@ -1358,9 +1357,8 @@ pub fn qualified_target_table(target_schema: &str, def: &TransformDef) -> String
 /// definition's live source table (backfill, CDC apply, quarantine
 /// recompute) must use in place of a bare `quote_ident(&def.source)`/
 /// `quote_ident(source_key)`, which would otherwise leave the schema to
-/// resolve against whatever `search_path` the executing session happens to
-/// carry (`pool::session_bootstrap`'s pinned `Config::schema`/
-/// `Config::target_schema`/`"public"`) — exactly the bug class ADR-0011
+/// resolve against the executing session's `search_path` (Trellis's own
+/// schema alone, `pool::search_path_sql`) — exactly the bug class ADR-0011
 /// exists to close.
 ///
 /// Splits on the first `.`, matching `intake::qualify`'s sole
@@ -1385,8 +1383,8 @@ pub(crate) fn qualified_source_table(qualified: &str) -> String {
 /// target-write sites, `staging::quarantine`'s column recompute). A `TRANSFORM`
 /// clause can spell an explicit non-default target schema, so binding
 /// `def.def.target` (bare) straight into `quote_ident` would silently
-/// mis-resolve (or simply not find) a target explicitly qualified outside the
-/// connection's pinned `search_path`. Every such site reads
+/// mis-resolve (or simply not find) the target: the connection's pinned
+/// `search_path` lists Trellis's own schema alone. Every such site reads
 /// [`super::model::Definition::target_table`] (or a plan field carrying it
 /// forward, as `source`/`qualified_source` are threaded through) through this
 /// function instead.

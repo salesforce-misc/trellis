@@ -6,9 +6,9 @@
 //!
 //! - **I-T1.** A name is a rendering of an OID, never an identity.
 //!   `format_type` omits the schema of a type visible on the session's
-//!   `search_path`, and Trellis's sessions put the Trellis and target schemas
-//!   on it, so a name rendered in one session can resolve to another type in
-//!   another. The rendering here never depends on the path: a `pg_catalog`
+//!   `search_path`, and Trellis's sessions put the Trellis schema on it while
+//!   other sessions put theirs, so a name rendered in one session can resolve
+//!   to another type in another. The rendering here never depends on the path: a `pg_catalog`
 //!   type is `format_type(oid, -1)` (always visible, so never ambiguous), any
 //!   other type is `quote_ident(schema).quote_ident(typname)`, an array of one
 //!   that with `[]`.

@@ -201,7 +201,7 @@ async fn seed_order_summaries(db: &TestDatabase, orders_def: &TransformDef) {
         "public",
         &pk,
         &order_totals_columns,
-        &summary_def.def.source,
+        &summary_def.source_table,
     )
     .await
     .expect("create order_summaries table");
@@ -625,7 +625,7 @@ async fn seed_order_reports(db: &TestDatabase, orders_def: &TransformDef) {
         "public",
         &pk,
         &order_summaries_columns,
-        &reports_def.def.source,
+        &reports_def.source_table,
     )
     .await
     .expect("create order_reports table");
@@ -2716,7 +2716,7 @@ async fn seed_items_transform_of(
     )
     .await
     .expect("create definition");
-    let pk = source_primary_key(&db.pool, &definition.def.source)
+    let pk = source_primary_key(&db.pool, &definition.source_table)
         .await
         .expect("introspect source primary key");
     create_target_table(
@@ -2725,7 +2725,7 @@ async fn seed_items_transform_of(
         "public",
         &pk,
         &source_columns,
-        &definition.def.source,
+        &definition.source_table,
     )
     .await
     .expect("create target table");
@@ -3155,7 +3155,7 @@ async fn a_definition_reading_a_frozen_sibling_is_paused_and_resumed_through_it(
     )
     .await
     .expect("create the downstream definition");
-    let pk = source_primary_key(&db.pool, &downstream.def.source)
+    let pk = source_primary_key(&db.pool, &downstream.source_table)
         .await
         .expect("introspect source primary key");
     create_target_table(
@@ -3164,7 +3164,7 @@ async fn a_definition_reading_a_frozen_sibling_is_paused_and_resumed_through_it(
         "public",
         &pk,
         &sib_columns,
-        &downstream.def.source,
+        &downstream.source_table,
     )
     .await
     .expect("create the downstream target table");
@@ -5433,7 +5433,7 @@ async fn another_instances_held_column_pause_lock_does_not_hold_up_this_ones() {
     )
     .await
     .expect("instance B's define takes its own lock");
-    let pk = source_primary_key(&pool_b, &definition.def.source)
+    let pk = source_primary_key(&pool_b, &definition.source_table)
         .await
         .expect("introspect source primary key");
     create_target_table(
@@ -5442,7 +5442,7 @@ async fn another_instances_held_column_pause_lock_does_not_hold_up_this_ones() {
         "public",
         &pk,
         &source_columns,
-        &definition.def.source,
+        &definition.source_table,
     )
     .await
     .expect("create target table");

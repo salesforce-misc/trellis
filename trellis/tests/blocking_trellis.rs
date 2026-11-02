@@ -44,7 +44,7 @@ fn full_lifecycle_is_synchronous_start_to_finish() {
     setup_runtime.block_on(async {
         let client = db.pool.get().await.expect("get connection");
         client
-            .batch_execute("create table widgets (id bigint primary key, price numeric)")
+            .batch_execute("create table public.widgets (id bigint primary key, price numeric)")
             .await
             .expect("create source table");
     });
@@ -124,7 +124,7 @@ fn define_returns_before_backfill_completes() {
     setup_runtime.block_on(async {
         let client = db.pool.get().await.expect("get connection");
         client
-            .batch_execute("create table widgets (id bigint primary key, price numeric)")
+            .batch_execute("create table public.widgets (id bigint primary key, price numeric)")
             .await
             .expect("create source table");
         // Enough rows that, even if something were watching the chunk
@@ -133,7 +133,7 @@ fn define_returns_before_backfill_completes() {
         // this test actually relies on (see the doc comment above).
         for start in (0..2000).step_by(200) {
             let mut stmt = String::from(
-                "insert into widgets (id, price) select g, g::numeric from generate_series(",
+                "insert into public.widgets (id, price) select g, g::numeric from generate_series(",
             );
             stmt.push_str(&format!("{start}, {}) g", start + 199));
             client.batch_execute(&stmt).await.expect("seed rows");

@@ -1245,7 +1245,8 @@ impl super::Backend for ManualBackend {
                     // only takes one `pk_col` name — narrowed to the first
                     // (and, for every definition this suite actually
                     // generates, only) column.
-                    let pk = source_primary_key(&self.pool, &def.source).await?;
+                    let source = sql::persisted_source(&self.raw, &def.target).await?;
+                    let pk = source_primary_key(&self.pool, &source).await?;
                     let target_columns: Vec<Column> = std::iter::once(Column {
                         name: pk[0].name.clone(),
                         value_type: ValueType::Numeric,

@@ -96,7 +96,7 @@ async fn target_table_is_created_with_inherited_pk_and_numeric_calculated_column
              from pg_index i
              join pg_attribute a on a.attrelid = i.indrelid and a.attnum = any(i.indkey)
              where i.indrelid = pg_catalog.to_regclass($1) and i.indisprimary",
-            &[&def.target],
+            &[&format!("public.{}", def.target)],
         )
         .await
         .expect("introspect target primary key");
@@ -618,7 +618,7 @@ async fn numeric_family_passthrough_keeps_its_own_concrete_type() {
                and a.attnum > 0
                and not a.attisdropped
              order by a.attnum",
-            &[&def.target],
+            &[&format!("public.{}", def.target)],
         )
         .await
         .expect("introspect target columns");
@@ -719,7 +719,7 @@ async fn uuid_column_works_as_an_aggregate_group_by_key() {
              from pg_index i
              join pg_attribute a on a.attrelid = i.indrelid and a.attnum = any(i.indkey)
              where i.indrelid = pg_catalog.to_regclass($1) and i.indisunique",
-            &[&def.target],
+            &[&format!("public.{}", def.target)],
         )
         .await
         .expect("introspect target unique key");
@@ -808,7 +808,7 @@ async fn aggregate_target_table_gets_a_nulls_not_distinct_unique_key_from_the_gr
         .query_one(
             "select count(*) from pg_index i
              where i.indrelid = pg_catalog.to_regclass($1) and i.indisprimary",
-            &[&def.target],
+            &[&format!("public.{}", def.target)],
         )
         .await
         .expect("introspect target primary key")
@@ -820,7 +820,7 @@ async fn aggregate_target_table_gets_a_nulls_not_distinct_unique_key_from_the_gr
             "select i.indnullsnotdistinct, i.indexrelid
              from pg_index i
              where i.indrelid = pg_catalog.to_regclass($1) and i.indisunique",
-            &[&def.target],
+            &[&format!("public.{}", def.target)],
         )
         .await
         .expect("introspect target unique key");
@@ -964,7 +964,7 @@ async fn create_target_table_mirrors_a_composite_primary_key_in_full() {
         .query(
             "select a.attname::text from pg_attribute a
              join pg_index i on i.indrelid = a.attrelid and a.attnum = any(i.indkey)
-             where a.attrelid = 'order_line_totals'::regclass and i.indisprimary
+             where a.attrelid = 'public.order_line_totals'::regclass and i.indisprimary
              order by array_position(i.indkey, a.attnum)",
             &[],
         )

@@ -565,7 +565,7 @@ async fn seed_order_summary(db: &TestDatabase, def: &TransformDef) {
         "public",
         &pk,
         &order_totals_columns,
-        &summary_def.def.source,
+        &summary_def.source_table,
     )
     .await
     .expect("create order_summary table");
@@ -2218,7 +2218,7 @@ async fn seed_two_readers(db: &TestDatabase, client: &Client) {
         "public",
         &pk,
         &source_columns,
-        &prices.def.source,
+        &prices.source_table,
     )
     .await
     .expect("create order_prices table");

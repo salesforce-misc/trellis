@@ -586,7 +586,8 @@ impl super::Backend for SubprocessBackend {
                     // for every definition this suite actually generates,
                     // only) column, matching `sql::read_table`'s single
                     // `pk_col` contract.
-                    let pk = source_primary_key(&self.pool, &def.source).await?;
+                    let source = super::sql::persisted_source(&self.raw, &def.target).await?;
+                    let pk = source_primary_key(&self.pool, &source).await?;
                     let target_columns: Vec<crate::model::Column> =
                         std::iter::once(crate::model::Column {
                             name: pk[0].name.clone(),

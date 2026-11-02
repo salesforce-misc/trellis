@@ -428,7 +428,7 @@ fn render_select(def: &TransformDef, pk_column: &str) -> String {
             format!(
                 "select {} from {}",
                 select_list.join(", "),
-                quote_ident(&def.source)
+                table_sql(&def.source, def.explicit_source_schema.as_deref())
             )
         }
         KeySpace::Aggregate { group_by } => {
@@ -448,11 +448,54 @@ fn render_select(def: &TransformDef, pk_column: &str) -> String {
             format!(
                 "select {} from {} group by {}",
                 select_list.join(", "),
-                quote_ident(&def.source),
+                table_sql(&def.source, def.explicit_source_schema.as_deref()),
                 group_cols.join(", ")
             )
         }
     }
+}
+
+/// A table reference for a `FROM`/`JOIN`: `"schema"."table"` when the
+/// schema is known, the bare quoted name otherwise. A column reference
+/// qualified by the bare table name (`"fa"."k"`) still reads it.
+fn table_sql(table: &str, schema: Option<&str>) -> String {
+    match schema {
+        Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(table)),
+        None => quote_ident(table),
+    }
+}
+
+/// `def` with its source and a `JOIN`'s joined table qualified the way the
+/// catalog persisted them at define, or `def` as it is when it isn't
+/// installed. The oracle reads on a Trellis connection, whose `search_path`
+/// holds Trellis's schema alone, so a bare name the definition resolved
+/// through the target schema or `public` wouldn't resolve there.
+async fn as_persisted(
+    client: &tokio_postgres::Client,
+    def: &TransformDef,
+) -> Result<TransformDef, OracleError> {
+    let mut def = def.clone();
+    let Some(row) = client
+        .query_opt(
+            "select source_table, join_table from transform_definitions \
+             where split_part(target_table, '.', 2) = $1",
+            &[&def.target],
+        )
+        .await?
+    else {
+        return Ok(def);
+    };
+    let schema_of = |qualified: &str| qualified.split_once('.').map(|(s, _)| s.to_string());
+    if def.explicit_source_schema.is_none() {
+        def.explicit_source_schema = schema_of(row.get::<_, &str>(0));
+    }
+    if let (KeySpace::Join(join) | KeySpace::JoinOneToOne(join), Some(joined)) =
+        (&mut def.key_space, row.get::<_, Option<&str>>(1))
+        && join.explicit_right_schema.is_none()
+    {
+        join.explicit_right_schema = schema_of(joined);
+    }
+    Ok(def)
 }
 
 /// Runs `def` rendered as a `SELECT` (see [`render_select`]) in `pool`'s
@@ -473,8 +516,9 @@ pub async fn sql_oracle(
     def: &TransformDef,
     pk_column: &str,
 ) -> Result<Rows, OracleError> {
-    let sql = render_select(def, pk_column);
     let client = pool.get().await?;
+    let def = &as_persisted(&client, def).await?;
+    let sql = render_select(def, pk_column);
     let db_rows = client.query(sql.as_str(), &[]).await?;
 
     match &def.key_space {
@@ -847,12 +891,15 @@ pub fn field_types(
 ///
 /// If `def` isn't a `JOIN`.
 pub fn render_join_select(def: &TransformDef) -> String {
-    render_join_select_over(def, &|table| quote_ident(table))
+    render_join_select_over(def, &table_sql)
 }
 
 /// [`render_join_select`] with each side read from `relation(table)`: the
 /// table itself, or a subquery aliased to its name ([`chained_relation`]).
-fn render_join_select_over(def: &TransformDef, relation: &dyn Fn(&str) -> String) -> String {
+fn render_join_select_over(
+    def: &TransformDef,
+    relation: &dyn Fn(&str, Option<&str>) -> String,
+) -> String {
     let KeySpace::Join(join) = &def.key_space else {
         panic!("render_join_select: {:?} is not a JOIN", def.target);
     };
@@ -892,12 +939,12 @@ fn render_join_select_over(def: &TransformDef, relation: &dyn Fn(&str) -> String
     format!(
         "select {} from {} {} {} on {} group by {}",
         select.join(", "),
-        relation(&def.source),
+        relation(&def.source, def.explicit_source_schema.as_deref()),
         match join.kind {
             trellis::dev::defs::ast::JoinKind::Inner => "join",
             trellis::dev::defs::ast::JoinKind::Left => "left join",
         },
-        relation(&join.right),
+        relation(&join.right, join.explicit_right_schema.as_deref()),
         on.join(" and "),
         group_by.join(", ")
     )
@@ -913,7 +960,7 @@ fn render_join_select_over(def: &TransformDef, relation: &dyn Fn(&str) -> String
 ///
 /// If `def` isn't a 1-1 `JOIN`.
 pub fn render_join_one_to_one_select(def: &TransformDef, pk_column: &str) -> String {
-    render_join_one_to_one_select_over(def, pk_column, &|table| quote_ident(table))
+    render_join_one_to_one_select_over(def, pk_column, &table_sql)
 }
 
 /// [`render_join_one_to_one_select`] with each side read from
@@ -921,7 +968,7 @@ pub fn render_join_one_to_one_select(def: &TransformDef, pk_column: &str) -> Str
 fn render_join_one_to_one_select_over(
     def: &TransformDef,
     pk_column: &str,
-    relation: &dyn Fn(&str) -> String,
+    relation: &dyn Fn(&str, Option<&str>) -> String,
 ) -> String {
     let KeySpace::JoinOneToOne(join) = &def.key_space else {
         panic!(
@@ -953,12 +1000,12 @@ fn render_join_one_to_one_select_over(
     format!(
         "select {} from {} {} {} on {}",
         select.join(", "),
-        relation(&def.source),
+        relation(&def.source, def.explicit_source_schema.as_deref()),
         match join.kind {
             trellis::dev::defs::ast::JoinKind::Inner => "join",
             trellis::dev::defs::ast::JoinKind::Left => "left join",
         },
-        relation(&join.right),
+        relation(&join.right, join.explicit_right_schema.as_deref()),
         on.join(" and "),
     )
 }
@@ -1035,12 +1082,13 @@ fn render_join_expr(expr: &Expr) -> String {
 async fn join_sql_oracle(
     pool: &Pool,
     def: &TransformDef,
-    relation: &dyn Fn(&str) -> String,
+    relation: &dyn Fn(&str, Option<&str>) -> String,
 ) -> Result<Rows, OracleError> {
     let KeySpace::Join(join) = &def.key_space else {
         unreachable!("join_sql_oracle is only called on a JOIN");
     };
     let client = pool.get().await?;
+    let def = &as_persisted(&client, def).await?;
     let db_rows = client
         .query(render_join_select_over(def, relation).as_str(), &[])
         .await?;
@@ -1071,9 +1119,10 @@ async fn join_one_to_one_sql_oracle(
     pool: &Pool,
     def: &TransformDef,
     pk_column: &str,
-    relation: &dyn Fn(&str) -> String,
+    relation: &dyn Fn(&str, Option<&str>) -> String,
 ) -> Result<Rows, OracleError> {
     let client = pool.get().await?;
+    let def = &as_persisted(&client, def).await?;
     let db_rows = client
         .query(
             render_join_one_to_one_select_over(def, pk_column, relation).as_str(),
@@ -1144,23 +1193,32 @@ pub fn one_to_one_target_table(def: &TransformDef, source: &Table) -> Table {
     }
 }
 
-/// How a `JOIN`'s oracle reads `table`: the table itself, or, when it is the
+/// How a `JOIN`'s oracle reads `table` (qualified by `schema` when known, as
+/// [`table_sql`]): the table itself, or, when it is the
 /// target of a plain 1-1 definition in `upstreams`, that definition's own
 /// query over its source, aliased to the target's name. So a `JOIN` over
 /// another definition's target is checked against its query written over the
 /// upstream's query, which holds once both have converged, and an upstream
-/// target that went wrong can't hide the `JOIN`'s own divergence.
+/// target that went wrong can't hide the `JOIN`'s own divergence. An
+/// upstream's source is read through its `explicit_source_schema`, so
+/// `upstreams` come from [`as_persisted`] when the session's `search_path`
+/// is Trellis's schema alone.
 ///
 /// # Panics
 ///
 /// If an upstream's source isn't one of `program`'s tables: a chain of more
 /// than one hop is outside what the generator draws.
-pub fn chained_relation(program: &Program, upstreams: &[TransformDef], table: &str) -> String {
+pub fn chained_relation(
+    program: &Program,
+    upstreams: &[TransformDef],
+    table: &str,
+    schema: Option<&str>,
+) -> String {
     let Some(upstream) = upstreams
         .iter()
         .find(|d| d.target == table && matches!(d.key_space, KeySpace::OneToOne))
     else {
-        return quote_ident(table);
+        return table_sql(table, schema);
     };
     let source = program
         .tables
@@ -1184,9 +1242,26 @@ pub fn chained_relation(program: &Program, upstreams: &[TransformDef], table: &s
     format!(
         "(select {} from {}) as {}",
         select.join(", "),
-        quote_ident(&source.name),
+        table_sql(&source.name, upstream.explicit_source_schema.as_deref()),
         quote_ident(table)
     )
+}
+
+/// `upstreams` with each source qualified the way the catalog persisted it
+/// ([`as_persisted`]).
+async fn persisted_upstreams(
+    pool: &Pool,
+    upstreams: &[TransformDef],
+) -> Result<Vec<TransformDef>, OracleError> {
+    if upstreams.is_empty() {
+        return Ok(Vec::new());
+    }
+    let client = pool.get().await?;
+    let mut persisted = Vec::with_capacity(upstreams.len());
+    for upstream in upstreams {
+        persisted.push(as_persisted(&client, upstream).await?);
+    }
+    Ok(persisted)
 }
 
 /// [`check`] for a definition that may read the target of a plain 1-1
@@ -1200,7 +1275,9 @@ pub async fn check_over(
     source_columns: &HashMap<String, ValueType>,
     target: &Rows,
 ) -> Result<OracleReport, OracleError> {
-    let relation = |table: &str| chained_relation(program, upstreams, table);
+    let upstreams = persisted_upstreams(pool, upstreams).await?;
+    let relation =
+        |table: &str, schema: Option<&str>| chained_relation(program, &upstreams, table, schema);
     // A `JOIN`'s oracle is its own `JOIN … GROUP BY` query over the
     // two tables, compared byte for byte.
     if matches!(def.key_space, KeySpace::Join(_)) {

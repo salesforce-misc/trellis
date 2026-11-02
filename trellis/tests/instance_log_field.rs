@@ -95,8 +95,8 @@ async fn every_engine_event_names_its_own_instance() {
 
     let raw = db.pool.get().await.expect("connection");
     raw.batch_execute(
-        "create table a_src (id bigint primary key, price numeric); \
-         create table b_src (id bigint primary key, price numeric)",
+        "create table public.a_src (id bigint primary key, price numeric); \
+         create table public.b_src (id bigint primary key, price numeric)",
     )
     .await
     .expect("create the sources");

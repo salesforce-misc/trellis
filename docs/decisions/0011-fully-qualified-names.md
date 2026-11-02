@@ -26,8 +26,9 @@ once, at definition-acceptance time, and persists that qualified form as the
 reference's identity. It never persists or re-resolves the bare spelling.**
 
 1. **Definitions persist qualified names.** A bare name is resolved exactly once
-   using PostgreSQL's `search_path` semantics — first schema with a matching
-   table wins — and the qualified result, not the bare spelling, is persisted.
+   using PostgreSQL's `search_path` semantics over Trellis's schema, the target
+   schema and `public`, in that order — first schema with a matching table wins
+   — and the qualified result, not the bare spelling, is persisted.
 
 2. **The dependency graph keys on qualified identity.** `public.posts` and
    `archive.posts` are distinct nodes with independent edges, versions, and
@@ -67,9 +68,9 @@ the repeated work, extending to identity the resolve-once reasoning
 ## Consequences
 
 * **The schema-confusion bug class is closed by construction.** Resolution
-  happens once, in the session whose `search_path` the bare name is meant to
-  read against; nothing downstream re-resolves, so no later step can bind the
-  same definition to a different object.
+  happens once, against the configured list of schemas the bare name is meant
+  to read against; nothing downstream re-resolves, so no later step can bind
+  the same definition to a different object.
 
 * **Same-named tables in different schemas are distinct definitions,** with no
   shared identity to confuse.

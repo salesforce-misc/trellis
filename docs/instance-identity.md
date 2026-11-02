@@ -24,9 +24,10 @@ Trellis owns lives in `public` or under unqualified names.
 Trellis qualifies its records under a schema named `trellis` by default,
 configurable via the `TRELLIS_SCHEMA` environment variable.
 
-The schema is created if absent when migrations run, and the connection pool
-pins `search_path` to it on every connection, so Trellis's own SQL never
-qualifies names by hand. Resolution and defaulting live in
+The schema is created if absent when migrations run, and every connection
+Trellis opens pins `search_path` to it alone, so Trellis's own SQL never
+qualifies its own names by hand, and nothing a user creates in another schema
+is on the path (sources and targets are always schema-qualified). Resolution and defaulting live in
 `trellis/src/config.rs` (`DEFAULT_SCHEMA`); the `search_path` seam lives in
 `trellis/src/pool.rs`. `Config::schema()` exposes the resolved schema, and
 `Config`'s `Display` impl gives a one-line summary for logging.

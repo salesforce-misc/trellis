@@ -101,8 +101,14 @@ connection Trellis opens pins the output settings
 [type support](../type-support.md#text-rendering) lists (`DateStyle`,
 `IntervalStyle`, `TimeZone`, `extra_float_digits` and the rest),
 `timezone_abbreviations`, so `AT TIME ZONE 'UTC'` reads `'UTC'` the same way
-everywhere, and `search_path`, to Trellis's schema, the target schema and
-`public`, after the implicit `pg_catalog`. What can't be pinned per session, such as
+everywhere, and `search_path`, to Trellis's schema alone. Postgres searches
+`pg_catalog` first when the path doesn't list it, but a better argument-type
+match beats schema order, so a user's `public.strpos(varchar, text)` or
+`public.+(numeric, integer)` on the path would win over the built-in an
+expression means, and `IS DISTINCT FROM` looks up `=` through the path and
+can't be qualified. With only Trellis's schema on the path, which holds no
+functions or operators, built-ins can't be shadowed; Trellis's SQL
+schema-qualifies every source and target table instead. What can't be pinned per session, such as
 a column's collation for text ordering, or the time zone database behind
 `'America/New_York'`, is refused.
 

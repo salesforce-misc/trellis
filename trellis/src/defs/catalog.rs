@@ -2912,6 +2912,7 @@ async fn create_definition_inner(
     let def: TransformDef = parse(source_text)?;
     validate_for_define(pool, &def, source_columns).await?;
 
+    let bare_schemas = bare_name_schemas(pool);
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
 
@@ -2952,10 +2953,10 @@ async fn create_definition_inner(
             confirm_qualified_source(&*txn, schema, &def.source).await?;
             crate::intake::qualify(schema, &def.source)?
         }
-        None => match resolve_graph_identity_in_txn(&txn, &def.source).await {
+        None => match resolve_graph_identity_in_txn(&txn, &bare_schemas, &def.source).await {
             // A source the role can't see doesn't resolve.
             Err(err @ CatalogError::SourceTableNotFound(_)) => {
-                reject_inaccessible_table(&*txn, None, &def.source).await?;
+                reject_inaccessible_table(&*txn, &bare_schemas, &def.source).await?;
                 return Err(err);
             }
             result => result?,
@@ -2976,9 +2977,10 @@ async fn create_definition_inner(
                     confirm_qualified_source(&*txn, schema, &join.right).await?;
                     crate::intake::qualify(schema, &join.right)?
                 }
-                None => match resolve_graph_identity_in_txn(&txn, &join.right).await {
+                None => match resolve_graph_identity_in_txn(&txn, &bare_schemas, &join.right).await
+                {
                     Err(err @ CatalogError::SourceTableNotFound(_)) => {
-                        reject_inaccessible_table(&*txn, None, &join.right).await?;
+                        reject_inaccessible_table(&*txn, &bare_schemas, &join.right).await?;
                         return Err(err);
                     }
                     result => result?,
@@ -3618,10 +3620,37 @@ pub(crate) async fn capture_readers(
         .collect::<Result<Vec<_>, CatalogError>>()
 }
 
-/// Resolves `source_table`'s actual schema the same way Postgres itself
-/// would resolve the bare, unqualified name: the first schema on this
-/// connection's `search_path` (`current_schemas(false)`, in `search_path`
-/// order) that actually has a table by that name. Mirrors `defctl`'s own
+/// The schemas a bare source name in a definition resolves through, in order
+/// (ADR-0011): Trellis's own schema, the configured target schema, then
+/// `public`, as `pool`'s configuration names them.
+///
+/// This is an explicit list rather than the session's `search_path`, which
+/// holds Trellis's schema alone ([`crate::pool::search_path_sql`]), so that
+/// narrowing the path to keep user objects out of Trellis's SQL doesn't
+/// change which table a bare `FROM orders` finds.
+pub(crate) fn bare_name_schemas(pool: &Pool) -> Vec<String> {
+    vec![
+        pool.schema().to_string(),
+        pool.target_schema().to_string(),
+        "public".to_string(),
+    ]
+}
+
+/// The bare-name lookup [`resolve_source_schema_in_txn`] and
+/// [`resolve_source_schema`] run, with the name as `$1` and
+/// [`bare_name_schemas`] as `$2`: the first of those schemas, in order, that
+/// the role has `USAGE` on and that holds a table by that name the role can
+/// see in `information_schema.tables`. The `USAGE` filter is the one
+/// `current_schemas(false)` applies to a session's path.
+const BARE_NAME_LOOKUP_SQL: &str = "select table_schema::text from information_schema.tables \
+     where table_name = $1 and table_schema::text = any($2::text[]) \
+       and pg_catalog.has_schema_privilege(table_schema::text, 'USAGE') \
+     order by pg_catalog.array_position($2::text[], table_schema::text) \
+     limit 1";
+
+/// Resolves `source_table`'s actual schema the way Postgres would resolve the
+/// bare, unqualified name on a path of `schemas` ([`bare_name_schemas`]): the
+/// first of them that actually has a table by that name. Mirrors `defctl`'s own
 /// `source_columns`/`qualified_source_tables` introspection — see
 /// [`create_definition`]'s call site for why this replaced an
 /// `is_target`-based guess.
@@ -3638,16 +3667,11 @@ pub(crate) async fn capture_readers(
 /// [`CatalogError::SourceTableNotFound`].
 async fn resolve_source_schema_in_txn(
     txn: &tokio_postgres::Transaction<'_>,
+    schemas: &[String],
     source_table: &str,
 ) -> Result<String, CatalogError> {
     let row = txn
-        .query_opt(
-            "select table_schema from information_schema.tables \
-             where table_name = $1 and table_schema = any(current_schemas(false)) \
-             order by array_position(current_schemas(false), table_schema) \
-             limit 1",
-            &[&source_table],
-        )
+        .query_opt(BARE_NAME_LOOKUP_SQL, &[&source_table, &schemas])
         .await?;
     row.map(|row| row.get(0))
         .ok_or_else(|| CatalogError::SourceTableNotFound(source_table.to_string()))
@@ -3665,7 +3689,7 @@ async fn resolve_source_schema_in_txn(
 /// Two-step, mirroring the two ways a bare name can already be real:
 ///
 /// 1. The common case: `table` physically exists, so
-///    [`resolve_source_schema_in_txn`]'s `search_path` walk finds it
+///    [`resolve_source_schema_in_txn`]'s walk of [`bare_name_schemas`] finds it
 ///    directly — the same resolution used for `qualified_source`.
 /// 2. `table` instead names another definition's own persisted target
 ///    (`transform_definitions.target_table`) — a legitimate
@@ -3703,9 +3727,10 @@ async fn resolve_source_schema_in_txn(
 /// from a qualified column.
 async fn resolve_graph_identity_in_txn(
     txn: &tokio_postgres::Transaction<'_>,
+    schemas: &[String],
     table: &str,
 ) -> Result<String, CatalogError> {
-    match resolve_source_schema_in_txn(txn, table).await {
+    match resolve_source_schema_in_txn(txn, schemas, table).await {
         Ok(schema) => Ok(crate::intake::qualify(&schema, table)?),
         Err(CatalogError::SourceTableNotFound(_)) => {
             let row = txn
@@ -3726,7 +3751,7 @@ async fn resolve_graph_identity_in_txn(
 }
 
 /// Pooled (non-transaction) counterpart to [`resolve_graph_identity_in_txn`]
-/// — same two-step resolution (physical `search_path` lookup, falling back
+/// — same two-step resolution (physical [`bare_name_schemas`] lookup, falling back
 /// to a live definition's own bare target-suffix), for callers outside a
 /// catalog-owned transaction. `staging::apply::compute`'s
 /// `qualified_schema_node_key` is one caller: a `Recompute` row's `src_table`
@@ -3772,20 +3797,17 @@ fn effective_target_schema<'a>(def: &'a TransformDef, target_schema: &'a str) ->
 }
 
 /// Pooled (non-transaction) counterpart to [`resolve_source_schema_in_txn`],
-/// the `search_path` step of [`resolve_graph_identity`], for callers on plain
+/// the physical-lookup step of [`resolve_graph_identity`], for callers on plain
 /// pooled connections outside a catalog transaction — mirrors
 /// [`column_type`]/[`column_type_in_txn`]'s same pool-vs-txn split. Same
-/// `search_path` walk, same [`CatalogError::SourceTableNotFound`] on no
-/// match.
+/// walk of [`bare_name_schemas`] (from `pool`'s configuration), same
+/// [`CatalogError::SourceTableNotFound`] on no match.
 async fn resolve_source_schema(pool: &Pool, source_table: &str) -> Result<String, CatalogError> {
     let client = pool.get().await?;
     let row = client
         .query_opt(
-            "select table_schema from information_schema.tables \
-             where table_name = $1 and table_schema = any(current_schemas(false)) \
-             order by array_position(current_schemas(false), table_schema) \
-             limit 1",
-            &[&source_table],
+            BARE_NAME_LOOKUP_SQL,
+            &[&source_table, &bare_name_schemas(pool)],
         )
         .await?;
     row.map(|row| row.get(0))
@@ -3793,10 +3815,10 @@ async fn resolve_source_schema(pool: &Pool, source_table: &str) -> Result<String
 }
 
 /// Refuses `table` with [`CatalogError::TableNotAccessible`] when it exists
-/// but the role this session runs as can't use it. `schema`
-/// names the schema a qualified reference spelled; `None` looks where a bare
-/// name would resolve, the schemas this session's `search_path` setting
-/// lists.
+/// but the role this session runs as can't use it. `schemas` is where to
+/// look, in order: the one schema a qualified reference spelled, or, for a
+/// bare name, [`bare_name_schemas`], whether or not the role has `USAGE` on
+/// them.
 ///
 /// The lookup reads `pg_class` and `pg_namespace`, which show every relation
 /// whatever the role's privileges, because the two places a name resolves
@@ -3814,21 +3836,9 @@ async fn resolve_source_schema(pool: &Pool, source_table: &str) -> Result<String
 /// ([`resolve_graph_identity`]) never calls it.
 pub(crate) async fn reject_inaccessible_table(
     client: &impl GenericClient,
-    schema: Option<&str>,
+    schemas: &[String],
     table: &str,
 ) -> Result<(), CatalogError> {
-    let schemas = match schema {
-        Some(schema) => vec![schema.to_string()],
-        None => {
-            let row = client
-                .query_one(
-                    "select current_setting('search_path'), current_user::text",
-                    &[],
-                )
-                .await?;
-            search_path_schemas(row.get(0), row.get(1))
-        }
-    };
     let Some(row) = client
         .query_opt(
             "select n.nspname::text, current_user::text, pg_get_userbyid(c.relowner)::text, \
@@ -3869,54 +3879,14 @@ pub(crate) async fn reject_inaccessible_table(
     })
 }
 
-/// The schemas a `search_path` setting lists, in order, the way Postgres
-/// splits it (`SplitIdentifierString`): comma-separated, a double-quoted
-/// element taken as written (`""` is a quote), an unquoted one with its ASCII
-/// letters lowercased, and `$user` read as `user`. Schemas that don't exist
-/// are kept; the caller matches them against `pg_namespace`. Postgres also
-/// truncates a name to 63 bytes, which this doesn't: an over-long name just
-/// matches nothing, so the caller's not-found stands.
-fn search_path_schemas(setting: &str, user: &str) -> Vec<String> {
-    let mut schemas = Vec::new();
-    let mut chars = setting.chars().peekable();
-    loop {
-        while chars.next_if(|c| c.is_whitespace()).is_some() {}
-        let Some(&first) = chars.peek() else { break };
-        let mut name = String::new();
-        if first == '"' {
-            chars.next();
-            while let Some(c) = chars.next() {
-                if c == '"' && chars.next_if_eq(&'"').is_none() {
-                    break;
-                }
-                name.push(c);
-            }
-        } else {
-            // `downcase_identifier`: ASCII only, in a UTF-8 database.
-            while let Some(c) = chars.next_if(|c| *c != ',' && !c.is_whitespace()) {
-                name.push(c.to_ascii_lowercase());
-            }
-        }
-        schemas.push(if name == "$user" {
-            user.to_string()
-        } else {
-            name
-        });
-        while chars.next_if(|c| *c != ',').is_some() {}
-        if chars.next().is_none() {
-            break;
-        }
-    }
-    schemas
-}
-
 /// [`resolve_source_for_install`] for a definition being defined: a bare
 /// source that doesn't resolve because the role can't see it is refused as
 /// [`CatalogError::TableNotAccessible`] rather than not found.
 async fn resolve_source_to_define(pool: &Pool, def: &TransformDef) -> Result<String, CatalogError> {
     match resolve_source_for_install(pool, def).await {
         Err(err @ CatalogError::SourceTableNotFound(_)) => {
-            reject_inaccessible_table(&**pool.get().await?, None, &def.source).await?;
+            reject_inaccessible_table(&**pool.get().await?, &bare_name_schemas(pool), &def.source)
+                .await?;
             Err(err)
         }
         result => result,
@@ -3935,7 +3905,7 @@ async fn confirm_qualified_source(
     schema: &str,
     table: &str,
 ) -> Result<(), CatalogError> {
-    reject_inaccessible_table(client, Some(schema), table).await?;
+    reject_inaccessible_table(client, &[schema.to_string()], table).await?;
     if !qualified_table_exists(client, schema, table).await? {
         return Err(ValidationError::QualifiedSourceTableNotFound {
             schema: schema.to_string(),
@@ -4285,8 +4255,8 @@ async fn join_columns_of(
 /// (`ddl::source_primary_key`, `ddl::target_table_ddl`) so none of them can
 /// independently re-derive a different answer, and so every physical SQL
 /// builder among them emits the qualified identity rather than a bare
-/// `def.source` left to the executing connection's own `search_path`
-/// (ADR-0011, clause 3: "Every generated statement emits qualified names").
+/// `def.source`, which the executing connection's `search_path` (Trellis's
+/// schema alone) would not find (ADR-0011, clause 3: "Every generated statement emits qualified names").
 ///
 /// `create_definition_inner` (further below) computes its *own* copy inside
 /// its own transaction rather than receiving this one as a parameter — see
@@ -7493,28 +7463,6 @@ mod key_collation_tests {
 #[cfg(test)]
 mod table_not_accessible_tests {
     use super::*;
-
-    #[test]
-    fn a_search_path_splits_the_way_postgres_splits_it() {
-        assert_eq!(
-            search_path_schemas("\"$user\", public", "trellis"),
-            ["trellis", "public"]
-        );
-        assert_eq!(
-            search_path_schemas("trellis,trellis_targets ,  public", "x"),
-            ["trellis", "trellis_targets", "public"]
-        );
-        // Unquoted is lowercased, quoted is kept, and `""` is a quote.
-        assert_eq!(
-            search_path_schemas("App, \"My, \"\"Odd\"\" Schema\", $user", "Who"),
-            ["app", "My, \"Odd\" Schema", "Who"]
-        );
-        // Postgres lowercases only ASCII letters in a UTF-8 database: an
-        // unquoted `É` names schema `É`, not `é`.
-        assert_eq!(search_path_schemas("Éa, éB", "x"), ["Éa", "éb"]);
-        assert_eq!(search_path_schemas("", "x"), Vec::<String>::new());
-        assert_eq!(search_path_schemas("  ", "x"), Vec::<String>::new());
-    }
 
     fn not_accessible(usage: bool, privilege: bool) -> CatalogError {
         CatalogError::TableNotAccessible {

@@ -79,10 +79,11 @@ pub async fn define(
         .await
         .expect("create the definition");
     let def = parse(text).expect("parse");
-    let pk = source_primary_key(&db.pool, &def.source)
+    let source = format!("public.{}", def.source);
+    let pk = source_primary_key(&db.pool, &source)
         .await
         .expect("the source's key");
-    create_target_table(&db.pool, &def, "public", &pk, &columns, &def.source)
+    create_target_table(&db.pool, &def, "public", &pk, &columns, &source)
         .await
         .expect("create the target");
 }

@@ -780,6 +780,24 @@ async fn apply_write(
     Ok(affected)
 }
 
+/// The qualified source table the catalog persisted for the definition
+/// whose target is `target` (bare), read on `raw`, whose `search_path` lists
+/// the instance schema first. A bare `def.source` is no good to the engine's
+/// helpers: no Trellis session has the target schema or `public` on its
+/// `search_path` to resolve it.
+pub(super) async fn persisted_source(
+    raw: &tokio_postgres::Client,
+    target: &str,
+) -> Result<String, tokio_postgres::Error> {
+    raw.query_one(
+        "select source_table from transform_definitions \
+         where split_part(target_table, '.', 2) = $1",
+        &[&target],
+    )
+    .await
+    .map(|row| row.get(0))
+}
+
 /// Reads `qualified_table` back as text, ordered by `pk_col`, into `pk ->
 /// column -> value`.
 pub(super) async fn read_table(

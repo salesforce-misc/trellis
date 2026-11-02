@@ -3,15 +3,12 @@
 //! [`Pool::new`] wires up a `deadpool_postgres::Pool` from a resolved
 //! [`Config`] and attaches a per-connection session bootstrap hook (via
 //! deadpool's `post_create` hook). That hook pins `search_path` to the
-//! configured Trellis schema followed by the configured target schema (see
-//! `Config::target_schema`), so migrations and staging objects land in the
-//! Trellis schema and transform target tables resolve without every query
-//! needing to qualify table names, while [`crate::defs::ddl`] still
-//! schema-qualifies target-table DDL explicitly (`search_path` only decides
-//! where an *unqualified* `CREATE TABLE` lands, and that must be the
-//! Trellis schema, not the target schema, for the rest of this module's
-//! unqualified references to Trellis's own objects to keep resolving
-//! correctly).
+//! configured Trellis schema alone ([`search_path_sql`]), so migrations and
+//! staging objects land in the Trellis schema and Trellis's own objects
+//! resolve unqualified, while every source and target table is
+//! schema-qualified in the SQL that names it (ADR-0011): no user object in
+//! `public` or the target schema is on the path, so none can shadow a
+//! built-in function or operator a rendered expression calls.
 //!
 //! Beyond `search_path`, the hook also pins the output GUCs that make a
 //! value's text rendering depend on the value alone rather than on the
@@ -376,8 +373,7 @@ pub struct Pool {
     /// [`Pool::schema`].
     schema: String,
     /// A copy of the [`Config::target_schema`] this pool was built from —
-    /// see [`Pool::target_schema`]. [`Pool::connect_unpooled`] bootstraps
-    /// its connection's `search_path` with it.
+    /// see [`Pool::target_schema`].
     target_schema: String,
     /// The name this pool's instance logs under ([`crate::instance_log`]),
     /// for the drivers [`Pool::connect_unpooled`] spawns.
@@ -482,13 +478,11 @@ impl Pool {
         let manager = Manager::from_config(pg_config.clone(), tls.clone(), manager_config);
 
         let schema = config.schema().to_string();
-        let target_schema = config.target_schema().to_string();
         let inner = DeadpoolPool::builder(manager)
             .post_create(Hook::async_fn(move |client, _metrics| {
                 let schema = schema.clone();
-                let target_schema = target_schema.clone();
                 Box::pin(async move {
-                    session_bootstrap(client, &schema, &target_schema)
+                    session_bootstrap(client, &schema)
                         .await
                         .map_err(HookError::Backend)
                 })
@@ -634,7 +628,7 @@ impl Pool {
                 }
             },
         ));
-        session_bootstrap(&mut client, &self.schema, &self.target_schema).await?;
+        session_bootstrap(&mut client, &self.schema).await?;
         // Closed when dropped, so nothing to reset: a call's deadline simply
         // ends with the connection.
         if let Some(deadline) = crate::deadline::current() {
@@ -646,7 +640,7 @@ impl Pool {
     }
 
     /// The [`Config::schema`] this pool was built with: the instance's own
-    /// catalog schema, first on every connection's `search_path`. Trellis's
+    /// catalog schema, the only one on every connection's `search_path`. Trellis's
     /// internal tables that DDL creates at runtime rather than a migration
     /// (an aggregate's or a `JOIN`'s hidden tables) are qualified with it
     /// explicitly.
@@ -654,9 +648,9 @@ impl Pool {
         &self.schema
     }
 
-    /// The [`Config::target_schema`] this pool was built with (ADR-0011) — the same
-    /// value baked into every connection's own `search_path` by [`session_bootstrap`]
-    /// above, and the same value every real caller of
+    /// The [`Config::target_schema`] this pool was built with (ADR-0011): the
+    /// schema a bare source name resolves through after Trellis's own
+    /// ([`crate::defs::catalog::bare_name_schemas`]), and the same value every real caller of
     /// [`crate::defs::install_definition`] already passes as its own `target_schema`
     /// argument (that argument and this one are never meant to diverge;
     /// `install_definition` still takes its own explicit parameter rather than reading
@@ -667,8 +661,7 @@ impl Pool {
     /// [`crate::defs::catalog::create_definition_without_backfill`] — the test-fixture
     /// entry points, which take no `target_schema` parameter of their own — can qualify
     /// a definition's target table the same way, without widening their public
-    /// signature. Gated like its only callers.
-    #[cfg(any(test, feature = "test-util"))]
+    /// signature.
     pub(crate) fn target_schema(&self) -> &str {
         &self.target_schema
     }
@@ -941,34 +934,54 @@ pub(crate) const JIT_OFF: &str = "set jit to off";
 pub(crate) const READ_COMMITTED: &str = "set default_transaction_isolation to 'read committed'";
 
 /// Runs once per physical connection, right after it's established and
-/// before it's returned to any caller.
-///
-/// Pins `search_path` to `schema` (first, so unqualified references to
-/// Trellis's own objects always resolve there) followed by `target_schema`
-/// (so unqualified reads/writes against a transform target table resolve
-/// even when it lives outside both `schema` and `public`) and `public`
-/// (Postgres's own default, kept last as a fallback for anything that
-/// depends on it today), plus [`DETERMINISTIC_TEXT_OUTPUT_GUCS`],
-/// [`EXPRESSION_INPUT_GUCS`], [`ROW_SECURITY_OFF`], [`JIT_OFF`], [`READ_COMMITTED`], the server-side
+/// before it's returned to any caller: [`session_setup`] with the server-side
 /// TCP keepalives ([`tcp_keepalive_gucs`], without the user timeout: see
-/// [`DeadPeerDetection::KeepalivesOnly`]) and the session's
-/// `lock_timeout` cap ([`crate::locks::session_lock_timeout_sql`], ADR-0002
-/// I7).
+/// [`DeadPeerDetection::KeepalivesOnly`]).
 async fn session_bootstrap(
     client: &mut tokio_postgres::Client,
     schema: &str,
-    target_schema: &str,
 ) -> Result<(), tokio_postgres::Error> {
     client
-        .batch_execute(&format!(
-            "set search_path to {}, {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; \
-             {EXPRESSION_INPUT_GUCS}; {ROW_SECURITY_OFF}; {JIT_OFF}; {READ_COMMITTED}; {}; {}",
-            quote_ident(schema),
-            quote_ident(target_schema),
-            tcp_keepalive_gucs(DeadPeerDetection::KeepalivesOnly),
-            crate::locks::session_lock_timeout_sql()
-        ))
+        .batch_execute(&session_setup(schema, DeadPeerDetection::KeepalivesOnly))
         .await
+}
+
+/// The session setup every Trellis connection runs before its first use.
+///
+/// Pins `search_path` to `schema` alone ([`search_path_sql`]), plus [`DETERMINISTIC_TEXT_OUTPUT_GUCS`],
+/// [`EXPRESSION_INPUT_GUCS`], [`ROW_SECURITY_OFF`], [`JIT_OFF`], [`READ_COMMITTED`], the server-side
+/// TCP keepalives ([`tcp_keepalive_gucs`]) as `detection` says, and the
+/// session's `lock_timeout` cap ([`crate::locks::session_lock_timeout_sql`],
+/// ADR-0002 I7).
+fn session_setup(schema: &str, detection: DeadPeerDetection) -> String {
+    format!(
+        "{}; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; {EXPRESSION_INPUT_GUCS}; {ROW_SECURITY_OFF}; \
+         {JIT_OFF}; {READ_COMMITTED}; {}; {}",
+        search_path_sql(schema),
+        tcp_keepalive_gucs(detection),
+        crate::locks::session_lock_timeout_sql()
+    )
+}
+
+/// `set search_path` to Trellis's own schema alone.
+///
+/// Every statement Trellis runs either names a relation in its own schema
+/// unqualified (its catalog, the ring, the hidden tables) or schema-qualifies
+/// it (a source, a target: ADR-0011), so nothing it runs needs another schema
+/// on the path. Keeping `public` and the target schema off it is what keeps a
+/// user's objects out of Trellis's SQL: Postgres searches `pg_catalog` first
+/// when the path doesn't list it, but an argument-type match beats schema
+/// order, so a `public.strpos(varchar, text)` or `public.+(numeric, integer)`
+/// on the path would win over the built-in a rendered expression means (and
+/// `IS DISTINCT FROM` looks up `=` through the path and can't be qualified).
+/// With only Trellis's schema listed, only objects in it can compete, and
+/// Trellis creates no functions or operators there.
+///
+/// A bare source name in a definition resolves through
+/// [`crate::defs::catalog::bare_name_schemas`]'s explicit list instead, never
+/// through this path.
+pub(crate) fn search_path_sql(schema: &str) -> String {
+    format!("set search_path to {}", quote_ident(schema))
 }
 
 // ---------------------------------------------------------------------
@@ -1185,20 +1198,10 @@ pub(crate) type DedicatedConnection = tokio_postgres::Connection<
 >;
 
 /// The session setup a dedicated connection runs straight after
-/// [`connect_dedicated`], mirroring what [`session_bootstrap`] does for a
-/// pooled one: `search_path` pinned to `schema` then `public`,
-/// [`DETERMINISTIC_TEXT_OUTPUT_GUCS`], [`EXPRESSION_INPUT_GUCS`],
-/// [`ROW_SECURITY_OFF`], [`JIT_OFF`],
-/// [`READ_COMMITTED`], [`tcp_keepalive_gucs`] with the user timeout, and
-/// the `lock_timeout` cap ([`crate::locks::session_lock_timeout_sql`]).
+/// [`connect_dedicated`]: [`session_setup`], as [`session_bootstrap`] runs it
+/// for a pooled one, with [`tcp_keepalive_gucs`] including the user timeout.
 pub(crate) fn dedicated_session_setup(schema: &str) -> String {
-    format!(
-        "set search_path to {}, public; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; \
-         {EXPRESSION_INPUT_GUCS}; {ROW_SECURITY_OFF}; {JIT_OFF}; {READ_COMMITTED}; {}; {}",
-        quote_ident(schema),
-        tcp_keepalive_gucs(DeadPeerDetection::KeepalivesAndUserTimeout),
-        crate::locks::session_lock_timeout_sql()
-    )
+    session_setup(schema, DeadPeerDetection::KeepalivesAndUserTimeout)
 }
 
 /// Quotes a Postgres identifier for safe interpolation into SQL text.
@@ -1553,7 +1556,8 @@ mod tests {
     async fn session_settings_are_pinned_on_every_session_kind() {
         /// Each setting, the database default this test sets, and the value
         /// every Trellis session pins.
-        const SETTINGS: [(&str, &str, &str); 3] = [
+        const SETTINGS: [(&str, &str, &str); 4] = [
+            ("search_path", "public", "trellis"),
             ("row_security", "on", "off"),
             ("jit", "on", "off"),
             (
@@ -1660,6 +1664,31 @@ mod tests {
         assert_eq!(settings(&mut dedicated).await, pinned, "dedicated");
     }
 
+    /// Every session kind's setup pins `search_path` to Trellis's schema
+    /// alone, with no `public` and no target schema (#1477): a user's
+    /// function or operator in either would otherwise win over the built-in
+    /// a rendered expression calls.
+    #[test]
+    fn session_setup_puts_only_the_trellis_schema_on_the_search_path() {
+        for (kind, sql) in [
+            (
+                "pooled",
+                session_setup("my \"schema", DeadPeerDetection::KeepalivesOnly),
+            ),
+            ("dedicated", dedicated_session_setup("my \"schema")),
+        ] {
+            let statements: Vec<&str> = sql
+                .split("; ")
+                .filter(|statement| statement.contains("search_path"))
+                .collect();
+            assert_eq!(
+                statements,
+                ["set search_path to \"my \"\"schema\""],
+                "{kind}: {sql}"
+            );
+        }
+    }
+
     /// The SQL Trellis writes escapes a string literal by
     /// doubling `'` only ([`quote_literal`],
     /// [`crate::defs::typed_literal::render_sql`]), which assumes
@@ -1695,7 +1724,7 @@ mod tests {
             format!(
                 "select array_agg(e.key || '=' || e.value order by e.key collate \"C\"), \
                         ({})::text \
-                 from t, jsonb_each_text({}) e",
+                 from public.t as t, jsonb_each_text({}) e",
                 crate::defs::typed_literal::render_sql(ValueType::Other(PgType::Bytea), "\\x0102"),
                 crate::staging::apply::row_as_text_jsonb_sql("t", &columns)
             )

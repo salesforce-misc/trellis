@@ -25,19 +25,18 @@ pub struct Definition {
     pub status: StoredStatus,
     /// The persisted, fully-qualified `"schema.table"` form of `def.source`
     /// — `transform_definitions.source_table` read back verbatim (it is
-    /// resolved once, at acceptance time, via `search_path` for a bare
-    /// `FROM`, or trusted outright for an explicit `FROM <schema>.<source>`;
+    /// resolved once, at acceptance time, through
+    /// `catalog::bare_name_schemas` for a bare `FROM`, or trusted outright for an explicit `FROM <schema>.<source>`;
     /// see `catalog::create_definition_inner`'s `qualified_source`).
     ///
     /// **This is the identity every physical SQL-builder that reads the live
     /// source table at backfill/CDC-apply/quarantine-recompute time must use**
     /// (ADR-0011) — never `def.source` alone, which is always bare (see
     /// [`super::ast::TransformDef`]'s own doc comment) and, left unqualified
-    /// in emitted SQL, would silently resolve against whichever schema the
-    /// executing session's pinned `search_path` (`Config::schema`,
-    /// `Config::target_schema`, `"public"` — see `pool::session_bootstrap`)
-    /// happens to carry, not necessarily the schema this definition actually
-    /// resolved against at creation time. `defs::ddl::qualified_source_table`
+    /// in emitted SQL, would resolve against the executing session's pinned
+    /// `search_path` (`Config::schema` alone — see `pool::search_path_sql`),
+    /// not the schema this definition actually resolved against at creation
+    /// time. `defs::ddl::qualified_source_table`
     /// turns this into a directly-interpolatable, independently-quoted DDL/DML
     /// fragment; a `to_regclass($1)`-style introspection query can bind this
     /// string as-is.

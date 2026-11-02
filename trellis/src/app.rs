@@ -1085,24 +1085,29 @@ impl Trellis {
                     // from one that doesn't. A bare name is looked up the way
                     // define resolves it; a table the role can't use is refused
                     // as such rather than as not found.
-                    let (schema, table) = match source_table.split_once('.') {
-                        Some((schema, table)) => (Some(schema), table),
-                        None => (None, source_table),
+                    let (schemas, table, bare) = match source_table.split_once('.') {
+                        Some((schema, table)) => (vec![schema.to_string()], table, false),
+                        None => (
+                            defs::catalog::bare_name_schemas(&self.pool),
+                            source_table,
+                            true,
+                        ),
                     };
+                    // A bare name skips a schema the role lacks `USAGE` on,
+                    // as a path lookup does; a qualified one doesn't.
                     let found = client
                         .query_opt(
-                            "select table_schema from information_schema.tables \
-                             where table_name = $2 \
-                               and (table_schema = $1::text \
-                                    or ($1::text is null \
-                                        and table_schema = any(current_schemas(false)))) \
-                             order by array_position(current_schemas(false), table_schema) \
+                            "select table_schema::text from information_schema.tables \
+                             where table_name = $1 and table_schema::text = any($2::text[]) \
+                               and (not $3::bool \
+                                    or pg_catalog.has_schema_privilege(table_schema::text, 'USAGE')) \
+                             order by pg_catalog.array_position($2::text[], table_schema::text) \
                              limit 1",
-                            &[&schema, &table],
+                            &[&table, &schemas, &bare],
                         )
                         .await?;
                     let Some(row) = found else {
-                        defs::catalog::reject_inaccessible_table(&**client, schema, table).await?;
+                        defs::catalog::reject_inaccessible_table(&**client, &schemas, table).await?;
                         return Err(TrellisError::SourceTableNotFound(source_table.to_string()));
                     };
                     let found_schema: String = row.get(0);
@@ -1783,17 +1788,17 @@ impl Trellis {
     /// definition, and it returns [`TrellisError::SourceTableNotFound`]
     /// eagerly on an empty result, so it must accept both an
     /// explicitly-qualified `FROM <schema>.<table>` naming a table outside
-    /// this connection's `search_path` and a bare `FROM <table>` chaining off
+    /// the schemas a bare name resolves through and a bare `FROM <table>` chaining off
     /// another definition's target explicitly qualified into a non-default
     /// schema, before `install_definition`'s own resolution
     /// (`resolve_source_for_install`) is reached. It resolves the source
     /// the same way `resolve_source_for_install` does — an explicit schema
     /// names that exact relation directly, a bare name goes through
     /// [`defs::catalog::resolve_graph_identity`]'s two-step (physical
-    /// `search_path` lookup, falling back to a live definition's own bare
-    /// target-suffix) — then queries `information_schema.columns` by the
-    /// resolved `table_schema`/`table_name` pair directly, rather than
-    /// walking `search_path` a second time.
+    /// lookup over [`defs::catalog::bare_name_schemas`], falling back to a
+    /// live definition's own bare target-suffix) — then queries
+    /// `information_schema.columns` by the resolved `table_schema`/`table_name`
+    /// pair directly, rather than resolving the bare name a second time.
     ///
     /// The same read finds the source's virtual generated columns, and a
     /// definition that isn't a `JOIN` is refused here if it reads one
@@ -1812,14 +1817,23 @@ impl Trellis {
         let qualified = match explicit_source_schema {
             Some(schema) => {
                 let client = self.pool.get().await?;
-                defs::catalog::reject_inaccessible_table(&**client, Some(schema), source_table)
-                    .await?;
+                defs::catalog::reject_inaccessible_table(
+                    &**client,
+                    &[schema.to_string()],
+                    source_table,
+                )
+                .await?;
                 crate::intake::qualify(schema, source_table).map_err(CatalogError::from)?
             }
             None => match defs::catalog::resolve_graph_identity(&self.pool, source_table).await {
                 Err(err @ CatalogError::SourceTableNotFound(_)) => {
                     let client = self.pool.get().await?;
-                    defs::catalog::reject_inaccessible_table(&**client, None, source_table).await?;
+                    defs::catalog::reject_inaccessible_table(
+                        &**client,
+                        &defs::catalog::bare_name_schemas(&self.pool),
+                        source_table,
+                    )
+                    .await?;
                     return Err(err.into());
                 }
                 result => result?,

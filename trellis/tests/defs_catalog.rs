@@ -1392,7 +1392,7 @@ async fn a_one_to_one_transform_against_a_composite_primary_key_source_is_accept
         .query(
             "select a.attname::text from pg_attribute a
              join pg_index i on i.indrelid = a.attrelid and a.attnum = any(i.indkey)
-             where a.attrelid = 'line_totals'::regclass and i.indisprimary
+             where a.attrelid = 'public.line_totals'::regclass and i.indisprimary
              order by array_position(i.indkey, a.attnum)",
             &[],
         )

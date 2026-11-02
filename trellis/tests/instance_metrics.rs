@@ -92,7 +92,7 @@ async fn a_running_instances_workers_record_under_its_name() {
     let db = cluster.create_empty_database().await;
     let config = Config::with_schema(db.dsn().to_string(), DEFAULT_SCHEMA).expect("schema");
     let raw = db.pool.get().await.expect("connection");
-    raw.batch_execute("create table metric_src (id bigint primary key, price numeric)")
+    raw.batch_execute("create table public.metric_src (id bigint primary key, price numeric)")
         .await
         .expect("create the source");
     let database: String = raw
@@ -122,7 +122,7 @@ async fn a_running_instances_workers_record_under_its_name() {
     )
     .await
     .expect("connect");
-    raw.batch_execute("insert into metric_src values (1, 10)")
+    raw.batch_execute("insert into public.metric_src values (1, 10)")
         .await
         .expect("insert");
     let token = trellis.watermark_token().await.expect("token");

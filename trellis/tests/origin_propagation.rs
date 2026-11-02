@@ -105,7 +105,9 @@ async fn derived_rows_carry_their_source_commits_origin_hop_by_hop() {
         .expect("create source");
 
     // Created while `orders` is empty, so no backfill row joins the ring.
-    let pk = source_primary_key(&db.pool, "orders").await.expect("pk");
+    let pk = source_primary_key(&db.pool, "public.orders")
+        .await
+        .expect("pk");
     for (target, source, columns) in [
         ("hop_a", "orders", ["id", "price"]),
         ("hop_b", "hop_a", ["id", "v"]),
@@ -126,7 +128,7 @@ async fn derived_rows_carry_their_source_commits_origin_hop_by_hop() {
             "public",
             &pk,
             &source_columns,
-            &definition.def.source,
+            &definition.source_table,
         )
         .await
         .unwrap_or_else(|e| panic!("create {target}: {e}"));

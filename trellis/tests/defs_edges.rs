@@ -52,10 +52,11 @@ async fn materialize_chained_target(
     source_columns: &HashMap<String, ValueType>,
 ) {
     let def = parse(dsl).expect("parse dsl for target materialization");
-    let pk = source_primary_key(pool, &def.source)
+    let source = format!("public.{}", def.source);
+    let pk = source_primary_key(pool, &source)
         .await
         .expect("introspect source primary key");
-    create_target_table(pool, &def, "public", &pk, source_columns, &def.source)
+    create_target_table(pool, &def, "public", &pk, source_columns, &source)
         .await
         .expect("materialize chained target table");
 }

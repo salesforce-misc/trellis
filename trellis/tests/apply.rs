@@ -1146,7 +1146,7 @@ async fn a_truncate_clears_every_target_row_but_a_same_batch_post_truncate_inser
         "public",
         &pk,
         &order_totals_columns,
-        &summary_def.def.source,
+        &summary_def.source_table,
     )
     .await
     .expect("create order_summary table");
@@ -1383,7 +1383,7 @@ async fn a_change_propagates_two_hops_downstream_then_stops() {
         "public",
         &pk,
         &order_totals_columns,
-        &summary_def.def.source,
+        &summary_def.source_table,
     )
     .await
     .expect("create order_summary table");

@@ -645,7 +645,8 @@ impl Fixture {
         def: &trellis::dev::defs::ast::TransformDef,
         diverge: &impl Fn(Property, String) -> Divergence,
     ) -> Result<(), Divergence> {
-        let pk = source_primary_key(&self.pool, &def.source)
+        let source = format!("public.{}", def.source);
+        let pk = source_primary_key(&self.pool, &source)
             .await
             .expect("the table's key");
         let target = &def.target;
@@ -655,7 +656,7 @@ impl Fixture {
             "public",
             &pk,
             &self.source_columns,
-            &def.source,
+            &source,
         )
         .await
         {
