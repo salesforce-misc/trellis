@@ -332,3 +332,198 @@ async fn migrate_with_nothing_pending_beside_another_version_changes_nothing() {
     refused(trellis.apply("PAUSE TRANSFORM nothing").await);
     trellis.shutdown().await.expect("shutdown");
 }
+
+/// Rule 8: a binary meets refinery's missing-migration check first, so it
+/// never attaches to a database a newer binary migrated. That holds while a
+/// process of the newer version is live too: `migrate` with nothing of its
+/// own pending refuses there as it does with nothing live, rather than
+/// succeeding and letting this binary take over once the newer one stops.
+#[tokio::test]
+async fn migrate_beside_a_newer_version_still_refuses_its_migrations() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    raw.execute(
+        "insert into refinery_schema_history (version, name, applied_on, checksum) \
+         values (9999, 'from_a_newer_binary', '2026-11-02T00:00:00Z', '1')",
+        &[],
+    )
+    .await
+    .expect("a migration this binary lacks");
+    let trellis = Trellis::connect(config(&db), TrellisOptions::default())
+        .await
+        .expect("connect");
+    let alone = trellis
+        .migrate()
+        .await
+        .expect_err("refinery refuses a database carrying a migration this binary lacks");
+    assert!(alone.to_string().contains("9999"), "{alone}");
+
+    raw.execute(
+        "insert into worker_registry (worker_id, version) values ('trellis-new-1-00', $1)",
+        &[&OTHER],
+    )
+    .await
+    .expect("a live process of the newer version");
+    let beside = trellis
+        .migrate()
+        .await
+        .expect_err("refused beside the newer version too");
+    assert!(beside.to_string().contains("9999"), "{beside}");
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// Two processes of one version never hold each other back, whatever their
+/// roles: a second worker beside a leading one (a rolling deploy of the same
+/// release, or a restart beside the old process's row) takes over, the
+/// leader's lock matched to its row, and a call goes through.
+#[tokio::test]
+async fn processes_of_one_version_never_stand_by() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    let worker = TrellisOptions {
+        staging: true,
+        drain_threads: 1,
+        ..Default::default()
+    };
+    let leader = Trellis::connect(config(&db), worker.clone())
+        .await
+        .expect("connect the leader");
+    assert!(leader.has_live_staging_worker().await.expect("read"));
+    let second = Trellis::connect(config(&db), worker)
+        .await
+        .expect("connect a second worker");
+    let rows = registry(&raw).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.iter().all(|(_, _, standby)| !standby), "{rows:?}");
+    let pool = trellis::pool::Pool::new(&config(&db)).expect("pool");
+    assert!(
+        handover_pass_as(&pool, &config(&db), "probe")
+            .await
+            .expect("pass"),
+        "the leader's lock is matched to its row of this version"
+    );
+    let err = second
+        .apply("TRANSFORM m_copy FROM m SELECT g AS g")
+        .await
+        .expect_err("there is no source table");
+    assert_ne!(err.code(), ErrorCode::VersionHandover, "{err}");
+    second.shutdown().await.expect("shutdown");
+    leader.shutdown().await.expect("shutdown");
+}
+
+/// `has_live_drain_workers` counts the live rows whose drain threads run and
+/// don't stand by, and a row with no version (a release before 0.2.0, where
+/// only drain workers registered), but not a staging-only process or one that
+/// stands by.
+#[tokio::test]
+async fn has_live_drain_workers_counts_running_drain_threads() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    let trellis = Trellis::connect(config(&db), TrellisOptions::default())
+        .await
+        .expect("connect");
+    raw.batch_execute(&format!(
+        "insert into worker_registry (worker_id, version, staging, drain, standby) values \
+           ('staging-only', '{OTHER}', true, false, false), \
+           ('standing-by', '{OTHER}', false, true, true)"
+    ))
+    .await
+    .expect("rows that drain nothing");
+    assert!(!trellis.has_live_drain_workers().await.expect("read"));
+    raw.execute(
+        "insert into worker_registry (worker_id) values ('trellis-old-1-00')",
+        &[],
+    )
+    .await
+    .expect("a pre-0.2.0 drain worker's row");
+    assert!(trellis.has_live_drain_workers().await.expect("read"));
+    raw.batch_execute(
+        "delete from worker_registry where version is null; \
+         update worker_registry set standby = false where worker_id = 'standing-by'",
+    )
+    .await
+    .expect("the drain worker takes over");
+    assert!(trellis.has_live_drain_workers().await.expect("read"));
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// A background process's pass and `migrate` decide under the instance's
+/// handover lock, so two of them never decide at once: while another session
+/// holds it, neither finishes, and both do once it is released. (A pass that
+/// didn't take the lock would finish at once; one that does can't finish
+/// while it is held, so the timeout only bounds the wait, never the result.)
+#[tokio::test]
+async fn the_pass_and_migrate_wait_for_the_handover_lock() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    let trellis = Trellis::connect(config(&db), TrellisOptions::default())
+        .await
+        .expect("connect");
+    let pool = trellis::pool::Pool::new(&config(&db)).expect("pool");
+    let key = trellis::handover::handover_lock_key(trellis::config::DEFAULT_SCHEMA);
+    raw.execute("select pg_advisory_lock($1)", &[&key])
+        .await
+        .expect("hold the handover lock");
+    let wait = std::time::Duration::from_secs(2);
+    assert!(
+        tokio::time::timeout(wait, handover_pass_as(&pool, &config(&db), "probe"))
+            .await
+            .is_err(),
+        "the pass waits for the lock"
+    );
+    assert!(
+        tokio::time::timeout(wait, trellis.migrate()).await.is_err(),
+        "migrate waits for the lock"
+    );
+    raw.execute("select pg_advisory_unlock($1)", &[&key])
+        .await
+        .expect("release it");
+    assert!(
+        handover_pass_as(&pool, &config(&db), "probe")
+            .await
+            .expect("pass")
+    );
+    trellis.migrate().await.expect("migrate");
+    trellis.shutdown().await.expect("shutdown");
+}
+
+/// Rule 4 at start: a worker that stands by from its first pass never takes
+/// the staging-worker lock, so it installs and seals nothing. The staging
+/// setup, which runs before `connect` returns, and the maintenance loop both
+/// check; were neither to, the lock would be held when it is read here.
+#[tokio::test]
+async fn a_worker_standing_by_from_the_start_takes_no_staging_lock() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    raw.execute(
+        "insert into worker_registry (worker_id) values ('trellis-old-1-00')",
+        &[],
+    )
+    .await
+    .expect("a pre-0.2.0 drain worker's row");
+    let worker = Trellis::connect(
+        config(&db),
+        TrellisOptions {
+            staging: true,
+            drain_threads: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a standby connects without error");
+    assert!(!worker.has_live_staging_worker().await.expect("read"));
+    let rows = registry(&raw).await;
+    assert!(
+        rows.iter()
+            .any(|(id, version, standby)| id != "trellis-old-1-00"
+                && version.is_some()
+                && *standby),
+        "{rows:?}"
+    );
+    worker.shutdown().await.expect("shutdown");
+}

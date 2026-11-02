@@ -63,11 +63,7 @@ pub(crate) async fn migrations_pending(
         .iter()
         .map(|migration| migration.version())
         .collect();
-    let exists: bool = client
-        .query_one("select to_regclass($1) is not null", &[&history])
-        .await?
-        .get(0);
-    if !exists {
+    if !has_history(client, schema).await? {
         return Ok(false);
     }
     let applied: std::collections::HashSet<i32> = client
@@ -77,6 +73,18 @@ pub(crate) async fn migrations_pending(
         .map(|row| row.get(0))
         .collect();
     Ok(carried.iter().any(|version| !applied.contains(version)))
+}
+
+/// Whether `schema` has refinery's history table: it has been migrated.
+async fn has_history(
+    client: &impl tokio_postgres::GenericClient,
+    schema: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    let history = format!("{}.refinery_schema_history", quote_ident(schema));
+    Ok(client
+        .query_one("select to_regclass($1) is not null", &[&history])
+        .await?
+        .get(0))
 }
 
 /// Ensures `config.schema()` exists and is safe to attach to (see
@@ -130,8 +138,9 @@ async fn attach(pg_client: &mut tokio_postgres::Client, config: &Config) -> Resu
 /// [`attach`] once the handover lock is held. Migrations never run while a
 /// Trellis process is live (ADR-0023, rule 3): one is of an older version
 /// than the migrations. While another version is live and nothing is
-/// pending, the attach changes nothing: it runs its checks, and refuses if
-/// the grammar check would pause a definition or the marker would change.
+/// pending, the attach changes nothing: it runs its checks (refinery's among
+/// them), and refuses if the grammar check would pause a definition or the
+/// marker would change.
 async fn attach_under_handover(
     pg_client: &mut tokio_postgres::Client,
     config: &Config,
@@ -147,6 +156,13 @@ async fn attach_under_handover(
             handover::Verdict::StandBy(_) => unreachable!("only a background process stands by"),
         };
     if let Some(seen) = other_version {
+        // Refinery's divergence and missing-migration checks still refuse a
+        // database a newer binary migrated (rule 8). Nothing is pending, so
+        // the run applies and writes nothing; a schema without a history has
+        // nothing to check, and the run would create it.
+        if has_history(&*pg_client, config.schema()).await? {
+            embedded::migrations::runner().run_async(pg_client).await?;
+        }
         let would_pause = crate::defs::grammar::check_stored_versions_dry_run(pg_client).await?;
         if would_pause > 0 || identity::marker_would_change(pg_client, config).await? {
             return Err(Error::OtherVersionLive(seen));

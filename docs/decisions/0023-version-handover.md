@@ -46,7 +46,8 @@ stage, drain or change state side by side.
    migrations is running: `migrate` (and `trellis apply`, which migrates first)
    refuses with the error of rule 6, and a background process waits. With
    nothing pending and another version live, `migrate` changes nothing: it
-   runs its checks and succeeds, or refuses when the attach would write (a
+   runs its checks, refinery's refusal of a missing or changed migration
+   among them, and succeeds, or refuses when the attach would write (a
    grammar-version pause, [ADR-0018](0018-grammar-versioning.md), or a changed
    marker). A background process never migrates; `trellis run` migrates before
    it starts its pipeline, and waits on the refusal.

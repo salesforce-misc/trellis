@@ -44,7 +44,7 @@ const HANDOVER_LOCK_NAMESPACE: u64 = 0x7472_6c73_6876_6572;
 /// two processes starting at once see each other's rows (the second stands by
 /// rather than both taking over), and no process registers while a migration
 /// it would have to wait for runs. Per instance, like the staging lock.
-pub(crate) fn handover_lock_key(schema: &str) -> i64 {
+pub fn handover_lock_key(schema: &str) -> i64 {
     (crate::staging::session::fnv1a_64(schema) ^ HANDOVER_LOCK_NAMESPACE) as i64
 }
 
