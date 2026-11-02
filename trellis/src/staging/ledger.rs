@@ -119,9 +119,11 @@ pub(crate) async fn page_may_predate_build(
 }
 
 /// Raises the truncate floor `key` names (a `ledger_truncate_floor` key) to
-/// `lsn`, if it is below it: a change at or below it is refused, an Apply to a
-/// 1-1 ledger's entry (`super::one_to_one_ledger::raise_floor`) as a staged
-/// side of a group-basis table (`super::group_basis`'s apply).
+/// `lsn`, if it is below it. A change at or below the floor is refused: the
+/// 1-1 ledger's entry writes (`super::one_to_one_ledger`) and a group-basis
+/// table's apply of a staged side (`super::group_basis::GroupTargetPlan`)
+/// read it. A 1-1 ledger raises its floor through
+/// `super::one_to_one_ledger::raise_floor`, a group-basis table directly.
 pub(crate) async fn raise_truncate_floor(
     txn: &Transaction<'_>,
     key: &str,
