@@ -582,8 +582,8 @@ impl From<crate::error::Error> for ApplyError {
 /// ([`crate::staging::target_mutations`]). A bare name is a shape only a
 /// hand-staged fixture (or a durable row from before that qualification)
 /// produces; it resolves through [`catalog::resolve_graph_identity`], which
-/// searches the bare-name schema list and then a live definition's target
-/// suffix. That is a search by name, so no caller holding the qualified
+/// searches the bare-name schema list and then the definitions' target
+/// suffixes. That is a search by name, so no caller holding the qualified
 /// identity should come through here.
 ///
 /// The reading side tolerates a bare name rather than rejecting it: ring
@@ -3158,11 +3158,11 @@ pub(super) async fn compute_page(
         };
         // `&change.src_table` (qualified), not `source_key` — see
         // the by-source loop above's identical comment on its own
-        // `transforms_for_source` call. A `TRUNCATE` is always a real
-        // physical CDC event (never a bare, internally-synthesized
-        // `Recompute` row), so `qualified_schema_node_key` is a no-op here
-        // in practice — routed through it anyway for the same safety the
-        // by-source loop gets, at effectively no cost.
+        // `transforms_for_source` call. A truncate sentinel is only ever
+        // staged by capture, qualified (a cleared upstream target propagates
+        // per-key changes, not a sentinel), so `qualified_schema_node_key` is
+        // a no-op here in practice — routed through it anyway for a
+        // hand-staged bare fixture, as the by-source loop is.
         let defs = catalog::transforms_for_source(
             pool,
             &qualified_schema_node_key(pool, &change.src_table).await?,
@@ -3318,6 +3318,14 @@ pub(super) async fn compute_page(
     // recorded here.
     let mut terminal_end_to_end_origins: HashMap<String, Vec<std::time::SystemTime>> =
         HashMap::new();
+    // Every plan entry is made after its definition's `qualified_targets`
+    // entry; a target missing one would silently lose its terminal sample.
+    debug_assert!(
+        all_targets
+            .iter()
+            .all(|target| qualified_targets.contains_key(*target)),
+        "a planned target has no qualified_targets entry"
+    );
     for (target, qualified_target) in &qualified_targets {
         if !all_targets.contains(target) {
             continue;

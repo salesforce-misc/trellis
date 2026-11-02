@@ -3752,7 +3752,7 @@ async fn resolve_graph_identity_in_txn(
 
 /// Pooled (non-transaction) counterpart to [`resolve_graph_identity_in_txn`]
 /// — same two-step resolution (physical [`bare_name_schemas`] lookup, falling back
-/// to a live definition's own bare target-suffix), for callers outside a
+/// to a definition's own bare target-suffix), for callers outside a
 /// catalog-owned transaction. Step 2 matters to a bare name that is another
 /// definition's target outside the bare-name schemas — a `FROM <target>`
 /// written bare. A caller that already holds a definition's qualified
