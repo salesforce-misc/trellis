@@ -69,11 +69,12 @@ use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, LOG_LEVELS, PlainApplied, PlainBackfillFailure,
     PlainCaptureFailure, PlainCaptureWait, PlainConfig, PlainCorrectingNode, PlainDefinitionStatus,
     PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys,
-    PlainPoisonEntry, PlainQuarantineEntry, PlainSamplePage, PlainSelfCheckJob,
-    PlainSelfCheckReport, PlainSourceIndexGap, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES,
-    SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor, decode_watermark,
-    encode_watermark, index_role_names, quarantine_state_names, require_transform_statement,
-    self_check_mode, system_time_from_epoch_micros, transform_status_names,
+    PlainOtherProcess, PlainPoisonEntry, PlainQuarantineEntry, PlainSamplePage, PlainSelfCheckJob,
+    PlainSelfCheckReport, PlainSourceIndexGap, PlainVersionHandover, SELF_CHECK_MODES,
+    SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor,
+    decode_watermark, encode_watermark, index_role_names, quarantine_state_names,
+    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
+    transform_status_names,
 };
 
 /// What every NIF returns: `{:ok, T}` or `{:error, {code, message}}`.
@@ -227,6 +228,49 @@ struct StatusTerm {
     source_index_gaps: Vec<SourceIndexGapTerm>,
     correcting: Vec<CorrectingNodeTerm>,
     paused_upstream_columns: Vec<String>,
+    build_wait_xid: Option<i64>,
+    version_handover: Option<VersionHandoverTerm>,
+}
+
+/// Another Trellis version is live, so this binary stands by, as `status/2`
+/// reports it.
+#[derive(NifMap)]
+struct VersionHandoverTerm {
+    this_version: String,
+    processes: Vec<OtherProcessTerm>,
+    unregistered_staging_worker: bool,
+    migrations_pending: bool,
+}
+
+impl From<PlainVersionHandover> for VersionHandoverTerm {
+    fn from(seen: PlainVersionHandover) -> Self {
+        VersionHandoverTerm {
+            this_version: seen.this_version,
+            processes: seen
+                .processes
+                .into_iter()
+                .map(OtherProcessTerm::from)
+                .collect(),
+            unregistered_staging_worker: seen.unregistered_staging_worker,
+            migrations_pending: seen.migrations_pending,
+        }
+    }
+}
+
+/// A live process of another version, as `status/2` reports it.
+#[derive(NifMap)]
+struct OtherProcessTerm {
+    worker_id: String,
+    version: Option<String>,
+}
+
+impl From<PlainOtherProcess> for OtherProcessTerm {
+    fn from(process: PlainOtherProcess) -> Self {
+        OtherProcessTerm {
+            worker_id: process.worker_id,
+            version: process.version,
+        }
+    }
 }
 
 /// A node of a partitioned source a definition is being corrected for, as
@@ -987,6 +1031,8 @@ fn status<'a>(
                     .map(CorrectingNodeTerm::from)
                     .collect(),
                 paused_upstream_columns: status.paused_upstream_columns,
+                build_wait_xid: status.build_wait_xid,
+                version_handover: status.version_handover.map(VersionHandoverTerm::from),
             }))
         },
     )

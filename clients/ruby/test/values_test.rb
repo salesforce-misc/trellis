@@ -28,7 +28,8 @@ class ValuesTest < Minitest::Test
       backfill_failure: { source_table: "public.orders", attempts: 3,
                           last_error: "permission denied", next_attempt_at_micros: MICROS },
       capture_wait: nil, capture_failure: nil, held_keys: nil, drain_failure: nil,
-      source_index_gaps: [], correcting: [], paused_upstream_columns: []
+      source_index_gaps: [], correcting: [], paused_upstream_columns: [],
+      build_wait_xid: nil, version_handover: nil
     )
     assert_equal Trellis::Status.new(
       status: :waiting_to_backfill,
@@ -41,7 +42,7 @@ class ValuesTest < Minitest::Test
       held_keys: nil,
       drain_failure: nil,
       source_index_gaps: [],
-      correcting: [], paused_upstream_columns: []
+      correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil
     ), status
   end
 
@@ -54,7 +55,8 @@ class ValuesTest < Minitest::Test
       capture_failure: { kind: :capture, source_table: "public.lines", columns: ["qty"],
                          error: "column \"qty\" was dropped", detected_at_micros: MICROS },
       held_keys: { count: 2, oldest_poisoned_at_micros: MICROS + 2 },
-      drain_failure: nil, source_index_gaps: [], correcting: [], paused_upstream_columns: []
+      drain_failure: nil, source_index_gaps: [], correcting: [], paused_upstream_columns: [],
+      build_wait_xid: nil, version_handover: nil
     )
     assert_equal Trellis::Status.new(
       status: :catching_up, backfill_failure: nil,
@@ -71,7 +73,7 @@ class ValuesTest < Minitest::Test
       held_keys: Trellis::HeldKeys.new(count: 2, oldest_poisoned_at: Trellis::EpochMicros.to_time(MICROS + 2)),
       drain_failure: nil,
       source_index_gaps: [],
-      correcting: [], paused_upstream_columns: []
+      correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil
     ), status
   end
 
@@ -81,7 +83,8 @@ class ValuesTest < Minitest::Test
       drain_failure: { seg_seq: 17, tables: ["public.lines", "public.orders"],
                        error: "permission denied for function audit_hook", sqlstate: "42501",
                        since_micros: MICROS, last_seen_micros: MICROS + 1, attempts: 5 },
-      source_index_gaps: [], correcting: [], paused_upstream_columns: []
+      source_index_gaps: [], correcting: [], paused_upstream_columns: [],
+      build_wait_xid: nil, version_handover: nil
     )
     assert_equal Trellis::DrainFailure.new(
       seg_seq: 17, tables: ["public.lines", "public.orders"],
@@ -120,7 +123,8 @@ class ValuesTest < Minitest::Test
             fix: 'create index on "public"."orders" ("customer_id")' }
     status = Trellis::Status.from_native(
       status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil, held_keys: nil,
-      drain_failure: nil, source_index_gaps: [gap], correcting: [], paused_upstream_columns: []
+      drain_failure: nil, source_index_gaps: [gap], correcting: [], paused_upstream_columns: [],
+      build_wait_xid: nil, version_handover: nil
     )
     assert_equal [Trellis::SourceIndexGap.new(**gap)], status.source_index_gaps
   end
@@ -131,7 +135,7 @@ class ValuesTest < Minitest::Test
       held_keys: nil, drain_failure: nil, source_index_gaps: [],
       correcting: [{ node: "public.items_p1", since_micros: MICROS, keys_remaining: 5 },
                    { node: "public.items_p2", since_micros: MICROS + 1, keys_remaining: nil }],
-      paused_upstream_columns: []
+      paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil
     )
     assert_equal :backfilling, status.status
     assert_equal [
@@ -146,10 +150,45 @@ class ValuesTest < Minitest::Test
     status = Trellis::Status.from_native(
       status: :catching_up, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
       held_keys: nil, drain_failure: nil, source_index_gaps: [],
-      correcting: [], paused_upstream_columns: ["t.total"]
+      correcting: [], paused_upstream_columns: ["t.total"],
+      build_wait_xid: nil, version_handover: nil
     )
     assert_equal :catching_up, status.status
     assert_equal ["t.total"], status.paused_upstream_columns
+  end
+
+  def test_a_build_waiting_on_a_fence_keeps_its_transaction_id
+    status = Trellis::Status.from_native(
+      status: :backfilling, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
+      held_keys: nil, drain_failure: nil, source_index_gaps: [],
+      correcting: [], paused_upstream_columns: [],
+      build_wait_xid: 4_294_967_301, version_handover: nil
+    )
+    assert_equal 4_294_967_301, status.build_wait_xid
+    assert_nil status.version_handover
+  end
+
+  def test_a_version_handover_becomes_a_value_naming_the_other_processes
+    status = Trellis::Status.from_native(
+      status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
+      held_keys: nil, drain_failure: nil, source_index_gaps: [],
+      correcting: [], paused_upstream_columns: [], build_wait_xid: nil,
+      version_handover: {
+        this_version: "0.2.0",
+        processes: [{ worker_id: "trellis-host-17-ab12", version: "0.1.0" },
+                    { worker_id: "trellis-host-18-cd34", version: nil }],
+        unregistered_staging_worker: true, migrations_pending: false
+      }
+    )
+    assert_nil status.build_wait_xid
+    assert_equal Trellis::VersionHandover.new(
+      this_version: "0.2.0",
+      processes: [
+        Trellis::OtherProcess.new(worker_id: "trellis-host-17-ab12", version: "0.1.0"),
+        Trellis::OtherProcess.new(worker_id: "trellis-host-18-cd34", version: nil)
+      ],
+      unregistered_staging_worker: true, migrations_pending: false
+    ), status.version_handover
   end
 
   def test_a_definition_summarys_backfill_failure_becomes_a_backfill_failure

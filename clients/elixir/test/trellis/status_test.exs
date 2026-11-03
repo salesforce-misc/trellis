@@ -25,7 +25,9 @@ defmodule Trellis.StatusTest do
         drain_failure: nil,
         source_index_gaps: [],
         correcting: [],
-        paused_upstream_columns: []
+        paused_upstream_columns: [],
+        build_wait_xid: nil,
+        version_handover: nil
       })
 
     assert %Trellis.Status{
@@ -65,7 +67,9 @@ defmodule Trellis.StatusTest do
         drain_failure: nil,
         source_index_gaps: [],
         correcting: [],
-        paused_upstream_columns: []
+        paused_upstream_columns: [],
+        build_wait_xid: nil,
+        version_handover: nil
       })
 
     assert %Trellis.Status{
@@ -112,7 +116,9 @@ defmodule Trellis.StatusTest do
         },
         source_index_gaps: [],
         correcting: [],
-        paused_upstream_columns: []
+        paused_upstream_columns: [],
+        build_wait_xid: nil,
+        version_handover: nil
       })
 
     assert status.drain_failure == %Trellis.DrainFailure{
@@ -145,7 +151,9 @@ defmodule Trellis.StatusTest do
           }
         ],
         correcting: [],
-        paused_upstream_columns: []
+        paused_upstream_columns: [],
+        build_wait_xid: nil,
+        version_handover: nil
       })
 
     assert status.source_index_gaps == [
@@ -173,7 +181,9 @@ defmodule Trellis.StatusTest do
           %{node: "public.items_p1", since_micros: 1_727_222_400_654_321, keys_remaining: 5},
           %{node: "public.items_p2", since_micros: 1_727_222_400_654_322, keys_remaining: nil}
         ],
-        paused_upstream_columns: ["t.total"]
+        paused_upstream_columns: ["t.total"],
+        build_wait_xid: nil,
+        version_handover: nil
       })
 
     assert status.paused_upstream_columns == ["t.total"]
@@ -190,6 +200,63 @@ defmodule Trellis.StatusTest do
                keys_remaining: nil
              }
            ]
+  end
+
+  test "a build waiting on a fence keeps its transaction id" do
+    status =
+      Trellis.Status.from_native(%{
+        status: :backfilling,
+        backfill_failure: nil,
+        capture_wait: nil,
+        capture_failure: nil,
+        held_keys: nil,
+        drain_failure: nil,
+        source_index_gaps: [],
+        correcting: [],
+        paused_upstream_columns: [],
+        build_wait_xid: 4_294_967_301,
+        version_handover: nil
+      })
+
+    assert status.build_wait_xid == 4_294_967_301
+    assert status.version_handover == nil
+  end
+
+  test "a version handover becomes a struct naming the other processes" do
+    status =
+      Trellis.Status.from_native(%{
+        status: :live,
+        backfill_failure: nil,
+        capture_wait: nil,
+        capture_failure: nil,
+        held_keys: nil,
+        drain_failure: nil,
+        source_index_gaps: [],
+        correcting: [],
+        paused_upstream_columns: [],
+        build_wait_xid: nil,
+        version_handover: %{
+          this_version: "0.2.0",
+          processes: [
+            %{worker_id: "trellis-host-17-ab12", version: "0.1.0"},
+            %{worker_id: "trellis-host-18-cd34", version: nil}
+          ],
+          unregistered_staging_worker: true,
+          migrations_pending: false
+        }
+      })
+
+    assert status.build_wait_xid == nil
+
+    assert status.version_handover == %Trellis.VersionHandover{
+             this_version: "0.2.0",
+             processes: [
+               %Trellis.OtherProcess{worker_id: "trellis-host-17-ab12", version: "0.1.0"},
+               %Trellis.OtherProcess{worker_id: "trellis-host-18-cd34", version: nil}
+             ],
+             unregistered_staging_worker: true,
+             migrations_pending: false
+           }
   end
 
   test "a definition summary's halt becomes a capture failure of kind halt" do

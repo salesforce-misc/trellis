@@ -64,11 +64,12 @@ use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, PlainApplied, PlainBackfillFailure, PlainCaptureFailure,
     PlainCaptureWait, PlainConfig, PlainCorrectingNode, PlainDefinitionStatus,
     PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys,
-    PlainPoisonEntry, PlainQuarantineEntry, PlainSamplePage, PlainSelfCheckJob,
-    PlainSelfCheckReport, PlainSourceIndexGap, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES,
-    SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor, decode_watermark,
-    encode_watermark, index_role_names, quarantine_state_names, require_transform_statement,
-    self_check_mode, system_time_from_epoch_micros, transform_status_names,
+    PlainOtherProcess, PlainPoisonEntry, PlainQuarantineEntry, PlainSamplePage, PlainSelfCheckJob,
+    PlainSelfCheckReport, PlainSourceIndexGap, PlainVersionHandover, SELF_CHECK_MODES,
+    SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor,
+    decode_watermark, encode_watermark, index_role_names, quarantine_state_names,
+    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
+    transform_status_names,
 };
 
 /// What a blocking call produces: its value, or the engine's error as plain
@@ -908,6 +909,10 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
     let source_index_gaps = array(ruby, status.source_index_gaps, source_index_gap_hash)?;
     let correcting = array(ruby, status.correcting, correcting_hash)?;
     let paused_upstream_columns = ruby.ary_from_iter(status.paused_upstream_columns);
+    let version_handover = status
+        .version_handover
+        .map(|seen| version_handover_hash(ruby, seen))
+        .transpose()?;
     record(
         ruby,
         [
@@ -923,6 +928,39 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
                 "paused_upstream_columns",
                 paused_upstream_columns.as_value(),
             ),
+            ("build_wait_xid", ruby.into_value(status.build_wait_xid)),
+            ("version_handover", ruby.into_value(version_handover)),
+        ],
+    )
+}
+
+/// Another Trellis version is live, so this binary stands by.
+fn version_handover_hash(ruby: &Ruby, seen: PlainVersionHandover) -> Result<RHash, Error> {
+    let processes = array(ruby, seen.processes, other_process_hash)?;
+    record(
+        ruby,
+        [
+            ("this_version", ruby.into_value(seen.this_version)),
+            ("processes", processes.as_value()),
+            (
+                "unregistered_staging_worker",
+                ruby.into_value(seen.unregistered_staging_worker),
+            ),
+            (
+                "migrations_pending",
+                ruby.into_value(seen.migrations_pending),
+            ),
+        ],
+    )
+}
+
+/// A live process of another version.
+fn other_process_hash(ruby: &Ruby, process: PlainOtherProcess) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("worker_id", ruby.into_value(process.worker_id)),
+            ("version", ruby.into_value(process.version)),
         ],
     )
 }

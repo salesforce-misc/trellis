@@ -92,15 +92,33 @@ module Trellis
   # over its frozen values, so it is stale against the source. Nothing is
   # paused or rebuilt: resuming the column writes through to the reader and
   # it reads :live again.
+  #
+  # build_wait_xid is set while its build waits on something other than its
+  # own work: the transaction id of a fence. The build's source is another
+  # definition's target, and no chunk runs until every transaction that was
+  # open when the fence was taken has ended (a writer of that target could
+  # otherwise commit after a chunk's snapshot without the build seeing its
+  # rows). Look in pg_stat_activity for a transaction with a backend_xid at
+  # or below it; the wait clears on its own when that transaction ends. nil
+  # when the build waits on nothing.
+  #
+  # version_handover is set while a process of another Trellis version is
+  # live on the instance (a VersionHandover): this process stands by (it
+  # stages, drains and builds nothing) and its state-changing calls raise
+  # VersionHandoverError until the other version is gone. A process killed
+  # without a clean shutdown keeps its row live, and so delays the takeover,
+  # for at most 30 seconds. nil when none is.
   Status = Data.define(:status, :backfill_failure, :capture_wait, :capture_failure,
                        :held_keys, :drain_failure, :source_index_gaps,
-                       :correcting, :paused_upstream_columns) do
+                       :correcting, :paused_upstream_columns,
+                       :build_wait_xid, :version_handover) do
     def self.from_native(hash)
       failure = hash[:backfill_failure]
       wait = hash[:capture_wait]
       capture_failure = hash[:capture_failure]
       held_keys = hash[:held_keys]
       drain_failure = hash[:drain_failure]
+      version_handover = hash[:version_handover]
       new(status: hash[:status],
           backfill_failure: failure && BackfillFailure.from_native(failure),
           capture_wait: wait && CaptureWait.from_native(wait),
@@ -109,9 +127,34 @@ module Trellis
           drain_failure: drain_failure && DrainFailure.from_native(drain_failure),
           source_index_gaps: hash.fetch(:source_index_gaps).map { |g| SourceIndexGap.new(**g) },
           correcting: hash.fetch(:correcting).map { |c| CorrectingNode.from_native(c) },
-          paused_upstream_columns: hash.fetch(:paused_upstream_columns))
+          paused_upstream_columns: hash.fetch(:paused_upstream_columns),
+          build_wait_xid: hash.fetch(:build_wait_xid),
+          version_handover: version_handover && VersionHandover.from_native(version_handover))
     end
   end
+
+  # Another Trellis version is live on the instance, so this process changes
+  # nothing until it is gone, as Trellis.status reports it: this binary's
+  # version (this_version), the live processes holding it back (processes,
+  # OtherProcesses), whether the staging-worker lock is held by a session no
+  # registered process names, which is a staging worker of a release before
+  # 0.2.0 (unregistered_staging_worker), and whether the migrations this
+  # binary carries are pending (migrations_pending), in which case every
+  # live process holds it back, whatever its version.
+  VersionHandover = Data.define(:this_version, :processes, :unregistered_staging_worker,
+                                :migrations_pending) do
+    def self.from_native(hash)
+      new(this_version: hash.fetch(:this_version),
+          processes: hash.fetch(:processes).map { |p| OtherProcess.new(**p) },
+          unregistered_staging_worker: hash.fetch(:unregistered_staging_worker),
+          migrations_pending: hash.fetch(:migrations_pending))
+    end
+  end
+
+  # A live process of another Trellis version, in a VersionHandover: its
+  # worker id (worker_id, trellis-<host>-<pid>-<random>) and its binary's
+  # version (version, nil for a release before 0.2.0, which records none).
+  OtherProcess = Data.define(:worker_id, :version)
 
   # A node of a partitioned source a definition is being corrected for, as
   # Trellis.status reports it: the schema-qualified node (node), when the

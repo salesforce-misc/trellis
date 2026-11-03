@@ -14,11 +14,12 @@
 //! |---|---|---|
 //! | any error's `code()` + `Display` | `(code, message)` | [`PlainError`] |
 //! | [`trellis::DefinitionSummary`] | summary fields + backfill failure + halt | [`PlainDefinitionSummary`] |
-//! | [`trellis::DefinitionStatus`] | status word + backfill failure + capture wait + capture failure + held keys + drain failure + source index gaps + correcting nodes | [`PlainDefinitionStatus`] |
+//! | [`trellis::DefinitionStatus`] | status word + backfill failure + capture wait + capture failure + held keys + drain failure + source index gaps + correcting nodes + build wait xid + version handover | [`PlainDefinitionStatus`] |
 //! | [`trellis::HeldKeys`] | count + oldest poison time | [`PlainHeldKeys`] |
 //! | [`trellis::DrainFailure`] | fields + first and latest failure times | [`PlainDrainFailure`] |
 //! | [`trellis::SourceIndexGap`] | fields + its role as a word + the fix as a `create index` statement | [`PlainSourceIndexGap`] |
 //! | [`trellis::CorrectingNode`] | fields + queue time | [`PlainCorrectingNode`] |
+//! | [`trellis::OtherVersionLive`] / [`trellis::OtherProcess`] | this version + the other processes by worker id and version + two flags | [`PlainVersionHandover`] / [`PlainOtherProcess`] |
 //! | [`trellis::CaptureFailureKind`] | its `as_str()` word | [`PlainCaptureFailure::kind`] / [`capture_failure_kind_names`] |
 //! | `SystemTime` | epoch microseconds | [`epoch_micros`] / [`system_time_from_epoch_micros`] |
 //! | [`trellis::TransformStatus`] / [`trellis::QuarantineState`] | their `as_str()` word | [`transform_status`] / [`quarantine_state`] |
@@ -66,8 +67,8 @@ pub use config::PlainConfig;
 pub use cursor::{decode_cursor, encode_cursor, next_cursor};
 pub use definition::{
     PlainBackfillFailure, PlainCaptureFailure, PlainCaptureWait, PlainCorrectingNode,
-    PlainDefinitionStatus, PlainDefinitionSummary, PlainDrainFailure, PlainSourceIndexGap,
-    capture_failure_kind_names, index_role_names,
+    PlainDefinitionStatus, PlainDefinitionSummary, PlainDrainFailure, PlainOtherProcess,
+    PlainSourceIndexGap, PlainVersionHandover, capture_failure_kind_names, index_role_names,
 };
 pub use error::{CodedError, ERROR_CODES, PlainError};
 pub use log::{

@@ -580,7 +580,8 @@ fence, after it starts, before its first chunk or its one-transaction build: a
 transaction that held a transaction id then (one that had
 written or locked a row) holds it, and `status().build_wait` names the fence
 (`BuildWait::Fence { xid }`, a `backend_xid` at or below it in
-`pg_stat_activity`) until every such transaction has ended
+`pg_stat_activity`; the Elixir and Ruby bindings report the `xid` as
+`build_wait_xid`) until every such transaction has ended
 ([data-flow — The Re-derive build](data-flow.md#the-re-derive-build)). Because
 the wait is on transactions older than the fence anywhere in the cluster, an
 unrelated long-running transaction holds such a build in `backfilling` until
@@ -606,7 +607,8 @@ state-changing calls refuse with the `version_handover` error code, and each
 background process logs a warning once when it starts standing by and an info
 line when it takes over ([version handover](decisions/0023-version-handover.md)).
 A process killed without a clean shutdown keeps counting until its registry row
-ages out, up to the reclaim TTL of 30 seconds.
+ages out, up to the reclaim TTL of 30 seconds. The Elixir and Ruby bindings
+report it as `version_handover`.
 
 ### A build that keeps failing
 

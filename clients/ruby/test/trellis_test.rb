@@ -27,7 +27,8 @@ class TrellisTest < Minitest::Test
     status = await_status("widget_prices")
     assert_equal Trellis::Status.new(status: :live, backfill_failure: nil, capture_wait: nil,
                                      capture_failure: nil, held_keys: nil, drain_failure: nil,
-                                     source_index_gaps: [], correcting: [], paused_upstream_columns: []),
+                                     source_index_gaps: [], correcting: [], paused_upstream_columns: [],
+                                     build_wait_xid: nil, version_handover: nil),
                  status
 
     # The backfill carried the existing row across.

@@ -84,7 +84,15 @@ Nothing in the binding uses it.
   INDEX`. `status` lists the partitions of a partitioned source a definition
   is being corrected for while it reads `:backfilling` for them
   (`correcting`, each a `Trellis::CorrectingNode` with `node`, `since` and
-  `keys_remaining`).
+  `keys_remaining`). `status` names what a Re-derive build waits on instead
+  of its own work (`build_wait_xid`, the transaction id of the fence it
+  waits out, `nil` when it waits on nothing). While a process of another
+  Trellis version is live, `status` reports that this process stands by
+  (`version_handover`, a `Trellis::VersionHandover` with `this_version`,
+  `processes`, each a `Trellis::OtherProcess` with `worker_id` and
+  `version` (`nil` for a release before 0.2.0),
+  `unregistered_staging_worker` and `migrations_pending`), and
+  state-changing calls raise a `version_handover` error until it is gone.
 - `Trellis.request_backfill(source_table)`,
   `Trellis.detect_capture_disruptions` (pauses now the readers of every table
   whose Trellis capture was changed outside Trellis, and returns the tables),

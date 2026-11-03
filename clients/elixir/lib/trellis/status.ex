@@ -61,6 +61,22 @@ defmodule Trellis.Status do
   the source. Nothing is paused or rebuilt: resuming the column writes
   through to the reader and it reads `:live` again.
 
+  `build_wait_xid` is set while its build waits on something other than its
+  own work: the transaction id of a fence. The build's source is another
+  transform's target, and no chunk runs until every transaction that was open
+  when the fence was taken has ended (a writer of that target could
+  otherwise commit after a chunk's snapshot without the build seeing its
+  rows). Look in `pg_stat_activity` for a transaction with a `backend_xid`
+  at or below it; the wait clears on its own when that transaction ends.
+  `nil` when the build waits on nothing.
+
+  `version_handover` is set while a process of another Trellis version is
+  live on the instance (a `Trellis.VersionHandover`): this process stands by
+  (it stages, drains and builds nothing) and its state-changing calls
+  refuse with a `version_handover` error until the other version is gone. A
+  process killed without a clean shutdown keeps its row live, and so delays
+  the takeover, for at most 30 seconds. `nil` when none is.
+
   Every process sees them, whichever one runs the staging worker.
   """
 
@@ -77,7 +93,9 @@ defmodule Trellis.Status do
           drain_failure: Trellis.DrainFailure.t() | nil,
           source_index_gaps: [Trellis.SourceIndexGap.t()],
           correcting: [Trellis.CorrectingNode.t()],
-          paused_upstream_columns: [String.t()]
+          paused_upstream_columns: [String.t()],
+          build_wait_xid: integer() | nil,
+          version_handover: Trellis.VersionHandover.t() | nil
         }
 
   @enforce_keys [
@@ -89,7 +107,9 @@ defmodule Trellis.Status do
     :drain_failure,
     :source_index_gaps,
     :correcting,
-    :paused_upstream_columns
+    :paused_upstream_columns,
+    :build_wait_xid,
+    :version_handover
   ]
   defstruct @enforce_keys
 
@@ -103,7 +123,9 @@ defmodule Trellis.Status do
         drain_failure: drain_failure,
         source_index_gaps: source_index_gaps,
         correcting: correcting,
-        paused_upstream_columns: paused_upstream_columns
+        paused_upstream_columns: paused_upstream_columns,
+        build_wait_xid: build_wait_xid,
+        version_handover: version_handover
       }) do
     %__MODULE__{
       status: status,
@@ -114,8 +136,68 @@ defmodule Trellis.Status do
       drain_failure: drain_failure && Trellis.DrainFailure.from_native(drain_failure),
       source_index_gaps: Enum.map(source_index_gaps, &Trellis.SourceIndexGap.from_native/1),
       correcting: Enum.map(correcting, &Trellis.CorrectingNode.from_native/1),
-      paused_upstream_columns: paused_upstream_columns
+      paused_upstream_columns: paused_upstream_columns,
+      build_wait_xid: build_wait_xid,
+      version_handover: version_handover && Trellis.VersionHandover.from_native(version_handover)
     }
+  end
+end
+
+defmodule Trellis.VersionHandover do
+  @moduledoc """
+  Another Trellis version is live on the instance, so this process changes
+  nothing until it is gone, as `Trellis.status/2` reports it: this binary's
+  version (`this_version`), the live processes holding it back
+  (`processes`, each a `Trellis.OtherProcess`), whether the staging-worker
+  lock is held by a session no registered process names, which is a staging
+  worker of a release before 0.2.0 (`unregistered_staging_worker`), and
+  whether the migrations this binary carries are pending
+  (`migrations_pending`), in which case every live process holds it back,
+  whatever its version.
+  """
+
+  @type t :: %__MODULE__{
+          this_version: String.t(),
+          processes: [Trellis.OtherProcess.t()],
+          unregistered_staging_worker: boolean(),
+          migrations_pending: boolean()
+        }
+
+  @enforce_keys [:this_version, :processes, :unregistered_staging_worker, :migrations_pending]
+  defstruct @enforce_keys
+
+  @doc false
+  def from_native(%{
+        this_version: this_version,
+        processes: processes,
+        unregistered_staging_worker: unregistered_staging_worker,
+        migrations_pending: migrations_pending
+      }) do
+    %__MODULE__{
+      this_version: this_version,
+      processes: Enum.map(processes, &Trellis.OtherProcess.from_native/1),
+      unregistered_staging_worker: unregistered_staging_worker,
+      migrations_pending: migrations_pending
+    }
+  end
+end
+
+defmodule Trellis.OtherProcess do
+  @moduledoc """
+  A live process of another Trellis version, in a `Trellis.VersionHandover`:
+  its worker id (`worker_id`, `trellis-<host>-<pid>-<random>`) and its
+  binary's version (`version`, `nil` for a release before 0.2.0, which
+  records none).
+  """
+
+  @type t :: %__MODULE__{worker_id: String.t(), version: String.t() | nil}
+
+  @enforce_keys [:worker_id, :version]
+  defstruct @enforce_keys
+
+  @doc false
+  def from_native(%{worker_id: worker_id, version: version}) do
+    %__MODULE__{worker_id: worker_id, version: version}
   end
 end
 

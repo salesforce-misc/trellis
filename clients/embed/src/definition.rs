@@ -4,13 +4,16 @@
 //! [`DefinitionStatus`] (what `status()` polls) flattens here too, with its
 //! backfill failure's retry time, its capture wait's times, its capture
 //! failure's detection time and its drain failure's times in epoch
-//! microseconds. A capture failure's kind
+//! microseconds. Its build wait crosses as the fence's transaction id, and
+//! its version handover as this binary's version and the other processes
+//! by worker id and version. A capture failure's kind
 //! crosses as its word, one of [`capture_failure_kind_names`], which a host
 //! turns into an atom or symbol from that set, allocated at load.
 
 use trellis::{
-    BackfillFailure, CaptureFailure, CaptureFailureKind, CaptureWait, CorrectingNode,
-    DefinitionStatus, DefinitionSummary, DrainFailure, SourceIndexGap,
+    BackfillFailure, BuildWait, CaptureFailure, CaptureFailureKind, CaptureWait, CorrectingNode,
+    DefinitionStatus, DefinitionSummary, DrainFailure, OtherProcess, OtherVersionLive,
+    SourceIndexGap,
 };
 
 use crate::{PlainHeldKeys, epoch_micros, transform_status};
@@ -78,6 +81,61 @@ pub struct PlainDefinitionStatus {
     /// definition report `catching_up`; see
     /// [`DefinitionStatus::paused_upstream_columns`].
     pub paused_upstream_columns: Vec<String>,
+    /// The transaction id of the fence a Re-derive build waits on instead of
+    /// doing its own work; see [`DefinitionStatus::build_wait`] and
+    /// [`BuildWait::Fence`]. A kind of wait that carries no id gets its own
+    /// field beside this one.
+    pub build_wait_xid: Option<i64>,
+    /// Set while a process of another Trellis version is live, so this
+    /// binary stands by; see [`DefinitionStatus::version_handover`].
+    pub version_handover: Option<PlainVersionHandover>,
+}
+
+/// An [`OtherVersionLive`] flattened to plain data: another Trellis version
+/// is live on the instance, so this binary changes nothing until it is gone
+/// (ADR-0023).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainVersionHandover {
+    /// This binary's version.
+    pub this_version: String,
+    /// The live processes holding this binary back.
+    pub processes: Vec<PlainOtherProcess>,
+    /// The staging-worker lock is held by a session no registered process
+    /// names: a staging worker of a release before 0.2.0.
+    pub unregistered_staging_worker: bool,
+    /// Migrations this binary carries are pending, so every live process
+    /// holds it back, whatever its version.
+    pub migrations_pending: bool,
+}
+
+/// An [`OtherProcess`] flattened to plain data: one live process of another
+/// version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainOtherProcess {
+    /// Its `worker_registry` id.
+    pub worker_id: String,
+    /// Its binary's version, `None` for a release before 0.2.0.
+    pub version: Option<String>,
+}
+
+impl From<&OtherVersionLive> for PlainVersionHandover {
+    fn from(seen: &OtherVersionLive) -> Self {
+        PlainVersionHandover {
+            this_version: seen.this_version.clone(),
+            processes: seen.processes.iter().map(PlainOtherProcess::from).collect(),
+            unregistered_staging_worker: seen.unregistered_staging_worker,
+            migrations_pending: seen.migrations_pending,
+        }
+    }
+}
+
+impl From<&OtherProcess> for PlainOtherProcess {
+    fn from(process: &OtherProcess) -> Self {
+        PlainOtherProcess {
+            worker_id: process.worker_id.clone(),
+            version: process.version.clone(),
+        }
+    }
 }
 
 /// A [`CorrectingNode`] flattened to plain data: a node of a partitioned
@@ -220,6 +278,16 @@ impl From<&DefinitionStatus> for PlainDefinitionStatus {
                 .map(PlainCorrectingNode::from)
                 .collect(),
             paused_upstream_columns: status.paused_upstream_columns.clone(),
+            build_wait_xid: status.build_wait.as_ref().and_then(|wait| match wait {
+                BuildWait::Fence { xid } => Some(*xid),
+                // `BuildWait` is `#[non_exhaustive]`: a kind of wait added
+                // later gets its own plain field.
+                _ => None,
+            }),
+            version_handover: status
+                .version_handover
+                .as_ref()
+                .map(PlainVersionHandover::from),
         }
     }
 }
@@ -296,7 +364,7 @@ impl From<&BackfillFailure> for PlainBackfillFailure {
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use trellis::TransformStatus;
+    use trellis::{BuildWait, TransformStatus};
 
     use super::*;
 
@@ -415,6 +483,8 @@ mod tests {
                 source_index_gaps: Vec::new(),
                 paused_upstream_columns: Vec::new(),
                 correcting: Vec::new(),
+                build_wait_xid: None,
+                version_handover: None,
             }
         );
     }
@@ -615,6 +685,8 @@ mod tests {
                 source_index_gaps: Vec::new(),
                 paused_upstream_columns: Vec::new(),
                 correcting: Vec::new(),
+                build_wait_xid: None,
+                version_handover: None,
             }
         );
     }
@@ -670,6 +742,62 @@ mod tests {
                 columns: vec!["qty".to_string()],
                 error: "capture of public.lines needs column \"qty\"".to_string(),
                 detected_at_micros: 1_727_222_400_000_003,
+            })
+        );
+    }
+
+    #[test]
+    fn a_build_waiting_on_a_fence_crosses_as_its_transaction_id() {
+        let status = trellis::fixture!(DefinitionStatus {
+            status: TransformStatus::Backfilling,
+            build_wait: Some(BuildWait::Fence { xid: 4_294_967_301 }),
+        });
+
+        let plain = PlainDefinitionStatus::from(&status);
+
+        assert_eq!(plain.build_wait_xid, Some(4_294_967_301));
+        assert_eq!(plain.version_handover, None);
+    }
+
+    #[test]
+    fn a_version_handover_crosses_with_its_processes_by_worker_id_and_version() {
+        let status = trellis::fixture!(DefinitionStatus {
+            version_handover: Some(trellis::fixture!(OtherVersionLive {
+                this_version: "0.2.0".to_string(),
+                processes: vec![
+                    trellis::fixture!(OtherProcess {
+                        worker_id: "trellis-host-17-ab12".to_string(),
+                        version: Some("0.1.0".to_string()),
+                    }),
+                    trellis::fixture!(OtherProcess {
+                        worker_id: "trellis-host-18-cd34".to_string(),
+                        version: None,
+                    }),
+                ],
+                unregistered_staging_worker: true,
+                migrations_pending: true,
+            })),
+        });
+
+        let plain = PlainDefinitionStatus::from(&status);
+
+        assert_eq!(plain.build_wait_xid, None);
+        assert_eq!(
+            plain.version_handover,
+            Some(PlainVersionHandover {
+                this_version: "0.2.0".to_string(),
+                processes: vec![
+                    PlainOtherProcess {
+                        worker_id: "trellis-host-17-ab12".to_string(),
+                        version: Some("0.1.0".to_string()),
+                    },
+                    PlainOtherProcess {
+                        worker_id: "trellis-host-18-cd34".to_string(),
+                        version: None,
+                    },
+                ],
+                unregistered_staging_worker: true,
+                migrations_pending: true,
             })
         );
     }

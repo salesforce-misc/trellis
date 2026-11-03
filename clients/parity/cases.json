@@ -17,7 +17,19 @@
       "drain_failure": {"nullable": {"record": "DrainFailure"}},
       "source_index_gaps": {"list_of": {"record": "SourceIndexGap"}},
       "paused_upstream_columns": {"list_of": "string"},
-      "correcting": {"list_of": {"record": "CorrectingNode"}}
+      "correcting": {"list_of": {"record": "CorrectingNode"}},
+      "build_wait_xid": {"nullable": "integer"},
+      "version_handover": {"nullable": {"record": "VersionHandover"}}
+    },
+    "VersionHandover": {
+      "this_version": "string",
+      "processes": {"list_of": {"record": "OtherProcess"}},
+      "unregistered_staging_worker": "boolean",
+      "migrations_pending": "boolean"
+    },
+    "OtherProcess": {
+      "worker_id": "string",
+      "version": {"nullable": "string"}
     },
     "CorrectingNode": {
       "node": "string",
@@ -358,25 +370,25 @@
     {
       "about": "A failing backfill, which a live run can't produce cheaply: the retry time is rehydrated from epoch microseconds exactly.",
       "type": "Status",
-      "native": {"status": {"$word": "waiting_to_backfill"}, "backfill_failure": {"source_table": "public.orders", "attempts": 3, "last_error": "canceling statement due to statement timeout", "next_attempt_at_micros": 1727222400123456}, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [], "paused_upstream_columns": [], "correcting": []},
+      "native": {"status": {"$word": "waiting_to_backfill"}, "backfill_failure": {"source_table": "public.orders", "attempts": 3, "last_error": "canceling statement due to statement timeout", "next_attempt_at_micros": 1727222400123456}, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [], "paused_upstream_columns": [], "correcting": [], "build_wait_xid": null, "version_handover": null},
       "expect": {"record": "Status", "fields": {"status": {"word": "waiting_to_backfill"}, "backfill_failure": {"record": "BackfillFailure", "fields": {"source_table": {"eq": "public.orders"}, "attempts": {"eq": 3}, "next_attempt_at": {"time_micros": 1727222400123456}}}, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null}}
     },
     {
       "about": "A capture lock wait, a capture failure and held keys, which need a held lock, a broken source table or a refused write, so a live run can't produce them all cheaply: their times are rehydrated from epoch microseconds exactly.",
       "type": "Status",
-      "native": {"status": {"$word": "catching_up"}, "backfill_failure": null, "capture_wait": {"table": "public.orders", "operation": "widen", "lock_mode": "ShareRowExclusiveLock", "waiting_since_micros": 1727222400123456, "observed_at_micros": 1727222400123457, "blockers": ["pid 42 (client backend) holds RowExclusiveLock"]}, "capture_failure": {"kind": {"$word": "capture"}, "source_table": "public.lines", "columns": ["qty"], "error": "capture of public.lines needs column \"qty\", which the table doesn't have", "detected_at_micros": 1727222400123458}, "held_keys": {"count": 2, "oldest_poisoned_at_micros": 1727222400123459}, "drain_failure": null, "source_index_gaps": [], "paused_upstream_columns": [], "correcting": []},
+      "native": {"status": {"$word": "catching_up"}, "backfill_failure": null, "capture_wait": {"table": "public.orders", "operation": "widen", "lock_mode": "ShareRowExclusiveLock", "waiting_since_micros": 1727222400123456, "observed_at_micros": 1727222400123457, "blockers": ["pid 42 (client backend) holds RowExclusiveLock"]}, "capture_failure": {"kind": {"$word": "capture"}, "source_table": "public.lines", "columns": ["qty"], "error": "capture of public.lines needs column \"qty\", which the table doesn't have", "detected_at_micros": 1727222400123458}, "held_keys": {"count": 2, "oldest_poisoned_at_micros": 1727222400123459}, "drain_failure": null, "source_index_gaps": [], "paused_upstream_columns": [], "correcting": [], "build_wait_xid": null, "version_handover": null},
       "expect": {"record": "Status", "fields": {"status": {"word": "catching_up"}, "backfill_failure": null, "capture_wait": {"record": "CaptureWait", "fields": {"table": {"eq": "public.orders"}, "operation": {"eq": "widen"}, "waiting_since": {"time_micros": 1727222400123456}, "observed_at": {"time_micros": 1727222400123457}, "blockers": {"list": [{"eq": "pid 42 (client backend) holds RowExclusiveLock"}]}}}, "capture_failure": {"record": "CaptureFailure", "fields": {"kind": {"word": "capture"}, "source_table": {"eq": "public.lines"}, "columns": {"list": [{"eq": "qty"}]}, "detected_at": {"time_micros": 1727222400123458}}}, "held_keys": {"record": "HeldKeys", "fields": {"count": {"eq": 2}, "oldest_poisoned_at": {"time_micros": 1727222400123459}}}, "drain_failure": null}}
     },
     {
       "about": "A drain failure, which needs a page the drain keeps failing on with nothing charged or paused, so a live run can't produce it cheaply: its tables and SQLSTATE cross as they are, and its times are rehydrated from epoch microseconds exactly.",
       "type": "Status",
-      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": {"seg_seq": 17, "tables": ["public.lines", "public.orders"], "error": "permission denied for function audit_hook", "sqlstate": "42501", "since_micros": 1727222400123456, "last_seen_micros": 1727222400123457, "attempts": 5}, "source_index_gaps": [], "paused_upstream_columns": [], "correcting": []},
+      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": {"seg_seq": 17, "tables": ["public.lines", "public.orders"], "error": "permission denied for function audit_hook", "sqlstate": "42501", "since_micros": 1727222400123456, "last_seen_micros": 1727222400123457, "attempts": 5}, "source_index_gaps": [], "paused_upstream_columns": [], "correcting": [], "build_wait_xid": null, "version_handover": null},
       "expect": {"record": "Status", "fields": {"status": {"word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": {"record": "DrainFailure", "fields": {"seg_seq": {"eq": 17}, "tables": {"list": [{"eq": "public.lines"}, {"eq": "public.orders"}]}, "error": {"eq": "permission denied for function audit_hook"}, "sqlstate": {"eq": "42501"}, "since": {"time_micros": 1727222400123456}, "last_seen": {"time_micros": 1727222400123457}, "attempts": {"eq": 5}}}}}
     },
     {
       "about": "Nodes of a partitioned source under correction (ADR-0017), which need a partition operation and a correction stopped mid-way, so a live run can't produce them cheaply: each crosses with its queue time rehydrated from epoch microseconds exactly, a count not yet taken is null, and the list keeps its order.",
       "type": "Status",
-      "native": {"status": {"$word": "backfilling"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [], "paused_upstream_columns": [], "correcting": [{"node": "public.items_p1", "since_micros": 1727222400123456, "keys_remaining": 5}, {"node": "public.items_p2", "since_micros": 1727222400123457, "keys_remaining": null}]},
+      "native": {"status": {"$word": "backfilling"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [], "paused_upstream_columns": [], "correcting": [{"node": "public.items_p1", "since_micros": 1727222400123456, "keys_remaining": 5}, {"node": "public.items_p2", "since_micros": 1727222400123457, "keys_remaining": null}], "build_wait_xid": null, "version_handover": null},
       "expect": {"record": "Status", "fields": {"status": {"word": "backfilling"}, "correcting": {"list": [{"record": "CorrectingNode", "fields": {"node": {"eq": "public.items_p1"}, "since": {"time_micros": 1727222400123456}, "keys_remaining": {"eq": 5}}}, {"record": "CorrectingNode", "fields": {"node": {"eq": "public.items_p2"}, "since": {"time_micros": 1727222400123457}, "keys_remaining": null}}]}}}
     },
     {
@@ -394,20 +406,32 @@
     {
       "about": "A source index gap in a status: the entry crosses with its columns, its role, whether it opted out, and its create index statement.",
       "type": "Status",
-      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [{"table": "public.orders", "columns": ["customer_id", "region"], "role": {"$word": "join_from"}, "opted_out": true, "fix": "create index on \"public\".\"orders\" (\"customer_id\", \"region\")"}], "paused_upstream_columns": [], "correcting": []},
+      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [{"table": "public.orders", "columns": ["customer_id", "region"], "role": {"$word": "join_from"}, "opted_out": true, "fix": "create index on \"public\".\"orders\" (\"customer_id\", \"region\")"}], "paused_upstream_columns": [], "correcting": [], "build_wait_xid": null, "version_handover": null},
       "expect": {"record": "Status", "fields": {"source_index_gaps": {"list": [{"record": "SourceIndexGap", "fields": {"table": {"eq": "public.orders"}, "columns": {"list": [{"eq": "customer_id"}, {"eq": "region"}]}, "role": {"word": "join_from"}, "opted_out": {"eq": true}, "fix": {"eq": "create index on \"public\".\"orders\" (\"customer_id\", \"region\")"}}}]}}}
     },
     {
       "about": "Two source index gaps on the same table and columns cross as two entries, in order, told apart only by their roles (a self-join's two sides each report their own gap). The grammar refuses a self-join, so this is a decode-only fixture.",
       "type": "Status",
-      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [{"table": "public.orders", "columns": ["id"], "role": {"$word": "join_from"}, "opted_out": false, "fix": "create index on \"public\".\"orders\" (\"id\")"}, {"table": "public.orders", "columns": ["id"], "role": {"$word": "join_joined"}, "opted_out": false, "fix": "create index on \"public\".\"orders\" (\"id\")"}], "paused_upstream_columns": [], "correcting": []},
+      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [{"table": "public.orders", "columns": ["id"], "role": {"$word": "join_from"}, "opted_out": false, "fix": "create index on \"public\".\"orders\" (\"id\")"}, {"table": "public.orders", "columns": ["id"], "role": {"$word": "join_joined"}, "opted_out": false, "fix": "create index on \"public\".\"orders\" (\"id\")"}], "paused_upstream_columns": [], "correcting": [], "build_wait_xid": null, "version_handover": null},
       "expect": {"record": "Status", "fields": {"source_index_gaps": {"list": [{"record": "SourceIndexGap", "fields": {"table": {"eq": "public.orders"}, "columns": {"list": [{"eq": "id"}]}, "role": {"word": "join_from"}, "opted_out": {"eq": false}, "fix": {"eq": "create index on \"public\".\"orders\" (\"id\")"}}}, {"record": "SourceIndexGap", "fields": {"table": {"eq": "public.orders"}, "columns": {"list": [{"eq": "id"}]}, "role": {"word": "join_joined"}, "opted_out": {"eq": false}, "fix": {"eq": "create index on \"public\".\"orders\" (\"id\")"}}}]}}}
     },
     {
       "about": "A reader of a paused upstream column in a status: it reports catching_up and names the column, target then column.",
       "type": "Status",
-      "native": {"status": {"$word": "catching_up"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [], "paused_upstream_columns": ["t.total", "u.qty"], "correcting": []},
+      "native": {"status": {"$word": "catching_up"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [], "paused_upstream_columns": ["t.total", "u.qty"], "correcting": [], "build_wait_xid": null, "version_handover": null},
       "expect": {"record": "Status", "fields": {"status": {"word": "catching_up"}, "paused_upstream_columns": {"list": [{"eq": "t.total"}, {"eq": "u.qty"}]}}}
+    },
+    {
+      "about": "A build waiting on a fence in a status: the fence's transaction id crosses as an integer, past 32 bits.",
+      "type": "Status",
+      "native": {"status": {"$word": "backfilling"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [], "paused_upstream_columns": [], "correcting": [], "build_wait_xid": 4294967301, "version_handover": null},
+      "expect": {"record": "Status", "fields": {"status": {"word": "backfilling"}, "build_wait_xid": {"eq": 4294967301}, "version_handover": null}}
+    },
+    {
+      "about": "A version handover in a status, which needs a process of another version live beside the suite's own: this version, the other processes by worker id with their version (nil for a release before 0.2.0), the unregistered-staging-worker flag and the migrations-pending flag cross as they are.",
+      "type": "Status",
+      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [], "paused_upstream_columns": [], "correcting": [], "build_wait_xid": null, "version_handover": {"this_version": "0.2.0", "processes": [{"worker_id": "trellis-host-17-ab12", "version": "0.1.0"}, {"worker_id": "trellis-host-18-cd34", "version": null}], "unregistered_staging_worker": true, "migrations_pending": false}},
+      "expect": {"record": "Status", "fields": {"build_wait_xid": null, "version_handover": {"record": "VersionHandover", "fields": {"this_version": {"eq": "0.2.0"}, "processes": {"list": [{"record": "OtherProcess", "fields": {"worker_id": {"eq": "trellis-host-17-ab12"}, "version": {"eq": "0.1.0"}}}, {"record": "OtherProcess", "fields": {"worker_id": {"eq": "trellis-host-18-cd34"}, "version": null}}]}, "unregistered_staging_worker": {"eq": true}, "migrations_pending": {"eq": false}}}}}
     },
     {
       "about": "A job that stopped before the end of the target's keys says so: the outcome is not_caught_up, the report is truncated, and the position it stopped at is a token.",

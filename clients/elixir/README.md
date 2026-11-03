@@ -74,7 +74,16 @@ The surface mirrors the Rust crate's `BlockingTrellis`. Every function has a ban
   INDEX`. `status/2` lists the partitions of a partitioned source a transform
   is being corrected for while it reads `:backfilling` for them
   (`correcting`, each a `Trellis.CorrectingNode` with `node`, `since` and
-  `keys_remaining`).
+  `keys_remaining`). `status/2` names what a Re-derive build waits on
+  instead of its own work (`build_wait_xid`, the transaction id of the
+  fence it waits out, `nil` when it waits on nothing). While a process of
+  another Trellis version is live, `status/2` reports that this process
+  stands by (`version_handover`, a `Trellis.VersionHandover` with
+  `this_version`, `processes`, each a `Trellis.OtherProcess` with
+  `worker_id` and `version` (`nil` for a release before 0.2.0),
+  `unregistered_staging_worker` and `migrations_pending`), and
+  state-changing calls refuse with a `version_handover` error until it is
+  gone.
 - `request_backfill/2`, `detect_capture_disruptions/1` (pauses now the readers
   of every table whose Trellis capture was changed outside Trellis, and
   returns the tables), `has_live_drain_workers/1`,
