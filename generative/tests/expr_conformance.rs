@@ -680,6 +680,17 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
         // planner goes on past it.
         "COALESCE(STRPOS(NULLIF('a', 'a'), ta), 2147483647 + 1)",
         "CASE WHEN STRPOS(NULLIF('a', 'a'), ta) = 1 THEN 0 ELSE 2147483647 + 1 END",
+        // A strict call with a `NULL` argument is `NULL` to the planner: a
+        // condition over it (`IS NULL`, `IS DISTINCT FROM`) is decided, so a
+        // later branch or argument is simplified (#1627).
+        "CASE WHEN STRPOS(CAST(NULL AS text), '') IS DISTINCT FROM NULL THEN 1 \
+         ELSE 2147483647 + 1 END",
+        "CASE WHEN STRPOS(CAST(NULL AS text), '') IS NULL THEN 2147483647 + 1 END",
+        "COALESCE(STRPOS('', CAST(NULL AS text)), 2147483647 + 1)",
+        "COALESCE(ROUND(CAST(NULL AS numeric), 2), CAST(2147483647 + 1 AS numeric))",
+        "CASE WHEN ABS(STRPOS(CAST(NULL AS text), '')) IS NULL THEN 2147483647 + 1 END",
+        "CASE WHEN CHAR_LENGTH(CAST(NULL AS text)) IS NOT DISTINCT FROM NULL \
+         THEN 2147483647 + 1 END",
     ];
     for text in refused {
         match check_text(text, None) {
@@ -716,6 +727,14 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
         "CASE WHEN STRPOS('a', 'a') = 2 AND i4a > 0 THEN 2147483647 + 1 ELSE 0 END",
         "CASE WHEN NULLIF(STRPOS('a', 'a'), 1) + i4a > 0 THEN 2147483647 + 1 ELSE 0 END",
         "COALESCE(CASE WHEN STRPOS('a', 'a') = 1 THEN 5 WHEN i4a > 0 THEN 6 END, 2147483647 + 1)",
+        // The same `NULL` call, on the side of the condition that drops the
+        // overflow (#1627).
+        "CASE WHEN STRPOS(CAST(NULL AS text), '') IS NULL THEN 1 ELSE 2147483647 + 1 END",
+        "CASE WHEN STRPOS(CAST(NULL AS text), '') IS DISTINCT FROM NULL \
+         THEN 2147483647 + 1 ELSE 1 END",
+        "CASE WHEN STRPOS(CAST(NULL AS text), '') IS NOT NULL THEN 2147483647 + 1 END",
+        "COALESCE(STRPOS('', CAST(NULL AS text)), 5, 2147483647 + 1)",
+        "COALESCE(ROUND(CAST(NULL AS numeric), 2), 5, 2147483647 + 1)",
         // A runtime divisor is left to the rows.
         "CASE WHEN i4a > 0 THEN na / i4a END",
         "i4a <> 0 AND na / i4a > 1",

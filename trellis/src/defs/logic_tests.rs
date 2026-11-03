@@ -1111,10 +1111,35 @@ fn a_branch_after_a_constant_define_cannot_compute_is_not_refused() {
             "CASE WHEN STRPOS(NULLIF('a', 'a'), t) = 1 THEN 2147483647 + 1 ELSE 0 END",
             I4,
         ),
+        // A strict call over a `NULL` constant is `NULL`: a guard over it is
+        // decided, and the planner drops the branch it does not select
+        // (#1627).
+        (
+            "CASE WHEN STRPOS(CAST(NULL AS text), '') IS NULL THEN 0 ELSE 2147483647 + 1 END",
+            I4,
+        ),
+        (
+            "CASE WHEN STRPOS(CAST(NULL AS text), '') IS DISTINCT FROM NULL \
+             THEN 2147483647 + 1 ELSE 0 END",
+            I4,
+        ),
+        (
+            "CASE WHEN STRPOS(CAST(NULL AS text), '') IS NOT NULL THEN 2147483647 + 1 END",
+            I4,
+        ),
+        (
+            "COALESCE(STRPOS('', CAST(NULL AS text)), 5, 2147483647 + 1)",
+            I4,
+        ),
         // Through a calculated field.
         (
             "NULLIF(STRPOS('a','a'), NULL) AS g, \
              CASE WHEN g = 2 THEN 2147483647 + 1 ELSE 0 END",
+            I4,
+        ),
+        (
+            "STRPOS(CAST(NULL AS text), '') AS g, \
+             CASE WHEN g IS NULL THEN 0 ELSE 2147483647 + 1 END",
             I4,
         ),
     ] {
@@ -1150,6 +1175,16 @@ fn a_branch_after_a_constant_define_cannot_compute_is_not_refused() {
         "COALESCE(STRPOS(NULLIF('a', 'a'), t), 2147483647 + 1)",
         "COALESCE(CHAR_LENGTH(NULLIF('a', 'a')) + i4, 2147483647 + 1)",
         "CASE WHEN STRPOS(NULLIF('a', 'a'), t) = 1 THEN 0 ELSE 2147483647 + 1 END",
+        // The same call, whose `NULL` decides the guard the other way.
+        "CASE WHEN STRPOS(CAST(NULL AS text), '') IS DISTINCT FROM NULL THEN 1 \
+         ELSE 2147483647 + 1 END",
+        "CASE WHEN STRPOS(CAST(NULL AS text), '') IS NULL THEN 2147483647 + 1 END",
+        "CASE WHEN CHAR_LENGTH(CAST(NULL AS text)) IS NOT DISTINCT FROM NULL \
+         THEN 2147483647 + 1 END",
+        "COALESCE(STRPOS('', CAST(NULL AS text)), 2147483647 + 1)",
+        "COALESCE(ROUND(CAST(NULL AS numeric), 2), CAST(2147483647 + 1 AS numeric))",
+        "STRPOS(CAST(NULL AS text), '') AS g, \
+         CASE WHEN g IS NULL THEN 2147483647 + 1 END",
         // The guard's own constants are simplified, whatever it is.
         "CASE WHEN STRPOS('a','a') = 2147483647 + 1 THEN 0 ELSE 1 END",
         "COALESCE(STRPOS('a','a') + 2147483647 * 2, 0)",

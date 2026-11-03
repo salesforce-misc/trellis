@@ -3765,8 +3765,9 @@ fn comparison_holds(op: super::ast::Operator, order: std::cmp::Ordering) -> bool
 /// `COALESCE` (its first argument that is not the `NULL` constant), the
 /// `TRUE`, `FALSE` and `NULL` literals, or a calculated field whose expression is one, resolved
 /// as [`infer_expr`] resolves a name. `None` for anything that reads a
-/// column (except a strict operator with a `NULL` constant operand, which
-/// the planner folds to `NULL` whatever the other reads), and for a sum
+/// column (except a strict operator or function call with a `NULL` constant
+/// operand, which the planner folds to `NULL` whatever the other reads), for
+/// a call whose arguments are all non-`NULL` (it has no value here), and for a sum
 /// whose value Postgres could not compute (which
 /// [`check_constant_sum`] has refused). `memo` holds each calculated field
 /// already folded, so a chain of fields that each read the one before twice
@@ -3980,6 +3981,21 @@ fn fold_constant<'f>(
                 }
             }
             Some(Constant::Null)
+        }
+        // Every other function is strict: a `NULL` argument makes the call
+        // `NULL` whatever its other arguments read or fold to. A call over
+        // arguments that are all non-`NULL` has no value here (#1446).
+        Expr::FunctionCall { name, args }
+            if super::registry::lookup_aggregate_function(name).is_none() =>
+        {
+            // Every argument is folded (no early return), so a memo fills
+            // the same whichever argument is `NULL`.
+            let folded: Vec<Option<Constant>> =
+                args.iter().map(|arg| recurse(arg, field_name)).collect();
+            folded
+                .iter()
+                .any(|found| matches!(found, Some(Constant::Null)))
+                .then_some(Constant::Null)
         }
         Expr::Column(name) => {
             let is_self_passthrough = name == field_name && source_columns.contains_key(name);
