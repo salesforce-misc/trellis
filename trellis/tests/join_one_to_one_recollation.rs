@@ -404,9 +404,18 @@ async fn run_cell(cell: &Cell, kind: &str) {
     assert_converged(&d, "public.t", name).await;
 
     // A TRUNCATE of either table empties its ledger, and one of `b` starts a
-    // rebuild of the target.
+    // rebuild of the target. A `LEFT` row keeps its old `b` columns until the
+    // rebuild's chunk reaches it, and `work_to_idle` also stops at a chunk
+    // waiting out its retry (#1594), so the rebuild must be `live` before the
+    // target is compared (#1618).
     apply(&mut d, name, "truncate public.b").await;
     work_to_idle(&d).await;
+    let (status, error) = status_and_error(&d, "public.t").await;
+    assert_eq!(
+        (status.as_str(), error),
+        ("live", None),
+        "{name}: rebuilt after b truncated"
+    );
     assert_matches(&d, kind, name, "b truncated").await;
     let b_new = Layout::id_of(cell.layout.b_id, "5");
     apply(
