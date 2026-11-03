@@ -256,3 +256,39 @@ async fn failing_migration_rolls_back_without_partial_ledger_entry() {
         "a failed migration must not leave a partial ledger entry"
     );
 }
+
+/// A server that refuses a pooled connection (no such database, no such
+/// role) says why in the error's message: the pool's own wrapper reads only
+/// "db error", so the server's `FATAL` text has to be written through.
+#[tokio::test]
+async fn a_refused_pool_connection_names_the_servers_reason() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+
+    for (suffix, expected) in [
+        (
+            "dbname=trellis_no_such_database",
+            "database \"trellis_no_such_database\" does not exist",
+        ),
+        (
+            "user=trellis_no_such_role",
+            "role \"trellis_no_such_role\" does not exist",
+        ),
+    ] {
+        let config =
+            Config::from_dsn(format!("{} {suffix}", db.dsn())).expect("valid DSN and schema");
+        let pool = trellis::pool::Pool::new(&config).expect("pool builds lazily");
+        let err = match pool.get().await {
+            Err(err) => err,
+            Ok(_) => panic!("the server must refuse a connection ({suffix})"),
+        };
+        assert!(matches!(err, Error::Pool(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(
+            message.contains(expected),
+            "the message must carry the server's own text ({expected:?}), got: {message}"
+        );
+        // Still a pool checkout that failed, not a different category.
+        assert_eq!(err.code(), trellis::ErrorCode::Connectivity);
+    }
+}
