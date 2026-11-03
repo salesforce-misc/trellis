@@ -43,9 +43,14 @@ command: the older release degrades per definition by itself.
 1. **Two floors, both Trellis release versions compared as semver.**
    - The **catalog floor** is the oldest release that can read the catalog's
      instance-wide state: its tables, the ring's format, instance-scoped
-     values. Each migration and each new instance-wide format declares the
-     oldest release that can read the catalog after it, and the catalog floor
-     is the highest of them. One an older release can't read raises it.
+     values, and the shape of the capture objects on source tables (which
+     triggers and functions exist, where, and what they record). Each
+     migration and each new instance-wide format declares the oldest release
+     that can read the catalog after it, and the catalog floor is the highest
+     of them. One an older release can't read raises it. A change to the
+     shape of capture objects always raises it: those objects belong to a
+     source table, not to one definition, so every definition reading the
+     table meets them, including the ones an older release can run.
    - A **definition floor** is the oldest release that can run one
      definition: its grammar features, its key space, its hidden-table layout
      and its per-definition state. Trellis stamps it whenever it writes the
@@ -60,21 +65,24 @@ command: the older release degrades per definition by itself.
    the binary's newest migration, still refuses.
 3. **Per definition.** A definition whose floor is above the running version
    is paused with a `capture_failure` reason that names the definition's floor
-   and the running version, and gives the remedies: roll forward to the floor
-   or later and `RESUME`, or `DROP` and define it again with features the
-   running version supports. The binary never parses such a definition. No
-   path that loads definitions errors on it, so it never blocks other
-   definitions or the process. A stored `grammar_version` newer than the
+   and the running version, and gives the remedy: roll forward to the floor
+   or later, then `RESUME` it, or `DROP` it there. The binary never parses
+   such a definition. No path that loads definitions errors on it, so it never
+   blocks other definitions or the process. It reads nothing while paused, so
+   it adds no columns to its tables' capture. A stored `grammar_version` newer than the
    binary reads pauses that one definition the same way instead of refusing
    the attach ([ADR-0018](0018-grammar-versioning.md)).
 4. **Roll forward needs `RESUME`.** When a release that meets the floor runs
    again, the definition stays paused until an operator resumes it, as with
    every other pause ([ADR-0014](0014-pause-and-drop-a-transform.md)). The
    resume rebuilds it.
-5. **`DROP` works from any release at or above the catalog floor,** including
-   on a definition above the running version. Trellis records each
-   definition's hidden objects, and the drop removes the recorded objects
-   without understanding their layout.
+5. **`DROP` refuses a definition above the running version,** naming the
+   definition's floor and the running version, and changes nothing. Only a
+   release that meets the floor knows everything the definition owns, so only
+   it can drop the definition completely; a partial drop could leave state
+   behind that a later definition of the same name picks up. The remedy is to
+   roll forward and drop it there. A definition at or below the running
+   version drops as usual.
 6. **Never default an unknown stored value.** An enum-like value a binary
    doesn't know pauses the definition it belongs to, or refuses the attach for
    instance-wide state. It never falls through to a default and never panics.
@@ -90,6 +98,24 @@ command: the older release degrades per definition by itself.
    release notes say so. A release before 0.2.0 refuses, in `migrate`, any
    database a later release has migrated; a handle of one that connects without
    migrating checks nothing.
+
+## Rolling back
+
+Before rolling back to an earlier release, the operator reads the floors from
+`status()` and, under the newer release, drops each definition whose floor is
+above the release they are rolling back to. The older release then attaches
+with nothing to pause. An operator who skips this step loses nothing to
+silence: the older release pauses those definitions, refuses to drop them, and
+names the floor in both places.
+
+Dropping a definition removes its target and its data, and rolling forward
+again doesn't restore it: the application's migration that defined it has
+already run, so it is defined again by hand, or by rolling that migration back
+and forward. A definition the older application itself defined can have a
+floor above it when the newer release rewrote it (for example by recreating
+its hidden tables), and dropping it removes a table the older application
+still reads. Pausing it would leave that table stale instead. So a release
+raises an existing definition's floor only when it must.
 
 A rollback is a cross-version deploy, so [ADR-0023](0023-version-handover.md)
 applies to it: the older release stands by while a process of the newer one is
@@ -140,7 +166,14 @@ has stopped.
   pauses cleanly.
 * **A read-only rollback-check tool** (with a variant that prepares the
   database by dropping the newer-only definitions). `status()` shows the
-  floors, and a definition above the running version pauses with its remedies.
+  floors, and a definition above the running version pauses with its remedy.
+* **`DROP` of a definition above the running version, from a record of its
+  hidden objects.** The older release would remove what the record lists
+  without understanding the layout. Each release that changes what a
+  definition owns, or how its capture is shared with other definitions, would
+  have to keep that record complete for every older release, and a gap would
+  show up only as a drop that missed something. Dropping before the rollback,
+  under the release that made the definition, needs no such promise.
 * **A 0.1.x backport.** It would carry the per-definition pause, the floor
   check, tolerance of migrations it doesn't carry and the version handover, and
   every 0.1.x installation would have to take it before upgrading.
@@ -155,6 +188,9 @@ has stopped.
 * Keeping the floor down costs compatibility code: an additive migration adds
   nullable or defaulted columns and tables an older release ignores.
 * A definition resumed after a rollback is fully rebuilt.
+* A definition the older release can't run is either dropped before the
+  rollback, losing its target, or left paused through it, its target going
+  stale, until the application rolls forward.
 * The release that introduces a feature decides the floor of every definition
   that uses it, so a rolled-back application keeps every definition the older
   release can run, and only the others pause.

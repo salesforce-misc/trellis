@@ -87,10 +87,10 @@ text and its version and returns the definition in the current grammar's terms:
   `RESUME` refuses; `DROP TRANSFORM` works without reading the text.
 - **Newer than the binary knows:** not read. The transform pauses, its
   `capture_failure` naming the stored version and the newest this binary
-  reads, with the remedies of a definition above the running version
+  reads, with the remedy of a definition above the running version
   ([ADR-0024](0024-compatibility-floors-and-rollback.md)): roll forward to a
-  release that reads it and `RESUME` the transform, or drop it and define it
-  again in this grammar. The other definitions keep running.
+  release that reads it, then `RESUME` the transform or drop it there. The
+  other definitions keep running.
 - **Text that fails to parse at a known version:** refused, and the definition
   is neither read nor written. This is how a load outside an attach sees text
   this release refuses; drop the transform and define it again.
