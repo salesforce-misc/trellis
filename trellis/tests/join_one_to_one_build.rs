@@ -253,7 +253,9 @@ async fn build_step(pool: &trellis::pool::Pool, worker: &str, chunk_rows: i64) -
 /// page that may hold a row of `a` in quarantine takes it before its lock
 /// row, so the step's record of its failure, which takes the row `FOR
 /// UPDATE`, queues behind the page: the step runs in its own task, and the
-/// page is released once that record has queued.
+/// page is released once that record has queued. The step gives up under
+/// `CHUNK_LOCK_TIMEOUT`, so its record queues well before the session's
+/// `LOCK_TIMEOUT` could have run out.
 async fn step_behind_frozen_page(
     d: &Driver,
     page: &mut drain_driver::RunningDrain,
@@ -262,9 +264,10 @@ async fn step_behind_frozen_page(
     chunk_rows: i64,
 ) -> Step {
     let pool = d.pool().clone();
+    let started = std::time::Instant::now();
     let step = tokio::spawn(async move { build_step(&pool, worker, chunk_rows).await });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    loop {
+    let deadline = started + std::time::Duration::from_secs(60);
+    let gave_up = loop {
         let queued: bool = d
             .ctl
             .query_one(
@@ -277,16 +280,22 @@ async fn step_behind_frozen_page(
             .expect("read pg_stat_activity")
             .get(0);
         if queued {
-            break;
+            break started.elapsed();
         }
         assert!(
             std::time::Instant::now() < deadline,
             "the step's failure never queued on the definition's row"
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    };
     d.release(page, PausePoint::BeforeCommit).await;
-    step.await.expect("the build step's task")
+    let step = step.await.expect("the build step's task");
+    assert!(
+        gave_up < trellis::locks::LOCK_TIMEOUT,
+        "the step gave up on the page's lock under its short lock timeout, \
+         not the session's: it took {gave_up:?}"
+    );
+    step
 }
 
 /// How many of the definitions' plan and chunk rows are still to run.
