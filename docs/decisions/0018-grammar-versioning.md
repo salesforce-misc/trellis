@@ -111,11 +111,9 @@ pause something ([ADR-0023](0023-version-handover.md)). The load-time check
 stands on its own, since a process can connect without attaching and a newer
 binary can write after the attach.
 
-Too old and too new both pause, each with its own fix in the reason: the
-operator fixes a too-old definition here by redefining it, and a too-new one
-by rolling forward to the release that wrote it, or by redefining it in this
-grammar. Pausing the one definition rather than refusing the attach keeps every
-other definition running after a rollback.
+Too old and too new both pause, each with its own fix in the reason. Pausing
+the one definition rather than refusing the attach keeps every other
+definition running after a rollback.
 
 ### Rewriting moves a definition to the current grammar without a rebuild
 

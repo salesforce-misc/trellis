@@ -325,14 +325,11 @@ each one costs and what to expect around it
 
 ## Runbooks
 
-* **Upgrading Trellis:** start the new version beside the old one. Its
-  processes stand by, `status()` shows `version_handover` naming the old
-  version's worker ids, and `apply` and the other state-changing calls of the
-  new version refuse with the `version_handover` code; the old version runs
-  on, and capture never stops. Then stop the old version: the new one takes
-  over, running its migrations first (`trellis run` does; an embedder's
-  `migrate` refuses while the old version runs, so run it after). Roll back
-  as [upgrading and rolling back](upgrading.md#rolling-back) says.
+* **Upgrading or rolling back Trellis:** follow
+  [upgrading and rolling back](upgrading.md). In short, start the new version
+  beside the old (it stands by, and `status()` shows `version_handover`), stop
+  the old, and migrate (`trellis run` does it by itself; an embedder runs
+  `migrate` after the old version has stopped).
 * **After a table swap, a bulk load with triggers disabled, or a fixture load
   that ends with `ENABLE TRIGGER ALL`:** the readers of the table are paused.
   `RESUME` each one, which rebuilds it

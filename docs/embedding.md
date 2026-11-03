@@ -111,29 +111,14 @@ harmless; each one polls every 5 seconds.
 
 **Across a version boundary** the same deploy works, and the two versions never
 run side by side ([version handover](decisions/0023-version-handover.md)).
-Every process with `staging` or `drain_threads` registers its Trellis version.
-A process of the new version that finds one of the old version live stands by
-as a whole: it stages, drains and builds nothing, and checks again every 5
-seconds. Its handles' state-changing calls (`apply` and the define, `ALTER`,
-`PAUSE`, `RESUME` and `DROP` it runs, `request_backfill`, `release_key`,
-`detect_capture_disruptions`, `self_check`) refuse with the
-`version_handover` error code, from a web process's handle as much as the
-worker's, while `status()`, the listings and the health checks keep working,
-and `status()` shows `version_handover`, naming the old version's workers. Stop
-the old version, and the new one takes over at its next poll. A process killed
-without a clean shutdown leaves its registry row live for up to the reclaim
-TTL, 30 seconds, which delays the takeover by as much. Versions match exactly:
-any change of release is a handover. [Upgrading and rolling back](upgrading.md)
-gives the steps, and what rolling the application back does to its
-definitions.
-
-A release that adds a migration can't run it while any process of the old
-version is live: `migrate` refuses with the same code until the old version
-has stopped, and the new version's background processes wait for it.
-`trellis run` migrates by itself once the old version is gone. An embedded
-fleet runs `migrate` after stopping the old version, in a release step that
-runs after the old processes are gone; with no migration pending, `migrate`
-beside the old version changes nothing and succeeds.
+Every process with `staging` or `drain_threads` registers its Trellis version,
+and versions match exactly: any change of release is a handover.
+[Upgrading and rolling back](upgrading.md) gives the steps, including where
+`migrate` goes in the deploy, and what rolling the application back does to
+its definitions. While the new version stands by, the refusal of
+state-changing calls covers a web process's handle as much as the worker's;
+`status()`, the listings and the health checks keep working. A killed
+process's registry row stays live for up to the 30-second reclaim TTL.
 
 ### What a handle uses
 

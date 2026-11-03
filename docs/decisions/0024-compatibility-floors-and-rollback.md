@@ -8,15 +8,12 @@ deciders: Michael Ries
 
 An application embeds Trellis through its Ruby gem or Elixir package, whose
 version is the engine's. A release of the application bumps Trellis; a few
-hours later the team finds a serious bug and rolls the application back.
-Rolling back the code doesn't roll back the database: the catalog state the
-newer release wrote stays, and so do the definitions it made, since the
-application defines transforms in its own migrations and a code rollback runs
-no migration's `down`. The older release then meets all of it.
-
-Postgres's answer to a downgrade, restoring a backup, isn't available here.
-Trellis's catalog lives in the application's database, so a restore that undoes
-a Trellis upgrade also discards every write the application made since.
+hours later the team finds a serious bug and rolls the application back. The
+database stays as the newer release left it: its catalog state, and the
+definitions it made, since the application defines transforms in its own
+migrations and a code rollback runs no migration's `down`. Restoring a backup
+undoes that, but Trellis's catalog lives in the application's database, so the
+restore also discards every write the application made since.
 
 Run on real binaries, with v0.1.0 pointed at a database a later build wrote:
 
@@ -30,9 +27,9 @@ Run on real binaries, with v0.1.0 pointed at a database a later build wrote:
   older one runs the rest correctly, and rolling forward and resuming brings
   everything back.
 
-Underneath, nothing records which release can read what. Refinery refuses a
-database carrying any migration the binary lacks, but only in `migrate`; a
-newer `grammar_version` refuses the whole attach
+Nothing records which release can read what. Refinery refuses a database
+carrying any migration the binary lacks, but only in `migrate`; a newer
+`grammar_version` refuses the whole attach
 ([ADR-0018](0018-grammar-versioning.md)); hidden tables carry no layout
 version; and some enum-like stored values fall through to a default when a
 binary doesn't know them.
@@ -102,50 +99,39 @@ has stopped.
 
 ## Precedents
 
-- **Postgres is forward-only.** Its minor releases are "always compatible with
-  earlier and later minor releases"
-  ([upgrading](https://www.postgresql.org/docs/current/upgrading.html)), a
-  promise about the storage format, not about running an older server on a
-  cluster a newer one has modified, which the project has never supported.
-  After a major upgrade the way back is an untouched old cluster or a restored
-  backup, and either loses the writes made since. That fits a database that is
-  the product; it doesn't fit a catalog embedded in the application's database.
-- **Postgres extensions** are the closest analogue: versioned objects with a
-  catalog inside the user's database. `ALTER EXTENSION UPDATE TO` follows any
-  script path, downgrade scripts included, and TimescaleDB ships them for one
-  step back (patch versions and consecutive minors), noting they may not work
-  once the database has changed since the upgrade.
 - **Flyway** ignores applied migrations newer than the binary by default
   (`*:future`), the opposite of refinery's `abort_missing`.
 - **Oban, GoodJob and Que,** job queues whose tables live in the
   application's database, run older versions on a newer schema by keeping
-  schema changes additive within a line. GoodJob, for one, keeps the
-  migrations of a minor release optional until the next major and detects at
-  runtime which columns exist.
+  schema changes additive within a line. GoodJob keeps the migrations of a
+  minor release optional until the next major and detects at runtime which
+  columns exist.
 - **SQLite** lets an older library open a database a newer one wrote, as long
   as the database uses none of the newer features: a floor per feature in use,
   which is what a definition floor is.
-- **MongoDB's feature compatibility version and CockroachDB's finalize** record
-  a floor too, but raise it in a separate step once the new version has burned
-  in: an operator's command in MongoDB, an automatic step in CockroachDB that
-  the operator can hold back. Until then the previous version can still run.
-  Rejected below.
 
 ## Rejected
 
 * **Restore a backup as the only way back** (Postgres, Elasticsearch, Vault).
-  It costs the developers nothing and the operator everything: the restore also
-  discards the application's own writes. It remains the answer only for
-  releases before 0.2.0.
+  Postgres has never supported running an older server on a cluster a newer
+  one has modified; after a major upgrade the way back is an untouched old
+  cluster or a restored backup. That costs the developers nothing and the
+  operator everything: the restore also discards the application's own writes.
+  It fits a database that is the product, not a catalog embedded in the
+  application's database, and remains the answer only for releases before
+  0.2.0.
 * **An explicit downgrade command or reverse migrations** (etcd's
-  `downgrade enable`, extension downgrade scripts, Timescale's one-step
-  scripts). Each release needs a reverse path, which gets lossy once newer data
-  exists, and a team reverting a deploy mid-incident won't first run a step
-  from the release it is abandoning.
-* **An operator finalize step** (MongoDB, CockroachDB, Kafka's
-  `metadata.version`). An embedded deploy has no place for it: the Trellis
-  version moves with the application's own deploy. Floors raised automatically
-  need no step.
+  `downgrade enable`, `ALTER EXTENSION UPDATE TO` with downgrade scripts,
+  which TimescaleDB ships for one step back and notes may not work once the
+  database has changed since the upgrade). Each release needs a reverse path,
+  which gets lossy once newer data exists, and a team reverting a deploy
+  mid-incident won't first run a step from the release it is abandoning.
+* **A finalize step** (MongoDB's feature compatibility version, CockroachDB's
+  finalize, Kafka's `metadata.version`), which raises a recorded floor only
+  once the new version has burned in, so the previous version can still run
+  until then. An embedded deploy has no place for it: the Trellis version
+  moves with the application's own deploy. Floors raised automatically need no
+  step.
 * **A `grammar_version` bump for every additive change,** reusing ADR-0018's
   machinery instead of a definition floor. A bump ships only in a breaking
   release and brings a compatibility rule, and a grammar version covers only
@@ -174,4 +160,3 @@ has stopped.
 * The release that introduces a feature decides the floor of every definition
   that uses it, so a rolled-back application keeps every definition the older
   release can run, and only the others pause.
-* Rolling back to a release before 0.2.0 stays a restore from backup.
