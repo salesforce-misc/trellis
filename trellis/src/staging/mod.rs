@@ -74,6 +74,12 @@ pub(crate) mod join_one_to_one;
 pub use join_one_to_one::diverging_keys as one_to_one_join_diverging_keys;
 #[cfg(any(test, feature = "internals"))]
 pub use join_one_to_one::explain_target_write as one_to_one_join_explain_target_write;
+#[cfg(any(test, feature = "internals"))]
+pub use join_one_to_one::fan_out::FanOutStep as OneToOneJoinFanOutStep;
+#[cfg(all(any(test, feature = "test-util"), any(test, feature = "internals")))]
+pub use join_one_to_one::fan_out::run_pending as one_to_one_join_run_pending_fan_outs;
+#[cfg(any(test, feature = "internals"))]
+pub use join_one_to_one::fan_out::step as one_to_one_join_fan_out_step;
 pub(crate) mod join_one_to_one_status;
 pub(crate) mod join_status;
 pub(crate) mod ledger;

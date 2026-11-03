@@ -1,7 +1,7 @@
 //! What `Trellis::status` reports about a 1-1 `JOIN` transform (ADR-0021,
 //! #1402): how big its hidden tables are, the step its build runs, and a
 //! warning when one join key has so many `a` rows that a change of its `b` row
-//! rewrites them all in one transaction. It is [`super::join_status`]'s
+//! takes seconds to reach them all. It is [`super::join_status`]'s
 //! [`JoinStatus`], filled for a definition with no `P` and `T`: `hidden_tables`
 //! lists `R`, `M` and `J`, `building` names a [`OneToOneBuildStep`] and
 //! `fan_out_warning` is set. Detection only: nothing here changes the
@@ -16,9 +16,9 @@
 //!
 //! # The fan-out warning
 //!
-//! A change of a `b` row rewrites every target row on its key, in the
-//! transaction that applies it, while an `a` change on the key waits
-//! (ADR-0021). The warning names the largest group of live `R` entries on one
+//! A change of a `b` row rewrites every target row on its key, in chunks
+//! (`super::join_one_to_one::fan_out`), before a watermark token past it
+//! converges (ADR-0021). The warning names the largest group of live `R` entries on one
 //! join key when it holds more than [`fan_out_warning_rows`] of them.
 //!
 //! It is *sampled*, not read from `pg_stats`: the statistics are as stale as
@@ -58,10 +58,10 @@ use crate::pool::quote_ident;
 pub const FAN_OUT_WARNING_ENV: &str = "TRELLIS_ONE_TO_ONE_JOIN_FAN_OUT_WARNING";
 
 /// The fan-out warning threshold when [`FAN_OUT_WARNING_ENV`] isn't set (or
-/// isn't a positive number): the rows of a join key whose `b` change stalls
-/// that key's `a` writers for about a second. `bench one-to-one-join-fan-out`
-/// measures a fan-out at about 4 µs per row (0.37 s at 100k rows, 4.2 s at a
-/// million), whatever the size of `R`. ADR-0021 names 250k.
+/// isn't a positive number): the rows of a join key whose `b` change takes a
+/// few seconds to reach them all. `bench one-to-one-join-fan-out` measures a
+/// chunked fan-out at about 10 µs per row (10.6 s at a million), whatever the
+/// size of `R`. ADR-0021 names 250k.
 pub const DEFAULT_FAN_OUT_WARNING_ROWS: i64 = 250_000;
 
 /// 0: not read yet; otherwise the threshold.
@@ -100,7 +100,7 @@ const PROBE_KEYS: i64 = 8;
 const COUNT_CAP_FACTOR: i64 = 10;
 
 /// A join key whose `a` group is large enough that a change of its `b` row
-/// rewrites that many target rows in one transaction; see
+/// takes seconds to rewrite its target rows; see
 /// [`JoinStatus::fan_out_warning`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

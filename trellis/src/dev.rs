@@ -70,11 +70,13 @@ pub mod defs {
     /// the same reason `registry` is reachable here.
     pub use crate::defs::typed_literal;
 
-    /// The 1-1 JOIN's fan-out cap and fan-out warning threshold (ADR-0021):
-    /// tests and `benchmark` set them, once, before a client starts.
-    pub use crate::defs::join_one_to_one::{
-        MAX_FANOUT_ENV as ONE_TO_ONE_JOIN_MAX_FANOUT_ENV,
-        set_max_fanout as set_one_to_one_join_max_fanout,
+    /// The 1-1 JOIN's fan-out chunk and fan-out warning threshold
+    /// (ADR-0021): tests and `benchmark` set them, once, before a client
+    /// starts.
+    pub use crate::staging::join_one_to_one::fan_out::{
+        DEFAULT_CHUNK_ROWS as ONE_TO_ONE_JOIN_DEFAULT_FAN_OUT_CHUNK_ROWS,
+        chunk_rows as one_to_one_join_fan_out_chunk_rows,
+        set_chunk_rows as set_one_to_one_join_fan_out_chunk_rows,
     };
     pub use crate::staging::join_one_to_one_status::{
         FAN_OUT_WARNING_ENV as ONE_TO_ONE_JOIN_FAN_OUT_WARNING_ENV,

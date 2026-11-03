@@ -53,7 +53,7 @@ use std::time::Duration;
 use drain_driver::Driver;
 use trellis::defs::ValueType;
 use trellis::defs::chunk_queue;
-use trellis::defs::join_one_to_one::set_max_fanout;
+use trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows;
 use trellis::integer::IntWidth;
 use trellis::staging::converge;
 use trellis::staging::interleave::PausePoint;
@@ -581,48 +581,21 @@ async fn s3_a_source_primary_key_update_reaches_the_join_as_a_delete_and_an_inse
 
 // ------------------------------------------------------------------- S4
 
-/// The number of `ta` rows a delete of every `tb` row fans out to in `join`:
-/// the `a` rows it matches.
-async fn matched_a_rows(d: &Driver, join: Join) -> u64 {
-    d.ctl
-        .query_one(
-            &format!(
-                "select count(*) from public.ta a join public.tb b on {}",
-                join.on("a", "b")
-            ),
-            &[],
-        )
-        .await
-        .expect("count the matched rows")
-        .get::<_, i64>(0) as u64
-}
-
-/// The most `a` rows a delete of every `tb` row fans out to in any `JOIN`.
-async fn widest_fan_out(d: &Driver) -> u64 {
-    let mut widest = 0;
-    for join in JOINS {
-        widest = widest.max(matched_a_rows(d, join).await);
-    }
-    widest
-}
-
 /// S4: a `TRUNCATE` of an upstream's source clears its target row by row
 /// through the seam (ADR-0019: a target is never truncated as a change of
 /// its own), so a `JOIN` sees deletes, never a truncate. A `TRUNCATE bsrc`
 /// starts no rebuild of the `JOIN`s (#1399's rule is for a truncate of `b`
 /// itself): the upstream stages every key in one transaction, so a `JOIN`'s
-/// page of them fans out over every `a` row they match at once, under the
-/// cap as for any `b` change. With the cap at the widest such fan-out every
-/// `JOIN` stays live, and refilled, and truncated and refilled before one
-/// drain, they follow. One row under it, the truncate halts the widest
-/// `JOIN` with the cap's reason: an upstream truncate costs a fan-out of
-/// every matched `a` row, in one page.
+/// page of them fans out over every `a` row they match, as for any `b`
+/// change. Refilled, and truncated and refilled before one drain, the
+/// `JOIN`s follow. With the fan-out chunk at one row, the page recomputes
+/// one row and leaves every other key to its chunks, and the `JOIN`s follow
+/// as well: an upstream truncate costs a fan-out of every matched `a` row,
+/// in chunks, and halts nothing.
 #[tokio::test]
 async fn s4_a_truncate_of_an_upstream_source_reaches_the_join_as_deletes() {
     let _serial = SERIAL.lock().await;
     let mut d = start().await;
-    let widest = widest_fan_out(&d).await;
-    set_max_fanout(widest);
     step(&mut d, "truncate public.bsrc").await;
     let rebuilds = d
         .rows("select count(*) from backfill_chunks where kind = 'plan' and not done")
@@ -652,36 +625,18 @@ async fn s4_a_truncate_of_an_upstream_source_reaches_the_join_as_deletes() {
     )
     .await;
     assert_exact(&mut d, "reseeded").await;
-    let widest = widest_fan_out(&d).await;
-    set_max_fanout(widest - 1);
-    step(&mut d, "truncate public.bsrc").await;
-    set_max_fanout(0);
-    let halted = d
-        .rows(
-            "select substr(d.target_table, 8), f.kind, \
-                    f.error like '%TRELLIS_ONE_TO_ONE_JOIN_MAX_FANOUT%' \
-             from transform_definitions d join capture_failures f on f.transform_id = d.id \
-             where d.status = 'paused' order by d.id",
-        )
-        .await;
-    // The `a`-on-pk `JOIN`s match 3 rows, the non-key ones 5.
-    let expected: Vec<String> = JOINS
-        .into_iter()
-        .filter(|join| join.on == On::ANonKey)
-        .map(|join| format!("({},halt,t)", join.name()))
-        .collect();
-    assert_eq!(
-        halted, expected,
-        "only the widest JOINs halt, on the cap: {halted:?}"
-    );
+    set_one_to_one_join_fan_out_chunk_rows(1);
+    write(&d, "truncate public.bsrc").await;
+    // The upstream's page, then the `JOIN`s' pages of its deletes, with no
+    // chunk run yet.
+    drain_rounds(&mut d, 2).await;
+    let pending = d.rows("select count(*) > 0 from join1_fan_out").await;
+    assert_exact(&mut d, "bsrc truncated in chunks").await;
+    set_one_to_one_join_fan_out_chunk_rows(0);
+    assert_eq!(pending, ["(t)"], "the page leaves keys to their chunks");
     assert!(
-        statuses(&d)
-            .await
-            .iter()
-            .filter(|s| s.ends_with(",paused)"))
-            .count()
-            == expected.len(),
-        "nothing else pauses"
+        statuses(&d).await.iter().all(|s| !s.ends_with(",paused)")),
+        "nothing pauses"
     );
 }
 

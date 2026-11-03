@@ -32,7 +32,7 @@ in the ring when the token is read, and the waiter writes nothing.
 ## The predicate
 
 `converged_through(token)` is **one statement**, so every condition is evaluated
-against one committed snapshot. True iff all three hold (numbered 2–4, as in
+against one committed snapshot. True iff all four hold (numbered 2–5, as in
 `staging::converge`):
 
 2. **the active batch's table holds no row with `origin_lsn <= token`** — the
@@ -43,7 +43,12 @@ against one committed snapshot. True iff all three hold (numbered 2–4, as in
 4. **no parked quarantine row has `origin_lsn <= token`** — the poison band
    ([06](06-cleanup-and-reclaim.md)). Held rows are per transform; a
    wait scoped to one transform (`await_converged_for`, the self-check
-   auditor's) counts only that transform's.
+   auditor's) counts only that transform's;
+5. **no pending 1-1 `JOIN` fan-out has `origin_lsn <= token`**: a `b` change
+   whose target rows a page left to chunks keeps a marker carrying the earliest
+   origin of the `b` changes its remaining rows don't reflect yet
+   ([ADR-0021](../decisions/0021-one-to-one-join-transforms.md#a-b-changes-fan-out-runs-in-chunks-under-a-pending-marker)).
+   It is scoped like condition 4.
 
 `origin_lsn` is the **oldest un-reflected trigger position** carried by a pending
 change. It LEAST-merges in the fold ([04](04-claiming-and-the-fold.md)) — a re-stage
@@ -114,7 +119,7 @@ crosses. The two conditions get there differently, both load-bearing:
 |---|---|---|---|
 | "has my token converged?" | the four conditions, one statement | cheap — index-served | the await poll |
 | "is anything pending at all?" | `EXISTS`, short-circuits on first pending row | cheapest | a polled gate (`has_pending`, test and harness builds) |
-| "how much is pending?" | `count(*)` over every slot plus quarantine | expensive — full scan | observability only, **never polled** |
+| "how much is pending?" | `count(*)` over every slot plus quarantine and pending fan-outs | expensive — full scan | observability only, **never polled** |
 
 `pending_count` is linear in the ring and no index helps — there is no predicate to
 index away. It stays **off the polling path**: the engine's await polls the token
@@ -150,7 +155,9 @@ or below the token, because that work is un-applied: a quarantined key keeps blo
 a caller waiting on its band until an operator release or the transform's resume
 clears it. `await_converged_for` narrows condition 4 to one transform's held keys,
 since a key another transform holds is applied by this one as usual. The ring's pending
-rows (conditions 2 and 3) count in full either way.
+rows (conditions 2 and 3) count in full either way. A 1-1 `JOIN`'s pending fan-out
+(condition 5) holds the wait the same way until its last chunk commits, and is
+narrowed the same way.
 
 ## No loose view feeds the predicate
 

@@ -14,10 +14,10 @@
 //! For each fan-out size `F` (`--fan-outs`), a fresh cluster holds `F` rows of
 //! `asrc` on key 1. The definition is built (the build is timed too), then
 //! `--reps` times one `update bsrc set w = w + 1 where id = 1` commits and the
-//! run waits for its one page to land. A page's transaction is the span in
-//! which an `a` change on the key waits ([`PAGE_TRANSACTION_METRIC`]), so its
-//! duration is the stall. Reported per size: that duration (mean, min, max),
-//! its cost per row, the wall time from the `bsrc` commit to the page landing,
+//! run waits for its page to land and for the chunks of the fan-out the page
+//! left pending (`join1_fan_out`) to finish. Reported per size: the page's
+//! transaction duration ([`PAGE_TRANSACTION_METRIC`]; mean, min, max), its
+//! cost per row, the wall time from the `bsrc` commit to the last chunk,
 //! WAL bytes and Postgres CPU per row, the engine process's peak RSS, and the
 //! **control**: the same rewrite as one hand-written set-based `UPDATE` of a
 //! copy of the target (`create table ctl as select * from jt`), run on the
@@ -307,6 +307,29 @@ async fn wait_page(
     }
 }
 
+/// Waits until no 1-1 `JOIN` fan-out is pending: the chunks after a page
+/// that left its key to them (`join1_fan_out`) have all committed, so every
+/// target row on the key joins the new `b` row.
+async fn wait_fan_outs_done(raw: &RawClient, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let sql = format!(
+        "select exists (select 1 from {}.join1_fan_out)",
+        trellis::dev::config::DEFAULT_SCHEMA
+    );
+    loop {
+        let pending: bool = raw
+            .query_one(&sql, &[])
+            .await
+            .expect("read the pending fan-outs")
+            .get(0);
+        if !pending {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the fan-out never finished");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
 /// `checkpoint`, so every rep starts with the same full-page-write state.
 async fn checkpoint(raw: &RawClient) {
     raw.batch_execute("checkpoint").await.expect("checkpoint");
@@ -326,6 +349,9 @@ async fn one_rep(f: &Fixture, timeout: Duration) -> (Rep, Landed) {
         .await
         .expect("update b");
     let landed = wait_page(&f.raw, &before, applied, timeout).await;
+    if matches!(landed, Landed::Page) {
+        wait_fan_outs_done(&f.raw, timeout).await;
+    }
     let wall_secs = started.elapsed().as_secs_f64();
     let pages = PageHistogram::capture(&scrape()).since(&before);
     let cost = cost.finish(&f.raw).await;
@@ -583,6 +609,7 @@ pub async fn run_fan_out(cfg: &OneToOneJoin, tuning: &EngineTuning, fan_out: i64
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        wait_fan_outs_done(&f.raw, cfg.timeout).await;
     }
     if cfg.statements {
         println!("{}", top_statements(&f.raw, fan_out).await);

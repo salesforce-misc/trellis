@@ -119,6 +119,26 @@ impl HeldOrigin {
         }
     }
 
+    /// An origin a pending fan-out's marker stored (`super::fan_out`).
+    pub(super) fn of_parts(
+        origin_lsn: Option<PgLsn>,
+        src_changed: Option<SystemTime>,
+        hop_gen: i32,
+    ) -> Self {
+        HeldOrigin {
+            seen: true,
+            origin_lsn,
+            src_changed,
+            hop_gen,
+        }
+    }
+
+    /// The origin's LSN (`None`: unknown), source-change time and `hop_gen`,
+    /// as a pending fan-out's marker stores them (`super::fan_out`).
+    pub(super) fn parts(&self) -> (Option<PgLsn>, Option<SystemTime>, i32) {
+        (self.origin_lsn, self.src_changed, self.hop_gen)
+    }
+
     /// This origin merged with `other`'s, as [`HeldOrigin::add`] merges a
     /// change: what a row parks with when it holds back the changes of both.
     pub(super) fn merged(&self, other: &HeldOrigin) -> HeldOrigin {
@@ -154,7 +174,7 @@ impl Held {
             .extend(rows);
     }
 
-    fn take(&self) -> Vec<HeldRow> {
+    pub(super) fn take(&self) -> Vec<HeldRow> {
         std::mem::take(
             &mut *self
                 .0
@@ -321,7 +341,13 @@ pub(crate) async fn charge_after_commit<'a>(
     }
 }
 
-async fn charge(pool: &Pool, shape: &JoinShape, rows: &[HeldRow]) -> Result<(), ApplyError> {
+/// Charges the fuses for `rows`, which a page or a fan-out chunk of
+/// `shape`'s definition held once it committed.
+pub(super) async fn charge(
+    pool: &Pool,
+    shape: &JoinShape,
+    rows: &[HeldRow],
+) -> Result<(), ApplyError> {
     let Some(definition) = catalog::definition_by_id(pool, shape.id).await? else {
         return Ok(());
     };

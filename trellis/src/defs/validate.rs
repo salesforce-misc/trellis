@@ -2757,7 +2757,7 @@ pub const INDEX_MAX_KEYS: usize = 32;
 
 /// Refuses an index key of `columns` columns, described by `clause`, when it
 /// is wider than [`INDEX_MAX_KEYS`].
-fn check_index_key_width(
+pub(crate) fn check_index_key_width(
     clause: impl FnOnce() -> String,
     columns: usize,
 ) -> Result<(), ValidationError> {

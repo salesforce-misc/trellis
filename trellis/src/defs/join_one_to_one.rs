@@ -11,7 +11,8 @@
 //! - `R` ([`HiddenTable::FromEntries`]): one entry per `a` row, keyed by
 //!   `a`'s primary key text, holding the 1-1 ledger's ordering state
 //!   (`super::ledger`), the row's join key and the `a` columns the fields
-//!   read. Indexed on the join key (how a `b` change finds its rows) and by
+//!   read. Indexed on the join key and then the entry key (how a `b` change
+//!   finds its rows, and a fan-out chunk walks them from a cursor), and by
 //!   the partial `where __tombstone` index the tombstone collection walks;
 //! - `M` ([`HiddenTable::JoinedEntries`]): the same, one entry per `b` row;
 //! - `J` ([`HiddenTable::Keys`]): one lock row per join key;
@@ -23,13 +24,11 @@
 //! They're fully derived: define creates them empty, `DROP TRANSFORM` drops
 //! them, and a resume drops and recreates them.
 //!
-//! Pages of either side's changes, Re-derives and `TRUNCATE`s, and the
-//! chunked build, run in `crate::staging::join_one_to_one`. A page whose
-//! fan-out passes the cap ([`max_fanout`]) halts the transform with the reason
-//! rather than fan out in one transaction.
+//! Pages of either side's changes, Re-derives and `TRUNCATE`s, the chunks of
+//! a pending fan-out, and the chunked build, run in
+//! `crate::staging::join_one_to_one`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio_postgres::GenericClient;
 
@@ -40,42 +39,6 @@ use super::join::{
 };
 use super::validate::{JoinColumnInfo, ValidationError};
 use crate::pool::quote_ident;
-
-/// The environment variable that sets the hard fan-out cap: the most `a` rows
-/// one page's `b` changes may recompute (ADR-0021's v1 limits). A page past it
-/// halts the transform with the reason rather than fan out in one
-/// transaction. Read once, when nothing has set it.
-pub const MAX_FANOUT_ENV: &str = "TRELLIS_ONE_TO_ONE_JOIN_MAX_FANOUT";
-
-/// The fan-out cap when [`MAX_FANOUT_ENV`] isn't set (or isn't a positive
-/// number).
-pub const DEFAULT_MAX_FANOUT: u64 = 5_000_000;
-
-/// 0: not read yet; otherwise the cap.
-static MAX_FANOUT: AtomicU64 = AtomicU64::new(0);
-
-/// The hard fan-out cap ([`MAX_FANOUT_ENV`]).
-pub fn max_fanout() -> u64 {
-    match MAX_FANOUT.load(Ordering::Relaxed) {
-        0 => {
-            let cap = std::env::var(MAX_FANOUT_ENV)
-                .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .filter(|cap| *cap > 0)
-                .unwrap_or(DEFAULT_MAX_FANOUT);
-            MAX_FANOUT.store(cap, Ordering::Relaxed);
-            cap
-        }
-        cap => cap,
-    }
-}
-
-/// Sets the fan-out cap for this process, for tests; `0` reads
-/// [`MAX_FANOUT_ENV`] again on next use.
-#[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
-pub fn set_max_fanout(cap: u64) {
-    MAX_FANOUT.store(cap, Ordering::Relaxed);
-}
 
 /// One hidden table of a 1-1 `JOIN` definition (this module's doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,7 +165,13 @@ pub(crate) fn hidden_tables_ddl(
         )];
         body.push(super::ledger::ordering_state_columns());
         body.extend(read.iter().map(|column| typed_column(columns, column)));
-        let quoted_key: Vec<String> = key.iter().map(|c| quote_ident(c)).collect();
+        let mut quoted_key: Vec<String> = key.iter().map(|c| quote_ident(c)).collect();
+        // `R`'s index ends with the entry key: a fan-out chunk walks one
+        // join key's entries in key order from a cursor
+        // (`crate::staging::join_one_to_one::fan_out`).
+        if table == HiddenTable::FromEntries {
+            quoted_key.push(quote_ident(super::ledger::KEY_COLUMN));
+        }
         sql.push_str(&format!(
             "create table {name} ({});\n\
              create index on {name} ({});\n\
@@ -225,14 +194,20 @@ pub(crate) fn hidden_tables_ddl(
     sql
 }
 
-/// The statement dropping every hidden table of definition `id` from
-/// `catalog_schema`, any that is already gone included.
+/// The statements dropping every hidden table of definition `id` from
+/// `catalog_schema`, any that is already gone included, and deleting its
+/// pending fan-outs (`join1_fan_out`), which name keys of the `R` and `J`
+/// they drop: a resume's build recomputes every row.
 pub(crate) fn drop_hidden_tables_sql(catalog_schema: &str, id: i64) -> String {
     let tables: Vec<String> = HiddenTable::ALL
         .iter()
         .map(|table| table.qualified(catalog_schema, id))
         .collect();
-    format!("drop table if exists {}", tables.join(", "))
+    format!(
+        "drop table if exists {}; delete from {}.join1_fan_out where transform_id = {id}",
+        tables.join(", "),
+        quote_ident(catalog_schema),
+    )
 }
 
 /// The Postgres type of a 1-1 `JOIN` field: a bare column of either table
@@ -519,7 +494,8 @@ mod tests {
         assert_eq!(
             drop_hidden_tables_sql("trellis", 7),
             "drop table if exists \"trellis\".\"join1_7_r\", \"trellis\".\"join1_7_m\", \
-             \"trellis\".\"join1_7_j\", \"trellis\".\"join1_7_l\""
+             \"trellis\".\"join1_7_j\", \"trellis\".\"join1_7_l\"; \
+             delete from \"trellis\".join1_fan_out where transform_id = 7"
         );
     }
 
@@ -570,7 +546,7 @@ mod tests {
                  primary key, \"__applied_lsn\" pg_lsn, \"__applied_seg\" bigint, \
                  \"__basis\" pg_snapshot, \"__tombstone\" boolean not null default false, \
                  \"cust\" integer, \"tenant\" integer, \"total\" numeric);\n\
-                 create index on \"trellis\".\"join1_7_r\" (\"cust\", \"tenant\");\n\
+                 create index on \"trellis\".\"join1_7_r\" (\"cust\", \"tenant\", \"__from_key\");\n\
                  create index on \"trellis\".\"join1_7_r\" (\"__applied_seg\") \
                  where \"__tombstone\";\n"
             ),

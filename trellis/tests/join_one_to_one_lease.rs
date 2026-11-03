@@ -1,13 +1,12 @@
 //! Two instances and a 1-1 `JOIN` fan-out that outlives its claim (ADR-0021,
-//! #1514). A `b` change recomputes every `a` row on its key in one page
-//! transaction, up to `TRELLIS_ONE_TO_ONE_JOIN_MAX_FANOUT` rows, holding the
-//! key's locks; a fan-out of a million rows can run longer than the claim
-//! lease (`liveness::DEFAULT_RECLAIM_TTL`, 30 s) if the worker's heartbeat
-//! stalls. Locks give correctness: a second instance that reclaims the
+//! #1514). A `b` change recomputes the `a` rows on its key in its page
+//! transaction, up to one fan-out chunk of them, holding the key's locks; a
+//! page can run longer than the claim lease (`liveness::DEFAULT_RECLAIM_TTL`,
+//! 30 s) if the worker's heartbeat stalls. Locks give correctness: a second instance that reclaims the
 //! bucket queues behind the first's page, the first fails its claim check
 //! when it reaches it, and nothing it wrote commits.
 //!
-//! The scenarios shrink the fan-out to a cap of 25 rows and play the lease by
+//! The scenarios shrink the fan-out chunk to 25 rows and play the lease by
 //! hand: aging a claim and sweeping it is what a stalled worker looks like
 //! once the TTL passed (`reclaim_stale`, as `drain_paging.rs` does), and the
 //! heartbeat daemon runs for real against a short interval. Nothing sleeps:
@@ -21,7 +20,7 @@ use std::time::{Duration, Instant};
 use drain_driver::Driver;
 use trellis::config::DEFAULT_SCHEMA;
 use trellis::defs::ValueType;
-use trellis::defs::join_one_to_one::set_max_fanout;
+use trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows;
 use trellis::integer::IntWidth;
 use trellis::staging::ApplyError;
 use trellis::staging::interleave::PausePoint;
@@ -32,11 +31,11 @@ const DDL: &str = "create table public.a (id integer primary key, k integer, x i
                    create unique index on public.b (k); \
                    create index on public.a (k)";
 
-/// The fan-out cap these tests run with: key 10 holds exactly this many `a`
-/// rows.
+/// The fan-out chunk these tests run with: key 10 holds exactly this many
+/// `a` rows, so its page recomputes them all.
 const CAP: i64 = 25;
 
-/// The fan-out cap is process-wide, so these tests run one at a time.
+/// The fan-out chunk is process-wide, so these tests run one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn int4() -> ValueType {
@@ -72,9 +71,9 @@ impl Kind {
 }
 
 /// `kind` over `CAP` rows of `a` on key 10, one on key 20, and `b` rows on
-/// both keys, built and live, with the fan-out cap at `CAP`.
+/// both keys, built and live, with the fan-out chunk at `CAP`.
 async fn start(kind: Kind) -> Driver {
-    set_max_fanout(CAP as u64);
+    set_one_to_one_join_fan_out_chunk_rows(CAP as usize);
     let seed = format!(
         "insert into public.a select i, 10, i from generate_series(1, {CAP}) i; \
          insert into public.a values (100, 20, 100); \
@@ -94,12 +93,12 @@ async fn start(kind: Kind) -> Driver {
     .await
 }
 
-/// The cap is a process-wide setting: every test puts it back.
+/// The chunk is a process-wide setting: every test puts it back.
 struct CapGuard;
 
 impl Drop for CapGuard {
     fn drop(&mut self) {
-        set_max_fanout(0);
+        set_one_to_one_join_fan_out_chunk_rows(0);
     }
 }
 
@@ -193,7 +192,7 @@ async fn backend_xid(d: &Driver, pid: i32) -> String {
         .expect("the frozen page has written, so it holds an xid")
 }
 
-/// A fan-out of exactly the cap whose worker loses its claim to the TTL
+/// A fan-out of exactly one chunk whose worker loses its claim to the TTL
 /// sweep while the page is frozen before the fan-out, holding the key's
 /// locks. The second instance claims the freed bucket and queues behind the
 /// page's locks; when the first goes on it writes its 25 rows, fails its

@@ -551,15 +551,16 @@ well, with these differences:
   from the jobs' cursors as above.
 - `fan_out_warning` is set when the largest group of live `R` entries on one join key
   holds more rows than the threshold: a change of the `b` row on that key rewrites all of
-  them in one transaction, while an `a` write on the key waits. It names the key (its
+  them, in chunks of 10,000 rows, before a watermark token past it converges. It names the key (its
   columns' values joined by `,`), the group's rows and the threshold. The group is found
   by sampling `R` (2000 pages of it, all of a smaller `R`) and counting the keys met most
   often over `R`'s join-key index, not from `pg_stats`, which is stale after a build. A
   count stops at ten times the threshold. In a very large `R` a group just past the threshold
   can go unreported until it grows. The threshold is 250,000 by default and
   `TRELLIS_ONE_TO_ONE_JOIN_FAN_OUT_WARNING` sets another. The benchmark
-  (`one-to-one-join-fan-out`) measures a `LEFT` join's fan-out at about 4 µs per row, so a
-  key past the default stalls its `a` writers for about a second (0.37 s at 100,000 rows).
+  (`one-to-one-join-fan-out`) measures a `LEFT` join's chunked fan-out at about 10 µs per
+  row (10.6 s at a million), so a `b` change on a key past the default takes a few seconds
+  to reach every row. An `a` write on the key waits for one chunk at most.
 
 The `J` lock wait is a metric rather than a status field: the time a `JOIN` page
 spends in its sorted `select … for update` of its `J` rows is the histogram

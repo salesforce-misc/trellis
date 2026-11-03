@@ -246,8 +246,8 @@ async fn the_pre_0_2_0_shapes_hold_this_version_back() {
 
 /// Rule 3: a migration this binary carries is never run while a Trellis
 /// process is live; `migrate` refuses instead and runs it once nothing is.
-/// The database is put back to before migration V9, with a live row of the
-/// release that wrote it.
+/// The database is put back to before migration V9 (V10 after it undone
+/// too), with a live row of the release that wrote it.
 #[tokio::test]
 async fn a_pending_migration_is_not_run_while_a_process_is_live() {
     let cluster = TestCluster::start();
@@ -256,7 +256,8 @@ async fn a_pending_migration_is_not_run_while_a_process_is_live() {
     raw.batch_execute(
         "alter table worker_registry drop column version, drop column staging, \
            drop column drain, drop column standby, drop column staging_pid; \
-         delete from refinery_schema_history where version = 9; \
+         drop table join1_fan_out; \
+         delete from refinery_schema_history where version in (9, 10); \
          insert into worker_registry (worker_id) values ('trellis-old-1-00')",
     )
     .await

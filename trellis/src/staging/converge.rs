@@ -85,6 +85,9 @@ pub(crate) fn per_ring_table(sep: &str, f: impl Fn(i16, &str) -> String) -> Stri
 ///   this `origin_lsn is null or origin_lsn <= $1`. Same NULL-gates-old
 ///   reasoning as condition 2/3 below, since a parked recompute-shaped row
 ///   carries no `origin_lsn` either.
+/// - **Condition 5** — no 1-1 `JOIN` pending fan-out (`join1_fan_out`) with
+///   `origin_lsn is null or origin_lsn <= $1`: its marker carries the
+///   earliest origin of the `b` changes some of its rows don't reflect yet.
 ///
 /// `origin_lsn = '0/0'` means "unknown, conservatively old" and is `<=` any
 /// token, so a zero-origin pending row always gates conditions 2 and 3 —
@@ -122,8 +125,9 @@ pub async fn converged_through(
 /// as the SQL expression `token`: `$1` for the typed query above, or an
 /// inlined `pg_lsn` literal for [`await_converged`]'s simple-protocol poll.
 ///
-/// `held_by` scopes condition 4 to one definition's held keys
-/// ([`await_converged_for`]); `None` counts every definition's.
+/// `held_by` scopes conditions 4 and 5 to one definition's held keys and
+/// pending fan-outs ([`await_converged_for`]); `None` counts every
+/// definition's.
 fn converged_sql(token: &str, held_by: Option<i64>) -> String {
     // `origin_lsn` is nullable — a row of unknown origin (a build's `NULL`-key
     // `Recompute`, say) reads NULL here, not `'0/0'`. Both are "unknown", and the doc pins
@@ -165,6 +169,13 @@ fn converged_sql(token: &str, held_by: Option<i64>) -> String {
     };
     let condition4 = format!(
         "select 1 from poison_held \
+         where {held_by}(origin_lsn is null or origin_lsn <= {token})"
+    );
+    // Condition 5: a 1-1 `JOIN`'s pending fan-out, whose marker carries the
+    // earliest origin of the `b` changes its remaining rows don't reflect
+    // yet (`super::join_one_to_one::fan_out`), gates like a parked row.
+    let condition5 = format!(
+        "select 1 from join1_fan_out \
          where {held_by}(origin_lsn is null or origin_lsn <= {token})"
     );
 
@@ -217,7 +228,8 @@ fn converged_sql(token: &str, held_by: Option<i64>) -> String {
         "select \
              not ({condition2}) \
              and not exists ({condition3}) \
-             and not exists ({condition4})"
+             and not exists ({condition4}) \
+             and not exists ({condition5})"
     )
 }
 
@@ -246,7 +258,11 @@ pub async fn has_pending(client: &impl GenericClient) -> Result<bool, StagingErr
     });
     // A parked `poison_held` row is pending too — it hasn't
     // drained, it's excluded from the active batch until release replays it.
-    let sql = format!("select exists ({arms} union all select 1 from poison_held)");
+    // So is a 1-1 `JOIN`'s pending fan-out.
+    let sql = format!(
+        "select exists ({arms} union all select 1 from poison_held \
+         union all select 1 from join1_fan_out)"
+    );
     let row = client.query_one(&sql, &[]).await?;
     Ok(row.get(0))
 }
@@ -267,10 +283,12 @@ pub async fn pending_count(client: &impl GenericClient) -> Result<i64, StagingEr
              )"
         )
     });
-    // Every parked `poison_held` row counts as pending too.
+    // Every parked `poison_held` row counts as pending too, and so does each
+    // 1-1 `JOIN`'s pending fan-out.
     let sql = format!(
         "select coalesce(sum(c), 0)::bigint from \
-         ({arms} union all select count(*) as c from poison_held) counts"
+         ({arms} union all select count(*) as c from poison_held \
+          union all select count(*) as c from join1_fan_out) counts"
     );
     let row = client.query_one(&sql, &[]).await?;
     Ok(row.get(0))
@@ -398,8 +416,9 @@ pub async fn watermark_token(client: &impl GenericClient) -> Result<PgLsn, Stagi
 /// implicit transaction, and the timeout it sets must not outlive it.
 ///
 /// Cluster-wide: a key any definition holds in quarantine keeps blocking a
-/// token at or above its band (condition 4). [`await_converged_for`] waits
-/// on one definition's held keys only.
+/// token at or above its band (condition 4), as does any 1-1 `JOIN`'s
+/// pending fan-out (condition 5). [`await_converged_for`] waits on one
+/// definition's held keys and pending fan-outs only.
 pub async fn await_converged(
     client: &Client,
     token: PgLsn,
@@ -409,7 +428,8 @@ pub async fn await_converged(
 }
 
 /// [`await_converged`], with condition 4 counting only the keys the
-/// definition `transform_id` holds in quarantine. Whole-key poison is
+/// definition `transform_id` holds in quarantine, and condition 5 only its
+/// pending fan-outs. Whole-key poison is
 /// per transform, so a key another definition holds is applied by this one
 /// as usual and gives it nothing to wait for. Its own held keys still
 /// block, as they block every cluster-wide wait. The ring's pending rows

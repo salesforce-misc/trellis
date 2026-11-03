@@ -83,15 +83,16 @@ below holds for them as it does for a captured side.
 - A target is never truncated as a change of its own: a `TRUNCATE` of its
   upstream's source reaches the JOIN as a delete of every row, in one
   upstream transaction. For a `b` side that is a change of `b` like any
-  other, so it starts no rebuild, and its fan-out over every `a` row those
-  rows match counts toward the cap below.
+  other, so it starts no rebuild, and it fans out over every `a` row those
+  rows match, in chunks, as below.
 
 ### Each side keeps a Trellis-owned copy, ordered by ADR-0002's 1-1 ledger
 
 - **`R`**, one entry per `a` row: the 1-1 ledger's ordering state, plus the
   row's join key and the `a` columns the fields read. It is filled from
-  captured images and indexed on the join key, which is how a `b` change finds
-  its rows. It is about the size of `a`.
+  captured images and indexed on the join key and then the entry key, which
+  is how a `b` change finds its rows and its chunks walk them. It is about the
+  size of `a`.
 - **`M`**, one entry per `b` row, keyed by `b`'s primary key and indexed on the
   join key: the ledger's ordering state plus the `b` columns the fields read.
   It is about the size of `b`. Keyed by `b`'s primary key rather than by join
@@ -179,34 +180,63 @@ A change of either side that was staged before a truncate and reaches a page
 after it is below the side's floor and refused, by the same I2 check as a
 change older than an entry's applied position.
 
-### A `b` change's fan-out is linear in the `a` rows on its key
+### A `b` change's fan-out runs in chunks under a pending marker
 
-A `b` change rewrites every target row on its key while holding `J[k]`: about
-2.7 µs and 318 B of WAL per row in the model, before the target-mutation
-seam's images. An `a` change on that key waits for the whole fan-out. Fan-out
-in chunks that each take `J[k]` again was exact.
+A `b` change rewrites every target row on its key, each recomputed from `R`
+and the newest live `M` entry while the writer holds `J[k]`, and an `a` change
+on that key waits for `J[k]`. Fan-out in chunks that each take `J[k]` again is
+exact (#1375 Y5), so no transaction recomputes more than one chunk of 10k `R`
+entries:
 
-In v1, fan-out runs in one transaction, and that key's `a` writers wait for
-all of it. The benchmark (`one-to-one-join-fan-out`) measures a `LEFT` join's
-fan-out at about 4 µs and 340 B of WAL per row whatever the size of `R`, since
-each batch of the upsert probes `R`'s primary key once per entry: 0.37 s at
-100k rows, 4.2 s at a million and 19.5 s at the 5M cap. An `INNER` join's
-fan-out costs more, since each batch also deletes the target rows of entries
-whose key has lost its last live `b` row. Three limits keep it bounded:
+- **The page** counts the entries on each key its `b` changes reach, each
+  count stopping one past the budget left, and recomputes itself the keys
+  that fit one chunk between them. For every other key it writes a pending
+  marker `(k, gen, cursor)` in its own transaction, at the key's start, with
+  the earliest origin of the page's `b` changes. A key the page recomputes
+  whole loses its marker. A later page on a pending key sets the cursor back
+  to the start and keeps the earlier origin: the rows behind the cursor joined
+  the older `b` row, and every row must join the newer one.
+- **A chunk** is one transaction, run by a drain worker as build work, after
+  its segments and before any build chunk. In the page's lock order it takes
+  both tables' version fences, the definition row `FOR KEY SHARE` (a chunk may
+  hold a row, as a page's fan-out may), the lock row `FOR SHARE`, `J[k]` and
+  the marker. It recomputes the next chunk of live `R` entries after the
+  cursor in key order, a range of `R`'s index on the join key and then the
+  entry key, and advances the cursor, or deletes the marker after the key's
+  last entry. A chunk that dies commits nothing, and the next resumes from the
+  cursor the last commit left. A worker never queues for a `J` row: it skips a
+  key another holds and takes the next marker, or does nothing. Queued behind
+  another worker's chunk, it would put every `a` writer on the key behind one
+  more chunk, and drain no segment while it waited.
+- Every recompute reads `R` and `M` under `J[k]`, so the result is exact
+  whatever ran between two chunks: an `a` change writes its own row from the
+  same state, and a row that joins the key behind the cursor, or leaves it,
+  is written by its own page.
+- A marker holds back every watermark token at or past its origin, as a
+  parked row does, so a read after `await_converged` sees the fan-out done,
+  and `self_check` re-checks a divergence of the target while one is pending.
+  A row a chunk fails to write is held as a page's fan-out holds it, parked
+  with the marker's origin and segment. A `TRUNCATE` of either side deletes
+  the definition's markers (a `TRUNCATE b` starts a rebuild, and a `TRUNCATE
+  a` leaves no row to recompute), and so does `RESUME`, whose build
+  recomputes every row.
+- The index the chunks walk holds the `ON` columns and the entry key, so a 1-1
+  JOIN's `ON` has at most 31 columns.
 
-- A `status()` warning names the join key with the most `a` rows when it holds more than 250k, a
-  key whose `b` change stalls its `a` writers for about a second. The count is a sample of `R`'s
-  join-key index, not `pg_stats`, which is stale after a build.
-- A hard cap halts the transform rather than fan out past a configured row
-  count.
-- No transform may read a 1-1 JOIN target. The seam holds every changed key's
-  prior image in memory until commit: about 300 MB per million rows with any
-  reader, and more on the image feed.
+The benchmark (`one-to-one-join-fan-out`, 1M `a` rows on one key, a `LEFT`
+join) measures the page at 0.03 s and the whole fan-out at about 10.6 s, from
+the `b` commit to the last chunk: about 10 µs per row, against 4.3 s in one
+transaction, with the same 340 B of WAL per row. An `a` change on the key
+lands in a median 0.17 s, against 4.4 s behind one transaction. An `INNER`
+join's fan-out costs more, since each batch also deletes the target rows of
+entries whose key has lost its last live `b` row.
 
-Chunked fan-out with a durable per-key pending marker lifts these limits
-later. In the model (#1375 Y5) it was exact under worker kills and a second
-`b` change mid-way, and it bounded an `a` writer's wait to one chunk: 0.13 s
-against 3.8 s. It took about 5x as long overall.
+- A `status()` warning names the join key with the most `a` rows when it
+  holds more than 250k, a key whose `b` change takes seconds to reach every
+  row. The count is a sample of `R`'s join-key index, not `pg_stats`, which
+  is stale after a build.
+- No transform may read a 1-1 JOIN target. Neither a page's fan-out nor a
+  chunk records its writes for the target-mutation seam.
 
 ### A row a page fails to write is held in the page
 

@@ -334,19 +334,21 @@ async fn an_aggregate_join_key_wider_than_an_index_is_refused_at_validation() {
 async fn a_one_to_one_join_key_wider_than_an_index_is_refused_at_validation() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    // `fb` is keyed by 32 columns (the most Postgres takes) and has more
-    // columns beyond them.
+    // `fb` is keyed by 32 columns (the most Postgres takes), unique on the
+    // first 31 of them too, and has more columns beyond them.
     let pk = names("p", 32);
     batch(
         &db.pool,
         &format!(
-            "{} create table public.fb ({}, q0 integer, q1 integer, primary key ({}));",
+            "{} create table public.fb ({}, q0 integer, q1 integer, primary key ({})); \
+             create unique index on public.fb ({});",
             table_sql("fa", &[], "f", 40),
             pk.iter()
                 .map(|c| format!("{c} integer not null"))
                 .collect::<Vec<_>>()
                 .join(", "),
-            pk.join(", ")
+            pk.join(", "),
+            pk[..31].join(", ")
         ),
     )
     .await;
@@ -367,10 +369,18 @@ async fn a_one_to_one_join_key_wider_than_an_index_is_refused_at_validation() {
         )
     };
 
-    define(&db.pool, &text("o32", 32), &HashMap::new())
+    // `R`'s join-key index ends with the entry key, which a fan-out chunk
+    // walks a key's rows by: 31 `ON` columns are the most it holds.
+    define(&db.pool, &text("o31", 31), &HashMap::new())
         .await
-        .expect("a 32-column ON is admitted");
+        .expect("a 31-column ON is admitted");
     let hidden = hidden_table_count(&db.pool).await;
+    assert_too_wide(
+        define(&db.pool, &text("o32", 32), &HashMap::new()).await,
+        "each side of ON, with the key fa's hidden ledger adds to them,",
+        33,
+    );
+    nothing_registered(&db.pool, "o32").await;
     assert_too_wide(
         define(&db.pool, &text("o33", 33), &HashMap::new()).await,
         "each side of ON",

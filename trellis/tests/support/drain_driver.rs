@@ -635,12 +635,14 @@ impl Driver {
         }
     }
 
-    /// Seals and drains until nothing is pending anywhere in the ring. A
-    /// bounded deterministic loop, not a wait for convergence.
+    /// Seals and drains until nothing is pending anywhere in the ring, and
+    /// runs every 1-1 `JOIN`'s pending fan-out to its end. A bounded
+    /// deterministic loop, not a wait for convergence.
     pub async fn settle(&mut self) {
         for _ in 0..16 {
             let batch = self.seal().await;
             self.drain(batch, "settle").await;
+            self.run_fan_outs().await;
             retire_drained_segments(&mut self.ctl)
                 .await
                 .expect("retire drained segments");
@@ -650,6 +652,15 @@ impl Driver {
             }
         }
         panic!("pipeline did not reach quiescence within 16 seal/drain rounds");
+    }
+
+    /// Runs every 1-1 `JOIN`'s pending fan-out to its end, a chunk at a time
+    /// (`trellis::staging::one_to_one_join_fan_out_step`), returning how many
+    /// chunks ran.
+    pub async fn run_fan_outs(&self) -> usize {
+        trellis::staging::one_to_one_join_run_pending_fan_outs(&self.db.pool)
+            .await
+            .expect("run the pending fan-outs")
     }
 
     /// Frees the ring slots of drained segments.

@@ -47,7 +47,11 @@
 //!
 //! A divergence on a key the ring can't vouch for exactly (an unapplied row
 //! with no usable image, an op that touches every key) is re-checked after a
-//! fresh wait in `Standard` mode, like every comparison that reads a ring. The
+//! fresh wait in `Standard` mode, like every comparison that reads a ring. So
+//! is every divergence of the target part while the definition has a pending
+//! fan-out (`super::join_one_to_one::fan_out`): the rows of its key past the
+//! cursor still join the `b` row `M` held before, and the fresh wait waits
+//! for the fan-out to finish. The
 //! duplicate part can't subtract: a hand-off of a join key between two `b` rows
 //! holds two live entries for as long as the two changes are applied out of
 //! order, so it re-checks whenever `b`'s ring holds an unapplied row.
@@ -385,11 +389,13 @@ impl Audit<'_> {
                 " union all select 3, page.page_end, u.__k, null::text[] \
                     from page, ({a_unc}) u \
                   union all select 4, page.page_end, '', null::text[] from page \
-                   where {a_global} or {b_global} or exists ({b_unc})",
+                   where {a_global} or {b_global} or exists ({b_unc}) \
+                      or exists (select 1 from join1_fan_out where transform_id = {id})",
                 a_unc = a_ring.uncertain_keys_sql(),
                 a_global = a_ring.global_sql(),
                 b_global = b_ring.global_sql(),
                 b_unc = b_ring.uncertain_keys_sql(),
+                id = self.id(),
             ),
         )
     }

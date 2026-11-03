@@ -142,11 +142,10 @@ pub enum ApplyError {
     /// retry reads the keys again, inside its transaction. Taking the late
     /// key's `J` lock instead would break lock sorting.
     JoinKeyMoved { target: String },
-    /// A 1-1 `JOIN` page (`super::join_one_to_one`) that can't finish its
-    /// `b` changes' fan-out: it reaches more `a` rows than the cap
-    /// (`crate::defs::join_one_to_one::max_fanout`), or a field fails on
-    /// more of them than the bisection can name, which holds each row it
-    /// names in quarantine otherwise (`super::join_one_to_one::held`). Like
+    /// A 1-1 `JOIN` page (`super::join_one_to_one`), or a chunk of its
+    /// fan-out, that can't finish its write: a field fails on more `a` rows
+    /// than the bisection can name, which holds each row it names in
+    /// quarantine otherwise (`super::join_one_to_one::held`). Like
     /// [`ApplyError::GroupBasisUnsupported`], every page of the target would
     /// reproduce it, so it halts the target with the reason.
     JoinOneToOneHalt { target: String, reason: String },

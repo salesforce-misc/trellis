@@ -2353,8 +2353,8 @@ enum BuildStep {
 }
 
 /// A drain worker's build work for one pass of its loop, after its segments:
-/// one step of the Re-derive builds' work
-/// ([`rederive_build_step`]).
+/// one chunk of a 1-1 `JOIN`'s pending fan-out ([`fan_out_step`]), or else
+/// one step of the Re-derive builds' work ([`rederive_build_step`]).
 async fn build_step(
     pool: &Pool,
     claimed_by: &str,
@@ -2370,10 +2370,33 @@ async fn build_step(
             next_due: probe.next_due,
         };
     }
+    // A 1-1 `JOIN`'s pending fan-out first: it is a `b` change on its way to
+    // the target, which a reader waits on, where a build is a whole
+    // target's.
+    if fan_out_step(pool, claimed_by).await {
+        return BuildStep::Progress;
+    }
     if rederive_build_step(pool, claimed_by, build_options).await {
         BuildStep::Progress
     } else {
         BuildStep::Waiting
+    }
+}
+
+/// One chunk of a 1-1 `JOIN`'s pending fan-out
+/// (`staging::join_one_to_one::fan_out`), when there is one to run. Returns
+/// whether it ran one.
+async fn fan_out_step(pool: &Pool, claimed_by: &str) -> bool {
+    match staging::join_one_to_one::fan_out::step(pool).await {
+        Ok(step) => step.progressed(),
+        Err(error) => {
+            crate::instance_log::warn!(
+                worker = %claimed_by,
+                error = %error,
+                "1-1 JOIN fan-out chunk failed; retrying on the next pass"
+            );
+            false
+        }
     }
 }
 

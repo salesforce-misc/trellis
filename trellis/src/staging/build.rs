@@ -1256,7 +1256,9 @@ pub struct WorkProbe {
 /// unclaimed and not backing off, of a definition in a dispatchable status
 /// ([`chunk_queue::claim_chunks_of`]'s candidates, minus its kind and sweep
 /// filters), or a definition a
-/// Re-derive build is running for ([`building`] is not empty). It is a
+/// Re-derive build is running for ([`building`] is not empty), or a 1-1
+/// `JOIN`'s pending fan-out of a definition in a dispatchable status
+/// (`super::join_one_to_one::fan_out::step`'s candidates). It is a
 /// superset of both probes the step makes on every idle wake (`claim_chunks_of`,
 /// then `building`), so a `false` means each of them would have found
 /// nothing, and a `true` only means they are worth running (#273).
@@ -1279,7 +1281,10 @@ pub async fn work_probe(pool: &Pool) -> Result<WorkProbe, ChunkQueueError> {
                    where not bc.done and bc.claimed_by is null \
                      and (bc.next_attempt_at is null or bc.next_attempt_at <= now()) \
                      and {gate} \
-               ) or exists (select 1 from transform_definitions d where {building}) as may_exist) p",
+               ) or exists (select 1 from transform_definitions d where {building}) \
+                 or exists (select 1 from join1_fan_out f \
+                            join transform_definitions fd on fd.id = f.transform_id \
+                            where fd.status = any($3)) as may_exist) p",
         gate = chunk_queue::dispatchable_gate_sql("$3"),
         building = building_predicate(),
     );

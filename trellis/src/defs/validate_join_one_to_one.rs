@@ -66,6 +66,17 @@ pub fn validate(
         join_field_value_type(def, field, left, right)?;
     }
     super::validate::check_join_collation_reads(def, join, left, right)?;
+    // `R`'s join-key index ends with the entry key, which a fan-out chunk
+    // walks a key's entries by: one column past the `ON` columns.
+    super::validate::check_index_key_width(
+        || {
+            format!(
+                "each side of ON, with the key {}'s hidden ledger adds to them,",
+                def.source
+            )
+        },
+        join.on.len() + 1,
+    )?;
     // A ledger copies every column its side's fields read beside its own.
     for (table, columns) in super::join_one_to_one::ledger_widths(def) {
         super::validate::check_table_width(|| table, columns)?;

@@ -71,7 +71,8 @@ pub struct JoinStatus {
     pub partials_warning: Option<PartialsWarning>,
     /// A 1-1 `JOIN`'s largest group of `a` rows on one join key, when it
     /// passes the threshold: a change of its `b` row rewrites that many target
-    /// rows in one transaction. Sampled; see [`FanOutWarning`]. Always `None`
+    /// rows, in chunks, before a token past it converges. Sampled; see
+    /// [`FanOutWarning`]. Always `None`
     /// for an aggregate `JOIN`.
     pub fan_out_warning: Option<FanOutWarning>,
     /// The step the definition's build runs now, or runs next if no worker

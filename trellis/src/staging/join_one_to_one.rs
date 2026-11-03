@@ -55,9 +55,10 @@
 //!    match, is deleted ([`write_a_changes`]). Then the fan-out
 //!    ([`fan_out`]): every other live `R` entry on a key a changed `M` entry
 //!    held before the page or holds after it is recomputed the same way, in
-//!    sorted keyset batches of 10k, one statement each. Fields are rendered
-//!    SQL, never evaluated in Rust. More rows than the cap
-//!    ([`crate::defs::join_one_to_one::max_fanout`]) halt the transform. A
+//!    sorted keyset batches of 10k, one statement each, for the keys whose
+//!    entries fit one chunk between them; every other key is left to the
+//!    chunks of its pending marker ([`fan_out`]'s module), which the page
+//!    writes. Fields are rendered SQL, never evaluated in Rust. A
 //!    field that fails on a row of either write holds that row of `a` in
 //!    quarantine on this first failure, once a bisection under savepoints
 //!    has named the rows and fields, and the rest of the page commits
@@ -75,9 +76,10 @@
 //! check), and a `b` page reads the entries it fans out to after locking
 //! their key, which no writer of an entry can leave or reach without the
 //! same lock. So two pages that write one target row queue on a `J` row
-//! before either locks it, whatever order their statements take. Nothing
-//! reads a 1-1 `JOIN` target in v1 (define refuses it), so a page records
-//! nothing for the seam.
+//! before either locks it, whatever order their statements take, and a chunk
+//! of a pending fan-out takes the same `J` row. Nothing reads a 1-1 `JOIN`
+//! target (define refuses it), so neither a page nor a chunk records anything
+//! for the seam.
 //!
 //! # A `TRUNCATE` ([`truncate_sides`], [`lock_definitions`], [`start_rebuilds`])
 //!
@@ -85,7 +87,8 @@
 //! UPDATE` instead, so it waits for the pages and chunks in flight and every
 //! other page waits for it, and settles the truncate before its changes: the
 //! side's ledger is emptied and its floor raised, and a `TRUNCATE` of `a`
-//! empties the target. `J` keeps its rows. The ledger is emptied by `DELETE`,
+//! empties the target, and either deletes the definition's pending fan-outs.
+//! `J` keeps its rows. The ledger is emptied by `DELETE`,
 //! not `TRUNCATE`: a sweep or `M` pass batch reads `R` or `M` before it takes
 //! the lock row, and a `TRUNCATE`'s `ACCESS EXCLUSIVE` lock would wait for
 //! that read while the batch waited for the lock row. A `TRUNCATE` of `b`
@@ -113,6 +116,7 @@ use tokio_postgres::Transaction;
 use tokio_postgres::types::{PgLsn, ToSql};
 
 pub(crate) mod build;
+pub(crate) mod fan_out;
 pub(crate) mod held;
 
 use crate::defs::ast::{Expr, JoinKind, TransformDef};
@@ -945,6 +949,9 @@ async fn truncate_sides(
             ledger::raise_floor(txn, ledger, lsn).await?;
         }
     }
+    // Every pending fan-out goes: a truncated `b` starts a rebuild, which
+    // recomputes every row, and a truncated `a` leaves no row to recompute.
+    fan_out::clear_all(txn, shape).await?;
     if truncate.from.is_none() {
         return Ok(0);
     }
@@ -1646,26 +1653,19 @@ async fn write_a_changes(
     }
 }
 
-/// Step 7's fan-out (the module doc): the target row of
-/// every live `R` entry on `keys` is recomputed from `R` and the newest live
-/// `M` entry on its key, but the `written` ones, which the page's `a` changes
-/// wrote already, and those of the `a` rows the definition holds in
-/// quarantine, which stay as they are until their release re-derives them
-/// ([`held`]). The page holds `J` for each of `keys` (they are in K), and
-/// every writer of an `R` entry on a key, or of an `M` entry on it, holds that
-/// key's `J` row too, so the entries read here are the ones the key has until
-/// the page commits.
+/// Step 7's fan-out (the module doc): the target row of every live `R` entry
+/// on `keys` is recomputed from `R` and the newest live `M` entry on its key,
+/// but the `written` ones, which the page's `a` changes wrote already, and
+/// those of the `a` rows the definition holds in quarantine, which stay as
+/// they are until their release re-derives them ([`held`]). The page holds
+/// `J` for each of `keys` (they are in K), and every writer of an `R` entry
+/// on a key, or of an `M` entry on it, holds that key's `J` row too, so the
+/// entries read here are the ones the key has until the page commits.
 ///
-/// More entries than the cap ([`crate::defs::join_one_to_one::max_fanout`])
-/// halt the transform with the reason; the entries are read with a `limit`
-/// one past it. The rest are written in sorted keyset batches of
-/// [`WRITE_BATCH`], one statement each ([`write_target`]), under one
-/// savepoint. A data exception rolls the fan-out back to it and bisects the
-/// batches down to the rows whose fields fail ([`fan_out_failure`]), which
-/// the page holds in quarantine ([`held::hold`]) while it writes every other
-/// row, so the `b` change commits and `M` advances. A bisection that can't
-/// name every failing row within [`MAX_FAN_OUT_PROBES`] attempts halts the
-/// transform.
+/// The page recomputes the keys whose rows fit one chunk's budget itself, and
+/// leaves every other key to its chunks under a pending marker it writes
+/// ([`fan_out::split`]); a key it recomputes whole loses the marker an
+/// earlier page left it.
 async fn fan_out(
     txn: &Transaction<'_>,
     plan: &JoinOneToOnePlan,
@@ -1678,7 +1678,34 @@ async fn fan_out(
         return Ok((0, 0));
     }
     let shape = &*plan.shape;
-    let cap = crate::defs::join_one_to_one::max_fanout();
+    let inline = fan_out::split(txn, plan, keys, seg_seq).await?;
+    let entries: Vec<String> = live_entries_on(txn, shape, &inline)
+        .await?
+        .into_iter()
+        .filter(|key| !written.contains(key))
+        .collect();
+    write_fan_out(
+        txn,
+        shape,
+        &entries,
+        &plan.held_origin,
+        seg_seq,
+        mutations,
+        &plan.held,
+    )
+    .await
+}
+
+/// The keys of the live `R` entries on `keys`, sorted, but those of the `a`
+/// rows the definition holds in quarantine.
+async fn live_entries_on(
+    txn: &Transaction<'_>,
+    shape: &JoinShape,
+    keys: &BTreeSet<KeyText>,
+) -> Result<Vec<String>, ApplyError> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
     let columns = key_arrays(shape.key.len(), keys);
     let mut params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
     let (unnest, casts) = key_unnest(shape);
@@ -1687,61 +1714,82 @@ async fn fan_out(
         .iter()
         .map(|c| format!("r.{}", quote_ident(&c.name)))
         .collect();
-    // Planted bug: the fan-out writes the rows of `a` held in quarantine.
-    // See `crate::plant`.
-    #[cfg(any(test, feature = "test-util"))]
-    let writes_held = crate::plant::armed() == Some(crate::plant::Plant::Join1FanOutHeldRow)
-        && crate::plant::fires(
-            crate::plant::Plant::Join1FanOutHeldRow,
-            held::holds_any(txn, shape).await?,
-        );
-    #[cfg(not(any(test, feature = "test-util")))]
-    let writes_held = false;
-    let not_held = if writes_held {
-        String::new()
-    } else {
-        let n = params.len();
-        params.push(&shape.id);
-        params.push(&shape.source_table);
-        format!(" and {}", held::not_held_sql("r", n + 1, n + 2))
-    };
+    let n = params.len();
+    params.push(&shape.id);
+    params.push(&shape.source_table);
+    let not_held = not_held_filter(txn, shape, n + 1, n + 2).await?;
     let rows = super::ledger::query_by_entry_key(
         txn,
         &format!(
             "select r.{key} from {r} r \
-             where ({qualified}) in (select {casts} from {unnest}) and not r.{tomb}{not_held} \
-             limit {limit}",
+             where ({qualified}) in (select {casts} from {unnest}) and not r.{tomb}{not_held}",
             key = quote_ident(schema::KEY_COLUMN),
             r = shape.r.ident,
             qualified = qualified.join(", "),
             casts = casts.join(", "),
             tomb = quote_ident(schema::TOMBSTONE_COLUMN),
-            limit = cap.saturating_add(1),
         ),
         &params,
     )
     .await?;
-    if rows.len() as u64 > cap {
-        return Err(ApplyError::JoinOneToOneHalt {
-            target: shape.target.clone(),
-            reason: format!(
-                "a change of {} whose fan-out reaches more than {cap} rows of {} in one page, \
-                 past the fan-out cap ({})",
-                shape.joined_table,
-                shape.source_table,
-                crate::defs::join_one_to_one::MAX_FANOUT_ENV,
-            ),
-        });
+    let mut entries: Vec<String> = rows.into_iter().map(|row| row.get(0)).collect();
+    entries.sort_unstable();
+    Ok(entries)
+}
+
+/// ` and ` the predicate that leaves out the rows of `a` held in quarantine
+/// ([`held::not_held_sql`]), over `R` as `r`, the definition's id and `a`'s
+/// name being parameters `$id_param` and `$table_param`.
+async fn not_held_filter(
+    txn: &Transaction<'_>,
+    shape: &JoinShape,
+    id_param: usize,
+    table_param: usize,
+) -> Result<String, ApplyError> {
+    // Planted bug: the fan-out writes the rows of `a` held in quarantine.
+    // See `crate::plant`. Both parameters stay bound, so the statement's
+    // parameters don't change with the plant.
+    #[cfg(any(test, feature = "test-util"))]
+    if crate::plant::armed() == Some(crate::plant::Plant::Join1FanOutHeldRow)
+        && crate::plant::fires(
+            crate::plant::Plant::Join1FanOutHeldRow,
+            held::holds_any(txn, shape).await?,
+        )
+    {
+        return Ok(format!(
+            " and ${id_param}::bigint is not null and ${table_param}::text is not null"
+        ));
     }
-    let mut entries: Vec<String> = rows
-        .into_iter()
-        .map(|row| row.get::<_, String>(0))
-        .filter(|key| !written.contains(key))
-        .collect();
+    #[cfg(not(any(test, feature = "test-util")))]
+    let _ = (txn, shape);
+    Ok(format!(
+        " and {}",
+        held::not_held_sql("r", id_param, table_param)
+    ))
+}
+
+/// Writes the target rows of a fan-out's `entries` (sorted `R` keys): a
+/// page's ([`fan_out`]) or a chunk's ([`fan_out::step`]). They are written in
+/// sorted keyset batches of [`WRITE_BATCH`], one statement each
+/// ([`write_target`]), under one savepoint. A data exception rolls the
+/// fan-out back to it and bisects the batches down to the rows whose fields
+/// fail ([`fan_out_failure`]), which are held in quarantine ([`held::hold`]),
+/// parked with `origin` and `seg_seq` and recorded in `held` for the fuses,
+/// while every other row is written, so the `b` change commits and `M`
+/// advances. A bisection that can't name every failing row within
+/// [`MAX_FAN_OUT_PROBES`] attempts halts the transform.
+async fn write_fan_out(
+    txn: &Transaction<'_>,
+    shape: &JoinShape,
+    entries: &[String],
+    origin: &held::HeldOrigin,
+    seg_seq: i64,
+    mutations: &mut TargetMutations,
+    held: &held::Held,
+) -> Result<(usize, usize), ApplyError> {
     if entries.is_empty() {
         return Ok((0, 0));
     }
-    entries.sort_unstable();
     let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
     txn.batch_execute("savepoint join1_fan_out").await?;
     let (mut written, mut deleted) = (0, 0);
@@ -1756,9 +1804,9 @@ async fn fan_out(
                     .await?;
                 let (written, deleted, rows) =
                     fan_out_failure(txn, shape, Side::Joined, &entries, mutations).await?;
-                let held: Vec<_> = rows.iter().map(|row| (row, &plan.held_origin)).collect();
-                held::hold(txn, shape, seg_seq, Side::Joined, &held).await?;
-                plan.held.record(rows);
+                let parked: Vec<_> = rows.iter().map(|row| (row, origin)).collect();
+                held::hold(txn, shape, seg_seq, Side::Joined, &parked).await?;
+                held.record(rows);
                 txn.batch_execute("release savepoint join1_fan_out").await?;
                 return Ok((written, deleted));
             }
@@ -1957,8 +2005,8 @@ async fn write_target(
     if keys.is_empty() {
         return Ok((0, 0));
     }
-    // Nothing reads a 1-1 JOIN target in v1 (define refuses it), so there
-    // are no prior images to capture and nothing to record for the seam.
+    // Nothing reads a 1-1 JOIN target (define refuses it), so there are no
+    // prior images to capture and nothing to record for the seam.
     if mutations
         .image_sql(txn, &shape.target, "t")
         .await?

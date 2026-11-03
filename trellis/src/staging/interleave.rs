@@ -65,7 +65,10 @@
 //! checked their held keys, the same three around its `M` entry lock with
 //! `AfterJoin1MEntryLock` last, `AfterJoin1Read` after a Re-derive's read,
 //! `BeforeJoin1Recompute` before its target write and fan-out, and
-//! `BeforeCommit`.
+//! `BeforeCommit`. A chunk of its pending fan-out
+//! (`super::join_one_to_one::fan_out`) fires `AfterJoin1FanOutLock` once it
+//! holds its key's `J` row and marker, and `BeforeJoin1FanOutCommit` after
+//! its last write.
 //!
 //! A 1-1 build chunk (`super::build::one_to_one::run_chunk`) fires
 //! `AfterPlaceholders` and `AfterEntryLock` around its entry lock, and
@@ -264,6 +267,13 @@ pub enum PausePoint {
     /// re-derives them (`super::build`'s sweep job). Nothing of theirs is
     /// locked here, so a page can apply a change of their rows.
     AfterJoin1OrphanRead,
+    /// On a 1-1 `JOIN` target, after a fan-out chunk
+    /// (`super::join_one_to_one::fan_out`) took its key's `J` row and its
+    /// pending marker, before it reads `R`.
+    AfterJoin1FanOutLock,
+    /// On a 1-1 `JOIN` target, after a fan-out chunk wrote its rows and moved
+    /// its key's marker on (or deleted it), before it commits.
+    BeforeJoin1FanOutCommit,
     /// After a Re-derive's live read of the source (on a 1-1 ledger, a
     /// forced group recompute).
     AfterRederiveRead,

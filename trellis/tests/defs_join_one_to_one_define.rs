@@ -802,7 +802,11 @@ async fn define_registers_both_tables_the_target_and_the_hidden_tables() {
                 .any(|i| i.contains("__applied_seg") && i.contains("WHERE __tombstone")),
             "{table}: {indexes:?}"
         );
-        let key = if part == "r" { "(cust)" } else { "(id)" };
+        let key = if part == "r" {
+            "(cust, __from_key)"
+        } else {
+            "(id)"
+        };
         assert!(
             indexes.iter().any(|i| i.ends_with(key)),
             "{table}: {indexes:?}"

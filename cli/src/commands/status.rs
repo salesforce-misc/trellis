@@ -312,8 +312,8 @@ fn format_join(join: &JoinStatus) -> String {
     }
     if let Some(w) = &join.fan_out_warning {
         out.push_str(&format!(
-            "    warning: {} rows of the FROM table share join key {}, past the {} that one \
-             change of its JOIN row rewrites in a single transaction\n",
+            "    warning: {} rows of the FROM table share join key {}, past the {}: one \
+             change of its JOIN row takes seconds to rewrite them all\n",
             w.rows, w.key, w.threshold
         ));
     }
@@ -484,8 +484,8 @@ mod tests {
         }));
         assert_eq!(
             format_join(&join),
-            "    warning: 120000 rows of the FROM table share join key 30, past the 100000 that \
-             one change of its JOIN row rewrites in a single transaction\n"
+            "    warning: 120000 rows of the FROM table share join key 30, past the 100000: \
+             one change of its JOIN row takes seconds to rewrite them all\n"
         );
     }
 
