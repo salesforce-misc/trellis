@@ -998,6 +998,14 @@ async fn a_one_to_one_whose_source_lost_its_key_fails_through_its_plan_job() {
             .expect("the database's clock")
             .get(0);
         assert_eq!(f.run_chunks_by_hand(1).await, 1, "the plan job is claimed");
+        // And after it: the failing transaction committed before the job
+        // returned, so its `now()` is no later than this.
+        let after: std::time::SystemTime = f
+            .raw
+            .query_one("select clock_timestamp()", &[])
+            .await
+            .expect("the database's clock")
+            .get(0);
         let status = trellis
             .status("one")
             .await
@@ -1015,10 +1023,18 @@ async fn a_one_to_one_whose_source_lost_its_key_fails_through_its_plan_job() {
         );
         // `chunk_queue::retry_delay` with `REDERIVE_RETRY_CAP`, which are
         // crate-private: a second, a doubling per further failure, at most five.
+        // The delay is taken from the failure count, which the test pins above.
         let delay = Duration::from_secs((1u64 << (charge - 1)).min(5));
         assert!(
             failure.next_attempt_at >= before + delay,
             "the retry is backed off by at least {delay:?}: due at {:?}, the job began at {before:?}",
+            failure.next_attempt_at
+        );
+        // Nor later than the job's end plus `delay`: the doubling stops at the
+        // cap, so a backoff that outgrows it fails here.
+        assert!(
+            failure.next_attempt_at <= after + delay,
+            "the retry is backed off by at most {delay:?}: due at {:?}, the job ended at {after:?}",
             failure.next_attempt_at
         );
     }
