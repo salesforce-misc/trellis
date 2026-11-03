@@ -360,7 +360,9 @@ impl fmt::Display for ApplyError {
                 write!(f, "apply database error: ")?;
                 crate::error::write_pg_error(f, err)
             }
-            ApplyError::Pool(err) => write!(f, "failed to acquire a connection: {err}"),
+            // `err` already says what failed (a pool checkout reads
+            // "failed to acquire a connection: ...").
+            ApplyError::Pool(err) => write!(f, "{err}"),
             ApplyError::ClaimLost => write!(
                 f,
                 "this worker's claim was gone by completion time; nothing was applied twice, \

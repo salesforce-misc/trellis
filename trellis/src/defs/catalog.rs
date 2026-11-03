@@ -525,7 +525,9 @@ impl fmt::Display for CatalogError {
                 write!(f, "transform catalog database error: ")?;
                 crate::error::write_pg_error(f, err)
             }
-            CatalogError::Pool(err) => write!(f, "failed to acquire a connection: {err}"),
+            // `err` already says what failed (a pool checkout reads
+            // "failed to acquire a connection: ...").
+            CatalogError::Pool(err) => write!(f, "{err}"),
             CatalogError::UnknownValueType { column, text } => write!(
                 f,
                 "column '{column}' has an unrecognized persisted value type '{text}'"

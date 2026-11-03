@@ -292,3 +292,100 @@ async fn a_refused_pool_connection_names_the_servers_reason() {
         assert_eq!(err.code(), trellis::ErrorCode::Connectivity);
     }
 }
+
+/// A refused pool checkout reads the same through every error type that
+/// wraps one: the server's own text, and "failed to acquire a connection"
+/// once (each wrapper prints the [`Error`] it holds as it is).
+#[tokio::test]
+async fn every_pool_wrapper_names_the_servers_reason_once() {
+    use trellis::defs::backfill::BackfillError;
+    use trellis::defs::chunk_queue::ChunkQueueError;
+    use trellis::{ApplyError, CatalogError, DdlError, SelfCheckError};
+
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let config = Config::from_dsn(format!("{} dbname=trellis_no_such_database", db.dsn()))
+        .expect("valid DSN and schema");
+    let pool = trellis::pool::Pool::new(&config).expect("pool builds lazily");
+    let refused = || async {
+        match pool.get().await {
+            Err(err) => err,
+            Ok(_) => panic!("the server must refuse a connection"),
+        }
+    };
+
+    let messages = [
+        ("Error", refused().await.to_string()),
+        (
+            "BackfillError",
+            BackfillError::from(refused().await).to_string(),
+        ),
+        (
+            "ChunkQueueError",
+            ChunkQueueError::from(refused().await).to_string(),
+        ),
+        ("DdlError", DdlError::from(refused().await).to_string()),
+        (
+            "CatalogError",
+            CatalogError::from(refused().await).to_string(),
+        ),
+        ("ApplyError", ApplyError::from(refused().await).to_string()),
+        (
+            "SelfCheckError",
+            SelfCheckError::from(refused().await).to_string(),
+        ),
+    ];
+    for (wrapper, message) in messages {
+        assert!(
+            message.contains("database \"trellis_no_such_database\" does not exist"),
+            "{wrapper} must carry the server's own text, got: {message}"
+        );
+        assert_eq!(
+            message.matches("failed to acquire a connection").count(),
+            1,
+            "{wrapper} must say it once, got: {message}"
+        );
+    }
+}
+
+/// `migrate` connects on its own session, outside the pool; a server that
+/// refuses that connection says why there too.
+#[tokio::test]
+async fn a_refused_migrate_connection_names_the_servers_reason() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let config = Config::from_dsn(format!("{} dbname=trellis_no_such_database", db.dsn()))
+        .expect("valid DSN and schema");
+
+    let err = trellis::migrate(&config)
+        .await
+        .expect_err("the server must refuse the connection");
+    assert!(matches!(err, Error::Connect(_)), "{err:?}");
+    let message = err.to_string();
+    assert!(
+        message.contains("database \"trellis_no_such_database\" does not exist"),
+        "the message must carry the server's own text, got: {message}"
+    );
+}
+
+/// A new pooled connection whose session setup the server rejects says why:
+/// deadpool's `post_create` hook error reads only "db error" on its own.
+#[tokio::test]
+async fn a_rejected_session_setup_names_the_servers_reason() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let client = db.pool.get().await.expect("acquire connection");
+    let server_err = client
+        .batch_execute("select 1 / 0")
+        .await
+        .expect_err("division by zero");
+
+    let err = Error::Pool(deadpool_postgres::PoolError::PostCreateHook(
+        deadpool_postgres::HookError::Backend(server_err),
+    ));
+    let message = err.to_string();
+    assert!(
+        message.contains("division by zero"),
+        "the message must carry the server's own text, got: {message}"
+    );
+}

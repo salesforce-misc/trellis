@@ -77,7 +77,9 @@ impl std::fmt::Display for BackfillError {
                 write!(f, "direct backfill database error: ")?;
                 crate::error::write_pg_error(f, err)
             }
-            BackfillError::Pool(err) => write!(f, "failed to acquire a connection: {err}"),
+            // `err` already says what failed (a pool checkout reads
+            // "failed to acquire a connection: ...").
+            BackfillError::Pool(err) => write!(f, "{err}"),
             BackfillError::Ddl(err) => write!(f, "direct backfill schema error: {err}"),
             BackfillError::Unsupported(what) => {
                 write!(f, "direct backfill does not support {what}")

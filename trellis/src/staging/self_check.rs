@@ -488,7 +488,9 @@ impl fmt::Display for SelfCheckError {
                 write!(f, "self_check database error: ")?;
                 crate::error::write_pg_error(f, err)
             }
-            SelfCheckError::Pool(err) => write!(f, "failed to acquire a connection: {err}"),
+            // `err` already says what failed (a pool checkout reads
+            // "failed to acquire a connection: ...").
+            SelfCheckError::Pool(err) => write!(f, "{err}"),
         }
     }
 }

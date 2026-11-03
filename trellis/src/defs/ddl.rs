@@ -344,7 +344,9 @@ impl fmt::Display for DdlError {
                 write!(f, "target-table DDL database error: ")?;
                 crate::error::write_pg_error(f, err)
             }
-            DdlError::Pool(err) => write!(f, "failed to acquire a connection: {err}"),
+            // `err` already says what failed (a pool checkout reads
+            // "failed to acquire a connection: ...").
+            DdlError::Pool(err) => write!(f, "{err}"),
         }
     }
 }

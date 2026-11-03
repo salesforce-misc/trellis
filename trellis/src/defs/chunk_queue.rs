@@ -78,7 +78,9 @@ impl std::fmt::Display for ChunkQueueError {
                 write!(f, "backfill chunk queue database error: ")?;
                 crate::error::write_pg_error(f, err)
             }
-            ChunkQueueError::Pool(err) => write!(f, "failed to acquire a connection: {err}"),
+            // `err` already says what failed (a pool checkout reads
+            // "failed to acquire a connection: ...").
+            ChunkQueueError::Pool(err) => write!(f, "{err}"),
             ChunkQueueError::Backfill(err) => write!(f, "backfill chunk execution failed: {err}"),
             ChunkQueueError::Catalog(err) => write!(f, "backfill chunk completion failed: {err}"),
             ChunkQueueError::DefinitionNotFound { definition_id } => write!(
