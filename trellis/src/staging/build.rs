@@ -188,11 +188,50 @@ pub struct SweepOutcome {
     pub finished: bool,
 }
 
-/// How long a chunk waits for its entry lock before giving up.
-/// A drain page waits up to `locks::LOCK_TIMEOUT` for the same locks, so a
-/// page never queues for long behind a chunk, and a chunk never holds up a
-/// page that got there first. The caller retries the chunk later.
+/// How long a chunk waits for a lock on the rows it writes, its entry lock
+/// among them, before giving up ([`under_chunk_lock_timeout`]). A drain page
+/// waits up to `locks::LOCK_TIMEOUT` for the same locks, so a page never
+/// queues for long behind a chunk, and a chunk never holds up a page that got
+/// there first. The caller retries the chunk later.
 pub const CHUNK_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Runs `step`, the part of a build transaction that locks the rows it
+/// writes, under [`CHUNK_LOCK_TIMEOUT`], then gives the transaction back the
+/// `lock_timeout` it had before: the session's, which every Trellis
+/// connection caps at `locks::LOCK_TIMEOUT` (I7).
+///
+/// What follows `step` is the job's update of its own `backfill_chunks` row
+/// (its done mark or its cursor), then the commit. While the job holds its
+/// claim the only other writer of that row is the job's own heartbeat
+/// (`chunk_queue::ChunkHeartbeat`): the transaction holds the row `for key
+/// share` ([`ClaimFence::hold`]), so a resume or a drop waits for it and
+/// the stale-claim sweep and the claim skip it. The heartbeat's refresh is
+/// an autocommit update that keeps the row locked until its commit has
+/// flushed, which under slow WAL flush takes over a second. Under the short
+/// timeout the job's update gives up on that wait and the whole step rolls
+/// back to run again, so it waits under the session's timeout instead,
+/// which still bounds a refresh whose commit never ends.
+///
+/// `step` is a future, so it runs only when awaited here, once the timeout
+/// is set. When it fails the caller rolls the transaction back, and the
+/// timeout with it.
+pub(super) async fn under_chunk_lock_timeout<T, E>(
+    txn: &impl GenericClient,
+    step: impl Future<Output = Result<T, E>>,
+) -> Result<T, E>
+where
+    E: From<tokio_postgres::Error>,
+{
+    let previous: String = txn
+        .query_one("select current_setting('lock_timeout')", &[])
+        .await?
+        .get(0);
+    crate::locks::set_local_lock_timeout(txn, CHUNK_LOCK_TIMEOUT).await?;
+    let out = step.await?;
+    txn.execute("select set_config('lock_timeout', $1, true)", &[&previous])
+        .await?;
+    Ok(out)
+}
 
 // ---------------------------------------------------------------------
 // The scheduled build

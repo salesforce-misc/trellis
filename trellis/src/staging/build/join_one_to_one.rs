@@ -12,9 +12,11 @@
 //!   batch commits with the job's cursor ([`PlanStage`]), so a job that
 //!   fails or dies during the pass or the walk resumes from its last batch.
 //! - **A chunk** ([`run_chunk`]) runs in the transaction that marks it done,
-//!   under [`CHUNK_LOCK_TIMEOUT`] for every lock it takes, so a page waits
-//!   at most one chunk's length behind it, and a chunk that meets a page
-//!   holding a lock gives up and retries.
+//!   under [`CHUNK_LOCK_TIMEOUT`](super::CHUNK_LOCK_TIMEOUT) for every lock it takes on the rows it
+//!   writes, so a page waits at most one chunk's length behind it, and a
+//!   chunk that meets a page holding a lock gives up and retries. Its done
+//!   mark, like each `M` pass or sweep batch's cursor, waits under the
+//!   session's timeout instead ([`under_chunk_lock_timeout`]).
 //! - **The rebuild sweep** ([`sweep_batch`]) runs after the plan job and
 //!   every chunk, in two passes: `R`'s stale entries, then the orphans,
 //!   target rows no live `R` entry backs. Each batch re-derives what it found
@@ -37,8 +39,8 @@ use crate::staging::one_to_one_ledger;
 
 use super::orphans::{self, OrphanCursor, OrphanWalk};
 use super::{
-    CHUNK_APPLICATION_NAME, CHUNK_LOCK_TIMEOUT, ChunkQueueError, ClaimFence, Definition, Pool,
-    SweepOutcome, WorkerOptions, build_error,
+    CHUNK_APPLICATION_NAME, ChunkQueueError, ClaimFence, Definition, Pool, SweepOutcome,
+    WorkerOptions, build_error, under_chunk_lock_timeout,
 };
 
 /// What a 1-1 `JOIN`'s chunk or sweep batch needs: the definition's shape,
@@ -78,7 +80,7 @@ impl JoinPlan {
 }
 
 /// Begins one `READ COMMITTED` transaction of a build step, with the chunk's
-/// `application_name` and [`CHUNK_LOCK_TIMEOUT`] for every lock it takes.
+/// `application_name`.
 async fn begin(client: &mut tokio_postgres::Client) -> Result<Transaction<'_>, ChunkQueueError> {
     let txn = client
         .build_transaction()
@@ -89,7 +91,6 @@ async fn begin(client: &mut tokio_postgres::Client) -> Result<Transaction<'_>, C
         "set local application_name = '{CHUNK_APPLICATION_NAME}'"
     ))
     .await?;
-    crate::locks::set_local_lock_timeout(&txn, CHUNK_LOCK_TIMEOUT).await?;
     Ok(txn)
 }
 
@@ -200,44 +201,8 @@ pub(super) async fn build_m(
             txn.rollback().await?;
             return Ok(false);
         }
-        let next = match &stage {
-            PlanStage::B(after) => {
-                match steps::m_batch(&txn, &shape, &m_pk, after.as_deref(), limit)
-                    .await
-                    .map_err(build_error)?
-                {
-                    Some(key) => PlanStage::B(Some(key)),
-                    None => PlanStage::BNulls(None),
-                }
-            }
-            PlanStage::BNulls(after) => {
-                match steps::m_null_batch(&txn, &shape, &m_pk, after.as_deref(), limit)
-                    .await
-                    .map_err(build_error)?
-                {
-                    Some(key) => PlanStage::BNulls(Some(key)),
-                    None => PlanStage::Gone(None),
-                }
-            }
-            // Planted bug: the `M` pass walks only `b`, not `M`'s entries
-            // whose `b` row is gone. See `crate::plant`.
-            #[cfg(any(test, feature = "test-util"))]
-            PlanStage::Gone(_)
-                if crate::plant::fires(crate::plant::Plant::Join1MPassBOnly, true) =>
-            {
-                PlanStage::Walk(None)
-            }
-            PlanStage::Gone(after) => {
-                match steps::m_gone_batch(&txn, &shape, &m_pk, after.as_deref(), limit)
-                    .await
-                    .map_err(build_error)?
-                {
-                    Some(key) => PlanStage::Gone(Some(key)),
-                    None => PlanStage::Walk(None),
-                }
-            }
-            PlanStage::Walk(_) => unreachable!("the pass ends at the walk of `a`"),
-        };
+        let next = under_chunk_lock_timeout(&txn, m_pass_batch(&txn, &shape, &m_pk, &stage, limit))
+            .await?;
         let walking_b = matches!(next, PlanStage::B(_));
         txn.execute(
             "update backfill_chunks set lo = $2, key_collations = $3 where id = $1",
@@ -254,6 +219,53 @@ pub(super) async fn build_m(
     Ok(true)
 }
 
+/// One batch of the `M` pass ([`build_m`]) from `stage`, in `txn`: the
+/// steps that lock the rows they write. Returns the stage after it.
+async fn m_pass_batch(
+    txn: &Transaction<'_>,
+    shape: &Arc<JoinShape>,
+    m_pk: &[PrimaryKeyColumn],
+    stage: &PlanStage,
+    limit: i64,
+) -> Result<PlanStage, ChunkQueueError> {
+    Ok(match stage {
+        PlanStage::B(after) => {
+            match steps::m_batch(txn, shape, m_pk, after.as_deref(), limit)
+                .await
+                .map_err(build_error)?
+            {
+                Some(key) => PlanStage::B(Some(key)),
+                None => PlanStage::BNulls(None),
+            }
+        }
+        PlanStage::BNulls(after) => {
+            match steps::m_null_batch(txn, shape, m_pk, after.as_deref(), limit)
+                .await
+                .map_err(build_error)?
+            {
+                Some(key) => PlanStage::BNulls(Some(key)),
+                None => PlanStage::Gone(None),
+            }
+        }
+        // Planted bug: the `M` pass walks only `b`, not `M`'s entries
+        // whose `b` row is gone. See `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        PlanStage::Gone(_) if crate::plant::fires(crate::plant::Plant::Join1MPassBOnly, true) => {
+            PlanStage::Walk(None)
+        }
+        PlanStage::Gone(after) => {
+            match steps::m_gone_batch(txn, shape, m_pk, after.as_deref(), limit)
+                .await
+                .map_err(build_error)?
+            {
+                Some(key) => PlanStage::Gone(Some(key)),
+                None => PlanStage::Walk(None),
+            }
+        }
+        PlanStage::Walk(_) => unreachable!("the pass ends at the walk of `a`"),
+    })
+}
+
 /// One chunk, `(lo, hi]` of `a`'s primary key, in `txn`, the chunk's own
 /// transaction (`super::run_rederive`), which marks it done and commits.
 /// Returns the keys it re-derived.
@@ -263,10 +275,12 @@ pub(super) async fn run_chunk(
     lo: Option<&str>,
     hi: &str,
 ) -> Result<usize, ChunkQueueError> {
-    crate::locks::set_local_lock_timeout(txn, CHUNK_LOCK_TIMEOUT).await?;
-    let outcome = steps::run_chunk(txn, &plan.shape, &plan.range_pk, lo, hi)
-        .await
-        .map_err(build_error)?;
+    let outcome = under_chunk_lock_timeout(txn, async {
+        steps::run_chunk(txn, &plan.shape, &plan.range_pk, lo, hi)
+            .await
+            .map_err(build_error)
+    })
+    .await?;
     // Test-only pause point: the chunk has written everything and holds its
     // locks. See `super::super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
@@ -338,7 +352,17 @@ pub(super) async fn sweep_batch(
     cursor: Option<&str>,
     scan: i64,
 ) -> Result<SweepOutcome, ChunkQueueError> {
-    crate::locks::set_local_lock_timeout(txn, CHUNK_LOCK_TIMEOUT).await?;
+    under_chunk_lock_timeout(txn, sweep_batch_steps(txn, plan, start_xid, cursor, scan)).await
+}
+
+/// [`sweep_batch`]'s steps, which lock the rows they write.
+async fn sweep_batch_steps(
+    txn: &Transaction<'_>,
+    plan: &JoinPlan,
+    start_xid: &str,
+    cursor: Option<&str>,
+    scan: i64,
+) -> Result<SweepOutcome, ChunkQueueError> {
     let shape = &plan.shape;
     let stage = Stage::parse(cursor);
     let (scanned, rederived, next) = match stage {

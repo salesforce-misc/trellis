@@ -41,12 +41,6 @@ use trellis::staging::build::{self, Step, WorkerOptions};
 use trellis::staging::self_check::{SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page};
 use trellis::{Trellis, TrellisOptions};
 
-/// These tests run one at a time. Side by side, each a cluster of its own
-/// running rebuilds, they load the box enough that a build chunk's statement
-/// hits its 1 s lock timeout, and `work_to_idle` stops at the chunk's retry
-/// with the target not yet rebuilt (#1594).
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 fn options() -> WorkerOptions {
     WorkerOptions {
         chunk_rows: 3,
@@ -428,7 +422,6 @@ async fn run_cell(cell: &Cell, kind: &str) {
 }
 
 async fn run(cell: Cell) {
-    let _serial = SERIAL.lock().await;
     for kind in ["", "LEFT"] {
         run_cell(&cell, kind).await;
     }
@@ -606,7 +599,6 @@ async fn step(d: &mut Driver, sql: &str) {
 /// and by its own page, and its release: the held-row checks and the
 /// release's re-derive meet `R`, `M` and `J` as a page does.
 async fn a_held_row_is_released_after_a_re_collation(cell: Cell) {
-    let _serial = SERIAL.lock().await;
     for kind in ["", "LEFT"] {
         let case = format!("{} ({kind})", cell.name);
         let case = case.as_str();
@@ -774,7 +766,6 @@ async fn run_keys_cell(
 /// and its target key are one text.
 #[tokio::test]
 async fn an_on_column_that_is_its_tables_primary_key_re_collated() {
-    let _serial = SERIAL.lock().await;
     let ddl = "create table public.a (kt text collate \"und-x-icu\" primary key, v integer); \
          create table public.b (kt text collate \"und-x-icu\" primary key, y integer); \
          insert into public.a select k, i \
@@ -849,7 +840,6 @@ async fn an_on_column_that_is_its_tables_primary_key_re_collated() {
 /// `a` with a text part, each re-collated, the `ON` pairs to two collations.
 #[tokio::test]
 async fn a_composite_on_and_a_composite_primary_key_re_collated() {
-    let _serial = SERIAL.lock().await;
     let ddl = "create table public.a (p1 text collate \"und-x-icu\", p2 integer, \
              k1 text collate \"und-x-icu\", k2 text collate \"C\", v integer, \
              primary key (p1, p2)); \
@@ -919,7 +909,6 @@ async fn a_composite_on_and_a_composite_primary_key_re_collated() {
 /// with.
 #[tokio::test]
 async fn the_from_tables_keys_re_collated_during_its_build() {
-    let _serial = SERIAL.lock().await;
     for kind in ["", "LEFT"] {
         let ddl = "create table public.a (id text collate \"und-x-icu\" primary key, \
                  kt text collate \"und-x-icu\", v integer); \

@@ -439,6 +439,131 @@ async fn c_a_chunk_on_a_pages_key_gives_up_and_retries() {
     }
 }
 
+/// A job's update of its own `backfill_chunks` row waits out the job's own
+/// heartbeat (#1594). The heartbeat's refresh is an autocommit update that
+/// holds the row until its commit has flushed, over a second under slow WAL
+/// flush, and the job's claim (`FOR KEY SHARE`) lets it through. The job's
+/// done mark or cursor then waits on it, under the session's lock timeout,
+/// not the chunk's short one, which bounds the job's waits on the rows it
+/// writes (`c_a_chunk_on_a_pages_key_gives_up_and_retries`). A connection of
+/// the test's plays the refresh: it holds the row `FOR NO KEY UPDATE`, the
+/// refresh's lock, from a pause inside the job's transaction until the job's
+/// update has waited past `CHUNK_LOCK_TIMEOUT`. The job then commits with no
+/// failure recorded: a chunk, an `M` pass batch and a sweep batch.
+#[tokio::test]
+async fn a_jobs_update_of_its_own_row_waits_out_its_heartbeat() {
+    let _serial = SERIAL.lock().await;
+    for kind in KINDS {
+        let target = kind.target();
+
+        let d = start(&[kind], false).await;
+        let mut planner = d
+            .run_frozen(
+                &[(PausePoint::BeforeJoin1Lock, &target)],
+                |pool| async move { Ok(build_step(&pool, "planner", 2).await) },
+            )
+            .await;
+        hold_the_jobs_row(&d, &mut planner, PausePoint::BeforeJoin1Lock, "plan").await;
+        assert_eq!(planner.finish().await, Step::Planned);
+        assert_no_failure(&d, "plan", "an M pass batch").await;
+
+        let mut d = start(&[kind], false).await;
+        assert_eq!(build_step(d.pool(), "planner", 100).await, Step::Planned);
+        let mut chunk = d
+            .run_frozen(
+                &[(PausePoint::BeforeRebuildCommit, &target)],
+                |pool| async move { Ok(build_step(&pool, "chunk", 100).await) },
+            )
+            .await;
+        hold_the_jobs_row(&d, &mut chunk, PausePoint::BeforeRebuildCommit, "rederive").await;
+        assert_eq!(chunk.finish().await, Step::Chunk);
+        assert_no_failure(&d, "rederive", "a chunk").await;
+        assert_oracle(&mut d, &[kind], "a chunk behind its heartbeat").await;
+
+        let mut d = start(&[kind], true).await;
+        change_while_paused(&mut d, &[kind], "delete from public.a where id = 'a03'").await;
+        run_until_the_sweep(&d).await;
+        let mut sweep = d
+            .run_frozen(
+                &[(PausePoint::AfterJoin1OrphanRead, &target)],
+                |pool| async move { Ok(build_step(&pool, "sweep", 3).await) },
+            )
+            .await;
+        hold_the_jobs_row(&d, &mut sweep, PausePoint::AfterJoin1OrphanRead, "sweep").await;
+        sweep.finish().await;
+        assert_no_failure(&d, "sweep", "a sweep batch").await;
+        assert_oracle(&mut d, &[kind], "a sweep batch behind its heartbeat").await;
+    }
+}
+
+/// Holds the `kind` job's `backfill_chunks` row `FOR NO KEY UPDATE`, as its
+/// heartbeat's refresh does until its commit flushes, from the job's `point`
+/// until the job's own update of the row has queued on it (or on the
+/// heartbeat queued behind it) for longer than `CHUNK_LOCK_TIMEOUT`, then
+/// commits. The wait is a lower bound, not a wait
+/// for convergence: a job under the short timeout has given up by then.
+async fn hold_the_jobs_row<T>(
+    d: &Driver,
+    job: &mut drain_driver::Running<T>,
+    point: PausePoint,
+    kind: &str,
+) {
+    let reached = job.reached(point).await;
+    let mut holder = drain_driver::connect(d.db.dsn()).await;
+    let txn = holder.transaction().await.expect("begin the holder");
+    txn.query_one(
+        "select id from backfill_chunks where kind = $1 and not done for no key update",
+        &[&kind],
+    )
+    .await
+    .expect("hold the job's row");
+    d.release(job, point).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let queued: bool = d
+            .ctl
+            .query_one(
+                "select exists (select 1 from pg_stat_activity \
+                 where pid = $1 and cardinality(pg_blocking_pids(pid)) > 0 \
+                   and query like 'update backfill_chunks%')",
+                &[&reached.backend_pid],
+            )
+            .await
+            .expect("read pg_stat_activity")
+            .get(0);
+        if queued {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the {kind} job's update of its row never queued on the holder"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(build::CHUNK_LOCK_TIMEOUT + std::time::Duration::from_millis(500)).await;
+    txn.commit().await.expect("release the job's row");
+}
+
+/// The `kind` job recorded no failure.
+async fn assert_no_failure(d: &Driver, kind: &str, step: &str) {
+    let failed: Vec<Option<String>> = d
+        .ctl
+        .query(
+            "select last_error from backfill_chunks \
+             where kind = $1 and last_error is not null",
+            &[&kind],
+        )
+        .await
+        .expect("read the job's failures")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "{step}: its update of its own row waited out the holder: {failed:?}"
+    );
+}
+
 /// A `TRUNCATE b` in the middle of a build (#1399): the chunks that ran
 /// before it wrote their rows from the `b` side it removed, and the chunks
 /// still to run read the `M` it emptied. The page starts a rebuild of its
@@ -1050,7 +1175,7 @@ async fn end_session(d: &Driver, pid: i32) {
         .await
         .expect("end the job's session")
         .get(0);
-    assert!(ended, "the job's session {pid} exited");
+    assert!(ended, "the job's session {pid} did not exit within 60 s");
 }
 
 /// `kind`'s `M` entries' row versions, by key.

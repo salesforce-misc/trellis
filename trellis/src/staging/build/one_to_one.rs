@@ -66,7 +66,7 @@ use super::super::apply::ApplyError;
 use super::super::one_to_one_ledger::{self, EntryChange};
 use super::super::target_mutations::TargetMutations;
 use super::orphans::{self, OrphanCursor, OrphanWalk};
-use super::{CHUNK_LOCK_TIMEOUT, SweepOutcome};
+use super::{SweepOutcome, under_chunk_lock_timeout};
 
 /// What a 1-1 Re-derive build needs to know about its target.
 #[derive(Debug, Clone)]
@@ -173,9 +173,9 @@ pub struct OneToOneOutcome {
 /// `txn` must be `read committed`, as for an aggregate's chunk
 /// ([`super::run_chunk`]): step 3's snapshot must be its own statement's,
 /// taken after the entry lock (ADR-0002 I1). A lock wait past
-/// [`CHUNK_LOCK_TIMEOUT`] fails it with `55P03`, and an entry the tombstone
-/// GC collects under its lock with [`ApplyError::LedgerEntryCollected`];
-/// both are transient.
+/// [`CHUNK_LOCK_TIMEOUT`](super::CHUNK_LOCK_TIMEOUT) fails it with `55P03`,
+/// and an entry the tombstone GC collects under its lock with
+/// [`ApplyError::LedgerEntryCollected`]; both are transient.
 pub async fn run_chunk(
     txn: &Transaction<'_>,
     plan: &OneToOnePlan,
@@ -708,7 +708,8 @@ fn sweep_pick(plan: &OneToOnePlan, pattern: &[bool]) -> Pick {
 
 /// A 1-1 chunk's or sweep batch's entry lock
 /// (`one_to_one_ledger::lock_entries`, every key a Re-derive), under
-/// [`CHUNK_LOCK_TIMEOUT`], which it sets for the lock alone.
+/// [`CHUNK_LOCK_TIMEOUT`](super::CHUNK_LOCK_TIMEOUT) for the lock alone
+/// ([`under_chunk_lock_timeout`]).
 async fn lock_chunk_entries(
     txn: &Transaction<'_>,
     plan: &OneToOnePlan,
@@ -733,14 +734,9 @@ async fn lock_chunk_entries(
         })
         .collect();
     let started = Instant::now();
-    let locked = async {
-        let previous: String = txn
-            .query_one("select current_setting('lock_timeout')", &[])
-            .await?
-            .get(0);
-        crate::locks::set_local_lock_timeout(txn, CHUNK_LOCK_TIMEOUT).await?;
-        // The segment stamp is only for an Apply the insert settles; a
-        // Re-derive's placeholder takes none.
+    // The segment stamp is only for an Apply the insert settles; a
+    // Re-derive's placeholder takes none.
+    let locked = under_chunk_lock_timeout(txn, async {
         one_to_one_ledger::lock_entries(
             txn,
             &one_to_one_ledger::LedgerRef::of_target(&plan.target),
@@ -750,10 +746,8 @@ async fn lock_chunk_entries(
             skip_lock,
         )
         .await?;
-        txn.execute("select set_config('lock_timeout', $1, true)", &[&previous])
-            .await?;
         Ok::<_, ApplyError>(())
-    }
+    })
     .await;
     metrics::record_build_statement(BuildStatement::ChunkLock, started.elapsed());
     locked
