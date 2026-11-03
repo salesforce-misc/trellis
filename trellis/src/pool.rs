@@ -17,8 +17,8 @@
 //! instead (see [`ROW_SECURITY_OFF`]), turns JIT compilation
 //! off (see [`JIT_OFF`]), starts every transaction at
 //! `READ COMMITTED` (see [`READ_COMMITTED`]), and turns on
-//! TCP keepalives at both ends so a partitioned connection's locks don't
-//! outlive it by hours (see [`tcp_keepalive_gucs`]). The
+//! TCP keepalives and a user timeout at both ends so a partitioned
+//! connection's locks don't outlive it by hours (see [`tcp_keepalive_gucs`]). The
 //! dedicated, non-pooled connections get the same through
 //! [`connect_dedicated`] and [`dedicated_session_setup`].
 
@@ -472,7 +472,7 @@ impl Pool {
         }
         let (mut pg_config, tls_spec) = crate::config::parse_dsn_tls(config.dsn())?;
         let tls = tls_spec.connector()?;
-        with_client_keepalives(&mut pg_config, DeadPeerDetection::KeepalivesOnly);
+        with_client_keepalives(&mut pg_config);
 
         let manager_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
@@ -937,30 +937,27 @@ pub(crate) const READ_COMMITTED: &str = "set default_transaction_isolation to 'r
 
 /// Runs once per physical connection, right after it's established and
 /// before it's returned to any caller: [`session_setup`] with the server-side
-/// TCP keepalives ([`tcp_keepalive_gucs`], without the user timeout: see
-/// [`DeadPeerDetection::KeepalivesOnly`]).
+/// TCP keepalives and user timeout ([`tcp_keepalive_gucs`]).
 async fn session_bootstrap(
     client: &mut tokio_postgres::Client,
     schema: &str,
 ) -> Result<(), tokio_postgres::Error> {
-    client
-        .batch_execute(&session_setup(schema, DeadPeerDetection::KeepalivesOnly))
-        .await
+    client.batch_execute(&session_setup(schema)).await
 }
 
 /// The session setup every Trellis connection runs before its first use.
 ///
 /// Pins `search_path` to `schema` alone ([`search_path_sql`]), plus [`DETERMINISTIC_TEXT_OUTPUT_GUCS`],
 /// [`EXPRESSION_INPUT_GUCS`], [`ROW_SECURITY_OFF`], [`JIT_OFF`], [`READ_COMMITTED`], the server-side
-/// TCP keepalives ([`tcp_keepalive_gucs`]) as `detection` says, and the
+/// TCP keepalives and user timeout ([`tcp_keepalive_gucs`]), and the
 /// session's `lock_timeout` cap ([`crate::locks::session_lock_timeout_sql`],
 /// ADR-0002 I7).
-fn session_setup(schema: &str, detection: DeadPeerDetection) -> String {
+fn session_setup(schema: &str) -> String {
     format!(
         "{}; {DETERMINISTIC_TEXT_OUTPUT_GUCS}; {EXPRESSION_INPUT_GUCS}; {ROW_SECURITY_OFF}; \
          {JIT_OFF}; {READ_COMMITTED}; {}; {}",
         search_path_sql(schema),
-        tcp_keepalive_gucs(detection),
+        tcp_keepalive_gucs(),
         crate::locks::session_lock_timeout_sql()
     )
 }
@@ -1011,8 +1008,7 @@ pub(crate) fn search_path_sql(schema: &str) -> String {
 /// producer kept every restart standing by, unable to take the lock, for the
 /// whole two hours. But any connection partitioned mid-transaction pins its row
 /// and advisory locks the same way, so the pool and every dedicated connection
-/// get the keepalives too. Only the dedicated ones also get
-/// [`TCP_USER_TIMEOUT`]; see [`DeadPeerDetection`] for why the pool doesn't.
+/// get the keepalives, and [`TCP_USER_TIMEOUT`] with them.
 ///
 /// Idle 10s, then up to 3 probes 5s apart, is a dead peer declared about 25s
 /// after it last answered ([`TCP_USER_TIMEOUT`] matches that). The cost is one
@@ -1056,46 +1052,23 @@ const TCP_KEEPALIVE_COUNT: u32 = 3;
 /// set Linux also uses it in place of the probe count to decide when
 /// keepalives have failed, which is why it matches the keepalive total.
 ///
-/// Unlike the keepalives, it can end a healthy connection. See
-/// [`DeadPeerDetection::KeepalivesOnly`].
+/// Unlike the keepalives, it can end a healthy connection. It also fires on a
+/// live peer that stops reading: once the reader's receive buffer is full it
+/// advertises a zero window, and Linux (5.11+) aborts a socket whose window
+/// has stayed shut for the user timeout even though the peer keeps
+/// acknowledging the window probes. That would kill a connection whose
+/// caller streams a large result (`query_raw`, `copy_out`) and pauses more
+/// than 25s between rows. So it is safe only because nothing outside Trellis
+/// holds a Trellis connection (the pool is not public API, and an embedder
+/// opens its own connections), and Trellis itself runs every query on them,
+/// reads every result eagerly and never pipelines a bulk write, so neither
+/// end sits on a shut window. A new caller that streams on a Trellis
+/// connection has to give it a connection of its own instead.
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// `tokio_postgres`'s default keepalive idle time. A parsed DSN reporting
 /// anything else set `keepalives_idle` itself.
 const TOKIO_POSTGRES_DEFAULT_KEEPALIVE_IDLE: Duration = Duration::from_secs(2 * 60 * 60);
-
-/// How much of the dead-peer schedule a connection gets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DeadPeerDetection {
-    /// Keepalives only, for the pool. [`TCP_USER_TIMEOUT`] also fires on a
-    /// live peer that stops reading: once the reader's receive buffer is
-    /// full it advertises a zero window, and Linux (5.11+) aborts a socket
-    /// whose window has stayed shut for the user timeout even though the
-    /// peer keeps acknowledging the window probes. On the server end that
-    /// kills a pooled connection whose caller streams a large result
-    /// (`query_raw`, `copy_out`) and pauses more than 25s between rows, so
-    /// the pool goes without (issue #1589 tracks giving it the timeout now
-    /// that only Trellis and its test harnesses read on it). A partition
-    /// that strikes a pooled connection with data in flight is then noticed
-    /// at the retransmission timeout (~15 minutes); the idle case, the usual
-    /// one, drops from about 2h to 25s.
-    KeepalivesOnly,
-    /// Keepalives plus [`TCP_USER_TIMEOUT`], for Trellis's own dedicated
-    /// connections (producer session, maintenance loop, heartbeat daemon,
-    /// wake listener). Trellis runs every query on them, reads every result
-    /// eagerly and never pipelines a bulk write, so neither end sits on a
-    /// shut window.
-    KeepalivesAndUserTimeout,
-}
-
-impl DeadPeerDetection {
-    fn user_timeout(self) -> Option<Duration> {
-        match self {
-            Self::KeepalivesOnly => None,
-            Self::KeepalivesAndUserTimeout => Some(TCP_USER_TIMEOUT),
-        }
-    }
-}
 
 /// The statement that makes the **server** probe this connection's client
 /// and drop it once the client stops answering. This is the half that
@@ -1108,8 +1081,8 @@ impl DeadPeerDetection {
 /// to partition, and reads them back as `0` there. On a server without
 /// `TCP_USER_TIMEOUT` support (macOS) it logs that it can't set that one,
 /// and the statement still succeeds.
-pub(crate) fn tcp_keepalive_gucs(detection: DeadPeerDetection) -> String {
-    let mut settings = vec![
+pub(crate) fn tcp_keepalive_gucs() -> String {
+    let settings = [
         (
             "tcp_keepalives_idle",
             TCP_KEEPALIVE_IDLE.as_secs().to_string(),
@@ -1119,10 +1092,8 @@ pub(crate) fn tcp_keepalive_gucs(detection: DeadPeerDetection) -> String {
             TCP_KEEPALIVE_INTERVAL.as_secs().to_string(),
         ),
         ("tcp_keepalives_count", TCP_KEEPALIVE_COUNT.to_string()),
+        ("tcp_user_timeout", TCP_USER_TIMEOUT.as_millis().to_string()),
     ];
-    if let Some(user_timeout) = detection.user_timeout() {
-        settings.push(("tcp_user_timeout", user_timeout.as_millis().to_string()));
-    }
     let values = settings
         .iter()
         .map(|(name, value)| format!("('{name}', '{value}')"))
@@ -1153,10 +1124,7 @@ pub(crate) fn tcp_keepalive_gucs(detection: DeadPeerDetection) -> String {
 ///
 /// `tokio_postgres` sets the user timeout on Linux only and ignores it
 /// elsewhere; the keepalive options work on Linux, macOS and Windows.
-pub(crate) fn with_client_keepalives(
-    config: &mut tokio_postgres::Config,
-    detection: DeadPeerDetection,
-) {
+pub(crate) fn with_client_keepalives(config: &mut tokio_postgres::Config) {
     let dsn_set_any = !config.get_keepalives()
         || config.get_keepalives_idle() != TOKIO_POSTGRES_DEFAULT_KEEPALIVE_IDLE
         || config.get_keepalives_interval().is_some()
@@ -1169,10 +1137,8 @@ pub(crate) fn with_client_keepalives(
         .keepalives(true)
         .keepalives_idle(TCP_KEEPALIVE_IDLE)
         .keepalives_interval(TCP_KEEPALIVE_INTERVAL)
-        .keepalives_retries(TCP_KEEPALIVE_COUNT);
-    if let Some(user_timeout) = detection.user_timeout() {
-        config.tcp_user_timeout(user_timeout);
-    }
+        .keepalives_retries(TCP_KEEPALIVE_COUNT)
+        .tcp_user_timeout(TCP_USER_TIMEOUT);
 }
 
 /// Opens a standalone (non-pooled) connection to `dsn` with the client-side
@@ -1191,7 +1157,7 @@ pub(crate) async fn connect_dedicated(
 ) -> Result<(tokio_postgres::Client, DedicatedConnection), Error> {
     let (mut config, tls) = crate::config::parse_dsn_tls(dsn)?;
     let tls = tls.connector()?;
-    with_client_keepalives(&mut config, DeadPeerDetection::KeepalivesAndUserTimeout);
+    with_client_keepalives(&mut config);
     Ok(config.connect(tls).await?)
 }
 
@@ -1203,9 +1169,9 @@ pub(crate) type DedicatedConnection = tokio_postgres::Connection<
 
 /// The session setup a dedicated connection runs straight after
 /// [`connect_dedicated`]: [`session_setup`], as [`session_bootstrap`] runs it
-/// for a pooled one, with [`tcp_keepalive_gucs`] including the user timeout.
+/// for a pooled one.
 pub(crate) fn dedicated_session_setup(schema: &str) -> String {
-    session_setup(schema, DeadPeerDetection::KeepalivesAndUserTimeout)
+    session_setup(schema)
 }
 
 /// Quotes a Postgres identifier for safe interpolation into SQL text.
@@ -1340,31 +1306,23 @@ mod tests {
         assert_eq!(quote_ident("weird\"schema"), "\"weird\"\"schema\"");
     }
 
-    /// The client probes on the same schedule the server does,
-    /// with the user timeout only on dedicated connections. The server half
+    /// The client probes on the same schedule the server does, with the same
+    /// user timeout. The server half
     /// is checked against a live TCP session in `tests/tcp_keepalives.rs`;
     /// `tokio_postgres` exposes no way to read the client's socket options
     /// back, so this checks the config instead.
     #[test]
     fn client_keepalives_match_the_server_schedule() {
-        for (detection, user_timeout) in [
-            (DeadPeerDetection::KeepalivesOnly, None),
-            (
-                DeadPeerDetection::KeepalivesAndUserTimeout,
-                Some(&TCP_USER_TIMEOUT),
-            ),
-        ] {
-            let mut config = tokio_postgres::Config::from_str("host=127.0.0.1").expect("parse dsn");
-            with_client_keepalives(&mut config, detection);
-            assert!(config.get_keepalives(), "{detection:?}");
-            assert_eq!(config.get_keepalives_idle(), TCP_KEEPALIVE_IDLE);
-            assert_eq!(
-                config.get_keepalives_interval(),
-                Some(TCP_KEEPALIVE_INTERVAL)
-            );
-            assert_eq!(config.get_keepalives_retries(), Some(TCP_KEEPALIVE_COUNT));
-            assert_eq!(config.get_tcp_user_timeout(), user_timeout, "{detection:?}");
-        }
+        let mut config = tokio_postgres::Config::from_str("host=127.0.0.1").expect("parse dsn");
+        with_client_keepalives(&mut config);
+        assert!(config.get_keepalives());
+        assert_eq!(config.get_keepalives_idle(), TCP_KEEPALIVE_IDLE);
+        assert_eq!(
+            config.get_keepalives_interval(),
+            Some(TCP_KEEPALIVE_INTERVAL)
+        );
+        assert_eq!(config.get_keepalives_retries(), Some(TCP_KEEPALIVE_COUNT));
+        assert_eq!(config.get_tcp_user_timeout(), Some(&TCP_USER_TIMEOUT));
         // The user timeout replaces the probe count on Linux once set, so
         // it has to equal the probing budget or it changes the schedule.
         assert_eq!(
@@ -1392,7 +1350,7 @@ mod tests {
         ] {
             let parsed = tokio_postgres::Config::from_str(dsn).expect("parse dsn");
             let mut config = parsed.clone();
-            with_client_keepalives(&mut config, DeadPeerDetection::KeepalivesAndUserTimeout);
+            with_client_keepalives(&mut config);
             assert_eq!(config.get_keepalives(), parsed.get_keepalives(), "{dsn}");
             assert_eq!(
                 config.get_keepalives_idle(),
@@ -1675,10 +1633,7 @@ mod tests {
     #[test]
     fn session_setup_puts_only_the_trellis_schema_on_the_search_path() {
         for (kind, sql) in [
-            (
-                "pooled",
-                session_setup("my \"schema", DeadPeerDetection::KeepalivesOnly),
-            ),
+            ("pooled", session_setup("my \"schema")),
             ("dedicated", dedicated_session_setup("my \"schema")),
         ] {
             let statements: Vec<&str> = sql

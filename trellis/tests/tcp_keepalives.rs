@@ -1,5 +1,5 @@
 //! Every connection Trellis opens turns on server-side TCP
-//! keepalives, so a partitioned client's backend (and the locks it holds,
+//! keepalives and a TCP user timeout, so a partitioned client's backend (and the locks it holds,
 //! the producer singleton above all) goes away in seconds rather than the
 //! ~2h the kernel defaults allow.
 //!
@@ -16,26 +16,16 @@ use trellis::config::DEFAULT_SCHEMA;
 use trellis::pool::Pool;
 use trellis::staging::ProducerSession;
 
-/// What a dedicated connection should read back: 10s idle, 3 probes 5s
-/// apart, and a 25s `tcp_user_timeout`. `SHOW` prints these without units
-/// (seconds for the keepalives, milliseconds for the user timeout), because
-/// on a TCP session it reports what's actually set on the socket.
-const DEDICATED: [(&str, &str); 4] = [
+/// What a Trellis connection, pooled or dedicated, should read back: 10s
+/// idle, 3 probes 5s apart, and a 25s `tcp_user_timeout`. `SHOW` prints these
+/// without units (seconds for the keepalives, milliseconds for the user
+/// timeout), because on a TCP session it reports what's actually set on the
+/// socket.
+const EXPECTED: [(&str, &str); 4] = [
     ("tcp_keepalives_idle", "10"),
     ("tcp_keepalives_interval", "5"),
     ("tcp_keepalives_count", "3"),
     ("tcp_user_timeout", "25000"),
-];
-
-/// A pooled connection gets the same keepalives but no user timeout (`0`,
-/// the kernel default): the pool is handed to embedders, and a user timeout
-/// would also end a healthy connection whose caller reads a large result
-/// slowly. See `pool::DeadPeerDetection::KeepalivesOnly`.
-const POOLED: [(&str, &str); 4] = [
-    ("tcp_keepalives_idle", "10"),
-    ("tcp_keepalives_interval", "5"),
-    ("tcp_keepalives_count", "3"),
-    ("tcp_user_timeout", "0"),
 ];
 
 async fn assert_settings(client: &impl GenericClient, which: &str, expected: &[(&str, &str)]) {
@@ -62,7 +52,7 @@ async fn producer_session_sets_server_side_tcp_keepalives() {
         .await
         .expect("open the producer session over TCP");
 
-    assert_settings(session.client(), "producer session", &DEDICATED).await;
+    assert_settings(session.client(), "producer session", &EXPECTED).await;
 }
 
 #[tokio::test]
@@ -74,7 +64,7 @@ async fn pooled_connections_set_server_side_tcp_keepalives() {
 
     let client = pool.get().await.expect("pooled connection over TCP");
 
-    assert_settings(&**client, "pooled connection", &POOLED).await;
+    assert_settings(&**client, "pooled connection", &EXPECTED).await;
 }
 
 /// A `tcp_*` GUC the operator set for this connection, here through the
