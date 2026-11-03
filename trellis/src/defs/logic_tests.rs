@@ -1183,6 +1183,10 @@ fn a_branch_after_a_constant_define_cannot_compute_is_not_refused() {
          THEN 2147483647 + 1 END",
         "COALESCE(STRPOS('', CAST(NULL AS text)), 2147483647 + 1)",
         "COALESCE(ROUND(CAST(NULL AS numeric), 2), CAST(2147483647 + 1 AS numeric))",
+        "COALESCE(CASE WHEN 1 = 2 THEN 1 ELSE STRPOS('', CAST(NULL AS text)) END, \
+         2147483647 + 1)",
+        "COALESCE(CASE WHEN 1 = 2 THEN 1 ELSE STRPOS(t, CAST(NULL AS text)) END, \
+         2147483647 + 1)",
         "STRPOS(CAST(NULL AS text), '') AS g, \
          CASE WHEN g IS NULL THEN 2147483647 + 1 END",
         // The guard's own constants are simplified, whatever it is.

@@ -688,6 +688,10 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
         "CASE WHEN STRPOS(CAST(NULL AS text), '') IS NULL THEN 2147483647 + 1 END",
         "COALESCE(STRPOS('', CAST(NULL AS text)), 2147483647 + 1)",
         "COALESCE(ROUND(CAST(NULL AS numeric), 2), CAST(2147483647 + 1 AS numeric))",
+        "COALESCE(CASE WHEN 1 = 2 THEN 1 ELSE STRPOS('', CAST(NULL AS text)) END, \
+         2147483647 + 1)",
+        "COALESCE(CASE WHEN 1 = 2 THEN 1 ELSE STRPOS(ta, CAST(NULL AS text)) END, \
+         2147483647 + 1)",
         "CASE WHEN ABS(STRPOS(CAST(NULL AS text), '')) IS NULL THEN 2147483647 + 1 END",
         "CASE WHEN CHAR_LENGTH(CAST(NULL AS text)) IS NOT DISTINCT FROM NULL \
          THEN 2147483647 + 1 END",
@@ -735,6 +739,8 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
         "CASE WHEN STRPOS(CAST(NULL AS text), '') IS NOT NULL THEN 2147483647 + 1 END",
         "COALESCE(STRPOS('', CAST(NULL AS text)), 5, 2147483647 + 1)",
         "COALESCE(ROUND(CAST(NULL AS numeric), 2), 5, 2147483647 + 1)",
+        "COALESCE(CASE WHEN 1 = 2 THEN 1 ELSE STRPOS('', CAST(NULL AS text)) END, \
+         5, 2147483647 + 1)",
         // A runtime divisor is left to the rows.
         "CASE WHEN i4a > 0 THEN na / i4a END",
         "i4a <> 0 AND na / i4a > 1",
@@ -747,6 +753,33 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
             Err(d) => panic!("{d}"),
         }
     }
+}
+
+/// Define folds a call with a `NULL` argument to `NULL`, as the planner folds
+/// a strict function. That holds only while every function the grammar
+/// admits (bar `COALESCE` and `NULLIF`, which define folds by their own
+/// rules) is strict, so a non-strict one added to the registry (`CONCAT`)
+/// fails here.
+#[test]
+fn every_admitted_function_is_strict() {
+    let signatures = registry::FUNCTIONS
+        .iter()
+        .map(|spec| {
+            let args: Vec<String> = spec.arg_types.iter().map(ToString::to_string).collect();
+            format!("{}({})", spec.name.to_lowercase(), args.join(", "))
+        })
+        .chain([
+            "extract(text, date)".into(),
+            "extract(text, timestamp)".into(),
+        ]);
+    HARNESS.with(|h| {
+        for signature in signatures {
+            let strict = h.runtime.block_on(h.fixture.scalar(&format!(
+                "select proisstrict from pg_proc where oid = '{signature}'::regprocedure"
+            )));
+            assert_eq!(strict, Ok(Some("true".into())), "`{signature}`");
+        }
+    });
 }
 
 /// Constants Postgres folds into an error at plan time are refused at
