@@ -775,7 +775,7 @@ mod tests {
                     }),
                 ],
                 unregistered_staging_worker: true,
-                migrations_pending: true,
+                migrations_pending: false,
             })),
         });
 
@@ -797,7 +797,7 @@ mod tests {
                     },
                 ],
                 unregistered_staging_worker: true,
-                migrations_pending: true,
+                migrations_pending: false,
             })
         );
     }
