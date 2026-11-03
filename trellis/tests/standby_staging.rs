@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use testkit::TestCluster;
+use trellis::config::DEFAULT_SCHEMA;
 use trellis::{Config, Trellis, TrellisOptions};
 
 /// The standby polls every 5 seconds; waits give it a few polls.
@@ -33,12 +34,19 @@ async fn raw_connection(dsn: &str) -> tokio_postgres::Client {
     client
 }
 
-/// The backend pids that hold an advisory lock (the producer singleton is the
-/// only one held for good), sorted.
+/// The backend pids that hold the staging-worker singleton, sorted. Only that
+/// lock: a handover pass holds a transaction-scoped advisory lock of its own
+/// for a moment on a pooled connection, and under load that moment is long
+/// enough to be seen.
 async fn lock_holders(raw: &tokio_postgres::Client) -> Vec<i32> {
+    let key = trellis::staging::session::producer_singleton_lock_key(DEFAULT_SCHEMA);
     raw.query(
-        "select distinct pid from pg_locks where locktype = 'advisory' and granted order by pid",
-        &[],
+        "select distinct pid from pg_locks \
+         where locktype = 'advisory' and granted and objsubid = 1 \
+           and database = (select oid from pg_database where datname = current_database()) \
+           and ((classid::int8 << 32) | objid::int8) = $1 \
+         order by pid",
+        &[&key],
     )
     .await
     .expect("read pg_locks")
@@ -47,7 +55,7 @@ async fn lock_holders(raw: &tokio_postgres::Client) -> Vec<i32> {
     .collect()
 }
 
-/// Polls `holders` until it reads a single backend that is not `not`.
+/// Polls `lock_holders` until it reads a single backend that is not `not`.
 async fn wait_for_new_leader(raw: &tokio_postgres::Client, not: &[i32]) -> i32 {
     let deadline = tokio::time::Instant::now() + TAKEOVER_WAIT;
     loop {

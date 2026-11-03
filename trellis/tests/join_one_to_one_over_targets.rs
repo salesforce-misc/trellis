@@ -816,8 +816,12 @@ async fn s5_an_upstream_resume_reaches_the_join() {
 
 // ------------------------------------------------------------------- S6
 
-/// Claims one plan job, if any is claimable, and runs it.
-async fn run_plan(d: &Driver) -> bool {
+/// Claims one plan job, if any is claimable, runs it and returns its id. A job
+/// that gives its claim back to wait on its fence is held out of reach for an
+/// hour, so a caller that runs plans in a loop meets each job once however
+/// long its other queries take (the fence's own retry is half a second); a
+/// test that wants a held job again clears `next_attempt_at`.
+async fn run_plan(d: &Driver) -> Option<i64> {
     let claimed = chunk_queue::claim_chunks_of(
         &**d.pool().get().await.expect("pool"),
         "test",
@@ -826,9 +830,7 @@ async fn run_plan(d: &Driver) -> bool {
     )
     .await
     .expect("claim a plan job");
-    let Some(chunk) = claimed.first() else {
-        return false;
-    };
+    let chunk = claimed.first()?;
     let options = trellis::staging::build::WorkerOptions {
         chunk_rows: 1_000,
         drain_batch_cap: usize::MAX,
@@ -836,7 +838,15 @@ async fn run_plan(d: &Driver) -> bool {
         reclaim_ttl: Duration::from_secs(60),
     };
     trellis::staging::build::run_claimed(d.pool(), chunk, "test", &options).await;
-    true
+    d.ctl
+        .execute(
+            "update backfill_chunks set next_attempt_at = now() + interval '1 hour' \
+             where id = $1 and not done and claimed_by is null and fence_xid is not null",
+            &[&chunk.id],
+        )
+        .await
+        .expect("hold the deferred plan job");
+    Some(chunk.id)
 }
 
 /// S6: the `JOIN`s are defined while an upstream page is in flight. The page
@@ -914,11 +924,11 @@ async fn s6_a_join_defined_while_an_upstream_writer_is_in_flight_does_not_miss_i
             .expect("start the JOINs' builds");
         // The page's rows land in a segment after the builds'.
         let between = d.seal().await;
-        let mut deferred = 0;
-        while run_plan(&d).await {
-            deferred += 1;
+        let mut plans = std::collections::BTreeSet::new();
+        while let Some(plan) = run_plan(&d).await {
+            plans.insert(plan);
         }
-        assert_eq!(deferred, JOINS.len(), "{when}: a plan job per JOIN");
+        assert_eq!(plans.len(), JOINS.len(), "{when}: a plan job per JOIN");
         assert_eq!(
             d.rows(
                 "select done, fence_xid is not null from backfill_chunks where kind = 'plan' \

@@ -1398,6 +1398,17 @@ async fn a_seam_fed_build_plans_no_chunk_until_the_writer_open_at_its_fence_ends
             .expect("the plan job's first step"),
         Step::Planned
     );
+    // The plan job's claim is held out of reach, so the step below asks only
+    // whether a chunk is claimable however long the reads between take (the
+    // job's own retry is half a second). The release below clears it.
+    d.ctl
+        .execute(
+            "update backfill_chunks set next_attempt_at = now() + interval '1 hour' \
+             where kind = 'plan'",
+            &[],
+        )
+        .await
+        .expect("hold the deferred plan job");
     let fence: i64 = d
         .ctl
         .query_one(
