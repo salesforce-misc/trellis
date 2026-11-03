@@ -22,7 +22,9 @@
 //!   queues behind a chunk;
 //! - a `TRUNCATE` of either side and a `RESUME` drop the markers, and the
 //!   rebuild is exact; a paused transform's markers wait;
-//! - a row a chunk fails on is held in quarantine with the marker's origin.
+//! - a row a chunk fails on is held in quarantine with the marker's origin;
+//! - `self_check` doesn't vouch for a target with a pending fan-out, and
+//!   waits for it.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -385,7 +387,9 @@ async fn a_chunk_killed_mid_way_changes_nothing_and_the_next_resumes_from_its_cu
 /// that holds the key's `J` row, and applies before the next: its page
 /// queues behind the frozen chunk, and commits once the chunk does with the
 /// marker still pending. A page that fanned out in one transaction would
-/// leave no marker, and the writer would wait for every row.
+/// leave no marker, and the writer would wait for every row. The chunk is
+/// frozen once it holds the key's `J` row and marker, before it writes a
+/// target row, so the writer queues on `J`, not on a row the chunk wrote.
 #[tokio::test]
 async fn an_a_writer_on_a_pending_key_waits_for_one_chunk_at_most() {
     let _chunked = chunked().await;
@@ -397,14 +401,14 @@ async fn an_a_writer_on_a_pending_key_waits_for_one_chunk_at_most() {
             ["({10},1,)"],
             "{kind:?}: the page leaves the key to its chunks"
         );
-        let mut chunk = frozen_chunk(&d, kind, PausePoint::BeforeJoin1FanOutCommit).await;
-        let reached = chunk.reached(PausePoint::BeforeJoin1FanOutCommit).await;
+        let mut chunk = frozen_chunk(&d, kind, PausePoint::AfterJoin1FanOutLock).await;
+        let reached = chunk.reached(PausePoint::AfterJoin1FanOutLock).await;
         // Row 5, after the chunk's two, and row 1, in it.
         write(&d, "update public.a set x = x + 1000 where id in (1, 5)").await;
         let batch = d.seal().await;
         let page = d.drain_frozen(batch, "writer", &[]).await;
         d.wait_blocked_behind(reached.backend_pid).await;
-        d.release(&mut chunk, PausePoint::BeforeJoin1FanOutCommit)
+        d.release(&mut chunk, PausePoint::AfterJoin1FanOutLock)
             .await;
         assert_eq!(chunk.finish().await, OneToOneJoinFanOutStep::Chunk);
         page.finish().await;
@@ -613,6 +617,54 @@ async fn a_row_a_chunk_fails_on_is_held_with_the_markers_origin() {
             key_rows(&d, kind).await,
             rows,
             "{kind:?}: every row but the held one joins the new b row"
+        );
+    }
+}
+
+/// A pending fan-out whose `b` change is applied, as one is when it lands
+/// after a `self_check`'s wait: the rows past the cursor still join the old
+/// `b` row, which no ring row stands for, so the comparison can't vouch for
+/// the target and each divergence is re-checked after a fresh wait rather
+/// than reported. Once the last chunk commits, it vouches again.
+#[tokio::test]
+async fn self_check_does_not_vouch_for_a_target_with_a_pending_fan_out() {
+    use trellis::staging::self_check::{SelfCheckScope, compare_page};
+    let _chunked = chunked().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        step(&mut d, "update public.b set w = 900 where id = 1").await;
+        one_chunk(&d).await;
+        let compare = |d: &Driver| {
+            let pool = d.pool().clone();
+            let target = kind.target();
+            async move {
+                compare_page(
+                    &pool,
+                    &target,
+                    SelfCheckScope {
+                        after: None,
+                        limit: 1000,
+                    },
+                )
+                .await
+                .expect("a comparison")
+            }
+        };
+        let pending = compare(&d).await;
+        assert!(
+            !pending.divergences.is_empty(),
+            "{kind:?}: rows 3 to 7 still join the old b row"
+        );
+        assert!(
+            pending.uncertain_all,
+            "{kind:?}: a pending fan-out leaves every divergence to a re-check"
+        );
+        d.run_fan_outs().await;
+        let done = compare(&d).await;
+        assert!(done.divergences.is_empty(), "{kind:?}: {done:?}");
+        assert!(
+            !done.uncertain_all,
+            "{kind:?}: with no marker left the comparison vouches for the target"
         );
     }
 }

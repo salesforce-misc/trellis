@@ -157,7 +157,8 @@ clears it. `await_converged_for` narrows condition 4 to one transform's held key
 since a key another transform holds is applied by this one as usual. The ring's pending
 rows (conditions 2 and 3) count in full either way. A 1-1 `JOIN`'s pending fan-out
 (condition 5) holds the wait the same way until its last chunk commits, and is
-narrowed the same way.
+narrowed the same way. A paused transform runs no chunk, so its pending fan-out holds
+the wait until its `RESUME` (whose rebuild recomputes every row) or `DROP` deletes it.
 
 ## No loose view feeds the predicate
 

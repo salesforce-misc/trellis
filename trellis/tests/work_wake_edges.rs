@@ -277,6 +277,39 @@ async fn resuming_a_paused_definition_with_a_chunk_wakes_workers() {
     assert!(probe().await, "resumed");
 }
 
+/// A 1-1 `JOIN`'s pending fan-out (`join1_fan_out`) is build work for a drain
+/// worker: a new marker announces itself, and the probe sees it while its
+/// definition is dispatchable (a paused one's waits for its `RESUME`), and
+/// not once it is gone. A marker set back to its key's start by a later page
+/// was there already, so it is no edge. The definition here is an aggregate:
+/// the probe and the trigger read no definition kind.
+#[tokio::test]
+async fn a_pending_fan_out_announces_itself_and_the_probe_sees_it() {
+    let mut f = Fixture::new().await;
+    let probe = || async {
+        build::work_probe(&f.db.pool)
+            .await
+            .expect("probe")
+            .may_exist
+    };
+    f.sql(
+        "insert into join1_fan_out (transform_id, join_key, seg_seq) \
+         select id, array['1'], 1 from transform_definitions",
+    )
+    .await;
+    assert_eq!(f.listener.heard().await, 1, "a new marker");
+    assert!(!probe().await, "paused");
+    f.sql("update transform_definitions set status = 'live'")
+        .await;
+    f.listener.heard().await;
+    assert!(probe().await, "a live definition's marker");
+    f.sql("update join1_fan_out set gen = gen + 1, cursor = null")
+        .await;
+    assert_eq!(f.listener.heard().await, 0, "a reset marker");
+    f.sql("delete from join1_fan_out").await;
+    assert!(!probe().await, "no marker");
+}
+
 /// The one edge nothing announces: a backing-off chunk coming due. The probe
 /// reports when, so the idle worker wakes for it itself.
 #[tokio::test]

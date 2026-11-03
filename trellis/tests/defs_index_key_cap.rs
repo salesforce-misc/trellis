@@ -377,7 +377,8 @@ async fn a_one_to_one_join_key_wider_than_an_index_is_refused_at_validation() {
     let hidden = hidden_table_count(&db.pool).await;
     assert_too_wide(
         define(&db.pool, &text("o32", 32), &HashMap::new()).await,
-        "each side of ON, with the key fa's hidden ledger adds to them,",
+        "each side of ON plus the row key of fa, which a 1-1 JOIN's hidden ledger indexes \
+         together,",
         33,
     );
     nothing_registered(&db.pool, "o32").await;

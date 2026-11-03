@@ -71,7 +71,8 @@ pub fn validate(
     super::validate::check_index_key_width(
         || {
             format!(
-                "each side of ON, with the key {}'s hidden ledger adds to them,",
+                "each side of ON plus the row key of {}, which a 1-1 JOIN's hidden ledger \
+                 indexes together,",
                 def.source
             )
         },
