@@ -78,10 +78,10 @@ defmodule Trellis.Status do
   the takeover, for at most 30 seconds. `nil` when none is.
 
   `join` is set for a `JOIN` transform, aggregate or 1-1, and `nil` for any
-  other (a `Trellis.JoinStatus`). It is a warning, never a hold-up: it
-  changes nothing about the transform's status. It reports the estimated size
-  of the transform's hidden tables, the `P`-size warning, the fan-out warning
-  of a 1-1 `JOIN` and the step its build runs.
+  other (a `Trellis.JoinStatus`). It never holds anything up: it changes
+  nothing about the transform's status. It reports the estimated size of the
+  transform's hidden tables, the `P`-size warning, the fan-out warning of a
+  1-1 `JOIN` and the step its build runs.
 
   Every process sees them, whichever one runs the staging worker.
   """

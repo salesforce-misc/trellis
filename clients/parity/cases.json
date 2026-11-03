@@ -261,6 +261,40 @@
     {"op": "apply", "args": ["PAUSE TRANSFORM parity_sales_by_region"], "expect": {"record": "Applied", "fields": {"kind": {"word": "paused"}}}},
     {"op": "apply", "args": ["DROP TRANSFORM parity_sales_by_region"], "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}}}},
 
+    {
+      "about": "A JOIN's status, as the binding encodes it from live definitions, at three points: here, before any build; with the staging worker but no drain worker, at each build's first step; and in phase two, built. parity_lines_by_bucket joins two partitioned tables with rows, so its build runs leaf by leaf, and its 1000 (bucket, kind_id) cells over 1200 rows put P past half the FROM table, for the P-size warning; parity_pets_named is a 1-1 JOIN. Before a build no hidden table has estimated rows, though each has a size on disk (its indexes), and no build is under way, as no staging worker has started one. The distinct counts make a binding that swaps two fields fail.",
+      "op": "sql",
+      "args": [
+        "create table parity_lines (id integer, bucket integer, kind_id integer, primary key (id, bucket)) partition by range (bucket)",
+        "create table parity_lines_p1 partition of parity_lines for values from (0) to (500)",
+        "create table parity_lines_p2 partition of parity_lines for values from (500) to (1000)",
+        "insert into parity_lines (id, bucket, kind_id) select i, i % 1000, i % 2 + 1 from generate_series(1, 1200) i",
+        "create index on parity_lines (kind_id)",
+        "create table parity_kinds (id integer primary key, name text) partition by range (id)",
+        "create table parity_kinds_k1 partition of parity_kinds for values from (1) to (2)",
+        "create table parity_kinds_k2 partition of parity_kinds for values from (2) to (3)",
+        "insert into parity_kinds (id, name) values (1, 'a'), (2, 'b')",
+        "create table parity_pets (id integer primary key, species_id integer)",
+        "insert into parity_pets (id, species_id) values (1, 1), (2, 1), (3, 2)",
+        "create index on parity_pets (species_id)",
+        "create table parity_species (id integer primary key, name text)",
+        "insert into parity_species (id, name) values (1, 'a'), (2, 'b')"
+      ]
+    },
+    {"op": "apply", "args": ["TRANSFORM parity_lines_by_bucket FROM parity_lines JOIN parity_kinds ON parity_lines.kind_id = parity_kinds.id GROUP BY parity_lines.bucket SELECT parity_lines.bucket AS bucket, COUNT(*) AS n"], "expect": {"record": "Applied", "fields": {"kind": {"word": "transform_defined"}}}},
+    {"op": "status", "args": ["parity_lines_by_bucket"], "expect": {"record": "Status", "fields": {"status": {"word": "waiting_to_backfill"}, "join": {"record": "JoinStatus", "fields": {
+      "hidden_tables": {"list": [
+        {"record": "HiddenTable", "fields": {"table": {"eq": "P"}, "estimated_rows": {"eq": 0}}},
+        {"record": "HiddenTable", "fields": {"table": {"eq": "M"}, "estimated_rows": {"eq": 0}}},
+        {"record": "HiddenTable", "fields": {"table": {"eq": "J"}, "estimated_rows": {"eq": 0}}},
+        {"record": "HiddenTable", "fields": {"table": {"eq": "T"}, "estimated_rows": {"eq": 0}}}
+      ]},
+      "partials_warning": null,
+      "fan_out_warning": null,
+      "building": null
+    }}}}},
+    {"op": "apply", "args": ["TRANSFORM parity_pets_named FROM parity_pets JOIN parity_species ON parity_pets.species_id = parity_species.id SELECT parity_species.name AS name"], "expect": {"record": "Applied", "fields": {"kind": {"word": "transform_defined"}}}},
+
     {"op": "await_converged", "args": ["parity: not a token"], "opts": {"timeout_ms": 0}, "expect": {"error": "validation"}},
 
     {"about": "Version handover: a live registry row of another version (a version no build has, with a fresh heartbeat) makes every state-changing call refuse, so two versions never change one instance side by side. This handle runs nothing in the background, so only the row is in the way; the refusal comes after the statement parses and before its transform is looked up.", "op": "sql", "args": ["insert into trellis.worker_registry (worker_id, version, staging, drain) values ('parity-other-version', '9.9.9', true, true)"]},
@@ -273,6 +307,9 @@
     {"about": "A staging worker with no drain workers. connect returns once the worker's first capture pass has installed capture on every defined source, so the write below is captured, and nothing drains it.", "op": "connect", "opts": {"url": {"$dsn": {}}, "staging": true, "drain_threads": 0}, "expect": null},
     {"op": "has_live_staging_worker", "until": {"eq": true}, "waiting_for": "a live staging worker"},
     {"op": "has_live_drain_workers", "expect": {"eq": false}},
+    {"about": "The staging worker starts parity_lines_by_bucket's build, and with no drain worker to run it, the step under way stays the first: the FROM side's first leaf, by its recorded name.", "op": "status", "args": ["parity_lines_by_bucket"], "until": {"record": "Status", "fields": {"status": {"word": "backfilling"}, "join": {"record": "JoinStatus", "fields": {"building": {"record": "JoinBuildStep", "fields": {"step": {"word": "side"}, "side": {"word": "from"}, "part": {"word": "leaf"}, "leaf": {"eq": "public.parity_lines_p1"}, "remaining": null}}}}}}, "waiting_for": "parity_lines_by_bucket's build to start"},
+    {"about": "The same step against the schema's own shapes, unnarrowed: each word is one of the sets the binding reports.", "op": "status", "args": ["parity_lines_by_bucket"], "expect": {"record": "Status", "fields": {"join": {"record": "JoinStatus", "fields": {"building": {"record": "JoinBuildStep"}}}}}},
+    {"about": "A 1-1 JOIN's build likewise stays at its first step, the pass over b's rows.", "op": "status", "args": ["parity_pets_named"], "until": {"record": "Status", "fields": {"status": {"word": "backfilling"}, "join": {"record": "JoinStatus", "fields": {"building": {"record": "JoinBuildStep", "fields": {"step": {"word": "joined_rows"}, "side": null, "part": null, "leaf": null, "remaining": null}}}}}}, "waiting_for": "parity_pets_named's build to start"},
     {"about": "A captured write to a defined source: the token below has work outstanding.", "op": "sql", "args": ["update parity_items set price = 51 where id = 5"]},
     {"op": "watermark_token", "save": "idle_token", "expect": "string"},
     {"about": "Nothing drains the write, so the token can't converge.", "op": "await_converged", "args": [{"$ref": "idle_token"}], "opts": {"timeout_ms": 0}, "expect": {"error": "timeout"}},
@@ -293,6 +330,30 @@
     {"op": "status", "args": ["parity_doubled"], "until": {"record": "Status", "fields": {"status": {"word": "live"}}}, "waiting_for": "parity_doubled to go live"},
     {"op": "status", "args": ["parity_gizmo_prices"], "until": {"record": "Status", "fields": {"status": {"word": "live"}}}, "waiting_for": "parity_gizmo_prices to go live"},
     {"op": "status", "args": ["parity_scratch"], "until": {"record": "Status", "fields": {"status": {"word": "live"}}}, "waiting_for": "parity_scratch to go live"},
+    {"op": "status", "args": ["parity_lines_by_bucket"], "until": {"record": "Status", "fields": {"status": {"word": "live"}}}, "waiting_for": "parity_lines_by_bucket to go live"},
+    {"about": "Built and analyzed, P holds parity_lines_by_bucket's 1000 cells, past half the FROM table's 1200 rows, so the P-size warning names both counts; no build is under way.", "op": "sql", "args": ["analyze"]},
+    {"op": "status", "args": ["parity_lines_by_bucket"], "expect": {"record": "Status", "fields": {"join": {"record": "JoinStatus", "fields": {
+      "hidden_tables": {"list": [
+        {"record": "HiddenTable", "fields": {"table": {"eq": "P"}, "estimated_rows": {"eq": 1000}}},
+        {"record": "HiddenTable", "fields": {"table": {"eq": "M"}}},
+        {"record": "HiddenTable", "fields": {"table": {"eq": "J"}}},
+        {"record": "HiddenTable", "fields": {"table": {"eq": "T"}}}
+      ]},
+      "partials_warning": {"record": "PartialsWarning", "fields": {"partials_rows": {"eq": 1000}, "fact_rows": {"eq": 1200}}},
+      "fan_out_warning": null,
+      "building": null
+    }}}}},
+    {"op": "status", "args": ["parity_pets_named"], "until": {"record": "Status", "fields": {"status": {"word": "live"}}}, "waiting_for": "parity_pets_named to go live"},
+    {"about": "Built, the 1-1 JOIN reports R, M and J, and no warning: it has no P, and no join key holds a group of rows anywhere near the fan-out threshold.", "op": "status", "args": ["parity_pets_named"], "expect": {"record": "Status", "fields": {"join": {"record": "JoinStatus", "fields": {
+      "hidden_tables": {"list": [
+        {"record": "HiddenTable", "fields": {"table": {"eq": "R"}}},
+        {"record": "HiddenTable", "fields": {"table": {"eq": "M"}}},
+        {"record": "HiddenTable", "fields": {"table": {"eq": "J"}}}
+      ]},
+      "partials_warning": null,
+      "fan_out_warning": null,
+      "building": null
+    }}}}},
 
     {
       "about": "ALTER TRANSFORM edits only a live definition, which is why these statement forms wait for phase two.",
@@ -463,13 +524,13 @@
       "expect": {"record": "Status", "fields": {"build_wait_xid": null, "version_handover": {"record": "VersionHandover", "fields": {"this_version": {"eq": "0.2.0"}, "processes": {"list": [{"record": "OtherProcess", "fields": {"worker_id": {"eq": "trellis-host-17-ab12"}, "version": {"eq": "0.1.0"}}}, {"record": "OtherProcess", "fields": {"worker_id": {"eq": "trellis-host-18-cd34"}, "version": null}}]}, "unregistered_staging_worker": {"eq": true}, "migrations_pending": {"eq": false}}}}}
     },
     {
-      "about": "A JOIN's status, which needs a built JOIN with a partitioned side and a warning-sized table, so a live run can't produce it cheaply: two hidden tables, a partials warning, a fan-out warning and a side step on one leaf cross with every sibling number distinct and past 32 bits, so a swapped or narrowed field fails.",
+      "about": "A JOIN's status with a fan-out warning, which needs a 1-1 JOIN with a group of rows past the 250,000-row threshold, so a live run can't produce it cheaply (the live steps check the rest as the binding encodes it): two hidden tables, a partials warning, a fan-out warning and a side step on one leaf cross with every sibling number distinct and past 32 bits, so a host that swaps or narrows a field fails.",
       "type": "Status",
       "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [], "paused_upstream_columns": [], "correcting": [], "build_wait_xid": null, "version_handover": null, "join": {"hidden_tables": [{"table": "P", "name": "join_7_p", "estimated_rows": 5000000011, "bytes": 9000000017}, {"table": "M", "name": "join_7_m", "estimated_rows": 21, "bytes": 8192}], "partials_warning": {"partials_rows": 6000000013, "fact_rows": 7000000019}, "fan_out_warning": {"key": "42,eu", "rows": 3000000023, "threshold": 250000}, "building": {"step": {"$word": "side"}, "side": {"$word": "joined"}, "part": {"$word": "leaf"}, "leaf": "public.items_p2", "remaining": null}}},
       "expect": {"record": "Status", "fields": {"status": {"word": "live"}, "join": {"record": "JoinStatus", "fields": {"hidden_tables": {"list": [{"record": "HiddenTable", "fields": {"table": {"eq": "P"}, "name": {"eq": "join_7_p"}, "estimated_rows": {"eq": 5000000011}, "bytes": {"eq": 9000000017}}}, {"record": "HiddenTable", "fields": {"table": {"eq": "M"}, "name": {"eq": "join_7_m"}, "estimated_rows": {"eq": 21}, "bytes": {"eq": 8192}}}]}, "partials_warning": {"record": "PartialsWarning", "fields": {"partials_rows": {"eq": 6000000013}, "fact_rows": {"eq": 7000000019}}}, "fan_out_warning": {"record": "FanOutWarning", "fields": {"key": {"eq": "42,eu"}, "rows": {"eq": 3000000023}, "threshold": {"eq": 250000}}}, "building": {"record": "JoinBuildStep", "fields": {"step": {"word": "side"}, "side": {"word": "joined"}, "part": {"word": "leaf"}, "leaf": {"eq": "public.items_p2"}, "remaining": null}}}}}}
     },
     {
-      "about": "A 1-1 JOIN's chunk step in a status: the chunks still to run cross as an integer past 32 bits, the side, part and leaf are null, and a JOIN with no tables or warnings crosses an empty list and two nulls.",
+      "about": "A 1-1 JOIN's chunk step in a status, which needs a build stopped between its plan and its chunks, so a live run can't produce it reliably: the chunks still to run cross as an integer past 32 bits, the side, part and leaf are null, and a JOIN with no tables or warnings crosses an empty list and two nulls.",
       "type": "Status",
       "native": {"status": {"$word": "backfilling"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [], "paused_upstream_columns": [], "correcting": [], "build_wait_xid": null, "version_handover": null, "join": {"hidden_tables": [], "partials_warning": null, "fan_out_warning": null, "building": {"step": {"$word": "chunks"}, "side": null, "part": null, "leaf": null, "remaining": 4294967301}}},
       "expect": {"record": "Status", "fields": {"status": {"word": "backfilling"}, "join": {"record": "JoinStatus", "fields": {"hidden_tables": {"list": []}, "partials_warning": null, "fan_out_warning": null, "building": {"record": "JoinBuildStep", "fields": {"step": {"word": "chunks"}, "side": null, "part": null, "leaf": null, "remaining": {"eq": 4294967301}}}}}}}

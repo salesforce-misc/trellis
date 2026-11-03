@@ -110,7 +110,7 @@ module Trellis
   # for at most 30 seconds. nil when none is.
   #
   # join is set for a JOIN definition, aggregate or 1-1, and nil for any
-  # other (a JoinStatus). It is a warning, never a hold-up: it changes nothing
+  # other (a JoinStatus). It never holds anything up: it changes nothing
   # about the definition's status. It reports the estimated size of the
   # definition's hidden tables, the P-size warning, the fan-out warning of a
   # 1-1 JOIN and the step its build runs.

@@ -508,8 +508,7 @@ entry. Which indexes a target needs is in
 [Supported sources and targets](transforms.md#supported-sources-and-targets).
 
 `join` on `DefinitionStatus` is set for a `JOIN` transform (aggregate or 1-1) and `None` for any
-other (`nil` in the Elixir and Ruby bindings, which flatten it: the build step is a `step` word
-with its `side`, `part`, `leaf` or `remaining`, and an unrecognised step reads `unknown`). It reports three things, none of which changes the transform's status:
+other. It reports three things, none of which changes the transform's status:
 
 - `hidden_tables`: the estimated rows (`pg_class.reltuples`, 0 before the first
   analyze) and total on-disk size in bytes of `P`, `M`, `J` and `T`, the
@@ -570,6 +569,10 @@ another page or writer holding one of its join keys, so a rising tail shows
 contention on hot keys.
 `trellis status` prints a `join tables` line, a `join build` line while a build is
 under way, and one warning line per finding (a 1-1 `JOIN`'s fan-out included).
+The Elixir and Ruby bindings' `status` carries `join` too (`nil` for any other
+transform), with the build step flattened to a `step` word and the `side`, `part`, `leaf`
+or `remaining` its kind of step has; a step, side or part newer than the binding reads
+`unknown`.
 
 ### A build's fence on a seam-fed source
 
