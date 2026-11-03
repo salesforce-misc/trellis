@@ -77,6 +77,12 @@ defmodule Trellis.Status do
   process killed without a clean shutdown keeps its row live, and so delays
   the takeover, for at most 30 seconds. `nil` when none is.
 
+  `join` is set for a `JOIN` transform, aggregate or 1-1, and `nil` for any
+  other (a `Trellis.JoinStatus`). It is a warning, never a hold-up: it
+  changes nothing about the transform's status. It reports the estimated size
+  of the transform's hidden tables, the `P`-size warning, the fan-out warning
+  of a 1-1 `JOIN` and the step its build runs.
+
   Every process sees them, whichever one runs the staging worker.
   """
 
@@ -95,7 +101,8 @@ defmodule Trellis.Status do
           correcting: [Trellis.CorrectingNode.t()],
           paused_upstream_columns: [String.t()],
           build_wait_xid: integer() | nil,
-          version_handover: Trellis.VersionHandover.t() | nil
+          version_handover: Trellis.VersionHandover.t() | nil,
+          join: Trellis.JoinStatus.t() | nil
         }
 
   @enforce_keys [
@@ -109,7 +116,8 @@ defmodule Trellis.Status do
     :correcting,
     :paused_upstream_columns,
     :build_wait_xid,
-    :version_handover
+    :version_handover,
+    :join
   ]
   defstruct @enforce_keys
 
@@ -125,7 +133,8 @@ defmodule Trellis.Status do
         correcting: correcting,
         paused_upstream_columns: paused_upstream_columns,
         build_wait_xid: build_wait_xid,
-        version_handover: version_handover
+        version_handover: version_handover,
+        join: join
       }) do
     %__MODULE__{
       status: status,
@@ -138,8 +147,173 @@ defmodule Trellis.Status do
       correcting: Enum.map(correcting, &Trellis.CorrectingNode.from_native/1),
       paused_upstream_columns: paused_upstream_columns,
       build_wait_xid: build_wait_xid,
-      version_handover: version_handover && Trellis.VersionHandover.from_native(version_handover)
+      version_handover: version_handover && Trellis.VersionHandover.from_native(version_handover),
+      join: join && Trellis.JoinStatus.from_native(join)
     }
+  end
+end
+
+defmodule Trellis.JoinStatus do
+  @moduledoc """
+  A `JOIN` transform's hidden tables, as `Trellis.status/2` reports them:
+  the estimated size of each (`hidden_tables`, each a
+  `Trellis.HiddenTable`: `P`, `M`, `J` and `T`, or `R`, `M` and `J` for a 1-1
+  `JOIN`, a table that doesn't exist left out), a warning when `P` has grown
+  close to the fact table's size (`partials_warning`, a
+  `Trellis.PartialsWarning`), a 1-1 `JOIN`'s warning that one join key holds
+  a very large group of rows (`fan_out_warning`, a `Trellis.FanOutWarning`)
+  and the step its build runs now, or runs next while no worker holds its job
+  (`building`, a `Trellis.JoinBuildStep`). Each warning and `building` are
+  `nil` when there is none. Sizes are the planner's estimates, as fresh as
+  the table's last `ANALYZE` or autovacuum.
+  """
+
+  @type t :: %__MODULE__{
+          hidden_tables: [Trellis.HiddenTable.t()],
+          partials_warning: Trellis.PartialsWarning.t() | nil,
+          fan_out_warning: Trellis.FanOutWarning.t() | nil,
+          building: Trellis.JoinBuildStep.t() | nil
+        }
+
+  @enforce_keys [:hidden_tables, :partials_warning, :fan_out_warning, :building]
+  defstruct @enforce_keys
+
+  @doc false
+  def from_native(%{
+        hidden_tables: hidden_tables,
+        partials_warning: partials_warning,
+        fan_out_warning: fan_out_warning,
+        building: building
+      }) do
+    %__MODULE__{
+      hidden_tables: Enum.map(hidden_tables, &Trellis.HiddenTable.from_native/1),
+      partials_warning: partials_warning && Trellis.PartialsWarning.from_native(partials_warning),
+      fan_out_warning: fan_out_warning && Trellis.FanOutWarning.from_native(fan_out_warning),
+      building: building && Trellis.JoinBuildStep.from_native(building)
+    }
+  end
+end
+
+defmodule Trellis.HiddenTable do
+  @moduledoc """
+  One hidden table of a `JOIN`, in a `Trellis.JoinStatus`: which table it is
+  (`table`, `"P"`, `"M"`, `"J"`, `"T"` or a 1-1 `JOIN`'s `"R"`), its name in
+  the catalog schema (`name`), its estimated live rows (`estimated_rows`, 0
+  before the first analyze) and its total size on disk with its indexes, in
+  bytes (`bytes`).
+  """
+
+  @type t :: %__MODULE__{
+          table: String.t(),
+          name: String.t(),
+          estimated_rows: integer(),
+          bytes: integer()
+        }
+
+  @enforce_keys [:table, :name, :estimated_rows, :bytes]
+  defstruct @enforce_keys
+
+  @doc false
+  def from_native(%{table: table, name: name, estimated_rows: estimated_rows, bytes: bytes}) do
+    %__MODULE__{table: table, name: name, estimated_rows: estimated_rows, bytes: bytes}
+  end
+end
+
+defmodule Trellis.PartialsWarning do
+  @moduledoc """
+  `P`, the `FROM` table grouped by the transform's `GROUP BY` columns and
+  join key, has grown close to the fact table's size, so the `JOIN` costs
+  about as much as the table it summarises: `P`'s estimated rows
+  (`partials_rows`) reach half of the fact table's (`fact_rows`).
+  """
+
+  @type t :: %__MODULE__{partials_rows: integer(), fact_rows: integer()}
+
+  @enforce_keys [:partials_rows, :fact_rows]
+  defstruct @enforce_keys
+
+  @doc false
+  def from_native(%{partials_rows: partials_rows, fact_rows: fact_rows}) do
+    %__MODULE__{partials_rows: partials_rows, fact_rows: fact_rows}
+  end
+end
+
+defmodule Trellis.FanOutWarning do
+  @moduledoc """
+  A 1-1 `JOIN` has a join key with a very large group of `a` rows: a change
+  of its `b` row rewrites that many target rows, in chunks, before a
+  watermark token past it converges. It names the join key's text (`key`,
+  its columns' values joined by `,`), the group's live rows (`rows`, exact up
+  to ten times the threshold) and the threshold it passed (`threshold`). The
+  group is found by sampling, so a group just past the threshold can go
+  unreported until it grows.
+  """
+
+  @type t :: %__MODULE__{key: String.t(), rows: integer(), threshold: integer()}
+
+  @enforce_keys [:key, :rows, :threshold]
+  defstruct @enforce_keys
+
+  @doc false
+  def from_native(%{key: key, rows: rows, threshold: threshold}) do
+    %__MODULE__{key: key, rows: rows, threshold: threshold}
+  end
+end
+
+defmodule Trellis.JoinBuildStep do
+  @moduledoc """
+  The step a `JOIN` build runs, in a `Trellis.JoinStatus`. `step` is the
+  kind:
+
+    * `:whole`: the whole build in one transaction, because neither side is
+      a partitioned table with rows.
+    * `:side`: a step of a build with a partitioned side. `side` is `:from` or
+      `:joined`, and `part` says what it builds of that side: `:whole`, one
+      `:leaf` (named by `leaf`, a `schema.table`; leaves build in oid order),
+      the `:remainder` (the cells that route to none of its leaves) or
+      `:unroutable` (the side's partition tree isn't recorded, or a leaf has no
+      usable constraint text, so the build fails on this side and
+      `backfill_failure` says why).
+    * `:final`: the step that writes `T` and the target and completes the
+      build.
+    * A 1-1 `JOIN`'s steps: `:joined_rows`, `:joined_null_keys` and
+      `:joined_gone` for the pass over `M`, `:planning_chunks` while the plan
+      job walks `a`'s primary key, `:chunks` while the chunks of that key run
+      (`remaining` of them are still to run), and `:sweep_stale` and
+      `:sweep_orphans` for the two passes of the sweep that ends a rebuild in
+      place.
+    * `:unknown`: a step added since this binding was built; `side` and
+      `part` read `:unknown` likewise for an unknown side or part.
+
+  `side`, `part`, `leaf` and `remaining` are `nil` for the steps that don't
+  carry them.
+  """
+
+  @type t :: %__MODULE__{
+          step:
+            :whole
+            | :side
+            | :final
+            | :joined_rows
+            | :joined_null_keys
+            | :joined_gone
+            | :planning_chunks
+            | :chunks
+            | :sweep_stale
+            | :sweep_orphans
+            | :unknown,
+          side: :from | :joined | :unknown | nil,
+          part: :whole | :leaf | :remainder | :unroutable | :unknown | nil,
+          leaf: String.t() | nil,
+          remaining: integer() | nil
+        }
+
+  @enforce_keys [:step, :side, :part, :leaf, :remaining]
+  defstruct @enforce_keys
+
+  @doc false
+  def from_native(%{step: step, side: side, part: part, leaf: leaf, remaining: remaining}) do
+    %__MODULE__{step: step, side: side, part: part, leaf: leaf, remaining: remaining}
   end
 end
 

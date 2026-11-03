@@ -56,6 +56,27 @@ defmodule Trellis.ConversionsTest do
     assert Trellis.Native.capture_failure_kinds() == {:ok, [:capture, :halt, :disruption]}
 
     assert Trellis.Native.index_roles() == {:ok, [:group_by, :join_from, :join_joined]}
+
+    assert Trellis.Native.join_build_steps() ==
+             {:ok,
+              [
+                :whole,
+                :side,
+                :final,
+                :joined_rows,
+                :joined_null_keys,
+                :joined_gone,
+                :planning_chunks,
+                :chunks,
+                :sweep_stale,
+                :sweep_orphans,
+                :unknown
+              ]}
+
+    assert Trellis.Native.join_sides() == {:ok, [:from, :joined, :unknown]}
+
+    assert Trellis.Native.join_side_parts() ==
+             {:ok, [:whole, :leaf, :remainder, :unroutable, :unknown]}
   end
 
   test "a self-check report's divergences become structs" do

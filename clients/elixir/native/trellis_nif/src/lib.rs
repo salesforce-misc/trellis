@@ -66,15 +66,16 @@ use rustler::env::OwnedEnv;
 use rustler::{Atom, Encoder, Env, NifMap, ResourceArc, Term};
 use trellis::{BlockingTrellis, Config, ErrorCode, PendingCall, TrellisOptions};
 use trellis_embed::{
-    DIVERGENCE_KINDS, ERROR_CODES, LOG_LEVELS, PlainApplied, PlainBackfillFailure,
-    PlainCaptureFailure, PlainCaptureWait, PlainConfig, PlainCorrectingNode, PlainDefinitionStatus,
-    PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys,
-    PlainOtherProcess, PlainPoisonEntry, PlainQuarantineEntry, PlainSamplePage, PlainSelfCheckJob,
-    PlainSelfCheckReport, PlainSourceIndexGap, PlainVersionHandover, SELF_CHECK_MODES,
-    SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor,
-    decode_watermark, encode_watermark, index_role_names, quarantine_state_names,
-    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
-    transform_status_names,
+    DIVERGENCE_KINDS, ERROR_CODES, JOIN_BUILD_STEPS, JOIN_SIDE_PARTS, JOIN_SIDES, LOG_LEVELS,
+    PlainApplied, PlainBackfillFailure, PlainCaptureFailure, PlainCaptureWait, PlainConfig,
+    PlainCorrectingNode, PlainDefinitionStatus, PlainDefinitionSummary, PlainDivergence,
+    PlainDrainFailure, PlainError, PlainFanOutWarning, PlainHeldKeys, PlainHiddenTable,
+    PlainJoinBuildStep, PlainJoinStatus, PlainOtherProcess, PlainPartialsWarning, PlainPoisonEntry,
+    PlainQuarantineEntry, PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport,
+    PlainSourceIndexGap, PlainVersionHandover, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES,
+    SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor, decode_watermark,
+    encode_watermark, index_role_names, quarantine_state_names, require_transform_statement,
+    self_check_mode, system_time_from_epoch_micros, transform_status_names,
 };
 
 /// What every NIF returns: `{:ok, T}` or `{:error, {code, message}}`.
@@ -230,6 +231,114 @@ struct StatusTerm {
     paused_upstream_columns: Vec<String>,
     build_wait_xid: Option<i64>,
     version_handover: Option<VersionHandoverTerm>,
+    join: Option<JoinStatusTerm>,
+}
+
+/// A `JOIN` transform's hidden tables, warnings and build step, as `status/2`
+/// reports them.
+#[derive(NifMap)]
+struct JoinStatusTerm {
+    hidden_tables: Vec<HiddenTableTerm>,
+    partials_warning: Option<PartialsWarningTerm>,
+    fan_out_warning: Option<FanOutWarningTerm>,
+    building: Option<JoinBuildStepTerm>,
+}
+
+impl JoinStatusTerm {
+    fn new(env: Env, join: PlainJoinStatus) -> NifReply<Self> {
+        Ok(JoinStatusTerm {
+            hidden_tables: join
+                .hidden_tables
+                .into_iter()
+                .map(HiddenTableTerm::from)
+                .collect(),
+            partials_warning: join.partials_warning.map(PartialsWarningTerm::from),
+            fan_out_warning: join.fan_out_warning.map(FanOutWarningTerm::from),
+            building: join
+                .building
+                .map(|step| JoinBuildStepTerm::new(env, step))
+                .transpose()?,
+        })
+    }
+}
+
+/// One hidden table of a `JOIN`, as `status/2` reports it.
+#[derive(NifMap)]
+struct HiddenTableTerm {
+    table: String,
+    name: String,
+    estimated_rows: i64,
+    bytes: i64,
+}
+
+impl From<PlainHiddenTable> for HiddenTableTerm {
+    fn from(table: PlainHiddenTable) -> Self {
+        HiddenTableTerm {
+            table: table.table,
+            name: table.name,
+            estimated_rows: table.estimated_rows,
+            bytes: table.bytes,
+        }
+    }
+}
+
+/// `P` has grown close to the fact table's size, as `status/2` reports it.
+#[derive(NifMap)]
+struct PartialsWarningTerm {
+    partials_rows: i64,
+    fact_rows: i64,
+}
+
+impl From<PlainPartialsWarning> for PartialsWarningTerm {
+    fn from(warning: PlainPartialsWarning) -> Self {
+        PartialsWarningTerm {
+            partials_rows: warning.partials_rows,
+            fact_rows: warning.fact_rows,
+        }
+    }
+}
+
+/// A 1-1 `JOIN`'s very large group on one join key, as `status/2` reports it.
+#[derive(NifMap)]
+struct FanOutWarningTerm {
+    key: String,
+    rows: i64,
+    threshold: i64,
+}
+
+impl From<PlainFanOutWarning> for FanOutWarningTerm {
+    fn from(warning: PlainFanOutWarning) -> Self {
+        FanOutWarningTerm {
+            key: warning.key,
+            rows: warning.rows,
+            threshold: warning.threshold,
+        }
+    }
+}
+
+/// The step a `JOIN` build runs, as `status/2` reports it. `step`, `side` and
+/// `part` are words from [`JOIN_BUILD_STEPS`], [`JOIN_SIDES`] and
+/// [`JOIN_SIDE_PARTS`]; each of the others is set only for the step that
+/// carries it.
+#[derive(NifMap)]
+struct JoinBuildStepTerm {
+    step: Atom,
+    side: Option<Atom>,
+    part: Option<Atom>,
+    leaf: Option<String>,
+    remaining: Option<i64>,
+}
+
+impl JoinBuildStepTerm {
+    fn new(env: Env, step: PlainJoinBuildStep) -> NifReply<Self> {
+        Ok(JoinBuildStepTerm {
+            step: word_atom(env, step.step)?,
+            side: step.side.map(|word| word_atom(env, word)).transpose()?,
+            part: step.part.map(|word| word_atom(env, word)).transpose()?,
+            leaf: step.leaf,
+            remaining: step.remaining,
+        })
+    }
 }
 
 /// Another Trellis version is live, so this binary stands by, as `status/2`
@@ -452,6 +561,9 @@ fn atom_words() -> impl Iterator<Item = &'static str> {
         .chain(capture_failure_kind_names())
         .chain(LOG_LEVELS)
         .chain(index_role_names())
+        .chain(JOIN_BUILD_STEPS)
+        .chain(JOIN_SIDES)
+        .chain(JOIN_SIDE_PARTS)
 }
 
 /// A registered definition, as `definitions/1` lists it.
@@ -1033,6 +1145,10 @@ fn status<'a>(
                 paused_upstream_columns: status.paused_upstream_columns,
                 build_wait_xid: status.build_wait_xid,
                 version_handover: status.version_handover.map(VersionHandoverTerm::from),
+                join: status
+                    .join
+                    .map(|join| JoinStatusTerm::new(env, join))
+                    .transpose()?,
             }))
         },
     )
@@ -1115,6 +1231,24 @@ fn capture_failure_kinds(env: Env) -> NifReply<Vec<Atom>> {
 #[rustler::nif(schedule = "DirtyIo")]
 fn index_roles(env: Env) -> NifReply<Vec<Atom>> {
     word_atoms(env, index_role_names().to_vec())
+}
+
+/// Every step atom a `JOIN` build's status can carry.
+#[rustler::nif(schedule = "DirtyIo")]
+fn join_build_steps(env: Env) -> NifReply<Vec<Atom>> {
+    word_atoms(env, JOIN_BUILD_STEPS.to_vec())
+}
+
+/// Every side atom a `JOIN` build step can carry.
+#[rustler::nif(schedule = "DirtyIo")]
+fn join_sides(env: Env) -> NifReply<Vec<Atom>> {
+    word_atoms(env, JOIN_SIDES.to_vec())
+}
+
+/// Every part atom a `JOIN` build's side step can carry.
+#[rustler::nif(schedule = "DirtyIo")]
+fn join_side_parts(env: Env) -> NifReply<Vec<Atom>> {
+    word_atoms(env, JOIN_SIDE_PARTS.to_vec())
 }
 
 /// Every level atom `take_log_records/1` can return.

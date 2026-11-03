@@ -211,10 +211,11 @@ pub mod fixtures {
 
     use crate::{
         BackfillFailure, CaptureFailure, CaptureFailureKind, CaptureWait, CorrectingNode,
-        DefinitionStatus, DefinitionSummary, DrainFailure, FanOutWarning, HeldKeys, IndexRole,
-        JoinStatus, OtherProcess, OtherVersionLive, PoisonEntry, PoisonSample, QuarantineEntry,
-        QuarantineState, QuarantineTarget, SelfCheckJob, SelfCheckJobState, SelfCheckMode,
-        SelfCheckOutcome, SelfCheckReport, SourceIndexGap, TransformStatus,
+        DefinitionStatus, DefinitionSummary, DrainFailure, FanOutWarning, HeldKeys,
+        HiddenTableSize, IndexRole, JoinStatus, OtherProcess, OtherVersionLive, PartialsWarning,
+        PoisonEntry, PoisonSample, QuarantineEntry, QuarantineState, QuarantineTarget,
+        SelfCheckJob, SelfCheckJobState, SelfCheckMode, SelfCheckOutcome, SelfCheckReport,
+        SourceIndexGap, TransformStatus,
     };
 
     #[allow(non_snake_case)]
@@ -335,6 +336,24 @@ pub mod fixtures {
             key: String::new(),
             rows: 0,
             threshold: 0,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn HiddenTableSize() -> HiddenTableSize {
+        HiddenTableSize {
+            table: "P",
+            name: String::new(),
+            estimated_rows: 0,
+            bytes: 0,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn PartialsWarning() -> PartialsWarning {
+        PartialsWarning {
+            partials_rows: 0,
+            fact_rows: 0,
         }
     }
 

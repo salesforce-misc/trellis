@@ -508,7 +508,8 @@ entry. Which indexes a target needs is in
 [Supported sources and targets](transforms.md#supported-sources-and-targets).
 
 `join` on `DefinitionStatus` is set for a `JOIN` transform (aggregate or 1-1) and `None` for any
-other. It reports three things, none of which changes the transform's status:
+other (`nil` in the Elixir and Ruby bindings, which flatten it: the build step is a `step` word
+with its `side`, `part`, `leaf` or `remaining`, and an unrecognised step reads `unknown`). It reports three things, none of which changes the transform's status:
 
 - `hidden_tables`: the estimated rows (`pg_class.reltuples`, 0 before the first
   analyze) and total on-disk size in bytes of `P`, `M`, `J` and `T`, the

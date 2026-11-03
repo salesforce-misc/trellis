@@ -108,10 +108,16 @@ module Trellis
   # VersionHandoverError until the other version is gone. A process killed
   # without a clean shutdown keeps its row live, and so delays the takeover,
   # for at most 30 seconds. nil when none is.
+  #
+  # join is set for a JOIN definition, aggregate or 1-1, and nil for any
+  # other (a JoinStatus). It is a warning, never a hold-up: it changes nothing
+  # about the definition's status. It reports the estimated size of the
+  # definition's hidden tables, the P-size warning, the fan-out warning of a
+  # 1-1 JOIN and the step its build runs.
   Status = Data.define(:status, :backfill_failure, :capture_wait, :capture_failure,
                        :held_keys, :drain_failure, :source_index_gaps,
                        :correcting, :paused_upstream_columns,
-                       :build_wait_xid, :version_handover) do
+                       :build_wait_xid, :version_handover, :join) do
     def self.from_native(hash)
       failure = hash[:backfill_failure]
       wait = hash[:capture_wait]
@@ -119,6 +125,7 @@ module Trellis
       held_keys = hash[:held_keys]
       drain_failure = hash[:drain_failure]
       version_handover = hash[:version_handover]
+      join = hash[:join]
       new(status: hash[:status],
           backfill_failure: failure && BackfillFailure.from_native(failure),
           capture_wait: wait && CaptureWait.from_native(wait),
@@ -129,9 +136,76 @@ module Trellis
           correcting: hash.fetch(:correcting).map { |c| CorrectingNode.from_native(c) },
           paused_upstream_columns: hash.fetch(:paused_upstream_columns),
           build_wait_xid: hash.fetch(:build_wait_xid),
-          version_handover: version_handover && VersionHandover.from_native(version_handover))
+          version_handover: version_handover && VersionHandover.from_native(version_handover),
+          join: join && JoinStatus.from_native(join))
     end
   end
+
+  # A JOIN definition's hidden tables, as Trellis.status reports them: the
+  # estimated size of each (hidden_tables, HiddenTables: P, M, J and T, or R, M
+  # and J for a 1-1 JOIN, a table that doesn't exist left out), a warning when
+  # P has grown close to the fact table's size (partials_warning, a
+  # PartialsWarning), a 1-1 JOIN's warning that one join key holds a very
+  # large group of rows (fan_out_warning, a FanOutWarning) and the step its
+  # build runs now, or runs next while no worker holds its job (building, a
+  # JoinBuildStep). Each warning and building are nil when there is none.
+  # Sizes are the planner's estimates, as fresh as the table's last ANALYZE or
+  # autovacuum.
+  JoinStatus = Data.define(:hidden_tables, :partials_warning, :fan_out_warning, :building) do
+    def self.from_native(hash)
+      partials_warning = hash.fetch(:partials_warning)
+      fan_out_warning = hash.fetch(:fan_out_warning)
+      building = hash.fetch(:building)
+      new(hidden_tables: hash.fetch(:hidden_tables).map { |t| HiddenTable.new(**t) },
+          partials_warning: partials_warning && PartialsWarning.new(**partials_warning),
+          fan_out_warning: fan_out_warning && FanOutWarning.new(**fan_out_warning),
+          building: building && JoinBuildStep.new(**building))
+    end
+  end
+
+  # One hidden table of a JOIN, in a JoinStatus: which table it is (table,
+  # "P", "M", "J", "T" or a 1-1 JOIN's "R"), its name in the catalog schema
+  # (name), its estimated live rows (estimated_rows, 0 before the first
+  # analyze) and its total size on disk with its indexes, in bytes (bytes).
+  HiddenTable = Data.define(:table, :name, :estimated_rows, :bytes)
+
+  # P, the FROM table grouped by the definition's GROUP BY columns and join
+  # key, has grown close to the fact table's size, so the JOIN costs about as
+  # much as the table it summarises: P's estimated rows (partials_rows) reach
+  # half of the fact table's (fact_rows).
+  PartialsWarning = Data.define(:partials_rows, :fact_rows)
+
+  # A 1-1 JOIN has a join key with a very large group of a rows: a change of
+  # its b row rewrites that many target rows, in chunks, before a watermark
+  # token past it converges. It names the join key's text (key, its columns'
+  # values joined by ","), the group's live rows (rows, exact up to ten times
+  # the threshold) and the threshold it passed (threshold). The group is found
+  # by sampling, so a group just past the threshold can go unreported until it
+  # grows.
+  FanOutWarning = Data.define(:key, :rows, :threshold)
+
+  # The step a JOIN build runs, in a JoinStatus. step is the kind:
+  #
+  # * :whole, the whole build in one transaction, because neither side is a
+  #   partitioned table with rows.
+  # * :side, a step of a build with a partitioned side. side is :from or
+  #   :joined, and part says what it builds of that side: :whole, one :leaf
+  #   (named by leaf, a schema.table; leaves build in oid order), the
+  #   :remainder (the cells that route to none of its leaves) or :unroutable
+  #   (the side's partition tree isn't recorded, or a leaf has no usable
+  #   constraint text, so the build fails on this side and backfill_failure
+  #   says why).
+  # * :final, the step that writes T and the target and completes the build.
+  # * A 1-1 JOIN's steps: :joined_rows, :joined_null_keys and :joined_gone for
+  #   the pass over M, :planning_chunks while the plan job walks a's primary
+  #   key, :chunks while the chunks of that key run (remaining of them are
+  #   still to run), and :sweep_stale and :sweep_orphans for the two passes of
+  #   the sweep that ends a rebuild in place.
+  # * :unknown, a step added since this binding was built; side and part read
+  #   :unknown likewise for an unknown side or part.
+  #
+  # side, part, leaf and remaining are nil for the steps that don't carry them.
+  JoinBuildStep = Data.define(:step, :side, :part, :leaf, :remaining)
 
   # Another Trellis version is live on the instance, so this process changes
   # nothing until it is gone, as Trellis.status reports it: this binary's

@@ -30,6 +30,9 @@ defmodule Trellis.Parity do
   def word_set("divergence_kind"), do: words(Trellis.Native.divergence_kinds())
   def word_set("capture_failure_kind"), do: words(Trellis.Native.capture_failure_kinds())
   def word_set("index_role"), do: words(Trellis.Native.index_roles())
+  def word_set("join_build_step"), do: words(Trellis.Native.join_build_steps())
+  def word_set("join_side"), do: words(Trellis.Native.join_sides())
+  def word_set("join_side_part"), do: words(Trellis.Native.join_side_parts())
 
   defp words({:ok, atoms}), do: Enum.map(atoms, &Atom.to_string/1)
 

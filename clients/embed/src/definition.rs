@@ -6,14 +6,18 @@
 //! failure's detection time and its drain failure's times in epoch
 //! microseconds. Its build wait crosses as the fence's transaction id, and
 //! its version handover as this binary's version and the other processes
-//! by worker id and version. A capture failure's kind
+//! by worker id and version. Its `JOIN` status crosses as the hidden tables'
+//! sizes, the two warnings and the build step under way, the step as words
+//! from [`JOIN_BUILD_STEPS`], [`JOIN_SIDES`] and [`JOIN_SIDE_PARTS`]. A
+//! capture failure's kind
 //! crosses as its word, one of [`capture_failure_kind_names`], which a host
 //! turns into an atom or symbol from that set, allocated at load.
 
 use trellis::{
     BackfillFailure, BuildWait, CaptureFailure, CaptureFailureKind, CaptureWait, CorrectingNode,
-    DefinitionStatus, DefinitionSummary, DrainFailure, OtherProcess, OtherVersionLive,
-    SourceIndexGap,
+    DefinitionStatus, DefinitionSummary, DrainFailure, FanOutWarning, HiddenTableSize,
+    JoinBuildStep, JoinSide, JoinSidePart, JoinStatus, OneToOneBuildStep, OtherProcess,
+    OtherVersionLive, PartialsWarning, SourceIndexGap,
 };
 
 use crate::{PlainHeldKeys, epoch_micros, transform_status};
@@ -89,7 +93,105 @@ pub struct PlainDefinitionStatus {
     /// Set while a process of another Trellis version is live, so this
     /// binary stands by; see [`DefinitionStatus::version_handover`].
     pub version_handover: Option<PlainVersionHandover>,
+    /// A `JOIN` transform's hidden tables, warnings and build step; see
+    /// [`DefinitionStatus::join`]. `None` for any other transform.
+    pub join: Option<PlainJoinStatus>,
 }
+
+/// A [`JoinStatus`] flattened to plain data: how big a `JOIN` transform's
+/// hidden tables are, the warnings that point at its cost, and the step its
+/// build runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainJoinStatus {
+    /// `P`, `M`, `J` and `T` (`R`, `M` and `J` for a 1-1 `JOIN`), in that
+    /// order; a table that doesn't exist is left out.
+    pub hidden_tables: Vec<PlainHiddenTable>,
+    /// Set when `P` has grown close to the fact table's size; see
+    /// [`JoinStatus::partials_warning`].
+    pub partials_warning: Option<PlainPartialsWarning>,
+    /// Set when a 1-1 `JOIN` has a join key with a very large group of `a`
+    /// rows; see [`JoinStatus::fan_out_warning`].
+    pub fan_out_warning: Option<PlainFanOutWarning>,
+    /// The step the build runs now, or runs next while no worker holds its
+    /// job; `None` when no build is under way.
+    pub building: Option<PlainJoinBuildStep>,
+}
+
+/// A [`HiddenTableSize`] flattened to plain data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainHiddenTable {
+    /// Which table: `P`, `M`, `J`, `T` or (a 1-1 `JOIN`'s) `R`.
+    pub table: String,
+    /// The table's name in the catalog schema.
+    pub name: String,
+    /// The estimated live rows (0 before the first analyze).
+    pub estimated_rows: i64,
+    /// The table's total size on disk with its indexes, in bytes.
+    pub bytes: i64,
+}
+
+/// A [`PartialsWarning`] flattened to plain data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainPartialsWarning {
+    /// `P`'s estimated rows.
+    pub partials_rows: i64,
+    /// The `FROM` (fact) table's estimated rows.
+    pub fact_rows: i64,
+}
+
+/// A [`FanOutWarning`] flattened to plain data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainFanOutWarning {
+    /// The join key's text: its columns' values, joined by `,`.
+    pub key: String,
+    /// The live `R` entries on the key.
+    pub rows: i64,
+    /// The threshold the group passed.
+    pub threshold: i64,
+}
+
+/// A [`JoinBuildStep`] flattened to plain data: the step's kind as a word,
+/// and the fields only some kinds carry, which are `None` for the others.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlainJoinBuildStep {
+    /// One of [`JOIN_BUILD_STEPS`]: `whole`, `side`, `final`, a 1-1 `JOIN`'s
+    /// `joined_rows`, `joined_null_keys`, `joined_gone`, `planning_chunks`,
+    /// `chunks`, `sweep_stale` or `sweep_orphans`, or `unknown` for a step
+    /// added since this binding was built.
+    pub step: &'static str,
+    /// For a `side` step, the side it builds: one of [`JOIN_SIDES`].
+    pub side: Option<&'static str>,
+    /// For a `side` step, what it builds of its side: one of
+    /// [`JOIN_SIDE_PARTS`].
+    pub part: Option<&'static str>,
+    /// For a `side` step whose `part` is `leaf`, the leaf's recorded
+    /// `schema.table` name.
+    pub leaf: Option<String>,
+    /// For a `chunks` step, how many chunks are still to run.
+    pub remaining: Option<i64>,
+}
+
+/// Every [`PlainJoinBuildStep::step`] word, for a binding to intern up
+/// front.
+pub const JOIN_BUILD_STEPS: [&str; 11] = [
+    "whole",
+    "side",
+    "final",
+    "joined_rows",
+    "joined_null_keys",
+    "joined_gone",
+    "planning_chunks",
+    "chunks",
+    "sweep_stale",
+    "sweep_orphans",
+    "unknown",
+];
+
+/// Every [`PlainJoinBuildStep::side`] word.
+pub const JOIN_SIDES: [&str; 3] = ["from", "joined", "unknown"];
+
+/// Every [`PlainJoinBuildStep::part`] word.
+pub const JOIN_SIDE_PARTS: [&str; 5] = ["whole", "leaf", "remainder", "unroutable", "unknown"];
 
 /// An [`OtherVersionLive`] flattened to plain data: another Trellis version
 /// is live on the instance, so this binary changes nothing until it is gone
@@ -288,6 +390,104 @@ impl From<&DefinitionStatus> for PlainDefinitionStatus {
                 .version_handover
                 .as_ref()
                 .map(PlainVersionHandover::from),
+            join: status.join.as_ref().map(PlainJoinStatus::from),
+        }
+    }
+}
+
+impl From<&JoinStatus> for PlainJoinStatus {
+    fn from(join: &JoinStatus) -> Self {
+        PlainJoinStatus {
+            hidden_tables: join
+                .hidden_tables
+                .iter()
+                .map(PlainHiddenTable::from)
+                .collect(),
+            partials_warning: join
+                .partials_warning
+                .as_ref()
+                .map(PlainPartialsWarning::from),
+            fan_out_warning: join.fan_out_warning.as_ref().map(PlainFanOutWarning::from),
+            building: join.building.as_ref().map(PlainJoinBuildStep::from),
+        }
+    }
+}
+
+impl From<&HiddenTableSize> for PlainHiddenTable {
+    fn from(table: &HiddenTableSize) -> Self {
+        PlainHiddenTable {
+            table: table.table.to_string(),
+            name: table.name.clone(),
+            estimated_rows: table.estimated_rows,
+            bytes: table.bytes,
+        }
+    }
+}
+
+impl From<&PartialsWarning> for PlainPartialsWarning {
+    fn from(warning: &PartialsWarning) -> Self {
+        PlainPartialsWarning {
+            partials_rows: warning.partials_rows,
+            fact_rows: warning.fact_rows,
+        }
+    }
+}
+
+impl From<&FanOutWarning> for PlainFanOutWarning {
+    fn from(warning: &FanOutWarning) -> Self {
+        PlainFanOutWarning {
+            key: warning.key.clone(),
+            rows: warning.rows,
+            threshold: warning.threshold,
+        }
+    }
+}
+
+impl From<&JoinBuildStep> for PlainJoinBuildStep {
+    fn from(step: &JoinBuildStep) -> Self {
+        let kind = |step| PlainJoinBuildStep {
+            step,
+            ..PlainJoinBuildStep::default()
+        };
+        // The enums are `#[non_exhaustive]`: a variant added later crosses
+        // as `unknown` until the binding learns its word.
+        match step {
+            JoinBuildStep::Whole => kind("whole"),
+            JoinBuildStep::Final => kind("final"),
+            JoinBuildStep::Side { side, part } => {
+                let (part, leaf) = match part {
+                    JoinSidePart::Whole => ("whole", None),
+                    JoinSidePart::Leaf(name) => ("leaf", Some(name.clone())),
+                    JoinSidePart::Remainder => ("remainder", None),
+                    JoinSidePart::Unroutable => ("unroutable", None),
+                    _ => ("unknown", None),
+                };
+                PlainJoinBuildStep {
+                    step: "side",
+                    side: Some(match side {
+                        JoinSide::From => "from",
+                        JoinSide::Joined => "joined",
+                        _ => "unknown",
+                    }),
+                    part: Some(part),
+                    leaf,
+                    remaining: None,
+                }
+            }
+            JoinBuildStep::OneToOne(step) => match step {
+                OneToOneBuildStep::JoinedRows => kind("joined_rows"),
+                OneToOneBuildStep::JoinedNullKeys => kind("joined_null_keys"),
+                OneToOneBuildStep::JoinedGone => kind("joined_gone"),
+                OneToOneBuildStep::PlanningChunks => kind("planning_chunks"),
+                OneToOneBuildStep::Chunks { remaining } => PlainJoinBuildStep {
+                    remaining: Some(*remaining),
+                    ..kind("chunks")
+                },
+                OneToOneBuildStep::SweepStale => kind("sweep_stale"),
+                OneToOneBuildStep::SweepOrphans => kind("sweep_orphans"),
+                _ => kind("unknown"),
+            },
+            _ => kind("unknown"),
         }
     }
 }
@@ -485,6 +685,7 @@ mod tests {
                 correcting: Vec::new(),
                 build_wait_xid: None,
                 version_handover: None,
+                join: None,
             }
         );
     }
@@ -687,6 +888,7 @@ mod tests {
                 correcting: Vec::new(),
                 build_wait_xid: None,
                 version_handover: None,
+                join: None,
             }
         );
     }
@@ -800,5 +1002,195 @@ mod tests {
                 migrations_pending: false,
             })
         );
+    }
+
+    #[test]
+    fn a_join_status_crosses_with_its_tables_warnings_and_build_step() {
+        // Every sibling number is distinct, and the sizes pass 32 bits, so a
+        // swapped pair of fields or a narrowed integer fails.
+        let status = trellis::fixture!(DefinitionStatus {
+            join: Some(trellis::fixture!(JoinStatus {
+                hidden_tables: vec![
+                    trellis::fixture!(HiddenTableSize {
+                        table: "P",
+                        name: "join_7_p".to_string(),
+                        estimated_rows: 5_000_000_011,
+                        bytes: 9_000_000_017,
+                    }),
+                    trellis::fixture!(HiddenTableSize {
+                        table: "M",
+                        name: "join_7_m".to_string(),
+                        estimated_rows: 21,
+                        bytes: 8192,
+                    }),
+                ],
+                partials_warning: Some(trellis::fixture!(PartialsWarning {
+                    partials_rows: 6_000_000_013,
+                    fact_rows: 7_000_000_019,
+                })),
+                fan_out_warning: Some(trellis::fixture!(FanOutWarning {
+                    key: "42,eu".to_string(),
+                    rows: 3_000_000_023,
+                    threshold: 250_000,
+                })),
+                building: Some(JoinBuildStep::Final),
+            })),
+        });
+
+        let plain = PlainDefinitionStatus::from(&status);
+
+        assert_eq!(
+            plain.join,
+            Some(PlainJoinStatus {
+                hidden_tables: vec![
+                    PlainHiddenTable {
+                        table: "P".to_string(),
+                        name: "join_7_p".to_string(),
+                        estimated_rows: 5_000_000_011,
+                        bytes: 9_000_000_017,
+                    },
+                    PlainHiddenTable {
+                        table: "M".to_string(),
+                        name: "join_7_m".to_string(),
+                        estimated_rows: 21,
+                        bytes: 8192,
+                    },
+                ],
+                partials_warning: Some(PlainPartialsWarning {
+                    partials_rows: 6_000_000_013,
+                    fact_rows: 7_000_000_019,
+                }),
+                fan_out_warning: Some(PlainFanOutWarning {
+                    key: "42,eu".to_string(),
+                    rows: 3_000_000_023,
+                    threshold: 250_000,
+                }),
+                building: Some(PlainJoinBuildStep {
+                    step: "final",
+                    ..PlainJoinBuildStep::default()
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn a_definition_that_is_not_a_join_has_no_join_status() {
+        let status = trellis::fixture!(DefinitionStatus {});
+
+        assert_eq!(PlainDefinitionStatus::from(&status).join, None);
+    }
+
+    #[test]
+    fn every_join_build_step_crosses_as_its_word_and_data() {
+        let step = |step: JoinBuildStep| PlainJoinBuildStep::from(&step);
+        let side = |side, part| step(JoinBuildStep::Side { side, part });
+        let words =
+            |step: PlainJoinBuildStep| (step.step, step.side, step.part, step.leaf, step.remaining);
+
+        assert_eq!(
+            words(step(JoinBuildStep::Whole)),
+            ("whole", None, None, None, None)
+        );
+        assert_eq!(
+            words(step(JoinBuildStep::Final)),
+            ("final", None, None, None, None)
+        );
+        assert_eq!(
+            words(side(JoinSide::From, JoinSidePart::Whole)),
+            ("side", Some("from"), Some("whole"), None, None)
+        );
+        assert_eq!(
+            words(side(
+                JoinSide::Joined,
+                JoinSidePart::Leaf("public.items_p2".to_string())
+            )),
+            (
+                "side",
+                Some("joined"),
+                Some("leaf"),
+                Some("public.items_p2".to_string()),
+                None
+            )
+        );
+        assert_eq!(
+            words(side(JoinSide::From, JoinSidePart::Remainder)),
+            ("side", Some("from"), Some("remainder"), None, None)
+        );
+        assert_eq!(
+            words(side(JoinSide::Joined, JoinSidePart::Unroutable)),
+            ("side", Some("joined"), Some("unroutable"), None, None)
+        );
+        for (one_to_one, word) in [
+            (OneToOneBuildStep::JoinedRows, "joined_rows"),
+            (OneToOneBuildStep::JoinedNullKeys, "joined_null_keys"),
+            (OneToOneBuildStep::JoinedGone, "joined_gone"),
+            (OneToOneBuildStep::PlanningChunks, "planning_chunks"),
+            (OneToOneBuildStep::SweepStale, "sweep_stale"),
+            (OneToOneBuildStep::SweepOrphans, "sweep_orphans"),
+        ] {
+            assert_eq!(
+                words(step(JoinBuildStep::OneToOne(one_to_one))),
+                (word, None, None, None, None)
+            );
+        }
+        assert_eq!(
+            words(step(JoinBuildStep::OneToOne(OneToOneBuildStep::Chunks {
+                remaining: 4_294_967_301,
+            }))),
+            ("chunks", None, None, None, Some(4_294_967_301))
+        );
+    }
+
+    #[test]
+    fn the_join_word_sets_hold_every_word_a_step_can_carry() {
+        let steps = [
+            JoinBuildStep::Whole,
+            JoinBuildStep::Final,
+            JoinBuildStep::Side {
+                side: JoinSide::From,
+                part: JoinSidePart::Whole,
+            },
+            JoinBuildStep::Side {
+                side: JoinSide::Joined,
+                part: JoinSidePart::Leaf(String::new()),
+            },
+            JoinBuildStep::Side {
+                side: JoinSide::From,
+                part: JoinSidePart::Remainder,
+            },
+            JoinBuildStep::Side {
+                side: JoinSide::Joined,
+                part: JoinSidePart::Unroutable,
+            },
+            JoinBuildStep::OneToOne(OneToOneBuildStep::JoinedRows),
+            JoinBuildStep::OneToOne(OneToOneBuildStep::JoinedNullKeys),
+            JoinBuildStep::OneToOne(OneToOneBuildStep::JoinedGone),
+            JoinBuildStep::OneToOne(OneToOneBuildStep::PlanningChunks),
+            JoinBuildStep::OneToOne(OneToOneBuildStep::Chunks { remaining: 1 }),
+            JoinBuildStep::OneToOne(OneToOneBuildStep::SweepStale),
+            JoinBuildStep::OneToOne(OneToOneBuildStep::SweepOrphans),
+        ];
+        let mut seen_steps = Vec::new();
+        let mut seen_parts = Vec::new();
+        for step in &steps {
+            let plain = PlainJoinBuildStep::from(step);
+            assert!(JOIN_BUILD_STEPS.contains(&plain.step), "{}", plain.step);
+            seen_steps.push(plain.step);
+            if let Some(side) = plain.side {
+                assert!(JOIN_SIDES.contains(&side), "{side}");
+            }
+            if let Some(part) = plain.part {
+                assert!(JOIN_SIDE_PARTS.contains(&part), "{part}");
+                seen_parts.push(part);
+            }
+        }
+        // Each word but `unknown`, which no variant known now maps to, is
+        // reached.
+        for word in JOIN_BUILD_STEPS.iter().filter(|word| **word != "unknown") {
+            assert!(seen_steps.contains(word), "{word}");
+        }
+        for word in JOIN_SIDE_PARTS.iter().filter(|word| **word != "unknown") {
+            assert!(seen_parts.contains(word), "{word}");
+        }
     }
 }

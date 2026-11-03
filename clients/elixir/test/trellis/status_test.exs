@@ -27,7 +27,8 @@ defmodule Trellis.StatusTest do
         correcting: [],
         paused_upstream_columns: [],
         build_wait_xid: nil,
-        version_handover: nil
+        version_handover: nil,
+        join: nil
       })
 
     assert %Trellis.Status{
@@ -69,7 +70,8 @@ defmodule Trellis.StatusTest do
         correcting: [],
         paused_upstream_columns: [],
         build_wait_xid: nil,
-        version_handover: nil
+        version_handover: nil,
+        join: nil
       })
 
     assert %Trellis.Status{
@@ -118,7 +120,8 @@ defmodule Trellis.StatusTest do
         correcting: [],
         paused_upstream_columns: [],
         build_wait_xid: nil,
-        version_handover: nil
+        version_handover: nil,
+        join: nil
       })
 
     assert status.drain_failure == %Trellis.DrainFailure{
@@ -153,7 +156,8 @@ defmodule Trellis.StatusTest do
         correcting: [],
         paused_upstream_columns: [],
         build_wait_xid: nil,
-        version_handover: nil
+        version_handover: nil,
+        join: nil
       })
 
     assert status.source_index_gaps == [
@@ -183,7 +187,8 @@ defmodule Trellis.StatusTest do
         ],
         paused_upstream_columns: ["t.total"],
         build_wait_xid: nil,
-        version_handover: nil
+        version_handover: nil,
+        join: nil
       })
 
     assert status.paused_upstream_columns == ["t.total"]
@@ -215,7 +220,8 @@ defmodule Trellis.StatusTest do
         correcting: [],
         paused_upstream_columns: [],
         build_wait_xid: 4_294_967_301,
-        version_handover: nil
+        version_handover: nil,
+        join: nil
       })
 
     assert status.build_wait_xid == 4_294_967_301
@@ -243,7 +249,8 @@ defmodule Trellis.StatusTest do
           ],
           unregistered_staging_worker: true,
           migrations_pending: false
-        }
+        },
+        join: nil
       })
 
     assert status.build_wait_xid == nil
@@ -256,6 +263,113 @@ defmodule Trellis.StatusTest do
              ],
              unregistered_staging_worker: true,
              migrations_pending: false
+           }
+  end
+
+  test "a join status keeps its tables, warnings and build step" do
+    status =
+      Trellis.Status.from_native(%{
+        status: :live,
+        backfill_failure: nil,
+        capture_wait: nil,
+        capture_failure: nil,
+        held_keys: nil,
+        drain_failure: nil,
+        source_index_gaps: [],
+        correcting: [],
+        paused_upstream_columns: [],
+        build_wait_xid: nil,
+        version_handover: nil,
+        join: %{
+          hidden_tables: [
+            %{table: "P", name: "join_7_p", estimated_rows: 5_000_000_011, bytes: 9_000_000_017},
+            %{table: "M", name: "join_7_m", estimated_rows: 21, bytes: 8192}
+          ],
+          partials_warning: %{partials_rows: 6_000_000_013, fact_rows: 7_000_000_019},
+          fan_out_warning: %{key: "42,eu", rows: 3_000_000_023, threshold: 250_000},
+          building: %{
+            step: :side,
+            side: :joined,
+            part: :leaf,
+            leaf: "public.items_p2",
+            remaining: nil
+          }
+        }
+      })
+
+    assert status.join == %Trellis.JoinStatus{
+             hidden_tables: [
+               %Trellis.HiddenTable{
+                 table: "P",
+                 name: "join_7_p",
+                 estimated_rows: 5_000_000_011,
+                 bytes: 9_000_000_017
+               },
+               %Trellis.HiddenTable{
+                 table: "M",
+                 name: "join_7_m",
+                 estimated_rows: 21,
+                 bytes: 8192
+               }
+             ],
+             partials_warning: %Trellis.PartialsWarning{
+               partials_rows: 6_000_000_013,
+               fact_rows: 7_000_000_019
+             },
+             fan_out_warning: %Trellis.FanOutWarning{
+               key: "42,eu",
+               rows: 3_000_000_023,
+               threshold: 250_000
+             },
+             building: %Trellis.JoinBuildStep{
+               step: :side,
+               side: :joined,
+               part: :leaf,
+               leaf: "public.items_p2",
+               remaining: nil
+             }
+           }
+  end
+
+  test "a 1-1 join's chunk step keeps how many chunks remain, and a join with no warnings has none" do
+    status =
+      Trellis.Status.from_native(%{
+        status: :backfilling,
+        backfill_failure: nil,
+        capture_wait: nil,
+        capture_failure: nil,
+        held_keys: nil,
+        drain_failure: nil,
+        source_index_gaps: [],
+        correcting: [],
+        paused_upstream_columns: [],
+        build_wait_xid: nil,
+        version_handover: nil,
+        join: %{
+          hidden_tables: [],
+          partials_warning: nil,
+          fan_out_warning: nil,
+          building: %{
+            step: :chunks,
+            side: nil,
+            part: nil,
+            leaf: nil,
+            remaining: 4_294_967_301
+          }
+        }
+      })
+
+    assert status.join == %Trellis.JoinStatus{
+             hidden_tables: [],
+             partials_warning: nil,
+             fan_out_warning: nil,
+             building: %Trellis.JoinBuildStep{
+               step: :chunks,
+               side: nil,
+               part: nil,
+               leaf: nil,
+               remaining: 4_294_967_301
+             }
            }
   end
 

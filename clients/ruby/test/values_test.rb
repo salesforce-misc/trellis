@@ -29,7 +29,7 @@ class ValuesTest < Minitest::Test
                           last_error: "permission denied", next_attempt_at_micros: MICROS },
       capture_wait: nil, capture_failure: nil, held_keys: nil, drain_failure: nil,
       source_index_gaps: [], correcting: [], paused_upstream_columns: [],
-      build_wait_xid: nil, version_handover: nil
+      build_wait_xid: nil, version_handover: nil, join: nil
     )
     assert_equal Trellis::Status.new(
       status: :waiting_to_backfill,
@@ -42,7 +42,7 @@ class ValuesTest < Minitest::Test
       held_keys: nil,
       drain_failure: nil,
       source_index_gaps: [],
-      correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil
+      correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil, join: nil
     ), status
   end
 
@@ -56,7 +56,7 @@ class ValuesTest < Minitest::Test
                          error: "column \"qty\" was dropped", detected_at_micros: MICROS },
       held_keys: { count: 2, oldest_poisoned_at_micros: MICROS + 2 },
       drain_failure: nil, source_index_gaps: [], correcting: [], paused_upstream_columns: [],
-      build_wait_xid: nil, version_handover: nil
+      build_wait_xid: nil, version_handover: nil, join: nil
     )
     assert_equal Trellis::Status.new(
       status: :catching_up, backfill_failure: nil,
@@ -73,7 +73,7 @@ class ValuesTest < Minitest::Test
       held_keys: Trellis::HeldKeys.new(count: 2, oldest_poisoned_at: Trellis::EpochMicros.to_time(MICROS + 2)),
       drain_failure: nil,
       source_index_gaps: [],
-      correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil
+      correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil, join: nil
     ), status
   end
 
@@ -84,7 +84,7 @@ class ValuesTest < Minitest::Test
                        error: "permission denied for function audit_hook", sqlstate: "42501",
                        since_micros: MICROS, last_seen_micros: MICROS + 1, attempts: 5 },
       source_index_gaps: [], correcting: [], paused_upstream_columns: [],
-      build_wait_xid: nil, version_handover: nil
+      build_wait_xid: nil, version_handover: nil, join: nil
     )
     assert_equal Trellis::DrainFailure.new(
       seg_seq: 17, tables: ["public.lines", "public.orders"],
@@ -124,7 +124,7 @@ class ValuesTest < Minitest::Test
     status = Trellis::Status.from_native(
       status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil, held_keys: nil,
       drain_failure: nil, source_index_gaps: [gap], correcting: [], paused_upstream_columns: [],
-      build_wait_xid: nil, version_handover: nil
+      build_wait_xid: nil, version_handover: nil, join: nil
     )
     assert_equal [Trellis::SourceIndexGap.new(**gap)], status.source_index_gaps
   end
@@ -135,7 +135,7 @@ class ValuesTest < Minitest::Test
       held_keys: nil, drain_failure: nil, source_index_gaps: [],
       correcting: [{ node: "public.items_p1", since_micros: MICROS, keys_remaining: 5 },
                    { node: "public.items_p2", since_micros: MICROS + 1, keys_remaining: nil }],
-      paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil
+      paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil, join: nil
     )
     assert_equal :backfilling, status.status
     assert_equal [
@@ -151,7 +151,7 @@ class ValuesTest < Minitest::Test
       status: :catching_up, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
       held_keys: nil, drain_failure: nil, source_index_gaps: [],
       correcting: [], paused_upstream_columns: ["t.total"],
-      build_wait_xid: nil, version_handover: nil
+      build_wait_xid: nil, version_handover: nil, join: nil
     )
     assert_equal :catching_up, status.status
     assert_equal ["t.total"], status.paused_upstream_columns
@@ -162,7 +162,7 @@ class ValuesTest < Minitest::Test
       status: :backfilling, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
       held_keys: nil, drain_failure: nil, source_index_gaps: [],
       correcting: [], paused_upstream_columns: [],
-      build_wait_xid: 4_294_967_301, version_handover: nil
+      build_wait_xid: 4_294_967_301, version_handover: nil, join: nil
     )
     assert_equal 4_294_967_301, status.build_wait_xid
     assert_nil status.version_handover
@@ -178,7 +178,8 @@ class ValuesTest < Minitest::Test
         processes: [{ worker_id: "trellis-host-17-ab12", version: "0.1.0" },
                     { worker_id: "trellis-host-18-cd34", version: nil }],
         unregistered_staging_worker: true, migrations_pending: false
-      }
+      },
+      join: nil
     )
     assert_nil status.build_wait_xid
     assert_equal Trellis::VersionHandover.new(
@@ -189,6 +190,54 @@ class ValuesTest < Minitest::Test
       ],
       unregistered_staging_worker: true, migrations_pending: false
     ), status.version_handover
+  end
+
+  def test_a_join_status_keeps_its_tables_warnings_and_build_step
+    status = Trellis::Status.from_native(
+      status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
+      held_keys: nil, drain_failure: nil, source_index_gaps: [],
+      correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil,
+      join: {
+        hidden_tables: [
+          { table: "P", name: "join_7_p", estimated_rows: 5_000_000_011, bytes: 9_000_000_017 },
+          { table: "M", name: "join_7_m", estimated_rows: 21, bytes: 8192 }
+        ],
+        partials_warning: { partials_rows: 6_000_000_013, fact_rows: 7_000_000_019 },
+        fan_out_warning: { key: "42,eu", rows: 3_000_000_023, threshold: 250_000 },
+        building: { step: :side, side: :joined, part: :leaf, leaf: "public.items_p2",
+                    remaining: nil }
+      }
+    )
+    assert_equal Trellis::JoinStatus.new(
+      hidden_tables: [
+        Trellis::HiddenTable.new(table: "P", name: "join_7_p",
+                                 estimated_rows: 5_000_000_011, bytes: 9_000_000_017),
+        Trellis::HiddenTable.new(table: "M", name: "join_7_m", estimated_rows: 21, bytes: 8192)
+      ],
+      partials_warning: Trellis::PartialsWarning.new(partials_rows: 6_000_000_013,
+                                                     fact_rows: 7_000_000_019),
+      fan_out_warning: Trellis::FanOutWarning.new(key: "42,eu", rows: 3_000_000_023,
+                                                  threshold: 250_000),
+      building: Trellis::JoinBuildStep.new(step: :side, side: :joined, part: :leaf,
+                                           leaf: "public.items_p2", remaining: nil)
+    ), status.join
+  end
+
+  def test_a_one_to_one_joins_chunk_step_keeps_how_many_chunks_remain
+    status = Trellis::Status.from_native(
+      status: :backfilling, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
+      held_keys: nil, drain_failure: nil, source_index_gaps: [],
+      correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil,
+      join: {
+        hidden_tables: [], partials_warning: nil, fan_out_warning: nil,
+        building: { step: :chunks, side: nil, part: nil, leaf: nil, remaining: 4_294_967_301 }
+      }
+    )
+    assert_equal Trellis::JoinStatus.new(
+      hidden_tables: [], partials_warning: nil, fan_out_warning: nil,
+      building: Trellis::JoinBuildStep.new(step: :chunks, side: nil, part: nil, leaf: nil,
+                                           remaining: 4_294_967_301)
+    ), status.join
   end
 
   def test_a_definition_summarys_backfill_failure_becomes_a_backfill_failure
@@ -268,5 +317,10 @@ class ValuesTest < Minitest::Test
                  Trellis::Native.divergence_kinds
     assert_equal %i[capture halt disruption], Trellis::Native.capture_failure_kinds
     assert_equal %i[group_by join_from join_joined], Trellis::Native.index_roles
+    assert_equal %i[whole side final joined_rows joined_null_keys joined_gone planning_chunks
+                    chunks sweep_stale sweep_orphans unknown],
+                 Trellis::Native.join_build_steps
+    assert_equal %i[from joined unknown], Trellis::Native.join_sides
+    assert_equal %i[whole leaf remainder unroutable unknown], Trellis::Native.join_side_parts
   end
 end

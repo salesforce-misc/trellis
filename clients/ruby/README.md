@@ -93,6 +93,14 @@ Nothing in the binding uses it.
   `version` (`nil` for a release before 0.2.0),
   `unregistered_staging_worker` and `migrations_pending`), and
   state-changing calls raise a `version_handover` error until it is gone.
+  For a `JOIN` definition `status` reports its hidden tables (`join`, a
+  `Trellis::JoinStatus`): `hidden_tables`, each a `Trellis::HiddenTable` with
+  `table`, `name`, `estimated_rows` and `bytes`, the `P`-size warning
+  (`partials_warning`, a `Trellis::PartialsWarning`), a 1-1 `JOIN`'s fan-out
+  warning (`fan_out_warning`, a `Trellis::FanOutWarning`) and the step its
+  build runs (`building`, a `Trellis::JoinBuildStep` with `step` and the
+  `side`, `part`, `leaf` or `remaining` its kind of step carries). `join` is
+  `nil` for any other definition.
 - `Trellis.request_backfill(source_table)`,
   `Trellis.detect_capture_disruptions` (pauses now the readers of every table
   whose Trellis capture was changed outside Trellis, and returns the tables),

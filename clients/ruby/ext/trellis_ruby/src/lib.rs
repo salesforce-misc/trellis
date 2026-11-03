@@ -61,15 +61,16 @@ use magnus::{
 };
 use trellis::{BlockingTrellis, Config, ErrorCode, PendingCall, TrellisOptions};
 use trellis_embed::{
-    DIVERGENCE_KINDS, ERROR_CODES, PlainApplied, PlainBackfillFailure, PlainCaptureFailure,
-    PlainCaptureWait, PlainConfig, PlainCorrectingNode, PlainDefinitionStatus,
-    PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainHeldKeys,
-    PlainOtherProcess, PlainPoisonEntry, PlainQuarantineEntry, PlainSamplePage, PlainSelfCheckJob,
-    PlainSelfCheckReport, PlainSourceIndexGap, PlainVersionHandover, SELF_CHECK_MODES,
-    SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor,
-    decode_watermark, encode_watermark, index_role_names, quarantine_state_names,
-    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
-    transform_status_names,
+    DIVERGENCE_KINDS, ERROR_CODES, JOIN_BUILD_STEPS, JOIN_SIDE_PARTS, JOIN_SIDES, PlainApplied,
+    PlainBackfillFailure, PlainCaptureFailure, PlainCaptureWait, PlainConfig, PlainCorrectingNode,
+    PlainDefinitionStatus, PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError,
+    PlainFanOutWarning, PlainHeldKeys, PlainHiddenTable, PlainJoinBuildStep, PlainJoinStatus,
+    PlainOtherProcess, PlainPartialsWarning, PlainPoisonEntry, PlainQuarantineEntry,
+    PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport, PlainSourceIndexGap,
+    PlainVersionHandover, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES, SELF_CHECK_STATES,
+    capture_failure_kind_names, decode_cursor, decode_watermark, encode_watermark,
+    index_role_names, quarantine_state_names, require_transform_statement, self_check_mode,
+    system_time_from_epoch_micros, transform_status_names,
 };
 
 /// What a blocking call produces: its value, or the engine's error as plain
@@ -836,6 +837,9 @@ fn symbol_words() -> impl Iterator<Item = &'static str> {
         .chain(DIVERGENCE_KINDS)
         .chain(capture_failure_kind_names())
         .chain(index_role_names())
+        .chain(JOIN_BUILD_STEPS)
+        .chain(JOIN_SIDES)
+        .chain(JOIN_SIDE_PARTS)
 }
 
 /// A hash from symbol keys to `fields`' values: the shape every record
@@ -913,6 +917,10 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
         .version_handover
         .map(|seen| version_handover_hash(ruby, seen))
         .transpose()?;
+    let join = status
+        .join
+        .map(|join| join_status_hash(ruby, join))
+        .transpose()?;
     record(
         ruby,
         [
@@ -930,6 +938,91 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
             ),
             ("build_wait_xid", ruby.into_value(status.build_wait_xid)),
             ("version_handover", ruby.into_value(version_handover)),
+            ("join", ruby.into_value(join)),
+        ],
+    )
+}
+
+/// A `JOIN` transform's hidden tables, warnings and build step.
+fn join_status_hash(ruby: &Ruby, join: PlainJoinStatus) -> Result<RHash, Error> {
+    let hidden_tables = array(ruby, join.hidden_tables, hidden_table_hash)?;
+    let partials_warning = join
+        .partials_warning
+        .map(|warning| partials_warning_hash(ruby, warning))
+        .transpose()?;
+    let fan_out_warning = join
+        .fan_out_warning
+        .map(|warning| fan_out_warning_hash(ruby, warning))
+        .transpose()?;
+    let building = join
+        .building
+        .map(|step| join_build_step_hash(ruby, step))
+        .transpose()?;
+    record(
+        ruby,
+        [
+            ("hidden_tables", hidden_tables.as_value()),
+            ("partials_warning", ruby.into_value(partials_warning)),
+            ("fan_out_warning", ruby.into_value(fan_out_warning)),
+            ("building", ruby.into_value(building)),
+        ],
+    )
+}
+
+/// One hidden table of a `JOIN`.
+fn hidden_table_hash(ruby: &Ruby, table: PlainHiddenTable) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("table", ruby.into_value(table.table)),
+            ("name", ruby.into_value(table.name)),
+            ("estimated_rows", ruby.into_value(table.estimated_rows)),
+            ("bytes", ruby.into_value(table.bytes)),
+        ],
+    )
+}
+
+/// `P` has grown close to the fact table's size.
+fn partials_warning_hash(ruby: &Ruby, warning: PlainPartialsWarning) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("partials_rows", ruby.into_value(warning.partials_rows)),
+            ("fact_rows", ruby.into_value(warning.fact_rows)),
+        ],
+    )
+}
+
+/// A 1-1 `JOIN`'s very large group on one join key.
+fn fan_out_warning_hash(ruby: &Ruby, warning: PlainFanOutWarning) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("key", ruby.into_value(warning.key)),
+            ("rows", ruby.into_value(warning.rows)),
+            ("threshold", ruby.into_value(warning.threshold)),
+        ],
+    )
+}
+
+/// The step a `JOIN` build runs. `step`, `side` and `part` are symbols from
+/// [`JOIN_BUILD_STEPS`], [`JOIN_SIDES`] and [`JOIN_SIDE_PARTS`]; each of the
+/// others is set only for the step that carries it.
+fn join_build_step_hash(ruby: &Ruby, step: PlainJoinBuildStep) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("step", word_symbol(ruby, step.step).as_value()),
+            (
+                "side",
+                ruby.into_value(step.side.map(|word| word_symbol(ruby, word))),
+            ),
+            (
+                "part",
+                ruby.into_value(step.part.map(|word| word_symbol(ruby, word))),
+            ),
+            ("leaf", ruby.into_value(step.leaf)),
+            ("remaining", ruby.into_value(step.remaining)),
         ],
     )
 }
@@ -1260,6 +1353,21 @@ fn index_roles(ruby: &Ruby) -> RArray {
     word_symbols(ruby, index_role_names())
 }
 
+/// Every step symbol a `JOIN` build's status can carry.
+fn join_build_steps(ruby: &Ruby) -> RArray {
+    word_symbols(ruby, JOIN_BUILD_STEPS)
+}
+
+/// Every side symbol a `JOIN` build step can carry.
+fn join_sides(ruby: &Ruby) -> RArray {
+    word_symbols(ruby, JOIN_SIDES)
+}
+
+/// Every part symbol a `JOIN` build's side step can carry.
+fn join_side_parts(ruby: &Ruby) -> RArray {
+    word_symbols(ruby, JOIN_SIDE_PARTS)
+}
+
 /// Every statement kind `trellis`'s grammar has, for the test asserting
 /// `apply`'s round trip covers each one.
 fn statement_kinds() -> Vec<&'static str> {
@@ -1303,6 +1411,9 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     native.define_module_function("divergence_kinds", function!(divergence_kinds, 0))?;
     native.define_module_function("capture_failure_kinds", function!(capture_failure_kinds, 0))?;
     native.define_module_function("index_roles", function!(index_roles, 0))?;
+    native.define_module_function("join_build_steps", function!(join_build_steps, 0))?;
+    native.define_module_function("join_sides", function!(join_sides, 0))?;
+    native.define_module_function("join_side_parts", function!(join_side_parts, 0))?;
     native.define_module_function("statement_kinds", function!(statement_kinds, 0))?;
     native.define_module_function("render_prometheus", function!(render_prometheus, 0))?;
 

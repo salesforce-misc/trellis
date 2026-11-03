@@ -83,7 +83,15 @@ The surface mirrors the Rust crate's `BlockingTrellis`. Every function has a ban
   `worker_id` and `version` (`nil` for a release before 0.2.0),
   `unregistered_staging_worker` and `migrations_pending`), and
   state-changing calls refuse with a `version_handover` error until it is
-  gone.
+  gone. For a `JOIN` transform `status/2` reports its hidden tables
+  (`join`, a `Trellis.JoinStatus`): `hidden_tables`, each a
+  `Trellis.HiddenTable` with `table`, `name`, `estimated_rows` and `bytes`,
+  the `P`-size warning (`partials_warning`, a `Trellis.PartialsWarning`),
+  a 1-1 `JOIN`'s fan-out warning (`fan_out_warning`, a
+  `Trellis.FanOutWarning`) and the step its build runs (`building`, a
+  `Trellis.JoinBuildStep` with `step` and the `side`, `part`, `leaf` or
+  `remaining` its kind of step carries). `join` is `nil` for any other
+  transform.
 - `request_backfill/2`, `detect_capture_disruptions/1` (pauses now the readers
   of every table whose Trellis capture was changed outside Trellis, and
   returns the tables), `has_live_drain_workers/1`,
