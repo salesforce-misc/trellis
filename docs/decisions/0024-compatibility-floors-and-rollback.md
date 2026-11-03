@@ -89,8 +89,7 @@ command: the older release degrades per definition by itself.
    back to one means restoring a backup taken before the upgrade, and the 0.2.0
    release notes say so. A release before 0.2.0 refuses, in `migrate`, any
    database a later release has migrated; a handle of one that connects without
-   migrating checks nothing
-   ([known correctness gaps](../known-correctness-gaps.md)).
+   migrating checks nothing.
 
 A rollback is a cross-version deploy, so [ADR-0023](0023-version-handover.md)
 applies to it: the older release stands by while a process of the newer one is
@@ -152,8 +151,7 @@ has stopped.
 ## Consequences
 
 * Every migration, grammar feature, key space, hidden-table layout and stored
-  enum-like value declares its floor, and CI checks the declarations
-  ([CONTRIBUTING](../../CONTRIBUTING.md#compatibility-floors)).
+  enum-like value declares its floor, and CI checks the declarations.
 * Keeping the floor down costs compatibility code: an additive migration adds
   nullable or defaulted columns and tables an older release ignores.
 * A definition resumed after a rollback is fully rebuilt.

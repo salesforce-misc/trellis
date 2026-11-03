@@ -2,7 +2,7 @@
 
 How to move a Trellis instance to another release, and back. Trellis's state
 (its catalog, the staging ring, the hidden tables beside each target) lives in
-your database, so a release change changes that state as well as the binary.
+your database, so a release changes that state.
 [Version handover](decisions/0023-version-handover.md) keeps two releases from
 running side by side, and
 [ADR-0024](decisions/0024-compatibility-floors-and-rollback.md) records the
@@ -76,8 +76,7 @@ adds a migration it doesn't carry. `trellis run`, `trellis apply`,
 helpers and a release task that calls `Trellis.migrate!` all migrate first, so
 each one stops with that error. A handle that connects without migrating, such
 as a worker the application starts at boot, checks nothing and runs on the
-newer database
-([known correctness gaps](known-correctness-gaps.md#a-release-before-020-started-on-a-database-a-later-release-migrated)).
+newer database.
 A rollback deploy's `bin/rails db:migrate` or `mix ecto.migrate` doesn't stop
 it: every migration of the rolled-back application has already run, so no
 helper runs. Keep an explicit Trellis `migrate` step in your deploy, as in

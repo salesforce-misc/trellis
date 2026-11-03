@@ -30,6 +30,7 @@ wrong rows, on the targets it compares
 | [A column's values rewritten in place by `ALTER COLUMN TYPE`](#a-columns-values-rewritten-in-place-by-alter-column-type) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study) |
 | [A stored generated column's expression replaced by `SET EXPRESSION`](#a-stored-generated-columns-expression-replaced-by-set-expression) | `self_check` | [#1540](https://github.com/salesforce-misc/trellis/issues/1540) (study) |
 | [An enum label renamed and added again](#an-enum-label-renamed-and-added-again) | `self_check` | documented |
+| [A read column's name swapped with another's and back within one pass](#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass) | `self_check` | [#1586](https://github.com/salesforce-misc/trellis/issues/1586) |
 | **Writes past a unique key** | | |
 | [A duplicate in `b` past a deferrable key under `session_replication_role = replica`](#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica) | `self_check` | documented |
 | **Writes capture never sees** | | |
@@ -42,8 +43,6 @@ wrong rows, on the targets it compares
 | **Changes made outside Trellis to what it owns** | | |
 | [Rows written into a target, a hidden table or Trellis's schema](#rows-written-into-a-target-a-hidden-table-or-trelliss-schema) | `self_check`, except Trellis's schema | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
 | [Part of the database restored from another point in time](#part-of-the-database-restored-from-another-point-in-time) | `self_check` | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
-| **An older release on a newer database** | | |
-| [A release before 0.2.0 started on a database a later release migrated](#a-release-before-020-started-on-a-database-a-later-release-migrated) | `self_check` after rolling forward | documented |
 
 ## Preconditions
 
@@ -77,14 +76,12 @@ while every rule holds.
   shapes [listed below](#a-columns-values-rewritten-in-place-by-alter-column-type),
   or by [`SET EXPRESSION` on a stored generated
   column](#a-stored-generated-columns-expression-replaced-by-set-expression).
+* **Let another column take a read column's name only while the
+  transforms that read it are paused**
+  ([below](#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass)).
 * **Don't write a 1-1 `JOIN`'s `b` under `session_replication_role =
   replica`** when its key on the `ON` columns is a deferrable constraint
   ([below](#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica)).
-* **Roll back to a release before 0.2.0 only by restoring a backup** taken
-  before the upgrade. Such a release's `migrate` refuses a database a later
-  release migrated, but a handle of it that connects without migrating runs
-  on one unchecked
-  ([below](#a-release-before-020-started-on-a-database-a-later-release-migrated)).
 
 ## Schema changes Trellis can't tell from routine work
 
@@ -195,6 +192,50 @@ no error. Without the re-add, the label fails to cast and the key is held
 **Repair:** `request_backfill` the table.
 
 **Ends with:** documented.
+
+### A read column's name swapped with another's and back within one pass
+
+**When:** a column a definition reads is renamed away, another column takes
+its name, a write is made, and the names are put back before the next
+reconcile pass:
+
+```sql
+ALTER TABLE orders RENAME COLUMN amount TO amount_old;
+ALTER TABLE orders RENAME COLUMN discount TO amount;
+UPDATE orders SET amount = 5 WHERE id = 1;  -- writes the column now named amount
+ALTER TABLE orders RENAME COLUMN amount TO discount;
+ALTER TABLE orders RENAME COLUMN amount_old TO amount;
+```
+
+The other column can also be one added under the read column's name and
+dropped again, or a virtual generated column (PostgreSQL 18) renamed onto it
+and back. A pass that runs while the other column has the name rebuilds the
+readers, as for a column dropped and added again, or, for a virtual column,
+pauses them
+([capture by triggers — What rebuilds, what pauses, and what's
+missed](staging-and-claiming/01-capture-by-triggers.md#what-rebuilds-what-pauses-and-whats-missed)).
+
+**What goes wrong:** the capture function finds the columns it images by
+name, so while the other column has the name it images that column's values
+as the read column's. A virtual column has no value in a transition table: an
+insert or a delete fails, and an update stages the read column as `NULL`, or
+stages nothing, so its new value is lost. After the names are put back the
+read column has its old position, type and default, and only the `xmin` of
+its catalog row has moved, as routine work such as `SET STATISTICS` moves it,
+so the next pass acts on nothing. The readers stay `live` with the wrong
+value. A 1-1 target's row, and a 1-1 `JOIN`'s, is repaired by the next write
+that changes a column the definition reads in the row of the table that holds
+the column; an aggregate or `JOIN` target stays wrong until it's rebuilt.
+
+**Detected by:** `self_check`.
+
+**Repair:** `request_backfill` the table, or `PAUSE`/`RESUME` the transforms
+that read it. To avoid it, let another column take a read column's name only
+while the transforms that read the table are paused.
+
+**Ends with:** [#1586](https://github.com/salesforce-misc/trellis/issues/1586)
+weighs having the capture function check each column's position as well as
+its name.
 
 ## Writes past a unique key
 
@@ -457,38 +498,6 @@ ring held.
 TRANSFORM` and define each affected transform again.
 
 **Ends with:** [#1209](https://github.com/salesforce-misc/trellis/issues/1209).
-
-## An older release on a newer database
-
-### A release before 0.2.0 started on a database a later release migrated
-
-**When:** an application rolls back to a release before 0.2.0 without
-restoring a backup, and a handle of that release connects without running
-`migrate`: a worker the application starts at boot, for one. Its `migrate`
-refuses such a database, since 0.2.0 adds a migration it doesn't carry, so
-`trellis run`, `trellis apply`, `bin/rails trellis:migrate`, the migration
-helpers and a release task that migrates all stop with an error. Its connect
-checks nothing, and a rollback deploy's `bin/rails db:migrate` or
-`mix ecto.migrate` calls no helper, since every migration of the rolled-back
-application has already run.
-
-**What goes wrong:** the older release runs its pipeline over the definitions
-and state the newer one wrote, with its own rules. Definition text added after
-it can read as something else: a bare `NULL` reads as a column named
-`"NULL"`, so a definition reading `COALESCE(amount, NULL)` computes from that
-column when the source has one. The definition stays `live`.
-
-**Detected by:** `self_check` under the release that migrated the database,
-after rolling forward. The older release's own `self_check` recomputes from
-its own reading of the definition, so it agrees with the target.
-
-**Repair:** stop the older release, roll forward, and `PAUSE` and `RESUME`
-each definition it ran, which rebuilds it; or restore the backup taken before
-the upgrade ([upgrading — rolling back](upgrading.md#to-a-release-before-020)).
-
-**Ends with:** documented. The check has to live in the older release, and no
-release before 0.2.0 carries one
-([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md)).
 
 ## What `self_check` can't see
 

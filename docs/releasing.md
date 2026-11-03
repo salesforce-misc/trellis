@@ -259,9 +259,7 @@ For each release, the notes carry:
   `0.2.0`: rolling back to `0.1.x` means restoring a backup taken before the
   upgrade, which also discards the application's writes since, and a `0.1.x`
   worker started without `migrate` runs unchecked on a database `0.2.0`
-  migrated
-  ([upgrading](upgrading.md#to-a-release-before-020),
-  [known correctness gaps](known-correctness-gaps.md#a-release-before-020-started-on-a-database-a-later-release-migrated)).
+  migrated ([upgrading](upgrading.md#to-a-release-before-020)).
 - **For databases that came from a pre-release,** which the battery does not
   start from:
   - a database loaded from a `0.1.0-gamma` `structure.sql` has aggregate
