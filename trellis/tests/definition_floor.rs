@@ -129,6 +129,51 @@ async fn define_alter_pause_and_resume_each_leave_the_floor_they_should() {
     assert_eq!(floor(&raw, &this_build, "t").await, "0.3.0");
 }
 
+/// Define and `ALTER` count the argument values and type rules the validator
+/// admitted the definition by, over its columns' live types, not only its
+/// tree.
+#[tokio::test]
+async fn define_and_alter_count_the_values_and_type_rules_validation_used() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    raw.batch_execute(
+        "create table public.s (id bigint primary key, ts timestamp, n integer, w bigint)",
+    )
+    .await
+    .expect("source");
+
+    // A release that added the `week` unit and the identity integer cast in
+    // 0.3.0.
+    let later = handle(
+        &db,
+        "0.3.0",
+        &[
+            (r#"Value(DateTruncUnit("week"))"#, "0.3.0"),
+            ("TypeRule(Cast(IntegerIdentity))", "0.3.0"),
+        ],
+    )
+    .await;
+    later
+        .apply("TRANSFORM t FROM s SELECT DATE_TRUNC('week', ts) AS wk")
+        .await
+        .expect("define");
+    assert_eq!(floor(&raw, &later, "t").await, "0.3.0");
+    later
+        .apply("TRANSFORM u FROM s SELECT DATE_TRUNC('day', ts) AS d, CAST(n AS bigint) AS b")
+        .await
+        .expect("define");
+    assert_eq!(floor(&raw, &later, "u").await, "0.2.0");
+    build_everything(&later).await;
+
+    // The same `CAST` over the `bigint` column is the identity case.
+    later
+        .apply("ALTER TRANSFORM u ADD CAST(w AS bigint) AS c")
+        .await
+        .expect("add an identity cast");
+    assert_eq!(floor(&raw, &later, "u").await, "0.3.0");
+}
+
 /// A partitioned source counts, and a floor never exceeds the release that
 /// stamps it.
 #[tokio::test]

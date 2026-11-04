@@ -287,16 +287,16 @@ fn every_admitted_date_form_types_as_postgres_does() {
     assert_type("d + (d - d2)", DATE);
     assert_type("d - DATE '2024-01-01'", I4);
     // `DATE_TRUNC` keeps the timestamp.
-    for unit in super::registry::DATE_TRUNC_UNITS {
+    for unit in super::registry::values(super::registry::DATE_TRUNC_UNITS) {
         assert_type(&format!("DATE_TRUNC('{unit}', ts)"), TS);
         assert_type(&format!("date_trunc('{}', ts)", unit.to_uppercase()), TS);
     }
     // `EXTRACT` gives an unconstrained numeric, for every field its type has.
-    for field in super::registry::EXTRACT_DATE_FIELDS {
+    for field in super::registry::values(super::registry::EXTRACT_DATE_FIELDS) {
         assert_type(&format!("EXTRACT({field} FROM d)"), ValueType::Numeric);
         assert_type(&format!("EXTRACT({field} FROM ts)"), ValueType::Numeric);
     }
-    for field in super::registry::EXTRACT_CLOCK_FIELDS {
+    for field in super::registry::values(super::registry::EXTRACT_CLOCK_FIELDS) {
         assert_type(&format!("EXTRACT({field} FROM ts)"), ValueType::Numeric);
     }
     assert_type("EXTRACT(year FROM d) + 1", ValueType::Numeric);

@@ -5,22 +5,35 @@
 //! `transform_definitions.floor_version`. It is the highest release any
 //! [`Feature`] the definition uses arrived in: the grammar constructs of its
 //! parsed tree, its key space and options, whether a table it reads is
-//! partitioned, and the hidden-table layout and per-definition state this
-//! release writes for it. [`Floors::of`] computes it, and [`stamp`] writes
-//! it wherever Trellis writes the definition (define, `ALTER TRANSFORM`) or
-//! recreates its hidden tables (a resume's rebuild). A pause or a read
-//! never changes it, and it can go down: an `ALTER` that removes the only
-//! newer feature lowers it.
+//! partitioned, the hidden-table layout and per-definition state this
+//! release writes for it, and every argument value and type rule the
+//! validator admitted it by over its columns' types. [`Floors::of`] computes
+//! it, and [`stamp`] writes it wherever Trellis writes the definition
+//! (define, `ALTER TRANSFORM`), recreates its hidden tables (a resume's
+//! rebuild), or sees a column it reads change type while the validator
+//! still admits it. A pause or a read never changes it, and it can go down:
+//! an `ALTER` that removes the only newer feature lowers it, and so can a
+//! retype that changes which type rule admits an expression.
+//!
+//! Loading a stored definition only parses it, so the tree alone can't tell
+//! an older release that a value or an operand type it would refuse is in
+//! use. The validation can: each value ([`super::registry::ArgValueSpec`])
+//! and each case of a type rule ([`super::registry::TypeRule`]) declares
+//! its release, a rule returns its case as a required part of its result
+//! ([`super::registry::Admitted`]), and reading the result [`record`]s it
+//! while [`validated_features`] runs the validation.
 //!
 //! The registry is exhaustive by construction. [`features_used`] matches
 //! every node kind of the tree, and [`Feature::since`] matches every
 //! feature, so a new node kind, key space, option or layout can't compile
-//! without declaring the release it arrived in. A function, typed literal or
-//! `CAST` target declares it in its own registry entry
+//! without declaring the release it arrived in. A function, typed literal,
+//! `CAST` target or argument value declares it in its own registry entry
 //! ([`super::registry::FunctionSpec::since`],
 //! [`super::typed_literal::TypedLiteralSpec::since`],
-//! [`super::registry::CastTargetSpec::since`]). Everything that exists when
-//! floors were introduced has floor [`BASELINE`].
+//! [`super::registry::CastTargetSpec::since`],
+//! [`super::registry::ArgValueSpec::since`]), and a type rule's case in
+//! [`super::registry::TypeRule::since`]. Everything that exists when floors
+//! were introduced has floor [`BASELINE`].
 //!
 //! A definition above the running release, or written under a grammar newer
 //! than this binary reads, is one this binary can't run ([`Unrunnable`],
@@ -192,6 +205,13 @@ pub enum Feature {
     CastTarget(ValueType),
     /// A hidden-table layout or per-definition state this release writes.
     Layout(Layout),
+    /// A case of a type rule the validator admitted the definition's operand
+    /// types by ([`super::registry::TypeRule`]).
+    TypeRule(super::registry::TypeRule),
+    /// An argument value the validator admitted: an `EXTRACT` field, a
+    /// `DATE_TRUNC` unit or an `AT TIME ZONE` zone
+    /// ([`super::registry::ArgValue`]).
+    Value(super::registry::ArgValue),
 }
 
 /// The special forms the parser builds as a [`Expr::FunctionCall`] without
@@ -273,6 +293,8 @@ impl Feature {
                 | Layout::Join
                 | Layout::JoinOneToOne => BASELINE,
             }),
+            Feature::TypeRule(rule) => Some(rule.since()),
+            Feature::Value(value) => value.since(),
         }
     }
 
@@ -471,6 +493,83 @@ impl Used {
     }
 }
 
+thread_local! {
+    /// The features the validation running on this thread has used so far,
+    /// while [`collect`] runs it; `None` outside one.
+    static VALIDATED: std::cell::RefCell<Option<Vec<Feature>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Records that the validation running on this thread used `feature`: a
+/// type rule's case or an argument value. A no-op outside [`collect`], so a
+/// rule called for any other reason (a generator, a renderer) records
+/// nothing.
+pub(crate) fn record(feature: Feature) {
+    VALIDATED.with(|used| {
+        if let Some(used) = used.borrow_mut().as_mut()
+            && !used.contains(&feature)
+        {
+            used.push(feature);
+        }
+    });
+}
+
+/// Runs `validate` (synchronous, so it stays on this thread) and returns its
+/// result with every feature it [`record`]ed, each once. Validation is a
+/// pure function of the tree and the column types, so the same definition
+/// over the same types always records the same features.
+pub(crate) fn collect<T>(validate: impl FnOnce() -> T) -> (T, Vec<Feature>) {
+    /// Puts back the collection this one interrupted, also on unwind.
+    struct Restore(Option<Option<Vec<Feature>>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(outer) = self.0.take() {
+                VALIDATED.with(|used| *used.borrow_mut() = outer);
+            }
+        }
+    }
+    let outer = VALIDATED.with(|cell| cell.replace(Some(Vec::new())));
+    let mut restore = Restore(Some(outer));
+    let result = validate();
+    let used = VALIDATED.with(|cell| cell.take()).unwrap_or_default();
+    // A nested validation's features are the outer one's too.
+    let outer = restore.0.take().expect("restored once").map(|mut outer| {
+        for feature in &used {
+            if !outer.contains(feature) {
+                outer.push(*feature);
+            }
+        }
+        outer
+    });
+    VALIDATED.with(|cell| cell.replace(outer));
+    (result, used)
+}
+
+/// The value and type rules define's validation admits `def` by, over the
+/// live columns of the table it reads (`from`) and, for a `JOIN`, of the
+/// joined table: the validation define and a resume run on the same types
+/// ([`super::validate::validate`] or [`super::validate::validate_join`],
+/// and the aggregate family check), collected with [`collect`]. The
+/// validator's refusal when it no longer admits them.
+pub(crate) fn validated_features(
+    def: &TransformDef,
+    from: &std::collections::HashMap<String, super::validate::JoinColumnInfo>,
+    joined: Option<&std::collections::HashMap<String, super::validate::JoinColumnInfo>>,
+) -> Result<Vec<Feature>, super::validate::ValidationError> {
+    let (result, used) = collect(|| match joined {
+        Some(joined) => super::validate::validate_join(def, from, joined),
+        None => {
+            let value_types = from
+                .iter()
+                .map(|(name, info)| (name.clone(), info.value_type))
+                .collect();
+            super::validate::validate(def, &value_types)?;
+            super::validate::validate_aggregate_admitted(def, from)
+        }
+    });
+    result.map(|()| used)
+}
+
 /// What a floor is computed against: the running release and, in tests, the
 /// since a feature is given in place of its registry entry's. Built from a
 /// [`crate::config::Config`] and carried by each [`crate::pool::Pool`].
@@ -562,20 +661,29 @@ impl Floors {
 
     /// The floor of `def`, `partitioned` when a table it reads is: the
     /// latest since of every feature it uses, at most the running release.
+    /// `validated` is what the validator admitted it by over its columns'
+    /// types ([`validated_features`]), `None` when the validator refuses it,
+    /// which counts at the running release.
     ///
     /// A binary only writes what it carries, so a floor above the running
     /// release is a registry entry declared for a later release than the
     /// binary's; capping it keeps the binary from writing a definition it
     /// would itself refuse to run. A feature no entry declares counts at the
     /// running release, never lower.
-    pub(crate) fn of(&self, def: &TransformDef, partitioned: bool) -> Release {
+    pub(crate) fn of(
+        &self,
+        def: &TransformDef,
+        partitioned: bool,
+        validated: Option<&[Feature]>,
+    ) -> Release {
         let (features, unknown) = features_used(def, partitioned);
         let ceiling = self
             .running
             .unwrap_or(Release::new(u64::MAX, u64::MAX, u64::MAX));
-        let unknown = unknown.then_some(ceiling);
+        let unknown = (unknown || validated.is_none()).then_some(ceiling);
         features
             .iter()
+            .chain(validated.unwrap_or_default())
             .map(|feature| self.since(feature).unwrap_or(ceiling))
             .chain(unknown)
             .max()
@@ -650,6 +758,27 @@ pub(crate) fn unrunnable_error(existing: Option<&str>, reason: &str) -> Option<S
     (error != existing).then_some(error)
 }
 
+/// The floor of `def`, which reads `source` and, for a `JOIN`, `joined`,
+/// over those tables' columns as they are now: what define writes, and what
+/// [`stamp`] stores.
+pub(crate) async fn of_live(
+    client: &impl tokio_postgres::GenericClient,
+    floors: &Floors,
+    def: &TransformDef,
+    source: &str,
+    joined: Option<&str>,
+) -> Result<Release, super::catalog::CatalogError> {
+    let tables: Vec<&str> = std::iter::once(source).chain(joined).collect();
+    let partitioned = any_partitioned(client, &tables).await?;
+    let from = super::catalog::column_infos(client, source).await?;
+    let joined = match joined {
+        Some(joined) => Some(super::catalog::column_infos(client, joined).await?),
+        None => None,
+    };
+    let validated = validated_features(def, &from, joined.as_ref()).ok();
+    Ok(floors.of(def, partitioned, validated.as_deref()))
+}
+
 /// Whether any of `tables` (qualified `schema.table` names) is a
 /// partitioned table.
 pub(crate) async fn any_partitioned(
@@ -673,14 +802,15 @@ pub(crate) async fn any_partitioned(
 }
 
 /// The floor of definition `id`, whose parsed tree is `def`, computed now
-/// and stored: wherever Trellis writes the definition or recreates its
-/// hidden tables.
+/// over its tables' live column types and stored: wherever Trellis writes
+/// the definition or recreates its hidden tables, and where the capture pass
+/// sees a column it reads change type and the validator still admits it.
 pub(crate) async fn stamp(
     client: &impl tokio_postgres::GenericClient,
     floors: &Floors,
     id: i64,
     def: &TransformDef,
-) -> Result<Release, tokio_postgres::Error> {
+) -> Result<Release, super::catalog::CatalogError> {
     let row = client
         .query_one(
             "select source_table, join_table from transform_definitions where id = $1",
@@ -689,10 +819,7 @@ pub(crate) async fn stamp(
         .await?;
     let source: String = row.get(0);
     let joined: Option<String> = row.get(1);
-    let tables: Vec<&str> = std::iter::once(source.as_str())
-        .chain(joined.as_deref())
-        .collect();
-    let floor = floors.of(def, any_partitioned(client, &tables).await?);
+    let floor = of_live(client, floors, def, &source, joined.as_deref()).await?;
     client
         .execute(
             "update transform_definitions set floor_version = $2 where id = $1",
@@ -720,7 +847,9 @@ mod tests {
     }
 
     fn floor_of(floors: &Floors, text: &str) -> String {
-        floors.of(&parse(text).expect("parses"), false).to_string()
+        floors
+            .of(&parse(text).expect("parses"), false, Some(&[]))
+            .to_string()
     }
 
     #[test]
@@ -783,7 +912,10 @@ mod tests {
             }
         }
         let def = parse(shapes[0]).unwrap();
-        assert_eq!(floors("0.3.0", &[]).of(&def, true).to_string(), "0.2.0");
+        assert_eq!(
+            floors("0.3.0", &[]).of(&def, true, Some(&[])).to_string(),
+            "0.2.0"
+        );
     }
 
     /// `ADOPT EXISTING TABLE` is a feature of its own: a definition that
@@ -853,7 +985,7 @@ mod tests {
             assert_eq!(floor_of(&later, text), floor, "{text}");
         }
         let plain = parse("TRANSFORM t FROM s SELECT a AS a").unwrap();
-        assert_eq!(later.of(&plain, true).to_string(), "0.3.2");
+        assert_eq!(later.of(&plain, true, Some(&[])).to_string(), "0.3.2");
     }
 
     /// An `ALTER` stamps the floor of the edited tree: adding the only
@@ -862,12 +994,12 @@ mod tests {
     fn an_edit_raises_and_lowers_the_floor() {
         let later = floors("0.3.0", &[("Expr(Case)", "0.3.0")]);
         let mut def = parse("TRANSFORM t FROM s SELECT a AS a").unwrap();
-        assert_eq!(later.of(&def, false).to_string(), "0.2.0");
+        assert_eq!(later.of(&def, false, Some(&[])).to_string(), "0.2.0");
         let edited = parse("TRANSFORM t FROM s SELECT CASE WHEN f THEN a END AS b").unwrap();
         def.fields.push(edited.fields[0].clone());
-        assert_eq!(later.of(&def, false).to_string(), "0.3.0");
+        assert_eq!(later.of(&def, false, Some(&[])).to_string(), "0.3.0");
         def.fields.pop();
-        assert_eq!(later.of(&def, false).to_string(), "0.2.0");
+        assert_eq!(later.of(&def, false, Some(&[])).to_string(), "0.2.0");
     }
 
     /// A layout this release writes counts like a grammar construct, so a
@@ -918,10 +1050,15 @@ mod tests {
             args: vec![],
         };
         assert_eq!(
-            floors("0.4.0", &[]).of(&unknown, false).to_string(),
+            floors("0.4.0", &[])
+                .of(&unknown, false, Some(&[]))
+                .to_string(),
             "0.4.0"
         );
-        assert_eq!(floors("0.4.0", &[]).of(&def, false).to_string(), "0.2.0");
+        assert_eq!(
+            floors("0.4.0", &[]).of(&def, false, Some(&[])).to_string(),
+            "0.2.0"
+        );
     }
 
     /// (definition floor, running version) → drop or refuse (ADR-0024 rule
@@ -1096,8 +1233,8 @@ mod tests {
     /// An argument the validator checks, not the parser (an `EXTRACT`
     /// field, a `DATE_TRUNC` unit), is a value in the tree, not a node kind:
     /// text with one this release refuses still parses, which is all
-    /// loading a stored definition does, so the floor can't stand in for
-    /// it (ADR-0024, "Only the tree is counted").
+    /// loading a stored definition does. The tree's features can't tell the
+    /// two apart; the validation's ([`validated_features`]) count the value.
     #[test]
     fn a_validator_checked_argument_parses_without_a_feature_of_its_own() {
         let columns = std::collections::HashMap::from([(
@@ -1140,5 +1277,177 @@ mod tests {
         {
             assert!(Feature::CastTarget(spec.value_type).since().is_some());
         }
+    }
+
+    fn column(pg_type: &str, value_type: ValueType) -> super::super::validate::JoinColumnInfo {
+        super::super::validate::JoinColumnInfo {
+            value_type,
+            pg_type: pg_type.to_string(),
+            type_oid: 0,
+            typmod: -1,
+            collation_oid: 0,
+            collation: None,
+            collation_deterministic: true,
+            is_enum: false,
+            copy_type: pg_type.to_string(),
+            copy_collation: None,
+            trellis_target: false,
+        }
+    }
+
+    /// The floor of `select` from `s(id integer, c <c>, d date, ts
+    /// timestamp)`, as define computes it: the tree's features and the
+    /// validation's over those types. `None` when the validator refuses it.
+    fn validated_floor(floors: &Floors, select: &str, c: (&str, ValueType)) -> Option<String> {
+        use crate::defs::pg_type::PgType;
+        use crate::integer::IntWidth;
+        let def = parse(&format!("TRANSFORM t FROM s {select}")).expect("parses");
+        let columns = std::collections::HashMap::from([
+            (
+                "id".to_string(),
+                column("integer", ValueType::Integer(IntWidth::Int4)),
+            ),
+            ("c".to_string(), column(c.0, c.1)),
+            (
+                "d".to_string(),
+                column("date", ValueType::Other(PgType::Date)),
+            ),
+            (
+                "ts".to_string(),
+                column(
+                    "timestamp without time zone",
+                    ValueType::Other(PgType::Timestamp),
+                ),
+            ),
+        ]);
+        let validated = validated_features(&def, &columns, None).ok()?;
+        Some(floors.of(&def, false, Some(&validated)).to_string())
+    }
+
+    const INT4: (&str, ValueType) = (
+        "integer",
+        ValueType::Integer(crate::integer::IntWidth::Int4),
+    );
+    const INT8: (&str, ValueType) = ("bigint", ValueType::Integer(crate::integer::IntWidth::Int8));
+
+    /// Every value and type rule that exists has floor 0.2.0, so a validated
+    /// definition's floor is its tree's.
+    #[test]
+    fn validated_baseline_shapes_have_floor_0_2_0() {
+        let floors = floors("0.3.0", &[]);
+        for select in [
+            "SELECT id AS id, CAST(c AS bigint) AS x",
+            "SELECT id AS id, d + c AS x",
+            "SELECT id AS id, c > 5 AS x, COALESCE(c, 0) AS y, -c AS z",
+            "SELECT id AS id, EXTRACT(hour FROM ts) AS x, DATE_TRUNC('day', ts) AS y",
+            "GROUP BY id SELECT id AS id, SUM(c) AS s, AVG(c) AS a, COUNT(*) AS n",
+        ] {
+            assert_eq!(
+                validated_floor(&floors, select, INT4).as_deref(),
+                Some("0.2.0"),
+                "{select}"
+            );
+        }
+    }
+
+    /// An argument value declared for a later release raises the floor of a
+    /// definition using it, and only of one using it.
+    #[test]
+    fn a_value_declared_later_raises_the_floor() {
+        let floors = floors(
+            "0.4.0",
+            &[
+                (r#"Value(DateTruncUnit("week"))"#, "0.3.0"),
+                (r#"Value(ExtractField("isodow"))"#, "0.3.1"),
+                (r#"Value(TimeZone("UTC"))"#, "0.3.2"),
+            ],
+        );
+        let floor = |select: &str| validated_floor(&floors, select, INT4).expect("validates");
+        assert_eq!(
+            floor("SELECT id AS id, DATE_TRUNC('week', ts) AS x"),
+            "0.3.0"
+        );
+        assert_eq!(
+            floor("SELECT id AS id, DATE_TRUNC('day', ts) AS x"),
+            "0.2.0"
+        );
+        assert_eq!(
+            floor("SELECT id AS id, EXTRACT(isodow FROM d) AS x"),
+            "0.3.1"
+        );
+        assert_eq!(floor("SELECT id AS id, EXTRACT(dow FROM d) AS x"), "0.2.0");
+        assert_eq!(
+            floor("SELECT id AS id, CAST(ts AS timestamp) AS x"),
+            "0.2.0"
+        );
+    }
+
+    /// A type rule's case declared for a later release raises the floor of a
+    /// definition the validator admits by it, so the floor depends on the
+    /// columns' types: the same text over a widened column uses another case.
+    #[test]
+    fn a_type_rule_declared_later_raises_the_floor() {
+        let floors = floors(
+            "0.4.0",
+            &[
+                ("TypeRule(Cast(IntegerIdentity))", "0.3.0"),
+                ("TypeRule(Unify(Integer))", "0.3.1"),
+                ("TypeRule(AggregateAdmission(SumAvgInteger))", "0.3.2"),
+            ],
+        );
+        let cast = "SELECT id AS id, CAST(c AS bigint) AS x";
+        assert_eq!(
+            validated_floor(&floors, cast, INT4).as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(
+            validated_floor(&floors, cast, INT8).as_deref(),
+            Some("0.3.0")
+        );
+        // `COALESCE(c, 0)`: `bigint` beside `integer` unifies two widths;
+        // `integer` beside `integer` is the same type.
+        let coalesce = "SELECT id AS id, COALESCE(c, 0) AS x";
+        assert_eq!(
+            validated_floor(&floors, coalesce, INT4).as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(
+            validated_floor(&floors, coalesce, INT8).as_deref(),
+            Some("0.3.1")
+        );
+        assert_eq!(
+            validated_floor(&floors, "GROUP BY id SELECT id AS id, SUM(c) AS s", INT4).as_deref(),
+            Some("0.3.2")
+        );
+    }
+
+    /// The validator's refusal is no floor: `date + bigint` has no operator.
+    #[test]
+    fn a_refused_definition_has_no_validated_floor() {
+        let floors = floors("0.3.0", &[]);
+        let select = "SELECT id AS id, d + c AS x";
+        assert_eq!(
+            validated_floor(&floors, select, INT4).as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(validated_floor(&floors, select, INT8), None);
+        // Counted at the running release when it is computed anyway.
+        let def = parse(&format!("TRANSFORM t FROM s {select}")).unwrap();
+        assert_eq!(floors.of(&def, false, None).to_string(), "0.3.0");
+    }
+
+    /// A rule called outside a validation records nothing, and a validation
+    /// nested in another counts toward both.
+    #[test]
+    fn only_a_collecting_validation_records() {
+        use super::super::registry::{CastRule, TypeRule};
+        let int4 = ValueType::Integer(crate::integer::IntWidth::Int4);
+        let identity = Feature::TypeRule(TypeRule::Cast(CastRule::IntegerIdentity));
+        super::super::registry::cast_result_type(int4, int4);
+        let ((_, inner), outer) =
+            collect(|| collect(|| super::super::registry::cast_result_type(int4, int4)));
+        assert_eq!(inner, vec![identity]);
+        assert_eq!(outer, vec![identity]);
+        assert_eq!(collect(|| ()).1, Vec::<Feature>::new());
     }
 }

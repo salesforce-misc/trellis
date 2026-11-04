@@ -3462,16 +3462,10 @@ async fn create_definition_inner(
         .map(encode_type_map)
         .unwrap_or_default();
     let join_table = join_sides.as_ref().map(|sides| sides.joined.as_str());
-    // ADR-0024: the oldest release that can run what this define writes.
-    let read_tables: Vec<&str> = std::iter::once(qualified_source.as_str())
-        .chain(join_table)
-        .collect();
-    let floor = pool
-        .floors()
-        .of(
-            &def,
-            super::floor::any_partitioned(&*txn, &read_tables).await?,
-        )
+    // ADR-0024: the oldest release that can run what this define writes,
+    // over the column types it was just validated against.
+    let floor = super::floor::of_live(&*txn, pool.floors(), &def, &qualified_source, join_table)
+        .await?
         .to_string();
     let id: i64 = match txn
         .query_one(
@@ -4333,6 +4327,16 @@ async fn check_aggregate_admitted(
     }
     let (columns, _) = join_columns_of(client, qualified_source).await?;
     Ok(super::validate::validate_aggregate_admitted(def, &columns)?)
+}
+
+/// Every column of `qualified` as the validator reads it ([`join_columns_of`]
+/// without the virtual columns): what a definition's floor is computed over
+/// ([`super::floor::of_live`]).
+pub(crate) async fn column_infos(
+    client: &impl GenericClient,
+    qualified: &str,
+) -> Result<HashMap<String, super::validate::JoinColumnInfo>, CatalogError> {
+    Ok(join_columns_of(client, qualified).await?.0)
 }
 
 /// Every column of `qualified` as [`super::validate::validate_join`] reads

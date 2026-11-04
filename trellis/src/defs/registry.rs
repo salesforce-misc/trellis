@@ -295,20 +295,26 @@ pub fn operator_spec(operator: Operator) -> &'static OperatorSpec {
 /// `common_numeric_type`, which models that separately because Postgres
 /// does.
 pub fn operator_result_type(op: Operator, lhs: ValueType, rhs: ValueType) -> Option<ValueType> {
+    operator_rule(op, lhs, rhs).map(Admitted::into_type)
+}
+
+/// [`operator_result_type`] with the case that admits the pair.
+pub fn operator_rule(op: Operator, lhs: ValueType, rhs: ValueType) -> Option<Admitted> {
     if op.is_comparison() {
-        return comparison_result_type(op, lhs, rhs);
+        return comparison_rule(op, lhs, rhs);
     }
     if matches!(op, Operator::And | Operator::Or) {
         return (lhs == ValueType::Boolean && rhs == ValueType::Boolean)
-            .then_some(ValueType::Boolean);
+            .then_some(Admitted::new(ValueType::Boolean, TypeRule::Logic));
     }
     if op == Operator::AtTimeZone {
         // The zone is a text literal (`validate` admits only `'UTC'`); the
         // `timestamptz` operand gives the same instant as a `timestamp`.
-        return (lhs == ValueType::Other(PgType::TimestampTz) && rhs == ValueType::Text)
-            .then_some(ValueType::Other(PgType::Timestamp));
+        return (lhs == ValueType::Other(PgType::TimestampTz) && rhs == ValueType::Text).then_some(
+            Admitted::new(ValueType::Other(PgType::Timestamp), TypeRule::AtTimeZone),
+        );
     }
-    if let Some(result) = date_arithmetic_result_type(op, lhs, rhs) {
+    if let Some(result) = date_arithmetic_rule(op, lhs, rhs) {
         return result;
     }
     if !lhs.is_numeric_family() || !rhs.is_numeric_family() {
@@ -316,13 +322,23 @@ pub fn operator_result_type(op: Operator, lhs: ValueType, rhs: ValueType) -> Opt
     }
     // The type `+`, `-` and `*` give: two integers the wider width, a float
     // beside anything the float rule, otherwise `numeric`.
-    let arithmetic = || match (lhs, rhs) {
-        (ValueType::Float(a), ValueType::Float(b)) => ValueType::Float(a.wider(b)),
-        // A float mixed with anything else is the `float8` operator on two
-        // `double precision` operands.
-        (ValueType::Float(_), _) | (_, ValueType::Float(_)) => ValueType::Float(FloatWidth::Float8),
-        (ValueType::Integer(a), ValueType::Integer(b)) => ValueType::Integer(a.wider(b)),
-        _ => ValueType::Numeric,
+    let arithmetic = || {
+        let (value_type, rule) = match (lhs, rhs) {
+            (ValueType::Float(a), ValueType::Float(b)) => {
+                (ValueType::Float(a.wider(b)), ArithmeticRule::Float)
+            }
+            // A float mixed with anything else is the `float8` operator on
+            // two `double precision` operands.
+            (ValueType::Float(_), _) | (_, ValueType::Float(_)) => (
+                ValueType::Float(FloatWidth::Float8),
+                ArithmeticRule::FloatBesideExact,
+            ),
+            (ValueType::Integer(a), ValueType::Integer(b)) => {
+                (ValueType::Integer(a.wider(b)), ArithmeticRule::Integer)
+            }
+            _ => (ValueType::Numeric, ArithmeticRule::Numeric),
+        };
+        Admitted::new(value_type, TypeRule::Arithmetic(rule))
     };
     Some(match op {
         Operator::Add | Operator::Subtract | Operator::Multiply => arithmetic(),
@@ -342,6 +358,295 @@ pub fn operator_result_type(op: Operator, lhs: ValueType, rhs: ValueType) -> Opt
     })
 }
 
+/// A result type a type rule admitted, with the case that admitted it. The
+/// case is a required part of every rule's result, so a new case can't
+/// compile without naming the [`TypeRule`] whose release it arrived in, and
+/// reading the type ([`Admitted::into_type`]) records that case for the
+/// definition's floor (ADR-0024, [`super::floor`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Admitted {
+    value_type: ValueType,
+    rule: TypeRule,
+}
+
+impl Admitted {
+    /// `value_type`, admitted by `rule`.
+    pub const fn new(value_type: ValueType, rule: TypeRule) -> Self {
+        Self { value_type, rule }
+    }
+
+    /// The admitted type. Records the case for the floor of the definition
+    /// being validated on this thread, if any ([`super::floor::record`]).
+    pub fn into_type(self) -> ValueType {
+        super::floor::record(super::floor::Feature::TypeRule(self.rule));
+        self.value_type
+    }
+}
+
+/// One case of a type rule: a combination of operand types a rule admits,
+/// which a release can add. [`TypeRule::since`] declares the release of
+/// each, so adding a case means adding a variant with its release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeRule {
+    /// `+`, `-`, `*`, `/` or `%` over this pair ([`operator_rule`]).
+    Arithmetic(ArithmeticRule),
+    /// Date arithmetic ([`operator_rule`]).
+    DateArithmetic(DateArithmeticRule),
+    /// `AND` or `OR` over two booleans.
+    Logic,
+    /// `<timestamptz> AT TIME ZONE <text>`.
+    AtTimeZone,
+    /// A comparison over this pair ([`comparison_rule`]).
+    Comparison(ComparisonRule),
+    /// Prefix `-` over a number.
+    Negate,
+    /// `CAST(<operand> AS <target>)` ([`cast_rule`]).
+    Cast(CastRule),
+    /// `COALESCE` or `CASE` unifying two types (`validate`'s
+    /// `common_numeric_type`).
+    Unify(UnifyRule),
+    /// `EXTRACT` from this operand type ([`extract_fields`]).
+    Extract(ExtractRule),
+    /// An aggregate's result over this argument type
+    /// ([`aggregate_rule`]).
+    Aggregate(AggregateRule),
+    /// An aggregate the group basis keeps, over this argument type
+    /// (`validate::check_aggregate_admitted`).
+    AggregateAdmission(AggregateAdmissionRule),
+}
+
+/// The pairs `+`, `-`, `*`, `/` and `%` take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithmeticRule {
+    /// Two integers: the wider width.
+    Integer,
+    /// Exact numbers, one of them `numeric`: `numeric`.
+    Numeric,
+    /// Two floats: the wider width.
+    Float,
+    /// A float beside an exact number: `double precision`.
+    FloatBesideExact,
+}
+
+/// The date operators `+` and `-` have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateArithmeticRule {
+    /// `date ± smallint/integer`.
+    DateAndDays,
+    /// `smallint/integer + date`.
+    DaysPlusDate,
+    /// `date - date`: the days between.
+    DateMinusDate,
+}
+
+/// The pairs a comparison family takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComparisonRule {
+    /// Two exact numbers, any widths.
+    ExactNumeric,
+    /// Two floats.
+    Float,
+    /// A float beside a bare number literal (`validate`'s
+    /// `comparison_type`).
+    FloatBesideNumberLiteral,
+    /// Two booleans.
+    Boolean,
+    /// Two uuids.
+    Uuid,
+    /// Two texts, equality only.
+    TextEquality,
+    /// The same comparable temporal type on both sides.
+    Temporal,
+}
+
+/// The casts `CAST` admits over a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastRule {
+    /// An integer to a strictly wider integer.
+    IntegerWidening,
+    /// An integer to its own width.
+    IntegerIdentity,
+    /// An integer to `numeric`.
+    IntegerToNumeric,
+    /// `numeric` to `numeric`.
+    NumericIdentity,
+    /// `date` to `timestamp`.
+    DateToTimestamp,
+    /// `timestamp` to `timestamp`.
+    TimestampIdentity,
+}
+
+/// How `COALESCE` and `CASE` unify two result types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnifyRule {
+    /// The same type.
+    Same,
+    /// Two floats: the wider width.
+    Float,
+    /// A float beside an exact number: the float.
+    FloatBesideExact,
+    /// Two integers: the wider width.
+    Integer,
+    /// Exact numbers, one of them `numeric`: `numeric`.
+    Numeric,
+}
+
+/// The operand types `EXTRACT` takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractRule {
+    Date,
+    Timestamp,
+}
+
+/// The argument types `SUM` and `AVG` are typed over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateRule {
+    /// `SUM` of a `smallint` or `integer`: `bigint`.
+    SumNarrowInteger,
+    /// `SUM` of a `bigint` or `numeric`: `numeric`.
+    SumWideExact,
+    /// `SUM` of a float: its own type.
+    SumFloat,
+    /// `SUM` of an `interval`, typed so the family check refuses it.
+    SumInterval,
+    /// `AVG` of a float: `double precision`.
+    AvgFloat,
+    /// `AVG` of an exact number: `numeric`.
+    AvgExact,
+}
+
+/// The aggregates and argument types the group basis keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateAdmissionRule {
+    /// `COUNT`, of anything.
+    Count,
+    /// `SUM` or `AVG` of an integer.
+    SumAvgInteger,
+    /// `SUM` or `AVG` of a `numeric` with a declared scale.
+    SumAvgScaledNumeric,
+}
+
+impl TypeRule {
+    /// The release this case arrived in. Every case that exists when floors
+    /// started counting type rules is [`BASELINE`].
+    pub fn since(&self) -> Release {
+        match *self {
+            TypeRule::Arithmetic(rule) => match rule {
+                ArithmeticRule::Integer
+                | ArithmeticRule::Numeric
+                | ArithmeticRule::Float
+                | ArithmeticRule::FloatBesideExact => BASELINE,
+            },
+            TypeRule::DateArithmetic(rule) => match rule {
+                DateArithmeticRule::DateAndDays
+                | DateArithmeticRule::DaysPlusDate
+                | DateArithmeticRule::DateMinusDate => BASELINE,
+            },
+            TypeRule::Logic | TypeRule::AtTimeZone | TypeRule::Negate => BASELINE,
+            TypeRule::Comparison(rule) => match rule {
+                ComparisonRule::ExactNumeric
+                | ComparisonRule::Float
+                | ComparisonRule::FloatBesideNumberLiteral
+                | ComparisonRule::Boolean
+                | ComparisonRule::Uuid
+                | ComparisonRule::TextEquality
+                | ComparisonRule::Temporal => BASELINE,
+            },
+            TypeRule::Cast(rule) => match rule {
+                CastRule::IntegerWidening
+                | CastRule::IntegerIdentity
+                | CastRule::IntegerToNumeric
+                | CastRule::NumericIdentity
+                | CastRule::DateToTimestamp
+                | CastRule::TimestampIdentity => BASELINE,
+            },
+            TypeRule::Unify(rule) => match rule {
+                UnifyRule::Same
+                | UnifyRule::Float
+                | UnifyRule::FloatBesideExact
+                | UnifyRule::Integer
+                | UnifyRule::Numeric => BASELINE,
+            },
+            TypeRule::Extract(rule) => match rule {
+                ExtractRule::Date | ExtractRule::Timestamp => BASELINE,
+            },
+            TypeRule::Aggregate(rule) => match rule {
+                AggregateRule::SumNarrowInteger
+                | AggregateRule::SumWideExact
+                | AggregateRule::SumFloat
+                | AggregateRule::SumInterval
+                | AggregateRule::AvgFloat
+                | AggregateRule::AvgExact => BASELINE,
+            },
+            TypeRule::AggregateAdmission(rule) => match rule {
+                AggregateAdmissionRule::Count
+                | AggregateAdmissionRule::SumAvgInteger
+                | AggregateAdmissionRule::SumAvgScaledNumeric => BASELINE,
+            },
+        }
+    }
+}
+
+/// One argument value the validator admits, read from the call's string
+/// literal, and the release it arrived in.
+#[derive(Debug, Clone, Copy)]
+pub struct ArgValueSpec {
+    pub value: &'static str,
+    /// The release this value arrived in, which raises the floor of a
+    /// definition using it (ADR-0024, [`super::floor`]).
+    pub since: Release,
+}
+
+const fn arg_value(value: &'static str, since: Release) -> ArgValueSpec {
+    ArgValueSpec { value, since }
+}
+
+/// An argument value a definition uses, by the table that declares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgValue {
+    /// An `EXTRACT` field ([`EXTRACT_DATE_FIELDS`], [`EXTRACT_CLOCK_FIELDS`]).
+    ExtractField(&'static str),
+    /// A `DATE_TRUNC` unit ([`DATE_TRUNC_UNITS`]).
+    DateTruncUnit(&'static str),
+    /// An `AT TIME ZONE` zone ([`TIME_ZONES`]).
+    TimeZone(&'static str),
+}
+
+impl ArgValue {
+    /// The release this value arrived in: its table entry's. `None` for a
+    /// value no entry declares.
+    pub fn since(&self) -> Option<Release> {
+        let (table, value): (&[&[ArgValueSpec]], _) = match *self {
+            ArgValue::ExtractField(value) => (&[EXTRACT_DATE_FIELDS, EXTRACT_CLOCK_FIELDS], value),
+            ArgValue::DateTruncUnit(value) => (&[DATE_TRUNC_UNITS], value),
+            ArgValue::TimeZone(value) => (&[TIME_ZONES], value),
+        };
+        table
+            .iter()
+            .flat_map(|specs| specs.iter())
+            .find(|spec| spec.value == value)
+            .map(|spec| spec.since)
+    }
+}
+
+/// The entry of `specs` spelled `value`, recorded as `kind` for the floor of
+/// the definition being validated on this thread, if any. `None` for a value
+/// no entry declares.
+pub fn admit_value(
+    specs: &'static [ArgValueSpec],
+    value: &str,
+    kind: fn(&'static str) -> ArgValue,
+) -> Option<&'static str> {
+    let found = specs.iter().find(|spec| spec.value == value)?.value;
+    super::floor::record(super::floor::Feature::Value(kind(found)));
+    Some(found)
+}
+
+/// The values of `specs`, in order.
+pub fn values(specs: &[ArgValueSpec]) -> Vec<&'static str> {
+    specs.iter().map(|spec| spec.value).collect()
+}
+
 /// `date ± integer`, `integer + date` and `date - date`, the date operators
 /// `+`/`-` have (`date_pli`, `date_mii`, `date_mi`): `Some(Some(result))` for
 /// an admitted pair, `Some(None)` for a pair with a date that is refused, and
@@ -355,11 +660,7 @@ pub fn operator_result_type(op: Operator, lhs: ValueType, rhs: ValueType) -> Opt
 ///
 /// Postgres has no `date + bigint` or `date + numeric`; a `smallint` widens to
 /// `integer`.
-fn date_arithmetic_result_type(
-    op: Operator,
-    lhs: ValueType,
-    rhs: ValueType,
-) -> Option<Option<ValueType>> {
+fn date_arithmetic_rule(op: Operator, lhs: ValueType, rhs: ValueType) -> Option<Option<Admitted>> {
     const DATE: ValueType = ValueType::Other(PgType::Date);
     if !matches!(op, Operator::Add | Operator::Subtract) || (lhs != DATE && rhs != DATE) {
         return None;
@@ -370,10 +671,15 @@ fn date_arithmetic_result_type(
             ValueType::Integer(IntWidth::Int2) | ValueType::Integer(IntWidth::Int4)
         )
     };
+    let admitted =
+        |value_type, rule| Some(Admitted::new(value_type, TypeRule::DateArithmetic(rule)));
     Some(match (op, lhs, rhs) {
-        (_, DATE, n) if days(n) => Some(DATE),
-        (Operator::Add, n, DATE) if days(n) => Some(DATE),
-        (Operator::Subtract, DATE, DATE) => Some(ValueType::Integer(IntWidth::Int4)),
+        (_, DATE, n) if days(n) => admitted(DATE, DateArithmeticRule::DateAndDays),
+        (Operator::Add, n, DATE) if days(n) => admitted(DATE, DateArithmeticRule::DaysPlusDate),
+        (Operator::Subtract, DATE, DATE) => admitted(
+            ValueType::Integer(IntWidth::Int4),
+            DateArithmeticRule::DateMinusDate,
+        ),
         _ => None,
     })
 }
@@ -393,15 +699,28 @@ fn date_arithmetic_result_type(
 /// Everything else is `None`. A float against a *bare number literal* is
 /// admitted by [`super::validate`], which sees the operand's syntax.
 pub fn comparison_result_type(op: Operator, lhs: ValueType, rhs: ValueType) -> Option<ValueType> {
-    let comparable = match (lhs, rhs) {
-        (l, r) if l.is_exact_numeric_family() && r.is_exact_numeric_family() => true,
-        (ValueType::Float(_), ValueType::Float(_)) => true,
-        (ValueType::Boolean, ValueType::Boolean) | (ValueType::Uuid, ValueType::Uuid) => true,
-        (ValueType::Text, ValueType::Text) => !op.is_ordering(),
-        (ValueType::Other(a), ValueType::Other(b)) => a == b && is_comparable_temporal(a),
-        _ => false,
+    comparison_rule(op, lhs, rhs).map(Admitted::into_type)
+}
+
+/// [`comparison_result_type`] with the case that admits the pair.
+pub fn comparison_rule(op: Operator, lhs: ValueType, rhs: ValueType) -> Option<Admitted> {
+    let rule = match (lhs, rhs) {
+        (l, r) if l.is_exact_numeric_family() && r.is_exact_numeric_family() => {
+            ComparisonRule::ExactNumeric
+        }
+        (ValueType::Float(_), ValueType::Float(_)) => ComparisonRule::Float,
+        (ValueType::Boolean, ValueType::Boolean) => ComparisonRule::Boolean,
+        (ValueType::Uuid, ValueType::Uuid) => ComparisonRule::Uuid,
+        (ValueType::Text, ValueType::Text) if !op.is_ordering() => ComparisonRule::TextEquality,
+        (ValueType::Other(a), ValueType::Other(b)) if a == b && is_comparable_temporal(a) => {
+            ComparisonRule::Temporal
+        }
+        _ => return None,
     };
-    comparable.then_some(ValueType::Boolean)
+    Some(Admitted::new(
+        ValueType::Boolean,
+        TypeRule::Comparison(rule),
+    ))
 }
 
 /// The temporal types whose same-type comparison is `IMMUTABLE`.
@@ -424,7 +743,10 @@ pub fn is_mixed_temporal(lhs: ValueType, rhs: ValueType) -> bool {
 /// operand's own type (`int2um`, `int4um`, `int8um`, `numeric_uminus`,
 /// `float4um`, `float8um`), `None` for a non-numeric operand.
 pub fn negate_result_type(operand: ValueType) -> Option<ValueType> {
-    operand.is_numeric_family().then_some(operand)
+    operand
+        .is_numeric_family()
+        .then_some(Admitted::new(operand, TypeRule::Negate))
+        .map(Admitted::into_type)
 }
 
 /// One type a `CAST` can name.
@@ -537,26 +859,32 @@ pub fn cast_target_spec(value_type: ValueType) -> Option<&'static CastTargetSpec
 /// fractional digits. That is what lets a correct `SUM(CAST(qty AS bigint))`
 /// keep defining after `qty` widens from `integer` to `bigint`. Both operand
 /// and target are modifier-free [`ValueType`]s, so the identity is the same
-/// type; the release of each admitted pair is its target's
-/// ([`CAST_TARGETS`]), declared once there.
+/// type. Each admitted pair is a [`CastRule`], which declares its release.
 ///
 /// `date` to `timestamp` is exact and `IMMUTABLE`, but not total: a date past
 /// 294276 AD is out of range for `timestamp`, which is a data error (class 22)
 /// for the row that holds it.
 pub fn cast_result_type(operand: ValueType, target: ValueType) -> Option<ValueType> {
-    match (operand, target) {
-        (ValueType::Integer(from), ValueType::Integer(to)) if from.range().1 <= to.range().1 => {
-            Some(target)
+    cast_rule(operand, target).map(Admitted::into_type)
+}
+
+/// [`cast_result_type`] with the case that admits the cast.
+pub fn cast_rule(operand: ValueType, target: ValueType) -> Option<Admitted> {
+    const TIMESTAMP: ValueType = ValueType::Other(PgType::Timestamp);
+    let rule = match (operand, target) {
+        (ValueType::Integer(from), ValueType::Integer(to)) if from == to => {
+            CastRule::IntegerIdentity
         }
-        (ValueType::Integer(_) | ValueType::Numeric, ValueType::Numeric) => {
-            Some(ValueType::Numeric)
+        (ValueType::Integer(from), ValueType::Integer(to)) if from.range().1 < to.range().1 => {
+            CastRule::IntegerWidening
         }
-        (
-            ValueType::Other(PgType::Date | PgType::Timestamp),
-            ValueType::Other(PgType::Timestamp),
-        ) => Some(target),
-        _ => None,
-    }
+        (ValueType::Integer(_), ValueType::Numeric) => CastRule::IntegerToNumeric,
+        (ValueType::Numeric, ValueType::Numeric) => CastRule::NumericIdentity,
+        (ValueType::Other(PgType::Date), TIMESTAMP) => CastRule::DateToTimestamp,
+        (TIMESTAMP, TIMESTAMP) => CastRule::TimestampIdentity,
+        _ => return None,
+    };
+    Some(Admitted::new(target, TypeRule::Cast(rule)))
 }
 
 /// Whether one operand is a float and the other an exact numeric (an integer
@@ -750,44 +1078,53 @@ pub const INTEGER_LITERAL_ARGS: &[(&str, usize)] = &[("ROUND", 1), ("TRUNC", 1)]
 
 /// The units `DATE_TRUNC('<unit>', <timestamp>)` takes, spelled as Postgres
 /// prints them. `week` truncates to Monday.
-pub const DATE_TRUNC_UNITS: &[&str] = &[
-    "microseconds",
-    "milliseconds",
-    "second",
-    "minute",
-    "hour",
-    "day",
-    "week",
-    "month",
-    "quarter",
-    "year",
-    "decade",
-    "century",
-    "millennium",
+pub const DATE_TRUNC_UNITS: &[ArgValueSpec] = &[
+    arg_value("microseconds", BASELINE),
+    arg_value("milliseconds", BASELINE),
+    arg_value("second", BASELINE),
+    arg_value("minute", BASELINE),
+    arg_value("hour", BASELINE),
+    arg_value("day", BASELINE),
+    arg_value("week", BASELINE),
+    arg_value("month", BASELINE),
+    arg_value("quarter", BASELINE),
+    arg_value("year", BASELINE),
+    arg_value("decade", BASELINE),
+    arg_value("century", BASELINE),
+    arg_value("millennium", BASELINE),
 ];
 
 /// The `EXTRACT(<field> FROM <date>)` fields a `date` has. A `timestamp` has
 /// these and [`EXTRACT_CLOCK_FIELDS`].
-pub const EXTRACT_DATE_FIELDS: &[&str] = &[
-    "year",
-    "quarter",
-    "month",
-    "week",
-    "day",
-    "dow",
-    "isodow",
-    "doy",
-    "isoyear",
-    "decade",
-    "century",
-    "millennium",
-    "epoch",
+pub const EXTRACT_DATE_FIELDS: &[ArgValueSpec] = &[
+    arg_value("year", BASELINE),
+    arg_value("quarter", BASELINE),
+    arg_value("month", BASELINE),
+    arg_value("week", BASELINE),
+    arg_value("day", BASELINE),
+    arg_value("dow", BASELINE),
+    arg_value("isodow", BASELINE),
+    arg_value("doy", BASELINE),
+    arg_value("isoyear", BASELINE),
+    arg_value("decade", BASELINE),
+    arg_value("century", BASELINE),
+    arg_value("millennium", BASELINE),
+    arg_value("epoch", BASELINE),
 ];
 
 /// The `EXTRACT` fields only a `timestamp` has: Postgres raises for these on
 /// a `date`.
-pub const EXTRACT_CLOCK_FIELDS: &[&str] =
-    &["hour", "minute", "second", "milliseconds", "microseconds"];
+pub const EXTRACT_CLOCK_FIELDS: &[ArgValueSpec] = &[
+    arg_value("hour", BASELINE),
+    arg_value("minute", BASELINE),
+    arg_value("second", BASELINE),
+    arg_value("milliseconds", BASELINE),
+    arg_value("microseconds", BASELINE),
+];
+
+/// The zones `<timestamptz> AT TIME ZONE '<zone>'` takes: only `UTC`, whose
+/// offset no time zone database release changes.
+pub const TIME_ZONES: &[ArgValueSpec] = &[arg_value("UTC", BASELINE)];
 
 /// The `EXTRACT` fields Postgres accepts for a `date` or `timestamp` and the
 /// grammar refuses: `julian` (a different epoch per type) and the zone
@@ -799,17 +1136,16 @@ pub const EXTRACT_REFUSED_FIELDS: &[&str] =
 /// admit the type (`timestamptz` reads `TimeZone`; `time` and `interval` are
 /// not admitted).
 pub fn extract_fields(operand: ValueType) -> Option<Vec<&'static str>> {
-    match operand {
-        ValueType::Other(PgType::Date) => Some(EXTRACT_DATE_FIELDS.to_vec()),
-        ValueType::Other(PgType::Timestamp) => Some(
-            EXTRACT_DATE_FIELDS
-                .iter()
-                .chain(EXTRACT_CLOCK_FIELDS)
-                .copied()
-                .collect(),
+    let (rule, fields): (_, &[&[ArgValueSpec]]) = match operand {
+        ValueType::Other(PgType::Date) => (ExtractRule::Date, &[EXTRACT_DATE_FIELDS]),
+        ValueType::Other(PgType::Timestamp) => (
+            ExtractRule::Timestamp,
+            &[EXTRACT_DATE_FIELDS, EXTRACT_CLOCK_FIELDS],
         ),
-        _ => None,
-    }
+        _ => return None,
+    };
+    super::floor::record(super::floor::Feature::TypeRule(TypeRule::Extract(rule)));
+    Some(fields.iter().flat_map(|specs| values(specs)).collect())
 }
 
 /// Aggregate function names, called out specifically so a rejection can
@@ -967,25 +1303,43 @@ pub fn lookup_aggregate_function(name: &str) -> Option<&'static FunctionSpec> {
 /// column's type for definitions that reference no integer at all) and is
 /// not done here.
 pub fn aggregate_result_type(name: &str, arg: ValueType) -> Option<ValueType> {
+    aggregate_rule(name, arg).map(Admitted::into_type)
+}
+
+/// [`aggregate_result_type`] with the case that admits the argument.
+pub fn aggregate_rule(name: &str, arg: ValueType) -> Option<Admitted> {
+    let admitted = |value_type, rule| Some(Admitted::new(value_type, TypeRule::Aggregate(rule)));
     // A float or `interval` sum is typed so a definition reaches its family
     // refusal (`validate::check_aggregate_admitted`, #1119) rather than a
     // type error; the group basis keeps neither.
     if let ValueType::Other(PgType::Interval) = arg {
-        return (name == "SUM").then_some(arg);
+        return if name == "SUM" {
+            admitted(arg, AggregateRule::SumInterval)
+        } else {
+            None
+        };
     }
     if !arg.is_numeric_family() {
         return None;
     }
-    Some(match (name, arg) {
-        ("SUM", ValueType::Integer(IntWidth::Int2 | IntWidth::Int4)) => {
-            ValueType::Integer(IntWidth::Int8)
+    match (name, arg) {
+        ("SUM", ValueType::Integer(IntWidth::Int2 | IntWidth::Int4)) => admitted(
+            ValueType::Integer(IntWidth::Int8),
+            AggregateRule::SumNarrowInteger,
+        ),
+        ("SUM", ValueType::Integer(IntWidth::Int8) | ValueType::Numeric) => {
+            admitted(ValueType::Numeric, AggregateRule::SumWideExact)
         }
-        ("SUM", ValueType::Integer(IntWidth::Int8) | ValueType::Numeric) => ValueType::Numeric,
-        ("SUM", ValueType::Float(width)) => ValueType::Float(width),
-        ("AVG", ValueType::Float(_)) => ValueType::Float(FloatWidth::Float8),
-        ("AVG", _) => ValueType::Numeric,
-        _ => return None,
-    })
+        ("SUM", ValueType::Float(width)) => {
+            admitted(ValueType::Float(width), AggregateRule::SumFloat)
+        }
+        ("AVG", ValueType::Float(_)) => admitted(
+            ValueType::Float(FloatWidth::Float8),
+            AggregateRule::AvgFloat,
+        ),
+        ("AVG", _) => admitted(ValueType::Numeric, AggregateRule::AvgExact),
+        _ => None,
+    }
 }
 
 /// Identifiers known to be non-immutable (depend on database/session state
@@ -1326,9 +1680,9 @@ mod tests {
     fn extract_fields_are_a_dates_and_a_timestamps() {
         let date = extract_fields(ValueType::Other(PgType::Date)).expect("date");
         let timestamp = extract_fields(ValueType::Other(PgType::Timestamp)).expect("timestamp");
-        assert_eq!(date, EXTRACT_DATE_FIELDS);
+        assert_eq!(date, values(EXTRACT_DATE_FIELDS));
         assert_eq!(timestamp.len(), date.len() + EXTRACT_CLOCK_FIELDS.len());
-        for field in EXTRACT_CLOCK_FIELDS {
+        for field in &values(EXTRACT_CLOCK_FIELDS) {
             assert!(
                 !date.contains(field) && timestamp.contains(field),
                 "{field}"

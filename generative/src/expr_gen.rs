@@ -1343,7 +1343,7 @@ fn date_near_misses(columns: &[Column], out: &mut Vec<NearMiss>) {
         });
     };
     // A field the type does not have, or that is refused for every type.
-    for field in registry::EXTRACT_CLOCK_FIELDS {
+    for field in registry::values(registry::EXTRACT_CLOCK_FIELDS) {
         miss(
             "extract-field-of-a-date",
             format!("EXTRACT({field} FROM {date})"),
@@ -1678,7 +1678,7 @@ pub mod strategy {
                                 .prop_map(|n| Expr::NumberLiteral(n.to_string()))
                                 .boxed()
                         } else if *name == "DATE_TRUNC" && i == 0 {
-                            prop::sample::select(registry::DATE_TRUNC_UNITS.to_vec())
+                            prop::sample::select(registry::values(registry::DATE_TRUNC_UNITS))
                                 .prop_map(|u| Expr::StringLiteral(u.to_string()))
                                 .boxed()
                         } else if LITERAL_ONLY_ARGS.contains(&(*name, i)) {

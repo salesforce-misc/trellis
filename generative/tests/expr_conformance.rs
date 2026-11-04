@@ -920,7 +920,7 @@ fn instances(rule: &expr_gen::Rule) -> Vec<Expr> {
                             .map(|n| Expr::NumberLiteral((*n).to_string()))
                             .collect()
                     } else if *name == "DATE_TRUNC" && i == 0 {
-                        registry::DATE_TRUNC_UNITS
+                        registry::values(registry::DATE_TRUNC_UNITS)
                             .iter()
                             .map(|u| Expr::StringLiteral((*u).to_string()))
                             .collect()

@@ -1907,13 +1907,22 @@ pub(crate) fn check_aggregate_admitted(
     {
         return Err(ValidationError::DeferredAggregate { function, family });
     }
+    use super::registry::{AggregateAdmissionRule, TypeRule};
+    let admitted = |rule| {
+        super::floor::record(super::floor::Feature::TypeRule(
+            TypeRule::AggregateAdmission(rule),
+        ));
+        Ok(())
+    };
     match function.as_str() {
-        "COUNT" => Ok(()),
+        "COUNT" => admitted(AggregateAdmissionRule::Count),
         "SUM" | "AVG" => {
             let Some(arg) = arg else { return Ok(()) };
             match arg.value_type {
-                ValueType::Integer(_) => Ok(()),
-                ValueType::Numeric if arg.typmod != -1 => Ok(()),
+                ValueType::Integer(_) => admitted(AggregateAdmissionRule::SumAvgInteger),
+                ValueType::Numeric if arg.typmod != -1 => {
+                    admitted(AggregateAdmissionRule::SumAvgScaledNumeric)
+                }
                 ValueType::Numeric if arg.trellis_target => {
                     Err(ValidationError::ChainedNumericAggregate {
                         function,
@@ -4693,7 +4702,13 @@ fn comparison_type(
                     }
                 })?;
             }
-            return Ok(ValueType::Boolean);
+            return Ok(super::registry::Admitted::new(
+                ValueType::Boolean,
+                super::registry::TypeRule::Comparison(
+                    super::registry::ComparisonRule::FloatBesideNumberLiteral,
+                ),
+            )
+            .into_type());
         }
         return Err(ValidationError::MixedFloatExactComparison {
             field: field_name.to_string(),
@@ -5584,8 +5599,13 @@ fn check_utc_zone(zone: &Expr, field_name: &str) -> Result<(), ValidationError> 
             .to_string(),
     };
     match zone {
-        Expr::StringLiteral(text) if text == "UTC" => Ok(()),
-        Expr::StringLiteral(text) => Err(refused(Some(text.clone()))),
+        Expr::StringLiteral(text) => super::registry::admit_value(
+            super::registry::TIME_ZONES,
+            text,
+            super::registry::ArgValue::TimeZone,
+        )
+        .map(|_| ())
+        .ok_or_else(|| refused(Some(text.clone()))),
         _ => Err(refused(None)),
     }
 }
@@ -5687,7 +5707,9 @@ fn infer_date_part_call(
                 "its value is not the same for every type, or needs a time zone this \
                  value does not have"
                     .to_string()
-            } else if super::registry::EXTRACT_CLOCK_FIELDS.contains(&word.as_str()) {
+            } else if super::registry::values(super::registry::EXTRACT_CLOCK_FIELDS)
+                .contains(&word.as_str())
+            {
                 format!(
                     "a date has no {word}; extract it from the timestamp: EXTRACT({word} FROM \
                      CAST(d AS timestamp))"
@@ -5700,14 +5722,32 @@ fn infer_date_part_call(
             };
             return Err(literal_error(Some(word.clone()), reason));
         }
+        super::registry::admit_value(
+            super::registry::EXTRACT_DATE_FIELDS,
+            word,
+            super::registry::ArgValue::ExtractField,
+        )
+        .or_else(|| {
+            super::registry::admit_value(
+                super::registry::EXTRACT_CLOCK_FIELDS,
+                word,
+                super::registry::ArgValue::ExtractField,
+            )
+        });
         return Ok(ValueType::Numeric);
     }
-    if !super::registry::DATE_TRUNC_UNITS.contains(&word.as_str()) {
+    if super::registry::admit_value(
+        super::registry::DATE_TRUNC_UNITS,
+        word,
+        super::registry::ArgValue::DateTruncUnit,
+    )
+    .is_none()
+    {
         return Err(literal_error(
             Some(word.clone()),
             format!(
                 "the units admitted are {}",
-                super::registry::DATE_TRUNC_UNITS.join(", ")
+                super::registry::values(super::registry::DATE_TRUNC_UNITS).join(", ")
             ),
         ));
     }
@@ -5838,28 +5878,35 @@ pub(crate) fn number_literal_type(text: &str) -> ValueType {
 /// only the same closed set [`super::registry::operator_result_type`]
 /// admits.
 fn common_numeric_type(a: ValueType, b: ValueType) -> Option<ValueType> {
-    if a == b {
-        return Some(a);
-    }
-    if !a.is_numeric_family() || !b.is_numeric_family() {
+    use super::registry::{Admitted, TypeRule, UnifyRule};
+    let (value_type, rule) = if a == b {
+        (a, UnifyRule::Same)
+    } else if !a.is_numeric_family() || !b.is_numeric_family() {
         return None;
-    }
-    Some(match (a, b) {
-        // `COALESCE` resolves through Postgres's
-        // `select_common_type`, which is *not* the same algorithm operator
-        // overload resolution uses, and the difference is visible: a live
-        // server types `coalesce(1::real, 1::numeric)` (and
-        // `coalesce(1::numeric, 1::real)`, and both orders of
-        // `real`/`integer`) as **`real`**, while `1::real + 1::numeric` is
-        // `double precision`. So a float wins over every exact type here
-        // without being widened, and only a genuine `double precision`
-        // operand produces `double precision`.
-        (ValueType::Float(x), ValueType::Float(y)) => ValueType::Float(x.wider(y)),
-        (ValueType::Float(x), _) => ValueType::Float(x),
-        (_, ValueType::Float(y)) => ValueType::Float(y),
-        (ValueType::Integer(x), ValueType::Integer(y)) => ValueType::Integer(x.wider(y)),
-        _ => ValueType::Numeric,
-    })
+    } else {
+        match (a, b) {
+            // `COALESCE` resolves through Postgres's
+            // `select_common_type`, which is *not* the same algorithm
+            // operator overload resolution uses, and the difference is
+            // visible: a live server types `coalesce(1::real, 1::numeric)`
+            // (and `coalesce(1::numeric, 1::real)`, and both orders of
+            // `real`/`integer`) as **`real`**, while `1::real + 1::numeric`
+            // is `double precision`. So a float wins over every exact type
+            // here without being widened, and only a genuine `double
+            // precision` operand produces `double precision`.
+            (ValueType::Float(x), ValueType::Float(y)) => {
+                (ValueType::Float(x.wider(y)), UnifyRule::Float)
+            }
+            (ValueType::Float(x), _) | (_, ValueType::Float(x)) => {
+                (ValueType::Float(x), UnifyRule::FloatBesideExact)
+            }
+            (ValueType::Integer(x), ValueType::Integer(y)) => {
+                (ValueType::Integer(x.wider(y)), UnifyRule::Integer)
+            }
+            _ => (ValueType::Numeric, UnifyRule::Numeric),
+        }
+    };
+    Some(Admitted::new(value_type, TypeRule::Unify(rule)).into_type())
 }
 
 /// Checks `regexp_count`'s pattern argument is a string literal. Whether
