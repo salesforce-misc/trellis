@@ -571,6 +571,21 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
         .split_once('.')
         .map_or(qualified.as_str(), |(_, t)| t);
 
+    // ADR-0024 rule 5: only a release that meets the definition's floor
+    // knows everything it owns, so a drop above the running release would be
+    // partial. Read from the row locked above, so it is the floor this drop
+    // acts on, and checked before the status: the remedy is the same whether
+    // it is paused or not, and nothing below (the dependency refusal's
+    // column detail parses the definition) runs on text this release may not
+    // read.
+    if let Some(running) = pool.floors().above_running(&locked.floor) {
+        return Err(CatalogError::AboveRunningRelease {
+            transform: target.to_string(),
+            floor: locked.floor,
+            running: running.to_string(),
+        });
+    }
+
     if !status.is_frozen() {
         return Err(CatalogError::TransformNotPaused {
             transform: target.to_string(),
@@ -833,6 +848,8 @@ struct LockedDefinition {
     id: i64,
     status: StoredStatus,
     target_table: String,
+    /// Its stored floor (ADR-0024), as `floor_version` holds it.
+    floor: String,
 }
 
 async fn locked_definition(
@@ -842,7 +859,7 @@ async fn locked_definition(
     let row = txn
         .query_opt(
             &format!(
-                "select id, status, target_table from transform_definitions \
+                "select id, status, target_table, floor_version from transform_definitions \
                  where {} for update",
                 super::catalog::target_match_sql("target_table", 1)
             ),
@@ -856,6 +873,7 @@ async fn locked_definition(
             id: row.get(0),
             status,
             target_table: row.get(2),
+            floor: row.get(3),
         }
     }))
 }

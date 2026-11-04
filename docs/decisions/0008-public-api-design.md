@@ -97,10 +97,11 @@ running out of its deadline ([decision 6](#6-every-public-call-returns-within-30
 is an expected, retryable outcome that a host must be able to tell from a bug.
 `VersionHandover` is a state-changing call refused while a process of another
 Trellis version is live ([ADR-0023](0023-version-handover.md)), retryable once
-it has stopped. `VersionFloor` is an attach refused because this binary's
-version is below a compatibility floor the database records
-([ADR-0024](0024-compatibility-floors-and-rollback.md)); only another version
-gets past it.
+it has stopped. `VersionFloor` is a call refused because this binary's version
+is below a compatibility floor the database records
+([ADR-0024](0024-compatibility-floors-and-rollback.md)): an attach, or a
+state-changing call, below the catalog floor, or a `DROP TRANSFORM` of a
+definition whose floor is above it; only another version gets past it.
 Every caller-facing error type (`TrellisError`, `ClientError`, `CatalogError`,
 `ApplyError`, ...) has a `code()` method, and a raw Postgres error is classified
 by its SQLSTATE. `source()`/chaining stays

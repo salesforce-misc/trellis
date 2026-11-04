@@ -171,3 +171,149 @@ async fn a_partitioned_source_counts_and_the_floor_stops_at_the_running_release(
     assert_eq!(floor(&raw, &later, "by_flag").await, "0.2.0");
     assert_eq!(floor(&raw, &later, "cased").await, "0.3.0");
 }
+
+/// Everything a drop could remove: the relations in the target and catalog
+/// schemas, and the catalog rows naming a definition or its tables.
+async fn snapshot(raw: &Client) -> Vec<String> {
+    let mut rows = Vec::new();
+    for query in [
+        "select n.nspname || '.' || c.relname from pg_catalog.pg_class c \
+         join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+         where n.nspname in ('public', 'trellis') and c.relkind in ('r', 'p') order by 1",
+        "select format('%s %s %s', target_table, status, floor_version) \
+         from transform_definitions order by id",
+        "select format('%s %s %s', from_node_id, to_node_id, kind) from schema_edges order by 1",
+        "select table_name from schema_nodes order by 1",
+        "select format('%s %s', transform_table, column_name) from column_status order by 1",
+    ] {
+        rows.extend(
+            raw.query(query, &[])
+                .await
+                .unwrap_or_else(|err| panic!("{query}: {err}"))
+                .into_iter()
+                .map(|row| row.get::<_, String>(0)),
+        );
+    }
+    rows
+}
+
+/// `DROP TRANSFORM` of a definition whose floor is above the running release
+/// refuses, naming the definition, its floor and the running release, and
+/// changes nothing: its target, its hidden tables and its catalog rows stay.
+/// A definition at or below the running release drops as before, and the
+/// refused one drops under a release that meets its floor.
+#[tokio::test]
+async fn drop_refuses_a_definition_above_the_running_release() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    raw.batch_execute(
+        "create table public.orders (id integer primary key, region text); \
+         create table public.items (id integer primary key, order_id integer, qty integer); \
+         create index on public.items (order_id)",
+    )
+    .await
+    .expect("sources");
+
+    // A release whose aggregate `JOIN` is new in 0.3.0 defines one, and a
+    // definition every release can run.
+    let newer = handle(&db, "0.3.0", &[("KeySpace(Join)", "0.3.0")]).await;
+    newer
+        .apply(
+            "TRANSFORM by_region FROM orders JOIN items ON orders.id = items.order_id \
+             GROUP BY orders.region SELECT SUM(items.qty) AS qty",
+        )
+        .await
+        .expect("define the JOIN");
+    newer
+        .apply("TRANSFORM regions FROM orders SELECT region AS region")
+        .await
+        .expect("define the 1-1");
+    assert_eq!(floor(&raw, &newer, "by_region").await, "0.3.0");
+    assert_eq!(floor(&raw, &newer, "regions").await, "0.2.0");
+    let join_id: i64 = raw
+        .query_one(
+            "select id from transform_definitions where target_table = 'public.by_region'",
+            &[],
+        )
+        .await
+        .expect("the JOIN's id")
+        .get(0);
+
+    // Rolled back to 0.2.0.
+    let older = handle(&db, "0.2.0", &[]).await;
+    for target in ["by_region", "regions"] {
+        older
+            .apply(&format!("PAUSE TRANSFORM {target}"))
+            .await
+            .expect("pause");
+    }
+    let before = snapshot(&raw).await;
+    let hidden = format!("trellis.join_{join_id}_");
+    assert!(
+        before.iter().any(|row| row.starts_with(&hidden)),
+        "the JOIN has hidden tables to keep: {before:?}"
+    );
+    assert!(before.iter().any(|row| row == "public.by_region"));
+
+    let err = older
+        .apply("DROP TRANSFORM by_region")
+        .await
+        .expect_err("a definition above the running release doesn't drop");
+    assert_eq!(err.code(), trellis::ErrorCode::VersionFloor, "{err}");
+    let message = err.to_string();
+    for part in [
+        "'by_region'",
+        "floor is 0.3.0",
+        "release 0.2.0",
+        "roll forward",
+    ] {
+        assert!(message.contains(part), "{part:?} in {message:?}");
+    }
+    assert_eq!(
+        snapshot(&raw).await,
+        before,
+        "a refused drop changes nothing"
+    );
+
+    // A qualified name, and a live definition, refuse the same way.
+    newer
+        .apply("RESUME TRANSFORM by_region")
+        .await
+        .expect("resume under the newer release");
+    let err = older
+        .apply("DROP TRANSFORM public.by_region")
+        .await
+        .expect_err("a live definition above the running release doesn't drop");
+    assert_eq!(err.code(), trellis::ErrorCode::VersionFloor, "{err}");
+    newer
+        .apply("PAUSE TRANSFORM by_region")
+        .await
+        .expect("pause again");
+
+    // At or below the running release, a drop is as it always was.
+    older
+        .apply("DROP TRANSFORM regions")
+        .await
+        .expect("drop a definition the running release meets");
+    assert!(
+        !snapshot(&raw)
+            .await
+            .iter()
+            .any(|row| row == "public.regions"),
+        "its target went"
+    );
+
+    // Rolled forward, the same drop removes everything.
+    newer
+        .apply("DROP TRANSFORM by_region")
+        .await
+        .expect("drop under a release that meets the floor");
+    let after = snapshot(&raw).await;
+    assert!(
+        !after
+            .iter()
+            .any(|row| row.starts_with(&hidden) || row.contains("by_region")),
+        "{after:?}"
+    );
+}

@@ -32,10 +32,12 @@ defmodule Trellis.Error do
     version boundary). Read-only calls keep working. Retry once the other
     version's processes have stopped; the message names the versions and
     their worker ids.
-  - `:version_floor`: this Trellis version is below the catalog floor, the
-    oldest version that can read the instance's catalog, so `migrate/1` or a
-    state-changing call refused it. Not retryable with this version: run the
-    version the message names, or a later one.
+  - `:version_floor`: this Trellis version is below a compatibility floor
+    the database records: the catalog floor, the oldest version that can
+    read the instance's catalog, so `migrate/1` or a state-changing call
+    refused it; or a definition's floor, the oldest version that can run
+    it, so `DROP TRANSFORM` refused it and changed nothing. Not retryable
+    with this version: run the version the message names, or a later one.
   - `:internal`: a Trellis bug or an unexpected database failure.
   - `:unknown`: a code newer than this binding.
   """

@@ -119,11 +119,36 @@ layout it uses arrived in. `status()` reports it as `floor`
 records it when a definition is defined, altered or rebuilt by a resume;
 every definition that exists when floors are introduced has floor 0.2.0.
 
-Before rolling back to an earlier release, read the floors under the newer
-release, and drop each definition whose floor is above the release you roll
-back to there. The release notes name the features each release introduces
-with a new floor
-([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md#rolling-back)).
+The release notes name the features each release introduces with a new
+floor.
+
+### Before rolling back
+
+Under the newer release, before you deploy the older one:
+
+1. Read each definition's `floor` from `status()` (or `trellis status`).
+2. Pause and drop, still under the newer release, every definition whose
+   floor is above the release you roll back to. Only a release that meets a
+   definition's floor knows everything the definition owns, so only it can
+   drop the definition completely
+   ([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md#rolling-back)).
+
+Dropping a definition removes its target and the target's data, and rolling
+forward again doesn't bring it back: the application migration that defined
+it has already run, so define it again by hand, or roll that migration back
+and forward.
+
+If you skip this step, the older release can't drop those definitions.
+`DROP TRANSFORM` of a definition whose floor is above the running release
+refuses with the `version_floor` error code and changes nothing, whether the
+definition is paused or not:
+
+```
+cannot drop 'by_region': its floor is 0.3.0, the oldest Trellis release that can run it, and this binary runs release 0.2.0; only a release at or above the floor knows everything the definition owns, so roll forward to Trellis 0.3.0 or later and drop it there
+```
+
+Roll forward to the floor or later, drop the definition there, and roll back
+again. A definition whose floor the older release meets drops as usual.
 
 ### To a release before 0.2.0
 

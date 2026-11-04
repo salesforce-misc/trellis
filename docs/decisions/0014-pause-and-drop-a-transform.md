@@ -49,7 +49,9 @@ definition and its data. Every freeze stays until an operator acts.
 
 Drop acts only on a frozen definition (`paused` or `quarantined`). There is no direct
 live-to-gone edge: quiescing first is a precondition, so the removal never has to reason
-about a fold still dispatching to the target.
+about a fold still dispatching to the target. A drop also refuses a definition whose floor
+is above the running version, and changes nothing: only a release that meets the floor
+knows everything the definition owns ([ADR-0024](0024-compatibility-floors-and-rollback.md)).
 
 ## Decisions
 

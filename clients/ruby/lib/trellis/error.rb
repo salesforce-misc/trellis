@@ -80,11 +80,12 @@ module Trellis
     CODE = :version_handover
   end
 
-  # This Trellis version is below the catalog floor, the oldest version that
-  # can read the instance's catalog, so Trellis.migrate or a state-changing
-  # call refused it. Not
-  # retryable with this version: run the version the message names, or a
-  # later one.
+  # This Trellis version is below a compatibility floor the database
+  # records: the catalog floor, the oldest version that can read the
+  # instance's catalog, so Trellis.migrate or a state-changing call refused
+  # it; or a definition's floor, the oldest version that can run it, so DROP
+  # TRANSFORM refused it and changed nothing. Not retryable with this
+  # version: run the version the message names, or a later one.
   class VersionFloorError < Error
     CODE = :version_floor
   end

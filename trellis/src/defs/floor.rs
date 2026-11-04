@@ -24,7 +24,8 @@
 //!
 //! Acting on a floor is not here: a definition above the running release is
 //! paused without being parsed, and `DROP` refuses it (ADR-0024 rules 3 and
-//! 5). Both read the stored column, which [`Release::parse`] reads back.
+//! 5). Both read the stored column, and [`Floors::above_running`] decides
+//! whether it is above the running release.
 
 use std::fmt;
 use std::sync::Arc;
@@ -490,6 +491,20 @@ impl Floors {
         Self::new(crate::handover::BINARY_VERSION, Arc::from([]))
     }
 
+    /// The running release when a definition whose stored floor is `stored`
+    /// is above it, so this binary can't run the definition and must not
+    /// drop it (ADR-0024 rules 3 and 5); `None` when the binary meets the
+    /// floor. A floor that doesn't read as a release is above it: an unknown
+    /// stored value never falls through to a default (rule 6). A binary
+    /// whose version isn't a release meets every floor.
+    pub(crate) fn above_running(&self, stored: &str) -> Option<Release> {
+        let running = self.running?;
+        match Release::parse(stored) {
+            Some(floor) if floor <= running => None,
+            _ => Some(running),
+        }
+    }
+
     /// The release `feature` arrived in, a test's override first.
     fn since(&self, feature: &Feature) -> Option<Release> {
         let key = feature.key();
@@ -770,6 +785,52 @@ mod tests {
             "0.4.0"
         );
         assert_eq!(floors("0.4.0", &[]).of(&def, false).to_string(), "0.2.0");
+    }
+
+    /// (definition floor, running version) → drop or refuse (ADR-0024 rule
+    /// 5): only a floor above the running release refuses, semver-ordered,
+    /// and a stored floor that isn't a release never reads as one the binary
+    /// meets.
+    #[test]
+    fn only_a_floor_above_the_running_release_is_above_it() {
+        for (floor, running, above) in [
+            ("0.2.0", "0.2.0", false),
+            ("0.2.0", "0.3.0", false),
+            ("0.3.0", "0.3.0", false),
+            ("0.3.0", "0.2.0", true),
+            ("0.2.1", "0.2.0", true),
+            ("0.10.0", "0.9.0", true),
+            ("0.9.0", "0.10.0", false),
+            ("1.0.0", "0.99.99", true),
+            // A pre-release belongs to its release.
+            ("0.3.0", "0.3.0-rc.1", false),
+            ("0.3.1", "0.3.0-rc.1", true),
+            // A development build below 0.2.0 runs as 0.2.0.
+            ("0.2.0", "0.1.0", false),
+            ("0.2.1", "0.1.0", true),
+            // An unknown stored value is above every release.
+            ("0.3", "0.9.0", true),
+            ("0.3.0-rc.1", "0.9.0", true),
+            ("", "0.9.0", true),
+            // A version that isn't a release is above every floor.
+            ("9.9.9", "next", false),
+            ("0.3", "next", false),
+        ] {
+            assert_eq!(
+                floors(running, &[]).above_running(floor).is_some(),
+                above,
+                "floor {floor:?}, running {running:?}"
+            );
+        }
+        // The refusal names the release the binary runs as.
+        assert_eq!(
+            floors("0.1.0", &[]).above_running("0.3.0"),
+            Some(Release::new(0, 2, 0))
+        );
+        assert_eq!(
+            floors("0.3.0-rc.1", &[]).above_running("0.4.0"),
+            Some(Release::new(0, 3, 0))
+        );
     }
 
     /// Every name the parser builds a call of is declared somewhere: a

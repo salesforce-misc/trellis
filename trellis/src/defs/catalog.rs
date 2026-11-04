@@ -362,6 +362,19 @@ pub enum CatalogError {
         transform: String,
         status: TransformStatus,
     },
+    /// `super::lifecycle::drop_transform` was asked to drop a definition
+    /// whose floor, the oldest Trellis release that can run it, is above
+    /// the running release (ADR-0024 rule 5). Only a release that meets the
+    /// floor knows everything the definition owns, so the drop changes
+    /// nothing; the remedy is to roll forward to the floor or later and
+    /// drop it there.
+    AboveRunningRelease {
+        transform: String,
+        /// The definition's stored floor.
+        floor: String,
+        /// The release this binary runs as, `major.minor.patch`.
+        running: String,
+    },
     /// A still-live definition depends on the definition being dropped
     /// (ADR-0014's "Drops go in reverse dependency order — no
     /// cascade"). Trellis refuses rather than cascading, and names the
@@ -476,6 +489,8 @@ impl CatalogError {
             // precondition.
             CatalogError::TransformNotPaused { .. } => ErrorCode::Conflict,
             CatalogError::DependentsBlockDrop { .. } => ErrorCode::Conflict,
+            // Only another version gets past it, like a catalog floor.
+            CatalogError::AboveRunningRelease { .. } => ErrorCode::VersionFloor,
             // Same "the world isn't in the state this operation needs"
             // category as `TransformNotPaused` above.
             CatalogError::TransformNotLive { .. } => ErrorCode::Conflict,
@@ -703,6 +718,17 @@ impl fmt::Display for CatalogError {
                  be dropped, so the apply path is quiesced before its target goes away",
                 status.as_str()
             ),
+            CatalogError::AboveRunningRelease {
+                transform,
+                floor,
+                running,
+            } => write!(
+                f,
+                "cannot drop '{transform}': its floor is {floor}, the oldest Trellis release \
+                 that can run it, and this binary runs release {running}; only a release at \
+                 or above the floor knows everything the definition owns, so roll forward to \
+                 Trellis {floor} or later and drop it there"
+            ),
             CatalogError::DependentsBlockDrop {
                 subject,
                 dependents,
@@ -781,6 +807,7 @@ impl std::error::Error for CatalogError {
             CatalogError::DirectBackfill(err) => Some(err),
             CatalogError::TransformNotFound { .. } => None,
             CatalogError::TransformNotPaused { .. } => None,
+            CatalogError::AboveRunningRelease { .. } => None,
             CatalogError::DependentsBlockDrop { .. } => None,
             CatalogError::TransformNotLive { .. } => None,
             CatalogError::AlterFieldNotFound { .. } => None,

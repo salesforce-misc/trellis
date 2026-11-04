@@ -265,6 +265,10 @@
     {"op": "apply", "args": ["TRANSFORM parity_sales_by_region FROM parity_regions LEFT JOIN parity_sales ON parity_regions.id = parity_sales.region_id GROUP BY parity_regions.name WITHOUT SOURCE INDEX SELECT parity_regions.name AS name, COUNT(*) AS n"], "expect": {"record": "Applied", "fields": {"kind": {"word": "transform_defined"}}}},
     {"op": "status", "args": ["parity_sales_by_region"], "expect": {"record": "Status", "fields": {"source_index_gaps": {"list": [{"record": "SourceIndexGap", "fields": {"table": {"eq": "public.parity_sales"}, "columns": {"list": [{"eq": "region_id"}]}, "role": {"word": "join_joined"}, "opted_out": {"eq": true}, "fix": {"eq": "create index on \"public\".\"parity_sales\" (\"region_id\")"}}}]}}}},
     {"op": "apply", "args": ["PAUSE TRANSFORM parity_sales_by_region"], "expect": {"record": "Applied", "fields": {"kind": {"word": "paused"}}}},
+    {"about": "A definition whose floor is above the running release: DROP refuses it and changes nothing, since only a release that meets the floor knows everything it owns. Put back, the same drop goes ahead.", "op": "sql", "args": ["update trellis.transform_definitions set floor_version = '99.0.0' where target_table = 'public.parity_sales_by_region'"]},
+    {"op": "apply", "args": ["DROP TRANSFORM parity_sales_by_region"], "expect": {"error": "version_floor"}},
+    {"op": "status", "args": ["parity_sales_by_region"], "expect": {"record": "Status", "fields": {"status": {"word": "paused"}, "floor": {"eq": "99.0.0"}}}},
+    {"op": "sql", "args": ["update trellis.transform_definitions set floor_version = '0.2.0' where target_table = 'public.parity_sales_by_region'"]},
     {"op": "apply", "args": ["DROP TRANSFORM parity_sales_by_region"], "expect": {"record": "Applied", "fields": {"kind": {"word": "dropped"}}}},
 
     {
