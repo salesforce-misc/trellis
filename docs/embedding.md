@@ -922,66 +922,79 @@ for a target that already exists is an `ALTER TRANSFORM`
 ([Changing a definition](transforms.md#changing-a-definition)), in a
 migration of its own, not a second define.
 
-A schema dump carries a definition only when the dump appends it. `pg_dump
---schema-only` writes the Trellis schema, the capture triggers and the target
-tables, but a definition is a row in Trellis's own tables, which it doesn't
-write. A database loaded from such a dump has target tables and no
-transforms, and it fails loudly: `Trellis::migrate` fails, because the dump
-carries Trellis's tables without its migration history; every application
-write to a captured source fails in its capture function, because the dump
-carries the triggers without the rows capture needs, until a staging
-worker's pass removes the triggers and leaves the target tables as plain
-tables nothing maintains; and defining a transform again fails with a
-`conflict` error because its table exists. So
-a dump appends the rows after the `pg_dump` output, the way Rails and Ecto
-append the `schema_migrations` rows.
-`dump_definitions_sql` (Rust `Trellis` and `BlockingTrellis`, Ruby
-`Trellis::Instance#dump_definitions_sql`) returns them as SQL: Trellis's
-migration history, the instance marker, the transform
-definitions, the seed rows capture needs and the one lock row of each `JOIN`'s
-hidden lock table. Runtime state (the 1-1 ledgers, the hidden tables of an
-aggregate or a `JOIN`, ring, build chunks, quarantine, claims and statuses) is
-never in it, because it describes source and target rows a schema-only dump
-doesn't carry. Loading
-the file needs no Trellis step: every definition loads as
-`waiting_to_backfill`, as a `define` leaves it, and the worker builds it from
-the source rows.
+### Schema dumps
 
-* **Rails** does this itself, and refuses to dump a `schema.rb`, which can't
-  carry them. With `config.active_record.schema_format = :sql`,
-  `db:migrate`'s dump and `db:schema:dump` append the definitions of
-  `config.trellis.connect` and `config.trellis.instances`, and add their
-  schemas and target schemas to the `pg_dump`. `db:schema:load`, `db:prepare`
-  and `maintain_test_schema!` then load them with the tables. See the
+A definition is a row in Trellis's own tables, which a schema-only `pg_dump`
+doesn't write, so an embedded application's schema dump (`structure.sql`)
+carries its definitions another way
+([ADR-0025](decisions/0025-schema-dumps-restore-definitions.md)). The dump
+has the application's schema and the target tables, with their indexes and
+grants, and an appendix with one row per definition in a restore queue: its
+source, target and `JOIN` table, its text as written, its grammar version and
+its floor. Trellis's own schema, the capture triggers on source tables and
+the 1-1 targets' ledgers are not in it, so the same definitions give the same
+file, and regenerating it changes only the lines of definitions that changed.
+
+`migrate` on a database loaded from the file creates Trellis's tables and
+restores each queued definition in order, each reader after its upstream,
+then drops the queue. Each is defined into the target the dump created, at
+the grammar version it was written under, and loads unbuilt; the worker
+builds it from the source rows. A definition that was paused or quarantined
+where the dump was taken loads unpaused: the pause is runtime state.
+
+* The text has to resolve to the source, target and `JOIN` table the dump
+  recorded. A different `target_schema` setting would resolve a bare name
+  elsewhere, so `migrate` refuses with `can't restore transform <target> from
+  the schema dump: …`, and so it does when the target can't be adopted (a
+  user's unique index on it, for one; the message names it). Each definition
+  is restored in its own transaction: the ones before a refusal stay
+  restored, and the rest stay queued for the next `migrate`.
+* A definition the loading release can't run is stored paused, unparsed,
+  with the reason in its status: its floor is above the release, its grammar
+  version is outside the release's window, the release refuses its text, or
+  it reads from such a definition. A release that meets its floor can drop it
+  and define it again. A 1-1 one restored this way has no ledger, so `RESUME`
+  on that release refuses it.
+* The restore runs inside `migrate`, so it refuses beside a live process of
+  another version, as `migrate` does ([Rolling deploys](#rolling-deploys)).
+* A file in the format written before the restore queue, which carries the
+  Trellis schema and its catalog rows, still loads as plain SQL; `migrate`
+  after it finds no queue.
+* A dump with data, or a physical backup, carries the Trellis schema and
+  restores as the [preconditions](known-correctness-gaps.md#preconditions) describe.
+
+The clients write and load the file themselves:
+
+* **Rails**, with `config.active_record.schema_format = :sql`: `db:migrate`'s
+  dump and `db:schema:dump` write it for `config.trellis.connect` and
+  `config.trellis.instances`, and `db:schema:load`, `db:prepare` and
+  `maintain_test_schema!` run `migrate` after loading it. A `schema.rb` can't
+  carry the definitions, so the hook refuses to dump one. See the
   [Ruby README](../clients/ruby/README.md#schema-dumps).
-* **Ecto** appends them through `mix trellis.dump` (below). A plain `mix
-  ecto.dump`, without the alias, writes a dump with no definitions, and
-  gives no warning.
-* **Your own dump** appends `dump_definitions_sql` to a `pg_dump --schema-only`
-  of the Trellis schema and the schemas it maintains. `pg_dump` and
-  `dump_definitions_sql` read separate snapshots, so a define or drop that
-  commits between them leaves the file's tables and definitions disagreeing.
-  Read the SQL before and after the `pg_dump` and redo the dump if the two
-  reads differ, as the Rails hook does, or dump from a step no define runs
-  alongside.
-* A definition that was paused or quarantined where the dump was taken loads
-  as `waiting_to_backfill`: the pause is runtime state, and the loaded
-  database builds it.
+* **Ecto**: `mix trellis.dump` writes it, running `pg_dump` itself since `mix
+  ecto.dump` can't take extra arguments, and `mix trellis.load` loads it and
+  runs `migrate`. Alias them as `ecto.dump` and `ecto.load`. A plain `mix
+  ecto.dump`, without the alias, writes a dump with the Trellis schema and no
+  definitions, and gives no warning. See the
+  [Elixir README](../clients/elixir/README.md#schema-dumps).
+* **A load that doesn't go through a hook** (`psql -f structure.sql`) is
+  followed by `migrate` (`bin/rails trellis:migrate`, `Trellis.migrate/1`,
+  `Trellis::migrate`).
+* **Your own dump**: call `schema_dump` (Rust `Trellis` and
+  `BlockingTrellis`, Ruby `Trellis::Instance#schema_dump`, Elixir
+  `Trellis.schema_dump/1`). Run `pg_dump --schema-only` with its
+  `pg_dump_args`, which exclude the Trellis schema and the ledgers (and with
+  the target schema among your `--schema` flags, if you pass any), pass the
+  output through `filter_schema_dump`, which takes the capture triggers out,
+  and append its `appendix`. `pg_dump` and `schema_dump` read separate
+  snapshots, so a define or drop that commits between them leaves the
+  file's tables and definitions disagreeing: read `schema_dump` before and
+  after the `pg_dump` and redo the dump if the two reads differ, as the
+  hooks do, or dump from a step no define runs alongside.
 * A dump that includes `public` has `CREATE SCHEMA public` (`pg_dump` 17),
   which fails to load into a database that already has one. Load it into an
   empty database or change it to `CREATE SCHEMA IF NOT EXISTS public`, as the
-  Rails hook does.
-
-In Elixir, `mix trellis.dump` runs `mix ecto.dump` and appends the
-definitions to the structure file it wrote, so `mix ecto.load` builds a
-database that has its transforms: they load defined and not built, and the
-worker builds them. Add the alias `"ecto.dump": "trellis.dump"` to `mix.exs`,
-and the Trellis schema to the dump's `--prefix` list or the repo's
-`:dump_prefixes` if either names schemas. The task reads the definitions
-before and after the `pg_dump` and redoes the dump when a define or drop
-committed in between. `Trellis.dump_definitions_sql/1` returns the same SQL
-for a caller that assembles its own dump. A paused or quarantined transform
-loads `waiting_to_backfill`.
+  hooks do.
 
 ## Every call returns within 30 seconds
 

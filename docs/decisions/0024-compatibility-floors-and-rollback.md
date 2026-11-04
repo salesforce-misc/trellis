@@ -213,8 +213,8 @@ cost doesn't depend on table size.
   Text an older release would read differently is a change in meaning,
   which bumps the grammar version ([ADR-0018](0018-grammar-versioning.md)).
 
-`status()` reports the floor, and a dump of the definitions
-(`dump_definitions_sql`) carries it.
+`status()` reports the floor, and a schema dump carries it with each
+definition ([ADR-0025](0025-schema-dumps-restore-definitions.md)).
 
 ## Rolling back
 

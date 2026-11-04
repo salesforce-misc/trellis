@@ -211,41 +211,12 @@ The rule behind each: a shape may cross only if both hosts can represent it
 without inventing semantics for it. When it can't, it's flattened in Rust,
 where there is one implementation to get right — decision 2 applied to types.
 
-## 5. A schema dump carries definitions by appending them
+## 5. A schema dump carries the definitions
 
-A definition is a row in Trellis's own tables, which `pg_dump --schema-only`
-doesn't write, so a schema-only dump alone yields target tables and no
-transforms. Both frameworks already append the rows that describe how a schema
-came to be (Rails, `schema_migrations` after `structure_dump`; ecto_sql, the
-same after `pg_dump`), and Trellis does the same:
-
-* **The engine generates the rows.** `dump_definitions_sql` (on `Trellis` and
-  `BlockingTrellis`, so on every binding) returns `INSERT`s for Trellis's
-  migration history, the instance marker, the transform
-  definitions and the seed rows capture needs. A binding never lists
-  Trellis's tables. The engine classifies each table in its schema as
-  definition, seed or runtime state, and a test fails on a table nobody
-  classified.
-* **Runtime state is never dumped.** The 1-1 ledgers, ring, build chunks,
-  quarantine, claims and statuses describe source and target rows a
-  schema-only dump doesn't carry. Definitions load as `waiting_to_backfill`,
-  the state a `define` commits, whatever state they were in when dumped.
-* **Loading takes no Trellis step.** The file is plain SQL, so
-  `db:schema:load`, `db:prepare`, `maintain_test_schema!` and `mix ecto.load`
-  run it as they run any dump, and the worker builds what it finds unbuilt.
-* **The dump scope includes Trellis's schema and the target schemas**, so the
-  tables, capture triggers and targets travel in the `pg_dump` part. Rails
-  adds them to the `--schema` flags it passes.
-* **The binding's hook reads the definitions on both sides of the `pg_dump`**
-  and redoes the dump when they differ, because the two read separate
-  snapshots.
-* **Each binding's hook is the framework's own dump step plus the append.**
-  The rows below are what each hook adds:
-
-  | Binding | Hook | Notes |
-  |---|---|---|
-  | Ruby | `Trellis::SchemaDump` wraps `DatabaseTasks.dump_schema` and `PostgreSQLDatabaseTasks#structure_dump`, the points `db:migrate` and `db:schema:dump` both go through, and applies to the one database config `config.trellis.dump_database` names | A Rails app uses `structure.sql`: `schema.rb` can't carry another schema's tables or triggers, so the hook refuses to dump one. Redoes the dump when the definitions changed during `pg_dump`, up to 3 attempts, then raises `ConflictError`. |
-  | Elixir | `mix trellis.dump` (`Trellis.StructureDump`) runs `ecto.dump` itself between two reads of the definitions and appends to its file; the app wires it with the alias `"ecto.dump": "trellis.dump"` | Same redo, up to 3 attempts, then the task fails. Rewrites `pg_dump` 17's `CREATE SCHEMA public;` to `IF NOT EXISTS`, which `mix ecto.load` into a created database would otherwise stop at. |
+[ADR-0025](0025-schema-dumps-restore-definitions.md) supersedes this
+decision: an embedded client's schema dump carries the application's schema,
+the target tables and one row per definition, and the clients' load hooks run
+`migrate`, which restores them.
 
 ## Consequences
 
