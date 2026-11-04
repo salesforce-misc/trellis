@@ -769,14 +769,14 @@ pub(crate) async fn of_live(
     joined: Option<&str>,
 ) -> Result<Release, super::catalog::CatalogError> {
     let tables: Vec<&str> = std::iter::once(source).chain(joined).collect();
-    let partitioned = any_partitioned(client, &tables).await?;
-    let from = super::catalog::column_infos(client, source).await?;
-    let joined = match joined {
-        Some(joined) => Some(super::catalog::column_infos(client, joined).await?),
-        None => None,
-    };
-    let validated = validated_features(def, &from, joined.as_ref()).ok();
-    Ok(floors.of(def, partitioned, validated.as_deref()))
+    Ok(
+        match on_live_retype(client, floors, def, source, joined).await? {
+            OnRetype::Restamp(floor) => floor,
+            // Validated just before in the same transaction, so not expected:
+            // counted at the running release, never lower.
+            OnRetype::Pause(_) => floors.of(def, any_partitioned(client, &tables).await?, None),
+        },
+    )
 }
 
 /// Whether any of `tables` (qualified `schema.table` names) is a
@@ -820,13 +820,69 @@ pub(crate) async fn stamp(
     let source: String = row.get(0);
     let joined: Option<String> = row.get(1);
     let floor = of_live(client, floors, def, &source, joined.as_deref()).await?;
+    store(client, id, floor).await?;
+    Ok(floor)
+}
+
+/// Stores `floor` as definition `id`'s.
+pub(crate) async fn store(
+    client: &impl tokio_postgres::GenericClient,
+    id: i64,
+    floor: Release,
+) -> Result<(), tokio_postgres::Error> {
     client
         .execute(
             "update transform_definitions set floor_version = $2 where id = $1",
             &[&id, &floor.to_string()],
         )
         .await?;
-    Ok(floor)
+    Ok(())
+}
+
+/// What a change to the type of a column `def` reads means for it, once the
+/// validator has looked at it over the live types, as define would (ADR-0024,
+/// "A retype re-stamps or pauses").
+#[derive(Debug)]
+pub(crate) enum OnRetype {
+    /// The validator still admits it: its floor over the new types, to store
+    /// in the transaction that records them. It can be lower than before.
+    Restamp(Release),
+    /// The validator refuses it: it pauses, naming this refusal.
+    Pause(super::validate::ValidationError),
+}
+
+/// [`OnRetype`] for `def` over the live columns of its source (`from`) and,
+/// for a `JOIN`, of its joined table, `partitioned` when a table it reads is.
+pub(crate) fn on_retype(
+    floors: &Floors,
+    def: &TransformDef,
+    partitioned: bool,
+    from: &std::collections::HashMap<String, super::validate::JoinColumnInfo>,
+    joined: Option<&std::collections::HashMap<String, super::validate::JoinColumnInfo>>,
+) -> OnRetype {
+    match validated_features(def, from, joined) {
+        Ok(validated) => OnRetype::Restamp(floors.of(def, partitioned, Some(&validated))),
+        Err(refusal) => OnRetype::Pause(refusal),
+    }
+}
+
+/// [`on_retype`] over the live columns of `source` and `joined`, the tables
+/// `def` reads.
+pub(crate) async fn on_live_retype(
+    client: &impl tokio_postgres::GenericClient,
+    floors: &Floors,
+    def: &TransformDef,
+    source: &str,
+    joined: Option<&str>,
+) -> Result<OnRetype, super::catalog::CatalogError> {
+    let tables: Vec<&str> = std::iter::once(source).chain(joined).collect();
+    let partitioned = any_partitioned(client, &tables).await?;
+    let from = super::catalog::column_infos(client, source).await?;
+    let joined = match joined {
+        Some(joined) => Some(super::catalog::column_infos(client, joined).await?),
+        None => None,
+    };
+    Ok(on_retype(floors, def, partitioned, &from, joined.as_ref()))
 }
 
 #[cfg(test)]
@@ -1299,10 +1355,18 @@ mod tests {
     /// timestamp)`, as define computes it: the tree's features and the
     /// validation's over those types. `None` when the validator refuses it.
     fn validated_floor(floors: &Floors, select: &str, c: (&str, ValueType)) -> Option<String> {
+        let def = parse(&format!("TRANSFORM t FROM s {select}")).expect("parses");
+        let validated = validated_features(&def, &columns(c), None).ok()?;
+        Some(floors.of(&def, false, Some(&validated)).to_string())
+    }
+
+    /// The columns of `s(id integer, c <c>, d date, ts timestamp)`.
+    fn columns(
+        c: (&str, ValueType),
+    ) -> std::collections::HashMap<String, super::super::validate::JoinColumnInfo> {
         use crate::defs::pg_type::PgType;
         use crate::integer::IntWidth;
-        let def = parse(&format!("TRANSFORM t FROM s {select}")).expect("parses");
-        let columns = std::collections::HashMap::from([
+        std::collections::HashMap::from([
             (
                 "id".to_string(),
                 column("integer", ValueType::Integer(IntWidth::Int4)),
@@ -1319,9 +1383,7 @@ mod tests {
                     ValueType::Other(PgType::Timestamp),
                 ),
             ),
-        ]);
-        let validated = validated_features(&def, &columns, None).ok()?;
-        Some(floors.of(&def, false, Some(&validated)).to_string())
+        ])
     }
 
     const INT4: (&str, ValueType) = (
@@ -1449,5 +1511,48 @@ mod tests {
         assert_eq!(inner, vec![identity]);
         assert_eq!(outer, vec![identity]);
         assert_eq!(collect(|| ()).1, Vec::<Feature>::new());
+    }
+
+    /// A retype the validator still admits re-stamps, up or down, by the case
+    /// that admits the new types; one it refuses pauses with the refusal.
+    #[test]
+    fn a_retype_restamps_or_pauses() {
+        let floors = floors("0.4.0", &[("TypeRule(Cast(IntegerIdentity))", "0.3.0")]);
+        let on = |select: &str, c| {
+            let def = parse(&format!("TRANSFORM t FROM s {select}")).unwrap();
+            on_retype(&floors, &def, false, &columns(c), None)
+        };
+        let restamped = |select: &str, c| match on(select, c) {
+            OnRetype::Restamp(floor) => floor.to_string(),
+            OnRetype::Pause(refusal) => panic!("{select}: paused: {refusal}"),
+        };
+        // `integer` to `bigint` under `CAST(c AS bigint)`: the identity cast
+        // now, so the floor goes up; back again, down.
+        let cast = "SELECT id AS id, CAST(c AS bigint) AS x";
+        assert_eq!(restamped(cast, INT4), "0.2.0");
+        assert_eq!(restamped(cast, INT8), "0.3.0");
+        // `date + c` takes no `bigint`: the retype pauses, naming why.
+        let days = "SELECT id AS id, d + c AS x";
+        assert_eq!(restamped(days, INT4), "0.2.0");
+        match on(days, INT8) {
+            OnRetype::Pause(refusal) => {
+                assert!(refusal.to_string().contains("date arithmetic"), "{refusal}")
+            }
+            OnRetype::Restamp(floor) => panic!("restamped at {floor}"),
+        }
+        // `smallint` to `bigint` under `CAST(c AS integer)`: a narrowing
+        // cast now, which the validator refuses (#1640's accepted cost).
+        let narrowing = "SELECT id AS id, CAST(c AS integer) AS x";
+        assert_eq!(
+            restamped(
+                narrowing,
+                (
+                    "smallint",
+                    ValueType::Integer(crate::integer::IntWidth::Int2)
+                )
+            ),
+            "0.2.0"
+        );
+        assert!(matches!(on(narrowing, INT8), OnRetype::Pause(_)));
     }
 }

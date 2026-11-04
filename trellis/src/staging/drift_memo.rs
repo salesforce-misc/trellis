@@ -439,6 +439,7 @@ mod tests {
         crate::staging::schema_change::pause_readers_of_retyped(
             raw,
             SCHEMA,
+            &crate::defs::floor::Floors::of_this_binary(),
             instance,
             catalog,
             drift,

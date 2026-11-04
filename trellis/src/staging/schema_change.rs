@@ -804,6 +804,15 @@ pub(crate) async fn pause_readers_in_hierarchy(
 /// changed without a pause (a widening, a wider `numeric` scale) is
 /// re-recorded here, as a resume would.
 ///
+/// A key column whose type moved from the recorded one, or a column the
+/// fourth check finds outgrown, re-validates the definition over the live
+/// types as define would ([`crate::defs::floor::on_live_retype`],
+/// ADR-0024). A refusal pauses it naming the refusal and the remedies
+/// (`ALTER TRANSFORM` to a definition that validates, or change the column
+/// back, then `RESUME`), so the pause never promises a rebuild a resume would
+/// refuse. A definition left unpaused has its floor stamped again over the
+/// new types, in the transaction that re-records its key types.
+///
 /// The fourth check's comparison of a definition's columns with the live
 /// schema is skipped while every relation it reads is as it was when the last
 /// comparison found every column current (`drift`, [`drift_memo`]). The
@@ -816,6 +825,7 @@ pub(crate) async fn pause_readers_in_hierarchy(
 pub(crate) async fn pause_readers_of_retyped(
     client: &mut Client,
     schema: &str,
+    floors: &crate::defs::floor::Floors,
     instance: &str,
     catalog: &CaptureCatalog,
     drift: &Fingerprints,
@@ -873,6 +883,9 @@ pub(crate) async fn pause_readers_of_retyped(
         let mut reasons: Vec<String> = Vec::new();
         // Whether a resume would refuse: define refuses what it found.
         let mut refused = false;
+        // Its key columns whose type moved from the recorded one, with the
+        // recorded and live renderings: what makes it re-validated below.
+        let mut moved: Vec<(String, String, String)> = Vec::new();
         let mut flag = |column: &str, reason: String, columns: &mut Vec<String>| {
             if !columns.iter().any(|c| c == column) {
                 columns.push(column.to_string());
@@ -895,6 +908,11 @@ pub(crate) async fn pause_readers_of_retyped(
                 refused = true;
                 flag(&column, reason, &mut columns);
                 continue;
+            }
+            if let Some((old, was)) = recorded.get(&(reader.id, column.clone()))
+                && old != &now.ty
+            {
+                moved.push((column.clone(), was.clone(), now.display.clone()));
             }
             match recorded.get(&(reader.id, column.clone())) {
                 Some((old, was)) if key_types::renders_differently(old, &now.ty) => {
@@ -970,6 +988,7 @@ pub(crate) async fn pause_readers_of_retyped(
                 columns,
                 reasons,
                 refused,
+                moved,
                 states: Vec::new(),
             });
             continue;
@@ -999,19 +1018,68 @@ pub(crate) async fn pause_readers_of_retyped(
             columns,
             reasons,
             refused,
+            moved,
             states,
         });
     }
 
     let mut pauses: Vec<Pause> = Vec::new();
+    // The floors of the definitions re-validated below over the new types,
+    // stored for each one left unpaused (ADR-0024).
+    let mut restamps: Vec<(i64, crate::defs::floor::Release)> = Vec::new();
     for Checked {
         id,
         mut columns,
         mut reasons,
-        refused,
+        mut refused,
+        moved,
         states,
     } in checked
     {
+        // A key column whose type moved, or a column Trellis created that a
+        // column of this table outgrew, re-validates the definition over the
+        // live types, as define would: a refusal pauses it naming the
+        // refusal, so the pause never promises a resume define would refuse.
+        if !refused
+            && (!moved.is_empty() || states.iter().any(copies::CopyState::outgrown))
+            && let Some(reader) = catalog.definitions.iter().find(|r| r.id == id)
+        {
+            match crate::defs::floor::on_live_retype(
+                &*client,
+                floors,
+                &reader.def,
+                &reader.source,
+                reader.join.as_deref(),
+            )
+            .await?
+            {
+                crate::defs::floor::OnRetype::Restamp(floor) => restamps.push((id, floor)),
+                crate::defs::floor::OnRetype::Pause(refusal) => {
+                    refused = true;
+                    let changed: Vec<String> = moved
+                        .iter()
+                        .map(|(column, was, now)| {
+                            format!("column {column:?} of {table} changed type from {was} to {now}")
+                        })
+                        .collect();
+                    let changed = if changed.is_empty() {
+                        format!("columns of {table} changed type")
+                    } else {
+                        changed.join(", ")
+                    };
+                    reasons.push(format!(
+                        "{changed}, and define would now refuse the definition: {refusal}. ALTER \
+                         TRANSFORM it to a definition that validates, or change the column back, \
+                         then resume it"
+                    ));
+                    for (column, _, _) in &moved {
+                        if !columns.contains(column) {
+                            columns.push(column.clone());
+                        }
+                    }
+                }
+            }
+        }
         // Without a refusal, every key column flagged above is one whose
         // change re-renders the keys stored.
         let rerendered: Vec<String> = if refused { Vec::new() } else { columns.clone() };
@@ -1097,8 +1165,18 @@ pub(crate) async fn pause_readers_of_retyped(
                 .push((table.to_string(), column));
         }
     }
-    for (id, columns) in &widened {
-        key_types::rerecord(&*client, *id, columns).await?;
+    // Each key column re-recorded at its new type with the floor of its
+    // definition over the new types, in one transaction.
+    restamps.retain(|(id, _)| !pauses.iter().any(|p| p.id == *id));
+    if !widened.is_empty() || !restamps.is_empty() {
+        let txn = client.transaction().await?;
+        for (id, columns) in &widened {
+            key_types::rerecord(&txn, *id, columns).await?;
+        }
+        for &(id, floor) in &restamps {
+            crate::defs::floor::store(&txn, id, floor).await?;
+        }
+        txn.commit().await?;
     }
     if pauses.is_empty() {
         return Ok(false);
@@ -1632,6 +1710,8 @@ struct Checked {
     columns: Vec<String>,
     reasons: Vec<String>,
     refused: bool,
+    /// Its key columns whose type moved: the column, recorded and live.
+    moved: Vec<(String, String, String)>,
     /// Empty when the comparison of its copies was skipped.
     states: Vec<copies::CopyState>,
 }

@@ -13,10 +13,12 @@
 //!   precision` changes what a definition can do with it. A pure widening
 //!   ([`key_types::pure_widening`]: a wider integer, a longer string bound,
 //!   more `numeric` precision at the same scale or none, a wider temporal or
-//!   `interval` precision) keeps every value's text, and is acted on here
-//!   only when it takes a `numeric`'s declared scale away, which a reader
-//!   may need; a copy Trellis made that it outgrows is
-//!   `pause_readers_of_retyped`'s.
+//!   `interval` precision) keeps every value's text, so it rebuilds nothing,
+//!   but its readers are re-validated like any other retype's: the new type
+//!   can make define refuse one (`date + c` after `integer` to `bigint`, a
+//!   `SUM` over a `numeric` that lost its declared scale), and changes which
+//!   type rules admit the rest, so their floors are stamped again (ADR-0024).
+//!   A copy Trellis made that it outgrows is `pause_readers_of_retyped`'s.
 //! - **R3b, a same-type value rewrite.** `ALTER COLUMN b TYPE integer USING
 //!   b * 10` on an `integer` column rewrites the table with no DML trigger,
 //!   and leaves the column's name, `attnum`, type and modifier as they were.
@@ -81,14 +83,24 @@
 //!   ([`CaptureRebuildCause`]).
 //! - **R1 where a definition reading the column may no longer be valid:**
 //!   define would now refuse it (`defs::catalog::revalidate`: a `SUM` over
-//!   a `numeric` that lost its declared scale), a column Trellis created for
+//!   a `numeric` that lost its declared scale, `date + c` over a `bigint`, a
+//!   narrowing `CAST`), a column Trellis created for
 //!   it from the column was outgrown by an integer or float width (a copy
 //!   has no type modifier, ADR-0020, so no modifier change outgrows one), or
 //!   the value type it evaluates the column as changed (`integer` to
 //!   `double precision`). The pass pauses that definition with a
-//!   `capture_failure` naming the change; `RESUME` re-validates, re-types
-//!   and rebuilds. A widening that only took a declared scale away, and
-//!   left every reader valid, changed no value: nothing rebuilds.
+//!   `capture_failure` naming the change and, for a refusal, the validator's
+//!   reason and the remedies (`ALTER TRANSFORM` to a definition that
+//!   validates, or change the column back, then `RESUME`); `RESUME`
+//!   re-validates, re-types and rebuilds. A pure widening that left every
+//!   reader valid changed no value: nothing rebuilds.
+//!
+//! Every reader of a retyped column that stays valid has its floor stamped
+//! again over the new types, in the transaction that writes the baseline
+//! back ([`crate::defs::floor::stamp`]). The floor can go up or down. The
+//! trigger is the column's `(atttypid, atttypmod)` against the baseline, and
+//! the pass runs it after the logical-restore check, so a restored
+//! database's OIDs are never compared with the original's.
 //!
 //! R1's type check leaves alone a definition that uses the column as a
 //! key: `pause_readers_of_retyped` owns a key column's type. A key
@@ -613,10 +625,11 @@ enum Change {
     /// A stored generated column's values were rewritten under a new
     /// expression (`SET EXPRESSION`).
     ExpressionChanged,
-    /// R1: a pure widening that takes away the declared scale of a `numeric`
-    /// (`numeric(10,2)` to `numeric`): every value keeps its text, so nothing
-    /// rebuilds, but a reader that needs the scale (a `SUM`) may no longer be
-    /// valid, which only its re-validation tells.
+    /// R1: a pure widening ([`key_types::pure_widening`]): every value keeps
+    /// its text, so nothing rebuilds, but a reader may no longer be valid (a
+    /// `SUM` over a `numeric` that lost its declared scale, `date + c` over
+    /// an integer widened to `bigint`), and the type rules that admit it may
+    /// have changed, which only its re-validation tells.
     Widened { from: String, to: String },
     /// R1: its type or modifier changed, not by a pure widening, from the
     /// first rendering to the second.
@@ -626,7 +639,7 @@ enum Change {
 }
 
 impl Change {
-    /// Whether the column's type changed (not a pure widening).
+    /// Whether the column's type changed.
     fn retyped(&self) -> bool {
         match self {
             Change::Rewritten | Change::ExpressionChanged => false,
@@ -658,7 +671,7 @@ fn compare(was: &Column, now: &Column) -> Option<Change> {
     }
     if was.retyped(now) {
         if key_types::pure_widening(&was.ty, &now.ty) {
-            return key_types::loses_declared_scale(&was.ty, &now.ty).then(|| Change::Widened {
+            return Some(Change::Widened {
                 from: was.display.clone(),
                 to: now.display.clone(),
             });
@@ -721,6 +734,9 @@ fn compare_all(baseline: &Columns, live: &Columns) -> Found {
 /// What one reader of a changed column needs (see the module doc).
 enum Response {
     Rebuild,
+    /// Still valid after a pure widening, which changed no value: only its
+    /// floor is stamped again.
+    Restamp,
     Pause(String),
 }
 
@@ -765,6 +781,9 @@ pub(crate) async fn check(
     let txn = client.transaction().await?;
     let mut pauses: BTreeMap<i64, Vec<(String, String)>> = BTreeMap::new();
     let mut causes: BTreeSet<CaptureRebuildCause> = BTreeSet::new();
+    // The readers whose read column changed type and that stay valid, whose
+    // floor is stamped again over the new types (ADR-0024).
+    let mut restamp: BTreeMap<i64, &crate::defs::ast::TransformDef> = BTreeMap::new();
     if !found.changes.is_empty() {
         let readers: Vec<i64> = readers_of(catalog, table, &BTreeSet::new(), true);
         if !readers.is_empty() {
@@ -798,6 +817,12 @@ pub(crate) async fn check(
                 match respond(&txn, schema, floors, reader, table, &key, column, change).await? {
                     Some(Response::Rebuild) => {
                         causes.insert(CaptureRebuildCause::ColumnChanged);
+                        if change.retyped() {
+                            restamp.insert(reader.id, &reader.def);
+                        }
+                    }
+                    Some(Response::Restamp) => {
+                        restamp.insert(reader.id, &reader.def);
                     }
                     Some(Response::Pause(error)) => {
                         pauses
@@ -826,6 +851,11 @@ pub(crate) async fn check(
         .await?
         {
             crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
+        }
+    }
+    for (&id, def) in &restamp {
+        if !pauses.contains_key(&id) {
+            crate::defs::floor::stamp(&txn, floors, id, def).await?;
         }
     }
     let mut rebuilt_targets: Vec<String> = Vec::new();
@@ -919,7 +949,8 @@ async fn respond(
         Err(err @ (CatalogError::Db(_) | CatalogError::Pool(_))) => return Err(err.into()),
         Err(reason) => {
             return Ok(Some(Response::Pause(format!(
-                "{what}, and define would now refuse it: {reason}"
+                "{what}, and define would now refuse it: {reason}. ALTER TRANSFORM it to a \
+                 definition that validates, or change the column back, then resume it"
             ))));
         }
     };
@@ -980,9 +1011,9 @@ async fn respond(
             drifted.join(", ")
         ))));
     }
-    // A widening that only took away a declared scale changed no value.
+    // A pure widening changed no value.
     if matches!(change, Change::Widened { .. }) {
-        return Ok(None);
+        return Ok(Some(Response::Restamp));
     }
     Ok(Some(Response::Rebuild))
 }
@@ -1159,16 +1190,18 @@ mod tests {
     }
 
     #[test]
-    fn a_column_s_identity_changes_unless_it_widens_purely() {
+    fn a_column_s_identity_changes_and_a_pure_widening_is_told_apart() {
         let was = column(3, "int4", -1, "100", 16384, "h");
         assert!(matches!(
             compare(&was, &column(9, "int4", -1, "200", 16384, "h2")),
             Some(Change::Readded { .. })
         ));
-        assert_eq!(
+        // A pure widening rebuilds nothing, but its readers are re-validated
+        // and re-stamped.
+        assert!(matches!(
             compare(&was, &column(3, "int8", -1, "200", 16390, "h2")),
-            None
-        );
+            Some(Change::Widened { .. })
+        ));
         assert!(matches!(
             compare(&was, &column(3, "numeric", -1, "200", 16390, "h2")),
             Some(Change::Retyped { .. })

@@ -30,6 +30,7 @@ wrong rows, on the targets it compares
 | [A column's values rewritten in place by `ALTER COLUMN TYPE`](#a-columns-values-rewritten-in-place-by-alter-column-type) | `self_check` | [#1654](https://github.com/salesforce-misc/trellis/issues/1654) (study) |
 | [An enum label renamed and added again](#an-enum-label-renamed-and-added-again) | `self_check` | documented |
 | [A read column's name swapped with another's and back within one pass](#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass) | `self_check` | [#1586](https://github.com/salesforce-misc/trellis/issues/1586) |
+| [A read column given a nondeterministic collation](#a-read-column-given-a-nondeterministic-collation) | `self_check` | [#1643](https://github.com/salesforce-misc/trellis/issues/1643) (research) |
 | **Writes past a unique key** | | |
 | [A duplicate in `b` past a deferrable key under `session_replication_role = replica`](#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica) | `self_check` | documented |
 | **Writes capture never sees** | | |
@@ -76,6 +77,9 @@ while every rule holds.
 * **Let another column take a read column's name only while the
   transforms that read it are paused**
   ([below](#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass)).
+* **Change a read column to a nondeterministic collation only while the
+  transforms that read it are paused**
+  ([below](#a-read-column-given-a-nondeterministic-collation)).
 * **Don't write a 1-1 `JOIN`'s `b` under `session_replication_role =
   replica`** when its key on the `ON` columns is a deferrable constraint
   ([below](#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica)).
@@ -204,6 +208,39 @@ while the transforms that read the table are paused.
 **Ends with:** [#1586](https://github.com/salesforce-misc/trellis/issues/1586)
 weighs having the capture function check each column's position as well as
 its name.
+
+### A read column given a nondeterministic collation
+
+**When:** a column a definition reads, other than a key column, changes only
+its collation, to a nondeterministic one, while the definition is live:
+
+```sql
+CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+ALTER TABLE orders ALTER COLUMN status TYPE text COLLATE ci;
+```
+
+Define refuses a comparison or a text function over a column with a
+nondeterministic collation, and a resume would too. A key column's collation
+is checked on every reconcile pass, which pauses its readers. A read column's
+type is unchanged, so the pass's retype check doesn't see the change, and the
+readers stay `live`.
+
+**What goes wrong:** rows the definition computes after the change compare
+under the new collation (`status = 'open'` holds for `'OPEN'`), and rows it
+computed before keep the old result, so the target mixes the two. A text
+function that refuses a nondeterministic collation (`STRPOS`) raises `0A000`
+on every change instead, and the definition is quarantined, which is
+reported.
+
+**Detected by:** `self_check`.
+
+**Repair:** `ALTER TRANSFORM` the definition so it no longer compares or
+searches the column, or change the column back to a deterministic collation,
+then `request_backfill` the table. To avoid it, pause the transforms that
+read the column before changing its collation.
+
+**Ends with:** [#1643](https://github.com/salesforce-misc/trellis/issues/1643),
+research on detecting a collation change the way a retype is detected.
 
 ## Writes past a unique key
 

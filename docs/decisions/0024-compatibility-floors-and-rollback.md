@@ -65,10 +65,11 @@ command: the older release degrades per definition by itself.
      same release leaves the same floor, so the floor can't say whether this
      one reads that migration.
    - A **definition floor** is the oldest release that can run one
-     definition: its grammar features, its key space, its hidden-table layout
-     and its per-definition state. Trellis stamps it whenever it writes the
-     definition or recreates its hidden tables, from what the definition uses
-     then.
+     definition: its grammar features, the argument values and type rules
+     define's validation admitted it by, its key space, its hidden-table
+     layout and its per-definition state. Trellis stamps it whenever it
+     writes the definition, recreates its hidden tables, or sees a column it
+     reads change type, from what the definition uses then.
 2. **Attach.** A binary below the catalog floor refuses, with an error naming
    the floor and its own version. Every handle runs the check, a define-only
    one included, not only `migrate` ([ADR-0010](0010-embeddable-clients.md)):
@@ -137,11 +138,56 @@ change is a new layout with its own release. Every feature that exists when
 floors are introduced has floor 0.2.0, and the migration that adds the
 column gives every stored definition 0.2.0.
 
+Loading a stored definition only parses it, so a release runs a definition
+whose tree it knows even where it would have refused the definition at
+define: an argument value or a combination of operand types it doesn't
+admit. If a newer release renders that text differently, the older one
+silently computes different values. So the floor also counts everything
+define's validation admits a definition by:
+
+- **Argument values.** Each `EXTRACT` field, `DATE_TRUNC` unit and `AT TIME
+  ZONE` zone is a registry entry with its own release, matched against the
+  call's string literal.
+- **Type rules.** Each case of a rule that admits operand types (the
+  operators and comparisons, date arithmetic, `CAST`, `COALESCE`/`CASE`
+  unification, `EXTRACT`'s operand, an aggregate's argument, and the
+  aggregates the group basis keeps) declares its release. A rule returns its
+  case together with the result type, so a new case doesn't compile without
+  one.
+
+The validator collects the release of every value and case it used, at define,
+`ALTER TRANSFORM` and a resume's rebuild alike, and the floor is the latest of
+those and of the tree's features. An addition that renders the same under
+older releases still raises the floor: that costs rollback availability, not
+correctness. Text an older release would read differently is still a change
+in meaning ([ADR-0018](0018-grammar-versioning.md)).
+
+The floor now depends on the types of the columns a definition reads, so a
+retype re-validates it. When the capture pass sees a column a definition
+reads change `(atttypid, atttypmod)` against the type it recorded (the
+baseline of a read column, the recorded type of a key column, or a column
+Trellis created that the new type outgrew), it validates the definition over
+the live types as define would. The trigger runs after the logical-restore
+check, so a restored database's OIDs are never compared with the original's.
+
+- **Valid:** the floor is stamped again from that validation, in the
+  transaction that records the new type. It can go up or down.
+- **Not valid:** the definition pauses with a `capture_failure` naming the
+  table and column, the old and new types, the validator's refusal, and the
+  remedies: `ALTER TRANSFORM` to a definition that validates, or change the
+  column back, then `RESUME`. `RESUME` re-validates as define would, so it
+  refuses until one of them holds.
+
+Validation runs once per definition per detected retype, never per row, so its
+cost doesn't depend on table size.
+
 - **When it is stamped.** Define and `ALTER TRANSFORM` stamp the floor of the
-  tree they write, and a resume stamps it as it recreates the hidden tables.
-  Each counts the layout the running release writes. A pause or a read never
-  changes it, and it goes down when an `ALTER` removes the only newer
-  feature.
+  definition they write, a resume stamps it as it recreates the hidden
+  tables, and the capture pass stamps it when a column the definition reads
+  changes type and it still validates. Each counts the layout the running
+  release writes. A pause or a read never changes it, and it goes down when an
+  `ALTER` removes the only newer feature or a retype changes which case
+  admits an expression.
 - **Never above the running release.** A binary writes only what it carries,
   so a declared release later than the binary's is a declaration error, and
   the floor stops at the running release rather than have the binary pause

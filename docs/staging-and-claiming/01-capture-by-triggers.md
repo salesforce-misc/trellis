@@ -387,8 +387,11 @@ the same, and fire no DML trigger:
   `numeric` scale change (`1.50` becomes `1.5000`, or rounds), a move to
   another type family (`integer` to `double precision`). A pure widening (a
   wider integer, a longer `varchar` or `text`, more `numeric` precision at
-  the same scale, a wider temporal precision) keeps every value's text, and
-  is left to the previous section's checks of the columns Trellis created.
+  the same scale, a wider temporal precision) keeps every value's text, so
+  it rebuilds nothing, but its readers are re-validated like any other
+  retype's: the new type can leave one invalid (`date + c` after `integer`
+  to `bigint`). A column Trellis created that it outgrows is the previous
+  section's.
 - **A same-type rewrite**: `ALTER COLUMN b TYPE integer USING b * 10` on an
   `integer` column changes every value and leaves the name, `attnum`, type
   and modifier as they were.
@@ -411,7 +414,10 @@ it read back in the transaction of its response, so a change seen once is
 acted on once (`capture::baseline`). It costs two catalog reads per table.
 
 - **A changed `attnum`, or a type change that isn't a pure widening, is a
-  changed column.**
+  changed column. A pure widening is a widened column.** Both compare the
+  column's type and modifier with the baseline's, never the OIDs of a
+  database restored from a dump: the pass checks for a logical restore first,
+  and a restored table has no baseline.
 - **A same-type rewrite is the row's `xmin` and the node's file node both
   moved, and nothing else about the column changed.** Each moves alone in
   routine work: `SET DEFAULT`, `SET NOT NULL`, `SET STATISTICS` and column
@@ -448,9 +454,20 @@ The response follows whether the definitions are still valid as written:
   where the definition would evaluate it as another type (`integer` to
   `double precision`, so the types it recorded no longer hold), or where a
   `numeric` column Trellis created from it must be re-typed to the new
-  scale. `RESUME` re-validates, re-types and rebuilds, or refuses while
-  define would. A key column's type change is left to the previous
-  section's checks; a key column dropped and re-added rebuilds.
+  scale. A widened column where define would now refuse a reader pauses it
+  the same way. Where define would refuse it, the `capture_failure` names the
+  refusal and the remedies: `ALTER TRANSFORM` to a definition that
+  validates, or change the column back, then `RESUME`. `RESUME`
+  re-validates, re-types and rebuilds, or refuses while define would. A key
+  column's type change is left to the previous section's checks, which
+  re-validate the definition too and name the refusal the same way; a key
+  column dropped and re-added rebuilds.
+- **Floor stamped again.** A reader of a changed or widened column that stays
+  valid has its floor ([ADR-0024](../decisions/0024-compatibility-floors-and-rollback.md))
+  stamped again over the new types, in the transaction that writes the
+  baseline back, or, for a key column, that records its new type. A retype
+  can change which type rule admits an expression (`CAST(c AS bigint)` is the
+  identity cast once `c` is a `bigint`), so the floor can go up or down.
 
 ### An enum value relabelled
 

@@ -366,19 +366,6 @@ fn integer_outgrown_by_numeric(width: u8, live: i32) -> bool {
     }
 }
 
-/// Whether a pure widening ([`pure_widening`]) takes away the declared scale
-/// of a `numeric` (`numeric(10,2)` to `numeric`). No value changes, but a
-/// reader that needs a declared scale (a `SUM`) may no
-/// longer be valid.
-pub(crate) fn loses_declared_scale(old: &ColumnType, new: &ColumnType) -> bool {
-    old.builtin()
-        && new.builtin()
-        && old.base() == "numeric"
-        && new.base() == "numeric"
-        && numeric_modifier(old.typmod).is_some()
-        && numeric_modifier(new.typmod).is_none()
-}
-
 /// Whether an `interval` of modifier `new` rounds a value stored under
 /// modifier `old` finer than `new` keeps it: its finest field is coarser, or
 /// its fractional-second precision is smaller. Only the finest field of a

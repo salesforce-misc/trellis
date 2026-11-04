@@ -386,6 +386,7 @@ pub(crate) async fn reconcile_with_floors(
         match crate::staging::schema_change::pause_readers_of_retyped(
             client,
             schema,
+            floors,
             instance,
             &snapshot.catalog,
             &drift,
@@ -510,6 +511,7 @@ pub(crate) async fn reconcile_with_floors(
         match crate::staging::schema_change::pause_readers_of_retyped(
             client,
             schema,
+            floors,
             instance,
             &snapshot.catalog,
             &drift,
