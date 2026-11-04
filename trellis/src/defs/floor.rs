@@ -777,6 +777,9 @@ impl Unrunnable {
 /// - `transform_definitions.status` ([`super::model::StoredStatus`]);
 /// - `transform_definitions.build` (`staging::build::BUILD_REDERIVE`);
 /// - `backfill_chunks.kind` (`super::chunk_queue::KIND_*`);
+/// - the tag of a `backfill_chunks.lo` cursor
+///   (`staging::build::unknown_cursor_tag_sql`): an untagged cursor is the
+///   format every release reads;
 /// - `partition_correction_progress.phase`
 ///   (`staging::partition_correction::PHASES`);
 /// - `capture_failures.kind` ([`crate::CaptureFailureKind`]).
@@ -790,6 +793,7 @@ pub(crate) fn unknown_value_sql(d: &str) -> String {
     let kinds = words(super::chunk_queue::KINDS);
     let phases = words(crate::staging::partition_correction::PHASES);
     let capture = words(crate::CaptureFailureKind::STORED.iter().map(|k| k.as_str()));
+    let cursor = crate::staging::build::unknown_cursor_tag_sql(d, "bc");
     format!(
         "coalesce( \
              case when {d}.status <> all({status}) \
@@ -798,6 +802,10 @@ pub(crate) fn unknown_value_sql(d: &str) -> String {
                   then 'transform_definitions.build ' || quote_literal({d}.build) end, \
              (select 'backfill_chunks.kind ' || quote_literal(bc.kind) from backfill_chunks bc \
               where bc.definition_id = {d}.id and bc.kind <> all({kinds}) \
+              order by bc.id limit 1), \
+             (select 'backfill_chunks.lo cursor tag ' || quote_literal({cursor}) \
+              from backfill_chunks bc \
+              where bc.definition_id = {d}.id and {cursor} is not null \
               order by bc.id limit 1), \
              (select 'partition_correction_progress.phase ' || quote_literal(p.phase) \
               from partition_correction_progress p \

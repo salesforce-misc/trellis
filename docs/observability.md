@@ -419,8 +419,13 @@ pause are arcs of one lifecycle:
     RESUME it or DROP it there" (for a newer grammar, "it was written under
     grammar version `<n>`…"; for a value a newer release stored for it that
     this release doesn't know, such as its status, its build, a build chunk's
-    kind or a partition correction's phase, "its `<table>.<column>`
-    '`<value>`' was written by a newer Trellis release…"), kind `capture`,
+    kind, a build job's cursor tag or a partition correction's phase, "its
+    `<table>.<column>` '`<value>`' was written by a newer Trellis release…";
+    for a partitioned source whose recorded partition tree has a shape this
+    release can't read, "its source `<table>`'s partition_sources.nodes
+    record was written by a newer Trellis release…", which the capture pass
+    records on every definition reading the source, leaving the record as
+    it is), kind `capture`,
     with any reason it was already paused for after it. Until it is paused,
     `status()` of a definition whose status this release doesn't know refuses
     with `version_floor`, and a `capture_failure` whose kind it doesn't know

@@ -67,6 +67,7 @@ use super::super::one_to_one_ledger::{self, EntryChange};
 use super::super::target_mutations::TargetMutations;
 use super::orphans::{self, OrphanCursor, OrphanWalk};
 use super::{SweepOutcome, under_chunk_lock_timeout};
+use crate::defs::chunk_queue::UnknownCursorTag;
 
 /// What a 1-1 Re-derive build needs to know about its target.
 #[derive(Debug, Clone)]
@@ -423,15 +424,16 @@ async fn explain_range(
 /// first `scan` target rows in the target's key order and re-derives, with
 /// the rest, those that have no live entry; later batches walk the target on
 /// from a typed cursor ([`SweepCursor`], `super::orphans`), and the sweep is
-/// finished when the walk is.
+/// finished when the walk is. The caller parses the stored cursor, so one a
+/// newer release wrote never reaches here.
 pub async fn sweep_batch(
     txn: &Transaction<'_>,
     plan: &OneToOnePlan,
     start_xid: &str,
-    cursor: Option<&str>,
+    cursor: Option<SweepCursor<'_>>,
     scan: i64,
 ) -> Result<SweepOutcome, ApplyError> {
-    let cursor = match cursor.map(SweepCursor::parse) {
+    let cursor = match cursor {
         // A cursor in the orphan walk skips the ledger, which is already read.
         Some(SweepCursor::Orphans(after)) => {
             return orphan_batch(
@@ -513,12 +515,18 @@ pub async fn sweep_batch(
 ///
 /// A ledger cursor is stored as the bare key, as a sweep from before the
 /// orphan cursor stored it, unless the key starts with U+0001 (a key a
-/// source text column can hold): then it takes [`LEDGER_CURSOR_PREFIX`]. An
-/// orphan cursor always takes [`ORPHAN_CURSOR_PREFIX`] or
-/// [`ORPHAN_NULLS_PREFIX`]. So a stored cursor starting with U+0001 is one
-/// of the prefixed forms, and any other is a bare ledger key.
+/// source text column can hold): then it takes the `ledger` tag. An orphan
+/// cursor always takes the `orphans` or `orphan-nulls` tag. A tagged cursor
+/// is U+0001, the tag (a lowercase ASCII letter, then lowercase letters and
+/// `-`), U+0001, then the rest. So a stored cursor of that shape is a tagged
+/// one, and any other is a bare ledger key: an untagged cursor, as every
+/// release writes a ledger key that doesn't start with U+0001, and as a
+/// release before the orphan cursor wrote every one. A tag not in
+/// [`SWEEP_TAGS`] was written by a newer release, and reads as
+/// [`UnknownCursorTag`], never as a ledger key (ADR-0024 rule 6);
+/// `defs::floor::unknown_value_sql` finds it from SQL with the same shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SweepCursor<'a> {
+pub enum SweepCursor<'a> {
     Ledger(&'a str),
     Orphans(&'a str),
     OrphanNulls(Option<&'a str>),
@@ -528,16 +536,37 @@ const ORPHAN_CURSOR_PREFIX: &str = "\u{1}orphans\u{1}";
 const ORPHAN_NULLS_PREFIX: &str = "\u{1}orphan-nulls\u{1}";
 const LEDGER_CURSOR_PREFIX: &str = "\u{1}ledger\u{1}";
 
+/// Every tag a 1-1 sweep's cursor carries ([`SweepCursor`]). Writing a new
+/// one raises the definition floor of the definitions it is written for
+/// (ADR-0024 rule 6).
+pub(crate) const SWEEP_TAGS: [&str; 3] = ["orphans", "orphan-nulls", "ledger"];
+
+/// The tag of a tagged 1-1 sweep cursor ([`SweepCursor`]) and the text after
+/// it, or `None` for a bare ledger key. The SQL form is
+/// [`SWEEP_TAG_PATTERN`].
+fn sweep_tag(stored: &str) -> Option<(&str, &str)> {
+    let rest = stored.strip_prefix('\u{1}')?;
+    let (tag, after) = rest.split_once('\u{1}')?;
+    let mut chars = tag.chars();
+    let shaped = chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c == '-');
+    shaped.then_some((tag, after))
+}
+
+/// The POSIX regular expression whose first group is a tagged 1-1 sweep
+/// cursor's tag ([`sweep_tag`]), as SQL text that builds it.
+pub(crate) const SWEEP_TAG_PATTERN: &str = "'^' || chr(1) || '([a-z][a-z-]*)' || chr(1)";
+
 impl<'a> SweepCursor<'a> {
-    pub(crate) fn parse(stored: &'a str) -> Self {
-        if let Some(key) = stored.strip_prefix(ORPHAN_CURSOR_PREFIX) {
-            SweepCursor::Orphans(key)
-        } else if let Some(rest) = stored.strip_prefix(ORPHAN_NULLS_PREFIX) {
-            SweepCursor::OrphanNulls(rest.strip_prefix(':'))
-        } else if let Some(key) = stored.strip_prefix(LEDGER_CURSOR_PREFIX) {
-            SweepCursor::Ledger(key)
-        } else {
-            SweepCursor::Ledger(stored)
+    pub fn parse(stored: &'a str) -> Result<Self, UnknownCursorTag> {
+        let Some((tag, rest)) = sweep_tag(stored) else {
+            return Ok(SweepCursor::Ledger(stored));
+        };
+        match tag {
+            "orphans" => Ok(SweepCursor::Orphans(rest)),
+            "orphan-nulls" => Ok(SweepCursor::OrphanNulls(rest.strip_prefix(':'))),
+            "ledger" => Ok(SweepCursor::Ledger(rest)),
+            _ => Err(UnknownCursorTag(tag.to_string())),
         }
     }
 
@@ -1061,7 +1090,7 @@ fn field_statement(
 
 #[cfg(test)]
 mod unit_tests {
-    use super::SweepCursor;
+    use super::{SWEEP_TAGS, SweepCursor, UnknownCursorTag};
 
     /// Every cursor the sweep stores reads back as what it was: a ledger key
     /// stays bare unless it starts with U+0001, so a sweep stored by a
@@ -1076,6 +1105,7 @@ mod unit_tests {
             "\u{1}\u{1f}7",
             "\u{1}orphans\u{1}42",
             "\u{1}ledger\u{1}42",
+            "\u{1}stale\u{1}42",
             "orphans",
         ] {
             for cursor in [
@@ -1083,14 +1113,61 @@ mod unit_tests {
                 SweepCursor::Orphans(key),
                 SweepCursor::OrphanNulls(Some(key)),
             ] {
-                assert_eq!(SweepCursor::parse(&cursor.encode()), cursor, "{key:?}");
+                assert_eq!(SweepCursor::parse(&cursor.encode()), Ok(cursor), "{key:?}");
             }
         }
         assert_eq!(
             SweepCursor::parse(&SweepCursor::OrphanNulls(None).encode()),
-            SweepCursor::OrphanNulls(None)
+            Ok(SweepCursor::OrphanNulls(None))
         );
         assert_eq!(SweepCursor::Ledger("42").encode(), "42");
-        assert_eq!(SweepCursor::parse("42"), SweepCursor::Ledger("42"));
+        assert_eq!(SweepCursor::parse("42"), Ok(SweepCursor::Ledger("42")));
+    }
+
+    /// An untagged cursor is a ledger key, the form every release reads and
+    /// a release before the orphan cursor wrote for every key, U+0001 first
+    /// or not: only U+0001, a tag of lowercase letters and `-`, then U+0001
+    /// is tagged. A tagged one whose tag this release doesn't know is
+    /// [`UnknownCursorTag`], never a ledger key (ADR-0024 rule 6).
+    #[test]
+    fn a_sweep_cursor_tag_a_newer_release_wrote_is_unknown() {
+        for legacy in [
+            "\u{1}",
+            "\u{1}7",
+            "\u{1}stale",
+            "\u{1}Stale\u{1}7",
+            "\u{1}-stale\u{1}7",
+            "\u{1}st4le\u{1}7",
+            "\u{1}\u{1}7",
+        ] {
+            assert_eq!(
+                SweepCursor::parse(legacy),
+                Ok(SweepCursor::Ledger(legacy)),
+                "{legacy:?}"
+            );
+        }
+        for (stored, tag) in [
+            ("\u{1}stale\u{1}7", "stale"),
+            ("\u{1}orphan-gaps\u{1}", "orphan-gaps"),
+            ("\u{1}o\u{1}:7", "o"),
+        ] {
+            assert_eq!(
+                SweepCursor::parse(stored),
+                Err(UnknownCursorTag(tag.to_string())),
+                "{stored:?}"
+            );
+        }
+        // Each known tag is what its prefix carries.
+        for (cursor, tag) in [
+            (SweepCursor::Orphans("7"), "orphans"),
+            (SweepCursor::OrphanNulls(None), "orphan-nulls"),
+            (SweepCursor::Ledger("\u{1}7"), "ledger"),
+        ] {
+            assert_eq!(
+                super::sweep_tag(&cursor.encode()).map(|(t, _)| t),
+                Some(tag)
+            );
+            assert!(SWEEP_TAGS.contains(&tag));
+        }
     }
 }

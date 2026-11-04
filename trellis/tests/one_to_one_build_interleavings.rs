@@ -451,6 +451,7 @@ async fn the_orphan_walk_pages_by_key_cursor_and_removes_every_orphan() {
     let mut client = d.pool().get().await.expect("a connection");
     let mut sweep = async |cursor: Option<&str>| {
         let txn = client.transaction().await.expect("begin");
+        let cursor = cursor.map(|c| one_to_one::SweepCursor::parse(c).expect("a cursor it wrote"));
         let out = one_to_one::sweep_batch(&txn, &plan, "18446744073709551615", cursor, 3)
             .await
             .expect("sweep batch");

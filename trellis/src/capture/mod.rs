@@ -85,6 +85,12 @@ pub enum CaptureError {
     /// Rebuilding the readers an install commits with, or reading a capture
     /// gate, failed ([`install`], [`gate`]).
     Intake(crate::intake::IntakeError),
+    /// A partitioned source's recorded tree (`partition_sources.nodes`) has
+    /// a shape this release can't read: a newer release wrote it (ADR-0024
+    /// rule 6). The capture pass pauses the source's readers for it and
+    /// leaves the record as it is (`partitions::begin`); every other reader
+    /// of the record refuses with this rather than read it as no record.
+    UnreadableRecord { table: String, error: String },
     /// A catalog read, or the capture DDL, failed. A lock timeout on the
     /// table doesn't land here: once [`install`]'s retries stop at their
     /// deadline, the operation returns [`install::Progress::Waiting`].
@@ -108,6 +114,11 @@ impl fmt::Display for CaptureError {
             CaptureError::InvalidTableName(name) => {
                 write!(f, "{name:?} is not a schema.table identity")
             }
+            CaptureError::UnreadableRecord { table, error } => write!(
+                f,
+                "the recorded partition tree of {table} (partition_sources.nodes) has a shape \
+                 this release can't read, which a newer Trellis release wrote: {error}"
+            ),
             CaptureError::Catalog(e) => write!(f, "reading the catalog for capture: {e}"),
             CaptureError::Intake(e) => {
                 write!(f, "rebuilding or gating the readers of a capture: {e}")

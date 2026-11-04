@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 use tokio_postgres::{IsolationLevel, Transaction};
 
+use crate::defs::chunk_queue::UnknownCursorTag;
 use crate::defs::ddl::{self, PrimaryKeyColumn};
 use crate::defs::join::Side;
 use crate::staging::join_one_to_one::build as steps;
@@ -96,10 +97,12 @@ async fn begin(client: &mut tokio_postgres::Client) -> Result<Transaction<'_>, C
 
 /// Where a 1-1 `JOIN`'s plan job stands (its job's `lo`): in one of the `M`
 /// pass's three walks after a key, or in the walk of `a` after a boundary.
-/// Each stored form is U+0001 and a letter, then `:` and the key when there
-/// is one, so no stored `a` boundary reads as another stage whatever its key
-/// holds. No stored cursor, or one of another form, is the start of the `M`
-/// pass, which is idempotent.
+/// Each stored form is tagged: U+0001 and a tag letter, then `:` and the key
+/// when there is one, so no stored `a` boundary reads as another stage
+/// whatever its key holds. No stored cursor, or an untagged one, is the start
+/// of the `M` pass, which is idempotent. A tag not in [`PLAN_TAGS`] was
+/// written by a newer release, and reads as [`UnknownCursorTag`], never as
+/// another stage (ADR-0024 rule 6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PlanStage {
     /// `b`'s rows in its primary-key order, under the collations the job
@@ -113,22 +116,42 @@ pub(super) enum PlanStage {
     Walk(Option<String>),
 }
 
+/// Every tag a 1-1 `JOIN`'s plan job cursor carries ([`PlanStage`]). Writing
+/// a new one raises the definition floor of the definitions it is written
+/// for (ADR-0024 rule 6).
+pub(crate) const PLAN_TAGS: [&str; 4] = ["b", "n", "g", "a"];
+
+/// Every tag a 1-1 `JOIN`'s sweep job cursor carries ([`Stage`]), under the
+/// same rule as [`PLAN_TAGS`].
+pub(crate) const SWEEP_TAGS: [&str; 3] = ["r", "o", "n"];
+
+/// The tag of a tagged 1-1 `JOIN` cursor and its key, or `None` for an
+/// untagged one. The tag is the text after the leading U+0001 up to the first
+/// `:`, or to the end; the key is the text after that `:`. The SQL form is
+/// [`TAG_PATTERN`].
+fn tag(stored: &str) -> Option<(&str, Option<String>)> {
+    let rest = stored.strip_prefix('\u{1}')?;
+    Some(match rest.split_once(':') {
+        Some((tag, key)) => (tag, Some(key.to_string())),
+        None => (rest, None),
+    })
+}
+
+/// The POSIX regular expression whose first group is a tagged 1-1 `JOIN`
+/// cursor's tag ([`tag`]), as SQL text that builds it.
+pub(crate) const TAG_PATTERN: &str = "'^' || chr(1) || '([^:]*)'";
+
 impl PlanStage {
-    pub(super) fn parse(stored: Option<&str>) -> Self {
-        let Some(stored) = stored else {
-            return PlanStage::B(None);
+    pub(super) fn parse(stored: Option<&str>) -> Result<Self, UnknownCursorTag> {
+        let Some((tag, key)) = stored.and_then(tag) else {
+            return Ok(PlanStage::B(None));
         };
-        let mut chars = stored.chars();
-        let (Some('\u{1}'), Some(tag)) = (chars.next(), chars.next()) else {
-            return PlanStage::B(None);
-        };
-        let key = chars.as_str().strip_prefix(':').map(str::to_string);
         match tag {
-            'b' => PlanStage::B(key),
-            'n' => PlanStage::BNulls(key),
-            'g' => PlanStage::Gone(key),
-            'a' => PlanStage::Walk(key),
-            _ => PlanStage::B(None),
+            "b" => Ok(PlanStage::B(key)),
+            "n" => Ok(PlanStage::BNulls(key)),
+            "g" => Ok(PlanStage::Gone(key)),
+            "a" => Ok(PlanStage::Walk(key)),
+            _ => Err(UnknownCursorTag(tag.to_string())),
         }
     }
 
@@ -146,22 +169,24 @@ impl PlanStage {
     }
 }
 
-/// The step `status()` names for a plan job whose stored cursor is `cursor`.
-pub(crate) fn plan_step(cursor: Option<&str>) -> OneToOneBuildStep {
-    match PlanStage::parse(cursor) {
+/// The step `status()` names for a plan job whose stored cursor is `cursor`,
+/// or `None` for a cursor a newer release wrote.
+pub(crate) fn plan_step(cursor: Option<&str>) -> Option<OneToOneBuildStep> {
+    Some(match PlanStage::parse(cursor).ok()? {
         PlanStage::B(_) => OneToOneBuildStep::JoinedRows,
         PlanStage::BNulls(_) => OneToOneBuildStep::JoinedNullKeys,
         PlanStage::Gone(_) => OneToOneBuildStep::JoinedGone,
         PlanStage::Walk(_) => OneToOneBuildStep::PlanningChunks,
-    }
+    })
 }
 
-/// The step `status()` names for a sweep job whose stored cursor is `cursor`.
-pub(crate) fn sweep_step(cursor: Option<&str>) -> OneToOneBuildStep {
-    match Stage::parse(cursor) {
+/// The step `status()` names for a sweep job whose stored cursor is
+/// `cursor`, or `None` for a cursor a newer release wrote.
+pub(crate) fn sweep_step(cursor: Option<&str>) -> Option<OneToOneBuildStep> {
+    Some(match Stage::parse(cursor).ok()? {
         Stage::Stale(_) => OneToOneBuildStep::SweepStale,
         Stage::Orphans(_) => OneToOneBuildStep::SweepOrphans,
-    }
+    })
 }
 
 /// The plan job's `M` pass (see the module doc) from `stage`, chunk
@@ -302,8 +327,9 @@ pub(super) async fn run_chunk(
 
 /// Where a 1-1 `JOIN`'s rebuild sweep stands (its job's `lo`): in `R`'s
 /// stale pass after an entry key, or in the orphan walk. Each stored form is
-/// U+0001 and a letter, then `:` and the key when there is one; no stored
-/// cursor, or one of another form, is the start of `R`'s pass.
+/// tagged as [`PlanStage`]'s are; no stored cursor, or an untagged one, is
+/// the start of `R`'s pass, and a tag not in [`SWEEP_TAGS`] reads as
+/// [`UnknownCursorTag`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Stage {
     Stale(Option<String>),
@@ -311,20 +337,15 @@ enum Stage {
 }
 
 impl Stage {
-    fn parse(stored: Option<&str>) -> Self {
-        let Some(stored) = stored else {
-            return Stage::Stale(None);
+    fn parse(stored: Option<&str>) -> Result<Self, UnknownCursorTag> {
+        let Some((tag, key)) = stored.and_then(tag) else {
+            return Ok(Stage::Stale(None));
         };
-        let mut chars = stored.chars();
-        let (Some('\u{1}'), Some(tag)) = (chars.next(), chars.next()) else {
-            return Stage::Stale(None);
-        };
-        let key = chars.as_str().strip_prefix(':').map(str::to_string);
         match tag {
-            'r' => Stage::Stale(key),
-            'o' => Stage::Orphans(OrphanCursor::Keyed(key)),
-            'n' => Stage::Orphans(OrphanCursor::Nulls(key)),
-            _ => Stage::Stale(None),
+            "r" => Ok(Stage::Stale(key)),
+            "o" => Ok(Stage::Orphans(OrphanCursor::Keyed(key))),
+            "n" => Ok(Stage::Orphans(OrphanCursor::Nulls(key))),
+            _ => Err(UnknownCursorTag(tag.to_string())),
         }
     }
 
@@ -364,7 +385,7 @@ async fn sweep_batch_steps(
     scan: i64,
 ) -> Result<SweepOutcome, ChunkQueueError> {
     let shape = &plan.shape;
-    let stage = Stage::parse(cursor);
+    let stage = Stage::parse(cursor)?;
     let (scanned, rederived, next) = match stage {
         Stage::Stale(after) => {
             let (scanned, last, stale) = one_to_one_ledger::stale_entries(
@@ -466,7 +487,10 @@ async fn sweep_batch_steps(
 
 #[cfg(test)]
 mod tests {
-    use super::{OneToOneBuildStep, OrphanCursor, PlanStage, Stage, plan_step, sweep_step};
+    use super::{
+        OneToOneBuildStep, OrphanCursor, PLAN_TAGS, PlanStage, SWEEP_TAGS, Stage, UnknownCursorTag,
+        plan_step, sweep_step,
+    };
 
     /// Each stored cursor names the step `status()` reports, and no cursor
     /// names the first of a job.
@@ -488,9 +512,9 @@ mod tests {
                 OneToOneBuildStep::PlanningChunks,
             ),
         ] {
-            assert_eq!(plan_step(Some(&stage.encode())), step);
+            assert_eq!(plan_step(Some(&stage.encode())), Some(step));
         }
-        assert_eq!(plan_step(None), OneToOneBuildStep::JoinedRows);
+        assert_eq!(plan_step(None), Some(OneToOneBuildStep::JoinedRows));
         for (stage, step) in [
             (Stage::Stale(None), OneToOneBuildStep::SweepStale),
             (
@@ -506,9 +530,9 @@ mod tests {
                 OneToOneBuildStep::SweepOrphans,
             ),
         ] {
-            assert_eq!(sweep_step(Some(&stage.encode())), step);
+            assert_eq!(sweep_step(Some(&stage.encode())), Some(step));
         }
-        assert_eq!(sweep_step(None), OneToOneBuildStep::SweepStale);
+        assert_eq!(sweep_step(None), Some(OneToOneBuildStep::SweepStale));
     }
 
     /// Every stage's stored cursor parses back to itself, whatever its key
@@ -522,10 +546,10 @@ mod tests {
                 Stage::Orphans(OrphanCursor::Keyed(key.clone())),
                 Stage::Orphans(OrphanCursor::Nulls(key.clone())),
             ] {
-                assert_eq!(Stage::parse(Some(&stage.encode())), stage, "{key:?}");
+                assert_eq!(Stage::parse(Some(&stage.encode())), Ok(stage), "{key:?}");
             }
         }
-        assert_eq!(Stage::parse(None), Stage::Stale(None));
+        assert_eq!(Stage::parse(None), Ok(Stage::Stale(None)));
     }
 
     /// Every stage of the plan job's stored cursor parses back to itself,
@@ -541,10 +565,58 @@ mod tests {
                 PlanStage::Gone(key.clone()),
                 PlanStage::Walk(key.clone()),
             ] {
-                assert_eq!(PlanStage::parse(Some(&stage.encode())), stage, "{key:?}");
+                assert_eq!(
+                    PlanStage::parse(Some(&stage.encode())),
+                    Ok(stage),
+                    "{key:?}"
+                );
             }
         }
-        assert_eq!(PlanStage::parse(None), PlanStage::B(None));
-        assert_eq!(PlanStage::parse(Some("a07")), PlanStage::B(None));
+        assert_eq!(PlanStage::parse(None), Ok(PlanStage::B(None)));
+        assert_eq!(PlanStage::parse(Some("a07")), Ok(PlanStage::B(None)));
+    }
+
+    /// A tag this release doesn't know, in either job's cursor, is
+    /// [`UnknownCursorTag`], never another stage or the start of a pass
+    /// (ADR-0024 rule 6), and `status()` names no step for it. A tag is the
+    /// whole text up to the first `:`, so a longer one that starts with a
+    /// known letter is unknown too.
+    #[test]
+    fn a_cursor_tag_a_newer_release_wrote_is_unknown() {
+        fn unknown<T>(tag: &str) -> Result<T, UnknownCursorTag> {
+            Err(UnknownCursorTag(tag.to_string()))
+        }
+        for (stored, tag) in [
+            ("\u{1}z:3", "z"),
+            ("\u{1}z", "z"),
+            ("\u{1}bx:3", "bx"),
+            ("\u{1}", ""),
+            ("\u{1}r:3", "r"),
+        ] {
+            assert_eq!(PlanStage::parse(Some(stored)), unknown(tag), "{stored:?}");
+            assert_eq!(plan_step(Some(stored)), None, "{stored:?}");
+        }
+        for (stored, tag) in [("\u{1}z:3", "z"), ("\u{1}b:3", "b"), ("\u{1}ox", "ox")] {
+            assert_eq!(Stage::parse(Some(stored)), unknown(tag), "{stored:?}");
+            assert_eq!(sweep_step(Some(stored)), None, "{stored:?}");
+        }
+        // Each known tag is what its stage writes.
+        for stage in [
+            PlanStage::B(None),
+            PlanStage::BNulls(None),
+            PlanStage::Gone(None),
+            PlanStage::Walk(Some("7".into())),
+        ] {
+            let tag = super::tag(&stage.encode()).expect("tagged").0.to_string();
+            assert!(PLAN_TAGS.contains(&tag.as_str()), "{stage:?}");
+        }
+        for stage in [
+            Stage::Stale(None),
+            Stage::Orphans(OrphanCursor::Keyed(Some("7".into()))),
+            Stage::Orphans(OrphanCursor::Nulls(None)),
+        ] {
+            let tag = super::tag(&stage.encode()).expect("tagged").0.to_string();
+            assert!(SWEEP_TAGS.contains(&tag.as_str()), "{stage:?}");
+        }
     }
 }

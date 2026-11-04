@@ -66,6 +66,12 @@ pub enum ChunkQueueError {
     /// (`backfill_chunks_kind_bounds` rules out a mismatch), or a Re-derive
     /// build's row reached the old build's runner.
     UnknownKind { kind: String },
+    /// A claimed job's cursor (`backfill_chunks.lo`) carries a format tag
+    /// this release doesn't know: a newer release wrote it (ADR-0024 rule 6).
+    /// The definition pauses for it before any worker claims the job
+    /// (`super::floor::unknown_value_sql`), so this is a defensive refusal
+    /// to read it as some other position.
+    UnknownCursor { tag: String },
     /// A partition correction failed (ADR-0017 P4a,
     /// `staging::partition_correction`).
     Correction(Box<crate::staging::partition_correction::CorrectionError>),
@@ -97,6 +103,11 @@ impl std::fmt::Display for ChunkQueueError {
             ChunkQueueError::UnknownKind { kind } => {
                 write!(f, "claimed a backfill chunk of unknown kind {kind:?}")
             }
+            ChunkQueueError::UnknownCursor { tag } => write!(
+                f,
+                "claimed a backfill chunk whose {} was written by a newer Trellis release",
+                UnknownCursorTag(tag.clone())
+            ),
             ChunkQueueError::Correction(err) => write!(f, "{err}"),
         }
     }
@@ -113,8 +124,29 @@ impl std::error::Error for ChunkQueueError {
             ChunkQueueError::Quarantine(err) => Some(err.as_ref()),
             ChunkQueueError::Build(err) => Some(err.as_ref()),
             ChunkQueueError::UnknownKind { .. } => None,
+            ChunkQueueError::UnknownCursor { .. } => None,
             ChunkQueueError::Correction(err) => Some(err.as_ref()),
         }
+    }
+}
+
+/// The format tag of a job's cursor (`backfill_chunks.lo`) that this release
+/// doesn't know (ADR-0024 rule 6): a newer release wrote it. The 1-1 sweep
+/// (`staging::build::one_to_one::SweepCursor`) and the 1-1 `JOIN`'s plan and
+/// sweep jobs (`staging::build::join_one_to_one`) tag their cursors;
+/// `super::floor::unknown_value_sql` finds the same tags from SQL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownCursorTag(pub String);
+
+impl std::fmt::Display for UnknownCursorTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "backfill_chunks.lo cursor tag {:?}", self.0)
+    }
+}
+
+impl From<UnknownCursorTag> for ChunkQueueError {
+    fn from(UnknownCursorTag(tag): UnknownCursorTag) -> Self {
+        ChunkQueueError::UnknownCursor { tag }
     }
 }
 

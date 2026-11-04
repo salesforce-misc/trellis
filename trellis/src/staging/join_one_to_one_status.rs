@@ -271,7 +271,7 @@ async fn building(
             .map(|row| row.get::<_, Option<String>>(1))
     };
     if let Some(cursor) = job(KIND_PLAN) {
-        return Ok(Some(build::plan_step(cursor.as_deref())));
+        return Ok(build::plan_step(cursor.as_deref()));
     }
     let chunks = rows
         .iter()
@@ -280,7 +280,7 @@ async fn building(
     if chunks > 0 {
         return Ok(Some(OneToOneBuildStep::Chunks { remaining: chunks }));
     }
-    Ok(job(KIND_SWEEP).map(|cursor| build::sweep_step(cursor.as_deref())))
+    Ok(job(KIND_SWEEP).and_then(|cursor| build::sweep_step(cursor.as_deref())))
 }
 
 #[cfg(test)]

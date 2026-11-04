@@ -256,6 +256,46 @@ pub const CHUNK_APPLICATION_NAME: &str = "trellis build chunk";
 /// definition floor of the definitions it is written for (ADR-0024 rule 6).
 pub(crate) const BUILD_REDERIVE: &str = "rederive";
 
+/// SQL over a `backfill_chunks` row aliased `bc` and its definition's
+/// `transform_definitions` row aliased `d`: the tag of the row's cursor
+/// (`lo`) when the cursor is tagged and this release doesn't know the tag,
+/// else `NULL` (ADR-0024 rule 6). It reads the tag's shape, never the
+/// position after it.
+///
+/// Two families of job tag their cursors, and `d.join_table` tells them
+/// apart: a 1-1 sweep ([`one_to_one::SweepCursor`]), the only `sweep` job of
+/// a definition with no `JOIN`; and a 1-1 `JOIN`'s plan and sweep jobs
+/// (`join_one_to_one::PlanStage` and its sweep's stage), whose cursors are
+/// always tagged. An aggregate `JOIN`'s plan job stores `side:step`, which
+/// starts with no U+0001 and so reads as untagged. Every other job's cursor
+/// is a bare key or oid with no tag (a plain plan job's boundary, a
+/// `rederive` range, a group-basis build's leaf), so a new form of one of
+/// those has no tag to pause on, and only the definition floor it raises
+/// keeps an older release from reading it.
+pub(crate) fn unknown_cursor_tag_sql(d: &str, bc: &str) -> String {
+    fn words(words: &[&str]) -> String {
+        format!("'{{{}}}'::text[]", words.join(","))
+    }
+    format!(
+        "(select t.tag from (select case \
+             when {d}.join_table is null and {bc}.kind = '{sweep}' \
+                 then substring({bc}.lo from {sweep_pattern}) \
+             when {d}.join_table is not null and {bc}.kind in ('{plan}', '{sweep}') \
+                 then substring({bc}.lo from {join_pattern}) end as tag) t \
+          where t.tag <> all(case \
+             when {d}.join_table is null then {sweep_tags} \
+             when {bc}.kind = '{plan}' then {join_plan_tags} \
+             else {join_sweep_tags} end))",
+        sweep = chunk_queue::KIND_SWEEP,
+        plan = chunk_queue::KIND_PLAN,
+        sweep_pattern = one_to_one::SWEEP_TAG_PATTERN,
+        join_pattern = join_one_to_one::TAG_PATTERN,
+        sweep_tags = words(&one_to_one::SWEEP_TAGS),
+        join_plan_tags = words(&join_one_to_one::PLAN_TAGS),
+        join_sweep_tags = words(&join_one_to_one::SWEEP_TAGS),
+    )
+}
+
 /// Whether the partition correction engine
 /// (`super::partition_correction`) can re-derive the keys of `definition`
 /// when a node of its partitioned source is added: an aggregate on the group
@@ -1923,7 +1963,7 @@ async fn run_plan(
                        and a column resume rebuilds a 1-1 JOIN in place)",
             }));
         }
-        match join_one_to_one::PlanStage::parse(cursor.as_deref()) {
+        match join_one_to_one::PlanStage::parse(cursor.as_deref())? {
             join_one_to_one::PlanStage::Walk(after) => cursor = after,
             stage => {
                 if !join_one_to_one::build_m(
@@ -2944,7 +2984,11 @@ async fn run_sweep(
         let scan = options.chunk_rows.max(1);
         let outcome = match &plan {
             SweepPlan::OneToOne(plan) => {
-                one_to_one::sweep_batch(&txn, plan, &start_xid, cursor.as_deref(), scan)
+                let cursor = cursor
+                    .as_deref()
+                    .map(one_to_one::SweepCursor::parse)
+                    .transpose()?;
+                one_to_one::sweep_batch(&txn, plan, &start_xid, cursor, scan)
                     .await
                     .map_err(build_error)?
             }

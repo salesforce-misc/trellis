@@ -6305,9 +6305,10 @@ pub(crate) async fn definition_by_id_in(
 
 /// Refuses a statement that would act on the transform `name` names (either
 /// spelling, [`target_match_sql`]) when this release can't run it (ADR-0024
-/// rule 3), its floor or grammar newer than this release's or an enum-like
+/// rule 3), its floor or grammar newer than this release's, an enum-like
 /// value stored for it one a newer release wrote (rule 6,
-/// [`super::floor::unknown_value_sql`]): [`CatalogError::CannotRun`], with
+/// [`super::floor::unknown_value_sql`]), or a source's recorded partition
+/// tree in a shape a newer release wrote: [`CatalogError::CannotRun`], with
 /// `verb` and the transform's name as what it would have done, and the
 /// reason its pause records. `Ok` when
 /// it can, or when no transform has that name. Read before the statement's
@@ -6321,7 +6322,8 @@ pub(crate) async fn refuse_unrunnable(
     let Some(row) = client
         .query_opt(
             &format!(
-                "select d.target_table, d.grammar_version, d.floor_version, {} \
+                "select d.target_table, d.grammar_version, d.floor_version, {}, \
+                        d.source_table, d.join_table \
                  from transform_definitions d where {}",
                 super::floor::unknown_value_sql("d"),
                 target_match_sql("d.target_table", 1)
@@ -6333,10 +6335,21 @@ pub(crate) async fn refuse_unrunnable(
         return Ok(());
     };
     let target: String = row.get(0);
-    let unrunnable = floors.unrunnable(row.get(2), row.get(1)).or_else(|| {
+    let mut unrunnable = floors.unrunnable(row.get(2), row.get(1)).or_else(|| {
         row.get::<_, Option<String>>(3)
             .map(|value| super::floor::Unrunnable::UnknownValue { value })
     });
+    if unrunnable.is_none() {
+        // A partitioned source whose recorded tree a newer release wrote in
+        // a shape this one can't read (the capture pass pauses its readers
+        // for it, `capture::partitions`).
+        let source: String = row.get(4);
+        let join: Option<String> = row.get(5);
+        let tables: Vec<&str> = std::iter::once(source.as_str())
+            .chain(join.as_deref())
+            .collect();
+        unrunnable = crate::capture::partitions::unreadable_record(client, &tables).await?;
+    }
     match unrunnable {
         Some(unrunnable) => Err(CatalogError::CannotRun {
             action: format!("{verb} '{name}'"),

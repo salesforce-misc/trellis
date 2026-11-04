@@ -702,11 +702,7 @@ async fn load_state(
         return Ok(None);
     };
     let text: String = row.get(3);
-    // A row this binary can't read is as good as none: the deep check records
-    // the tree again.
-    let Ok(recorded) = serde_json::from_str::<Recorded>(&text) else {
-        return Ok(None);
-    };
+    let recorded = parse_recorded(table, &text)?;
     Ok(Some(Stored {
         root_oid: row.get::<_, i64>(0) as u32,
         lifecycle: row.get(1),
@@ -717,6 +713,82 @@ async fn load_state(
         stale: row.get(4),
         noncompliant: row.get(5),
     }))
+}
+
+/// A source's recorded tree from its stored `partition_sources.nodes`. A
+/// shape this release can't read was written by a newer release, and is an
+/// error, never no record (ADR-0024 rule 6): read as none, the deep check
+/// would record the tree over it and skip the comparison of the stored oids
+/// with the live ones that tells a restore apart ([`classify_cluster`]). A
+/// field this release doesn't know is ignored: a newer release that adds one
+/// an older release mustn't ignore raises the catalog floor (`migrate`'s
+/// "Instance-wide formats").
+fn parse_recorded(table: &str, text: &str) -> Result<Recorded, CaptureError> {
+    serde_json::from_str::<Recorded>(text).map_err(|e| CaptureError::UnreadableRecord {
+        table: table.to_string(),
+        error: e.to_string(),
+    })
+}
+
+/// The first of `tables` whose recorded tree has a shape this release can't
+/// read ([`parse_recorded`]), as the [`crate::defs::floor::Unrunnable`] its
+/// readers pause for, or `None`.
+pub(crate) async fn unreadable_record(
+    client: &impl GenericClient,
+    tables: &[&str],
+) -> Result<Option<crate::defs::floor::Unrunnable>, tokio_postgres::Error> {
+    let rows = client
+        .query(
+            "select table_name, nodes::text from partition_sources \
+             where table_name = any($1) order by table_name",
+            &[&tables],
+        )
+        .await?;
+    Ok(rows.iter().find_map(|row| {
+        let table: String = row.get(0);
+        parse_recorded(&table, &row.get::<_, String>(1))
+            .is_err()
+            .then(|| unreadable(&table))
+    }))
+}
+
+/// What a reader of `table` pauses for when its recorded tree has a shape
+/// this release can't read.
+fn unreadable(table: &str) -> crate::defs::floor::Unrunnable {
+    crate::defs::floor::Unrunnable::UnknownValue {
+        value: format!("source {table}'s partition_sources.nodes record"),
+    }
+}
+
+/// Pauses every reader of `table` that isn't paused for a capture failure
+/// yet, because its recorded tree has a shape this release can't read
+/// ([`parse_recorded`]), with the reason a value a newer release wrote gives
+/// (`defs::floor::Unrunnable::UnknownValue`): roll forward to the release
+/// that wrote it. The record stays as that release wrote it, and `RESUME`,
+/// `ALTER` and `self_check` of a reader refuse while it is
+/// (`defs::catalog::refuse_unrunnable`).
+async fn pause_readers_of_unreadable_record(
+    client: &mut Client,
+    catalog: &CaptureCatalog,
+    table: &str,
+) -> Result<(), CaptureError> {
+    let readers = crate::staging::schema_change::unpaused_readers(catalog, table);
+    if readers.is_empty() {
+        return Ok(());
+    }
+    let unknown = unreadable(table);
+    let txn = client.transaction().await?;
+    for id in readers {
+        let Some(reader) = catalog.definitions.iter().find(|r| r.id == id) else {
+            continue;
+        };
+        let reason = unknown.reason(&reader.target);
+        if crate::defs::lifecycle::pause_for_unrunnable(&txn, id, table, &reason).await? {
+            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {reason}");
+        }
+    }
+    txn.commit().await?;
+    Ok(())
 }
 
 /// The sources whose deep check ran in this process, per instance. A deep
@@ -802,7 +874,13 @@ pub(crate) async fn begin(
         observe_missing(&*client, table).await?;
         return Ok(Begin::NotPartitioned);
     }
-    let stored = load_state(&*client, table).await?;
+    let stored = match load_state(&*client, table).await {
+        Err(CaptureError::UnreadableRecord { .. }) => {
+            pause_readers_of_unreadable_record(client, catalog, table).await?;
+            return Ok(Begin::Held { deep: false });
+        }
+        stored => stored?,
+    };
     // A root other than the recorded one, under this database's own
     // record, is table maintenance, not partition maintenance. The pass's
     // gone-table check pauses the readers for it before this; a swap that
@@ -1378,6 +1456,40 @@ mod tests {
         let check = include_str!("../../migrations/V14__partition_correction_cause_check.sql");
         for word in Cause::STORED {
             assert!(check.contains(&format!("'{word}'")), "{word}");
+        }
+    }
+
+    /// A recorded tree in a shape this release can't read (a newer
+    /// release's) is an error naming the source, never no record; the shape
+    /// every release writes reads back, `level_collation` defaulted where an
+    /// earlier release left it out.
+    #[test]
+    fn a_record_shape_a_newer_release_wrote_is_unreadable() {
+        let tree = Recorded {
+            nodes: vec![root(1), node(2, Some(1), "FOR VALUES IN (1)", "7")],
+            keys: Vec::new(),
+        };
+        let text = serde_json::to_string(&tree).expect("serializes");
+        assert_eq!(parse_recorded("public.s", &text).expect("reads"), tree);
+        let without_level =
+            r#"{"nodes":[],"keys":[{"node":1,"column":"a","pg_type":"integer","collation":""}]}"#;
+        assert_eq!(
+            parse_recorded("public.s", without_level)
+                .expect("reads")
+                .keys[0]
+                .level_collation,
+            ""
+        );
+        for newer in [
+            r#"{"tree":{"nodes":[]},"keys":[]}"#,
+            r#"{"nodes":{"root":1},"keys":[]}"#,
+            r#"{"nodes":[{"oid":1,"parent":null,"name":"public.s","partitioned":true}],"keys":[]}"#,
+            r#"[1,2]"#,
+        ] {
+            match parse_recorded("public.s", newer) {
+                Err(CaptureError::UnreadableRecord { table, .. }) => assert_eq!(table, "public.s"),
+                other => panic!("{newer}: {other:?}"),
+            }
         }
     }
 

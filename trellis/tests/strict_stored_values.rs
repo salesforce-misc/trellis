@@ -235,3 +235,110 @@ async fn a_value_a_newer_release_wrote_pauses_its_definition_and_the_rest_keep_r
         .collect();
     assert_eq!(before, after);
 }
+
+/// The definitions a newer release wrote a job cursor for, the tag it
+/// carries, and the job's kind and cursor (`backfill_chunks.lo`).
+const NEWER_CURSORS: [(&str, &str, &str, &str); 3] = [
+    // A 1-1 sweep's tagged cursor.
+    (
+        "t_sweep",
+        "stale",
+        "sweep",
+        "chr(1) || 'stale' || chr(1) || '7'",
+    ),
+    // A 1-1 `JOIN`'s plan job and sweep job.
+    ("t_join_plan", "z", "plan", "chr(1) || 'z:7'"),
+    ("t_join_sweep", "q", "sweep", "chr(1) || 'q'"),
+];
+
+/// A job cursor whose tag a newer release wrote pauses its definition at
+/// attach, naming the tag, and `RESUME` refuses while it is stored. An
+/// untagged cursor is the format every release reads, and pauses nothing: a
+/// 1-1 sweep's ledger key that starts with U+0001 but isn't shaped as a tag
+/// (as a release before the tags wrote every ledger key), and a plain plan
+/// job's boundary, which is never tagged.
+#[tokio::test]
+async fn a_cursor_tag_a_newer_release_wrote_pauses_its_definition() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    raw.batch_execute(
+        "create table public.s (id integer primary key, a integer); \
+         insert into public.s values (1, 1), (2, 2); \
+         create table public.b (id integer primary key, k integer, img integer); \
+         create unique index on public.b (k); \
+         insert into public.b values (1, 1, 10)",
+    )
+    .await
+    .expect("sources");
+    let trellis = handle(&db).await;
+    for text in [
+        "TRANSFORM t_sweep FROM s SELECT a AS a",
+        "TRANSFORM t_legacy FROM s SELECT a AS a",
+        "TRANSFORM t_join_plan FROM public.s LEFT JOIN public.b ON s.a = b.k \
+         SELECT s.a AS a, b.img AS img",
+        "TRANSFORM t_join_sweep FROM public.s LEFT JOIN public.b ON s.a = b.k \
+         SELECT s.a AS a, b.img AS img",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    trellis::intake::harness::start_registered_builds(trellis.pool())
+        .await
+        .expect("dispatch the builds");
+    trellis::staging::build::settle_builds(trellis.pool()).await;
+
+    let insert = |kind: &str, cursor: &str| {
+        format!(
+            "insert into backfill_chunks (definition_id, kind, lo) \
+             select id, '{kind}', {cursor} from transform_definitions \
+             where split_part(target_table, '.', 2) = $1"
+        )
+    };
+    for &(target, _, kind, cursor) in &NEWER_CURSORS {
+        raw.execute(&insert(kind, cursor), &[&target])
+            .await
+            .expect(target);
+    }
+    for (kind, cursor) in [
+        ("sweep", "chr(1) || '7'"),
+        ("sweep", "chr(1) || 'Stale' || chr(1) || '7'"),
+        ("plan", "chr(1) || 'z:7'"),
+    ] {
+        raw.execute(&insert(kind, cursor), &[&"t_legacy"])
+            .await
+            .expect("an untagged cursor");
+    }
+
+    trellis::migrate::migrate_with_pool(&db.pool, &Config::from_dsn(db.dsn().to_string()).unwrap())
+        .await
+        .expect("a cursor a newer release wrote pauses; it doesn't refuse the attach");
+    for &(target, tag, ..) in &NEWER_CURSORS {
+        let status = trellis
+            .status(target)
+            .await
+            .expect("status")
+            .expect("defined");
+        assert_eq!(status.status, TransformStatus::Paused, "{target}");
+        let failure = status.capture_failure.expect("a reason");
+        assert!(
+            failure.error.starts_with(&format!(
+                "this release can't run transform public.{target}: its backfill_chunks.lo \
+                 cursor tag '{tag}' was written by a newer Trellis release"
+            )),
+            "{target}: {}",
+            failure.error
+        );
+        let err = trellis
+            .apply(&format!("RESUME TRANSFORM {target}"))
+            .await
+            .expect_err(target);
+        assert_eq!(err.code(), ErrorCode::VersionFloor, "{target}: {err}");
+    }
+    let legacy = trellis
+        .status("t_legacy")
+        .await
+        .expect("status")
+        .expect("defined");
+    assert_eq!(legacy.status, TransformStatus::Live);
+    assert!(legacy.capture_failure.is_none());
+}

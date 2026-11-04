@@ -59,12 +59,17 @@
 //! - the ring's `transition_images` shape, and the key text encoding of the
 //!   ring's `key` and of every stored key (`defs::ddl::split_pk_key`);
 //! - `segments.state`, `schema_edges.kind`, and `partition_corrections`'
-//!   `kind` and `cause`.
+//!   `kind` and `cause`;
+//! - the shape of `partition_sources.nodes`, a partitioned source's recorded
+//!   tree (`capture::partitions::Recorded`).
 //!
 //! Each enum-like column of these has a check that admits exactly the words
 //! a release writes, so a new word needs a migration that relaxes it, and
 //! that migration raises the floor: a release below it refuses to attach
-//! rather than read the word. A per-definition value is read strictly
+//! rather than read the word. The recorded tree's JSON has no check: a
+//! release that changes its shape raises the floor in a migration of its
+//! own, and a release that meets a shape it can't read anyway pauses the
+//! source's readers and leaves the record alone. A per-definition value is read strictly
 //! instead, and a word an older release doesn't know pauses the definition
 //! it belongs to (`defs::floor::unknown_value_sql`).
 //!

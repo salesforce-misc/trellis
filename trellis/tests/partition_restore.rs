@@ -139,6 +139,35 @@ impl Fx {
             .and_then(|r| r.get(0))
     }
 
+    /// The source's stored record, as text.
+    async fn stored_record(&self) -> String {
+        self.d
+            .ctl
+            .query_one(
+                "select nodes::text from partition_sources where table_name = $1",
+                &[&SOURCE],
+            )
+            .await
+            .expect("the record")
+            .get(0)
+    }
+
+    /// Every capture failure, with when it was detected.
+    async fn failures(&self) -> Vec<String> {
+        self.d
+            .ctl
+            .query(
+                "select transform_id || ' ' || error || ' ' || detected_at::text \
+                 from capture_failures order by transform_id",
+                &[],
+            )
+            .await
+            .expect("failures")
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+
     async fn recorded(&self) -> bool {
         partitions::recorded(&self.d.ctl, SOURCE)
             .await
@@ -396,4 +425,67 @@ async fn a_recreated_or_swapped_root_is_no_restore() {
         );
         assert_eq!(fx.queued().await, 0, "swap {swap}: nothing is corrected");
     }
+}
+
+/// A recorded tree in a shape a newer release wrote (ADR-0024 rule 6)
+/// pauses every definition that reads the source, naming the record and the
+/// remedy, and the pass leaves the record as that release wrote it: read as
+/// no record, the pass would record the tree over it and skip the restore
+/// check. The plain table's reader keeps running, and a later pass changes
+/// nothing.
+#[tokio::test]
+async fn a_recorded_tree_a_newer_release_wrote_pauses_its_readers_and_is_kept() {
+    let mut fx = Fx::start().await;
+    let newer = r#"{"tree": {"root": 1, "nodes": []}, "keys": []}"#;
+    fx.d.ctl
+        .execute(
+            "update partition_sources set nodes = $2::text::jsonb where table_name = $1",
+            &[&SOURCE, &newer],
+        )
+        .await
+        .expect("the newer release's record");
+    let written = fx.stored_record().await;
+    let err = partitions::recorded(&fx.d.ctl, SOURCE)
+        .await
+        .expect_err("a shape this release can't read is no record");
+    assert!(
+        err.to_string().contains("a newer Trellis release wrote"),
+        "{err}"
+    );
+
+    fx.pass().await;
+    assert_eq!(fx.status("agg").await, "paused");
+    let reason = fx.capture_failure("agg").await.expect("a reason");
+    assert!(
+        reason.starts_with(
+            "this release can't run transform public.agg: its source public.items's \
+             partition_sources.nodes record was written by a newer Trellis release"
+        ),
+        "{reason}"
+    );
+    assert_eq!(fx.stored_record().await, written, "the record is kept");
+    assert_eq!(fx.status("plain_agg").await, "live");
+    assert_eq!(fx.capture_failure("plain_agg").await, None);
+
+    // RESUME refuses while the record is stored.
+    let handle = trellis::Trellis::connect(
+        trellis::Config::from_dsn(fx.d.db.dsn().to_string()).expect("config"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    let err = handle
+        .apply("RESUME TRANSFORM agg")
+        .await
+        .expect_err("RESUME of a reader of the record");
+    assert_eq!(err.code(), trellis::ErrorCode::VersionFloor, "{err}");
+    assert!(
+        err.to_string().contains("partition_sources.nodes record"),
+        "{err}"
+    );
+
+    let before = fx.failures().await;
+    fx.full_pass().await;
+    assert_eq!(fx.failures().await, before);
+    assert_eq!(fx.stored_record().await, written, "the record is kept");
 }

@@ -931,6 +931,45 @@ async fn without_its_sweep_a_one_to_one_rebuild_keeps_a_deleted_key() {
     );
 }
 
+/// A 1-1 rebuild's sweep job whose cursor a release before the tagged
+/// cursors wrote resumes from it: a bare ledger key reads as a position in
+/// the ledger, whatever it starts with. This one starts with U+0001, the
+/// tags' lead, but isn't shaped as a tag, and sorts before every key, so the
+/// sweep reaches the key deleted while paused.
+#[tokio::test]
+async fn a_one_to_one_sweep_resumes_from_an_untagged_cursor() {
+    let mut f = Fixture::new(30, &[ONE]).await;
+    f.pass().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    let trellis = f.trellis().await;
+    trellis.apply("PAUSE TRANSFORM one").await.expect("pause");
+    f.raw
+        .batch_execute("delete from public.src where id = 5")
+        .await
+        .expect("delete while paused");
+    f.drain().await;
+    trellis.apply("RESUME TRANSFORM one").await.expect("resume");
+    f.pass().await;
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where kind = 'sweep' and not done")
+            .await,
+        1
+    );
+    f.raw
+        .batch_execute("update backfill_chunks set lo = chr(1) || '0' where kind = 'sweep'")
+        .await
+        .expect("the earlier release's cursor");
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where kind = 'sweep' and not done")
+            .await,
+        0
+    );
+    f.assert_one_oracle().await;
+}
+
 /// A 1-1 build leaves a quarantined key out: the build goes
 /// `live` without its row, and its entry is never taken.
 #[tokio::test]
