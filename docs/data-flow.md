@@ -80,8 +80,10 @@ source rows and installs no triggers, so its latency doesn't depend on the
 table's size. The table and the catalog row commit in one transaction, so a
 registration that fails leaves neither behind and can be retried as is. If
 any relation already exists under the target's qualified name, registration
-is refused with an error naming it: Trellis never adopts a table it didn't
-create, because `DROP` later drops the target table
+is refused with an error naming it: Trellis adopts a table it didn't create
+only when the definition asks for it (`ADOPT EXISTING TABLE`) and the table
+is empty and shaped as define would create it, because `DROP` later drops the
+target table
 ([ADR-0014](decisions/0014-pause-and-drop-a-transform.md)). Which sources and
 targets are accepted is
 [Supported sources and targets](transforms.md#supported-sources-and-targets).

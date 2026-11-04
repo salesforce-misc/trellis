@@ -320,10 +320,12 @@ An adopted target is held to what Trellis can maintain, and it refuses by defaul
   the comparison doesn't recognise, refuses with a code naming it, so a Postgres feature
   added later refuses until Trellis learns it.
 * **Owned and writable by the defining role.** Trellis later alters and drops the table,
-  so the defining role must own it or be a member of its owner, and hold every privilege
-  it writes the table with.
+  so the defining role must own it or inherit its owner's privileges as a member, and hold
+  every privilege it writes the table with.
 * **Everything beside the target is Trellis's to create.** The ledger and hidden tables
-  are created by the define; one that already exists refuses it.
+  are created by the define; one that already exists refuses it. Another definition's
+  target in the same instance is never adopted, so two of its definitions never share
+  one.
 
 After define an adopted target is an ordinary target: `DROP` drops it. The opt-in is part
 of the statement grammar, so a definition that uses it carries the floor of the release

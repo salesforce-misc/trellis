@@ -132,6 +132,8 @@ pub struct ConstraintDescription {
     pub kind: char,
     /// Its key columns, in key order.
     pub columns: Vec<String>,
+    /// Its index's `INCLUDE` columns, in order.
+    pub included: Vec<String>,
     pub deferrable: bool,
     /// Its index is `nulls not distinct`.
     pub nulls_not_distinct: bool,
@@ -139,10 +141,13 @@ pub struct ConstraintDescription {
 
 impl ConstraintDescription {
     /// Whether `self` keys a table as `other` does: kind, columns in order,
-    /// deferrability and nulls-distinctness, whatever the names.
+    /// `INCLUDE` columns, deferrability and nulls-distinctness, whatever the
+    /// names. An `INCLUDE` column counts because dropping it (`ALTER
+    /// TRANSFORM` dropping a field) drops the key with it.
     fn keys_like(&self, other: &ConstraintDescription) -> bool {
         self.kind == other.kind
             && self.columns == other.columns
+            && self.included == other.included
             && self.deferrable == other.deferrable
             && self.nulls_not_distinct == other.nulls_not_distinct
     }
@@ -154,8 +159,13 @@ impl ConstraintDescription {
             'u' => "unique",
             _ => "constraint",
         };
+        let include = if self.included.is_empty() {
+            String::new()
+        } else {
+            format!(" include ({})", self.included.join(", "))
+        };
         let deferrable = if self.deferrable { " deferrable" } else { "" };
-        format!("{kind} ({}){deferrable}", self.columns.join(", "))
+        format!("{kind} ({}){include}{deferrable}", self.columns.join(", "))
     }
 }
 
@@ -163,7 +173,9 @@ impl ConstraintDescription {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Dependent {
     /// `index`, `toast`, `sequence`, `rule`, `view`, `relation` (another
-    /// relation kind), or the catalog the object lives in (`pg_policy`).
+    /// relation kind), `referencing_constraint` or `referencing_trigger` (a
+    /// constraint or trigger of another table that refers to this one), or
+    /// the catalog the object lives in (`pg_policy`).
     pub kind: String,
     /// `pg_describe_object`'s description of it.
     pub description: String,
@@ -210,7 +222,8 @@ pub enum NotAdoptable {
     AccessMethod { expected: String, found: String },
     /// The role lacks a privilege on the table.
     Privilege { privilege: &'static str },
-    /// The role isn't the table's owner or a member of it.
+    /// The role isn't the table's owner and doesn't inherit its owner's
+    /// privileges.
     NotOwner { owner: String },
     /// The table has rows.
     NotEmpty,
@@ -256,6 +269,8 @@ pub enum NotAdoptable {
     ExclusionConstraint { name: String },
     /// A foreign key on the table.
     ForeignKey { name: String },
+    /// Another table's foreign key referencing the table.
+    ReferencedByForeignKey { description: String },
     /// A unique index besides the key's.
     UniqueIndex { name: String },
     /// A trigger.
@@ -298,7 +313,9 @@ impl NotAdoptable {
             NotAdoptable::CheckConstraint { .. } => "check_constraint",
             NotAdoptable::UniqueConstraint { .. } => "unique_constraint",
             NotAdoptable::ExclusionConstraint { .. } => "exclusion_constraint",
-            NotAdoptable::ForeignKey { .. } => "foreign_key",
+            NotAdoptable::ForeignKey { .. } | NotAdoptable::ReferencedByForeignKey { .. } => {
+                "foreign_key"
+            }
             NotAdoptable::UniqueIndex { .. } => "unique_index",
             NotAdoptable::Trigger { .. } => "trigger",
             NotAdoptable::Rule { .. } => "rule",
@@ -339,9 +356,10 @@ impl fmt::Display for NotAdoptable {
             ),
             NotAdoptable::NotOwner { owner } => write!(
                 f,
-                "it is owned by \"{owner}\", and the defining role is not a member of that \
-                 role; Trellis alters and drops its targets, which takes ownership \
-                 (ALTER TABLE … OWNER TO the defining role, or grant it membership)"
+                "it is owned by \"{owner}\", and the defining role doesn't hold that role's \
+                 privileges; Trellis alters and drops its targets, which takes ownership \
+                 (ALTER TABLE … OWNER TO the defining role, or grant it membership in \
+                 \"{owner}\" WITH INHERIT TRUE)"
             ),
             NotAdoptable::NotEmpty => write!(
                 f,
@@ -412,6 +430,11 @@ impl fmt::Display for NotAdoptable {
             NotAdoptable::ForeignKey { name } => {
                 write!(f, "it has foreign key \"{name}\"")
             }
+            NotAdoptable::ReferencedByForeignKey { description } => write!(
+                f,
+                "{description} references it, and Trellis deletes and truncates its \
+                 target's rows"
+            ),
             NotAdoptable::UniqueIndex { name } => write!(
                 f,
                 "it has unique index \"{name}\" besides the key define creates"
@@ -484,6 +507,9 @@ pub fn check_shape(
         match dependent.kind.as_str() {
             kind if ACCEPTED_DEPENDENTS.contains(&kind) => {}
             "rule" => return Err(NotAdoptable::Rule { description }),
+            "referencing_constraint" => {
+                return Err(NotAdoptable::ReferencedByForeignKey { description });
+            }
             "sequence" => return Err(NotAdoptable::OwnedSequence { description }),
             _ => return Err(NotAdoptable::Unrecognized { description }),
         }
@@ -660,6 +686,12 @@ pub(crate) async fn describe(
                           join pg_catalog.pg_attribute a \
                             on a.attrelid = co.conrelid and a.attnum = k.attnum \
                           order by k.ord), \
+                    array(select a.attname::text \
+                          from unnest(i.indkey::int2[]) with ordinality k(attnum, ord) \
+                          join pg_catalog.pg_attribute a \
+                            on a.attrelid = co.conrelid and a.attnum = k.attnum \
+                          where k.ord > i.indnkeyatts \
+                          order by k.ord), \
                     co.condeferrable, coalesce(i.indnullsnotdistinct, false) \
              from pg_catalog.pg_constraint co \
              left join pg_catalog.pg_index i on i.indexrelid = co.conindid \
@@ -673,8 +705,9 @@ pub(crate) async fn describe(
             name: row.get(0),
             kind: first(row.get(1)),
             columns: row.get(2),
-            deferrable: row.get(3),
-            nulls_not_distinct: row.get(4),
+            included: row.get(3),
+            deferrable: row.get(4),
+            nulls_not_distinct: row.get(5),
         })
         .collect();
     let unique_indexes = client
@@ -711,6 +744,14 @@ pub(crate) async fn describe(
                         (select case dc.relkind when 'i' then 'index' when 't' then 'toast' \
                                 when 'S' then 'sequence' else 'relation' end \
                          from pg_catalog.pg_class dc where dc.oid = d.objid) \
+                      when d.classid = 'pg_catalog.pg_constraint'::regclass then \
+                        (select case when co.conrelid = $1 then 'pg_constraint' \
+                                else 'referencing_constraint' end \
+                         from pg_catalog.pg_constraint co where co.oid = d.objid) \
+                      when d.classid = 'pg_catalog.pg_trigger'::regclass then \
+                        (select case when tg.tgrelid = $1 then 'pg_trigger' \
+                                else 'referencing_trigger' end \
+                         from pg_catalog.pg_trigger tg where tg.oid = d.objid) \
                       else (select cc.relname::text from pg_catalog.pg_class cc \
                             where cc.oid = d.classid) \
                     end, \
@@ -749,21 +790,68 @@ const PRIVILEGES: &[&str] = &["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE"
 
 /// Adopts `schema.table` (`qualified` quoted, as `ddl` names it) inside the
 /// define's transaction `txn`: refuses it unless it is a plain table the
-/// defining role can write and owns (or is a member of the owner of), empty
-/// under a lock that keeps writers out until the define commits, and shaped
-/// exactly as `ddl` would create it ([`check_shape`]). Then creates what
-/// `ddl` creates beside it (a 1-1 target's ledger). The ledger's name
-/// being taken is refused by the caller, as for a plain define.
+/// defining role can write and owns (or holds its owner's privileges as a
+/// member), empty under a lock that keeps writers out until the define
+/// commits, and shaped exactly as `ddl` would create it ([`check_shape`]).
+/// Then creates what `ddl` creates beside it (a 1-1 target's ledger). The
+/// ledger's name being taken is refused by the caller, as for a plain
+/// define.
 pub(crate) async fn adopt_in_txn(
     txn: &tokio_postgres::Transaction<'_>,
     schema: &str,
     table: &str,
     ddl: &TargetTableDdl,
 ) -> Result<(), AdoptError> {
+    // Checked before the lock, which a role without these privileges can't
+    // take, so it refuses naming them rather than failing the lock.
+    check_access(txn, schema, table).await?;
+    // Keeps writers and DDL out until the define commits, so the table
+    // checked is the table adopted and stays empty.
+    txn.batch_execute(&format!(
+        "lock table {} in share row exclusive mode",
+        ddl.table
+    ))
+    .await?;
+    // Checked again under the lock: the name may have been dropped,
+    // renamed or handed to another owner before it was taken, and nothing
+    // can change it now.
+    let oid = check_access(txn, schema, table).await?;
+    let actual = describe(txn, oid).await?;
+    if txn
+        .query_one(&format!("select exists (select from {})", ddl.table), &[])
+        .await?
+        .get::<_, bool>(0)
+    {
+        return Err(NotAdoptable::NotEmpty.into());
+    }
+    txn.batch_execute(&format!("create temp table {PROBE} {}", ddl.body))
+        .await?;
+    let probe_oid: u32 = txn
+        .query_one(&format!("select '{PROBE}'::regclass::oid"), &[])
+        .await?
+        .get(0);
+    let expected = describe(txn, probe_oid).await?;
+    txn.batch_execute(&format!("drop table {PROBE}")).await?;
+    check_shape(&expected, &actual)?;
+    if let Some(ledger) = ddl.ledger_sql() {
+        txn.batch_execute(ledger).await?;
+    }
+    Ok(())
+}
+
+/// The oid of `schema.table` if it is a table the defining role may adopt:
+/// one it owns (or holds its owner's privileges on, as a member that
+/// inherits them, which `ALTER TABLE` and `DROP TABLE` need) and holds every
+/// one of [`PRIVILEGES`] on.
+async fn check_access(
+    txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+    table: &str,
+) -> Result<u32, AdoptError> {
     let found = txn
         .query_opt(
             "select c.oid, c.relkind::text, pg_catalog.pg_get_userbyid(c.relowner)::text, \
-                    pg_catalog.pg_has_role(current_user, c.relowner, 'MEMBER') \
+                    pg_catalog.pg_has_role(current_user, c.relowner, 'USAGE') \
              from pg_catalog.pg_class c \
              join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
              where n.nspname = $1 and c.relname = $2",
@@ -799,34 +887,7 @@ pub(crate) async fn adopt_in_txn(
             return Err(NotAdoptable::Privilege { privilege }.into());
         }
     }
-    // Keeps writers and DDL out until the define commits, so the table
-    // checked is the table adopted and stays empty.
-    txn.batch_execute(&format!(
-        "lock table {} in share row exclusive mode",
-        ddl.table
-    ))
-    .await?;
-    let actual = describe(txn, oid).await?;
-    if txn
-        .query_one(&format!("select exists (select from {})", ddl.table), &[])
-        .await?
-        .get::<_, bool>(0)
-    {
-        return Err(NotAdoptable::NotEmpty.into());
-    }
-    txn.batch_execute(&format!("create temp table {PROBE} {}", ddl.body))
-        .await?;
-    let probe_oid: u32 = txn
-        .query_one(&format!("select '{PROBE}'::regclass::oid"), &[])
-        .await?
-        .get(0);
-    let expected = describe(txn, probe_oid).await?;
-    txn.batch_execute(&format!("drop table {PROBE}")).await?;
-    check_shape(&expected, &actual)?;
-    if let Some(ledger) = ddl.ledger_sql() {
-        txn.batch_execute(ledger).await?;
-    }
-    Ok(())
+    Ok(oid)
 }
 
 /// [`adopt_in_txn`]'s failure: a refusal, or the database's.
@@ -872,6 +933,7 @@ mod tests {
             name: "t_pkey".to_string(),
             kind,
             columns: columns.iter().map(|c| c.to_string()).collect(),
+            included: Vec::new(),
             deferrable: false,
             nulls_not_distinct: kind == 'u',
         }
@@ -1022,6 +1084,18 @@ mod tests {
                 Box::new(|t| t.constraints = vec![key('p', &["id", "region"])]),
             ),
             ("key", Box::new(|t| t.constraints[0].deferrable = true)),
+            (
+                "key",
+                Box::new(|t| t.constraints[0].included = vec!["region".to_string()]),
+            ),
+            (
+                "foreign_key",
+                Box::new(|t| t.dependents.push(dependent("referencing_constraint"))),
+            ),
+            (
+                "unrecognized",
+                Box::new(|t| t.dependents.push(dependent("referencing_trigger"))),
+            ),
             (
                 "check_constraint",
                 Box::new(|t| t.constraints.push(other('c'))),

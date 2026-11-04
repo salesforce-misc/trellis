@@ -324,6 +324,17 @@ async fn every_class_of_property_define_would_not_create_refuses_with_its_code()
              primary key (id))",
         ),
         (
+            "key",
+            "create table public.t (id bigint, a numeric, r text, primary key (id) include (r))",
+        ),
+        (
+            "foreign_key",
+            &format!(
+                "{ONE_TO_ONE_TABLE}; \
+                 create table public.child (tid bigint references public.t)"
+            ),
+        ),
+        (
             "unique_index",
             &format!("{ONE_TO_ONE_TABLE}; create unique index on public.t (r)"),
         ),
@@ -360,7 +371,7 @@ async fn every_class_of_property_define_would_not_create_refuses_with_its_code()
                  drop view public.t; \
                end if; \
              end $$; \
-             drop table if exists public.t, public.p cascade; \
+             drop table if exists public.t, public.p, public.child cascade; \
              drop function if exists public.noop(); {create}"
         ))
         .await
@@ -385,6 +396,30 @@ async fn a_taken_ledger_name_refuses_the_adopting_define() {
     assert!(
         err.to_string()
             .contains("\"public.t__ledger\" already exists"),
+        "{err}"
+    );
+}
+
+/// Another definition's target is Trellis's already: adopting it refuses as
+/// a taken name, even while it is empty.
+#[tokio::test]
+async fn another_definitions_target_refuses_the_adopting_define() {
+    let cluster = TestCluster::start();
+    let (_db, raw, trellis) = set_up(&cluster).await;
+    raw.batch_execute("truncate public.s")
+        .await
+        .expect("an empty source");
+    trellis
+        .apply("TRANSFORM g FROM s GROUP BY r SELECT r AS r, COUNT(*) AS n")
+        .await
+        .expect("the first definition");
+    let err = trellis
+        .apply("TRANSFORM g ADOPT EXISTING TABLE FROM s GROUP BY r SELECT r AS r, COUNT(*) AS n")
+        .await
+        .expect_err("refused");
+    assert_eq!(err.code(), ErrorCode::Conflict, "{err}");
+    assert!(
+        err.to_string().contains("\"public.g\" already exists"),
         "{err}"
     );
 }
@@ -499,6 +534,31 @@ async fn a_missing_privilege_or_ownership_refuses_naming_it() {
         assert!(message.contains(&format!("({code})")), "{message}");
         assert!(message.contains(named), "{message}");
         assert_eq!(err.code(), ErrorCode::Validation, "{message}");
+    }
+
+    // A member that doesn't inherit the owner's privileges (PostgreSQL 16's
+    // `WITH INHERIT FALSE`) can't alter or drop the table without SET ROLE,
+    // which Trellis doesn't do.
+    let version: i32 = admin
+        .query_one("select current_setting('server_version_num')::int", &[])
+        .await
+        .expect("server version")
+        .get(0);
+    if version >= 160_000 {
+        admin
+            .batch_execute(&format!(
+                "create role no_inherit_owner nologin; \
+                 grant no_inherit_owner to trellis with inherit false; \
+                 drop table {TARGETS}.t; {table}; \
+                 alter table {TARGETS}.t owner to no_inherit_owner; \
+                 grant all on {TARGETS}.t to trellis"
+            ))
+            .await
+            .expect("the table");
+        let err = trellis.apply(ONE_TO_ONE).await.expect_err("refused");
+        let message = err.to_string();
+        assert!(message.contains("(not_owner)"), "{message}");
+        assert!(message.contains("no_inherit_owner"), "{message}");
     }
 
     // Owned by a role the defining role is a member of, with every

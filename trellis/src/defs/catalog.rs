@@ -3608,6 +3608,18 @@ async fn create_target_in_txn(
         return Err(already_exists(&taken));
     }
     if adopt {
+        // Another definition's target is Trellis's already: two definitions
+        // can't share one (its ledger, for a 1-1 target, is refused above).
+        let defined: bool = txn
+            .query_one(
+                "select exists (select from transform_definitions where target_table = $1)",
+                &[&qualified_target],
+            )
+            .await?
+            .get(0);
+        if defined {
+            return Err(already_exists(table));
+        }
         return match super::adopt::adopt_in_txn(txn, schema, table, ddl).await {
             Ok(()) => Ok(()),
             Err(super::adopt::AdoptError::Refused(refusal)) => {

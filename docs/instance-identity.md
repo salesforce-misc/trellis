@@ -184,7 +184,8 @@ One thing remains the operator's responsibility, not the engine's:
 * **Target names that don't clash.** Target tables are application data,
   deliberately outside the instance schema (see `DEFAULT_TARGET_SCHEMA`), and
   two instances may share a target schema (`public` by default). A define
-  never takes over a relation it didn't create, so a target whose name, or
+  without `ADOPT EXISTING TABLE` never takes over a relation it didn't create,
+  so a target whose name, or
   whose `<target>__ledger`, is already taken in the
   target schema, by the other instance's target or anything else, is refused
   ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
