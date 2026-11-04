@@ -728,7 +728,7 @@ impl<T> Progress<T> {
 /// what it did. `deadline` bounds the retries of a locked table, as
 /// [`DdlRetry::new`]'s does: past it, the result is [`Progress::Waiting`]
 /// and nothing has changed.
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(any(test, feature = "internals"))]
 pub async fn reconcile(
     client: &mut Client,
     schema: &str,
