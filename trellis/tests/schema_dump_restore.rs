@@ -353,6 +353,30 @@ async fn a_restored_dump_builds_its_definitions() {
     }
 }
 
+/// Every line of `appendix` starts the way `Trellis.StructureDump`'s
+/// `@appendix_starts` says an appendix line does, so `append/2` over a file
+/// that ends in this appendix replaces it.
+fn every_line_is_one_the_elixir_client_strips(appendix: &str) {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../clients/elixir/lib/trellis/structure_dump.ex"
+    );
+    let source = std::fs::read_to_string(path).expect("read structure_dump.ex");
+    let list = source
+        .split_once("@appendix_starts [")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .expect("@appendix_starts list")
+        .0;
+    let starts: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
+    assert!(appendix.starts_with("-- Trellis definitions ("));
+    for line in appendix.lines() {
+        assert!(
+            line.is_empty() || starts.iter().any(|start| line.starts_with(start)),
+            "the Elixir client wouldn't strip this appendix line: {line}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn the_appendix_is_the_same_for_the_same_definitions() {
     let cluster = TestCluster::start();
@@ -380,6 +404,7 @@ async fn the_appendix_is_the_same_for_the_same_definitions() {
     assert_eq!(a, t_first.schema_dump().await.expect("dump again"));
     assert_eq!(a.appendix, b.appendix);
     assert_eq!(a.pg_dump_args, b.pg_dump_args);
+    every_line_is_one_the_elixir_client_strips(&a.appendix);
     assert_eq!(
         a.pg_dump_args,
         vec![

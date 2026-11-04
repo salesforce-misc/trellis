@@ -117,9 +117,9 @@ The surface mirrors the Rust crate's `BlockingTrellis`. Every function has a ban
 - `start_link/1`, as `{Trellis, options}` in a supervision tree: a process
   that owns the handle, so every function above also takes its name.
 - `Trellis.Migration`: `define`, `apply` and `status` in an Ecto migration.
-- `dump_definitions_sql/1`, `mix trellis.dump` and `Trellis.StructureDump`:
-  the definitions as SQL appended to the structure file (see
-  [Schema dumps](#schema-dumps)).
+- `schema_dump/1`, `filter_schema_dump/2`, `mix trellis.dump`,
+  `mix trellis.load` and `Trellis.StructureDump`: the definitions in the
+  structure file, restored when it loads (see [Schema dumps](#schema-dumps)).
 - `Trellis.Metrics.render_prometheus/0`: the process-wide metrics registry
   as Prometheus text, for a `/metrics` route the host already serves (the
   binding opens no port). It needs no handle. Every series carries the
@@ -326,42 +326,53 @@ fixtures that targets must reflect outside the sandbox transaction (in
 
 ## Schema dumps
 
-`mix ecto.dump` writes a schema-only `pg_dump`, which carries the Trellis
-schema, the target tables and the capture triggers but no rows, so a
-database `mix ecto.load` builds from it has targets and no transforms.
-`mix trellis.dump` runs `mix ecto.dump` and appends the definitions the way
-Ecto appends `schema_migrations`. Make it what `mix ecto.dump` runs, by an
-alias in `mix.exs`:
+`mix trellis.dump` writes the structure file `mix ecto.dump` writes, with
+the definitions in it the way Ecto puts `schema_migrations` in it, and
+`mix trellis.load` loads it. Make them what `mix ecto.dump` and
+`mix ecto.load` run, by aliases in `mix.exs`:
 
 ```elixir
 defp aliases do
-  ["ecto.dump": "trellis.dump"]
+  ["ecto.dump": "trellis.dump", "ecto.load": "trellis.load"]
 end
 ```
 
-The task passes its arguments (`-r`, `-d`, `--prefix`, `-q`) to `ecto.dump`
-unchanged. It reads the definitions before and after the `pg_dump` and redoes
-the dump, up to three times, when a define or drop committed in between, so
-the file's DDL and definitions agree.
+The file has the application's tables, the target tables (with their
+indexes and grants), the `schema_migrations` rows, and one row per
+definition: its source, target and `JOIN` table, its text as written, its
+grammar version and its floor. Trellis's own schema, the capture triggers on
+source tables and the 1-1 targets' ledgers are not in it, so regenerating
+the file changes it only where a definition changed. `mix trellis.load` runs
+`mix ecto.load` and then `Trellis.migrate/1` for each repo with a `:trellis`
+configuration, which creates Trellis's tables and restores each definition
+into its dumped target. Each is restored unbuilt, and the worker builds it
+from the source rows; a paused or quarantined transform is restored
+unpaused, because a pause is runtime state. A file loaded another way
+(`psql -f`) needs `Trellis.migrate/1` after it. How the restore works, and
+what it refuses, is in
+[`docs/embedding.md`](../../docs/embedding.md#schema-dumps).
 
-The repo needs its `:trellis` configuration (as for `Trellis.Migration`);
-the definitions are appended for each repo that has one. If the dump names
-its schemas (`--prefix`, or the repo's `:dump_prefixes`), the list has to
-include the Trellis schema, and the task refuses one that doesn't.
-`mix ecto.load` then runs the file and nothing else: the worker that starts
-on the loaded database finds definitions that aren't built and builds them.
-Only definitions are dumped; the ledger, backfill progress, quarantine and
-claims are runtime state, and a paused or quarantined transform loads
-`:waiting_to_backfill`.
+`mix ecto.dump` can't pass `pg_dump` extra arguments, so for a repo with a
+`:trellis` configuration (as for `Trellis.Migration`) `mix trellis.dump`
+runs `pg_dump` itself, with `ecto.dump`'s arguments (`-r`, `-d`, `--prefix`,
+`-q`) and `Trellis.schema_dump/1`'s, which leave Trellis's schema and the
+ledgers out. With `--prefix`, the instance's target schema is dumped too. It
+takes the capture triggers out of the output (`Trellis.filter_schema_dump/2`),
+and reads the definitions before and after the `pg_dump`, redoing the dump,
+up to three times, when a define or drop committed in between, so the
+file's DDL and definitions agree. A repo with no `:trellis` configuration
+is dumped by `mix ecto.dump`.
 
 `pg_dump` 17 writes `CREATE SCHEMA public;` when it dumps `public` by name,
 which stops `mix ecto.load` into a database `mix ecto.create` made; the task
 writes `CREATE SCHEMA IF NOT EXISTS public;` instead.
 
-`Trellis.StructureDump.append/2` appends to a structure file someone else
-dumped (reading the definitions once, so it can't see a define racing that
-dump), and `Trellis.dump_definitions_sql/1` returns the SQL for a caller that
-assembles its own dump.
+A structure file written by an earlier release, which carries the Trellis
+schema and the definitions' catalog rows, still loads.
+`Trellis.StructureDump.append/2` writes that format onto a structure file
+someone else dumped with the Trellis schema in it (reading the definitions
+once, so it can't see a define racing that dump), and
+`Trellis.dump_definitions_sql/1` returns its SQL.
 
 ## Layout
 

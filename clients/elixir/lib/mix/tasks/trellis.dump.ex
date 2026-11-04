@@ -2,12 +2,13 @@ if Code.ensure_loaded?(Mix.Tasks.Ecto.Dump) do
   defmodule Mix.Tasks.Trellis.Dump do
     use Mix.Task
 
-    @shortdoc "Runs ecto.dump and appends Trellis's definitions to the structure file"
+    @shortdoc "Dumps the structure as ecto.dump does, with Trellis's definitions"
 
     @moduledoc """
-    Runs `mix ecto.dump` and appends the repo's Trellis definitions to the
-    structure file it wrote, so `mix ecto.load` builds a database that has
-    its transforms (see `Trellis.StructureDump`).
+    Writes the structure file `mix ecto.dump` writes, with the repo's
+    Trellis definitions in it and Trellis's internal tables left out, so
+    `mix trellis.load` builds a database that has its transforms (see
+    `Trellis.StructureDump`).
 
         mix trellis.dump [-r Repo] [-d path] [--prefix schema]
 
@@ -20,13 +21,16 @@ if Code.ensure_loaded?(Mix.Tasks.Ecto.Dump) do
           ["ecto.dump": "trellis.dump"]
         end
 
-    The definitions are read before and after the `pg_dump`, and the dump is
-    redone (up to three times) when a define or drop committed in between.
+    For a repo with a `:trellis` configuration (as `Trellis.Migration` reads
+    it), it runs `pg_dump` itself, as `mix ecto.dump` does but with the
+    arguments that leave Trellis's own schema and the ledgers out
+    (`Trellis.schema_dump/1`); takes the capture triggers out of its output;
+    and appends the definitions. They are read before and after the
+    `pg_dump`, and the dump is redone (up to three times) when a define or
+    drop committed in between.
 
-    Every repo is dumped; the definitions are appended for each one with a
-    `:trellis` configuration (as `Trellis.Migration` reads it). A repo with
-    none is dumped as `ecto.dump` dumps it, and the task refuses to run when
-    no repo has one.
+    A repo with none is dumped by `mix ecto.dump` itself, and the task
+    refuses to run when no repo has one.
     """
 
     @aliases [d: :dump_path, q: :quiet, r: :repo]
@@ -46,39 +50,58 @@ if Code.ensure_loaded?(Mix.Tasks.Ecto.Dump) do
 
       repos = Mix.Ecto.parse_repo(args)
       Enum.each(repos, &Mix.Ecto.ensure_repo(&1, args))
+      {trellis_repos, other_repos} = Enum.split_with(repos, &is_list(&1.config()[:trellis]))
 
-      options =
-        case Keyword.get_values(opts, :prefix) do
-          [] -> []
-          prefixes -> [dump_prefixes: prefixes]
-        end
-        |> Keyword.merge(Keyword.take(opts, [:dump_path]))
-
-      dumped =
-        for repo <- repos, is_list(repo.config()[:trellis]) do
-          default = Path.join(Mix.EctoSQL.source_repo_priv(repo), "structure.sql")
-          {repo, Keyword.put(options, :default_path, default)}
-        end
-
-      if dumped == [] do
+      if trellis_repos == [] do
         Mix.raise(
           "none of #{inspect(repos)} has a Trellis to dump: configure one under the repo's " <>
             ":trellis key, with Trellis.connect/1's options, or run `mix ecto.dump`"
         )
       end
 
-      # The task module itself, not `Mix.Task.run("ecto.dump")`: the alias
-      # names `ecto.dump`, and Mix runs a task once per invocation, where a
-      # redone dump runs it again.
-      case Trellis.StructureDump.dump(dumped, fn -> Mix.Tasks.Ecto.Dump.run(args) end) do
+      # `mix ecto.dump` without `--prefix` dumps every schema, whatever the
+      # repo's :dump_prefixes says.
+      options =
+        case Keyword.get_values(opts, :prefix) do
+          [] -> [dump_prefixes: nil]
+          prefixes -> [dump_prefixes: prefixes]
+        end
+        |> Keyword.merge(Keyword.take(opts, [:dump_path]))
+
+      dumped =
+        for repo <- trellis_repos do
+          default = Path.join(Mix.EctoSQL.source_repo_priv(repo), "structure.sql")
+          {repo, Keyword.put(options, :default_path, default)}
+        end
+
+      case Trellis.StructureDump.dump(dumped) do
         {:ok, paths} ->
           unless opts[:quiet] do
-            Enum.each(paths, &Mix.shell().info("Trellis definitions appended to #{&1}"))
+            Enum.each(
+              paths,
+              &Mix.shell().info(
+                "The structure with Trellis's definitions has been dumped to #{&1}"
+              )
+            )
           end
 
         {:error, message} ->
           Mix.raise(message)
       end
+
+      # The task module itself, not `Mix.Task.run("ecto.dump")`: the alias
+      # names `ecto.dump`, and would run this task again.
+      for repo <- other_repos do
+        Mix.Tasks.Ecto.Dump.run(without_repos(args) ++ ["-r", inspect(repo)])
+      end
     end
+
+    # `args` without its `-r`/`--repo` options.
+    defp without_repos([flag, _repo | rest]) when flag in ["-r", "--repo"],
+      do: without_repos(rest)
+
+    defp without_repos(["--repo=" <> _ | rest]), do: without_repos(rest)
+    defp without_repos([arg | rest]), do: [arg | without_repos(rest)]
+    defp without_repos([]), do: []
   end
 end

@@ -892,6 +892,27 @@ fn dump_definitions_sql<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifRep
     )
 }
 
+/// What a schema dump of the database needs from this instance
+/// (`schema_dump`): `{pg_dump_args, appendix}`, the arguments that leave
+/// Trellis's own tables out of `pg_dump` and the SQL to append after its
+/// filtered output.
+#[rustler::nif]
+fn schema_dump<'a>(env: Env<'a>, handle: ResourceArc<Handle>) -> NifReply<Term<'a>> {
+    handle.submit(env, BlockingTrellis::start_schema_dump, |_, dump| {
+        Ok((dump.pg_dump_args, dump.appendix))
+    })
+}
+
+/// `pg_dump_output` without this instance's capture triggers
+/// (`filter_schema_dump`). Reads nothing from the database; a dirty CPU
+/// NIF, since a dump runs to megabytes.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn filter_schema_dump(handle: ResourceArc<Handle>, pg_dump_output: String) -> NifReply<String> {
+    handle
+        .with(|trellis| trellis.filter_schema_dump(&pg_dump_output))?
+        .map_err(plain)
+}
+
 /// Rebuilds every applying definition that reads `source_table`
 /// (`live -> backfilling`).
 #[rustler::nif]

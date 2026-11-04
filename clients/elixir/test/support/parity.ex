@@ -86,15 +86,17 @@ defmodule Trellis.Parity do
   these, and the fixture's operations run through a supervised handle there
   too.
 
-  `dump_definitions_sql` is here until the Ruby binding has its counterpart:
-  then it becomes a fixture operation and leaves this list.
-  `structure_dump_test.exs` covers it meanwhile.
+  The schema-dump calls return SQL text and `pg_dump` arguments, not
+  flattened records, so the shared fixture has nothing to shape;
+  `structure_dump_test.exs` covers them.
   """
   def not_operations do
     %{
       "child_spec" => "`{Trellis, options}` in a supervision tree",
       "start_link" => "`{Trellis, options}` in a supervision tree",
-      "dump_definitions_sql" => "Ruby's counterpart is its schema dump"
+      "dump_definitions_sql" => "SQL text for the older schema-dump format",
+      "schema_dump" => "pg_dump arguments and SQL text for `mix trellis.dump`",
+      "filter_schema_dump" => "rewrites pg_dump output for `mix trellis.dump`"
     }
   end
 

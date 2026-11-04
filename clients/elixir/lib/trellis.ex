@@ -13,8 +13,9 @@ defmodule Trellis do
     `DROP TRANSFORM`, `ALTER TRANSFORM`) and reports what it did as a `t:Trellis.Applied.t/0`.
     `define/2` is the one guarded convenience: an `apply/2` that refuses
     anything but a `TRANSFORM` statement before applying it.
-  - **Reads:** `status/2`, `definitions/1`, and
-    `dump_definitions_sql/1`, the definitions as SQL to append to a schema dump.
+  - **Reads:** `status/2`, `definitions/1`, and for schema dumps
+    `schema_dump/1` and `filter_schema_dump/2` (and
+    `dump_definitions_sql/1`, the older format).
   - **Quarantine:** `quarantined/1`, `quarantine_status/2`,
     `sample_quarantined/3`, `poisoned_since/2`. Pausing and resuming are
     statements: `apply(trellis, "RESUME TRANSFORM order_totals.total")`.
@@ -405,9 +406,59 @@ defmodule Trellis do
   def definitions!(trellis), do: bang(definitions(trellis))
 
   @doc """
+  What a schema dump of this instance's database needs, as a map:
+  `:pg_dump_args`, the arguments (each one argument, not shell words) that
+  leave Trellis's own schema and the 1-1 targets' ledgers out of `pg_dump`,
+  and `:appendix`, the SQL to append after the dump. `mix trellis.dump` runs
+  `pg_dump --schema-only` with the arguments (and the target schema among its
+  `-n` schemas, when it names any), passes the output through
+  `filter_schema_dump/2` and appends the appendix.
+
+  The appendix creates a restore queue in the Trellis schema with one row
+  per definition: its source, target and `JOIN` table, its text as written,
+  its grammar version and its floor. `migrate/1` on a database loaded from
+  the file creates Trellis's tables and restores each definition into its
+  dumped target, unbuilt; the worker builds them. Both values are the same
+  for the same definitions, whatever their history.
+  """
+  @spec schema_dump(trellis()) ::
+          {:ok, %{pg_dump_args: [String.t()], appendix: String.t()}} | {:error, Error.t()}
+  def schema_dump(trellis) when is_trellis(trellis) do
+    with {:ok, {pg_dump_args, appendix}} <- native(run(trellis, :schema_dump, [])) do
+      {:ok, %{pg_dump_args: pg_dump_args, appendix: appendix}}
+    end
+  end
+
+  @doc "Like `schema_dump/1`, but raises `Trellis.Error`."
+  @spec schema_dump!(trellis()) :: %{pg_dump_args: [String.t()], appendix: String.t()}
+  def schema_dump!(trellis), do: bang(schema_dump(trellis))
+
+  @doc """
+  `pg_dump_output`, the output of a `pg_dump` run with `schema_dump/1`'s
+  arguments, without this instance's capture triggers on its source tables,
+  which `pg_dump` can't leave out by itself. Reads nothing from the database.
+  An `:internal` error when a line still runs one of Trellis's functions
+  afterwards: the dump wouldn't load.
+  """
+  @spec filter_schema_dump(trellis(), String.t()) :: {:ok, String.t()} | {:error, Error.t()}
+  def filter_schema_dump(trellis, pg_dump_output)
+      when is_trellis(trellis) and is_binary(pg_dump_output) do
+    native(
+      with {:ok, ref} <- handle_ref(trellis),
+           do: Native.filter_schema_dump(ref, pg_dump_output)
+    )
+  end
+
+  @doc "Like `filter_schema_dump/2`, but raises `Trellis.Error`."
+  @spec filter_schema_dump!(trellis(), String.t()) :: String.t()
+  def filter_schema_dump!(trellis, pg_dump_output),
+    do: bang(filter_schema_dump(trellis, pg_dump_output))
+
+  @doc """
   The SQL that loads this instance's definitions into a database built from
-  a schema-only dump (`pg_dump --schema-only`, `mix ecto.dump`). Append it
-  to the dump; `mix trellis.dump` does.
+  a schema-only dump that carries the Trellis schema: the format schema
+  dumps had before `schema_dump/1`, which still loads. `StructureDump.append/2`
+  appends it.
 
   It holds `INSERT`s for the rows that say what is defined (Trellis's
   migration history, its instance marker, the transform definitions and the catalog rows they need), and nothing else: the ledger,

@@ -1,37 +1,47 @@
 defmodule Trellis.StructureDump do
   @moduledoc """
-  Appends Trellis's definitions to the structure file `mix ecto.dump` writes,
-  so `mix ecto.load` builds a database that has its transforms.
+  Writes the structure file `mix trellis.dump` writes in place of
+  `mix ecto.dump`'s, so `mix trellis.load` (`mix ecto.load`, then
+  `Trellis.migrate/1`) builds a database that has its transforms.
 
-  `pg_dump --schema-only` carries the Trellis schema, the target tables and
-  the capture triggers, but no rows, so a database loaded from it has targets
-  and no definitions. Ecto appends `INSERT`s for `schema_migrations` to the
-  dump for the same reason; this appends `Trellis.dump_definitions_sql/1`
-  after them. `mix trellis.dump` runs `dump/2` around `mix ecto.dump`, and
-  the app's alias runs it in place of `ecto.dump`.
+  The file is `mix ecto.dump`'s: `pg_dump --schema-only` of the repo's
+  database, then the `INSERT`s for `schema_migrations`. The `pg_dump` runs
+  with `Trellis.schema_dump/1`'s arguments, which leave out Trellis's own
+  schema and the 1-1 targets' ledgers; the capture triggers on source tables
+  are taken out of its output (`Trellis.filter_schema_dump/2`); and the
+  schema dump's appendix follows, one row per definition in a restore queue.
+  `Trellis.migrate/1` on a database loaded from the file creates Trellis's
+  tables and restores each definition into its dumped target. Regenerating
+  the file changes it only where a definition changed.
+
+  `mix ecto.dump` can't pass `pg_dump` extra arguments, so `dump/2` runs
+  `pg_dump` itself, through the adapter's `Ecto.Adapters.Postgres.dump_cmd/3`,
+  with the arguments `mix ecto.dump` gives it.
 
   ## What the structure file needs
 
-  - The Trellis schema in the dump. `mix ecto.dump` dumps every schema unless
-    it is given `--prefix` (the repo's `:dump_prefixes` is read by the
-    adapter, and as of ecto_sql 3.14 `mix ecto.dump` without `--prefix`
-    leaves it out). When either names schemas, the list has to include the
-    instance's `:schema` (default `"trellis"`), and this refuses to run
-    without it.
   - The repo's `:trellis` configuration, `Trellis.connect/1`'s options, as
     `Trellis.Migration` reads it. The handle starts no background work.
+  - The target schema in the dump. When `--prefix` (`:dump_prefixes`)
+    names schemas, the instance's `:target_schema` (default `"public"`) is
+    dumped as well.
 
   ## Loading
 
-  The file loads with `mix ecto.load` or plain `psql`, and nothing else runs:
-  the worker that starts on the loaded database finds definitions that aren't
-  built and builds them. Every definition loads `:waiting_to_backfill`,
+  `mix trellis.load` runs `mix ecto.load` and then `Trellis.migrate/1` for
+  each repo with a `:trellis` configuration; the app's alias runs it in
+  place of `ecto.load`. A file loaded another way (`psql -f`) needs
+  `Trellis.migrate/1` after it. Every definition is restored unbuilt,
   including one that was paused or quarantined where it was dumped, because
-  a pause is runtime state.
+  a pause is runtime state, and the worker builds it.
+
+  A structure file in the older format, which carries the Trellis schema and
+  `Trellis.dump_definitions_sql/1`'s rows, still loads: `append/2` writes
+  that format, for a dump someone else ran.
 
   ## Races
 
-  `pg_dump` and `dump_definitions_sql/1` read separate snapshots. `dump/2`
+  `pg_dump` and `Trellis.schema_dump/1` read separate snapshots. `dump/2`
   reads the definitions before and after the `pg_dump` and redoes the dump
   when they differ, up to three times, so a `define` or `DROP` committing
   in between can't leave a file whose DDL and definitions disagree.
@@ -51,11 +61,14 @@ defmodule Trellis.StructureDump do
   # the first's appendix rather than loading the definitions twice.
   @marker "-- Trellis definitions ("
 
-  # How each line of the engine's appendix starts (`trellis::dump`; each
-  # statement is one line). The engine's `dump_definitions_sql` test reads
-  # this list and checks every line of a dump against it.
+  # How each line of the engine's appendixes starts (`trellis::dump`, both
+  # formats; each statement is one line). The engine's `dump_definitions_sql`
+  # and `schema_dump_restore` tests read this list and check every line of an
+  # appendix against it.
   @appendix_starts [
     "--",
+    "create schema if not exists ",
+    "create table ",
     "insert into ",
     "select setval(",
     "update ",
@@ -68,27 +81,108 @@ defmodule Trellis.StructureDump do
   @attempts 3
 
   @doc """
-  Runs `dump`, a function that writes the structure files (`mix trellis.dump`
-  passes `mix ecto.dump` itself), between two reads of each repo's
-  definitions, and appends them to each repo's file once the two agree.
+  Writes each repo's structure file: `pg_dump` with the repo's Trellis's
+  `schema_dump/1` arguments between two reads of its definitions, then,
+  once the two agree, the capture triggers taken out and the appendix
+  appended.
 
-  `repos` is a list of `{repo, options}`, with `append/2`'s options.
+  `repos` is a list of `{repo, options}`, with `append/2`'s options
+  (`:dump_prefixes` is `mix ecto.dump`'s `--prefix`, and nil dumps every
+  schema, as `mix ecto.dump` does). `pg_dump` writes the dump before the
+  appendix: given a map with the repo's `:repo`, `:config` (its
+  configuration with the options applied) and `:path`, and the extra
+  `pg_dump` arguments, it returns `:ok` or `{:error, message}`. The default,
+  `pg_dump/2`, is what `mix ecto.dump` runs, plus the extra arguments.
 
   Returns `{:ok, paths}`, or `{:error, message}`: a repo that can't be
   dumped, or definitions that changed during each of three dumps.
   """
-  @spec dump([{module(), keyword()}], (-> term())) :: {:ok, [Path.t()]} | {:error, String.t()}
-  def dump(repos, dump) when is_list(repos) and is_function(dump, 0) do
-    with {:ok, plans} <- plans(repos) do
-      with_handles(plans, fn handles -> attempt(plans, handles, dump, @attempts) end)
+  @spec dump([{module(), keyword()}], (map(), [String.t()] -> :ok | {:error, String.t()})) ::
+          {:ok, [Path.t()]} | {:error, String.t()}
+  def dump(repos, pg_dump \\ &pg_dump/2) when is_list(repos) and is_function(pg_dump, 2) do
+    with {:ok, plans} <- plans(repos, false) do
+      Enum.reduce_while(plans, {:ok, []}, fn plan, {:ok, paths} ->
+        case with_handles([plan], fn [handle] -> attempt(plan, handle, pg_dump, @attempts) end) do
+          :ok -> {:cont, {:ok, paths ++ [plan.path]}}
+          error -> {:halt, error}
+        end
+      end)
     end
   end
 
   @doc """
-  Appends the definitions of `repo`'s Trellis to the structure file, which
-  must exist: run it after `mix ecto.dump`. It reads the definitions once,
-  so it can't tell a define that committed after the `pg_dump` (`dump/2`
-  can).
+  What `mix ecto.dump` runs for a repo, with `extra_args` added: `pg_dump
+  --schema-only --no-acl --no-owner` into `plan.path`, with `-n` for each of
+  `plan.config`'s `:dump_prefixes` (when there are any), then an `INSERT`
+  for each migration version in each prefix's (or `public`'s)
+  `schema_migrations`.
+  """
+  @spec pg_dump(map(), [String.t()]) :: :ok | {:error, String.t()}
+  def pg_dump(%{repo: repo, config: config, path: path}, extra_args) do
+    prefixes = config[:dump_prefixes] || []
+    args = ["--file", path, "--schema-only", "--no-acl", "--no-owner"]
+    args = Enum.reduce(prefixes, args, fn prefix, acc -> ["-n", prefix | acc] end) ++ extra_args
+    File.mkdir_p!(Path.dirname(path))
+
+    with {:ok, versions} <- migration_versions(repo, config) do
+      case Ecto.Adapters.Postgres.dump_cmd(args, [], config) do
+        {_output, 0} ->
+          File.write!(path, versions, [:append])
+          :ok
+
+        {output, _} ->
+          {:error, "The structure for #{inspect(repo)} couldn't be dumped: #{output}"}
+      end
+    end
+  end
+
+  # The `schema_migrations` rows as `mix ecto.dump` appends them: each
+  # prefix's (`public` without one) versions, in order, the last prefix's
+  # first.
+  defp migration_versions(repo, config) do
+    table = config[:migration_source] || "schema_migrations"
+    prefixes = config[:dump_prefixes] || ["public"]
+
+    read = fn repo ->
+      Enum.reduce_while(prefixes, {:ok, []}, fn prefix, {:ok, versions} ->
+        sql = ~s[SELECT version FROM #{prefix}."#{table}" ORDER BY version]
+
+        case Ecto.Adapters.SQL.query(repo, sql, []) do
+          {:ok, %{rows: rows}} ->
+            {:cont, {:ok, Enum.map(rows, &{prefix, hd(&1)}) ++ versions}}
+
+          {:error, %{postgres: %{code: :undefined_table}}} ->
+            {:cont, {:ok, versions}}
+
+          {:error, error} ->
+            {:halt, {:error, Exception.message(error)}}
+        end
+      end)
+    end
+
+    case Ecto.Migrator.with_repo(repo, read) do
+      {:ok, {:ok, versions}, _} ->
+        {:ok,
+         Enum.map_join(versions, fn {prefix, version} ->
+           ~s[INSERT INTO #{prefix}."#{table}" (version) VALUES (#{version});\n]
+         end)}
+
+      {:ok, {:error, message}, _} ->
+        {:error, "could not read #{inspect(repo)}'s migration versions: #{message}"}
+
+      {:error, reason} ->
+        {:error, "could not start #{inspect(repo)}: #{inspect(reason)}"}
+    end
+  end
+
+  @doc """
+  Appends the definitions of `repo`'s Trellis to a structure file in the
+  older format, which must exist and carry the Trellis schema: a dump
+  someone else ran (`mix ecto.dump` with the Trellis schema in it). It
+  appends `Trellis.dump_definitions_sql/1`, replacing an earlier appendix,
+  and the file loads with no Trellis step. `dump/2` writes the current
+  format. It reads the definitions once, so it can't tell a define that
+  committed after the `pg_dump` (`dump/2` can).
 
   Options:
 
@@ -103,7 +197,7 @@ defmodule Trellis.StructureDump do
   """
   @spec append(module(), keyword()) :: {:ok, Path.t()} | {:error, String.t()}
   def append(repo, options \\ []) when is_atom(repo) and is_list(options) do
-    with {:ok, [plan]} <- plans([{repo, options}]),
+    with {:ok, [plan]} <- plans([{repo, options}], true),
          :ok <- readable(plan.path) do
       with_handles([plan], fn [handle] ->
         with {:ok, sql} <- read(handle),
@@ -133,22 +227,38 @@ defmodule Trellis.StructureDump do
     {:error, "could not read the structure file #{path}: #{:file.format_error(reason)}"}
   end
 
-  defp plans(repos) do
+  # `old_format?`: the plan of `append/2`, whose dump has to carry the
+  # Trellis schema.
+  defp plans(repos, old_format?) do
     Enum.reduce_while(repos, {:ok, []}, fn {repo, options}, {:ok, plans} ->
-      case plan(repo, options) do
+      case plan(repo, options, old_format?) do
         {:ok, plan} -> {:cont, {:ok, plans ++ [plan]}}
         error -> {:halt, error}
       end
     end)
   end
 
-  defp plan(repo, options) do
+  defp plan(repo, options, old_format?) do
     config = Keyword.merge(repo.config(), Keyword.take(options, [:dump_prefixes]))
 
     with {:ok, trellis_options} <- trellis_options(repo, config),
          {:ok, path} <- path(repo, config, options),
-         :ok <- check_prefixes(config, trellis_options) do
-      {:ok, %{path: path, trellis_options: trellis_options}}
+         :ok <- if(old_format?, do: check_prefixes(config, trellis_options), else: :ok) do
+      config = Keyword.put(config, :dump_path, path) |> with_target_schema(trellis_options)
+      {:ok, %{repo: repo, config: config, path: path, trellis_options: trellis_options}}
+    end
+  end
+
+  # The target tables are in the dump: the instance's target schema joins
+  # any `:dump_prefixes`.
+  defp with_target_schema(config, trellis_options) do
+    case config[:dump_prefixes] do
+      prefixes when prefixes in [nil, []] ->
+        config
+
+      prefixes ->
+        target = Keyword.get(trellis_options, :target_schema, "public")
+        Keyword.put(config, :dump_prefixes, Enum.uniq(prefixes ++ [target]))
     end
   end
 
@@ -212,33 +322,59 @@ defmodule Trellis.StructureDump do
     end
   end
 
-  defp attempt(_plans, _handles, _dump, 0) do
+  defp attempt(_plan, _handle, _pg_dump, 0) do
     {:error,
      "Trellis's definitions changed during each of #{@attempts} dumps: dump when no " <>
        "migration is defining or dropping"}
   end
 
-  defp attempt(plans, handles, dump, left) do
-    with {:ok, before} <- read_all(handles) do
-      dump.()
-
-      with {:ok, now} <- read_all(handles) do
-        if now == before do
-          write_all(plans, now)
-        else
-          attempt(plans, handles, dump, left - 1)
-        end
+  defp attempt(plan, handle, pg_dump, left) do
+    with {:ok, before} <- read_schema_dump(handle),
+         :ok <- pg_dump.(Map.take(plan, [:repo, :config, :path]), before.pg_dump_args),
+         {:ok, now} <- read_schema_dump(handle) do
+      if now == before do
+        finish(plan.path, handle, before.appendix)
+      else
+        attempt(plan, handle, pg_dump, left - 1)
       end
     end
   end
 
-  defp read_all(handles) do
-    Enum.reduce_while(handles, {:ok, []}, fn handle, {:ok, sqls} ->
-      case read(handle) do
-        {:ok, sql} -> {:cont, {:ok, sqls ++ [sql]}}
-        error -> {:halt, error}
-      end
-    end)
+  defp read_schema_dump(handle) do
+    case Trellis.schema_dump(handle) do
+      {:ok, parts} -> {:ok, parts}
+      {:error, error} -> {:error, "Trellis could not dump its definitions: #{error.message}"}
+    end
+  end
+
+  # The dump at `path` without the capture triggers, loadable into a database
+  # that has `public`, then the appendix; written to a copy renamed over it.
+  defp finish(path, handle, appendix) do
+    with {:ok, text} <- read_file(path),
+         {:ok, filtered} <- filter(handle, loadable(text)) do
+      replace(path, terminated(filtered) <> appendix)
+    end
+  end
+
+  defp filter(handle, text) do
+    case Trellis.filter_schema_dump(handle, text) do
+      {:ok, filtered} -> {:ok, filtered}
+      {:error, error} -> {:error, "Trellis could not filter the dump: #{error.message}"}
+    end
+  end
+
+  defp read_file(path) do
+    case File.read(path) do
+      {:ok, text} -> {:ok, text}
+      {:error, reason} -> read_error(path, reason)
+    end
+  end
+
+  defp replace(path, text) do
+    copy = "#{path}.#{System.pid()}.#{System.unique_integer([:positive])}.tmp"
+    File.write!(copy, text)
+    File.rename!(copy, path)
+    :ok
   end
 
   defp read(handle) do
@@ -248,26 +384,12 @@ defmodule Trellis.StructureDump do
     end
   end
 
-  defp write_all(plans, sqls) do
-    plans
-    |> Enum.zip(sqls)
-    |> Enum.reduce_while({:ok, []}, fn {plan, sql}, {:ok, paths} ->
-      case write(plan.path, sql) do
-        :ok -> {:cont, {:ok, paths ++ [plan.path]}}
-        error -> {:halt, error}
-      end
-    end)
-  end
-
   # Writes a copy and renames it over the file, so a reader (or a second run)
   # never sees it half written.
   defp write(path, sql) do
     case File.read(path) do
       {:ok, existing} ->
-        text = existing |> strip() |> loadable() |> terminated()
-        copy = "#{path}.#{System.pid()}.#{System.unique_integer([:positive])}.tmp"
-        File.write!(copy, text <> sql)
-        File.rename!(copy, path)
+        replace(path, (existing |> strip() |> loadable() |> terminated()) <> sql)
 
       {:error, reason} ->
         read_error(path, reason)
