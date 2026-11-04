@@ -95,6 +95,13 @@ defmodule Trellis.StructureDumpTest do
     assert_received {:pg_dump, nil, [~s(--exclude-schema="trellis") | _ledgers]}
   end
 
+  test "a target schema joins the prefixes as a pattern that matches exactly it" do
+    assert StructureDump.exact_prefix("report_targets") == "report_targets"
+    # pg_dump would fold it to lower case and read "." as a pattern character.
+    assert StructureDump.exact_prefix("Audit.T") == ~s("Audit.T")
+    assert StructureDump.exact_prefix(~s(a"b)) == ~s("a""b")
+  end
+
   test "a dump_prefixes without the Trellis schema is refused naming it" do
     assert {:error, message} = StructureDump.append(TestRepo, dump_prefixes: ["public"])
     assert message =~ ~s(the Trellis schema "trellis" is not in :dump_prefixes)

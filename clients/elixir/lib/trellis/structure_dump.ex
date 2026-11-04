@@ -258,7 +258,20 @@ defmodule Trellis.StructureDump do
 
       prefixes ->
         target = Keyword.get(trellis_options, :target_schema, "public")
-        Keyword.put(config, :dump_prefixes, Enum.uniq(prefixes ++ [target]))
+        Keyword.put(config, :dump_prefixes, Enum.uniq(prefixes ++ [exact_prefix(target)]))
+    end
+  end
+
+  # `schema` as a `pg_dump` pattern that matches exactly it, which is also
+  # how SQL names it: as is when it is lower case letters, digits and
+  # underscores, and double-quoted otherwise, so its case and the pattern
+  # characters (`* ? .`) are taken literally.
+  @doc false
+  def exact_prefix(schema) do
+    if schema =~ ~r/\A[a-z_][a-z0-9_]*\z/ do
+      schema
+    else
+      ~s["#{String.replace(schema, ~s["], ~s[""])}"]
     end
   end
 

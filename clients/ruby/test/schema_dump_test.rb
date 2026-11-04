@@ -297,7 +297,9 @@ class SchemaDumpTest < Minitest::Test
   def test_the_target_schemas_and_pg_dump_args_join_the_dump_s_flags
     TrellisTestApp.config.trellis.connect = { url: "unused" }
     TrellisTestApp.config.trellis.instances = {
-      reports: { url: "unused", schema: "reports", target_schema: "report_targets" }
+      reports: { url: "unused", schema: "reports", target_schema: "report_targets" },
+      # A name pg_dump would fold to lower case and read "." in as a pattern.
+      audit: { url: "unused", schema: "audit", target_schema: "Audit.T" }
     }
     config = db_config(database("flags"))
     hash = { schema_search_path: "public" }
@@ -306,7 +308,7 @@ class SchemaDumpTest < Minitest::Test
                                                   '--exclude-table="public"."t__ledger"'], appendix: "" },
       { pg_dump_args: ['--exclude-schema="reports"'], appendix: "" }
     ]
-    assert_equal ["--schema=public", "--schema=report_targets", '--exclude-schema="trellis"',
+    assert_equal ["--schema=public", "--schema=report_targets", '--schema="Audit.T"', '--exclude-schema="trellis"',
                   '--exclude-table="public"."t__ledger"', '--exclude-schema="reports"'],
                  Trellis::SchemaDump.schema_flags(config, hash, parts)
     # No --schema at all means Rails dumps every schema: only the
@@ -315,6 +317,19 @@ class SchemaDumpTest < Minitest::Test
     assert_equal exclusions, Trellis::SchemaDump.schema_flags(config, {}, parts)
     ActiveRecord.dump_schemas = :all
     assert_equal exclusions, Trellis::SchemaDump.schema_flags(config, hash, parts)
+  end
+
+  def test_another_environment_s_url_takes_the_libpq_keys_rails_accepts
+    configured = "host=devhost hostaddr=10.0.0.1 port=5432 dbname=app_dev user=dev password=x"
+    hash = { adapter: "postgresql", host: "testhost", dbname: "app_test", user: "bob" }
+    config = ActiveRecord::DatabaseConfigurations::HashConfig.new("test", "primary", hash)
+    url = Trellis::SchemaDump.send(:environment_url, config, configured, "test")
+    keywords = PG::Connection.conninfo_parse(url).to_h { |entry| [entry[:keyword], entry[:val]] }
+    assert_equal({ "host" => "testhost", "hostaddr" => nil, "dbname" => "app_test", "user" => "bob",
+                   "password" => "x" },
+                 keywords.slice("host", "hostaddr", "dbname", "user", "password").merge(
+                   "hostaddr" => keywords["hostaddr"]
+                 ))
   end
 
   private

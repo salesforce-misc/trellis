@@ -151,10 +151,19 @@ module Trellis
         parts ||= Thread.current[PARTS_KEY] || self.parts
         flags = []
         if restricts_schemas?(configuration_hash)
-          flags.concat(configured_options.map { |options| "--schema=#{options.fetch(:target_schema, "public")}" })
+          flags.concat(configured_options.map { |options| "--schema=#{exact_pattern(options.fetch(:target_schema, "public"))}" })
         end
         flags.concat(parts.flat_map { |part| part.fetch(:pg_dump_args) })
         flags.uniq
+      end
+
+      # schema as a pg_dump pattern that matches exactly it: as is when it is
+      # lower case letters, digits and underscores, which pg_dump reads
+      # literally, and double-quoted otherwise, so its case and pattern
+      # characters (* ? .) are taken literally.
+      def exact_pattern(schema)
+        schema = schema.to_s
+        schema.match?(/\A[a-z_][a-z0-9_]*\z/) ? schema : "\"#{schema.gsub('"', '""')}\""
       end
 
       # Each configured instance's schema_dump Hashes (Trellis::Instance#schema_dump): the default
@@ -230,8 +239,13 @@ module Trellis
         host, port, dbname = rails_database(hash)
         keywords["dbname"] = dbname
         keywords["port"] = port
-        keywords["host"] = host if host
-        keywords["user"] = hash[:username].to_s if hash[:username]
+        if host
+          keywords["host"] = host
+          # A hostaddr would win over the host for the connection itself.
+          keywords.delete("hostaddr")
+        end
+        user = hash[:username] || hash[:user]
+        keywords["user"] = user.to_s if user
         keywords["password"] = hash[:password].to_s if hash[:password]
         keywords.map { |key, value| "#{key}='#{value.to_s.gsub(/[\\']/) { |c| "\\#{c}" }}'" }.join(" ")
       end
@@ -265,7 +279,8 @@ module Trellis
         hash = hash.transform_keys(&:to_sym)
         url = hash[:url] ? conninfo(hash[:url], "config.trellis.dump_database's url") : {}
         given = { host: hash[:host] || url["host"], port: hash[:port] || url["port"],
-                  dbname: hash[:database] || url["dbname"], user: hash[:username] || url["user"] }
+                  dbname: hash[:database] || hash[:dbname] || url["dbname"],
+                  user: hash[:username] || hash[:user] || url["user"] }
         defaults = PG::Connection.conndefaults_hash
         resolved = given.to_h do |key, value|
           value = defaults[key] if value.nil? || value.to_s.empty?
