@@ -33,6 +33,9 @@
 #                         needed (--candidate) for the library probe
 #   --old-tag TAG         the released version to start from (default v0.1.0)
 #   --old-bin PATH        use this CLI binary instead of the tag's release asset
+#   --old-src DIR         the old build's source tree, for the library probe and
+#                         --build-old, instead of a checkout of the tag (with
+#                         --old-bin, to try a pair before the old one is tagged)
 #   --build-old           build the tag's CLI instead of downloading the asset
 #                         (also the fallback when the download fails)
 #   --pg-bin DIR          PostgreSQL 15+ bin directory (default PGBIN, then
@@ -60,6 +63,7 @@ upstream=salesforce-misc/trellis
 
 old_tag=v0.1.0
 old_bin=""
+old_src_dir=""
 build_old=0
 candidate="$repo"
 candidate_bin=""
@@ -80,6 +84,7 @@ while [ $# -gt 0 ]; do
     --candidate-version) cand_ver_req="${2:?--candidate-version needs a version or none}"; shift 2 ;;
     --old-tag) old_tag="${2:?}"; shift 2 ;;
     --old-bin) old_bin="${2:?}"; shift 2 ;;
+    --old-src) old_src_dir=$(cd "${2:?}" && pwd) || die "no directory $2"; shift 2 ;;
     --build-old) build_old=1; shift ;;
     --pg-bin) pg_bin="${2:?}"; shift 2 ;;
     --port) port="${2:?}"; shift 2 ;;
@@ -285,7 +290,7 @@ checkout_at() {
     git -C "$repo" worktree add -q --detach "$1" "$2"
   fi
 }
-old_src=""
+old_src=$old_src_dir
 ensure_old_src() {
   [ -n "$old_src" ] && return 0
   git -C "$repo" rev-parse --verify -q "$old_tag^{commit}" >/dev/null ||
