@@ -318,6 +318,28 @@ fn an_alias_on_a_single_table_definition_is_refused() {
     }
 }
 
+/// An alias followed by something no definition admits is reported as what
+/// it is, never as an alias on a single-table definition: a comma join, or a
+/// syntax error.
+#[test]
+fn text_after_an_alias_that_no_definition_admits_is_not_blamed_on_the_alias() {
+    match parse("TRANSFORM t FROM a o, b SELECT o.x AS x").unwrap_err() {
+        ParseError::UnsupportedKeySpace { construct, .. } => assert_eq!(construct, "comma join"),
+        other => panic!("{other:?}"),
+    }
+    for text in [
+        "TRANSFORM t FROM a AS o AS p JOIN b ON o.k = b.k SELECT o.x AS x",
+        "TRANSFORM t FROM a o (c1) JOIN b ON o.k = b.k SELECT o.x AS x",
+        "TRANSFORM t FROM a AS o.x JOIN b ON o.k = b.k SELECT o.x AS x",
+        "TRANSFORM t FROM a o JION b ON o.k = b.k SELECT o.x AS x",
+    ] {
+        match parse(text).unwrap_err() {
+            ParseError::UnexpectedToken { .. } => {}
+            other => panic!("{text}: {other:?}"),
+        }
+    }
+}
+
 /// Two aliases over one table are still a self-join, refused saying why:
 /// one captured change would feed both sides.
 #[test]

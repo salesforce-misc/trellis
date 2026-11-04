@@ -751,18 +751,25 @@ impl Parser {
                 KeySpace::JoinOneToOne(spec)
             });
         }
-        if let Some(alias) = self.source_alias.clone() {
+        if self.peek_is_symbol(',') {
+            return Err(ParseError::UnsupportedKeySpace {
+                construct: "comma join".to_string(),
+                detail: "write the join as `FROM a [LEFT|INNER] JOIN b ON a.x = b.y`".to_string(),
+            });
+        }
+        // Only where a single-table definition goes on: anything else after
+        // an alias (`AS o AS p`, `o (c1)`) is a syntax error, reported as one
+        // by the caller rather than blamed on the alias.
+        if let Some(alias) = self.source_alias.clone()
+            && ["GROUP", "WITHOUT", "SELECT"]
+                .iter()
+                .any(|kw| self.peek_is_keyword(kw))
+        {
             return Err(ParseError::TableAlias {
                 alias,
                 detail: "only a JOIN definition names its tables in its columns; a \
                          single-table definition writes its columns bare"
                     .to_string(),
-            });
-        }
-        if self.peek_is_symbol(',') {
-            return Err(ParseError::UnsupportedKeySpace {
-                construct: "comma join".to_string(),
-                detail: "write the join as `FROM a [LEFT|INNER] JOIN b ON a.x = b.y`".to_string(),
             });
         }
         if self.peek_is_keyword("GROUP") {
