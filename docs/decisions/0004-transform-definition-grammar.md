@@ -129,7 +129,9 @@ Deliberately out:
   rule, and most interesting pairs aren't immutable (`timestamptz` → `date`
   reads `TimeZone`). Each type family decides its own pairs when it is
   admitted. Admitted today: an integer to a strictly wider integer (`integer`,
-  `bigint`), any integer to `numeric` and a `date` to `timestamp`, the casts
+  `bigint`), any integer to `numeric`, a `date` to `timestamp`, and a cast to
+  the operand's own type (an integer to its own width, `numeric` to `numeric`,
+  `timestamp` to `timestamp`, which Postgres runs as the identity), the casts
   that are exact and read no setting, with no modifier; every other pair is
   rejected by name.
 
@@ -239,8 +241,8 @@ declares its tier there.
   outside the list is refused until then.
 * The accepted language is narrower than Postgres's in places a SQL user will
   notice: a typed literal must use its type's canonical spelling, `::` casts and
-  a `CAST` other than the integer widenings, `date` to `timestamp` and a
-  `NULL`'s are refused, `COALESCE` refuses mixed non-numeric argument types,
+  a `CAST` other than the integer widenings, `date` to `timestamp`, a cast to
+  the operand's own type and a `NULL`'s are refused, `COALESCE` refuses mixed non-numeric argument types,
   and a `NULL` is refused where Postgres would type it by its
   function-candidate rules (a function argument) or find it ambiguous.
 * Precedence lives in our own operator table, so each new operator has to
