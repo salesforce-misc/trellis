@@ -363,7 +363,7 @@ mod tests {
             [true],
             "the active segment's row"
         );
-        let sealed = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+        let sealed = seal::seal_phase1_waiting(&mut client).await;
         seal::seal_phase2(&client, sealed.sealed_seg_seq, WAKE)
             .await
             .expect("seal phase 2");
@@ -486,7 +486,7 @@ mod tests {
         assert_eq!(pending(&client, &["a", "late"], None).await, [false, true]);
 
         // The next segment seals with the late row in its window, and drains.
-        let next = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+        let next = seal::seal_phase1_waiting(&mut client).await;
         seal::seal_phase2(&client, next.sealed_seg_seq, WAKE)
             .await
             .expect("seal phase 2");

@@ -218,9 +218,7 @@ impl Instance {
     }
 
     async fn drain_sealed(&mut self) -> Result<(), String> {
-        let sealed = seal::seal_phase1(&mut self.raw)
-            .await
-            .map_err(|e| e.to_string())?;
+        let sealed = seal::seal_phase1_within(&mut self.raw, seal::SEAL_GATE_WAIT).await?;
         seal::seal_phase2(&self.raw, sealed.sealed_seg_seq, "wake")
             .await
             .map_err(|e| e.to_string())?;

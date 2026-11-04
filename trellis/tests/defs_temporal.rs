@@ -1103,7 +1103,7 @@ async fn a_timestamp_group_key_seeded_by_backfill_and_by_live_read_is_one_group_
     }
 
     async fn drain_sealed(client: &mut Client, pool: &trellis::pool::Pool) {
-        let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+        let outcome = seal::seal_phase1_waiting(client).await;
         seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
             .await
             .expect("seal phase 2");

@@ -945,6 +945,48 @@ async fn seal_gate_blocks_until_the_straddler_settles() {
         .expect("the gate must open once the writer settles");
 }
 
+/// What the shared test helper reports when the gate stays blocked: the
+/// session holding the xid open, by pid, and the statement it last ran.
+#[tokio::test]
+async fn seal_phase1_within_names_the_xid_holder_of_a_gate_that_stays_blocked() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut sealer = connect_raw(db.dsn()).await;
+
+    let mut writer = connect_raw(db.dsn()).await;
+    let writer_pid: i32 = writer
+        .query_one("select pg_backend_pid()", &[])
+        .await
+        .expect("writer pid")
+        .get(0);
+    let writer_txn = writer.transaction().await.expect("begin writer");
+    writer_txn
+        .execute(
+            "insert into seg_0 (src_table, key, op, hop_gen) values ('orders', 'gated', 'recompute', 0)",
+            &[],
+        )
+        .await
+        .expect("insert gated row");
+
+    let outcome = seal::seal_phase1_waiting(&mut sealer).await;
+    seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
+        .await
+        .expect("seal phase 2");
+
+    let refused = seal::seal_phase1_within(&mut sealer, Duration::from_millis(50))
+        .await
+        .expect_err("the open writer holds the gate");
+    assert!(refused.contains("seal gate stayed blocked"), "{refused}");
+    assert!(
+        refused.contains(&format!("pid {writer_pid} ")),
+        "the message names the holder: {refused}"
+    );
+    assert!(refused.contains("insert into seg_0"), "{refused}");
+
+    writer_txn.commit().await.expect("commit writer");
+    seal::seal_phase1_waiting(&mut sealer).await;
+}
+
 #[tokio::test]
 async fn seal_gate_blocks_when_the_predecessor_fence_is_not_yet_published() {
     let cluster = TestCluster::start();

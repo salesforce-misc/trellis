@@ -74,7 +74,7 @@ async fn capture_pass(raw: &mut Client, pool: &trellis::pool::Pool) -> reconcile
 async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..16 {
-        let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+        let outcome = seal::seal_phase1_waiting(client).await;
         seal::seal_phase2(client, outcome.sealed_seg_seq, "capture_schema_change_wake")
             .await
             .expect("seal phase 2");
@@ -1346,7 +1346,7 @@ async fn a_halting_key_pauses_its_closure_once_and_the_rest_of_the_page_drains()
     )
     .await
     .expect("retype the key, and write it and the unrelated table");
-    let sealed = seal::seal_phase1(&mut raw).await.expect("seal phase 1");
+    let sealed = seal::seal_phase1_waiting(&mut raw).await;
     seal::seal_phase2(&raw, sealed.sealed_seg_seq, "capture_schema_change_wake")
         .await
         .expect("seal phase 2");
@@ -1591,7 +1591,7 @@ async fn peers_halting_on_one_closure_record_one_stop() {
     ))
     .await
     .expect("retype the key, and write enough rows to split the page");
-    let sealed = seal::seal_phase1(&mut raw).await.expect("seal phase 1");
+    let sealed = seal::seal_phase1_waiting(&mut raw).await;
     seal::seal_phase2(&raw, sealed.sealed_seg_seq, "capture_schema_change_wake")
         .await
         .expect("seal phase 2");

@@ -197,7 +197,10 @@ pub use quarantine::{
     release_key,
 };
 #[cfg(any(test, feature = "internals"))]
-pub use seal::{SealOutcome, fenced_rows};
+pub use seal::{
+    SEAL_GATE_WAIT, SealOutcome, fenced_rows, seal_phase1_retrying, seal_phase1_waiting,
+    seal_phase1_within, xid_holders,
+};
 #[cfg(any(test, feature = "internals"))]
 pub use session::producer_singleton_lock_key;
 #[cfg(any(test, feature = "internals"))]

@@ -359,7 +359,7 @@ async fn an_enum_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two()
     // cast instead.
     stage_bare_recompute(&client, "2").await;
 
-    let outcome = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+    let outcome = seal::seal_phase1_waiting(&mut client).await;
     seal::seal_phase2(&client, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");

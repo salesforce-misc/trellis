@@ -53,7 +53,7 @@ async fn connect_trellis(dsn: &str) -> Trellis {
 
 async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     for _ in 0..16 {
-        let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+        let outcome = seal::seal_phase1_waiting(client).await;
         seal::seal_phase2(client, outcome.sealed_seg_seq, WAKE)
             .await
             .expect("seal phase 2");

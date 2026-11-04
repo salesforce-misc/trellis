@@ -100,7 +100,7 @@ fn find<'a>(folded: &'a [FoldedChange], key: &str) -> &'a FoldedChange {
 /// Seals the currently-active segment and returns its `seg_seq` — the tests'
 /// standard "close the batch" step before folding it.
 async fn seal_active_segment(client: &mut Client) -> i64 {
-    let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+    let outcome = seal::seal_phase1_waiting(client).await;
     seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");

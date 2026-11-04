@@ -1107,9 +1107,7 @@ async fn stale_seam_rows_after_a_rebuilds_refresh_leave_an_aggregate_consumer_co
 
 /// Seals the active segment and returns its `seg_seq`, leaving it undrained.
 async fn seal_only(raw: &mut Client) -> i64 {
-    let outcome = trellis::staging::seal::seal_phase1(raw)
-        .await
-        .expect("seal phase 1");
+    let outcome = trellis::staging::seal::seal_phase1_waiting(raw).await;
     trellis::staging::seal::seal_phase2(raw, outcome.sealed_seg_seq, WAKE)
         .await
         .expect("seal phase 2");

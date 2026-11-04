@@ -744,3 +744,201 @@ pub async fn fenced_rows(
         .collect();
     Ok(rows)
 }
+
+/// How long [`seal_phase1_waiting`] waits for the seal gate: long enough for
+/// a server process stalled on a loaded box, short enough that a transaction
+/// the test itself left open fails the test in one timeout.
+#[cfg(any(test, feature = "internals"))]
+pub const SEAL_GATE_WAIT: Duration = Duration::from_secs(60);
+
+/// How often [`seal_phase1_within`] re-asks a blocked gate.
+#[cfg(any(test, feature = "internals"))]
+const SEAL_GATE_POLL: Duration = Duration::from_millis(10);
+
+/// [`seal_phase1`] for a test that expects the seal to succeed, waiting up
+/// to [`SEAL_GATE_WAIT`] for the seal gate. Panics, naming every session
+/// holding an xid open, if the gate never clears; panics at once on any
+/// other refusal.
+///
+/// The gate holds while a transaction that was in flight at the previous
+/// batch's fence is still open. That is backpressure the engine's own
+/// sealer retries, and on a loaded box the holder can be a server process
+/// (an autovacuum worker holds an xid while it works), so a bare
+/// `seal_phase1(..).expect(..)` would panic on the first refusal.
+#[cfg(any(test, feature = "internals"))]
+pub async fn seal_phase1_waiting(client: &mut Client) -> SealOutcome {
+    seal_phase1_within(client, SEAL_GATE_WAIT)
+        .await
+        .unwrap_or_else(|refused| panic!("seal phase 1: {refused}"))
+}
+
+/// [`seal_phase1_waiting`] with the wait given; `Err` says why it gave up:
+/// the sessions still holding an xid open when the gate stayed blocked for
+/// `wait`, or the refusal that is not the gate's.
+#[cfg(any(test, feature = "internals"))]
+pub async fn seal_phase1_within(
+    client: &mut Client,
+    wait: Duration,
+) -> Result<SealOutcome, String> {
+    match seal_phase1_retrying(client, wait).await {
+        Ok(outcome) => Ok(outcome),
+        Err(StagingError::SealGateBlocked) => Err(format!(
+            "the seal gate stayed blocked for {wait:?}; transactions holding an xid: {}",
+            xid_holders(client).await
+        )),
+        Err(other) => Err(format!("{other:?}")),
+    }
+}
+
+/// [`seal_phase1`], asking again while the seal gate is blocked, for at most
+/// `wait`: for a caller that answers the other refusals itself (a full
+/// ring's retirement pass, say) and wants only the gate waited out.
+#[cfg(any(test, feature = "internals"))]
+pub async fn seal_phase1_retrying(
+    client: &mut Client,
+    wait: Duration,
+) -> Result<SealOutcome, StagingError> {
+    retry_gate(wait, SEAL_GATE_POLL, client, async |client| {
+        seal_phase1(client).await
+    })
+    .await
+}
+
+/// Runs `attempt` on `ctx` until it is anything but a `SealGateBlocked`
+/// refusal, or `wait` has passed (the last refusal is then the answer),
+/// pausing `poll` between tries.
+#[cfg(any(test, feature = "internals"))]
+async fn retry_gate<C>(
+    wait: Duration,
+    poll: Duration,
+    ctx: &mut C,
+    mut attempt: impl AsyncFnMut(&mut C) -> Result<SealOutcome, StagingError>,
+) -> Result<SealOutcome, StagingError> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match attempt(ctx).await {
+            Err(StagingError::SealGateBlocked) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(poll).await;
+            }
+            settled => return settled,
+        }
+    }
+}
+
+/// Every session (and prepared transaction) other than `client`'s holding an
+/// xid open, one per line: what a blocked seal gate is waiting on. A failed
+/// read is reported in the text rather than raised, since it only
+/// annotates a failure already on its way.
+#[cfg(any(test, feature = "internals"))]
+pub async fn xid_holders(client: &Client) -> String {
+    let sessions = client
+        .query(
+            "select pid, state, backend_xid::text, backend_type, \
+                    coalesce(left(query, 120), '') \
+             from pg_stat_activity \
+             where backend_xid is not null and pid <> pg_backend_pid()",
+            &[],
+        )
+        .await;
+    let prepared = client
+        .query("select gid, transaction::text from pg_prepared_xacts", &[])
+        .await;
+    let (sessions, prepared) = match (sessions, prepared) {
+        (Ok(sessions), Ok(prepared)) => (sessions, prepared),
+        (Err(err), _) | (_, Err(err)) => return format!("unreadable ({err})"),
+    };
+    let mut lines: Vec<String> = sessions
+        .iter()
+        .map(|row| {
+            format!(
+                "pid {} ({}, {}) xid {}: {}",
+                row.get::<_, i32>(0),
+                row.get::<_, String>(3),
+                row.get::<_, Option<String>>(1).unwrap_or_default(),
+                row.get::<_, String>(2),
+                row.get::<_, String>(4)
+            )
+        })
+        .collect();
+    lines.extend(prepared.iter().map(|row| {
+        format!(
+            "prepared {} xid {}",
+            row.get::<_, String>(0),
+            row.get::<_, String>(1)
+        )
+    }));
+    if lines.is_empty() {
+        "none".to_string()
+    } else {
+        lines.join("; ")
+    }
+}
+
+#[cfg(test)]
+mod seal_gate_retry_tests {
+    use std::time::Duration;
+
+    use super::{SealOutcome, StagingError, retry_gate};
+
+    fn sealed() -> SealOutcome {
+        SealOutcome {
+            sealed_seg_seq: 7,
+            sealed_ring_slot: 1,
+            next_ring_slot: 2,
+        }
+    }
+
+    /// A blocked gate is asked again until it clears.
+    #[tokio::test]
+    async fn blocked_gate_is_retried_until_it_clears() {
+        let mut tries = 0;
+        let got = retry_gate(
+            Duration::from_secs(60),
+            Duration::ZERO,
+            &mut tries,
+            async |tries| {
+                *tries += 1;
+                if *tries < 3 {
+                    Err(StagingError::SealGateBlocked)
+                } else {
+                    Ok(sealed())
+                }
+            },
+        )
+        .await;
+        assert_eq!(got.expect("the third try seals").sealed_seg_seq, 7);
+        assert_eq!(tries, 3);
+    }
+
+    /// A gate still blocked once the wait has passed is the answer.
+    #[tokio::test]
+    async fn gate_blocked_past_the_wait_is_refused() {
+        let mut tries = 0;
+        let got = retry_gate(Duration::ZERO, Duration::ZERO, &mut tries, async |tries| {
+            *tries += 1;
+            Err(StagingError::SealGateBlocked)
+        })
+        .await;
+        assert!(matches!(got, Err(StagingError::SealGateBlocked)));
+        assert_eq!(tries, 1);
+    }
+
+    /// Only the gate's refusal is waited out: a full ring or a lost race is
+    /// the caller's to see at once.
+    #[tokio::test]
+    async fn other_refusals_are_not_retried() {
+        let mut tries = 0;
+        let got = retry_gate(
+            Duration::from_secs(60),
+            Duration::ZERO,
+            &mut tries,
+            async |tries| {
+                *tries += 1;
+                Err(StagingError::RingFull { ring_slot: 2 })
+            },
+        )
+        .await;
+        assert!(matches!(got, Err(StagingError::RingFull { ring_slot: 2 })));
+        assert_eq!(tries, 1);
+    }
+}

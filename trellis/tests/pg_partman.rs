@@ -228,7 +228,7 @@ async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
 async fn drain(pool: &trellis::pool::Pool, client: &mut Client, rounds: usize, strict: bool) {
     use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..rounds {
-        let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+        let outcome = seal::seal_phase1_waiting(client).await;
         seal::seal_phase2(client, outcome.sealed_seg_seq, "pg_partman_wake")
             .await
             .expect("seal phase 2");

@@ -798,7 +798,7 @@ async fn a_bounded_install_reports_who_holds_the_table_then_lands_once_released(
 
 /// Seals both phases and returns the sealed batch.
 async fn seal_both_phases(sealer: &mut Client) -> i64 {
-    let outcome = seal::seal_phase1(sealer).await.expect("seal phase 1");
+    let outcome = seal::seal_phase1_waiting(sealer).await;
     seal::seal_phase2(sealer, outcome.sealed_seg_seq, WAKE)
         .await
         .expect("seal phase 2");

@@ -100,7 +100,7 @@ async fn drain_segment(pool: &trellis::pool::Pool, seg_seq: i64) {
 
 /// Seals the active segment (both phases), returning the sealed `seg_seq`.
 async fn seal_active_segment(client: &mut Client) -> i64 {
-    let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+    let outcome = seal::seal_phase1_waiting(client).await;
     seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");

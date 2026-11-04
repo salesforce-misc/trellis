@@ -161,7 +161,7 @@ async fn stage_truncate(client: &Client) {
 
 async fn seal(client: &mut Client) -> i64 {
     use trellis::staging::seal;
-    let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+    let outcome = seal::seal_phase1_waiting(client).await;
     seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
@@ -846,10 +846,7 @@ async fn a_drain_never_claims_a_segment_before_its_fence_is_published() {
     setup_aggregate(&db, &client).await;
 
     insert_items(&client, &(1..=20).collect::<Vec<_>>()).await;
-    let seg = seal::seal_phase1(&mut client)
-        .await
-        .expect("seal phase 1")
-        .sealed_seg_seq;
+    let seg = seal::seal_phase1_waiting(&mut client).await.sealed_seg_seq;
 
     let result = drain(&db.pool, seg, "worker", 1000, &mut DrainHooks::default()).await;
     assert!(

@@ -96,7 +96,7 @@ async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     // Capture triggers stage in the writer's own transaction, so there is
     // no staged watermark to hold apply back. A saturated one never does.
     for _ in 0..16 {
-        let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+        let outcome = seal::seal_phase1_waiting(client).await;
         seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
             .await
             .expect("seal phase 2");
@@ -2818,7 +2818,7 @@ async fn a_job_does_not_wait_on_the_drain_worker_it_runs_beside() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(claimed, "no worker claimed the job within 30 s");
-    let outcome = seal::seal_phase1(&mut raw).await.expect("seal phase 1");
+    let outcome = seal::seal_phase1_waiting(&mut raw).await;
     seal::seal_phase2(&raw, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");

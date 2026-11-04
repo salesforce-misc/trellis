@@ -169,7 +169,7 @@ async fn stage_bare_recompute(client: &Client, key: &str, src_table: &str) {
 }
 
 async fn drain_sealed(client: &mut Client, pool: &trellis::pool::Pool, worker: &str) {
-    let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+    let outcome = seal::seal_phase1_waiting(client).await;
     seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");

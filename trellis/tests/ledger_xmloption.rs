@@ -54,7 +54,7 @@ async fn full_pass(raw: &mut Client, pool: &trellis::pool::Pool) {
 async fn drain_to_quiescence(pool: &trellis::pool::Pool, client: &mut Client) {
     use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
     for _ in 0..16 {
-        let outcome = seal::seal_phase1(client).await.expect("seal phase 1");
+        let outcome = seal::seal_phase1_waiting(client).await;
         seal::seal_phase2(client, outcome.sealed_seg_seq, "ledger_xmloption_wake")
             .await
             .expect("seal phase 2");

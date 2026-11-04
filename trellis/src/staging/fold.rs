@@ -1144,7 +1144,7 @@ mod plan_tests {
                     .expect("stage truncate");
             }
 
-            let outcome = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+            let outcome = seal::seal_phase1_waiting(&mut client).await;
             seal::seal_phase2(&client, outcome.sealed_seg_seq, "wake")
                 .await
                 .expect("seal phase 2");
@@ -1245,7 +1245,7 @@ mod plan_tests {
             )
             .await
             .expect("stage truncate");
-        let outcome = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+        let outcome = seal::seal_phase1_waiting(&mut client).await;
         seal::seal_phase2(&client, outcome.sealed_seg_seq, "wake")
             .await
             .expect("seal phase 2");
@@ -1404,7 +1404,7 @@ mod plan_tests {
                  for this test to mean anything"
             );
         }
-        let outcome = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+        let outcome = seal::seal_phase1_waiting(&mut client).await;
         seal::seal_phase2(&client, outcome.sealed_seg_seq, "wake")
             .await
             .expect("seal phase 2");
@@ -1499,7 +1499,7 @@ mod plan_tests {
             .await
             .expect("refill the slot");
 
-        let outcome = seal::seal_phase1(&mut client).await.expect("seal phase 1");
+        let outcome = seal::seal_phase1_waiting(&mut client).await;
         seal::seal_phase2(&client, outcome.sealed_seg_seq, "wake")
             .await
             .expect("seal phase 2");

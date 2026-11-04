@@ -122,9 +122,7 @@ impl H {
     pub async fn drain(&mut self) {
         use trellis::staging::{apply, has_pending, retire_drained_segments, seal};
         for _ in 0..16 {
-            let outcome = seal::seal_phase1(&mut self.raw)
-                .await
-                .expect("seal phase 1");
+            let outcome = seal::seal_phase1_waiting(&mut self.raw).await;
             seal::seal_phase2(&self.raw, outcome.sealed_seg_seq, "relabel_wake")
                 .await
                 .expect("seal phase 2");
@@ -154,9 +152,7 @@ impl H {
     /// drain goes past it. Bounded attempts, not a timed wait.
     pub async fn drain_past_failures(&mut self) {
         use trellis::staging::{apply, retire_drained_segments, seal};
-        let outcome = seal::seal_phase1(&mut self.raw)
-            .await
-            .expect("seal phase 1");
+        let outcome = seal::seal_phase1_waiting(&mut self.raw).await;
         seal::seal_phase2(&self.raw, outcome.sealed_seg_seq, "relabel_wake")
             .await
             .expect("seal phase 2");

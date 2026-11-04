@@ -37,7 +37,7 @@ pub const WAKE: &str = "interleave_wake";
 /// How long [`Driver::seal`] waits for the seal gate: long enough for a
 /// server process stalled on a loaded box, short enough that a transaction
 /// the test itself left open fails the test in one timeout.
-pub const SEAL_GATE_WAIT: Duration = Duration::from_secs(60);
+pub const SEAL_GATE_WAIT: Duration = seal::SEAL_GATE_WAIT;
 
 /// Splits `ddl` into its schema statements and its `insert into …` seed rows.
 /// A group-basis aggregate over a partitioned source is defined while the
@@ -313,47 +313,7 @@ impl Driver {
     /// Every session (and prepared transaction) holding an xid open, one per
     /// line: what a blocked seal gate is waiting on.
     async fn xid_holders(&self) -> String {
-        let sessions = self
-            .ctl
-            .query(
-                "select pid, state, backend_xid::text, backend_type, \
-                        coalesce(left(query, 120), '') \
-                 from pg_stat_activity \
-                 where backend_xid is not null and pid <> pg_backend_pid()",
-                &[],
-            )
-            .await
-            .expect("read pg_stat_activity");
-        let prepared = self
-            .ctl
-            .query("select gid, transaction::text from pg_prepared_xacts", &[])
-            .await
-            .expect("read pg_prepared_xacts");
-        let mut lines: Vec<String> = sessions
-            .iter()
-            .map(|row| {
-                format!(
-                    "pid {} ({}, {}) xid {}: {}",
-                    row.get::<_, i32>(0),
-                    row.get::<_, String>(3),
-                    row.get::<_, Option<String>>(1).unwrap_or_default(),
-                    row.get::<_, String>(2),
-                    row.get::<_, String>(4)
-                )
-            })
-            .collect();
-        lines.extend(prepared.iter().map(|row| {
-            format!(
-                "prepared {} xid {}",
-                row.get::<_, String>(0),
-                row.get::<_, String>(1)
-            )
-        }));
-        if lines.is_empty() {
-            "none".to_string()
-        } else {
-            lines.join("; ")
-        }
+        seal::xid_holders(&self.ctl).await
     }
 
     /// The registry rows and every lock another session holds on a ring

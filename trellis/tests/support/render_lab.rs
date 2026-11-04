@@ -41,14 +41,18 @@ pub async fn seal_active_segment(client: &mut Client) -> i64 {
     use trellis::staging::seal;
     // A full ring answers `RingFull` until drained segments are retired,
     // exactly as the engine's own seal-on-demand handles it.
-    let outcome = match seal::seal_phase1(client).await {
+    let outcome = match seal::seal_phase1_retrying(client, seal::SEAL_GATE_WAIT).await {
         Ok(outcome) => outcome,
         Err(trellis::StagingError::RingFull { .. }) => {
             trellis::staging::retire_drained_segments(client)
                 .await
                 .expect("retire drained segments");
-            seal::seal_phase1(client).await.expect("seal phase 1")
+            seal::seal_phase1_waiting(client).await
         }
+        Err(trellis::StagingError::SealGateBlocked) => panic!(
+            "seal phase 1: the seal gate stayed blocked; transactions holding an xid: {}",
+            seal::xid_holders(client).await
+        ),
         Err(err) => panic!("seal phase 1: {err:?}"),
     };
     seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")

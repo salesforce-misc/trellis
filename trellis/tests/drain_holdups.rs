@@ -154,7 +154,7 @@ async fn worker(it: &Instance, options: &str) -> trellis::pool::Pool {
 
 /// Seals the ring, both phases, and returns the sealed segment.
 async fn seal(raw: &mut Client) -> i64 {
-    let sealed = seal::seal_phase1(raw).await.expect("seal phase 1");
+    let sealed = seal::seal_phase1_waiting(raw).await;
     seal::seal_phase2(raw, sealed.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");

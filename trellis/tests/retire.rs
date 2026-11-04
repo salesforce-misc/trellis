@@ -24,7 +24,7 @@ async fn connect_raw(dsn: &str) -> Client {
 }
 
 async fn seal_and_fence(sealer: &mut Client) -> i64 {
-    let outcome = seal::seal_phase1(sealer).await.expect("seal phase 1");
+    let outcome = seal::seal_phase1_waiting(sealer).await;
     seal::seal_phase2(sealer, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
@@ -246,7 +246,7 @@ async fn an_unclosed_fence_boundary_blocks_retirement() {
     let db = cluster.create_isolated_database().await;
     let mut sealer = connect_raw(db.dsn()).await;
 
-    let outcome = seal::seal_phase1(&mut sealer).await.expect("seal phase 1");
+    let outcome = seal::seal_phase1_waiting(&mut sealer).await;
     seal::seal_phase2(&sealer, outcome.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");

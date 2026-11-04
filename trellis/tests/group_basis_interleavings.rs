@@ -1000,9 +1000,8 @@ async fn no_segment_is_sealed_past_an_unfenced_one() {
     step(&mut d, "insert into public.src values (1, 1, 10)").await;
     write(&d, "truncate public.src").await;
     d.retire().await;
-    let stuck = trellis::staging::seal::seal_phase1(&mut d.ctl)
+    let stuck = trellis::staging::seal::seal_phase1_waiting(&mut d.ctl)
         .await
-        .expect("seal phase 1")
         .sealed_seg_seq;
     write(&d, "insert into public.src values (2, 1, 5)").await;
     assert_eq!(

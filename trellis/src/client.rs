@@ -4058,7 +4058,7 @@ mod maintenance_failure_tests {
         // Segments 1-3 sealed into slots 0-2; segment 4 is active in slot 3,
         // and non-empty, so every tick tries to seal it into slot 0.
         for _ in 0..3 {
-            let outcome = staging::seal_phase1(&mut raw).await.expect("seal phase 1");
+            let outcome = staging::seal_phase1_waiting(&mut raw).await;
             staging::seal_phase2(&raw, outcome.sealed_seg_seq, "wake")
                 .await
                 .expect("seal phase 2");
@@ -4163,7 +4163,7 @@ mod maintenance_failure_tests {
         )
         .await
         .expect("a ledger holding more tombstones than one pass collects");
-        let outcome = staging::seal_phase1(&mut raw).await.expect("seal phase 1");
+        let outcome = staging::seal_phase1_waiting(&mut raw).await;
         staging::seal_phase2(&raw, outcome.sealed_seg_seq, "wake")
             .await
             .expect("seal phase 2");
@@ -5623,7 +5623,7 @@ mod restore_gate_tests {
         )
         .await
         .expect("a ring row, and a record the dump brought from another database");
-        let sealed = staging::seal_phase1(&mut raw).await.expect("seal phase 1");
+        let sealed = staging::seal_phase1_waiting(&mut raw).await;
         staging::seal_phase2(&raw, sealed.sealed_seg_seq, "wake")
             .await
             .expect("seal phase 2");

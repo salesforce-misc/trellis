@@ -642,7 +642,7 @@ async fn the_capture_pass_pauses_a_reader_of_a_seam_fed_table() {
 /// role: a bounded stand-in for one drain thread's turn. Returns the drain's
 /// error, if it failed.
 async fn seal_and_drain(raw: &mut Client, pool: &trellis::pool::Pool) -> Result<(), String> {
-    let sealed = seal::seal_phase1(raw).await.expect("seal phase 1");
+    let sealed = seal::seal_phase1_waiting(raw).await;
     seal::seal_phase2(raw, sealed.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
@@ -844,7 +844,7 @@ async fn a_refused_read_halts_while_a_key_failure_beside_it_is_held_for_its_defi
         )
         .await
         .expect("write both sources");
-    let sealed = seal::seal_phase1(&mut it.raw).await.expect("seal phase 1");
+    let sealed = seal::seal_phase1_waiting(&mut it.raw).await;
     seal::seal_phase2(&it.raw, sealed.sealed_seg_seq, "wake")
         .await
         .expect("seal phase 2");
