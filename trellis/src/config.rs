@@ -185,12 +185,18 @@ impl Config {
     /// line, where other users of the host can read it.
     ///
     /// Only the settings the connection string gives are returned, plus
-    /// `PGSSLMODE`, which is always set, so libpq's `prefer` default can't
-    /// differ from Trellis's. Clear the `PG*` variables the child would
-    /// inherit before setting these, or an inherited one fills a setting the
-    /// connection string left out. libpq still reads its default certificate
-    /// files (`~/.postgresql/`) where the connection string names none,
-    /// which Trellis doesn't.
+    /// three that keep libpq's defaults from differing from Trellis's:
+    /// `PGSSLMODE`, always; `PGGSSENCMODE=disable`, since libpq would use
+    /// GSSAPI encryption in place of TLS, unchecked by `sslmode`, wherever
+    /// Kerberos works; and `PGSSLCERTMODE=disable` when the connection
+    /// string names no client certificate, since libpq 16 and later would
+    /// send `~/.postgresql/postgresql.crt`. Clear the `PG*` variables the
+    /// child would inherit before setting these, or an inherited one fills
+    /// a setting the connection string left out. libpq still reads files
+    /// Trellis doesn't, each only where the connection string leaves the
+    /// setting out: `~/.postgresql/root.crt`, which makes `sslmode=require`
+    /// check the server's certificate, `~/.postgresql/postgresql.crt` before
+    /// libpq 16, and `~/.pgpass` for a password.
     ///
     /// Refuses a connection string Trellis can't connect with, as
     /// connecting does, and a password or socket path that isn't UTF-8.
@@ -631,23 +637,44 @@ mod tests {
                 "PGCONNECT_TIMEOUT=5",
                 "PGTARGETSESSIONATTRS=read-write",
                 "PGSSLMODE=verify-full",
+                "PGGSSENCMODE=disable",
+                "PGSSLCERTMODE=disable",
                 "PGSSLROOTCERT=/ca.pem",
             ]
         );
         assert_eq!(
             env("host=a,b port=1,2 user=u sslmode=disable"),
-            ["PGHOST=a,b", "PGPORT=1,2", "PGUSER=u", "PGSSLMODE=disable"]
+            [
+                "PGHOST=a,b",
+                "PGPORT=1,2",
+                "PGUSER=u",
+                "PGSSLMODE=disable",
+                "PGGSSENCMODE=disable",
+                "PGSSLCERTMODE=disable"
+            ]
         );
-        // Trellis's default, spelled out so libpq's can't differ.
+        // Trellis's default, spelled out so libpq's can't differ; a client
+        // certificate given is sent.
         assert_eq!(
             env("host=a user=u sslcert=/c.pem sslkey=/k.pem"),
             [
                 "PGHOST=a",
                 "PGUSER=u",
                 "PGSSLMODE=prefer",
+                "PGGSSENCMODE=disable",
                 "PGSSLCERT=/c.pem",
                 "PGSSLKEY=/k.pem"
             ]
+        );
+        // An IPv6 host, a unix socket directory, and a quoted key=value
+        // password with a quote, a backslash and spaces.
+        assert_eq!(
+            env("postgresql://u@[::1]:5433/d?sslmode=disable")[..3],
+            ["PGHOST=::1", "PGPORT=5433", "PGUSER=u"]
+        );
+        assert_eq!(
+            env(r"host=/run/pg user=u password='a b\'c\\d @%/' sslmode=disable")[..3],
+            ["PGHOST=/run/pg", "PGUSER=u", r"PGPASSWORD=a b'c\d @%/"]
         );
     }
 

@@ -165,6 +165,15 @@ impl TlsSpec {
     /// These options as the libpq environment variables that set them
     /// (`PGSSLMODE`, and `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY` when
     /// given), for [`crate::Config::libpq_environment`].
+    ///
+    /// Two more keep libpq to what Trellis does. `PGGSSENCMODE=disable`:
+    /// libpq's default tries GSSAPI encryption first wherever Kerberos
+    /// works and uses it in place of TLS whatever `sslmode` says, so the
+    /// server's certificate would go unchecked under `verify-full`; Trellis
+    /// never uses GSSAPI encryption. `PGSSLCERTMODE=disable` when no client
+    /// certificate is given: libpq 16 and later otherwise send
+    /// `~/.postgresql/postgresql.crt` when it exists, which Trellis never
+    /// does (older libpq ignores the variable, and sends it).
     pub(crate) fn libpq_environment(&self) -> Vec<(&'static str, String)> {
         let mode = match self.mode {
             SslMode::Disable => "disable",
@@ -173,7 +182,13 @@ impl TlsSpec {
             SslMode::VerifyCa => "verify-ca",
             SslMode::VerifyFull => "verify-full",
         };
-        let mut vars = vec![("PGSSLMODE", mode.to_string())];
+        let mut vars = vec![
+            ("PGSSLMODE", mode.to_string()),
+            ("PGGSSENCMODE", "disable".to_string()),
+        ];
+        if self.client_cert.is_none() {
+            vars.push(("PGSSLCERTMODE", "disable".to_string()));
+        }
         for (name, path) in [
             ("PGSSLROOTCERT", &self.root_cert),
             ("PGSSLCERT", &self.client_cert),
