@@ -2305,8 +2305,8 @@ impl GroupTargetPlan {
     /// probe of such a group scan the source (past
     /// [`MAX_NULL_PATTERN_COLUMNS`] group columns it does, for those
     /// groups). An index on the `GROUP BY` columns then the argument serves
-    /// every branch with one endpoint read; without one the probe scans the
-    /// group.
+    /// every branch with one endpoint read, `NULL` groups' included; without
+    /// one the probe scans the group.
     fn extreme_probe_sql(&self, x: &Extreme) -> String {
         let cols = quoted(&self.shape.group_cols);
         let arg = quote_ident(
@@ -2322,12 +2322,22 @@ impl GroupTargetPlan {
                 Population::Source,
             )
         };
+        // Each branch orders by the `GROUP BY` columns too, then the
+        // argument, all one way: the index's own order. The planner drops
+        // a column an `=` fixes from the order, but not one `is null`
+        // fixes, so ordered by the argument alone a `NULL` group's branch
+        // sorts every row of the group instead of reading one endpoint.
+        let order: Vec<String> = cols
+            .iter()
+            .chain(std::iter::once(&arg))
+            .map(|c| format!("s.{c}{}", x.order()))
+            .collect();
         let branch = |condition: String| {
             format!(
                 "(select s.{arg} as __v from {src} s where {condition} and s.{arg} is not null \
-                  order by s.{arg}{order} limit 1)",
+                  order by {order} limit 1)",
                 src = self.source_row,
-                order = x.order(),
+                order = order.join(", "),
             )
         };
         let equal: Vec<String> = cols
@@ -4592,6 +4602,35 @@ mod tests {
 
     fn shape_of(text: &str) -> GroupShape {
         shape(text).expect("admitted")
+    }
+
+    /// Every branch of an extreme's probe, the `NULL` groups' included,
+    /// orders by the `GROUP BY` columns then the argument, all in the
+    /// extreme's direction: the index's order, which Postgres reads as one
+    /// endpoint. Ordered by the argument alone, a branch fixing a column by
+    /// `is null` sorts the whole group (Postgres drops only an `=`-fixed
+    /// column from the order).
+    #[test]
+    fn an_extreme_probe_reads_the_index_in_its_own_order() {
+        let shape = shape_of("TRANSFORM t FROM s GROUP BY g, b SELECT MIN(a) AS lo, MAX(a) AS hi");
+        let plan = GroupTargetPlan::new(
+            "trellis",
+            7,
+            "public.t",
+            "public.s",
+            Vec::new(),
+            Vec::new(),
+            shape.clone(),
+        );
+        for (x, order) in shape.extremes().iter().zip([
+            r#"order by s."g", s."b", s."a" limit 1"#,
+            r#"order by s."g" desc, s."b" desc, s."a" desc limit 1"#,
+        ]) {
+            let sql = plan.extreme_probe_sql(x);
+            // The all-`=` branch and one per pattern of `NULL` columns.
+            assert_eq!(sql.matches("order by").count(), 4, "{sql}");
+            assert_eq!(sql.matches(order).count(), 4, "{sql}");
+        }
     }
 
     /// A session keeps the temp table it created under a name, and a resume

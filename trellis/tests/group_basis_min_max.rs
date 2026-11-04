@@ -716,7 +716,47 @@ async fn a_probe_behind_a_source_lock_retries_the_page() {
         .await
         .expect("the application's lock");
     let page = d.drain_frozen(batch, "a", &[]).await;
+    // The page's transaction waiting behind the application's lock: it
+    // times out and a later transaction waits in its place, while the
+    // application still holds the lock. A probe that waited without a
+    // `lock_timeout` would stay in its first transaction.
+    let waiting = "select pid, xact_start::text from pg_stat_activity \
+                   where $1 = any(pg_blocking_pids(pid))";
     d.wait_blocked_behind(pid).await;
+    let watcher = d.user().await;
+    let waiters = || async {
+        watcher
+            .query(waiting, &[&pid])
+            .await
+            .expect("the waiting page")
+            .into_iter()
+            .map(|row| (row.get::<_, i32>(0), row.get::<_, String>(1)))
+            .collect::<Vec<_>>()
+    };
+    let first = waiters().await;
+    assert_eq!(first.len(), 1, "one page waits: {first:?}");
+    // It waits for the source while it holds its groups: the probe, after
+    // the lock statement.
+    let held: bool = watcher
+        .query_one(
+            "select exists (select 1 from pg_locks where pid = $1 and not granted \
+                              and relation = 'public.src'::regclass) \
+                and exists (select 1 from pg_locks where pid = $1 and granted \
+                              and relation = $2::text::regclass)",
+            &[&first[0].0, &hidden(&d).await],
+        )
+        .await
+        .expect("the waiting page's locks")
+        .get(0);
+    assert!(held, "the page waits for the source holding its groups");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while waiters().await.iter().all(|w| *w == first[0]) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the page's first transaction ({first:?}) never timed out and retried"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     holder.batch_execute("commit").await.expect("commit");
     page.finish().await;
     assert_eq!(extremes(&d, 1).await, ["(5,5,t)"]);
