@@ -99,11 +99,15 @@ pub(crate) fn key_type_since(name: &str) -> Option<Release> {
         .map(|spec| spec.since)
 }
 
+/// The entry of [`SUPPORTED_KEY_TYPES`] that admits a `format_type` rendering.
+#[cfg(test)]
+pub(super) type KeyTypeAdmission = fn(&str) -> Option<&'static str>;
+
 /// Every entry of [`SUPPORTED_KEY_TYPES`] by name, and the entry that admits
 /// a partition key of `pg_type`: what the feature-floor manifest
 /// (`super::floor_manifest`) lists.
 #[cfg(test)]
-pub(super) fn key_type_admissions() -> (Vec<&'static str>, fn(&str) -> Option<&'static str>) {
+pub(super) fn key_type_admissions() -> (Vec<&'static str>, KeyTypeAdmission) {
     (
         SUPPORTED_KEY_TYPES.iter().map(|spec| spec.name).collect(),
         admitted_key_type,
