@@ -169,7 +169,7 @@ running for a manual step.
 | `basebackup` | A `pg_basebackup` taken while the old build and its writers ran starts as a cluster, and the candidate converges it with no pause and no `RESUME`. | Script |
 | `clients` | The Ruby gem and the Elixir package built from the candidate open a database the predecessor's clients used, with the same options. | Manual |
 | `mixed` | The candidate started while an old instance runs on the database stands by ([version handover](decisions/0023-version-handover.md)): it stays up, says it is standing by naming its own version (the one it was built as; a candidate reporting the old build's version string fails, since with migrations pending it stands by beside its own version too) and the old build as a release with no registered version, runs no migration, and pauses nothing, while the old instance's writes keep converging. Once the old instance stops, the candidate takes over: it migrates, its `worker_registry` row carries that version, and the writes made since converge with a clean `self_check`. | Script |
-| `downgrade` | What the old build does when pointed at a database the candidate has written ([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md) says what it should do). | Script, observed |
+| `downgrade` | Rollback ([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md)). The candidate defines every shape on a fresh database, with a definition for each feature its feature-floor manifest dates after the old release (a candidate-only type admission among them), and runs with writes. The old build then runs on that database with writes: the candidate-only definitions pause with the documented reason, and `RESUME` and `DROP` of one refuse naming its floor and change nothing; every other definition converges with a clean `self_check`; the process stays up. The candidate runs again: the paused definitions stay paused until `RESUME`, then converge, and `DROP` of one removes everything it owned. If the candidate raised the catalog floor above the old release, the old build's `run` stands by and its `apply` refuses, each naming the floor, instead. An old release before 0.2.0 refuses the candidate's database from `run` and from `apply`. | Script |
 
 ### The manual steps, and what the script expects
 
@@ -231,12 +231,18 @@ build and expects the candidate to migrate and converge. A candidate that runs
 beside the old one, exits, or pauses definitions fails the step, and the
 finding is filed.
 
-**Rollback (step 8).** The script records what the old build does when pointed
-at a database the candidate has written, for the release notes, and asserts
-none of [ADR-0024](decisions/0024-compatibility-floors-and-rollback.md)'s
-rules. A release before 0.2.0 carries no floors, so rolling back to one is a
-restore from a backup taken before the upgrade
-([upgrading](upgrading.md#to-a-release-before-020)).
+**Rollback (step 8).** The old release is the previous release and the
+candidate the release being cut. The step fails a line of the candidate's
+`.github/feature-floors.txt` dated after the old release that no definition in
+the script's `rollback_new_defs` list uses: when a release adds a feature, add
+a definition using it there, one over the shapes tables. The step also fails an
+entry whose definition the candidate stamps with a floor the old release meets.
+A release before 0.2.0 carries no floors: the step asserts that it refuses the
+candidate's database (`v0.1.0` refuses the instance format the floor migration
+sets, before its migration runner starts), and records that rolling back to it
+means restoring a backup taken before the upgrade
+([upgrading](upgrading.md#to-a-release-before-020)). Quote that, or what the
+step found, in the release notes.
 
 ### Release notes checklist
 
@@ -255,7 +261,10 @@ For each release, the notes carry:
 - **Compatibility floors:** the floors this release raised (the catalog floor,
   and which features carry a new definition floor) and what that means for
   rolling back to the previous release
-  ([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md)). For
+  ([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md)).
+  `.github/scripts/check-floors.py notes v<previous>` lists them: the
+  migrations that raised the catalog floor, and the features, overloads and
+  admissions whose release is after the previous release's. For
   `0.2.0`: the catalog floor is recorded, at `0.2.0`; rolling back to `0.1.x`
   means restoring a backup taken before the upgrade, which also discards the
   application's writes since, and a `0.1.x` worker started without `migrate`

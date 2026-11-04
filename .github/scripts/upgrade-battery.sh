@@ -18,7 +18,7 @@
 #   basebackup    5c. a pg_basebackup restore of a running v0.1.0 database
 #   clients       6. Ruby gem and Elixir package (manual)
 #   mixed         7. the candidate stands by beside a live v0.1.0, then takes over
-#   downgrade     8. v0.1.0 pointed at a database the candidate wrote (rollback, ADR-0024)
+#   downgrade     8. rollback: the old release on a database the candidate wrote (ADR-0024)
 #
 # Options:
 #   --candidate REV|DIR   the release candidate: a directory or a git revision.
@@ -414,8 +414,25 @@ say "building the $old_tag databases"
 shapes_expected_live="orders_copy chain1 orders_wide cust_totals cust_join cust_join_left tenant_totals tenant_join ledger_ovf"
 shapes_grammar_paused="ledger_copy deep deep2"
 shapes_paused="$shapes_grammar_paused ord_paused"
+# Step 8: definitions only the candidate can run. Each uses a feature,
+# overload, argument value or type-rule admission whose release in the
+# candidate's .github/feature-floors.txt is after the old release's (a
+# candidate-only type admission among them, when the candidate adds one). One
+# entry each: the manifest lines it covers (each without its release, an
+# admission also without its case, `;` between them), `|`, the target's name,
+# `|`, the definition over the shapes tables. The step fails a candidate-only
+# manifest line no entry covers. Empty for 0.2.0: floors arrive in it, and
+# v0.1.0, which carries none, refuses its database.
+rollback_new_defs=(
+)
+# What a release before 0.2.0 says when a later release has migrated the
+# database. Its `migrate`, which its `run` and `apply` call first, refuses the
+# marker's instance_format_version (2 from the floor migration on, above the 1
+# it understands) before its migration runner starts; refinery, which refuses
+# an applied migration the binary lacks, would refuse it next.
+pre_floor_refusal='written by a newer Trellis|refinery|missing from the filesystem'
 
-sql "$port" shapes <<'EOF'
+shapes_schema=$(cat <<'EOF'
 create table customers(id bigint primary key, name text not null, region text);
 create table orders(id bigint primary key, customer_id bigint not null, amount numeric(12,2) not null, note text);
 create index on orders(customer_id);
@@ -431,6 +448,8 @@ insert into orders select g, 1 + g % 50, g, 'n' from generate_series(1,2000) g;
 insert into ledger select g, g, g % 7 from generate_series(1,100) g;
 insert into events select g, g % 20, 1 from generate_series(1,1000) g;
 EOF
+)
+sql "$port" shapes <<<"$shapes_schema"
 seed_rows=$((50 + 2000 + 100 + 1000))
 
 deep_chain="n"; for _ in $(seq 1 130); do deep_chain="$deep_chain + 1"; done
@@ -557,10 +576,11 @@ echo "inflight before: $pre_inflight_status"
 echo "inflight after:  $post_inflight_status"
 
 # ---------------------------------------------------------------- the steps
-check_self() { # port db label targets...: self_check each with the candidate's probe
+check_self() { # port db label targets...: self_check each with the candidate's probe (PROBE= another)
   local p=$1 d=$2 label=$3 out; shift 3
-  if [ -z "$probe_new" ]; then record SKIP "$label" "the probe does not build against the candidate"; return 0; fi
-  if out=$(probe "$probe_new" "$p" "$d" self-check "$@" 2>&1); then
+  local b=${PROBE-$probe_new}
+  if [ -z "$b" ]; then record SKIP "$label" "the probe does not build against ${PROBE+$old_tag}${PROBE-the candidate}"; return 0; fi
+  if out=$(probe "$b" "$p" "$d" self-check "$@" 2>&1); then
     if grep -q 'held_keys=[1-9]' <<<"$out"; then
       record FAIL "$label" "self_check converged but a key is held: $(grep 'held_keys=[1-9]' <<<"$out" | head -1)"
     else
@@ -886,19 +906,244 @@ else
   record SKIP mixed "not selected"
 fi
 
+# ver_cmp <a> <b>: -1, 0 or 1, comparing two major.minor.patch releases.
+ver_cmp() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    split(a, x, "."); split(b, y, ".")
+    for (i = 1; i <= 3; i++) {
+      if (x[i] + 0 < y[i] + 0) { print -1; exit }
+      if (x[i] + 0 > y[i] + 0) { print 1; exit }
+    }
+    print 0 }'
+}
+# release_of <version>: its major.minor.patch (`trellis 0.3.0-rc.1` is 0.3.0).
+release_of() { local v=${1#trellis }; echo "${v%%[-+]*}"; }
+# manifest_ids <manifest> <release>: the identity of each line of a
+# feature-floor manifest whose release is after <release> (check-floors.py's:
+# the line without its release, and an admission without its case).
+manifest_ids() {
+  local line rel id
+  while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue ;; esac
+    rel=${line##* }; id=${line% *}
+    case "$id" in "admit "*) id=${id%% by *} ;; esac
+    [ "$(ver_cmp "$rel" "$2")" -le 0 ] || echo "$id"
+  done <"$1"
+}
+not_alive() { ! run_alive "$1"; }
+paused_with() { # port db name pattern: stored paused, and capture_failures.error matches
+  [ "$(stored_status "$1" "$2" "$3")" = paused ] && failure_reason "$1" "$2" "$3" | grep -qE "$4"
+}
+# leftovers <port> <db> <id>: rows any trellis table keeps for that transform id,
+# plus trellis relations named with it.
+leftovers() {
+  scalar "$1" "$2" "select coalesce(sum((xpath('/row/c/text()', query_to_xml(format('select count(*) c from trellis.%I where transform_id = %s', c.relname, $3), false, true, '')))[1]::text::bigint), 0)
+      + (select count(*) from pg_class where relnamespace = 'trellis'::regnamespace and relname ~ ('_' || $3 || '(_|\$)'))
+    from pg_class c join pg_attribute a on a.attrelid = c.oid
+   where c.relnamespace = 'trellis'::regnamespace and c.relkind in ('r', 'p') and a.attname = 'transform_id' and not a.attisdropped"
+}
+
+# A release before 0.2.0 carries no floor check (ADR-0024 rule 8). It refuses
+# the database in `migrate`, which its `run` and `apply` both call first
+# (pre_floor_refusal).
+rollback_before_floors() {
+  local out first
+  run_bg down-shapes "$port" shapes "$old_bin"
+  if wait_for 60 "$old_tag to exit" not_alive down-shapes; then
+    first=$(grep -m1 -iE "$pre_floor_refusal" "$logs/run-down-shapes.log" || true)
+    if [ -n "$first" ]; then
+      record PASS downgrade "$old_tag run refuses the database the candidate migrated: ${first:0:240}"
+    else
+      record FAIL downgrade "$old_tag run exited without the migration refusal: $(head -c 240 "$logs/run-down-shapes.log")"
+    fi
+  else
+    record FAIL downgrade "$old_tag run is up on a database the candidate migrated: $(status_lines "$port" shapes "$old_bin" | tr '\n' ' ')"
+    stop_run down-shapes
+  fi
+  if out=$(trellis "$port" shapes "$old_bin" apply 'TRANSFORM rb_probe FROM orders SELECT amount AS amount' 2>&1); then
+    record FAIL downgrade "$old_tag apply defined a transform on a database the candidate migrated"
+  elif first=$(grep -m1 -iE "$pre_floor_refusal" <<<"$out"); then
+    record PASS downgrade "$old_tag apply refuses it too: ${first:0:240}"
+  else
+    record FAIL downgrade "$old_tag apply failed without the migration refusal: ${out:0:240}"
+  fi
+  record INFO downgrade "rolling back to $old_tag means restoring a backup taken before the upgrade, which discards the application's writes since: $old_tag carries no floors (ADR-0024 rule 8, docs/upgrading.md); the release notes say so"
+}
+
+# From 0.2.0 on: the candidate defines every shape and the candidate-only
+# definitions, with writes; the old release then runs on that database.
+rollback_with_floors() {
+  local db=rollback n e rest name text floor id out first missing covered stmt
+  local cand_only="" shared="orders_copy chain1 orders_wide cust_totals cust_join cust_join_left tenant_totals tenant_join"
+  sql "$port" postgres -c "create database $db"
+  sql "$port" "$db" <<<"$shapes_schema"
+  seed_rows=$((seed_rows + 3150))
+  # Every manifest line after the old release is covered by a definition.
+  if [ -f "$cand_src/.github/feature-floors.txt" ]; then
+    covered=$(for e in ${rollback_new_defs[@]+"${rollback_new_defs[@]}"}; do echo "${e%%|*}" | tr ';' '\n'; done)
+    missing=$(manifest_ids "$cand_src/.github/feature-floors.txt" "$old_rel" | grep -vxF -f <(echo "${covered:-<none>}") || true)
+    if [ -n "$missing" ]; then
+      record FAIL downgrade "candidate-only features no rollback definition uses (add each to rollback_new_defs): $(echo "$missing" | head -5 | tr '\n' ';')"
+    else
+      record PASS downgrade "every feature after $old_rel in the candidate's feature-floor manifest has a rollback definition"
+    fi
+  else
+    record FAIL downgrade "the candidate has no .github/feature-floors.txt"
+  fi
+  apply_new() { trellis "$port" "$db" "$candidate_bin" apply "$1" >>"$logs/apply-rollback.log" 2>&1 || { record FAIL downgrade "the candidate refused: $1"; return 1; }; }
+  apply_new 'TRANSFORM orders_copy FROM orders SELECT amount AS amount, amount + 1 AS plus' || return 0
+  apply_new 'TRANSFORM cust_totals FROM orders GROUP BY customer_id SELECT customer_id AS customer_id, COUNT(*) AS n, SUM(amount) AS total' || return 0
+  apply_new 'TRANSFORM cust_join FROM orders JOIN customers ON orders.customer_id = customers.id GROUP BY customers.region SELECT customers.region AS region, COUNT(*) AS n, SUM(orders.amount) AS total' || return 0
+  apply_new 'TRANSFORM cust_join_left FROM orders LEFT JOIN customers ON orders.customer_id = customers.id GROUP BY customers.region SELECT customers.region AS region, COUNT(*) AS n' || return 0
+  apply_new 'TRANSFORM tenant_totals FROM events GROUP BY tenant SELECT tenant AS tenant, COUNT(*) AS n, SUM(v) AS s' || return 0
+  apply_new 'TRANSFORM tenant_join FROM events JOIN customers ON events.tenant = customers.id GROUP BY events.tenant SELECT events.tenant AS tenant, COUNT(*) AS n' || return 0
+  apply_new 'TRANSFORM orders_wide FROM orders SELECT amount AS amount, amount + 2 AS plus2, amount + 3 AS plus3' || return 0
+  for e in ${rollback_new_defs[@]+"${rollback_new_defs[@]}"}; do
+    rest=${e#*|}; name=${rest%%|*}; text=${rest#*|}
+    apply_new "$text" || return 0
+    cand_only="$cand_only $name"
+  done
+  run_bg cand-rb "$port" "$db" "$candidate_bin"
+  WAIT=240 wait_all "$port" "$db" "$candidate_bin" live orders_copy || { record FAIL downgrade "orders_copy did not go live under the candidate"; return 0; }
+  apply_new 'TRANSFORM chain1 FROM orders_copy SELECT plus AS plus_again' || return 0
+  # shellcheck disable=SC2086
+  if ! WAIT=240 wait_all "$port" "$db" "$candidate_bin" live $shared $cand_only; then
+    record FAIL downgrade "under the candidate, not live:$(missing_status "$port" "$db" "$candidate_bin" live $shared $cand_only)"
+    return 0
+  fi
+  start_writers "$port" "$db"
+  sleep 5
+  for n in $cand_only; do
+    floor=$(scalar "$port" "$db" "select floor_version from trellis.transform_definitions where target_table = 'public.$n'")
+    if [ "$(ver_cmp "$floor" "$old_rel")" -gt 0 ]; then
+      record PASS downgrade "$n has floor $floor under the candidate, after $old_rel"
+    else
+      record FAIL downgrade "$n has floor $floor, which $old_tag meets: its rollback_new_defs entry uses no candidate-only feature"
+    fi
+  done
+  floor=$(scalar "$port" "$db" "select version from trellis.catalog_floor")
+  stop_run cand-rb
+
+  if [ "$(ver_cmp "$floor" "$old_rel")" -gt 0 ]; then
+    # The candidate raised the catalog floor: every handle of the old release
+    # refuses with the floor error (ADR-0024 rule 2); `run` stands by.
+    run_bg old-rb "$port" "$db" "$old_bin"
+    sleep 15
+    if run_alive old-rb && grep -q "the catalog floor is $floor" "$logs/run-old-rb.log"; then
+      record PASS downgrade "$old_tag run stands by below the catalog floor $floor, naming it"
+    else
+      record FAIL downgrade "$old_tag run below the catalog floor $floor: $(head -c 240 "$logs/run-old-rb.log")"
+    fi
+    stop_run old-rb
+    if out=$(trellis "$port" "$db" "$old_bin" apply 'PAUSE TRANSFORM orders_copy' 2>&1); then
+      record FAIL downgrade "$old_tag apply changed a catalog above its floor"
+    elif grep -q "the catalog floor is $floor" <<<"$out"; then
+      record PASS downgrade "$old_tag apply refuses with the floor error"
+    else
+      record FAIL downgrade "$old_tag apply failed without the floor error: ${out:0:240}"
+    fi
+    out=$(trellis "$port" "$db" "$old_bin" status 2>&1 || true)
+    if grep -q "$floor" <<<"$out"; then
+      record PASS downgrade "$old_tag status reads the catalog and names the floor"
+    else
+      record FAIL downgrade "$old_tag status does not name the catalog floor $floor: ${out:0:240}"
+    fi
+    stop_writers
+    record INFO downgrade "the candidate raised the catalog floor to $floor, above $old_rel: rolling back to $old_tag means restoring a backup taken before the upgrade; the release notes say so"
+    return 0
+  fi
+
+  # The old release on the candidate's database, the writers still running.
+  run_bg old-rb "$port" "$db" "$old_bin"
+  for n in $cand_only; do
+    floor=$(scalar "$port" "$db" "select floor_version from trellis.transform_definitions where target_table = 'public.$n'")
+    if wait_for 120 "$n paused" paused_with "$port" "$db" "$n" "this release can't run transform [^:]*$n: its floor, the oldest Trellis release that can run it, is $floor, and this binary runs release $old_rel"; then
+      record PASS downgrade "$old_tag pauses $n with the documented reason"
+    else
+      record FAIL downgrade "$old_tag: $n is $(stored_status "$port" "$db" "$n"), reason: $(failure_reason "$port" "$db" "$n" | head -c 200)"
+    fi
+  done
+  # shellcheck disable=SC2086
+  WAIT=240 wait_all "$port" "$db" "$old_bin" live $shared || true
+  stop_writers
+  sleep 5
+  # shellcheck disable=SC2086
+  missing=$(missing_status "$port" "$db" "$old_bin" live $shared)
+  if [ -z "$missing" ]; then
+    record PASS downgrade "$old_tag runs every other definition: all live"
+    # shellcheck disable=SC2086
+    PROBE=$probe_old check_self "$port" "$db" downgrade $shared
+  else
+    record FAIL downgrade "under $old_tag, not live:$missing"
+  fi
+  for n in $cand_only; do
+    floor=$(scalar "$port" "$db" "select floor_version from trellis.transform_definitions where target_table = 'public.$n'")
+    for stmt in "RESUME TRANSFORM $n" "DROP TRANSFORM $n"; do
+      if out=$(trellis "$port" "$db" "$old_bin" apply "$stmt" 2>&1); then
+        record FAIL downgrade "$old_tag accepted $stmt above its floor"
+      elif grep -q "its floor is $floor" <<<"$out" && [ "$(stored_status "$port" "$db" "$n")" = paused ] &&
+        [ -n "$(scalar "$port" "$db" "select to_regclass('public.$n')")" ]; then
+        record PASS downgrade "$old_tag refuses $stmt, naming the floor, and changes nothing"
+      else
+        record FAIL downgrade "$old_tag $stmt: ${out:0:200}"
+      fi
+    done
+  done
+  if run_alive old-rb; then record PASS downgrade "$old_tag stayed up throughout"
+  else record FAIL downgrade "$old_tag exited: $(tail -c 240 "$logs/run-old-rb.log")"; fi
+  stop_run old-rb
+
+  # Roll forward: the paused definitions stay paused until RESUME.
+  run_bg cand-rb2 "$port" "$db" "$candidate_bin"
+  sleep 15
+  # shellcheck disable=SC2086
+  WAIT=180 wait_all "$port" "$db" "$candidate_bin" live $shared || true
+  for n in $cand_only; do
+    if [ "$(stored_status "$port" "$db" "$n")" = paused ]; then
+      record PASS downgrade "rolled forward, $n stays paused until RESUME"
+    else
+      record FAIL downgrade "rolled forward, $n is $(stored_status "$port" "$db" "$n") without a RESUME"
+    fi
+  done
+  # The first candidate-only definition is dropped there, the rest resumed.
+  first=""; local resumed=""
+  for n in $cand_only; do
+    if [ -z "$first" ]; then
+      first=$n
+      id=$(scalar "$port" "$db" "select id from trellis.transform_definitions where target_table = 'public.$n'")
+      if trellis "$port" "$db" "$candidate_bin" apply "DROP TRANSFORM $n" >>"$logs/apply-rollback.log" 2>&1 &&
+        [ -z "$(scalar "$port" "$db" "select to_regclass('public.$n')")" ] && [ "$(leftovers "$port" "$db" "$id")" = 0 ]; then
+        record PASS downgrade "rolled forward, DROP TRANSFORM $n removes its target, catalog rows and hidden tables"
+      else
+        record FAIL downgrade "rolled forward, DROP TRANSFORM $n left state behind (see $logs/apply-rollback.log; leftovers $(leftovers "$port" "$db" "$id"))"
+      fi
+    else
+      trellis "$port" "$db" "$candidate_bin" apply "RESUME TRANSFORM $n" >>"$logs/apply-rollback.log" 2>&1 || record FAIL downgrade "RESUME TRANSFORM $n refused"
+      resumed="$resumed $n"
+    fi
+  done
+  # shellcheck disable=SC2086
+  if WAIT=240 wait_all "$port" "$db" "$candidate_bin" live $shared $resumed; then
+    record PASS downgrade "rolled forward, every definition converges${resumed:+ (resumed:$resumed)}"
+    # shellcheck disable=SC2086
+    check_self "$port" "$db" downgrade $shared $resumed
+  else
+    record FAIL downgrade "rolled forward, not live:$(missing_status "$port" "$db" "$candidate_bin" live $shared $resumed)"
+  fi
+  [ -n "$cand_only" ] || record INFO downgrade "the candidate adds no feature after $old_rel: $old_tag runs every definition it can define"
+  stop_run cand-rb2
+}
+
 if want downgrade; then
-  say "8. downgrade: $old_tag against a database the candidate wrote"
+  say "8. rollback: $old_tag against a database the candidate wrote"
   stop_run new-shapes; stop_run new-inflight
   sleep 1
-  run_bg down-shapes "$port" shapes "$old_bin"
-  sleep 15
-  if run_alive down-shapes; then
-    record INFO downgrade "$old_tag opened a database the candidate wrote: statuses $(status_lines "$port" shapes "$old_bin" | tr '\n' ' ')"
+  old_rel=$(release_of "$old_version")
+  if [ "$(ver_cmp "$old_rel" 0.2.0)" -lt 0 ]; then
+    rollback_before_floors
   else
-    record INFO downgrade "$old_tag refused a database the candidate wrote: $(head -c 200 "$logs/run-down-shapes.log")"
+    rollback_with_floors
   fi
-  record INFO downgrade "the step asserts nothing: docs/decisions/0024-compatibility-floors-and-rollback.md says what a rollback does, and before 0.2.0 it is a restore from backup (docs/upgrading.md); quote this observation in the release notes"
-  stop_run down-shapes
 else
   record SKIP downgrade "not selected"
 fi
