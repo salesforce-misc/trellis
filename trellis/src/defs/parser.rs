@@ -470,7 +470,9 @@ impl Parser {
     /// `apply`ing a definition can't drift from `parse`ing one.
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         if self.peek_is_keyword("TRANSFORM") {
-            return self.parse_transform_def().map(Statement::DefineTransform);
+            return self
+                .parse_transform_def()
+                .map(|def| Statement::DefineTransform(Box::new(def)));
         }
         if self.peek_is_keyword("ALTER") {
             return self.parse_alter_transform().map(Statement::AlterTransform);

@@ -1221,7 +1221,7 @@ mod statement_grammar_tests {
         let Statement::DefineTransform(def) = parse_statement(text).unwrap() else {
             panic!("a TRANSFORM statement must parse as one");
         };
-        assert_eq!(def, parse(text).unwrap());
+        assert_eq!(*def, parse(text).unwrap());
         assert_eq!(def.target, "order_totals");
         assert_eq!(def.explicit_target_schema, Some("reporting".to_string()));
     }

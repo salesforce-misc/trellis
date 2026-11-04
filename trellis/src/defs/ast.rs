@@ -87,15 +87,11 @@ pub struct TransformDef {
 ///
 /// `AMEND` is deliberately absent: it needs its own semantics ADR before it
 /// can be a grammar addition.
-///
-/// A definition is far larger than the other forms; a statement is parsed
-/// once per `apply` and moved a few times, so its size costs nothing worth
-/// boxing the public variant for.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
-    /// `TRANSFORM <target> FROM <source> ... SELECT ...`
-    DefineTransform(TransformDef),
+    /// `TRANSFORM <target> FROM <source> ... SELECT ...`, boxed: a definition
+    /// is far larger than the other forms.
+    DefineTransform(Box<TransformDef>),
     /// `PAUSE TRANSFORM <target>[.<column>]` — ADR-0014's operator-driven
     /// freeze. Idempotent.
     Pause(TransformRef),
