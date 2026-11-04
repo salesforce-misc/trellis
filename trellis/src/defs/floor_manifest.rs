@@ -402,7 +402,8 @@ fn features() -> Vec<Feature> {
             .map(|spec| Feature::CastTarget(spec.value_type)),
     );
     features.extend(type_rules().into_iter().map(Feature::TypeRule));
-    let values: [(&[r::ArgValueSpec], fn(&'static str) -> ArgValue); 4] = [
+    type Table = (&'static [r::ArgValueSpec], fn(&'static str) -> ArgValue);
+    let values: [Table; 4] = [
         (r::EXTRACT_DATE_FIELDS, ArgValue::ExtractField),
         (r::EXTRACT_CLOCK_FIELDS, ArgValue::ExtractField),
         (r::DATE_TRUNC_UNITS, ArgValue::DateTruncUnit),
@@ -476,9 +477,12 @@ fn manifest() -> String {
         }
     }
     for &t in &types {
-        admissions(&mut lines, format!("negate({t:?})"), Option::is_some, || {
-            r::negate_result_type(t)
-        });
+        admissions(
+            &mut lines,
+            format!("negate({t:?})"),
+            Option::is_some,
+            || r::negate_result_type(t),
+        );
         admissions(
             &mut lines,
             format!("extract({t:?})"),
@@ -539,7 +543,10 @@ fn manifest() -> String {
     // The one admission that reads the operand's syntax: a float beside a
     // bare number literal.
     for &t in &types {
-        for spec in r::OPERATORS.iter().filter(|spec| spec.operator.is_comparison()) {
+        for spec in r::OPERATORS
+            .iter()
+            .filter(|spec| spec.operator.is_comparison())
+        {
             let op = spec.operator;
             let text = format!(
                 "TRANSFORM t FROM s SELECT id AS id, c {} 1.5 AS x",
