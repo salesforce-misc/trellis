@@ -52,7 +52,9 @@
 //! an integer argument or a `numeric` column) with literals, operators, functions
 //! and its `GROUP BY` keys. An argument may be an expression over the row (`SUM(a +
 //! b)`); a `numeric` one must be a column, whose declared scale define checks.
-//! Define refuses any other aggregate by family.
+//! Define refuses any other aggregate by family. The engine also keeps
+//! `MIN`/`MAX` over a plain source column of an ordered type with no
+//! collation ("Extremes" below), which define still refuses (#1117).
 //!
 //! # Where its state lives
 //!
@@ -143,6 +145,58 @@
 //!    index, one probe per group, and the hidden rows it updates by `ctid`,
 //!    so its cost under the groups' locks is the page's groups, not the
 //!    definition's.
+//!
+//! # Extremes (`MIN`/`MAX`)
+//!
+//! `MIN` and `MAX` have no inverse: removing a group's current extreme
+//! leaves a next one no partial records. So the group keeps each extreme
+//! as a value (`__min_<i>`/`__max_<i>`, at the argument's type, one per
+//! distinct call) with a basis of its own, `__xbasis`, and its stamp,
+//! `__xstamp`, and re-reads the extremes from the source when a retraction
+//! reaches one (#1117's rules Rx1–Rx8). A definition with no `MIN`/`MAX`
+//! has none of these columns, and its statements are as they were.
+//!
+//! - **The filter (Rx2).** A (group, transaction) sum applies to the
+//!   extremes only when its transaction isn't visible in `__xbasis` (a
+//!   `NULL` basis sees nothing), and to the partials only when it isn't
+//!   visible in `__basis`; both above the truncate floor. The two bases
+//!   differ: a probe stamps only `__xbasis`, so a change it saw still
+//!   applies to the partials. Stamping `__basis` instead (one basis per
+//!   group) would refuse that change's counts.
+//! - **Insertions (Rx3).** Staging keeps the extreme of a (group,
+//!   transaction, statement)'s insertion sides apart from its retraction
+//!   sides' ([`staged_columns`]), and the apply moves each extreme by
+//!   `least`/`greatest` to its insertions'. An insertion must be filtered:
+//!   `least` is idempotent, but an insertion of a row since deleted, applied
+//!   after the deletion's probe, would bring the deleted value back.
+//! - **The trigger (Rx4).** After that, a group whose retraction sides
+//!   reach an extreme (at or below a minimum, at or above a maximum), or
+//!   whose extreme is `NULL` while it has a non-`NULL` retraction, is probed.
+//!   A retraction below the stored minimum can arrive before its insertion,
+//!   and one onto a `NULL` extreme before the insertion that would set it.
+//! - **The probe (Rx5, [`probe_locked_groups`]).** In the page's own
+//!   transaction, after its lock statement and its apply: one statement
+//!   takes the snapshot and the newest segment, re-reads every extreme of
+//!   each probed group from the source (one index endpoint each, with an
+//!   index on the `GROUP BY` columns then the argument), and writes them
+//!   with the snapshot as `__xbasis` and the segment as `__xstamp`. A probe
+//!   read before the lock could miss a change another page applied in
+//!   between. It takes the source's `ACCESS SHARE` lock while the page holds
+//!   its groups, under the session's `lock_timeout` (I7): a timeout rolls the
+//!   page back and the drain retries it.
+//! - **Absolute writes (Rx6).** A build, rebuild, recompute, release and
+//!   partition correction write the extremes, `__xbasis` and `__xstamp` from
+//!   the snapshot they write the partials from.
+//! - **The GC (Rx7).** A zero group is collected only when both its stamps
+//!   are at or below the drained prefix (or the basis is missing): a probe's
+//!   basis can have seen an insertion whose page hasn't drained.
+//! - **Truncate (Rx8).** The truncate's wipe of the hidden table removes the
+//!   extremes with the partials.
+//!
+//! The visible row is written from the partials and the extremes. The apply
+//! and the probe each read an extreme's prior value with the group's
+//! hidden row, for the visible row's prior image, since an extreme has no
+//! change to subtract.
 //!
 //! # Image-less changes, releases and truncates
 //!
@@ -253,6 +307,73 @@ pub(super) enum Agg {
     /// `AVG(x)`: its sum over its count, as `numeric` (`numeric_div`, which
     /// is what Postgres's `avg()` over an exact argument computes).
     Avg(usize),
+    /// `MIN(x)` (`max` false) or `MAX(x)` (`max` true) over the plain
+    /// source column argument `arg`, whose type is `pg_type`: the group's
+    /// hidden extreme ([`Extreme`]).
+    Extreme {
+        max: bool,
+        arg: usize,
+        pg_type: String,
+    },
+}
+
+/// One hidden extreme of a group (see "Extremes" in the module doc): `MIN`
+/// or `MAX` of the plain source column argument `arg` (0-based in
+/// [`GroupShape::args`]), at the argument's type.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Extreme {
+    pub(super) max: bool,
+    pub(super) arg: usize,
+    pub(super) pg_type: String,
+}
+
+impl Extreme {
+    fn stem(&self) -> &'static str {
+        if self.max { "max" } else { "min" }
+    }
+
+    /// The hidden table's column: `__min_<i>` or `__max_<i>`.
+    pub(super) fn column(&self) -> String {
+        format!("__{}_{}", self.stem(), self.arg + 1)
+    }
+
+    /// A working column named `<prefix><stem><i>` (`__ominN`, `__nmaxN`, …).
+    fn named(&self, prefix: &str) -> String {
+        format!("{prefix}{}{}", self.stem(), self.arg + 1)
+    }
+
+    /// The staged extreme of the page's insertion sides (`+`) of one
+    /// (group, transaction, statement).
+    fn plus(&self) -> String {
+        self.named("__p")
+    }
+
+    /// The staged extreme of its retraction sides (`-`).
+    fn minus(&self) -> String {
+        self.named("__m")
+    }
+
+    /// The aggregate that combines values toward the extreme.
+    fn aggregate(&self) -> &'static str {
+        self.stem()
+    }
+
+    /// The function that moves the extreme by an insertion (Rx3).
+    fn combine(&self) -> &'static str {
+        if self.max { "greatest" } else { "least" }
+    }
+
+    /// `value` reaches `extreme`: at or below a minimum, at or above a
+    /// maximum (Rx4).
+    fn reaches(&self, value: &str, extreme: &str) -> String {
+        let op = if self.max { ">=" } else { "<=" };
+        format!("{value} {op} {extreme}")
+    }
+
+    /// The order a probe reads the argument in, the extreme first.
+    fn order(&self) -> &'static str {
+        if self.max { " desc" } else { "" }
+    }
 }
 
 /// One distinct aggregate argument.
@@ -300,6 +421,157 @@ impl GroupShape {
     pub(crate) fn group_types(&self) -> &[String] {
         &self.group_types
     }
+
+    /// The hidden extremes, one per distinct `MIN`/`MAX` call, in
+    /// [`Self::aggs`]' order. Empty for every definition with no `MIN` or
+    /// `MAX`, whose hidden table and statements are as they were.
+    pub(super) fn extremes(&self) -> Vec<Extreme> {
+        self.aggs
+            .iter()
+            .filter_map(|agg| match agg {
+                Agg::Extreme { max, arg, pg_type } => Some(Extreme {
+                    max: *max,
+                    arg: *arg,
+                    pg_type: pg_type.clone(),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Whether the group basis keeps a hidden extreme over an argument of type
+/// `value_type`: a type with a btree order and no collation. A collatable
+/// argument (text) needs the hidden column and the probe to agree on a
+/// collation, which this engine doesn't arrange yet.
+fn extreme_type_admitted(value_type: ValueType) -> bool {
+    use crate::defs::PgType;
+    matches!(
+        value_type,
+        ValueType::Integer(_)
+            | ValueType::Numeric
+            | ValueType::Float(_)
+            | ValueType::Other(
+                PgType::Date
+                    | PgType::Time
+                    | PgType::Timestamp
+                    | PgType::TimestampTz
+                    | PgType::Interval
+                    | PgType::Oid
+            )
+    )
+}
+
+/// The plain source column `MIN`/`MAX` reads, if `arg` is one.
+fn extreme_column(arg: &Expr) -> Option<&str> {
+    match arg {
+        Expr::Column(column) | Expr::SourceColumn { column, .. } => Some(column),
+        _ => None,
+    }
+}
+
+/// Whether `name` is `MIN` or `MAX`.
+fn is_extreme_name(name: &str) -> bool {
+    matches!(name.to_ascii_uppercase().as_str(), "MIN" | "MAX")
+}
+
+/// `expr` with every `MIN(x)`/`MAX(x)` call replaced by `CAST(NULL AS t)`,
+/// `t` the type of `x` over `source_columns`: an expression the validator
+/// types as Postgres types `min(x)`, for typing a definition the validator
+/// refuses by family (#1117). `None` when a call's argument has no type.
+fn without_extremes(expr: &Expr, source_columns: &HashMap<String, ValueType>) -> Option<Expr> {
+    let walk = |e: &Expr| without_extremes(e, source_columns);
+    Some(match expr {
+        Expr::FunctionCall { name, args } if is_extreme_name(name) && args.len() == 1 => {
+            Expr::Cast {
+                expr: Box::new(Expr::Null),
+                target: crate::defs::validate::infer_expr_type(&args[0], source_columns).ok()?,
+            }
+        }
+        Expr::FunctionCall { name, args } => Expr::FunctionCall {
+            name: name.clone(),
+            args: args.iter().map(walk).collect::<Option<Vec<_>>>()?,
+        },
+        Expr::BinaryOp { op, lhs, rhs } => Expr::BinaryOp {
+            op: *op,
+            lhs: Box::new(walk(lhs)?),
+            rhs: Box::new(walk(rhs)?),
+        },
+        Expr::Negate(operand) => Expr::Negate(Box::new(walk(operand)?)),
+        Expr::Cast {
+            expr: operand,
+            target,
+        } => Expr::Cast {
+            expr: Box::new(walk(operand)?),
+            target: *target,
+        },
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => expr
+            .map_logic_children(|child| walk(child).ok_or(()))
+            .expect("a logic node")
+            .ok()?,
+        other => other.clone(),
+    })
+}
+
+/// Whether any field of `def` calls `MIN` or `MAX`.
+fn calls_extremes(def: &TransformDef) -> bool {
+    fn walk(expr: &Expr) -> bool {
+        match expr {
+            Expr::FunctionCall { name, args } => is_extreme_name(name) || args.iter().any(walk),
+            Expr::BinaryOp { lhs, rhs, .. } => walk(lhs) || walk(rhs),
+            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => walk(operand),
+            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+                expr.logic_children().into_iter().any(walk)
+            }
+            _ => false,
+        }
+    }
+    def.fields.iter().any(|field| walk(&field.expr))
+}
+
+/// `def` with its `MIN`/`MAX` calls typed away ([`without_extremes`]), or
+/// `None` when it has none (or one can't be typed).
+fn extremes_typed_away(
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+) -> Option<TransformDef> {
+    if !calls_extremes(def) {
+        return None;
+    }
+    let mut typed = def.clone();
+    for field in &mut typed.fields {
+        field.expr = without_extremes(&field.expr, source_columns)?;
+    }
+    Some(typed)
+}
+
+/// Test-only admission of `MIN`/`MAX` on a plain aggregate (#1117, step 1
+/// of its PRs): define still refuses them by family, unless a test turned
+/// this on. The engine keeps them whatever this says; only define's
+/// refusal is skipped. The define gate itself comes with a later PR.
+#[cfg(any(test, feature = "test-util"))]
+static ADMIT_EXTREMES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turns [`ADMIT_EXTREMES`] on for the rest of this process.
+#[cfg(any(test, feature = "internals"))]
+pub fn admit_extremes_for_tests() {
+    ADMIT_EXTREMES.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What define validates in place of `def`: `def` itself, or, while a test
+/// admits `MIN`/`MAX` ([`admit_extremes_for_tests`]), `def` with its
+/// `MIN`/`MAX` calls typed away, so define's family refusal doesn't see them.
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) fn define_view(
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+) -> Option<TransformDef> {
+    if !ADMIT_EXTREMES.load(std::sync::atomic::Ordering::Relaxed)
+        || !matches!(def.key_space, KeySpace::Aggregate { .. })
+    {
+        return None;
+    }
+    extremes_typed_away(def, source_columns)
 }
 
 /// The column an aggregate call is read from inside a field's expression.
@@ -324,7 +596,13 @@ pub(crate) fn route(
         group_types.push(ddl::pg_type_name(*value_type).into_owned());
     }
     let substituted = crate::defs::backfill::substituted_field_exprs(def).ok()?;
-    let field_types = crate::defs::validate::infer_field_types(def, source_columns).ok()?;
+    // The validator refuses `MIN`/`MAX` by family, so a definition calling
+    // them is typed with each call as a `NULL` of its argument's type, which
+    // is the type Postgres gives `min(x)`.
+    let typed = extremes_typed_away(def, source_columns);
+    let field_types =
+        crate::defs::validate::infer_field_types(typed.as_ref().unwrap_or(def), source_columns)
+            .ok()?;
     let distinct = distinct_arguments(&def.fields, group_by, &substituted);
     let mut shape = GroupShape {
         group_cols,
@@ -347,7 +625,13 @@ pub(crate) fn route(
             continue;
         }
         let type_of = |arg: &Expr| crate::defs::validate::infer_expr_type(arg, source_columns).ok();
-        let expr = rewrite(&substituted[&field.name], &type_of, &arg_of, &mut shape)?;
+        let expr = rewrite_with(
+            &substituted[&field.name],
+            &type_of,
+            &arg_of,
+            &mut shape,
+            true,
+        )?;
         let pg_type = ddl::pg_type_name(*field_types.get(&field.name)?).into_owned();
         shape.fields.push((field.name.clone(), pg_type, expr));
     }
@@ -364,9 +648,36 @@ pub(super) fn rewrite(
     arg_of: &dyn Fn(&Expr) -> Option<usize>,
     shape: &mut GroupShape,
 ) -> Option<Expr> {
+    rewrite_with(expr, type_of, arg_of, shape, false)
+}
+
+/// [`rewrite`], admitting `MIN`/`MAX` over a plain source column when
+/// `extremes` is set: a plain aggregate's ([`route`]). A `JOIN`'s `T` keeps
+/// none.
+fn rewrite_with(
+    expr: &Expr,
+    type_of: &dyn Fn(&Expr) -> Option<ValueType>,
+    arg_of: &dyn Fn(&Expr) -> Option<usize>,
+    shape: &mut GroupShape,
+    extremes: bool,
+) -> Option<Expr> {
+    let rewrite =
+        |e: &Expr, shape: &mut GroupShape| rewrite_with(e, type_of, arg_of, shape, extremes);
     match expr {
         Expr::FunctionCall { name, args } if is_aggregate(name) => {
             let agg = match (name.to_ascii_uppercase().as_str(), args.as_slice()) {
+                (function @ ("MIN" | "MAX"), [arg]) if extremes => {
+                    extreme_column(arg)?;
+                    let value_type = type_of(arg)?;
+                    if !extreme_type_admitted(value_type) {
+                        return None;
+                    }
+                    Agg::Extreme {
+                        max: function == "MAX",
+                        arg: arg_of(arg)?,
+                        pg_type: ddl::pg_type_name(value_type).into_owned(),
+                    }
+                }
                 ("COUNT", []) => Agg::CountStar,
                 ("COUNT", [arg]) => Agg::Count(arg_of(arg)?),
                 (function @ ("SUM" | "AVG"), [arg]) => {
@@ -411,26 +722,24 @@ pub(super) fn rewrite(
             name: name.clone(),
             args: args
                 .iter()
-                .map(|a| rewrite(a, type_of, arg_of, shape))
+                .map(|a| rewrite(a, shape))
                 .collect::<Option<Vec<_>>>()?,
         }),
         Expr::BinaryOp { op, lhs, rhs } => Some(Expr::BinaryOp {
             op: *op,
-            lhs: Box::new(rewrite(lhs, type_of, arg_of, shape)?),
-            rhs: Box::new(rewrite(rhs, type_of, arg_of, shape)?),
+            lhs: Box::new(rewrite(lhs, shape)?),
+            rhs: Box::new(rewrite(rhs, shape)?),
         }),
-        Expr::Negate(operand) => Some(Expr::Negate(Box::new(rewrite(
-            operand, type_of, arg_of, shape,
-        )?))),
+        Expr::Negate(operand) => Some(Expr::Negate(Box::new(rewrite(operand, shape)?))),
         Expr::Cast {
             expr: operand,
             target,
         } => Some(Expr::Cast {
-            expr: Box::new(rewrite(operand, type_of, arg_of, shape)?),
+            expr: Box::new(rewrite(operand, shape)?),
             target: *target,
         }),
         Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => expr
-            .map_logic_children(|child| rewrite(child, type_of, arg_of, shape).ok_or(()))
+            .map_logic_children(|child| rewrite(child, &mut *shape).ok_or(()))
             .expect("a logic node")
             .ok(),
         other => Some(other.clone()),
@@ -518,8 +827,11 @@ pub(crate) fn hidden_table_ident(schema: &str, id: i64) -> String {
 
 /// The columns of the hidden table `shape` gives a definition, in order:
 /// the `GROUP BY` columns, the row count, a non-null count per aggregate
-/// argument and a sum for each a `SUM` or `AVG` reads, then the basis, stamp
-/// and zero-group flag. [`hidden_table_ddl`] creates exactly these (and the
+/// argument and a sum for each a `SUM` or `AVG` reads, an extreme per
+/// distinct `MIN`/`MAX`, then the basis and stamp, the extremes' basis and
+/// stamp when there are extremes, and the zero-group flag. A definition with
+/// no `MIN`/`MAX` has no extreme column and no extremes' basis.
+/// [`hidden_table_ddl`] creates exactly these (and the
 /// group identity), and [`hidden_table_width`] counts them, so a limit on the
 /// table's width is the width of the table.
 fn hidden_table_columns(shape: &GroupShape) -> Vec<String> {
@@ -539,8 +851,16 @@ fn hidden_table_columns(shape: &GroupShape) -> Vec<String> {
             zero.push(format!("__sum_{} = 0", i + 1));
         }
     }
+    let extremes = shape.extremes();
+    for extreme in &extremes {
+        columns.push(format!("{} {}", extreme.column(), extreme.pg_type));
+    }
     columns.push("__basis pg_snapshot".to_string());
     columns.push("__stamp bigint".to_string());
+    if !extremes.is_empty() {
+        columns.push("__xbasis pg_snapshot".to_string());
+        columns.push("__xstamp bigint".to_string());
+    }
     columns.push(format!(
         "__zero boolean not null generated always as ({}) stored",
         zero.join(" and ")
@@ -579,13 +899,22 @@ pub(crate) fn hidden_table_ddl(schema: &str, id: i64, shape: &GroupShape) -> Str
 /// `for update skip locked` in key order. With `basis` (the table has a
 /// basis column), only those that have no basis or whose stamp is at or
 /// below `$2`, the contiguous drained prefix; without (a `JOIN`'s `T`),
-/// every zero group. See "Zero groups" in the module doc;
+/// every zero group. With `xbasis` too (the table keeps extremes), only
+/// those whose extremes' basis is missing or whose `__xstamp` is at or below
+/// `$2` as well (Rx7). See "Zero groups" in the module doc;
 /// `super::retire::collect_tombstones` runs it.
-pub(crate) fn collect_zero_groups_sql(hidden: &str, group_cols: &str, basis: bool) -> String {
-    let rule = if basis {
-        " and (__basis is null or __stamp <= $2)"
-    } else {
-        ""
+pub(crate) fn collect_zero_groups_sql(
+    hidden: &str,
+    group_cols: &str,
+    basis: bool,
+    xbasis: bool,
+) -> String {
+    let rule = match (basis, xbasis) {
+        (true, true) => {
+            " and (__basis is null or __stamp <= $2) and (__xbasis is null or __xstamp <= $2)"
+        }
+        (true, false) => " and (__basis is null or __stamp <= $2)",
+        (false, _) => "",
     };
     format!(
         "delete from {hidden} where ctid = any(array( \
@@ -778,6 +1107,10 @@ pub(crate) struct GroupTargetPlan {
     /// The session's temporary table of the groups a page or a release
     /// recomputes ([`recompute_locked_groups`]), quoted.
     recomputed: String,
+    /// The session's temporary table of the groups whose extremes a page
+    /// probes ([`probe_locked_groups`]), quoted; empty for a `JOIN`'s
+    /// structures, which keep no extremes.
+    probed: String,
     /// The source, quoted and qualified: the row type images populate.
     source_row: String,
     /// The source as the ring names it (`src_table`), unquoted.
@@ -827,6 +1160,13 @@ fn staged_columns(shape: &GroupShape) -> Vec<String> {
         if arg.summed {
             columns.push(format!("__s{} numeric", i + 1));
         }
+    }
+    // Per extreme, the extreme of the insertion sides and of the
+    // retraction sides, kept apart (Rx4: a sum can't say which side reached
+    // the extreme).
+    for extreme in shape.extremes() {
+        columns.push(format!("{} {}", extreme.plus(), extreme.pg_type));
+        columns.push(format!("{} {}", extreme.minus(), extreme.pg_type));
     }
     columns
 }
@@ -884,6 +1224,13 @@ impl GroupTargetPlan {
                 "pg_temp.{}",
                 quote_ident(&format!(
                     "trellis_group_recompute_{definition_id}_{:016x}",
+                    shape_hash(&recompute_columns(&shape).join(","))
+                ))
+            ),
+            probed: format!(
+                "pg_temp.{}",
+                quote_ident(&format!(
+                    "trellis_group_probe_{definition_id}_{:016x}",
                     shape_hash(&recompute_columns(&shape).join(","))
                 ))
             ),
@@ -945,6 +1292,7 @@ impl GroupTargetPlan {
             hidden_ident: hidden,
             staged: format!("pg_temp.{}", quote_ident(staged)),
             recomputed,
+            probed: String::new(),
             source_row,
             source: source_name.to_string(),
             ring: Vec::new(),
@@ -1304,11 +1652,28 @@ impl GroupTargetPlan {
     /// [`Self::staged`], and but for a `JOIN`'s `T` [`Self::recomputed`].
     pub(super) fn working_ddl(&self) -> String {
         match self.writer {
+            Writer::Aggregate if !self.shape.extremes().is_empty() => format!(
+                "{}; {}; {}",
+                self.staged_ddl(),
+                self.recomputed_ddl(),
+                self.probed_ddl()
+            ),
             Writer::Aggregate | Writer::JoinPartials { .. } => {
                 format!("{}; {}", self.staged_ddl(), self.recomputed_ddl())
             }
             Writer::JoinTarget => self.staged_ddl(),
         }
+    }
+
+    /// The `create` of [`Self::probed`]'s table, one row per group whose
+    /// extremes the page probes. Created once a session; its rows go with
+    /// each page's transaction.
+    fn probed_ddl(&self) -> String {
+        format!(
+            "create temp table if not exists {} ({}) on commit delete rows",
+            self.probed.trim_start_matches("pg_temp."),
+            recompute_columns(&self.shape).join(", ")
+        )
     }
 
     /// The statement adding groups to [`Self::recomputed`] ([`name_groups`]):
@@ -1374,6 +1739,12 @@ impl GroupTargetPlan {
             if arg.summed {
                 sums.push(format!("sum(__sgn * coalesce(__a{i}, 0)::numeric)"));
             }
+        }
+        for extreme in self.shape.extremes() {
+            let a = format!("__a{}", extreme.arg + 1);
+            let agg = extreme.aggregate();
+            sums.push(format!("{agg}({a}) filter (where __sgn = 1)"));
+            sums.push(format!("{agg}({a}) filter (where __sgn = -1)"));
         }
         // A `JOIN`'s `T` has no `Recompute` rows ([`Self::push`]) and no
         // recompute table. Where the populated source row `s` is in scope a
@@ -1486,14 +1857,21 @@ impl GroupTargetPlan {
     }
 
     /// The SQL of aggregate `agg` over partials named by `n`, `count` and
-    /// `sum` (each a function of the argument's 1-based index).
+    /// `sum` (each a function of the argument's 1-based index), and
+    /// `extreme` (of the extreme).
     fn agg_sql(
         agg: &Agg,
         n: &str,
         count: &dyn Fn(usize) -> String,
         sum: &dyn Fn(usize) -> String,
+        extreme: &dyn Fn(&Extreme) -> String,
     ) -> String {
         match agg {
+            Agg::Extreme { max, arg, pg_type } => extreme(&Extreme {
+                max: *max,
+                arg: *arg,
+                pg_type: pg_type.clone(),
+            }),
             Agg::CountStar => n.to_string(),
             Agg::Count(i) => count(i + 1),
             Agg::Sum(i, cast) => format!(
@@ -1510,13 +1888,15 @@ impl GroupTargetPlan {
     }
 
     /// A lateral subquery computing every field over partials named by
-    /// `n`, `count` and `sum`, as columns `<prefix>0`, `<prefix>1`, ….
+    /// `n`, `count`, `sum` and `extreme`, as columns `<prefix>0`,
+    /// `<prefix>1`, ….
     fn fields_lateral(
         &self,
         prefix: &str,
         n: &str,
         count: &dyn Fn(usize) -> String,
         sum: &dyn Fn(usize) -> String,
+        extreme: &dyn Fn(&Extreme) -> String,
     ) -> String {
         let aggs: Vec<String> = self
             .shape
@@ -1526,7 +1906,7 @@ impl GroupTargetPlan {
             .map(|(k, agg)| {
                 format!(
                     "{} as {}",
-                    Self::agg_sql(agg, n, count, sum),
+                    Self::agg_sql(agg, n, count, sum, extreme),
                     quote_ident(&placeholder(k))
                 )
             })
@@ -1651,6 +2031,12 @@ impl GroupTargetPlan {
         if crate::plant::armed() == Some(crate::plant::Plant::GbLsnNotVisibility) {
             unseen = "sg.__txid >= pg_snapshot_xmax(b.__basis)";
         }
+        let extremes = self.shape.extremes();
+        if !extremes.is_empty() {
+            return self.apply_extremes_sql(
+                tail, &extremes, &sums, &sets, &nonzero, &up_groups, &returning, unseen,
+            );
+        }
         format!(
             "{basis_ctes}{lost}, \
              f as ( \
@@ -1676,11 +2062,127 @@ impl GroupTargetPlan {
         )
     }
 
+    /// [`Self::apply_sql_with`] for a definition with extremes (see
+    /// "Extremes" in the module doc). Each (group, transaction) sum is
+    /// checked against both bases: the partials' (`__ok`, R2) and the
+    /// extremes' (`__xok`, Rx2). The partials add what `__ok` keeps, as
+    /// without extremes; each extreme moves by `least`/`greatest` to the
+    /// extreme of the insertion sides `__xok` keeps (Rx3), and the group is
+    /// marked to probe (`__probe`) when a retraction `__xok` keeps reaches
+    /// the extreme so moved, or the extreme is `NULL` (Rx4). The groups to
+    /// probe go to [`Self::probed`]. `up` returns each extreme's prior value
+    /// (`__o…`, read with the basis) and its new one (`__n…`).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_extremes_sql(
+        &self,
+        tail: &str,
+        extremes: &[Extreme],
+        sums: &[String],
+        sets: &[String],
+        nonzero: &[String],
+        up_groups: &[String],
+        returning: &[String],
+        unseen: &str,
+    ) -> String {
+        let mut sums = sums.to_vec();
+        let mut totals =
+            vec!["coalesce(sum(__n) filter (where __ok), 0)::bigint as __n".to_string()];
+        for (i, arg) in self.shape.args.iter().enumerate() {
+            let i = i + 1;
+            totals.push(format!(
+                "coalesce(sum(__c{i}) filter (where __ok), 0)::bigint as __c{i}"
+            ));
+            if arg.summed {
+                totals.push(format!(
+                    "coalesce(sum(__s{i}) filter (where __ok), 0) as __s{i}"
+                ));
+            }
+        }
+        let mut sets = sets.to_vec();
+        let mut touched = nonzero.to_vec();
+        let mut returning = returning.to_vec();
+        let mut probe = Vec::with_capacity(extremes.len());
+        let mut prior = Vec::with_capacity(extremes.len());
+        for x in extremes {
+            let (agg, plus, minus, old) = (x.aggregate(), x.plus(), x.minus(), x.named("__o"));
+            let column = x.column();
+            sums.push(format!("{agg}({plus}) as {plus}"));
+            sums.push(format!("{agg}({minus}) as {minus}"));
+            totals.push(format!("{agg}({plus}) filter (where __xok) as {plus}"));
+            totals.push(format!("{agg}({minus}) filter (where __xok) as {minus}"));
+            totals.push(format!("{agg}({old}) as {old}"));
+            prior.push(format!("b.{old}"));
+            sets.push(format!("{column} = {}(u.{column}, t.{plus})", x.combine()));
+            touched.push(format!("t.{plus} is not null or t.{minus} is not null"));
+            returning.push(format!(
+                "t.{old} as {old}, u.{column} as {}",
+                x.named("__n")
+            ));
+            probe.push(format!(
+                "(t.{minus} is not null and (u.{column} is null or {}))",
+                x.reaches(&format!("t.{minus}"), &format!("u.{column}"))
+            ));
+        }
+        let cols = quoted(&self.shape.group_cols).join(", ");
+        format!(
+            "{basis_ctes}, \
+             f as ( \
+                 select sg.*, b.__hc, {prior}, \
+                        (b.__basis is null or {unseen}) as __ok, \
+                        (b.__xbasis is null \
+                            or not pg_visible_in_snapshot(sg.__txid, b.__xbasis)) as __xok \
+                 from sg join b on {matched} \
+             ), \
+             t as ( \
+                 select __hc, {totals} from f where __ok or __xok group by __hc \
+             ), \
+             up as ( \
+                 update {hidden} u set {sets} from t \
+                 where u.ctid = any(array(select t.__hc from t where {touched})) \
+                   and u.ctid = t.__hc \
+                 returning {up_groups}, {returning}, {probe} as __probe \
+             ), \
+             probed as (insert into {probed} ({cols}) select {cols} from up where __probe), \
+             {tail}",
+            basis_ctes = self.basis_ctes_sql(&sums),
+            prior = prior.join(", "),
+            matched = self.group_match("sg", "b"),
+            totals = totals.join(", "),
+            hidden = self.hidden_ident,
+            sets = sets.join(", "),
+            touched = touched.join(" or "),
+            up_groups = up_groups.join(", "),
+            returning = returning.join(", "),
+            probe = probe.join(" or "),
+            probed = self.probed,
+        )
+    }
+
     /// [`Self::apply_sql_with`]'s first CTEs: `sg`, the staged sides above
     /// the truncate floor (`$1`'s) summed per (group, transaction) into
-    /// `sums`; `pg`, their groups; and `b`, each group's hidden row and basis.
+    /// `sums`; `pg`, their groups; and `b`, each group's hidden row and basis
+    /// (and, with extremes, the extremes' basis `__xbasis` and each
+    /// extreme's value `__o…`).
     fn basis_ctes_sql(&self, sums: &[String]) -> String {
         let col_list = quoted(&self.shape.group_cols).join(", ");
+        let extremes = self.shape.extremes();
+        let (mut held, mut names) = (
+            if matches!(self.writer, Writer::JoinTarget) {
+                vec!["x.ctid".to_string(), "null::pg_snapshot".to_string()]
+            } else {
+                vec!["x.ctid".to_string(), "x.__basis".to_string()]
+            },
+            vec!["__hc".to_string(), "__basis".to_string()],
+        );
+        if !extremes.is_empty() {
+            held.push("x.__xbasis".to_string());
+            names.push("__xbasis".to_string());
+            for x in &extremes {
+                held.push(format!("x.{}", x.column()));
+                names.push(x.named("__o"));
+            }
+        }
+        let b_columns: Vec<String> = names.iter().map(|n| format!("h.{n}")).collect();
         format!(
             "with sg as ( \
                  select {col_list}, __txid, {sums} from {staged} \
@@ -1689,11 +2191,13 @@ impl GroupTargetPlan {
              ), \
              pg as (select distinct {col_list} from sg), \
              b as ( \
-                 select pg.*, h.__hc, h.__basis from pg \
-                 cross join lateral {lookup_hidden} as h(__hc, __basis) \
+                 select pg.*, {b_columns} from pg \
+                 cross join lateral {lookup_hidden} as h({names}) \
              )",
             staged = self.staged,
             sums = sums.join(", "),
+            b_columns = b_columns.join(", "),
+            names = names.join(", "),
             floor = if self.floor_key.is_some() {
                 "where __lsn > coalesce( \
                      (select floor from ledger_truncate_floor where target_table = $1), \
@@ -1705,11 +2209,7 @@ impl GroupTargetPlan {
                 &self.hidden_ident,
                 Population::Hidden,
                 "pg",
-                if matches!(self.writer, Writer::JoinTarget) {
-                    "x.ctid, null::pg_snapshot"
-                } else {
-                    "x.ctid, x.__basis"
-                }
+                &held.join(", ")
             ),
         )
     }
@@ -1796,6 +2296,157 @@ impl GroupTargetPlan {
         )
     }
 
+    /// The extreme `x` of the source rows of the group `rg` (a lateral
+    /// reference), as one index probe: the first non-`NULL` argument in the
+    /// extreme's order, read through the root. A group with a `NULL` part
+    /// matches each such column by `is null`, one branch per pattern of
+    /// `NULL` columns behind a one-time test of `rg`'s, as
+    /// [`Self::group_lookup`] does: `is not distinct from` would make each
+    /// probe of such a group scan the source (past
+    /// [`MAX_NULL_PATTERN_COLUMNS`] group columns it does, for those
+    /// groups). An index on the `GROUP BY` columns then the argument serves
+    /// every branch with one endpoint read; without one the probe scans the
+    /// group.
+    fn extreme_probe_sql(&self, x: &Extreme) -> String {
+        let cols = quoted(&self.shape.group_cols);
+        let arg = quote_ident(
+            extreme_column(&self.shape.args[x.arg].expr).expect("an extreme reads a plain column"),
+        );
+        // `rg`'s group is the working collation's; the probe runs under the
+        // source column's, the collation its index is on.
+        let rg = |i: usize, c: &str| {
+            self.collations.coerce(
+                &format!("rg.{c}"),
+                i,
+                Population::Hidden,
+                Population::Source,
+            )
+        };
+        let branch = |condition: String| {
+            format!(
+                "(select s.{arg} as __v from {src} s where {condition} and s.{arg} is not null \
+                  order by s.{arg}{order} limit 1)",
+                src = self.source_row,
+                order = x.order(),
+            )
+        };
+        let equal: Vec<String> = cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("s.{c} = {}", rg(i, c)))
+            .collect();
+        let mut branches = vec![branch(equal.join(" and "))];
+        if cols.len() <= MAX_NULL_PATTERN_COLUMNS {
+            for pattern in 1..(1_u32 << cols.len()) {
+                let is_null = |i: usize| pattern & (1 << i) != 0;
+                let condition: Vec<String> = cols
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        if is_null(i) {
+                            format!("rg.{c} is null and s.{c} is null")
+                        } else {
+                            format!("rg.{c} is not null and s.{c} = {}", rg(i, c))
+                        }
+                    })
+                    .collect();
+                branches.push(branch(condition.join(" and ")));
+            }
+        } else {
+            let has_null: Vec<String> = cols.iter().map(|c| format!("rg.{c} is null")).collect();
+            let same: Vec<String> = cols
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("s.{c} is not distinct from {}", rg(i, c)))
+                .collect();
+            branches.push(branch(format!(
+                "({}) and {}",
+                has_null.join(" or "),
+                same.join(" and ")
+            )));
+        }
+        format!(
+            "(select {agg}(__v) from ({branches}) as __p)",
+            agg = x.aggregate(),
+            branches = branches.join(" union all "),
+        )
+    }
+
+    /// The probe's statement ([`probe_locked_groups`], Rx5): over the groups
+    /// of [`Self::probed`], locked by the page's lock statement, takes the
+    /// snapshot and reads the newest segment's `seg_seq` in this one
+    /// statement, re-reads every extreme of each group from the source
+    /// ([`Self::extreme_probe_sql`]), and writes them with the snapshot as
+    /// the extremes' basis and the segment as their stamp. It reads and
+    /// writes no partial: the partials keep their own basis. `up` returns
+    /// each partial's value with a change of zero, and each extreme's prior
+    /// and new value, for [`Self::visible_tail_sql`].
+    fn probe_sql(&self, image_columns: Option<&[String]>) -> String {
+        let cols = quoted(&self.shape.group_cols);
+        let col_list = cols.join(", ");
+        let extremes = self.shape.extremes();
+        let mut held = vec!["x.ctid".to_string()];
+        let mut held_names = vec!["__hc".to_string()];
+        let mut probes = Vec::with_capacity(extremes.len());
+        let mut sets = Vec::with_capacity(extremes.len());
+        let mut returning = vec!["0::bigint as __dn".to_string(), "u.__n as __nn".to_string()];
+        for (i, arg) in self.shape.args.iter().enumerate() {
+            let i = i + 1;
+            returning.push(format!("0::bigint as __dc{i}, u.__count_{i} as __nc{i}"));
+            if arg.summed {
+                returning.push(format!("0::numeric as __ds{i}, u.__sum_{i} as __ns{i}"));
+            }
+        }
+        for x in &extremes {
+            let column = x.column();
+            held.push(format!("x.{column}"));
+            held_names.push(x.named("__o"));
+            probes.push(format!(
+                "{} as {}",
+                self.extreme_probe_sql(x),
+                x.named("__r")
+            ));
+            sets.push(format!("{column} = r.{}", x.named("__r")));
+            returning.push(format!(
+                "r.{} as {}, u.{column} as {}",
+                x.named("__o"),
+                x.named("__o"),
+                x.named("__n")
+            ));
+        }
+        let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
+        format!(
+            "with snap as materialized ({SNAPSHOT_AND_STAMP}), \
+             rg as (select distinct {col_list} from {probed}), \
+             r as ( \
+                 select h.*, p.* from rg \
+                 cross join lateral {lookup_hidden} as h({held_names}) \
+                 cross join lateral (select {probes}) as p \
+             ), \
+             up as ( \
+                 update {hidden} u set {sets}, __xbasis = snap.__snap, __xstamp = snap.__seg \
+                 from r, snap \
+                 where u.ctid = any(array(select r.__hc from r)) and u.ctid = r.__hc \
+                 returning {up_groups}, {returning}, false as __probe \
+             ), \
+             {tail}",
+            probed = self.probed,
+            lookup_hidden = self.group_lookup(
+                &self.hidden_ident,
+                Population::Hidden,
+                "rg",
+                &held.join(", ")
+            ),
+            held_names = held_names.join(", "),
+            probes = probes.join(", "),
+            hidden = self.hidden_ident,
+            sets = sets.join(", "),
+            up_groups = up_groups.join(", "),
+            returning = returning.join(", "),
+            tail = self.visible_tail_sql(image_columns),
+        )
+    }
+
     /// The recompute's statement ([`recompute_locked_groups`], R1, R5): over
     /// the groups of [`Self::recomputed`], already locked, takes the
     /// snapshot and reads the newest segment's `seg_seq` in this one
@@ -1852,6 +2503,31 @@ impl GroupTargetPlan {
                 ));
             }
         }
+        // Rx6: the extremes from the same snapshot, which becomes their
+        // basis too.
+        let extremes = self.shape.extremes();
+        let mut xsets = String::new();
+        for x in &extremes {
+            let (column, fresh_name) = (x.column(), x.named("__r"));
+            old.push(format!("x.{column}"));
+            old_names.push(x.named("__o"));
+            fresh.push(format!(
+                "{}({}) as {fresh_name}",
+                x.aggregate(),
+                self.shape.args[x.arg].sql
+            ));
+            zeroed.push(format!("n.{fresh_name} as {fresh_name}"));
+            sets.push(format!("{column} = r.{fresh_name}"));
+            returning.push(format!(
+                "r.{o} as {o}, u.{column} as {}",
+                x.named("__n"),
+                o = x.named("__o")
+            ));
+        }
+        if !extremes.is_empty() {
+            returning.push("false as __probe".to_string());
+            xsets = ", __xbasis = snap.__snap, __xstamp = snap.__seg".to_string();
+        }
         let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
         let lookup_hidden = self.group_lookup(
             &self.hidden_ident,
@@ -1902,7 +2578,7 @@ impl GroupTargetPlan {
              rg as (select distinct {col_list} from {recomputed}), \
              {r}, \
              up as ( \
-                 update {hidden} u set {sets}, __basis = snap.__snap, __stamp = snap.__seg \
+                 update {hidden} u set {sets}, __basis = snap.__snap, __stamp = snap.__seg{xsets} \
                  from r, snap \
                  where u.ctid = any(array(select r.__hc from r)) and u.ctid = r.__hc \
                  returning {up_groups}, {returning} \
@@ -2231,6 +2907,24 @@ impl GroupTargetPlan {
                 returning.push(format!("u.__sum_{i} as __ns{i}"));
             }
         }
+        // Rx6: the extremes from the same `GROUP BY` and snapshot, which
+        // becomes their basis too.
+        let extremes = self.shape.extremes();
+        let mut xsets = String::new();
+        for x in &extremes {
+            let (column, fresh_name) = (x.column(), x.named("__r"));
+            fresh.push(format!(
+                "{}({}) as {fresh_name}",
+                x.aggregate(),
+                self.shape.args[x.arg].sql
+            ));
+            kept.push(format!("a.{fresh_name} as {fresh_name}"));
+            sets.push(format!("{column} = r.{fresh_name}"));
+            returning.push(format!("u.{column} as {}", x.named("__n")));
+        }
+        if !extremes.is_empty() {
+            xsets = ", __xbasis = snap.__snap, __xstamp = snap.__seg".to_string();
+        }
         let positions: Vec<String> = (1..=cols.len()).map(|p| p.to_string()).collect();
         let matched = self.group_match("a", "rg");
         let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
@@ -2294,7 +2988,7 @@ impl GroupTargetPlan {
              rg as (select distinct {col_list} from {recomputed}), \
              {r}, \
              up as ( \
-                 update {hidden} u set {sets}, __basis = snap.__snap, __stamp = snap.__seg \
+                 update {hidden} u set {sets}, __basis = snap.__snap, __stamp = snap.__seg{xsets} \
                  from r, snap where u.ctid = r.__hc \
                  returning {up_groups}, {returning} \
              ), \
@@ -2331,6 +3025,14 @@ impl GroupTargetPlan {
                 ));
             }
         }
+        for x in self.shape.extremes() {
+            fresh.push(format!(
+                "{}({}) as {}",
+                x.aggregate(),
+                self.shape.args[x.arg].sql,
+                x.named("__r")
+            ));
+        }
         let positions: Vec<String> = (1..=cols.len()).map(|p| p.to_string()).collect();
         format!(
             "create temporary table {early} on commit drop as \
@@ -2364,6 +3066,10 @@ impl GroupTargetPlan {
                 applied.push(format!("cur.__ns{i}::text"));
             }
         }
+        // An absolute write leaves no extreme to probe.
+        if !self.shape.extremes().is_empty() {
+            applied.push("false".to_string());
+        }
         let field_count = self.shape.fields.len();
         let field_names: Vec<String> = self
             .shape
@@ -2371,9 +3077,13 @@ impl GroupTargetPlan {
             .iter()
             .map(|(name, _, _)| quote_ident(name))
             .collect();
-        let new_fields = self.fields_lateral("__nf", "up.__nn", &|i| format!("up.__nc{i}"), &|i| {
-            format!("up.__ns{i}")
-        });
+        let new_fields = self.fields_lateral(
+            "__nf",
+            "up.__nn",
+            &|i| format!("up.__nc{i}"),
+            &|i| format!("up.__ns{i}"),
+            &|x| x.named("up.__n"),
+        );
         let nf: Vec<String> = (0..field_count).map(|j| format!("nv.__nf{j}")).collect();
         let held: Vec<String> = (0..field_count).map(|j| format!("t.__vf{j}")).collect();
         let held_names: Vec<String> = (0..field_count).map(|j| format!("__vf{j}")).collect();
@@ -2569,14 +3279,21 @@ impl GroupTargetPlan {
         let cols = quoted(&self.shape.group_cols);
         let col_list = cols.join(", ");
         let args = &self.shape.args;
-        let new_fields = self.fields_lateral("__nf", "up.__nn", &|i| format!("up.__nc{i}"), &|i| {
-            format!("up.__ns{i}")
-        });
+        // An extreme has no change to subtract: `up` carries its prior
+        // value (`__o…`) beside its new one (`__n…`).
+        let new_fields = self.fields_lateral(
+            "__nf",
+            "up.__nn",
+            &|i| format!("up.__nc{i}"),
+            &|i| format!("up.__ns{i}"),
+            &|x| x.named("up.__n"),
+        );
         let prior_fields = self.fields_lateral(
             "__pf",
             "(up.__nn - up.__dn)",
             &|i| format!("(up.__nc{i} - up.__dc{i})"),
             &|i| format!("(up.__ns{i} - up.__ds{i})"),
+            &|x| x.named("up.__o"),
         );
         let field_count = self.shape.fields.len();
         let nf: Vec<String> = (0..field_count).map(|j| format!("__nf.__nf{j}")).collect();
@@ -2629,6 +3346,10 @@ impl GroupTargetPlan {
             if arg.summed {
                 applied.push(format!("vis.__ds{}::text", i + 1));
             }
+        }
+        // Whether the group's extremes are to be probed (Rx4).
+        if !self.shape.extremes().is_empty() {
+            applied.push("vis.__probe".to_string());
         }
         format!(
             "vis as ( \
@@ -2701,13 +3422,15 @@ const MAX_NULL_PATTERN_COLUMNS: usize = 4;
 /// What one page applied to one group ([`apply_locked_groups`]): the
 /// group's identity key text (`ddl::pk_key_sql_expr`), and the deltas it
 /// added to `__n`, to each argument's count and, for a summed argument, to
-/// its sum (as text), in argument order.
+/// its sum (as text), in argument order; and whether its extremes are to
+/// be probed (Rx4; always false for a definition with no `MIN`/`MAX`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AppliedGroup {
     pub key: String,
     pub n: i64,
     pub counts: Vec<i64>,
     pub sums: Vec<Option<String>>,
+    pub probe: bool,
 }
 
 /// Step 1 of a page on a group-basis target (see the module doc): locks, in
@@ -2720,6 +3443,17 @@ pub(crate) async fn lock_groups(
 ) -> Result<(), ApplyError> {
     stage_sides(txn, plan).await?;
     name_groups(txn, plan, &[], &plan.recompute_keys).await?;
+    // Test-only pause point: the page's sides are staged, and none of its
+    // groups is locked. See `super::interleave`.
+    #[cfg(any(test, feature = "test-util"))]
+    if matches!(plan.writer, Writer::Aggregate) {
+        super::interleave::pause_at(
+            txn,
+            super::interleave::PausePoint::BeforeGroupLock,
+            &plan.target,
+        )
+        .await?;
+    }
     // Planted bug: lock none of the groups that exist. See
     // `crate::plant`.
     #[cfg(any(test, feature = "test-util"))]
@@ -2999,6 +3733,28 @@ pub(super) async fn recompute_locked_groups_from(
     let image_columns = mutations.image_columns(txn, &plan.target).await?;
     let rows = txn
         .query(&plan.recompute_sql(image_columns.as_deref(), node), &[])
+        .await?;
+    let (_, written, deleted) = written_groups(plan, rows, mutations);
+    Ok((written, deleted))
+}
+
+/// The probe of the extremes of the groups in [`GroupTargetPlan::probed`]
+/// (Rx5), which the page's lock statement locked and its apply named: one
+/// statement takes the snapshot, re-reads each group's extremes from the
+/// source with an index probe, and writes them with the snapshot as the
+/// extremes' basis ([`GroupTargetPlan::probe_sql`]). It reads the source, so
+/// it takes the source's `ACCESS SHARE` lock, under the session's
+/// `lock_timeout` (I7): a timeout rolls the page back, and the drain retries
+/// it. Each changed visible row is recorded into `mutations`. Returns how
+/// many visible rows it wrote and deleted.
+pub(crate) async fn probe_locked_groups(
+    txn: &Transaction<'_>,
+    plan: &GroupTargetPlan,
+    mutations: &mut TargetMutations,
+) -> Result<(usize, usize), ApplyError> {
+    let image_columns = mutations.image_columns(txn, &plan.target).await?;
+    let rows = txn
+        .query(&plan.probe_sql(image_columns.as_deref()), &[])
         .await?;
     let (_, written, deleted) = written_groups(plan, rows, mutations);
     Ok((written, deleted))
@@ -3410,11 +4166,13 @@ fn written_groups(
                 sums.push(None);
             }
         }
+        let probe = !plan.shape.extremes().is_empty() && row.get::<_, bool>(column);
         applied.push(AppliedGroup {
             key,
             n,
             counts,
             sums,
+            probe,
         });
     }
     (applied, written, deleted)
@@ -3444,7 +4202,22 @@ pub(crate) async fn apply_group_target(
         &plan.target,
     )
     .await?;
-    let (_, mut written, mut deleted) = apply_locked_groups(txn, plan, mutations).await?;
+    let (applied, mut written, mut deleted) = apply_locked_groups(txn, plan, mutations).await?;
+    // A retraction reached a group's extreme (Rx4): re-read it.
+    if applied.iter().any(|group| group.probe) {
+        // Test-only pause point: the page's sides are applied, and its
+        // groups' extremes are not probed yet. See `super::interleave`.
+        #[cfg(any(test, feature = "test-util"))]
+        super::interleave::pause_at(
+            txn,
+            super::interleave::PausePoint::BeforeExtremeProbe,
+            &plan.target,
+        )
+        .await?;
+        let (w, d) = probe_locked_groups(txn, plan, mutations).await?;
+        written += w;
+        deleted += d;
+    }
     // Only an image-less change names a group to recompute: its key, and
     // its prior-image hint, which rides on the same ring row.
     if !plan.recompute_keys.is_empty() {
@@ -3752,8 +4525,9 @@ mod tests {
     #[test]
     fn takes_no_refused_aggregate_and_no_one_to_one() {
         for text in [
-            "TRANSFORM t FROM s GROUP BY g SELECT MIN(a) AS n",
-            "TRANSFORM t FROM s GROUP BY g SELECT MAX(a) + COUNT(*) AS n",
+            // `MIN`/`MAX` over an expression, or a collatable column.
+            "TRANSFORM t FROM s GROUP BY g SELECT MIN(a + 1) AS n",
+            "TRANSFORM t FROM s GROUP BY g SELECT MAX(h) AS n",
             "TRANSFORM t FROM s GROUP BY g SELECT SUM(f) AS n",
             "TRANSFORM t FROM s GROUP BY g SELECT AVG(f) AS n",
             // A `numeric` expression has no declared scale.
@@ -3762,6 +4536,62 @@ mod tests {
         ] {
             assert!(shape(text).is_none(), "{text}");
         }
+    }
+
+    /// `MIN`/`MAX` over a plain column of an ordered, uncollated type is one
+    /// hidden extreme per distinct call, typed as its argument, composed with
+    /// the other aggregates; the hidden table gains the extremes and their
+    /// own basis and stamp, and a definition with none keeps its columns.
+    #[test]
+    fn takes_min_and_max_over_a_plain_column() {
+        let shape = shape(
+            "TRANSFORM t FROM s GROUP BY g \
+             SELECT MIN(a) AS lo, MAX(a) + COUNT(*) AS hi, MIN(a) AS lo2, MAX(f) AS fx, \
+                    MIN(m) AS mm, SUM(a) AS total",
+        )
+        .expect("admitted");
+        let extremes: Vec<(bool, usize, String)> = shape
+            .extremes()
+            .into_iter()
+            .map(|x| (x.max, x.arg, x.pg_type))
+            .collect();
+        assert_eq!(
+            extremes,
+            [
+                (false, 0, "integer".to_string()),
+                (true, 0, "integer".to_string()),
+                (true, 1, "double precision".to_string()),
+                (false, 2, "numeric".to_string()),
+            ]
+        );
+        let columns = hidden_table_columns(&shape);
+        assert_eq!(
+            columns[columns.len() - 9..],
+            [
+                "__min_1 integer",
+                "__max_1 integer",
+                "__max_2 double precision",
+                "__min_3 numeric",
+                "__basis pg_snapshot",
+                "__stamp bigint",
+                "__xbasis pg_snapshot",
+                "__xstamp bigint",
+                "__zero boolean not null generated always as \
+                 (__n = 0 and __count_1 = 0 and __sum_1 = 0 and __count_2 = 0 and __count_3 = 0) \
+                 stored",
+            ]
+        );
+        let plain = shape_of("TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS total");
+        assert!(
+            !hidden_table_columns(&plain)
+                .iter()
+                .any(|c| c.starts_with("__xbasis") || c.starts_with("__min")),
+            "a definition with no MIN/MAX keeps its hidden table"
+        );
+    }
+
+    fn shape_of(text: &str) -> GroupShape {
+        shape(text).expect("admitted")
     }
 
     /// A session keeps the temp table it created under a name, and a resume

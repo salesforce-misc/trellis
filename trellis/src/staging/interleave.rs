@@ -44,9 +44,11 @@
 //! | [`PausePoint::AfterRederiveRead`] | directly after the one read-and-snapshot statement, when the page re-derives any key |
 //! | [`PausePoint::BeforeCommit`] | after the page's last write |
 //!
-//! An aggregate (`super::group_basis`) fires `AfterEntryLock` after
+//! An aggregate (`super::group_basis`) fires `BeforeGroupLock` after it
+//! stages its sides, `AfterEntryLock` after
 //! its sorted group lock, before the statement that reads the groups' bases,
-//! `AfterGroupUpsert` after that statement, and `BeforeCommit`.
+//! `BeforeExtremeProbe` after that statement when a group's `MIN`/`MAX` is to
+//! be re-read, `AfterGroupUpsert` after its last write, and `BeforeCommit`.
 //!
 //! A `JOIN` target (`super::join`) fires, in order:
 //! `BeforeJoinLock` after the pair's lock row, `AfterJoinKeyInsert` after
@@ -209,6 +211,14 @@ pub enum PausePoint {
     /// After the page has locked the entries (on an aggregate, the group
     /// rows; on a `JOIN`, its `P` and `M` cells) it will write.
     AfterEntryLock,
+    /// On a plain aggregate (`super::group_basis`), after the page staged
+    /// its sides, before its lock statement locks its groups.
+    BeforeGroupLock,
+    /// On a plain aggregate with `MIN`/`MAX`, after the page applied its
+    /// sides and found a group whose extreme it must re-read, before the
+    /// probe that re-reads it (`super::group_basis::probe_locked_groups`).
+    /// Only a page that probes reaches it.
+    BeforeExtremeProbe,
     /// On a `JOIN` target (`super::join`), at the start of a build's write
     /// (`super::join::build`): the definition row and the job row are
     /// held, and no hidden table has been read yet.

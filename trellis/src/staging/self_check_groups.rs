@@ -108,6 +108,11 @@ fn agg_sql(agg: &Agg) -> String {
             "case when __count_{n} = 0 then null else (__sum_{n}) / (__count_{n})::numeric end",
             n = i + 1
         ),
+        // The hidden extreme as it stands; the audit doesn't compare
+        // extremes with the source yet (#1117).
+        Agg::Extreme { max, arg, .. } => {
+            format!("__{}_{}", if *max { "max" } else { "min" }, arg + 1)
+        }
     }
 }
 

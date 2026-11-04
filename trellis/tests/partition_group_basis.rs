@@ -438,6 +438,60 @@ async fn a_truncate_and_an_insert_into_the_leaf_in_one_transaction_keep_the_new_
     );
 }
 
+/// The target's `MIN`/`MAX` equal a `GROUP BY` over the source.
+async fn extremes(fx: &Fx) {
+    assert_eq!(
+        fx.d.rows("select g, lo, hi from public.agg order by g")
+            .await,
+        fx.d.rows("select g, min(v), max(v) from public.items group by g order by g")
+            .await,
+        "the extremes (left) differ from the oracle (right)"
+    );
+}
+
+/// #1117's F9, `MIN`/`MAX` on the group basis: a leaf's `TRUNCATE` and an
+/// `INSERT` into it in one transaction, with retractions of a minimum and a
+/// maximum staged before it and drained after the correction. The rows the
+/// truncate removed have no retraction to probe on, so only the
+/// correction's recompute, which writes the extremes and their basis with
+/// the partials (Rx6), moves the leaf's groups' extremes; the retractions
+/// drained after it are refused or probe again, and change nothing. Fails
+/// under a recompute that leaves the extremes as they were: group 3 keeps
+/// its truncated minimum.
+#[tokio::test]
+async fn min_and_max_through_a_leaf_truncate_are_recomputed() {
+    trellis::staging::admit_min_max_for_tests();
+    let mut fx = Fx::start_with(
+        &tree("range"),
+        SEED,
+        &[
+            "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX \
+           SELECT SUM(v) AS total, COUNT(*) AS n, MIN(v) AS lo, MAX(v) AS hi",
+        ],
+    )
+    .await;
+    extremes(&fx).await;
+    fx.exec(
+        "delete from public.items where id in (1, 147); \
+         begin; truncate public.items_p0; \
+         insert into public.items_p0 values (1000, 3, 99); \
+         insert into public.items values (1001, 2, 98); commit;",
+    )
+    .await;
+    let batch = fx.d.seal().await;
+    assert_eq!(fx.kinds().await, ["truncated"]);
+    fx.run().await;
+    extremes(&fx).await;
+    fx.drain(batch).await;
+    fx.assert_right("truncate and insert").await;
+    extremes(&fx).await;
+    assert_eq!(
+        fx.d.rows("select g, lo, hi from public.agg where g < 4 order by g")
+            .await,
+        ["(2,98,98)", "(3,99,99)"]
+    );
+}
+
 /// A middle `TRUNCATE` corrects every group under the middle through its own
 /// text, and leaves the other leaves' groups alone.
 #[tokio::test]

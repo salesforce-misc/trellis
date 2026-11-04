@@ -4220,6 +4220,12 @@ async fn validate_for_define(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<(), CatalogError> {
+    // A test admitting `MIN`/`MAX` validates the definition with them
+    // typed away (`staging::group_basis::define_view`).
+    #[cfg(any(test, feature = "test-util"))]
+    let admitted = crate::staging::group_basis::define_view(def, source_columns);
+    #[cfg(any(test, feature = "test-util"))]
+    let def = admitted.as_ref().unwrap_or(def);
     if let KeySpace::Join(_) | KeySpace::JoinOneToOne(_) = &def.key_space {
         let sides = JoinSides::resolve(pool, def).await?;
         super::validate::validate_join(def, &sides.from_columns, &sides.joined_columns)?;
@@ -4333,6 +4339,18 @@ async fn check_aggregate_admitted(
         return Ok(());
     }
     let (columns, _) = join_columns_of(client, qualified_source).await?;
+    // A test admitting `MIN`/`MAX` checks the definition with them typed
+    // away (`staging::group_basis::define_view`).
+    #[cfg(any(test, feature = "test-util"))]
+    let admitted = crate::staging::group_basis::define_view(
+        def,
+        &columns
+            .iter()
+            .map(|(name, info)| (name.clone(), info.value_type))
+            .collect(),
+    );
+    #[cfg(any(test, feature = "test-util"))]
+    let def = admitted.as_ref().unwrap_or(def);
     Ok(super::validate::validate_aggregate_admitted(def, &columns)?)
 }
 

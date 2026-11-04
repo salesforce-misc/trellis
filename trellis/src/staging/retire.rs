@@ -396,8 +396,9 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
 /// table (`super::group_basis::hidden_table_name`) and each `JOIN`'s `P`,
 /// `M` and `T` (`crate::defs::join::HiddenTable`), schema-qualified and
 /// quoted, with the quoted key columns of its zero-group index, or `NULL`
-/// while it has none valid, and whether it has a basis column (`T` has
-/// none). A `JOIN`'s `J` rows are never collected (ADR-0019).
+/// while it has none valid, whether it has a basis column (`T` has
+/// none), and whether it has its extremes' basis (`__xbasis`: an aggregate
+/// with `MIN`/`MAX`). A `JOIN`'s `J` rows are never collected (ADR-0019).
 fn hidden_tables_sql() -> String {
     use crate::defs::join::HiddenTable;
     format!(
@@ -410,6 +411,9 @@ fn hidden_tables_sql() -> String {
                  where i.indrelid = c.oid and i.indisvalid and i.indpred is not null), \
                 exists (select 1 from pg_catalog.pg_attribute a \
                         where a.attrelid = c.oid and a.attname = '__basis' \
+                          and not a.attisdropped), \
+                exists (select 1 from pg_catalog.pg_attribute a \
+                        where a.attrelid = c.oid and a.attname = '__xbasis' \
                           and not a.attisdropped) \
          from transform_definitions d \
          join pg_catalog.pg_class c on c.relname in ({agg}, {p}, {m}, {t}) \
@@ -447,18 +451,18 @@ fn hidden_tables_sql() -> String {
 /// under its write, which then inserts the cell afresh with its basis
 /// (`super::group_basis`'s `join_build_sql`).
 async fn collect_zero_groups(client: &mut Client, through: i64) -> Result<u64, StagingError> {
-    let tables: Vec<(String, Option<String>, bool)> = client
+    let tables: Vec<(String, Option<String>, bool, bool)> = client
         .query(&hidden_tables_sql(), &[])
         .await?
         .into_iter()
-        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
         .collect();
     let mut collected = 0;
-    for (hidden, group_cols, basis) in &tables {
+    for (hidden, group_cols, basis, xbasis) in &tables {
         let Some(group_cols) = group_cols else {
             continue;
         };
-        let sql = super::group_basis::collect_zero_groups_sql(hidden, group_cols, *basis);
+        let sql = super::group_basis::collect_zero_groups_sql(hidden, group_cols, *basis, *xbasis);
         for _ in 0..TOMBSTONE_BATCHES_PER_PASS {
             let txn = client.transaction().await?;
             if let Err(err) = txn
@@ -539,9 +543,10 @@ pub async fn explain_collect_zero_groups(
         .and_then(|row| row.get::<_, Option<String>>(1))
         .unwrap_or_default();
     let basis = row.is_none_or(|row| row.get::<_, bool>(2));
+    let xbasis = row.is_some_and(|row| row.get::<_, bool>(3));
     let sql = format!(
         "explain {}",
-        super::group_basis::collect_zero_groups_sql(hidden, &group_cols, basis)
+        super::group_basis::collect_zero_groups_sql(hidden, &group_cols, basis, xbasis)
     );
     let txn = client.transaction().await?;
     txn.batch_execute(GC_PLAN_SETTINGS).await?;
