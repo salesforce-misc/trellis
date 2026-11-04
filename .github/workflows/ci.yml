@@ -63,6 +63,17 @@ jobs:
         # matrix below matches TEST_SHARDS; see .github/scripts/test-shards.py.
         run: python3 .github/scripts/test-shards.py check
 
+      - name: Check the compatibility-floor declarations
+        # Each migration's catalog-floor header against its SQL and the crate
+        # version, and .github/feature-floors.txt against the newest released
+        # tag's (ADR-0024; see the script's docstring). The self-test plants a
+        # violation of each rule. The release tags aren't in the shallow
+        # checkout, so it fetches them (one commit each).
+        run: |
+          git fetch --no-tags --depth=1 origin '+refs/tags/v*:refs/tags/v*'
+          python3 .github/scripts/check-floors.py self-test
+          python3 .github/scripts/check-floors.py check
+
       - name: Check the CLI binary carries no test-only code
         # A dev build of the CLI, whose dependencies the cache above holds
         # (a release build would recompile everything). It holds the same

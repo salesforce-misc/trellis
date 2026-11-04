@@ -130,6 +130,8 @@ mod arithmetic_tests;
 #[cfg(test)]
 mod date_tests;
 #[cfg(test)]
+mod floor_manifest;
+#[cfg(test)]
 mod literal_tests;
 #[cfg(test)]
 mod logic_tests;

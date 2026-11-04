@@ -5905,7 +5905,7 @@ pub(crate) fn number_literal_type(text: &str) -> ValueType {
 /// different types — this is deliberately not a general coercion lattice,
 /// only the same closed set [`super::registry::operator_result_type`]
 /// admits.
-fn common_numeric_type(a: ValueType, b: ValueType) -> Option<ValueType> {
+pub(super) fn common_numeric_type(a: ValueType, b: ValueType) -> Option<ValueType> {
     use super::registry::{Admitted, TypeRule, UnifyRule};
     let (value_type, rule) = if a == b {
         (a, UnifyRule::Same)
