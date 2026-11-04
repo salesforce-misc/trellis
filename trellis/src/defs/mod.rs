@@ -133,6 +133,8 @@ mod date_tests;
 mod literal_tests;
 #[cfg(test)]
 mod logic_tests;
+#[cfg(test)]
+mod table_alias_tests;
 
 #[cfg(test)]
 mod tests {
@@ -431,7 +433,7 @@ mod tests {
         let (construct, detail) =
             refusal("TRANSFORM t FROM a JOIN a ON a.k = a.j GROUP BY a.g SELECT COUNT(*) AS n");
         assert_eq!(construct, "JOIN");
-        assert!(detail.contains("itself"), "{detail}");
+        assert!(detail.contains("self-join"), "{detail}");
     }
 
     /// A `JOIN` with no `GROUP BY` parses to the 1-1 JOIN key space, and it

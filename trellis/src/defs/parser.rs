@@ -110,6 +110,7 @@ pub fn parse(input: &str) -> Result<TransformDef, ParseError> {
         last_height: 0,
         is_aggregate: false,
         source: None,
+        source_alias: None,
         joined: None,
     }
     .parse_transform_def()
@@ -125,8 +126,8 @@ pub fn parse(input: &str) -> Result<TransformDef, ParseError> {
 ///
 /// ```text
 /// TRANSFORM <target> FROM <source> [GROUP BY <keys>] SELECT <fields> [WHERE <predicate>]
-/// TRANSFORM <target> FROM <source> [LEFT|INNER] JOIN <other> ON <equi-join>
-///   GROUP BY <keys> SELECT <fields> [WHERE <predicate>]
+/// TRANSFORM <target> FROM <source> [[AS] <alias>] [LEFT|INNER] JOIN <other> [[AS] <alias>]
+///   ON <equi-join> [GROUP BY <keys>] SELECT <fields> [WHERE <predicate>]
 ///
 /// PAUSE  TRANSFORM <target>[.<column>]
 /// RESUME TRANSFORM <target>[.<column>]
@@ -159,6 +160,7 @@ pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
         last_height: 0,
         is_aggregate: false,
         source: None,
+        source_alias: None,
         joined: None,
     }
     .parse_statement()
@@ -201,6 +203,101 @@ impl Verb {
     }
 }
 
+/// Resolves every qualifier of a `JOIN` definition that names an aliased
+/// side to that side's bare table name, so everything past the parser works
+/// in sides and never sees an alias ([`JoinSpec`]). As in Postgres, an alias
+/// hides its table's name: a qualifier naming an aliased side's table, with
+/// or without its schema, is refused, naming the alias to write. Any other
+/// qualifier is left as written for the validator to check.
+fn resolve_aliases(def: &mut TransformDef) -> Result<(), ParseError> {
+    let (KeySpace::Join(join) | KeySpace::JoinOneToOne(join)) = &mut def.key_space else {
+        return Ok(());
+    };
+    let sides: Vec<(String, String)> = [
+        (&def.source, &join.source_alias),
+        (&join.right, &join.right_alias),
+    ]
+    .into_iter()
+    .filter_map(|(table, alias)| Some((table.clone(), alias.clone()?)))
+    .collect();
+    if sides.is_empty() {
+        return Ok(());
+    }
+    let resolve = |schema: &mut Option<String>, table: &mut String, column: &str| {
+        for (side_table, alias) in &sides {
+            if schema.is_none() && table.eq_ignore_ascii_case(alias) {
+                *table = side_table.clone();
+                return Ok(());
+            }
+        }
+        for (side_table, alias) in &sides {
+            if table.eq_ignore_ascii_case(side_table) {
+                return Err(ParseError::AliasedTableName {
+                    reference: super::ast::qualified_column_text(schema.as_deref(), table, column),
+                    alias: alias.clone(),
+                });
+            }
+        }
+        Ok(())
+    };
+    for term in &mut join.on {
+        for column in [&mut term.lhs, &mut term.rhs] {
+            resolve(&mut column.schema, &mut column.table, &column.column)?;
+        }
+    }
+    for key in &mut join.group_by {
+        resolve(&mut key.schema, &mut key.table, &key.column)?;
+    }
+    for field in &mut def.fields {
+        resolve_expr_aliases(&mut field.expr, &resolve)?;
+    }
+    Ok(())
+}
+
+/// Applies `resolve` to every qualified column of `expr`.
+fn resolve_expr_aliases(
+    expr: &mut Expr,
+    resolve: &impl Fn(&mut Option<String>, &mut String, &str) -> Result<(), ParseError>,
+) -> Result<(), ParseError> {
+    match expr {
+        Expr::SourceColumn {
+            schema,
+            table,
+            column,
+        } => resolve(schema, table, column),
+        Expr::Column(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::TypedLiteral { .. }
+        | Expr::BooleanLiteral(_)
+        | Expr::Null => Ok(()),
+        Expr::BinaryOp { lhs, rhs, .. } => {
+            resolve_expr_aliases(lhs, resolve)?;
+            resolve_expr_aliases(rhs, resolve)
+        }
+        Expr::FunctionCall { args, .. } => args
+            .iter_mut()
+            .try_for_each(|arg| resolve_expr_aliases(arg, resolve)),
+        Expr::Negate(operand)
+        | Expr::Not(operand)
+        | Expr::Cast { expr: operand, .. }
+        | Expr::IsNull { expr: operand, .. } => resolve_expr_aliases(operand, resolve),
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            for (condition, result) in branches {
+                resolve_expr_aliases(condition, resolve)?;
+                resolve_expr_aliases(result, resolve)?;
+            }
+            match otherwise {
+                Some(otherwise) => resolve_expr_aliases(otherwise, resolve),
+                None => Ok(()),
+            }
+        }
+    }
+}
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -218,6 +315,8 @@ struct Parser {
     /// parsed it: a two-part `GROUP BY` key must name this table. `None` for
     /// an `ALTER TRANSFORM` clause, whose statement doesn't name the source.
     source: Option<String>,
+    /// The alias the `FROM` table was given, if any.
+    source_alias: Option<String>,
     /// The `JOIN` table's bare name, once [`Self::parse_join_clause`] has
     /// parsed it.
     joined: Option<String>,
@@ -484,6 +583,7 @@ impl Parser {
         self.expect_keyword("FROM")?;
         let (source, explicit_source_schema) = self.parse_table_ref()?;
         self.source = Some(source.clone());
+        self.source_alias = self.parse_table_alias()?;
 
         let key_space = self.parse_key_space_clause()?;
 
@@ -515,7 +615,7 @@ impl Parser {
         self.reject_trailing_key_space_clause()?;
         self.expect_eof()?;
 
-        Ok(TransformDef {
+        let mut def = TransformDef {
             target,
             explicit_target_schema,
             source,
@@ -525,7 +625,41 @@ impl Parser {
             predicate,
             without_source_index,
             adopt_target,
-        })
+        };
+        resolve_aliases(&mut def)?;
+        Ok(def)
+    }
+
+    /// Parses the alias after a `FROM` or `JOIN` table, if one follows:
+    /// `AS <alias>`, or a bare `<alias>`. As in Postgres, a word Postgres
+    /// reserves is never an alias: after `AS` it is refused, and without
+    /// `AS` it is the next clause (`FROM a LEFT JOIN b`, `JOIN b ON`). So is
+    /// `WITHOUT` without `AS`, which starts this grammar's `WITHOUT SOURCE
+    /// INDEX`.
+    fn parse_table_alias(&mut self) -> Result<Option<String>, ParseError> {
+        if self.peek_is_keyword("AS") {
+            self.advance();
+            let alias = self.expect_ident()?;
+            if is_reserved_word(&alias) {
+                return Err(ParseError::TableAlias {
+                    detail: format!(
+                        "'{alias}' is a word Postgres reserves, so it can't name a table"
+                    ),
+                    alias,
+                });
+            }
+            return Ok(Some(alias));
+        }
+        match self.peek() {
+            Token::Ident(word)
+                if !is_reserved_word(word) && !word.eq_ignore_ascii_case("WITHOUT") =>
+            {
+                let alias = word.clone();
+                self.advance();
+                Ok(Some(alias))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Parses `ALTER TRANSFORM <target> <clause>[, <clause> ...]` (ADR-0015).
@@ -617,6 +751,14 @@ impl Parser {
                 KeySpace::JoinOneToOne(spec)
             });
         }
+        if let Some(alias) = self.source_alias.clone() {
+            return Err(ParseError::TableAlias {
+                alias,
+                detail: "only a JOIN definition names its tables in its columns; a \
+                         single-table definition writes its columns bare"
+                    .to_string(),
+            });
+        }
         if self.peek_is_symbol(',') {
             return Err(ParseError::UnsupportedKeySpace {
                 construct: "comma join".to_string(),
@@ -677,12 +819,14 @@ impl Parser {
             return Err(unsupported(
                 "JOIN",
                 &format!(
-                    "both tables are named '{right}': a table can't be joined to itself, and \
-                     two tables sharing a bare name can't be told apart, since every column \
-                     is written `<table>.<column>` and this grammar has no table aliases"
+                    "both tables are named '{right}': a JOIN can't read one table on both \
+                     sides (a self-join), even under two aliases, since one captured change \
+                     would feed both sides; nor two tables that share a bare name"
                 ),
             ));
         }
+        let right_alias = self.parse_table_alias()?;
+        self.check_aliases(&right, right_alias.as_deref())?;
         if self.peek_is_keyword("USING") {
             return Err(unsupported(
                 "JOIN USING",
@@ -720,8 +864,10 @@ impl Parser {
             return Ok((
                 JoinSpec {
                     kind,
+                    source_alias: self.source_alias.clone(),
                     right,
                     explicit_right_schema,
+                    right_alias,
                     on,
                     group_by: Vec::new(),
                 },
@@ -739,13 +885,47 @@ impl Parser {
         Ok((
             JoinSpec {
                 kind,
+                source_alias: self.source_alias.clone(),
                 right,
                 explicit_right_schema,
+                right_alias,
                 on,
                 group_by,
             },
             true,
         ))
+    }
+
+    /// Refuses a `JOIN`'s aliases that would leave a qualifier naming both
+    /// sides: an alias equal to the other side's alias or to the other
+    /// table's bare name. Postgres folds an unquoted name to lower case, so
+    /// `X` and `x` are the same name here as there.
+    fn check_aliases(&self, right: &str, right_alias: Option<&str>) -> Result<(), ParseError> {
+        let source = self.source.as_deref().unwrap_or_default();
+        let source_alias = self.source_alias.as_deref();
+        let clashes = [
+            (source_alias, right, "the joined table's name"),
+            (right_alias, source, "the FROM table's name"),
+            (
+                right_alias,
+                source_alias.unwrap_or_default(),
+                "the FROM table's alias",
+            ),
+        ];
+        for (alias, other, what) in clashes {
+            if let Some(alias) = alias
+                && alias.eq_ignore_ascii_case(other)
+            {
+                return Err(ParseError::TableAlias {
+                    alias: alias.to_string(),
+                    detail: format!(
+                        "it is also {what}, so a column qualified with it could be either \
+                         table's; give each table a name of its own"
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// One `<table>.<column> = <table>.<column>` term of a `JOIN ... ON`.

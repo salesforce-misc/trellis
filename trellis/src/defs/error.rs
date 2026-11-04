@@ -53,6 +53,15 @@ pub enum ParseError {
     /// whose head is not the `FROM` table. `source` is the `FROM` table's bare
     /// name. A key of another table is grouped by with a `JOIN`.
     GroupByKeyNotFromSource { reference: String, source: String },
+    /// A table alias this grammar refuses: a word Postgres reserves, one
+    /// the other table of the `JOIN` already goes by, or any alias on a
+    /// single-table definition. `alias` is the alias as written, `detail`
+    /// says why.
+    TableAlias { alias: String, detail: String },
+    /// A column qualified with the name of a table its `JOIN` gave an
+    /// alias. As in Postgres, the alias hides the table's own name, so the
+    /// column must be qualified with `alias`.
+    AliasedTableName { reference: String, alias: String },
     /// A `CAST(<expr> AS <type>)` naming a type that is not one of
     /// `super::registry::CAST_TARGETS`, or naming a modifier (`numeric(10,2)`).
     /// `name` is the target as written. Whether the operand converts to a
@@ -199,6 +208,14 @@ impl fmt::Display for ParseError {
                 "GROUP BY key '{reference}' does not name this transform's FROM table \
                  ('{source}'); a qualified key must name the FROM table, and a second table is \
                  read with a JOIN"
+            ),
+            ParseError::TableAlias { alias, detail } => {
+                write!(f, "table alias '{alias}' is refused: {detail}")
+            }
+            ParseError::AliasedTableName { reference, alias } => write!(
+                f,
+                "'{reference}' names a table this JOIN gives the alias '{alias}'; an alias \
+                 hides its table's name, so qualify the column with '{alias}'"
             ),
             ParseError::TooManyQualifiedNameParts { reference } => write!(
                 f,

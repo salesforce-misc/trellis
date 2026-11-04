@@ -213,6 +213,50 @@ async fn assert_clean(d: &Driver, when: &str) {
     }
 }
 
+// --------------------------------------------------------------- aliases
+
+/// A 1-1 `JOIN` written with table aliases (#1458) builds and maintains the
+/// target of the same `JOIN` written with table names, which matches
+/// Postgres's own `JOIN` over the tables, and its `self_check` finds nothing.
+/// An alias pasted into any SQL Trellis renders would name no table.
+#[tokio::test]
+async fn an_aliased_one_to_one_join_matches_the_join_written_with_table_names() {
+    let ddl = format!("{DDL}; {SEED}");
+    let plain = Kind::Left.definition();
+    let aliased = "TRANSFORM jx FROM public.a AS x LEFT JOIN public.b y ON x.k = y.k \
+                   SELECT x.r + COALESCE(y.img, 0) AS total, y.k0 AS k0, x.s AS s";
+    let mut d = Driver::start(
+        &ddl,
+        &columns(),
+        &[&plain, aliased],
+        &["public.a", "public.b"],
+    )
+    .await;
+    for sql in [
+        "update public.a set k = 30 where id = 'a01'",
+        "delete from public.a where id = 'a03'",
+        "update public.b set img = 999 where bid = 2",
+        "update public.b set k = 70 where bid = 6",
+    ] {
+        step(&mut d, sql).await;
+    }
+    for limit in [2, 1000] {
+        let walked = walk(&d, "public.jx", limit).await;
+        assert_eq!(walked.divergences, Vec::new(), "at {limit}");
+    }
+    let rows = |table: &str| format!("select id, total, k0, s from public.{table} order by id");
+    let found = d.rows(&rows("jx")).await;
+    assert_eq!(found, d.rows(&rows("jl")).await);
+    let oracle = d
+        .rows(
+            "select a.id, a.r + coalesce(b.img, 0), b.k0, a.s \
+             from public.a left join public.b on a.k = b.k order by a.id",
+        )
+        .await;
+    assert_eq!(found, oracle);
+    assert_eq!(found.len(), 19, "{found:?}");
+}
+
 // --------------------------------------------------------------- a clean walk
 
 /// Keys compared by a clean walk: the target's (the `a` rows, or the matched

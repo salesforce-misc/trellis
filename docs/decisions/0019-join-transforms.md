@@ -44,13 +44,24 @@ would break a stored definition, which is stored as text and re-parsed.
 
 - **Sides.** The two sides are two tables with different bare names, each a
   captured table with a primary key, a partitioned root, or another transform's
-  target (which needs no primary key). A side is named by its bare table name;
-  there are no table aliases, so two sides sharing a bare name (a self-join, or
-  `shop.orders JOIN archive.orders`) are refused.
+  target (which needs no primary key). Trellis tells the sides apart by bare
+  table name, so two sides sharing a bare name (a self-join, or
+  `shop.orders JOIN archive.orders`) are refused. A self-join stays refused
+  under two aliases: one captured change would feed both sides.
 - **Side qualification.** Every source column is written `<side>.<col>`, in
   `ON`, `GROUP BY` and fields alike; a bare name means a field. Resolving a
   bare name to whichever side has it would let a column later added to the
-  other side change or break a stored definition. A dotted name whose head
+  other side change or break a stored definition. A side is named by its
+  alias when it has one (`FROM <table> [AS] <alias>`, `JOIN <table> [AS]
+  <alias>`), and by its bare table name otherwise. As in Postgres, an alias
+  hides its table's name: a column qualified with an aliased side's table
+  name is refused, naming the alias. An alias is an unquoted identifier,
+  folded to lower case as Postgres folds it; a word Postgres reserves, a name
+  the other side already goes by, and an alias on a single-table definition
+  are refused. The parser resolves each alias to its side's table once, so
+  validation, hidden state, the catalog, capture and every rendered query
+  work in tables and never see an alias; a stored definition keeps its
+  aliases in its text, which renders them with `AS`. A dotted name whose head
   isn't a side is an unknown table qualifier.
 - **Join kind.** `JOIN` and `INNER JOIN` are `INNER`; `LEFT JOIN` and
   `LEFT OUTER JOIN` are `LEFT`, and `a` is the side `LEFT` keeps. A definition

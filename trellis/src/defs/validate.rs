@@ -100,8 +100,8 @@ pub enum ValidationError {
     /// against both tables' columns, by `validate_join`; this entry point
     /// has only the `FROM` table's.
     JoinNeedsBothTables,
-    /// The joined table is the `FROM` table. A self-join needs aliases, which
-    /// the grammar doesn't have.
+    /// The joined table is the `FROM` table. A self-join isn't supported,
+    /// even under two aliases: one captured change would feed both sides.
     JoinSelf { table: String },
     /// A `JOIN` definition's column reference names a table that is neither
     /// the `FROM` table nor the joined one.
@@ -985,18 +985,20 @@ impl fmt::Display for ValidationError {
             ),
             ValidationError::JoinSelf { table } => write!(
                 f,
-                "'{table}' is joined to itself; a self-join needs table aliases, which this \
-                 grammar doesn't have"
+                "'{table}' is joined to itself; a JOIN can't read one table on both sides \
+                 (a self-join), even under two aliases, since one captured change would feed \
+                 both sides"
             ),
             ValidationError::JoinUnknownTable { reference } => write!(
                 f,
                 "'{reference}' names a table that is neither the FROM table nor the joined \
-                 table"
+                 table, nor an alias of either"
             ),
             ValidationError::JoinUnqualifiedColumn { field, column } => write!(
                 f,
                 "field '{field}' reads column '{column}' without a table; in a JOIN every \
-                 column is written `<table>.<column>`"
+                 column is written `<table>.<column>`, or `<alias>.<column>` for an aliased \
+                 table"
             ),
             ValidationError::JoinUnresolvedColumn { reference } => {
                 write!(f, "'{reference}' is not a column of its table")

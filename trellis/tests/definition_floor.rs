@@ -1038,3 +1038,37 @@ async fn a_handle_that_never_migrates_pauses_what_it_cant_run_before_it_changes_
     );
     older_running.shutdown().await.expect("shutdown");
 }
+
+/// A `JOIN` that aliases its tables (#1458) carries the release aliases
+/// arrived in as its floor; the same `JOIN` written with table names keeps
+/// its floor.
+#[tokio::test]
+async fn a_join_with_table_aliases_carries_their_release() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    raw.batch_execute(
+        "create table public.a (id bigint primary key, k bigint, g bigint); \
+         create table public.b (id bigint primary key, k bigint); \
+         create index on public.a (k); create index on public.b (k)",
+    )
+    .await
+    .expect("tables");
+    let later = handle(&db, "0.3.0", &[("TableAlias", "0.3.0")]).await;
+    later
+        .apply(
+            "TRANSFORM aliased FROM a AS x JOIN b y ON x.k = y.k GROUP BY x.g \
+             WITHOUT SOURCE INDEX SELECT x.g AS g, COUNT(*) AS n",
+        )
+        .await
+        .expect("define the aliased JOIN");
+    later
+        .apply(
+            "TRANSFORM plain FROM a JOIN b ON a.k = b.k GROUP BY a.g \
+             WITHOUT SOURCE INDEX SELECT a.g AS g, COUNT(*) AS n",
+        )
+        .await
+        .expect("define the plain JOIN");
+    assert_eq!(floor(&raw, &later, "aliased").await, "0.3.0");
+    assert_eq!(floor(&raw, &later, "plain").await, "0.2.0");
+}

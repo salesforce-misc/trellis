@@ -200,6 +200,8 @@ pub enum Feature {
     WithoutSourceIndex,
     /// `ADOPT EXISTING TABLE`: define builds into an existing empty target.
     AdoptTarget,
+    /// A `JOIN`'s table given an alias (`FROM <table> [AS] <alias>`).
+    TableAlias,
     /// A table it reads is partitioned (ADR-0017).
     PartitionedSource,
     /// An expression node of this kind.
@@ -259,6 +261,8 @@ impl Feature {
             }
             // Arrives in 0.2.0, the release floors arrive in.
             Feature::AdoptTarget => Some(BASELINE),
+            // Arrives in 0.2.0, the release floors arrive in.
+            Feature::TableAlias => Some(BASELINE),
             Feature::Predicate(kind) => Some(match kind {
                 PredicateKind::True => BASELINE,
             }),
@@ -399,8 +403,10 @@ pub(crate) fn features_used(def: &TransformDef, partitioned: bool) -> (Vec<Featu
     used.add(Feature::KeySpace(kind));
     if let Some(JoinSpec {
         kind,
+        source_alias,
         right: _,
         explicit_right_schema,
+        right_alias,
         on,
         group_by: _,
     }) = join
@@ -408,6 +414,9 @@ pub(crate) fn features_used(def: &TransformDef, partitioned: bool) -> (Vec<Featu
         used.add(Feature::JoinKind(*kind));
         if explicit_right_schema.is_some() {
             used.add(Feature::QualifiedTable);
+        }
+        if source_alias.is_some() || right_alias.is_some() {
+            used.add(Feature::TableAlias);
         }
         // An `ON` term is two columns, which every `JOIN` has.
         for JoinOn { lhs: _, rhs: _ } in on {}
@@ -1127,6 +1136,34 @@ mod tests {
             floor_of(
                 &floors("0.2.0", &[]),
                 "TRANSFORM t ADOPT EXISTING TABLE FROM s GROUP BY g SELECT g AS g, COUNT(*) AS n"
+            ),
+            "0.2.0"
+        );
+    }
+
+    /// A table alias is a feature of its own: a `JOIN` that aliases either
+    /// table carries its release, and the same `JOIN` without aliases
+    /// doesn't.
+    #[test]
+    fn a_table_alias_carries_its_release() {
+        let later = floors("0.5.0", &[("TableAlias", "0.3.0")]);
+        for aliased in [
+            "TRANSFORM t FROM s AS a JOIN u ON a.k = u.k GROUP BY a.g SELECT a.g AS g, \
+             COUNT(*) AS n",
+            "TRANSFORM t FROM s JOIN app.u b ON s.k = b.k SELECT s.a AS a, b.b AS b",
+        ] {
+            assert_eq!(floor_of(&later, aliased), "0.3.0", "{aliased}");
+        }
+        for plain in [
+            "TRANSFORM t FROM s JOIN u ON s.k = u.k GROUP BY s.g SELECT s.g AS g, COUNT(*) AS n",
+            "TRANSFORM t FROM s JOIN app.u ON s.k = u.k SELECT s.a AS a, u.b AS b",
+        ] {
+            assert_eq!(floor_of(&later, plain), "0.2.0", "{plain}");
+        }
+        assert_eq!(
+            floor_of(
+                &floors("0.2.0", &[]),
+                "TRANSFORM t FROM s a JOIN u b ON a.k = b.k SELECT a.a AS a"
             ),
             "0.2.0"
         );
