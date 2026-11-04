@@ -155,7 +155,10 @@ the remedy, and `trellis status` prints both:
 A definition stored under a grammar newer than the older release reads
 ([ADR-0018](decisions/0018-grammar-versioning.md)) pauses the same way, naming
 its grammar version; when the older release meets its floor, it drops as
-usual.
+usual. A definition for which a newer release stored a value the older one
+doesn't know (its status, its build, a build chunk's kind, a partition
+correction's phase, a capture failure's kind) pauses the same way, naming the
+value.
 
 While it is paused, its target keeps its rows and stops updating, and a
 definition reading that target reads it as it would any paused upstream: it

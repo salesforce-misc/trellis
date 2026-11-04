@@ -1366,9 +1366,11 @@ async fn status_nodes(client: &impl GenericClient) -> Result<Vec<StatusNode>, Ca
         let status_text: String = row.get(3);
         // A status a newer release wrote: every dispatch gate is an allowlist
         // of the statuses this release knows, so it doesn't maintain the
-        // definition, and its readers are derived as a frozen one's. Its own
-        // status is never reported as one (`StoredStatus::from_row`), and
-        // attaching pauses it (`super::floor::unknown_value_sql`).
+        // definition, and it and its readers are derived as a frozen one's:
+        // `definitions()` lists it `paused`, which is what this release does
+        // with it, and attaching records that pause with the value's reason
+        // (`super::floor::unknown_value_sql`). `status()` of it refuses
+        // instead (`StoredStatus::from_row`).
         let status = StoredStatus::from_persisted(&status_text).unwrap_or(StoredStatus::Paused);
         let source: String = row.get(2);
         // Only a `live` definition's reported status can differ from its

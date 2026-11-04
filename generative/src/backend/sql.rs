@@ -1583,7 +1583,7 @@ mod tests {
         raw.batch_execute(
             "insert into partition_corrections (table_name, kind, node_oid, node_name, cause) \
              values ('public.r', 'new_leaf', 'public.r1'::regclass::oid::bigint, \
-                     'public.r1', 'attached')",
+                     'public.r1', 'created')",
         )
         .await
         .expect("queue");
