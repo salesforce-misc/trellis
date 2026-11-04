@@ -28,11 +28,17 @@
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
+use std::time::Duration;
+
 use drain_driver::Driver;
 use trellis::config::DEFAULT_SCHEMA;
-use trellis::defs::ValueType;
+use trellis::defs::{PgType, ValueType};
+use trellis::float::FloatWidth;
 use trellis::integer::IntWidth;
 use trellis::staging::interleave::PausePoint;
+use trellis::staging::self_check::{
+    Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page, compare_page,
+};
 
 const SRC: &str = "public.src";
 const AGG: &str = "TRANSFORM agg FROM public.src GROUP BY g \
@@ -678,6 +684,424 @@ async fn f6_a_zero_group_a_probe_stamped_stays_until_the_prefix_passes_it() {
     assert_eq!(probed, ["(7,7,t)"]);
     assert_eq!(collected, 0, "the probe's stamp kept the zero group");
     assert_oracle(&mut d).await;
+}
+
+// ------------------------------------------------------------- self_check
+
+/// Every page of the check of `agg`, `limit` groups at a time, after its
+/// convergence wait: the divergences it reports.
+async fn walk(d: &Driver, limit: i64) -> Vec<Divergence> {
+    let mut after = None;
+    let mut found = Vec::new();
+    loop {
+        let page = check_page(
+            d.pool(),
+            "agg",
+            SelfCheckScope { after, limit },
+            SelfCheckMode::Standard,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("a page of the check");
+        match page.outcome {
+            SelfCheckOutcome::Converged => {}
+            SelfCheckOutcome::Diverged(mut divergences) => found.append(&mut divergences),
+            other => panic!("unexpected outcome {other:?}"),
+        }
+        after = page.next_after;
+        if after.is_none() {
+            return found;
+        }
+    }
+}
+
+/// Every page of one comparison of `agg`, with no convergence wait and
+/// whatever the ring holds: the divergences, and whether any group was
+/// uncertain.
+async fn compare(d: &Driver, limit: i64) -> (Vec<Divergence>, bool) {
+    let mut after = None;
+    let (mut found, mut uncertain) = (Vec::new(), false);
+    loop {
+        let page = compare_page(d.pool(), "agg", SelfCheckScope { after, limit })
+            .await
+            .expect("a comparison");
+        found.extend(page.divergences);
+        uncertain |= page.uncertain_all || !page.uncertain_keys.is_empty();
+        after = page.next_after;
+        if after.is_none() {
+            return (found, uncertain);
+        }
+    }
+}
+
+fn cell(key: &str, column: &str, persisted: Option<&str>, recomputed: Option<&str>) -> Divergence {
+    Divergence::Cell {
+        key: key.to_string(),
+        column: column.to_string(),
+        persisted: persisted.map(str::to_string),
+        recomputed: recomputed.map(str::to_string),
+    }
+}
+
+/// The hidden table's name, unqualified, as a divergence names its columns.
+async fn hidden_name(d: &Driver) -> String {
+    hidden(d).await.rsplit('.').next().unwrap().to_string()
+}
+
+/// Asserts the walk at every page size reports exactly `want`.
+async fn assert_walk(d: &Driver, want: &[Divergence], what: &str) {
+    for limit in [1, 2, 100] {
+        let mut found = walk(d, limit).await;
+        found.sort_by_key(|d| format!("{d:?}"));
+        let mut want = want.to_vec();
+        want.sort_by_key(|d| format!("{d:?}"));
+        assert_eq!(found, want, "{what}, limit {limit}");
+    }
+}
+
+/// `self_check` compares each group's hidden extremes with a fresh
+/// `MIN`/`MAX` of the source: a converged target with ties, a group whose
+/// arguments are all `NULL`, the `NULL` group and a group emptied to zero
+/// reports nothing at any page size (the zero group collected). A planted extreme is reported on its
+/// hidden column whether the visible value was planted with it (the visible
+/// row then agrees with the hidden one, and only the source shows it) or
+/// alone (the visible row against the hidden extreme), on an ordinary
+/// group, on the `NULL` group, on an all-`NULL` group given a value, and on
+/// a group whose extreme is set to `NULL`. Fails if the source comparison is
+/// skipped, if it reads the other extreme's column, or if a group whose
+/// arguments are all `NULL` (or whose key is `NULL`) is left out of it.
+#[tokio::test]
+async fn self_check_compares_each_extreme_with_the_sources() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values \
+         (1, 1, 3), (2, 1, 3), (3, 1, 5), (4, 1, 9), \
+         (5, 2, null), (6, 2, null), \
+         (7, null, 4), (8, null, 6), \
+         (9, 3, 2)",
+    )
+    .await;
+    // A tie at the minimum: one of the two deleted probes and finds the
+    // other. Group 3 empties to a zero group.
+    step(&mut d, "delete from public.src where id in (1, 9)").await;
+    assert_oracle(&mut d).await;
+    assert_walk(&d, &[], "converged").await;
+
+    let hidden = hidden(&d).await;
+    let name = hidden_name(&d).await;
+    let min = format!("{name}.__min_1");
+    let max = format!("{name}.__max_1");
+    let plant = |sql: String| {
+        let d = &d;
+        async move { write(d, &sql).await }
+    };
+
+    // The hidden and visible minimum planted alike: only the source shows it.
+    plant(format!(
+        "update {hidden} set __min_1 = 4 where g = 1; update public.agg set lo = 4 where g = 1"
+    ))
+    .await;
+    assert_walk(
+        &d,
+        &[cell("1", &min, Some("4"), Some("3"))],
+        "planted alike",
+    )
+    .await;
+    // Then the visible value alone, back to the source's: the visible row
+    // against the hidden extreme.
+    plant("update public.agg set lo = 3 where g = 1".to_string()).await;
+    assert_walk(
+        &d,
+        &[
+            cell("1", &min, Some("4"), Some("3")),
+            cell("1", "lo", Some("3"), Some("4")),
+        ],
+        "visible restored alone",
+    )
+    .await;
+    plant(format!("update {hidden} set __min_1 = 3 where g = 1")).await;
+    assert_walk(&d, &[], "restored").await;
+
+    // The maximum, its own column.
+    plant(format!(
+        "update {hidden} set __max_1 = 10 where g = 1; update public.agg set hi = 10 where g = 1"
+    ))
+    .await;
+    assert_walk(&d, &[cell("1", &max, Some("10"), Some("9"))], "maximum").await;
+    plant(format!(
+        "update {hidden} set __max_1 = 9 where g = 1; update public.agg set hi = 9 where g = 1"
+    ))
+    .await;
+
+    // The visible maximum alone.
+    plant("update public.agg set hi = 8 where g = 1".to_string()).await;
+    assert_walk(
+        &d,
+        &[cell("1", "hi", Some("8"), Some("9"))],
+        "visible alone",
+    )
+    .await;
+    plant("update public.agg set hi = 9 where g = 1".to_string()).await;
+
+    // The all-`NULL` group given a value, and an ordinary group's extreme
+    // set to `NULL`, each alike in the hidden and visible rows.
+    plant(format!(
+        "update {hidden} set __min_1 = 1 where g = 2; update public.agg set lo = 1 where g = 2; \
+         update {hidden} set __max_1 = null where g = 1; update public.agg set hi = null where g = 1"
+    ))
+    .await;
+    assert_walk(
+        &d,
+        &[
+            cell("2", &min, Some("1"), None),
+            cell("1", &max, None, Some("9")),
+        ],
+        "NULL planted and replaced",
+    )
+    .await;
+    plant(format!(
+        "update {hidden} set __min_1 = null where g = 2; update public.agg set lo = null where g = 2; \
+         update {hidden} set __max_1 = 9 where g = 1; update public.agg set hi = 9 where g = 1"
+    ))
+    .await;
+
+    // The `NULL` group.
+    plant(format!(
+        "update {hidden} set __max_1 = 7 where g is null; \
+         update public.agg set hi = 7 where g is null"
+    ))
+    .await;
+    let found = walk(&d, 100).await;
+    assert!(
+        matches!(found.as_slice(), [Divergence::Cell { column, persisted, recomputed, .. }]
+            if *column == max && persisted.as_deref() == Some("7")
+                && recomputed.as_deref() == Some("6")),
+        "the NULL group's maximum: {found:?}"
+    );
+    plant(format!(
+        "update {hidden} set __max_1 = 6 where g is null; \
+         update public.agg set hi = 6 where g is null"
+    ))
+    .await;
+
+    // A hidden row of a group the source doesn't have, with an extreme:
+    // reported on its partials and its extreme alike.
+    plant(format!(
+        "insert into {hidden} (g, __n, __count_1, __min_1, __max_1) values (3, 0, 0, 2, null)"
+    ))
+    .await;
+    assert_walk(
+        &d,
+        &[cell("3", &min, Some("2"), None)],
+        "a zero group's extreme",
+    )
+    .await;
+    plant(format!("delete from {hidden} where g = 3")).await;
+    assert_walk(&d, &[], "restored").await;
+}
+
+/// A group's extremes are compared with the source under their own basis,
+/// `__xbasis`, not the partials'. First the F6 interleaving: T2 deletes T1's
+/// row and inserts 7, and T2's page drains first, so its probe saw T1. The
+/// group is then a zero group by its partials but keeps the extremes the
+/// probe read, and the comparison agrees with it before T1 drains and
+/// after, also with changes no basis saw pending. Then a group with rows
+/// whose minimum's probe saw an insertion that hasn't drained. Fails if the
+/// extremes' source rows subtract the unapplied changes `__xbasis` saw (as
+/// the partials' basis would), or keep a value whose insertion is
+/// subtracted.
+#[tokio::test]
+async fn self_check_reads_the_extremes_under_their_own_basis() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (100, 2, 0)").await;
+    write(&d, "insert into public.src values (1, 1, 1)").await;
+    let t1 = d.seal().await;
+    write(
+        &d,
+        "delete from public.src where id = 1; insert into public.src values (2, 1, 7)",
+    )
+    .await;
+    let t2 = d.seal().await;
+    d.drain(t2, "a").await;
+    assert_eq!(extremes(&d, 1).await, ["(7,7,t)"]);
+    for limit in [1, 2, 100] {
+        assert_eq!(compare(&d, limit).await, (vec![], false), "limit {limit}");
+    }
+    // A plant on the probed extreme is still reported.
+    let hidden = hidden(&d).await;
+    write(&d, &format!("update {hidden} set __max_1 = 8 where g = 1")).await;
+    assert_eq!(
+        compare(&d, 100).await,
+        (
+            vec![cell(
+                "1",
+                &format!("{}.__max_1", hidden_name(&d).await),
+                Some("8"),
+                Some("7")
+            )],
+            false
+        )
+    );
+    write(&d, &format!("update {hidden} set __max_1 = 7 where g = 1")).await;
+    // Changes no basis saw, not applied yet: an insertion below the
+    // minimum and a delete of the maximum are subtracted from the source.
+    write(
+        &d,
+        "insert into public.src values (3, 1, 0); delete from public.src where id = 2",
+    )
+    .await;
+    assert_eq!(compare(&d, 100).await, (vec![], false));
+    d.drain(t1, "b").await;
+    assert_eq!(compare(&d, 100).await, (vec![], false));
+    assert_oracle(&mut d).await;
+    assert_walk(&d, &[], "settled").await;
+
+    // A group with rows: T3 inserts 4, and T4's delete of the minimum 1
+    // drains first. Its probe sees T3, which its partials don't count yet.
+    step(
+        &mut d,
+        "insert into public.src values (10, 5, 1), (11, 5, 7)",
+    )
+    .await;
+    write(&d, "insert into public.src values (12, 5, 4)").await;
+    let t3 = d.seal().await;
+    write(&d, "delete from public.src where id = 10").await;
+    let t4 = d.seal().await;
+    d.drain(t4, "a").await;
+    assert_eq!(extremes(&d, 5).await, ["(4,7,t)"]);
+    assert_eq!(compare(&d, 100).await, (vec![], false));
+    d.drain(t3, "b").await;
+    assert_eq!(compare(&d, 100).await, (vec![], false));
+    assert_oracle(&mut d).await;
+}
+
+/// One definition `MIN(v) AS lo, MAX(v) AS hi` over `v` of type `ty`, seeded
+/// with `rows` (`(id, g, v)` literals) and settled.
+async fn start_typed(ty: &str, value_type: ValueType, rows: &str) -> Driver {
+    let mut d = start_with(
+        "TRANSFORM agg FROM public.src GROUP BY g SELECT MIN(v) AS lo, MAX(v) AS hi",
+        &format!(
+            "create table public.src (id integer primary key, g integer, v {ty}); \
+             create index on public.src (g, v)"
+        ),
+        &[("id", int4()), ("g", int4()), ("v", value_type)],
+    )
+    .await;
+    step(&mut d, &format!("insert into public.src values {rows}")).await;
+    d.settle().await;
+    assert_walk(&d, &[], "settled").await;
+    d
+}
+
+/// For each `(hidden and visible extreme, its column, source's extreme)`,
+/// plants the value in both the hidden table and the target of group 1 and
+/// asserts the check reports the hidden column exactly when `diverged`.
+async fn assert_planted(d: &Driver, plants: &[(&str, &str, &str, bool)]) {
+    let hidden = hidden(d).await;
+    let name = hidden_name(d).await;
+    for (value, stem, source, diverged) in plants {
+        let field = if *stem == "min" { "lo" } else { "hi" };
+        write(
+            d,
+            &format!(
+                "update {hidden} set __{stem}_1 = '{value}' where g = 1; \
+                 update public.agg set {field} = '{value}' where g = 1"
+            ),
+        )
+        .await;
+        let want = if *diverged {
+            vec![cell(
+                "1",
+                &format!("{name}.__{stem}_1"),
+                Some(value),
+                Some(source),
+            )]
+        } else {
+            vec![]
+        };
+        assert_walk(d, &want, &format!("{stem} planted as {value}")).await;
+        write(
+            d,
+            &format!(
+                "update {hidden} set __{stem}_1 = '{source}' where g = 1; \
+                 update public.agg set {field} = '{source}' where g = 1"
+            ),
+        )
+        .await;
+    }
+}
+
+/// Equal-but-distinguishable extremes are one equal value (#1117 rule 3,
+/// ADR-0020): an extreme that renders `1.000` against the source's `1.0`
+/// is no divergence, and one that differs by value is. A group whose
+/// arguments tie by value at different scales (`1.0`, `1.00`) converges
+/// whichever of them each side shows. Fails if extremes are compared as
+/// text.
+#[tokio::test]
+async fn numeric_extremes_compare_by_the_types_equality() {
+    let d = start_typed(
+        "numeric",
+        ValueType::Numeric,
+        "(1, 1, 1.0), (2, 1, 1.00), (3, 1, 2.50), (4, 1, 2.5), (5, 2, 'NaN'), (6, 2, 0)",
+    )
+    .await;
+    assert_planted(
+        &d,
+        &[
+            ("1.000", "min", "1.0", false),
+            ("1.001", "min", "1.0", true),
+            ("2.500000", "max", "2.50", false),
+            ("2.4", "max", "2.50", true),
+        ],
+    )
+    .await;
+}
+
+/// `float8`: `-0` and `0` are equal, `NaN` equals `NaN` (Postgres's float
+/// `=`), and the infinities are values like any other. Fails if extremes
+/// are compared as text.
+#[tokio::test]
+async fn float_extremes_compare_by_the_types_equality() {
+    let d = start_typed(
+        "double precision",
+        ValueType::Float(FloatWidth::Float8),
+        "(1, 1, 0), (2, 1, 'NaN'), (3, 1, 3), (4, 2, '-Infinity'), (5, 2, 'Infinity')",
+    )
+    .await;
+    assert_planted(
+        &d,
+        &[
+            ("-0", "min", "0", false),
+            ("1e-300", "min", "0", true),
+            ("NaN", "max", "NaN", false),
+            ("Infinity", "max", "NaN", true),
+            ("-Infinity", "min", "0", true),
+        ],
+    )
+    .await;
+}
+
+/// `interval`: `'1 day'` and `'24 hours'` are equal and render apart.
+/// Fails if extremes are compared as text.
+#[tokio::test]
+async fn interval_extremes_compare_by_the_types_equality() {
+    let d = start_typed(
+        "interval",
+        ValueType::Other(PgType::Interval),
+        "(1, 1, '1 day'), (2, 1, '3 days'), (3, 2, '1 hour')",
+    )
+    .await;
+    assert_planted(
+        &d,
+        &[
+            ("24:00:00", "min", "1 day", false),
+            ("25:00:00", "min", "1 day", true),
+            ("72:00:00", "max", "3 days", false),
+            ("1 mon", "max", "3 days", true),
+        ],
+    )
+    .await;
 }
 
 // ------------------------------------------------------------ source lock

@@ -561,6 +561,7 @@ impl Audit<'_> {
             floor_key: &hidden,
             basis: Some(Basis {
                 hidden: &hidden,
+                column: "__basis",
                 columns: &cells,
                 collations,
             }),

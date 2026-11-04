@@ -15,9 +15,15 @@
 //! 3. the visible row each hidden group's partials imply (a row exactly
 //!    while `__n > 0`, each field the function of the partials the
 //!    definition names);
-//! 4. the visible target's rows.
+//! 4. the visible target's rows;
 //!
-//! [`diff_groups`] compares 1 against 2 and 3 against 4, and reports a group
+//! and, for a definition with `MIN`/`MAX`, a seventh (5 and 6 name the
+//! groups the ring leaves uncertain, below): each group's extremes over the
+//! source as the target has applied them to its extremes, under the
+//! extremes' own basis ([`extremes_side`]), which side 2 lists after its
+//! partials.
+//!
+//! [`diff_groups`] compares 1 and 7 against 2 and 3 against 4, and reports a group
 //! 1 has and 4 lacks, or the reverse, as a missing or extra row. It reports, never
 //! repairs: the remedy is a `request_backfill` of the source or a
 //! `PAUSE`/`RESUME` (ADR-0013).
@@ -26,8 +32,9 @@
 //! equal value): the sides' groups are matched by the `GROUP BY` columns'
 //! equality, not their text ([`Keyset::ranked_by_value`]), so a group row
 //! keyed `1.25` is the source's `1.2500`; a partial sum drops its trailing
-//! zeros; and a visible field whose text differs is compared by its type's
-//! `=` ([`drop_equal_values`]).
+//! zeros; and a visible field or a hidden extreme whose text differs is
+//! compared by its type's `=` ([`drop_equal_values`]): a `MIN` of `1.0` and
+//! `1.00`, `-0` and `0`, or `'1 day'` and `'24 hours'` is either of them.
 //!
 //! Like the 1-1 comparison, the page is read only after the convergence wait
 //! `super::self_check::audit` makes. Side 1 is read from the source's rows
@@ -108,8 +115,7 @@ fn agg_sql(agg: &Agg) -> String {
             "case when __count_{n} = 0 then null else (__sum_{n}) / (__count_{n})::numeric end",
             n = i + 1
         ),
-        // The hidden extreme as it stands; the audit doesn't compare
-        // extremes with the source yet (#1117).
+        // The hidden extreme, which side 7 compares with the source.
         Agg::Extreme { max, arg, .. } => {
             format!("__{}_{}", if *max { "max" } else { "min" }, arg + 1)
         }
@@ -181,6 +187,7 @@ fn page_sql(
         floor_key,
         basis: Some(Basis {
             hidden,
+            column: "__basis",
             columns: &shape.group_cols,
             // An aggregate's hidden copy of a `GROUP BY` column has the
             // database's default collation, which pairs with any.
@@ -194,6 +201,7 @@ fn page_sql(
     // trimmed anyway, and this way the `GROUP BY` holds a page of groups
     // rather than every group past the cursor.
     let weighted = ring.weighted_sql(&lands);
+    let ext = extremes_side(shape, keyset, ring, hidden, floor_key, &within_hid);
     let src = keyset.side(&refs, |cond| {
         format!(
             "select {key} as __k{carried}, array[{}]::text[] as __v from {weighted} as __s \
@@ -206,10 +214,13 @@ fn page_sql(
     // Sides 2 and 3: the hidden table's partials, and the visible row they
     // imply.
     let columns = partial_columns(shape);
-    let hid_parts: Vec<String> = columns
+    let mut hid_parts: Vec<String> = columns
         .iter()
         .map(|c| partial_text(c, &quote_ident(c)))
         .collect();
+    for x in extremes(shape) {
+        hid_parts.push(format!("({})::text", quote_ident(&x.column())));
+    }
     let aggs: Vec<String> = shape
         .aggs
         .iter()
@@ -264,11 +275,16 @@ fn page_sql(
          src as materialized ({src}), \
          implied as (select __k{carried_cols_lead}, __f as __v from hid where __visible), \
          vis as materialized ({vis}), \
+         {ext}\
          unc as ( \
             select distinct ({unc_key}) collate {BYTE_ORDER} as __k{unc_carried} \
             from ({uncertain}) u \
             cross join lateral jsonb_populate_record(null::{source}, u.__i) as r), ",
         ring_ctes = ring.ctes(&lands),
+        ext = ext
+            .as_ref()
+            .map(|ext| format!("ext as materialized ({ext}), "))
+            .unwrap_or_default(),
         hid_order = keyset.order_by(&keyset.carried(None)),
         carried_cols = keyset.carried(None).join(", "),
         carried_cols_lead = keyset
@@ -289,12 +305,114 @@ fn page_sql(
         unc_named = keyset.named_key("unc", "unc.__k"),
         global = ring.global_sql(),
     );
-    Ok(keyset.ranked_by_value(
-        &ctes,
-        &[(1, "src"), (2, "hid"), (3, "implied"), (4, "vis")],
-        &[1, 2, 4],
-        &extra,
-    ))
+    let mut sides = vec![(1, "src"), (2, "hid"), (3, "implied"), (4, "vis")];
+    let mut bounds = vec![1, 2, 4];
+    if ext.is_some() {
+        sides.push((7, "ext"));
+        bounds.push(7);
+    }
+    Ok(keyset.ranked_by_value(&ctes, &sides, &bounds, &extra))
+}
+
+/// The hidden extremes, one per column ([`group_basis::Extreme::column`]),
+/// in [`GroupShape::aggs`]' order: what sides 2 and 7 list after the
+/// partials.
+fn extremes(shape: &GroupShape) -> Vec<group_basis::Extreme> {
+    let mut seen = HashSet::new();
+    shape
+        .extremes()
+        .into_iter()
+        .filter(|x| seen.insert(x.column()))
+        .collect()
+}
+
+/// Side 7 of [`page_sql`], or `None` for a definition with no `MIN`/`MAX`:
+/// each group's extremes over the source as the target has applied them to
+/// its extremes, as text, in [`extremes`]' order.
+///
+/// A group's extremes have a basis of their own, `__xbasis`, apart from its
+/// partials' (`group_basis`'s "Extremes"): a probe that saw a change the
+/// drain hasn't applied yet already counts it in the extremes, but not in
+/// the partials. So this side reads the weighted rows again, an unapplied
+/// change subtracted where `__xbasis` didn't see it, and its groups are the
+/// extremes' own: a group whose partials are all zero can still have an
+/// extreme a probe read.
+///
+/// `MIN`/`MAX` have no inverse, so a subtracted image can't be taken off a
+/// running extreme: the rows are first summed per (group, arguments), and
+/// only the arguments still present (a positive weight) are aggregated. The
+/// `GROUP BY` of an argument merges its equal values (`1.0` and `1.00`), and
+/// the extreme is one of them, as Postgres's own `min()` gives; the
+/// comparison with the hidden extreme is by the type's `=`
+/// ([`drop_equal_values`], ADR-0020). A group whose arguments are all
+/// `NULL` has `NULL` extremes, and a group the target has no row for has
+/// none.
+fn extremes_side(
+    shape: &GroupShape,
+    keyset: &Keyset,
+    ring: &Ring<'_>,
+    hidden: &str,
+    floor_key: &str,
+    within_hid: &str,
+) -> Option<String> {
+    let extremes = extremes(shape);
+    if extremes.is_empty() {
+        return None;
+    }
+    let refs = keyset.refs(None);
+    let key = ddl::pk_key_sql_expr(keyset.columns(), None);
+    let carried = keyset.select_carried(&refs);
+    let order = keyset.order_by(&refs);
+    let group_cols = shape
+        .group_cols
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let args: BTreeSet<usize> = extremes.iter().map(|x| x.arg).collect();
+    let selected: Vec<String> = args
+        .iter()
+        .map(|i| format!("({}) as __a{i}", render_leaf(&shape.args[*i].expr)))
+        .collect();
+    let grouped: Vec<String> = args
+        .iter()
+        .map(|i| format!("({})", render_leaf(&shape.args[*i].expr)))
+        .collect();
+    let values: Vec<String> = extremes
+        .iter()
+        .map(|x| {
+            format!(
+                "({}(__a{}))::text",
+                if x.max { "max" } else { "min" },
+                x.arg
+            )
+        })
+        .collect();
+    let lands = Lands {
+        floor_key,
+        basis: Some(Basis {
+            hidden,
+            column: "__xbasis",
+            columns: &shape.group_cols,
+            collations: &[],
+        }),
+        filter: String::new(),
+        late_probe: true,
+    };
+    let weighted = ring.weighted_sql(&lands);
+    let w = WEIGHT;
+    Some(keyset.side(&refs, |cond| {
+        format!(
+            "select {key} as __k{carried}, array[{values}]::text[] as __v from ( \
+                select {group_cols}, {selected} from {weighted} as __s \
+                where {cond} and {within_hid} \
+                group by {group_cols}, {grouped} having sum({w}) > 0) as __t \
+             group by {group_cols} order by {order} limit $1",
+            values = values.join(", "),
+            selected = selected.join(", "),
+            grouped = grouped.join(", "),
+        )
+    }))
 }
 
 /// The partials of weighted rows (`super::self_check_ring`) over `args`
@@ -460,6 +578,7 @@ pub(super) async fn compare(
     let rows = Keyset::run(&mut client, sql.as_str(), scope.limit, steer).await?;
 
     let mut sides: [Side; 4] = Default::default();
+    let mut ext = Side::new();
     let mut uncertain = Uncertain::default();
     let mut page_end: Option<String> = None;
     for row in &rows {
@@ -470,6 +589,9 @@ pub(super) async fn compare(
                 uncertain.keys.insert(row.get(2));
             }
             6 => uncertain.all = true,
+            7 => {
+                ext.insert(row.get(2), row.get(3));
+            }
             _ => {
                 sides[(side - 1) as usize].insert(row.get(2), row.get(3));
             }
@@ -481,14 +603,34 @@ pub(super) async fn compare(
         .into_iter()
         .map(|c| format!("{hidden_name}.{c}"))
         .collect();
+    let extremes = extremes(shape);
+    let extreme_names: Vec<String> = extremes
+        .iter()
+        .map(|x| format!("{hidden_name}.{}", x.column()))
+        .collect();
     let fields: Vec<&str> = shape.fields.iter().map(|(n, _, _)| n.as_str()).collect();
-    let (rows_compared, next_after, mut divergences) =
-        diff_groups(&partials, &fields, paused, src, hid, implied, vis, page_end);
-    let types: HashMap<&str, &str> = shape
+    let (rows_compared, next_after, mut divergences) = diff_groups(
+        &partials,
+        &extreme_names,
+        &fields,
+        paused,
+        src,
+        hid,
+        ext,
+        implied,
+        vis,
+        page_end,
+    );
+    // A visible field, and a hidden extreme against the source's, compare by
+    // their types' `=`; the partials are compared as text.
+    let mut types: HashMap<&str, &str> = shape
         .fields
         .iter()
         .map(|(name, pg_type, _)| (name.as_str(), pg_type.as_str()))
         .collect();
+    for (name, x) in extreme_names.iter().zip(&extremes) {
+        types.insert(name.as_str(), x.pg_type.as_str());
+    }
     drop_equal_values(&client, &types, &mut divergences).await?;
     Ok(ComparePass {
         checked_through,
@@ -592,33 +734,48 @@ pub(super) async fn drop_equal_values(
 }
 
 /// The pure half of [`compare`]: `(rows compared, next cursor, divergences)`.
-/// `partials` and `fields` name the columns of the sides' value lists.
+/// `partials`, `extremes` and `fields` name the columns of the sides' value
+/// lists: side 1's are `partials`, side 7's `extremes`, side 2's both, in
+/// that order, and sides 3 and 4's `fields`.
 #[allow(clippy::too_many_arguments)]
 fn diff_groups(
     partials: &[String],
+    extremes: &[String],
     fields: &[&str],
     paused: &HashSet<String>,
     src: Side,
     hid: Side,
+    ext: Side,
     implied: Side,
     vis: Side,
     page_end: Option<String>,
 ) -> (i64, Option<String>, Vec<Divergence>) {
     let mut divergences = Vec::new();
     let zeros: Vec<Option<String>> = partials.iter().map(|_| Some("0".to_string())).collect();
+    let nulls: Vec<Option<String>> = extremes.iter().map(|_| None).collect();
+    let empty: Vec<Option<String>> = zeros.iter().chain(&nulls).cloned().collect();
+    let columns: Vec<&String> = partials.iter().chain(extremes).collect();
 
-    // The hidden partials against the source's. A group on one side only is
-    // all zeros on the other: the hidden table keeps a zero group's row until
-    // the zero-group GC (`retire::collect_zero_groups`) deletes it.
-    let keys: BTreeSet<&String> = src.keys().chain(hid.keys()).collect();
+    // The hidden partials and extremes against the source's. A group on one
+    // side only is all zeros and `NULL` extremes on the other: the hidden
+    // table keeps a zero group's row until the zero-group GC
+    // (`retire::collect_zero_groups`) deletes it. The extremes' groups are
+    // their own (side 7): a zero group can keep an extreme its probe saw.
+    let keys: BTreeSet<&String> = src.keys().chain(hid.keys()).chain(ext.keys()).collect();
     for key in keys {
-        let expected = src.get(key).unwrap_or(&zeros);
-        let actual = hid.get(key).unwrap_or(&zeros);
-        for (column, (r, p)) in partials.iter().zip(expected.iter().zip(actual)) {
+        let expected: Vec<Option<String>> = src
+            .get(key)
+            .unwrap_or(&zeros)
+            .iter()
+            .chain(ext.get(key).unwrap_or(&nulls))
+            .cloned()
+            .collect();
+        let actual = hid.get(key).unwrap_or(&empty);
+        for (column, (r, p)) in columns.iter().zip(expected.iter().zip(actual)) {
             if r != p {
                 divergences.push(Divergence::Cell {
                     key: key.clone(),
-                    column: column.clone(),
+                    column: (*column).clone(),
                     persisted: p.clone(),
                     recomputed: r.clone(),
                 });
@@ -667,6 +824,7 @@ fn diff_groups(
     let all: BTreeSet<&String> = src
         .keys()
         .chain(hid.keys())
+        .chain(ext.keys())
         .chain(implied.keys())
         .chain(vis.keys())
         .collect();
@@ -730,10 +888,12 @@ mod tests {
         let [src, hid, implied, vis] = sides;
         diff_groups(
             &["h.__n".to_string()],
+            &[],
             &["n"],
             &HashSet::new(),
             src,
             hid,
+            Side::new(),
             implied,
             vis,
             None,

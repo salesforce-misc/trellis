@@ -92,11 +92,14 @@ pub(super) struct Lands<'a> {
     pub(super) late_probe: bool,
 }
 
-/// The hidden table (quoted, qualified) whose row's `__basis` refuses an
+/// The hidden table (quoted, qualified) whose row's basis column refuses an
 /// unapplied change, and its key columns, which carry the source columns'
 /// names.
 pub(super) struct Basis<'a> {
     pub(super) hidden: &'a str,
+    /// The basis column: `__basis`, or a group's extremes' own `__xbasis`
+    /// (`super::group_basis`'s "Extremes").
+    pub(super) column: &'a str,
     pub(super) columns: &'a [String],
     /// For each of `columns`, the collation the change's column is read
     /// under to find the hidden row, `None` to read it as it is: a source
@@ -371,7 +374,7 @@ impl Ring<'_> {
 }
 
 /// ` and …`: the change of the image `image` (a row of a CTE carrying its
-/// `__txid`), populated as `alias`, is unseen by the `__basis` of the row
+/// `__txid`), populated as `alias`, is unseen by the basis of the row
 /// it lands in (`lands`), or empty when `lands` has no basis.
 fn unseen_by_basis(lands: &Lands<'_>, image: &str, alias: &str) -> String {
     match &lands.basis {
@@ -383,7 +386,7 @@ fn unseen_by_basis(lands: &Lands<'_>, image: &str, alias: &str) -> String {
     }
 }
 
-/// The `__basis` of the row of `basis`'s hidden table whose key columns
+/// The basis ([`Basis::column`]) of the row of `basis`'s hidden table whose key columns
 /// equal `alias`'s, `NULL` matching `NULL`, or `NULL` when there is none.
 /// Plain equality first, which the hidden table's key index serves (a
 /// re-collated column of `alias` is read under its hidden copy's collation,
@@ -391,10 +394,13 @@ fn unseen_by_basis(lands: &Lands<'_>, image: &str, alias: &str) -> String {
 /// lookup, which no index serves.
 fn basis_probe(basis: &Basis<'_>, alias: &str) -> String {
     let Basis {
-        hidden, columns, ..
+        hidden,
+        column,
+        columns,
+        ..
     } = basis;
     if columns.is_empty() {
-        return format!("(select x.__basis from {hidden} x limit 1)");
+        return format!("(select x.{column} from {hidden} x limit 1)");
     }
     let read = |i: usize, c: &str| match basis.collations.get(i).and_then(Option::as_deref) {
         Some(collation) => format!("{alias}.{c} collate {collation}"),
@@ -421,8 +427,8 @@ fn basis_probe(basis: &Basis<'_>, alias: &str) -> String {
         })
         .collect();
     format!(
-        "coalesce((select x.__basis from {hidden} x where {}), \
-                  (select x.__basis from {hidden} x where ({}) and {}))",
+        "coalesce((select x.{column} from {hidden} x where {}), \
+                  (select x.{column} from {hidden} x where ({}) and {}))",
         equal.join(" and "),
         has_null.join(" or "),
         same.join(" and "),
