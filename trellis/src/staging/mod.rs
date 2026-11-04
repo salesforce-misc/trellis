@@ -90,6 +90,7 @@ pub(crate) mod page;
 pub mod partition_correction;
 pub mod quarantine;
 pub mod retire;
+pub(crate) mod ring_gauges;
 pub(crate) mod schema_change;
 pub mod seal;
 pub mod self_check;
@@ -154,7 +155,6 @@ pub use quarantine::HeldKeys;
 pub use self_check::{Divergence, SelfCheckMode, SelfCheckOutcome};
 pub use self_check_job::{SelfCheckJob, SelfCheckJobState, SelfCheckReport};
 pub use session::ProducerSession;
-pub use state::segment_state_counts;
 pub use worker_registry::{
     Registration, clear_staging, deregister_worker, reclaim_stale_workers, register_worker,
 };

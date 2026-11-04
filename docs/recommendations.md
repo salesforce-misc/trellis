@@ -106,9 +106,13 @@ At 10,000 changes per second, a one-hour outage needs about 6.8 GB.
   only while Trellis runs.
 * While every Trellis process is down, nothing drains or bounds the ring, and
   the database's own disk alerts are the only guard. Alert on free disk.
-* To see the ring's size on disk, sum `pg_total_relation_size` over the ring
-  tables `seg_0` to `seg_3` in Trellis's schema.
-* The ring's gauges and its soft and hard bounds are designed but not built
+* To see the ring's size on disk, read the `ring_bytes` gauge
+  ([observability](observability.md#metrics)), or sum
+  `pg_total_relation_size` over the ring tables `seg_0` to `seg_3` in
+  Trellis's schema. `ring_undrained_bytes` splits what is still to drain by
+  source table, and `ring_oldest_undrained_age_seconds` says how far behind
+  the drain is.
+* The ring's soft and hard bounds are designed but not built
   ([ADR-0002 — Consequences](decisions/0002-async-data-flow.md#consequences-and-costs)).
 
 ## `statement_timeout`

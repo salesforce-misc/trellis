@@ -151,6 +151,29 @@ below, and the histograms above, also carries the `trellis_instance` label
   state (ties to [the staging ring](staging-and-claiming/02-the-staging-ring.md)),
   chosen over a per-transform depth gauge for lower cost. The staging worker
   counts them every 5 s (`housekeeping_interval`).
+* `ring_rows`, `ring_bytes`, `ring_oldest_undrained_age_seconds` and
+  `ring_undrained_bytes{source_table}` — the staging ring's backlog, read by the
+  same 5 s housekeeping statement that counts the segments, so they add no
+  statement or transaction to the staging worker's idle load. The ring is the
+  application's database's own disk: these are the numbers to size and alert on
+  when capture outruns the drain
+  ([recommendations — Ring sizing](recommendations.md#ring-sizing)).
+  * `ring_bytes` is `pg_total_relation_size` over the four ring slots,
+    heap and index, drained segments awaiting retirement included. `ring_rows`
+    is their rows. Each slot is read whole while it is small; a slot of more
+    than about 22,000 captured rows (512 pages) is estimated from a sample of
+    its pages, so its rows are approximate.
+  * `ring_oldest_undrained_age_seconds` is the age of the oldest row (by its
+    `appended_at`, its writer's transaction start) in a segment that has not
+    fully drained, as of the read, and 0 while none is waiting. It is read from
+    the first rows of each such segment, so it also counts a bucket of the
+    segment that has drained already, and is exact only to the skew
+    of concurrent writers. Between two reads the gauge holds its last value.
+  * `ring_undrained_bytes{source_table}` is the bytes of the segments that have
+    not fully drained, split by the table each row belongs to in proportion to
+    the sizes of the sampled rows. A segment counts whole until its last bucket
+    drains. A table whose rows have all drained reads 0 for one read, then its
+    series expires. The split shows which tables hold the backlog.
 
 Backfill progress is deliberately *not* a metric — it's the transform's
 [lifecycle status](#transform-status-lifecycle), a small enumerable state.
@@ -174,13 +197,13 @@ registry:
 
 * **Counters and histograms** stay at their last value. Their rate is 0, which
   is true.
-* **Gauges** (`staging_segments`, `build_chunk_seconds_max`) disappear once
+* **Gauges** (`staging_segments`, the `ring_*` gauges, `build_chunk_seconds_max`) disappear once
   nothing has set them for 60 seconds. A handle's background client (`staging`
   or `drain_threads`) sets each of its instance's gauges again every 300 ms
   (`maintenance_interval`), to its last known value, so a gauge expires only
   once no client of its instance runs in the process. A running instance whose
   staging worker cannot read the ring keeps reporting the last segment counts
-  it read.
+  and ring gauges it read.
 * **`trellis_instance_up{trellis_instance}`** is 1 while at least one handle of
   the instance runs in this process, and 0 once the last one has shut down or been
   dropped. It never expires, so it keeps reporting 0. Alert on

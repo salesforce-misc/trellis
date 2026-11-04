@@ -8,10 +8,6 @@
 //! (claiming, apply) extends this function instead of re-deriving the edges
 //! at a new call site.
 
-use tokio_postgres::Client;
-
-use super::error::StagingError;
-
 /// One `segments.state` value. All four are valid `segments.state` CHECK values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentState {
@@ -55,36 +51,6 @@ impl SegmentState {
                 | (Draining, Drained) // apply ∪ mark, one txn (stage 05)
         )
     }
-}
-
-/// Counts of `segments` rows by state, `Active` first through `Drained`
-/// last — the reading side of ADR-0009 decision 5's `staging_segments{state}`
-/// gauge (`docs/decisions/0009-observability-decisions.md`). Always returns
-/// all four states, defaulting an unrepresented one to `0`, so a state that
-/// just drained to empty (e.g. no more `active` segments) reports `0` rather
-/// than leaving a stale prior value in whatever's rendering the gauge.
-pub async fn segment_state_counts(
-    client: &Client,
-) -> Result<[(SegmentState, i64); 4], StagingError> {
-    let rows = client
-        .query_typed("select state, count(*) from segments group by state", &[])
-        .await?;
-    let mut counts = [
-        (SegmentState::Active, 0i64),
-        (SegmentState::Sealed, 0i64),
-        (SegmentState::Draining, 0i64),
-        (SegmentState::Drained, 0i64),
-    ];
-    for row in rows {
-        let state_sql: String = row.get(0);
-        let count: i64 = row.get(1);
-        if let Some(state) = SegmentState::from_sql(&state_sql)
-            && let Some(slot) = counts.iter_mut().find(|(s, _)| *s == state)
-        {
-            slot.1 = count;
-        }
-    }
-    Ok(counts)
 }
 
 #[cfg(test)]

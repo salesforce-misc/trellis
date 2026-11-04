@@ -1508,15 +1508,19 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                     }
                 }
                 if !failed {
-                    // ADR-0009 decision 5's staging_segments{state} gauge: cheap
-                    // to read here since maintenance_loop already ticks on this
-                    // connection regardless, and a failed read just skips a
-                    // gauge refresh rather than derailing the tick's other work.
-                    let counts = staging::segment_state_counts(c).await;
-                    if let Ok(counts) = failures.check("segment_state_counts", counts) {
-                        for (state, count) in counts {
+                    // ADR-0009 decision 5's staging_segments{state} gauge and
+                    // the ring's gauges (rows, bytes, oldest undrained age,
+                    // undrained bytes per source table): one statement on this
+                    // connection, which maintenance_loop already ticks on
+                    // regardless, so the gauges add no transaction to the
+                    // pass. A failed read just skips a gauge refresh rather
+                    // than derailing the tick's other work.
+                    let reading = staging::ring_gauges::read(c).await;
+                    if let Ok(reading) = failures.check("ring_gauges", reading) {
+                        for (state, count) in reading.segments {
                             crate::metrics::set_staging_segments(state.as_sql(), count as u64);
                         }
+                        crate::metrics::set_ring_gauges(reading.ring);
                     }
                 }
                 if !failed
@@ -3905,7 +3909,7 @@ mod maintenance_failure_tests {
             ("reclaim_stale_chunks", ttl, ttl + ttl / 6 + tick),
             ("retire_drained_segments", Duration::ZERO, added),
             ("collect_tombstones", Duration::ZERO, added),
-            ("segment_state_counts", Duration::ZERO, added),
+            ("ring_gauges", Duration::ZERO, added),
         ];
         for (task, contract, bound) in tasks {
             // Simulate a condition that arose the instant after a pass.

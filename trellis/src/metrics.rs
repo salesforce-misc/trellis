@@ -128,6 +128,22 @@ const END_TO_END_LATENCY_METRIC: &str = "trellis_end_to_end_latency_seconds";
 /// rows by [`crate::staging::SegmentState`], labeled `state`.
 const STAGING_SEGMENTS_METRIC: &str = "trellis_staging_segments";
 
+/// The staging ring's rows, all four slots, drained segments not yet
+/// retired included ([`RingGauges::rows`]).
+const RING_ROWS_METRIC: &str = "trellis_ring_rows";
+
+/// The staging ring's size on disk, heap and index, all four slots
+/// ([`RingGauges::bytes`]).
+const RING_BYTES_METRIC: &str = "trellis_ring_bytes";
+
+/// How long the oldest undrained ring row has waited
+/// ([`RingGauges::oldest_undrained_age`]).
+const RING_OLDEST_UNDRAINED_AGE_METRIC: &str = "trellis_ring_oldest_undrained_age_seconds";
+
+/// The ring bytes still to drain, labeled `source_table`
+/// ([`RingGauges::undrained_bytes`]).
+const RING_UNDRAINED_BYTES_METRIC: &str = "trellis_ring_undrained_bytes";
+
 /// Worker time a Re-derive build spends in each of its statement
 /// classes, labeled `class` ([`BuildStatement`]). The `_sum` per class is
 /// worker-seconds; the profile divides it by the rows built.
@@ -476,6 +492,30 @@ fn describe_metrics() {
         STAGING_SEGMENTS_METRIC,
         "Count of staging ring segments, labeled by state (active/sealed/draining/drained)."
     );
+    metrics::describe_gauge!(
+        RING_ROWS_METRIC,
+        "Rows in the staging ring: every slot, drained segments not yet retired included. \
+         Estimated from a sample of each slot's pages once a slot outgrows the sample."
+    );
+    metrics::describe_gauge!(
+        RING_BYTES_METRIC,
+        metrics::Unit::Bytes,
+        "Size on disk of the staging ring's four slots, heap and index \
+         (pg_total_relation_size)."
+    );
+    metrics::describe_gauge!(
+        RING_OLDEST_UNDRAINED_AGE_METRIC,
+        metrics::Unit::Seconds,
+        "Age of the oldest row (by appended_at) in the staging ring's undrained segments, or 0 \
+         while none is waiting. Read from the start of each such segment, so it is exact for a \
+         segment appended in order and within the skew of concurrent transactions otherwise."
+    );
+    metrics::describe_gauge!(
+        RING_UNDRAINED_BYTES_METRIC,
+        metrics::Unit::Bytes,
+        "Ring bytes of the segments still to drain, by source_table. Each undrained slot's size \
+         is split by the sizes of the rows a sample of its pages holds for each table."
+    );
 }
 
 /// Ensures the registry is installed. Every recording function below calls
@@ -548,6 +588,51 @@ pub fn set_staging_segments(state: &str, count: u64) {
         .set(count as f64);
 }
 
+/// The staging ring's gauges, as one read of the ring left them
+/// (`staging::ring_gauges::read`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct RingGauges {
+    /// Rows in all four slots.
+    pub(crate) rows: u64,
+    /// Bytes on disk of all four slots, heap and index.
+    pub(crate) bytes: u64,
+    /// The age of the oldest row of a segment that has not fully drained, as
+    /// of the read. `ZERO` when no such segment holds a row.
+    pub(crate) oldest_undrained_age: Duration,
+    /// Bytes of the segments that have not fully drained, split by source
+    /// table.
+    pub(crate) undrained_bytes: BTreeMap<String, u64>,
+}
+
+/// Sets the ring gauges from `reading` — refreshed on the staging worker's
+/// housekeeping pass, next to [`set_staging_segments`], and kept for
+/// [`refresh_instance_gauges`] likewise. A source table the last reading
+/// named and this one doesn't is set to 0 once, then left to expire.
+pub(crate) fn set_ring_gauges(reading: RingGauges) {
+    ensure_installed();
+    let state = gauge_state(&instance_log::current());
+    let mut kept = state.ring.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut shown = reading.clone();
+    if let Some(last) = kept.as_ref() {
+        for table in last.undrained_bytes.keys() {
+            shown.undrained_bytes.entry(table.clone()).or_insert(0);
+        }
+    }
+    publish_ring_gauges(&instance(), &shown);
+    *kept = Some(reading);
+}
+
+fn publish_ring_gauges(label: &str, ring: &RingGauges) {
+    metrics::gauge!(RING_ROWS_METRIC, INSTANCE_LABEL => label.to_string()).set(ring.rows as f64);
+    metrics::gauge!(RING_BYTES_METRIC, INSTANCE_LABEL => label.to_string()).set(ring.bytes as f64);
+    metrics::gauge!(RING_OLDEST_UNDRAINED_AGE_METRIC, INSTANCE_LABEL => label.to_string())
+        .set(ring.oldest_undrained_age.as_secs_f64());
+    for (table, bytes) in &ring.undrained_bytes {
+        metrics::gauge!(RING_UNDRAINED_BYTES_METRIC, INSTANCE_LABEL => label.to_string(), "source_table" => table.clone())
+            .set(*bytes as f64);
+    }
+}
+
 /// What an instance's gauges are set from. The gauges drop out of the
 /// recorder after [`GAUGE_IDLE_TIMEOUT`] unset, so a value that changes only
 /// on an event (a build chunk's longest duration) has to be kept here and set
@@ -559,6 +644,8 @@ struct GaugeState {
     chunk_max_nanos: AtomicU64,
     /// The last segment count per state.
     segments: Mutex<BTreeMap<String, u64>>,
+    /// The last ring reading, unset until the first.
+    ring: Mutex<Option<RingGauges>>,
     /// Woken by each [`refresh_instance_gauges`] of the instance, for the
     /// test that pins the client's refresh task ([`refreshed`]).
     #[cfg(test)]
@@ -605,6 +692,15 @@ pub fn refresh_instance_gauges() {
     for (segment_state, count) in segments.iter() {
         metrics::gauge!(STAGING_SEGMENTS_METRIC, INSTANCE_LABEL => label.clone(), "state" => segment_state.clone())
             .set(*count as f64);
+    }
+    drop(segments);
+    if let Some(ring) = state
+        .ring
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+    {
+        publish_ring_gauges(&label, ring);
     }
     #[cfg(test)]
     state.refreshed.notify_one();
@@ -923,6 +1019,73 @@ mod tests {
         record_end_to_end_latency("t", Duration::from_millis(1));
         increment_changes_applied("t", 1);
         set_staging_segments("active", 1);
+        set_ring_gauges(ring_reading(&[("public.t", 1)]));
+    }
+
+    fn ring_reading(tables: &[(&str, u64)]) -> RingGauges {
+        RingGauges {
+            rows: 7,
+            bytes: 4096,
+            oldest_undrained_age: Duration::from_secs(90),
+            undrained_bytes: tables
+                .iter()
+                .map(|(table, bytes)| (table.to_string(), *bytes))
+                .collect(),
+        }
+    }
+
+    /// The ring gauges carry the reading; a source table the next reading
+    /// drops is set to 0 once; and the housekeeping-less refresh sets the
+    /// last reading again.
+    #[test]
+    fn the_ring_gauges_follow_the_last_reading() {
+        local(None, |render| {
+            let instance = "ring_gauges/trellis";
+            let inst = name(instance);
+            let table = |rendered: &str, table: &str| {
+                sample(
+                    rendered,
+                    RING_UNDRAINED_BYTES_METRIC,
+                    &[&label(instance), &format!("source_table=\"{table}\"")],
+                )
+            };
+            instance_log::run_scoped(&inst, || {
+                set_ring_gauges(ring_reading(&[("public.a", 300), ("public.b", 100)]))
+            });
+            let rendered = render();
+            let gauge = |metric: &str| sample(&rendered, metric, &[&label(instance)]);
+            assert_eq!(gauge(RING_ROWS_METRIC), Some(7.0), "{rendered}");
+            assert_eq!(gauge(RING_BYTES_METRIC), Some(4096.0), "{rendered}");
+            assert_eq!(
+                gauge(RING_OLDEST_UNDRAINED_AGE_METRIC),
+                Some(90.0),
+                "{rendered}"
+            );
+            assert_eq!(table(&rendered, "public.a"), Some(300.0), "{rendered}");
+            assert_eq!(table(&rendered, "public.b"), Some(100.0), "{rendered}");
+
+            instance_log::run_scoped(&inst, || set_ring_gauges(ring_reading(&[("public.a", 50)])));
+            let rendered = render();
+            assert_eq!(table(&rendered, "public.a"), Some(50.0), "{rendered}");
+            assert_eq!(
+                table(&rendered, "public.b"),
+                Some(0.0),
+                "a table that drained is set to 0, not left at its last size: {rendered}"
+            );
+
+            // The refresh republishes the last reading, without the zeroed
+            // table (it is left to expire).
+            instance_log::run_scoped(&inst, || {
+                set_ring_gauges(ring_reading(&[("public.a", 60)]));
+                refresh_instance_gauges();
+            });
+            let rendered = render();
+            assert_eq!(table(&rendered, "public.a"), Some(60.0), "{rendered}");
+            assert_eq!(
+                sample(&rendered, RING_ROWS_METRIC, &[&label(instance)]),
+                Some(7.0)
+            );
+        });
     }
 
     /// Two instances in one process write the same transform
@@ -1040,6 +1203,10 @@ mod tests {
                 END_TO_END_LATENCY_METRIC,
                 CHANGES_APPLIED_METRIC,
                 STAGING_SEGMENTS_METRIC,
+                RING_ROWS_METRIC,
+                RING_BYTES_METRIC,
+                RING_OLDEST_UNDRAINED_AGE_METRIC,
+                RING_UNDRAINED_BYTES_METRIC,
             ] {
                 assert!(
                     series
@@ -1075,7 +1242,7 @@ mod tests {
                 );
             }
         }
-        assert!(sites >= 14, "found {sites} recording sites");
+        assert!(sites >= 18, "found {sites} recording sites");
     }
 
     fn rust_files(dir: &std::path::Path, into: &mut Vec<std::path::PathBuf>) {
