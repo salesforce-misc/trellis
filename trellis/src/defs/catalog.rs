@@ -1058,7 +1058,12 @@ fn parse_for_define(
     let Some(restoring) = restoring else {
         return parse(source_text);
     };
-    let mut def = grammar::load(source_text, restoring.grammar_version)?;
+    let mut def = grammar::load_in(
+        source_text,
+        restoring.grammar_version,
+        grammar::OLDEST_SUPPORTED_GRAMMAR_VERSION,
+        grammar::CURRENT_GRAMMAR_VERSION,
+    )?;
     def.adopt_target = true;
     Ok(def)
 }

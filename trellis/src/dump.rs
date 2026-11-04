@@ -820,7 +820,12 @@ pub(crate) async fn restore_queued(
                  dump stored paused; RESUME that transform, then this one"
             ))
         } else {
-            match crate::defs::grammar::load(unparsed.definition_text, unparsed.grammar_version) {
+            match crate::defs::grammar::load_in(
+                unparsed.definition_text,
+                unparsed.grammar_version,
+                crate::defs::grammar::OLDEST_SUPPORTED_GRAMMAR_VERSION,
+                crate::defs::grammar::CURRENT_GRAMMAR_VERSION,
+            ) {
                 Err(err) => Some(crate::defs::grammar::unparsable_stored_text_reason(
                     target, &err,
                 )),
@@ -835,8 +840,13 @@ pub(crate) async fn restore_queued(
             paused_targets.push(target.to_string());
             continue;
         }
-        let def = crate::defs::grammar::load(unparsed.definition_text, unparsed.grammar_version)
-            .map_err(|err| refused(err.code(), err.to_string()))?;
+        let def = crate::defs::grammar::load_in(
+            unparsed.definition_text,
+            unparsed.grammar_version,
+            crate::defs::grammar::OLDEST_SUPPORTED_GRAMMAR_VERSION,
+            crate::defs::grammar::CURRENT_GRAMMAR_VERSION,
+        )
+        .map_err(|err| refused(err.code(), err.to_string()))?;
         // What the text resolves to here, against what the dump recorded.
         let resolve = async |explicit: Option<&str>, bare: &str| match explicit {
             Some(schema) => crate::intake::qualify(schema, bare)
