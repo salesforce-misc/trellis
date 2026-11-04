@@ -174,6 +174,63 @@ async fn define_and_alter_count_the_values_and_type_rules_validation_used() {
     assert_eq!(floor(&raw, &later, "u").await, "0.3.0");
 }
 
+/// Define counts the `GROUP BY` and `JOIN ... ON` key types the validator
+/// admitted, over the live column types: an `inet` key or an enum join key
+/// declared later raises the floor, a `text` or `bigint` key doesn't.
+#[tokio::test]
+async fn define_counts_the_key_types_validation_admitted() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    raw.batch_execute(
+        "create type public.status as enum ('open', 'closed'); \
+         create table public.s (id bigint primary key, addr inet, label text, st public.status); \
+         create table public.u (id bigint primary key, st public.status)",
+    )
+    .await
+    .expect("sources");
+
+    let later = handle(
+        &db,
+        "0.3.0",
+        &[
+            ("TypeRule(GroupByKey(Inet))", "0.3.0"),
+            ("JoinKey(Enum)", "0.3.0"),
+        ],
+    )
+    .await;
+    for (target, text) in [
+        (
+            "by_addr",
+            "FROM s GROUP BY addr WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
+        ),
+        (
+            "by_label",
+            "FROM s GROUP BY label WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
+        ),
+        (
+            "on_status",
+            "FROM s JOIN u ON s.st = u.st GROUP BY s.id WITHOUT SOURCE INDEX \
+             SELECT COUNT(*) AS n",
+        ),
+        (
+            "on_id",
+            "FROM s JOIN u ON s.id = u.id GROUP BY s.label WITHOUT SOURCE INDEX \
+             SELECT COUNT(*) AS n",
+        ),
+    ] {
+        later
+            .apply(&format!("TRANSFORM {target} {text}"))
+            .await
+            .unwrap_or_else(|e| panic!("define {target}: {e}"));
+    }
+
+    assert_eq!(floor(&raw, &later, "by_addr").await, "0.3.0");
+    assert_eq!(floor(&raw, &later, "by_label").await, "0.2.0");
+    assert_eq!(floor(&raw, &later, "on_status").await, "0.3.0");
+    assert_eq!(floor(&raw, &later, "on_id").await, "0.2.0");
+}
+
 /// A partitioned source counts, and a floor never exceeds the release that
 /// stamps it.
 #[tokio::test]
