@@ -836,30 +836,32 @@ pub(crate) async fn restore_queued(
                 unparsed.definition_text,
                 unparsed.grammar_version,
             );
-            if (
+            let found = (
                 found.0.as_str(),
                 found.1.as_deref(),
                 found.2.as_str(),
                 found.3,
-            ) != recorded
-            {
+            );
+            if found != recorded {
+                // Both sides in full: they can differ in any one field.
+                let described = |(source, join, text, grammar): (&str, Option<&str>, &str, i32)| {
+                    format!(
+                        "from {source}{} as `{text}` (grammar version {grammar})",
+                        join.map(|j| format!(" joined with {j}"))
+                            .unwrap_or_default(),
+                    )
+                };
                 return Err(refused(
                     crate::ErrorCode::Validation,
                     format!(
-                        "this database already has a transform into {target}, defined from {}{} \
-                         as `{}`, and the restore queue holds a different definition for it \
-                         (`{}`). The existing one is kept: delete the row from {queue} where \
-                         ordinal = {ordinal} to keep it, or, to use the queued one, `DROP \
-                         TRANSFORM` the existing one, define the queued text yourself and \
-                         then delete the row",
-                        found.0,
-                        found
-                            .1
-                            .as_deref()
-                            .map(|j| format!(" joined with {j}"))
-                            .unwrap_or_default(),
-                        found.2,
-                        unparsed.definition_text,
+                        "this database already has a transform into {target}, defined {}, and \
+                         the restore queue holds a different definition for it, {}. The \
+                         existing one is kept: delete the row from {queue} where ordinal = \
+                         {ordinal} to keep it, or, to use the queued one, PAUSE and DROP \
+                         TRANSFORM the existing one, define the queued text yourself and then \
+                         delete the row",
+                        described(found),
+                        described(recorded),
                     ),
                 ));
             }

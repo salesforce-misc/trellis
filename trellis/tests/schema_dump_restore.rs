@@ -30,6 +30,9 @@
 //!   (`an_appendix_over_a_different_definition_refuses_and_names_the_cause`)
 //! - a chain whose upstream already exists restores the rest, built or not
 //!   (`a_chain_whose_upstream_already_exists_restores_the_rest`)
+//! - a row differing only in its `JOIN` table or grammar version refuses
+//!   too, and the way out the refusal names works end to end
+//!   (`the_refusal_names_a_way_out_that_works_and_every_recorded_field_counts`)
 
 use std::process::Command;
 
@@ -941,6 +944,120 @@ async fn a_chain_whose_upstream_already_exists_restores_the_rest() {
             .await,
             o1,
             "o1 is the definition that was there"
+        );
+    }
+}
+
+/// The two ways out the refusal names, end to end: drop the existing
+/// definition and define the queued text, after which the row is either
+/// deleted by hand or dequeued as identical; and a row that differs only in
+/// its `JOIN` table or its grammar version refuses as a different text does.
+#[tokio::test]
+async fn the_refusal_names_a_way_out_that_works_and_every_recorded_field_counts() {
+    let cluster = TestCluster::start();
+    let (loaded, appendix) = load_edited_keeping_the_appendix(&cluster, str::to_string).await;
+    let after = connect_raw(loaded.dsn()).await;
+    after.batch_execute(SOURCE_ROWS).await.expect("rows");
+    let t = facade(loaded.dsn()).await;
+    t.migrate().await.expect("migrate");
+    build_everything(t.pool()).await;
+    let defined = rows_json(&after, DEFINITIONS).await;
+
+    // Only the JOIN table differs, then only the grammar version.
+    for (what, from, to, named) in [
+        (
+            "join table",
+            "'public.oc', 'public.cats',",
+            "'public.oc', 'public.o1',",
+            "different definition for it, from public.orders joined with public.o1",
+        ),
+        (
+            "grammar version",
+            "COUNT(*) AS n', 1,",
+            "COUNT(*) AS n', 2,",
+            "COUNT(*) AS n` (grammar version 2)",
+        ),
+    ] {
+        let edited = appendix.replace(from, to);
+        assert_ne!(edited, appendix, "{what}: {appendix}");
+        after.batch_execute(&edited).await.expect("append");
+        let refused = facade(loaded.dsn()).await.migrate().await.expect_err(what);
+        assert!(
+            refused
+                .to_string()
+                .contains("already has a transform into public.oc")
+                && refused.to_string().contains(named),
+            "{what}: {refused}"
+        );
+        assert_eq!(
+            rows_json(&after, QUEUED).await,
+            vec!["\"public.oc\"".to_string()],
+            "{what}"
+        );
+        assert_eq!(rows_json(&after, DEFINITIONS).await, defined, "{what}");
+        after
+            .batch_execute("drop table trellis.restore_queue")
+            .await
+            .expect("drop the queue");
+    }
+
+    // The queued oc differs; use it instead of the running one, as the
+    // message says, once deleting the row by hand and once leaving it.
+    for (round, column) in ["m", "k"].into_iter().enumerate() {
+        let changed = appendix.replace("COUNT(*) AS n", &format!("COUNT(*) AS {column}"));
+        after.batch_execute(&changed).await.expect("append");
+        let refused = t.migrate().await.expect_err("oc differs");
+        let message = refused.to_string();
+        assert!(message.contains("PAUSE and DROP TRANSFORM"), "{message}");
+        let queued: String = after
+            .query_one(
+                "select definition_text from trellis.restore_queue \
+                 where target_table = 'public.oc'",
+                &[],
+            )
+            .await
+            .expect("the queued text")
+            .get(0);
+        t.apply("PAUSE TRANSFORM oc").await.expect("pause oc");
+        t.apply("DROP TRANSFORM oc").await.expect("drop oc");
+        t.apply(&queued).await.expect("define the queued text");
+        if round == 0 {
+            after
+                .batch_execute("delete from trellis.restore_queue where target_table = 'public.oc'")
+                .await
+                .expect("delete the row");
+        }
+        t.migrate()
+            .await
+            .expect("migrate once the queued text is defined");
+        assert_eq!(
+            count(
+                &after,
+                "select (to_regclass('trellis.restore_queue') is null)::int::bigint"
+            )
+            .await,
+            1,
+            "the queue is dropped"
+        );
+        build_everything(t.pool()).await;
+        let statuses = rows_json(&after, STATUSES).await;
+        assert_eq!(
+            statuses,
+            vec![
+                "public.o1 live".to_string(),
+                "public.tot live".to_string(),
+                "public.oc live".to_string()
+            ],
+            "round {round}"
+        );
+        assert_eq!(
+            count(
+                &after,
+                &format!("select sum({column})::bigint from public.oc")
+            )
+            .await,
+            3,
+            "oc is built from the queued text"
         );
     }
 }
