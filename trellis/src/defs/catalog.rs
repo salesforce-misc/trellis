@@ -932,6 +932,7 @@ pub async fn create_definition(
         StoredStatus::WaitingToBackfill,
         pool.target_schema(),
         None,
+        None,
     )
     .await?;
     let mut client = pool.get().await?;
@@ -968,6 +969,7 @@ pub async fn create_definition_without_backfill(
         source_columns,
         StoredStatus::Live,
         pool.target_schema(),
+        None,
         None,
     )
     .await
@@ -1022,7 +1024,136 @@ pub async fn install_definition(
     source_columns: &HashMap<String, ValueType>,
     target_schema: &str,
 ) -> Result<Definition, CatalogError> {
-    let def: TransformDef = parse(source_text)?;
+    install_definition_restoring(pool, source_text, source_columns, target_schema, None).await
+}
+
+/// How a define restores a definition a schema dump queued
+/// (`crate::dump::restore_queued`), against a plain define:
+///
+/// * its text is read at the grammar version the dump recorded and stored at
+///   that version, as written: never rewritten into the current grammar
+///   (ADR-0018);
+/// * the target the dump created is adopted, as `ADOPT EXISTING TABLE`
+///   would, without the clause being in the text ([`super::adopt`]);
+/// * a source that is another definition's unbuilt target is accepted, as
+///   the restore defines every definition unbuilt, in an order that defines
+///   each upstream first;
+/// * the queue row is deleted in the define's own transaction, so a restore
+///   that stops part way goes on from the first row it didn't restore.
+pub(crate) struct Restoring<'a> {
+    /// The grammar version the dump recorded for the text.
+    pub(crate) grammar_version: i32,
+    /// The quoted, qualified restore queue table.
+    pub(crate) queue: &'a str,
+    /// The queue row's `ordinal`.
+    pub(crate) ordinal: i32,
+}
+
+/// The definition `source_text` reads as: under the current grammar for a
+/// define, under the recorded one, and adopting its target, for a restore.
+fn parse_for_define(
+    source_text: &str,
+    restoring: Option<&Restoring<'_>>,
+) -> Result<TransformDef, ParseError> {
+    let Some(restoring) = restoring else {
+        return parse(source_text);
+    };
+    let mut def = grammar::load(source_text, restoring.grammar_version)?;
+    def.adopt_target = true;
+    Ok(def)
+}
+
+/// A queued definition this release can't run, as the dump recorded it
+/// (`crate::dump::restore_queued`).
+pub(crate) struct Unparsed<'a> {
+    pub(crate) source_table: &'a str,
+    pub(crate) target_table: &'a str,
+    pub(crate) join_table: Option<&'a str>,
+    pub(crate) definition_text: &'a str,
+    pub(crate) grammar_version: i32,
+    pub(crate) floor_version: &'a str,
+}
+
+/// Stores `unparsed`, a queued definition this release can't run, paused
+/// with `reason` and without parsing it (ADR-0024 rule 3, ADR-0018), and
+/// deletes its queue row, in one transaction. It gets its catalog row at the
+/// grammar version and floor the dump recorded, its source fences and its
+/// edges in the schema graph, which its recorded identities decide, and
+/// nothing a parse would decide: no target table check, hidden tables or
+/// ledger. A release that meets its floor rebuilds it on `RESUME`.
+pub(crate) async fn store_unrunnable(
+    pool: &Pool,
+    unparsed: &Unparsed<'_>,
+    reason: &str,
+    restoring: &Restoring<'_>,
+) -> Result<(), CatalogError> {
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    let mut version = 1;
+    for table in std::iter::once(unparsed.source_table).chain(unparsed.join_table) {
+        let bumped: i64 = txn
+            .query_one(
+                "insert into source_table_versions (source_table, version) values ($1, 1) \
+                 on conflict (source_table) \
+                 do update set version = source_table_versions.version + 1 \
+                 returning version",
+                &[&table],
+            )
+            .await?
+            .get(0);
+        if table == unparsed.source_table {
+            version = bumped;
+        }
+    }
+    let source_node = resolve_node_in_txn(&txn, unparsed.source_table, NodeKind::Source).await?;
+    let target_node = resolve_node_in_txn(&txn, unparsed.target_table, NodeKind::Target).await?;
+    persist_edge_in_txn(&txn, source_node.id, target_node.id, EdgeKind::Source).await?;
+    if let Some(joined) = unparsed.join_table {
+        let joined_node = resolve_node_in_txn(&txn, joined, NodeKind::Source).await?;
+        persist_edge_in_txn(&txn, joined_node.id, target_node.id, EdgeKind::Join).await?;
+    }
+    let id: i64 = txn
+        .query_one(
+            "insert into transform_definitions \
+                (target_table, source_table, source_version, definition_text, status, \
+                 grammar_version, join_table, join_columns, floor_version) \
+             values ($1, $2, $3, $4, $5, $6, $7::text, \
+                     case when $7::text is null then null else '{}'::jsonb end, $8) \
+             returning id",
+            &[
+                &unparsed.target_table,
+                &unparsed.source_table,
+                &version,
+                &unparsed.definition_text,
+                &StoredStatus::WaitingToBackfill.as_str(),
+                &unparsed.grammar_version,
+                &unparsed.join_table,
+                &unparsed.floor_version,
+            ],
+        )
+        .await?
+        .get(0);
+    super::lifecycle::pause_for_grammar_version(&txn, id, unparsed.source_table, reason).await?;
+    txn.execute(
+        &format!("delete from {} where ordinal = $1", restoring.queue),
+        &[&restoring.ordinal],
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(())
+}
+
+/// [`install_definition`], restoring a queued definition when `restoring`
+/// is given ([`Restoring`]).
+pub(crate) async fn install_definition_restoring(
+    pool: &Pool,
+    source_text: &str,
+    source_columns: &HashMap<String, ValueType>,
+    target_schema: &str,
+    restoring: Option<&Restoring<'_>>,
+) -> Result<Definition, CatalogError> {
+    let def: TransformDef = parse_for_define(source_text, restoring)?;
+    let restore = restoring.is_some();
 
     // ADR-0011: an explicit schema on either
     // side is trusted outright rather than resolved — checked here, before
@@ -1095,7 +1226,7 @@ pub async fn install_definition(
     let qualified_source = resolve_source_to_define(pool, &def).await?;
     // Fail fast, before any DDL, on a source that is another
     // definition's not-yet-live target (see `reject_non_live_upstream`).
-    reject_non_live_upstream(&**pool.get().await?, &qualified_source).await?;
+    reject_non_live_upstream(&**pool.get().await?, &qualified_source, restore).await?;
 
     // `reject_unkeyed_source` fails fast in both arms, before the
     // target's DDL is rendered. `create_definition_inner` repeats it as the
@@ -1118,7 +1249,7 @@ pub async fn install_definition(
             // the declared columns; its hidden tables are created with the
             // definition row, named by its id.
             let sides = JoinSides::resolve(pool, &def).await?;
-            reject_non_live_upstream(&**pool.get().await?, &sides.joined).await?;
+            reject_non_live_upstream(&**pool.get().await?, &sides.joined, restore).await?;
             for side in [&sides.from, &sides.joined] {
                 reject_unkeyed_source(&**pool.get().await?, side, &def).await?;
             }
@@ -1134,7 +1265,7 @@ pub async fn install_definition(
             // `b` is held to the source rules too. Hidden tables are created
             // with the definition row, as an aggregate JOIN's are.
             let sides = JoinSides::resolve(pool, &def).await?;
-            reject_non_live_upstream(&**pool.get().await?, &sides.joined).await?;
+            reject_non_live_upstream(&**pool.get().await?, &sides.joined, restore).await?;
             for side in [&sides.from, &sides.joined] {
                 reject_unkeyed_source(&**pool.get().await?, side, &def).await?;
             }
@@ -1208,6 +1339,7 @@ pub async fn install_definition(
         StoredStatus::WaitingToBackfill,
         target_schema,
         Some(&target_ddl),
+        restoring,
     )
     .await
 }
@@ -1542,9 +1674,15 @@ fn derive_reported(
 /// write, so a reader attached mid-build would silently miss whatever the
 /// rest of the build writes. Wait for the upstream definition to go live
 /// (or at least reach `catching_up`), then define the chained one.
+///
+/// A restore (`restore`, [`Restoring`]) accepts an upstream that is waiting
+/// for its first build too: it defines every definition unbuilt, upstream
+/// first, the state a define-only handle leaves a chain in once it is built
+/// and its definitions loaded unbuilt.
 async fn reject_non_live_upstream(
     client: &impl GenericClient,
     qualified_source: &str,
+    restore: bool,
 ) -> Result<(), CatalogError> {
     let Some(row) = client
         .query_opt(
@@ -1560,7 +1698,7 @@ async fn reject_non_live_upstream(
     let status = StoredStatus::from_row(&status_text)?;
     // A `catching_up` upstream's build has finished: every write to its
     // target goes through the seam now.
-    if status.is_applying() {
+    if status.is_applying() || (restore && status == StoredStatus::WaitingToBackfill) {
         return Ok(());
     }
     Err(CatalogError::TransformNotLive {
@@ -3007,8 +3145,9 @@ async fn create_definition_inner(
     status: StoredStatus,
     target_schema: &str,
     target_ddl: Option<&TargetTableDdl>,
+    restoring: Option<&Restoring<'_>>,
 ) -> Result<Definition, CatalogError> {
-    let def: TransformDef = parse(source_text)?;
+    let def: TransformDef = parse_for_define(source_text, restoring)?;
     validate_for_define(pool, &def, source_columns).await?;
 
     let bare_schemas = bare_name_schemas(pool);
@@ -3063,7 +3202,7 @@ async fn create_definition_inner(
     };
     // The authoritative check (`install_definition` repeats it
     // earlier, before any DDL, as a fail-fast).
-    reject_non_live_upstream(&*txn, &qualified_source).await?;
+    reject_non_live_upstream(&*txn, &qualified_source, restoring.is_some()).await?;
     // No transform reads a 1-1 JOIN's target (ADR-0021).
     super::join_one_to_one::reject_reader_of_target(
         &*txn,
@@ -3090,7 +3229,7 @@ async fn create_definition_inner(
                     result => result?,
                 },
             };
-            reject_non_live_upstream(&*txn, &joined).await?;
+            reject_non_live_upstream(&*txn, &joined, restoring.is_some()).await?;
             super::join_one_to_one::reject_reader_of_target(
                 &*txn,
                 pool.floors(),
@@ -3491,7 +3630,7 @@ async fn create_definition_inner(
                 &type_keys,
                 &type_vals,
                 &status_text,
-                &CURRENT_GRAMMAR_VERSION,
+                &restoring.map_or(CURRENT_GRAMMAR_VERSION, |r| r.grammar_version),
                 &join_table,
                 &join_keys,
                 &join_vals,
@@ -3578,6 +3717,14 @@ async fn create_definition_inner(
             &qualified_source,
             &upstreams,
             false,
+        )
+        .await?;
+    }
+
+    if let Some(restoring) = restoring {
+        txn.execute(
+            &format!("delete from {} where ordinal = $1", restoring.queue),
+            &[&restoring.ordinal],
         )
         .await?;
     }
@@ -3956,7 +4103,10 @@ pub(crate) async fn resolve_graph_identity(
 /// qualified spelling names its own schema, it doesn't inherit the
 /// configured default. `None` (the bare, common case) keeps using
 /// `target_schema`.
-fn effective_target_schema<'a>(def: &'a TransformDef, target_schema: &'a str) -> &'a str {
+pub(crate) fn effective_target_schema<'a>(
+    def: &'a TransformDef,
+    target_schema: &'a str,
+) -> &'a str {
     def.explicit_target_schema
         .as_deref()
         .unwrap_or(target_schema)

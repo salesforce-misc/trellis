@@ -385,14 +385,19 @@ async fn schema_exists(client: &tokio_postgres::Client, schema: &str) -> Result<
 /// distinguish an empty pre-existing schema, which is safe to take over,
 /// from one with foreign objects, which isn't — see
 /// [`schema_has_refinery_ledger`] for the other half of that distinction).
+///
+/// The restore queue a schema dump's appendix creates (`crate::dump`) is not
+/// counted: a database loaded from such a dump has the Trellis schema with
+/// that one table in it, and the attach that follows restores it.
 async fn schema_has_any_tables(
     client: &tokio_postgres::Client,
     schema: &str,
 ) -> Result<bool, Error> {
     let row = client
         .query_one(
-            "select exists(select 1 from information_schema.tables where table_schema = $1)",
-            &[&schema],
+            "select exists(select 1 from information_schema.tables \
+                           where table_schema = $1 and table_name <> $2)",
+            &[&schema, &crate::dump::RESTORE_QUEUE],
         )
         .await?;
     Ok(row.get(0))

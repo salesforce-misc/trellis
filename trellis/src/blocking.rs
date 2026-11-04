@@ -67,6 +67,7 @@ enum Job {
     Apply(String, oneshot::Sender<Result<Applied, TrellisError>>),
     Definitions(oneshot::Sender<Result<Vec<DefinitionSummary>, TrellisError>>),
     DumpDefinitionsSql(oneshot::Sender<Result<String, TrellisError>>),
+    SchemaDump(oneshot::Sender<Result<crate::dump::SchemaDump, TrellisError>>),
     RequestBackfill(String, oneshot::Sender<Result<(), TrellisError>>),
     PoisonedSince(
         SystemTime,
@@ -287,6 +288,25 @@ impl BlockingTrellis {
     /// Submits [`BlockingTrellis::dump_definitions_sql`] and returns without waiting for it.
     pub fn start_dump_definitions_sql(&self) -> PendingCall<String> {
         self.start(Job::DumpDefinitionsSql)
+    }
+
+    /// What a schema dump of the embedded database needs from Trellis. See
+    /// [`Trellis::schema_dump`].
+    pub fn schema_dump(&self) -> Result<crate::dump::SchemaDump, TrellisError> {
+        self.start_schema_dump().wait()
+    }
+
+    /// Submits [`BlockingTrellis::schema_dump`] and returns without waiting for it.
+    pub fn start_schema_dump(&self) -> PendingCall<crate::dump::SchemaDump> {
+        self.start(Job::SchemaDump)
+    }
+
+    /// `pg_dump_output` without this instance's capture triggers. See
+    /// [`Trellis::filter_schema_dump`]. Runs on the calling thread and reads
+    /// nothing from the database.
+    pub fn filter_schema_dump(&self, pg_dump_output: &str) -> Result<String, TrellisError> {
+        crate::dump::filter_pg_dump(pg_dump_output, self.config.schema())
+            .map_err(TrellisError::Engine)
     }
 
     /// Rebuilds every definition applying from `source_table`. See
@@ -723,6 +743,9 @@ async fn run(
                     Box::pin(async move { t.submitted(at, t.dump_definitions_sql()).await })
                 })
             }
+            Job::SchemaDump(reply) => calls.spawn(trellis, submitted, reply, move |t, at| {
+                Box::pin(async move { t.submitted(at, t.schema_dump()).await })
+            }),
             Job::RequestBackfill(table, reply) => {
                 calls.spawn(trellis, submitted, reply, move |t, at| {
                     Box::pin(async move { t.submitted(at, t.request_backfill(&table)).await })

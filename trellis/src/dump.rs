@@ -383,3 +383,717 @@ pub async fn dump_definitions_sql(pool: &Pool, config: &Config) -> Result<String
     txn.commit().await?;
     Ok(sql)
 }
+
+/// The table a schema dump's appendix creates in the Trellis schema
+/// ([`schema_dump`]): one row per definition, which `migrate` restores and
+/// then drops ([ADR-0025](../../docs/decisions/0025-schema-dumps-restore-definitions.md)).
+///
+/// Its shape is permanent: a checked-in dump outlives the release that
+/// wrote it, so every later release reads these columns as they are, and
+/// anything a later release needs to say about a definition goes into its
+/// floor (ADR-0024 rule 6).
+///
+/// ```sql
+/// create table <schema>.restore_queue (
+///     ordinal integer primary key,     -- the restore order, from 1
+///     source_table text not null,      -- schema.table the text's FROM resolved to
+///     target_table text not null,      -- schema.table of its target
+///     join_table text,                 -- schema.table of a JOIN's other table
+///     definition_text text not null,   -- the text, as written
+///     grammar_version integer not null,-- the grammar it was written under (ADR-0018)
+///     floor_version text not null      -- its floor (ADR-0024)
+/// )
+/// ```
+pub const RESTORE_QUEUE: &str = "restore_queue";
+
+/// The columns of [`RESTORE_QUEUE`], in order.
+const QUEUE_COLUMNS: &[&str] = &[
+    "ordinal",
+    "source_table",
+    "target_table",
+    "join_table",
+    "definition_text",
+    "grammar_version",
+    "floor_version",
+];
+
+/// What a schema dump of an embedded database needs from Trellis
+/// ([`crate::Trellis::schema_dump`]): the `pg_dump` arguments that leave Trellis's own
+/// tables out, and the SQL to append after the dump.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SchemaDump {
+    /// Arguments for `pg_dump`, each one argument (not shell words): the
+    /// Trellis schema and each 1-1 target's ledger table excluded. They
+    /// add to whatever `--schema` arguments the dump has, and the target
+    /// schema has to be one of those when there are any.
+    pub pg_dump_args: Vec<String>,
+    /// The SQL to append after `pg_dump`'s output, once the output has been
+    /// through [`crate::Trellis::filter_schema_dump`]: it creates the
+    /// restore queue, a `restore_queue` table in the Trellis schema, and
+    /// inserts one row per definition, one row per line, in restore order.
+    /// `migrate` restores them and drops the queue.
+    pub appendix: String,
+}
+
+/// A name as a `pg_dump` pattern that matches exactly it: double-quoted, so
+/// case and the pattern characters (`*`, `?`, `.`) are taken literally.
+fn exact_pattern(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// `text` as an SQL literal on one line: an escape string (`E'…'`) when it
+/// has a backslash or a control character in it, so a definition written
+/// over several lines is still one line of the appendix.
+fn one_line_literal(text: &str) -> String {
+    if !text.chars().any(|c| c == '\\' || c.is_control()) {
+        return format!("'{}'", text.replace('\'', "''"));
+    }
+    let mut literal = String::from("E'");
+    for c in text.chars() {
+        match c {
+            '\\' => literal.push_str("\\\\"),
+            '\'' => literal.push_str("''"),
+            '\n' => literal.push_str("\\n"),
+            '\r' => literal.push_str("\\r"),
+            '\t' => literal.push_str("\\t"),
+            c if c.is_control() => literal.push_str(&format!("\\u{:04x}", c as u32)),
+            c => literal.push(c),
+        }
+    }
+    literal.push('\'');
+    literal
+}
+
+/// One definition as the dump records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Recorded {
+    id: i64,
+    source_table: String,
+    target_table: String,
+    join_table: Option<String>,
+    definition_text: String,
+    grammar_version: i32,
+    floor_version: String,
+}
+
+/// `definitions` in restore order: each after every definition whose target
+/// it reads (a chain's upstream first), and otherwise in id order, the
+/// order they were defined in. A cycle can't be stored, so every
+/// definition is placed; one that somehow is in a cycle goes last, in id
+/// order, and its define refuses it.
+fn restore_order(mut definitions: Vec<Recorded>) -> Vec<Recorded> {
+    definitions.sort_by_key(|d| d.id);
+    let mut placed: Vec<Recorded> = Vec::with_capacity(definitions.len());
+    let mut left = definitions;
+    while !left.is_empty() {
+        let unplaced_targets: std::collections::HashSet<String> =
+            left.iter().map(|d| d.target_table.clone()).collect();
+        let next = left.iter().position(|d| {
+            std::iter::once(&d.source_table)
+                .chain(d.join_table.as_ref())
+                .all(|read| read == &d.target_table || !unplaced_targets.contains(read))
+        });
+        placed.push(left.remove(next.unwrap_or(0)));
+    }
+    placed
+}
+
+/// The schema dump of this instance's definitions, for a dump of an
+/// embedded database that leaves Trellis's internal state out
+/// (`docs/embedding.md`, schema dumps): `pg_dump` with
+/// [`SchemaDump::pg_dump_args`], its output through [`filter_pg_dump`],
+/// then [`SchemaDump::appendix`]. `migrate` on a database loaded from it
+/// restores each definition into its dumped target.
+///
+/// Reads one snapshot. Two reads of the same definitions give the same
+/// value: no timestamps, ids or runtime state are in it, so a dump hook can
+/// compare reads taken around its `pg_dump`, and a regenerated dump changes
+/// only where a definition did.
+pub async fn schema_dump(pool: &Pool, config: &Config) -> Result<SchemaDump, TrellisError> {
+    let schema = config.schema();
+    let quoted_schema = quote_ident(schema);
+    let mut client = pool.get().await?;
+    let txn = client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .await?;
+    let rows = txn
+        .query(
+            &format!(
+                "select id, source_table, target_table, join_table, definition_text, \
+                        grammar_version, floor_version \
+                 from {quoted_schema}.transform_definitions order by id"
+            ),
+            &[],
+        )
+        .await?;
+    let definitions: Vec<Recorded> = rows
+        .iter()
+        .map(|row| Recorded {
+            id: row.get(0),
+            source_table: row.get(1),
+            target_table: row.get(2),
+            join_table: row.get(3),
+            definition_text: row.get(4),
+            grammar_version: row.get(5),
+            floor_version: row.get(6),
+        })
+        .collect();
+    // Each target's ledger that exists: a 1-1 target's.
+    let mut ledgers: Vec<String> = Vec::new();
+    for definition in &definitions {
+        let Some((target_schema, target)) = definition.target_table.split_once('.') else {
+            continue;
+        };
+        let ledger = crate::defs::ledger::ledger_table_name(target);
+        let exists: bool = txn
+            .query_one(
+                "select pg_catalog.to_regclass($1) is not null",
+                &[&format!(
+                    "{}.{}",
+                    quote_ident(target_schema),
+                    quote_ident(&ledger)
+                )],
+            )
+            .await?
+            .get(0);
+        if exists {
+            ledgers.push(format!(
+                "{}.{}",
+                exact_pattern(target_schema),
+                exact_pattern(&ledger)
+            ));
+        }
+    }
+    txn.commit().await?;
+    ledgers.sort();
+
+    let mut pg_dump_args = vec![format!("--exclude-schema={}", exact_pattern(schema))];
+    pg_dump_args.extend(ledgers.into_iter().map(|l| format!("--exclude-table={l}")));
+
+    let queue = format!("{quoted_schema}.{RESTORE_QUEUE}");
+    let mut appendix = format!(
+        "-- Trellis definitions (trellis::dump::schema_dump): `migrate` restores each into its\n\
+         -- target and drops the queue (docs/embedding.md, schema dumps).\n\
+         create schema if not exists {quoted_schema};\n\
+         create table {queue} (ordinal integer primary key, source_table text not null, \
+         target_table text not null, join_table text, definition_text text not null, \
+         grammar_version integer not null, floor_version text not null);\n"
+    );
+    for (ordinal, definition) in restore_order(definitions).into_iter().enumerate() {
+        appendix.push_str(&format!(
+            "insert into {queue} values ({}, {}, {}, {}, {}, {}, {});\n",
+            ordinal + 1,
+            one_line_literal(&definition.source_table),
+            one_line_literal(&definition.target_table),
+            definition
+                .join_table
+                .as_deref()
+                .map_or_else(|| "null".to_string(), one_line_literal),
+            one_line_literal(&definition.definition_text),
+            definition.grammar_version,
+            one_line_literal(&definition.floor_version),
+        ));
+    }
+    Ok(SchemaDump {
+        pg_dump_args,
+        appendix,
+    })
+}
+
+/// Both spellings `pg_dump` may write `name` in: as is, and double-quoted
+/// (it quotes a name that isn't all lower case letters, digits and
+/// underscores, or is a keyword).
+fn spellings(name: &str) -> [String; 2] {
+    [name.to_string(), quote_ident(name)]
+}
+
+/// The trigger `line` creates, as `(table, trigger)` spelled as `pg_dump`
+/// writes them, when it is the `CREATE TRIGGER` of one of `triggers` running
+/// a function in `schema`.
+fn capture_trigger(
+    line: &str,
+    triggers: &[[String; 2]],
+    schema: &[String; 2],
+) -> Option<(String, String)> {
+    let rest = line.strip_prefix("CREATE TRIGGER ")?;
+    let name = triggers.iter().flatten().find(|name| {
+        rest.strip_prefix(name.as_str())
+            .is_some_and(|after| after.starts_with(' '))
+    })?;
+    if !schema
+        .iter()
+        .any(|s| line.contains(&format!(" EXECUTE FUNCTION {s}.")))
+    {
+        return None;
+    }
+    // `… ON <table> [REFERENCING …] FOR EACH …`: a capture trigger has no
+    // other clause between its table and `FOR EACH`.
+    let end = line
+        .find(" REFERENCING ")
+        .or_else(|| line.find(" FOR EACH "))?;
+    let start = line[..end].rfind(" ON ")? + " ON ".len();
+    Some((line[start..end].to_string(), name.clone()))
+}
+
+/// Whether `line` is the `ALTER TABLE … ENABLE ALWAYS TRIGGER` of one of
+/// `removed`, the `(table, trigger)` pairs the filter took out.
+fn is_capture_enable(line: &str, removed: &[(String, String)]) -> bool {
+    removed.iter().any(|(table, trigger)| {
+        line == format!("ALTER TABLE {table} ENABLE ALWAYS TRIGGER {trigger};")
+            || line == format!("ALTER TABLE ONLY {table} ENABLE ALWAYS TRIGGER {trigger};")
+    })
+}
+
+/// `sql`, a `pg_dump --schema-only` of the application's schemas run with
+/// [`SchemaDump::pg_dump_args`], without the capture triggers of the
+/// Trellis instance whose schema is `schema` on its source tables.
+///
+/// `pg_dump` can leave out a schema or a table, but not one trigger, and a
+/// source table's triggers run functions in the Trellis schema, which the
+/// dump leaves out. Each trigger is two statements, each on a line of its
+/// own: its `CREATE TRIGGER`, which names the function it runs, and then its
+/// `ALTER TABLE … ENABLE ALWAYS TRIGGER`. Both go, with the comment block
+/// `pg_dump` writes before them. Nothing else changes, `\restrict` lines
+/// included.
+///
+/// Refuses with [`crate::error::Error::SchemaDump`] when a line still runs
+/// a function in `schema` afterwards: the load would fail on it.
+pub fn filter_pg_dump(sql: &str, schema: &str) -> Result<String, crate::error::Error> {
+    let triggers: Vec<[String; 2]> = crate::capture::sql::CaptureEvent::ALL
+        .iter()
+        .map(|event| spellings(&crate::capture::sql::trigger_name(schema, *event)))
+        .collect();
+    let schema_spellings = spellings(schema);
+    let lines: Vec<&str> = sql.split_inclusive('\n').collect();
+    let bare = |i: usize| lines.get(i).map(|l| l.trim_end_matches(['\n', '\r']));
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut removed: Vec<(String, String)> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = bare(i).unwrap_or_default();
+        // `pg_dump`'s comment block before a trigger: `--`, a line naming
+        // it, `--`, a blank line. It goes when the trigger does.
+        let header_is_trigger = line == "--"
+            && bare(i + 1)
+                .is_some_and(|l| l.starts_with("-- Name: ") && l.contains("; Type: TRIGGER;"))
+            && bare(i + 2) == Some("--")
+            && bare(i + 3) == Some("");
+        if header_is_trigger
+            && bare(i + 4)
+                .is_some_and(|l| capture_trigger(l, &triggers, &schema_spellings).is_some())
+        {
+            i += 4;
+            continue;
+        }
+        let trigger = capture_trigger(line, &triggers, &schema_spellings);
+        let enable = is_capture_enable(line, &removed);
+        if trigger.is_some() || enable {
+            removed.extend(trigger);
+            i += 1;
+            // The blank lines `pg_dump` writes after the statement.
+            while bare(i) == Some("") {
+                i += 1;
+            }
+            continue;
+        }
+        kept.push(lines[i]);
+        i += 1;
+    }
+    let filtered = kept.concat();
+    if let Some(missed) = filtered.lines().find(|line| {
+        schema_spellings
+            .iter()
+            .any(|s| line.contains(&format!(" EXECUTE FUNCTION {s}.")))
+    }) {
+        return Err(crate::error::Error::SchemaDump(format!(
+            "this line of pg_dump's output runs a function in the Trellis schema {schema:?}, \
+             which the dump leaves out, so the dump wouldn't load: {missed}"
+        )));
+    }
+    Ok(filtered)
+}
+
+/// Restores the definitions a schema dump queued ([`RESTORE_QUEUE`]), in
+/// order, then drops the queue. `migrate` runs it after the migrations and
+/// the grammar check, under the attach and handover locks (ADR-0023), so
+/// it never runs beside a live process of another version. Returns how many
+/// definitions it restored, the paused ones included; `0` when there is no
+/// queue.
+///
+/// Each row is restored in its own transaction, which deletes the row: a
+/// refusal leaves the rows from it on queued, and the next `migrate` goes
+/// on from there.
+///
+/// * A row this release can't run is stored paused without being parsed
+///   (ADR-0024 rule 3): its floor is above this release, its grammar
+///   version is outside what this release reads, this release refuses its
+///   text (ADR-0018), or a definition it reads from was stored paused.
+/// * Any other row is defined at its recorded grammar version, adopting the
+///   target the dump created ([`crate::defs::catalog::Restoring`]). The text
+///   must resolve to the source, target and joined table the dump recorded
+///   first: a different `target_schema` setting, say, would resolve a bare
+///   name elsewhere, and that refuses rather than define a transform of
+///   other tables.
+pub(crate) async fn restore_queued(
+    pool: &Pool,
+    config: &Config,
+) -> Result<usize, crate::error::Error> {
+    use crate::error::Error;
+    let queue = format!("{}.{RESTORE_QUEUE}", quote_ident(config.schema()));
+    let client = pool.get().await?;
+    let columns: Vec<String> = client
+        .query(
+            "select a.attname::text from pg_catalog.pg_attribute a \
+             where a.attrelid = pg_catalog.to_regclass($1) and a.attnum > 0 \
+               and not a.attisdropped order by a.attnum",
+            &[&queue],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    if columns.is_empty() {
+        return Ok(0);
+    }
+    // ADR-0024 rule 6: a queue of another shape was written by a format
+    // this release doesn't know, and isn't read as if it were this one.
+    if columns != QUEUE_COLUMNS {
+        return Err(Error::IncompatibleInstance(format!(
+            "the schema dump's restore queue {queue} has the columns {columns:?}, and this \
+             release reads {QUEUE_COLUMNS:?}: load the dump with the release that wrote it, \
+             or a later one"
+        )));
+    }
+    let rows = client
+        .query(
+            &format!(
+                "select ordinal, source_table, target_table, join_table, definition_text, \
+                        grammar_version, floor_version \
+                 from {queue} order by ordinal"
+            ),
+            &[],
+        )
+        .await?;
+    drop(client);
+    // The targets of the rows stored paused: a row reading one is too.
+    let mut paused_targets: Vec<String> = Vec::new();
+    for row in &rows {
+        let ordinal: i32 = row.get(0);
+        let unparsed = crate::defs::catalog::Unparsed {
+            source_table: row.get(1),
+            target_table: row.get(2),
+            join_table: row.get(3),
+            definition_text: row.get(4),
+            grammar_version: row.get(5),
+            floor_version: row.get(6),
+        };
+        let restoring = crate::defs::catalog::Restoring {
+            grammar_version: unparsed.grammar_version,
+            queue: &queue,
+            ordinal,
+        };
+        let refused = |code, message: String| Error::RestoreDefinition {
+            target: unparsed.target_table.to_string(),
+            code,
+            message,
+        };
+        let catalog = |err: crate::defs::CatalogError| refused(err.code(), err.to_string());
+        let target = unparsed.target_table;
+        let upstream_paused = std::iter::once(unparsed.source_table)
+            .chain(unparsed.join_table)
+            .find(|read| paused_targets.iter().any(|t| t == read));
+        let unrunnable = if let Some(running) = pool.floors().above_running(unparsed.floor_version)
+        {
+            Some(format!(
+                "this release can't run transform {target}: its floor, the oldest Trellis \
+                 release that can run it, is {}, and this binary runs release {running}; roll \
+                 forward to {} or later, then RESUME it or DROP it there",
+                unparsed.floor_version, unparsed.floor_version
+            ))
+        } else if let Some(upstream) = upstream_paused {
+            Some(format!(
+                "transform {target} reads {upstream}, whose transform the restore of the schema \
+                 dump stored paused; RESUME that transform, then this one"
+            ))
+        } else {
+            match crate::defs::grammar::load(unparsed.definition_text, unparsed.grammar_version) {
+                Err(err) => Some(crate::defs::grammar::unparsable_stored_text_reason(
+                    target, &err,
+                )),
+                Ok(_) => None,
+            }
+        };
+        if let Some(reason) = unrunnable {
+            crate::defs::catalog::store_unrunnable(pool, &unparsed, &reason, &restoring)
+                .await
+                .map_err(catalog)?;
+            crate::instance_log::warn!(target = %target, reason = %reason, "restored paused");
+            paused_targets.push(target.to_string());
+            continue;
+        }
+        let def = crate::defs::grammar::load(unparsed.definition_text, unparsed.grammar_version)
+            .map_err(|err| refused(err.code(), err.to_string()))?;
+        // What the text resolves to here, against what the dump recorded.
+        let resolve = async |explicit: Option<&str>, bare: &str| match explicit {
+            Some(schema) => crate::intake::qualify(schema, bare)
+                .map_err(|err| catalog(crate::defs::CatalogError::from(err))),
+            None => crate::defs::catalog::resolve_graph_identity(pool, bare)
+                .await
+                .map_err(catalog),
+        };
+        let resolved_target = crate::intake::qualify(
+            crate::defs::catalog::effective_target_schema(&def, config.target_schema()),
+            &def.target,
+        )
+        .map_err(|err| catalog(crate::defs::CatalogError::from(err)))?;
+        let resolved_source = resolve(def.explicit_source_schema.as_deref(), &def.source).await?;
+        let resolved_join = match crate::defs::join::spec(&def) {
+            Some(join) => Some(resolve(join.explicit_right_schema.as_deref(), &join.right).await?),
+            None => None,
+        };
+        let recorded = (
+            unparsed.source_table,
+            unparsed.target_table,
+            unparsed.join_table,
+        );
+        let now = (
+            resolved_source.as_str(),
+            resolved_target.as_str(),
+            resolved_join.as_deref(),
+        );
+        if recorded != now {
+            return Err(refused(
+                crate::ErrorCode::Validation,
+                format!(
+                    "its text reads {} into {}{} here, and it read {} into {}{} where it was \
+                     dumped; restore with the settings it was dumped with (target_schema, the \
+                     instance schema), or define it again",
+                    now.0,
+                    now.1,
+                    now.2
+                        .map(|j| format!(" joined with {j}"))
+                        .unwrap_or_default(),
+                    recorded.0,
+                    recorded.1,
+                    recorded
+                        .2
+                        .map(|j| format!(" joined with {j}"))
+                        .unwrap_or_default(),
+                ),
+            ));
+        }
+        let client = pool.get().await?;
+        let (source_columns, virtual_columns) =
+            crate::defs::catalog::live_source_columns_and_virtual(&**client, unparsed.source_table)
+                .await
+                .map_err(catalog)?;
+        drop(client);
+        if crate::defs::join::spec(&def).is_none() {
+            crate::defs::catalog::reject_virtual_generated_reads(
+                &def,
+                None,
+                unparsed.source_table,
+                &virtual_columns,
+            )
+            .map_err(catalog)?;
+        }
+        crate::defs::catalog::install_definition_restoring(
+            pool,
+            unparsed.definition_text,
+            &source_columns,
+            config.target_schema(),
+            Some(&restoring),
+        )
+        .await
+        .map_err(catalog)?;
+    }
+    let client = pool.get().await?;
+    client.batch_execute(&format!("drop table {queue}")).await?;
+    Ok(rows.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `pg_dump --schema-only` of a database with a 1-1 transform of
+    /// `orders` and its capture triggers, plus a user's own trigger on
+    /// `orders`, by `pg_dump` 15 to 18 (each against its own server), run
+    /// with the dump's arguments.
+    const PG_DUMPS: &[(&str, &str)] = &[
+        (
+            "15",
+            include_str!("../tests/fixtures/pg_dump/pg_dump_15.sql"),
+        ),
+        (
+            "16",
+            include_str!("../tests/fixtures/pg_dump/pg_dump_16.sql"),
+        ),
+        (
+            "17",
+            include_str!("../tests/fixtures/pg_dump/pg_dump_17.sql"),
+        ),
+        (
+            "18",
+            include_str!("../tests/fixtures/pg_dump/pg_dump_18.sql"),
+        ),
+    ];
+
+    #[test]
+    fn the_filter_removes_each_capture_trigger_and_nothing_else() {
+        for (version, dump) in PG_DUMPS {
+            assert_eq!(
+                dump.matches("CREATE TRIGGER trellis_capture_").count(),
+                5,
+                "pg_dump {version}'s fixture has the five capture triggers"
+            );
+            let filtered = filter_pg_dump(dump, "trellis").expect("filters");
+            assert!(
+                !filtered.contains("trellis_capture_"),
+                "pg_dump {version}: {filtered}"
+            );
+            assert!(
+                !filtered.contains("trellis."),
+                "pg_dump {version}: {filtered}"
+            );
+            // Every other line is kept, in order: the user's trigger and the
+            // `\restrict` pair included.
+            let removed: Vec<&str> = dump
+                .lines()
+                .filter(|line| line.contains("trellis_capture_"))
+                .collect();
+            assert_eq!(
+                removed.len(),
+                15,
+                "pg_dump {version}: header, create, enable"
+            );
+            let kept: Vec<&str> = dump
+                .lines()
+                .filter(|line| !line.contains("trellis_capture_"))
+                .filter(|line| !line.is_empty() && *line != "--")
+                .collect();
+            let after: Vec<&str> = filtered
+                .lines()
+                .filter(|line| !line.is_empty() && *line != "--")
+                .collect();
+            assert_eq!(after, kept, "pg_dump {version}");
+            assert!(filtered.contains("CREATE TRIGGER orders_audit "));
+            assert!(filtered.starts_with("--\n-- PostgreSQL database dump\n"));
+            assert_eq!(
+                filtered
+                    .lines()
+                    .filter(|l| l.starts_with("\\restrict "))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                filtered
+                    .lines()
+                    .filter(|l| l.starts_with("\\unrestrict "))
+                    .count(),
+                1
+            );
+            // Filtering again changes nothing.
+            assert_eq!(
+                filter_pg_dump(&filtered, "trellis").expect("again"),
+                filtered
+            );
+        }
+    }
+
+    #[test]
+    fn the_filter_leaves_another_instances_triggers() {
+        for (version, dump) in PG_DUMPS {
+            assert_eq!(
+                filter_pg_dump(dump, "other").expect("filters"),
+                *dump,
+                "pg_dump {version}: trellis's triggers aren't other's to remove"
+            );
+            let unchanged = dump.replace("trellis.cap_", "elsewhere.cap_");
+            assert_eq!(
+                filter_pg_dump(&unchanged, "trellis").expect("filters"),
+                unchanged,
+                "pg_dump {version}: a trigger with the name running another schema's \
+                 function is not Trellis's"
+            );
+        }
+    }
+
+    #[test]
+    fn the_filter_handles_a_quoted_schema_and_no_comments() {
+        let schema = "My Trellis";
+        let insert =
+            crate::capture::sql::trigger_name(schema, crate::capture::sql::CaptureEvent::ALL[0]);
+        let dump = format!(
+            "CREATE TABLE public.t (id bigint);\n\
+             CREATE TRIGGER \"{insert}\" AFTER INSERT ON public.\"T\" FOR EACH STATEMENT \
+             EXECUTE FUNCTION \"My Trellis\".cap_x();\n\
+             \n\
+             ALTER TABLE public.\"T\" ENABLE ALWAYS TRIGGER \"{insert}\";\n\
+             \n\
+             CREATE INDEX t_i ON public.t USING btree (id);\n"
+        );
+        assert_eq!(
+            filter_pg_dump(&dump, schema).expect("filters"),
+            "CREATE TABLE public.t (id bigint);\n\
+             CREATE INDEX t_i ON public.t USING btree (id);\n"
+        );
+    }
+
+    #[test]
+    fn a_line_still_running_a_trellis_function_refuses() {
+        let dump = "CREATE TRIGGER mine AFTER INSERT ON public.t FOR EACH STATEMENT \
+                    EXECUTE FUNCTION trellis.cap_x();\n";
+        let err = filter_pg_dump(dump, "trellis").expect_err("a miss refuses");
+        assert_eq!(err.code(), crate::ErrorCode::Internal);
+        assert!(err.to_string().contains("CREATE TRIGGER mine"), "{err}");
+    }
+
+    #[test]
+    fn a_literal_stays_on_one_line() {
+        assert_eq!(one_line_literal("a 'b'"), "'a ''b'''");
+        assert_eq!(
+            one_line_literal("TRANSFORM t\n  FROM s\tx\\y\r'"),
+            "E'TRANSFORM t\\n  FROM s\\tx\\\\y\\r'''"
+        );
+        assert_eq!(one_line_literal("a\u{1}b"), "E'a\\u0001b'");
+        assert!(!one_line_literal("x\ny\u{85}z").contains('\n'));
+    }
+
+    #[test]
+    fn a_pattern_matches_the_name_exactly() {
+        assert_eq!(exact_pattern("o1__ledger"), "\"o1__ledger\"");
+        assert_eq!(exact_pattern("a\"b*"), "\"a\"\"b*\"");
+    }
+
+    fn recorded(id: i64, source: &str, target: &str, join: Option<&str>) -> Recorded {
+        Recorded {
+            id,
+            source_table: source.into(),
+            target_table: target.into(),
+            join_table: join.map(Into::into),
+            definition_text: String::new(),
+            grammar_version: 1,
+            floor_version: "0.2.0".into(),
+        }
+    }
+
+    #[test]
+    fn a_reader_is_restored_after_its_upstream() {
+        // `c` was altered to read `d`'s target, which was defined after it;
+        // `e` joins `b`'s target.
+        let order = restore_order(vec![
+            recorded(5, "s.x", "s.e", Some("s.b")),
+            recorded(1, "s.x", "s.a", None),
+            recorded(2, "s.a", "s.b", None),
+            recorded(3, "s.d", "s.c", None),
+            recorded(4, "s.x", "s.d", None),
+        ]);
+        let ids: Vec<i64> = order.iter().map(|d| d.id).collect();
+        assert_eq!(ids, vec![1, 2, 4, 3, 5]);
+    }
+}

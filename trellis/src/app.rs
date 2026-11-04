@@ -851,6 +851,35 @@ impl Trellis {
             .await
     }
 
+    /// What a schema dump of the embedded database needs from Trellis, so
+    /// the dump carries the application's schema, the target tables and one
+    /// row per definition, and none of Trellis's own state
+    /// ([ADR-0025](../docs/decisions/0025-schema-dumps-restore-definitions.md)):
+    /// run `pg_dump --schema-only` with [`SchemaDump::pg_dump_args`], put its
+    /// output through [`Trellis::filter_schema_dump`], and append
+    /// [`SchemaDump::appendix`]. [`Trellis::migrate`] on a database loaded
+    /// from the result restores every definition into its dumped target.
+    ///
+    /// Two reads of unchanged definitions are equal, so a hook can read it on
+    /// both sides of its `pg_dump` and redo the dump when they differ.
+    ///
+    /// [`SchemaDump::pg_dump_args`]: crate::SchemaDump::pg_dump_args
+    /// [`SchemaDump::appendix`]: crate::SchemaDump::appendix
+    pub async fn schema_dump(&self) -> Result<crate::SchemaDump, TrellisError> {
+        self.call(crate::dump::schema_dump(&self.pool, &self.config))
+            .await
+    }
+
+    /// `pg_dump_output` without this instance's capture triggers, which run
+    /// functions in the Trellis schema a schema dump leaves out
+    /// ([`Trellis::schema_dump`]). Reads nothing from the database.
+    /// Refuses ([`ErrorCode::Internal`]) when a line still runs one of the
+    /// instance's functions afterwards.
+    pub fn filter_schema_dump(&self, pg_dump_output: &str) -> Result<String, TrellisError> {
+        crate::dump::filter_pg_dump(pg_dump_output, self.config.schema())
+            .map_err(TrellisError::Engine)
+    }
+
     /// One registered transform definition's current [`TransformStatus`],
     /// by target table name — the read a host-language embedder
     /// polls after [`apply`](Trellis::apply) registers a definition, per

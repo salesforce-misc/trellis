@@ -226,13 +226,14 @@ async fn migrate_carrying(
     // the markers other attaches write. The attach runs on the lock's own
     // session, so the lock can't end before it. See `identity::AttachLock`.
     let mut lock = identity::AttachLock::acquire(pool).await?;
-    let attached = attach(lock.client(), config, migrations).await;
+    let attached = attach(lock.client(), pool, config, migrations).await;
     lock.release().await;
     attached
 }
 
 async fn attach(
     pg_client: &mut tokio_postgres::Client,
+    pool: &Pool,
     config: &Config,
     migrations: &Migrations,
 ) -> Result<(), Error> {
@@ -257,7 +258,7 @@ async fn attach(
     pg_client
         .execute("select pg_advisory_lock($1)", &[&handover_key])
         .await?;
-    let attached = attach_under_handover(pg_client, config, migrations).await;
+    let attached = attach_under_handover(pg_client, pool, config, migrations).await;
     let _ = pg_client
         .execute("select pg_advisory_unlock($1)", &[&handover_key])
         .await;
@@ -272,6 +273,7 @@ async fn attach(
 /// pause a definition or the marker would change.
 async fn attach_under_handover(
     pg_client: &mut tokio_postgres::Client,
+    pool: &Pool,
     config: &Config,
     migrations: &Migrations,
 ) -> Result<(), Error> {
@@ -289,7 +291,10 @@ async fn attach_under_handover(
         let would_pause =
             crate::defs::grammar::check_stored_versions_dry_run(pg_client, &config.floors())
                 .await?;
-        if would_pause > 0 || identity::marker_would_change(pg_client, config).await? {
+        if would_pause > 0
+            || identity::marker_would_change(pg_client, config).await?
+            || restore_queued(pg_client, config).await?
+        {
             return Err(Error::OtherVersionLive(seen));
         }
         return Ok(());
@@ -310,7 +315,26 @@ async fn attach_under_handover(
     // are all handled by one statement rather than separate states to track.
     identity::seed_marker(pg_client, config).await?;
 
+    // A database loaded from a schema dump has its definitions queued, not
+    // defined (`crate::dump`): restore them now, with the catalog current.
+    crate::dump::restore_queued(pool, config).await?;
+
     Ok(())
+}
+
+/// Whether a schema dump's restore queue is waiting in `config`'s schema
+/// (`crate::dump::RESTORE_QUEUE`): restoring it changes state, which an
+/// attach beside another live version mustn't.
+async fn restore_queued(client: &tokio_postgres::Client, config: &Config) -> Result<bool, Error> {
+    let queue = format!(
+        "{}.{}",
+        quote_ident(config.schema()),
+        crate::dump::RESTORE_QUEUE
+    );
+    Ok(client
+        .query_one("select pg_catalog.to_regclass($1) is not null", &[&queue])
+        .await?
+        .get(0))
 }
 
 /// Runs the pending migrations. Inside a public call (issue #599) it runs

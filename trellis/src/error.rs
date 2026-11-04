@@ -46,6 +46,23 @@ pub enum Error {
     /// a shared version with another name or checksum, or a gap below this
     /// binary's newest migration.
     MigrationHistory(String),
+    /// `migrate` couldn't restore a definition a schema dump queued
+    /// (`trellis::dump`): the text resolves to other tables than the dump
+    /// recorded, or its define refused. The definitions before it in the
+    /// queue are restored, and it and the rest stay queued for the next
+    /// `migrate`.
+    RestoreDefinition {
+        /// The transform's qualified target, as the dump recorded it.
+        target: String,
+        /// The refusal's category.
+        code: ErrorCode,
+        /// Why it was refused, and the remedy.
+        message: String,
+    },
+    /// A schema dump's `pg_dump` output still names this instance's capture
+    /// functions after the filter (`trellis::dump::filter_pg_dump`), so it
+    /// would fail to load: a form of the output the filter doesn't know.
+    SchemaDump(String),
 }
 
 impl Error {
@@ -71,6 +88,8 @@ impl Error {
             Error::BelowCatalogFloor { .. } => ErrorCode::VersionFloor,
             // Like a refinery refusal: a deployment problem.
             Error::MigrationHistory(_) => ErrorCode::Internal,
+            Error::RestoreDefinition { code, .. } => *code,
+            Error::SchemaDump(_) => ErrorCode::Internal,
         }
     }
 }
@@ -101,6 +120,13 @@ impl fmt::Display for Error {
                  Trellis {floor} or later"
             ),
             Error::MigrationHistory(msg) => write!(f, "refusing to attach: {msg}"),
+            Error::RestoreDefinition {
+                target, message, ..
+            } => write!(
+                f,
+                "can't restore transform {target} from the schema dump: {message}"
+            ),
+            Error::SchemaDump(msg) => write!(f, "can't write the schema dump: {msg}"),
         }
     }
 }
@@ -115,7 +141,10 @@ impl std::error::Error for Error {
             Error::Migrate(err) => Some(err),
             Error::IncompatibleInstance(_) => None,
             Error::OtherVersionLive(seen) => Some(seen),
-            Error::BelowCatalogFloor { .. } | Error::MigrationHistory(_) => None,
+            Error::BelowCatalogFloor { .. }
+            | Error::MigrationHistory(_)
+            | Error::RestoreDefinition { .. }
+            | Error::SchemaDump(_) => None,
         }
     }
 }

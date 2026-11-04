@@ -44,6 +44,7 @@ function BlockingTrellis::connect
 function BlockingTrellis::definitions
 function BlockingTrellis::detect_capture_disruptions
 function BlockingTrellis::dump_definitions_sql
+function BlockingTrellis::filter_schema_dump
 function BlockingTrellis::has_live_drain_workers
 function BlockingTrellis::has_live_staging_worker
 function BlockingTrellis::max_call_pool_size
@@ -55,6 +56,7 @@ function BlockingTrellis::quarantined
 function BlockingTrellis::release_key
 function BlockingTrellis::request_backfill
 function BlockingTrellis::sample_quarantined
+function BlockingTrellis::schema_dump
 function BlockingTrellis::self_check
 function BlockingTrellis::self_check_job
 function BlockingTrellis::shutdown
@@ -72,6 +74,7 @@ function BlockingTrellis::start_quarantined
 function BlockingTrellis::start_release_key
 function BlockingTrellis::start_request_backfill
 function BlockingTrellis::start_sample_quarantined
+function BlockingTrellis::start_schema_dump
 function BlockingTrellis::start_self_check
 function BlockingTrellis::start_self_check_job
 function BlockingTrellis::start_shutdown
@@ -126,6 +129,7 @@ function Trellis::connect
 function Trellis::definitions
 function Trellis::detect_capture_disruptions
 function Trellis::dump_definitions_sql
+function Trellis::filter_schema_dump
 function Trellis::has_live_drain_workers
 function Trellis::has_live_staging_worker
 function Trellis::metrics
@@ -136,6 +140,7 @@ function Trellis::quarantined
 function Trellis::release_key
 function Trellis::request_backfill
 function Trellis::sample_quarantined
+function Trellis::schema_dump
 function Trellis::self_check
 function Trellis::self_check_job
 function Trellis::shutdown
@@ -170,6 +175,7 @@ struct PendingCall
 struct PoisonEntry
 struct PoisonSample
 struct QuarantineEntry
+struct SchemaDump
 struct SelfCheckJob
 struct SelfCheckReport
 struct Shutdown
