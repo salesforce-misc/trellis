@@ -440,8 +440,7 @@ fn an_aggregate_over_an_identity_cast_defines() {
         "SUM(CAST(qty AS bigint))",
         "SUM(CAST(i8 AS bigint))",
         "SUM(CAST(i4 AS integer))",
-        "SUM(CAST(n AS numeric))",
-        "AVG(CAST(n AS numeric))",
+        "AVG(CAST(i8 AS int8))",
     ] {
         let def = parse(&format!(
             "TRANSFORM t FROM s GROUP BY i4 SELECT {text} AS x"

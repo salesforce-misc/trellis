@@ -8482,6 +8482,10 @@ mod tests {
             "SUM(ABS(cost))",
             "SUM(ROUND(cost, 2))",
             "SUM(CAST(qty AS numeric))",
+            // A cast to its own type drops `cost`'s modifier, as in Postgres
+            // (`cost::numeric` is an unconstrained `numeric`).
+            "SUM(CAST(cost AS numeric))",
+            "AVG(CAST(cost AS decimal))",
         ] {
             let err = check(&format!("{call} AS v")).unwrap_err();
             assert!(
@@ -8497,6 +8501,7 @@ mod tests {
             // Integer arithmetic keeps its type, so a sum of it is admitted.
             "SUM(qty * order_id) AS s, AVG(qty - order_id) AS a",
             "SUM(-qty) AS s, SUM(ABS(qty)) AS a, SUM(CAST(qty AS bigint)) AS b",
+            "SUM(CAST(qty AS integer)) AS s, AVG(CAST(order_id AS int4)) AS a",
             "SUM(qty % 7) AS s, SUM(qty * 2 - 1) AS t",
             "-SUM(qty) AS s, COALESCE(SUM(qty), 0) * 2 AS t, ROUND(AVG(qty), 2) AS r",
         ] {

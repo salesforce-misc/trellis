@@ -263,7 +263,7 @@ operator against a live server,
 | `CEIL(a)`, `FLOOR(a)`, `TRUNC(a)` | `numeric`, `double precision` | the operand's type |
 | `ROUND(a)`, `ROUND(a, n)`, `TRUNC(a, n)` | `numeric`; `n` an integer literal | `numeric`; rounds half away from zero, `TRUNC` toward zero |
 | `CAST(a AS integer)` (or `int`, `int4`), `AS bigint` (or `int8`) | an integer of the same or a narrower width | the named integer; a cast to the operand's own type changes nothing |
-| `CAST(a AS numeric)` (or `decimal`) | any integer or `numeric` | `numeric`; a `numeric` keeps its scale (`1.50` stays `1.50`) |
+| `CAST(a AS numeric)` (or `decimal`) | any integer or `numeric` | `numeric`; a `numeric` value keeps its digits (`1.50` stays `1.50`), but the result has no declared scale, so `SUM` or `AVG` of it is refused as for any `numeric` expression |
 
 Prefix `-` binds tighter than every binary operator, and `*`, `/` and `%`
 bind tighter than `+` and `-`. A minus before a number literal is one negative
