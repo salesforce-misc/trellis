@@ -721,13 +721,21 @@ pub fn filter_pg_dump(sql: &str, schema: &str) -> Result<String, crate::error::E
 /// order, then drops the queue. `migrate` runs it after the migrations and
 /// the grammar check, under the attach and handover locks (ADR-0023), so
 /// it never runs beside a live process of another version. Returns how many
-/// definitions it restored, the paused ones included; `0` when there is no
-/// queue.
+/// definitions it restored, the paused ones included and the ones already
+/// in the catalog left out; `0` when there is no queue.
 ///
 /// Each row is restored in its own transaction, which deletes the row: a
 /// refusal leaves the rows from it on queued, and the next `migrate` goes
 /// on from there.
 ///
+/// * A row whose target already has a definition in the catalog is not
+///   restored again. If that definition is the one the row records (the same
+///   source, `JOIN` table, text and grammar version) the row is deleted and
+///   the existing definition is left as it is, so appending the appendix to a
+///   database that already holds its definitions is idempotent. If it differs, the row
+///   refuses and stays queued: restoring it would replace a definition the
+///   database already runs, or fail on its target table, and the message
+///   names that cause and the way out.
 /// * A row this release can't run is stored paused without being parsed
 ///   (ADR-0024 rule 3): its floor is above this release, its grammar
 ///   version is outside what this release reads, this release refuses its
@@ -781,6 +789,7 @@ pub(crate) async fn restore_queued(
     drop(client);
     // The targets of the rows stored paused: a row reading one is too.
     let mut paused_targets: Vec<String> = Vec::new();
+    let mut already_defined = 0;
     for row in &rows {
         let ordinal: i32 = row.get(0);
         let unparsed = crate::defs::catalog::Unparsed {
@@ -803,6 +812,71 @@ pub(crate) async fn restore_queued(
         };
         let catalog = |err: crate::defs::CatalogError| refused(err.code(), err.to_string());
         let target = unparsed.target_table;
+        // A definition the catalog already holds for this target: the same
+        // one dequeues, a different one refuses (see above).
+        let client = pool.get().await?;
+        let existing = client
+            .query_opt(
+                "select source_table, join_table, definition_text, grammar_version \
+                 from transform_definitions where target_table = $1",
+                &[&target],
+            )
+            .await?;
+        drop(client);
+        if let Some(existing) = existing {
+            let found = (
+                existing.get::<_, String>(0),
+                existing.get::<_, Option<String>>(1),
+                existing.get::<_, String>(2),
+                existing.get::<_, i32>(3),
+            );
+            let recorded = (
+                unparsed.source_table,
+                unparsed.join_table,
+                unparsed.definition_text,
+                unparsed.grammar_version,
+            );
+            if (
+                found.0.as_str(),
+                found.1.as_deref(),
+                found.2.as_str(),
+                found.3,
+            ) != recorded
+            {
+                return Err(refused(
+                    crate::ErrorCode::Validation,
+                    format!(
+                        "this database already has a transform into {target}, defined from {}{} \
+                         as `{}`, and the restore queue holds a different definition for it \
+                         (`{}`). The existing one is kept: delete the row from {queue} where \
+                         ordinal = {ordinal} to keep it, or, to use the queued one, `DROP \
+                         TRANSFORM` the existing one, define the queued text yourself and \
+                         then delete the row",
+                        found.0,
+                        found
+                            .1
+                            .as_deref()
+                            .map(|j| format!(" joined with {j}"))
+                            .unwrap_or_default(),
+                        found.2,
+                        unparsed.definition_text,
+                    ),
+                ));
+            }
+            let client = pool.get().await?;
+            client
+                .execute(
+                    &format!("delete from {queue} where ordinal = $1"),
+                    &[&ordinal],
+                )
+                .await?;
+            already_defined += 1;
+            crate::instance_log::info!(
+                target = %target,
+                "already defined as the dump records it; left as it is"
+            );
+            continue;
+        }
         let upstream_paused = std::iter::once(unparsed.source_table)
             .chain(unparsed.join_table)
             .find(|read| paused_targets.iter().any(|t| t == read));
@@ -925,7 +999,7 @@ pub(crate) async fn restore_queued(
     }
     let client = pool.get().await?;
     client.batch_execute(&format!("drop table {queue}")).await?;
-    Ok(rows.len())
+    Ok(rows.len() - already_defined)
 }
 
 #[cfg(test)]

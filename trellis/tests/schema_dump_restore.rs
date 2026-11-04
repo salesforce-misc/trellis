@@ -22,6 +22,14 @@
 //! - a refusal part way leaves the rows before it restored and the rest
 //!   queued, and the next `migrate` goes on from it
 //!   (`a_refusal_part_way_restores_the_rows_before_it_and_the_next_migrate_goes_on`)
+//! - an appendix loaded over a database that already holds the identical
+//!   definitions dequeues each row and leaves the definition as it was
+//!   (`an_appendix_over_identical_definitions_is_dequeued_and_changes_nothing`)
+//! - a row whose target holds a definition of different text refuses, names
+//!   that cause, and the rows before it are dequeued
+//!   (`an_appendix_over_a_different_definition_refuses_and_names_the_cause`)
+//! - a chain whose upstream already exists restores the rest, built or not
+//!   (`a_chain_whose_upstream_already_exists_restores_the_rest`)
 
 use std::process::Command;
 
@@ -427,6 +435,15 @@ async fn load_edited(
     cluster: &TestCluster,
     edit: impl Fn(&str) -> String,
 ) -> testkit::TestDatabase {
+    load_edited_keeping_the_appendix(cluster, edit).await.0
+}
+
+/// [`load_edited`], and the appendix of the file it loaded (the part after
+/// `pg_dump`'s output), for appending to a database again.
+async fn load_edited_keeping_the_appendix(
+    cluster: &TestCluster,
+    edit: impl Fn(&str) -> String,
+) -> (testkit::TestDatabase, String) {
     let source = cluster.create_isolated_database().await;
     let raw = connect_raw(source.dsn()).await;
     raw.batch_execute(SOURCE_DDL).await.expect("ddl");
@@ -446,7 +463,12 @@ async fn load_edited(
     let structure = edit(&structure_file(&t, source.dsn()).await);
     let loaded = cluster.create_empty_database().await;
     load(loaded.dsn(), &structure);
-    loaded
+    let appendix = structure
+        .split_once("-- Trellis definitions (")
+        .expect("the file ends with the appendix")
+        .1
+        .to_string();
+    (loaded, format!("-- Trellis definitions ({appendix}"))
 }
 
 #[tokio::test]
@@ -742,4 +764,183 @@ async fn a_refusal_part_way_restores_the_rows_before_it_and_the_next_migrate_goe
         1,
         "the queue is dropped"
     );
+}
+
+/// The three definitions' `(target, id, text)`, in catalog order.
+const DEFINITIONS: &str = "select jsonb_build_array(target_table, id, definition_text) \
+     from trellis.transform_definitions order by id";
+
+/// The queue's rows, in order, as their target.
+const QUEUED: &str = "select to_jsonb(target_table) from trellis.restore_queue order by ordinal";
+
+#[tokio::test]
+async fn an_appendix_over_identical_definitions_is_dequeued_and_changes_nothing() {
+    let cluster = TestCluster::start();
+    let (loaded, appendix) = load_edited_keeping_the_appendix(&cluster, str::to_string).await;
+    let after = connect_raw(loaded.dsn()).await;
+    facade(loaded.dsn()).await.migrate().await.expect("migrate");
+    let defined = rows_json(&after, DEFINITIONS).await;
+    assert_eq!(defined.len(), 3, "{defined:?}");
+    // Someone appends the appendix to a database that already has them.
+    after.batch_execute(&appendix).await.expect("append");
+    assert_eq!(
+        count(&after, "select count(*) from trellis.restore_queue").await,
+        3
+    );
+    // Twice: the second finds no queue.
+    for _ in 0..2 {
+        facade(loaded.dsn())
+            .await
+            .migrate()
+            .await
+            .expect("the identical definitions are not restored again");
+        assert_eq!(
+            rows_json(&after, DEFINITIONS).await,
+            defined,
+            "same ids and text: nothing was redefined"
+        );
+        assert_eq!(
+            count(
+                &after,
+                "select (to_regclass('trellis.restore_queue') is null)::int::bigint"
+            )
+            .await,
+            1,
+            "the queue is dropped"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_appendix_over_a_different_definition_refuses_and_names_the_cause() {
+    let cluster = TestCluster::start();
+    let (loaded, appendix) = load_edited_keeping_the_appendix(&cluster, str::to_string).await;
+    let after = connect_raw(loaded.dsn()).await;
+    facade(loaded.dsn()).await.migrate().await.expect("migrate");
+    let defined = rows_json(&after, DEFINITIONS).await;
+    // oc's queued text differs from the one the database runs.
+    let changed = appendix.replace("COUNT(*) AS n", "COUNT(*) AS m");
+    assert_ne!(changed, appendix);
+    after.batch_execute(&changed).await.expect("append");
+    let refused = facade(loaded.dsn())
+        .await
+        .migrate()
+        .await
+        .expect_err("oc's queued text is not the one it runs");
+    let message = refused.to_string();
+    assert!(
+        message.contains("can't restore transform public.oc")
+            && message.contains("already has a transform into public.oc")
+            && message.contains("COUNT(*) AS n")
+            && message.contains("COUNT(*) AS m")
+            && message.contains("delete the row from"),
+        "{message}"
+    );
+    assert!(!message.contains("already exists"), "{message}");
+    assert_eq!(refused.code(), trellis::ErrorCode::Validation);
+    assert_eq!(
+        rows_json(&after, QUEUED).await,
+        vec!["\"public.oc\"".to_string()],
+        "o1 and tot, identical, are dequeued; oc stays"
+    );
+    assert_eq!(
+        rows_json(&after, DEFINITIONS).await,
+        defined,
+        "the running definition is untouched"
+    );
+    // It keeps refusing until the row goes; the remedy the message names works.
+    facade(loaded.dsn())
+        .await
+        .migrate()
+        .await
+        .expect_err("still refused");
+    after
+        .batch_execute("delete from trellis.restore_queue where target_table = 'public.oc'")
+        .await
+        .expect("delete the row");
+    facade(loaded.dsn())
+        .await
+        .migrate()
+        .await
+        .expect("migrate once the row is gone");
+    assert_eq!(rows_json(&after, DEFINITIONS).await, defined);
+    // The same text recorded against another source is not the same
+    // definition either.
+    let elsewhere = appendix.replace("'public.orders', 'public.oc'", "'public.cats', 'public.oc'");
+    assert_ne!(elsewhere, appendix);
+    after.batch_execute(&elsewhere).await.expect("append");
+    let refused = facade(loaded.dsn())
+        .await
+        .migrate()
+        .await
+        .expect_err("oc's queued source is not the one it reads");
+    assert!(
+        refused
+            .to_string()
+            .contains("already has a transform into public.oc, defined from public.orders"),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+async fn a_chain_whose_upstream_already_exists_restores_the_rest() {
+    for built in [false, true] {
+        let cluster = TestCluster::start();
+        let loaded = load_edited(&cluster, str::to_string).await;
+        let after = connect_raw(loaded.dsn()).await;
+        // Restore only o1 (queue order: o1, tot, oc), keeping the rest of
+        // the rows aside to queue again.
+        after
+            .batch_execute(
+                "create table public.aside as table trellis.restore_queue; \
+                 delete from trellis.restore_queue where target_table <> 'public.o1'",
+            )
+            .await
+            .expect("set the later rows aside");
+        let t = facade(loaded.dsn()).await;
+        t.migrate().await.expect("restore o1");
+        if built {
+            build_everything(t.pool()).await;
+        }
+        let o1 = rows_json(
+            &after,
+            "select jsonb_build_array(id, status) from trellis.transform_definitions",
+        )
+        .await;
+        assert_eq!(o1.len(), 1, "{o1:?}");
+        // The whole queue again: o1 exists, tot reads it, oc is independent.
+        after
+            .batch_execute("create table trellis.restore_queue as table public.aside")
+            .await
+            .expect("queue every definition again");
+        assert_eq!(
+            rows_json(&after, QUEUED).await.first().map(String::as_str),
+            Some("\"public.o1\"")
+        );
+        facade(loaded.dsn())
+            .await
+            .migrate()
+            .await
+            .expect("o1 is dequeued, tot and oc are restored");
+        let statuses = rows_json(&after, STATUSES).await;
+        assert_eq!(statuses.len(), 3, "built={built}: {statuses:?}");
+        assert_eq!(
+            statuses[1..],
+            [
+                "public.tot waiting_to_backfill".to_string(),
+                "public.oc waiting_to_backfill".to_string()
+            ],
+            "built={built}"
+        );
+        assert_eq!(
+            rows_json(
+                &after,
+                "select jsonb_build_array(id, status) from trellis.transform_definitions \
+                 where target_table = 'public.o1'"
+            )
+            .await,
+            o1,
+            "o1 is the definition that was there"
+        );
+    }
 }

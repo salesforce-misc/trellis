@@ -949,6 +949,18 @@ where the dump was taken loads unpaused: the pause is runtime state.
   user's unique index on it, for one; the message names it). Each definition
   is restored in its own transaction: the ones before a refusal stay
   restored, and the rest stay queued for the next `migrate`.
+* A queued definition whose target already has a definition is not restored
+  a second time. If the existing one is the one queued (the same source,
+  `JOIN` table, text and grammar version), `migrate` deletes the queue row and
+  leaves the existing definition as it is, so appending the appendix to a
+  database that holds its definitions leaves them as they were and `migrate`
+  drops the queue. If the existing one differs, `migrate` refuses with
+  `can't restore transform <target> from the schema dump: this database
+  already has a transform into <target>, …`, which shows both texts. The row
+  and the rows after it stay queued, and `migrate` refuses again until the row
+  is deleted from the restore queue to keep the existing definition, or the
+  existing transform is dropped (`DROP TRANSFORM` drops its target too) and
+  the queued text defined by hand, then the row deleted.
 * A definition the loading release can't run is stored paused, unparsed,
   with the reason in its status: its floor is above the release, its grammar
   version is outside the release's window, the release refuses its text, or
