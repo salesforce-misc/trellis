@@ -28,6 +28,7 @@ defmodule Trellis.StatusTest do
         paused_upstream_columns: [],
         build_wait_xid: nil,
         version_handover: nil,
+        below_catalog_floor: nil,
         join: nil
       })
 
@@ -71,6 +72,7 @@ defmodule Trellis.StatusTest do
         paused_upstream_columns: [],
         build_wait_xid: nil,
         version_handover: nil,
+        below_catalog_floor: nil,
         join: nil
       })
 
@@ -121,6 +123,7 @@ defmodule Trellis.StatusTest do
         paused_upstream_columns: [],
         build_wait_xid: nil,
         version_handover: nil,
+        below_catalog_floor: nil,
         join: nil
       })
 
@@ -157,6 +160,7 @@ defmodule Trellis.StatusTest do
         paused_upstream_columns: [],
         build_wait_xid: nil,
         version_handover: nil,
+        below_catalog_floor: nil,
         join: nil
       })
 
@@ -188,6 +192,7 @@ defmodule Trellis.StatusTest do
         paused_upstream_columns: ["t.total"],
         build_wait_xid: nil,
         version_handover: nil,
+        below_catalog_floor: nil,
         join: nil
       })
 
@@ -221,6 +226,7 @@ defmodule Trellis.StatusTest do
         paused_upstream_columns: [],
         build_wait_xid: 4_294_967_301,
         version_handover: nil,
+        below_catalog_floor: nil,
         join: nil
       })
 
@@ -250,6 +256,7 @@ defmodule Trellis.StatusTest do
           unregistered_staging_worker: true,
           migrations_pending: false
         },
+        below_catalog_floor: nil,
         join: nil
       })
 
@@ -263,6 +270,30 @@ defmodule Trellis.StatusTest do
              ],
              unregistered_staging_worker: true,
              migrations_pending: false
+           }
+  end
+
+  test "a catalog floor becomes a struct naming the floor and this version" do
+    status =
+      Trellis.Status.from_native(%{
+        status: :live,
+        backfill_failure: nil,
+        capture_wait: nil,
+        capture_failure: nil,
+        held_keys: nil,
+        drain_failure: nil,
+        source_index_gaps: [],
+        correcting: [],
+        paused_upstream_columns: [],
+        build_wait_xid: nil,
+        version_handover: nil,
+        below_catalog_floor: %{floor: "0.3.0", this_version: "0.2.0"},
+        join: nil
+      })
+
+    assert status.below_catalog_floor == %Trellis.BelowCatalogFloor{
+             floor: "0.3.0",
+             this_version: "0.2.0"
            }
   end
 
@@ -280,6 +311,7 @@ defmodule Trellis.StatusTest do
         paused_upstream_columns: [],
         build_wait_xid: nil,
         version_handover: nil,
+        below_catalog_floor: nil,
         join: %{
           hidden_tables: [
             %{table: "P", name: "join_7_p", estimated_rows: 5_000_000_011, bytes: 9_000_000_017},
@@ -345,6 +377,7 @@ defmodule Trellis.StatusTest do
         paused_upstream_columns: [],
         build_wait_xid: nil,
         version_handover: nil,
+        below_catalog_floor: nil,
         join: %{
           hidden_tables: [],
           partials_warning: nil,

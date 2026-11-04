@@ -70,9 +70,12 @@ command: the older release degrades per definition by itself.
      definition or recreates its hidden tables, from what the definition uses
      then.
 2. **Attach.** A binary below the catalog floor refuses, with an error naming
-   the floor and its own version. Every handle runs the check when it
-   connects, a define-only one included, not only `migrate`
-   ([ADR-0010](0010-embeddable-clients.md)). A binary at or above the floor
+   the floor and its own version. Every handle runs the check, a define-only
+   one included, not only `migrate` ([ADR-0010](0010-embeddable-clients.md)):
+   before it starts background work, which stands by below the floor and
+   checks again every standby poll, and before each state-changing call,
+   which refuses. Read-only calls keep working, and `status` names the
+   floor. A binary at or above the floor
    tolerates applied migrations it doesn't carry, runs none of them, and runs
    none of its own again: it classifies the applied history before refinery
    runs, and refinery's blanket `abort_missing` is off. A name or checksum

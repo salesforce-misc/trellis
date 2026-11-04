@@ -112,6 +112,8 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
     let mut listed = Vec::with_capacity(definitions.len());
     // ADR-0023: set while a process of another Trellis version is live.
     let mut handover = None;
+    // ADR-0024: set while this binary is below the catalog floor.
+    let mut below_floor = None;
     for def in definitions {
         let status = trellis
             .status(&def.target_table)
@@ -119,6 +121,9 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
             .map_err(|err| err.to_string())?;
         if handover.is_none() {
             handover = status.as_ref().and_then(|s| s.version_handover.clone());
+        }
+        if below_floor.is_none() {
+            below_floor = status.as_ref().and_then(|s| s.below_catalog_floor.clone());
         }
         let warnings = status.map_or_else(StatusWarnings::default, |status| StatusWarnings {
             drain_failure: status.drain_failure,
@@ -135,6 +140,9 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
         .map_err(|err| err.to_string())?;
 
     let mut out = String::new();
+    if let Some(seen) = below_floor {
+        out.push_str(&format!("Standing by: {seen}\n\n"));
+    }
     if let Some(seen) = handover {
         out.push_str(&format!("Standing by: {seen}\n\n"));
     }

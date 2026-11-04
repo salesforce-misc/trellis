@@ -4,9 +4,10 @@
 //! [`DefinitionStatus`] (what `status()` polls) flattens here too, with its
 //! backfill failure's retry time, its capture wait's times, its capture
 //! failure's detection time and its drain failure's times in epoch
-//! microseconds. Its build wait crosses as the fence's transaction id, and
-//! its version handover as this binary's version and the other processes
-//! by worker id and version. Its `JOIN` status crosses as the hidden tables'
+//! microseconds. Its build wait crosses as the fence's transaction id, its
+//! version handover as this binary's version and the other processes by
+//! worker id and version, and a catalog floor this binary is below as the
+//! floor and this binary's version. Its `JOIN` status crosses as the hidden tables'
 //! sizes, the two warnings and the build step under way, the step as words
 //! from [`JOIN_BUILD_STEPS`], [`JOIN_SIDES`] and [`JOIN_SIDE_PARTS`]. A
 //! capture failure's kind
@@ -14,10 +15,10 @@
 //! turns into an atom or symbol from that set, allocated at load.
 
 use trellis::{
-    BackfillFailure, BuildWait, CaptureFailure, CaptureFailureKind, CaptureWait, CorrectingNode,
-    DefinitionStatus, DefinitionSummary, DrainFailure, FanOutWarning, HiddenTableSize,
-    JoinBuildStep, JoinSide, JoinSidePart, JoinStatus, OneToOneBuildStep, OtherProcess,
-    OtherVersionLive, PartialsWarning, SourceIndexGap,
+    BackfillFailure, BelowCatalogFloor, BuildWait, CaptureFailure, CaptureFailureKind, CaptureWait,
+    CorrectingNode, DefinitionStatus, DefinitionSummary, DrainFailure, FanOutWarning,
+    HiddenTableSize, JoinBuildStep, JoinSide, JoinSidePart, JoinStatus, OneToOneBuildStep,
+    OtherProcess, OtherVersionLive, PartialsWarning, SourceIndexGap,
 };
 
 use crate::{PlainHeldKeys, epoch_micros, transform_status};
@@ -93,6 +94,10 @@ pub struct PlainDefinitionStatus {
     /// Set while a process of another Trellis version is live, so this
     /// binary stands by; see [`DefinitionStatus::version_handover`].
     pub version_handover: Option<PlainVersionHandover>,
+    /// Set while this binary is below the catalog floor, so it stands by and
+    /// its state-changing calls refuse; see
+    /// [`DefinitionStatus::below_catalog_floor`].
+    pub below_catalog_floor: Option<PlainBelowCatalogFloor>,
     /// A `JOIN` transform's hidden tables, warnings and build step; see
     /// [`DefinitionStatus::join`]. `None` for any other transform.
     pub join: Option<PlainJoinStatus>,
@@ -208,6 +213,25 @@ pub struct PlainVersionHandover {
     /// Migrations this binary carries are pending, so every live process
     /// holds it back, whatever its version.
     pub migrations_pending: bool,
+}
+
+/// A [`BelowCatalogFloor`] flattened to plain data: this binary's version is
+/// below the catalog floor, so it changes nothing (ADR-0024).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainBelowCatalogFloor {
+    /// The floor the catalog records.
+    pub floor: String,
+    /// This binary's version.
+    pub this_version: String,
+}
+
+impl From<&BelowCatalogFloor> for PlainBelowCatalogFloor {
+    fn from(seen: &BelowCatalogFloor) -> Self {
+        PlainBelowCatalogFloor {
+            floor: seen.floor.clone(),
+            this_version: seen.this_version.clone(),
+        }
+    }
 }
 
 /// An [`OtherProcess`] flattened to plain data: one live process of another
@@ -390,6 +414,10 @@ impl From<&DefinitionStatus> for PlainDefinitionStatus {
                 .version_handover
                 .as_ref()
                 .map(PlainVersionHandover::from),
+            below_catalog_floor: status
+                .below_catalog_floor
+                .as_ref()
+                .map(PlainBelowCatalogFloor::from),
             join: status.join.as_ref().map(PlainJoinStatus::from),
         }
     }
@@ -685,6 +713,7 @@ mod tests {
                 correcting: Vec::new(),
                 build_wait_xid: None,
                 version_handover: None,
+                below_catalog_floor: None,
                 join: None,
             }
         );
@@ -888,6 +917,7 @@ mod tests {
                 correcting: Vec::new(),
                 build_wait_xid: None,
                 version_handover: None,
+                below_catalog_floor: None,
                 join: None,
             }
         );
@@ -959,6 +989,27 @@ mod tests {
 
         assert_eq!(plain.build_wait_xid, Some(4_294_967_301));
         assert_eq!(plain.version_handover, None);
+        assert_eq!(plain.below_catalog_floor, None);
+    }
+
+    #[test]
+    fn a_catalog_floor_crosses_with_this_binarys_version() {
+        let status = trellis::fixture!(DefinitionStatus {
+            below_catalog_floor: Some(trellis::fixture!(BelowCatalogFloor {
+                floor: "0.3.0".to_string(),
+                this_version: "0.2.0".to_string(),
+            })),
+        });
+
+        let plain = PlainDefinitionStatus::from(&status);
+
+        assert_eq!(
+            plain.below_catalog_floor,
+            Some(PlainBelowCatalogFloor {
+                floor: "0.3.0".to_string(),
+                this_version: "0.2.0".to_string(),
+            })
+        );
     }
 
     #[test]

@@ -120,6 +120,14 @@ state-changing calls covers a web process's handle as much as the worker's;
 `status()`, the listings and the health checks keep working. A killed
 process's registry row stays live for up to the 30-second reclaim TTL.
 
+**Rolled back below the catalog floor,** a worker that only connects, and
+never runs `migrate`, is covered too: every handle checks the
+[catalog floor](upgrading.md#the-catalog-floor) before it starts background
+work and before each state-changing call. Below it, the worker connects and
+stands by, checking again every 5 seconds rather than exiting, and every
+handle's state-changing calls refuse with the `version_floor` code, while
+`status()` names the floor in `below_catalog_floor`.
+
 ### What a handle uses
 
 A handle's connections, threads and memory depend on its options. Nothing is

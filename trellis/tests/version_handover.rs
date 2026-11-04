@@ -553,3 +553,160 @@ async fn a_worker_standing_by_from_the_start_takes_no_staging_lock() {
     );
     worker.shutdown().await.expect("shutdown");
 }
+
+fn below_the_floor(result: Result<impl std::fmt::Debug, TrellisError>) -> TrellisError {
+    let err = result.expect_err("refused below the catalog floor");
+    assert_eq!(err.code(), ErrorCode::VersionFloor, "{err}");
+    err
+}
+
+/// ADR-0024 rule 2 for a handle that only connects: below the catalog floor,
+/// a worker connects and stands by without writing anything (no registry
+/// row, no staging lock, no capture), every state-changing call of any of
+/// this version's handles refuses with `version_floor`, read-only calls and
+/// `status` keep working and name the floor, and a version that meets the
+/// floor goes on. Once the floor comes down, this version's next pass takes
+/// over and its calls go through.
+#[tokio::test]
+async fn a_handle_below_the_catalog_floor_stands_by_and_refuses_until_it_meets_it() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    raw.batch_execute(
+        "create table public.m (id bigint primary key, g bigint not null); \
+         create index on public.m (g)",
+    )
+    .await
+    .expect("source");
+    let definer = Trellis::connect(config(&db), TrellisOptions::default())
+        .await
+        .expect("connect a define-only handle");
+    definer
+        .apply("TRANSFORM m_agg FROM m GROUP BY g SELECT g AS g, COUNT(*) AS n")
+        .await
+        .expect("define at the floor");
+    let floor: String = raw
+        .query_one("select version from catalog_floor", &[])
+        .await
+        .expect("the floor")
+        .get(0);
+    raw.execute("update catalog_floor set version = '9.9.9'", &[])
+        .await
+        .expect("a newer release raised the floor");
+
+    let worker = Trellis::connect(
+        config(&db),
+        TrellisOptions {
+            staging: true,
+            drain_threads: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a worker below the floor connects without error");
+    assert!(
+        !worker.has_live_staging_worker().await.expect("read"),
+        "it takes no staging lock"
+    );
+    assert_eq!(registry(&raw).await, [], "it registers nothing");
+    let triggers: i64 = raw
+        .query_one(
+            "select count(*) from pg_trigger where tgrelid = 'public.m'::regclass \
+             and not tgisinternal",
+            &[],
+        )
+        .await
+        .expect("count triggers")
+        .get(0);
+    assert_eq!(triggers, 0, "it installs no capture");
+    let pool = trellis::pool::Pool::new(&config(&db)).expect("pool");
+    assert!(
+        !handover_pass_as(&pool, &config(&db), "probe")
+            .await
+            .expect("pass"),
+        "every standby poll checks the floor again"
+    );
+
+    for handle in [&definer, &worker] {
+        let err = below_the_floor(handle.apply("PAUSE TRANSFORM m_agg").await);
+        let text = err.to_string();
+        assert!(text.contains("9.9.9"), "{text}");
+        assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+        below_the_floor(handle.apply("TRANSFORM m_copy FROM m SELECT g AS g").await);
+        below_the_floor(handle.request_backfill("public.m").await);
+        below_the_floor(handle.release_key("m_agg", "public.m", "1").await);
+        below_the_floor(handle.detect_capture_disruptions().await);
+        below_the_floor(
+            handle
+                .self_check(
+                    "m_agg",
+                    trellis::SelfCheckMode::Standard,
+                    std::time::Duration::from_secs(1),
+                )
+                .await,
+        );
+        assert_eq!(handle.definitions().await.expect("listing").len(), 1);
+        let status = handle
+            .status("m_agg")
+            .await
+            .expect("status")
+            .expect("defined");
+        let seen = status.below_catalog_floor.expect("status says why");
+        assert_eq!(seen.floor, "9.9.9");
+        assert_eq!(seen.this_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            status.version_handover, None,
+            "{:?}",
+            status.version_handover
+        );
+    }
+
+    // A version at the floor goes on: a process standing by below it holds
+    // nothing back.
+    let newer = Trellis::connect(
+        config(&db).with_binary_version("9.9.9"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a version at the floor");
+    newer
+        .apply("PAUSE TRANSFORM m_agg")
+        .await
+        .expect("a version at the floor changes state");
+    assert_eq!(
+        newer
+            .status("m_agg")
+            .await
+            .expect("status")
+            .expect("defined")
+            .below_catalog_floor,
+        None
+    );
+    newer.shutdown().await.expect("shutdown");
+
+    raw.execute("update catalog_floor set version = $1", &[&floor])
+        .await
+        .expect("the floor comes down");
+    assert!(
+        handover_pass_as(&pool, &config(&db), "next-pass")
+            .await
+            .expect("pass"),
+        "this version's next pass takes over"
+    );
+    worker
+        .apply("RESUME TRANSFORM m_agg")
+        .await
+        .expect("calls go through once it meets the floor");
+    assert_eq!(
+        worker
+            .status("m_agg")
+            .await
+            .expect("status")
+            .expect("defined")
+            .below_catalog_floor,
+        None
+    );
+
+    worker.shutdown().await.expect("shutdown");
+    definer.shutdown().await.expect("shutdown");
+}

@@ -210,8 +210,8 @@ pub mod fixtures {
     use std::time::SystemTime;
 
     use crate::{
-        BackfillFailure, CaptureFailure, CaptureFailureKind, CaptureWait, CorrectingNode,
-        DefinitionStatus, DefinitionSummary, DrainFailure, FanOutWarning, HeldKeys,
+        BackfillFailure, BelowCatalogFloor, CaptureFailure, CaptureFailureKind, CaptureWait,
+        CorrectingNode, DefinitionStatus, DefinitionSummary, DrainFailure, FanOutWarning, HeldKeys,
         HiddenTableSize, IndexRole, JoinStatus, OtherProcess, OtherVersionLive, PartialsWarning,
         PoisonEntry, PoisonSample, QuarantineEntry, QuarantineState, QuarantineTarget,
         SelfCheckJob, SelfCheckJobState, SelfCheckMode, SelfCheckOutcome, SelfCheckReport,
@@ -275,6 +275,15 @@ pub mod fixtures {
             paused_upstream_columns: Vec::new(),
             build_wait: None,
             version_handover: None,
+            below_catalog_floor: None,
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn BelowCatalogFloor() -> BelowCatalogFloor {
+        BelowCatalogFloor {
+            floor: String::new(),
+            this_version: String::new(),
         }
     }
 

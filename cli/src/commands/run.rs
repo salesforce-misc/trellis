@@ -18,7 +18,9 @@
 //! and `run` stands by instead of exiting: it says why, tries again every 5
 //! seconds, and goes on as soon as the other version's processes have
 //! stopped. Once running, the pipeline itself stands by the same way while
-//! another version is live.
+//! another version is live. Below the catalog floor (ADR-0024), `migrate`
+//! refuses too, and `run` stands by the same way until the floor no longer
+//! refuses it, rather than exit and restart under a supervisor.
 //!
 //! No definitions need to be registered yet: the staging worker
 //! captures nothing until `trellis apply` registers something, then picks
@@ -60,6 +62,8 @@ interrupted with Ctrl-C. Migrates the database first if needed. Definitions
 registered later (via `trellis apply`) are picked up without a restart.
 While a Trellis process of another version is live on the database, stands
 by (stages, drains and migrates nothing) and takes over once it has stopped.
+Below the catalog floor (a later release's catalog it can't read), stands by
+the same way.
 
 Options:
   --staging                  Run the staging worker: installs capture triggers
@@ -272,22 +276,33 @@ pub async fn run(args: Args, database_url: Option<String>) -> Result<String, Str
 const STANDBY_POLL: Duration = Duration::from_secs(5);
 
 /// Runs `migrate`, standing by while it refuses because a process of another
-/// Trellis version is live (ADR-0023, rule 3): says so once, then tries again
-/// every [`STANDBY_POLL`] until it succeeds. `Ok(false)` when Ctrl-C came
-/// first.
+/// Trellis version is live (ADR-0023, rule 3) or this binary is below the
+/// catalog floor (ADR-0024, rule 2): says so once, then tries again every
+/// [`STANDBY_POLL`] until it succeeds. `Ok(false)` when Ctrl-C came first.
 async fn migrate_once_no_other_version_is_live(migrator: &Trellis) -> Result<bool, String> {
-    let mut standing_by = false;
+    let mut standing_by = None;
     loop {
         match migrator.migrate().await {
             Ok(()) => {
-                if standing_by {
-                    println!("no other Trellis version is live any more; migrated, taking over");
+                match standing_by {
+                    Some(ErrorCode::VersionHandover) => {
+                        println!("no other Trellis version is live any more; migrated, taking over")
+                    }
+                    Some(_) => {
+                        println!("this version meets the catalog floor now; migrated, taking over")
+                    }
+                    None => {}
                 }
                 return Ok(true);
             }
-            Err(err) if err.code() == ErrorCode::VersionHandover => {
-                if !standing_by {
-                    standing_by = true;
+            Err(err)
+                if matches!(
+                    err.code(),
+                    ErrorCode::VersionHandover | ErrorCode::VersionFloor
+                ) =>
+            {
+                if standing_by != Some(err.code()) {
+                    standing_by = Some(err.code());
                     match &err {
                         TrellisError::OtherVersionLive(seen) => {
                             println!("trellis standing by: {seen}")

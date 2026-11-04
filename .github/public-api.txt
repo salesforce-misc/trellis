@@ -146,6 +146,7 @@ function ValidationError::code
 function migrate
 function statement_kind
 struct BackfillFailure
+struct BelowCatalogFloor
 struct BlockingTrellis
 struct CaptureFailure
 struct CaptureWait

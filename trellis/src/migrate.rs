@@ -104,6 +104,26 @@ impl Migrations {
     }
 }
 
+/// Whether a binary of `version`, carrying this binary's migrations, is below
+/// `schema`'s catalog floor ([`catalog_floor::check_floor`]): what every
+/// background process checks before it stages, drains or builds, and every
+/// state-changing call before it changes anything (ADR-0024, rule 2).
+pub(crate) async fn below_catalog_floor(
+    client: &impl tokio_postgres::GenericClient,
+    schema: &str,
+    version: &str,
+) -> Result<Option<catalog_floor::FloorRefused>, tokio_postgres::Error> {
+    let migrations = Migrations::embedded();
+    catalog_floor::check_floor(
+        client,
+        schema,
+        version,
+        &migrations.floor,
+        &migrations.records(),
+    )
+    .await
+}
+
 /// Whether some migration this binary carries hasn't run on `schema`'s
 /// instance: refinery's history lacks its version. A schema with no history
 /// has never been migrated, so no process of any version can be running on
@@ -194,8 +214,8 @@ async fn attach(
     identity::prepare_attach(pg_client, config).await?;
 
     // ADR-0024: refuse a catalog this binary can't read before anything
-    // runs on it. A handle that connects without migrating doesn't run this
-    // check (#1602).
+    // runs on it. A handle that connects without migrating runs the floor
+    // half of this check ([`below_catalog_floor`]).
     catalog_floor::check(
         &*pg_client,
         config.schema(),

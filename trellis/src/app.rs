@@ -510,21 +510,24 @@ impl Trellis {
     /// ADR-0023, rule 6: a state-changing call refuses while a process of
     /// another Trellis version is live on the instance, from any handle, a
     /// define-only one included, so two versions never change one instance's
-    /// state side by side. Read-only calls don't ask.
+    /// state side by side. First, ADR-0024 rule 2: it refuses below the
+    /// catalog floor, with the error `migrate` returns there
+    /// ([`ErrorCode::VersionFloor`]). Read-only calls ask neither.
     async fn refuse_while_another_version_is_live(&self) -> Result<(), TrellisError> {
-        match self.version_handover().await? {
+        let client = self.pool.get().await?;
+        if let Some(refused) = crate::migrate::below_catalog_floor(
+            &**client,
+            self.config.schema(),
+            self.config.binary_version(),
+        )
+        .await?
+        {
+            return Err(refused.into_error().into());
+        }
+        match version_handover_on(&**client, &self.config).await? {
             None => Ok(()),
             Some(seen) => Err(TrellisError::OtherVersionLive(seen)),
         }
-    }
-
-    /// The live processes of another version that hold this binary back
-    /// (ADR-0023), or `None` when there are none.
-    async fn version_handover(
-        &self,
-    ) -> Result<Option<crate::handover::OtherVersionLive>, TrellisError> {
-        let client = self.pool.get().await?;
-        version_handover_on(&**client, &self.config).await
     }
 
     /// [`Statement::AlterTransform`](defs::Statement::AlterTransform)'s half
@@ -986,6 +989,17 @@ impl Trellis {
             } else {
                 None
             };
+            let below_catalog_floor = if row.is_some() {
+                crate::migrate::below_catalog_floor(
+                    &*txn,
+                    self.config.schema(),
+                    self.config.binary_version(),
+                )
+                .await?
+                .map(|refused| refused.seen)
+            } else {
+                None
+            };
             txn.commit().await?;
             let (capture_wait, stalled) = holdup;
             Ok(row.zip(status).map(|(row, status)| DefinitionStatus {
@@ -1008,6 +1022,7 @@ impl Trellis {
                     .get::<_, Option<i64>>("build_fence")
                     .map(|xid| BuildWait::Fence { xid }),
                 version_handover,
+                below_catalog_floor,
             }))
         })
         .await
@@ -2016,7 +2031,8 @@ fn capture_failure(row: &tokio_postgres::Row) -> Option<CaptureFailure> {
         })
 }
 
-/// [`Trellis::version_handover`] on `client`.
+/// The live processes of another version that hold this binary back
+/// (ADR-0023), or `None` when there are none.
 async fn version_handover_on(
     client: &impl tokio_postgres::GenericClient,
     config: &Config,
@@ -2200,6 +2216,13 @@ pub struct DefinitionStatus {
     /// process killed without a clean shutdown keeps its row live, and so
     /// delays the takeover, for at most the reclaim TTL (30 seconds).
     pub version_handover: Option<crate::handover::OtherVersionLive>,
+    /// Set while this binary's version is below the instance's catalog
+    /// floor, the oldest Trellis version that can read its catalog
+    /// (ADR-0024): its background processes stand by (they stage, drain and
+    /// build nothing, and check again every standby poll) and its
+    /// state-changing calls refuse ([`ErrorCode::VersionFloor`]). Names the
+    /// floor and this binary's version. Run a version at or above the floor.
+    pub below_catalog_floor: Option<crate::catalog_floor::BelowCatalogFloor>,
 }
 
 /// Why capture of a table a definition reads is broken; see [`DefinitionStatus::capture_failure`].

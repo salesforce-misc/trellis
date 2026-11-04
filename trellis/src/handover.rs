@@ -120,6 +120,11 @@ pub(crate) enum StandBy {
     /// binary's migrations yet: a background process never migrates, it
     /// waits for `migrate` (`trellis run` migrates before it starts one).
     MigrationsPending,
+    /// This binary is below the catalog floor (ADR-0024): it can't read the
+    /// catalog, so it waits for the floor to come down, which in practice
+    /// means a release at or above the floor replaces it. Decided before
+    /// [`decide`] runs, by `crate::migrate::below_catalog_floor`.
+    BelowCatalogFloor(crate::catalog_floor::BelowCatalogFloor),
 }
 
 /// ADR-0023's whole decision: rules 2, 3 and 6 over what [`observe`] read.

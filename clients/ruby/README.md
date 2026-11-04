@@ -93,6 +93,10 @@ Nothing in the binding uses it.
   `version` (`nil` for a release before 0.2.0),
   `unregistered_staging_worker` and `migrations_pending`), and
   state-changing calls raise a `version_handover` error until it is gone.
+  While this binary is below the catalog floor, `status` reports that this
+  process stands by (`below_catalog_floor`, a `Trellis::BelowCatalogFloor`
+  with `floor` and `this_version`), and state-changing calls raise a
+  `version_floor` error.
   For a `JOIN` definition `status` reports its hidden tables (`join`, a
   `Trellis::JoinStatus`): `hidden_tables`, each a `Trellis::HiddenTable` with
   `table`, `name`, `estimated_rows` and `bytes`, the `P`-size warning

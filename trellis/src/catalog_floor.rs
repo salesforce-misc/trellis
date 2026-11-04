@@ -17,8 +17,13 @@
 //! checksum differs, still refuses.
 //!
 //! [`decide`] is pure, so every case is tested without a database; [`check`]
-//! reads its input. `migrate` runs [`check`] as it attaches; a handle that
-//! connects without migrating doesn't yet (#1602).
+//! reads its input. `migrate` runs [`check`] as it attaches. Every handle
+//! runs the floor half of it, [`check_floor`], before any background work
+//! and before every state-changing call: a background process below the
+//! floor stands by and checks again each standby poll, a call refuses with
+//! the error `migrate` returns, and `status` reports [`BelowCatalogFloor`].
+//! The history half stays `migrate`'s: a handle that only connects runs
+//! nothing that depends on it.
 
 use crate::error::Error;
 use crate::pool::quote_ident;
@@ -177,34 +182,8 @@ pub(crate) fn decide(
     applied: &[MigrationRecord],
     carried: &[MigrationRecord],
 ) -> Verdict {
-    if let Some(floor_text) = catalog_floor {
-        let Some(floor) = ReleaseVersion::parse(floor_text) else {
-            return Verdict::Refuse(Refusal::UnreadableFloor {
-                floor: floor_text.to_string(),
-            });
-        };
-        let Some(own) = ReleaseVersion::parse(own_version) else {
-            return Verdict::Refuse(Refusal::UnreadableVersion {
-                this_version: own_version.to_string(),
-            });
-        };
-        // The floor this binary's migrations declare counts only on a catalog
-        // they left: one that has run no migration this binary lacks. A
-        // pre-release or development build shares its floor with the later
-        // builds of that release, so a migration one of them added since
-        // doesn't move the floor past it.
-        let carries_every_applied = applied
-            .iter()
-            .all(|a| carried.iter().any(|c| c.version == a.version));
-        let meets = own >= floor
-            || (carries_every_applied
-                && ReleaseVersion::parse(own_floor).is_some_and(|f| f >= floor));
-        if !meets {
-            return Verdict::Refuse(Refusal::BelowFloor {
-                floor: floor_text.to_string(),
-                this_version: own_version.to_string(),
-            });
-        }
+    if let Some(refusal) = floor_refusal(own_version, own_floor, catalog_floor, applied, carried) {
+        return Verdict::Refuse(refusal);
     }
 
     for applied in applied {
@@ -250,6 +229,116 @@ pub(crate) fn decide(
         return Verdict::Refuse(Refusal::FutureWithoutFloor { versions: future });
     }
     Verdict::Attach { future }
+}
+
+/// [`decide`]'s floor half: the refusal when the binary doesn't meet
+/// `catalog_floor`, or can't tell whether it does (a floor or a version that
+/// isn't semver). `None` when it meets the floor, and on a catalog that
+/// records none.
+fn floor_refusal(
+    own_version: &str,
+    own_floor: &str,
+    catalog_floor: Option<&str>,
+    applied: &[MigrationRecord],
+    carried: &[MigrationRecord],
+) -> Option<Refusal> {
+    let floor_text = catalog_floor?;
+    let Some(floor) = ReleaseVersion::parse(floor_text) else {
+        return Some(Refusal::UnreadableFloor {
+            floor: floor_text.to_string(),
+        });
+    };
+    let Some(own) = ReleaseVersion::parse(own_version) else {
+        return Some(Refusal::UnreadableVersion {
+            this_version: own_version.to_string(),
+        });
+    };
+    // The floor this binary's migrations declare counts only on a catalog
+    // they left: one that has run no migration this binary lacks. A
+    // pre-release or development build shares its floor with the later
+    // builds of that release, so a migration one of them added since
+    // doesn't move the floor past it.
+    let carries_every_applied = applied
+        .iter()
+        .all(|a| carried.iter().any(|c| c.version == a.version));
+    let meets = own >= floor
+        || (carries_every_applied && ReleaseVersion::parse(own_floor).is_some_and(|f| f >= floor));
+    (!meets).then(|| Refusal::BelowFloor {
+        floor: floor_text.to_string(),
+        this_version: own_version.to_string(),
+    })
+}
+
+/// This binary's version is below the instance's catalog floor, the oldest
+/// Trellis version that can read its catalog (ADR-0024): its background
+/// processes stand by and its state-changing calls refuse
+/// ([`crate::ErrorCode::VersionFloor`]) until a version at or above `floor`
+/// runs instead, or the floor is lowered. Carried by
+/// [`crate::DefinitionStatus::below_catalog_floor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BelowCatalogFloor {
+    /// The floor the catalog records.
+    pub floor: String,
+    /// This binary's version.
+    pub this_version: String,
+}
+
+impl std::fmt::Display for BelowCatalogFloor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the catalog floor is {floor}, the oldest Trellis version that can read this \
+             catalog, and this binary is version {this}; run Trellis {floor} or later",
+            floor = self.floor,
+            this = self.this_version
+        )
+    }
+}
+
+/// What [`check_floor`] refuses: the [`BelowCatalogFloor`] a background
+/// process stands by for and `status` reports, and the refusal a
+/// state-changing call returns, the error `migrate` returns for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FloorRefused {
+    pub(crate) seen: BelowCatalogFloor,
+    refusal: Refusal,
+}
+
+impl FloorRefused {
+    /// The error a state-changing call returns: [`check`]'s for this catalog.
+    pub(crate) fn into_error(self) -> Error {
+        self.refusal.into_error()
+    }
+}
+
+/// The floor half of [`check`] on `schema`, for a binary of `own_version`
+/// carrying `carried`, whose migrations leave `own_floor`: `None` when it
+/// meets the catalog floor, and on a catalog that records none (never
+/// migrated, or not yet to V11). Logs nothing, so a background process can
+/// run it every standby poll.
+pub(crate) async fn check_floor(
+    client: &impl tokio_postgres::GenericClient,
+    schema: &str,
+    own_version: &str,
+    own_floor: &str,
+    carried: &[MigrationRecord],
+) -> Result<Option<FloorRefused>, tokio_postgres::Error> {
+    let Some(floor) = read_floor(client, schema).await? else {
+        return Ok(None);
+    };
+    let applied = read_history(client, schema).await?;
+    Ok(
+        floor_refusal(own_version, own_floor, Some(&floor), &applied, carried).map(|refusal| {
+            FloorRefused {
+                seen: BelowCatalogFloor {
+                    floor: floor.clone(),
+                    this_version: own_version.to_string(),
+                },
+                refusal,
+            }
+        }),
+    )
 }
 
 /// The stored catalog floor, or `None` when `schema` has no `catalog_floor`
@@ -591,5 +680,40 @@ mod tests {
             panic!("refuses");
         };
         assert!(refusal.to_string().contains("checksum"), "{refusal}");
+    }
+
+    /// The floor half a handle runs as it connects refuses only what the
+    /// floor refuses: a history `migrate` refuses at or above the floor, and
+    /// a catalog with no floor, pass it.
+    #[test]
+    fn the_floor_half_refuses_only_below_the_floor() {
+        let mut divergent = ms(1..=11);
+        divergent[4].checksum = "99".to_string();
+        assert!(matches!(
+            decide(OWN, OWN, Some("0.2.0"), &divergent, &ms(1..=11)),
+            Verdict::Refuse(Refusal::Divergent { .. })
+        ));
+        assert_eq!(
+            floor_refusal(OWN, OWN, Some("0.2.0"), &divergent, &ms(1..=11)),
+            None
+        );
+        assert_eq!(
+            floor_refusal(OWN, OWN, None, &ms(1..=13), &ms(1..=11)),
+            None
+        );
+        assert_eq!(
+            floor_refusal(OWN, OWN, Some("0.3.0"), &ms(1..=11), &ms(1..=11)),
+            Some(Refusal::BelowFloor {
+                floor: "0.3.0".to_string(),
+                this_version: OWN.to_string(),
+            })
+        );
+        // A development build of an older version whose own migrations leave
+        // the floor meets it, until the catalog runs one it lacks.
+        assert_eq!(
+            floor_refusal("0.1.0", OWN, Some("0.2.0"), &ms(1..=11), &ms(1..=11)),
+            None
+        );
+        assert!(floor_refusal("0.1.0", OWN, Some("0.2.0"), &ms(1..=12), &ms(1..=11)).is_some());
     }
 }

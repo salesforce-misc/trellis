@@ -77,6 +77,13 @@ defmodule Trellis.Status do
   process killed without a clean shutdown keeps its row live, and so delays
   the takeover, for at most 30 seconds. `nil` when none is.
 
+  `below_catalog_floor` is set while this binary's version is below the
+  instance's catalog floor, the oldest Trellis version that can read its
+  catalog (a `Trellis.BelowCatalogFloor`): this process stands by (it stages,
+  drains and builds nothing, and checks again every standby poll) and its
+  state-changing calls refuse with a `version_floor` error. Run a version at
+  or above the floor. `nil` when this binary meets it.
+
   `join` is set for a `JOIN` transform, aggregate or 1-1, and `nil` for any
   other (a `Trellis.JoinStatus`). It never holds anything up: it changes
   nothing about the transform's status. It reports the estimated size of the
@@ -102,6 +109,7 @@ defmodule Trellis.Status do
           paused_upstream_columns: [String.t()],
           build_wait_xid: integer() | nil,
           version_handover: Trellis.VersionHandover.t() | nil,
+          below_catalog_floor: Trellis.BelowCatalogFloor.t() | nil,
           join: Trellis.JoinStatus.t() | nil
         }
 
@@ -117,6 +125,7 @@ defmodule Trellis.Status do
     :paused_upstream_columns,
     :build_wait_xid,
     :version_handover,
+    :below_catalog_floor,
     :join
   ]
   defstruct @enforce_keys
@@ -134,6 +143,7 @@ defmodule Trellis.Status do
         paused_upstream_columns: paused_upstream_columns,
         build_wait_xid: build_wait_xid,
         version_handover: version_handover,
+        below_catalog_floor: below_catalog_floor,
         join: join
       }) do
     %__MODULE__{
@@ -148,6 +158,8 @@ defmodule Trellis.Status do
       paused_upstream_columns: paused_upstream_columns,
       build_wait_xid: build_wait_xid,
       version_handover: version_handover && Trellis.VersionHandover.from_native(version_handover),
+      below_catalog_floor:
+        below_catalog_floor && Trellis.BelowCatalogFloor.from_native(below_catalog_floor),
       join: join && Trellis.JoinStatus.from_native(join)
     }
   end
@@ -353,6 +365,24 @@ defmodule Trellis.VersionHandover do
       unregistered_staging_worker: unregistered_staging_worker,
       migrations_pending: migrations_pending
     }
+  end
+end
+
+defmodule Trellis.BelowCatalogFloor do
+  @moduledoc """
+  This binary's version is below the instance's catalog floor, so this
+  process changes nothing, as `Trellis.status/2` reports it: the floor the
+  catalog records (`floor`) and this binary's version (`this_version`).
+  """
+
+  @type t :: %__MODULE__{floor: String.t(), this_version: String.t()}
+
+  @enforce_keys [:floor, :this_version]
+  defstruct @enforce_keys
+
+  @doc false
+  def from_native(%{floor: floor, this_version: this_version}) do
+    %__MODULE__{floor: floor, this_version: this_version}
   end
 end
 

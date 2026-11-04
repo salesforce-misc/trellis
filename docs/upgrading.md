@@ -75,13 +75,28 @@ say so. Read it with:
 select version from trellis.catalog_floor;  -- the instance's catalog schema
 ```
 
-`migrate` checks it before it runs anything. A release below the floor
-refuses with the `version_floor` error code, naming the floor and its own
-version:
+Every handle checks it, not only one that runs `migrate`: `migrate` before
+it runs anything, and a handle that only connects (a worker the application
+starts at boot, while a deploy step runs `migrate`) before it starts any
+background work and before each state-changing call. A release below the
+floor changes nothing:
 
-```
-refusing to attach: the catalog floor is 0.3.0, the oldest Trellis version that can read this catalog, and this binary is version 0.2.0; run Trellis 0.3.0 or later
-```
+- `migrate` and the state-changing calls (the same calls as in
+  [Upgrading](#upgrading)) refuse with the `version_floor` error code, naming
+  the floor and its own version:
+
+  ```
+  refusing to attach: the catalog floor is 0.3.0, the oldest Trellis version that can read this catalog, and this binary is version 0.2.0; run Trellis 0.3.0 or later
+  ```
+
+- Its background processes connect and stand by: they stage, drain and
+  build nothing, register nowhere, and check again every 5 seconds, so an
+  orchestrator doesn't restart them in a loop. `trellis run` stands by the
+  same way, printing `trellis standing by: …`.
+- `status()` and the listings keep working. `status()` carries
+  `below_catalog_floor`, naming the floor and this binary's version
+  ([observability](observability.md#below-the-catalog-floor)), and
+  `trellis status` prints it as a `Standing by:` line.
 
 Roll forward to the floor or later. Nothing changed, and the newer release
 attaches as before.
@@ -91,8 +106,8 @@ migrated. It runs none of the later release's migrations and none of its own
 again, and logs once which migrations it doesn't carry. It still refuses
 (with the `internal` code) a catalog whose history doesn't fit its own
 migrations: one it carries that ran with another name or checksum, or a gap
-below its newest migration. A handle that connects without migrating doesn't
-check the floor.
+below its newest migration. A handle that connects without migrating
+doesn't check the history: `migrate` does.
 
 ### To a release before 0.2.0
 

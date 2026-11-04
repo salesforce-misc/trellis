@@ -82,8 +82,9 @@ catalog schema. `Trellis::connect`
 runs the instance-identity check and the catalog-floor check, builds the pool,
 and optionally starts background workers — none of it per-call, which is why a
 handle is created once and shared rather than connected per request. Below the
-catalog floor, every handle refuses to connect, a define-only one included,
-whether or not it runs `migrate`
+catalog floor, no handle changes anything, a define-only one included, whether
+or not it runs `migrate`: its background workers stand by and its
+state-changing calls refuse
 ([ADR-0024](0024-compatibility-floors-and-rollback.md)).
 
 * **Elixir:** a `ResourceArc` owned by a process in the supervision tree, so

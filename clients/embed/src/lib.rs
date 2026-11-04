@@ -14,12 +14,13 @@
 //! |---|---|---|
 //! | any error's `code()` + `Display` | `(code, message)` | [`PlainError`] |
 //! | [`trellis::DefinitionSummary`] | summary fields + backfill failure + halt | [`PlainDefinitionSummary`] |
-//! | [`trellis::DefinitionStatus`] | status word + backfill failure + capture wait + capture failure + held keys + drain failure + source index gaps + correcting nodes + build wait xid + version handover + join status | [`PlainDefinitionStatus`] |
+//! | [`trellis::DefinitionStatus`] | status word + backfill failure + capture wait + capture failure + held keys + drain failure + source index gaps + correcting nodes + build wait xid + version handover + catalog floor + join status | [`PlainDefinitionStatus`] |
 //! | [`trellis::HeldKeys`] | count + oldest poison time | [`PlainHeldKeys`] |
 //! | [`trellis::DrainFailure`] | fields + first and latest failure times | [`PlainDrainFailure`] |
 //! | [`trellis::SourceIndexGap`] | fields + its role as a word + the fix as a `create index` statement | [`PlainSourceIndexGap`] |
 //! | [`trellis::CorrectingNode`] | fields + queue time | [`PlainCorrectingNode`] |
 //! | [`trellis::OtherVersionLive`] / [`trellis::OtherProcess`] | this version + the other processes by worker id and version + two flags | [`PlainVersionHandover`] / [`PlainOtherProcess`] |
+//! | [`trellis::BelowCatalogFloor`] | the floor + this version | [`PlainBelowCatalogFloor`] |
 //! | [`trellis::JoinStatus`] | hidden table sizes + two warnings + the build step as words and data | [`PlainJoinStatus`] / [`PlainJoinBuildStep`] |
 //! | [`trellis::CaptureFailureKind`] | its `as_str()` word | [`PlainCaptureFailure::kind`] / [`capture_failure_kind_names`] |
 //! | `SystemTime` | epoch microseconds | [`epoch_micros`] / [`system_time_from_epoch_micros`] |
@@ -67,11 +68,11 @@ pub use config::PlainConfig;
 
 pub use cursor::{decode_cursor, encode_cursor, next_cursor};
 pub use definition::{
-    JOIN_BUILD_STEPS, JOIN_SIDE_PARTS, JOIN_SIDES, PlainBackfillFailure, PlainCaptureFailure,
-    PlainCaptureWait, PlainCorrectingNode, PlainDefinitionStatus, PlainDefinitionSummary,
-    PlainDrainFailure, PlainFanOutWarning, PlainHiddenTable, PlainJoinBuildStep, PlainJoinStatus,
-    PlainOtherProcess, PlainPartialsWarning, PlainSourceIndexGap, PlainVersionHandover,
-    capture_failure_kind_names, index_role_names,
+    JOIN_BUILD_STEPS, JOIN_SIDE_PARTS, JOIN_SIDES, PlainBackfillFailure, PlainBelowCatalogFloor,
+    PlainCaptureFailure, PlainCaptureWait, PlainCorrectingNode, PlainDefinitionStatus,
+    PlainDefinitionSummary, PlainDrainFailure, PlainFanOutWarning, PlainHiddenTable,
+    PlainJoinBuildStep, PlainJoinStatus, PlainOtherProcess, PlainPartialsWarning,
+    PlainSourceIndexGap, PlainVersionHandover, capture_failure_kind_names, index_role_names,
 };
 pub use error::{CodedError, ERROR_CODES, PlainError};
 pub use log::{

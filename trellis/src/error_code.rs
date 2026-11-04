@@ -79,8 +79,9 @@ pub enum ErrorCode {
     /// message names this binary's version and the other versions seen.
     VersionHandover,
     /// This binary's version is below a compatibility floor the database
-    /// records (ADR-0024): `migrate` refuses a catalog whose floor, the oldest
-    /// Trellis version that can read it, is above this binary's version. Not
+    /// records (ADR-0024): `migrate`, and every state-changing call of any
+    /// handle, refuses a catalog whose floor, the oldest Trellis version that
+    /// can read it, is above this binary's version. Not
     /// retryable with this binary: run a version at or above the floor, which
     /// the message names with this binary's own version.
     VersionFloor,

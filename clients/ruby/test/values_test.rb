@@ -42,7 +42,8 @@ class ValuesTest < Minitest::Test
       held_keys: nil,
       drain_failure: nil,
       source_index_gaps: [],
-      correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil, join: nil
+      correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil,
+      below_catalog_floor: nil, join: nil
     ), status
   end
 
@@ -73,7 +74,8 @@ class ValuesTest < Minitest::Test
       held_keys: Trellis::HeldKeys.new(count: 2, oldest_poisoned_at: Trellis::EpochMicros.to_time(MICROS + 2)),
       drain_failure: nil,
       source_index_gaps: [],
-      correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil, join: nil
+      correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil,
+      below_catalog_floor: nil, join: nil
     ), status
   end
 
@@ -190,6 +192,18 @@ class ValuesTest < Minitest::Test
       ],
       unregistered_staging_worker: true, migrations_pending: false
     ), status.version_handover
+  end
+
+  def test_a_catalog_floor_becomes_a_value_naming_the_floor_and_this_version
+    status = Trellis::Status.from_native(
+      status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
+      held_keys: nil, drain_failure: nil, source_index_gaps: [],
+      correcting: [], paused_upstream_columns: [], build_wait_xid: nil,
+      version_handover: nil, below_catalog_floor: { floor: "0.3.0", this_version: "0.2.0" },
+      join: nil
+    )
+    assert_equal Trellis::BelowCatalogFloor.new(floor: "0.3.0", this_version: "0.2.0"),
+                 status.below_catalog_floor
   end
 
   def test_a_join_status_keeps_its_tables_warnings_and_build_step

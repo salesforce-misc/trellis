@@ -62,15 +62,16 @@ use magnus::{
 use trellis::{BlockingTrellis, Config, ErrorCode, PendingCall, TrellisOptions};
 use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, JOIN_BUILD_STEPS, JOIN_SIDE_PARTS, JOIN_SIDES, PlainApplied,
-    PlainBackfillFailure, PlainCaptureFailure, PlainCaptureWait, PlainConfig, PlainCorrectingNode,
-    PlainDefinitionStatus, PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError,
-    PlainFanOutWarning, PlainHeldKeys, PlainHiddenTable, PlainJoinBuildStep, PlainJoinStatus,
-    PlainOtherProcess, PlainPartialsWarning, PlainPoisonEntry, PlainQuarantineEntry,
-    PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport, PlainSourceIndexGap,
-    PlainVersionHandover, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES, SELF_CHECK_STATES,
-    capture_failure_kind_names, decode_cursor, decode_watermark, encode_watermark,
-    index_role_names, quarantine_state_names, require_transform_statement, self_check_mode,
-    system_time_from_epoch_micros, transform_status_names,
+    PlainBackfillFailure, PlainBelowCatalogFloor, PlainCaptureFailure, PlainCaptureWait,
+    PlainConfig, PlainCorrectingNode, PlainDefinitionStatus, PlainDefinitionSummary,
+    PlainDivergence, PlainDrainFailure, PlainError, PlainFanOutWarning, PlainHeldKeys,
+    PlainHiddenTable, PlainJoinBuildStep, PlainJoinStatus, PlainOtherProcess, PlainPartialsWarning,
+    PlainPoisonEntry, PlainQuarantineEntry, PlainSamplePage, PlainSelfCheckJob,
+    PlainSelfCheckReport, PlainSourceIndexGap, PlainVersionHandover, SELF_CHECK_MODES,
+    SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor,
+    decode_watermark, encode_watermark, index_role_names, quarantine_state_names,
+    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
+    transform_status_names,
 };
 
 /// What a blocking call produces: its value, or the engine's error as plain
@@ -917,6 +918,10 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
         .version_handover
         .map(|seen| version_handover_hash(ruby, seen))
         .transpose()?;
+    let below_catalog_floor = status
+        .below_catalog_floor
+        .map(|seen| below_catalog_floor_hash(ruby, seen))
+        .transpose()?;
     let join = status
         .join
         .map(|join| join_status_hash(ruby, join))
@@ -938,6 +943,7 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
             ),
             ("build_wait_xid", ruby.into_value(status.build_wait_xid)),
             ("version_handover", ruby.into_value(version_handover)),
+            ("below_catalog_floor", ruby.into_value(below_catalog_floor)),
             ("join", ruby.into_value(join)),
         ],
     )
@@ -1043,6 +1049,17 @@ fn version_handover_hash(ruby: &Ruby, seen: PlainVersionHandover) -> Result<RHas
                 "migrations_pending",
                 ruby.into_value(seen.migrations_pending),
             ),
+        ],
+    )
+}
+
+/// This binary is below the catalog floor, so it stands by.
+fn below_catalog_floor_hash(ruby: &Ruby, seen: PlainBelowCatalogFloor) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("floor", ruby.into_value(seen.floor)),
+            ("this_version", ruby.into_value(seen.this_version)),
         ],
     )
 }

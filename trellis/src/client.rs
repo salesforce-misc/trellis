@@ -2803,7 +2803,9 @@ impl BackgroundProcess {
 /// roles (`drain`: whether drain threads run in it). The lock makes two
 /// processes starting at once decide one after the other, so the second sees
 /// the first. While this binary's migrations are pending, it registers
-/// nothing (the registry may not have the columns yet).
+/// nothing (the registry may not have the columns yet). Below the catalog
+/// floor (ADR-0024) it stands by before it reads anything else, and writes
+/// nothing: it can't read the catalog, the registry included.
 async fn handover_pass(process: &BackgroundProcess, drain: bool) -> Result<Verdict, StagingError> {
     let mut client = process.pool.get().await.map_err(checkout_error)?;
     let pg: &mut tokio_postgres::Client = &mut client;
@@ -2813,6 +2815,14 @@ async fn handover_pass(process: &BackgroundProcess, drain: bool) -> Result<Verdi
         &[&handover::handover_lock_key(&process.schema)],
     )
     .await?;
+    if let Some(refused) =
+        crate::migrate::below_catalog_floor(&txn, &process.schema, &process.version).await?
+    {
+        txn.commit().await?;
+        return Ok(Verdict::StandBy(handover::StandBy::BelowCatalogFloor(
+            refused.seen,
+        )));
+    }
     let observed = handover::observe(&txn, &process.schema, true).await?;
     let verdict = handover::decide(&process.version, &observed, handover::Asker::Background);
     if observed.registry_exists && !observed.migrations_pending {
@@ -2902,6 +2912,16 @@ impl HandoverLog {
         self.failing = false;
         if self.last.as_ref() != Some(&verdict) {
             match &verdict {
+                Verdict::TakeOver
+                    if matches!(
+                        self.last,
+                        Some(Verdict::StandBy(handover::StandBy::BelowCatalogFloor(_)))
+                    ) =>
+                {
+                    crate::instance_log::info!(
+                        "this version meets the catalog floor now; taking over"
+                    )
+                }
                 Verdict::TakeOver if self.last.is_some() => crate::instance_log::info!(
                     "no other Trellis version is live any more; taking over"
                 ),
@@ -2917,6 +2937,12 @@ impl HandoverLog {
                         "standing by: this binary's migrations haven't run on the instance; \
                          run migrate (`trellis run` and `Trellis::migrate`), and this process \
                          takes over at its next standby poll"
+                    )
+                }
+                Verdict::StandBy(handover::StandBy::BelowCatalogFloor(seen)) => {
+                    crate::instance_log::warn!(
+                        "standing by: staging, draining and builds wait, and every standby \
+                         poll checks again: {seen}"
                     )
                 }
             }

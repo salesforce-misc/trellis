@@ -33,9 +33,9 @@ defmodule Trellis.Error do
     version's processes have stopped; the message names the versions and
     their worker ids.
   - `:version_floor`: this Trellis version is below the catalog floor, the
-    oldest version that can read the instance's catalog, so `migrate/1`
-    refused it. Not retryable with this version: run the version the message
-    names, or a later one.
+    oldest version that can read the instance's catalog, so `migrate/1` or a
+    state-changing call refused it. Not retryable with this version: run the
+    version the message names, or a later one.
   - `:internal`: a Trellis bug or an unexpected database failure.
   - `:unknown`: a code newer than this binding.
   """

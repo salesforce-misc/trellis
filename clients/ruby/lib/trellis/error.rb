@@ -81,7 +81,8 @@ module Trellis
   end
 
   # This Trellis version is below the catalog floor, the oldest version that
-  # can read the instance's catalog, so Trellis.migrate refused it. Not
+  # can read the instance's catalog, so Trellis.migrate or a state-changing
+  # call refused it. Not
   # retryable with this version: run the version the message names, or a
   # later one.
   class VersionFloorError < Error

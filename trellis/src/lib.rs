@@ -229,6 +229,7 @@ pub use app::{
     QuarantineState, QuarantineTarget, Trellis, TrellisError, TrellisOptions,
 };
 pub use blocking::{BlockingTrellis, PendingCall, Shutdown};
+pub use catalog_floor::BelowCatalogFloor;
 pub use client::{Client, ClientError, ClientOptions};
 
 // --- Tier 2: composable primitives ----------------------------------------

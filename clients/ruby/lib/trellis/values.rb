@@ -109,6 +109,13 @@ module Trellis
   # without a clean shutdown keeps its row live, and so delays the takeover,
   # for at most 30 seconds. nil when none is.
   #
+  # below_catalog_floor is set while this binary's version is below the
+  # instance's catalog floor, the oldest Trellis version that can read its
+  # catalog (a BelowCatalogFloor): this process stands by (it stages, drains
+  # and builds nothing, and checks again every standby poll) and its
+  # state-changing calls raise VersionFloorError. Run a version at or above
+  # the floor. nil when this binary meets it.
+  #
   # join is set for a JOIN definition, aggregate or 1-1, and nil for any
   # other (a JoinStatus). It never holds anything up: it changes nothing
   # about the definition's status. It reports the estimated size of the
@@ -117,7 +124,8 @@ module Trellis
   Status = Data.define(:status, :backfill_failure, :capture_wait, :capture_failure,
                        :held_keys, :drain_failure, :source_index_gaps,
                        :correcting, :paused_upstream_columns,
-                       :build_wait_xid, :version_handover, :join) do
+                       :build_wait_xid, :version_handover, :below_catalog_floor,
+                       :join) do
     def self.from_native(hash)
       failure = hash[:backfill_failure]
       wait = hash[:capture_wait]
@@ -125,6 +133,7 @@ module Trellis
       held_keys = hash[:held_keys]
       drain_failure = hash[:drain_failure]
       version_handover = hash[:version_handover]
+      below_catalog_floor = hash[:below_catalog_floor]
       join = hash[:join]
       new(status: hash[:status],
           backfill_failure: failure && BackfillFailure.from_native(failure),
@@ -137,6 +146,7 @@ module Trellis
           paused_upstream_columns: hash.fetch(:paused_upstream_columns),
           build_wait_xid: hash.fetch(:build_wait_xid),
           version_handover: version_handover && VersionHandover.from_native(version_handover),
+          below_catalog_floor: below_catalog_floor && BelowCatalogFloor.new(**below_catalog_floor),
           join: join && JoinStatus.from_native(join))
     end
   end
@@ -229,6 +239,11 @@ module Trellis
   # worker id (worker_id, trellis-<host>-<pid>-<random>) and its binary's
   # version (version, nil for a release before 0.2.0, which records none).
   OtherProcess = Data.define(:worker_id, :version)
+
+  # This binary's version is below the instance's catalog floor, so this
+  # process changes nothing, as Trellis.status reports it: the floor the
+  # catalog records (floor) and this binary's version (this_version).
+  BelowCatalogFloor = Data.define(:floor, :this_version)
 
   # A node of a partitioned source a definition is being corrected for, as
   # Trellis.status reports it: the schema-qualified node (node), when the

@@ -615,6 +615,19 @@ A process killed without a clean shutdown keeps counting until its registry row
 ages out, up to the reclaim TTL of 30 seconds. The Elixir and Ruby bindings
 report it as `version_handover`.
 
+### Below the catalog floor
+
+While this binary's version is below the instance's catalog floor, the oldest
+Trellis version that can read its catalog (a later release migrated it),
+`status().below_catalog_floor` is set: it names the floor and this binary's
+version. Meanwhile this binary's background processes stage, drain and build
+nothing and register nowhere, `migrate` and its state-changing calls refuse
+with the `version_floor` error code, and each background process logs a
+warning once when it starts standing by and an info line when it takes over
+([the catalog floor](upgrading.md#the-catalog-floor)). It checks again every
+standby poll (5 seconds). The Elixir and Ruby bindings report it as
+`below_catalog_floor`.
+
 ### A build that keeps failing
 
 A plain 1-1 transform's build runs as
