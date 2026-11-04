@@ -94,7 +94,9 @@ async fn status(raw: &Client, target: &str) -> TransformStatus {
         .await
         .expect("read status")
         .get(0);
-    trellis::defs::StoredStatus::from_row(&text).into()
+    trellis::defs::StoredStatus::from_persisted(&text)
+        .expect("a stored status")
+        .into()
 }
 
 async fn counts(raw: &Client, sql: &str) -> Vec<(i32, i64)> {

@@ -212,7 +212,9 @@ async fn status_of(client: &Client, target_table: &str) -> TransformStatus {
         .await
         .expect("query status")
         .get(0);
-    trellis::defs::StoredStatus::from_row(&text).into()
+    trellis::defs::StoredStatus::from_persisted(&text)
+        .expect("a stored status")
+        .into()
 }
 
 /// One seal/drain/retire round, with no exit condition of its own — the

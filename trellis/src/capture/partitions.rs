@@ -257,6 +257,22 @@ pub enum Cause {
 }
 
 impl Cause {
+    /// Every `partition_corrections.cause` a release writes: each cause's
+    /// word, and a complement correction's, whose cause is its kind
+    /// (`capture::complement`). Migration V14's check admits exactly these;
+    /// a new one needs a migration that relaxes it, which raises the
+    /// catalog floor (ADR-0024 rule 6).
+    #[cfg(test)]
+    pub(crate) const STORED: [&'static str; 7] = [
+        "created",
+        "reattached",
+        "default_siblings",
+        "renamed",
+        "gone",
+        "truncated",
+        "complement",
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Cause::Created => "created",
@@ -1343,6 +1359,27 @@ pub async fn recorded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every word a release writes to `partition_corrections.cause` is one
+    /// V14's check admits (ADR-0024 rule 6).
+    #[test]
+    fn every_cause_written_is_one_the_check_admits() {
+        for cause in [
+            Cause::Created,
+            Cause::Reattached,
+            Cause::DefaultSiblings,
+            Cause::Renamed,
+            Cause::Gone,
+            Cause::Truncated,
+        ] {
+            assert!(Cause::STORED.contains(&cause.as_str()), "{cause:?}");
+        }
+        assert!(Cause::STORED.contains(&Kind::Complement.as_str()));
+        let check = include_str!("../../migrations/V14__partition_correction_cause_check.sql");
+        for word in Cause::STORED {
+            assert!(check.contains(&format!("'{word}'")), "{word}");
+        }
+    }
 
     fn node(oid: u32, parent: Option<u32>, bound: &str, xmin: &str) -> Node {
         Node {

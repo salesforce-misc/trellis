@@ -418,8 +418,8 @@ pub(crate) async fn pause_for_grammar_version(
     pause_with_record(txn, id, source_table, &[], error, "capture", None).await
 }
 
-/// Pauses definition `id`, which this binary can't run (ADR-0024 rule 3),
-/// recording `reason` (an [`super::floor::Unrunnable::reason`]) as its
+/// Pauses definition `id`, which this binary can't run (ADR-0024 rules 3
+/// and 6), recording `reason` (an [`super::floor::Unrunnable::reason`]) as its
 /// `capture_failure`, kind `capture`: only an operator's `RESUME` under a
 /// release that runs it resumes it. A definition already paused keeps its
 /// reasons after this one ([`super::floor::unrunnable_error`]), and loses any
@@ -472,13 +472,19 @@ pub(crate) async fn pause_for_unrunnable(
         .await?;
     }
     changed |= error.is_some();
+    // A status a newer release wrote is paused over too (ADR-0024 rule 6):
+    // nothing in this release can read it, and the record's reason says
+    // which it was.
+    let known: Vec<&str> = StoredStatus::ALL.iter().map(|s| s.as_str()).collect();
     changed |= txn
         .execute(
-            "update transform_definitions set status = $2 where id = $1 and status = any($3)",
+            "update transform_definitions set status = $2 \
+             where id = $1 and (status = any($3) or status <> all($4))",
             &[
                 &id,
                 &StoredStatus::Paused.as_str(),
                 &StoredStatus::dispatchable(),
+                &known,
             ],
         )
         .await?
@@ -938,16 +944,17 @@ async fn locked_definition(
             &[&target],
         )
         .await?;
-    Ok(row.map(|row| {
+    row.map(|row| {
         let status_text: String = row.get(1);
-        let status = StoredStatus::from_row(&status_text);
-        LockedDefinition {
+        let status = StoredStatus::from_row(&status_text)?;
+        Ok(LockedDefinition {
             id: row.get(0),
             status,
             target_table: row.get(2),
             floor: row.get(3),
-        }
-    }))
+        })
+    })
+    .transpose()
 }
 
 async fn node_id_for(txn: &Transaction<'_>, qualified: &str) -> Result<Option<i64>, CatalogError> {

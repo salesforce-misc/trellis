@@ -352,7 +352,7 @@ class ValuesTest < Minitest::Test
     assert_equal %i[converged not_caught_up not_live diverged], Trellis::Native.self_check_outcomes
     assert_equal %i[cell missing_row extra_row missing_column extra_column capture],
                  Trellis::Native.divergence_kinds
-    assert_equal %i[capture halt disruption], Trellis::Native.capture_failure_kinds
+    assert_equal %i[capture halt disruption unknown], Trellis::Native.capture_failure_kinds
     assert_equal %i[group_by join_from join_joined], Trellis::Native.index_roles
     assert_equal %i[whole side final joined_rows joined_null_keys joined_gone planning_chunks
                     chunks sweep_stale sweep_orphans unknown],

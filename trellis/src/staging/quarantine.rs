@@ -3523,7 +3523,7 @@ pub(crate) async fn resume_pairs(
             continue;
         };
         let status_text: String = row.get(0);
-        let status = StoredStatus::from_row(&status_text);
+        let status = StoredStatus::from_row(&status_text)?;
         let build: Option<String> = row.get(1);
         // A definition that has not started building has built nothing the
         // column's pause held out: every build of it, the Re-derive build
@@ -3996,7 +3996,7 @@ async fn lock_frozen(
         return Ok(None);
     }
     let status_text: String = row.get(2);
-    let status = StoredStatus::from_row(&status_text);
+    let status = StoredStatus::from_row(&status_text)?;
     Ok(Some((row.get(0), status)))
 }
 

@@ -315,7 +315,8 @@ module Trellis
   end
 
   # Why capture of source_table is broken, or why the drain (or a build's
-  # merge) halted on the definition: kind is :capture or :halt, error is a
+  # merge) halted on the definition: kind is :capture, :halt, :disruption, or
+  # :unknown for a kind a newer Trellis release stored, error is a
   # sentence naming the cause, columns the columns it is about (empty when it
   # isn't about a column, and for a halt), and detected_at (a Time) when it
   # was first found.

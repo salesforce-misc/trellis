@@ -335,7 +335,8 @@ pub struct PlainCaptureWait {
 /// A [`CaptureFailure`] flattened to plain data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlainCaptureFailure {
-    /// `capture` or `halt`, as [`CaptureFailureKind::as_str`] spells it.
+    /// `capture`, `halt`, `disruption` or `unknown`, as
+    /// [`CaptureFailureKind::as_str`] spells it.
     pub kind: &'static str,
     /// The fully-qualified `schema.table` whose capture is broken.
     pub source_table: String,
@@ -681,7 +682,7 @@ mod tests {
     #[test]
     fn every_capture_failure_kind_word_is_in_the_load_time_set_once() {
         let names = capture_failure_kind_names();
-        assert_eq!(names, vec!["capture", "halt", "disruption"]);
+        assert_eq!(names, vec!["capture", "halt", "disruption", "unknown"]);
         for kind in CaptureFailureKind::ALL {
             assert!(names.contains(&kind.as_str()));
         }

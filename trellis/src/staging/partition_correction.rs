@@ -453,26 +453,39 @@ enum Phase {
 }
 
 impl Phase {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Phase::Fence => "fence",
             Phase::Done => "done",
         }
     }
 
-    fn parse(text: &str) -> Phase {
-        match text {
-            "fence" => Phase::Fence,
-            _ => Phase::Done,
-        }
+    /// The phase `text` stores, or `None` for one a newer release wrote
+    /// (V4's check already admits `ledger` and `node`, which no release
+    /// writes yet). Never read as `done`: a correction a newer release is
+    /// still walking would count as re-derived, and its groups would keep
+    /// the wrong aggregates.
+    fn parse(text: &str) -> Option<Phase> {
+        PHASES
+            .iter()
+            .position(|&word| word == text)
+            .map(|i| [Phase::Fence, Phase::Done][i])
     }
 }
+
+/// Every `partition_correction_progress.phase` this release writes and
+/// reads. Another was written by a newer release, and its definition pauses
+/// (`defs::floor::unknown_value_sql`); writing a new one raises the
+/// definition floor of the definitions it is written for (ADR-0024 rule 6).
+pub(crate) const PHASES: [&str; 2] = [Phase::Fence.as_str(), Phase::Done.as_str()];
 
 /// One definition's progress on one correction
 /// (`partition_correction_progress`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Progress {
-    phase: &'static str,
+    /// The stored phase, as stored: a newer release's phase is kept as it
+    /// is, never read as one this release knows.
+    phase: String,
     /// The column's cursor; a correction commits in one transaction, so it
     /// is always `None`.
     pub cursor: Option<String>,
@@ -484,9 +497,21 @@ pub struct Progress {
 }
 
 impl Progress {
-    /// The phase: `fence` or `done`.
+    /// The phase: `fence` or `done`, or one a newer release wrote.
+    #[cfg_attr(
+        not(any(test, feature = "internals")),
+        allow(dead_code, reason = "read by tests and embedders through `internals`")
+    )]
     pub fn phase(&self) -> &str {
-        self.phase
+        &self.phase
+    }
+
+    /// Whether the definition has re-derived the correction. A phase a newer
+    /// release wrote is not done: its definition pauses
+    /// (`defs::floor::unknown_value_sql`) and keeps the correction until it
+    /// is resumed.
+    pub(crate) fn is_done(&self) -> bool {
+        Phase::parse(&self.phase) == Some(Phase::Done)
     }
 
     /// Keys still to re-derive by the estimate.
@@ -575,7 +600,7 @@ pub async fn progress(
         )
         .await?
         .map(|row| Progress {
-            phase: Phase::parse(row.get(0)).as_str(),
+            phase: row.get(0),
             cursor: row.get(1),
             keys_done: row.get(2),
             keys_total: row.get(3),
@@ -659,7 +684,7 @@ async fn done(
     let client = pool.get().await?;
     Ok(progress(&**client, correction_id, definition_id)
         .await?
-        .is_some_and(|p| p.phase() == Phase::Done.as_str()))
+        .is_some_and(|p| p.is_done()))
 }
 
 /// Enqueues correction `correction_id`'s row for `definition_id` unless the
@@ -1265,6 +1290,29 @@ fn reads_node(correction: &PendingCorrection, route: &Route) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0024 rule 6: a phase a newer release wrote (`ledger` and `node`
+    /// are already admitted by the check) is not read as `done`, which would
+    /// take the correction as re-derived and keep the wrong aggregates.
+    #[test]
+    fn a_phase_a_newer_release_wrote_is_never_done() {
+        let progress = |phase: &str| Progress {
+            phase: phase.to_string(),
+            cursor: None,
+            keys_done: 0,
+            keys_total: None,
+        };
+        for word in PHASES {
+            assert_eq!(Phase::parse(word).map(Phase::as_str), Some(word));
+        }
+        assert!(progress("done").is_done());
+        assert!(!progress("fence").is_done());
+        for newer in ["ledger", "node", "merging"] {
+            assert_eq!(Phase::parse(newer), None, "{newer}");
+            assert!(!progress(newer).is_done(), "{newer}");
+            assert_eq!(progress(newer).phase(), newer);
+        }
+    }
 
     fn column(name: &str, ty: &str, collation: &str) -> RouteColumn {
         RouteColumn {

@@ -109,7 +109,9 @@ async fn statuses(raw: &Client) -> BTreeMap<String, TransformStatus> {
     .map(|row| {
         (
             row.get(0),
-            trellis::defs::StoredStatus::from_row(row.get(1)).into(),
+            trellis::defs::StoredStatus::from_persisted(row.get(1))
+                .expect("a stored status")
+                .into(),
         )
     })
     .collect()

@@ -417,8 +417,14 @@ pause are arcs of one lifecycle:
     floor, the oldest Trellis release that can run it, is `<floor>`, and this
     binary runs release `<running>`; roll forward to `<floor>` or later, then
     RESUME it or DROP it there" (for a newer grammar, "it was written under
-    grammar version `<n>`…"), kind `capture`, with any reason it was already
-    paused for after it. `RESUME`, `ALTER TRANSFORM` and `self_check` of it
+    grammar version `<n>`…"; for a value a newer release stored for it that
+    this release doesn't know, such as its status, its build, a build chunk's
+    kind or a partition correction's phase, "its `<table>.<column>`
+    '`<value>`' was written by a newer Trellis release…"), kind `capture`,
+    with any reason it was already paused for after it. Until it is paused,
+    `status()` of a definition whose status this release doesn't know refuses
+    with `version_floor`, and a `capture_failure` whose kind it doesn't know
+    reports kind `unknown`. `RESUME`, `ALTER TRANSFORM` and `self_check` of it
     refuse with the `version_floor` code until a release that runs it does
     them, and so does `DROP TRANSFORM` of one above its floor
     ([before rolling back](upgrading.md#before-rolling-back));

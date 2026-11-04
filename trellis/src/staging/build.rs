@@ -249,7 +249,11 @@ pub const PLAN_BATCH: usize = 100;
 /// their text (`one_to_one_ledger::lock_entries`).
 pub const CHUNK_APPLICATION_NAME: &str = "trellis build chunk";
 
-/// The `transform_definitions.build` word of a running Re-derive build.
+/// The `transform_definitions.build` word of a running Re-derive build,
+/// the only one this release writes or reads. Another word was written by a
+/// newer release, and its definition pauses
+/// (`defs::floor::unknown_value_sql`); writing a new one raises the
+/// definition floor of the definitions it is written for (ADR-0024 rule 6).
 pub(crate) const BUILD_REDERIVE: &str = "rederive";
 
 /// Whether the partition correction engine

@@ -945,7 +945,7 @@ impl Trellis {
             let mut correcting = Vec::new();
             if let Some(row) = &row {
                 let status_text: String = row.get(0);
-                let stored = StoredStatus::from_row(&status_text);
+                let stored = StoredStatus::from_row(&status_text)?;
                 let (reported, causes) =
                     reported_status_with_causes(&*txn, self.pool.floors(), row.get(1), stored)
                         .await?;
@@ -1350,7 +1350,7 @@ impl Trellis {
                         .await?
                         .ok_or_else(|| TrellisError::TransformNotFound(t.clone()))?;
                     let status_text: String = row.get(0);
-                    let stored = StoredStatus::from_row(&status_text);
+                    let stored = StoredStatus::from_row(&status_text)?;
                     // The status `Trellis::status` reports.
                     let status =
                         reported_status(&**client, self.pool.floors(), row.get(1), stored).await?;
@@ -2328,35 +2328,50 @@ pub enum CaptureFailureKind {
     /// load selects on this kind. A definition that was already frozen when
     /// the disruption was seen gets [`CaptureFailureKind::Capture`] instead.
     Disruption,
+    /// A kind a newer Trellis release wrote, which this release doesn't know
+    /// (ADR-0024 rule 6). The definition stays paused: this release pauses
+    /// it as one it can't run, which keeps this record's reason after its
+    /// own, and refuses to resume it until that newer release runs again.
+    Unknown,
 }
 
 impl CaptureFailureKind {
     /// Every kind, in declaration order.
-    pub const ALL: [CaptureFailureKind; 3] = [
+    pub const ALL: [CaptureFailureKind; 4] = [
+        CaptureFailureKind::Capture,
+        CaptureFailureKind::Halt,
+        CaptureFailureKind::Disruption,
+        CaptureFailureKind::Unknown,
+    ];
+
+    /// Every kind this release stores. A stored kind not listed was written
+    /// by a newer release (`defs::floor::unknown_value_sql`); storing a new
+    /// kind raises the definition floor of the definitions it is stored for.
+    pub(crate) const STORED: [CaptureFailureKind; 3] = [
         CaptureFailureKind::Capture,
         CaptureFailureKind::Halt,
         CaptureFailureKind::Disruption,
     ];
 
     /// The word `capture_failures.kind` stores: `capture`, `halt` or
-    /// `disruption`.
+    /// `disruption`; `unknown` for one a newer release wrote, which is
+    /// never stored.
     pub fn as_str(self) -> &'static str {
         match self {
             CaptureFailureKind::Capture => "capture",
             CaptureFailureKind::Halt => "halt",
             CaptureFailureKind::Disruption => "disruption",
+            CaptureFailureKind::Unknown => "unknown",
         }
     }
 
-    /// The kind `capture_failures.kind` stores. Its check constraint admits
-    /// only these.
+    /// The kind `capture_failures.kind` stores, or
+    /// [`CaptureFailureKind::Unknown`] for a word a newer release wrote.
     fn from_persisted(kind: &str) -> Self {
-        match kind {
-            "halt" => CaptureFailureKind::Halt,
-            "capture" => CaptureFailureKind::Capture,
-            "disruption" => CaptureFailureKind::Disruption,
-            other => panic!("capture_failures.kind held unrecognized value '{other}'"),
-        }
+        Self::STORED
+            .into_iter()
+            .find(|stored| stored.as_str() == kind)
+            .unwrap_or(CaptureFailureKind::Unknown)
     }
 }
 
@@ -3000,6 +3015,29 @@ impl From<StagingError> for TrellisError {
 impl From<SelfCheckError> for TrellisError {
     fn from(err: SelfCheckError) -> Self {
         TrellisError::SelfCheck(err)
+    }
+}
+
+#[cfg(test)]
+mod capture_failure_kind_tests {
+    use super::*;
+
+    /// ADR-0024 rule 6: a `capture_failures.kind` a newer release wrote is
+    /// reported as `unknown`, never read as a kind this release knows and
+    /// never a panic in `status()`.
+    #[test]
+    fn a_kind_a_newer_release_wrote_reads_as_unknown() {
+        for kind in CaptureFailureKind::STORED {
+            assert_eq!(CaptureFailureKind::from_persisted(kind.as_str()), kind);
+        }
+        assert_eq!(
+            CaptureFailureKind::from_persisted("relabel"),
+            CaptureFailureKind::Unknown
+        );
+        // `unknown` is reported, never stored: a stored `unknown` is a newer
+        // release's word too.
+        assert!(!CaptureFailureKind::STORED.contains(&CaptureFailureKind::Unknown));
+        assert!(CaptureFailureKind::ALL.contains(&CaptureFailureKind::Unknown));
     }
 }
 

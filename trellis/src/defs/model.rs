@@ -249,11 +249,24 @@ impl StoredStatus {
     }
 
     /// [`Self::from_persisted`] for a value read from
-    /// `transform_definitions.status`, where anything unrecognized (a stored
-    /// `catching_up` included) is an internal error.
-    pub fn from_row(text: &str) -> Self {
-        Self::from_persisted(text).unwrap_or_else(|| {
-            panic!("transform_definitions.status held unrecognized value '{text}'")
+    /// `transform_definitions.status`. Anything else (a stored `catching_up`
+    /// included) was written by a newer release (ADR-0024 rule 6): it is
+    /// refused with [`super::catalog::CatalogError::CannotRun`], never read as
+    /// a status this release knows and never a panic. Attaching pauses such a
+    /// definition (`super::floor::unknown_value_sql`), which stores `paused`
+    /// over it, so only a handle that hasn't changed anything since a newer
+    /// release ran meets one.
+    ///
+    /// Writing a new status raises the definition floor of the definitions
+    /// it is written for.
+    pub fn from_row(text: &str) -> Result<Self, super::catalog::CatalogError> {
+        Self::from_persisted(text).ok_or_else(|| super::catalog::CatalogError::CannotRun {
+            action: "run a transform".to_string(),
+            reason: format!(
+                "its transform_definitions.status '{text}' was written by a newer Trellis \
+                 release, and this release doesn't know it; roll forward to the release that \
+                 wrote it"
+            ),
         })
     }
 
@@ -447,10 +460,23 @@ mod tests {
         }
     }
 
+    /// ADR-0024 rule 6: a status this release doesn't know (a reported
+    /// `catching_up`, or a newer release's word) is refused with
+    /// `version_floor`, never read as a known status and never a panic.
     #[test]
-    #[should_panic(expected = "unrecognized value 'catching_up'")]
-    fn a_stored_catching_up_row_is_an_internal_error() {
-        StoredStatus::from_row("catching_up");
+    fn a_status_a_newer_release_wrote_is_refused() {
+        for status in StoredStatus::ALL {
+            assert_eq!(StoredStatus::from_row(status.as_str()).ok(), Some(status));
+        }
+        for newer in ["catching_up", "merging"] {
+            let err = StoredStatus::from_row(newer).expect_err(newer);
+            assert_eq!(err.code(), crate::ErrorCode::VersionFloor);
+            assert!(
+                err.to_string()
+                    .contains(&format!("'{newer}' was written by a newer Trellis")),
+                "{err}"
+            );
+        }
     }
 
     /// The chunk queue's allowlist is exactly "not frozen" — asserted against

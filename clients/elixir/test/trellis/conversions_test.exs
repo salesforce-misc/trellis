@@ -53,7 +53,7 @@ defmodule Trellis.ConversionsTest do
     assert Trellis.Native.divergence_kinds() ==
              {:ok, [:cell, :missing_row, :extra_row, :missing_column, :extra_column, :capture]}
 
-    assert Trellis.Native.capture_failure_kinds() == {:ok, [:capture, :halt, :disruption]}
+    assert Trellis.Native.capture_failure_kinds() == {:ok, [:capture, :halt, :disruption, :unknown]}
 
     assert Trellis.Native.index_roles() == {:ok, [:group_by, :join_from, :join_joined]}
 

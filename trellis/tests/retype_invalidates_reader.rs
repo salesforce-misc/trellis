@@ -100,7 +100,9 @@ async fn status(raw: &Client, target: &str) -> TransformStatus {
         .await
         .expect("read status")
         .get(0);
-    trellis::defs::StoredStatus::from_row(&text).into()
+    trellis::defs::StoredStatus::from_persisted(&text)
+        .expect("a stored status")
+        .into()
 }
 
 /// Alternates staging-worker passes and drains until every one of

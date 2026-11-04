@@ -1364,7 +1364,12 @@ async fn status_nodes(client: &impl GenericClient) -> Result<Vec<StatusNode>, Ca
     let mut nodes = Vec::with_capacity(rows.len());
     for row in rows {
         let status_text: String = row.get(3);
-        let status = StoredStatus::from_row(&status_text);
+        // A status a newer release wrote: every dispatch gate is an allowlist
+        // of the statuses this release knows, so it doesn't maintain the
+        // definition, and its readers are derived as a frozen one's. Its own
+        // status is never reported as one (`StoredStatus::from_row`), and
+        // attaching pauses it (`super::floor::unknown_value_sql`).
+        let status = StoredStatus::from_persisted(&status_text).unwrap_or(StoredStatus::Paused);
         let source: String = row.get(2);
         // Only a `live` definition's reported status can differ from its
         // persisted one, so only its reads are needed.
@@ -1550,7 +1555,7 @@ async fn reject_non_live_upstream(
         return Ok(());
     };
     let status_text: String = row.get(1);
-    let status = StoredStatus::from_row(&status_text);
+    let status = StoredStatus::from_row(&status_text)?;
     // A `catching_up` upstream's build has finished: every write to its
     // target goes through the seam now.
     if status.is_applying() {
@@ -1881,7 +1886,7 @@ pub async fn alter_transform(
         });
     };
     let status_text: String = row.get(0);
-    let status = StoredStatus::from_row(&status_text);
+    let status = StoredStatus::from_row(&status_text)?;
     // A field build needs a definition that applies
     // (`staging::build::takes_field_build`): `live`, or
     // already under a Re-derive build, which it joins. An edit that only
@@ -5882,7 +5887,8 @@ struct PendingDefinition {
     text: String,
     grammar_version: i32,
     floor: String,
-    status: StoredStatus,
+    /// `None` for a status a newer release wrote.
+    status: Option<StoredStatus>,
     source_columns: HashMap<String, ValueType>,
     source_table: String,
     target_table: String,
@@ -5974,7 +5980,7 @@ async fn dependents_via(
         let pending = by_id.entry(id).or_insert_with(|| {
             order.push(id);
             let status_text: String = row.get(3);
-            let status = StoredStatus::from_row(&status_text);
+            let status = StoredStatus::from_persisted(&status_text);
             PendingDefinition {
                 source_version: row.get(1),
                 text: row.get(2),
@@ -6001,6 +6007,13 @@ async fn dependents_via(
     let mut result = Vec::with_capacity(order.len());
     for id in order {
         let pending = by_id.remove(&id).expect("id was just pushed to order");
+        // A status a newer release wrote: this release doesn't maintain the
+        // definition, and attaching pauses it
+        // (`super::floor::unknown_value_sql`). Skipped, as one it can't run
+        // is below.
+        let Some(status) = pending.status else {
+            continue;
+        };
         // A definition this release can't run is paused, so the applying
         // filter has already left it out once attaching paused it; skipped
         // here too, unparsed, for a read before that.
@@ -6018,7 +6031,7 @@ async fn dependents_via(
             source_version: pending.source_version,
             def,
             source_columns: pending.source_columns,
-            status: pending.status,
+            status,
             source_table: pending.source_table,
             target_table: pending.target_table,
         });
@@ -6257,7 +6270,7 @@ pub(crate) async fn definition_by_id_in(
     let status_text: String = rows[0].get(2);
     let source_table: String = rows[0].get(3);
     let target_table: String = rows[0].get(4);
-    let status = StoredStatus::from_row(&status_text);
+    let status = StoredStatus::from_row(&status_text)?;
     let Some(def) = grammar::load_stored(floors, &text, rows[0].get(7), rows[0].get(8))? else {
         return Ok(None);
     };
@@ -6290,8 +6303,11 @@ pub(crate) async fn definition_by_id_in(
 
 /// Refuses a statement that would act on the transform `name` names (either
 /// spelling, [`target_match_sql`]) when this release can't run it (ADR-0024
-/// rule 3): [`CatalogError::CannotRun`], with `verb` and the transform's name
-/// as what it would have done, and the reason its pause records. `Ok` when
+/// rule 3), its floor or grammar newer than this release's or an enum-like
+/// value stored for it one a newer release wrote (rule 6,
+/// [`super::floor::unknown_value_sql`]): [`CatalogError::CannotRun`], with
+/// `verb` and the transform's name as what it would have done, and the
+/// reason its pause records. `Ok` when
 /// it can, or when no transform has that name. Read before the statement's
 /// own lookups, which would skip such a definition as if it weren't there.
 pub(crate) async fn refuse_unrunnable(
@@ -6303,9 +6319,10 @@ pub(crate) async fn refuse_unrunnable(
     let Some(row) = client
         .query_opt(
             &format!(
-                "select target_table, grammar_version, floor_version \
-                 from transform_definitions where {}",
-                target_match_sql("target_table", 1)
+                "select d.target_table, d.grammar_version, d.floor_version, {} \
+                 from transform_definitions d where {}",
+                super::floor::unknown_value_sql("d"),
+                target_match_sql("d.target_table", 1)
             ),
             &[&name],
         )
@@ -6314,7 +6331,11 @@ pub(crate) async fn refuse_unrunnable(
         return Ok(());
     };
     let target: String = row.get(0);
-    match floors.unrunnable(row.get(2), row.get(1)) {
+    let unrunnable = floors.unrunnable(row.get(2), row.get(1)).or_else(|| {
+        row.get::<_, Option<String>>(3)
+            .map(|value| super::floor::Unrunnable::UnknownValue { value })
+    });
+    match unrunnable {
         Some(unrunnable) => Err(CatalogError::CannotRun {
             action: format!("{verb} '{name}'"),
             reason: unrunnable.reason(&target),
@@ -6402,7 +6423,7 @@ pub async fn definition_by_target(
     let status_text: String = rows[0].get(3);
     let source_table: String = rows[0].get(4);
     let qualified_target_table: String = rows[0].get(5);
-    let status = StoredStatus::from_row(&status_text);
+    let status = StoredStatus::from_row(&status_text)?;
     let Some(def) = grammar::load_stored(pool.floors(), &text, rows[0].get(8), rows[0].get(9))?
     else {
         return Ok(None);

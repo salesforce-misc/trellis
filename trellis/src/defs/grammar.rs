@@ -176,8 +176,10 @@ pub(crate) struct UnrunnableDefinition {
 }
 
 /// Each stored definition this binary can't run: its floor is above the
-/// running release, or its grammar is newer than `current`. Reads only the
-/// stored columns, never the text.
+/// running release, its grammar is newer than `current`, or an enum-like
+/// value stored for it is one a newer release wrote
+/// ([`super::floor::unknown_value_sql`]). Reads only the stored columns,
+/// never the text.
 pub(crate) async fn unrunnable_definitions(
     client: &impl tokio_postgres::GenericClient,
     floors: &Floors,
@@ -185,14 +187,23 @@ pub(crate) async fn unrunnable_definitions(
 ) -> Result<Vec<UnrunnableDefinition>, tokio_postgres::Error> {
     Ok(client
         .query(
-            "select id, source_table, target_table, grammar_version, floor_version \
-             from transform_definitions order by id",
+            &format!(
+                "select d.id, d.source_table, d.target_table, d.grammar_version, \
+                        d.floor_version, {} \
+                 from transform_definitions d order by d.id",
+                super::floor::unknown_value_sql("d")
+            ),
             &[],
         )
         .await?
         .iter()
         .filter_map(|row| {
-            let unrunnable = floors.unrunnable_in(row.get(4), row.get(3), current)?;
+            let unrunnable = floors
+                .unrunnable_in(row.get(4), row.get(3), current)
+                .or_else(|| {
+                    row.get::<_, Option<String>>(5)
+                        .map(|value| super::floor::Unrunnable::UnknownValue { value })
+                })?;
             let target: String = row.get(2);
             Some(UnrunnableDefinition {
                 id: row.get(0),

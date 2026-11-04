@@ -568,15 +568,16 @@ end
 defmodule Trellis.CaptureFailure do
   @moduledoc """
   Why capture of `source_table` is broken, or why the drain (or a build's
-  merge) halted on the transform: `kind` is `:capture`, `:halt` or
-  `:disruption`, `error`
+  merge) halted on the transform: `kind` is `:capture`, `:halt`,
+  `:disruption`, or `:unknown` for a kind a newer Trellis release stored,
+  which this release doesn't know, `error`
   is a sentence naming the cause, `columns` the columns it is about (empty
   when it isn't about a column, and for a halt), and `detected_at` when it
   was first found.
   """
 
-  @typedoc "Whether capture broke, the drain halted, or capture was changed outside Trellis."
-  @type kind :: :capture | :halt | :disruption
+  @typedoc "Whether capture broke, the drain halted, capture was changed outside Trellis, or a newer release stored a kind this one doesn't know."
+  @type kind :: :capture | :halt | :disruption | :unknown
 
   @type t :: %__MODULE__{
           kind: kind(),

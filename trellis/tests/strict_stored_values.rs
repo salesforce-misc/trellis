@@ -1,0 +1,237 @@
+//! Strict reads of enum-like stored values (ADR-0024 rule 6): a value a
+//! newer Trellis release wrote, which this release doesn't know, pauses the
+//! definition it belongs to with a reason naming it, never reads as a value
+//! this release knows and never panics. Every other definition keeps
+//! running.
+//!
+//! A test stands in for the newer release: it relaxes the check constraints
+//! as that release's migration would, and writes the values it would write.
+
+use testkit::TestCluster;
+use tokio_postgres::Client;
+use trellis::{CaptureFailureKind, Config, ErrorCode, TransformStatus, Trellis, TrellisOptions};
+
+async fn raw(db: &testkit::TestDatabase) -> Client {
+    let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(&format!(
+            "set search_path to {}, public",
+            trellis::config::DEFAULT_SCHEMA
+        ))
+        .await
+        .expect("search_path");
+    client
+}
+
+async fn handle(db: &testkit::TestDatabase) -> Trellis {
+    Trellis::connect(
+        Config::from_dsn(db.dsn().to_string()).expect("config"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect")
+}
+
+/// The definitions the newer release wrote a value for, the column it
+/// wrote, and the SQL that writes it.
+const NEWER: [(&str, &str, &str); 5] = [
+    (
+        "t_status",
+        "transform_definitions.status 'merging'",
+        "update transform_definitions set status = 'merging' where id = $1",
+    ),
+    (
+        "t_build",
+        "transform_definitions.build 'merging'",
+        "update transform_definitions set build = 'merging' where id = $1",
+    ),
+    (
+        "t_chunk",
+        "backfill_chunks.kind 'merging'",
+        "insert into backfill_chunks (definition_id, kind) values ($1, 'merging')",
+    ),
+    (
+        "t_phase",
+        "partition_correction_progress.phase 'ledger'",
+        "insert into partition_correction_progress (correction_id, definition_id, phase) \
+         values ((select max(id) from partition_corrections), $1, 'ledger')",
+    ),
+    (
+        "t_kind",
+        "capture_failures.kind 'relabel'",
+        "with paused as (update transform_definitions set status = 'paused' where id = $1) \
+         insert into capture_failures (transform_id, source_table, columns, error, kind) \
+         values ($1, 'public.s', '{}', 'relabelled by the newer release', 'relabel')",
+    ),
+];
+
+/// Each value a newer release wrote pauses its own definition at attach,
+/// naming the value; `status()` reports it (a status it can't read is
+/// refused, a capture failure kind it can't read is `unknown`) and never
+/// panics; `RESUME` refuses with `version_floor` while the value is stored;
+/// and the definition beside them keeps running.
+#[tokio::test]
+async fn a_value_a_newer_release_wrote_pauses_its_definition_and_the_rest_keep_running() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    raw.batch_execute(
+        "create table public.s (id integer primary key, a integer); \
+         insert into public.s values (1, 1), (2, 2)",
+    )
+    .await
+    .expect("source");
+    let trellis = handle(&db).await;
+    let targets: Vec<&str> = NEWER
+        .iter()
+        .map(|&(target, ..)| target)
+        .chain(["ok"])
+        .collect();
+    for target in &targets {
+        let text = format!("TRANSFORM {target} FROM s SELECT a AS a");
+        trellis.apply(&text).await.expect(&text);
+    }
+    trellis::intake::harness::start_registered_builds(trellis.pool())
+        .await
+        .expect("dispatch the builds");
+    trellis::staging::build::settle_builds(trellis.pool()).await;
+
+    // The newer release's migration relaxes the checks, and it writes the
+    // values.
+    raw.batch_execute(
+        "alter table transform_definitions drop constraint transform_definitions_status_check; \
+         alter table transform_definitions drop constraint transform_definitions_build_check; \
+         alter table backfill_chunks drop constraint backfill_chunks_kind_check; \
+         alter table capture_failures drop constraint capture_failures_kind_check; \
+         insert into partition_corrections (table_name, kind, node_oid, node_name, cause) \
+         values ('public.s', 'new_leaf', 1, 'public.s_1', 'created')",
+    )
+    .await
+    .expect("relax the checks");
+    for &(target, _, write) in &NEWER {
+        let id: i64 = raw
+            .query_one(
+                "select id from transform_definitions \
+                 where split_part(target_table, '.', 2) = $1",
+                &[&target],
+            )
+            .await
+            .expect("id")
+            .get(0);
+        raw.execute(write, &[&id]).await.expect(write);
+    }
+
+    // Before anything pauses them, a read neither panics nor reads the
+    // value as one this release knows.
+    let err = trellis
+        .status("t_status")
+        .await
+        .expect_err("a status this release can't read");
+    assert_eq!(err.code(), ErrorCode::VersionFloor, "{err}");
+    assert!(
+        err.to_string()
+            .contains("transform_definitions.status 'merging' was written by a newer Trellis"),
+        "{err}"
+    );
+    let kind = trellis
+        .status("t_kind")
+        .await
+        .expect("status")
+        .expect("defined")
+        .capture_failure
+        .expect("its failure")
+        .kind;
+    assert_eq!(kind, CaptureFailureKind::Unknown);
+
+    // Attaching pauses each, naming the value, and nothing else.
+    trellis::migrate::migrate_with_pool(&db.pool, &Config::from_dsn(db.dsn().to_string()).unwrap())
+        .await
+        .expect("a value a newer release wrote pauses; it doesn't refuse the attach");
+    for &(target, value, _) in &NEWER {
+        let status = trellis
+            .status(target)
+            .await
+            .expect("status")
+            .expect("defined");
+        assert_eq!(status.status, TransformStatus::Paused, "{target}");
+        let failure = status.capture_failure.expect("a reason");
+        assert_eq!(failure.kind, CaptureFailureKind::Capture, "{target}");
+        assert!(
+            failure.error.starts_with(&format!(
+                "this release can't run transform public.{target}: its {value} was written by \
+                 a newer Trellis release"
+            )),
+            "{target}: {}",
+            failure.error
+        );
+    }
+    let kept = trellis
+        .status("t_kind")
+        .await
+        .expect("status")
+        .expect("defined")
+        .capture_failure
+        .expect("a reason")
+        .error;
+    assert!(
+        kept.ends_with("It was already paused: relabelled by the newer release"),
+        "{kept}"
+    );
+    assert_eq!(
+        trellis
+            .status("ok")
+            .await
+            .expect("status")
+            .expect("defined")
+            .status,
+        TransformStatus::Live
+    );
+
+    // RESUME refuses while the value is stored. The pause itself stored
+    // `paused` over a status, and `capture` over a kind, so those two have
+    // nothing left to refuse on.
+    for target in ["t_build", "t_chunk", "t_phase"] {
+        let err = trellis
+            .apply(&format!("RESUME TRANSFORM {target}"))
+            .await
+            .expect_err(target);
+        assert_eq!(err.code(), ErrorCode::VersionFloor, "{target}: {err}");
+        assert!(
+            err.to_string().contains("was written by a newer Trellis"),
+            "{err}"
+        );
+    }
+
+    // A second attach finds them recorded and changes nothing.
+    let before: Vec<String> = raw
+        .query(
+            "select transform_id || ' ' || error || ' ' || detected_at::text \
+             from capture_failures order by transform_id",
+            &[],
+        )
+        .await
+        .expect("failures")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    trellis::migrate::migrate_with_pool(&db.pool, &Config::from_dsn(db.dsn().to_string()).unwrap())
+        .await
+        .expect("attach again");
+    let after: Vec<String> = raw
+        .query(
+            "select transform_id || ' ' || error || ' ' || detected_at::text \
+             from capture_failures order by transform_id",
+            &[],
+        )
+        .await
+        .expect("failures")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(before, after);
+}

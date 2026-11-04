@@ -702,6 +702,11 @@ pub(crate) enum Unrunnable {
     /// Its text was written under a grammar newer than this binary reads
     /// (ADR-0018).
     NewerGrammar { stored: i32, current: i32 },
+    /// A per-definition enum-like value stored for it is one this release
+    /// doesn't know, so a newer release wrote it (ADR-0024 rule 6):
+    /// `value` names the column and the value, as [`unknown_value_sql`]
+    /// describes it.
+    UnknownValue { value: String },
 }
 
 /// How every [`Unrunnable::reason`] starts, so a later attach finds the one
@@ -729,8 +734,59 @@ impl Unrunnable {
                  and this binary reads grammar versions up to {current}; roll forward to a \
                  release that reads it, then RESUME it or DROP it there"
             ),
+            Unrunnable::UnknownValue { value } => format!(
+                "{UNRUNNABLE_PREFIX}{target}: its {value} was written by a newer Trellis \
+                 release, and this release doesn't know it; roll forward to the release that \
+                 wrote it, then RESUME it or DROP it there"
+            ),
         }
     }
+}
+
+/// SQL over a `transform_definitions` row aliased `d`: the first
+/// per-definition enum-like value stored for it that this release doesn't
+/// know, as `<table>.<column> '<value>'`, or `NULL` when it knows them all
+/// (ADR-0024 rule 6). A newer release wrote such a value, so the definition
+/// is paused ([`Unrunnable::UnknownValue`]) rather than read with a default.
+/// Asked with the floor and grammar checks: at attach, at a takeover, before
+/// each state-changing call, and by `RESUME` and `ALTER`, which refuse while
+/// one is stored.
+///
+/// Writing a new value of any of these raises the definition floor of every
+/// definition it is written for:
+///
+/// - `transform_definitions.status` ([`super::model::StoredStatus`]);
+/// - `transform_definitions.build` (`staging::build::BUILD_REDERIVE`);
+/// - `backfill_chunks.kind` (`super::chunk_queue::KIND_*`);
+/// - `partition_correction_progress.phase`
+///   (`staging::partition_correction::PHASES`);
+/// - `capture_failures.kind` ([`crate::CaptureFailureKind`]).
+pub(crate) fn unknown_value_sql(d: &str) -> String {
+    fn words<'a>(words: impl IntoIterator<Item = &'a str>) -> String {
+        let words: Vec<&str> = words.into_iter().collect();
+        format!("'{{{}}}'::text[]", words.join(","))
+    }
+    let status = words(super::model::StoredStatus::ALL.iter().map(|s| s.as_str()));
+    let build = words([crate::staging::build::BUILD_REDERIVE]);
+    let kinds = words(super::chunk_queue::KINDS);
+    let phases = words(crate::staging::partition_correction::PHASES);
+    let capture = words(crate::CaptureFailureKind::STORED.iter().map(|k| k.as_str()));
+    format!(
+        "coalesce( \
+             case when {d}.status <> all({status}) \
+                  then 'transform_definitions.status ' || quote_literal({d}.status) end, \
+             case when {d}.build <> all({build}) \
+                  then 'transform_definitions.build ' || quote_literal({d}.build) end, \
+             (select 'backfill_chunks.kind ' || quote_literal(bc.kind) from backfill_chunks bc \
+              where bc.definition_id = {d}.id and bc.kind <> all({kinds}) \
+              order by bc.id limit 1), \
+             (select 'partition_correction_progress.phase ' || quote_literal(p.phase) \
+              from partition_correction_progress p \
+              where p.definition_id = {d}.id and p.phase <> all({phases}) \
+              order by p.correction_id limit 1), \
+             (select 'capture_failures.kind ' || quote_literal(cf.kind) from capture_failures cf \
+              where cf.transform_id = {d}.id and cf.kind <> all({capture})))"
+    )
 }
 
 /// The `capture_failure` error a definition paused for `reason` (an
@@ -1188,6 +1244,7 @@ mod tests {
             let kind = decided.as_ref().map(|unrunnable| match unrunnable {
                 Unrunnable::AboveFloor { .. } => "floor",
                 Unrunnable::NewerGrammar { .. } => "grammar",
+                Unrunnable::UnknownValue { .. } => "value",
             });
             assert_eq!(
                 kind, expected,

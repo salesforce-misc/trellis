@@ -48,6 +48,26 @@
 //!
 //! and [`crate::catalog_floor::CATALOG_FLOOR`] moves with it.
 //!
+//! # Instance-wide formats
+//!
+//! These instance-wide values and formats are read by every release at or
+//! above the catalog floor, so any change to them raises the floor
+//! (ADR-0024 rules 1 and 6):
+//!
+//! - the ring's `op` (`seg_N_op_check`): an op an older release doesn't know
+//!   would fold as an upsert, or be dropped by the group basis;
+//! - the ring's `transition_images` shape, and the key text encoding of the
+//!   ring's `key` and of every stored key (`defs::ddl::split_pk_key`);
+//! - `segments.state`, `schema_edges.kind`, and `partition_corrections`'
+//!   `kind` and `cause`.
+//!
+//! Each enum-like column of these has a check that admits exactly the words
+//! a release writes, so a new word needs a migration that relaxes it, and
+//! that migration raises the floor: a release below it refuses to attach
+//! rather than read the word. A per-definition value is read strictly
+//! instead, and a word an older release doesn't know pauses the definition
+//! it belongs to (`defs::floor::unknown_value_sql`).
+//!
 //! # Rebuilding a catalog table
 //!
 //! A migration must never rebuild `partition_sources`, `capture_baselines` or

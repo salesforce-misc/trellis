@@ -210,6 +210,11 @@ pub const KIND_REDERIVE: &str = "rederive";
 pub const KIND_SWEEP: &str = "sweep";
 /// `backfill_chunks.kind` of a partition correction (ADR-0017 P4a).
 pub const KIND_CORRECTION: &str = "correction";
+/// Every `backfill_chunks.kind` this release writes and reads. A kind not
+/// listed was written by a newer release, and its definition pauses
+/// (`super::floor::unknown_value_sql`); writing a new kind raises the
+/// definition floor of the definitions it is written for (ADR-0024 rule 6).
+pub(crate) const KINDS: [&str; 4] = [KIND_PLAN, KIND_REDERIVE, KIND_SWEEP, KIND_CORRECTION];
 
 /// SQL predicate over a `backfill_chunks` row aliased `bc` joined to its
 /// definition's `transform_definitions` row aliased `d`: whether the chunk was

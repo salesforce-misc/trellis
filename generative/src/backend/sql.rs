@@ -947,7 +947,7 @@ async fn unsettled_definitions(
             continue;
         };
         let status_text: String = row.get(0);
-        let status = StoredStatus::from_row(&status_text);
+        let status = StoredStatus::from_persisted(&status_text).expect("a stored status");
         // A `RESUME` that waits for an upstream to be `live` leaves its
         // definition paused with a resume request, which the capture pass
         // completes: still on its way back, so not settled.

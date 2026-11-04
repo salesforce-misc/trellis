@@ -102,7 +102,7 @@ pub(super) async fn correct(
         let client = pool.get().await?;
         if progress(&**client, correction.id, definition.id)
             .await?
-            .is_some_and(|p| p.phase() == Phase::Done.as_str())
+            .is_some_and(|p| p.is_done())
         {
             return Ok(Step::Done);
         }

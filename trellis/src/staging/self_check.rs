@@ -429,6 +429,15 @@ pub enum SelfCheckError {
     PageTimedOut {
         budget: Duration,
     },
+    /// A `self_check` job holds a value a newer Trellis release wrote (its
+    /// state, mode, outcome or saved divergences), which this release can't
+    /// read (ADR-0024 rule 6). Polling reports it; a worker never claims a
+    /// job in a mode it doesn't run, and ends one whose saved progress it
+    /// can't read as `failed` with this.
+    UnreadableJob {
+        target: String,
+        detail: String,
+    },
     Ddl(DdlError),
     Catalog(CatalogError),
     Staging(StagingError),
@@ -449,6 +458,9 @@ impl SelfCheckError {
             | SelfCheckError::UnsupportedExpr { .. }
             | SelfCheckError::InvalidScope { .. } => ErrorCode::Validation,
             SelfCheckError::PageTimedOut { .. } => ErrorCode::Timeout,
+            // Only a release that reads it gets past it, like a catalog
+            // floor.
+            SelfCheckError::UnreadableJob { .. } => ErrorCode::VersionFloor,
             SelfCheckError::Ddl(err) => err.code(),
             SelfCheckError::Catalog(err) => err.code(),
             SelfCheckError::Staging(err) => err.code(),
@@ -477,6 +489,12 @@ impl fmt::Display for SelfCheckError {
                 f,
                 "a self_check page ran past its {budget:?} budget, and the server stopped it"
             ),
+            SelfCheckError::UnreadableJob { target, detail } => {
+                write!(
+                    f,
+                    "the self_check job of \"{target}\" can't be read: {detail}"
+                )
+            }
             SelfCheckError::InvalidScope { limit } => write!(
                 f,
                 "self_check needs a positive SelfCheckScope::limit; got {limit}"
@@ -507,6 +525,7 @@ impl std::error::Error for SelfCheckError {
             | SelfCheckError::UnsupportedKeySpace { .. }
             | SelfCheckError::UnsupportedExpr { .. }
             | SelfCheckError::PageTimedOut { .. }
+            | SelfCheckError::UnreadableJob { .. }
             | SelfCheckError::InvalidScope { .. } => None,
         }
     }

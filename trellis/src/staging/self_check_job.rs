@@ -52,6 +52,7 @@
 //!   passes; one unfinished job per definition. A finished job stays until
 //!   the next `self_check` of the target replaces it.
 
+use std::fmt;
 use std::time::Duration;
 
 use tokio_postgres::types::{PgLsn, Type};
@@ -145,14 +146,17 @@ impl SelfCheckJobState {
         }
     }
 
-    fn from_persisted(text: &str) -> Self {
+    /// The state `text` stores, or `None` for one a newer release wrote
+    /// (ADR-0024 rule 6). A worker never claims a job in such a state: it
+    /// claims `queued` and `running` ones only.
+    fn from_persisted(text: &str) -> Option<Self> {
         match text {
-            "queued" => SelfCheckJobState::Queued,
-            "running" => SelfCheckJobState::Running,
-            "done" => SelfCheckJobState::Done,
-            "failed" => SelfCheckJobState::Failed,
-            "cancelled" => SelfCheckJobState::Cancelled,
-            other => panic!("self_check_jobs.state held unrecognized value '{other}'"),
+            "queued" => Some(SelfCheckJobState::Queued),
+            "running" => Some(SelfCheckJobState::Running),
+            "done" => Some(SelfCheckJobState::Done),
+            "failed" => Some(SelfCheckJobState::Failed),
+            "cancelled" => Some(SelfCheckJobState::Cancelled),
+            _ => None,
         }
     }
 
@@ -239,12 +243,55 @@ fn mode_word(mode: SelfCheckMode) -> &'static str {
     }
 }
 
-fn mode_from_word(word: &str) -> SelfCheckMode {
-    match word {
-        "standard" => SelfCheckMode::Standard,
-        "strict" => SelfCheckMode::Strict,
-        other => panic!("self_check_jobs.mode held unrecognized value '{other}'"),
+/// Every `self_check_jobs.mode` this release runs. A worker claims only a
+/// job in one of these; another was written by a newer release.
+const MODES: [SelfCheckMode; 2] = [SelfCheckMode::Standard, SelfCheckMode::Strict];
+
+/// The mode `word` stores, or `None` for one a newer release wrote.
+fn mode_from_word(word: &str) -> Option<SelfCheckMode> {
+    MODES.into_iter().find(|&mode| mode_word(mode) == word)
+}
+
+/// The error a job some value of which a newer release wrote is reported
+/// with (ADR-0024 rule 6): `what` names the column and the value. Writing a
+/// new value of a job's state, mode, outcome or divergences changes what an
+/// older release reads, so it raises the definition floor of the audited
+/// definition.
+fn unreadable(target: &str, what: impl fmt::Display) -> SelfCheckError {
+    SelfCheckError::UnreadableJob {
+        target: target.to_string(),
+        detail: format!(
+            "its {what} was written by a newer Trellis release, and this release can't \
+             read it; read it under that release, or start a new self_check"
+        ),
     }
+}
+
+/// A finished job's saved outcome: `outcome`, the status a `not_live` job
+/// found, and the divergences, as the job's row stores them. `Err` names the
+/// value a newer release wrote, for [`unreadable`].
+fn saved_outcome(
+    outcome: Option<&str>,
+    not_live: Option<&str>,
+    divergences: &str,
+) -> Result<SelfCheckOutcome, String> {
+    match outcome {
+        Some("converged") => Ok(SelfCheckOutcome::Converged),
+        Some("not_caught_up") => Ok(SelfCheckOutcome::NotCaughtUp),
+        Some("diverged") => Ok(SelfCheckOutcome::Diverged(saved_divergences(divergences)?)),
+        Some("not_live") => not_live
+            .and_then(TransformStatus::from_word)
+            .map(SelfCheckOutcome::NotLive)
+            .ok_or_else(|| format!("self_check_jobs.not_live_status {not_live:?}")),
+        other => Err(format!("self_check_jobs.outcome {other:?}")),
+    }
+}
+
+/// A job's saved divergences, or `Err` naming them when a newer release
+/// wrote a shape this release can't read.
+fn saved_divergences(divergences: &str) -> Result<Vec<Divergence>, String> {
+    serde_json::from_str(divergences)
+        .map_err(|_| format!("self_check_jobs.divergences {divergences}"))
 }
 
 fn millis(timeout: Duration) -> i64 {
@@ -331,7 +378,12 @@ pub async fn get(pool: &Pool, id: i64) -> Result<Option<SelfCheckJob>, SelfCheck
     };
 
     let target: String = row.get(1);
-    let state = SelfCheckJobState::from_persisted(row.get(3));
+    let state: &str = row.get(3);
+    let state = SelfCheckJobState::from_persisted(state)
+        .ok_or_else(|| unreadable(&target, format_args!("self_check_jobs.state '{state}'")))?;
+    let mode: &str = row.get(2);
+    let mode = mode_from_word(mode)
+        .ok_or_else(|| unreadable(&target, format_args!("self_check_jobs.mode '{mode}'")))?;
     let rows_compared: i64 = row.get(4);
     let report = if state == SelfCheckJobState::Done {
         Some(report_of(pool, &target, &row).await?)
@@ -341,7 +393,7 @@ pub async fn get(pool: &Pool, id: i64) -> Result<Option<SelfCheckJob>, SelfCheck
     Ok(Some(SelfCheckJob {
         id: row.get(0),
         target,
-        mode: mode_from_word(row.get(2)),
+        mode,
         state,
         rows_compared,
         report,
@@ -356,24 +408,11 @@ async fn report_of(
     target: &str,
     row: &tokio_postgres::Row,
 ) -> Result<SelfCheckReport, SelfCheckError> {
-    let divergences: String = row.get(5);
-    let divergences: Vec<Divergence> =
-        serde_json::from_str(&divergences).expect("self_check_jobs.divergences held our JSON");
-    let outcome = match row.get::<_, Option<&str>>(6) {
-        Some("converged") => SelfCheckOutcome::Converged,
-        Some("not_caught_up") => SelfCheckOutcome::NotCaughtUp,
-        Some("diverged") => SelfCheckOutcome::Diverged(divergences),
-        Some("not_live") => {
-            let status: &str = row
-                .get::<_, Option<&str>>(7)
-                .expect("a not_live job saved the status it found");
-            SelfCheckOutcome::NotLive(
-                TransformStatus::from_word(status)
-                    .expect("a not_live job saved a reported status word"),
-            )
-        }
-        other => panic!("a done self_check job held outcome {other:?}"),
-    };
+    let outcome = saved_outcome(row.get(6), row.get(7), row.get(5))
+        .map_err(|what| unreadable(target, what))?;
+    let checked_through = row
+        .get::<_, Option<PgLsn>>(8)
+        .ok_or_else(|| unreadable(target, "self_check_jobs.checked_through NULL of a done job"))?;
     // The transform can be dropped between the two reads; there is then
     // nothing of it to report.
     let findings = match crate::defs::catalog::definition_by_target(pool, target).await? {
@@ -386,9 +425,7 @@ async fn report_of(
     };
     Ok(SelfCheckReport {
         target: target.to_string(),
-        checked_through: row
-            .get::<_, Option<PgLsn>>(8)
-            .expect("a done job saved the position it checked through"),
+        checked_through,
         rows_compared: row.get(4),
         truncated: row.get(9),
         outcome,
@@ -519,8 +556,17 @@ pub async fn work_once(
     claimed_by: &str,
     options: &WorkerOptions,
 ) -> Result<bool, SelfCheckError> {
-    let Some(mut claim) = claim(pool, claimed_by, options).await? else {
+    let Some((id, claim)) = claim(pool, claimed_by, options).await? else {
         return Ok(false);
+    };
+    // Progress a newer release saved, which this release can't read, ends
+    // the job rather than being claimed again and again.
+    let mut claim = match claim {
+        Ok(claim) => claim,
+        Err(error) => {
+            fail(pool, claimed_by, id, &error).await?;
+            return Ok(true);
+        }
     };
 
     let page = run_page(pool, &claim, options).await;
@@ -589,12 +635,16 @@ async fn run_page(
 }
 
 /// Takes the oldest job that is `queued`, that this worker already runs, or
-/// that its claimant has left, and returns it as it was last saved.
+/// that its claimant has left, and returns its id and the job as it was last
+/// saved. Only a job in a mode this release runs is taken; one a newer
+/// release queued in another waits for it. `Err` with the id is a job whose
+/// saved progress a newer release wrote, which this release can't read.
 async fn claim(
     pool: &Pool,
     claimed_by: &str,
     options: &WorkerOptions,
-) -> Result<Option<Claim>, SelfCheckError> {
+) -> Result<Option<(i64, Result<Claim, SelfCheckError>)>, SelfCheckError> {
+    let modes: Vec<&str> = MODES.into_iter().map(mode_word).collect();
     let client = pool.get().await?;
     let ttl_secs = options.reclaim_ttl.as_secs_f64();
     let row = client
@@ -603,10 +653,11 @@ async fn claim(
                  update self_check_jobs set state = 'running', claimed_by = $1, claimed_at = now() \
                  where id = ( \
                      select id from self_check_jobs \
-                     where state = 'queued' \
+                     where (state = 'queued' \
                         or (state = 'running' and (claimed_by = $1 \
                             or claimed_at < now() - (interval '1 second' * $2 \
-                                + interval '1 millisecond' * (2 * await_timeout_ms + $3)))) \
+                                + interval '1 millisecond' * (2 * await_timeout_ms + $3))))) \
+                       and mode = any($4) \
                      order by id limit 1 \
                      for update skip locked) \
                  returning * ) \
@@ -617,23 +668,31 @@ async fn claim(
                 (&claimed_by, Type::TEXT),
                 (&ttl_secs, Type::FLOAT8),
                 (&millis(options.compare_budget), Type::INT8),
+                (&modes, Type::TEXT_ARRAY),
             ],
         )
         .await?;
     Ok(row.map(|row| {
-        let divergences: String = row.get(6);
-        Claim {
-            id: row.get(0),
-            target: row.get(1),
-            mode: mode_from_word(row.get(2)),
-            await_timeout: Duration::from_millis(row.get::<_, i64>(3) as u64),
-            progress: Progress {
-                after: row.get(4),
-                rows_compared: row.get(5),
-                divergences: serde_json::from_str(&divergences)
-                    .expect("self_check_jobs.divergences held our JSON"),
-            },
-        }
+        let id: i64 = row.get(0);
+        let target: String = row.get(1);
+        let mode: &str = row.get(2);
+        // Claimed only in a mode this release runs (`$4`).
+        let mode = mode_from_word(mode).ok_or_else(|| format!("self_check_jobs.mode '{mode}'"));
+        let claim = mode
+            .and_then(|mode| Ok((mode, saved_divergences(row.get(6))?)))
+            .map(|(mode, divergences)| Claim {
+                id,
+                target: target.clone(),
+                mode,
+                await_timeout: Duration::from_millis(row.get::<_, i64>(3) as u64),
+                progress: Progress {
+                    after: row.get(4),
+                    rows_compared: row.get(5),
+                    divergences,
+                },
+            })
+            .map_err(|what| unreadable(&target, what));
+        (id, claim)
     }))
 }
 
@@ -1007,8 +1066,62 @@ mod tests {
             SelfCheckJobState::Failed,
             SelfCheckJobState::Cancelled,
         ] {
-            assert_eq!(SelfCheckJobState::from_persisted(state.as_str()), state);
+            assert_eq!(
+                SelfCheckJobState::from_persisted(state.as_str()),
+                Some(state)
+            );
         }
+    }
+
+    /// ADR-0024 rule 6: a job's state, mode, outcome or divergences a newer
+    /// release wrote is reported as unreadable (`version_floor`), never read
+    /// as a value this release knows and never a panic.
+    #[test]
+    fn a_job_value_a_newer_release_wrote_is_unreadable() {
+        assert_eq!(SelfCheckJobState::from_persisted("paused"), None);
+        for mode in MODES {
+            assert_eq!(mode_from_word(mode_word(mode)), Some(mode));
+        }
+        assert_eq!(mode_from_word("deep"), None);
+
+        assert_eq!(
+            saved_outcome(Some("converged"), None, "[]"),
+            Ok(SelfCheckOutcome::Converged)
+        );
+        assert_eq!(
+            saved_outcome(Some("not_live"), Some("paused"), "[]"),
+            Ok(SelfCheckOutcome::NotLive(TransformStatus::Paused))
+        );
+        for (outcome, not_live, divergences, names) in [
+            (
+                Some("partial"),
+                None,
+                "[]",
+                "self_check_jobs.outcome Some(\"partial\")",
+            ),
+            (None, None, "[]", "self_check_jobs.outcome None"),
+            (Some("not_live"), Some("merging"), "[]", "not_live_status"),
+            (Some("not_live"), None, "[]", "not_live_status"),
+            (
+                Some("diverged"),
+                None,
+                r#"[{"RowHash":{"key":"a"}}]"#,
+                "self_check_jobs.divergences",
+            ),
+        ] {
+            let what = saved_outcome(outcome, not_live, divergences).expect_err(names);
+            assert!(what.contains(names), "{what}");
+        }
+        assert!(saved_divergences(r#"{"cells":[]}"#).is_err());
+
+        let error = unreadable("t", "self_check_jobs.mode 'deep'");
+        assert_eq!(error.code(), crate::ErrorCode::VersionFloor);
+        assert!(
+            error
+                .to_string()
+                .contains("its self_check_jobs.mode 'deep' was written by a newer Trellis"),
+            "{error}"
+        );
     }
 
     #[test]
