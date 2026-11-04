@@ -256,7 +256,7 @@ For each release, the notes carry:
   and which features carry a new definition floor) and what that means for
   rolling back to the previous release
   ([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md)). For
-  `0.2.0`: rolling back to `0.1.x` means restoring a backup taken before the
+  `0.2.0`: the catalog floor is recorded, at `0.2.0`; rolling back to `0.1.x` means restoring a backup taken before the
   upgrade, which also discards the application's writes since, and a `0.1.x`
   worker started without `migrate` runs unchecked on a database `0.2.0`
   migrated ([upgrading](upgrading.md#to-a-release-before-020)).

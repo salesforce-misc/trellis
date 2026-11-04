@@ -32,6 +32,10 @@ defmodule Trellis.Error do
     version boundary). Read-only calls keep working. Retry once the other
     version's processes have stopped; the message names the versions and
     their worker ids.
+  - `:version_floor`: this Trellis version is below the catalog floor, the
+    oldest version that can read the instance's catalog, so `migrate/1`
+    refused it. Not retryable with this version: run the version the message
+    names, or a later one.
   - `:internal`: a Trellis bug or an unexpected database failure.
   - `:unknown`: a code newer than this binding.
   """
@@ -43,6 +47,7 @@ defmodule Trellis.Error do
           | :not_found
           | :timeout
           | :version_handover
+          | :version_floor
           | :internal
           | :unknown
 
@@ -61,6 +66,7 @@ defmodule Trellis.Error do
     "not_found" => :not_found,
     "timeout" => :timeout,
     "version_handover" => :version_handover,
+    "version_floor" => :version_floor,
     "internal" => :internal
   }
 

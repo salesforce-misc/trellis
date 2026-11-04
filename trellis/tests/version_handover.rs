@@ -257,7 +257,9 @@ async fn a_pending_migration_is_not_run_while_a_process_is_live() {
         "alter table worker_registry drop column version, drop column staging, \
            drop column drain, drop column standby, drop column staging_pid; \
          drop table join1_fan_out; \
-         delete from refinery_schema_history where version in (9, 10); \
+         drop table catalog_floor; \
+         update trellis_instance set instance_format_version = 1; \
+         delete from refinery_schema_history where version > 8; \
          insert into worker_registry (worker_id) values ('trellis-old-1-00')",
     )
     .await
@@ -334,13 +336,13 @@ async fn migrate_with_nothing_pending_beside_another_version_changes_nothing() {
     trellis.shutdown().await.expect("shutdown");
 }
 
-/// Rule 8: a binary meets refinery's missing-migration check first, so it
-/// never attaches to a database a newer binary migrated. That holds while a
-/// process of the newer version is live too: `migrate` with nothing of its
-/// own pending refuses there as it does with nothing live, rather than
-/// succeeding and letting this binary take over once the newer one stops.
+/// Rule 8 with ADR-0024: a binary meets the catalog floor first, so it never
+/// attaches to a database a newer binary migrated past what it can read.
+/// Below the floor it refuses, alone and beside a live process of the newer
+/// version alike, rather than succeeding there and taking over once the newer
+/// one stops. At or above the floor, it tolerates the newer migration.
 #[tokio::test]
-async fn migrate_beside_a_newer_version_still_refuses_its_migrations() {
+async fn migrate_beside_a_newer_version_still_refuses_below_the_catalog_floor() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = raw(&db).await;
@@ -354,11 +356,17 @@ async fn migrate_beside_a_newer_version_still_refuses_its_migrations() {
     let trellis = Trellis::connect(config(&db), TrellisOptions::default())
         .await
         .expect("connect");
-    let alone = trellis
+    trellis
         .migrate()
         .await
-        .expect_err("refinery refuses a database carrying a migration this binary lacks");
-    assert!(alone.to_string().contains("9999"), "{alone}");
+        .expect("at the floor, a newer binary's migration is tolerated");
+
+    raw.execute("update catalog_floor set version = '9.9.9'", &[])
+        .await
+        .expect("the newer binary raised the floor");
+    let alone = trellis.migrate().await.expect_err("below the floor");
+    assert_eq!(alone.code(), ErrorCode::VersionFloor, "{alone}");
+    assert!(alone.to_string().contains("9.9.9"), "{alone}");
 
     raw.execute(
         "insert into worker_registry (worker_id, version) values ('trellis-new-1-00', $1)",
@@ -370,7 +378,7 @@ async fn migrate_beside_a_newer_version_still_refuses_its_migrations() {
         .migrate()
         .await
         .expect_err("refused beside the newer version too");
-    assert!(beside.to_string().contains("9999"), "{beside}");
+    assert_eq!(beside.code(), ErrorCode::VersionFloor, "{beside}");
     trellis.shutdown().await.expect("shutdown");
 }
 

@@ -155,7 +155,8 @@ async fn reattaching_to_the_same_instance_is_a_clean_noop() {
     let schema_name: String = rows[0].get(0);
     let format_version: i32 = rows[0].get(1);
     assert_eq!(schema_name, "instance_reattach");
-    assert_eq!(format_version, trellis::identity::INSTANCE_FORMAT_VERSION);
+    // Retired at 2, which releases before 0.2.0 refuse (migration V11).
+    assert_eq!(format_version, 2);
 }
 
 #[tokio::test]
@@ -190,8 +191,11 @@ async fn marker_recording_a_different_schema_name_is_refused() {
     );
 }
 
+/// A catalog a newer Trellis can read and this one can't (ADR-0024): its
+/// floor is above this binary, so the attach refuses with `version_floor`,
+/// naming the floor. The marker's format version no longer decides it.
 #[tokio::test]
-async fn marker_with_a_newer_format_version_is_refused() {
+async fn a_catalog_floor_above_this_binary_is_refused() {
     let cluster = TestCluster::start();
     let db = cluster.create_empty_database().await;
     let config = config_for_schema(db.dsn(), "instance_future");
@@ -201,24 +205,22 @@ async fn marker_with_a_newer_format_version_is_refused() {
         .await
         .expect("initial attach");
 
-    // Simulate a schema last written by a newer Trellis build.
+    // Simulate a catalog a newer Trellis raised the floor of.
     let client = pool.get().await.expect("connect");
     client
-        .execute(
-            "update trellis_instance set instance_format_version = $1",
-            &[&(trellis::identity::INSTANCE_FORMAT_VERSION + 1)],
-        )
+        .execute("update catalog_floor set version = '99.0.0'", &[])
         .await
-        .expect("simulate a newer instance format version");
+        .expect("simulate a newer catalog floor");
     drop(client);
 
     let err = migrate_with_pool(&pool, &config)
         .await
-        .expect_err("attaching to a newer instance format version must be refused");
+        .expect_err("attaching below the catalog floor must be refused");
     assert!(
-        matches!(err, Error::IncompatibleInstance(_)),
-        "expected IncompatibleInstance, got {err:?}"
+        matches!(err, Error::BelowCatalogFloor { ref floor, .. } if floor == "99.0.0"),
+        "expected BelowCatalogFloor, got {err:?}"
     );
+    assert_eq!(err.code(), trellis::ErrorCode::VersionFloor);
 }
 
 #[tokio::test]

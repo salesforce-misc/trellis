@@ -27,14 +27,25 @@ pub enum Error {
     /// Applying migrations failed.
     Migrate(refinery::Error),
     /// The configured schema already belongs to a different Trellis
-    /// instance (a mismatched identity marker), an incompatible one (an
-    /// instance format version newer than this build understands), or a
-    /// pre-existing, non-Trellis schema with no marker at all. See
-    /// `crate::identity`.
+    /// instance (a mismatched identity marker), or is a pre-existing,
+    /// non-Trellis schema with no marker at all. See `crate::identity`.
     IncompatibleInstance(String),
     /// Another Trellis version is live on the instance, so `migrate` changes
     /// nothing (ADR-0023, version handover).
     OtherVersionLive(crate::handover::OtherVersionLive),
+    /// This binary's version is below the catalog floor, the oldest Trellis
+    /// version that can read the catalog (ADR-0024), so it refuses to attach.
+    /// The remedy is a version at or above `floor`.
+    BelowCatalogFloor {
+        /// The floor the catalog records.
+        floor: String,
+        /// This binary's version.
+        this_version: String,
+    },
+    /// The catalog's migration history doesn't fit this binary's migrations:
+    /// a shared version with another name or checksum, or a gap below this
+    /// binary's newest migration.
+    MigrationHistory(String),
 }
 
 impl Error {
@@ -57,6 +68,9 @@ impl Error {
             // instance colliding with existing state.
             Error::IncompatibleInstance(_) => ErrorCode::Conflict,
             Error::OtherVersionLive(_) => ErrorCode::VersionHandover,
+            Error::BelowCatalogFloor { .. } => ErrorCode::VersionFloor,
+            // Like a refinery refusal: a deployment problem.
+            Error::MigrationHistory(_) => ErrorCode::Internal,
         }
     }
 }
@@ -77,6 +91,16 @@ impl fmt::Display for Error {
             Error::Migrate(err) => write!(f, "failed to apply migrations: {err}"),
             Error::IncompatibleInstance(msg) => write!(f, "refusing to attach: {msg}"),
             Error::OtherVersionLive(seen) => write!(f, "refusing to migrate: {seen}"),
+            Error::BelowCatalogFloor {
+                floor,
+                this_version,
+            } => write!(
+                f,
+                "refusing to attach: the catalog floor is {floor}, the oldest Trellis version \
+                 that can read this catalog, and this binary is version {this_version}; run \
+                 Trellis {floor} or later"
+            ),
+            Error::MigrationHistory(msg) => write!(f, "refusing to attach: {msg}"),
         }
     }
 }
@@ -91,6 +115,7 @@ impl std::error::Error for Error {
             Error::Migrate(err) => Some(err),
             Error::IncompatibleInstance(_) => None,
             Error::OtherVersionLive(seen) => Some(seen),
+            Error::BelowCatalogFloor { .. } | Error::MigrationHistory(_) => None,
         }
     }
 }

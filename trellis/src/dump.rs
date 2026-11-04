@@ -89,6 +89,7 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
     // Definitions.
     ("refinery_schema_history", Class::Definition { reset: NONE }),
     ("trellis_instance", Class::Definition { reset: NONE }),
+    ("catalog_floor", Class::Definition { reset: NONE }),
     ("schema_nodes", Class::Definition { reset: NONE }),
     ("schema_edges", Class::Definition { reset: NONE }),
     ("source_table_versions", Class::Definition { reset: NONE }),

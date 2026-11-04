@@ -78,6 +78,12 @@ pub enum ErrorCode {
     /// and retryable once the other version's processes have stopped; the
     /// message names this binary's version and the other versions seen.
     VersionHandover,
+    /// This binary's version is below a compatibility floor the database
+    /// records (ADR-0024): `migrate` refuses a catalog whose floor, the oldest
+    /// Trellis version that can read it, is above this binary's version. Not
+    /// retryable with this binary: run a version at or above the floor, which
+    /// the message names with this binary's own version.
+    VersionFloor,
     /// Anything else: engine-internal failures, "should not happen"
     /// invariants, IO failures, and Postgres errors with no more specific
     /// category. The catch-all so a new internal variant always has
@@ -94,7 +100,7 @@ impl ErrorCode {
     /// Adding a variant fails `every_variant_is_listed_in_all` below until it
     /// is added here as well (`assert_all_is_every_variant` in this module), and the
     /// bindings' own test then fails until they map the new code deliberately.
-    pub const ALL: [ErrorCode; 8] = [
+    pub const ALL: [ErrorCode; 9] = [
         ErrorCode::Parse,
         ErrorCode::Validation,
         ErrorCode::Connectivity,
@@ -102,6 +108,7 @@ impl ErrorCode {
         ErrorCode::NotFound,
         ErrorCode::Timeout,
         ErrorCode::VersionHandover,
+        ErrorCode::VersionFloor,
         ErrorCode::Internal,
     ];
 
@@ -116,6 +123,7 @@ impl ErrorCode {
             ErrorCode::NotFound => "not_found",
             ErrorCode::Timeout => "timeout",
             ErrorCode::VersionHandover => "version_handover",
+            ErrorCode::VersionFloor => "version_floor",
             ErrorCode::Internal => "internal",
         }
     }
@@ -235,6 +243,7 @@ mod tests {
             NotFound,
             Timeout,
             VersionHandover,
+            VersionFloor,
             Internal,
         );
         let names: std::collections::HashSet<&str> =

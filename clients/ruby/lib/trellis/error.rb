@@ -14,8 +14,8 @@ module Trellis
     CODE = nil
 
     # One of :parse, :validation, :connectivity, :conflict, :not_found,
-    # :internal, :timeout, :version_handover, or :unknown for a code newer
-    # than this binding.
+    # :internal, :timeout, :version_handover, :version_floor, or :unknown for
+    # a code newer than this binding.
     def code
       self.class::CODE
     end
@@ -80,6 +80,14 @@ module Trellis
     CODE = :version_handover
   end
 
+  # This Trellis version is below the catalog floor, the oldest version that
+  # can read the instance's catalog, so Trellis.migrate refused it. Not
+  # retryable with this version: run the version the message names, or a
+  # later one.
+  class VersionFloorError < Error
+    CODE = :version_floor
+  end
+
   # An error code newer than this binding. The message names the code.
   class UnknownError < Error
     CODE = :unknown
@@ -110,7 +118,8 @@ module Trellis
       "not_found" => NotFoundError,
       "internal" => InternalError,
       "timeout" => TimeoutError,
-      "version_handover" => VersionHandoverError
+      "version_handover" => VersionHandoverError,
+      "version_floor" => VersionFloorError
     }.freeze
   end
 end

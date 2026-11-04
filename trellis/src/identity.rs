@@ -14,14 +14,18 @@
 //!    fresh schema, or a crashed first-ever migrate would permanently lock
 //!    itself out. Ours to take/resume.
 //! 2. **Same instance.** The schema already carries our marker
-//!    (`trellis_instance`) recording this exact schema name and a format
-//!    version we understand — a clean, idempotent re-attach.
+//!    (`trellis_instance`) recording this exact schema name — a clean,
+//!    idempotent re-attach.
 //! 3. **Someone else's.** The marker records a *different* schema name (a
-//!    marker was copied/restored under the wrong name), the marker records
-//!    a format version newer than this build understands, or the schema
+//!    marker was copied/restored under the wrong name), or the schema
 //!    pre-existed with foreign objects and neither a marker nor a Trellis
-//!    migration ledger (not ours, don't clobber it). All three are refused
-//!    with [`Error::IncompatibleInstance`].
+//!    migration ledger (not ours, don't clobber it). Both are refused with
+//!    [`Error::IncompatibleInstance`].
+//!
+//! Whether this binary can read the catalog at all is the catalog floor's
+//! question (`crate::catalog_floor`), not the marker's. The marker's
+//! `instance_format_version` is 2 from migration V11 on, which releases before
+//! 0.2.0 refuse; no later release reads or writes it.
 //!
 //! [`prepare_attach`] runs this decision *before* [`crate::migrate::migrate`]
 //! hands off to the refinery runner, and [`seed_marker`] runs after the
@@ -40,14 +44,6 @@
 use crate::config::Config;
 use crate::error::Error;
 use crate::pool::quote_ident;
-
-/// The on-disk shape/meaning of the `trellis_instance` marker. Bump this
-/// when a future change to the marker (or to what attaching means) isn't
-/// safely interpretable by old code — a schema whose marker records a
-/// version newer than this constant is refused rather than guessed at. Only
-/// one version has ever existed, so there's no migration path defined yet;
-/// add one alongside the first version bump.
-pub const INSTANCE_FORMAT_VERSION: i32 = 1;
 
 /// Ensures `config.schema()` exists and is safe to attach to, refusing it
 /// otherwise (see the module docs for the three cases).
@@ -102,14 +98,7 @@ pub(crate) async fn prepare_attach(
                     marker.schema_name
                 )));
             }
-            if marker.instance_format_version > INSTANCE_FORMAT_VERSION {
-                return Err(Error::IncompatibleInstance(format!(
-                    "schema {schema:?} was written by a newer Trellis (instance format \
-                     version {}); this build only understands up to version {INSTANCE_FORMAT_VERSION}",
-                    marker.instance_format_version
-                )));
-            }
-            // Same schema, a format version we understand: a clean re-attach.
+            // Same schema: a clean re-attach.
             Ok(())
         }
         None => {
@@ -157,7 +146,7 @@ pub(crate) async fn prepare_attach(
 ///   brand-new schema both reach this point; `singleton`'s primary key
 ///   would turn a second plain insert into a `Error::Connect` (a unique
 ///   violation), when the right outcome is a no-op for the loser. Its row
-///   already matches (same schema, same version) since they're attaching
+///   already matches (same schema) since they're attaching
 ///   to the same config. ([`AttachLock`] serializes the attaches now, so the
 ///   loser finds the row there already; the upsert stays the one statement
 ///   that covers every case.)
@@ -173,11 +162,11 @@ pub(crate) async fn seed_marker(
     let target_schema = config.target_schema();
     client
         .execute(
-            "insert into trellis_instance (schema_name, instance_format_version, target_schema) \
-             values ($1, $2, $3) \
+            "insert into trellis_instance (schema_name, target_schema) \
+             values ($1, $2) \
              on conflict (singleton) do update set target_schema = excluded.target_schema \
              where trellis_instance.target_schema is distinct from excluded.target_schema",
-            &[&schema, &INSTANCE_FORMAT_VERSION, &target_schema],
+            &[&schema, &target_schema],
         )
         .await?;
     Ok(())
@@ -377,7 +366,6 @@ impl AttachLock {
 
 struct Marker {
     schema_name: String,
-    instance_format_version: i32,
 }
 
 /// Whether `schema` exists at all, independent of `search_path` (this must
@@ -463,7 +451,7 @@ async fn read_marker(
     let row = client
         .query_opt(
             &format!(
-                "select schema_name, instance_format_version from {}.trellis_instance",
+                "select schema_name from {}.trellis_instance",
                 quote_ident(schema)
             ),
             &[],
@@ -471,7 +459,6 @@ async fn read_marker(
         .await?;
     Ok(row.map(|row| Marker {
         schema_name: row.get(0),
-        instance_format_version: row.get(1),
     }))
 }
 

@@ -51,6 +51,16 @@ command: the older release degrades per definition by itself.
      shape of capture objects always raises it: those objects belong to a
      source table, not to one definition, so every definition reading the
      table meets them, including the ones an older release can run.
+   - The catalog floor is the one row of the catalog's `catalog_floor` table.
+     The migration that creates it seeds it at 0.2.0. A migration that raises
+     it does so in its own SQL, to the greater of the stored floor and its
+     own, so the floor and the applied history never disagree. It replaces the
+     marker's `instance_format_version`, which no release from 0.2.0 on reads
+     or writes; it stays at 2, which every release before 0.2.0 refuses.
+   - A build carries its release's migrations, so it meets every floor they
+     declare, whatever its version string says: a pre-release, or a
+     development build that still carries the previous release's version,
+     reads the catalog its own migrations leave.
    - A **definition floor** is the oldest release that can run one
      definition: its grammar features, its key space, its hidden-table layout
      and its per-definition state. Trellis stamps it whenever it writes the
@@ -60,9 +70,13 @@ command: the older release degrades per definition by itself.
    the floor and its own version. Every handle runs the check when it
    connects, a define-only one included, not only `migrate`
    ([ADR-0010](0010-embeddable-clients.md)). A binary at or above the floor
-   tolerates applied migrations it doesn't carry: refinery's blanket
-   `abort_missing` no longer decides this. A checksum mismatch, or a gap below
-   the binary's newest migration, still refuses.
+   tolerates applied migrations it doesn't carry, runs none of them, and runs
+   none of its own again: it classifies the applied history before refinery
+   runs, and refinery's blanket `abort_missing` is off. A name or checksum
+   mismatch on a version both carry, or a gap below the binary's newest
+   migration (one it lacks, or one of its own not applied below the newest
+   applied), still refuses. The refusal below the floor has its own error
+   code, `version_floor`.
 3. **Per definition.** A definition whose floor is above the running version
    is paused with a `capture_failure` reason that names the definition's floor
    and the running version, and gives the remedy: roll forward to the floor
@@ -186,7 +200,10 @@ has stopped.
 * Every migration, grammar feature, key space, hidden-table layout and stored
   enum-like value declares its floor, and CI checks the declarations.
 * Keeping the floor down costs compatibility code: an additive migration adds
-  nullable or defaulted columns and tables an older release ignores.
+  nullable or defaulted columns and tables an older release ignores. An older
+  release at or above the floor keeps writing rows without them, so the
+  release that adds a column reads a `NULL` there (or the default) as a row an
+  older release wrote, and handles it.
 * A definition resumed after a rollback is fully rebuilt.
 * A definition the older release can't run is either dropped before the
   rollback, losing its target, or left paused through it, its target going

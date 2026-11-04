@@ -64,14 +64,46 @@ that runs `PAUSE TRANSFORM` and `DROP TRANSFORM`: `bin/rails db:rollback` or
 `mix ecto.rollback` of it drops the transform and its target table with the
 target's data, and defining it again builds the target from empty.
 
+### The catalog floor
+
+The catalog floor is the oldest Trellis release that can read the instance's
+catalog. 0.2.0 records it at 0.2.0, and a later release raises it only when it
+changes the catalog in a way an earlier release can't read; its release notes
+say so. Read it with:
+
+```sql
+select version from trellis.catalog_floor;  -- the instance's catalog schema
+```
+
+`migrate` checks it before it runs anything. A release below the floor
+refuses with the `version_floor` error code, naming the floor and its own
+version:
+
+```
+refusing to attach: the catalog floor is 0.3.0, the oldest Trellis version that can read this catalog, and this binary is version 0.2.0; run Trellis 0.3.0 or later
+```
+
+Roll forward to the floor or later. Nothing changed, and the newer release
+attaches as before.
+
+A release at or above the floor attaches to a catalog a later release
+migrated. It runs none of the later release's migrations and none of its own
+again, and logs once which migrations it doesn't carry. It still refuses
+(with the `internal` code) a catalog whose history doesn't fit its own
+migrations: one it carries that ran with another name or checksum, or a gap
+below its newest migration. A handle that connects without migrating doesn't
+check the floor.
+
 ### To a release before 0.2.0
 
 Restore a backup of the whole database taken before the upgrade. The restore
 also discards every write your application made since the upgrade, not only
 Trellis's.
 
-Without it, the older release's `migrate` refuses the database, since 0.2.0
-adds a migration it doesn't carry. `trellis run`, `trellis apply`,
+Without it, the older release's `migrate` refuses the database: 0.2.0 marks
+the catalog with an instance format version the older release doesn't know
+(`refusing to attach: schema "trellis" was written by a newer Trellis
+(instance format version 2)`). `trellis run`, `trellis apply`,
 `bin/rails trellis:migrate`, the `Trellis::Migration` and `Trellis.Migration`
 helpers and a release task that calls `Trellis.migrate!` all migrate first, so
 each one stops with that error. A handle that connects without migrating, such

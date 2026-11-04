@@ -94,6 +94,7 @@ pub mod app;
 mod blocking;
 #[cfg(feature = "internals")]
 pub mod blocking;
+pub(crate) mod catalog_floor;
 #[cfg(not(feature = "internals"))]
 mod client;
 #[cfg(feature = "internals")]
@@ -150,6 +151,7 @@ pub mod otel;
 mod pool;
 #[cfg(feature = "internals")]
 pub mod pool;
+pub(crate) mod release_version;
 pub(crate) mod tls;
 
 // Tier 3 (the engine) — see ADR-0012. Crate-private: no external crate names

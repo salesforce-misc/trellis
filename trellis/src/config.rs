@@ -192,7 +192,7 @@ impl Config {
     /// Returns `self` running as binary version `version` instead of this
     /// build's own, so a test can stand two versions side by side on one
     /// database (ADR-0023).
-    #[cfg(feature = "internals")]
+    #[cfg(any(test, feature = "internals"))]
     pub fn with_binary_version(mut self, version: impl Into<String>) -> Self {
         self.binary_version = std::borrow::Cow::Owned(version.into());
         self

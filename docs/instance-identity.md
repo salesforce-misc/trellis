@@ -48,8 +48,11 @@ unvalidated name.
 A shared name doesn't prove two attaches are the same instance — the schema
 could have been recreated, restored under the wrong name, or never been
 Trellis's. So each instance writes a single-row identity marker,
-`trellis_instance`, recording its schema name and an
-`instance_format_version` (`trellis::identity::INSTANCE_FORMAT_VERSION`).
+`trellis_instance`, recording its schema name. Whether this release can read
+the catalog at all is the catalog floor's question
+([upgrading](upgrading.md#the-catalog-floor)); the marker's
+`instance_format_version` is 2 from 0.2.0 on, which releases before 0.2.0
+refuse, and no later release reads it.
 
 Before the migration runner touches the schema, `trellis::identity::prepare_attach`
 (called from `trellis::migrate`) checks it:
@@ -63,11 +66,11 @@ Before the migration runner touches the schema, `trellis::identity::prepare_atta
   ledger with an empty marker table. The ledger's presence is what
   distinguishes "ours, unfinished" from "genuinely foreign," so this is
   treated as a fresh attach.
-* **Same instance** — marker present, schema name matches, format version
-  understood. A clean idempotent no-op.
-* **Refused** — a mismatched schema name in the marker, a format version newer
-  than this build understands, or a pre-existing schema with foreign objects
-  and *neither* a marker *nor* a migration ledger. Each surfaces as a typed
+* **Same instance** — marker present, schema name matches. A clean idempotent
+  no-op.
+* **Refused** — a mismatched schema name in the marker, or a pre-existing
+  schema with foreign objects and *neither* a marker *nor* a migration
+  ledger. Each surfaces as a typed
   `Error::IncompatibleInstance`.
 
 After the runner ensures `trellis_instance` exists, `trellis::identity::seed_marker`

@@ -302,6 +302,11 @@
     {"about": "Once that process is gone the same call goes ahead (and finds nothing to pause), so the refusal above was the row's.", "op": "sql", "args": ["delete from trellis.worker_registry where worker_id = 'parity-other-version'"]},
     {"op": "apply", "args": ["PAUSE TRANSFORM parity_nowhere"], "expect": {"error": "not_found"}},
 
+    {"about": "The catalog floor: a catalog a later release raised the floor of above this version refuses migrate before anything runs on it. Put back, migrate goes ahead.", "op": "sql", "args": ["create table parity_saved_floor as select version from trellis.catalog_floor", "update trellis.catalog_floor set version = '99.0.0'"]},
+    {"op": "migrate", "expect": {"error": "version_floor"}},
+    {"op": "sql", "args": ["update trellis.catalog_floor set version = (select version from parity_saved_floor)", "drop table parity_saved_floor"]},
+    {"op": "migrate", "expect": null},
+
     {"op": "shutdown", "expect": null},
 
     {"about": "A staging worker with no drain workers. connect returns once the worker's first capture pass has installed capture on every defined source, so the write below is captured, and nothing drains it.", "op": "connect", "opts": {"url": {"$dsn": {}}, "staging": true, "drain_threads": 0}, "expect": null},

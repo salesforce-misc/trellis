@@ -281,7 +281,8 @@ default one included.
   ```
 - **Errors** are raised as a subclass of `Trellis::Error` per error code
   (`ParseError`, `ValidationError`, `ConnectivityError`, `ConflictError`,
-  `NotFoundError`, `InternalError`, `TimeoutError`, `VersionHandoverError`),
+  `NotFoundError`, `InternalError`, `TimeoutError`, `VersionHandoverError`,
+  `VersionFloorError`),
   each with `#code` (a
   symbol) and `#message`. A code newer than the binding arrives as
   `UnknownError`, naming the code in its message. `ForkedHandleError` is a

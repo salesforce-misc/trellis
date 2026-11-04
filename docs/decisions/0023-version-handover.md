@@ -46,8 +46,8 @@ stage, drain or change state side by side.
    migrations is running: `migrate` (and `trellis apply`, which migrates first)
    refuses with the error of rule 6, and a background process waits. With
    nothing pending and another version live, `migrate` changes nothing: it
-   runs its checks, the catalog floor and refinery's refusal of a changed
-   migration or a gap in the history among them
+   runs its checks, the catalog floor and the refusal of a changed migration
+   or a gap in the history among them
    ([ADR-0024](0024-compatibility-floors-and-rollback.md)),
    and succeeds, or refuses when the attach would write (a
    grammar-version pause, [ADR-0018](0018-grammar-versioning.md), or a changed
@@ -84,7 +84,7 @@ stage, drain or change state side by side.
    ([ADR-0024](0024-compatibility-floors-and-rollback.md)) as it attaches: it
    refuses a catalog whose floor is above its version, and pauses each
    definition whose floor is. A release before 0.2.0 has no floors; its
-   refinery refuses in `migrate` any database V9 has run on.
+   `migrate` refuses any database a later release has migrated.
 
 A schema that has never been migrated has no history and nothing live on it:
 it reads as nothing pending, so `migrate` creates it, and a background process
