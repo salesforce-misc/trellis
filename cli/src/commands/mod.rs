@@ -5,6 +5,8 @@
 //! module here plus one arm there, not touching anything else.
 
 pub mod apply;
+pub mod dump;
 pub mod release;
+pub mod restore;
 pub mod run;
 pub mod status;

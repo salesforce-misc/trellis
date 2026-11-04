@@ -10,10 +10,12 @@
 //!
 //! Each subcommand lives in its own `commands::<name>` module; this file is
 //! just the top-level usage/help and the match that dispatches to one.
-//! The commands are `apply`, `run`, `status` and `release`.
+//! The commands are `apply`, `run`, `status`, `release`, `dump` and
+//! `restore`.
 
 mod commands;
 mod connection;
+mod postgres_tools;
 
 use std::process::ExitCode;
 
@@ -27,6 +29,9 @@ Commands:
   status              Print registered definitions and exit.
   release <TRANSFORM> <SOURCE_TABLE> <KEY>
                       Release one key a transform holds in quarantine.
+  dump                Write a schema-only dump that carries the definitions.
+  restore <FILE>      Load such a dump into an empty database and restore
+                       its definitions.
 
 Options:
   -d, --database-url <URL>  Postgres connection string. May be given before
@@ -92,6 +97,8 @@ fn run(mut args: Vec<String>) -> ExitCode {
         "run" => run_run(args, database_url),
         "status" => run_status(args, database_url),
         "release" => run_release(args, database_url),
+        "dump" => run_dump(args, database_url),
+        "restore" => run_restore(args, database_url),
         _ if wants_help(std::slice::from_ref(&command)) => {
             print!("{USAGE}");
             ExitCode::SUCCESS
@@ -211,6 +218,83 @@ fn run_release(args: Vec<String>, database_url: Option<String>) -> ExitCode {
     };
 
     match runtime.block_on(commands::release::run(parsed, database_url)) {
+        Ok(message) => {
+            println!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Dispatches `trellis dump`: handles `-h`/`--help` itself (so it works
+/// without a database connection), otherwise parses the flags and writes the
+/// dump on a single-use tokio runtime. What `run` returns goes to stdout as
+/// it is: the dump itself, or the confirmation when it went to a file.
+fn run_dump(args: Vec<String>, database_url: Option<String>) -> ExitCode {
+    if wants_help(&args) {
+        print!("{}", commands::dump::USAGE);
+        return ExitCode::SUCCESS;
+    }
+
+    let parsed = match commands::dump::parse(&args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("error: failed to start async runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match runtime.block_on(commands::dump::run(parsed, database_url)) {
+        Ok(output) => {
+            print!("{output}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Dispatches `trellis restore`: handles `-h`/`--help` itself (so it works
+/// without a database connection), otherwise parses the file argument and
+/// loads it on a single-use tokio runtime.
+fn run_restore(args: Vec<String>, database_url: Option<String>) -> ExitCode {
+    // A `--` ends the options: a file named `-h` after it is a file.
+    let options = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    if wants_help(&args[..options]) {
+        print!("{}", commands::restore::USAGE);
+        return ExitCode::SUCCESS;
+    }
+
+    let parsed = match commands::restore::parse(&args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("error: failed to start async runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match runtime.block_on(commands::restore::run(parsed, database_url)) {
         Ok(message) => {
             println!("{message}");
             ExitCode::SUCCESS
@@ -353,6 +437,21 @@ mod tests {
             ]),
             ExitCode::FAILURE
         );
+    }
+
+    #[test]
+    fn dump_and_restore_help_and_bad_args_need_no_database() {
+        for command in ["dump", "restore"] {
+            assert_eq!(
+                run(vec![command.to_string(), "--help".to_string()]),
+                ExitCode::SUCCESS
+            );
+            assert_eq!(
+                run(vec![command.to_string(), "--bogus".to_string()]),
+                ExitCode::FAILURE
+            );
+        }
+        assert_eq!(run(vec!["restore".to_string()]), ExitCode::FAILURE);
     }
 
     #[test]

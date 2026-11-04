@@ -162,6 +162,30 @@ impl TlsSpec {
         Ok(spec)
     }
 
+    /// These options as the libpq environment variables that set them
+    /// (`PGSSLMODE`, and `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY` when
+    /// given), for [`crate::Config::libpq_environment`].
+    pub(crate) fn libpq_environment(&self) -> Vec<(&'static str, String)> {
+        let mode = match self.mode {
+            SslMode::Disable => "disable",
+            SslMode::Prefer => "prefer",
+            SslMode::Require => "require",
+            SslMode::VerifyCa => "verify-ca",
+            SslMode::VerifyFull => "verify-full",
+        };
+        let mut vars = vec![("PGSSLMODE", mode.to_string())];
+        for (name, path) in [
+            ("PGSSLROOTCERT", &self.root_cert),
+            ("PGSSLCERT", &self.client_cert),
+            ("PGSSLKEY", &self.client_key),
+        ] {
+            if let Some(path) = path {
+                vars.push((name, path.to_string_lossy().into_owned()));
+            }
+        }
+        vars
+    }
+
     /// Whether this spec forbids a plaintext session, so a unix-socket host
     /// (where `tokio_postgres` never uses TLS) would silently break it.
     fn demands_encryption(&self) -> bool {

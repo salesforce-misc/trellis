@@ -177,6 +177,96 @@ impl Config {
         &self.dsn
     }
 
+    /// This configuration's connection as the libpq environment variables
+    /// (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`,
+    /// `PGSSLMODE` and the rest) that a Postgres client program such as
+    /// `pg_dump` or `psql` reads, so a child process connects where Trellis
+    /// does without the connection string, and its password, on its command
+    /// line, where other users of the host can read it.
+    ///
+    /// Only the settings the connection string gives are returned, plus
+    /// `PGSSLMODE`, which is always set, so libpq's `prefer` default can't
+    /// differ from Trellis's. Clear the `PG*` variables the child would
+    /// inherit before setting these, or an inherited one fills a setting the
+    /// connection string left out. libpq still reads its default certificate
+    /// files (`~/.postgresql/`) where the connection string names none,
+    /// which Trellis doesn't.
+    ///
+    /// Refuses a connection string Trellis can't connect with, as
+    /// connecting does, and a password or socket path that isn't UTF-8.
+    pub fn libpq_environment(&self) -> Result<Vec<(&'static str, String)>, Error> {
+        use tokio_postgres::config::{ChannelBinding, Host, LoadBalanceHosts, TargetSessionAttrs};
+        let (config, tls) = parse_dsn_tls(&self.dsn)?;
+        let not_utf8 = |what: &str| {
+            Error::Config(format!(
+                "the connection's {what} is not UTF-8, so it can't be passed to a client program"
+            ))
+        };
+        let mut vars: Vec<(&'static str, String)> = Vec::new();
+        let hosts = config
+            .get_hosts()
+            .iter()
+            .map(|host| match host {
+                Host::Tcp(name) => Ok(name.clone()),
+                #[cfg(unix)]
+                Host::Unix(path) => path
+                    .to_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| not_utf8("socket directory")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let joined = |items: Vec<String>| items.join(",");
+        if !hosts.is_empty() {
+            vars.push(("PGHOST", joined(hosts)));
+        }
+        let addrs: Vec<String> = config
+            .get_hostaddrs()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        if !addrs.is_empty() {
+            vars.push(("PGHOSTADDR", joined(addrs)));
+        }
+        let ports: Vec<String> = config.get_ports().iter().map(ToString::to_string).collect();
+        if !ports.is_empty() {
+            vars.push(("PGPORT", joined(ports)));
+        }
+        if let Some(user) = config.get_user() {
+            vars.push(("PGUSER", user.to_string()));
+        }
+        if let Some(password) = config.get_password() {
+            let password = std::str::from_utf8(password).map_err(|_| not_utf8("password"))?;
+            vars.push(("PGPASSWORD", password.to_string()));
+        }
+        if let Some(dbname) = config.get_dbname() {
+            vars.push(("PGDATABASE", dbname.to_string()));
+        }
+        if let Some(options) = config.get_options() {
+            vars.push(("PGOPTIONS", options.to_string()));
+        }
+        if let Some(name) = config.get_application_name() {
+            vars.push(("PGAPPNAME", name.to_string()));
+        }
+        if let Some(timeout) = config.get_connect_timeout() {
+            // libpq takes whole seconds; round up so it never waits less.
+            let seconds = timeout.as_secs() + u64::from(timeout.subsec_nanos() > 0);
+            vars.push(("PGCONNECT_TIMEOUT", seconds.to_string()));
+        }
+        if config.get_target_session_attrs() == TargetSessionAttrs::ReadWrite {
+            vars.push(("PGTARGETSESSIONATTRS", "read-write".to_string()));
+        }
+        match config.get_channel_binding() {
+            ChannelBinding::Disable => vars.push(("PGCHANNELBINDING", "disable".to_string())),
+            ChannelBinding::Require => vars.push(("PGCHANNELBINDING", "require".to_string())),
+            _ => {}
+        }
+        if config.get_load_balance_hosts() == LoadBalanceHosts::Random {
+            vars.push(("PGLOADBALANCEHOSTS", "random".to_string()));
+        }
+        vars.extend(tls.libpq_environment());
+        Ok(vars)
+    }
+
     /// The Postgres schema this instance is configured to operate in. See
     /// `DEFAULT_SCHEMA` and `docs/instance-identity.md`.
     pub fn schema(&self) -> &str {
@@ -508,6 +598,69 @@ mod tests {
         assert_eq!(config.target_schema(), "analytics");
         // Overriding the target schema leaves the instance schema alone.
         assert_eq!(config.schema(), DEFAULT_SCHEMA);
+    }
+
+    /// A URL and a key=value connection string give a client program the
+    /// settings Trellis connects with, the password decoded and the TLS
+    /// options included, and nothing they leave out.
+    #[test]
+    fn libpq_environment_carries_every_setting_given() {
+        let env = |dsn: &str| {
+            Config::from_dsn(dsn)
+                .unwrap()
+                .libpq_environment()
+                .unwrap()
+                .into_iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            env(
+                "postgresql://app%40corp:p%40ss%20w@db.example.com:6432/my%20db\
+                 ?sslmode=verify-full&sslrootcert=/ca.pem&application_name=x\
+                 &connect_timeout=5&target_session_attrs=read-write&options=-c%20a%3Db"
+            ),
+            [
+                "PGHOST=db.example.com",
+                "PGPORT=6432",
+                "PGUSER=app@corp",
+                "PGPASSWORD=p@ss w",
+                "PGDATABASE=my db",
+                "PGOPTIONS=-c a=b",
+                "PGAPPNAME=x",
+                "PGCONNECT_TIMEOUT=5",
+                "PGTARGETSESSIONATTRS=read-write",
+                "PGSSLMODE=verify-full",
+                "PGSSLROOTCERT=/ca.pem",
+            ]
+        );
+        assert_eq!(
+            env("host=a,b port=1,2 user=u sslmode=disable"),
+            ["PGHOST=a,b", "PGPORT=1,2", "PGUSER=u", "PGSSLMODE=disable"]
+        );
+        // Trellis's default, spelled out so libpq's can't differ.
+        assert_eq!(
+            env("host=a user=u sslcert=/c.pem sslkey=/k.pem"),
+            [
+                "PGHOST=a",
+                "PGUSER=u",
+                "PGSSLMODE=prefer",
+                "PGSSLCERT=/c.pem",
+                "PGSSLKEY=/k.pem"
+            ]
+        );
+    }
+
+    /// A connection string Trellis can't connect with is refused, without
+    /// quoting it.
+    #[test]
+    fn libpq_environment_refuses_what_connecting_refuses() {
+        let err = Config::from_dsn("host=a password=hunter2 xyzzy=1")
+            .unwrap()
+            .libpq_environment()
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("hunter2"), "{err}");
     }
 
     #[test]

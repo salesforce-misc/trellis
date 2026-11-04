@@ -389,6 +389,32 @@ each one costs and what to expect around it
   * Trellis's schema or the targets restored without the rest need the
     affected transforms paused, dropped and defined again, or the whole
     database restored from one backup.
+* **Moving an instance's definitions to another database** (a staging copy, a
+  fresh test database, another cluster), without its data:
+  1. `trellis dump --out dump.sql` against the database. It runs `pg_dump
+     --schema-only --no-owner` (version 15 or later, no older than the
+     server, the first on `PATH`) over every schema but Trellis's own,
+     leaves out the 1-1 targets' ledgers and the capture triggers on source
+     tables, and appends one line per definition
+     ([schema dumps](embedding.md#schema-dumps)). It doesn't migrate the
+     database. `--definitions-only` writes just those lines,
+     to append to a `pg_dump` you run yourself.
+  2. `createdb` the new database, then `trellis restore dump.sql` against
+     it. It refuses a database with anything in it but an empty `public`
+     schema, loads the file with `psql` in one transaction (nothing is
+     loaded if a statement fails), then migrates, which restores each
+     definition into its dumped target, unbuilt and unpaused.
+  3. `trellis run` against the new database builds every definition from
+     its source rows.
+
+  `TRELLIS_SCHEMA` has to name the same Trellis schema on both sides, and
+  `TRELLIS_TARGET_SCHEMA` has to resolve each definition's bare names to the
+  tables the dump recorded; a definition that doesn't, or whose target can't
+  be adopted, fails the restore naming it. The ones before it stay restored,
+  and the next command that migrates (`trellis run`, `trellis apply`)
+  restores the rest once the cause is fixed. `pg_dump` 17.6 and later write
+  `\restrict` lines with a key chosen per run, so two dumps of the same
+  database differ in those two lines; the definitions are the same bytes.
 * **After a crash or a failover,** `request_backfill` each unlogged source
   ([known correctness gaps](known-correctness-gaps.md#an-unlogged-source-emptied-by-a-crash-or-failover)).
 * **After an `ALTER COLUMN … TYPE … USING` that changes a read column's

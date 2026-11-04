@@ -92,6 +92,7 @@ function ClientError::code
 function ClientOptions::wake_channel_for
 function Config::dsn
 function Config::from_dsn
+function Config::libpq_environment
 function Config::resolve
 function Config::schema
 function Config::target_schema
