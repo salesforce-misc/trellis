@@ -89,8 +89,9 @@ pub struct TransformDef {
 /// can be a grammar addition.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
-    /// `TRANSFORM <target> FROM <source> ... SELECT ...`
-    DefineTransform(TransformDef),
+    /// `TRANSFORM <target> FROM <source> ... SELECT ...`, boxed: a definition
+    /// is far larger than the other forms.
+    DefineTransform(Box<TransformDef>),
     /// `PAUSE TRANSFORM <target>[.<column>]` — ADR-0014's operator-driven
     /// freeze. Idempotent.
     Pause(TransformRef),
@@ -335,14 +336,26 @@ pub struct JoinOn {
 /// The `JOIN` half of a [`KeySpace::Join`] definition. The `FROM` table is
 /// [`TransformDef::source`]; this is the other table, how it joins, and the
 /// `GROUP BY` keys, each of which may come from either table.
+///
+/// Every qualifier in the tree ([`QualifiedColumn::table`],
+/// [`Expr::SourceColumn`]'s `table`) names its side by the side's bare table
+/// name, even where the text wrote the side's alias: the parser resolves each
+/// alias to its table once, so nothing past it sees an alias. The aliases are
+/// kept only so [`render_definition_text`] writes them back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinSpec {
     pub kind: JoinKind,
+    /// The alias the `FROM` table was given (`FROM <table> [AS] <alias>`),
+    /// as written.
+    pub source_alias: Option<String>,
     /// The joined table's bare name.
     pub right: String,
     /// `Some(schema)` when the joined table was written `<schema>.<table>`;
     /// the twin of [`TransformDef::explicit_source_schema`].
     pub explicit_right_schema: Option<String>,
+    /// The alias the joined table was given (`JOIN <table> [AS] <alias>`),
+    /// as written.
+    pub right_alias: Option<String>,
     /// The `ON` terms, joined by `AND`. At least one.
     pub on: Vec<JoinOn>,
     /// The `GROUP BY` keys in the order written; at least one.
@@ -710,6 +723,7 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
     }
     out.push_str(" FROM ");
     render_table_ref(&mut out, &def.source, def.explicit_source_schema.as_deref());
+    let aliases = Aliases::of(def);
 
     match &def.key_space {
         KeySpace::OneToOne => {}
@@ -718,15 +732,16 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
             out.push_str(&group_by.join(", "));
         }
         KeySpace::Join(join) | KeySpace::JoinOneToOne(join) => {
-            let qualified = |column: &QualifiedColumn| match &column.schema {
-                Some(schema) => format!("{schema}.{}.{}", column.table, column.column),
-                None => format!("{}.{}", column.table, column.column),
+            let qualified = |column: &QualifiedColumn| {
+                aliases.qualified(column.schema.as_deref(), &column.table, &column.column)
             };
+            render_alias(&mut out, join.source_alias.as_deref());
             out.push_str(match join.kind {
                 JoinKind::Inner => " INNER JOIN ",
                 JoinKind::Left => " LEFT JOIN ",
             });
             render_table_ref(&mut out, &join.right, join.explicit_right_schema.as_deref());
+            render_alias(&mut out, join.right_alias.as_deref());
             out.push_str(" ON ");
             let terms: Vec<String> = join
                 .on
@@ -750,7 +765,7 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
     let fields: Vec<String> = def
         .fields
         .iter()
-        .map(|field| format!("{} AS {}", render_field_expr(&field.expr), field.name))
+        .map(|field| format!("{} AS {}", render_expr(&field.expr, &aliases), field.name))
         .collect();
     out.push_str(&fields.join(", "));
 
@@ -771,7 +786,52 @@ fn render_table_ref(out: &mut String, table: &str, explicit_schema: Option<&str>
     out.push_str(table);
 }
 
+/// ` AS <alias>`, the canonical spelling of a table alias, or nothing.
+fn render_alias(out: &mut String, alias: Option<&str>) {
+    if let Some(alias) = alias {
+        out.push_str(" AS ");
+        out.push_str(alias);
+    }
+}
+
+/// The aliases a `JOIN` definition gave its tables, by bare table name: how
+/// [`render_definition_text`] writes a qualifier the parser resolved to a
+/// table back as the alias it was written with.
+struct Aliases<'a>(Vec<(&'a str, &'a str)>);
+
+impl<'a> Aliases<'a> {
+    fn of(def: &'a TransformDef) -> Self {
+        let mut aliases = Vec::new();
+        if let KeySpace::Join(join) | KeySpace::JoinOneToOne(join) = &def.key_space {
+            if let Some(alias) = &join.source_alias {
+                aliases.push((def.source.as_str(), alias.as_str()));
+            }
+            if let Some(alias) = &join.right_alias {
+                aliases.push((join.right.as_str(), alias.as_str()));
+            }
+        }
+        Self(aliases)
+    }
+
+    /// `<qualifier>.<column>`: the alias of `table`'s side if it has one
+    /// (an aliased side's qualifier never carries a schema), else the
+    /// qualifier as [`qualified_column_text`] writes it.
+    fn qualified(&self, schema: Option<&str>, table: &str, column: &str) -> String {
+        match self.0.iter().find(|(aliased, _)| *aliased == table) {
+            Some((_, alias)) if schema.is_none() => format!("{alias}.{column}"),
+            _ => qualified_column_text(schema, table, column),
+        }
+    }
+}
+
+/// `expr` as definition text, every qualifier as the tree holds it: a
+/// table's name, never an alias ([`JoinSpec`]).
 pub(crate) fn render_field_expr(expr: &Expr) -> String {
+    render_expr(expr, &Aliases(Vec::new()))
+}
+
+fn render_expr(expr: &Expr, aliases: &Aliases<'_>) -> String {
+    let render_field_expr = |expr: &Expr| render_expr(expr, aliases);
     match expr {
         Expr::Column(name) => name.clone(),
         Expr::NumberLiteral(text) => text.clone(),
@@ -788,7 +848,7 @@ pub(crate) fn render_field_expr(expr: &Expr) -> String {
             schema,
             table,
             column,
-        } => qualified_column_text(schema.as_deref(), table, column),
+        } => aliases.qualified(schema.as_deref(), table, column),
         Expr::BinaryOp { op, lhs, rhs } => format!(
             "({} {} {})",
             render_field_expr(lhs),

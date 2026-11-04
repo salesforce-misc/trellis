@@ -135,6 +135,8 @@ mod floor_manifest;
 mod literal_tests;
 #[cfg(test)]
 mod logic_tests;
+#[cfg(test)]
+mod table_alias_tests;
 
 #[cfg(test)]
 mod tests {
@@ -433,7 +435,7 @@ mod tests {
         let (construct, detail) =
             refusal("TRANSFORM t FROM a JOIN a ON a.k = a.j GROUP BY a.g SELECT COUNT(*) AS n");
         assert_eq!(construct, "JOIN");
-        assert!(detail.contains("itself"), "{detail}");
+        assert!(detail.contains("self-join"), "{detail}");
     }
 
     /// A `JOIN` with no `GROUP BY` parses to the 1-1 JOIN key space, and it
@@ -1221,7 +1223,7 @@ mod statement_grammar_tests {
         let Statement::DefineTransform(def) = parse_statement(text).unwrap() else {
             panic!("a TRANSFORM statement must parse as one");
         };
-        assert_eq!(def, parse(text).unwrap());
+        assert_eq!(*def, parse(text).unwrap());
         assert_eq!(def.target, "order_totals");
         assert_eq!(def.explicit_target_schema, Some("reporting".to_string()));
     }

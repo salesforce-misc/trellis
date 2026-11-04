@@ -102,6 +102,14 @@ async fn define_validates_a_join_against_both_tables_then_refuses_it() {
             "TRANSFORM by_line FROM orders JOIN other.lines ON orders.id = lines.order_id \
              GROUP BY orders.region WITHOUT SOURCE INDEX SELECT SUM(lines.qty) AS qty",
         ),
+        // Both tables aliased (#1458): the catalog names the tables, never
+        // an alias.
+        (
+            "by_line_aliased",
+            "TRANSFORM by_line_aliased FROM orders AS o JOIN other.lines l \
+             ON o.id = l.order_id GROUP BY o.region WITHOUT SOURCE INDEX \
+             SELECT o.region AS region, SUM(l.qty) AS qty",
+        ),
     ] {
         let definition = install_definition(&db.pool, text, &HashMap::new(), "public")
             .await
@@ -128,7 +136,41 @@ async fn define_validates_a_join_against_both_tables_then_refuses_it() {
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(joined, ["public.items", "public.items", "other.lines"]);
+    assert_eq!(
+        joined,
+        ["public.items", "public.items", "other.lines", "other.lines"]
+    );
+
+    // A qualifier naming neither table nor alias, and a table's name used
+    // after its side was aliased, are refused.
+    let err = define_err(
+        &db.pool,
+        "TRANSFORM by_region FROM orders o JOIN items i ON o.id = i.order_id \
+         GROUP BY o.region WITHOUT SOURCE INDEX SELECT SUM(public.o.total) AS t",
+    )
+    .await;
+    assert!(
+        matches!(
+            &err,
+            CatalogError::Validate(ValidationError::JoinUnknownTable { reference })
+                if reference == "public.o.total"
+        ),
+        "{err:?}"
+    );
+    let err = define_err(
+        &db.pool,
+        "TRANSFORM by_region FROM orders o JOIN items i ON o.id = i.order_id \
+         GROUP BY orders.region WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
+    )
+    .await;
+    assert!(
+        matches!(
+            &err,
+            CatalogError::Parse(trellis::defs::ParseError::AliasedTableName { alias, .. })
+                if alias == "o"
+        ),
+        "{err:?}"
+    );
 
     // Each check reads the live column, on either side.
     let on = |on: &str, select: &str| {

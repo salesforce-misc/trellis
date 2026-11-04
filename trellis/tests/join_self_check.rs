@@ -186,6 +186,48 @@ async fn a_converged_join_target_reports_no_divergence_at_every_page_size() {
     }
 }
 
+/// [`LEFT_PAIR`] written with table aliases (#1458): each side's columns
+/// qualified by its alias, one with `AS` and one without.
+const LEFT_PAIR_ALIASED: &str = "TRANSFORM la FROM public.a AS x LEFT JOIN public.b y \
+     ON x.t = y.t AND x.k = y.k GROUP BY x.ga, y.gb \
+    WITHOUT SOURCE INDEX SELECT x.ga AS ga, y.gb AS gb, COUNT(*) AS n, COUNT(x.x) AS cx, SUM(x.x) AS sx, \
+            AVG(y.y) AS ay, COALESCE(SUM(y.y), 0) + COUNT(*) AS mixed, COUNT(y.y) AS cy, \
+            COUNT(x.t) AS ct";
+
+/// A `JOIN` written with aliases builds and maintains the target of the
+/// same `JOIN` written with table names, which matches Postgres's own
+/// `JOIN … GROUP BY` over the tables, and its `self_check` (whose oracle
+/// renders that `JOIN` from the definition) finds nothing at every page
+/// size. An alias pasted into any SQL Trellis renders would name no table.
+#[tokio::test]
+async fn an_aliased_join_matches_the_join_written_with_table_names() {
+    let mut d = start(&[LEFT_PAIR, LEFT_PAIR_ALIASED]).await;
+    seed(&mut d).await;
+    for limit in [1, 3, 100] {
+        let (found, _, _) = walk(&d, "la", limit).await;
+        assert_eq!(found, [], "limit {limit}");
+    }
+    let columns = "ga, gb, n, cx, sx, ay, mixed, cy, ct";
+    let aliased = d
+        .rows(&format!("select {columns} from public.la order by ga, gb"))
+        .await;
+    assert_eq!(
+        aliased,
+        d.rows(&format!("select {columns} from public.l order by ga, gb"))
+            .await
+    );
+    let oracle = d
+        .rows(
+            "select a.ga, b.gb, count(*), count(a.x), sum(a.x), avg(b.y), \
+                    coalesce(sum(b.y), 0) + count(*), count(b.y), count(a.t) \
+             from public.a left join public.b on a.t = b.t and a.k = b.k \
+             group by a.ga, b.gb order by 1, 2",
+        )
+        .await;
+    assert_eq!(aliased, oracle);
+    assert!(aliased.len() > 3, "{aliased:?}");
+}
+
 /// The tombstone pass collects `T`'s zero groups (the seed leaves some on
 /// both kinds), and the check reads a group `T` lacks as zeros: the target
 /// still reports nothing at every page size.
