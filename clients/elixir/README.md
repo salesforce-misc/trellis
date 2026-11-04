@@ -363,6 +363,19 @@ up to three times, when a define or drop committed in between, so the
 file's DDL and definitions agree. A repo with no `:trellis` configuration
 is dumped by `mix ecto.dump`.
 
+`mix trellis.dump` also dumps a repo's `:migration_repo`, as `mix ecto.dump`
+does, before the Trellis repo's file, and with `--prefix` it reads
+`schema_migrations` from the schemas named only (not the target schema it adds
+to the dump). The repo and its `:trellis` url have to name the same database,
+by host, port and database name spelled alike (`localhost` is not
+`127.0.0.1`; a repo connecting over a socket directory matches a local
+host), or `mix trellis.dump` and `mix trellis.load` refuse, before
+anything is written or loaded. A dump that fails after `pg_dump` has run
+removes the file, whose raw `pg_dump` output would load without the
+definitions. `mix trellis.load` restores nothing for a repo `mix ecto.load`
+left alone (`--skip-if-loaded` on a loaded database, or a "no" to its
+prompt).
+
 `pg_dump` 17 writes `CREATE SCHEMA public;` when it dumps `public` by name,
 which stops `mix ecto.load` into a database `mix ecto.create` made; the task
 writes `CREATE SCHEMA IF NOT EXISTS public;` instead.

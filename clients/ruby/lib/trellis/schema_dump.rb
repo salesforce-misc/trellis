@@ -2,6 +2,7 @@
 
 require "active_record"
 require "etc"
+require "fileutils"
 require "trellis/pg"
 
 module Trellis
@@ -227,10 +228,11 @@ module Trellis
 
       # A libpq connection string for the database db_config names, in
       # another environment than configured_url's: configured_url's
-      # settings with db_config's database, and its host, port, user and
-      # password where db_config names them (a host left to libpq's default
-      # keeps configured_url's, a local one by verify_same_database!). A
-      # db_config with a url is that url.
+      # settings with db_config's database, and its host, port, user,
+      # password and other libpq keywords (sslmode, sslrootcert, ...) where
+      # db_config names them (a host left to libpq's default keeps
+      # configured_url's, a local one by verify_same_database!). A db_config
+      # with a url is that url.
       def environment_url(db_config, configured_url, what)
         hash = db_config.configuration_hash.transform_keys(&:to_sym)
         return hash[:url].to_s if hash[:url]
@@ -246,7 +248,16 @@ module Trellis
         end
         user = hash[:username] || hash[:user]
         keywords["user"] = user.to_s if user
-        keywords["password"] = hash[:password].to_s if hash[:password]
+        # Every other libpq keyword the config names (sslmode, sslrootcert,
+        # connect_timeout, ...) is the connection Rails makes: the adapter
+        # hands them all to libpq. A blank one names nothing, a blank password
+        # included: it doesn't blank the url's.
+        PG::Connection.conndefaults_hash.each_key do |key|
+          next if %i[host port dbname user].include?(key)
+
+          value = hash[key]
+          keywords[key.to_s] = value.to_s unless value.nil? || value.to_s.empty?
+        end
         keywords.map { |key, value| "#{key}='#{value.to_s.gsub(/[\\']/) { |c| "\\#{c}" }}'" }.join(" ")
       end
 
@@ -346,22 +357,34 @@ module Trellis
 
         SchemaDump.verify_same_database!(db_config)
 
-        SchemaDump::ATTEMPTS.times do
-          before = SchemaDump.parts
-          begin
-            Thread.current[SchemaDump::PARTS_KEY] = before
-            super(db_config, format)
-          ensure
-            Thread.current[SchemaDump::PARTS_KEY] = nil
+        written = false
+        finished = false
+        begin
+          SchemaDump::ATTEMPTS.times do
+            before = SchemaDump.parts
+            begin
+              Thread.current[SchemaDump::PARTS_KEY] = before
+              written = true
+              super(db_config, format)
+            ensure
+              Thread.current[SchemaDump::PARTS_KEY] = nil
+            end
+            if SchemaDump.parts == before
+              SchemaDump.finish(filename, before)
+              finished = true
+              return nil
+            end
           end
-          if SchemaDump.parts == before
-            SchemaDump.finish(filename, before)
-            return nil
-          end
+          raise Trellis::ConflictError,
+                "Trellis's definitions changed during each of #{SchemaDump::ATTEMPTS} dumps of " \
+                "#{db_config.name}: run the dump when no define or drop is running"
+        ensure
+          # Whatever Rails wrote is raw `pg_dump` output with the capture
+          # triggers in and no definitions: left in place, a later
+          # `db:schema:load` would load it without a word. A failure before
+          # the first `pg_dump` leaves the previous file alone.
+          FileUtils.rm_f(filename) if written && !finished
         end
-        raise Trellis::ConflictError,
-              "Trellis's definitions changed during each of #{SchemaDump::ATTEMPTS} dumps of " \
-              "#{db_config.name}: run the dump when no define or drop is running"
       end
 
       # After Rails loads the dump database's `structure.sql`, restores the

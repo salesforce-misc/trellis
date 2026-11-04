@@ -24,7 +24,14 @@ defmodule Trellis.StructureDump do
     `Trellis.Migration` reads it. The handle starts no background work.
   - The target schema in the dump. When `--prefix` (`:dump_prefixes`)
     names schemas, the instance's `:target_schema` (default `"public"`) is
-    dumped as well.
+    dumped as well. Its `schema_migrations` rows are not: those are the
+    named schemas'.
+  - The repo and the `:trellis` url naming the same database, by host, port
+    and database name. The definitions of one database don't belong in the
+    structure file of another, so a `dump/2` or `append/2` at a url that
+    names another refuses, and so does `mix trellis.load`. `localhost` is
+    not `127.0.0.1`; a repo connecting over a socket directory matches a
+    local Trellis host.
 
   ## Loading
 
@@ -47,6 +54,10 @@ defmodule Trellis.StructureDump do
   in between can't leave a file whose DDL and definitions disagree.
   `append/2` reads once, after a dump someone else ran, and can't tell.
 
+  A dump that fails after `pg_dump` has run (definitions that changed during
+  each attempt, a failed filter) removes the file: what `pg_dump` wrote has
+  the capture triggers in and no definitions, and would load without a word.
+
   ## `CREATE SCHEMA public`
 
   `pg_dump` 17 writes `CREATE SCHEMA public;` when it dumps `public` by
@@ -56,6 +67,8 @@ defmodule Trellis.StructureDump do
   `CREATE SCHEMA IF NOT EXISTS public;` so the file loads into a fresh
   database.
   """
+
+  alias Trellis.StructureDump.Database
 
   # The engine's appendix starts with this line; a second append replaces
   # the first's appendix rather than loading the definitions twice.
@@ -115,7 +128,10 @@ defmodule Trellis.StructureDump do
   --schema-only --no-acl --no-owner` into `plan.path`, with `-n` for each of
   `plan.config`'s `:dump_prefixes` (when there are any), then an `INSERT`
   for each migration version in each prefix's (or `public`'s)
-  `schema_migrations`.
+  `schema_migrations`. The prefixes are `plan.config`'s `:migration_prefixes`
+  when it has them: `dump/2` adds the instance's target schema to
+  `:dump_prefixes` so the target tables are dumped, and that schema's
+  `schema_migrations` is not part of the dump.
   """
   @spec pg_dump(map(), [String.t()]) :: :ok | {:error, String.t()}
   def pg_dump(%{repo: repo, config: config, path: path}, extra_args) do
@@ -141,7 +157,7 @@ defmodule Trellis.StructureDump do
   # first.
   defp migration_versions(repo, config) do
     table = config[:migration_source] || "schema_migrations"
-    prefixes = config[:dump_prefixes] || ["public"]
+    prefixes = config[:migration_prefixes] || config[:dump_prefixes] || ["public"]
 
     read = fn repo ->
       Enum.reduce_while(prefixes, {:ok, []}, fn prefix, {:ok, versions} ->
@@ -242,6 +258,7 @@ defmodule Trellis.StructureDump do
     config = Keyword.merge(repo.config(), Keyword.take(options, [:dump_prefixes]))
 
     with {:ok, trellis_options} <- trellis_options(repo, config),
+         :ok <- Database.verify(repo, config, trellis_options),
          {:ok, path} <- path(repo, config, options),
          :ok <- if(old_format?, do: check_prefixes(config, trellis_options), else: :ok) do
       config = Keyword.put(config, :dump_path, path) |> with_target_schema(trellis_options)
@@ -250,7 +267,8 @@ defmodule Trellis.StructureDump do
   end
 
   # The target tables are in the dump: the instance's target schema joins
-  # any `:dump_prefixes`.
+  # any `:dump_prefixes`. It is not one of the schemas whose migrations
+  # `mix ecto.dump` dumps (`:migration_prefixes`: the ones `--prefix` names).
   defp with_target_schema(config, trellis_options) do
     case config[:dump_prefixes] do
       prefixes when prefixes in [nil, []] ->
@@ -258,7 +276,10 @@ defmodule Trellis.StructureDump do
 
       prefixes ->
         target = Keyword.get(trellis_options, :target_schema, "public")
-        Keyword.put(config, :dump_prefixes, Enum.uniq(prefixes ++ [exact_prefix(target)]))
+
+        config
+        |> Keyword.put(:dump_prefixes, Enum.uniq(prefixes ++ [exact_prefix(target)]))
+        |> Keyword.put(:migration_prefixes, prefixes)
     end
   end
 
@@ -335,20 +356,43 @@ defmodule Trellis.StructureDump do
     end
   end
 
-  defp attempt(_plan, _handle, _pg_dump, 0) do
-    {:error,
-     "Trellis's definitions changed during each of #{@attempts} dumps: dump when no " <>
-       "migration is defining or dropping"}
-  end
-
+  # One dump, between two reads of the definitions: done when they agree and
+  # the file is finished, redone (`left` more times) when they differ. Once
+  # `pg_dump` has run, whatever the file holds is raw `pg_dump` output, with
+  # the capture triggers in and no definitions; any way out but success
+  # removes it, so `mix ecto.load` can't load it without a word. A failure
+  # before the first `pg_dump` leaves the previous file alone.
   defp attempt(plan, handle, pg_dump, left) do
-    with {:ok, before} <- read_schema_dump(handle),
-         :ok <- pg_dump.(Map.take(plan, [:repo, :config, :path]), before.pg_dump_args),
-         {:ok, now} <- read_schema_dump(handle) do
-      if now == before do
-        finish(plan.path, handle, before.appendix)
-      else
-        attempt(plan, handle, pg_dump, left - 1)
+    with {:ok, before} <- read_schema_dump(handle) do
+      outcome =
+        try do
+          with :ok <- pg_dump.(Map.take(plan, [:repo, :config, :path]), before.pg_dump_args),
+               {:ok, now} <- read_schema_dump(handle) do
+            if now == before, do: finish(plan.path, handle, before.appendix), else: :changed
+          end
+        catch
+          kind, reason ->
+            File.rm(plan.path)
+            :erlang.raise(kind, reason, __STACKTRACE__)
+        end
+
+      case outcome do
+        :changed when left > 1 ->
+          attempt(plan, handle, pg_dump, left - 1)
+
+        :changed ->
+          File.rm(plan.path)
+
+          {:error,
+           "Trellis's definitions changed during each of #{@attempts} dumps: dump when no " <>
+             "migration is defining or dropping"}
+
+        {:error, _} = error ->
+          File.rm(plan.path)
+          error
+
+        :ok ->
+          :ok
       end
     end
   end

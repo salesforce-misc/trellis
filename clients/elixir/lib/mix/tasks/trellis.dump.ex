@@ -30,7 +30,12 @@ if Code.ensure_loaded?(Mix.Tasks.Ecto.Dump) do
     drop committed in between.
 
     A repo with none is dumped by `mix ecto.dump` itself, and the task
-    refuses to run when no repo has one.
+    refuses to run when no repo has one. A repo's `:migration_repo` is dumped
+    by `mix ecto.dump` as well, as it is for any repo, unless it is among the
+    repos given. The repo and its `:trellis` url have to name the same
+    database (host, port and database name, spelled alike), or the task
+    refuses: the definitions of one database don't belong in the structure
+    file of another.
     """
 
     @aliases [d: :dump_path, q: :quiet, r: :repo]
@@ -74,6 +79,13 @@ if Code.ensure_loaded?(Mix.Tasks.Ecto.Dump) do
           {repo, Keyword.put(options, :default_path, default)}
         end
 
+      # `mix ecto.dump` also dumps a repo's `:migration_repo`. It is dumped
+      # first: given a `--dump-path`, `ecto.dump` writes every repo it dumps
+      # to that path, and the Trellis file has to be the one left there.
+      for repo <- migration_repos(trellis_repos, repos) do
+        Mix.Tasks.Ecto.Dump.run(without_repos(args) ++ ["-r", inspect(repo)])
+      end
+
       case Trellis.StructureDump.dump(dumped) do
         {:ok, paths} ->
           unless opts[:quiet] do
@@ -94,6 +106,17 @@ if Code.ensure_loaded?(Mix.Tasks.Ecto.Dump) do
       for repo <- other_repos do
         Mix.Tasks.Ecto.Dump.run(without_repos(args) ++ ["-r", inspect(repo)])
       end
+    end
+
+    # The migration repos of `trellis_repos` that are not themselves among
+    # `repos`, which dump on their own.
+    defp migration_repos(trellis_repos, repos) do
+      for repo <- trellis_repos,
+          migration_repo = repo.config()[:migration_repo],
+          migration_repo != repo,
+          migration_repo not in repos,
+          uniq: true,
+          do: migration_repo
     end
 
     # `args` without its `-r`/`--repo` options.

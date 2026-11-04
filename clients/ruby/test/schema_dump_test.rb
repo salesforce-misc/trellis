@@ -332,9 +332,67 @@ class SchemaDumpTest < Minitest::Test
                  ))
   end
 
+  def test_another_environment_s_url_carries_its_ssl_keys_and_a_blank_password_keeps_the_urls
+    configured = "host=devhost port=5432 dbname=app_dev user=dev password=secret sslmode=disable connect_timeout=3"
+    hash = { adapter: "postgresql", host: "testhost", dbname: "app_test", sslmode: "verify-full",
+             sslrootcert: "/etc/ssl/ca.pem", password: "", connect_timeout: "" }
+    keywords = environment_keywords(hash, configured)
+    assert_equal "verify-full", keywords["sslmode"]
+    assert_equal "/etc/ssl/ca.pem", keywords["sslrootcert"]
+    # Blank values name nothing: the url's stay.
+    assert_equal "secret", keywords["password"]
+    assert_equal "3", keywords["connect_timeout"]
+
+    # A password the config does name replaces the url's, and so does a
+    # keyword the url doesn't have.
+    keywords = environment_keywords(hash.merge(password: "other"), "host=devhost user=dev")
+    assert_equal "other", keywords["password"]
+    assert_equal "verify-full", keywords["sslmode"]
+  end
+
+  def test_a_dump_that_fails_leaves_no_file_to_load
+    source = database("failed")
+    define_in(source)
+    path = File.join(@dir, "structure.sql")
+    config = db_config(source)
+
+    # Never settles.
+    serial = 0
+    reads = -> { [{ pg_dump_args: [], appendix: "read #{serial += 1}" }] }
+    SchemaDump.stub(:parts, reads) do
+      Tasks.stub(:structure_dump, ->(_config, file) { File.write(file, "-- raw\n") }) do
+        assert_raises(Trellis::ConflictError) { Tasks.dump_schema(config, :sql) }
+      end
+    end
+    refute File.exist?(path)
+
+    # The pg_dump itself fails after writing part of the file.
+    failing = lambda do |_config, file|
+      File.write(file, "-- partial\n")
+      raise "pg_dump failed"
+    end
+    Tasks.stub(:structure_dump, failing) do
+      assert_raises(RuntimeError) { Tasks.dump_schema(config, :sql) }
+    end
+    refute File.exist?(path)
+
+    # A failure before the first pg_dump leaves the file already there alone.
+    File.write(path, "-- previous\n")
+    SchemaDump.stub(:parts, -> { raise Trellis::ConnectivityError, "down" }) do
+      assert_raises(Trellis::ConnectivityError) { Tasks.dump_schema(config, :sql) }
+    end
+    assert_equal "-- previous\n", File.read(path)
+  end
+
   private
 
   SchemaDump = Trellis::SchemaDump
+
+  def environment_keywords(hash, configured)
+    config = ActiveRecord::DatabaseConfigurations::HashConfig.new("test", "primary", hash)
+    url = SchemaDump.send(:environment_url, config, configured, "test")
+    PG::Connection.conninfo_parse(url).to_h { |entry| [entry[:keyword], entry[:val]] }
+  end
 
   def database(role)
     name = "sd_#{role}_#{@id}_#{Process.pid}"

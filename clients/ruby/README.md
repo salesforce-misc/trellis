@@ -561,8 +561,9 @@ How the restore works, and what it refuses, is in
   `db:test:prepare` loads it. That dump is checked against development's
   config of the same name, which `config.trellis.connect` points at, and the
   load's restore connects to the test database: the configured options with
-  the test config's database, and its host, port, user and password where it
-  names them (its `url` when it has one).
+  the test config's database, and its host, port, user, password and other
+  libpq keywords (`sslmode`, `sslrootcert`, ...) where it names a non-blank
+  value (its `url` when it has one).
 - The hook adds each instance's exclusions (its Trellis schema, its ledgers)
   to the flags Rails passes `pg_dump`, and its `target_schema` to the
   `--schema` flags when Rails passes any. `pg_dump` can't leave out one
@@ -572,7 +573,8 @@ How the restore works, and what it refuses, is in
   hook reads the definitions before and after the `pg_dump` and redoes the
   dump when they differ (three attempts, then `Trellis::ConflictError`), so a
   define or drop that races a dump can't leave tables and definitions
-  disagreeing.
+  disagreeing. A dump that fails leaves no `structure.sql` behind, since
+  what Rails wrote has no definitions and would load without a word.
 - A definition that was paused or quarantined where the dump was taken loads
   unpaused: the pause is runtime state.
 - A `structure.sql` written by an earlier release, which carries Trellis's
