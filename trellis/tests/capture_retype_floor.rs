@@ -72,7 +72,9 @@ async fn state(raw: &Client, target: &str) -> (TransformStatus, String, Option<S
         .await
         .expect("read the definition");
     (
-        trellis::defs::StoredStatus::from_row(row.get(0)).into(),
+        trellis::defs::StoredStatus::from_row(row.get(0))
+            .expect("a status this release knows")
+            .into(),
         row.get(1),
         row.get(2),
     )
