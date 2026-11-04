@@ -1031,6 +1031,134 @@ async fn self_check_reads_the_extremes_under_their_own_basis() {
     assert_oracle(&mut d).await;
 }
 
+/// The groups only the extremes' side has. Group 1 is F6's zero group, whose
+/// extremes the source's partials don't show. Its hidden row lost is
+/// reported on its extremes alone (a later insertion would set the extreme
+/// from `NULL`). Group 2's hidden row lost is reported on group 2 only, at
+/// every page size: at limit 2 the extremes' side (groups 1 and 2) ends the
+/// page before the hidden side (1 and 3) and the source's (2 and 3), so
+/// group 3 isn't compared against an extremes' side that stopped short of
+/// it. Fails if side 7 doesn't bound the page, or if a group only side 7
+/// has isn't compared.
+#[tokio::test]
+async fn self_check_compares_the_groups_only_the_extremes_have() {
+    let mut d = start().await;
+    step(
+        &mut d,
+        "insert into public.src values (100, 2, 0), (300, 3, 5)",
+    )
+    .await;
+    write(&d, "insert into public.src values (1, 1, 1)").await;
+    let t1 = d.seal().await;
+    write(
+        &d,
+        "delete from public.src where id = 1; insert into public.src values (2, 1, 7)",
+    )
+    .await;
+    let t2 = d.seal().await;
+    d.drain(t2, "a").await;
+    assert_eq!(extremes(&d, 1).await, ["(7,7,t)"]);
+    for limit in [1, 2, 100] {
+        assert_eq!(compare(&d, limit).await, (vec![], false), "limit {limit}");
+    }
+    let hidden = hidden(&d).await;
+    let name = hidden_name(&d).await;
+    let save = |g: i32| {
+        format!(
+            "create table public.saved as select * from {hidden} where g = {g}; \
+             delete from {hidden} where g = {g}"
+        )
+    };
+    // The hidden table's stored columns: a generated one takes no value.
+    let stored = scalar(
+        &d,
+        &format!(
+            "select string_agg(attname, '|' order by attnum) from pg_attribute \
+             where attrelid = '{hidden}'::regclass and attnum > 0 and not attisdropped \
+               and attgenerated = ''"
+        ),
+    )
+    .await
+    .replace('|', ", ");
+    let restore = format!(
+        "insert into {hidden} ({stored}) select {stored} from public.saved; \
+         drop table public.saved"
+    );
+
+    write(&d, &save(1)).await;
+    for limit in [1, 2, 100] {
+        assert_eq!(
+            compare(&d, limit).await,
+            (
+                vec![
+                    cell("1", &format!("{name}.__min_1"), None, Some("7")),
+                    cell("1", &format!("{name}.__max_1"), None, Some("7")),
+                ],
+                false
+            ),
+            "limit {limit}"
+        );
+    }
+    write(&d, &restore).await;
+
+    write(&d, &save(2)).await;
+    for limit in [1, 2, 100] {
+        let (found, _) = compare(&d, limit).await;
+        assert!(
+            !found.is_empty()
+                && found.iter().all(|x| matches!(x,
+                    Divergence::Cell { key, .. } | Divergence::ExtraRow { key } if key == "2")),
+            "limit {limit}: {found:?}"
+        );
+    }
+    write(&d, &restore).await;
+
+    d.drain(t1, "b").await;
+    assert_oracle(&mut d).await;
+    assert_walk(&d, &[], "settled").await;
+}
+
+/// Extremes of two arguments, each `NULL` on rows where the other isn't:
+/// side 7 sums weights per (group, both arguments) and takes each extreme
+/// over the rows its own argument isn't `NULL` on, through pending changes
+/// and after they drain. Fails if a row with either argument `NULL` is left
+/// out of both extremes.
+#[tokio::test]
+async fn self_check_takes_each_extreme_over_its_own_arguments() {
+    let mut d = start_with(
+        "TRANSFORM agg FROM public.src GROUP BY g SELECT MIN(v) AS lo, MAX(w) AS hi",
+        "create table public.src (id integer primary key, g integer, v integer, w integer); \
+         create index on public.src (g, v); create index on public.src (g, w)",
+        &[("id", int4()), ("g", int4()), ("v", int4()), ("w", int4())],
+    )
+    .await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 5, null), (2, 1, null, 9), (3, 1, 6, 2), \
+         (4, 2, null, 3), (5, 3, 4, null)",
+    )
+    .await;
+    assert_walk(&d, &[], "settled").await;
+    write(
+        &d,
+        "insert into public.src values (6, 1, 1, null); update public.src set w = 10 where id = 4",
+    )
+    .await;
+    let pending = d.seal().await;
+    for limit in [1, 2, 100] {
+        assert_eq!(compare(&d, limit).await, (vec![], false), "limit {limit}");
+    }
+    d.drain(pending, "late").await;
+    assert_walk(&d, &[], "drained").await;
+    assert_now(
+        &d,
+        "select g, lo, hi from public.agg order by g",
+        "select g, min(v), max(w) from public.src group by g order by g",
+        "drained",
+    )
+    .await;
+}
+
 /// One definition `MIN(v) AS lo, MAX(v) AS hi` over `v` of type `ty`, seeded
 /// with `rows` (`(id, g, v)` literals) and settled.
 async fn start_typed(ty: &str, value_type: ValueType, rows: &str) -> Driver {
