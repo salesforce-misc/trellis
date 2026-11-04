@@ -107,14 +107,16 @@ pub(crate) fn load_in(
 /// can't run ([`pause_unrunnable_in`]), without parsing it; each older than
 /// `oldest`; and each whose text this binary refuses. Each one pauses alone,
 /// so every other definition keeps running. Returns how many it paused or
-/// gave a new reason.
+/// gave a new reason, and which of them it can't run, for the caller to log
+/// once it commits ([`log_unrunnable_pauses`]).
 pub(crate) async fn pause_unloadable_in(
     txn: &tokio_postgres::Transaction<'_>,
     floors: &Floors,
     oldest: i32,
     current: i32,
-) -> Result<usize, crate::Error> {
-    let mut paused = pause_unrunnable_in(txn, floors, current).await?;
+) -> Result<(usize, Vec<UnrunnableDefinition>), crate::Error> {
+    let unrunnable = pause_unrunnable_in(txn, floors, current).await?;
+    let mut paused = unrunnable.len();
     let stored = txn
         .query(
             "select id, source_table, target_table, definition_text, grammar_version, \
@@ -159,15 +161,69 @@ pub(crate) async fn pause_unloadable_in(
             }
         }
     }
-    Ok(paused)
+    Ok((paused, unrunnable))
+}
+
+/// A stored definition this binary can't run (ADR-0024 rule 3), read from
+/// its stored columns alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnrunnableDefinition {
+    id: i64,
+    source: String,
+    target: String,
+    /// Its [`super::floor::Unrunnable::reason`].
+    reason: String,
+}
+
+/// Each stored definition this binary can't run: its floor is above the
+/// running release, or its grammar is newer than `current`. Reads only the
+/// stored columns, never the text.
+pub(crate) async fn unrunnable_definitions(
+    client: &impl tokio_postgres::GenericClient,
+    floors: &Floors,
+    current: i32,
+) -> Result<Vec<UnrunnableDefinition>, tokio_postgres::Error> {
+    Ok(client
+        .query(
+            "select id, source_table, target_table, grammar_version, floor_version \
+             from transform_definitions order by id",
+            &[],
+        )
+        .await?
+        .iter()
+        .filter_map(|row| {
+            let unrunnable = floors.unrunnable_in(row.get(4), row.get(3), current)?;
+            let target: String = row.get(2);
+            Some(UnrunnableDefinition {
+                id: row.get(0),
+                source: row.get(1),
+                reason: unrunnable.reason(&target),
+                target,
+            })
+        })
+        .collect())
+}
+
+/// Logs each pause [`pause_unrunnable_in`] made, once its transaction has
+/// committed: a rolled-back check (`migrate`'s while another version is
+/// live) paused nothing, so it logs nothing.
+pub(crate) fn log_unrunnable_pauses(paused: &[UnrunnableDefinition]) {
+    for definition in paused {
+        crate::instance_log::warn!(
+            transform = %definition.target,
+            reason = %definition.reason,
+            "paused a transform this release can't run"
+        );
+    }
 }
 
 /// Pauses, in `txn`, each definition this binary can't run (ADR-0024 rule
 /// 3): its floor is above the running release, or its grammar is newer than
 /// `current`. Reads only the stored columns, never the text, and records the
 /// [`super::floor::Unrunnable::reason`] as its `capture_failure`, keeping any
-/// reason it was already paused for. Returns how many it paused or gave a new
-/// reason: none once an earlier call recorded them.
+/// reason it was already paused for. Returns the ones it paused or gave a new
+/// reason, none once an earlier call recorded them, for the caller to log
+/// once it commits ([`log_unrunnable_pauses`]).
 ///
 /// Attaching runs it ([`pause_unloadable_in`]), and so does every handle
 /// before it changes anything: a background process when it takes over, and
@@ -176,30 +232,19 @@ pub(crate) async fn pause_unrunnable_in(
     txn: &tokio_postgres::Transaction<'_>,
     floors: &Floors,
     current: i32,
-) -> Result<usize, crate::Error> {
-    let stored = txn
-        .query(
-            "select id, source_table, target_table, grammar_version, floor_version \
-             from transform_definitions order by id",
-            &[],
+) -> Result<Vec<UnrunnableDefinition>, crate::Error> {
+    let mut paused = Vec::new();
+    for definition in unrunnable_definitions(txn, floors, current).await? {
+        if super::lifecycle::pause_for_unrunnable(
+            txn,
+            definition.id,
+            &definition.source,
+            &definition.reason,
         )
-        .await?;
-    let mut paused = 0;
-    for row in &stored {
-        let Some(unrunnable) = floors.unrunnable_in(row.get(4), row.get(3), current) else {
-            continue;
-        };
-        let (id, source, target): (i64, String, String) = (row.get(0), row.get(1), row.get(2));
-        if super::lifecycle::pause_for_unrunnable(txn, id, &source, &unrunnable.reason(&target))
-            .await
-            .map_err(incompatible)?
+        .await
+        .map_err(incompatible)?
         {
-            crate::instance_log::warn!(
-                transform = %target,
-                reason = %unrunnable.reason(&target),
-                "paused a transform this release can't run"
-            );
-            paused += 1;
+            paused.push(definition);
         }
     }
     Ok(paused)
@@ -226,7 +271,7 @@ async fn pause_unloadable_on(
     apply: bool,
 ) -> Result<usize, crate::Error> {
     let txn = client.transaction().await?;
-    let paused = pause_unloadable_in(
+    let (paused, unrunnable) = pause_unloadable_in(
         &txn,
         floors,
         OLDEST_SUPPORTED_GRAMMAR_VERSION,
@@ -235,6 +280,7 @@ async fn pause_unloadable_on(
     .await?;
     if apply {
         txn.commit().await?;
+        log_unrunnable_pauses(&unrunnable);
     } else {
         txn.rollback().await?;
     }

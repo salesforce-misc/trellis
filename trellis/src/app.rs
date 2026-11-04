@@ -516,8 +516,11 @@ impl Trellis {
     ///
     /// Then, as attaching does, it pauses each definition this release
     /// can't run (ADR-0024 rule 3), so a handle that never migrates pauses
-    /// them before it changes anything too. Once they are paused, that reads
-    /// the definitions and changes nothing.
+    /// them before it changes anything too. Only when there is one, it
+    /// takes the handover lock and asks again whether another version is
+    /// live before it pauses, as a background process's takeover does: a
+    /// release that can run them, taking over meanwhile, is never paused
+    /// under. Once they are paused, that changes nothing.
     async fn refuse_while_another_version_is_live(&self) -> Result<(), TrellisError> {
         let mut client = self.pool.get().await?;
         if let Some(refused) = crate::migrate::below_catalog_floor(
@@ -532,14 +535,26 @@ impl Trellis {
         if let Some(seen) = version_handover_on(&**client, &self.config).await? {
             return Err(TrellisError::OtherVersionLive(seen));
         }
+        let current = crate::defs::grammar::CURRENT_GRAMMAR_VERSION;
+        if crate::defs::grammar::unrunnable_definitions(&**client, self.pool.floors(), current)
+            .await?
+            .is_empty()
+        {
+            return Ok(());
+        }
         let txn = client.transaction().await?;
-        crate::defs::grammar::pause_unrunnable_in(
-            &txn,
-            self.pool.floors(),
-            crate::defs::grammar::CURRENT_GRAMMAR_VERSION,
+        txn.execute(
+            "select pg_advisory_xact_lock($1)",
+            &[&crate::handover::handover_lock_key(self.config.schema())],
         )
         .await?;
+        if let Some(seen) = version_handover_on(&*txn, &self.config).await? {
+            return Err(TrellisError::OtherVersionLive(seen));
+        }
+        let paused =
+            crate::defs::grammar::pause_unrunnable_in(&txn, self.pool.floors(), current).await?;
         txn.commit().await?;
+        crate::defs::grammar::log_unrunnable_pauses(&paused);
         Ok(())
     }
 

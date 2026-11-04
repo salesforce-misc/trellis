@@ -7973,6 +7973,63 @@ mod grammar_window_tests {
         let newer = pool_as(&db, "0.3.0");
         assert!(definition_by_target(&newer, "chained").await.is_err());
     }
+
+    /// Pausing a definition this release can't run withdraws every resume
+    /// that would complete without the operator (a pending resume request,
+    /// an upstream cause), keeps the reason it was already paused for after
+    /// its own, and changes nothing the second time.
+    #[tokio::test]
+    async fn the_pause_withdraws_every_resume_and_keeps_the_earlier_reason() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = db.pool.get().await.expect("acquire connection");
+        seed(&**client, CURRENT_GRAMMAR_VERSION, CURRENT_GRAMMAR_VERSION).await;
+        above_floor(&**client, "0.3.0").await;
+        client
+            .batch_execute(
+                "update transform_definitions set status = 'paused' \
+                 where target_table = 'public.chained'; \
+                 insert into resume_requests (transform_id) \
+                 select id from transform_definitions where target_table = 'public.chained'; \
+                 insert into capture_failures \
+                     (transform_id, source_table, columns, error, kind, caused_by) \
+                 select c.id, 'public.t', '{}', 'resuming: waiting for t', 'capture', t.id \
+                 from transform_definitions c, transform_definitions t \
+                 where c.target_table = 'public.chained' and t.target_table = 'public.t'",
+            )
+            .await
+            .expect("a resume waiting on its upstream");
+        let floors = floors("0.2.0");
+        let pause = async |client: &mut tokio_postgres::Client| {
+            let txn = client.transaction().await.expect("begin");
+            let paused = grammar::pause_unrunnable_in(&txn, &floors, CURRENT_GRAMMAR_VERSION)
+                .await
+                .expect("pause");
+            txn.commit().await.expect("commit");
+            paused.len()
+        };
+        assert_eq!(pause(&mut client).await, 1);
+        let row = client
+            .query_one(
+                "select d.status, cf.error, cf.caused_by is null, \
+                        exists (select 1 from resume_requests r where r.transform_id = d.id) \
+                 from transform_definitions d join capture_failures cf on cf.transform_id = d.id \
+                 where d.target_table = 'public.chained'",
+                &[],
+            )
+            .await
+            .expect("chained's pause");
+        let (status, error, no_cause, requested): (String, String, bool, bool) =
+            (row.get(0), row.get(1), row.get(2), row.get(3));
+        assert_eq!(status, "paused");
+        assert!(
+            error.starts_with("this release can't run transform public.chained")
+                && error.ends_with("It was already paused: resuming: waiting for t"),
+            "{error}"
+        );
+        assert!(no_cause && !requested);
+        assert_eq!(pause(&mut client).await, 0);
+    }
 }
 
 #[cfg(test)]

@@ -2841,14 +2841,16 @@ async fn handover_pass(process: &BackgroundProcess, drain: bool) -> Result<Verdi
     // that takes over pauses each definition this release can't run, which
     // nothing it runs then reads. Under the handover lock, so no other
     // version writes meanwhile; a pass that finds them paused changes nothing.
-    if verdict == Verdict::TakeOver && !observed.migrations_pending {
+    let paused = if verdict == Verdict::TakeOver && !observed.migrations_pending {
         crate::defs::grammar::pause_unrunnable_in(
             &txn,
             process.pool.floors(),
             crate::defs::grammar::CURRENT_GRAMMAR_VERSION,
         )
-        .await?;
-    }
+        .await?
+    } else {
+        Vec::new()
+    };
     if observed.registry_exists && !observed.migrations_pending {
         let pid = process.staging_pid.load(Ordering::SeqCst);
         staging::register_worker(
@@ -2865,6 +2867,7 @@ async fn handover_pass(process: &BackgroundProcess, drain: bool) -> Result<Verdi
         .await?;
     }
     txn.commit().await?;
+    crate::defs::grammar::log_unrunnable_pauses(&paused);
     Ok(verdict)
 }
 

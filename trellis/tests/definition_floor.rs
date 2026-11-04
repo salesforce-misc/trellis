@@ -766,3 +766,97 @@ async fn no_path_parses_a_definition_above_the_running_release() {
     self_check_clean(&older, &["t", "t_too"]).await;
     older.shutdown().await.expect("shutdown");
 }
+
+/// The status, floor and pause reason `trellis` reports for `target`.
+async fn paused_for(
+    trellis: &Trellis,
+    target: &str,
+) -> (trellis::TransformStatus, String, Option<String>) {
+    let status = trellis
+        .status(target)
+        .await
+        .expect("status")
+        .expect("defined");
+    (
+        status.status,
+        status.floor,
+        status.capture_failure.map(|failure| failure.error),
+    )
+}
+
+/// ADR-0024 rules 2 and 3 for a handle that never migrates: a read-only
+/// call neither pauses a definition above the running release nor fails on
+/// it; a state-changing call pauses it before it changes anything, unless a
+/// process of another version is live, when it refuses and pauses nothing;
+/// and a background process pauses it when it takes over.
+#[tokio::test]
+async fn a_handle_that_never_migrates_pauses_what_it_cant_run_before_it_changes_anything() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    raw.batch_execute(
+        "create table public.s (id integer primary key, a integer); \
+         insert into public.s values (1, 1)",
+    )
+    .await
+    .expect("source");
+    let newer = handle(&db, "0.3.0", &[("Expr(Case)", "0.3.0")]).await;
+    for text in [
+        "TRANSFORM t FROM s SELECT a AS a",
+        "TRANSFORM held FROM s SELECT CASE WHEN a > 0 THEN a END AS b",
+    ] {
+        newer.apply(text).await.expect(text);
+    }
+    build_everything(&newer).await;
+    assert_eq!(floor(&raw, &newer, "held").await, "0.3.0");
+    let live = trellis::TransformStatus::Live;
+    let paused = trellis::TransformStatus::Paused;
+
+    // A read-only call of the older release changes nothing.
+    let older = handle(&db, "0.2.0", &[("Expr(Case)", "0.3.0")]).await;
+    let (status, floor, reason) = paused_for(&older, "held").await;
+    assert_ne!(status, paused);
+    assert_eq!((floor.as_str(), reason), ("0.3.0", None));
+    assert_eq!(older.definitions().await.expect("definitions").len(), 2);
+
+    // While the newer release's process is live, a state-changing call
+    // refuses and pauses nothing.
+    let newer_running = running(&db, "0.3.0").await;
+    let err = older
+        .apply("PAUSE TRANSFORM t")
+        .await
+        .expect_err("another version is live");
+    assert_eq!(err.code(), trellis::ErrorCode::VersionHandover, "{err}");
+    assert_eq!(paused_for(&older, "held").await.2, None);
+    newer_running.shutdown().await.expect("shut 0.3.0 down");
+
+    // Once it is gone, the call pauses the definition first.
+    older.apply("PAUSE TRANSFORM t").await.expect("pause t");
+    let (status, _, reason) = paused_for(&older, "held").await;
+    assert_eq!(status, paused);
+    let reason = reason.expect("a reason");
+    assert!(
+        reason.contains("roll forward to 0.3.0 or later, then RESUME it or DROP it there"),
+        "{reason}"
+    );
+
+    // Resumed under the newer release, then a background process of the
+    // older one that takes over without migrating pauses it again.
+    for statement in ["RESUME TRANSFORM held", "RESUME TRANSFORM t"] {
+        newer.apply(statement).await.expect(statement);
+    }
+    build_everything(&newer).await;
+    assert_eq!(paused_for(&newer, "held").await.2, None);
+    let older_running = running(&db, "0.2.0").await;
+    wait_for(&older_running, &["held"], paused).await;
+    wait_for(&older_running, &["t"], live).await;
+    let reason = paused_for(&older_running, "held")
+        .await
+        .2
+        .expect("a reason");
+    assert!(
+        reason.contains("this binary runs release 0.2.0"),
+        "{reason}"
+    );
+    older_running.shutdown().await.expect("shutdown");
+}
