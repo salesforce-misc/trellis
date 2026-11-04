@@ -734,6 +734,7 @@ enum Response {
 pub(crate) async fn check(
     client: &mut Client,
     schema: &str,
+    floors: &crate::defs::floor::Floors,
     catalog: &CaptureCatalog,
     table: &str,
 ) -> Result<bool, CaptureError> {
@@ -794,7 +795,7 @@ pub(crate) async fn check(
                 .iter()
                 .filter(|r| !r.capture_failed && read_by.contains(&r.id))
             {
-                match respond(&txn, schema, reader, table, &key, column, change).await? {
+                match respond(&txn, schema, floors, reader, table, &key, column, change).await? {
                     Some(Response::Rebuild) => {
                         causes.insert(CaptureRebuildCause::ColumnChanged);
                     }
@@ -836,9 +837,13 @@ pub(crate) async fn check(
             .filter(|r| applying.contains(&r.id))
             .map(|r| r.target.clone())
             .collect();
-        let rebuilt =
-            crate::intake::catch_up::park_table_catch_ups(&txn, &[table.to_string()], false)
-                .await?;
+        let rebuilt = crate::intake::catch_up::park_table_catch_ups(
+            &txn,
+            floors,
+            &[table.to_string()],
+            false,
+        )
+        .await?;
         crate::staging::build::stamp_rebuild_seg(&txn, &rebuilt).await?;
     }
     write(&txn, table, &found.rewrite).await?;
@@ -870,6 +875,7 @@ pub(crate) async fn check(
 async fn respond(
     txn: &tokio_postgres::Transaction<'_>,
     schema: &str,
+    floors: &crate::defs::floor::Floors,
     reader: &super::columns::CaptureReader,
     table: &str,
     key: &[String],
@@ -902,10 +908,13 @@ async fn respond(
         )
     };
 
-    let Some(definition) = crate::defs::catalog::definition_by_id_in(txn, reader.id).await? else {
+    let Some(definition) =
+        crate::defs::catalog::definition_by_id_in(txn, floors, reader.id).await?
+    else {
         return Ok(None);
     };
-    let revalidated = match crate::defs::catalog::revalidate(txn, schema, &definition).await {
+    let revalidated = match crate::defs::catalog::revalidate(txn, schema, floors, &definition).await
+    {
         Ok(revalidated) => revalidated,
         Err(err @ (CatalogError::Db(_) | CatalogError::Pool(_))) => return Err(err.into()),
         Err(reason) => {

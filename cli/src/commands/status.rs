@@ -15,7 +15,9 @@
 //! keyspace lifecycle status (`TransformStatus`), plus, on a
 //! line of its own, the failure of its source's backfill if that keeps
 //! failing (`backfill_failure`), on another why the drain
-//! halted on it, if it did (`halt`), and on another the page the
+//! halted on it, if it did (`halt`), on another why it is paused otherwise
+//! (its `capture_failure`, such as the floor a release below it paused it
+//! for, ADR-0024), and on another the page the
 //! drain keeps failing on with nothing charged or paused, if one holds it
 //! back (`drain_failure` from [`Trellis::status`]), and one per
 //! source index it lacks (`source_index_gaps`), and one per node of its partitioned
@@ -34,8 +36,9 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 use trellis::{
-    Config, CorrectingNode, DefinitionSummary, DrainFailure, JoinBuildStep, JoinSide, JoinSidePart,
-    JoinStatus, OneToOneBuildStep, SourceIndexGap, Trellis, TrellisOptions,
+    CaptureFailure, CaptureFailureKind, Config, CorrectingNode, DefinitionSummary, DrainFailure,
+    JoinBuildStep, JoinSide, JoinSidePart, JoinStatus, OneToOneBuildStep, SourceIndexGap, Trellis,
+    TrellisOptions,
 };
 
 use super::release::shell_quote;
@@ -132,6 +135,10 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
             join: status.join,
             paused_upstream_columns: status.paused_upstream_columns,
             floor: Some(status.floor),
+            // A halt is on the summary's own line already.
+            paused: status
+                .capture_failure
+                .filter(|failure| failure.kind != CaptureFailureKind::Halt),
         });
         listed.push((def, warnings));
     }
@@ -191,6 +198,10 @@ struct StatusWarnings {
     paused_upstream_columns: Vec<String>,
     /// The oldest release that can run the definition (ADR-0024).
     floor: Option<String>,
+    /// Why capture or a resume holds it paused, other than a halt: its
+    /// `capture_failure`, such as the reason a release below its floor
+    /// paused it (ADR-0024).
+    paused: Option<CaptureFailure>,
 }
 
 /// One line per definition, each followed by an indented line per thing
@@ -238,6 +249,17 @@ fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> St
                     halt.source_table,
                     format_timestamp(halt.detected_at),
                     halt.error
+                ));
+            }
+            // Why it is paused, other than a halt: its remedy is in the
+            // reason (a release below its floor names the release to roll
+            // forward to, ADR-0024).
+            if let Some(paused) = &warnings.paused {
+                line.push_str(&format!(
+                    "    paused reading {} since {}: error={:?}\n",
+                    paused.source_table,
+                    format_timestamp(paused.detected_at),
+                    paused.error
                 ));
             }
             // A page the drain keeps failing on holds the definition's
@@ -639,6 +661,45 @@ mod tests {
              status=paused created_at=1970-01-01 00:00:00 UTC\n    \
              halted on public.orders at 2024-01-01 00:00:00 UTC: \
              error=\"the drain halted: no primary key\"\n"
+        );
+    }
+
+    /// A definition a release below its floor paused shows its floor and
+    /// the reason, with the remedy, under it (ADR-0024).
+    #[test]
+    fn a_definition_paused_below_its_floor_shows_the_floor_and_the_reason() {
+        // `date -u -d "2024-01-01 00:00:00" +%s` => 1704067200
+        let detected_at = UNIX_EPOCH + Duration::from_secs(1_704_067_200);
+        let def = trellis::fixture!(DefinitionSummary {
+            target_table: "public.order_totals".to_string(),
+            status: trellis::TransformStatus::Paused,
+            created_at: UNIX_EPOCH,
+            backfill_failure: None,
+            halt: None,
+        });
+        let reason = "this release can't run transform public.order_totals: its floor, the \
+                      oldest Trellis release that can run it, is 0.3.0, and this binary runs \
+                      release 0.2.0; roll forward to 0.3.0 or later, then RESUME it or DROP \
+                      it there";
+        let warnings = StatusWarnings {
+            floor: Some("0.3.0".to_string()),
+            paused: Some(trellis::fixture!(CaptureFailure {
+                kind: CaptureFailureKind::Capture,
+                source_table: "public.orders".to_string(),
+                columns: Vec::new(),
+                error: reason.to_string(),
+                detected_at,
+            })),
+            ..StatusWarnings::default()
+        };
+        let formatted = format_definitions(&[(def, warnings)]);
+        assert_eq!(
+            formatted,
+            format!(
+                "  target=public.order_totals status=paused floor=0.3.0 \
+                 created_at=1970-01-01 00:00:00 UTC\n    \
+                 paused reading public.orders since 2024-01-01 00:00:00 UTC: error={reason:?}\n"
+            )
         );
     }
 

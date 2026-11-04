@@ -2,12 +2,15 @@
 //!
 //! Every stored transform definition carries the
 //! `grammar_version` its text was written under, stamped when the text is
-//! written. Every read of stored transform text goes through [`load`], which
-//! takes the text and its version and returns the definition in the current
-//! grammar's terms. Nothing after it sees a version.
+//! written. Every read of stored transform text goes through [`load_stored`],
+//! which first skips a definition this binary can't run (its floor or its
+//! grammar is newer, ADR-0024 rule 3) without parsing it, then takes the text
+//! and its version and returns the definition in the current grammar's terms.
+//! Nothing after it sees a version.
 
 use super::ParseError;
 use super::ast::TransformDef;
+use super::floor::Floors;
 use super::parser::parse;
 
 /// The grammar version this binary writes. Grammar 1 is the grammar when the
@@ -48,9 +51,31 @@ pub(crate) fn standing_in(stored: i32, oldest: i32, current: i32) -> Standing {
     }
 }
 
+/// Loads a stored definition, in the current grammar's terms: `text`, written
+/// under grammar `grammar_version`, of a definition whose stored floor is
+/// `floor`. This is the one entry point for stored transform text.
+///
+/// `None`, without parsing the text, for a definition this binary can't run
+/// ([`Floors::unrunnable`]): its floor is above the running release, or its
+/// grammar is newer than this binary reads. Attaching paused it, so it reads
+/// and writes nothing, and every caller skips it as it would a definition
+/// that isn't there. An error is the text of a definition this binary can run
+/// failing to load: older than the window, or refused.
+pub(crate) fn load_stored(
+    floors: &Floors,
+    text: &str,
+    grammar_version: i32,
+    floor: &str,
+) -> Result<Option<TransformDef>, ParseError> {
+    if floors.unrunnable(floor, grammar_version).is_some() {
+        return Ok(None);
+    }
+    load(text, grammar_version).map(Some)
+}
+
 /// Loads stored definition text written under grammar `stored`, in the current
-/// grammar's terms. This is the one entry point for stored transform text.
-pub fn load(text: &str, stored: i32) -> Result<TransformDef, ParseError> {
+/// grammar's terms, whatever its floor: only [`load_stored`] calls it.
+fn load(text: &str, stored: i32) -> Result<TransformDef, ParseError> {
     load_in(
         text,
         stored,
@@ -77,97 +102,112 @@ pub(crate) fn load_in(
     }
 }
 
-/// The attach-time check (ADR-0018) against an explicit window: refuses when
-/// any stored definition is newer than `current`, naming them, and pauses each
-/// transform older than `oldest`, or whose text this binary refuses, with the
-/// reason in its `capture_failure`.
-/// Returns how many it paused.
-pub(crate) async fn check_stored_versions_in(
-    client: &mut tokio_postgres::Client,
+/// The attach-time check (ADR-0018, ADR-0024 rule 3) against the grammar
+/// window `oldest..=current`, in `txn`. Pauses each definition this binary
+/// can't run ([`pause_unrunnable_in`]), without parsing it; each older than
+/// `oldest`; and each whose text this binary refuses. Each one pauses alone,
+/// so every other definition keeps running. Returns how many it paused or
+/// gave a new reason.
+pub(crate) async fn pause_unloadable_in(
+    txn: &tokio_postgres::Transaction<'_>,
+    floors: &Floors,
     oldest: i32,
     current: i32,
 ) -> Result<usize, crate::Error> {
-    check_stored_versions_window(client, oldest, current, true).await
-}
-
-/// [`check_stored_versions_in`], or with `apply` false the same check rolled
-/// back: how many transforms it would pause, pausing none.
-async fn check_stored_versions_window(
-    client: &mut tokio_postgres::Client,
-    oldest: i32,
-    current: i32,
-    apply: bool,
-) -> Result<usize, crate::Error> {
-    let newer = client
+    let mut paused = pause_unrunnable_in(txn, floors, current).await?;
+    let stored = txn
         .query(
-            "select 'transform ' || target_table, grammar_version from transform_definitions \
-               where grammar_version > $1 \
-             order by 1",
-            &[&current],
+            "select id, source_table, target_table, definition_text, grammar_version, \
+                    floor_version \
+             from transform_definitions order by id",
+            &[],
         )
         .await?;
-    if !newer.is_empty() {
-        let named: Vec<String> = newer
-            .iter()
-            .map(|row| {
-                format!(
-                    "{} (grammar version {})",
-                    row.get::<_, String>(0),
-                    row.get::<_, i32>(1)
-                )
-            })
-            .collect();
-        return Err(crate::Error::IncompatibleInstance(format!(
-            "stored definitions were written under a grammar newer than this binary reads \
-             (version {current}): {}; run a binary that reads them",
-            named.join(", ")
-        )));
-    }
-    let txn = client.transaction().await?;
-    let too_old = txn
-        .query(
-            "select id, source_table, grammar_version from transform_definitions \
-             where grammar_version < $1 order by id",
-            &[&oldest],
-        )
-        .await?;
-    let mut paused = 0;
-    for row in &too_old {
-        let (id, source, stored): (i64, String, i32) = (row.get(0), row.get(1), row.get(2));
-        let reason = ParseError::GrammarVersionTooOld { stored, oldest }.to_string();
-        super::lifecycle::pause_for_grammar_version(&txn, id, &source, &reason)
-            .await
-            .map_err(|e| crate::Error::IncompatibleInstance(e.to_string()))?;
-        paused += 1;
-    }
-    // Stored text inside the window that this release refuses (a form a newer
-    // release narrowed toward Postgres, ADR-0022) pauses the same way, naming
-    // the refusal, rather than failing every reader of the catalog.
-    let in_window = txn
-        .query(
-            "select id, source_table, target_table, definition_text, grammar_version \
-             from transform_definitions where grammar_version >= $1 order by id",
-            &[&oldest],
-        )
-        .await?;
-    for row in &in_window {
+    for row in &stored {
         let (id, source, target): (i64, String, String) = (row.get(0), row.get(1), row.get(2));
-        if let Err(e) = load_in(row.get(3), row.get(4), oldest, current) {
-            let reason = unparsable_stored_text_reason(&target, &e);
-            if super::lifecycle::pause_for_grammar_version(&txn, id, &source, &reason)
+        let (text, grammar_version, floor): (&str, i32, &str) =
+            (row.get(3), row.get(4), row.get(5));
+        if floors
+            .unrunnable_in(floor, grammar_version, current)
+            .is_some()
+        {
+            continue;
+        }
+        if grammar_version < oldest {
+            let reason = ParseError::GrammarVersionTooOld {
+                stored: grammar_version,
+                oldest,
+            }
+            .to_string();
+            super::lifecycle::pause_for_grammar_version(txn, id, &source, &reason)
                 .await
-                .map_err(|e| crate::Error::IncompatibleInstance(e.to_string()))?
+                .map_err(incompatible)?;
+            paused += 1;
+            continue;
+        }
+        // Stored text inside the window that this release refuses (a form a
+        // newer release narrowed toward Postgres, ADR-0022) pauses the same
+        // way, naming the refusal, rather than failing every reader of the
+        // catalog.
+        if let Err(e) = load_in(text, grammar_version, oldest, current) {
+            let reason = unparsable_stored_text_reason(&target, &e);
+            if super::lifecycle::pause_for_grammar_version(txn, id, &source, &reason)
+                .await
+                .map_err(incompatible)?
             {
                 paused += 1;
             }
         }
     }
-    if apply {
-        txn.commit().await?;
-    } else {
-        txn.rollback().await?;
+    Ok(paused)
+}
+
+/// Pauses, in `txn`, each definition this binary can't run (ADR-0024 rule
+/// 3): its floor is above the running release, or its grammar is newer than
+/// `current`. Reads only the stored columns, never the text, and records the
+/// [`super::floor::Unrunnable::reason`] as its `capture_failure`, keeping any
+/// reason it was already paused for. Returns how many it paused or gave a new
+/// reason: none once an earlier call recorded them.
+///
+/// Attaching runs it ([`pause_unloadable_in`]), and so does every handle
+/// before it changes anything: a background process when it takes over, and
+/// each state-changing call (ADR-0024 rule 2).
+pub(crate) async fn pause_unrunnable_in(
+    txn: &tokio_postgres::Transaction<'_>,
+    floors: &Floors,
+    current: i32,
+) -> Result<usize, crate::Error> {
+    let stored = txn
+        .query(
+            "select id, source_table, target_table, grammar_version, floor_version \
+             from transform_definitions order by id",
+            &[],
+        )
+        .await?;
+    let mut paused = 0;
+    for row in &stored {
+        let Some(unrunnable) = floors.unrunnable_in(row.get(4), row.get(3), current) else {
+            continue;
+        };
+        let (id, source, target): (i64, String, String) = (row.get(0), row.get(1), row.get(2));
+        if super::lifecycle::pause_for_unrunnable(txn, id, &source, &unrunnable.reason(&target))
+            .await
+            .map_err(incompatible)?
+        {
+            crate::instance_log::warn!(
+                transform = %target,
+                reason = %unrunnable.reason(&target),
+                "paused a transform this release can't run"
+            );
+            paused += 1;
+        }
     }
     Ok(paused)
+}
+
+/// A catalog failure of the attach's pauses, as the attach reports it.
+fn incompatible(e: super::catalog::CatalogError) -> crate::Error {
+    crate::Error::IncompatibleInstance(e.to_string())
 }
 
 /// The `capture_failure` of a transform whose stored text this release refuses.
@@ -178,31 +218,47 @@ pub(crate) fn unparsable_stored_text_reason(target: &str, error: &ParseError) ->
     )
 }
 
-/// [`check_stored_versions_in`] against this binary's window.
-pub(crate) async fn check_stored_versions(
+/// [`pause_unloadable_in`] against this binary's window, in a transaction of
+/// its own on `client`, committed when `apply` and rolled back otherwise.
+async fn pause_unloadable_on(
     client: &mut tokio_postgres::Client,
+    floors: &Floors,
+    apply: bool,
 ) -> Result<usize, crate::Error> {
-    check_stored_versions_in(
-        client,
+    let txn = client.transaction().await?;
+    let paused = pause_unloadable_in(
+        &txn,
+        floors,
         OLDEST_SUPPORTED_GRAMMAR_VERSION,
         CURRENT_GRAMMAR_VERSION,
     )
-    .await
+    .await?;
+    if apply {
+        txn.commit().await?;
+    } else {
+        txn.rollback().await?;
+    }
+    Ok(paused)
 }
 
-/// [`check_stored_versions`] rolled back: refuses as it does, and otherwise
-/// returns how many transforms it would pause, pausing none. `migrate` runs
-/// this while another version is live (ADR-0023), when it may change nothing.
+/// The attach's check ([`pause_unloadable_in`]) against this binary's
+/// window: before anything reads a stored definition, pauses the ones this
+/// binary can't run or read. Returns how many it paused.
+pub(crate) async fn check_stored_versions(
+    client: &mut tokio_postgres::Client,
+    floors: &Floors,
+) -> Result<usize, crate::Error> {
+    pause_unloadable_on(client, floors, true).await
+}
+
+/// [`check_stored_versions`] rolled back: how many definitions it would
+/// pause, pausing none. `migrate` runs this while another version is live
+/// (ADR-0023), when it may change nothing.
 pub(crate) async fn check_stored_versions_dry_run(
     client: &mut tokio_postgres::Client,
+    floors: &Floors,
 ) -> Result<usize, crate::Error> {
-    check_stored_versions_window(
-        client,
-        OLDEST_SUPPORTED_GRAMMAR_VERSION,
-        CURRENT_GRAMMAR_VERSION,
-        false,
-    )
-    .await
+    pause_unloadable_on(client, floors, false).await
 }
 
 #[cfg(test)]
@@ -258,5 +314,30 @@ mod tests {
             }
         );
         assert!(load(TEXT, CURRENT_GRAMMAR_VERSION + 1).is_err());
+    }
+
+    /// A definition this binary can't run loads as nothing, and its text is
+    /// never parsed: text no release of this grammar reads loads the same.
+    /// One it can run parses, and fails as it always did.
+    #[test]
+    fn a_definition_this_binary_cant_run_is_skipped_unparsed() {
+        let floors = Floors::new("0.2.0", std::sync::Arc::from([]));
+        let unreadable = "TRANSFORM t FROM s SELECT FROBNICATE a AS a";
+        for (text, grammar, floor) in [
+            (unreadable, CURRENT_GRAMMAR_VERSION, "0.3.0"),
+            (unreadable, CURRENT_GRAMMAR_VERSION + 1, "0.2.0"),
+            (unreadable, CURRENT_GRAMMAR_VERSION, "not a release"),
+        ] {
+            assert_eq!(
+                load_stored(&floors, text, grammar, floor),
+                Ok(None),
+                "{grammar} {floor}"
+            );
+        }
+        assert_eq!(
+            load_stored(&floors, TEXT, CURRENT_GRAMMAR_VERSION, "0.2.0"),
+            Ok(Some(parse(TEXT).unwrap()))
+        );
+        assert!(load_stored(&floors, unreadable, CURRENT_GRAMMAR_VERSION, "0.2.0").is_err());
     }
 }

@@ -97,6 +97,7 @@ use super::ast::{
 use super::backfill::BackfillError;
 use super::ddl::{self, DdlError};
 use super::error::ParseError;
+use super::floor::Floors;
 use super::grammar::{self, CURRENT_GRAMMAR_VERSION};
 #[cfg(any(test, feature = "internals"))]
 use super::model::SchemaEdge;
@@ -375,6 +376,19 @@ pub enum CatalogError {
         /// The release this binary runs as, `major.minor.patch`.
         running: String,
     },
+    /// A statement that needs a definition this binary can't run (ADR-0024
+    /// rule 3): its floor is above the running release, or its text was
+    /// written under a grammar newer than this binary reads. Such a
+    /// definition is paused and never parsed, so `RESUME` and `ALTER
+    /// TRANSFORM` of it refuse, and so does a statement whose check would
+    /// have to read it. Nothing changes; the remedy is to roll forward.
+    CannotRun {
+        /// What the statement would have done.
+        action: String,
+        /// Why this binary can't run the definition, with the remedy: the
+        /// reason its pause records.
+        reason: String,
+    },
     /// A still-live definition depends on the definition being dropped
     /// (ADR-0014's "Drops go in reverse dependency order — no
     /// cascade"). Trellis refuses rather than cascading, and names the
@@ -491,6 +505,7 @@ impl CatalogError {
             CatalogError::DependentsBlockDrop { .. } => ErrorCode::Conflict,
             // Only another version gets past it, like a catalog floor.
             CatalogError::AboveRunningRelease { .. } => ErrorCode::VersionFloor,
+            CatalogError::CannotRun { .. } => ErrorCode::VersionFloor,
             // Same "the world isn't in the state this operation needs"
             // category as `TransformNotPaused` above.
             CatalogError::TransformNotLive { .. } => ErrorCode::Conflict,
@@ -729,6 +744,9 @@ impl fmt::Display for CatalogError {
                  or above the floor knows everything the definition owns, so roll forward to \
                  Trellis {floor} or later and drop it there"
             ),
+            CatalogError::CannotRun { action, reason } => {
+                write!(f, "cannot {action}: {reason}")
+            }
             CatalogError::DependentsBlockDrop {
                 subject,
                 dependents,
@@ -808,6 +826,7 @@ impl std::error::Error for CatalogError {
             CatalogError::TransformNotFound { .. } => None,
             CatalogError::TransformNotPaused { .. } => None,
             CatalogError::AboveRunningRelease { .. } => None,
+            CatalogError::CannotRun { .. } => None,
             CatalogError::DependentsBlockDrop { .. } => None,
             CatalogError::TransformNotLive { .. } => None,
             CatalogError::AlterFieldNotFound { .. } => None,
@@ -1256,8 +1275,9 @@ fn tables_read_by(qualified_source: String, joined: Option<String>) -> Vec<Strin
 /// `catching_up` always does.
 pub(crate) async fn reported_statuses(
     client: &impl GenericClient,
+    floors: &Floors,
 ) -> Result<HashMap<i64, TransformStatus>, CatalogError> {
-    Ok(reported_statuses_with_causes(client).await?.0)
+    Ok(reported_statuses_with_causes(client, floors).await?.0)
 }
 
 /// [`reported_statuses`] plus, per definition, the paused upstream columns
@@ -1274,11 +1294,15 @@ pub(crate) async fn reported_statuses(
 /// until the column's resume writes through to it. Nothing is paused or
 /// rebuilt. A reader whose reading field the cascade paused already shows
 /// that pause, so it isn't a cause here: the column the cascade paused is.
+///
+/// `floors` decides which readers are read: one this release can't run is
+/// paused, never parsed, and causes nothing (ADR-0024 rule 3).
 pub(crate) async fn reported_statuses_with_causes(
     client: &impl GenericClient,
+    floors: &Floors,
 ) -> Result<(HashMap<i64, TransformStatus>, HashMap<i64, Vec<String>>), CatalogError> {
     let mut nodes = status_nodes(client).await?;
-    add_paused_column_causes(client, &mut nodes).await?;
+    add_paused_column_causes(client, floors, &mut nodes).await?;
     Ok(derive_reported(&nodes))
 }
 
@@ -1330,6 +1354,7 @@ async fn status_nodes(client: &impl GenericClient) -> Result<Vec<StatusNode>, Ca
 /// ([`reported_statuses_with_causes`]), each once.
 async fn add_paused_column_causes(
     client: &impl GenericClient,
+    floors: &Floors,
     nodes: &mut [StatusNode],
 ) -> Result<(), CatalogError> {
     let paused: Vec<(String, String)> = client
@@ -1357,7 +1382,7 @@ async fn add_paused_column_causes(
             })
             .collect();
         for (table, column) in &paused {
-            for dep in column_dependents_any_keyspace(client, table, column).await? {
+            for dep in column_dependents_any_keyspace(client, floors, table, column).await? {
                 if paused_set.contains(&dep) {
                     continue;
                 }
@@ -1628,6 +1653,7 @@ pub async fn alter_transform(
     pool: &Pool,
     alter: &AlterTransform,
 ) -> Result<AlterOutcome, CatalogError> {
+    refuse_unrunnable(&**pool.get().await?, pool.floors(), &alter.target, "alter").await?;
     let Some(current) = definition_by_target(pool, &alter.target).await? else {
         return Err(CatalogError::TransformNotFound {
             transform: alter.target.clone(),
@@ -1864,7 +1890,7 @@ pub async fn alter_transform(
     // same ordering discipline `lifecycle::drop_transform`'s
     // `dependency_blockers` call already follows.
     for field in &real_drops {
-        check_no_column_dependents_in_txn(&txn, &alter.target, field).await?;
+        check_no_column_dependents_in_txn(&txn, pool.floors(), &alter.target, field).await?;
     }
 
     // Re-check every real `ALTER`'s type-change refusal inside the
@@ -2764,7 +2790,7 @@ async fn check_no_column_dependents(
     field: &str,
 ) -> Result<(), CatalogError> {
     let client = pool.get().await?;
-    check_no_column_dependents_via(&**client, target, field).await
+    check_no_column_dependents_via(&**client, pool.floors(), target, field).await
 }
 
 /// The transaction-scoped counterpart to [`check_no_column_dependents`],
@@ -2773,18 +2799,20 @@ async fn check_no_column_dependents(
 /// through.
 async fn check_no_column_dependents_in_txn(
     txn: &tokio_postgres::Transaction<'_>,
+    floors: &Floors,
     target: &str,
     field: &str,
 ) -> Result<(), CatalogError> {
-    check_no_column_dependents_via(txn, target, field).await
+    check_no_column_dependents_via(txn, floors, target, field).await
 }
 
 async fn check_no_column_dependents_via(
     client: &impl GenericClient,
+    floors: &Floors,
     target: &str,
     field: &str,
 ) -> Result<(), CatalogError> {
-    let deps = column_dependents_any_keyspace(client, target, field).await?;
+    let deps = column_dependents_via(client, floors, target, field, Lineage::DropCheck).await?;
     if deps.is_empty() {
         return Ok(());
     }
@@ -2997,7 +3025,12 @@ async fn create_definition_inner(
     // earlier, before any DDL, as a fail-fast).
     reject_non_live_upstream(&*txn, &qualified_source).await?;
     // No transform reads a 1-1 JOIN's target (ADR-0021).
-    super::join_one_to_one::reject_reader_of_target(&*txn, &[qualified_source.as_str()]).await?;
+    super::join_one_to_one::reject_reader_of_target(
+        &*txn,
+        pool.floors(),
+        &[qualified_source.as_str()],
+    )
+    .await?;
     // A JOIN's joined table resolves the way its `FROM` does, and is
     // held to the same checks. Its columns are read here, in this
     // transaction, for the catalog row and the hidden tables.
@@ -3018,12 +3051,18 @@ async fn create_definition_inner(
                 },
             };
             reject_non_live_upstream(&*txn, &joined).await?;
-            super::join_one_to_one::reject_reader_of_target(&*txn, &[joined.as_str()]).await?;
+            super::join_one_to_one::reject_reader_of_target(
+                &*txn,
+                pool.floors(),
+                &[joined.as_str()],
+            )
+            .await?;
             let sides = JoinSides::read(&*txn, qualified_source.clone(), joined).await?;
             super::validate::validate_join(&def, &sides.from_columns, &sides.joined_columns)?;
             reject_virtual_join_reads(&def, &sides)?;
             if super::join::is_one_to_one(&def) {
-                super::join_one_to_one::check_define(&*txn, &def, &sides.joined).await?;
+                super::join_one_to_one::check_define(&*txn, pool.floors(), &def, &sides.joined)
+                    .await?;
             }
             Some(sides)
         }
@@ -3631,40 +3670,44 @@ pub(crate) struct CaptureReaderRow {
 /// Definitions in every status count. A table is captured from the moment
 /// something registers a reader of it, before that reader builds, and a
 /// paused or quarantined reader still needs its columns when it resumes.
-/// The exception is a definition older than the grammar window (ADR-0018),
-/// or whose stored text this release refuses: attaching paused it, it never
-/// resumes, and its fix is a drop and a fresh define, so it reads nothing and
-/// is left out. A definition newer than the
-/// window fails the read, since its columns can't be known.
+/// The exceptions read nothing and are left out: a definition this binary
+/// can't run (ADR-0024 rule 3: its floor or its grammar is newer), which is
+/// never parsed and resumes only under a release that runs it, whose capture
+/// it then widens; and one older than the grammar window (ADR-0018), or
+/// whose stored text this release refuses, which attaching paused for good,
+/// its fix a drop and a fresh define.
 pub(crate) async fn capture_readers(
     client: &impl GenericClient,
+    floors: &Floors,
 ) -> Result<Vec<CaptureReaderRow>, CatalogError> {
     client
         .query_typed(
             "select d.id, d.source_table, d.definition_text, \
                     exists (select 1 from capture_failures f where f.transform_id = d.id), \
-                    d.target_table, d.grammar_version, d.join_table \
+                    d.target_table, d.grammar_version, d.join_table, d.floor_version \
              from transform_definitions d order by d.id",
             &[],
         )
         .await?
         .into_iter()
-        .filter_map(|row| match grammar::load(row.get(2), row.get(5)) {
-            Ok(def) => Some(Ok(CaptureReaderRow {
-                id: row.get(0),
-                source: row.get(1),
-                def,
-                capture_failed: row.get(3),
-                target: row.get(4),
-                join: row.get(6),
-            })),
-            Err(ParseError::GrammarVersionTooOld { .. }) => None,
-            // Stored text this release refuses: attaching paused it with a
-            // capture failure (`grammar::check_stored_versions_in`), and like
-            // a too-old definition its fix is a drop and a fresh define.
-            Err(_) if row.get::<_, bool>(3) => None,
-            Err(e) => Some(Err(e.into())),
-        })
+        .filter_map(
+            |row| match grammar::load_stored(floors, row.get(2), row.get(5), row.get(7)) {
+                Ok(Some(def)) => Some(Ok(CaptureReaderRow {
+                    id: row.get(0),
+                    source: row.get(1),
+                    def,
+                    capture_failed: row.get(3),
+                    target: row.get(4),
+                    join: row.get(6),
+                })),
+                Ok(None) | Err(ParseError::GrammarVersionTooOld { .. }) => None,
+                // Stored text this release refuses: attaching paused it with a
+                // capture failure (`grammar::pause_unloadable_in`), and like
+                // a too-old definition its fix is a drop and a fresh define.
+                Err(_) if row.get::<_, bool>(3) => None,
+                Err(e) => Some(Err(e.into())),
+            },
+        )
         .collect::<Result<Vec<_>, CatalogError>>()
 }
 
@@ -4111,7 +4154,8 @@ async fn validate_for_define(
         reject_virtual_join_reads(def, &sides)?;
         if super::join::is_one_to_one(def) {
             let client = pool.get().await?;
-            super::join_one_to_one::check_define(&**client, def, &sides.joined).await?;
+            super::join_one_to_one::check_define(&**client, pool.floors(), def, &sides.joined)
+                .await?;
         }
         return Ok(());
     }
@@ -4611,6 +4655,7 @@ pub(crate) struct Revalidated {
 pub(crate) async fn revalidate(
     txn: &tokio_postgres::Transaction<'_>,
     schema: &str,
+    floors: &Floors,
     definition: &Definition,
 ) -> Result<Revalidated, CatalogError> {
     let source = definition.source_table.as_str();
@@ -4620,9 +4665,9 @@ pub(crate) async fn revalidate(
     // table took the name of a source dropped while this one was paused.
     let mut read = vec![source];
     read.extend(joined.as_deref());
-    super::join_one_to_one::reject_reader_of_target(txn, &read).await?;
+    super::join_one_to_one::reject_reader_of_target(txn, floors, &read).await?;
     if let Some(joined) = joined {
-        return revalidate_join(txn, schema, definition, joined).await;
+        return revalidate_join(txn, schema, floors, definition, joined).await;
     }
     let (source_columns, virtual_columns) = live_source_columns_and_virtual(txn, source).await?;
     if source_columns.is_empty() {
@@ -4671,6 +4716,7 @@ pub(crate) async fn revalidate(
 async fn revalidate_join(
     txn: &tokio_postgres::Transaction<'_>,
     schema: &str,
+    floors: &Floors,
     definition: &Definition,
     joined: String,
 ) -> Result<Revalidated, CatalogError> {
@@ -4690,7 +4736,7 @@ async fn revalidate_join(
         // The joined table's `ON` columns are still unique, and the target
         // is still keyed by `a`'s key; a changed key's only repair is to
         // drop and define again, as for a 1-1 target.
-        super::join_one_to_one::check_define(txn, &definition.def, &sides.joined).await?;
+        super::join_one_to_one::check_define(txn, floors, &definition.def, &sides.joined).await?;
         let target_key: Vec<String> = ddl::identity_key_columns(txn, &definition.target_table)
             .await?
             .into_iter()
@@ -5760,6 +5806,7 @@ struct PendingDefinition {
     source_version: i64,
     text: String,
     grammar_version: i32,
+    floor: String,
     status: StoredStatus,
     source_columns: HashMap<String, ValueType>,
     source_table: String,
@@ -5825,7 +5872,7 @@ async fn dependents_via(
         .query(
             &format!(
                 "select t.id, t.source_version, t.definition_text, t.status, t.source_table, \
-                        t.target_table, e.key, e.value, t.grammar_version
+                        t.target_table, e.key, e.value, t.grammar_version, t.floor_version
                  from schema_nodes from_node
                  join schema_edges se on se.from_node_id = from_node.id and se.kind = any($2)
                  join schema_nodes to_node on to_node.id = se.to_node_id
@@ -5857,6 +5904,7 @@ async fn dependents_via(
                 source_version: row.get(1),
                 text: row.get(2),
                 grammar_version: row.get(8),
+                floor: row.get(9),
                 status,
                 source_columns: HashMap::new(),
                 source_table: row.get(4),
@@ -5878,7 +5926,18 @@ async fn dependents_via(
     let mut result = Vec::with_capacity(order.len());
     for id in order {
         let pending = by_id.remove(&id).expect("id was just pushed to order");
-        let def = grammar::load(&pending.text, pending.grammar_version)?;
+        // A definition this release can't run is paused, so the applying
+        // filter has already left it out once attaching paused it; skipped
+        // here too, unparsed, for a read before that.
+        let Some(def) = grammar::load_stored(
+            pool.floors(),
+            &pending.text,
+            pending.grammar_version,
+            &pending.floor,
+        )?
+        else {
+            continue;
+        };
         result.push(Definition {
             id,
             source_version: pending.source_version,
@@ -6083,17 +6142,22 @@ pub(crate) async fn source_columns_in(
 /// inserted (or already deleted, e.g. a definition dropped mid-backfill —
 /// not exposed by any API yet, but `backfill_chunks`' `on delete cascade`
 /// means this can legitimately come back empty for a stale claim).
+///
+/// `None` too for a definition this release can't run (ADR-0024 rule 3),
+/// whose text is never parsed: attaching paused it, so nothing acts on it
+/// until a release that runs it resumes it.
 pub(crate) async fn definition_by_id(
     pool: &Pool,
     id: i64,
 ) -> Result<Option<Definition>, CatalogError> {
     let client = pool.get().await?;
-    definition_by_id_in(&**client, id).await
+    definition_by_id_in(&**client, pool.floors(), id).await
 }
 
-/// [`definition_by_id`] on `client`.
+/// [`definition_by_id`] on `client`, for a binary running as `floors` says.
 pub(crate) async fn definition_by_id_in(
     client: &impl GenericClient,
+    floors: &Floors,
     id: i64,
 ) -> Result<Option<Definition>, CatalogError> {
     // `left join lateral jsonb_each_text(...)` — same "decode JSON via SQL, no
@@ -6102,7 +6166,7 @@ pub(crate) async fn definition_by_id_in(
     let rows = client
         .query(
             "select t.source_version, t.definition_text, t.status, t.source_table, \
-                    t.target_table, e.key, e.value, t.grammar_version \
+                    t.target_table, e.key, e.value, t.grammar_version, t.floor_version \
              from transform_definitions t \
              left join lateral jsonb_each_text(t.source_columns) e on true \
              where t.id = $1",
@@ -6119,7 +6183,9 @@ pub(crate) async fn definition_by_id_in(
     let source_table: String = rows[0].get(3);
     let target_table: String = rows[0].get(4);
     let status = StoredStatus::from_row(&status_text);
-    let def = grammar::load(&text, rows[0].get(7))?;
+    let Some(def) = grammar::load_stored(floors, &text, rows[0].get(7), rows[0].get(8))? else {
+        return Ok(None);
+    };
 
     let mut source_columns = HashMap::new();
     for row in &rows {
@@ -6145,6 +6211,41 @@ pub(crate) async fn definition_by_id_in(
         source_table,
         target_table,
     }))
+}
+
+/// Refuses a statement that would act on the transform `name` names (either
+/// spelling, [`target_match_sql`]) when this release can't run it (ADR-0024
+/// rule 3): [`CatalogError::CannotRun`], with `verb` and the transform's name
+/// as what it would have done, and the reason its pause records. `Ok` when
+/// it can, or when no transform has that name. Read before the statement's
+/// own lookups, which would skip such a definition as if it weren't there.
+pub(crate) async fn refuse_unrunnable(
+    client: &impl GenericClient,
+    floors: &Floors,
+    name: &str,
+    verb: &str,
+) -> Result<(), CatalogError> {
+    let Some(row) = client
+        .query_opt(
+            &format!(
+                "select target_table, grammar_version, floor_version \
+                 from transform_definitions where {}",
+                target_match_sql("target_table", 1)
+            ),
+            &[&name],
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let target: String = row.get(0);
+    match floors.unrunnable(row.get(2), row.get(1)) {
+        Some(unrunnable) => Err(CatalogError::CannotRun {
+            action: format!("{verb} '{name}'"),
+            reason: unrunnable.reason(&target),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// The one predicate every caller-facing transform name goes through: SQL
@@ -6195,6 +6296,9 @@ pub(crate) async fn bare_target_name(
 /// `TRANSFORM <name> FROM ...` text declared ([`target_match_sql`]). A
 /// `transform.column` address is not a transform name; callers split that on
 /// its first `.` before they get here.
+///
+/// `None` too for a definition this release can't run, as
+/// [`definition_by_id`] says.
 pub async fn definition_by_target(
     pool: &Pool,
     target_table: &str,
@@ -6204,7 +6308,7 @@ pub async fn definition_by_target(
         .query(
             &format!(
                 "select t.id, t.source_version, t.definition_text, t.status, t.source_table, \
-                        t.target_table, e.key, e.value, t.grammar_version \
+                        t.target_table, e.key, e.value, t.grammar_version, t.floor_version \
                  from transform_definitions t \
                  left join lateral jsonb_each_text(t.source_columns) e on true \
                  where {}",
@@ -6224,7 +6328,10 @@ pub async fn definition_by_target(
     let source_table: String = rows[0].get(4);
     let qualified_target_table: String = rows[0].get(5);
     let status = StoredStatus::from_row(&status_text);
-    let def = grammar::load(&text, rows[0].get(8))?;
+    let Some(def) = grammar::load_stored(pool.floors(), &text, rows[0].get(8), rows[0].get(9))?
+    else {
+        return Ok(None);
+    };
 
     let mut source_columns = HashMap::new();
     for row in &rows {
@@ -6314,7 +6421,16 @@ pub(crate) async fn column_dependents(
         _ => Vec::new(),
     };
     let client = pool.get().await?;
-    deps.extend(column_dependents_via(&**client, upstream_table, upstream_column, true).await?);
+    deps.extend(
+        column_dependents_via(
+            &**client,
+            pool.floors(),
+            upstream_table,
+            upstream_column,
+            Lineage::OneToOne,
+        )
+        .await?,
+    );
     Ok(deps)
 }
 
@@ -6325,38 +6441,48 @@ pub(crate) async fn column_dependents(
 /// and re-asks this for each pair under the column-pause lock, which every
 /// edit of a definition holds exclusive, so the answer can't change before
 /// the pair commits.
+///
+/// A definition this release can't run (ADR-0024 rule 3) reads nothing: it
+/// is never parsed, and its pause keeps it out of every cascade.
 pub(crate) async fn reads_column(
     client: &impl GenericClient,
+    floors: &Floors,
     (reader_transform, reader_field): (&str, &str),
     (upstream_table, upstream_column): (&str, &str),
 ) -> Result<bool, CatalogError> {
     if reader_transform == upstream_table {
-        let text: Option<(String, i32)> = client
+        let stored = client
             .query_opt(
-                "select definition_text, grammar_version from transform_definitions \
+                "select definition_text, grammar_version, floor_version \
+                 from transform_definitions \
                  where split_part(target_table, '.', 2) = $1",
                 &[&upstream_table],
             )
-            .await?
-            .map(|row| (row.get(0), row.get(1)));
-        if let Some((text, grammar_version)) = text {
-            let def = grammar::load(&text, grammar_version)?;
-            if matches!(def.key_space, KeySpace::OneToOne)
-                && super::alias_readers::AliasReaders::of(&def)
-                    .direct(upstream_column)
-                    .iter()
-                    .any(|reader| reader == reader_field)
-            {
-                return Ok(true);
-            }
+            .await?;
+        let def = match &stored {
+            Some(row) => grammar::load_stored(floors, row.get(0), row.get(1), row.get(2))?,
+            None => None,
+        };
+        if let Some(def) = def
+            && matches!(def.key_space, KeySpace::OneToOne)
+            && super::alias_readers::AliasReaders::of(&def)
+                .direct(upstream_column)
+                .iter()
+                .any(|reader| reader == reader_field)
+        {
+            return Ok(true);
         }
     }
-    Ok(
-        column_dependents_via(client, upstream_table, upstream_column, true)
-            .await?
-            .iter()
-            .any(|(transform, field)| transform == reader_transform && field == reader_field),
+    Ok(column_dependents_via(
+        client,
+        floors,
+        upstream_table,
+        upstream_column,
+        Lineage::OneToOne,
     )
+    .await?
+    .iter()
+    .any(|(transform, field)| transform == reader_transform && field == reader_field))
 }
 
 /// [`column_dependents`], generalized to *every* downstream key-space (not
@@ -6389,10 +6515,32 @@ pub(crate) async fn reads_column(
 /// single-field drop has to check against).
 pub(crate) async fn column_dependents_any_keyspace(
     client: &impl GenericClient,
+    floors: &Floors,
     upstream_table: &str,
     upstream_column: &str,
 ) -> Result<Vec<(String, String)>, CatalogError> {
-    column_dependents_via(client, upstream_table, upstream_column, false).await
+    column_dependents_via(
+        client,
+        floors,
+        upstream_table,
+        upstream_column,
+        Lineage::Any,
+    )
+    .await
+}
+
+/// Which readers [`column_dependents_via`] lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lineage {
+    /// 1-1 readers only ([`column_dependents`]).
+    OneToOne,
+    /// Readers of every key space ([`column_dependents_any_keyspace`]).
+    Any,
+    /// Readers of every key space, for an `ALTER TRANSFORM ... DROP
+    /// <field>`, for which the scan is the whole refusal: a definition this
+    /// release can't run that reads the table refuses the drop, since which
+    /// columns it reads can't be known.
+    DropCheck,
 }
 
 /// A definition that reads a re-typed column of another's target and that
@@ -6411,14 +6559,17 @@ pub(crate) struct RefusedReader {
 /// that stays valid isn't returned; a database error propagates.
 pub(crate) async fn refused_readers(
     txn: &tokio_postgres::Transaction<'_>,
+    floors: &Floors,
     schema: &str,
     upstream: &str,
     columns: &[String],
 ) -> Result<Vec<RefusedReader>, tokio_postgres::Error> {
     let mut refused = Vec::new();
-    for (id, _) in column_readers(txn, upstream, columns).await? {
-        let checked = match definition_by_id_in(txn, id).await {
-            Ok(Some(definition)) => revalidate(txn, schema, &definition).await.map(|_| ()),
+    for (id, _) in column_readers(txn, floors, upstream, columns).await? {
+        let checked = match definition_by_id_in(txn, floors, id).await {
+            Ok(Some(definition)) => revalidate(txn, schema, floors, &definition)
+                .await
+                .map(|_| ()),
             Ok(None) => continue,
             Err(err) => Err(err),
         };
@@ -6437,12 +6588,13 @@ pub(crate) async fn refused_readers(
 /// depend on its type, so a caller can read them before it re-types it.
 pub(crate) async fn column_readers(
     client: &impl GenericClient,
+    floors: &Floors,
     upstream: &str,
     columns: &[String],
 ) -> Result<Vec<(i64, String)>, tokio_postgres::Error> {
     let mut targets: Vec<String> = Vec::new();
     for column in columns {
-        match column_dependents_any_keyspace(client, upstream, column).await {
+        match column_dependents_any_keyspace(client, floors, upstream, column).await {
             Ok(deps) => targets.extend(deps.into_iter().map(|(target, _)| target)),
             Err(CatalogError::Db(err)) => return Err(err),
             Err(_) => {}
@@ -6468,10 +6620,12 @@ pub(crate) async fn column_readers(
 
 async fn column_dependents_via(
     client: &impl GenericClient,
+    floors: &Floors,
     upstream_table: &str,
     upstream_column: &str,
-    only_one_to_one: bool,
+    lineage: Lineage,
 ) -> Result<Vec<(String, String)>, CatalogError> {
+    let only_one_to_one = lineage == Lineage::OneToOne;
     let def_rows = client
         .query(
             // `split_part(target_table, '.', 2)`, not the qualified column
@@ -6486,7 +6640,7 @@ async fn column_dependents_via(
             // the same transform depending on whether a row was reached
             // directly or via cascade.
             "select split_part(target_table, '.', 2), definition_text, source_table, \
-                    target_table, grammar_version, join_table \
+                    target_table, grammar_version, join_table, floor_version \
              from transform_definitions",
             &[],
         )
@@ -6512,28 +6666,36 @@ async fn column_dependents_via(
         let qualified_source: String = row.get(2);
         // A `JOIN`'s joined table, which it reads directly too.
         let joined: Option<String> = row.get(5);
+        let reads_upstream = qualified_source == qualified_upstream
+            || joined.as_deref() == Some(qualified_upstream.as_str());
+        // A definition this release can't run (ADR-0024 rule 3) is never
+        // parsed, so which columns it reads can't be known here. It is
+        // paused, so no cascade reaches it, and it is no cause of another's
+        // status. For a field drop this scan is the whole check, so a drop of
+        // a column of a table it reads is refused rather than allowed past
+        // it.
+        let floor: String = row.get(6);
+        if let Some(unrunnable) = floors.unrunnable(&floor, row.get(4)) {
+            if lineage == Lineage::DropCheck && reads_upstream {
+                return Err(CatalogError::CannotRun {
+                    action: format!(
+                        "drop column {upstream_column} of {upstream_table}, which transform \
+                         {target} reads"
+                    ),
+                    reason: unrunnable.reason(&row.get::<_, String>(3)),
+                });
+            }
+            continue;
+        }
         // A definition already persisted here is expected to always re-parse
         // (the same assumption every other read path in this module makes);
         // skip rather than fail this best-effort lineage scan on the
         // unexpected chance it doesn't, rather than let one bad row prevent
-        // cascading a pause to every other, healthy dependent.
-        //
-        // The exception is a definition written under a newer grammar
-        // (ADR-0018) that could read the upstream table. For the drop refusal this scan is the whole check,
-        // and whether that definition reads the column can't be known here,
-        // so the drop is refused rather than allowed past it. A definition
+        // cascading a pause to every other, healthy dependent. A definition
         // older than the window is paused for good and redefined from
         // scratch, so it doesn't hold a drop up.
-        let def = match grammar::load(&text, row.get(4)) {
-            Ok(def) => def,
-            Err(e @ ParseError::GrammarVersionTooNew { .. })
-                if !only_one_to_one
-                    && (qualified_source == qualified_upstream
-                        || joined.as_deref() == Some(qualified_upstream.as_str())) =>
-            {
-                return Err(e.into());
-            }
-            Err(_) => continue,
+        let Ok(Some(def)) = grammar::load_stored(floors, &text, row.get(4), &floor) else {
+            continue;
         };
         if only_one_to_one && !matches!(def.key_space, KeySpace::OneToOne) {
             continue;
@@ -6679,9 +6841,10 @@ mod column_dependents_tests {
             .await
             .expect("seed definitions");
 
-        let mut deps = column_dependents_any_keyspace(&**client, "t", "a")
-            .await
-            .expect("column dependents");
+        let mut deps =
+            column_dependents_any_keyspace(&**client, &Floors::of_this_binary(), "t", "a")
+                .await
+                .expect("column dependents");
         deps.sort();
         // `reader` reads `other.t.a`: a different table that only shares the
         // bare name `t` with the target `public.t`.
@@ -6725,9 +6888,10 @@ mod column_dependents_tests {
             ("b", vec![("j_joined", "b")]),
             ("k", vec![("j_from", "k"), ("j_joined", "k")]),
         ] {
-            let mut deps = column_dependents_any_keyspace(&**client, "t", column)
-                .await
-                .expect("column dependents");
+            let mut deps =
+                column_dependents_any_keyspace(&**client, &Floors::of_this_binary(), "t", column)
+                    .await
+                    .expect("column dependents");
             deps.sort();
             let expected: Vec<(String, String)> = expected
                 .into_iter()
@@ -6811,6 +6975,7 @@ mod column_dependents_tests {
             for reader in &readers {
                 let reads = reads_column(
                     &**client,
+                    &Floors::of_this_binary(),
                     (&reader.0, &reader.1),
                     (table.as_str(), column.as_str()),
                 )
@@ -7555,11 +7720,16 @@ mod table_not_accessible_tests {
     }
 }
 
-/// ADR-0018: the catalog scans that read every definition handle one outside
-/// this binary's grammar window as that window's rules require.
+/// ADR-0018 and ADR-0024 rule 3: the catalog scans that read every
+/// definition handle one outside this binary's grammar window as that
+/// window's rules require, and skip one this binary can't run without
+/// parsing it.
 #[cfg(test)]
 mod grammar_window_tests {
     use super::*;
+
+    /// Text no grammar reads: a scan that parsed it would fail.
+    const UNPARSABLE: &str = "TRANSFORM chained FROM t SELECT FROBNICATE a AS a_copy";
 
     /// Seeds `public.t` over `public.s`, `public.chained` reading `t.a`,
     /// and `public.other` over the unrelated `public.u`, then stamps the
@@ -7574,7 +7744,7 @@ mod grammar_window_tests {
                  values \
                  ('public.t', 'public.s', 1, 'TRANSFORM t FROM s SELECT a AS a', 'live'), \
                  ('public.chained', 'public.t', 1, \
-                  'TRANSFORM chained FROM t SELECT a AS a_copy', 'paused'), \
+                  'TRANSFORM chained FROM t SELECT a AS a_copy', 'live'), \
                  ('public.other', 'public.u', 1, \
                   'TRANSFORM other FROM u SELECT a AS a', 'paused')",
             )
@@ -7592,75 +7762,216 @@ mod grammar_window_tests {
         }
     }
 
+    /// Makes `public.chained` one a release before `floor` can't run, with
+    /// text no grammar reads.
+    async fn above_floor(client: &impl GenericClient, floor: &str) {
+        client
+            .execute(
+                "update transform_definitions set floor_version = $1, definition_text = $2 \
+                 where target_table = 'public.chained'",
+                &[&floor, &UNPARSABLE],
+            )
+            .await
+            .expect("stamp the floor");
+    }
+
+    fn floors(binary: &str) -> Floors {
+        Floors::new(binary, std::sync::Arc::from([]))
+    }
+
+    /// A pool whose binary runs as release `binary`.
+    fn pool_as(db: &testkit::TestDatabase, binary: &str) -> Pool {
+        Pool::new(
+            &crate::config::Config::from_dsn(db.dsn().to_string())
+                .expect("valid dsn")
+                .with_binary_version(binary),
+        )
+        .expect("pool")
+    }
+
     /// A definition older than the window is left out of the capture
-    /// readers, so it can't stop capture for every other one; a newer one
-    /// fails the read.
+    /// readers, so it can't stop capture for every other one; so is one
+    /// newer than the window, which this binary can't run.
     #[tokio::test]
-    async fn capture_readers_leave_out_a_too_old_definition_and_refuse_a_too_new_one() {
+    async fn capture_readers_leave_out_a_too_old_and_a_too_new_definition() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let client = db.pool.get().await.expect("acquire connection");
         let old = grammar::OLDEST_SUPPORTED_GRAMMAR_VERSION - 1;
         seed(&**client, old, CURRENT_GRAMMAR_VERSION).await;
+        let floors = floors("0.2.0");
 
-        let definitions = capture_readers(&**client).await.expect("capture readers");
+        let definitions = capture_readers(&**client, &floors)
+            .await
+            .expect("capture readers");
         let targets: Vec<&str> = definitions.iter().map(|d| d.target.as_str()).collect();
         assert_eq!(targets, ["public.t", "public.other"]);
 
         client
             .execute(
-                "update transform_definitions set grammar_version = $1 \
+                "update transform_definitions set grammar_version = $1, definition_text = $2 \
                  where target_table = 'public.chained'",
-                &[&(CURRENT_GRAMMAR_VERSION + 1)],
+                &[&(CURRENT_GRAMMAR_VERSION + 1), &UNPARSABLE],
             )
             .await
             .expect("stamp newer");
-        match capture_readers(&**client).await {
-            Err(CatalogError::Parse(ParseError::GrammarVersionTooNew { .. })) => {}
-            other => panic!("expected GrammarVersionTooNew, got {other:?}"),
-        }
+        let definitions = capture_readers(&**client, &floors)
+            .await
+            .expect("a newer definition doesn't fail the read");
+        let targets: Vec<&str> = definitions.iter().map(|d| d.target.as_str()).collect();
+        assert_eq!(targets, ["public.t", "public.other"]);
     }
 
-    /// Dropping a field is refused while a definition this binary can't read
-    /// could read it; a newer definition over an unrelated table, or a
-    /// too-old one, doesn't hold it up, and the pause cascade skips both.
+    /// Dropping a field is refused while a definition this binary can't run
+    /// (a newer grammar, or a floor above it) could read it; a newer
+    /// definition over an unrelated table, or a too-old one, doesn't hold it
+    /// up, and the pause cascade and the other lineage scans skip them all.
     #[tokio::test]
-    async fn a_field_drop_is_refused_past_a_newer_definition_that_could_read_it() {
+    async fn a_field_drop_is_refused_past_a_definition_this_binary_cant_run() {
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let client = db.pool.get().await.expect("acquire connection");
         let newer = CURRENT_GRAMMAR_VERSION + 1;
         seed(&**client, newer, newer).await;
+        let floors = floors("0.2.0");
 
-        match column_dependents_any_keyspace(&**client, "t", "a").await {
-            Err(CatalogError::Parse(ParseError::GrammarVersionTooNew { stored, .. })) => {
-                assert_eq!(stored, newer);
+        for unrunnable in ["newer grammar", "floor above"] {
+            if unrunnable == "floor above" {
+                client
+                    .execute(
+                        "update transform_definitions set grammar_version = $1",
+                        &[&CURRENT_GRAMMAR_VERSION],
+                    )
+                    .await
+                    .expect("current grammar");
+                above_floor(&**client, "0.3.0").await;
             }
-            other => panic!("expected GrammarVersionTooNew, got {other:?}"),
+            match check_no_column_dependents_via(&**client, &floors, "t", "a").await {
+                Err(err @ CatalogError::CannotRun { .. }) => {
+                    assert_eq!(err.code(), ErrorCode::VersionFloor);
+                    let message = err.to_string();
+                    assert!(
+                        message.contains("drop column a of t")
+                            && message.contains("public.chained")
+                            && message.contains("then RESUME it or DROP it there"),
+                        "{unrunnable}: {message}"
+                    );
+                }
+                other => panic!("{unrunnable}: expected CannotRun, got {other:?}"),
+            }
+            assert_eq!(
+                column_dependents_any_keyspace(&**client, &floors, "t", "a")
+                    .await
+                    .expect("the lineage scan skips it"),
+                Vec::<(String, String)>::new(),
+                "{unrunnable}"
+            );
+            assert!(
+                !reads_column(&**client, &floors, ("chained", "a_copy"), ("t", "a"))
+                    .await
+                    .expect("reads_column skips it"),
+                "{unrunnable}"
+            );
+            assert_eq!(
+                column_dependents(&pool_as(&db, "0.2.0"), "t", "a")
+                    .await
+                    .expect("cascade"),
+                Vec::<(String, String)>::new(),
+                "{unrunnable}"
+            );
         }
-        let pool = crate::pool::Pool::new(
-            &crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn"),
-        )
-        .expect("pool");
-        assert_eq!(
-            column_dependents(&pool, "t", "a").await.expect("cascade"),
-            Vec::<(String, String)>::new()
-        );
 
         client
             .execute(
-                "update transform_definitions set grammar_version = $1 \
+                "update transform_definitions \
+                 set grammar_version = $1, floor_version = '0.2.0', \
+                     definition_text = 'TRANSFORM chained FROM t SELECT a AS a_copy' \
                  where target_table = 'public.chained'",
                 &[&(grammar::OLDEST_SUPPORTED_GRAMMAR_VERSION - 1)],
             )
             .await
             .expect("stamp too old");
         assert_eq!(
-            column_dependents_any_keyspace(&**client, "t", "a")
+            column_dependents_any_keyspace(&**client, &floors, "t", "a")
                 .await
                 .expect("an unrelated newer definition and a too-old one don't refuse"),
             Vec::<(String, String)>::new()
         );
+    }
+
+    /// Every lookup of one definition, every scan of a table's readers and
+    /// the reported statuses skip a definition above the running release
+    /// without parsing it (its text parses under no grammar) and without
+    /// failing; a release that meets its floor reads it again.
+    #[tokio::test]
+    async fn every_load_path_skips_a_definition_above_the_running_release() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let client = db.pool.get().await.expect("acquire connection");
+        seed(&**client, CURRENT_GRAMMAR_VERSION, CURRENT_GRAMMAR_VERSION).await;
+        // `chained` reads `t`, and is applying, so only its floor keeps it
+        // out of `t`'s readers.
+        client
+            .batch_execute(
+                "insert into schema_nodes (table_name, is_source, is_target) \
+                 values ('public.t', true, true), ('public.chained', false, true); \
+                 insert into schema_edges (from_node_id, to_node_id, kind) \
+                 select f.id, t.id, 'source' from schema_nodes f, schema_nodes t \
+                 where f.table_name = 'public.t' and t.table_name = 'public.chained'",
+            )
+            .await
+            .expect("chained's edge");
+        assert_eq!(
+            transforms_for_source(&pool_as(&db, "0.3.0"), "public.t")
+                .await
+                .expect("readers of t under the release that runs chained")
+                .len(),
+            1
+        );
+        above_floor(&**client, "0.3.0").await;
+        let chained: i64 = client
+            .query_one(
+                "select id from transform_definitions where target_table = 'public.chained'",
+                &[],
+            )
+            .await
+            .expect("chained's id")
+            .get(0);
+        let older = pool_as(&db, "0.2.0");
+
+        assert!(
+            definition_by_id(&older, chained)
+                .await
+                .expect("by id")
+                .is_none()
+        );
+        assert!(
+            definition_by_target(&older, "chained")
+                .await
+                .expect("by target")
+                .is_none()
+        );
+        assert!(
+            definition_by_target(&older, "t")
+                .await
+                .expect("by target")
+                .is_some(),
+            "another definition still loads"
+        );
+        assert!(
+            transforms_for_source(&older, "public.t")
+                .await
+                .expect("readers of t")
+                .is_empty()
+        );
+        reported_statuses_with_causes(&**client, older.floors())
+            .await
+            .expect("reported statuses");
+
+        // The release that meets the floor reads it, and only then parses the
+        // text, which fails as unreadable text does.
+        let newer = pool_as(&db, "0.3.0");
+        assert!(definition_by_target(&newer, "chained").await.is_err());
     }
 }
 

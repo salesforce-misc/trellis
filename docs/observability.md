@@ -407,6 +407,21 @@ pause are arcs of one lifecycle:
     target from the restored source, or drop the definition", with kind
     `disruption` (a definition that was already paused keeps its reason, and
     its kind `capture`);
+  * this release can't run it: its `floor` is above the running release, or
+    it was written under a grammar newer than this release reads (a later
+    release defined or rebuilt it, and this one was rolled back to,
+    [ADR-0024](decisions/0024-compatibility-floors-and-rollback.md)). Trellis
+    pauses it when it attaches, when a background process takes over, and
+    before each state-changing call, and never reads its text.
+    `capture_failure` reads "this release can't run transform `<target>`: its
+    floor, the oldest Trellis release that can run it, is `<floor>`, and this
+    binary runs release `<running>`; roll forward to `<floor>` or later, then
+    RESUME it or DROP it there" (for a newer grammar, "it was written under
+    grammar version `<n>`…"), kind `capture`, with any reason it was already
+    paused for after it. `RESUME`, `ALTER TRANSFORM` and `self_check` of it
+    refuse with the `version_floor` code until a release that runs it does
+    them, and so does `DROP TRANSFORM` of one above its floor
+    ([before rolling back](upgrading.md#before-rolling-back));
   * its build kept failing in a way no retry gets past: the error stays on
     `backfill_failure`;
   * the drain hit a failure that every key reproduces (a source with no usable

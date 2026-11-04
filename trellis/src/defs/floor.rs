@@ -22,10 +22,13 @@
 //! [`super::registry::CastTargetSpec::since`]). Everything that exists when
 //! floors were introduced has floor [`BASELINE`].
 //!
-//! Acting on a floor is not here: a definition above the running release is
-//! paused without being parsed, and `DROP` refuses it (ADR-0024 rules 3 and
-//! 5). Both read the stored column, and [`Floors::above_running`] decides
-//! whether it is above the running release.
+//! A definition above the running release, or written under a grammar newer
+//! than this binary reads, is one this binary can't run ([`Unrunnable`],
+//! ADR-0024 rule 3). [`Floors::unrunnable`] decides it from the stored
+//! columns alone, before anything parses the text: every path that loads a
+//! stored definition skips such a one ([`super::grammar::load_stored`]),
+//! attaching pauses it with [`Unrunnable::reason`], and `RESUME`, `ALTER`
+//! and `DROP` refuse it.
 
 use std::fmt;
 use std::sync::Arc;
@@ -485,8 +488,9 @@ impl Floors {
         }
     }
 
-    /// The floors of this build, with no overrides.
-    #[cfg(any(test, feature = "internals"))]
+    /// The floors of this build, with no overrides: a test's, which
+    /// injects no version.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn of_this_binary() -> Self {
         Self::new(crate::handover::BINARY_VERSION, Arc::from([]))
     }
@@ -503,6 +507,39 @@ impl Floors {
             Some(floor) if floor <= running => None,
             _ => Some(running),
         }
+    }
+
+    /// Why this binary can't run a definition whose stored floor is `floor`
+    /// and whose text was written under grammar `grammar_version`, or `None`
+    /// when it can (ADR-0024 rule 3). Decided from the stored columns alone,
+    /// so it is asked before the text is parsed.
+    pub(crate) fn unrunnable(&self, floor: &str, grammar_version: i32) -> Option<Unrunnable> {
+        self.unrunnable_in(
+            floor,
+            grammar_version,
+            super::grammar::CURRENT_GRAMMAR_VERSION,
+        )
+    }
+
+    /// [`Floors::unrunnable`] for a binary whose newest grammar is `current`.
+    /// The floor is asked first: a definition above it names the release to
+    /// roll forward to.
+    pub(crate) fn unrunnable_in(
+        &self,
+        floor: &str,
+        grammar_version: i32,
+        current: i32,
+    ) -> Option<Unrunnable> {
+        if let Some(running) = self.above_running(floor) {
+            return Some(Unrunnable::AboveFloor {
+                floor: floor.to_string(),
+                running,
+            });
+        }
+        (grammar_version > current).then_some(Unrunnable::NewerGrammar {
+            stored: grammar_version,
+            current,
+        })
     }
 
     /// The release `feature` arrived in, a test's override first.
@@ -537,6 +574,72 @@ impl Floors {
             .unwrap_or(BASELINE)
             .min(ceiling)
     }
+}
+
+/// Why this binary can't run a stored definition (ADR-0024 rule 3), from
+/// [`Floors::unrunnable`]. Such a definition is paused and never parsed: its
+/// text may use what this release lacks, or mean something else under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Unrunnable {
+    /// Its floor is above the release this binary runs as.
+    AboveFloor { floor: String, running: Release },
+    /// Its text was written under a grammar newer than this binary reads
+    /// (ADR-0018).
+    NewerGrammar { stored: i32, current: i32 },
+}
+
+/// How every [`Unrunnable::reason`] starts, so a later attach finds the one
+/// an earlier attach recorded and replaces it rather than adding another.
+const UNRUNNABLE_PREFIX: &str = "this release can't run transform ";
+
+/// What joins a pause's reason to the reason the definition was already
+/// paused for, as the other pauses that keep an earlier reason write it
+/// (`lifecycle::pause_for_relabel`).
+const ALREADY_PAUSED: &str = " It was already paused: ";
+
+impl Unrunnable {
+    /// The `capture_failure` of definition `target` paused because this
+    /// binary can't run it: what it needs, what this binary is, and the
+    /// remedy. `RESUME` and `ALTER` refuse with it too.
+    pub(crate) fn reason(&self, target: &str) -> String {
+        match self {
+            Unrunnable::AboveFloor { floor, running } => format!(
+                "{UNRUNNABLE_PREFIX}{target}: its floor, the oldest Trellis release that can \
+                 run it, is {floor}, and this binary runs release {running}; roll forward to \
+                 {floor} or later, then RESUME it or DROP it there"
+            ),
+            Unrunnable::NewerGrammar { stored, current } => format!(
+                "{UNRUNNABLE_PREFIX}{target}: it was written under grammar version {stored}, \
+                 and this binary reads grammar versions up to {current}; roll forward to a \
+                 release that reads it, then RESUME it or DROP it there"
+            ),
+        }
+    }
+}
+
+/// The `capture_failure` error a definition paused for `reason` (an
+/// [`Unrunnable::reason`]) gets when its record holds `existing`, or `None`
+/// when the record already says it. A reason an earlier attach recorded
+/// (a different running release, say) is replaced, and every other reason is
+/// kept after it (ADR-0024 rule 3: pausing an already-paused definition keeps
+/// its reasons).
+pub(crate) fn unrunnable_error(existing: Option<&str>, reason: &str) -> Option<String> {
+    let Some(existing) = existing else {
+        return Some(reason.to_string());
+    };
+    let earlier = if existing.starts_with(UNRUNNABLE_PREFIX) {
+        existing
+            .split_once(ALREADY_PAUSED)
+            .map_or("", |(_, earlier)| earlier)
+    } else {
+        existing
+    };
+    let error = if earlier.is_empty() {
+        reason.to_string()
+    } else {
+        format!("{reason}{ALREADY_PAUSED}{earlier}")
+    };
+    (error != existing).then_some(error)
 }
 
 /// Whether any of `tables` (qualified `schema.table` names) is a
@@ -830,6 +933,90 @@ mod tests {
         assert_eq!(
             floors("0.3.0-rc.1", &[]).above_running("0.4.0"),
             Some(Release::new(0, 3, 0))
+        );
+    }
+
+    /// (definition floor, grammar version, running release) → run, or pause
+    /// with which reason (ADR-0024 rule 3); the same answer is what `RESUME`
+    /// refuses with. The floor is asked before the grammar.
+    #[test]
+    fn a_definition_runs_unless_its_floor_or_grammar_is_newer() {
+        const CURRENT: i32 = 1;
+        for (floor, grammar, running, expected) in [
+            ("0.2.0", 1, "0.2.0", None),
+            ("0.2.0", 1, "0.3.0", None),
+            ("0.3.0", 1, "0.3.0", None),
+            ("0.2.0", 0, "0.2.0", None),
+            ("0.3.0", 1, "0.2.0", Some("floor")),
+            ("0.3.0", 2, "0.2.0", Some("floor")),
+            ("0.3", 1, "0.2.0", Some("floor")),
+            ("0.2.0", 2, "0.2.0", Some("grammar")),
+            ("0.2.0", 2, "0.3.0", Some("grammar")),
+            // A binary whose version isn't a release meets every floor, but
+            // still reads only its own grammar.
+            ("9.9.9", 1, "next", None),
+            ("9.9.9", 2, "next", Some("grammar")),
+        ] {
+            let decided = floors(running, &[]).unrunnable_in(floor, grammar, CURRENT);
+            let kind = decided.as_ref().map(|unrunnable| match unrunnable {
+                Unrunnable::AboveFloor { .. } => "floor",
+                Unrunnable::NewerGrammar { .. } => "grammar",
+            });
+            assert_eq!(
+                kind, expected,
+                "floor {floor}, grammar {grammar}, running {running}"
+            );
+        }
+        let above = floors("0.2.0", &[])
+            .unrunnable_in("0.3.0", 1, CURRENT)
+            .unwrap()
+            .reason("public.t");
+        assert_eq!(
+            above,
+            "this release can't run transform public.t: its floor, the oldest Trellis release \
+             that can run it, is 0.3.0, and this binary runs release 0.2.0; roll forward to \
+             0.3.0 or later, then RESUME it or DROP it there"
+        );
+        let newer = floors("0.2.0", &[])
+            .unrunnable_in("0.2.0", 2, CURRENT)
+            .unwrap()
+            .reason("public.t");
+        assert!(
+            newer.contains("grammar version 2") && newer.contains("up to 1"),
+            "{newer}"
+        );
+        assert!(
+            newer.ends_with("then RESUME it or DROP it there"),
+            "{newer}"
+        );
+    }
+
+    /// (current `capture_failure`, the pause's reason) → the record's new
+    /// error: an unpaused definition gets the reason; a paused one keeps its
+    /// reasons after it; a later attach replaces the reason an earlier one
+    /// recorded, and one that finds it already recorded changes nothing.
+    #[test]
+    fn pausing_keeps_earlier_reasons_and_never_adds_its_own_twice() {
+        let floors_02 = floors("0.2.0", &[]);
+        let at_020 = floors_02.unrunnable("0.3.0", 1).unwrap().reason("public.t");
+        let at_021 = floors("0.2.1", &[])
+            .unrunnable("0.3.0", 1)
+            .unwrap()
+            .reason("public.t");
+        assert_eq!(unrunnable_error(None, &at_020), Some(at_020.clone()));
+        assert_eq!(unrunnable_error(Some(&at_020), &at_020), None);
+        assert_eq!(
+            unrunnable_error(Some(&at_020), &at_021),
+            Some(at_021.clone())
+        );
+
+        let operator = "paused by the operator";
+        let both = unrunnable_error(Some(operator), &at_020).unwrap();
+        assert_eq!(both, format!("{at_020} It was already paused: {operator}"));
+        assert_eq!(unrunnable_error(Some(&both), &at_020), None);
+        assert_eq!(
+            unrunnable_error(Some(&both), &at_021),
+            Some(format!("{at_021} It was already paused: {operator}"))
         );
     }
 

@@ -148,12 +148,23 @@ fn own_columns(def: &TransformDef) -> BTreeSet<String> {
     columns
 }
 
-/// Reads [`CaptureCatalog`] from the instance's catalog, through `client`'s
-/// `search_path`, like every catalog query.
+/// [`load_catalog_for`] as this build runs, for a test that reads the
+/// catalog without a pool.
+#[cfg(any(test, feature = "test-util"))]
 pub async fn load_catalog(
     client: &impl GenericClient,
 ) -> Result<CaptureCatalog, crate::defs::catalog::CatalogError> {
-    let definitions = crate::defs::catalog::capture_readers(client)
+    load_catalog_for(client, &crate::defs::floor::Floors::of_this_binary()).await
+}
+
+/// Reads [`CaptureCatalog`] from the instance's catalog, through `client`'s
+/// `search_path`, like every catalog query, for a binary running as
+/// `floors` says: a definition it can't run reads nothing (ADR-0024 rule 3).
+pub async fn load_catalog_for(
+    client: &impl GenericClient,
+    floors: &crate::defs::floor::Floors,
+) -> Result<CaptureCatalog, crate::defs::catalog::CatalogError> {
+    let definitions = crate::defs::catalog::capture_readers(client, floors)
         .await?
         .into_iter()
         .map(|row| CaptureReader {

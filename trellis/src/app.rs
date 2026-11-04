@@ -513,8 +513,13 @@ impl Trellis {
     /// state side by side. First, ADR-0024 rule 2: it refuses below the
     /// catalog floor, with the error `migrate` returns there
     /// ([`ErrorCode::VersionFloor`]). Read-only calls ask neither.
+    ///
+    /// Then, as attaching does, it pauses each definition this release
+    /// can't run (ADR-0024 rule 3), so a handle that never migrates pauses
+    /// them before it changes anything too. Once they are paused, that reads
+    /// the definitions and changes nothing.
     async fn refuse_while_another_version_is_live(&self) -> Result<(), TrellisError> {
-        let client = self.pool.get().await?;
+        let mut client = self.pool.get().await?;
         if let Some(refused) = crate::migrate::below_catalog_floor(
             &**client,
             self.config.schema(),
@@ -524,10 +529,18 @@ impl Trellis {
         {
             return Err(refused.into_error().into());
         }
-        match version_handover_on(&**client, &self.config).await? {
-            None => Ok(()),
-            Some(seen) => Err(TrellisError::OtherVersionLive(seen)),
+        if let Some(seen) = version_handover_on(&**client, &self.config).await? {
+            return Err(TrellisError::OtherVersionLive(seen));
         }
+        let txn = client.transaction().await?;
+        crate::defs::grammar::pause_unrunnable_in(
+            &txn,
+            self.pool.floors(),
+            crate::defs::grammar::CURRENT_GRAMMAR_VERSION,
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(())
     }
 
     /// [`Statement::AlterTransform`](defs::Statement::AlterTransform)'s half
@@ -790,7 +803,8 @@ impl Trellis {
                     &[],
                 )
                 .await?;
-            let reported = crate::defs::catalog::reported_statuses(&*txn).await?;
+            let reported =
+                crate::defs::catalog::reported_statuses(&*txn, self.pool.floors()).await?;
             txn.commit().await?;
             Ok(rows
                 .into_iter()
@@ -922,7 +936,8 @@ impl Trellis {
                 let status_text: String = row.get(0);
                 let stored = StoredStatus::from_row(&status_text);
                 let (reported, causes) =
-                    reported_status_with_causes(&*txn, row.get(1), stored).await?;
+                    reported_status_with_causes(&*txn, self.pool.floors(), row.get(1), stored)
+                        .await?;
                 status = Some(reported);
                 paused_upstream_columns = causes;
                 correcting =
@@ -949,16 +964,24 @@ impl Trellis {
                         )
                         .await?;
                 }
-                // A stored definition always parses.
-                if let Ok(def) = crate::defs::grammar::load(
+                // A stored definition always parses, unless this release
+                // can't run it (ADR-0024 rule 3): then it isn't parsed, and
+                // its `capture_failure` and floor say why.
+                if let Ok(Some(def)) = crate::defs::grammar::load_stored(
+                    self.pool.floors(),
                     row.get("definition_text"),
                     row.get("grammar_version"),
+                    row.get("floor_version"),
                 ) {
                     // Only an aggregate's requirement reads the recorded
                     // source columns (whether the group basis takes it).
                     let source_columns =
                         if matches!(def.key_space, defs::ast::KeySpace::Aggregate { .. }) {
-                            defs::catalog::definition_by_id_in(&*txn, row.get(1))
+                            defs::catalog::definition_by_id_in(
+                                &*txn,
+                                self.pool.floors(),
+                                row.get(1),
+                            )
                                 .await?
                                 .map(|d| d.source_columns)
                                 .unwrap_or_default()
@@ -1047,6 +1070,7 @@ impl Trellis {
             crate::capture::reconcile::detect_disruptions(
                 &mut client,
                 self.config.schema(),
+                self.pool.floors(),
                 &desired,
             )
             .await
@@ -1172,6 +1196,7 @@ impl Trellis {
             let txn = client.transaction().await?;
             let rebuilt = crate::intake::catch_up::park_table_catch_ups(
                 &*txn,
+                self.pool.floors(),
                 std::slice::from_ref(&qualified),
                 false,
             )
@@ -1316,7 +1341,8 @@ impl Trellis {
                     let status_text: String = row.get(0);
                     let stored = StoredStatus::from_row(&status_text);
                     // The status `Trellis::status` reports.
-                    let status = reported_status(&**client, row.get(1), stored).await?;
+                    let status =
+                        reported_status(&**client, self.pool.floors(), row.get(1), stored).await?;
                     Ok(QuarantineEntry {
                         target,
                         state: QuarantineState::from(status),
@@ -1940,16 +1966,20 @@ fn resolve_backfill_table(captured: &[String], name: &str) -> Result<Option<Stri
 /// differ, so any other skips the catalog read.
 async fn reported_status(
     client: &impl tokio_postgres::GenericClient,
+    floors: &crate::defs::floor::Floors,
     id: i64,
     stored: StoredStatus,
 ) -> Result<TransformStatus, TrellisError> {
-    Ok(reported_status_with_causes(client, id, stored).await?.0)
+    Ok(reported_status_with_causes(client, floors, id, stored)
+        .await?
+        .0)
 }
 
 /// [`reported_status`] and the paused upstream columns behind a reported
 /// `catching_up` ([`DefinitionStatus::paused_upstream_columns`]).
 async fn reported_status_with_causes(
     client: &impl tokio_postgres::GenericClient,
+    floors: &crate::defs::floor::Floors,
     id: i64,
     stored: StoredStatus,
 ) -> Result<(TransformStatus, Vec<String>), TrellisError> {
@@ -1957,7 +1987,7 @@ async fn reported_status_with_causes(
         return Ok((stored.into(), Vec::new()));
     }
     let (statuses, mut causes) =
-        crate::defs::catalog::reported_statuses_with_causes(client).await?;
+        crate::defs::catalog::reported_statuses_with_causes(client, floors).await?;
     Ok((
         statuses.get(&id).copied().unwrap_or(stored.into()),
         causes.remove(&id).unwrap_or_default(),

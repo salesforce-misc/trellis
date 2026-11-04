@@ -60,7 +60,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use tokio_postgres::{GenericClient, Transaction};
 
-use crate::capture::columns::{CaptureCatalog, load_catalog, readers_of};
+use crate::capture::columns::{CaptureCatalog, load_catalog_for, readers_of};
 use crate::defs::ddl::DdlError;
 use crate::defs::model::StoredStatus;
 use crate::defs::row_security;
@@ -118,6 +118,7 @@ pub async fn halt_closure(pool: &Pool, err: &ApplyError) -> Result<Vec<String>, 
     let paused = pause_closure(
         &txn,
         pool.schema(),
+        pool.floors(),
         seed,
         "the drain halted",
         &err.to_string(),
@@ -148,6 +149,7 @@ pub(crate) async fn halt_failed_start(
     let paused = pause_closure(
         &txn,
         pool.schema(),
+        pool.floors(),
         Some(Seed::Target(target.to_string())),
         &halted,
         err,
@@ -165,11 +167,12 @@ pub(crate) async fn halt_failed_start(
 async fn pause_closure(
     txn: &Transaction<'_>,
     schema: &str,
+    floors: &crate::defs::floor::Floors,
     seed: Option<Seed>,
     halted: &str,
     err: &str,
 ) -> Result<Vec<String>, ApplyError> {
-    let catalog = load_catalog(txn).await?;
+    let catalog = load_catalog_for(txn, floors).await?;
     let unfrozen: HashSet<i64> = txn
         .query(
             "select id from transform_definitions where status = any($1)",

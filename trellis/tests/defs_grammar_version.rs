@@ -53,8 +53,11 @@ async fn definitions_are_stamped_with_the_current_grammar() {
     assert_eq!(v, CURRENT_GRAMMAR_VERSION);
 }
 
+/// A definition written under a newer grammar is one this binary can't run
+/// (ADR-0024 rule 3): a lookup skips it without reading its text, and leaves
+/// it as it was.
 #[tokio::test]
-async fn a_definition_with_a_newer_grammar_is_refused_and_left_untouched() {
+async fn a_definition_with_a_newer_grammar_is_skipped_unread_and_left_untouched() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -86,10 +89,8 @@ async fn a_definition_with_a_newer_grammar_is_refused_and_left_untouched() {
         .unwrap();
 
     match trellis::defs::catalog::definition_by_target(&db.pool, "t").await {
-        Err(CatalogError::Parse(ParseError::GrammarVersionTooNew { stored, current })) => {
-            assert_eq!((stored, current), (newer, CURRENT_GRAMMAR_VERSION));
-        }
-        other => panic!("expected GrammarVersionTooNew, got {other:?}"),
+        Ok(None) => {}
+        other => panic!("expected the definition skipped, got {other:?}"),
     }
 
     let after = raw
@@ -106,8 +107,11 @@ async fn a_definition_with_a_newer_grammar_is_refused_and_left_untouched() {
     assert_eq!(after.get::<_, i32>(3), newer);
 }
 
+/// Attaching over a definition written under a newer grammar pauses that
+/// one definition, naming its grammar version and the remedy, instead of
+/// refusing the attach (ADR-0018, ADR-0024 rule 3).
 #[tokio::test]
-async fn attaching_over_a_newer_definition_is_refused_naming_it() {
+async fn attaching_pauses_a_definition_with_a_newer_grammar_naming_the_remedy() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let raw = connect_raw(db.dsn()).await;
@@ -130,11 +134,37 @@ async fn attaching_over_a_newer_definition_is_refused_naming_it() {
     .unwrap();
 
     let config = Config::from_dsn(db.dsn().to_string()).unwrap();
-    let err = trellis::migrate::migrate_with_pool(&db.pool, &config)
+    trellis::migrate::migrate_with_pool(&db.pool, &config)
         .await
-        .expect_err("attach must refuse");
-    let msg = err.to_string();
-    assert!(msg.contains("public.t") && msg.contains("grammar"), "{msg}");
+        .expect("a newer definition pauses; it doesn't refuse the attach");
+    let row = raw
+        .query_one(
+            "select d.status, f.error, f.kind from transform_definitions d \
+             join capture_failures f on f.transform_id = d.id",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "paused");
+    let error: String = row.get(1);
+    assert!(
+        error.contains("public.t")
+            && error.contains(&format!("grammar version {}", CURRENT_GRAMMAR_VERSION + 1))
+            && error.contains("roll forward")
+            && error.contains("then RESUME it or DROP it there"),
+        "{error}"
+    );
+    assert_eq!(row.get::<_, String>(2), "capture");
+    // A second attach finds it paused and changes nothing.
+    trellis::migrate::migrate_with_pool(&db.pool, &config)
+        .await
+        .expect("re-attach");
+    let again: String = raw
+        .query_one("select error from capture_failures", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(again, error);
 }
 
 #[tokio::test]

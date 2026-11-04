@@ -138,17 +138,47 @@ forward again doesn't bring it back: the application migration that defined
 it has already run, so define it again by hand, or roll that migration back
 and forward.
 
-If you skip this step, the older release can't drop those definitions.
-`DROP TRANSFORM` of a definition whose floor is above the running release
-refuses with the `version_floor` error code and changes nothing, whether the
-definition is paused or not:
+If you skip this step, the older release pauses those definitions and runs
+the rest. It never reads a definition above its own release, so one such
+definition never stops the others or the process. When it attaches (`migrate`),
+when its background process takes over, and before each state-changing call,
+it pauses each definition whose floor is above it, keeping any reason it was
+already paused for. `status()` reports it `paused`, with its `floor` and a
+`capture_failure` of kind `capture` naming the floor, the running release and
+the remedy, and `trellis status` prints both:
 
 ```
-cannot drop 'by_region': its floor is 0.3.0, the oldest Trellis release that can run it, and this binary runs release 0.2.0; only a release at or above the floor knows everything the definition owns, so roll forward to Trellis 0.3.0 or later and drop it there
+  target=public.by_region status=paused floor=0.3.0 created_at=…
+    paused reading public.orders since …: error="this release can't run transform public.by_region: its floor, the oldest Trellis release that can run it, is 0.3.0, and this binary runs release 0.2.0; roll forward to 0.3.0 or later, then RESUME it or DROP it there"
 ```
 
-Roll forward to the floor or later, drop the definition there, and roll back
-again. A definition whose floor the older release meets drops as usual.
+A definition stored under a grammar newer than the older release reads
+([ADR-0018](decisions/0018-grammar-versioning.md)) pauses the same way, naming
+its grammar version; when the older release meets its floor, it drops as
+usual.
+
+While it is paused, its target keeps its rows and stops updating, and a
+definition reading that target reads it as it would any paused upstream: it
+reports `catching_up`. The older release refuses to act on it, with the
+`version_floor` error code, changing nothing:
+
+- `RESUME TRANSFORM`, `ALTER TRANSFORM` and `self_check` of it refuse with
+  the reason above.
+- `DROP TRANSFORM` of it refuses whether it is paused or not. Only a release
+  that meets its floor knows everything it owns, so only that release can
+  drop it completely:
+
+  ```
+  cannot drop 'by_region': its floor is 0.3.0, the oldest Trellis release that can run it, and this binary runs release 0.2.0; only a release at or above the floor knows everything the definition owns, so roll forward to Trellis 0.3.0 or later and drop it there
+  ```
+
+- An `ALTER TRANSFORM ... DROP` of a field of a target it reads refuses too,
+  since which columns it reads can't be known.
+
+Roll forward to the floor or later, then `RESUME` it, which rebuilds it from
+its sources, or drop it there. Rolling forward alone leaves it paused: it
+resumes only when you resume it, like every other pause. A definition whose
+floor the older release meets runs and drops as usual.
 
 ### To a release before 0.2.0
 

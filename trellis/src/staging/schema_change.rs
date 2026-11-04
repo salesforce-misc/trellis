@@ -49,7 +49,7 @@ use tokio_postgres::Client;
 use super::apply::ApplyError;
 use super::drift_memo::{self, Fingerprints};
 use crate::capture::CaptureError;
-use crate::capture::columns::{CaptureCatalog, load_catalog, read_columns, readers_of};
+use crate::capture::columns::{CaptureCatalog, load_catalog_for, read_columns, readers_of};
 use crate::capture::install::{Installed, installed};
 use crate::defs::catalog::CatalogError;
 use crate::defs::model::StoredStatus;
@@ -120,7 +120,7 @@ pub(crate) async fn pause_readers(pool: &Pool, seg_seqs: &[i64]) -> Result<(), A
         }
     }
 
-    let catalog = load_catalog(&**client).await?;
+    let catalog = load_catalog_for(&**client, pool.floors()).await?;
     let txn = client.transaction().await?;
     for (table, missing) in &by_table {
         let readers = readers_of(&catalog, table, &missing.columns, missing.whole_table());
@@ -219,7 +219,7 @@ pub(crate) async fn pause_readers_of_redefined_keys(
     if changed.is_empty() {
         return Ok(());
     }
-    let catalog = load_catalog(&**client).await?;
+    let catalog = load_catalog_for(&**client, pool.floors()).await?;
     for table in changed {
         match pause_readers_of_missing(&mut client, schema, &catalog, &table).await {
             Ok(_) => {}

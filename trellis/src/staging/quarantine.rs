@@ -532,6 +532,7 @@ pub(crate) const MERGE_HELD_ROW: &str = "on conflict (transform_id, src_table, k
 /// reaches it after misses it and computes again.
 pub(super) async fn park_batch_contribution(
     txn: &Transaction<'_>,
+    floors: &crate::defs::floor::Floors,
     seg_seq: i64,
     changes: &[(i64, FoldedChange)],
 ) -> Result<(), ApplyError> {
@@ -575,7 +576,7 @@ pub(super) async fn park_batch_contribution(
     // side's cell columns.
     let mut definitions: HashMap<i64, Option<crate::defs::model::Definition>> = HashMap::new();
     for id in &ids {
-        definitions.insert(*id, catalog::definition_by_id_in(txn, *id).await?);
+        definitions.insert(*id, catalog::definition_by_id_in(txn, floors, *id).await?);
     }
     let cell_columns = |id: i64, src_table: &str| -> Option<Vec<String>> {
         let def = definitions.get(&id)?.as_ref()?;
@@ -744,6 +745,7 @@ struct Culprit {
 /// key.
 async fn evict_key(
     txn: &Transaction<'_>,
+    floors: &crate::defs::floor::Floors,
     seg_seq: i64,
     probe: &PoisonedProbe,
     contribution: Option<&FoldedChange>,
@@ -784,7 +786,7 @@ async fn evict_key(
         // name is also the ring invariant anyway.
         let mut parked = change.clone();
         parked.src_table = probe.canonical_src_table.clone();
-        park_batch_contribution(txn, seg_seq, &[(culprit.transform_id, parked)]).await?;
+        park_batch_contribution(txn, floors, seg_seq, &[(culprit.transform_id, parked)]).await?;
     }
     Ok(())
 }
@@ -1707,7 +1709,7 @@ async fn isolate_and_evict_probing(
             if !still_charged_to_threshold(&txn, probe, threshold).await? {
                 continue;
             }
-            evict_key(&txn, seg_seq, probe, contribution).await?;
+            evict_key(&txn, pool.floors(), seg_seq, probe, contribution).await?;
             evicted += 1;
         }
         quarantine_if_crossed(&txn, transform_id, &not_frozen_sql()).await?;
@@ -2868,6 +2870,7 @@ async fn pause_dependent(
     if !upstream_paused
         || !catalog::reads_column(
             &*txn,
+            pool.floors(),
             (downstream_transform, downstream_column),
             (upstream_transform, upstream_column),
         )
@@ -3178,6 +3181,10 @@ pub async fn resume_column(
 ) -> Result<Vec<(String, String)>, ApplyError> {
     {
         let client = pool.get().await?;
+        // ADR-0024 rule 3: a definition this release can't run resumes only
+        // under a release that can, whole.
+        catalog::refuse_unrunnable(&**client, pool.floors(), transform, "resume a column of")
+            .await?;
         let awaiting_capture: Option<bool> = client
             .query_opt(
                 "select awaiting_capture from column_status \
@@ -3563,7 +3570,7 @@ pub(crate) async fn resume_pairs(
         // `ALTER TRANSFORM` that dropped or edited a field since the lookup
         // above has committed (it takes both), and the build below must
         // cover the fields as they are now.
-        let Some(def) = catalog::definition_by_id_in(&*txn, def.id).await? else {
+        let Some(def) = catalog::definition_by_id_in(&*txn, pool.floors(), def.id).await? else {
             txn.rollback().await?;
             continue;
         };
@@ -3587,7 +3594,7 @@ pub(crate) async fn resume_pairs(
         // mid-build does above. Nothing is written yet, so it rolls back
         // before it is held.
         if t != transform {
-            match refuse_unless_valid_in(&txn, pool.schema(), &t, &def).await {
+            match refuse_unless_valid_in(&txn, pool.schema(), pool.floors(), &t, &def).await {
                 Ok(()) => {}
                 Err(ApplyError::ResumeRefused { reason, .. }) => {
                     txn.rollback().await?;
@@ -3735,7 +3742,7 @@ async fn refuse_unless_valid(
 ) -> Result<(), ApplyError> {
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
-    refuse_unless_valid_in(&txn, pool.schema(), transform, definition).await
+    refuse_unless_valid_in(&txn, pool.schema(), pool.floors(), transform, definition).await
 }
 
 /// [`refuse_unless_valid`] on a transaction the caller holds, which it
@@ -3743,10 +3750,11 @@ async fn refuse_unless_valid(
 async fn refuse_unless_valid_in(
     txn: &tokio_postgres::Transaction<'_>,
     schema: &str,
+    floors: &crate::defs::floor::Floors,
     transform: &str,
     definition: &crate::defs::model::Definition,
 ) -> Result<(), ApplyError> {
-    match catalog::revalidate(txn, schema, definition).await {
+    match catalog::revalidate(txn, schema, floors, definition).await {
         Ok(_) => Ok(()),
         Err(err @ (catalog::CatalogError::Db(_) | catalog::CatalogError::Pool(_))) => {
             Err(err.into())
@@ -3873,6 +3881,11 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     else {
         return Err(not_found());
     };
+    // ADR-0024 rules 3 and 4: only a release that runs the definition
+    // resumes it, rebuilding it; this one refuses with the reason its pause
+    // records. Read under the row lock taken above, so a definition this
+    // release can't run is never parsed by the resume below.
+    catalog::refuse_unrunnable(&*txn, pool.floors(), original, "resume").await?;
     if !status.is_frozen() {
         return Err(ApplyError::TransformNotPaused {
             transform: target.to_string(),
@@ -4220,7 +4233,7 @@ async fn resume_locked(
     status: StoredStatus,
     from_pass: bool,
 ) -> Result<ResumeStep, ApplyError> {
-    let Some(definition) = catalog::definition_by_id_in(txn, id).await? else {
+    let Some(definition) = catalog::definition_by_id_in(txn, floors, id).await? else {
         return Err(ApplyError::TransformNotFound {
             transform: target.to_string(),
         });
@@ -4237,7 +4250,7 @@ async fn resume_locked(
         }
         return Ok(ResumeStep::Draining);
     }
-    let revalidated = match catalog::revalidate(txn, schema, &definition).await {
+    let revalidated = match catalog::revalidate(txn, schema, floors, &definition).await {
         Ok(revalidated) => revalidated,
         Err(err @ (catalog::CatalogError::Db(_) | catalog::CatalogError::Pool(_))) => {
             return Err(err.into());
@@ -5030,7 +5043,7 @@ async fn finish_requested_resume(
         };
         let source_table: String = row.get(0);
         let target: String = row.get(1);
-        let Some(definition) = catalog::definition_by_id_in(&txn, id).await? else {
+        let Some(definition) = catalog::definition_by_id_in(&txn, floors, id).await? else {
             return Ok(());
         };
         // Nothing is re-validated or re-typed until every upstream is
@@ -5062,7 +5075,7 @@ async fn finish_requested_resume(
         // A 1-1 target's ledger is checked here too, before anything is
         // re-typed under `ACCESS EXCLUSIVE` that `resume_locked` would then
         // refuse.
-        let checked = match catalog::revalidate(&txn, schema, &definition).await {
+        let checked = match catalog::revalidate(&txn, schema, floors, &definition).await {
             Ok(revalidated) => catalog::check_owned_tables(&txn, &definition, &revalidated).await,
             Err(err) => Err(err),
         };
@@ -5129,10 +5142,10 @@ async fn finish_requested_resume(
         let txn = client.transaction().await?;
         crate::locks::set_local_lock_timeout(&txn, RETYPE_LOCK_TIMEOUT).await?;
         let retyped_now = async {
-            lock_column_readers(&txn, &columns).await?;
+            lock_column_readers(&txn, floors, &columns).await?;
             txn.batch_execute(&sql).await?;
             record_retype_causes(&txn, id, &columns).await?;
-            pause_refused_readers(&txn, schema, &columns).await
+            pause_refused_readers(&txn, floors, schema, &columns).await
         }
         .await;
         match retyped_now {
@@ -5323,6 +5336,7 @@ async fn record_retype_causes(
 /// commits.
 async fn lock_column_readers(
     txn: &Transaction<'_>,
+    floors: &crate::defs::floor::Floors,
     columns: &[RetypedColumn],
 ) -> Result<(), tokio_postgres::Error> {
     let Some(first) = columns.first() else {
@@ -5330,7 +5344,7 @@ async fn lock_column_readers(
     };
     let upstream = first.table.rsplit('.').next().unwrap_or(&first.table);
     let names: Vec<String> = columns.iter().map(|c| c.column.clone()).collect();
-    let ids: Vec<i64> = catalog::column_readers(txn, upstream, &names)
+    let ids: Vec<i64> = catalog::column_readers(txn, floors, upstream, &names)
         .await?
         .into_iter()
         .map(|(id, _)| id)
@@ -5356,6 +5370,7 @@ async fn lock_column_readers(
 /// mechanism ([`record_retype_causes`]).
 async fn pause_refused_readers(
     txn: &Transaction<'_>,
+    floors: &crate::defs::floor::Floors,
     schema: &str,
     columns: &[RetypedColumn],
 ) -> Result<(), tokio_postgres::Error> {
@@ -5364,7 +5379,7 @@ async fn pause_refused_readers(
     };
     let upstream = first.table.rsplit('.').next().unwrap_or(&first.table);
     let names: Vec<String> = columns.iter().map(|c| c.column.clone()).collect();
-    let refused = catalog::refused_readers(txn, schema, upstream, &names).await?;
+    let refused = catalog::refused_readers(txn, floors, schema, upstream, &names).await?;
     for reader in refused {
         let retyped: Vec<String> = columns
             .iter()
@@ -5822,7 +5837,9 @@ async fn release_key_as(
 
     // A held row of a 1-1 `JOIN`'s `FROM` table is re-derived here, under
     // its `J` lock, before its rows are deleted.
-    if let Some(definition) = catalog::definition_by_id_in(&*txn, transform_id).await? {
+    if let Some(definition) =
+        catalog::definition_by_id_in(&*txn, pool.floors(), transform_id).await?
+    {
         super::join_one_to_one::held::release(&txn, pool, &definition, transform, &names[0], key)
             .await?;
     }
@@ -5884,7 +5901,7 @@ async fn release_key_as(
     // row's. The parked changes are discarded. The version fence above keeps
     // every page of the source out until this commits, and the groups are
     // locked after it, the order a page takes them in.
-    let definition = catalog::definition_by_id_in(&*txn, transform_id).await?;
+    let definition = catalog::definition_by_id_in(&*txn, pool.floors(), transform_id).await?;
     if let Some(definition) = &definition {
         let groups: Vec<String> = held
             .iter()
@@ -8488,7 +8505,7 @@ mod unit_tests {
     async fn park_one(pool: &Pool, transform_id: i64, seg_seq: i64, change: FoldedChange) {
         let mut client = pool.get().await.expect("pool connection");
         let txn = client.transaction().await.expect("begin");
-        park_batch_contribution(&txn, seg_seq, &[(transform_id, change)])
+        park_batch_contribution(&txn, pool.floors(), seg_seq, &[(transform_id, change)])
             .await
             .expect("park");
         txn.commit().await.expect("commit the park");
@@ -8693,7 +8710,13 @@ mod unit_tests {
                     .collect();
                 let mut client = pool.get().await.expect("pool connection");
                 let txn = client.transaction().await.expect("begin");
-                park_batch_contribution(&txn, seg_seq, &changes).await?;
+                park_batch_contribution(
+                    &txn,
+                    &crate::defs::floor::Floors::of_this_binary(),
+                    seg_seq,
+                    &changes,
+                )
+                .await?;
                 txn.commit().await?;
                 Ok::<_, ApplyError>(())
             })

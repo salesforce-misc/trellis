@@ -119,7 +119,7 @@ use tokio_postgres::types::Type;
 use tokio_postgres::{Client, GenericClient};
 
 use super::CaptureError;
-use super::columns::{CaptureCatalog, capture_spec, load_catalog};
+use super::columns::{CaptureCatalog, capture_spec, load_catalog_for};
 use super::install::{self, CaptureAction, LockWait, Progress};
 use super::partitions;
 use super::sql::{CaptureEvent, trigger_name};
@@ -219,7 +219,7 @@ pub(crate) async fn reconcile_with_floors(
     }
     crate::staging::quarantine::resume_caused_definitions(client, schema, floors).await?;
     crate::staging::quarantine::finish_requested_resumes(client, schema, floors).await?;
-    let snapshot = read_snapshot(client).await?;
+    let snapshot = read_snapshot(client, floors).await?;
     let installed = installed_tables(&*client, schema).await?;
     let database: String = client
         .query_typed_one("select pg_catalog.current_database()::text", &[])
@@ -403,7 +403,7 @@ pub(crate) async fn reconcile_with_floors(
         // A read column dropped and re-added, retyped, or
         // its values rewritten in place, since the last pass. Its readers
         // rebuild, or pause where their definition may no longer be valid.
-        match super::baseline::check(client, schema, &snapshot.catalog, table).await {
+        match super::baseline::check(client, schema, floors, &snapshot.catalog, table).await {
             Ok(false) => {}
             Ok(true) => continue,
             Err(err) => {
@@ -418,7 +418,7 @@ pub(crate) async fn reconcile_with_floors(
                 continue;
             }
         };
-        match install::reconcile(client, schema, &spec, Some(deadline)).await {
+        match install::reconcile_for(client, schema, floors, &spec, Some(deadline)).await {
             Ok(Progress::Done(action)) => {
                 if action != CaptureAction::Unchanged {
                     crate::instance_log::info!(table = %table, action = ?action, "capture reconciled");
@@ -621,9 +621,10 @@ struct Snapshot {
 pub async fn detect_disruptions(
     client: &mut Client,
     schema: &str,
+    floors: &crate::defs::floor::Floors,
     desired: &[String],
 ) -> Result<Vec<String>, CaptureError> {
-    let snapshot = read_snapshot(client).await?;
+    let snapshot = read_snapshot(client, floors).await?;
     let mut found = Vec::new();
     // A logical restore pauses every definition.
     if super::restore::detect(client).await? {
@@ -640,14 +641,17 @@ pub async fn detect_disruptions(
     Ok(found)
 }
 
-async fn read_snapshot(client: &mut Client) -> Result<Snapshot, CaptureError> {
+async fn read_snapshot(
+    client: &mut Client,
+    floors: &crate::defs::floor::Floors,
+) -> Result<Snapshot, CaptureError> {
     let txn = client
         .build_transaction()
         .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
         .read_only(true)
         .start()
         .await?;
-    let catalog = load_catalog(&txn).await?;
+    let catalog = load_catalog_for(&txn, floors).await?;
     let rows = txn
         .query(
             "select id, source_table, join_table \

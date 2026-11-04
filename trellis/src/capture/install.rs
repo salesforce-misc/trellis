@@ -257,6 +257,7 @@
 //! role, and the schema's owner has no privilege on it. Functions owned by
 //! the schema's owner would fail every captured write.
 
+use crate::defs::floor::Floors;
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio_postgres::types::{PgLsn, Type};
@@ -727,9 +728,29 @@ impl<T> Progress<T> {
 /// what it did. `deadline` bounds the retries of a locked table, as
 /// [`DdlRetry::new`]'s does: past it, the result is [`Progress::Waiting`]
 /// and nothing has changed.
+#[cfg(any(test, feature = "test-util"))]
 pub async fn reconcile(
     client: &mut Client,
     schema: &str,
+    desired: &CaptureSpec,
+    deadline: Option<Instant>,
+) -> Result<Progress<CaptureAction>, CaptureError> {
+    reconcile_for(
+        client,
+        schema,
+        &crate::defs::floor::Floors::of_this_binary(),
+        desired,
+        deadline,
+    )
+    .await
+}
+
+/// [`reconcile`] for a binary running as `floors` says: an install's
+/// catch-up reads the definitions it rebuilds (`intake::catch_up`).
+pub(crate) async fn reconcile_for(
+    client: &mut Client,
+    schema: &str,
+    floors: &Floors,
     desired: &CaptureSpec,
     deadline: Option<Instant>,
 ) -> Result<Progress<CaptureAction>, CaptureError> {
@@ -739,7 +760,7 @@ pub async fn reconcile(
     );
     let progress = match action {
         CaptureAction::Unchanged => Progress::Done(()),
-        CaptureAction::Install => install_tree(client, schema, desired, deadline).await?,
+        CaptureAction::Install => install_tree(client, schema, floors, desired, deadline).await?,
         CaptureAction::Widen => run(client, schema, Op::Widen(desired), deadline).await?,
         CaptureAction::Narrow => Progress::Done(narrow(client, schema, desired).await?),
     };
@@ -761,9 +782,15 @@ pub async fn install(
     if plan(&installed(&*client, schema, spec.table()).await?, spec) == CaptureAction::Unchanged {
         return Ok(Progress::Done(false));
     }
-    Ok(install_tree(client, schema, spec, deadline)
-        .await?
-        .map(|()| true))
+    Ok(install_tree(
+        client,
+        schema,
+        &crate::defs::floor::Floors::of_this_binary(),
+        spec,
+        deadline,
+    )
+    .await?
+    .map(|()| true))
 }
 
 /// The most tables of one partition tree, the root included, whose capture
@@ -781,6 +808,7 @@ pub const SINGLE_TRANSACTION_TABLES: usize = 100;
 async fn install_tree(
     client: &mut Client,
     schema: &str,
+    floors: &Floors,
     spec: &CaptureSpec,
     deadline: Option<Instant>,
 ) -> Result<Progress<()>, CaptureError> {
@@ -792,6 +820,7 @@ async fn install_tree(
             scope: Scope::All,
             last: true,
             new_nodes,
+            floors,
         };
         return run(client, schema, op, deadline).await;
     }
@@ -805,6 +834,7 @@ async fn install_tree(
         scope: Scope::Root,
         last: missing.is_empty(),
         new_nodes,
+        floors,
     };
     if let waiting @ Progress::Waiting(_) = run(client, schema, root, deadline).await? {
         return Ok(waiting);
@@ -815,6 +845,7 @@ async fn install_tree(
             scope: Scope::Node(node),
             last: i + 1 == missing.len(),
             new_nodes,
+            floors,
         };
         if let waiting @ Progress::Waiting(_) = run(client, schema, op, deadline).await? {
             return Ok(waiting);
@@ -834,11 +865,13 @@ pub async fn install_in_one_transaction(
     spec: &CaptureSpec,
     deadline: Option<Instant>,
 ) -> Result<Progress<()>, CaptureError> {
+    let floors = crate::defs::floor::Floors::of_this_binary();
     let op = Op::Install {
         spec,
         scope: Scope::All,
         last: true,
         new_nodes: false,
+        floors: &floors,
     };
     run(client, schema, op, deadline).await
 }
@@ -979,6 +1012,8 @@ enum Op<'a> {
         scope: Scope<'a>,
         last: bool,
         new_nodes: bool,
+        /// What the catch-up's reads of the definitions it rebuilds skip.
+        floors: &'a Floors,
     },
     Widen(&'a CaptureSpec),
     Uninstall {
@@ -1140,11 +1175,16 @@ async fn attempt(
         Op::Install {
             last: true,
             new_nodes,
+            floors,
             ..
         } => {
-            rebuilt =
-                crate::intake::catch_up::park_table_catch_ups(&txn, &[table.to_string()], new_nodes)
-                    .await?
+            rebuilt = crate::intake::catch_up::park_table_catch_ups(
+                &txn,
+                floors,
+                &[table.to_string()],
+                new_nodes,
+            )
+            .await?
         }
         Op::Install { .. } | Op::Widen(_) | Op::Uninstall { .. } => {}
     }

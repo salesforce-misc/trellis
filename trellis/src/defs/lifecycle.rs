@@ -418,6 +418,74 @@ pub(crate) async fn pause_for_grammar_version(
     pause_with_record(txn, id, source_table, &[], error, "capture", None).await
 }
 
+/// Pauses definition `id`, which this binary can't run (ADR-0024 rule 3),
+/// recording `reason` (an [`super::floor::Unrunnable::reason`]) as its
+/// `capture_failure`, kind `capture`: only an operator's `RESUME` under a
+/// release that runs it resumes it. A definition already paused keeps its
+/// reasons after this one ([`super::floor::unrunnable_error`]), and loses any
+/// resume that would complete without the operator: a pending resume request
+/// and an upstream cause. Returns whether this changed anything, so a later
+/// attach that finds it already recorded changes nothing.
+pub(crate) async fn pause_for_unrunnable(
+    txn: &Transaction<'_>,
+    id: i64,
+    source_table: &str,
+    reason: &str,
+) -> Result<bool, CatalogError> {
+    let Some(row) = txn
+        .query_opt(
+            "select cf.error, cf.caused_by is not null \
+             from transform_definitions d \
+             left join capture_failures cf on cf.transform_id = d.id \
+             where d.id = $1 for update of d",
+            &[&id],
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    let existing: Option<String> = row.get(0);
+    let mut changed = row.get::<_, Option<bool>>(1) == Some(true);
+    changed |= txn
+        .execute(
+            "delete from resume_requests where transform_id = $1",
+            &[&id],
+        )
+        .await?
+        == 1;
+    let error = super::floor::unrunnable_error(existing.as_deref(), reason);
+    if let Some(error) = &error {
+        txn.execute(
+            "insert into capture_failures (transform_id, source_table, columns, error, kind) \
+             values ($1, $2, '{}', $3, 'capture') \
+             on conflict (transform_id) do update \
+             set error = excluded.error, kind = 'capture', caused_by = null, \
+                 detected_at = now()",
+            &[&id, &source_table, error],
+        )
+        .await?;
+    } else if changed {
+        txn.execute(
+            "update capture_failures set caused_by = null where transform_id = $1",
+            &[&id],
+        )
+        .await?;
+    }
+    changed |= error.is_some();
+    changed |= txn
+        .execute(
+            "update transform_definitions set status = $2 where id = $1 and status = any($3)",
+            &[
+                &id,
+                &StoredStatus::Paused.as_str(),
+                &StoredStatus::dispatchable(),
+            ],
+        )
+        .await?
+        == 1;
+    Ok(changed)
+}
+
 /// [`pause_for_capture_failure`] for a drain's halt
 /// (`staging::halt`): pauses definition `id` because a page failed with a
 /// halting error on `source_table` that it reads, directly or downstream of
@@ -596,7 +664,8 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // Before any write, and inside the same transaction as the writes, so a
     // `define` that registers a new dependent cannot interleave between the
     // refusal check and the commit.
-    let (blockers, column_detail) = dependency_blockers(&txn, target, &qualified, id).await?;
+    let (blockers, column_detail) =
+        dependency_blockers(&txn, pool.floors(), target, &qualified, id).await?;
     if !blockers.is_empty() {
         return Err(CatalogError::DependentsBlockDrop {
             subject: target.to_string(),
@@ -745,6 +814,7 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
 /// Returns blocker names, bare transform names, sorted and deduplicated.
 async fn dependency_blockers(
     txn: &Transaction<'_>,
+    floors: &super::floor::Floors,
     target: &str,
     qualified_target: &str,
     definition_id: i64,
@@ -763,19 +833,20 @@ async fn dependency_blockers(
     // of only "something reads this table."
     let column_detail = match txn
         .query_opt(
-            "select definition_text, grammar_version from transform_definitions where id = $1",
+            "select definition_text, grammar_version, floor_version \
+             from transform_definitions where id = $1",
             &[&definition_id],
         )
         .await?
     {
         Some(row) => {
-            let text: String = row.get(0);
-            match super::grammar::load(&text, row.get(1)) {
-                Ok(def) => {
+            match super::grammar::load_stored(floors, row.get(0), row.get(1), row.get(2)) {
+                Ok(Some(def)) => {
                     let mut detail = Vec::new();
                     for field in &def.fields {
                         let deps = super::catalog::column_dependents_any_keyspace(
                             txn,
+                            floors,
                             target,
                             &field.name,
                         )
@@ -789,8 +860,9 @@ async fn dependency_blockers(
                 }
                 // Same "best-effort, never fail the drop over this precision
                 // feature" tolerance `column_dependents` itself already
-                // applies to every *other* definition's text.
-                Err(_) => Vec::new(),
+                // applies to every *other* definition's text, and a
+                // definition this release can't run names no column.
+                Ok(None) | Err(_) => Vec::new(),
             }
         }
         None => Vec::new(),

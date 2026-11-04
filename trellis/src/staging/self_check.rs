@@ -627,11 +627,19 @@ impl CheckPageExt for crate::Trellis {
 
 /// The definition registered under `target_table`, if it is one `self_check`
 /// can compare: a 1-1 target, an aggregate on the group basis, a `JOIN`
-/// that applies or a 1-1 `JOIN`. Refused with what is wrong otherwise.
+/// that applies or a 1-1 `JOIN`. Refused with what is wrong otherwise, a
+/// definition this release can't run (ADR-0024 rule 3) with why.
 pub(crate) async fn comparable_definition(
     pool: &Pool,
     target_table: &str,
 ) -> Result<Definition, SelfCheckError> {
+    catalog::refuse_unrunnable(
+        &**pool.get().await?,
+        pool.floors(),
+        target_table,
+        "self_check",
+    )
+    .await?;
     let def = catalog::definition_by_target(pool, target_table)
         .await?
         .ok_or_else(|| SelfCheckError::TargetNotFound(target_table.to_string()))?;
@@ -790,7 +798,7 @@ pub(crate) async fn audit(
     // (one query over the definitions, plus one per paused column).
     let reported = if def.status == StoredStatus::Live {
         let client = pool.get().await?;
-        catalog::reported_statuses(&**client)
+        catalog::reported_statuses(&**client, pool.floors())
             .await?
             .get(&def.id)
             .copied()

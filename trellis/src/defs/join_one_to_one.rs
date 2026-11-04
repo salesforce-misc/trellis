@@ -28,6 +28,7 @@
 //! a pending fan-out, and the chunked build, run in
 //! `crate::staging::join_one_to_one`.
 
+use super::floor::Floors;
 use std::collections::HashMap;
 
 use tokio_postgres::GenericClient;
@@ -311,20 +312,37 @@ pub(crate) fn joined_on_columns(def: &TransformDef) -> Vec<String> {
 
 /// The key space of the definition whose target is `qualified_table`, if one
 /// is: the definition is read back from its stored text.
+///
+/// A definition this release can't run (ADR-0024 rule 3) isn't parsed, so its
+/// key space can't be known: the check that asks refuses, naming why, rather
+/// than let a reader of a target this release can't vouch for through.
 async fn target_key_space(
     client: &impl GenericClient,
+    floors: &Floors,
     qualified_table: &str,
 ) -> Result<Option<super::ast::KeySpace>, super::catalog::CatalogError> {
-    let text: Option<String> = client
+    let Some(row) = client
         .query_opt(
-            "select definition_text from transform_definitions where target_table = $1",
+            "select definition_text, grammar_version, floor_version \
+             from transform_definitions where target_table = $1",
             &[&qualified_table],
         )
         .await?
-        .map(|row| row.get(0));
-    Ok(text
-        .and_then(|text| super::parser::parse(&text).ok())
-        .map(|def| def.key_space))
+    else {
+        return Ok(None);
+    };
+    if let Some(unrunnable) = floors.unrunnable(row.get(2), row.get(1)) {
+        return Err(super::catalog::CatalogError::CannotRun {
+            action: format!("define a transform reading {qualified_table}"),
+            reason: unrunnable.reason(qualified_table),
+        });
+    }
+    Ok(
+        super::grammar::load_stored(floors, row.get(0), row.get(1), row.get(2))
+            .ok()
+            .flatten()
+            .map(|def| def.key_space),
+    )
 }
 
 /// Refuses a definition that reads `tables` (qualified) when one is the
@@ -333,10 +351,12 @@ async fn target_key_space(
 /// makes the check, whatever its own key space.
 pub(crate) async fn reject_reader_of_target(
     client: &impl GenericClient,
+    floors: &Floors,
     tables: &[&str],
 ) -> Result<(), super::catalog::CatalogError> {
     for table in tables {
-        if let Some(super::ast::KeySpace::JoinOneToOne(_)) = target_key_space(client, table).await?
+        if let Some(super::ast::KeySpace::JoinOneToOne(_)) =
+            target_key_space(client, floors, table).await?
         {
             return Err(ValidationError::OneToOneJoinTargetRead {
                 table: (*table).to_string(),
@@ -388,6 +408,7 @@ pub(crate) async fn reject_target_with_reader(
 /// The `FROM` table has no such rule: its `ON` columns carry no uniqueness.
 pub(crate) async fn check_define(
     client: &impl GenericClient,
+    floors: &Floors,
     def: &TransformDef,
     joined: &str,
 ) -> Result<(), super::catalog::CatalogError> {
@@ -400,7 +421,7 @@ pub(crate) async fn check_define(
         .into());
     }
     if matches!(
-        target_key_space(client, joined).await?,
+        target_key_space(client, floors, joined).await?,
         Some(super::ast::KeySpace::OneToOne)
     ) {
         let pk: Vec<String> = super::ddl::identity_key_columns(client, joined)

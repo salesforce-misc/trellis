@@ -261,7 +261,9 @@ async fn attach_under_handover(
             handover::Verdict::StandBy(_) => unreachable!("only a background process stands by"),
         };
     if let Some(seen) = other_version {
-        let would_pause = crate::defs::grammar::check_stored_versions_dry_run(pg_client).await?;
+        let would_pause =
+            crate::defs::grammar::check_stored_versions_dry_run(pg_client, &config.floors())
+                .await?;
         if would_pause > 0 || identity::marker_would_change(pg_client, config).await? {
             return Err(Error::OtherVersionLive(seen));
         }
@@ -270,10 +272,11 @@ async fn attach_under_handover(
 
     run_migrations(pg_client, migrations).await?;
 
-    // ADR-0018: before anything reads a stored definition, refuse an attach
-    // over definitions this binary can't read and pause the ones outside the
-    // support window.
-    crate::defs::grammar::check_stored_versions(pg_client).await?;
+    // ADR-0018, ADR-0024 rule 3: before anything reads a stored definition,
+    // pause each one this binary can't run (its floor or its grammar is
+    // newer) or read (outside the support window, or text it refuses), each
+    // on its own, so the rest of the instance runs beside it.
+    crate::defs::grammar::check_stored_versions(pg_client, &config.floors()).await?;
 
     // Always seed/reconcile the marker, not just on a "fresh attach" — see
     // `identity::seed_marker` for why: it's an idempotent upsert, so a

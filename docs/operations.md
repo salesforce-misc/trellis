@@ -18,6 +18,7 @@ the ways a target can go wrong without a stop, and names the repair for each.
 | `paused`, with a `capture_failure` naming a partition-key column or the leaf limit | A partitioned source stopped meeting the shape define accepts | Make the tree comply ([the refusal table](transforms.md#supported-sources-and-targets)), then `RESUME` |
 | `paused`, with a `capture_failure` saying an enum value was renamed | `ALTER TYPE … RENAME VALUE` on an enum it reads: the changes it staged and the keys it holds name the old label | `RESUME`, which rebuilds the target from the source ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#an-enum-value-relabelled)) |
 | `paused`, with a `capture_failure` saying the database was restored from a logical dump | Every definition's ordering state came from the original database | `RESUME` each definition, which rebuilds it ([After a restore or an upgrade](#runbooks)) |
+| `paused`, with a `capture_failure` reading "this release can't run transform …" | The definition's `floor` is above this release, or it was written under a newer grammar: a later release defined or rebuilt it, and this one was rolled back to. Its target keeps its rows and stops updating; the rest of the instance runs. `RESUME`, `ALTER` and `self_check` of it refuse with the `version_floor` code, and so does `DROP` of one above its floor | Roll forward to the release the message names or later, then `RESUME` it there, which rebuilds it, or `DROP` it there ([before rolling back](upgrading.md#before-rolling-back)) |
 | `paused`, with a `capture_failure` reading "resuming: …" | A `RESUME` is re-typing copies, waiting for an upstream to go `live`, or waiting for the changes staged before an enum relabel, or a re-type to another enum, to drain | Wait. A `PAUSE` withdraws the resume |
 | `quarantined` | Too many of its keys failed to apply, so the whole-definition fuse tripped | Fix the cause `sample_quarantined` shows, then `RESUME` |
 | `held_keys` | Keys that keep failing to apply are held, with their target rows frozen | Fix the cause, then [release them](#releasing-held-keys) |
@@ -355,7 +356,11 @@ each one costs and what to expect around it
   [upgrading and rolling back](upgrading.md). In short, start the new version
   beside the old (it stands by, and `status()` shows `version_handover`), stop
   the old, and migrate (`trellis run` does it by itself; an embedder runs
-  `migrate` after the old version has stopped).
+  `migrate` after the old version has stopped). Before rolling back, drop,
+  under the newer release, each definition whose `floor` is above the release
+  you roll back to; the older release pauses any you leave, and only a
+  release that meets the floor resumes or drops them
+  ([before rolling back](upgrading.md#before-rolling-back)).
 * **After a table swap, a bulk load with triggers disabled, or a fixture load
   that ends with `ENABLE TRIGGER ALL`:** the readers of the table are paused.
   `RESUME` each one, which rebuilds it

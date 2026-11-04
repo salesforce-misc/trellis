@@ -62,6 +62,7 @@ pub(crate) async fn park_target_catchup_if_read(
 /// node's own rows' among them.
 pub(crate) async fn park_table_catch_ups(
     client: &impl GenericClient,
+    floors: &crate::defs::floor::Floors,
     tables: &[String],
     new_nodes: bool,
 ) -> Result<Vec<i64>, IntakeError> {
@@ -69,7 +70,8 @@ pub(crate) async fn park_table_catch_ups(
     if new_nodes {
         let mut corrected = Vec::new();
         for &id in &readers {
-            if let Some(definition) = crate::defs::catalog::definition_by_id_in(client, id).await?
+            if let Some(definition) =
+                crate::defs::catalog::definition_by_id_in(client, floors, id).await?
                 && corrected_by_new_node(client, &definition, tables).await?
             {
                 corrected.push(id);
