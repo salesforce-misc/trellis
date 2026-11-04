@@ -172,11 +172,13 @@ async fn a_partitioned_source_counts_and_the_floor_stops_at_the_running_release(
     assert_eq!(floor(&raw, &later, "cased").await, "0.3.0");
 }
 
-/// Everything a drop could remove: the relations in the target and catalog
-/// schemas, and the catalog rows naming a definition or its tables.
+/// Everything a drop could remove or bump: the relations in the target and
+/// catalog schemas, the catalog rows naming a definition or its tables, and
+/// the version fences of the tables it reads.
 async fn snapshot(raw: &Client) -> Vec<String> {
     let mut rows = Vec::new();
     for query in [
+        "select format('%s %s', source_table, version) from source_table_versions order by 1",
         "select n.nspname || '.' || c.relname from pg_catalog.pg_class c \
          join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
          where n.nspname in ('public', 'trellis') and c.relkind in ('r', 'p') order by 1",
@@ -215,8 +217,8 @@ async fn drop_refuses_a_definition_above_the_running_release() {
     .await
     .expect("sources");
 
-    // A release whose aggregate `JOIN` is new in 0.3.0 defines one, and a
-    // definition every release can run.
+    // A release whose aggregate `JOIN` is new in 0.3.0 defines one, a
+    // definition reading its target, and a definition every release can run.
     let newer = handle(&db, "0.3.0", &[("KeySpace(Join)", "0.3.0")]).await;
     newer
         .apply(
@@ -229,6 +231,11 @@ async fn drop_refuses_a_definition_above_the_running_release() {
         .apply("TRANSFORM regions FROM orders SELECT region AS region")
         .await
         .expect("define the 1-1");
+    build_everything(&newer).await;
+    newer
+        .apply("TRANSFORM region_qty FROM by_region SELECT qty AS qty")
+        .await
+        .expect("define a reader of the JOIN's target");
     assert_eq!(floor(&raw, &newer, "by_region").await, "0.3.0");
     assert_eq!(floor(&raw, &newer, "regions").await, "0.2.0");
     let join_id: i64 = raw
@@ -242,7 +249,7 @@ async fn drop_refuses_a_definition_above_the_running_release() {
 
     // Rolled back to 0.2.0.
     let older = handle(&db, "0.2.0", &[]).await;
-    for target in ["by_region", "regions"] {
+    for target in ["by_region", "region_qty", "regions"] {
         older
             .apply(&format!("PAUSE TRANSFORM {target}"))
             .await
@@ -256,6 +263,8 @@ async fn drop_refuses_a_definition_above_the_running_release() {
     );
     assert!(before.iter().any(|row| row == "public.by_region"));
 
+    // Refused before its dependents are read: that refusal's column detail
+    // parses the definition, which this release may not read.
     let err = older
         .apply("DROP TRANSFORM by_region")
         .await
@@ -304,16 +313,21 @@ async fn drop_refuses_a_definition_above_the_running_release() {
         "its target went"
     );
 
-    // Rolled forward, the same drop removes everything.
+    // Rolled forward, the same drop removes everything, once its reader
+    // has gone first.
+    newer
+        .apply("DROP TRANSFORM region_qty")
+        .await
+        .expect("drop the reader");
     newer
         .apply("DROP TRANSFORM by_region")
         .await
         .expect("drop under a release that meets the floor");
+    // A version fence only counts up, so the target's own stays.
     let after = snapshot(&raw).await;
     assert!(
-        !after
-            .iter()
-            .any(|row| row.starts_with(&hidden) || row.contains("by_region")),
+        !after.iter().any(|row| row.starts_with(&hidden)
+            || (row.contains("by_region") && !row.starts_with("public.by_region "))),
         "{after:?}"
     );
 }
