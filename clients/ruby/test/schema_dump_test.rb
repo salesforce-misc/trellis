@@ -382,6 +382,19 @@ class SchemaDumpTest < Minitest::Test
       assert_raises(Trellis::ConnectivityError) { Tasks.dump_schema(config, :sql) }
     end
     assert_equal "-- previous\n", File.read(path)
+
+    # So does a pg_dump that fails before it opens the file (it can't
+    # connect, or it is older than the server).
+    Tasks.stub(:structure_dump, ->(_config, _file) { raise "pg_dump failed" }) do
+      assert_raises(RuntimeError) { Tasks.dump_schema(config, :sql) }
+    end
+    assert_equal "-- previous\n", File.read(path)
+
+    # But not one that wrote to it.
+    Tasks.stub(:structure_dump, failing) do
+      assert_raises(RuntimeError) { Tasks.dump_schema(config, :sql) }
+    end
+    refute File.exist?(path)
   end
 
   private

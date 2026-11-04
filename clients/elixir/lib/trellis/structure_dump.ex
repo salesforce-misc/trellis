@@ -30,8 +30,8 @@ defmodule Trellis.StructureDump do
     and database name. The definitions of one database don't belong in the
     structure file of another, so a `dump/2` or `append/2` at a url that
     names another refuses, and so does `mix trellis.load`. `localhost` is
-    not `127.0.0.1`; a repo connecting over a socket directory matches a
-    local Trellis host.
+    not `127.0.0.1`; a repo connecting over a socket directory, or naming
+    no host, matches a local Trellis host.
 
   ## Loading
 
@@ -54,9 +54,10 @@ defmodule Trellis.StructureDump do
   in between can't leave a file whose DDL and definitions disagree.
   `append/2` reads once, after a dump someone else ran, and can't tell.
 
-  A dump that fails after `pg_dump` has run (definitions that changed during
-  each attempt, a failed filter) removes the file: what `pg_dump` wrote has
-  the capture triggers in and no definitions, and would load without a word.
+  A dump that fails once `pg_dump` has written the file (definitions that
+  changed during each attempt, a failed filter) removes it: what `pg_dump`
+  wrote has the capture triggers in and no definitions, and would load
+  without a word. A file no `pg_dump` wrote to is left as it was.
 
   ## `CREATE SCHEMA public`
 
@@ -115,7 +116,7 @@ defmodule Trellis.StructureDump do
   def dump(repos, pg_dump \\ &pg_dump/2) when is_list(repos) and is_function(pg_dump, 2) do
     with {:ok, plans} <- plans(repos, false) do
       Enum.reduce_while(plans, {:ok, []}, fn plan, {:ok, paths} ->
-        case with_handles([plan], fn [handle] -> attempt(plan, handle, pg_dump, @attempts) end) do
+        case with_handles([plan], fn [handle] -> dump_one(plan, handle, pg_dump) end) do
           :ok -> {:cont, {:ok, paths ++ [plan.path]}}
           error -> {:halt, error}
         end
@@ -356,43 +357,56 @@ defmodule Trellis.StructureDump do
     end
   end
 
-  # One dump, between two reads of the definitions: done when they agree and
-  # the file is finished, redone (`left` more times) when they differ. Once
-  # `pg_dump` has run, whatever the file holds is raw `pg_dump` output, with
-  # the capture triggers in and no definitions; any way out but success
-  # removes it, so `mix ecto.load` can't load it without a word. A failure
-  # before the first `pg_dump` leaves the previous file alone.
-  defp attempt(plan, handle, pg_dump, left) do
-    with {:ok, before} <- read_schema_dump(handle) do
-      outcome =
-        try do
-          with :ok <- pg_dump.(Map.take(plan, [:repo, :config, :path]), before.pg_dump_args),
-               {:ok, now} <- read_schema_dump(handle) do
-            if now == before, do: finish(plan.path, handle, before.appendix), else: :changed
-          end
-        catch
-          kind, reason ->
-            File.rm(plan.path)
-            :erlang.raise(kind, reason, __STACKTRACE__)
-        end
+  # The dump of one plan. Once `pg_dump` has written the file, it holds raw
+  # `pg_dump` output, with the capture triggers in and no definitions; any
+  # way out but success removes it, so `mix ecto.load` can't load it without
+  # a word. A file no `pg_dump` wrote to (a failure before the first, or a
+  # `pg_dump` that failed before opening it) is the previous dump: left
+  # alone.
+  defp dump_one(plan, handle, pg_dump) do
+    previous = File.read(plan.path)
 
-      case outcome do
-        :changed when left > 1 ->
+    try do
+      case attempt(plan, handle, pg_dump, @attempts) do
+        :ok ->
+          :ok
+
+        error ->
+          discard_unfinished(plan.path, previous)
+          error
+      end
+    catch
+      kind, reason ->
+        discard_unfinished(plan.path, previous)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+  end
+
+  defp discard_unfinished(path, previous) do
+    case {File.read(path), previous} do
+      {{:ok, same}, {:ok, same}} -> :ok
+      {{:ok, _}, _} -> File.rm(path)
+      _ -> :ok
+    end
+  end
+
+  # One dump, between two reads of the definitions: done when they agree and
+  # the file is finished, redone (`left` more times) when they differ.
+  defp attempt(plan, handle, pg_dump, left) do
+    with {:ok, before} <- read_schema_dump(handle),
+         :ok <- pg_dump.(Map.take(plan, [:repo, :config, :path]), before.pg_dump_args),
+         {:ok, now} <- read_schema_dump(handle) do
+      cond do
+        now == before ->
+          finish(plan.path, handle, before.appendix)
+
+        left > 1 ->
           attempt(plan, handle, pg_dump, left - 1)
 
-        :changed ->
-          File.rm(plan.path)
-
+        true ->
           {:error,
            "Trellis's definitions changed during each of #{@attempts} dumps: dump when no " <>
              "migration is defining or dropping"}
-
-        {:error, _} = error ->
-          File.rm(plan.path)
-          error
-
-        :ok ->
-          :ok
       end
     end
   end

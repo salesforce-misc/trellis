@@ -186,6 +186,16 @@ module Trellis
         File.write(filename, "#{sql}\n#{appendix}", encoding: "utf-8")
       end
 
+      # Removes what a dump that failed left at filename, unless it is
+      # previous (the file's bytes before the dump, nil when there was none):
+      # a failure before `pg_dump` wrote to the file leaves it alone.
+      def discard_unfinished(filename, previous)
+        return unless File.exist?(filename)
+        return if previous && File.binread(filename) == previous
+
+        FileUtils.rm_f(filename)
+      end
+
       # Restores the definitions a load of db_config's dump queued: `migrate`
       # on each configured instance, in the database db_config names.
       def restore(db_config)
@@ -357,14 +367,13 @@ module Trellis
 
         SchemaDump.verify_same_database!(db_config)
 
-        written = false
+        previous = File.exist?(filename) ? File.binread(filename) : nil
         finished = false
         begin
           SchemaDump::ATTEMPTS.times do
             before = SchemaDump.parts
             begin
               Thread.current[SchemaDump::PARTS_KEY] = before
-              written = true
               super(db_config, format)
             ensure
               Thread.current[SchemaDump::PARTS_KEY] = nil
@@ -381,9 +390,10 @@ module Trellis
         ensure
           # Whatever Rails wrote is raw `pg_dump` output with the capture
           # triggers in and no definitions: left in place, a later
-          # `db:schema:load` would load it without a word. A failure before
-          # the first `pg_dump` leaves the previous file alone.
-          FileUtils.rm_f(filename) if written && !finished
+          # `db:schema:load` would load it without a word. A file no
+          # `pg_dump` wrote to (a failure before the first, or a `pg_dump`
+          # that failed before opening it) is the previous dump: left alone.
+          SchemaDump.discard_unfinished(filename, previous) unless finished
         end
       end
 

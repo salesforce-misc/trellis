@@ -216,6 +216,17 @@ defmodule Trellis.StructureDumpTest do
     assert_raise RuntimeError, "boom", fn -> StructureDump.dump([{TestRepo, []}], raising) end
     refute File.exists?(path)
 
+    # A pg_dump that fails before it opens the file (it can't connect, or
+    # it is older than the server) leaves the file that was there...
+    File.write!(path, "-- previous\n")
+    unopened = fn _plan, _args -> {:error, "pg_dump: error: connection failed"} end
+    assert {:error, _} = StructureDump.dump([{TestRepo, []}], unopened)
+    assert File.read!(path) == "-- previous\n"
+
+    # ...and one that wrote to it doesn't.
+    assert {:error, "boom"} = StructureDump.dump([{TestRepo, []}], failing)
+    refute File.exists?(path)
+
     # Refused before pg_dump runs: the file that was there stays.
     File.write!(path, "-- previous\n")
     point_trellis_at(cluster, "elsewhere")
@@ -345,6 +356,15 @@ defmodule Trellis.StructureDumpTest do
     # Hosts are not equated across spellings.
     refute same?.(tcp, "postgres://db.internal.example/app")
     refute same?.([hostname: "localhost", database: "app"], "postgres://127.0.0.1/app")
+    refute same?.([hostname: "localhost", database: "app"], "host=/run/pg dbname=app")
+    # A repo naming no host matches a local one, as a Rails config naming none
+    # does in the Ruby client (when PGHOST names none either).
+    if is_nil(System.get_env("PGHOST")) do
+      assert same?.([database: "app"], "postgres://127.0.0.1/app")
+      assert same?.([database: "app"], "host=/run/pg dbname=app")
+      refute same?.([database: "app"], "postgres://db.internal/app")
+    end
+
     # The database defaults to the user, as libpq's does.
     refute same?.(tcp, "postgres://me@db.internal")
     assert same?.([hostname: "h", database: "me"], "postgres://me@h")
@@ -386,6 +406,27 @@ defmodule Trellis.StructureDumpTest do
 
     assert File.read!(migrations) =~ "PostgreSQL database dump"
     assert File.read!(structure) =~ "-- Trellis definitions ("
+  end
+
+  test "a declined ecto.load prompt is matched to its repo by the whole name" do
+    # `mix ecto.load`'s two prompts, as it words them.
+    new = fn repo ->
+      "Are you sure you want to load a new structure for #{inspect(repo)}? Any existing " <>
+        "data in this repo may be lost."
+    end
+
+    loaded = fn repo ->
+      "It looks like a structure was already loaded for #{inspect(repo)}. Any attempt to " <>
+        "load it again might fail.\nAre you sure you want to proceed?\n"
+    end
+
+    declined? = &Mix.Tasks.Trellis.Load.declined?/2
+    assert declined?.([new.(MyApp.Repo)], MyApp.Repo)
+    assert declined?.([loaded.(MyApp.Repo)], MyApp.Repo)
+    # A "no" for a repo whose name extends this one's is not a "no" for it.
+    refute declined?.([new.(MyApp.Repo.Replica)], MyApp.Repo)
+    refute declined?.([loaded.(MyApp.Repo.Replica)], MyApp.Repo)
+    refute declined?.([new.(MyApp.Repo)], MyApp.Repo.Replica)
   end
 
   describe "mix trellis.load leaves a repo alone that ecto.load left alone" do

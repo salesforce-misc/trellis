@@ -94,9 +94,12 @@ if Code.ensure_loaded?(Mix.Tasks.Ecto.Load) do
     defp load(args), do: RecordingShell.run(fn -> Mix.Tasks.Ecto.Load.run(args) end)
 
     # `ecto.load`'s prompt names the repo: "... a new structure for Repo?
-    # ..." or "... already loaded for Repo. ...".
-    defp declined?(declined, repo) do
-      pattern = ~r/for #{Regex.escape(inspect(repo))}[?.]/
+    # Any ..." or "... already loaded for Repo. Any ...". The white space
+    # after the `?` or `.` keeps `MyApp.Repo` from matching a prompt for
+    # `MyApp.Repo.Replica`.
+    @doc false
+    def declined?(declined, repo) do
+      pattern = ~r/for #{Regex.escape(inspect(repo))}[?.]\s/
       Enum.any?(declined, &(&1 =~ pattern))
     end
 

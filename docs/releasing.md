@@ -164,7 +164,7 @@ running for a manual step.
 | `definitions` | One of each shape the release supports, built under the old build with writers running and undrained ring segments in flight: a plain 1-1, a chained 1-1, a 1-1 with a paused column, a group-basis aggregate, an aggregate over a `JOIN` (inner and `LEFT`), an aggregate and a `JOIN` over a hash-partitioned source, a 1-1 with a held key, and a paused transform. Under the candidate each resumes, converges and has a clean `self_check`; the held key and the pauses are unchanged; nothing else pauses. A plain recompute of two targets in SQL cross-checks `self_check`. | Script |
 | `grammar` | A definition the old build accepted and the candidate refuses pauses with a reason that names the remedy, not an error loop and not silent staleness, and the remedy works: a bare reserved word as a column name, and an expression nested over 100 levels (as a chain and as parentheses). | Script, plus the manual cases below |
 | `inflight` | Upgrading while a definition is mid-build, mid-rebuild (a `RESUME`), waiting for capture, paused, or holding a key: each continues to `live`, or stays as it was. A held key stands for quarantine: the script does not trip the whole-definition fuse, so no definition is `quarantined` at the upgrade. | Script |
-| `structure` | A `structure.sql` made by the old build (a `pg_dump --schema-only` of the Trellis schema and `public`, plus the old build's `dump_definitions_sql`) loads into an empty database and every definition builds. Covers the older format only (see the manual step below). | Script |
+| `structure` | A `structure.sql` made by the old build (a `pg_dump --schema-only` of the Trellis schema and `public`, plus the old build's `dump_definitions_sql`) loads into an empty database and every definition builds. Covers the older format only (see the [release notes checklist](#release-notes-checklist)). | Script |
 | `pgrestore` | A `pg_dump` and `pg_restore` of the old database opens under the candidate, pauses every definition with the documented reason ([operations — runbooks](operations.md#runbooks)), and `RESUME` brings each back to `live` with a clean `self_check`. | Script |
 | `basebackup` | A `pg_basebackup` taken while the old build and its writers ran starts as a cluster, and the candidate converges it with no pause and no `RESUME`. | Script |
 | `clients` | The Ruby gem and the Elixir package built from the candidate open a database the predecessor's clients used, with the same options. | Manual |
@@ -270,21 +270,15 @@ For each release, the notes carry:
   application's writes since, and a `0.1.x` worker started without `migrate`
   runs unchecked on a database `0.2.0` migrated
   ([upgrading](upgrading.md#to-a-release-before-020)).
-- **`structure`, the format [ADR-0025](decisions/0025-schema-dumps-restore-definitions.md)
-  writes:** a `structure.sql` made by the old build's `schema_dump` (a
-  `pg_dump --schema-only` with its `pg_dump_args`, through
-  `filter_schema_dump`, then its `appendix`) is not covered by the script.
-  A release before `schema_dump` (`v0.1.0`) has no such file, and the
-  probe's source (`upgrade-battery/check`) is built against the old tag and
-  the candidate alike, so a `schema-dump` command in it fails to build
-  against a tag without the call and would `SKIP` the older-format row too.
-  When the old tag has `schema_dump`: give the probe that command behind a
-  cargo feature the script enables only for such a tag, dump the `shapes`
-  database with it, load the file into an empty database, run the
-  candidate's `migrate`, and check what the older-format row checks (every
-  definition live, the paused ones as they were, a clean `self_check`) plus
-  that `trellis.restore_queue` is gone. Until then, nothing in the battery
-  checks that a file one release dumped loads under the next.
+- **`structure.sql` in the format
+  [ADR-0025](decisions/0025-schema-dumps-restore-definitions.md) writes,**
+  which the battery does not check: a file the old build's `schema_dump`
+  wrote (a `pg_dump --schema-only` with its `pg_dump_args`, through
+  `filter_schema_dump`, then its `appendix`) loading under the candidate. The
+  `structure` step covers the older `dump_definitions_sql` format only: the
+  probe (`upgrade-battery/check`) is built from one source against the old
+  tag and the candidate alike, and a tag before `schema_dump` (`v0.1.0`) has
+  no call for it to build against.
 - **For databases that came from a pre-release,** which the battery does not
   start from:
   - a database loaded from a `0.1.0-gamma` `structure.sql` has aggregate

@@ -573,8 +573,9 @@ How the restore works, and what it refuses, is in
   hook reads the definitions before and after the `pg_dump` and redoes the
   dump when they differ (three attempts, then `Trellis::ConflictError`), so a
   define or drop that races a dump can't leave tables and definitions
-  disagreeing. A dump that fails leaves no `structure.sql` behind, since
-  what Rails wrote has no definitions and would load without a word.
+  disagreeing. A dump that fails once `pg_dump` has written `structure.sql`
+  removes it, since what Rails wrote has no definitions and would load
+  without a word; a file no `pg_dump` wrote to is left as it was.
 - A definition that was paused or quarantined where the dump was taken loads
   unpaused: the pause is runtime state.
 - A `structure.sql` written by an earlier release, which carries Trellis's

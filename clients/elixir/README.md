@@ -368,11 +368,12 @@ does, before the Trellis repo's file, and with `--prefix` it reads
 `schema_migrations` from the schemas named only (not the target schema it adds
 to the dump). The repo and its `:trellis` url have to name the same database,
 by host, port and database name spelled alike (`localhost` is not
-`127.0.0.1`; a repo connecting over a socket directory matches a local
-host), or `mix trellis.dump` and `mix trellis.load` refuse, before
-anything is written or loaded. A dump that fails after `pg_dump` has run
-removes the file, whose raw `pg_dump` output would load without the
-definitions. `mix trellis.load` restores nothing for a repo `mix ecto.load`
+`127.0.0.1`; a repo connecting over a socket directory, or naming no
+host, matches a local host), or `mix trellis.dump` and `mix trellis.load`
+refuse, before anything is written or loaded. A dump that fails once
+`pg_dump` has written the file removes it, since its raw `pg_dump` output
+would load without the definitions; a file no `pg_dump` wrote to is left as
+it was. `mix trellis.load` restores nothing for a repo `mix ecto.load`
 left alone (`--skip-if-loaded` on a loaded database, or a "no" to its
 prompt).
 

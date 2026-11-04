@@ -12,9 +12,10 @@ defmodule Trellis.StructureDump.Database do
   # `localhost`; `:port`, else `PGPORT`, else 5432; `:database`, else
   # `PGDATABASE`, else the user's name). Trellis's is read from the url alone
   # (port 5432, database the user's name), since it reads nothing from the
-  # environment. A repo connecting over a socket directory matches a local
-  # Trellis host (`localhost`, `127.0.0.1`, `::1` or a socket directory).
-  # Other spellings of a host are not equated: `localhost` is not
+  # environment. A repo connecting over a socket directory, or naming no
+  # host at all (as Ruby's check treats a Rails config naming none), matches
+  # a local Trellis host (`localhost`, `127.0.0.1`, `::1` or a socket
+  # directory). Other spellings of a host are not equated: `localhost` is not
   # `127.0.0.1`.
   #
   # A url this can't read, or one naming several hosts, is not compared:
@@ -34,7 +35,7 @@ defmodule Trellis.StructureDump.Database do
          {:ok, trellis} <- trellis(url) do
       ours = repo(config)
 
-      if same?(trellis, ours) do
+      if same?(trellis, ours, local_default?(config)) do
         :ok
       else
         {:error,
@@ -80,11 +81,16 @@ defmodule Trellis.StructureDump.Database do
     end
   end
 
-  defp same?({host, port, database}, {repo_host, repo_port, repo_database}) do
+  defp same?({host, port, database}, {repo_host, repo_port, repo_database}, local_default?) do
     port == repo_port and
       (is_nil(database) or is_nil(repo_database) or database == repo_database) and
-      (host == repo_host or (socket?(repo_host) and local?(host)))
+      (host == repo_host or ((local_default? or socket?(repo_host)) and local?(host)))
   end
+
+  # Whether the repo names no host, and `pg_dump` gets `mix ecto.dump`'s
+  # default, `localhost`.
+  defp local_default?(config),
+    do: is_nil(config[:socket_dir] || config[:hostname] || System.get_env("PGHOST"))
 
   defp socket?(host), do: String.starts_with?(host, "/")
   defp local?(host), do: host in @local_hosts or String.starts_with?(host, ["/", "@"])
