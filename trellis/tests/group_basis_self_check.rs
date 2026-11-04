@@ -569,6 +569,38 @@ async fn ring_rows_not_applied_yet_are_subtracted_from_the_source() {
     assert_eq!(walk(&d, 2).await.0, []);
 }
 
+/// A deletion drained before the insertion it retracts leaves a group whose
+/// `__n` is `-1` in the hidden table and in the source as the target has
+/// applied it, and no row in the target: the comparison finds nothing, at
+/// every page size, before the insertion drains and after. Fails if a source
+/// group is expected to have a row whatever its `__n`.
+#[tokio::test]
+async fn a_group_of_negative_count_has_no_row_to_miss() {
+    let mut d = start().await;
+    step(&mut d, "insert into public.src values (1, 1, 10)").await;
+    exec(&d, "insert into public.src values (2, 2, 5)").await;
+    let insertion = d.seal().await;
+    exec(&d, "delete from public.src where id = 2").await;
+    let deletion = d.seal().await;
+    d.drain(deletion, "early").await;
+    let hidden = hidden(&d).await;
+    assert_eq!(
+        d.rows(&format!("select __n from {hidden} where g = 2"))
+            .await,
+        ["(-1)"]
+    );
+    for limit in [1, 2, 100] {
+        assert_eq!(
+            compare(&d, limit).await,
+            (vec![], vec![], false),
+            "limit {limit}"
+        );
+    }
+    d.drain(insertion, "late").await;
+    assert_eq!(compare(&d, 1).await, (vec![], vec![], false));
+    assert_eq!(walk(&d, 1).await.0, []);
+}
+
 /// A planted partial error on a group the ring holds changes for is
 /// reported with its exact delta, in one pass, and so is the visible row the
 /// partials no longer imply: the changes not applied yet are subtracted, so

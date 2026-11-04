@@ -329,6 +329,13 @@ fn bind(sql: &str, g: i32) -> String {
 /// the `N`th batch sealed, and `r` stages an image-less change for every key
 /// the sequences touch (a page's group recompute, Rx6, at that point).
 async fn f2_run(script: &str) {
+    f2_run_checked(script, false).await;
+}
+
+/// [`f2_run`], and with `checked`, a comparison of every page size after
+/// each action of `script`, with whatever the ring holds: it must report no
+/// divergence on a group it is certain of.
+async fn f2_run_checked(script: &str, checked: bool) {
     let mut d = start().await;
     let mut seed = Vec::new();
     for (k, sequence) in SEQUENCES.iter().enumerate() {
@@ -368,6 +375,16 @@ async fn f2_run(script: &str) {
                 d.stage_recomputes(SRC, &keys).await;
             }
             _ => panic!("{action}"),
+        }
+        if checked {
+            let mut bad = Vec::new();
+            for limit in [1, 2, 100] {
+                let found = compare_certain(&d, limit).await;
+                if !found.is_empty() {
+                    bad.push((limit, found));
+                }
+            }
+            assert_eq!(bad, vec![], "{script}: after {action}");
         }
     }
     let names: Vec<&str> = SEQUENCES.iter().map(|s| s.name).collect();
@@ -415,6 +432,20 @@ async fn f2_every_sequence_drained_out_of_order() {
 async fn f2_every_sequence_drained_out_of_order_with_a_recompute() {
     for order in ORDERS {
         f2_run(&order.replacen("w0", "w0 r", 1)).await;
+    }
+}
+
+/// `self_check` agrees with the target at every step of every F2 order,
+/// with and without a recompute: whatever the ring holds, whichever pages
+/// drained and whatever their probes saw, a comparison of the extremes
+/// under `__xbasis` (and of the partials under `__basis`) reports no group
+/// it is certain of. Fails if the extremes are read under `__basis`, or if
+/// a subtracted image's value stays in the extremes.
+#[tokio::test]
+async fn self_check_agrees_at_every_step_of_f2() {
+    for order in ORDERS {
+        f2_run_checked(order, true).await;
+        f2_run_checked(&order.replacen("w0", "w0 r", 1), true).await;
     }
 }
 
@@ -730,6 +761,30 @@ async fn compare(d: &Driver, limit: i64) -> (Vec<Divergence>, bool) {
         after = page.next_after;
         if after.is_none() {
             return (found, uncertain);
+        }
+    }
+}
+
+/// [`compare`]'s divergences, without those of the groups it is uncertain
+/// of.
+async fn compare_certain(d: &Driver, limit: i64) -> Vec<Divergence> {
+    let mut after = None;
+    let mut found = Vec::new();
+    loop {
+        let page = compare_page(d.pool(), "agg", SelfCheckScope { after, limit })
+            .await
+            .expect("a comparison");
+        if !page.uncertain_all {
+            found.extend(page.divergences.into_iter().filter(|x| match x {
+                Divergence::Cell { key, .. }
+                | Divergence::MissingRow { key }
+                | Divergence::ExtraRow { key } => !page.uncertain_keys.contains(key),
+                _ => true,
+            }));
+        }
+        after = page.next_after;
+        if after.is_none() {
+            return found;
         }
     }
 }

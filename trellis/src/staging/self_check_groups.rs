@@ -810,8 +810,16 @@ fn diff_groups(
     // The visible rows against the source's groups (ADR-0013: a group the
     // source has and the target lacks, or the reverse, is a missing or extra
     // row), where the partials agree with the target and so didn't say it.
-    for key in src.keys() {
-        if !vis.contains_key(key) && !implied.contains_key(key) {
+    // A group has a row while its `__n` (the first partial) is positive: a
+    // retraction drained before its insertion leaves a source group whose
+    // `__n` is negative, which the target rightly has no row for.
+    for (key, values) in &src {
+        let visible = values
+            .first()
+            .and_then(Option::as_deref)
+            .and_then(|n| n.parse::<i64>().ok())
+            .is_none_or(|n| n > 0);
+        if visible && !vis.contains_key(key) && !implied.contains_key(key) {
             divergences.push(Divergence::MissingRow { key: key.clone() });
         }
     }
