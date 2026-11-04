@@ -251,3 +251,97 @@ async fn a_key_retype_the_validator_refuses_names_the_refusal() {
     );
     assert!(trellis.apply("RESUME TRANSFORM r_p5").await.is_err());
 }
+
+/// A handle running as 0.3.0 in which `bigint` arrived as a key type (the
+/// join-key allowlist's entry, which also admits a primary key).
+async fn bigint_key_release(dsn: &str) -> Trellis {
+    Trellis::connect(
+        Config::from_dsn(dsn.to_string())
+            .expect("valid dsn")
+            .with_binary_version("0.3.0")
+            .with_feature_since(r#"JoinKey(Listed("bigint"))"#, "0.3.0"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect")
+}
+
+/// A retype of a source's primary-key column re-stamps the floor with the
+/// entry that admits the new key type (#1660): an aggregate's source key
+/// widened from `integer` to `bigint`, which no copy holds, stays live, and
+/// its floor rises to `bigint`'s release.
+#[tokio::test]
+async fn a_primary_key_retype_restamps_the_floor_with_the_new_key_type() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.k1 (id int primary key, g int not null, c int); \
+         insert into public.k1 select i, i % 3, i from generate_series(1, 10) i;",
+    )
+    .await
+    .expect("source");
+    let trellis = bigint_key_release(db.dsn()).await;
+    trellis
+        .apply(
+            "TRANSFORM r_k1 FROM public.k1 GROUP BY g WITHOUT SOURCE INDEX \
+             SELECT g AS g, COUNT(*) AS n",
+        )
+        .await
+        .expect("define");
+    build_everything(&mut raw, &trellis).await;
+    assert_eq!(
+        state(&raw, "r_k1").await,
+        (TransformStatus::Live, "0.2.0".to_string(), None)
+    );
+
+    raw.batch_execute("alter table public.k1 alter column id type bigint")
+        .await
+        .expect("retype the key");
+    pass(&mut raw, &trellis).await;
+    pass(&mut raw, &trellis).await;
+    assert_eq!(
+        state(&raw, "r_k1").await,
+        (TransformStatus::Live, "0.3.0".to_string(), None)
+    );
+}
+
+/// A retype of a 1-1 source's primary-key column to a type define refuses
+/// as a key (`numeric`) pauses the definition through the key check, naming
+/// the column and the new type, and leaves its floor as it was: the floor's
+/// re-stamp over live key types never runs for it.
+#[tokio::test]
+async fn a_primary_key_retype_to_a_refused_type_pauses_and_keeps_the_floor() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    raw.batch_execute(
+        "create table public.k2 (id int primary key, v text); \
+         insert into public.k2 select i, i::text from generate_series(1, 10) i;",
+    )
+    .await
+    .expect("source");
+    let trellis = bigint_key_release(db.dsn()).await;
+    trellis
+        .apply("TRANSFORM r_k2 FROM public.k2 SELECT v AS v")
+        .await
+        .expect("define");
+    build_everything(&mut raw, &trellis).await;
+
+    raw.batch_execute("alter table public.k2 alter column id type numeric")
+        .await
+        .expect("retype the key");
+    pass(&mut raw, &trellis).await;
+    pass(&mut raw, &trellis).await;
+
+    let (status, floor, failure) = state(&raw, "r_k2").await;
+    assert_eq!((status, floor.as_str()), (TransformStatus::Paused, "0.2.0"));
+    let failure = failure.expect("a capture failure");
+    for part in [
+        "column \"id\" of public.k2",
+        "is now numeric, a type Trellis refuses as such a key at define",
+    ] {
+        assert!(failure.contains(part), "{part:?} in {failure}");
+    }
+    assert!(trellis.apply("RESUME TRANSFORM r_k2").await.is_err());
+}

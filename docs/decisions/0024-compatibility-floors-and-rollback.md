@@ -154,12 +154,14 @@ define's validation admits a definition by:
   aggregates the group basis keeps) declares its release. A rule returns its
   case together with the result type, so a new case doesn't compile without
   one.
-- **Key types.** Each type admitted as a `GROUP BY` key or a `JOIN ... ON`
-  key declares its release. A `GROUP BY` key type is a case of a type rule;
-  a `JOIN ... ON` key type is an entry of the join-key allowlist, where enum
-  types, which no list can name, are one entry. The validator admits a key
-  only through its case or entry, so a new key type doesn't compile without
-  its release.
+- **Key types.** Each type admitted as a `GROUP BY` key, a `JOIN ... ON`
+  key, the primary key of a table the definition reads, or the partition key
+  of a partitioned table it reads declares its release. A `GROUP BY` key type
+  is a case of a type rule; a `JOIN ... ON` or primary key type is an entry
+  of the join-key allowlist, where enum types, which no list can name, are
+  one entry; a partition key type is an entry of the partition-key type
+  list. Each key is admitted only through its case or entry, so a new key
+  type doesn't compile without its release.
 
 The validator collects the release of every value, case and key type it
 used, at define, `ALTER TRANSFORM` and a resume's rebuild alike, and the
