@@ -227,10 +227,13 @@ readers stay `live`.
 
 **What goes wrong:** rows the definition computes after the change compare
 under the new collation (`status = 'open'` holds for `'OPEN'`), and rows it
-computed before keep the old result, so the target mixes the two. A text
-function that refuses a nondeterministic collation (`STRPOS`) raises `0A000`
-on every change instead, and the definition is quarantined, which is
-reported.
+computed before keep the old result, so a 1-1 target mixes the two. An
+aggregate can hold a value neither collation gives: a row counted under the
+old comparison is taken out under the new one, so `SUM(CASE WHEN status =
+'open' THEN 1 ELSE 0 END)` drops to `0` for a group that still holds an
+`'open'` row once an `'OPEN'` row leaves it. A text function that refuses a
+nondeterministic collation (`STRPOS`) raises `0A000` on every change instead,
+and the definition is quarantined, which is reported.
 
 **Detected by:** `self_check`.
 
