@@ -295,7 +295,8 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: %{floor: "0.3.0", this_version: "0.2.0"},
-        join: nil
+        join: nil,
+        floor: "0.2.0"
       })
 
     assert status.below_catalog_floor == %Trellis.BelowCatalogFloor{
@@ -429,6 +430,7 @@ defmodule Trellis.StatusTest do
         paused_upstream_columns: ["upstream.amount"],
         build_wait_xid: nil,
         version_handover: nil,
+        below_catalog_floor: nil,
         join: nil,
         floor: "0.3.1"
       })

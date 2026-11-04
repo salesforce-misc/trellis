@@ -540,7 +540,7 @@
     {
       "about": "A catalog floor in a status: the floor and this binary's version cross as strings, checked exactly here since a live run's version is the build's own.",
       "type": "Status",
-      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [], "paused_upstream_columns": [], "correcting": [], "build_wait_xid": null, "version_handover": null, "below_catalog_floor": {"floor": "0.3.0", "this_version": "0.2.0"}, "join": null},
+      "native": {"status": {"$word": "live"}, "backfill_failure": null, "capture_wait": null, "capture_failure": null, "held_keys": null, "drain_failure": null, "source_index_gaps": [], "paused_upstream_columns": [], "correcting": [], "build_wait_xid": null, "version_handover": null, "below_catalog_floor": {"floor": "0.3.0", "this_version": "0.2.0"}, "join": null, "floor": "0.2.0"},
       "expect": {"record": "Status", "fields": {"version_handover": null, "below_catalog_floor": {"record": "BelowCatalogFloor", "fields": {"floor": {"eq": "0.3.0"}, "this_version": {"eq": "0.2.0"}}}}}
     },
     {

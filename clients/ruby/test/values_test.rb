@@ -210,7 +210,7 @@ class ValuesTest < Minitest::Test
       held_keys: nil, drain_failure: nil, source_index_gaps: [],
       correcting: [], paused_upstream_columns: [], build_wait_xid: nil,
       version_handover: nil, below_catalog_floor: { floor: "0.3.0", this_version: "0.2.0" },
-      join: nil
+      join: nil, floor: "0.2.0"
     )
     assert_equal Trellis::BelowCatalogFloor.new(floor: "0.3.0", this_version: "0.2.0"),
                  status.below_catalog_floor
@@ -271,7 +271,7 @@ class ValuesTest < Minitest::Test
       status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
       held_keys: nil, drain_failure: nil, source_index_gaps: [],
       correcting: [], paused_upstream_columns: ["upstream.amount"], build_wait_xid: nil,
-      version_handover: nil, join: nil, floor: "0.3.1"
+      version_handover: nil, below_catalog_floor: nil, join: nil, floor: "0.3.1"
     )
     assert_equal "0.3.1", status.floor
     assert_equal ["upstream.amount"], status.paused_upstream_columns
