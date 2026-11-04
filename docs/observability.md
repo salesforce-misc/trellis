@@ -106,9 +106,11 @@ below, and the histograms above, also carries the `trellis_instance` label
   their definitions stayed valid
   ([capture by triggers](staging-and-claiming/01-capture-by-triggers.md#a-column-changed-or-rewritten-without-a-trigger)).
   `cause` is `value_rewrite` (a read column's values rewritten in place by an
-  `ALTER COLUMN … TYPE` to the same type with a `USING`) or `column_changed`
+  `ALTER COLUMN … TYPE` to the same type with a `USING`), `column_changed`
   (a read column dropped and re-added, or retyped other than by a pure
-  widening). Each count is one re-read of the table, the same as a
+  widening) or `generated_expression` (a read stored generated column's
+  values rewritten under a new expression by `ALTER COLUMN … SET
+  EXPRESSION`). Each count is one re-read of the table, the same as a
   `request_backfill`, and a `WARN` log names the table, the cause and the
   readers. Watch it to see how often these are detected: a steady rate means
   routine DDL keeps meeting a detector, which costs a rebuild each time.

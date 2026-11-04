@@ -187,6 +187,9 @@ pub enum CaptureRebuildCause {
     /// in a way that isn't a pure widening, and every definition reading it
     /// is still valid.
     ColumnChanged,
+    /// A read stored generated column's values were rewritten under a new
+    /// expression by `ALTER COLUMN ... SET EXPRESSION`.
+    GeneratedExpression,
 }
 
 impl CaptureRebuildCause {
@@ -195,6 +198,7 @@ impl CaptureRebuildCause {
         match self {
             CaptureRebuildCause::ValueRewrite => "value_rewrite",
             CaptureRebuildCause::ColumnChanged => "column_changed",
+            CaptureRebuildCause::GeneratedExpression => "generated_expression",
         }
     }
 }
@@ -437,7 +441,7 @@ fn describe_metrics() {
         CAPTURE_AUTO_REBUILDS_METRIC,
         "Count of rebuilds of a source table's readers the capture pass started on its own, \
          without pausing them, because they missed changes no capture trigger saw, labeled by \
-         source_table and cause (value_rewrite/column_changed)."
+         source_table and cause (value_rewrite/column_changed/generated_expression)."
     );
     metrics::describe_counter!(
         SEAL_REFUSED_METRIC,

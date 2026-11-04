@@ -378,7 +378,7 @@ first one stands.
 
 ## A column changed or rewritten without a trigger
 
-Two more kinds of DDL change what a read column holds while its name stays
+Three more kinds of DDL change what a read column holds while its name stays
 the same, and fire no DML trigger:
 
 - **A column dropped and re-added** (`DROP COLUMN plan; ADD COLUMN plan
@@ -392,12 +392,18 @@ the same, and fire no DML trigger:
 - **A same-type rewrite**: `ALTER COLUMN b TYPE integer USING b * 10` on an
   `integer` column changes every value and leaves the name, `attnum`, type
   and modifier as they were.
+- **A stored generated column's expression replaced**: `ALTER COLUMN g SET
+  EXPRESSION AS (img * 3)` (PostgreSQL 17 and later) recomputes every value
+  under the new expression, and leaves the name, `attnum`, type and modifier
+  as they were.
 
 So each captured table keeps a baseline in `capture_baselines`: per column
 its capture images, on the table itself or on each leaf of a partitioned
 root (the root has no storage of its own), its `attnum`, type and modifier,
 the `xmin` of its `pg_attribute` row, a hash of the rest of that row with
-its default expression, and the node's file node. An install, widen or
+its default expression, whether it is a stored generated column, a hash of
+its default or generation expression alone, and the node's file node. An
+install, widen or
 narrow records it in the transaction that installs the functions, for the
 columns and leaves it newly covers. Each capture pass compares the live
 catalog with it before it regenerates the table's functions, and writes what
@@ -416,16 +422,26 @@ acted on once (`capture::baseline`). It costs two catalog reads per table.
   the rewrite counts only when the rest of the column's row, its default
   expression included, is what it was. A catalog freeze leaves the `xmin` a
   query reads as it was.
+- **A stored generated column's expression replaced is the column stored
+  generated before and after, the node's file node moved, and its
+  expression's hash changed.** The expression is hashed as stored, with the
+  parse offsets left out, so a rename of a column it reads, or a restatement
+  that parses the same (`(img*2)`, `((img * 2))`), changes nothing. A
+  major-version `pg_upgrade` stores every expression anew, but keeps the file
+  nodes. A `SET EXPRESSION` always rewrites the table, so it also counts with
+  a metadata change to the same column in the same window. One that restates
+  the expression the column already has is a same-type rewrite.
 
 The response follows whether the definitions are still valid as written:
 
-- **Rebuilt automatically, pausing nobody.** A same-type rewrite, and a
-  changed column every definition reading it is still valid over. The pass
+- **Rebuilt automatically, pausing nobody.** A same-type rewrite, a stored
+  generated column's expression replaced, and a changed column every
+  definition reading it is still valid over. The pass
   re-reads the table for its applying readers, exactly as
   `Trellis::request_backfill` does: each reader reports `backfilling` until
   its rebuild is done. It logs a `WARN` naming the table, the cause and the readers, and
   counts `capture_auto_rebuilds_total{source_table, cause}`, `cause`
-  `value_rewrite` or `column_changed`
+  `value_rewrite`, `generated_expression` or `column_changed`
   ([observability](../observability.md#metrics)).
 - **Paused, with a `capture_failure` naming the column and the change.** A
   changed column where define would now refuse a definition that reads it,
@@ -613,6 +629,8 @@ them:
 - **Repaired on its own, pausing nobody** (a re-read's readers report
   `backfilling` until it's done):
   - a same-type `USING` rewrite of a read column: re-read;
+  - a read stored generated column's expression replaced by `SET
+    EXPRESSION`: re-read;
   - a read column dropped and re-added, or retyped other than by a pure
     widening, where every definition reading it is still valid: re-read;
   - a widening of a modifier that changes only the catalog: nothing to do,
@@ -645,9 +663,7 @@ them:
   rewrite has touched since (the rewrite clears the default the column's row
   keeps for older rows, as `VACUUM FULL` does); one on a column with a
   compression method, a storage mode or a non-default collation set (the
-  `ALTER` resets each); a pure widening no copy outgrows; and a stored
-  generated column's expression replaced by `SET EXPRESSION`
-  ([known correctness gaps](../known-correctness-gaps.md#a-stored-generated-columns-expression-replaced-by-set-expression)).
+  `ALTER` resets each); and a pure widening no copy outgrows.
   Between two passes
   ([known correctness gaps](../known-correctness-gaps.md#capture-disrupted-and-restored-between-two-passes)):
   a table attached to a hierarchy, or given an inheritance child, and
@@ -660,8 +676,10 @@ them:
 
 A few routine operations rebuild for nothing, at the cost of one re-read: a
 rewrite that leaves the values as they were (`USING b + 0`, or a column
-retyped and back between two passes), and an identical `SET DEFAULT`
-re-applied in the same window as a table rewrite.
+retyped and back between two passes), an identical `SET DEFAULT`
+re-applied in the same window as a table rewrite, and a `SET EXPRESSION` to
+an expression written differently that computes the same values (`2 * img`
+for `img * 2`), or to the expression the column already has.
 
 ## Nested writes to the same key
 

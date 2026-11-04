@@ -1,16 +1,12 @@
 //! `ALTER COLUMN … SET EXPRESSION` on a stored generated column (PostgreSQL
 //! 17 and later): the statement rewrites every value of the column with no
-//! row trigger, and changes the column's `pg_attrdef` expression, so the
-//! capture pass's same-type rewrite check (`capture::baseline`, R3b) doesn't
-//! act on it. Every reader of the column keeps the old values and stays
-//! `live`: the gap entry "A stored generated column's expression replaced by
-//! `SET EXPRESSION`" in `docs/known-correctness-gaps.md`. This pins what the
-//! entry says: `self_check` reports each kind of reader (a plain 1-1, a 1-1
-//! `JOIN` reading either side, an aggregate summing or grouping by the
-//! column, a `JOIN` aggregate reading either side), a later write repairs a
-//! 1-1 row and not an aggregate group, and `request_backfill` of the table
-//! holding the column repairs every reader. On a server older than 17 the
-//! test returns without running.
+//! row trigger. The capture pass sees the column's expression changed as the
+//! table was rewritten (`capture::baseline`) and rebuilds every applying
+//! reader of the table, pausing none, under the `generated_expression` cause.
+//! This covers each kind of reader: a plain 1-1, a 1-1 `JOIN` reading either
+//! side, an aggregate summing or grouping by the column, and a `JOIN`
+//! aggregate reading either side. On a server older than 17 the test returns
+//! without running.
 //!
 //! Every pass, build and drain is driven by hand; nothing polls or sleeps.
 
@@ -99,15 +95,6 @@ async fn rows(raw: &Client, sql: &str) -> Vec<String> {
         .collect()
 }
 
-/// Each of `queries`' rows, in turn.
-async fn values(raw: &Client, queries: &[&str]) -> Vec<String> {
-    let mut values = Vec::new();
-    for sql in queries {
-        values.extend(rows(raw, sql).await);
-    }
-    values
-}
-
 /// Each reader: its target, a query over it, and the same query over the
 /// live sources, both ordered.
 const READERS: [(&str, &str, &str); 6] = [
@@ -173,14 +160,30 @@ async fn survey(raw: &Client, trellis: &Trellis) -> (Vec<&'static str>, Vec<&'st
     (stale, diverged)
 }
 
+/// How many times the pass rebuilt `table`'s readers for `cause`.
+fn auto_rebuilds(table: &str, cause: &str) -> u64 {
+    trellis::Metrics::new()
+        .render_prometheus()
+        .lines()
+        .filter(|line| {
+            line.starts_with("trellis_capture_auto_rebuilds_total{")
+                && line.contains(&format!("source_table=\"{table}\""))
+                && line.contains(&format!("cause=\"{cause}\""))
+        })
+        .map(|line| {
+            line.rsplit(' ')
+                .next()
+                .and_then(|n| n.parse::<f64>().ok())
+                .expect("a counter value") as u64
+        })
+        .sum()
+}
+
 /// A stored generated column on each side, read by every kind of reader:
-/// after `SET EXPRESSION` on `b.g`, every reader of it is stale, `live`, and
-/// reported by `self_check`; a write that changes the `b` row repairs the
-/// 1-1 rows computed from it and no aggregate group, and a write to the
-/// joined `a` row repairs nothing; `request_backfill` of `b` repairs every
-/// reader. Then the same for `a.ga` and `request_backfill` of `a`.
+/// after `SET EXPRESSION` on `b.g`, the next passes rebuild every reader of
+/// `b`, which ends equal to its sources and `live`; then the same for `a.ga`.
 #[tokio::test]
-async fn set_expression_on_a_stored_generated_column_is_missed_and_repaired_by_a_backfill() {
+async fn set_expression_on_a_stored_generated_column_rebuilds_its_readers() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -238,52 +241,17 @@ async fn set_expression_on_a_stored_generated_column_is_missed_and_repaired_by_a
         .await
         .expect("set b.g's expression");
     work(&mut raw, &db.pool, 3).await;
-    let b_readers = vec!["p", "jb", "s", "sg", "j"];
     assert_eq!(
-        survey(&raw, &trellis).await,
-        (b_readers.clone(), b_readers.clone()),
-        "every reader of b.g is stale, live and reported by self_check"
+        rows(&raw, "select g from public.p order by bid").await,
+        ["(300)", "(600)", "(900)", "(1200)", "(1500)", "(1800)"],
+        "p holds the values of the new expression"
     );
-
-    // A write that changes nothing read stages nothing, so it repairs
-    // nothing; nor does one to the `a` row, which `jb` joins to its copy of
-    // the `b` row. One that changes `g` (300 to 303) repairs the 1-1 rows
-    // computed from the `b` row, and moves an aggregate group by its delta
-    // only.
-    let of_one = [
-        "select g from public.p where bid = 1",
-        "select bg from public.jb where id = 1",
-        "select total from public.s where grp = 1",
-    ];
-    for (write, want) in [
-        (
-            "update public.b set img = img where bid = 1",
-            ["(200)", "(200)", "(1800)"],
-        ),
-        (
-            "update public.a set r = r + 1 where id = 1",
-            ["(200)", "(200)", "(1800)"],
-        ),
-        (
-            "update public.b set img = img + 1 where bid = 1",
-            ["(303)", "(303)", "(1803)"],
-        ),
-    ] {
-        app.batch_execute(write).await.expect(write);
-        work(&mut raw, &db.pool, 1).await;
-        assert_eq!(values(&raw, &of_one).await, want, "after {write}");
-    }
-
-    trellis
-        .request_backfill("public.b")
-        .await
-        .expect("request_backfill b");
-    work(&mut raw, &db.pool, 3).await;
     assert_eq!(
         survey(&raw, &trellis).await,
         (vec![], vec![]),
-        "request_backfill of b repairs every reader"
+        "every reader of b.g is rebuilt and live"
     );
+    assert_eq!(auto_rebuilds("public.b", "generated_expression"), 1);
 
     app.batch_execute("alter table public.a alter column ga set expression as (r * 5)")
         .await
@@ -291,32 +259,11 @@ async fn set_expression_on_a_stored_generated_column_is_missed_and_repaired_by_a
     work(&mut raw, &db.pool, 3).await;
     assert_eq!(
         survey(&raw, &trellis).await,
-        (vec!["ja", "j"], vec!["ja", "j"]),
-        "every reader of a.ga is stale, live and reported by self_check"
-    );
-    // `ja` reads `b.img` too: a write to the `b` row joins it to `ja`'s copy
-    // of the `a` row, and only a write to the `a` row repairs it.
-    let of_two = ["select ag, img from public.ja where id = 2"];
-    for (write, want) in [
-        (
-            "update public.b set img = img + 1 where bid = 2",
-            ["(40,201)"],
-        ),
-        ("update public.a set r = r + 1 where id = 2", ["(105,201)"]),
-    ] {
-        app.batch_execute(write).await.expect(write);
-        work(&mut raw, &db.pool, 1).await;
-        assert_eq!(values(&raw, &of_two).await, want, "after {write}");
-    }
-    trellis
-        .request_backfill("public.a")
-        .await
-        .expect("request_backfill a");
-    work(&mut raw, &db.pool, 3).await;
-    assert_eq!(
-        survey(&raw, &trellis).await,
         (vec![], vec![]),
-        "request_backfill of a repairs every reader"
+        "every reader of a.ga is rebuilt and live"
     );
+    assert_eq!(auto_rebuilds("public.a", "generated_expression"), 1);
+    assert_eq!(auto_rebuilds("public.b", "value_rewrite"), 0);
+    assert_eq!(auto_rebuilds("public.a", "value_rewrite"), 0);
     trellis.shutdown().await.expect("shutdown");
 }

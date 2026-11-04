@@ -28,7 +28,6 @@ wrong rows, on the targets it compares
 |---|---|---|
 | **Schema changes Trellis can't tell from routine work** | | |
 | [A column's values rewritten in place by `ALTER COLUMN TYPE`](#a-columns-values-rewritten-in-place-by-alter-column-type) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study) |
-| [A stored generated column's expression replaced by `SET EXPRESSION`](#a-stored-generated-columns-expression-replaced-by-set-expression) | `self_check` | [#1540](https://github.com/salesforce-misc/trellis/issues/1540) (study) |
 | [An enum label renamed and added again](#an-enum-label-renamed-and-added-again) | `self_check` | documented |
 | [A read column's name swapped with another's and back within one pass](#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass) | `self_check` | [#1586](https://github.com/salesforce-misc/trellis/issues/1586) |
 | **Writes past a unique key** | | |
@@ -73,9 +72,7 @@ while every rule holds.
   and between partition maintenance and a `pg_upgrade`
   ([below](#a-merge-that-moves-a-row-to-another-partition)).
 * **Repair after DDL that rewrites a read column's values** in one of the
-  shapes [listed below](#a-columns-values-rewritten-in-place-by-alter-column-type),
-  or by [`SET EXPRESSION` on a stored generated
-  column](#a-stored-generated-columns-expression-replaced-by-set-expression).
+  shapes [listed below](#a-columns-values-rewritten-in-place-by-alter-column-type).
 * **Let another column take a read column's name only while the
   transforms that read it are paused**
   ([below](#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass)).
@@ -127,40 +124,6 @@ its source row; an aggregate or `JOIN` target stays wrong until it's rebuilt.
 a false-positive study of signals that would catch these shapes. Event
 triggers would see every rewrite but need superuser, and logical decoding has
 the same blind spot: `pgoutput` never sends a rewrite's rows.
-
-### A stored generated column's expression replaced by `SET EXPRESSION`
-
-**When:** `ALTER COLUMN … SET EXPRESSION AS (…)` (PostgreSQL 17 and later)
-replaces the generation expression of a stored generated column that a
-definition reads:
-
-```sql
-CREATE TABLE b (bid integer PRIMARY KEY, img integer,
-                g integer GENERATED ALWAYS AS (img * 2) STORED);
-ALTER TABLE b ALTER COLUMN g SET EXPRESSION AS (img * 3);
-```
-
-**What goes wrong:** the statement recomputes and rewrites every value of the
-column without firing a trigger, so every target reading the column keeps the
-old values. The reconcile pass doesn't rebuild the readers as it does for a
-same-type rewrite, because the statement also changes the column's expression
-in the catalog, which reads as a metadata change and a rewrite in one interval,
-[a shape above](#a-columns-values-rewritten-in-place-by-alter-column-type)
-that routine work also produces. A 1-1 target's row is repaired by the next
-write that changes a column the definition reads in the row of the table that
-holds the generated column (for a 1-1 `JOIN`, not the row joined to it); an
-aggregate or `JOIN` target stays wrong until it's rebuilt.
-
-**Detected by:** `self_check`.
-
-**Repair:** right after the `ALTER`, `request_backfill` the table that holds
-the column.
-
-**Ends with:** [#1540](https://github.com/salesforce-misc/trellis/issues/1540),
-a false-positive study of rebuilding the readers when a stored generated
-column's expression changes. Event triggers would see the statement but need
-superuser, and logical decoding has the same blind spot: `pgoutput` never
-sends a rewrite's rows.
 
 ### An enum label renamed and added again
 

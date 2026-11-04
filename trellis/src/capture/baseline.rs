@@ -2,7 +2,7 @@
 //! looked, and the capture pass's response to a change no capture trigger
 //! saw.
 //!
-//! Capture knows a column by its name, and two kinds of DDL change what a
+//! Capture knows a column by its name, and three kinds of DDL change what a
 //! column holds without firing a DML trigger or changing its name:
 //!
 //! - **R1, the column's identity.** A column dropped and re-added under the
@@ -30,6 +30,19 @@
 //!   expression, to be unchanged ([`Column::hash`]): a rewrite that changed
 //!   nothing else about the column. A catalog freeze doesn't change the
 //!   `xmin` a query reads.
+//! - **A stored generated column's expression replaced.** `ALTER COLUMN g
+//!   SET EXPRESSION AS (...)` (PostgreSQL 17 and later) rewrites the table
+//!   with every value of `g` computed by the new expression, with no DML
+//!   trigger, and changes the column's `pg_attrdef` expression, so its row's
+//!   hash changed and R3b doesn't see it. It is acted on when the column is
+//!   stored generated before and after, the file node moved, and the
+//!   expression's own hash ([`Column::expr_hash`]) changed. The hash leaves
+//!   out the expression's `:location` fields, and the expression refers to the
+//!   columns it reads by number, so a rename of one of them or a restatement
+//!   that parses the same changes nothing. A major-version `pg_upgrade`
+//!   stores every expression anew (PostgreSQL 18 adds a field to every column
+//!   reference) but keeps every file node. A `SET EXPRESSION` that restates
+//!   the column's expression leaves the hash as it was, and is R3b's.
 //!
 //! # The baseline
 //!
@@ -52,12 +65,15 @@
 //! or a file node that moved alone becomes the next pass's baseline, and a
 //! response that fails is tried again. A node or a column gone since is
 //! forgotten (a column renamed or dropped is
-//! `staging::schema_change::pause_readers_of_missing`'s).
+//! `staging::schema_change::pause_readers_of_missing`'s). A row recorded
+//! before the baseline kept a column's expression is written back without
+//! acting on it, as a newly recorded row is.
 //!
 //! The response follows the definition's validity:
 //!
-//! - **R3b, and R1 where every definition reading the column is still valid
-//!   as written:** only data was missed. The pass rebuilds every applying
+//! - **R3b, a stored generated column's expression replaced, and R1 where
+//!   every definition reading the column is still valid as written:** only
+//!   data was missed. The pass rebuilds every applying
 //!   reader of the table, exactly what `Trellis::request_backfill(table)`
 //!   does (`intake::catch_up::park_table_catch_ups`), and pauses nobody. It
 //!   logs a `WARN` naming the table, the cause and the readers it rebuilt,
@@ -93,11 +109,12 @@
 //! column added with a constant default: its row keeps that default for the
 //! rows that predate it (`atthasmissing`) until the table is rewritten, and
 //! any rewrite clears it, `VACUUM FULL` included, which is why the hash
-//! can't leave it out. So does `SET EXPRESSION` on a stored generated
-//! column, which changes the column's expression as it rewrites the values.
-//! An identity rewrite (`USING b + 0`), or an identical `SET DEFAULT` re-applied in the same window as a
-//! rewrite, rebuilds the readers for nothing, as does a column retyped and
-//! back between two passes (two rewrites that leave the row as it was).
+//! can't leave it out. An identity rewrite (`USING b + 0`), or an identical
+//! `SET DEFAULT` re-applied in the same window as a rewrite, rebuilds the
+//! readers for nothing, as does a column retyped and back between two passes
+//! (two rewrites that leave the row as it was). So does a `SET EXPRESSION`
+//! to an expression that parses differently and computes the same values
+//! (`2 * img` for `img * 2`), or to the expression the column already has.
 //!
 //! A pure widening with a `USING` that changes values (`integer` to `bigint
 //! USING b * 10`) is never R1's, and its row changed, so it isn't R3b's
@@ -138,6 +155,13 @@ struct Column {
     /// read as a changed one and a same-type rewrite of a column with a
     /// default would never be acted on.
     hash: String,
+    /// Whether the column is a stored generated column (`attgenerated =
+    /// 's'`). `None` in a row recorded before the baseline kept it.
+    generated_stored: Option<bool>,
+    /// A hash of the column's default or generation expression alone, its
+    /// `:location` fields left out as in [`Column::hash`]: `None` for a
+    /// column with neither, and in a row recorded before the baseline kept it.
+    expr_hash: Option<String>,
 }
 
 impl Column {
@@ -167,7 +191,10 @@ const LIVE_COLUMNS: &str = "\
            pg_catalog.format_type(a.atttypid, a.atttypmod), a.xmin::text, \
            pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to( \
                pg_catalog.to_jsonb(a)::text || coalesce(pg_catalog.regexp_replace( \
-                   d.adbin::text, ' :location -?[0-9]+', '', 'g'), ''), 'UTF8')), 'hex') \
+                   d.adbin::text, ' :location -?[0-9]+', '', 'g'), ''), 'UTF8')), 'hex'), \
+           a.attgenerated = 's', \
+           pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(pg_catalog.regexp_replace( \
+               d.adbin::text, ' :location -?[0-9]+', '', 'g'), 'UTF8')), 'hex') \
     from tree t \
     join pg_catalog.pg_attribute a \
       on a.attrelid = t.relid and a.attnum > 0 and not a.attisdropped \
@@ -207,6 +234,8 @@ async fn live(
                     display: row.get(7),
                     xmin: row.get(8),
                     hash: row.get(9),
+                    generated_stored: Some(row.get(10)),
+                    expr_hash: row.get(11),
                 },
             )
         })
@@ -218,7 +247,7 @@ async fn recorded(client: &impl GenericClient, table: &str) -> Result<Columns, C
         .query_typed(
             "select node, column_name, filenode, attnum, type_oid, type_name, typmod, \
                     coalesce(pg_catalog.format_type(type_oid, typmod), type_name), \
-                    attr_xmin, attr_hash \
+                    attr_xmin, attr_hash, generated_stored, expr_hash \
              from capture_baselines where table_name = $1",
             &[(&table, Type::TEXT)],
         )
@@ -239,6 +268,8 @@ async fn recorded(client: &impl GenericClient, table: &str) -> Result<Columns, C
                     display: row.get(7),
                     xmin: row.get(8),
                     hash: row.get(9),
+                    generated_stored: row.get(10),
+                    expr_hash: row.get(11),
                 },
             )
         })
@@ -264,6 +295,8 @@ async fn write(
     let mut typmods: Vec<i32> = Vec::with_capacity(rows.len());
     let mut xmins: Vec<&str> = Vec::with_capacity(rows.len());
     let mut hashes: Vec<&str> = Vec::with_capacity(rows.len());
+    let mut generated: Vec<Option<bool>> = Vec::with_capacity(rows.len());
+    let mut expr_hashes: Vec<Option<&str>> = Vec::with_capacity(rows.len());
     for ((node, name), column) in rows {
         nodes.push(*node);
         names.push(name);
@@ -274,19 +307,23 @@ async fn write(
         typmods.push(column.ty.typmod);
         xmins.push(&column.xmin);
         hashes.push(&column.hash);
+        generated.push(column.generated_stored);
+        expr_hashes.push(column.expr_hash.as_deref());
     }
     client
         .execute_typed(
             "insert into capture_baselines as b \
                  (table_name, node, column_name, filenode, attnum, type_oid, type_name, typmod, \
-                  attr_xmin, attr_hash) \
+                  attr_xmin, attr_hash, generated_stored, expr_hash) \
              select $1, r.* from unnest($2::oid[], $3::text[], $4::oid[], $5::int2[], \
-                 $6::oid[], $7::text[], $8::int4[], $9::text[], $10::text[]) as r \
+                 $6::oid[], $7::text[], $8::int4[], $9::text[], $10::text[], $11::bool[], \
+                 $12::text[]) as r \
              on conflict (table_name, node, column_name) do update set \
                  filenode = excluded.filenode, attnum = excluded.attnum, \
                  type_oid = excluded.type_oid, type_name = excluded.type_name, \
                  typmod = excluded.typmod, attr_xmin = excluded.attr_xmin, \
-                 attr_hash = excluded.attr_hash",
+                 attr_hash = excluded.attr_hash, generated_stored = excluded.generated_stored, \
+                 expr_hash = excluded.expr_hash",
             &[
                 (&table, Type::TEXT),
                 (&nodes, Type::OID_ARRAY),
@@ -298,6 +335,8 @@ async fn write(
                 (&typmods, Type::INT4_ARRAY),
                 (&xmins, Type::TEXT_ARRAY),
                 (&hashes, Type::TEXT_ARRAY),
+                (&generated, Type::BOOL_ARRAY),
+                (&expr_hashes, Type::TEXT_ARRAY),
             ],
         )
         .await?;
@@ -568,6 +607,9 @@ pub(crate) async fn follow_renamed_types(client: &mut Client) -> Result<(), Capt
 enum Change {
     /// R3b: its values were rewritten in place.
     Rewritten,
+    /// A stored generated column's values were rewritten under a new
+    /// expression (`SET EXPRESSION`).
+    ExpressionChanged,
     /// R1: a pure widening that takes away the declared scale of a `numeric`
     /// (`numeric(10,2)` to `numeric`): every value keeps its text, so nothing
     /// rebuilds, but a reader that needs the scale (a `SUM`) may no longer be
@@ -584,7 +626,7 @@ impl Change {
     /// Whether the column's type changed (not a pure widening).
     fn retyped(&self) -> bool {
         match self {
-            Change::Rewritten => false,
+            Change::Rewritten | Change::ExpressionChanged => false,
             Change::Widened { .. } | Change::Retyped { .. } => true,
             Change::Readded { from, to } => from != to,
         }
@@ -594,9 +636,10 @@ impl Change {
     fn rank(&self) -> u8 {
         match self {
             Change::Rewritten => 0,
-            Change::Widened { .. } => 1,
-            Change::Retyped { .. } => 2,
-            Change::Readded { .. } => 3,
+            Change::ExpressionChanged => 1,
+            Change::Widened { .. } => 2,
+            Change::Retyped { .. } => 3,
+            Change::Readded { .. } => 4,
         }
     }
 }
@@ -622,8 +665,24 @@ fn compare(was: &Column, now: &Column) -> Option<Change> {
             to: now.display.clone(),
         });
     }
+    if expression_changed(was, now) {
+        return Some(Change::ExpressionChanged);
+    }
     (was.xmin != now.xmin && was.filenode != now.filenode && was.hash == now.hash)
         .then_some(Change::Rewritten)
+}
+
+/// Whether a stored generated column of the same identity was rewritten
+/// under a new expression: stored generated before and after, the file node
+/// moved, and a recorded expression hash changed. Without the file node, a
+/// major-version `pg_upgrade` (which keeps file nodes and serialises every
+/// expression anew) would read as a change to every one.
+fn expression_changed(was: &Column, now: &Column) -> bool {
+    was.generated_stored == Some(true)
+        && now.generated_stored == Some(true)
+        && was.filenode != now.filenode
+        && was.expr_hash.is_some()
+        && was.expr_hash != now.expr_hash
 }
 
 /// What [`compare_all`] found: each changed column's change, the rows to
@@ -717,8 +776,13 @@ pub(crate) async fn check(
             Vec::new()
         };
         for (column, change) in &found.changes {
-            if *change == Change::Rewritten {
-                causes.insert(CaptureRebuildCause::ValueRewrite);
+            let cause = match change {
+                Change::Rewritten => Some(CaptureRebuildCause::ValueRewrite),
+                Change::ExpressionChanged => Some(CaptureRebuildCause::GeneratedExpression),
+                _ => None,
+            };
+            if let Some(cause) = cause {
+                causes.insert(cause);
                 continue;
             }
             let read_by = readers_of(catalog, table, &BTreeSet::from([column.clone()]), false);
@@ -810,7 +874,7 @@ async fn respond(
     change: &Change,
 ) -> Result<Option<Response>, CaptureError> {
     let (from, to, readded) = match change {
-        Change::Rewritten => return Ok(Some(Response::Rebuild)),
+        Change::Rewritten | Change::ExpressionChanged => return Ok(Some(Response::Rebuild)),
         Change::Widened { from, to } | Change::Retyped { from, to } => (from, to, false),
         Change::Readded { from, to } => (from, to, true),
     };
@@ -934,7 +998,112 @@ mod tests {
             display: ty.to_string(),
             xmin: xmin.to_string(),
             hash: hash.to_string(),
+            generated_stored: Some(false),
+            expr_hash: None,
         }
+    }
+
+    /// A stored generated `int4` column whose expression hashes to `expr`.
+    fn generated(xmin: &str, filenode: u32, hash: &str, expr: &str) -> Column {
+        Column {
+            generated_stored: Some(true),
+            expr_hash: Some(expr.to_string()),
+            ..column(3, "int4", -1, xmin, filenode, hash)
+        }
+    }
+
+    /// The false-positive study's rows on issue #1540, by number: the live
+    /// column after each operation against `g int generated always as (img *
+    /// 2) stored`, recorded as `was`.
+    #[test]
+    fn a_stored_generated_column_rewritten_under_a_new_expression_rebuilds() {
+        let was = generated("100", 16384, "h", "e");
+        // 1: `SET EXPRESSION AS (img * 3)`, which moves the row, its hash, the
+        // expression and the file node.
+        assert_eq!(
+            compare(&was, &generated("200", 16390, "h2", "e3")),
+            Some(Change::ExpressionChanged)
+        );
+        // 4: `SET EXPRESSION AS (2 * img)`: equal values, another parse tree.
+        // It rebuilds for nothing, accepted.
+        assert_eq!(
+            compare(&was, &generated("200", 16390, "h4", "e4")),
+            Some(Change::ExpressionChanged)
+        );
+        // 10: with `SET STATISTICS` on the same column in the window, which
+        // changes the row's hash too: the same.
+        assert_eq!(
+            compare(&was, &generated("300", 16390, "h10", "e3")),
+            Some(Change::ExpressionChanged)
+        );
+        // 17: a function the expression calls replaced, then an identical
+        // `SET EXPRESSION`: only R3b sees it.
+        assert_eq!(
+            compare(&was, &generated("200", 16390, "h", "e")),
+            Some(Change::Rewritten)
+        );
+        // 23 and 24: a column the expression reads renamed (the expression
+        // refers to it by number), alone and with `VACUUM FULL`.
+        assert_eq!(compare(&was, &generated("100", 16384, "h", "e")), None);
+        assert_eq!(compare(&was, &generated("100", 16390, "h", "e")), None);
+        // 28: a same-type `ALTER COLUMN g TYPE integer` and `VACUUM FULL` in
+        // one window: R3b's rebuild for nothing, no new cause.
+        assert_eq!(
+            compare(&was, &generated("200", 16390, "h", "e")),
+            Some(Change::Rewritten)
+        );
+        // 45: `pg_upgrade` to a major version that serialises every
+        // expression anew, keeping the file node.
+        assert_eq!(compare(&was, &generated("200", 16384, "h45", "e45")), None);
+        // A column that is no longer stored generated (`DROP EXPRESSION`
+        // rewrites nothing) or never was.
+        let dropped = Column {
+            generated_stored: Some(false),
+            expr_hash: None,
+            ..generated("200", 16390, "h18", "e")
+        };
+        assert_eq!(compare(&was, &dropped), None);
+        let plain = column(3, "int4", -1, "100", 16384, "h");
+        let defaulted = Column {
+            expr_hash: Some("d2".to_string()),
+            ..column(3, "int4", -1, "200", 16390, "h2")
+        };
+        assert_eq!(
+            compare(
+                &Column {
+                    expr_hash: Some("d".to_string()),
+                    ..plain
+                },
+                &defaulted
+            ),
+            None
+        );
+    }
+
+    /// A row recorded before the baseline kept a column's expression is
+    /// written back, and nothing acts on it in that window.
+    #[test]
+    fn a_row_recorded_without_the_expression_is_written_back_without_acting() {
+        let old = Column {
+            generated_stored: None,
+            expr_hash: None,
+            ..generated("100", 16384, "h", "e")
+        };
+        let key = (1, "g".to_string());
+        let live = generated("200", 16390, "h2", "e3");
+        let found = compare_all(
+            &[(key.clone(), old.clone())].into(),
+            &[(key.clone(), live.clone())].into(),
+        );
+        assert!(found.changes.is_empty(), "{:?}", found.changes);
+        assert_eq!(found.rewrite, [(key.clone(), live)].into());
+        // Nothing else changed: the row is written back all the same.
+        let found = compare_all(
+            &[(key.clone(), old)].into(),
+            &[(key.clone(), generated("100", 16384, "h", "e"))].into(),
+        );
+        assert!(found.changes.is_empty());
+        assert_eq!(found.rewrite.len(), 1);
     }
 
     #[test]

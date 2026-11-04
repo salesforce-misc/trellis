@@ -195,6 +195,31 @@ nothing. It's a background job
 which targets it compares is in
 [known correctness gaps — What `self_check` can't see](known-correctness-gaps.md#what-self_check-cant-see).
 
+## Rewrites that rebuild by themselves
+
+A statement that rewrites a read column's values without firing a trigger
+makes the staging worker's next reconcile pass rebuild every transform
+applying from the table, pausing none. `ALTER COLUMN … SET EXPRESSION` on a
+stored generated column (PostgreSQL 17 and later) is one: the transforms come
+back with the values of the new expression, and need nothing from you. So is a
+same-type `ALTER COLUMN … TYPE … USING`, except in the shapes
+[known correctness gaps](known-correctness-gaps.md#a-columns-values-rewritten-in-place-by-alter-column-type)
+lists. The pass logs a `WARN` naming the table, the cause and
+the transforms it rebuilt, and counts
+[`capture_auto_rebuilds_total`](observability.md#metrics).
+
+Each rebuild is one full re-read of the table per transform applying from it,
+the same as a [`request_backfill`](#request_backfill) of the table: a few
+minutes at 100M rows (about 5 minutes with no writers, about 16 with eight
+writers at 2,000 writes a second, on our test machine). A `SET EXPRESSION`
+that changes no value rebuilds all the same: one to an expression written
+differently that computes the same values (`2 * img` for `img * 2`), or one
+that sets the expression the column already has.
+
+A rewrite that leaves every value as it was rebuilds nothing: `VACUUM FULL`,
+`CLUSTER`, and an `ADD COLUMN` with a volatile default such as
+`clock_timestamp()`.
+
 ## What a repair costs
 
 * **A resume that re-types copies holds `ACCESS EXCLUSIVE` on them.** After a
@@ -364,9 +389,6 @@ each one costs and what to expect around it
 * **After an `ALTER COLUMN … TYPE … USING` that changes a read column's
   values,** `request_backfill` the table
   ([known correctness gaps](known-correctness-gaps.md#a-columns-values-rewritten-in-place-by-alter-column-type)).
-* **After an `ALTER COLUMN … SET EXPRESSION` on a stored generated column a
-  definition reads,** `request_backfill` the table
-  ([known correctness gaps](known-correctness-gaps.md#a-stored-generated-columns-expression-replaced-by-set-expression)).
 * **After granting a missing privilege or `BYPASSRLS`:** `RESUME` the paused
   definitions. A drain holdup on a refusal commits on the next pass, which
   clears its `drain_failure`.

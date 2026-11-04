@@ -259,6 +259,7 @@ async fn a_pending_migration_is_not_run_while_a_process_is_live() {
          drop table join1_fan_out; \
          drop table catalog_floor; \
          alter table transform_definitions drop column floor_version; \
+         alter table capture_baselines drop column generated_stored, drop column expr_hash; \
          update trellis_instance set instance_format_version = 1; \
          delete from refinery_schema_history where version > 8; \
          insert into worker_registry (worker_id) values ('trellis-old-1-00')",
