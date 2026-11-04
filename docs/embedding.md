@@ -952,9 +952,9 @@ where the dump was taken loads unpaused: the pause is runtime state.
 * A definition the loading release can't run is stored paused, unparsed,
   with the reason in its status: its floor is above the release, its grammar
   version is outside the release's window, the release refuses its text, or
-  it reads from such a definition. A release that meets its floor can drop it
-  and define it again. A 1-1 one restored this way has no ledger, so `RESUME`
-  on that release refuses it.
+  it reads from such a definition. A release that meets its floor rebuilds
+  it on `RESUME`, except a 1-1 one: restored this way it has no ledger, so
+  `RESUME` refuses it, and it is dropped and defined again.
 * The restore runs inside `migrate`, so it refuses beside a live process of
   another version, as `migrate` does ([Rolling deploys](#rolling-deploys)).
 * A file in the format written before the restore queue, which carries the

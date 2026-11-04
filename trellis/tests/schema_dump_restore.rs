@@ -16,6 +16,9 @@
 //!   the next `migrate` (`a_changed_target_schema_refuses_and_keeps_the_queue`)
 //! - a row this release can't run is stored paused and unparsed, and so is a
 //!   row reading its target (`a_row_this_release_cannot_run_is_stored_paused`)
+//! - a release that meets the floor of a row stored paused rebuilds it on
+//!   `RESUME`, but a 1-1 one, which has no ledger
+//!   (`rows_restored_paused_resume_on_a_release_that_meets_their_floor`)
 
 use std::process::Command;
 
@@ -540,7 +543,8 @@ async fn a_row_this_release_cannot_run_is_stored_paused() {
         rows[1].contains("public.oc")
             && rows[1].contains("\"paused\"")
             && rows[1].contains(", 99,")
-            && rows[1].contains("grammar"),
+            && rows[1].contains("it was written under grammar version 99")
+            && rows[1].contains("roll forward"),
         "{rows:?}"
     );
     assert!(
@@ -558,4 +562,112 @@ async fn a_row_this_release_cannot_run_is_stored_paused() {
         1,
         "the queue is dropped"
     );
+}
+
+/// A dump whose every row has a floor above the loading release: each is
+/// stored paused, and a release that meets the floor rebuilds each on
+/// `RESUME` but a 1-1 definition, which has no ledger and refuses
+/// (ADR-0025, `docs/embedding.md`).
+#[tokio::test]
+async fn rows_restored_paused_resume_on_a_release_that_meets_their_floor() {
+    let cluster = TestCluster::start();
+    let source = cluster.create_isolated_database().await;
+    let mut raw = connect_raw(source.dsn()).await;
+    raw.batch_execute(SOURCE_DDL).await.expect("ddl");
+    let t = facade(source.dsn()).await;
+    define_everything(&t, &mut raw).await;
+    let structure = structure_file(&t, source.dsn())
+        .await
+        .lines()
+        .map(|line| line.replace(", '0.2.0');", ", '0.3.0');"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let loaded = cluster.create_empty_database().await;
+    load(loaded.dsn(), &structure);
+    let after = connect_raw(loaded.dsn()).await;
+    let at = |version: &str| {
+        Config::from_dsn(loaded.dsn().to_string())
+            .expect("dsn")
+            .with_binary_version(version)
+    };
+    facade_with(at("0.2.0"))
+        .await
+        .migrate()
+        .await
+        .expect("0.2.0 stores every row paused");
+    let statuses = rows_json(&after, STATUSES).await;
+    assert!(
+        statuses.iter().all(|s| s.ends_with(" paused")),
+        "{statuses:?}"
+    );
+    after.batch_execute(SOURCE_ROWS).await.expect("source rows");
+
+    let forward = Trellis::connect(
+        at("0.3.0"),
+        TrellisOptions {
+            staging: true,
+            drain_threads: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect 0.3.0");
+    let err = forward
+        .apply("RESUME TRANSFORM o1")
+        .await
+        .expect_err("a 1-1 definition restored paused has no ledger");
+    assert!(err.to_string().contains("o1__ledger"), "{err}");
+    let resumed = ["oc", "ol", "ov", "rt"];
+    for target in resumed {
+        forward
+            .apply(&format!("RESUME TRANSFORM {target}"))
+            .await
+            .unwrap_or_else(|err| panic!("resume {target}: {err}"));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    for target in resumed {
+        loop {
+            let status = forward
+                .status(target)
+                .await
+                .expect("status")
+                .expect("defined")
+                .status;
+            if status == trellis::TransformStatus::Live {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{target} never went live: {status:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    let token = forward.watermark_token().await.expect("token");
+    forward
+        .await_converged(token, std::time::Duration::from_secs(60))
+        .await
+        .expect("converged");
+    use trellis::staging::self_check::CheckPageExt;
+    for target in resumed {
+        let report = forward
+            .self_check_to_end(
+                target,
+                trellis::SelfCheckMode::Strict,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("self_check {target}: {err}"));
+        assert_eq!(
+            report.outcome,
+            trellis::SelfCheckOutcome::Converged,
+            "{target}"
+        );
+        assert!(
+            count(&after, &format!("select count(*) from public.{target}")).await > 0,
+            "{target} built rows"
+        );
+    }
+    forward.shutdown().await.expect("shutdown");
 }

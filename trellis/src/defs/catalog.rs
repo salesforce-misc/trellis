@@ -1079,17 +1079,39 @@ pub(crate) struct Unparsed<'a> {
     pub(crate) floor_version: &'a str,
 }
 
+/// Why the restore stores a queued definition paused without parsing it
+/// ([`store_unrunnable`]), with the pause's reason.
+pub(crate) enum Held {
+    /// This release can't run it: an [`super::floor::Unrunnable::reason`],
+    /// recorded as the attach records one ([`super::lifecycle::pause_for_unrunnable`]).
+    Unrunnable(String),
+    /// This release refuses its text, or it reads a definition the restore
+    /// stored paused.
+    Other(String),
+}
+
+impl Held {
+    /// The pause's reason.
+    pub(crate) fn reason(&self) -> &str {
+        match self {
+            Held::Unrunnable(reason) | Held::Other(reason) => reason,
+        }
+    }
+}
+
 /// Stores `unparsed`, a queued definition this release can't run, paused
-/// with `reason` and without parsing it (ADR-0024 rule 3, ADR-0018), and
+/// for `held` and without parsing it (ADR-0024 rule 3, ADR-0018), and
 /// deletes its queue row, in one transaction. It gets its catalog row at the
 /// grammar version and floor the dump recorded, its source fences and its
 /// edges in the schema graph, which its recorded identities decide, and
 /// nothing a parse would decide: no target table check, hidden tables or
-/// ledger. A release that meets its floor rebuilds it on `RESUME`.
+/// ledger. A release that meets its floor rebuilds it on `RESUME`, but for
+/// a 1-1 definition, whose `RESUME` refuses without its ledger
+/// ([`CatalogError::LedgerTableMissing`]): it is dropped and defined again.
 pub(crate) async fn store_unrunnable(
     pool: &Pool,
     unparsed: &Unparsed<'_>,
-    reason: &str,
+    held: &Held,
     restoring: &Restoring<'_>,
 ) -> Result<(), CatalogError> {
     let mut client = pool.get().await?;
@@ -1138,7 +1160,15 @@ pub(crate) async fn store_unrunnable(
         )
         .await?
         .get(0);
-    super::lifecycle::pause_for_grammar_version(&txn, id, unparsed.source_table, reason).await?;
+    match held {
+        Held::Unrunnable(reason) => {
+            super::lifecycle::pause_for_unrunnable(&txn, id, unparsed.source_table, reason).await?
+        }
+        Held::Other(reason) => {
+            super::lifecycle::pause_for_grammar_version(&txn, id, unparsed.source_table, reason)
+                .await?
+        }
+    };
     txn.execute(
         &format!("delete from {} where ordinal = $1", restoring.queue),
         &[&restoring.ordinal],

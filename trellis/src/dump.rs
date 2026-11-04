@@ -806,19 +806,21 @@ pub(crate) async fn restore_queued(
         let upstream_paused = std::iter::once(unparsed.source_table)
             .chain(unparsed.join_table)
             .find(|read| paused_targets.iter().any(|t| t == read));
-        let unrunnable = if let Some(running) = pool.floors().above_running(unparsed.floor_version)
+        // Why this release can't run the row, if it can't: the attach's own
+        // reasons (`Floors::unrunnable`, ADR-0024 rule 3) first, then a
+        // paused upstream, then text this release refuses (ADR-0018).
+        let held = if let Some(unrunnable) = pool
+            .floors()
+            .unrunnable(unparsed.floor_version, unparsed.grammar_version)
         {
-            Some(format!(
-                "this release can't run transform {target}: its floor, the oldest Trellis \
-                 release that can run it, is {}, and this binary runs release {running}; roll \
-                 forward to {} or later, then RESUME it or DROP it there",
-                unparsed.floor_version, unparsed.floor_version
+            Some(crate::defs::catalog::Held::Unrunnable(
+                unrunnable.reason(target),
             ))
         } else if let Some(upstream) = upstream_paused {
-            Some(format!(
+            Some(crate::defs::catalog::Held::Other(format!(
                 "transform {target} reads {upstream}, whose transform the restore of the schema \
                  dump stored paused; RESUME that transform, then this one"
-            ))
+            )))
         } else {
             match crate::defs::grammar::load_in(
                 unparsed.definition_text,
@@ -826,17 +828,17 @@ pub(crate) async fn restore_queued(
                 crate::defs::grammar::OLDEST_SUPPORTED_GRAMMAR_VERSION,
                 crate::defs::grammar::CURRENT_GRAMMAR_VERSION,
             ) {
-                Err(err) => Some(crate::defs::grammar::unparsable_stored_text_reason(
-                    target, &err,
+                Err(err) => Some(crate::defs::catalog::Held::Other(
+                    crate::defs::grammar::unparsable_stored_text_reason(target, &err),
                 )),
                 Ok(_) => None,
             }
         };
-        if let Some(reason) = unrunnable {
-            crate::defs::catalog::store_unrunnable(pool, &unparsed, &reason, &restoring)
+        if let Some(held) = held {
+            crate::defs::catalog::store_unrunnable(pool, &unparsed, &held, &restoring)
                 .await
                 .map_err(catalog)?;
-            crate::instance_log::warn!(target = %target, reason = %reason, "restored paused");
+            crate::instance_log::warn!(target = %target, reason = %held.reason(), "restored paused");
             paused_targets.push(target.to_string());
             continue;
         }
