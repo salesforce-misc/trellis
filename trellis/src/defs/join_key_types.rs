@@ -388,6 +388,24 @@ pub(crate) fn admit_join_key(pg_type: &str, is_enum: bool) -> bool {
     true
 }
 
+/// The entry that admits a 1-1 source's primary-key column of type `pg_type`
+/// ([`super::ddl::admitted_primary_key`]), or `None` when the type is refused:
+/// a listed type, or a live enum ([`is_enum_type_name`]). The primary key's
+/// way to admit a type, as [`admit_join_key`] is the validator's. It is
+/// async, so it returns the entry rather than recording it
+/// ([`super::floor::record`]), and its caller hands the entry to the floor.
+pub(crate) async fn admit_primary_key_type(
+    client: &impl GenericClient,
+    pg_type: &str,
+) -> Result<Option<JoinKey>, tokio_postgres::Error> {
+    if let Some(key) = listed_join_key(pg_type) {
+        return Ok(Some(key));
+    }
+    Ok(is_enum_type_name(client, pg_type)
+        .await?
+        .then_some(JoinKey::Enum))
+}
+
 /// The dynamic counterpart to [`TEXT_STABLE_JOIN_KEY_TYPES`]/
 /// [`is_text_stable_join_key_type`], for enum types: `pg_type`
 /// (a `format_type` rendering, the same string [`is_text_stable_join_key_type`]

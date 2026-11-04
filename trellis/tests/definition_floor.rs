@@ -231,6 +231,82 @@ async fn define_counts_the_key_types_validation_admitted() {
     assert_eq!(floor(&raw, &later, "on_id").await, "0.2.0");
 }
 
+/// The key types the tables a definition reads are admitted by count, over
+/// the live catalog: a 1-1 source's primary-key type (an enum included, a
+/// composite key by any column, a `JOIN` side's key, an aggregate's source
+/// key) and a partitioned source's partition-key type, each declared later.
+/// A `text` or `bigint` key doesn't raise the floor.
+#[tokio::test]
+async fn define_counts_the_primary_and_partition_key_types_admitted() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    raw.batch_execute(
+        "create type public.status as enum ('open', 'closed'); \
+         create table public.pk_text (id text primary key, v text); \
+         create table public.pk_big (id bigint primary key, v text); \
+         create table public.pk_uuid (id uuid primary key, v text); \
+         create table public.pk_enum (st public.status primary key, v text); \
+         create table public.pk_two (a integer, b uuid, v text, primary key (a, b)); \
+         create table public.orders (id bigint primary key, region text); \
+         create table public.items (id uuid primary key, order_id bigint, qty integer); \
+         create index on public.items (order_id); \
+         create table public.events (id bigint not null, day date not null, \
+             primary key (day, id)) partition by range (day); \
+         create table public.events_a partition of public.events \
+             for values from ('2026-01-01') to ('2027-01-01'); \
+         create table public.events_b partition of public.events \
+             for values from ('2027-01-01') to ('2028-01-01')",
+    )
+    .await
+    .expect("sources");
+
+    let later = handle(
+        &db,
+        "0.4.0",
+        &[
+            (r#"JoinKey(Listed("uuid"))"#, "0.3.0"),
+            ("JoinKey(Enum)", "0.3.1"),
+            (r#"PartitionKeyType("date")"#, "0.3.2"),
+        ],
+    )
+    .await;
+    for (target, text) in [
+        ("one_text", "FROM pk_text SELECT v AS v"),
+        ("one_big", "FROM pk_big SELECT v AS v"),
+        ("one_uuid", "FROM pk_uuid SELECT v AS v"),
+        ("one_enum", "FROM pk_enum SELECT v AS v"),
+        ("one_two", "FROM pk_two SELECT v AS v"),
+        (
+            "agg_uuid",
+            "FROM pk_uuid GROUP BY v WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
+        ),
+        (
+            "joined_uuid",
+            "FROM orders JOIN items ON orders.id = items.order_id \
+             GROUP BY orders.region SELECT SUM(items.qty) AS qty",
+        ),
+        (
+            "by_day",
+            "FROM events GROUP BY day WITHOUT SOURCE INDEX SELECT COUNT(*) AS n",
+        ),
+    ] {
+        later
+            .apply(&format!("TRANSFORM {target} {text}"))
+            .await
+            .unwrap_or_else(|e| panic!("define {target}: {e}"));
+    }
+
+    assert_eq!(floor(&raw, &later, "one_text").await, "0.2.0");
+    assert_eq!(floor(&raw, &later, "one_big").await, "0.2.0");
+    assert_eq!(floor(&raw, &later, "one_uuid").await, "0.3.0");
+    assert_eq!(floor(&raw, &later, "one_enum").await, "0.3.1");
+    assert_eq!(floor(&raw, &later, "one_two").await, "0.3.0");
+    assert_eq!(floor(&raw, &later, "agg_uuid").await, "0.3.0");
+    assert_eq!(floor(&raw, &later, "joined_uuid").await, "0.3.0");
+    assert_eq!(floor(&raw, &later, "by_day").await, "0.3.2");
+}
+
 /// A partitioned source counts, and a floor never exceeds the release that
 /// stamps it.
 #[tokio::test]

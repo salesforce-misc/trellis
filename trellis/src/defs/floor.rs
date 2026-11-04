@@ -25,7 +25,12 @@
 //! each `GROUP BY` key type is a [`super::registry::GroupByKeyRule`] case of a
 //! type rule, and each `JOIN ... ON` key type an entry of the join-key
 //! allowlist ([`super::join_key_types::JoinKey`]), recorded where the
-//! validator admits the key.
+//! validator admits the key. The keys of the tables it reads are admitted
+//! away from the validator, over the live catalog: a primary key's type by
+//! the same allowlist entry ([`super::ddl::admitted_primary_key`]) and a
+//! partition key's by the partition-key type list
+//! ([`super::partition_tree::PartitionTree::key_types`]), both read by
+//! [`live_key_features`], which async code can't record into the collector.
 //!
 //! The registry is exhaustive by construction. [`features_used`] matches
 //! every node kind of the tree, and [`Feature::since`] matches every
@@ -217,9 +222,13 @@ pub enum Feature {
     /// `DATE_TRUNC` unit or an `AT TIME ZONE` zone
     /// ([`super::registry::ArgValue`]).
     Value(super::registry::ArgValue),
-    /// A type admitted as a `JOIN ... ON` key
-    /// ([`super::join_key_types::JoinKey`]).
+    /// A type admitted as a `JOIN ... ON` key, or as the primary key of a
+    /// table the definition reads ([`super::join_key_types::JoinKey`]).
     JoinKey(super::join_key_types::JoinKey),
+    /// A type admitted as the partition key of a partitioned table the
+    /// definition reads, by its name in the supported list
+    /// ([`super::partition_tree::PartitionTree::key_types`]).
+    PartitionKeyType(&'static str),
 }
 
 /// The special forms the parser builds as a [`Expr::FunctionCall`] without
@@ -304,6 +313,7 @@ impl Feature {
             Feature::TypeRule(rule) => Some(rule.since()),
             Feature::Value(value) => value.since(),
             Feature::JoinKey(key) => key.since(),
+            Feature::PartitionKeyType(name) => super::partition_tree::key_type_since(name),
         }
     }
 
@@ -862,17 +872,59 @@ pub(crate) enum OnRetype {
 
 /// [`OnRetype`] for `def` over the live columns of its source (`from`) and,
 /// for a `JOIN`, of its joined table, `partitioned` when a table it reads is.
+/// `keys` are the key types the tables' own keys were admitted by
+/// ([`live_key_features`]), which the validation over the columns can't see.
 pub(crate) fn on_retype(
     floors: &Floors,
     def: &TransformDef,
     partitioned: bool,
     from: &std::collections::HashMap<String, super::validate::JoinColumnInfo>,
     joined: Option<&std::collections::HashMap<String, super::validate::JoinColumnInfo>>,
+    keys: &[Feature],
 ) -> OnRetype {
     match validated_features(def, from, joined) {
-        Ok(validated) => OnRetype::Restamp(floors.of(def, partitioned, Some(&validated))),
+        Ok(mut validated) => {
+            validated.extend_from_slice(keys);
+            OnRetype::Restamp(floors.of(def, partitioned, Some(&validated)))
+        }
         Err(refusal) => OnRetype::Pause(refusal),
     }
+}
+
+/// The key types of `tables` (qualified `schema.table` names) that admit
+/// them as sources, read from the live catalog: the entry that admits each
+/// primary-key column ([`super::ddl::admitted_primary_key`], which gates
+/// every key space's source and each side of a `JOIN`), and the entry that
+/// admits each partition key of a partitioned table
+/// ([`super::partition_tree::PartitionTree::key_types`]). Both are admitted
+/// away from the validator ([`validated_features`]): they read the catalog
+/// across awaits, outside its synchronous collector, so they report their
+/// entries instead of recording them.
+///
+/// `None` when a table's primary key is refused, which define and a resume
+/// have already refused it for and a capture pass pauses the retype to it
+/// for; the floor then counts at the running release, as a refused
+/// validation does.
+pub(crate) async fn live_key_features(
+    client: &impl tokio_postgres::GenericClient,
+    tables: &[&str],
+) -> Result<Option<Vec<Feature>>, super::catalog::CatalogError> {
+    let mut features = Vec::new();
+    for table in tables {
+        let admitted_by = match super::ddl::admitted_primary_key(client, table).await {
+            Ok((_, admitted_by)) => admitted_by,
+            Err(
+                super::ddl::DdlError::NoPrimaryKey { .. }
+                | super::ddl::DdlError::UnsupportedPrimaryKeyType { .. },
+            ) => return Ok(None),
+            Err(other) => return Err(super::catalog::CatalogError::Ddl(other)),
+        };
+        features.extend(admitted_by.into_iter().map(Feature::JoinKey));
+        if let Some(tree) = super::partition_tree::read_partition_tree(client, table).await? {
+            features.extend(tree.key_types().into_iter().map(Feature::PartitionKeyType));
+        }
+    }
+    Ok(Some(features))
 }
 
 /// [`on_retype`] over the live columns of `source` and `joined`, the tables
@@ -887,11 +939,26 @@ pub(crate) async fn on_live_retype(
     let tables: Vec<&str> = std::iter::once(source).chain(joined).collect();
     let partitioned = any_partitioned(client, &tables).await?;
     let from = super::catalog::column_infos(client, source).await?;
-    let joined = match joined {
+    let joined_columns = match joined {
         Some(joined) => Some(super::catalog::column_infos(client, joined).await?),
         None => None,
     };
-    Ok(on_retype(floors, def, partitioned, &from, joined.as_ref()))
+    let Some(keys) = live_key_features(client, &tables).await? else {
+        return Ok(
+            match validated_features(def, &from, joined_columns.as_ref()) {
+                Ok(_) => OnRetype::Restamp(floors.of(def, partitioned, None)),
+                Err(refusal) => OnRetype::Pause(refusal),
+            },
+        );
+    };
+    Ok(on_retype(
+        floors,
+        def,
+        partitioned,
+        &from,
+        joined_columns.as_ref(),
+        &keys,
+    ))
 }
 
 #[cfg(test)]
@@ -1586,6 +1653,45 @@ mod tests {
         assert_eq!(join_floor(&floors, status, text).as_deref(), Some("0.3.1"));
     }
 
+    /// The key types the tables' own keys were admitted by count with what the
+    /// validator admitted: a 1-1 source's primary key (an enum included) and a
+    /// partitioned table's partition key, declared later. Their release is the
+    /// entry's, the join-key allowlist's for a primary key.
+    #[test]
+    fn a_table_key_type_declared_later_raises_the_floor() {
+        use crate::defs::join_key_types::JoinKey;
+        let floors = floors(
+            "0.4.0",
+            &[
+                (r#"JoinKey(Listed("uuid"))"#, "0.3.0"),
+                ("JoinKey(Enum)", "0.3.1"),
+                (r#"PartitionKeyType("date")"#, "0.3.2"),
+            ],
+        );
+        let def = parse("TRANSFORM t FROM s SELECT id AS id").unwrap();
+        let on =
+            |keys: &[Feature]| match on_retype(&floors, &def, false, &columns(INT4), None, keys) {
+                OnRetype::Restamp(floor) => floor.to_string(),
+                OnRetype::Pause(refusal) => panic!("paused: {refusal}"),
+            };
+        assert_eq!(on(&[]), "0.2.0");
+        assert_eq!(on(&[Feature::JoinKey(JoinKey::Listed("text"))]), "0.2.0");
+        assert_eq!(on(&[Feature::JoinKey(JoinKey::Listed("uuid"))]), "0.3.0");
+        assert_eq!(on(&[Feature::JoinKey(JoinKey::Enum)]), "0.3.1");
+        assert_eq!(on(&[Feature::PartitionKeyType("bigint")]), "0.2.0");
+        assert_eq!(on(&[Feature::PartitionKeyType("date")]), "0.3.2");
+        // The latest of them, and a key the entry no longer declares counts at
+        // the running release.
+        assert_eq!(
+            on(&[
+                Feature::JoinKey(JoinKey::Listed("uuid")),
+                Feature::PartitionKeyType("date"),
+            ]),
+            "0.3.2"
+        );
+        assert_eq!(on(&[Feature::PartitionKeyType("inet")]), "0.4.0");
+    }
+
     /// The validator's refusal is no floor: `date + bigint` has no operator.
     #[test]
     fn a_refused_definition_has_no_validated_floor() {
@@ -1623,7 +1729,7 @@ mod tests {
         let floors = floors("0.4.0", &[("TypeRule(Cast(IntegerIdentity))", "0.3.0")]);
         let on = |select: &str, c| {
             let def = parse(&format!("TRANSFORM t FROM s {select}")).unwrap();
-            on_retype(&floors, &def, false, &columns(c), None)
+            on_retype(&floors, &def, false, &columns(c), None, &[])
         };
         let restamped = |select: &str, c| match on(select, c) {
             OnRetype::Restamp(floor) => floor.to_string(),

@@ -735,7 +735,8 @@ option or hidden-table layout it uses arrived in, or any argument value
 (`EXTRACT` field, `DATE_TRUNC` unit, `AT TIME ZONE` zone), type rule (which
 operand types an operator, cast, function or aggregate takes) or key type (of
 a `GROUP BY` or `JOIN ... ON` key) define's validation admitted it by over its
-columns' types. Define, `ALTER TRANSFORM` and a resume's rebuild record it
+columns' types, or the type of a primary key or partition key it reads that
+define admitted. Define, `ALTER TRANSFORM` and a resume's rebuild record it
 from what the definition uses then, so an `ALTER` that removes the only newer
 construct lowers it; a pause never changes it. When a column it reads changes type, the staging worker's next capture
 pass validates it again over the new type: if it still validates, the floor

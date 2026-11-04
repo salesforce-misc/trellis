@@ -34,6 +34,7 @@ use std::fmt;
 use tokio_postgres::GenericClient;
 
 use crate::defs::ddl::regclass_arg;
+use crate::defs::floor::{BASELINE, Release};
 
 /// The largest tree a definition may read, in leaves. No build statement
 /// prunes, so each one plans, locks and opens every leaf; the default lock
@@ -43,21 +44,66 @@ pub const MAX_LEAVES: usize = 1_000;
 /// The oldest server a partitioned source is read on.
 pub const MIN_SERVER_VERSION_NUM: i32 = 150_000;
 
-/// The partition-key column types a partitioned source accepts, as
-/// `format_type` spells them.
-pub const SUPPORTED_KEY_TYPES: &[&str] = &[
-    "smallint",
-    "integer",
-    "bigint",
-    "numeric",
-    "text",
-    "character varying",
-    "uuid",
-    "date",
-    "timestamp without time zone",
-    "timestamp with time zone",
-    "boolean",
+/// One partition-key column type a partitioned source accepts, and the
+/// release it arrived in. The release is a required part of every entry, so a
+/// type can't join the list without declaring it (ADR-0024,
+/// [`super::floor`]).
+#[derive(Debug, Clone, Copy)]
+struct KeyTypeSpec {
+    /// The type as `format_type` spells it.
+    name: &'static str,
+    /// The release this type arrived in as a partition key, which raises the
+    /// floor of a definition reading a table partitioned on it.
+    since: Release,
+}
+
+const fn key_type(name: &'static str, since: Release) -> KeyTypeSpec {
+    KeyTypeSpec { name, since }
+}
+
+/// The partition-key column types a partitioned source accepts. Private, so
+/// the tree admits a key only through [`admitted_key_type`], by an entry
+/// with its release.
+const SUPPORTED_KEY_TYPES: &[KeyTypeSpec] = &[
+    key_type("smallint", BASELINE),
+    key_type("integer", BASELINE),
+    key_type("bigint", BASELINE),
+    key_type("numeric", BASELINE),
+    key_type("text", BASELINE),
+    key_type("character varying", BASELINE),
+    key_type("uuid", BASELINE),
+    key_type("date", BASELINE),
+    key_type("timestamp without time zone", BASELINE),
+    key_type("timestamp with time zone", BASELINE),
+    key_type("boolean", BASELINE),
 ];
+
+/// The name of the entry of [`SUPPORTED_KEY_TYPES`] that admits a partition
+/// key of type `pg_type` (a `format_type` rendering), or `None` when it is
+/// refused. [`PartitionTree::refusal`] admits a key only through it, and
+/// [`PartitionTree::key_types`] reports the entries for the floor.
+fn admitted_key_type(pg_type: &str) -> Option<&'static str> {
+    SUPPORTED_KEY_TYPES
+        .iter()
+        .find(|spec| spec.name == pg_type)
+        .map(|spec| spec.name)
+}
+
+/// The release the partition-key type `name` (an entry
+/// [`PartitionTree::key_types`] returned) arrived in; `None` for a name no
+/// entry declares.
+pub(crate) fn key_type_since(name: &str) -> Option<Release> {
+    SUPPORTED_KEY_TYPES
+        .iter()
+        .find(|spec| spec.name == name)
+        .map(|spec| spec.since)
+}
+
+/// The supported partition-key types as the refusal message lists them.
+fn supported_key_types() -> String {
+    let names: Vec<&str> = SUPPORTED_KEY_TYPES.iter().map(|spec| spec.name).collect();
+    names.join(", ")
+}
 
 /// How a node partitions its children.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +202,25 @@ impl PartitionTree {
         out
     }
 
+    /// The entries of [`SUPPORTED_KEY_TYPES`] that admit this tree's
+    /// partition keys (named columns of an accepted type), each once, in the
+    /// order first met: the key types the definition's floor counts
+    /// ([`super::floor::Feature::PartitionKeyType`]).
+    pub(crate) fn key_types(&self) -> Vec<&'static str> {
+        let mut admitted = Vec::new();
+        for key in self.levels.iter().flat_map(|level| &level.key) {
+            if let Some(name) = key
+                .column
+                .as_ref()
+                .and_then(|_| admitted_key_type(&key.pg_type))
+                && !admitted.contains(&name)
+            {
+                admitted.push(name);
+            }
+        }
+        admitted
+    }
+
     /// The first reason this tree can't be read by a definition whose group
     /// key is `group_key`, or `None` when it can. See the module doc for the
     /// order of the checks.
@@ -186,7 +251,7 @@ impl PartitionTree {
                         position: position + 1,
                     });
                 };
-                if !SUPPORTED_KEY_TYPES.contains(&key.pg_type.as_str()) {
+                if admitted_key_type(&key.pg_type).is_none() {
                     return Some(PartitionRefusal::UnsupportedKeyType {
                         table,
                         column,
@@ -289,7 +354,7 @@ impl fmt::Display for PartitionRefusal {
                 f,
                 "partitioned table {table} is partitioned by column \"{column}\" of type \
                  {pg_type}, which isn't a supported partition-key type; supported types are {}",
-                SUPPORTED_KEY_TYPES.join(", ")
+                supported_key_types()
             ),
             PartitionRefusal::NonDefaultOpclass { table, column } => write!(
                 f,
@@ -585,8 +650,15 @@ mod tests {
             "{text}"
         );
         for supported in SUPPORTED_KEY_TYPES {
-            let tree = flat(vec![key("k", supported)], 2);
-            assert_eq!(tree.refusal(150_000, &group(&["k"])), None, "{supported}");
+            let tree = flat(vec![key("k", supported.name)], 2);
+            assert_eq!(
+                tree.refusal(150_000, &group(&["k"])),
+                None,
+                "{}",
+                supported.name
+            );
+            assert_eq!(tree.key_types(), [supported.name]);
+            assert_eq!(key_type_since(supported.name), Some(supported.since));
         }
     }
 
@@ -627,5 +699,25 @@ mod tests {
         let tree = flat(vec![key("k", "text")], MAX_LEAVES + 1);
         let refusal = tree.refusal(140_011, &group(&["x"])).unwrap();
         assert!(refusal.to_string().contains("PostgreSQL 15"), "{refusal}");
+    }
+
+    /// The tree reports the entries that admit its keys, each once, across
+    /// levels; a refused type or an expression key has none.
+    #[test]
+    fn the_tree_reports_the_entries_that_admit_its_keys() {
+        let mut tree = flat(vec![key("a", "bigint"), key("b", "bigint")], 2);
+        tree.nodes[1].partitioned = true;
+        tree.levels.push(PartitionLevel {
+            node: 1,
+            strategy: Strategy::Hash,
+            key: vec![key("c", "date")],
+        });
+        assert_eq!(tree.key_types(), ["bigint", "date"]);
+        let mut expr = key("x", "integer");
+        expr.column = None;
+        assert_eq!(
+            flat(vec![key("a", "character"), expr], 2).key_types(),
+            Vec::<&str>::new()
+        );
     }
 }

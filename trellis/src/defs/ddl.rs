@@ -450,20 +450,38 @@ pub(crate) async fn source_primary_key_in_txn(
     client: &impl GenericClient,
     source_table: &str,
 ) -> Result<Vec<PrimaryKeyColumn>, DdlError> {
+    Ok(admitted_primary_key(client, source_table).await?.0)
+}
+
+/// [`source_primary_key_in_txn`] and, for each key column, the allowlist
+/// entry that admitted its type ([`super::join_key_types::JoinKey`]), in the
+/// key's column order. This is where the key type is admitted, and it runs
+/// across awaits, outside [`super::floor::collect`]'s synchronous collector,
+/// so it returns the entries for the definition's floor
+/// ([`super::floor::of_live`]) instead of recording them. The columns can
+/// only be admitted by an entry, so a type can't join the allowlist without
+/// declaring the release it arrived in.
+pub(crate) async fn admitted_primary_key(
+    client: &impl GenericClient,
+    source_table: &str,
+) -> Result<(Vec<PrimaryKeyColumn>, Vec<super::join_key_types::JoinKey>), DdlError> {
     let columns = identity_key_columns(client, source_table).await?;
     if columns.is_empty() {
         return Err(DdlError::NoPrimaryKey {
             source_table: source_table.to_string(),
         });
     }
+    let mut admitted_by = Vec::with_capacity(columns.len());
     for column in &columns {
         // A live enum type joins the static allowlist above via
         // the same dynamic `to_regtype`-based check a `JOIN` key's gets — see
         // `join_key_types::is_enum_type_name`'s own doc comment for why admitting
         // it is safe.
-        if !super::join_key_types::is_text_stable_join_key_type(&column.data_type)
-            && !super::join_key_types::is_enum_type_name(client, &column.data_type).await?
+        if let Some(entry) =
+            super::join_key_types::admit_primary_key_type(client, &column.data_type).await?
         {
+            admitted_by.push(entry);
+        } else {
             // The message names the type as the source declares it, with its
             // modifier; a copy of it has none.
             let declared: Option<String> = client
@@ -483,7 +501,7 @@ pub(crate) async fn source_primary_key_in_txn(
             });
         }
     }
-    Ok(columns)
+    Ok((columns, admitted_by))
 }
 
 /// The catalog half of [`source_primary_key_in_txn`], with none of its
