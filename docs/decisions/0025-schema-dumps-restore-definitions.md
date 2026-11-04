@@ -112,6 +112,11 @@ paths stay until a major release.
 
 - Loading an embedded dump is no longer plain SQL: every load path needs
   `migrate` after it. The Rails and Ecto hooks run it; any other path has to.
+- Loading takes longer. I loaded 100 definitions (50 1-1, 50 aggregates)
+  over empty sources three times in each format: the older file took 1.4 to
+  1.5 s from `psql` to every definition live, this one 2.8 to 3.3 s, of which
+  the restore inside `migrate` is 1.5 to 2.0 s. The file is a fifth of the
+  size (53 KB against 259 KB).
 - The clients filter `pg_dump`'s text output. The filter is confined to this
   path and is tested against each supported `pg_dump` version.
 - Two load formats, and two dump functions, until a major release.
