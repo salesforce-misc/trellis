@@ -2107,7 +2107,7 @@ fn upsert_sql(shape: &JoinShape) -> String {
     let target = ddl::qualified_target_table_ident(&shape.target);
     let pk_cols: Vec<String> = shape.pk.iter().map(|c| quote_ident(&c.name)).collect();
     let field_cols: Vec<String> = shape.fields.iter().map(|(n, _)| quote_ident(n)).collect();
-    let on_conflict = on_conflict_sql(&target, &pk_cols, &field_cols);
+    let on_conflict = super::one_to_one_render::on_conflict_by_text(&target, &pk_cols, &field_cols);
     let select_cols: Vec<String> = shape
         .pk
         .iter()
@@ -2148,39 +2148,9 @@ fn upsert_params(
     decoded: &[Vec<Option<String>>],
     keys: &[&str],
 ) -> Vec<Vec<Option<String>>> {
-    let mut columns = transpose(arity, decoded);
+    let mut columns = super::apply::transpose_pk_parts(arity, decoded);
     columns.push(keys.iter().map(|k| Some(k.to_string())).collect());
     columns
-}
-
-/// `rows` (each `arity` parts, a `NULL` one `None`) as one array per part.
-fn transpose(arity: usize, rows: &[Vec<Option<String>>]) -> Vec<Vec<Option<String>>> {
-    (0..arity)
-        .map(|j| rows.iter().map(|row| row[j].clone()).collect())
-        .collect()
-}
-
-/// The `on conflict` clause of a target upsert: a write by text, as every
-/// other 1-1 write compares (ADR-0020), and no write when every field is
-/// paused.
-fn on_conflict_sql(target: &str, pk_cols: &[String], field_cols: &[String]) -> String {
-    if field_cols.is_empty() {
-        return format!("on conflict ({}) do nothing", pk_cols.join(", "));
-    }
-    let set_list: Vec<String> = field_cols
-        .iter()
-        .map(|f| format!("{f} = excluded.{f}"))
-        .collect();
-    let target_cols: Vec<String> = field_cols.iter().map(|f| format!("{target}.{f}")).collect();
-    let excluded: Vec<String> = field_cols.iter().map(|f| format!("excluded.{f}")).collect();
-    format!(
-        "on conflict ({}) do update set {} \
-         where row({})::text is distinct from row({})::text",
-        pk_cols.join(", "),
-        set_list.join(", "),
-        target_cols.join(", "),
-        excluded.join(", ")
-    )
 }
 
 /// The basic `self_check` of a 1-1 `JOIN` target, for tests: the primary keys

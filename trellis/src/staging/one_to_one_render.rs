@@ -186,6 +186,48 @@ fn collect_columns(expr: &Expr, out: &mut BTreeSet<String>) {
     }
 }
 
+/// The `on conflict` clause of a 1-1 target upsert: the one place that
+/// states "a 1-1 write compares by text" (ADR-0020). A 1-1 copy holds the
+/// source's exact rendering, so `1.25` to `1.2500`, a case change under a
+/// nondeterministic collation or an `interval` respelling must write
+/// although the type's `=` calls the two equal. The comparison is of a
+/// record's text, not a bare `col::text`: a text column cast to text keeps
+/// its collation, and the comparison with it.
+///
+/// `pk_cols` and `field_cols` are the quoted column idents; `target` is how
+/// the statement refers to the target row (`t` under an `insert ... as t`,
+/// or the qualified table ident).
+///
+/// With no `field_cols` (every calculated column paused, ADR-0003) there is
+/// nothing for a conflicting key to update: `do update set` with an empty
+/// set list is invalid SQL, and so is an empty-tuple `is distinct from`.
+/// `do nothing` is also the right behavior, as an existing row with every
+/// column frozen has no physical change to make, and a brand-new key still
+/// gets its bare row inserted via the same statement's `insert` half.
+pub(crate) fn on_conflict_by_text(
+    target: &str,
+    pk_cols: &[String],
+    field_cols: &[String],
+) -> String {
+    let pk_cols = pk_cols.join(", ");
+    if field_cols.is_empty() {
+        return format!("on conflict ({pk_cols}) do nothing");
+    }
+    let set_list: Vec<String> = field_cols
+        .iter()
+        .map(|f| format!("{f} = excluded.{f}"))
+        .collect();
+    let target_cols: Vec<String> = field_cols.iter().map(|f| format!("{target}.{f}")).collect();
+    let excluded: Vec<String> = field_cols.iter().map(|f| format!("excluded.{f}")).collect();
+    format!(
+        "on conflict ({pk_cols}) do update set {} \
+         where row({})::text is distinct from row({})::text",
+        set_list.join(", "),
+        target_cols.join(", "),
+        excluded.join(", ")
+    )
+}
+
 /// Whether `err` is a data exception, SQLSTATE class 22: a value a field
 /// can't be computed from (an overflow, an invalid regex, an out-of-range
 /// cast), as opposed to a lock timeout, a serialization failure or a lost
@@ -232,4 +274,40 @@ pub(crate) async fn failing_fields(
         }
     }
     Ok(failing)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::on_conflict_by_text;
+
+    fn idents(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| format!("\"{n}\"")).collect()
+    }
+
+    #[test]
+    fn on_conflict_compares_by_text() {
+        assert_eq!(
+            on_conflict_by_text(
+                "\"public\".\"tgt\"",
+                &idents(&["a", "b"]),
+                &idents(&["x", "y"])
+            ),
+            "on conflict (\"a\", \"b\") do update set \"x\" = excluded.\"x\", \"y\" = excluded.\"y\" \
+             where row(\"public\".\"tgt\".\"x\", \"public\".\"tgt\".\"y\")::text \
+             is distinct from row(excluded.\"x\", excluded.\"y\")::text"
+        );
+        assert_eq!(
+            on_conflict_by_text("t", &idents(&["a"]), &idents(&["x"])),
+            "on conflict (\"a\") do update set \"x\" = excluded.\"x\" \
+             where row(t.\"x\")::text is distinct from row(excluded.\"x\")::text"
+        );
+    }
+
+    #[test]
+    fn on_conflict_with_every_field_paused_does_nothing() {
+        assert_eq!(
+            on_conflict_by_text("t", &idents(&["a", "b"]), &[]),
+            "on conflict (\"a\", \"b\") do nothing"
+        );
+    }
 }

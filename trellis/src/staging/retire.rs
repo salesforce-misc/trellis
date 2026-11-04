@@ -30,6 +30,7 @@ use tokio_postgres::types::Type;
 
 use super::append::ring_table_name;
 use super::error::StagingError;
+use crate::defs::join_one_to_one::HiddenTable;
 use crate::pool::quote_ident;
 
 /// The four eligibility conditions, as one query, ordered oldest-`seg_seq`
@@ -223,7 +224,14 @@ const DRAINED_PREFIX_SQL: &str = "\
 /// [`hidden_tables_sql`] finds the other hidden tables). An aggregate
 /// target's, a 1-1 target's and a hidden ledger carry the same
 /// ordering-state columns, so [`collect_tombstones`] collects them alike.
-const LEDGER_TABLES_SQL: &str = "\
+fn ledger_tables_sql() -> String {
+    let names = HiddenTable::LEDGERS
+        .iter()
+        .map(|table| table.name_sql("d.id"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "\
     select format('%I.%I', n.nspname, c.relname), d.id \
     from transform_definitions d \
     join pg_catalog.pg_namespace n on n.nspname = split_part(d.target_table, '.', 1) \
@@ -233,11 +241,13 @@ const LEDGER_TABLES_SQL: &str = "\
     select format('%I.%I', n.nspname, c.relname), d.id \
     from transform_definitions d \
     join pg_catalog.pg_class c on c.relname in ( \
-         ('join1_' || d.id || '_r'), ('join1_' || d.id || '_m')) \
+         {names}) \
      and c.relnamespace = (select relnamespace from pg_catalog.pg_class \
                            where oid = 'transform_definitions'::regclass) \
     join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
-    order by 1";
+    order by 1"
+    )
+}
 
 /// The most tombstones one GC transaction deletes.
 const TOMBSTONE_BATCH: i64 = 5_000;
@@ -331,7 +341,7 @@ pub async fn collect_tombstones(client: &mut Client) -> Result<u64, StagingError
 
     let ledgers: Vec<(String, i64)> = client
         .query_typed(
-            LEDGER_TABLES_SQL,
+            &ledger_tables_sql(),
             &[(&crate::defs::ledger::LEDGER_SUFFIX, Type::TEXT)],
         )
         .await?
@@ -677,4 +687,19 @@ fn is_lock_not_available(err: &tokio_postgres::Error) -> bool {
         err.code(),
         Some(code) if *code == tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE
     )
+}
+
+#[cfg(test)]
+mod ledger_tables_tests {
+    use super::ledger_tables_sql;
+
+    /// The 1-1 `JOIN` arm names its two hidden ledgers by
+    /// `HiddenTable::name_sql`, which renders them as the catalog creates them.
+    #[test]
+    fn ledger_tables_sql_names_the_hidden_ledgers() {
+        assert!(ledger_tables_sql().contains(
+            "c.relname in ( ('join1_' || d.id || '_r'), ('join1_' || d.id || '_m')) \
+             and c.relnamespace"
+        ));
+    }
 }

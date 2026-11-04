@@ -907,30 +907,10 @@ fn rederive_statement(
             .map(|(name, sql)| format!("{sql} as {}", q(name))),
     );
     let insert_cols: Vec<String> = pk_idents.iter().chain(&field_idents).cloned().collect();
-    // A rebuild writes a row whose text differs: a `numeric` rewritten with
-    // another scale (`1.25` to `1.2500`) is equal as a number and not as the
-    // value the source shows, and a copy has no modifier to normalize it
+    // A rebuild writes a row whose text differs, as every 1-1 write does
     // (ADR-0020).
-    // Every column can be paused at once; a new key still gets its bare row.
-    let on_conflict = if field_idents.is_empty() {
-        "do nothing".to_string()
-    } else {
-        let sets: Vec<String> = field_idents
-            .iter()
-            .map(|f| format!("{f} = excluded.{f}"))
-            .collect();
-        let old: Vec<String> = field_idents.iter().map(|f| format!("t.{f}")).collect();
-        let new: Vec<String> = field_idents
-            .iter()
-            .map(|f| format!("excluded.{f}"))
-            .collect();
-        format!(
-            "do update set {} where row({})::text is distinct from row({})::text",
-            sets.join(", "),
-            old.join(", "),
-            new.join(", ")
-        )
-    };
+    let on_conflict =
+        super::super::one_to_one_render::on_conflict_by_text("t", &pk_idents, &field_idents);
     let (prior, seam) = match image {
         Some(image) => (
             format!(
@@ -968,7 +948,7 @@ fn rederive_statement(
          ups as ( \
              insert into {target} as t ({insert_cols}) \
              select {insert_cols} from src \
-             on conflict ({pk_cols}) {on_conflict} \
+             {on_conflict} \
              returning {k_tgt} as __k \
          ), \
          del as ( \
@@ -994,7 +974,6 @@ fn rederive_statement(
         tombstone = q(crate::defs::ledger::TOMBSTONE_COLUMN),
         key = q(crate::defs::ledger::KEY_COLUMN),
         insert_cols = insert_cols.join(", "),
-        pk_cols = pk_idents.join(", "),
     )
 }
 

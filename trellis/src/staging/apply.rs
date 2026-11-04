@@ -3660,12 +3660,12 @@ async fn lock_composite_keys(
 }
 
 /// The per-column bind arrays [`pk_keyset_unnest`] needs, transposed from
-/// `rows` (each an already-[`decode_target_pk_parts`]-decoded key with no
-/// `NULL` part, in `pk`'s own declared column order) so column `j`'s array
+/// `rows` (each an already-[`decode_target_pk_parts`]-decoded key, in `pk`'s
+/// own declared column order, a `NULL` part a `None` where `T` is an `Option`) so column `j`'s array
 /// is every row's `j`th part.
-pub(super) fn transpose_pk_parts<'a>(arity: usize, rows: &[Vec<&'a str>]) -> Vec<Vec<&'a str>> {
+pub(super) fn transpose_pk_parts<T: Clone>(arity: usize, rows: &[Vec<T>]) -> Vec<Vec<T>> {
     (0..arity)
-        .map(|j| rows.iter().map(|r| r[j]).collect())
+        .map(|j| rows.iter().map(|r| r[j].clone()).collect())
         .collect()
 }
 
@@ -4042,7 +4042,6 @@ async fn apply_target(
 
     let arity = plan.pk.len();
     let pk_idents: Vec<String> = plan.pk.iter().map(|c| quote_ident(&c.name)).collect();
-    let pk_col_list = pk_idents.join(", ");
     // `plan.qualified_target` (the persisted identity), not a bare
     // `quote_ident(target)` — a target explicitly qualified into a
     // non-default schema isn't necessarily on this connection's
@@ -4146,46 +4145,8 @@ async fn apply_target(
 
     let mut written = Vec::new();
     if !writable.is_empty() {
-        // Every one of this target's calculated columns can be paused at
-        // once (ADR-0003) — a single-field definition whose lone
-        // column's fuse has tripped is the simplest such case. There is then
-        // nothing for a conflicting key to update at all: `do update set`
-        // with an empty set list is invalid SQL, and an empty-tuple `is
-        // distinct from` comparison is too. `do nothing` is also the
-        // semantically right behavior, not just the SQL-valid one — an
-        // existing row with every column frozen genuinely has no physical
-        // change to make; a brand-new key still gets its bare row inserted
-        // (frozen at the column defaults) via the same statement's `insert`
-        // half.
-        let on_conflict = if field_idents.is_empty() {
-            format!("on conflict ({pk_col_list}) do nothing")
-        } else {
-            let set_list = field_idents
-                .iter()
-                .map(|f| format!("{f} = excluded.{f}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let target_cols = field_idents
-                .iter()
-                .map(|f| format!("{target_ident}.{f}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let excluded_cols = field_idents
-                .iter()
-                .map(|f| format!("excluded.{f}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            // By text, as the rebuild merges do (ADR-0020): a 1-1 copy holds the
-            // source's exact rendering, so `1.25` to `1.2500`, a case change
-            // under a nondeterministic collation or an `interval` respelling
-            // must write although the type's `=` calls the two equal. A
-            // record's text, not a bare `col::text`: a text column cast to
-            // text keeps its collation, and the comparison with it.
-            format!(
-                "on conflict ({pk_col_list}) do update set {set_list} \
-                 where row({target_cols})::text is distinct from row({excluded_cols})::text"
-            )
-        };
+        let on_conflict =
+            super::one_to_one_render::on_conflict_by_text(&target_ident, &pk_idents, &field_idents);
 
         // The composite key's own canonical identity text —
         // what this statement's `RETURNING` reports as each written row's
