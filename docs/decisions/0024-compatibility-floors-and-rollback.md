@@ -65,9 +65,9 @@ command: the older release degrades per definition by itself.
      same release leaves the same floor, so the floor can't say whether this
      one reads that migration.
    - A **definition floor** is the oldest release that can run one
-     definition: its grammar features, the argument values and type rules
-     define's validation admitted it by, its key space, its hidden-table
-     layout and its per-definition state. Trellis stamps it whenever it
+     definition: its grammar features, the argument values, type rules and
+     key types define's validation admitted it by, its key space, its
+     hidden-table layout and its per-definition state. Trellis stamps it whenever it
      writes the definition, recreates its hidden tables, or sees a column it
      reads change type, from what the definition uses then.
 2. **Attach.** A binary below the catalog floor refuses, with an error naming
@@ -140,9 +140,9 @@ column gives every stored definition 0.2.0.
 
 Loading a stored definition only parses it, so a release runs a definition
 whose tree it knows even where it would have refused the definition at
-define: an argument value or a combination of operand types it doesn't
-admit. If a newer release renders that text differently, the older one
-silently computes different values. So the floor also counts everything
+define: an argument value, a combination of operand types or a key type it
+doesn't admit. If a newer release renders that text differently, the older
+one silently computes different values. So the floor also counts everything
 define's validation admits a definition by:
 
 - **Argument values.** Each `EXTRACT` field, `DATE_TRUNC` unit and `AT TIME
@@ -154,10 +154,16 @@ define's validation admits a definition by:
   aggregates the group basis keeps) declares its release. A rule returns its
   case together with the result type, so a new case doesn't compile without
   one.
+- **Key types.** Each type admitted as a `GROUP BY` key or a `JOIN ... ON`
+  key declares its release. A `GROUP BY` key type is a case of a type rule;
+  a `JOIN ... ON` key type is an entry of the join-key allowlist, where enum
+  types, which no list can name, are one entry. The validator admits a key
+  only through its case or entry, so a new key type doesn't compile without
+  its release.
 
-The validator collects the release of every value and case it used, at define,
-`ALTER TRANSFORM` and a resume's rebuild alike, and the floor is the latest of
-those and of the tree's features. An addition that renders the same under
+The validator collects the release of every value, case and key type it
+used, at define, `ALTER TRANSFORM` and a resume's rebuild alike, and the
+floor is the latest of those and of the tree's features. An addition that renders the same under
 older releases still raises the floor: that costs rollback availability, not
 correctness. Text an older release would read differently is still a change
 in meaning ([ADR-0018](0018-grammar-versioning.md)).
