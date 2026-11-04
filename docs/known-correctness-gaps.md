@@ -27,18 +27,18 @@ wrong rows, on the targets it compares
 | Gap | Detected by | Ends with |
 |---|---|---|
 | **Schema changes Trellis can't tell from routine work** | | |
-| [A column's values rewritten in place by `ALTER COLUMN TYPE`](#a-columns-values-rewritten-in-place-by-alter-column-type) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study) |
+| [A column's values rewritten in place by `ALTER COLUMN TYPE`](#a-columns-values-rewritten-in-place-by-alter-column-type) | `self_check` | [#1654](https://github.com/salesforce-misc/trellis/issues/1654) (study) |
 | [An enum label renamed and added again](#an-enum-label-renamed-and-added-again) | `self_check` | documented |
 | [A read column's name swapped with another's and back within one pass](#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass) | `self_check` | [#1586](https://github.com/salesforce-misc/trellis/issues/1586) |
 | **Writes past a unique key** | | |
 | [A duplicate in `b` past a deferrable key under `session_replication_role = replica`](#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica) | `self_check` | documented |
 | **Writes capture never sees** | | |
-| [Capture disrupted and restored between two passes](#capture-disrupted-and-restored-between-two-passes) | `self_check` | [#1206](https://github.com/salesforce-misc/trellis/issues/1206) (study), otherwise documented |
+| [Capture disrupted and restored between two passes](#capture-disrupted-and-restored-between-two-passes) | `self_check` | [#1654](https://github.com/salesforce-misc/trellis/issues/1654) (study), otherwise documented |
 | [An unlogged source emptied by a crash or failover](#an-unlogged-source-emptied-by-a-crash-or-failover) | `self_check` | documented |
 | [A `MERGE` that moves a row to another partition](#a-merge-that-moves-a-row-to-another-partition) | `self_check` | a Postgres fix |
-| [The source renamed or re-parented and back within one pass](#the-source-renamed-or-re-parented-and-back-within-one-pass) | `self_check` | [#1210](https://github.com/salesforce-misc/trellis/issues/1210) |
+| [The source renamed or re-parented and back within one pass](#the-source-renamed-or-re-parented-and-back-within-one-pass) | `self_check` | [#1652](https://github.com/salesforce-misc/trellis/issues/1652) |
 | [A short-lived leaf beside a `DEFAULT` partition](#a-short-lived-leaf-beside-a-default-partition) | `self_check` | documented |
-| [A leaf detached and attached again around a `pg_upgrade`](#a-leaf-detached-and-attached-again-around-a-pg_upgrade) | `self_check` | [#1210](https://github.com/salesforce-misc/trellis/issues/1210) |
+| [A leaf detached and attached again around a `pg_upgrade`](#a-leaf-detached-and-attached-again-around-a-pg_upgrade) | `self_check` | [#1652](https://github.com/salesforce-misc/trellis/issues/1652) |
 | **Changes made outside Trellis to what it owns** | | |
 | [Rows written into a target, a hidden table or Trellis's schema](#rows-written-into-a-target-a-hidden-table-or-trelliss-schema) | `self_check`, except Trellis's schema | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
 | [Part of the database restored from another point in time](#part-of-the-database-restored-from-another-point-in-time) | `self_check` | [#1209](https://github.com/salesforce-misc/trellis/issues/1209) |
@@ -99,8 +99,9 @@ definition reads, in one of these shapes:
 ALTER TABLE orders ALTER COLUMN amount SET DEFAULT 0;
 ALTER TABLE orders ALTER COLUMN amount TYPE integer USING amount * 10;
 
--- A widening that changes values:
-ALTER TABLE orders ALTER COLUMN amount TYPE bigint USING amount * 10;
+-- A widening that changes values, of a column no copy Trellis keeps
+-- outgrows:
+ALTER TABLE orders ALTER COLUMN price TYPE numeric(12,2) USING price * 10;
 ```
 
 or a same-type `USING` rewrite of a column that has:
@@ -111,6 +112,10 @@ or a same-type `USING` rewrite of a column that has:
   STORAGE`), rewritten for the first time since;
 * a non-default collation, rewritten without restating `COLLATE`.
 
+A widening that outgrows a copy Trellis keeps (`integer` to `bigint` under
+`amount AS amount` or `SUM(amount)`) pauses those readers instead, and their
+`RESUME` rebuilds them.
+
 **What goes wrong:** the statement rewrites the table without firing a
 trigger, so every target reading the column keeps the old values. A 1-1
 target's row is repaired by the next write that changes a column it reads in
@@ -120,7 +125,7 @@ its source row; an aggregate or `JOIN` target stays wrong until it's rebuilt.
 
 **Repair:** right after the `ALTER`, `request_backfill` the table.
 
-**Ends with:** [#1206](https://github.com/salesforce-misc/trellis/issues/1206),
+**Ends with:** [#1654](https://github.com/salesforce-misc/trellis/issues/1654),
 a false-positive study of signals that would catch these shapes. Event
 triggers would see every rewrite but need superuser, and logical decoding has
 the same blind spot: `pgoutput` never sends a rewrite's rows.
@@ -275,7 +280,7 @@ removes them.
 
 **Repair:** `request_backfill` the table, or `PAUSE`/`RESUME` its readers.
 
-**Ends with:** [#1206](https://github.com/salesforce-misc/trellis/issues/1206)
+**Ends with:** [#1654](https://github.com/salesforce-misc/trellis/issues/1654)
 studies a signal for the attach and inherit shapes. The others are documented:
 a replaced function's footprint also moves on routine `GRANT`s and owner
 changes, and a restore leaves nothing to compare.
@@ -342,7 +347,7 @@ Nothing in the catalog differs afterwards.
 `request_backfill` it. To avoid it, rename or re-parent a source only while
 its transforms are paused.
 
-**Ends with:** [#1210](https://github.com/salesforce-misc/trellis/issues/1210).
+**Ends with:** [#1652](https://github.com/salesforce-misc/trellis/issues/1652).
 
 ### A short-lived leaf beside a `DEFAULT` partition
 
@@ -381,7 +386,7 @@ groups the missed writes touched stay as they were.
 maintenance before an upgrade, and after the upgrade before detaching or
 attaching a partition.
 
-**Ends with:** [#1210](https://github.com/salesforce-misc/trellis/issues/1210).
+**Ends with:** [#1652](https://github.com/salesforce-misc/trellis/issues/1652).
 
 ## Changes made outside Trellis to what it owns
 

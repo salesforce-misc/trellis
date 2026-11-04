@@ -250,8 +250,10 @@ pub use staging::{
 };
 
 // --- Tier 2: the error types the public errors wrap -----------------------
-// Re-exported here even though they originate in `pub(crate)` modules: an
-// embedder handed an `Error` must be able to name and match its payload.
+// Re-exported here even though they originate in `pub(crate)` modules, so an
+// embedder handed an `Error` can name and match its variants. Some variants
+// carry engine types an embedder can't name; the error contract is `code()`
+// and `Display` (ADR-0010 decision 4), not the payloads.
 pub use defs::catalog::CatalogError;
 pub use defs::ddl::DdlError;
 pub use defs::error::ParseError;

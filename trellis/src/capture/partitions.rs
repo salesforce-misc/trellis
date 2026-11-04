@@ -22,9 +22,11 @@
 //!   renamed, which the lifecycle fingerprint, walking down from the root,
 //!   cannot.
 //!
-//! It does not cover the root's `pg_class.xmin`, which moves on `GRANT`, an
-//! owner change, a reloption, `VACUUM FULL` and `CLUSTER` and would force a
-//! deep check, and a correction, for each. (A `VACUUM FREEZE` of `pg_inherits`
+//! It does not cover the root's `pg_class.xmin`, which moves on `GRANT` (a
+//! repeated one included), an owner change, `ADD COLUMN`, a `CHECK` change,
+//! an RLS toggle and `REPLICA IDENTITY`, and would force a deep check, and a
+//! correction, for each. (`VACUUM FULL`, `CLUSTER`, `REINDEX` and `ANALYZE`
+//! leave a partitioned root's row as it was.) (A `VACUUM FREEZE` of `pg_inherits`
 //! itself leaves the `xmin` column as it was: it reports the raw value, and
 //! freezing only sets a flag.)
 //!

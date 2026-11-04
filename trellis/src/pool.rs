@@ -915,11 +915,11 @@ pub(crate) const ROW_SECURITY_OFF: &str = "set row_security to off";
 ///   statement that runs in 40 ms.
 ///
 /// The statements that do read a whole table (a group-basis build's or
-/// rebuild's absolute write, a 1-1 build's chunk and the resume's sweep) gain
-/// nothing
-/// from JIT either: at 5M rows each takes the same time, within 2%, with it
+/// rebuild's absolute write) gained nothing from JIT either on the narrow
+/// shapes measured: at 5M rows each took the same time, within 2%, with it
 /// on or off, since its time goes to writing, sorting and hashing rows, not
-/// to evaluating expressions.
+/// to evaluating expressions. Whether wider or expression-heavy shapes gain
+/// is open research (#1651).
 ///
 /// It is applied by [`session_bootstrap`] and [`dedicated_session_setup`],
 /// so every connection Trellis opens itself carries it, whatever the

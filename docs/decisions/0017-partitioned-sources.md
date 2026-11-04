@@ -165,8 +165,9 @@ or gains a level two deep, which the compliance fingerprint sees.
 same bound within one pass; without it, every trial of a detach, modify and
 re-attach with the triggers dropped ended wrong. Persisting them means a
 restart can't forget a change. Adding the source's own `pg_class.xmin` would also fire
-on a `GRANT`, an owner change, a reloption, `VACUUM FULL` or `CLUSTER`, and each
-firing would force a full rebuild.
+on a `GRANT` (even a repeated one), an owner change, `ADD COLUMN`, a `CHECK`
+change, an RLS toggle or `REPLICA IDENTITY`, and each firing would force a full
+rebuild.
 
 Why not an event trigger, which would see DDL sooner? It needs a superuser, some
 hosts don't offer one, and I found it fires neither for an interrupted
