@@ -350,6 +350,16 @@ pub(crate) fn supported_join_key_types() -> String {
     names.join(", ")
 }
 
+/// Every entry of [`TEXT_STABLE_JOIN_KEY_TYPES`], as the key it admits: what
+/// the feature-floor manifest (`super::floor_manifest`) lists.
+#[cfg(test)]
+pub(super) fn listed_join_keys() -> Vec<JoinKey> {
+    TEXT_STABLE_JOIN_KEY_TYPES
+        .iter()
+        .map(|spec| JoinKey::Listed(spec.name))
+        .collect()
+}
+
 /// Whether `pg_type` (a `format_type` rendering, e.g. `integer`, `character
 /// varying(255)`) is in [`TEXT_STABLE_JOIN_KEY_TYPES`] — the single source of truth
 /// both [`super::validate::validate_join`] (`JOIN` keys) and

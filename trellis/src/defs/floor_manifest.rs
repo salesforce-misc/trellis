@@ -1,6 +1,8 @@
 //! The feature-floor manifest, `.github/feature-floors.txt` (ADR-0024): every
-//! registry entry with its release, and every admission the validator's type
-//! rules make over every operand type, with the case that admits it.
+//! registry entry with its release, every admission the validator's type
+//! rules make over every operand type, with the case that admits it, and
+//! every key type the `GROUP BY`, join-key and primary-key, and
+//! partition-key gates admit, with the entry that admits it.
 //!
 //! The compiler makes each registry entry and each type-rule case declare a
 //! release, but it can't see an admission that reuses an existing case: a
@@ -13,7 +15,12 @@
 //! it, and none may be above the crate's release.
 //!
 //! It also fails an admission that records no case: every type the validator
-//! admits goes through a [`TypeRule`] with a release.
+//! admits goes through a [`TypeRule`] or a key-type entry with a release.
+//!
+//! A join or primary key is admitted by its `format_type` rendering, an open
+//! set of strings, so those probes try a fixed list of renderings
+//! ([`KEY_TYPE_RENDERINGS`] and the registries' own names): an old entry
+//! made to admit a rendering outside it goes unseen.
 //!
 //! To accept a change: `TRELLIS_BLESS_FEATURE_FLOORS=1 cargo test -p trellis
 //! --lib floor_manifest`.
@@ -22,16 +29,46 @@ use std::collections::HashMap;
 
 use super::ast::{JoinKind, Operator, ValueType};
 use super::floor::{ExprNode, Feature, KeySpaceKind, Layout, PredicateKind, collect};
+use super::join_key_types::JoinKey;
 use super::pg_type::PgType;
 use super::registry::{
     AggregateAdmissionRule, AggregateRule, ArgValue, ArithmeticRule, CastRule, ComparisonRule,
-    DateArithmeticRule, ExtractRule, TypeRule, UnifyRule,
+    DateArithmeticRule, ExtractRule, GroupByKeyRule, TypeRule, UnifyRule,
 };
 use crate::float::FloatWidth;
 use crate::integer::IntWidth;
 
 const MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../.github/feature-floors.txt");
 const BLESS: &str = "TRELLIS_BLESS_FEATURE_FLOORS";
+
+/// `format_type` renderings a key-type probe tries besides the registries'
+/// own names: modified and SQL-standard spellings of the listed families,
+/// and types the allowlists refuse.
+const KEY_TYPE_RENDERINGS: &[&str] = &[
+    "numeric(10,2)",
+    "real",
+    "double precision",
+    "boolean",
+    "character varying(255)",
+    "character",
+    "character(3)",
+    "\"char\"",
+    "name",
+    "citext",
+    "time without time zone",
+    "time(3) without time zone",
+    "time with time zone",
+    "timestamp(3) without time zone",
+    "timestamp with time zone",
+    "timestamp(3) with time zone",
+    "timestamp without time zone",
+    "bit(8)",
+    "\"bit\"",
+    "bit varying(8)",
+    "integer[]",
+    "int4",
+    "public.e",
+];
 
 /// `all`, after checking it holds each value of an enum exactly once:
 /// `index` is an exhaustive `match` numbering the variants, so a new variant
@@ -211,6 +248,24 @@ fn type_rules() -> Vec<TypeRule> {
         T::AggregateAdmission(AggregateAdmissionRule::Count),
         T::AggregateAdmission(AggregateAdmissionRule::SumAvgInteger),
         T::AggregateAdmission(AggregateAdmissionRule::SumAvgScaledNumeric),
+        T::GroupByKey(GroupByKeyRule::Integer),
+        T::GroupByKey(GroupByKeyRule::Numeric),
+        T::GroupByKey(GroupByKeyRule::Text),
+        T::GroupByKey(GroupByKeyRule::Uuid),
+        T::GroupByKey(GroupByKeyRule::Boolean),
+        T::GroupByKey(GroupByKeyRule::Oid),
+        T::GroupByKey(GroupByKeyRule::Bytea),
+        T::GroupByKey(GroupByKeyRule::Date),
+        T::GroupByKey(GroupByKeyRule::Time),
+        T::GroupByKey(GroupByKeyRule::TimeTz),
+        T::GroupByKey(GroupByKeyRule::Timestamp),
+        T::GroupByKey(GroupByKeyRule::TimestampTz),
+        T::GroupByKey(GroupByKeyRule::Cidr),
+        T::GroupByKey(GroupByKeyRule::MacAddr),
+        T::GroupByKey(GroupByKeyRule::MacAddr8),
+        T::GroupByKey(GroupByKeyRule::Inet),
+        T::GroupByKey(GroupByKeyRule::VarBit),
+        T::GroupByKey(GroupByKeyRule::Enum),
     ];
     every(&all, |rule| match rule {
         T::Arithmetic(r) => match r {
@@ -267,6 +322,26 @@ fn type_rules() -> Vec<TypeRule> {
             AggregateAdmissionRule::Count => 36,
             AggregateAdmissionRule::SumAvgInteger => 37,
             AggregateAdmissionRule::SumAvgScaledNumeric => 38,
+        },
+        T::GroupByKey(r) => match r {
+            GroupByKeyRule::Integer => 39,
+            GroupByKeyRule::Numeric => 40,
+            GroupByKeyRule::Text => 41,
+            GroupByKeyRule::Uuid => 42,
+            GroupByKeyRule::Boolean => 43,
+            GroupByKeyRule::Oid => 44,
+            GroupByKeyRule::Bytea => 45,
+            GroupByKeyRule::Date => 46,
+            GroupByKeyRule::Time => 47,
+            GroupByKeyRule::TimeTz => 48,
+            GroupByKeyRule::Timestamp => 49,
+            GroupByKeyRule::TimestampTz => 50,
+            GroupByKeyRule::Cidr => 51,
+            GroupByKeyRule::MacAddr => 52,
+            GroupByKeyRule::MacAddr8 => 53,
+            GroupByKeyRule::Inet => 54,
+            GroupByKeyRule::VarBit => 55,
+            GroupByKeyRule::Enum => 56,
         },
     })
 }
@@ -379,7 +454,9 @@ fn features() -> Vec<Feature> {
         | Feature::CastTarget(_)
         | Feature::Layout(_)
         | Feature::TypeRule(_)
-        | Feature::Value(_) => usize::MAX,
+        | Feature::Value(_)
+        | Feature::JoinKey(_)
+        | Feature::PartitionKeyType(_) => usize::MAX,
     }));
     let mut names: Vec<&'static str> = r::FUNCTIONS
         .iter()
@@ -412,6 +489,24 @@ fn features() -> Vec<Feature> {
     for (specs, kind) in values {
         features.extend(specs.iter().map(|spec| Feature::Value(kind(spec.value))));
     }
+    // One stand-in per variant, numbered exhaustively; a listed key expands
+    // to every allowlist entry.
+    let join_keys = [JoinKey::Listed(""), JoinKey::Enum];
+    for key in every(&join_keys, |k| match k {
+        JoinKey::Listed(_) => 0,
+        JoinKey::Enum => 1,
+    }) {
+        match key {
+            JoinKey::Listed(_) => features.extend(
+                super::join_key_types::listed_join_keys()
+                    .into_iter()
+                    .map(Feature::JoinKey),
+            ),
+            JoinKey::Enum => features.push(Feature::JoinKey(key)),
+        }
+    }
+    let (partition_keys, _) = super::partition_tree::key_type_admissions();
+    features.extend(partition_keys.into_iter().map(Feature::PartitionKeyType));
     features
 }
 
@@ -430,6 +525,9 @@ fn admissions<T: std::fmt::Debug>(
         .iter()
         .filter_map(|feature| match feature {
             Feature::TypeRule(rule) => Some(format!("{rule:?} {}", rule.since())),
+            Feature::JoinKey(_) | Feature::PartitionKeyType(_) => {
+                feature.since().map(|since| format!("{feature:?} {since}"))
+            }
             _ => None,
         })
         .collect();
@@ -440,7 +538,7 @@ fn admissions<T: std::fmt::Debug>(
     assert!(
         !rules.is_empty(),
         "{call} is admitted ({result:?}) without a type rule: return an `Admitted` \
-         naming a `TypeRule` case with its release"
+         naming a `TypeRule` case or a key-type entry with its release"
     );
     for rule in rules {
         lines.push(format!("admit {call} = {result:?} by {rule}"));
@@ -540,6 +638,60 @@ fn manifest() -> String {
             }
         }
     }
+    for &t in &types {
+        admissions(
+            &mut lines,
+            format!("group_by_key({t:?})"),
+            Result::is_ok,
+            || super::validate::reject_unsupported_group_by_key_type("c", t),
+        );
+    }
+    // A `JOIN ... ON` key and a source's primary key are admitted by a
+    // `format_type` rendering, not a `ValueType`: every allowlisted name and
+    // every partition-key name, the name of every `PgType`, and the other
+    // renderings of the families those cover (modifiers, the SQL-standard
+    // spellings, refused neighbours). A new entry is a new `feature` line
+    // above; a probe here catches an old entry made to admit another name.
+    let (partition_keys, admit_partition_key) = super::partition_tree::key_type_admissions();
+    let mut key_names: Vec<&str> = super::join_key_types::listed_join_keys()
+        .into_iter()
+        .filter_map(|key| match key {
+            JoinKey::Listed(name) => Some(name),
+            JoinKey::Enum => None,
+        })
+        .chain(partition_keys)
+        .chain(types.iter().filter_map(|t| match t {
+            ValueType::Other(p) => Some(p.name()),
+            _ => None,
+        }))
+        .chain(KEY_TYPE_RENDERINGS.iter().copied())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    key_names.retain(|name| seen.insert(*name));
+    // An enum type, which no list names: the catalog says it is one.
+    admissions(
+        &mut lines,
+        "key(enum)".to_string(),
+        |admitted: &bool| *admitted,
+        || super::join_key_types::admit_join_key("public.e", true),
+    );
+    for name in key_names {
+        admissions(
+            &mut lines,
+            format!("key({name:?})"),
+            |admitted: &bool| *admitted,
+            || super::join_key_types::admit_join_key(name, false),
+        );
+        if let Some(entry) = admit_partition_key(name) {
+            let feature = Feature::PartitionKeyType(entry);
+            let since = feature
+                .since()
+                .unwrap_or_else(|| panic!("{feature:?} has no release"));
+            lines.push(format!(
+                "admit partition_key({name:?}) = {entry:?} by {feature:?} {since}"
+            ));
+        }
+    }
     // The one admission that reads the operand's syntax: a float beside a
     // bare number literal.
     for &t in &types {
@@ -569,8 +721,9 @@ fn manifest() -> String {
         "# The feature-floor manifest (ADR-0024), generated by trellis's\n\
          # `defs::floor_manifest` test: every registry entry and type-rule case\n\
          # with the release it arrived in, and every admission the validator's\n\
-         # type rules make, with the case that admits it. check-floors.py\n\
-         # compares it with the newest released tag's. Regenerate with\n\
+         # type rules and key-type gates make, with the case that admits it.\n\
+         # check-floors.py compares it with the newest released tag's.\n\
+         # Regenerate with\n\
          # TRELLIS_BLESS_FEATURE_FLOORS=1 cargo test -p trellis --lib floor_manifest\n",
     );
     for line in lines {

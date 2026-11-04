@@ -99,6 +99,17 @@ pub(crate) fn key_type_since(name: &str) -> Option<Release> {
         .map(|spec| spec.since)
 }
 
+/// Every entry of [`SUPPORTED_KEY_TYPES`] by name, and the entry that admits
+/// a partition key of `pg_type`: what the feature-floor manifest
+/// (`super::floor_manifest`) lists.
+#[cfg(test)]
+pub(super) fn key_type_admissions() -> (Vec<&'static str>, fn(&str) -> Option<&'static str>) {
+    (
+        SUPPORTED_KEY_TYPES.iter().map(|spec| spec.name).collect(),
+        admitted_key_type,
+    )
+}
+
 /// The supported partition-key types as the refusal message lists them.
 fn supported_key_types() -> String {
     let names: Vec<&str> = SUPPORTED_KEY_TYPES.iter().map(|spec| spec.name).collect();
