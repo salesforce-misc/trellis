@@ -20,6 +20,8 @@ class ForkTest < Minitest::Test
     "config" => -> { Trellis.config },
     "definitions" => -> { Trellis.definitions },
     "dump_definitions_sql" => -> { Trellis.dump_definitions_sql },
+    "schema_dump" => -> { Trellis.schema_dump },
+    "filter_schema_dump" => -> { Trellis.filter_schema_dump("") },
     "request_backfill" => -> { Trellis.request_backfill("t") },
     "release_key" => -> { Trellis.release_key("t", "s", "1") },
     "poisoned_since" => -> { Trellis.poisoned_since(Time.now) },

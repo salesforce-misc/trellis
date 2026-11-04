@@ -521,9 +521,8 @@ true, drain_threads: 1`), because the resume rebuilds through them.
 A Rails app that uses Trellis dumps its schema as `structure.sql`
 (`config.active_record.schema_format = :sql`), and the dump carries Trellis's
 definitions, the way it carries `schema_migrations`. `schema.rb` can't carry
-another schema's tables or triggers, so with `schema_format = :ruby` the dump
-(`db:migrate`'s and `db:schema:dump`) raises `Trellis::ValidationError` and
-writes nothing.
+them, so with `schema_format = :ruby` the dump (`db:migrate`'s and
+`db:schema:dump`) raises `Trellis::ValidationError` and writes nothing.
 
 ```ruby
 # config/application.rb
@@ -531,49 +530,62 @@ config.active_record.schema_format = :sql
 config.trellis.connect = { url: ENV.fetch("DATABASE_URL") }
 ```
 
-Nothing else is set up. After `pg_dump`, `db:migrate`'s dump and
-`db:schema:dump` append `Trellis::Instance#dump_definitions_sql` for
-`config.trellis.connect` and each of `config.trellis.instances`: Trellis's
-migration history, the instance marker, the transform
-definitions and the seed rows capture needs. The Railtie also adds each
-instance's `schema` and `target_schema` to the `--schema` flags Rails passes
-`pg_dump` (nothing is added when Rails dumps every schema), so the Trellis
-tables, the target tables and the capture triggers are in the file.
-`db:schema:load`, `db:prepare`, `db:setup` and the test database
-`maintain_test_schema!` loads then build a database with every definition in
-place. Each loads as `waiting_to_backfill`, and the worker builds it from the
-source rows; a test database has none, so that is immediate. Runtime state
-(ledger, ring, build chunks, quarantine, claims, statuses) is never dumped.
+Nothing else is set up. The file has the application's tables, the target
+tables (with their indexes and grants), and one row per definition: its
+source, target and `JOIN` table, its text as written, its grammar version
+and its floor. Trellis's own schema, the capture triggers on source tables
+and the 1-1 targets' ledgers are not in it, so regenerating the dump changes
+it only where a definition changed. `db:schema:load`, `db:prepare`,
+`db:setup` and the test database `maintain_test_schema!` loads then run
+`migrate` for `config.trellis.connect` and each of `config.trellis.instances`,
+which creates Trellis's tables and restores each definition into its dumped
+target. Each is restored unbuilt, and the worker builds it from the source
+rows; a test database has none, so that is immediate. A file loaded another
+way (`psql -f structure.sql`) needs `bin/rails trellis:migrate` after it.
+How the restore works, and what it refuses, is in
+[`docs/embedding.md`](../../docs/embedding.md#schema-dumps).
 
-- The hook applies to one database config, `config.trellis.dump_database`
+- The hooks apply to one database config, `config.trellis.dump_database`
   (default `"primary"`): the one `config.trellis.connect` and
-  `config.trellis.instances` point at. Other databases dump as Rails dumps
-  them. The dump raises `Trellis::ValidationError`, writing nothing, when
-  `config.trellis.connect` or an instance points at a different database than
-  that config. They are compared by host, port and database name: the Rails
-  config's as libpq resolves them (`PGHOST`, `PGPORT` and `PGDATABASE`
-  included), Trellis's `url` from the url alone (port 5432, database the
-  user's name). A config with no host uses libpq's local socket, which
-  matches a local Trellis host (`localhost`, `127.0.0.1`, `::1` or a socket
-  directory). Other host spellings are not equated, so `localhost` is not
-  `127.0.0.1`. `db:prepare` in development also dumps the test database
-  after migrating it; that dump is checked against development's config of
-  the same name, which `config.trellis.connect` points at.
-- `pg_dump` and `dump_definitions_sql` read separate snapshots. The hook reads
-  the definitions before and after the `pg_dump` and redoes the dump when they
-  differ (three attempts, then `Trellis::ConflictError`), so a define or drop
-  that races a dump can't leave tables and definitions disagreeing.
+  `config.trellis.instances` point at. Other databases dump and load as Rails
+  does it. The dump and the load raise `Trellis::ValidationError`, the dump
+  writing nothing, when `config.trellis.connect` or an instance points at a
+  different database than that config. They are compared by host, port and
+  database name: the Rails config's as libpq resolves them (`PGHOST`,
+  `PGPORT` and `PGDATABASE` included), Trellis's `url` from the url alone
+  (port 5432, database the user's name). A config with no host uses libpq's
+  local socket, which matches a local Trellis host (`localhost`,
+  `127.0.0.1`, `::1` or a socket directory). Other host spellings are not
+  equated, so `localhost` is not `127.0.0.1`.
+- `db:prepare` in development also dumps and loads the test database, and
+  `db:test:prepare` loads it. That dump is checked against development's
+  config of the same name, which `config.trellis.connect` points at, and the
+  load's restore connects to the test database: the configured options with
+  the test config's database, and its host, port, user and password where it
+  names them (its `url` when it has one).
+- The hook adds each instance's exclusions (its Trellis schema, its ledgers)
+  to the flags Rails passes `pg_dump`, and its `target_schema` to the
+  `--schema` flags when Rails passes any. `pg_dump` can't leave out one
+  trigger, so the hook takes the capture triggers out of its output
+  (`Trellis::Instance#filter_schema_dump`).
+- `pg_dump` and `Trellis::Instance#schema_dump` read separate snapshots. The
+  hook reads the definitions before and after the `pg_dump` and redoes the
+  dump when they differ (three attempts, then `Trellis::ConflictError`), so a
+  define or drop that races a dump can't leave tables and definitions
+  disagreeing.
 - A definition that was paused or quarantined where the dump was taken loads
-  as `waiting_to_backfill`: the pause is runtime state.
+  unpaused: the pause is runtime state.
+- A `structure.sql` written by an earlier release, which carries Trellis's
+  schema and its definitions' catalog rows, still loads as it did.
 - `pg_dump` 17 writes `CREATE SCHEMA public`, which a database made by
   `db:create` already has; the hook writes `CREATE SCHEMA IF NOT EXISTS
   public` instead.
 - The dump connects through `Trellis::Railtie.with_handle`, so it migrates
   Trellis's tables first if the database lacks them, and starts no worker.
 - It hooks `ActiveRecord::Tasks::DatabaseTasks.dump_schema` and
-  `PostgreSQLDatabaseTasks#structure_dump`, which Rails marks `:nodoc:` and
-  offers no extension point for. A Rails upgrade that renames them fails the
-  test suite's round trip (`test/schema_dump_test.rb`).
+  `.load_schema`, and `PostgreSQLDatabaseTasks#structure_dump`, which Rails
+  marks `:nodoc:` and offers no extension point for. A Rails upgrade that
+  renames them fails the test suite's round trip (`test/schema_dump_test.rb`).
 
 ## Layout
 

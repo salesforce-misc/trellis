@@ -65,7 +65,8 @@ module Trellis
   #   TRANSFORM) and reports what it did
   #   as an Applied. define is the one guarded convenience: an apply that
   #   refuses anything but a TRANSFORM statement before applying it.
-  # - Reads: status, definitions, dump_definitions_sql.
+  # - Reads: status, definitions, schema_dump, filter_schema_dump,
+  #   dump_definitions_sql.
   # - Quarantine: quarantined, quarantine_status, sample_quarantined,
   #   poisoned_since, release_key. Pausing and resuming are statements:
   #   instance.apply("RESUME TRANSFORM order_totals.total").
@@ -334,6 +335,35 @@ module Trellis
     # pg_dump and retries when the two differ.
     def dump_definitions_sql
       handle.dump_definitions_sql
+    end
+
+    # What a schema dump of this instance's database needs, as a frozen Hash:
+    # :pg_dump_args, the arguments (each one argument, not shell words) that
+    # leave Trellis's own schema and the 1-1 targets' ledgers out of
+    # `pg_dump`, and :appendix, the SQL to append after the dump. Run
+    # `pg_dump --schema-only` with pg_dump_args (and the target schema among
+    # the dump's `--schema`s, if it names any), pass the output through
+    # filter_schema_dump, and append the appendix. Both are the same for the
+    # same definitions, whatever their history. A database loaded from the file has the application's
+    # schema and the target tables; `migrate` restores every definition into
+    # its target, each unbuilt, and the worker builds them. Trellis's own
+    # schema, the capture triggers and the ledgers are not in the dump.
+    #
+    # Read from one snapshot, a different one from the pg_dump's: the Rails
+    # hook (Trellis::SchemaDump) reads it on both sides of the pg_dump and
+    # retries when the two differ.
+    def schema_dump
+      pg_dump_args, appendix = handle.schema_dump
+      { pg_dump_args: pg_dump_args.freeze, appendix: appendix.freeze }.freeze
+    end
+
+    # pg_dump_output, the output of a `pg_dump` run with schema_dump's
+    # pg_dump_args, without this instance's capture triggers on its source
+    # tables, which `pg_dump` can't leave out by itself. Reads nothing from
+    # the database. Raises Trellis::InternalError if a line still runs one of
+    # Trellis's functions afterwards: the dump wouldn't load.
+    def filter_schema_dump(pg_dump_output)
+      handle.filter_schema_dump(pg_dump_output)
     end
 
     # Rebuilds every definition that reads source_table (a bare table name,

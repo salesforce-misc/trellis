@@ -7,41 +7,56 @@ require "trellis/pg"
 module Trellis
   # Makes `structure.sql` carry Trellis's definitions, the way Rails makes it
   # carry `schema_migrations`: after `pg_dump` writes the schema, the dump
-  # appends the `INSERT`s that describe how the schema came to be. A database
-  # built from the file (`db:schema:load`, `db:prepare`, the test database
-  # `maintain_test_schema!` loads) then has every transform defined, with no
-  # Trellis step to run: Trellis's worker finds the definitions unbuilt and builds them (ADR-0010).
+  # appends the rows that describe how the schema came to be. The dump has
+  # the application's schema and the target tables, and one row per
+  # definition (Trellis::Instance#schema_dump). Trellis's own schema, the
+  # capture triggers on source tables and the 1-1 targets' ledgers are left
+  # out: a database built from the file gets them from the loading release,
+  # whose `migrate` restores each definition into its dumped target (ADR-0025).
   #
   # Needs `config.active_record.schema_format = :sql`: a `schema.rb` can't
-  # carry another schema's tables or triggers. With `:ruby`, the dump raises
+  # carry the definitions. With `:ruby`, the dump raises
   # Trellis::ValidationError and writes nothing: a `schema.rb` would load
   # into a database with target tables and no definitions.
   #
-  # It hooks the two places Rails offers no extension point for (both the
-  # `db:schema:dump` task and the dump after `db:migrate` call them):
+  # It hooks the places Rails offers no extension point for:
   #
-  # - ActiveRecord::Tasks::DatabaseTasks.dump_schema, whose `:sql` branch
-  #   is `pg_dump` followed by the `schema_migrations` rows. This hook adds
-  #   the Trellis rows after them: Trellis::Instance#dump_definitions_sql
-  #   for the default instance and each of config.trellis.instances. Those
-  #   rows are read before and after the `pg_dump`, which reads its own
-  #   snapshot, and the dump is redone (up to three times) when a define or
-  #   drop committed in between, so the DDL and the rows agree.
-  # - ActiveRecord::Tasks::PostgreSQLDatabaseTasks#structure_dump, which
-  #   passes `--schema` only for the search path's schemas. This hook adds
-  #   each instance's `schema` and `target_schema`, so the Trellis tables and
-  #   capture triggers are in the dump. (Nothing is added when Rails dumps
-  #   every schema anyway, `ActiveRecord.dump_schemas = :all` or no
-  #   `schema_search_path`.)
+  # - ActiveRecord::Tasks::DatabaseTasks.dump_schema (the `db:schema:dump`
+  #   task and the dump after `db:migrate` both call it), whose `:sql`
+  #   branch is `pg_dump` followed by the `schema_migrations` rows. This
+  #   hook takes the capture triggers out of the `pg_dump` output
+  #   (Trellis::Instance#filter_schema_dump) and adds the definitions'
+  #   rows after the `schema_migrations` ones, for the default instance and
+  #   each of config.trellis.instances. Those rows are read before and after
+  #   the `pg_dump`, which reads its own snapshot, and the dump is redone (up
+  #   to three times) when a define or drop committed in between, so the DDL
+  #   and the rows agree.
+  # - ActiveRecord::Tasks::PostgreSQLDatabaseTasks#structure_dump. This hook
+  #   adds each instance's `pg_dump_args` (which exclude the Trellis schema
+  #   and the ledgers) and, when Rails passes `--schema` for the search
+  #   path's schemas, each instance's `target_schema`.
+  # - ActiveRecord::Tasks::DatabaseTasks.load_schema, which
+  #   `db:schema:load`, `db:prepare` and the test database's
+  #   `maintain_test_schema!` load the file with. After the load, this hook
+  #   runs `migrate` for each configured instance, which restores the
+  #   definitions (a file in the older format, which carries Trellis's
+  #   schema, needs nothing more and loads as before). A load of another
+  #   environment's database (`db:prepare` in development prepares the test
+  #   database too, and `db:test:prepare` the test one) runs it against
+  #   that database: the instances' options with the database's host, port,
+  #   name, user and password from its config.
   #
-  # Both apply to one database: the config named by
+  # A load that doesn't go through Rails (`psql -f structure.sql`) is followed
+  # by `rails trellis:migrate`.
+  #
+  # All three apply to one database: the config named by
   # `config.trellis.dump_database` (default "primary"), the one
   # config.trellis.connect and config.trellis.instances point at. The other
-  # databases of a multi-database app dump as Rails dumps them.
+  # databases of a multi-database app dump and load as Rails does it.
   #
   # A dump lists definitions and nothing else of Trellis's state. Every
-  # definition loads as `waiting_to_backfill`, as a `define` leaves it,
-  # including one that was paused or quarantined where the dump was taken.
+  # definition loads unbuilt, as a `define` leaves it, including one that
+  # was paused or quarantined where the dump was taken.
   #
   # `pg_dump` 17 writes `CREATE SCHEMA public` when `public` is dumped,
   # which fails to load into a database that has one (every database
@@ -54,18 +69,21 @@ module Trellis
     # socket) matches, besides a socket directory.
     LOCAL_HOSTS = %w[localhost 127.0.0.1 ::1].freeze
 
-    HEADER = <<~SQL
-      --
-      -- Trellis definitions (Trellis::Instance#dump_definitions_sql)
-      --
-
-    SQL
+    # The thread-local the dump hook leaves the parts it read before the
+    # `pg_dump` in, for the structure-dump hook's arguments.
+    PARTS_KEY = :trellis_schema_dump_parts
 
     class << self
       # Installs the hooks. Idempotent.
       def install
         ::ActiveRecord::Tasks::DatabaseTasks.singleton_class.prepend(DatabaseTasksHook)
         ::ActiveRecord::Tasks::PostgreSQLDatabaseTasks.prepend(StructureDumpHook)
+      end
+
+      # The schema format of a dump or load of db_config: the format
+      # argument args carries, or Rails' default for db_config.
+      def format_of(db_config, args)
+        args.first || (db_config.respond_to?(:schema_format) ? db_config.schema_format : ::ActiveRecord.schema_format)
       end
 
       # Whether Trellis's definitions belong in the dump of db_config: Trellis
@@ -122,37 +140,101 @@ module Trellis
         (app&.config&.trellis&.dump_database || "primary").to_s
       end
 
-      # The `--schema` flags to add to the pg_dump of db_config, whose
-      # connection settings are configuration_hash.
-      def schema_flags(db_config, configuration_hash)
-        return [] unless applies?(db_config) && restricts_schemas?(configuration_hash)
+      # The flags to add to the pg_dump of db_config, whose connection
+      # settings are configuration_hash: each instance's pg_dump_args, and its
+      # target schema when Rails names the schemas to dump. parts are the
+      # instances' schema_dump Hashes (Trellis::Instance#schema_dump), read now when the dump hook
+      # hasn't.
+      def schema_flags(db_config, configuration_hash, parts = nil)
+        return [] unless applies?(db_config)
 
-        schemas = []
-        default = Railtie.connect_options
-        schemas << default if default
-        schemas.concat(Railtie.instance_options.values)
-        schemas.flat_map { |options| [options.fetch(:schema, "trellis"), options.fetch(:target_schema, "public")] }
-               .uniq.map { |schema| "--schema=#{schema}" }
+        parts ||= Thread.current[PARTS_KEY] || self.parts
+        flags = []
+        if restricts_schemas?(configuration_hash)
+          flags.concat(configured_options.map { |options| "--schema=#{options.fetch(:target_schema, "public")}" })
+        end
+        flags.concat(parts.flat_map { |part| part.fetch(:pg_dump_args) })
+        flags.uniq
       end
 
-      # The definitions of every configured instance as SQL: each one's
-      # dump_definitions_sql.
-      def appendix
-        parts = []
-        parts << Railtie.with_handle(&:dump_definitions_sql) if Railtie.connect_options
-        Railtie.instance_options.each_key { |name| parts << Railtie.with_handle(name, &:dump_definitions_sql) }
-        parts.join("\n")
+      # Each configured instance's schema_dump Hashes (Trellis::Instance#schema_dump): the default
+      # instance's first, then config.trellis.instances' in order.
+      def parts
+        each_instance.map { |name| Railtie.with_handle(name, &:schema_dump) }
       end
 
-      # Appends appendix to the dump at filename, and makes its
-      # `CREATE SCHEMA public` loadable into a database that has one.
-      def finish(filename, appendix)
+      # The dump at filename without each instance's capture triggers, and
+      # its `CREATE SCHEMA public` loadable into a database that has one,
+      # followed by each of parts' appendix.
+      def finish(filename, parts)
         sql = File.read(filename, encoding: "utf-8")
         sql = sql.gsub(/^CREATE SCHEMA public;$/, "CREATE SCHEMA IF NOT EXISTS public;")
-        File.write(filename, "#{sql}#{HEADER}#{appendix}\n", encoding: "utf-8")
+        each_instance.each do |name|
+          sql = Railtie.with_handle(name) { |instance| instance.filter_schema_dump(sql) }
+        end
+        appendix = parts.map { |part| part.fetch(:appendix) }.join("\n")
+        File.write(filename, "#{sql}\n#{appendix}", encoding: "utf-8")
+      end
+
+      # Restores the definitions a load of db_config's dump queued: `migrate`
+      # on each configured instance, in the database db_config names.
+      def restore(db_config)
+        verify_same_database!(db_config)
+        if db_config.env_name.to_s == ::ActiveRecord::Tasks::DatabaseTasks.env.to_s
+          Railtie.migrate_all
+          return
+        end
+
+        configured = []
+        configured << [nil, Railtie.connect_options] if Railtie.connect_options
+        Railtie.instance_options.each { |name, options| configured << [name, options] }
+        configured.each do |name, options|
+          what = name ? "config.trellis.instances[#{name.inspect}]" : "config.trellis.connect"
+          url = environment_url(db_config, options[:url], what)
+          instance = Trellis::Instance.connect(**options, url:, staging: false, drain_threads: 0)
+          begin
+            instance.migrate
+          ensure
+            instance.shutdown
+          end
+        end
       end
 
       private
+
+      # nil for the default instance (when config.trellis.connect is set),
+      # then the name of each of config.trellis.instances.
+      def each_instance
+        names = []
+        names << nil if Railtie.connect_options
+        names.concat(Railtie.instance_options.keys)
+      end
+
+      def configured_options
+        options = []
+        options << Railtie.connect_options if Railtie.connect_options
+        options.concat(Railtie.instance_options.values)
+      end
+
+      # A libpq connection string for the database db_config names, in
+      # another environment than configured_url's: configured_url's
+      # settings with db_config's database, and its host, port, user and
+      # password where db_config names them (a host left to libpq's default
+      # keeps configured_url's, a local one by verify_same_database!). A
+      # db_config with a url is that url.
+      def environment_url(db_config, configured_url, what)
+        hash = db_config.configuration_hash.transform_keys(&:to_sym)
+        return hash[:url].to_s if hash[:url]
+
+        keywords = conninfo(configured_url, what).reject { |_, value| value.to_s.empty? }
+        host, port, dbname = rails_database(hash)
+        keywords["dbname"] = dbname
+        keywords["port"] = port
+        keywords["host"] = host if host
+        keywords["user"] = hash[:username].to_s if hash[:username]
+        keywords["password"] = hash[:password].to_s if hash[:password]
+        keywords.map { |key, value| "#{key}='#{value.to_s.gsub(/[\\']/) { |c| "\\#{c}" }}'" }.join(" ")
+      end
 
       # The keywords of a libpq connection string or URI. A failure names
       # what was being read and never the string or libpq's message, which
@@ -237,13 +319,11 @@ module Trellis
       def dump_schema(db_config, *args)
         return super unless SchemaDump.applies?(db_config) && db_config.schema_dump
 
-        format = args.first ||
-                 (db_config.respond_to?(:schema_format) ? db_config.schema_format : ::ActiveRecord.schema_format)
-
+        format = SchemaDump.format_of(db_config, args)
         unless format.to_sym == :sql
           raise Trellis::ValidationError,
                 "#{db_config.name}'s schema dump is #{format}, which can't carry Trellis's " \
-                "tables, triggers or definitions: set config.active_record.schema_format = :sql"
+                "definitions: set config.active_record.schema_format = :sql"
         end
 
         filename = schema_dump_path(db_config, format)
@@ -252,9 +332,14 @@ module Trellis
         SchemaDump.verify_same_database!(db_config)
 
         SchemaDump::ATTEMPTS.times do
-          before = SchemaDump.appendix
-          super(db_config, format)
-          if SchemaDump.appendix == before
+          before = SchemaDump.parts
+          begin
+            Thread.current[SchemaDump::PARTS_KEY] = before
+            super(db_config, format)
+          ensure
+            Thread.current[SchemaDump::PARTS_KEY] = nil
+          end
+          if SchemaDump.parts == before
             SchemaDump.finish(filename, before)
             return nil
           end
@@ -262,6 +347,17 @@ module Trellis
         raise Trellis::ConflictError,
               "Trellis's definitions changed during each of #{SchemaDump::ATTEMPTS} dumps of " \
               "#{db_config.name}: run the dump when no define or drop is running"
+      end
+
+      # After Rails loads the dump database's `structure.sql`, restores the
+      # definitions it queued (SchemaDump.restore).
+      def load_schema(db_config, *args)
+        result = super
+        if SchemaDump.applies?(db_config) && db_config.schema_dump &&
+           SchemaDump.format_of(db_config, args).to_sym == :sql
+          SchemaDump.restore(db_config)
+        end
+        result
       end
     end
 

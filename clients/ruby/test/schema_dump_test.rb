@@ -11,8 +11,9 @@ require "trellis/schema_dump"
 # definitions. The round trip runs Rails' own dump and load, in-process, over
 # two databases of the test cluster: define in one, dump with
 # DatabaseTasks.dump_schema, load the file into a fresh one with
-# DatabaseTasks.structure_load (what db:schema:load runs), and ask the loaded
-# database what it defines. Nothing here waits for a worker.
+# DatabaseTasks.load_schema (what db:schema:load runs), which restores the
+# definitions, and ask the loaded database what it defines. Nothing here
+# waits for a worker.
 class SchemaDumpTest < Minitest::Test
   include TrellisTestCase
 
@@ -46,7 +47,7 @@ class SchemaDumpTest < Minitest::Test
     super
   end
 
-  def test_a_dump_loaded_into_a_fresh_database_defines_what_the_source_defined
+  def test_a_dump_loaded_into_a_fresh_database_restores_what_the_source_defined
     source = database("src")
     define_in(source)
 
@@ -55,32 +56,76 @@ class SchemaDumpTest < Minitest::Test
     ActiveRecord.schema_format = :sql
     Tasks.dump_schema(db_config(source))
     structure = File.read(File.join(@dir, "structure.sql"))
-    assert_includes structure, "CREATE SCHEMA trellis"
-    assert_includes structure, "trellis.transform_definitions"
     assert_includes structure, "CREATE TABLE public.sd_totals_#{@id}"
+    assert_includes structure, "CREATE TABLE public.sd_orders_#{@id}"
     assert_includes structure, "-- Trellis definitions"
+    assert_includes structure, "insert into \"trellis\".restore_queue values (1, 'public.sd_orders_#{@id}'"
+    # Trellis's internals are left out: its schema, the capture triggers and
+    # the 1-1 target's ledger.
+    refute_includes structure, "CREATE SCHEMA trellis"
+    refute_includes structure, "trellis.transform_definitions"
+    refute_includes structure, "CREATE TRIGGER"
+    refute_includes structure, "__ledger"
     refute_match(/^CREATE SCHEMA public;/, structure)
-    assert_includes structure, "sd_totals_#{@id}"
 
     target = database("dst")
     # The database `db:create` makes has a `public` already: the dump has to
-    # load into it (pg_dump 17 writes CREATE SCHEMA public).
-    Tasks.structure_load(db_config(target), File.join(@dir, "structure.sql"))
-
+    # load into it (pg_dump 17 writes CREATE SCHEMA public). Rails' load
+    # restores the definitions.
     TrellisTestApp.config.trellis.connect = { url: dsn(target) }
-    Trellis::Railtie.with_handle do |loaded|
-      assert_equal ["public.sd_totals_#{@id}", "public.sd_grand_#{@id}"].sort,
-                   loaded.definitions.map(&:target_table).sort
-      assert_equal %i[waiting_to_backfill], loaded.definitions.map(&:status).uniq
-      assert_equal :waiting_to_backfill, loaded.status("sd_grand_#{@id}").status
-    end
-    pg = PG.connect(dsn(target))
-    begin
-      assert_equal "0", pg.exec("select count(*) from public.sd_totals_#{@id}__ledger").first.fetch("count")
-      assert_equal "0", pg.exec("select count(*) from public.sd_totals_#{@id}").first.fetch("count")
-    ensure
-      pg.close
-    end
+    Tasks.load_schema(db_config(target), :sql, File.join(@dir, "structure.sql"))
+
+    assert_loaded(target)
+  end
+
+  # A structure.sql written before the restore queue carries Trellis's
+  # schema and dump_definitions_sql's rows: it loads as it did.
+  def test_a_dump_in_the_older_format_still_loads
+    source = database("old")
+    define_in(source)
+    file = File.join(@dir, "old.sql")
+    info = TestCluster.info
+    assert system("pg_dump", "--schema-only", "--no-acl", "--no-owner", "--schema=trellis", "--schema=public",
+                  "--host=#{info.fetch("host")}", "--port=#{info.fetch("port")}",
+                  "--username=#{info.fetch("user")}", "--file=#{file}", source)
+    appendix = Trellis::Railtie.with_handle(&:dump_definitions_sql)
+    old = File.read(file).gsub(/^CREATE SCHEMA public;$/, "CREATE SCHEMA IF NOT EXISTS public;")
+    File.write(file, "#{old}\n#{appendix}\n")
+
+    target = database("old_dst")
+    TrellisTestApp.config.trellis.connect = { url: dsn(target) }
+    Tasks.load_schema(db_config(target), :sql, file)
+
+    assert_loaded(target)
+  end
+
+  # `db:prepare` in development loads the test database too, with
+  # development's config.trellis.connect: the restore runs in the test
+  # database, not development's.
+  def test_a_load_of_another_environment_s_database_restores_there
+    saved = { env: Tasks.env, configurations: ActiveRecord::Base.configurations }
+    development = database("env_dev")
+    test = database("env_test")
+    define_in(development)
+    ActiveRecord.schema_format = :sql
+    Tasks.dump_schema(db_config(development))
+
+    info = TestCluster.info
+    base = { "adapter" => "postgresql", "host" => info.fetch("host"), "port" => info.fetch("port"),
+             "username" => info.fetch("user"), "schema_search_path" => "public" }
+    ActiveRecord::Base.configurations = {
+      "development" => { "primary" => base.merge("database" => development) },
+      "test" => { "primary" => base.merge("database" => test) }
+    }
+    Tasks.env = "development"
+    test_config = ActiveRecord::Base.configurations.configs_for(env_name: "test", name: "primary")
+    Tasks.load_schema(test_config, :sql, File.join(@dir, "structure.sql"))
+
+    Tasks.env = saved.fetch(:env)
+    assert_loaded(test)
+  ensure
+    Tasks.env = saved.fetch(:env)
+    ActiveRecord::Base.configurations = saved.fetch(:configurations)
   end
 
   def test_a_dump_of_another_database_is_left_as_rails_wrote_it
@@ -211,10 +256,10 @@ class SchemaDumpTest < Minitest::Test
   def test_a_dump_redone_when_the_definitions_changed_under_it
     source = database("race")
     define_in(source)
-    reads = %w[old new new new]
+    reads = %w[old new new new].map { |appendix| [{ pg_dump_args: [], appendix: }] }
     dumps = 0
     config = db_config(source)
-    SchemaDump.stub(:appendix, -> { reads.shift }) do
+    SchemaDump.stub(:parts, -> { reads.shift }) do
       pg_dump = lambda do |_config, file|
         dumps += 1
         File.write(file, "-- dump #{dumps}\n")
@@ -233,7 +278,8 @@ class SchemaDumpTest < Minitest::Test
     define_in(source)
     serial = 0
     config = db_config(source)
-    Trellis::SchemaDump.stub(:appendix, -> { "read #{serial += 1}" }) do
+    reads = -> { [{ pg_dump_args: [], appendix: "read #{serial += 1}" }] }
+    Trellis::SchemaDump.stub(:parts, reads) do
       Tasks.stub(:structure_dump, ->(_config, file) { File.write(file, "-- dump\n") }) do
         assert_raises(Trellis::ConflictError) { Tasks.dump_schema(config, :sql) }
       end
@@ -248,19 +294,27 @@ class SchemaDumpTest < Minitest::Test
     refute File.exist?(File.join(@dir, "schema.rb"))
   end
 
-  def test_the_trellis_and_target_schemas_join_the_dump_s_schema_flags
+  def test_the_target_schemas_and_pg_dump_args_join_the_dump_s_flags
     TrellisTestApp.config.trellis.connect = { url: "unused" }
     TrellisTestApp.config.trellis.instances = {
       reports: { url: "unused", schema: "reports", target_schema: "report_targets" }
     }
     config = db_config(database("flags"))
     hash = { schema_search_path: "public" }
-    assert_equal %w[--schema=trellis --schema=public --schema=reports --schema=report_targets],
-                 Trellis::SchemaDump.schema_flags(config, hash)
-    # No --schema at all means Rails dumps every schema: nothing to add.
-    assert_empty Trellis::SchemaDump.schema_flags(config, {})
+    parts = [
+      { pg_dump_args: ['--exclude-schema="trellis"',
+                                                  '--exclude-table="public"."t__ledger"'], appendix: "" },
+      { pg_dump_args: ['--exclude-schema="reports"'], appendix: "" }
+    ]
+    assert_equal ["--schema=public", "--schema=report_targets", '--exclude-schema="trellis"',
+                  '--exclude-table="public"."t__ledger"', '--exclude-schema="reports"'],
+                 Trellis::SchemaDump.schema_flags(config, hash, parts)
+    # No --schema at all means Rails dumps every schema: only the
+    # exclusions are added.
+    exclusions = parts.flat_map { |part| part.fetch(:pg_dump_args) }
+    assert_equal exclusions, Trellis::SchemaDump.schema_flags(config, {}, parts)
     ActiveRecord.dump_schemas = :all
-    assert_empty Trellis::SchemaDump.schema_flags(config, hash)
+    assert_equal exclusions, Trellis::SchemaDump.schema_flags(config, hash, parts)
   end
 
   private
@@ -291,6 +345,25 @@ class SchemaDumpTest < Minitest::Test
     hash = { adapter: "postgresql", database:, host: info.fetch("host"), port: info.fetch("port"),
              username: info.fetch("user"), schema_search_path: "public" }
     ActiveRecord::DatabaseConfigurations::HashConfig.new("test", "primary", hash)
+  end
+
+  # The database restores what define_in defined: both definitions, unbuilt,
+  # the 1-1 target's ledger rebuilt by the restore, the targets empty.
+  def assert_loaded(database)
+    TrellisTestApp.config.trellis.connect = { url: dsn(database) }
+    Trellis::Railtie.with_handle do |loaded|
+      assert_equal ["public.sd_totals_#{@id}", "public.sd_grand_#{@id}"].sort,
+                   loaded.definitions.map(&:target_table).sort
+      assert_equal %i[waiting_to_backfill], loaded.definitions.map(&:status).uniq
+    end
+    pg = PG.connect(dsn(database))
+    begin
+      assert_equal "0", pg.exec("select count(*) from public.sd_totals_#{@id}__ledger").first.fetch("count")
+      assert_equal "0", pg.exec("select count(*) from public.sd_totals_#{@id}").first.fetch("count")
+      assert_equal "f", pg.exec("select to_regclass('trellis.restore_queue') is not null as q").first.fetch("q")
+    ensure
+      pg.close
+    end
   end
 
   # Migrates Trellis into the database, creates a source table and a 1-1 and an

@@ -23,7 +23,8 @@ class GvlTest < Minitest::Test
     {
       "status" => -> { assert_nil Trellis.status("no_such_target") },
       "definitions" => -> { assert_kind_of Array, Trellis.definitions },
-      "dump_definitions_sql" => -> { assert_kind_of String, Trellis.dump_definitions_sql }
+      "dump_definitions_sql" => -> { assert_kind_of String, Trellis.dump_definitions_sql },
+      "schema_dump" => -> { assert_kind_of Hash, Trellis.schema_dump }
     }.each do |name, call|
       holder, release = hold_lock(CATALOG, seconds: 1.0)
       begin

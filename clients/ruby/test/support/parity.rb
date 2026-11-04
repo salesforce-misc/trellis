@@ -62,7 +62,9 @@ module Parity
     "default_instance" => "Ruby's module-held default instance, for code that takes a Trellis::Instance",
     # Its result is SQL text for a dump hook, not a flattened record, so the
     # shared fixture has nothing to shape; test/schema_dump_test.rb runs it.
-    "dump_definitions_sql" => "SQL text for the schema-dump hook, tested by test/schema_dump_test.rb"
+    "dump_definitions_sql" => "SQL text for the schema-dump hook, tested by test/schema_dump_test.rb",
+    "schema_dump" => "pg_dump arguments and SQL text for the schema-dump hook, tested by test/schema_dump_test.rb",
+    "filter_schema_dump" => "rewrites pg_dump output for the schema-dump hook, tested by test/schema_dump_test.rb"
   }.freeze
 
   # The Rails integration's public calls outside the migration helpers, none

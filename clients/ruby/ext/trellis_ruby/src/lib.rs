@@ -237,6 +237,29 @@ impl Handle {
         rb_self.call(ruby, BlockingTrellis::start_dump_definitions_sql)
     }
 
+    /// What a schema dump of the database needs from this instance
+    /// ([`BlockingTrellis::schema_dump`]): `[pg_dump_args, appendix]`, the
+    /// arguments that leave Trellis's own tables out of `pg_dump` and the
+    /// SQL to append after its filtered output.
+    fn schema_dump(ruby: &Ruby, rb_self: &Self) -> Result<RArray, Error> {
+        let dump = rb_self.call(ruby, BlockingTrellis::start_schema_dump)?;
+        let args = ruby.ary_from_iter(dump.pg_dump_args);
+        Ok(ruby.ary_new_from_values(&[args.as_value(), ruby.str_new(&dump.appendix).as_value()]))
+    }
+
+    /// `pg_dump_output` without this instance's capture triggers
+    /// ([`BlockingTrellis::filter_schema_dump`]). Reads nothing from the
+    /// database.
+    fn filter_schema_dump(
+        ruby: &Ruby,
+        rb_self: &Self,
+        pg_dump_output: String,
+    ) -> Result<String, Error> {
+        rb_self
+            .with_engine(ruby, |trellis| trellis.filter_schema_dump(&pg_dump_output))?
+            .map_err(|err| raise(ruby, err.into()))
+    }
+
     /// Rebuilds every applying definition that reads `source_table`
     /// (`live -> backfilling`).
     fn request_backfill(ruby: &Ruby, rb_self: &Self, source_table: String) -> Result<(), Error> {
@@ -1446,6 +1469,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         "dump_definitions_sql",
         method!(Handle::dump_definitions_sql, 0),
     )?;
+    handle.define_method("schema_dump", method!(Handle::schema_dump, 0))?;
+    handle.define_method("filter_schema_dump", method!(Handle::filter_schema_dump, 1))?;
     handle.define_method("request_backfill", method!(Handle::request_backfill, 1))?;
     handle.define_method("release_key", method!(Handle::release_key, 3))?;
     handle.define_method("poisoned_since", method!(Handle::poisoned_since, 1))?;
