@@ -436,20 +436,17 @@ pub struct CastTargetSpec {
     pub since: Release,
 }
 
-const fn cast_to(value_type: ValueType) -> CastTargetSpec {
-    CastTargetSpec {
-        value_type,
-        since: BASELINE,
-    }
+const fn cast_to(value_type: ValueType, since: Release) -> CastTargetSpec {
+    CastTargetSpec { value_type, since }
 }
 
 /// The types `CAST(<expr> AS <type>)` can name, spelled as Postgres prints
 /// them. A modifier (`numeric(10,2)`) is not a target.
 pub const CAST_TARGETS: &[CastTargetSpec] = &[
-    cast_to(ValueType::Integer(IntWidth::Int4)),
-    cast_to(ValueType::Integer(IntWidth::Int8)),
-    cast_to(ValueType::Numeric),
-    cast_to(ValueType::Other(PgType::Timestamp)),
+    cast_to(ValueType::Integer(IntWidth::Int4), BASELINE),
+    cast_to(ValueType::Integer(IntWidth::Int8), BASELINE),
+    cast_to(ValueType::Numeric, BASELINE),
+    cast_to(ValueType::Other(PgType::Timestamp), BASELINE),
 ];
 
 /// Postgres's exact, permanent synonyms for the [`CAST_TARGETS`], accepted in
@@ -484,24 +481,24 @@ pub fn cast_target(keyword: &str) -> Option<ValueType> {
 /// operator or function takes, or a typed literal's), each by a name
 /// Postgres gives it. No value is converted, so no cast rule applies.
 pub const NULL_CAST_TARGETS: &[CastTargetSpec] = &[
-    cast_to(ValueType::Integer(IntWidth::Int2)),
-    cast_to(ValueType::Float(FloatWidth::Float4)),
-    cast_to(ValueType::Float(FloatWidth::Float8)),
-    cast_to(ValueType::Text),
-    cast_to(ValueType::Boolean),
-    cast_to(ValueType::Uuid),
-    cast_to(ValueType::Other(PgType::Date)),
-    cast_to(ValueType::Other(PgType::Time)),
-    cast_to(ValueType::Other(PgType::TimeTz)),
-    cast_to(ValueType::Other(PgType::TimestampTz)),
-    cast_to(ValueType::Other(PgType::Bytea)),
-    cast_to(ValueType::Other(PgType::Oid)),
-    cast_to(ValueType::Other(PgType::Inet)),
-    cast_to(ValueType::Other(PgType::Cidr)),
-    cast_to(ValueType::Other(PgType::MacAddr)),
-    cast_to(ValueType::Other(PgType::MacAddr8)),
-    cast_to(ValueType::Other(PgType::VarBit)),
-    cast_to(ValueType::Other(PgType::Jsonb)),
+    cast_to(ValueType::Integer(IntWidth::Int2), BASELINE),
+    cast_to(ValueType::Float(FloatWidth::Float4), BASELINE),
+    cast_to(ValueType::Float(FloatWidth::Float8), BASELINE),
+    cast_to(ValueType::Text, BASELINE),
+    cast_to(ValueType::Boolean, BASELINE),
+    cast_to(ValueType::Uuid, BASELINE),
+    cast_to(ValueType::Other(PgType::Date), BASELINE),
+    cast_to(ValueType::Other(PgType::Time), BASELINE),
+    cast_to(ValueType::Other(PgType::TimeTz), BASELINE),
+    cast_to(ValueType::Other(PgType::TimestampTz), BASELINE),
+    cast_to(ValueType::Other(PgType::Bytea), BASELINE),
+    cast_to(ValueType::Other(PgType::Oid), BASELINE),
+    cast_to(ValueType::Other(PgType::Inet), BASELINE),
+    cast_to(ValueType::Other(PgType::Cidr), BASELINE),
+    cast_to(ValueType::Other(PgType::MacAddr), BASELINE),
+    cast_to(ValueType::Other(PgType::MacAddr8), BASELINE),
+    cast_to(ValueType::Other(PgType::VarBit), BASELINE),
+    cast_to(ValueType::Other(PgType::Jsonb), BASELINE),
 ];
 
 /// The target `CAST(NULL AS <keyword>)` names: a [`cast_target`], or one of

@@ -29,7 +29,10 @@
 use std::fmt;
 use std::sync::Arc;
 
-use super::ast::{Expr, JoinKind, KeySpace, Operator, Predicate, TransformDef, ValueType};
+use super::ast::{
+    Expr, FieldDef, JoinKind, JoinOn, JoinSpec, KeySpace, Operator, Predicate, TransformDef,
+    ValueType,
+};
 
 /// A Trellis release version, `major.minor.patch`, ordered as semver orders
 /// releases. A floor is always a release, never a pre-release.
@@ -249,9 +252,12 @@ impl Feature {
                 .iter()
                 .find(|spec| spec.value_type == value_type)
                 .map(|spec| spec.since),
-            Feature::CastTarget(value_type) => {
-                super::registry::cast_target_spec(value_type).map(|spec| spec.since)
-            }
+            Feature::CastTarget(value_type) => super::registry::CAST_TARGETS
+                .iter()
+                .chain(super::registry::NULL_CAST_TARGETS)
+                .filter(|spec| spec.value_type == value_type)
+                .map(|spec| spec.since)
+                .max(),
             Feature::Layout(layout) => Some(match layout {
                 Layout::DefinitionState
                 | Layout::OneToOneLedger
@@ -262,7 +268,7 @@ impl Feature {
         }
     }
 
-    /// The name a test's override ([`Floors::with_since`]) addresses this
+    /// The name a test's override (`Config::with_feature_since`) addresses this
     /// feature by: its `Debug` form, `Expr(Case)` or `Function("ABS")`.
     fn key(&self) -> String {
         format!("{self:?}")
@@ -272,31 +278,47 @@ impl Feature {
 /// The release function `name` arrived in: the latest of its overloads',
 /// since a call's tree doesn't record which overload it resolved to.
 fn function_since(name: &str) -> Option<Release> {
-    super::registry::function_overloads(name)
-        .chain(super::registry::lookup_aggregate_function(name))
+    latest_overload(
+        name,
+        super::registry::FUNCTIONS
+            .iter()
+            .chain(super::registry::AGGREGATE_FUNCTION_SPECS),
+    )
+    .into_iter()
+    .chain(
+        SPECIAL_FORMS
+            .iter()
+            .filter(|(form, _)| *form == name)
+            .map(|&(_, since)| since),
+    )
+    .max()
+}
+
+/// The latest since of every entry of `specs` named `name`.
+fn latest_overload<'a>(
+    name: &str,
+    specs: impl Iterator<Item = &'a super::registry::FunctionSpec>,
+) -> Option<Release> {
+    specs
+        .filter(|spec| spec.name == name)
         .map(|spec| spec.since)
-        .chain(
-            SPECIAL_FORMS
-                .iter()
-                .filter(|(form, _)| *form == name)
-                .map(|&(_, since)| since),
-        )
         .max()
 }
 
 /// The registry's canonical `&'static` spelling of function `name`, so a
 /// [`Feature::Function`] is `Copy`. `None` for a name no entry declares.
 fn function_name(name: &str) -> Option<&'static str> {
-    super::registry::function_overloads(name)
-        .chain(super::registry::lookup_aggregate_function(name))
+    super::registry::FUNCTIONS
+        .iter()
+        .chain(super::registry::AGGREGATE_FUNCTION_SPECS)
+        .find(|spec| spec.name == name)
         .map(|spec| spec.name)
-        .chain(
+        .or_else(|| {
             SPECIAL_FORMS
                 .iter()
-                .filter(|(form, _)| *form == name)
-                .map(|&(form, _)| form),
-        )
-        .next()
+                .find(|(form, _)| *form == name)
+                .map(|&(form, _)| form)
+        })
 }
 
 /// Everything `def` uses, each once, in the order first met: its key space
@@ -305,37 +327,57 @@ fn function_name(name: &str) -> Option<&'static str> {
 /// partitioned, which only the database knows. A function name no registry
 /// entry declares is left out and reported in the second value.
 pub(crate) fn features_used(def: &TransformDef, partitioned: bool) -> (Vec<Feature>, bool) {
+    // Destructured whole, as is every part of the tree below, so a field
+    // added to the definition doesn't compile until it is counted here.
+    let TransformDef {
+        target: _,
+        explicit_target_schema,
+        source: _,
+        explicit_source_schema,
+        key_space,
+        fields,
+        predicate,
+        without_source_index,
+    } = def;
     let mut used = Used::default();
-    let qualified = def.explicit_target_schema.is_some() || def.explicit_source_schema.is_some();
-    let (kind, join) = match &def.key_space {
+    let (kind, join) = match key_space {
         KeySpace::OneToOne => (KeySpaceKind::OneToOne, None),
         KeySpace::Aggregate { group_by: _ } => (KeySpaceKind::Aggregate, None),
         KeySpace::Join(spec) => (KeySpaceKind::Join, Some(spec)),
         KeySpace::JoinOneToOne(spec) => (KeySpaceKind::JoinOneToOne, Some(spec)),
     };
     used.add(Feature::KeySpace(kind));
-    if let Some(spec) = join {
-        used.add(Feature::JoinKind(spec.kind));
-        if spec.explicit_right_schema.is_some() {
+    if let Some(JoinSpec {
+        kind,
+        right: _,
+        explicit_right_schema,
+        on,
+        group_by: _,
+    }) = join
+    {
+        used.add(Feature::JoinKind(*kind));
+        if explicit_right_schema.is_some() {
             used.add(Feature::QualifiedTable);
         }
+        // An `ON` term is two columns, which every `JOIN` has.
+        for JoinOn { lhs: _, rhs: _ } in on {}
     }
-    if qualified {
+    if explicit_target_schema.is_some() || explicit_source_schema.is_some() {
         used.add(Feature::QualifiedTable);
     }
-    used.add(Feature::Predicate(match def.predicate {
+    used.add(Feature::Predicate(match predicate {
         Predicate::True => PredicateKind::True,
     }));
-    if def.without_source_index {
+    if *without_source_index {
         used.add(Feature::WithoutSourceIndex);
     }
     if partitioned {
         used.add(Feature::PartitionedSource);
     }
-    for field in &def.fields {
-        used.expr(&field.expr);
+    for FieldDef { name: _, expr } in fields {
+        used.expr(expr);
     }
-    for layout in Layout::of(&def.key_space) {
+    for layout in Layout::of(key_space) {
         used.add(Feature::Layout(layout));
     }
     (used.features, used.unknown)
@@ -742,6 +784,60 @@ mod tests {
         for name in names {
             assert!(function_since(name).is_some(), "{name}");
             assert_eq!(function_name(name), Some(name));
+        }
+    }
+
+    /// A name's since is the latest of all its overloads', wherever in the
+    /// registry each sits, so an overload a later release adds raises every
+    /// call of the name.
+    #[test]
+    fn a_function_counts_at_its_latest_overload() {
+        use super::super::registry::FunctionSpec;
+        let overload = |arg, since| FunctionSpec {
+            name: "SUM",
+            arg_types: std::slice::from_ref(arg),
+            return_type: ValueType::Numeric,
+            since,
+        };
+        let specs = [
+            overload(&ValueType::Numeric, BASELINE),
+            overload(&ValueType::Text, Release::new(0, 3, 0)),
+            overload(&ValueType::Boolean, Release::new(0, 2, 5)),
+        ];
+        assert_eq!(
+            latest_overload("SUM", specs.iter()),
+            Some(Release::new(0, 3, 0))
+        );
+        assert_eq!(latest_overload("AVG", specs.iter()), None);
+    }
+
+    /// An argument the validator checks, not the parser (an `EXTRACT`
+    /// field, a `DATE_TRUNC` unit), is a value in the tree, not a node kind:
+    /// text with one this release refuses still parses, which is all
+    /// loading a stored definition does, so the floor can't stand in for
+    /// it (ADR-0024, "Only the tree is counted").
+    #[test]
+    fn a_validator_checked_argument_parses_without_a_feature_of_its_own() {
+        let columns = std::collections::HashMap::from([(
+            "ts".to_string(),
+            ValueType::Other(crate::defs::pg_type::PgType::Timestamp),
+        )]);
+        for (admitted, refused) in [
+            ("EXTRACT(year FROM ts) AS x", "EXTRACT(julian FROM ts) AS x"),
+            (
+                "DATE_TRUNC('month', ts) AS x",
+                "DATE_TRUNC('fortnight', ts) AS x",
+            ),
+        ] {
+            let admitted = parse(&format!("TRANSFORM t FROM s SELECT {admitted}")).unwrap();
+            let refused = parse(&format!("TRANSFORM t FROM s SELECT {refused}"))
+                .expect("loading the stored text parses it");
+            assert!(crate::defs::validate(&admitted, &columns).is_ok());
+            assert!(crate::defs::validate(&refused, &columns).is_err());
+            assert_eq!(
+                features_used(&admitted, false),
+                features_used(&refused, false)
+            );
         }
     }
 

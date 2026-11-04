@@ -150,14 +150,21 @@ column gives every stored definition 0.2.0.
 - **A function's floor is the latest of its overloads'.** A call in the tree
   doesn't record which overload it resolved to, so an overload added later
   raises the floor of every call of that name.
-- **Only the tree is counted.** A spelling the parser folds into a node
-  another spelling also builds (`int` for `integer` in a `CAST`, `CAST('…' AS
-  date)` for `DATE '…'`) and an argument value checked later (an `EXTRACT`
-  field) have no declaration of their own. A release adding one leaves the
-  floor where it was: an older release refuses the text when it parses it,
-  and pauses the definition with that refusal. Text an older release would
-  read differently is a change in meaning, which bumps the grammar version
-  ([ADR-0018](0018-grammar-versioning.md)).
+- **Only the tree is counted.** Two kinds of addition have no declaration
+  of their own, and a release adding one leaves the floor where it was:
+  - A spelling the parser folds into a node another spelling also builds
+    (`int` for `integer` in a `CAST`, `CAST('…' AS date)` for `DATE '…'`).
+    An older release's parser refuses the spelling, and the definition
+    pauses with that refusal.
+  - What only the validator checks: an argument's value (an `EXTRACT`
+    field, a `DATE_TRUNC` unit, the `AT TIME ZONE` zone) and the operand
+    types an operator, function or `CAST` admits. Loading a stored
+    definition parses it without validating it, so an older release
+    doesn't refuse such text: it runs it, rendering the tree to SQL as it
+    renders its own.
+
+  Text an older release would read differently is a change in meaning,
+  which bumps the grammar version ([ADR-0018](0018-grammar-versioning.md)).
 
 `status()` reports the floor, and a dump of the definitions
 (`dump_definitions_sql`) carries it.
