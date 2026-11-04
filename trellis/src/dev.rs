@@ -142,6 +142,10 @@ pub mod staging {
     /// tests.
     #[cfg(any(test, feature = "internals"))]
     pub use crate::staging::group_basis::explain_apply as explain_group_apply;
+    /// The plan of a group-basis target's `MIN`/`MAX` probe, for tests of
+    /// which index serves it.
+    #[cfg(any(test, feature = "internals"))]
+    pub use crate::staging::group_basis::explain_probe as explain_group_probe;
     /// The plans of a group-basis target's whole-source reads (its node-form
     /// recompute and its rebuild), for plan-shape tests.
     #[cfg(any(test, feature = "internals"))]
@@ -211,11 +215,11 @@ pub mod fixtures {
 
     use crate::{
         BackfillFailure, BelowCatalogFloor, CaptureFailure, CaptureFailureKind, CaptureWait,
-        CorrectingNode, DefinitionStatus, DefinitionSummary, DrainFailure, FanOutWarning, HeldKeys,
-        HiddenTableSize, IndexRole, JoinStatus, OtherProcess, OtherVersionLive, PartialsWarning,
-        PoisonEntry, PoisonSample, QuarantineEntry, QuarantineState, QuarantineTarget,
-        SelfCheckJob, SelfCheckJobState, SelfCheckMode, SelfCheckOutcome, SelfCheckReport,
-        SourceIndexGap, TransformStatus,
+        CorrectingNode, DefinitionStatus, DefinitionSummary, DrainFailure, ExtremeIndexGap,
+        FanOutWarning, HeldKeys, HiddenTableSize, IndexRole, JoinStatus, OtherProcess,
+        OtherVersionLive, PartialsWarning, PoisonEntry, PoisonSample, QuarantineEntry,
+        QuarantineState, QuarantineTarget, SelfCheckJob, SelfCheckJobState, SelfCheckMode,
+        SelfCheckOutcome, SelfCheckReport, SourceIndexGap, TransformStatus,
     };
 
     #[allow(non_snake_case)]
@@ -270,6 +274,7 @@ pub mod fixtures {
             held_keys: None,
             drain_failure: None,
             source_index_gaps: Vec::new(),
+            extreme_index_gaps: Vec::new(),
             join: None,
             correcting: Vec::new(),
             paused_upstream_columns: Vec::new(),
@@ -432,6 +437,16 @@ pub mod fixtures {
             outcome: SelfCheckOutcome::Converged,
             held_keys: None,
             drain_failures: Vec::new(),
+        }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn ExtremeIndexGap() -> ExtremeIndexGap {
+        ExtremeIndexGap {
+            table: String::new(),
+            columns: Vec::new(),
+            argument: String::new(),
+            opted_out: false,
         }
     }
 

@@ -112,7 +112,7 @@ use tokio_postgres::types::PgLsn;
 
 use crate::client::{Client, ClientError, ClientOptions};
 use crate::config::{Config, DEFAULT_CALL_POOL_MAX_SIZE, DEFAULT_CALL_POOL_WAIT_TIMEOUT};
-use crate::defs::source_index::SourceIndexGap;
+use crate::defs::source_index::{ExtremeIndexGap, SourceIndexGap};
 use crate::defs::{self, CatalogError, ParseError, StoredStatus, TransformStatus, ValueType};
 use crate::error_code::{self, ErrorCode};
 use crate::intake::IntakeError;
@@ -970,6 +970,7 @@ impl Trellis {
             let mut holdup = (None, None);
             let mut drain_failure = None;
             let mut source_index_gaps = Vec::new();
+            let mut extreme_index_gaps = Vec::new();
             let mut join = None;
             let mut correcting = Vec::new();
             if let Some(row) = &row {
@@ -1036,6 +1037,13 @@ impl Trellis {
                         row.get::<_, Option<String>>("join_table").as_deref(),
                     )
                     .await?;
+                    extreme_index_gaps = defs::source_index::extreme_gaps(
+                        &*txn,
+                        &def,
+                        &source_columns,
+                        row.get("source_table"),
+                    )
+                    .await?;
                     join = crate::staging::join_status::for_definition(
                         &*txn,
                         self.config.schema(),
@@ -1078,6 +1086,7 @@ impl Trellis {
                 ),
                 drain_failure,
                 source_index_gaps,
+                extreme_index_gaps,
                 join,
                 correcting,
                 paused_upstream_columns,
@@ -2245,6 +2254,16 @@ pub struct DefinitionStatus {
     /// Trellis never creates one. Read live on each call. Empty for every
     /// other target, and when the indexes exist.
     pub source_index_gaps: Vec<SourceIndexGap>,
+    /// The source indexes a `MIN`/`MAX` field's probe reads one endpoint of
+    /// and that the source lacks now: one entry per argument, an index on
+    /// the `GROUP BY` columns then the argument. A warning: nothing is
+    /// paused, the target stays exact and `self_check` still walks, but
+    /// each probe (a retraction that reaches a group's extreme) scans the
+    /// group's rows instead of reading one index entry.
+    /// [`ExtremeIndexGap::fix`] is a `create index` to run; Trellis never
+    /// creates one. Read live on each call; it clears once the index
+    /// exists. Empty for every definition with no `MIN` or `MAX`.
+    pub extreme_index_gaps: Vec<ExtremeIndexGap>,
     /// What a `JOIN` transform's hidden tables look like now: their
     /// sizes, a warning when `P` approaches the fact table's size, and the step
     /// its build runs while one is under way. `None` for a

@@ -100,6 +100,7 @@ function Config::with_target_schema
 function DdlError::code
 function Error::code
 function ErrorCode::as_str
+function ExtremeIndexGap::fix
 function HeldKeyRetry::backoff
 function IndexRole::as_str
 function IndexRole::describe
@@ -162,6 +163,7 @@ struct CorrectingNode
 struct DefinitionStatus
 struct DefinitionSummary
 struct DrainFailure
+struct ExtremeIndexGap
 struct FanOutWarning
 struct HeldKeyRetry
 struct HeldKeys

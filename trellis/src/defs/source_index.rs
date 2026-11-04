@@ -29,6 +29,13 @@
 //! index (`SourceIndexGap`) and `self_check` refuses to walk; nothing pauses.
 //! A `JOIN`'s `T` part, with group columns from both tables, is served by no
 //! one table's index and needs none.
+//!
+//! A `MIN`/`MAX` field's probe reads the extreme of a group as one endpoint
+//! of an index on the `GROUP BY` columns then its argument. Its statement
+//! doesn't depend on the index: without one Postgres scans the group (by
+//! the `GROUP BY` index when there is one), which is exact and slower, so
+//! the probe never reads the catalog. `status` reports the missing index
+//! (`ExtremeIndexGap`); nothing pauses and `self_check` still walks.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -168,6 +175,87 @@ pub(crate) async fn gaps(
             })
             .collect(),
     )
+}
+
+/// A source index a `MIN`/`MAX` field's probe reads one endpoint of, which
+/// the source lacks now, as `DefinitionStatus::extreme_index_gaps` reports
+/// it. Without it each probe scans the group for its extreme (exact, at the
+/// cost of reading every row of each probed group). Nothing pauses and
+/// `self_check` still walks: its pages lead with the `GROUP BY` columns
+/// alone ([`SourceIndexGap`] reports that index).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExtremeIndexGap {
+    /// The table the index is missing on, qualified.
+    pub table: String,
+    /// The columns the index should lead with: the `GROUP BY` columns, in
+    /// order, then [`Self::argument`].
+    pub columns: Vec<String>,
+    /// The source column the `MIN`/`MAX` reads.
+    pub argument: String,
+    /// Whether the definition was defined `WITHOUT SOURCE INDEX`.
+    pub opted_out: bool,
+}
+
+impl ExtremeIndexGap {
+    /// What to do about it: a statement creating a qualifying index, which
+    /// Trellis never runs.
+    pub fn fix(&self) -> String {
+        SourceIndex {
+            table: self.table.clone(),
+            columns: self.columns.clone(),
+            role: IndexRole::GroupBy,
+        }
+        .create_index()
+    }
+}
+
+/// The indexes `def`'s `MIN`/`MAX` probes read one endpoint of: per argument,
+/// one leading with the `GROUP BY` columns then the argument, under
+/// [`has_index`]'s rule (the probe reads it forward for `MIN`, backward for
+/// `MAX`). Empty for every definition with no `MIN` or `MAX`, which then
+/// costs no catalog read.
+fn extreme_indexes(
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+) -> Vec<(String, Vec<String>)> {
+    let Some(shape) = crate::staging::group_basis::route(def, source_columns) else {
+        return Vec::new();
+    };
+    shape
+        .extreme_arguments()
+        .into_iter()
+        .map(|argument| {
+            let mut columns = shape.group_columns().to_vec();
+            columns.push(argument.clone());
+            (argument, columns)
+        })
+        .collect()
+}
+
+/// The gaps in `def`'s `MIN`/`MAX` probe indexes now, for `status` (read
+/// live, like [`gaps`]). The probe itself never reads the catalog: its
+/// statement is the same with or without the index, and Postgres plans it
+/// as an endpoint read where the index exists and a scan of the group
+/// where it doesn't.
+pub(crate) async fn extreme_gaps(
+    client: &impl GenericClient,
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+    source_table: &str,
+) -> Result<Vec<ExtremeIndexGap>, tokio_postgres::Error> {
+    let mut out = Vec::new();
+    for (argument, columns) in extreme_indexes(def, source_columns) {
+        if !is_met(client, source_table, &columns).await? {
+            out.push(ExtremeIndexGap {
+                table: source_table.to_string(),
+                columns,
+                argument,
+                opted_out: def.without_source_index,
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// The indexes `def` needs: an aggregate on the group basis needs one on its

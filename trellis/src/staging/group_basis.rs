@@ -438,6 +438,22 @@ impl GroupShape {
             })
             .collect()
     }
+
+    /// The source column each `MIN`/`MAX` reads, once each, in
+    /// [`Self::extremes`]' order: an extreme's probe reads one endpoint of a
+    /// source index on the `GROUP BY` columns then this column, and scans
+    /// the group without one. Empty for a definition with no `MIN` or `MAX`.
+    pub(crate) fn extreme_arguments(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for x in self.extremes() {
+            if let Some(column) = extreme_column(&self.args[x.arg].expr)
+                && !out.iter().any(|c| c == column)
+            {
+                out.push(column.to_string());
+            }
+        }
+        out
+    }
 }
 
 /// Whether the group basis keeps a hidden extreme over an argument of type
@@ -4370,6 +4386,60 @@ pub async fn explain_whole_source_reads(
     }
     txn.rollback().await?;
     Ok(plans)
+}
+
+/// The plan of [`probe_locked_groups`]' statement on the group-basis target
+/// `target` (its bare name), as `explain`'s text, over an empty table of
+/// probed groups and with sequential scans disabled, so a small test source
+/// plans the way a large one does: which index (if any) serves each
+/// extreme's read, and whether it reads an endpoint or sorts the group. For
+/// tests of the probe's path. It locks and writes nothing.
+#[cfg(any(test, feature = "internals"))]
+pub async fn explain_probe(pool: &crate::pool::Pool, target: &str) -> Result<String, ApplyError> {
+    let Some(definition) = crate::defs::catalog::definition_by_target(pool, target).await? else {
+        return Err(ApplyError::TransformNotFound {
+            transform: target.to_string(),
+        });
+    };
+    let Some(shape) = route(&definition.def, &definition.source_columns) else {
+        return Err(ApplyError::GroupBasisUnsupported {
+            target: definition.target_table,
+            what: "a definition the group basis doesn't take",
+        });
+    };
+    if shape.extremes().is_empty() {
+        return Err(ApplyError::GroupBasisUnsupported {
+            target: definition.target_table,
+            what: "a probe of a definition with no MIN or MAX",
+        });
+    }
+    let mut client = pool.get().await?;
+    let identity = ddl::identity_key_columns(&**client, &definition.target_table).await?;
+    let plan = GroupTargetPlan::new(
+        pool.schema(),
+        definition.id,
+        &definition.target_table,
+        &definition.source_table,
+        ddl::source_primary_key_in_txn(&**client, &definition.source_table).await?,
+        identity,
+        shape,
+    );
+    let txn = client.transaction().await?;
+    txn.batch_execute(&format!(
+        "{}; {}; set local enable_seqscan = off",
+        plan.staged_ddl(),
+        plan.probed_ddl()
+    ))
+    .await?;
+    let rows = txn
+        .query(&format!("explain {}", plan.probe_sql(None)), &[])
+        .await?;
+    txn.rollback().await?;
+    Ok(rows
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 #[cfg(test)]
