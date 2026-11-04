@@ -393,6 +393,7 @@ pub fn has_constant_zero_divisor(expr: &Expr, columns: &[Column]) -> bool {
 /// admits a bare `0` beside each: an integer or `numeric` compares with it
 /// as Postgres does, and a float takes the literal spelling
 /// ([`Rule::NullIfLiteral`]).
+#[cfg(feature = "proptest")]
 fn guarded_divisor(divisor: Expr) -> Expr {
     Expr::FunctionCall {
         name: "NULLIF".to_string(),
