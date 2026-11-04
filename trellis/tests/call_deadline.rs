@@ -205,6 +205,7 @@ async fn a_call_stuck_on_a_lock_ends_at_its_deadline_and_the_server_drops_it() {
     stuck!(f, "definitions", t => t.definitions());
     stuck!(f, "status", t => t.status("widget_totals"));
     stuck!(f, "dump_definitions_sql", t => t.dump_definitions_sql());
+    stuck!(f, "schema_dump", t => t.schema_dump());
     stuck!(f, "request_backfill", t => t.request_backfill("widgets"));
     stuck!(f, "detect_capture_disruptions", t => t.detect_capture_disruptions());
     stuck!(f, "poisoned_since", t => t.poisoned_since(SystemTime::UNIX_EPOCH));
@@ -387,6 +388,7 @@ fn every_public_method_is_tested_or_exempt() {
         "definitions",
         "status",
         "dump_definitions_sql",
+        "schema_dump",
         "request_backfill",
         "detect_capture_disruptions",
         "poisoned_since",
@@ -409,6 +411,10 @@ fn every_public_method_is_tested_or_exempt() {
         ("pool", "a borrow of the pool, no call"),
         ("config", "a borrow, no call"),
         ("metrics", "reads the in-process registry, no database"),
+        (
+            "filter_schema_dump",
+            "filters text in memory; reads nothing from the database",
+        ),
         (
             "shutdown",
             "ends background work, not a request; each worker's own waits are bounded by \
