@@ -147,7 +147,7 @@ defmodule Trellis.StructureDump do
       Enum.reduce_while(prefixes, {:ok, []}, fn prefix, {:ok, versions} ->
         sql = ~s[SELECT version FROM #{prefix}."#{table}" ORDER BY version]
 
-        case Ecto.Adapters.SQL.query(repo, sql, []) do
+        case Ecto.Adapters.SQL.query(repo, sql, [], log: false) do
           {:ok, %{rows: rows}} ->
             {:cont, {:ok, Enum.map(rows, &{prefix, hd(&1)}) ++ versions}}
 
