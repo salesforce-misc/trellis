@@ -543,11 +543,7 @@ impl Trellis {
             return Ok(());
         }
         let txn = client.transaction().await?;
-        txn.execute(
-            "select pg_advisory_xact_lock($1)",
-            &[&crate::handover::handover_lock_key(self.config.schema())],
-        )
-        .await?;
+        crate::client::lock_handover_xact(&*txn, self.config.schema()).await?;
         if let Some(seen) = version_handover_on(&*txn, &self.config).await? {
             return Err(TrellisError::OtherVersionLive(seen));
         }

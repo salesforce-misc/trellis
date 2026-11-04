@@ -2809,6 +2809,22 @@ impl BackgroundProcess {
     }
 }
 
+/// Takes the transaction-scoped handover lock of the instance whose schema is
+/// `schema` (ADR-0023): the lock a background process's pass, and a call that
+/// pauses what this release can't run, hold while they check for another live
+/// version. The one place besides `migrate` that takes it.
+pub(crate) async fn lock_handover_xact(
+    txn: &impl tokio_postgres::GenericClient,
+    schema: &str,
+) -> Result<(), tokio_postgres::Error> {
+    txn.execute(
+        "select pg_advisory_xact_lock($1)",
+        &[&handover::handover_lock_key(schema)],
+    )
+    .await
+    .map(|_| ())
+}
+
 /// One handover pass (ADR-0023): under the instance's handover lock, reads
 /// the registry and the staging lock, decides whether this process takes over
 /// or stands by, and registers its row with that decision, its version and
@@ -2822,11 +2838,7 @@ async fn handover_pass(process: &BackgroundProcess, drain: bool) -> Result<Verdi
     let mut client = process.pool.get().await.map_err(checkout_error)?;
     let pg: &mut tokio_postgres::Client = &mut client;
     let txn = pg.transaction().await?;
-    txn.execute(
-        "select pg_advisory_xact_lock($1)",
-        &[&handover::handover_lock_key(&process.schema)],
-    )
-    .await?;
+    lock_handover_xact(&txn, &process.schema).await?;
     if let Some(refused) =
         crate::migrate::below_catalog_floor(&txn, &process.schema, &process.version).await?
     {
