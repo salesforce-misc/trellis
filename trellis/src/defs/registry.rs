@@ -413,6 +413,8 @@ pub enum TypeRule {
     /// An aggregate the group basis keeps, over this argument type
     /// (`validate::check_aggregate_admitted`).
     AggregateAdmission(AggregateAdmissionRule),
+    /// A `GROUP BY` key of this type (`validate::reject_unsupported_group_by_key_type`).
+    GroupByKey(GroupByKeyRule),
 }
 
 /// The pairs `+`, `-`, `*`, `/` and `%` take.
@@ -526,6 +528,32 @@ pub enum AggregateAdmissionRule {
     SumAvgScaledNumeric,
 }
 
+/// The `GROUP BY` key types the validator admits, one per type its gate
+/// names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupByKeyRule {
+    /// `smallint`, `integer` or `bigint`.
+    Integer,
+    Numeric,
+    Text,
+    Uuid,
+    Boolean,
+    Oid,
+    Bytea,
+    Date,
+    Time,
+    TimeTz,
+    Timestamp,
+    TimestampTz,
+    Cidr,
+    MacAddr,
+    MacAddr8,
+    Inet,
+    VarBit,
+    /// An enum type.
+    Enum,
+}
+
 impl TypeRule {
     /// The release this case arrived in. Every case that exists when floors
     /// started counting type rules is [`BASELINE`].
@@ -582,6 +610,26 @@ impl TypeRule {
                 AggregateAdmissionRule::Count
                 | AggregateAdmissionRule::SumAvgInteger
                 | AggregateAdmissionRule::SumAvgScaledNumeric => BASELINE,
+            },
+            TypeRule::GroupByKey(rule) => match rule {
+                GroupByKeyRule::Integer
+                | GroupByKeyRule::Numeric
+                | GroupByKeyRule::Text
+                | GroupByKeyRule::Uuid
+                | GroupByKeyRule::Boolean
+                | GroupByKeyRule::Oid
+                | GroupByKeyRule::Bytea
+                | GroupByKeyRule::Date
+                | GroupByKeyRule::Time
+                | GroupByKeyRule::TimeTz
+                | GroupByKeyRule::Timestamp
+                | GroupByKeyRule::TimestampTz
+                | GroupByKeyRule::Cidr
+                | GroupByKeyRule::MacAddr
+                | GroupByKeyRule::MacAddr8
+                | GroupByKeyRule::Inet
+                | GroupByKeyRule::VarBit
+                | GroupByKeyRule::Enum => BASELINE,
             },
         }
     }

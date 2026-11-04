@@ -733,8 +733,8 @@ Every stored definition also records its **floor**: the oldest Trellis
 release that can run it, the latest release any grammar construct, key space,
 option or hidden-table layout it uses arrived in, or any argument value
 (`EXTRACT` field, `DATE_TRUNC` unit, `AT TIME ZONE` zone) or type rule (which
-operand types an operator, cast, function or aggregate takes) define's
-validation admitted it by over its columns' types. Define, `ALTER TRANSFORM`
+operand types an operator, cast, function or aggregate takes) or key type
+(`GROUP BY` and `JOIN ... ON`) define's validation admitted it by over its columns' types. Define, `ALTER TRANSFORM`
 and a resume's rebuild record it from what the definition uses then, so an
 `ALTER` that removes the only newer construct lowers it; a pause never changes
 it. When a column it reads changes type, the staging worker's next capture

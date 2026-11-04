@@ -2127,7 +2127,7 @@ pub(crate) fn validate_join_tables_and_on(
     let resolve = join_resolver(def, join, left, right);
 
     let check_key_type = |column: &QualifiedColumn, info: &JoinColumnInfo| {
-        if !super::join_key_types::is_text_stable_join_key_type(&info.pg_type) && !info.is_enum {
+        if !super::join_key_types::admit_join_key(&info.pg_type, info.is_enum) {
             return Err(ValidationError::JoinUnsupportedKeyType {
                 reference: written(column),
                 pg_type: info.pg_type.clone(),
@@ -3115,6 +3115,26 @@ pub(crate) fn reject_unsupported_group_by_key_type(
     column: &str,
     value_type: ValueType,
 ) -> Result<(), ValidationError> {
+    match group_by_key_rule(value_type) {
+        Some(rule) => {
+            // The case that admits the key counts toward the definition's
+            // floor, so the validator can't admit a key type without one.
+            super::floor::record(super::floor::Feature::TypeRule(
+                super::registry::TypeRule::GroupByKey(rule),
+            ));
+            Ok(())
+        }
+        None => Err(ValidationError::UnsupportedGroupByKeyType {
+            column: column.to_string(),
+            value_type,
+        }),
+    }
+}
+
+/// The [`GroupByKeyRule`] that admits a `GROUP BY` key of `value_type`, or
+/// `None` when the gate refuses it. Each admitted type names the rule whose
+/// release it arrived in; [`reject_unsupported_group_by_key_type`] records it.
+fn group_by_key_rule(value_type: ValueType) -> Option<super::registry::GroupByKeyRule> {
     match value_type {
         // An exact integer's text rendering is canonical (no
         // leading zeros, no `+`, no whitespace), so it round-trips through
@@ -3128,7 +3148,10 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // is *rejected* as a `JOIN` key and as a primary key.
         // Tightening the `GROUP BY` gate to match belongs with the
         // typed key index, not here.
-        ValueType::Integer(_) | ValueType::Numeric | ValueType::Text | ValueType::Uuid => Ok(()),
+        ValueType::Integer(_) => Some(super::registry::GroupByKeyRule::Integer),
+        ValueType::Numeric => Some(super::registry::GroupByKeyRule::Numeric),
+        ValueType::Text => Some(super::registry::GroupByKeyRule::Text),
+        ValueType::Uuid => Some(super::registry::GroupByKeyRule::Uuid),
         // `boolean` was already admitted here (this arm
         // predates the issue), and it is genuinely safe, but not for the
         // reason every other admission on this function is — this is the
@@ -3156,7 +3179,7 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // resolve to the same group. `trellis/tests/defs_boolean.rs`'s
         // `a_boolean_group_key_seeded_by_cdc_and_by_live_read_is_one_group_not_two`
         // pins it.
-        ValueType::Boolean => Ok(()),
+        ValueType::Boolean => Some(super::registry::GroupByKeyRule::Boolean),
         // `real`/`double precision` are rejected outright, and
         // this is a deliberate *tightening* — before the float split they
         // reached here as `ValueType::Numeric` and were waved through.
@@ -3173,16 +3196,13 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // comparing decoded values through `crate::float::compare`; until
         // then, rejecting is the honest answer and `numeric` is the
         // steer-to. See `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES`.
-        ValueType::Float(_) => Err(ValidationError::UnsupportedGroupByKeyType {
-            column: column.to_string(),
-            value_type,
-        }),
+        ValueType::Float(_) => None,
         // `oid` is one `Other` family admitted as a key:
         // Postgres renders it as canonical unsigned decimal, so it is
         // text-stable in exactly the way `interval` is not. It stays an
         // `Other` rather than joining `ValueType::Integer` because Postgres
         // gives it no arithmetic at all — see `pg_type::PgType::Oid`.
-        ValueType::Other(PgType::Oid) => Ok(()),
+        ValueType::Other(PgType::Oid) => Some(super::registry::GroupByKeyRule::Oid),
         // `bytea` is the other, on the same "text-stability is
         // a property of the rendering, not the operator set" reasoning:
         // `byteaout` under the pinned `bytea_output = 'hex'` is a bijection
@@ -3192,7 +3212,7 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // predicate here — every `bytea` value clears the bar, not just a
         // subset — so it is a plain admit rather than a call into a sibling
         // module.
-        ValueType::Other(PgType::Bytea) => Ok(()),
+        ValueType::Other(PgType::Bytea) => Some(super::registry::GroupByKeyRule::Bytea),
         // `date`, `timestamp`, `time`, `timetz` and
         // `timestamptz` join `oid` on the same grounds, gated by
         // `crate::temporal`'s own per-family verdict rather than by a list
@@ -3210,13 +3230,24 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // canonical rendering at all — `'24 hours'` and `'1 day'` are `=`
         // and render differently, so a text-matched `GROUP BY` would split
         // one Postgres group in two, exactly as a float `-0`/`0` key would.
-        ValueType::Other(pg_type) if crate::temporal::is_text_stable(pg_type) => Ok(()),
+        ValueType::Other(pg_type) if crate::temporal::is_text_stable(pg_type) => match pg_type {
+            PgType::Date => Some(super::registry::GroupByKeyRule::Date),
+            PgType::Time => Some(super::registry::GroupByKeyRule::Time),
+            PgType::TimeTz => Some(super::registry::GroupByKeyRule::TimeTz),
+            PgType::Timestamp => Some(super::registry::GroupByKeyRule::Timestamp),
+            PgType::TimestampTz => Some(super::registry::GroupByKeyRule::TimestampTz),
+            // A temporal family without a rule is refused: admitting it
+            // takes a release.
+            _ => None,
+        },
         // `cidr`/`macaddr`/`macaddr8` join `oid`/`bytea` above —
         // each is on `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` (see that
         // constant's doc comment for the live `pg_cast`/renderer evidence),
         // and unlike the temporal families every value of each clears the
         // bar, not just a subset, so a plain admit is enough here too.
-        ValueType::Other(PgType::Cidr | PgType::MacAddr | PgType::MacAddr8) => Ok(()),
+        ValueType::Other(PgType::Cidr) => Some(super::registry::GroupByKeyRule::Cidr),
+        ValueType::Other(PgType::MacAddr) => Some(super::registry::GroupByKeyRule::MacAddr),
+        ValueType::Other(PgType::MacAddr8) => Some(super::registry::GroupByKeyRule::MacAddr8),
         // `inet` is admitted here despite being deliberately *absent* from
         // `join_key_types::TEXT_STABLE_JOIN_KEY_TYPES` — the same split
         // `boolean` has, for the same mechanical reason.
@@ -3233,7 +3264,7 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // type, and `inet_in` is permissive enough to parse both spellings
         // back to the identical stored value (`'192.168.1.5'::inet =
         // '192.168.1.5/32'::inet` is `true`, verified live).
-        ValueType::Other(PgType::Inet) => Ok(()),
+        ValueType::Other(PgType::Inet) => Some(super::registry::GroupByKeyRule::Inet),
         // `bit varying` is safe here for a *different* reason
         // than every arm above it — it isn't about `::text`-vs-native-`=`
         // rendering agreement at all. `bit`/`varbit` have no `pg_cast`
@@ -3276,7 +3307,7 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // because this one role's DDL has no concrete-type-introspection
         // escape hatch to reach for. `trellis/tests/defs_bit.rs` pins both
         // halves of this split live.
-        ValueType::Other(PgType::VarBit) => Ok(()),
+        ValueType::Other(PgType::VarBit) => Some(super::registry::GroupByKeyRule::VarBit),
         // `jsonb` falls through to the reject arm below like
         // every other unlisted `Other` family, and — unlike `bit`/`oid`/
         // `bytea` — this is *not* a rendering-vs-key-order gap that turned
@@ -3313,11 +3344,8 @@ pub(crate) fn reject_unsupported_group_by_key_type(
         // `ddl::create_aggregate_target_table` declaring a `GROUP BY` key's
         // column as bare `pg_type_name(Other(Enum(_)))` can never lose
         // precision the way a bare `bit` column declaration can.
-        ValueType::Other(PgType::Enum(_)) => Ok(()),
-        ValueType::Other(_) => Err(ValidationError::UnsupportedGroupByKeyType {
-            column: column.to_string(),
-            value_type,
-        }),
+        ValueType::Other(PgType::Enum(_)) => Some(super::registry::GroupByKeyRule::Enum),
+        ValueType::Other(_) => None,
     }
 }
 
@@ -6470,13 +6498,33 @@ mod tests {
 
         let mut admitted_names: Vec<&str> = Vec::new();
         for (name, value_type) in candidates.iter().copied() {
-            match reject_unsupported_group_by_key_type("k", value_type) {
+            // Admitting a key goes through a registry rule with a release:
+            // an admission records exactly one, a refusal none.
+            let (result, recorded) = crate::defs::floor::collect(|| {
+                reject_unsupported_group_by_key_type("k", value_type)
+            });
+            let rules: Vec<_> = recorded
+                .iter()
+                .filter(|feature| {
+                    matches!(
+                        feature,
+                        crate::defs::floor::Feature::TypeRule(
+                            crate::defs::registry::TypeRule::GroupByKey(_)
+                        )
+                    )
+                })
+                .collect();
+            match result {
                 Ok(()) => {
+                    assert_eq!(rules.len(), 1, "{value_type} admitted without one rule");
+                    assert!(rules[0].since().is_some(), "{value_type}: no release");
                     if !admitted_names.contains(&name) {
                         admitted_names.push(name);
                     }
                 }
-                Err(ValidationError::UnsupportedGroupByKeyType { .. }) => {}
+                Err(ValidationError::UnsupportedGroupByKeyType { .. }) => {
+                    assert!(rules.is_empty(), "{value_type} refused but recorded");
+                }
                 Err(other) => panic!("unexpected error for {value_type}: {other:?}"),
             }
         }

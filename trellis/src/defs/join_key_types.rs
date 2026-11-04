@@ -8,6 +8,49 @@ use std::borrow::Cow;
 
 use tokio_postgres::GenericClient;
 
+use super::floor::{BASELINE, Release};
+
+/// One type [`TEXT_STABLE_JOIN_KEY_TYPES`] admits as a join key, and the
+/// release it arrived in. The release is a required part of every entry, so a
+/// type can't join the list without declaring it (ADR-0024, [`super::floor`]).
+#[derive(Debug, Clone, Copy)]
+struct KeyTypeSpec {
+    /// The type's name as `format_type` renders it, modifier stripped.
+    name: &'static str,
+    /// The release this type arrived in as a join key, which raises the floor
+    /// of a definition keyed on it.
+    since: Release,
+}
+
+const fn key_type(name: &'static str, since: Release) -> KeyTypeSpec {
+    KeyTypeSpec { name, since }
+}
+
+/// A way a definition's `JOIN ... ON` key is admitted, by the entry that
+/// declares it. Recorded for the definition's floor where the validator
+/// admits the key ([`admit_join_key`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKey {
+    /// A type on the allowlist, by its name.
+    Listed(&'static str),
+    /// An enum type, which no fixed list can name ([`is_enum_type_name`]).
+    Enum,
+}
+
+impl JoinKey {
+    /// The release this key type arrived in as a join key: its allowlist
+    /// entry's. `None` for a name no entry declares.
+    pub fn since(&self) -> Option<Release> {
+        match *self {
+            JoinKey::Listed(name) => TEXT_STABLE_JOIN_KEY_TYPES
+                .iter()
+                .find(|spec| spec.name == name)
+                .map(|spec| spec.since),
+            JoinKey::Enum => Some(BASELINE),
+        }
+    }
+}
+
 /// Strips a `format_type` rendering's `(...)` type modifier, wherever it
 /// sits, leaving the bare type name: `character varying(255)` and
 /// `numeric(10,2)` become `character varying` and `numeric`, and
@@ -85,10 +128,10 @@ pub(crate) fn base_type_name(pg_type: &str) -> Cow<'_, str> {
 /// key index was the prerequisite; asked of a live server, it is
 /// not — pinning `bytea_output` alone already makes raw `::text` matching
 /// agree with `bytea`'s native `=` for every value.
-pub(crate) const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
-    "smallint",
-    "integer",
-    "bigint",
+const TEXT_STABLE_JOIN_KEY_TYPES: &[KeyTypeSpec] = &[
+    key_type("smallint", BASELINE),
+    key_type("integer", BASELINE),
+    key_type("bigint", BASELINE),
     // `oid` is an *unsigned* 32-bit integer whose `oid_out`
     // rendering is canonical decimal — no sign, no leading zeros, no
     // padding — so `a::text = b::text` agrees with `oid`'s native `=` for
@@ -96,10 +139,10 @@ pub(crate) const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // It is not a `ValueType::Integer` (Postgres gives it no arithmetic at
     // all; see `pg_type::PgType::Oid`), but text-stability is a property of
     // the *rendering*, not of the operator set, so it belongs here.
-    "oid",
-    "uuid",
-    "text",
-    "character varying",
+    key_type("oid", BASELINE),
+    key_type("uuid", BASELINE),
+    key_type("text", BASELINE),
+    key_type("character varying", BASELINE),
     // Four of the six temporal families, on the same
     // "text-stability is a property of the rendering" reasoning `oid` was
     // admitted under. `docs/type-support.md` had all six marked `🎯 typed
@@ -139,10 +182,10 @@ pub(crate) const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // * `interval` — `'24 hours'` and `'1 day'` are one value with two
     //   renderings. The float `-0`/`0` defect; no GUC and no renderer
     //   reconciliation fixes it, though a typed key index would.
-    "date",
-    "time without time zone",
-    "time with time zone",
-    "timestamp without time zone",
+    key_type("date", BASELINE),
+    key_type("time without time zone", BASELINE),
+    key_type("time with time zone", BASELINE),
+    key_type("timestamp without time zone", BASELINE),
     // `timestamp with time zone` joins the four above.
     // `timestamptz_out` renders the stored instant in the session's `TimeZone`,
     // so it needs two independent properties to be text-stable — the
@@ -155,12 +198,12 @@ pub(crate) const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // is a bijection on the instant in both. See
     // `crate::temporal::is_bijective_under_text`/ `is_render_consistent` for
     // the per-family verdict this list mirrors.
-    "timestamp with time zone",
+    key_type("timestamp with time zone", BASELINE),
     // `byteaout` under the pinned `bytea_output = 'hex'` is a
     // bijection on its values — see the doc comment above for the live
     // evidence. `bytea` has no length/precision modifier, so
     // `base_type_name` never has anything to strip for it.
-    "bytea",
+    key_type("bytea", BASELINE),
     // `cidr`/`macaddr`/`macaddr8` join the list; `inet` — despite
     // sharing `cidr`'s `pg_cast` row — deliberately does not. Full account in
     // `crate::netaddr`'s module doc, condensed here:
@@ -191,9 +234,9 @@ pub(crate) const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // its `GROUP BY` key role is still admitted, the same split `boolean`
     // got — see `validate::reject_unsupported_group_by_key_type`'s `Inet`
     // arm.
-    "cidr",
-    "macaddr",
-    "macaddr8",
+    key_type("cidr", BASELINE),
+    key_type("macaddr", BASELINE),
+    key_type("macaddr8", BASELINE),
     // `boolean` is deliberately *not* here, and the reason is
     // new — every other admission/refusal on this list turns on whether
     // `<type>_out` (the type's own output function, what capture images and
@@ -270,8 +313,8 @@ pub(crate) const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
     // (`ddl::source_primary_key`). Fixed-length `bit` is *not* admitted as a
     // `GROUP BY` key for a completely different, DDL-only reason — see
     // `validate::reject_unsupported_group_by_key_type`'s `VarBit` arm.
-    "bit",
-    "bit varying",
+    key_type("bit", BASELINE),
+    key_type("bit varying", BASELINE),
     // `jsonb` is deliberately **absent**, and — unlike
     // `boolean`/`inet` — not because of a second, disagreeing `::text`
     // renderer: `select castfunc from pg_cast where castsource =
@@ -300,7 +343,11 @@ pub(crate) const TEXT_STABLE_JOIN_KEY_TYPES: &[&str] = &[
 /// A hand-maintained second copy of the list would drift whenever a family
 /// is admitted.
 pub(crate) fn supported_join_key_types() -> String {
-    TEXT_STABLE_JOIN_KEY_TYPES.join(", ")
+    let names: Vec<&str> = TEXT_STABLE_JOIN_KEY_TYPES
+        .iter()
+        .map(|spec| spec.name)
+        .collect();
+    names.join(", ")
 }
 
 /// Whether `pg_type` (a `format_type` rendering, e.g. `integer`, `character
@@ -311,10 +358,34 @@ pub(crate) fn supported_join_key_types() -> String {
 /// matching, so `varchar(255)` and `varchar(100)` are both recognized as `character
 /// varying` — and `timestamp(3) without time zone` as `timestamp without time zone`
 /// — rather than falling through to the catch-all rejection as distinct strings.
+///
+/// A pure question: it records nothing for a floor. The validator admits a
+/// `JOIN` key through [`admit_join_key`].
 pub(crate) fn is_text_stable_join_key_type(pg_type: &str) -> bool {
+    listed_join_key(pg_type).is_some()
+}
+
+/// The allowlist entry `pg_type` matches, as the key it admits.
+fn listed_join_key(pg_type: &str) -> Option<JoinKey> {
     let base = base_type_name(pg_type);
     // A copy renders `bit` as the quoted `"bit"` ([`super::copy_type`]).
-    TEXT_STABLE_JOIN_KEY_TYPES.contains(&base.trim_matches('"'))
+    let base = base.trim_matches('"');
+    TEXT_STABLE_JOIN_KEY_TYPES
+        .iter()
+        .find(|spec| spec.name == base)
+        .map(|spec| JoinKey::Listed(spec.name))
+}
+
+/// Whether a `JOIN ... ON` key of type `pg_type` (`is_enum`: an enum type,
+/// [`is_enum_type_name`]) is admitted, recording the entry that admits it for
+/// the floor of the definition being validated on this thread, if any
+/// ([`super::floor::record`]). The validator's only way to admit a join key.
+pub(crate) fn admit_join_key(pg_type: &str, is_enum: bool) -> bool {
+    let Some(key) = listed_join_key(pg_type).or(is_enum.then_some(JoinKey::Enum)) else {
+        return false;
+    };
+    super::floor::record(super::floor::Feature::JoinKey(key));
+    true
 }
 
 /// The dynamic counterpart to [`TEXT_STABLE_JOIN_KEY_TYPES`]/
@@ -359,4 +430,47 @@ pub(crate) async fn is_enum_type_name(
         )
         .await?;
     Ok(row.get(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::defs::floor::{Feature, collect};
+
+    /// The validator's way to admit a join key records the entry that admits
+    /// it, for every type on the allowlist and for an enum, and records
+    /// nothing for a refusal. The allowlist itself is private to this module,
+    /// so nothing else can admit a key type without its release.
+    #[test]
+    fn a_join_key_is_admitted_only_through_an_entry_with_a_release() {
+        for spec in TEXT_STABLE_JOIN_KEY_TYPES {
+            // A modifier doesn't change the entry that admits it.
+            for rendering in [spec.name.to_string(), format!("\"{}\"", spec.name)] {
+                let (admitted, recorded) = collect(|| admit_join_key(&rendering, false));
+                assert!(admitted, "{rendering}");
+                assert_eq!(recorded, [Feature::JoinKey(JoinKey::Listed(spec.name))]);
+                assert_eq!(recorded[0].since(), Some(spec.since));
+            }
+        }
+        let (admitted, recorded) = collect(|| admit_join_key("app.status", true));
+        assert!(admitted);
+        assert_eq!(recorded, [Feature::JoinKey(JoinKey::Enum)]);
+        assert!(recorded[0].since().is_some());
+        for refused in ["numeric", "real", "boolean", "inet", "jsonb", "interval"] {
+            let (admitted, recorded) = collect(|| admit_join_key(refused, false));
+            assert!(!admitted && recorded.is_empty(), "{refused}");
+        }
+    }
+
+    /// The pure question and the recording admission agree on every type.
+    #[test]
+    fn the_pure_question_agrees_with_the_admission() {
+        for name in ["integer", "character varying(10)", "numeric(10,2)", "inet"] {
+            assert_eq!(
+                is_text_stable_join_key_type(name),
+                collect(|| admit_join_key(name, false)).0,
+                "{name}"
+            );
+        }
+    }
 }

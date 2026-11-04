@@ -6,8 +6,8 @@
 //! [`Feature`] the definition uses arrived in: the grammar constructs of its
 //! parsed tree, its key space and options, whether a table it reads is
 //! partitioned, the hidden-table layout and per-definition state this
-//! release writes for it, and every argument value and type rule the
-//! validator admitted it by over its columns' types. [`Floors::of`] computes
+//! release writes for it, and every argument value, type rule and key type
+//! the validator admitted it by over its columns' types. [`Floors::of`] computes
 //! it, and [`stamp`] writes it wherever Trellis writes the definition
 //! (define, `ALTER TRANSFORM`), recreates its hidden tables (a resume's
 //! rebuild), or sees a column it reads change type while the validator
@@ -21,7 +21,11 @@
 //! and each case of a type rule ([`super::registry::TypeRule`]) declares
 //! its release, a rule returns its case as a required part of its result
 //! ([`super::registry::Admitted`]), and reading the result [`record`]s it
-//! while [`validated_features`] runs the validation.
+//! while [`validated_features`] runs the validation. A key type is the same:
+//! each `GROUP BY` key type is a [`super::registry::GroupByKeyRule`] case of a
+//! type rule, and each `JOIN ... ON` key type an entry of the join-key
+//! allowlist ([`super::join_key_types::JoinKey`]), recorded where the
+//! validator admits the key.
 //!
 //! The registry is exhaustive by construction. [`features_used`] matches
 //! every node kind of the tree, and [`Feature::since`] matches every
@@ -32,7 +36,8 @@
 //! [`super::typed_literal::TypedLiteralSpec::since`],
 //! [`super::registry::CastTargetSpec::since`],
 //! [`super::registry::ArgValueSpec::since`]), and a type rule's case in
-//! [`super::registry::TypeRule::since`]. Everything that exists when floors
+//! [`super::registry::TypeRule::since`] (a join-key type in
+//! [`super::join_key_types::JoinKey::since`]). Everything that exists when floors
 //! were introduced has floor [`BASELINE`].
 //!
 //! A definition above the running release, or written under a grammar newer
@@ -212,6 +217,9 @@ pub enum Feature {
     /// `DATE_TRUNC` unit or an `AT TIME ZONE` zone
     /// ([`super::registry::ArgValue`]).
     Value(super::registry::ArgValue),
+    /// A type admitted as a `JOIN ... ON` key
+    /// ([`super::join_key_types::JoinKey`]).
+    JoinKey(super::join_key_types::JoinKey),
 }
 
 /// The special forms the parser builds as a [`Expr::FunctionCall`] without
@@ -295,6 +303,7 @@ impl Feature {
             }),
             Feature::TypeRule(rule) => Some(rule.since()),
             Feature::Value(value) => value.since(),
+            Feature::JoinKey(key) => key.since(),
         }
     }
 
@@ -1481,6 +1490,100 @@ mod tests {
             validated_floor(&floors, "GROUP BY id SELECT id AS id, SUM(c) AS s", INT4).as_deref(),
             Some("0.3.2")
         );
+    }
+
+    /// A `GROUP BY` key type declared for a later release raises the floor of
+    /// a definition keyed on it, and only of one keyed on it.
+    #[test]
+    fn a_group_by_key_type_declared_later_raises_the_floor() {
+        use crate::defs::pg_type::PgType;
+        let floors = floors(
+            "0.4.0",
+            &[
+                ("TypeRule(GroupByKey(Inet))", "0.3.0"),
+                ("TypeRule(GroupByKey(Integer))", "0.3.1"),
+            ],
+        );
+        let group = "GROUP BY c SELECT c AS c, COUNT(*) AS n";
+        let inet = ("inet", ValueType::Other(PgType::Inet));
+        assert_eq!(
+            validated_floor(&floors, group, inet).as_deref(),
+            Some("0.3.0")
+        );
+        assert_eq!(
+            validated_floor(&floors, group, INT4).as_deref(),
+            Some("0.3.1")
+        );
+        assert_eq!(
+            validated_floor(&floors, group, ("text", ValueType::Text)).as_deref(),
+            Some("0.2.0")
+        );
+        // `real` is no key at all: the validator refuses it.
+        assert_eq!(
+            validated_floor(
+                &floors,
+                group,
+                ("real", ValueType::Float(crate::float::FloatWidth::Float4))
+            ),
+            None
+        );
+    }
+
+    /// The floor of `GROUP BY s.g SELECT ...` over `s JOIN u ON s.k = u.k`,
+    /// the key `k` of type `k` on both sides and `g` of type `g` on `s`, as
+    /// define computes it.
+    fn join_floor(floors: &Floors, k: (&str, ValueType), g: (&str, ValueType)) -> Option<String> {
+        use crate::defs::pg_type::PgType;
+        let def = parse(
+            "TRANSFORM t FROM s JOIN u ON s.k = u.k GROUP BY s.g \
+             SELECT s.g AS g, COUNT(*) AS n",
+        )
+        .expect("parses");
+        let side = |columns: &[(&str, (&str, ValueType))]| {
+            columns
+                .iter()
+                .map(|(name, (pg_type, value_type))| {
+                    let mut info = column(pg_type, *value_type);
+                    info.is_enum = matches!(value_type, ValueType::Other(PgType::Enum(_)));
+                    (name.to_string(), info)
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let left = side(&[("k", k), ("g", g)]);
+        let right = side(&[("k", k)]);
+        let validated = validated_features(&def, &left, Some(&right)).ok()?;
+        Some(floors.of(&def, false, Some(&validated)).to_string())
+    }
+
+    /// A `JOIN ON` key type declared for a later release raises the floor of
+    /// a definition joined on it, an enum key included; so does a `GROUP BY`
+    /// key of a `JOIN`.
+    #[test]
+    fn a_join_key_type_declared_later_raises_the_floor() {
+        use crate::defs::pg_type::PgType;
+        let floors = floors(
+            "0.4.0",
+            &[
+                (r#"JoinKey(Listed("bigint"))"#, "0.3.0"),
+                ("JoinKey(Enum)", "0.3.1"),
+                ("TypeRule(GroupByKey(Inet))", "0.3.2"),
+            ],
+        );
+        let text = ("text", ValueType::Text);
+        assert_eq!(join_floor(&floors, INT8, text).as_deref(), Some("0.3.0"));
+        assert_eq!(join_floor(&floors, INT4, text).as_deref(), Some("0.2.0"));
+        // A modifier never changes the type: `varchar(20)` is `character varying`.
+        assert_eq!(
+            join_floor(&floors, ("character varying(20)", ValueType::Text), text).as_deref(),
+            Some("0.2.0")
+        );
+        let inet = ("inet", ValueType::Other(PgType::Inet));
+        assert_eq!(join_floor(&floors, INT4, inet).as_deref(), Some("0.3.2"));
+        let status = (
+            "status",
+            ValueType::Other(PgType::Enum("enum:public.status")),
+        );
+        assert_eq!(join_floor(&floors, status, text).as_deref(), Some("0.3.1"));
     }
 
     /// The validator's refusal is no floor: `date + bigint` has no operator.
