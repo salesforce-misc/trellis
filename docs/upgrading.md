@@ -170,7 +170,9 @@ reports `catching_up`. The older release refuses to act on it, with the
 `version_floor` error code, changing nothing:
 
 - `RESUME TRANSFORM`, `ALTER TRANSFORM` and `self_check` of it refuse with
-  the reason above.
+  the reason above while what the older release can't run is still stored.
+  The pause itself replaces an unknown status or capture failure kind, so
+  such a definition resumes under the older release.
 - `DROP TRANSFORM` of it refuses whether it is paused or not. Only a release
   that meets its floor knows everything it owns, so only that release can
   drop it completely:

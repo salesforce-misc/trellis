@@ -430,8 +430,11 @@ pause are arcs of one lifecycle:
     `status()` of a definition whose status this release doesn't know refuses
     with `version_floor`, and a `capture_failure` whose kind it doesn't know
     reports kind `unknown`. `RESUME`, `ALTER TRANSFORM` and `self_check` of it
-    refuse with the `version_floor` code until a release that runs it does
-    them, and so does `DROP TRANSFORM` of one above its floor
+    refuse with the `version_floor` code while what this release can't run is
+    still stored: its floor or grammar, a value a newer release stored for
+    it other than its status or a capture failure's kind (the pause replaces
+    those, so this release resumes it), or a source's unreadable partition
+    record. `DROP TRANSFORM` of one above its floor refuses too
     ([before rolling back](upgrading.md#before-rolling-back));
   * its build kept failing in a way no retry gets past: the error stays on
     `backfill_failure`;

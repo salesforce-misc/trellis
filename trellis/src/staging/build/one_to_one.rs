@@ -521,7 +521,9 @@ pub async fn sweep_batch(
 /// `-`), U+0001, then the rest. So a stored cursor of that shape is a tagged
 /// one, and any other is a bare ledger key: an untagged cursor, as every
 /// release writes a ledger key that doesn't start with U+0001, and as a
-/// release before the orphan cursor wrote every one. A tag not in
+/// release before the orphan cursor wrote every one. The one exception is
+/// a bare key such a release stored that is itself of the tagged shape: it
+/// reads as tagged. A tag not in
 /// [`SWEEP_TAGS`] was written by a newer release, and reads as
 /// [`UnknownCursorTag`], never as a ledger key (ADR-0024 rule 6);
 /// `defs::floor::unknown_value_sql` finds it from SQL with the same shape.
