@@ -14,17 +14,25 @@
 //!   [`SAMPLE_PAGES`] pages of it. A slot that small is read whole, and its
 //!   counts are exact; a larger one is scaled up from the sample, so its
 //!   rows are an estimate and its split follows the sizes of the rows the
-//!   sampled pages hold.
+//!   sampled pages hold. A row's size is [`ROW_SIZE`], its columns' stored
+//!   sizes: a TOASTed image counts what it holds in the TOAST table without
+//!   the read fetching it, so the read stays within the sampled pages.
 //! - **Undrained** is decided per slot, by the drain's own condition
 //!   ([`ring_slot_applied_sql`]): the slot's segment has not drained, or a
 //!   late row of it has not. A slot is counted whole while any of its rows
 //!   is still to drain, so a segment draining its last buckets still counts
 //!   all its bytes.
 //! - **The oldest undrained row's age** is read from the first
-//!   [`AGE_ROWS`] rows of each undrained slot, in heap order, not from every
-//!   row: the ring is append-only and truncated whole, so the heap runs in
-//!   append order, and `appended_at` is a writer's transaction start, which
-//!   concurrent transactions only reorder slightly. The age is that of the
+//!   [`AGE_PAGES`] pages of each undrained slot, not from every row: the
+//!   ring is append-only and truncated whole, so the heap runs in append
+//!   order, and `appended_at` is a writer's transaction start, which
+//!   concurrent transactions only reorder slightly. The pages are named by
+//!   a TID range, not a `LIMIT` on a plain scan: a large slot's sequential
+//!   scan starts wherever another scan of it reported reaching
+//!   (`synchronize_seqscans`), so its first rows would be a later stretch of
+//!   the slot. Only when those pages hold no visible row (a long writer's
+//!   uncommitted rows, or rows deleted from the slot) is the age read from
+//!   the first [`AGE_ROWS`] rows a plain scan returns. The age is that of the
 //!   oldest row of the oldest segment not fully drained, which can include a
 //!   bucket of it that has drained already.
 
@@ -43,7 +51,23 @@ use crate::metrics::RingGauges;
 /// size: about 22,000 captured rows.
 pub(crate) const SAMPLE_PAGES: u32 = 512;
 
-/// The rows at the start of an undrained slot that its age is read from.
+/// A ring row's size on disk, over ring row `t`: its variable-width columns
+/// as stored (a TOASTed one's stored size, without fetching it), plus the
+/// tuple header with its null bitmap (32 bytes) and the fixed-width columns
+/// (64). Not `pg_column_size(t)`: a
+/// whole-row value inlines every TOASTed column, so the sample would read
+/// each sampled row's images out of the TOAST table.
+const ROW_SIZE: &str = "(96 + pg_column_size(t.src_table) + pg_column_size(t.key) \
+     + pg_column_size(t.op) + coalesce(pg_column_size(t.old_image), 0) \
+     + coalesce(pg_column_size(t.new_image), 0) \
+     + coalesce(pg_column_size(t.transition_images), 0))";
+
+/// The pages at the start of an undrained slot that its age is read from,
+/// 256 KiB at the default page size.
+const AGE_PAGES: u32 = 32;
+
+/// The rows the age is read from when the first [`AGE_PAGES`] pages hold no
+/// visible row.
 const AGE_ROWS: u32 = 1000;
 
 /// What one read of the ring found: the segment counts and the ring's gauges.
@@ -74,13 +98,16 @@ fn sql(sample_pages: u32) -> String {
                     u.undrained, \
                     (100.0 / {pct})::float8 as scale, \
                     case when u.undrained then \
-                        extract(epoch from now() - (select min(a.appended_at) \
-                            from (select appended_at from {table} limit {AGE_ROWS}) a))::float8 \
+                        extract(epoch from now() - coalesce( \
+                            (select min(appended_at) from {table} \
+                             where ctid < '({AGE_PAGES},0)'::tid), \
+                            (select min(a.appended_at) \
+                             from (select appended_at from {table} limit {AGE_ROWS}) a)))::float8 \
                     end as age, \
                     g.src_table, g.n, g.b \
              from (select not {applied} as undrained) u \
              left join (select src_table, count(*) as n, \
-                               sum(pg_column_size(t))::float8 as b \
+                               sum({ROW_SIZE})::float8 as b \
                         from {table} t tablesample system ({pct}) \
                         group by src_table) g on true",
             applied = ring_slot_applied_sql(slot),
@@ -292,6 +319,135 @@ mod tests {
             "{age:?}"
         );
         assert_eq!(reading.segments.map(|(_, n)| n), [1, 1, 0, 1]);
+    }
+
+    /// The age is the slot's first rows', even while another scan of a slot
+    /// large enough for synchronized scans has stopped midway through it: a
+    /// plain scan of the slot would start where that one stopped, and read
+    /// rows half the slot younger.
+    #[tokio::test]
+    async fn the_age_reads_the_start_of_a_slot_another_scan_stopped_midway() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let conn = db.pool.get().await.expect("connection");
+        // Synchronized scans start on a table of more than a quarter of
+        // `shared_buffers`; outgrow that by a fifth.
+        let buffers: i64 = conn
+            .query_one(
+                "select setting::bigint from pg_settings where name = 'shared_buffers'",
+                &[],
+            )
+            .await
+            .expect("shared_buffers")
+            .get(0);
+        // About 25 rows of this size to a page; a row a second, the first the
+        // oldest.
+        let rows = buffers / 4 * 25 * 6 / 5;
+        conn.batch_execute(&format!(
+            "insert into seg_0 (src_table, key, op, new_image, appended_at) \
+             select 'public.t', lpad(i::text, 12, '0'), 'insert', \
+                    jsonb_build_object('id', i, 'pad', repeat('x', 200)), \
+                    now() - ({rows} - i) * interval '1 second' \
+             from generate_series(1, {rows}) i"
+        ))
+        .await
+        .expect("seed");
+        let pages = total_size(&db, 0).await as i64 / 8192;
+        assert!(
+            pages > buffers / 4,
+            "{pages} pages should exceed {buffers} / 4"
+        );
+
+        // Another scan stops halfway, its cursor open.
+        let scanner = db.pool.get().await.expect("connection");
+        scanner
+            .batch_execute(&format!(
+                "begin; declare c cursor for select * from seg_0; \
+                 move forward {} in c",
+                rows / 2
+            ))
+            .await
+            .expect("scan halfway");
+
+        let reading = read(&conn).await.expect("read");
+        let age = reading.ring.oldest_undrained_age.as_secs() as i64;
+        assert!(
+            age >= rows - 60,
+            "the oldest row is {rows} s old, read as {age} s"
+        );
+        scanner
+            .batch_execute("rollback")
+            .await
+            .expect("end the scan");
+    }
+
+    /// A slot of rows whose images are TOASTed is read without fetching the
+    /// images: the read's buffers stay within the sampled and age pages, and
+    /// the split weighs a row by what it stores, TOAST included.
+    #[tokio::test]
+    async fn a_read_does_not_fetch_toasted_images() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let conn = db.pool.get().await.expect("connection");
+        // 300 rows of ~19 KB of md5 text each (too random to compress under
+        // the TOAST threshold), next to 300 small rows.
+        conn.batch_execute(
+            "insert into seg_0 (src_table, key, op, new_image) \
+             select 'public.wide', lpad(i::text, 12, '0'), 'insert', \
+                    jsonb_build_object('pad', (select string_agg(md5(i::text || '.' || k), '') \
+                                               from generate_series(1, 600) k)) \
+             from generate_series(1, 300) i; \
+             insert into seg_0 (src_table, key, op, new_image) \
+             select 'public.narrow', lpad(i::text, 12, '0'), 'insert', jsonb_build_object('id', i) \
+             from generate_series(1, 300) i",
+        )
+        .await
+        .expect("seed");
+        let toast_pages: i64 = conn
+            .query_one(
+                "select pg_relation_size(reltoastrelid) / 8192 from pg_class \
+                 where oid = 'seg_0'::regclass",
+                &[],
+            )
+            .await
+            .expect("toast size")
+            .get(0);
+        assert!(toast_pages > 500, "{toast_pages} TOAST pages");
+
+        let plan: Vec<String> = conn
+            .query(
+                &format!(
+                    "explain (analyze, buffers, format text) {}",
+                    sql(SAMPLE_PAGES)
+                ),
+                &[],
+            )
+            .await
+            .expect("explain")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        // The plan's first `Buffers:` line is its root's, the whole read's.
+        let buffers: i64 = plan
+            .iter()
+            .find_map(|line| line.trim().strip_prefix("Buffers: shared "))
+            .expect("the root's buffers")
+            .split_whitespace()
+            .filter_map(|count| count.split_once('=')?.1.parse::<i64>().ok())
+            .sum();
+        assert!(
+            buffers < 100,
+            "the read touched {buffers} buffers of a slot of {toast_pages} TOAST pages:\n{}",
+            plan.join("\n")
+        );
+
+        let reading = read(&conn).await.expect("read");
+        let undrained = &reading.ring.undrained_bytes;
+        let (wide, narrow) = (undrained["public.wide"], undrained["public.narrow"]);
+        assert!(
+            wide > 50 * narrow,
+            "{wide} is mostly TOAST, {narrow} is not"
+        );
     }
 
     /// A slot bigger than the sample is scaled up from it: its rows are an
