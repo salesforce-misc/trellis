@@ -939,11 +939,13 @@ not_alive() { ! run_alive "$1"; }
 paused_with() { # port db name pattern: stored paused, and capture_failures.error matches
   [ "$(stored_status "$1" "$2" "$3")" = paused ] && failure_reason "$1" "$2" "$3" | grep -qE "$4"
 }
-# leftovers <port> <db> <id>: rows any trellis table keeps for that transform id,
-# plus trellis relations named with it.
+# leftovers <port> <db> <id> <name>: rows any trellis table keeps for that
+# transform id, its hidden tables (agg_<id>, join_<id>_*, join1_<id>_*) and
+# its target's ledger.
 leftovers() {
   scalar "$1" "$2" "select coalesce(sum((xpath('/row/c/text()', query_to_xml(format('select count(*) c from trellis.%I where transform_id = %s', c.relname, $3), false, true, '')))[1]::text::bigint), 0)
-      + (select count(*) from pg_class where relnamespace = 'trellis'::regnamespace and relname ~ ('_' || $3 || '(_|\$)'))
+      + (select count(*) from pg_class where relnamespace = 'trellis'::regnamespace and relname ~ ('^(agg|join|join1)_' || $3 || '(_|\$)'))
+      + (to_regclass('public.$4__ledger') is not null)::int
     from pg_class c join pg_attribute a on a.attrelid = c.oid
    where c.relnamespace = 'trellis'::regnamespace and c.relkind in ('r', 'p') and a.attname = 'transform_id' and not a.attisdropped"
 }
@@ -1117,10 +1119,10 @@ rollback_with_floors() {
       first=$n
       id=$(scalar "$port" "$db" "select id from trellis.transform_definitions where target_table = 'public.$n'")
       if trellis "$port" "$db" "$candidate_bin" apply "DROP TRANSFORM $n" >>"$logs/apply-rollback.log" 2>&1 &&
-        [ -z "$(scalar "$port" "$db" "select to_regclass('public.$n')")" ] && [ "$(leftovers "$port" "$db" "$id")" = 0 ]; then
+        [ -z "$(scalar "$port" "$db" "select to_regclass('public.$n')")" ] && [ "$(leftovers "$port" "$db" "$id" "$n")" = 0 ]; then
         record PASS downgrade "rolled forward, DROP TRANSFORM $n removes its target, catalog rows and hidden tables"
       else
-        record FAIL downgrade "rolled forward, DROP TRANSFORM $n left state behind (see $logs/apply-rollback.log; leftovers $(leftovers "$port" "$db" "$id"))"
+        record FAIL downgrade "rolled forward, DROP TRANSFORM $n left state behind (see $logs/apply-rollback.log; leftovers $(leftovers "$port" "$db" "$id" "$n"))"
       fi
     else
       trellis "$port" "$db" "$candidate_bin" apply "RESUME TRANSFORM $n" >>"$logs/apply-rollback.log" 2>&1 || record FAIL downgrade "RESUME TRANSFORM $n refused"
