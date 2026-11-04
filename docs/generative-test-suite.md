@@ -195,9 +195,10 @@ written by hand, each with a test that fails when it falls behind:
 A `Profile` sets the literal magnitude and nesting depth. The conformance
 properties draw boundary literals (`NaN`, `±Infinity`, range edges, numbers
 wider than any type) to depth 3. The end-to-end tiers draw small literals to
-depth 2, so a program the engine accepts also runs: Postgres computes every
-field, and one that raised for some row would quarantine it and keep the
-program from converging.
+depth 2 and divide only by `NULLIF(divisor, 0)`, so a program the engine
+accepts also runs: Postgres computes every field, and one that raised for some
+row (a column divisor that is zero there) would hold its key in quarantine and
+keep the program from converging.
 
 #### Expression conformance
 

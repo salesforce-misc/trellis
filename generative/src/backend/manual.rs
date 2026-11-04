@@ -125,6 +125,88 @@ async fn wait_for_producer_release(config: &Config) -> Result<(), ManualBackendE
     Ok(())
 }
 
+/// How long [`ManualBackend::restart`] and [`ManualBackend::stop_engine`]
+/// wait for the outgoing engine client's `shutdown`, which joins its thread
+/// and has no limit of its own. A clean shutdown takes milliseconds; a
+/// stalled one fails the case with [`ManualBackendError::ShutdownTimeout`]
+/// instead of hanging the property.
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Shuts `client` down, bounded by [`SHUTDOWN_TIMEOUT`]. On a timeout the
+/// client's thread is left behind (it can't be cancelled) and the error
+/// carries [`activity_summary`] of `config`'s database.
+async fn shutdown_within_timeout(
+    what: &'static str,
+    config: &Config,
+    client: EngineClient,
+) -> Result<(), ManualBackendError> {
+    let started = tokio::time::Instant::now();
+    match tokio::time::timeout(SHUTDOWN_TIMEOUT, client.shutdown()).await {
+        Ok(result) => Ok(result?),
+        Err(_) => Err(ManualBackendError::ShutdownTimeout {
+            what,
+            waited: started.elapsed(),
+            activity: activity_summary(config).await,
+        }),
+    }
+}
+
+/// One line per other session on `config`'s database: its state, wait event,
+/// how long its transaction and statement have run, and the statement's
+/// start. On a fresh connection, bounded at 10 s; a failure to read it is
+/// reported in its place. For timeout errors, so the next stall names what
+/// each session was waiting on.
+pub async fn activity_summary(config: &Config) -> String {
+    let read = async {
+        let (client, connection) = tokio_postgres::connect(config.dsn(), NoTls).await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok::<_, tokio_postgres::Error>(activity_summary_on(&client).await)
+    };
+    match tokio::time::timeout(Duration::from_secs(10), read).await {
+        Ok(Ok(summary)) => summary,
+        Ok(Err(err)) => format!("(couldn't connect to read pg_stat_activity: {err})"),
+        Err(_) => "(reading pg_stat_activity timed out)".to_string(),
+    }
+}
+
+/// [`activity_summary`] on a session the caller already holds.
+pub async fn activity_summary_on(client: &tokio_postgres::Client) -> String {
+    let rows = client
+        .query(
+            "select pid, coalesce(state, ''), coalesce(wait_event_type, ''), \
+                    coalesce(wait_event, ''), \
+                    coalesce(extract(epoch from now() - xact_start)::float8, -1), \
+                    coalesce(extract(epoch from now() - query_start)::float8, -1), \
+                    left(regexp_replace(coalesce(query, ''), '\\s+', ' ', 'g'), 200) \
+             from pg_stat_activity \
+             where datname = current_database() and pid <> pg_backend_pid() \
+             order by query_start",
+            &[],
+        )
+        .await;
+    match rows {
+        Ok(rows) => rows
+            .iter()
+            .map(|row| {
+                format!(
+                    "pid {} {} wait={}/{} xact={:.1}s query={:.1}s: {}",
+                    row.get::<_, i32>(0),
+                    row.get::<_, String>(1),
+                    row.get::<_, String>(2),
+                    row.get::<_, String>(3),
+                    row.get::<_, f64>(4),
+                    row.get::<_, f64>(5),
+                    row.get::<_, String>(6),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(err) => format!("(couldn't read pg_stat_activity: {err})"),
+    }
+}
+
 /// Opens the backend's own raw session: `search_path` pinned to the instance
 /// schema, and the text-output settings `sql::read_table` relies on.
 async fn connect_raw(config: &Config) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
@@ -161,6 +243,15 @@ pub enum ManualBackendError {
     /// always starts a client before any restart point is reached), not a
     /// condition a caller should need to handle gracefully.
     NoClientStarted,
+    /// An engine client's `shutdown` didn't return within
+    /// [`SHUTDOWN_TIMEOUT`]: `what` names the call, and `activity` is the
+    /// database's `pg_stat_activity` at the timeout (what each of the
+    /// client's sessions was running), for diagnosing the stall.
+    ShutdownTimeout {
+        what: &'static str,
+        waited: Duration,
+        activity: String,
+    },
     /// [`ManualBackend::quiesce`] waited [`QUIESCE_TIMEOUT`] for every
     /// installed definition to reach a terminal backfill outcome (`live` or
     /// `quarantined`) and at least one never did — `unsettled` names every
@@ -1054,7 +1145,7 @@ impl ManualBackend {
     /// an equivalent client back.
     pub async fn stop_engine(&mut self) -> Result<(), ManualBackendError> {
         if let Some(client) = self.engine_client.take() {
-            client.shutdown().await?;
+            shutdown_within_timeout("stop_engine", &self.config, client).await?;
         }
         Ok(())
     }
@@ -1305,7 +1396,7 @@ impl super::Backend for ManualBackend {
         // advisory lock is released (from this process's point of view)
         // before the new one tries to acquire it (layer 1 of `restart`'s fix).
         if let Some(old_client) = self.engine_client.take() {
-            old_client.shutdown().await?;
+            shutdown_within_timeout("restart", &self.config, old_client).await?;
         }
         // Layer 2: wait out the residual window `shutdown` alone can't close
         // (see this method's own doc comment).

@@ -63,6 +63,14 @@ pub struct Profile {
     /// install; the conformance properties draw them, since
     /// `expr_conformance` checks that define and Postgres both refuse.
     pub constant_zero_divisor: bool,
+    /// Draw every `/` and `%` divisor as `NULLIF(divisor, 0)`, so a divisor
+    /// that is zero for some row (`42 % c1`, a `CASE` that picks `REAL '0'`
+    /// on one branch) gives `NULL` instead of raising. On for the end-to-end
+    /// tiers: Postgres raises `division by zero` for that row, the engine
+    /// holds its key in quarantine, and a held key blocks every convergence
+    /// wait, so the program never settles. The oracle doesn't model held
+    /// keys. Off for the conformance properties, which check the raise.
+    pub guard_divisors: bool,
 }
 
 impl Profile {
@@ -73,6 +81,7 @@ impl Profile {
         mixed_coalesce: true,
         bare_null: true,
         constant_zero_divisor: true,
+        guard_divisors: false,
     };
     /// The end-to-end tiers: small literals and depth 2, so a program the
     /// engine accepts also runs.
@@ -82,6 +91,7 @@ impl Profile {
         mixed_coalesce: false,
         bare_null: false,
         constant_zero_divisor: false,
+        guard_divisors: true,
     };
 }
 
@@ -376,6 +386,18 @@ pub fn has_constant_zero_divisor(expr: &Expr, columns: &[Column]) -> bool {
         validate(&def, &source_columns),
         Err(ValidationError::ConstantDivisorZero { .. })
     )
+}
+
+/// `NULLIF(divisor, 0)`: [`Profile::guard_divisors`]. A divisor is always
+/// of the numeric family (`registry::operator_result_type`), and define
+/// admits a bare `0` beside each: an integer or `numeric` compares with it
+/// as Postgres does, and a float takes the literal spelling
+/// ([`Rule::NullIfLiteral`]).
+fn guarded_divisor(divisor: Expr) -> Expr {
+    Expr::FunctionCall {
+        name: "NULLIF".to_string(),
+        args: vec![divisor, Expr::NumberLiteral("0".to_string())],
+    }
 }
 
 /// Canonical spellings per typed-literal keyword. A keyword with no entry
@@ -1610,6 +1632,8 @@ pub mod strategy {
                     // operator over one type on both sides takes it on
                     // either side.
                     let nullable = self.profile.bare_null && lhs == rhs && literal_rhs.is_none();
+                    let guard = self.profile.guard_divisors
+                        && matches!(op, Operator::Divide | Operator::Modulo);
                     Some(
                         (l, r, 0..8u8)
                             .prop_map(move |(lhs, rhs, roll)| {
@@ -1618,6 +1642,7 @@ pub mod strategy {
                                     1 if nullable => (lhs, Expr::Null),
                                     _ => (lhs, rhs),
                                 };
+                                let rhs = if guard { guarded_divisor(rhs) } else { rhs };
                                 Expr::BinaryOp {
                                     op,
                                     lhs: Box::new(lhs),
@@ -2151,6 +2176,73 @@ mod tests {
                 .iter()
                 .any(|e| has_constant_zero_divisor(e, &columns)),
             "the conformance profile no longer draws a constant zero divisor"
+        );
+    }
+
+    /// Every `/` and `%` in `expr`, as (divisor, guarded) pairs.
+    fn divisors(expr: &Expr, out: &mut Vec<(Expr, bool)>) {
+        if let Expr::BinaryOp {
+            op: Operator::Divide | Operator::Modulo,
+            rhs,
+            ..
+        } = expr
+        {
+            let guarded = matches!(
+                &**rhs,
+                Expr::FunctionCall { name, args }
+                    if name == "NULLIF"
+                        && matches!(args.get(1), Some(Expr::NumberLiteral(t)) if t == "0")
+            );
+            out.push(((**rhs).clone(), guarded));
+        }
+        let children: Vec<&Expr> = match expr {
+            Expr::BinaryOp { lhs, rhs, .. } => vec![lhs, rhs],
+            Expr::FunctionCall { args, .. } => args.iter().collect(),
+            Expr::Negate(operand) => vec![operand],
+            Expr::Cast { expr, .. } => vec![expr],
+            _ => expr.logic_children(),
+        };
+        for child in children {
+            divisors(child, out);
+        }
+    }
+
+    /// #1641: the end-to-end profile drew divisors that are zero for some
+    /// row (`42 % c1` over `c1 = 0`, `99 / CASE WHEN c4 THEN NULL ELSE REAL
+    /// '0' END`). Postgres raised `division by zero` for that row, the engine
+    /// held its key in quarantine, and the held key kept every quiesce from
+    /// converging, so the case failed after its 30 s wait. Each such draw now
+    /// divides by `NULLIF(divisor, 0)`, which define admits for every
+    /// divisor type (checked by the test above over the same draws). The
+    /// conformance profile still draws a bare column divisor.
+    #[test]
+    fn the_end_to_end_profile_guards_every_divisor() {
+        let mut end_to_end = Vec::new();
+        for expr in draws(Profile::END_TO_END, 50_000) {
+            divisors(&expr, &mut end_to_end);
+        }
+        assert!(
+            end_to_end.len() > 100,
+            "too few end-to-end divisions drawn ({}) to judge",
+            end_to_end.len()
+        );
+        let bare: Vec<String> = end_to_end
+            .iter()
+            .filter(|(_, guarded)| !guarded)
+            .take(5)
+            .map(|(d, _)| render_text(d, TextStyle::default()))
+            .collect();
+        assert!(bare.is_empty(), "unguarded end-to-end divisors: {bare:?}");
+
+        let mut conformance = Vec::new();
+        for expr in draws(Profile::CONFORMANCE, 20_000) {
+            divisors(&expr, &mut conformance);
+        }
+        assert!(
+            conformance
+                .iter()
+                .any(|(d, guarded)| !guarded && matches!(d, Expr::Column(_))),
+            "the conformance profile no longer draws a bare column divisor"
         );
     }
 

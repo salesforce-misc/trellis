@@ -71,6 +71,12 @@ is transcribed from its printed `Program` into a hand-built pin, which the
 fast lane runs on every push and no generator change can invalidate (see
 `tests/concurrent_convergence.rs`'s shrink-trust convention).
 
+**A failure shrinks for at most five minutes.** A case that fails by timing
+out pays that timeout again on every shrink step, so each config sets
+`max_shrink_time` from `generative::shrink` and reports the smallest case found
+by then, with its seed. `PROPTEST_MAX_SHRINK_TIME` (milliseconds, `0` for no
+limit) overrides it.
+
 Useful local invocations:
 
 ```sh

@@ -62,6 +62,11 @@ use trellis::{
     Config, Divergence, SelfCheckMode, SelfCheckOutcome, SelfCheckReport, Trellis, TrellisOptions,
 };
 
+/// The most pages [`self_check_to_end`] runs, and the longest it runs them,
+/// before failing the case: a job here is one page.
+const SELF_CHECK_MAX_PAGES: usize = 100;
+const SELF_CHECK_LIMIT: Duration = Duration::from_secs(120);
+
 /// `Trellis::self_check` run to its end. The call starts a background job and
 /// returns. The caller stops the backend's engine first, and with it
 /// the worker task that would otherwise race this one for the job, so this
@@ -74,10 +79,32 @@ async fn self_check_to_end(trellis: &Trellis, pool: &Pool, target: &str) -> Self
         .await
         .expect("start self_check");
     let worker = SelfCheckWorkerOptions::new(Duration::from_secs(30));
+    // A job here is one page, and a page is bounded by the worker's 30 s
+    // budget, but a page that kept claiming work would loop forever. Fail
+    // the case instead, naming the job's state (#1641).
+    let started = std::time::Instant::now();
+    let mut pages = 0;
     while work_self_check_once(pool, "generative", &worker)
         .await
         .expect("a self_check page")
-    {}
+    {
+        pages += 1;
+        if pages >= SELF_CHECK_MAX_PAGES || started.elapsed() >= SELF_CHECK_LIMIT {
+            let state = trellis.self_check_job(job.id).await;
+            let sessions = match pool.get().await {
+                Ok(conn) => generative::backend::activity_summary_on(&conn).await,
+                Err(err) => format!("(no connection to read pg_stat_activity: {err})"),
+            };
+            panic!(
+                "self_check job {} still claimed work after {pages} page(s) in {:?} \
+                 (limits: {SELF_CHECK_MAX_PAGES} pages, {SELF_CHECK_LIMIT:?}); job: {state:?}\n\
+                 sessions:\n{}",
+                job.id,
+                started.elapsed(),
+                sessions,
+            );
+        }
+    }
     let job = trellis
         .self_check_job(job.id)
         .await
@@ -322,6 +349,7 @@ fn tampering_proptest_config() -> ProptestConfig {
         .unwrap_or(16);
     ProptestConfig {
         cases,
+        max_shrink_time: generative::shrink::max_shrink_time_ms(),
         failure_persistence: Some(Box::new(FileFailurePersistence::SourceParallel(
             "proptest-regressions",
         ))),

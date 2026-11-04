@@ -47,3 +47,5 @@ pub mod oracle;
 pub mod plant_sweep;
 #[cfg(feature = "engine-access")]
 pub mod run;
+#[cfg(feature = "engine-access")]
+pub mod shrink;

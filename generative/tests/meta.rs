@@ -67,6 +67,31 @@ async fn a_backend_that_cannot_stand_up_is_reported_unusable() {
     );
 }
 
+/// The diagnostic a harness timeout carries (#1641) names each other
+/// session on the database and what it is running.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_timeouts_activity_summary_names_the_other_sessions() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let config = trellis::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    let (other, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    tokio::spawn(connection);
+    other
+        .batch_execute("select 'marker-1641'")
+        .await
+        .expect("a statement to report");
+
+    let summary = generative::backend::activity_summary(&config).await;
+    assert!(
+        summary
+            .lines()
+            .any(|line| line.contains("idle") && line.contains("marker-1641")),
+        "the summary names the other session's last statement: {summary}"
+    );
+}
+
 /// Self-enforcing half of the fast/deep split: every proptest property is
 /// `#[ignore]`d, so a plain `cargo test --workspace` — the command every
 /// contributor and CI lane reaches for first — never deep-runs them by accident.
@@ -144,6 +169,41 @@ fn every_fn_declared_inside_proptest_blocks_is_prefixed_and_ignored_by_default()
          and marked `#[ignore]` so plain `cargo test` never deep-runs it (see \
          generative/README.md), but found:\n{}",
         violations.join("\n")
+    );
+}
+
+/// Every property file whose config saves failing seeds also bounds how long
+/// a failure shrinks (`generative::shrink`): a failure that costs a timeout
+/// per shrink step otherwise shrinks for hours and reports nothing (#1641).
+/// A text scan, like the one above: a config is a `ProptestConfig { ... }`
+/// literal naming `FileFailurePersistence`.
+#[test]
+fn every_property_config_bounds_its_shrink_time() {
+    let tests_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests");
+    let mut unbounded = Vec::new();
+    let mut configs = 0;
+    for entry in std::fs::read_dir(tests_dir).expect("generative/tests directory must be readable")
+    {
+        let path = entry.expect("a directory entry").path();
+        // This file names both strings below without being a config.
+        if path.extension().is_none_or(|ext| ext != "rs") || path.ends_with("meta.rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("reading {}: {err}", path.display()));
+        if !source.contains("FileFailurePersistence::SourceParallel") {
+            continue;
+        }
+        configs += 1;
+        if !source.contains("max_shrink_time: generative::shrink::max_shrink_time_ms()") {
+            unbounded.push(path.display().to_string());
+        }
+    }
+    assert!(configs > 0, "found no property config under {tests_dir}");
+    assert!(
+        unbounded.is_empty(),
+        "these property configs save failing seeds but don't set \
+         `max_shrink_time: generative::shrink::max_shrink_time_ms()`: {unbounded:?}"
     );
 }
 

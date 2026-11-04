@@ -1043,11 +1043,12 @@ fn aggregate_field_def(func: AggregateFn, c1: &str, c2: &str) -> FieldDef {
 /// **Why a generated expression stays infallible at run time.** The draws
 /// use [`crate::expr_gen::Profile::END_TO_END`]: small literals and shallow
 /// nesting, so no sum of the `0..=99` values the tables
-/// hold and a literal overflows `integer`, and `REGEXP_COUNT` patterns come
-/// from the dialect-common pool. Postgres computes every field, so a shape
-/// that could raise for some row would quarantine it and the program would
-/// not converge. The day a profile draws something data-dependent-fallible
-/// (division by a column that can be zero), this is the comment to revisit.
+/// hold and a literal overflows `integer`, `REGEXP_COUNT` patterns come
+/// from the dialect-common pool, and every `/` and `%` divides by
+/// `NULLIF(divisor, 0)` (`Profile::guard_divisors`), since a divisor can be a
+/// column or a `CASE` that is zero for some row. Postgres computes every
+/// field, so a shape that could raise for some row would hold its key in
+/// quarantine and the program would never converge: its quiesce times out.
 ///
 /// **Slots, not names.** The expression is drawn before the table's column
 /// names exist (names are minted by the table), so it refers to the four

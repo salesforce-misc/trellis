@@ -277,6 +277,7 @@ fn proptest_config() -> ProptestConfig {
         .unwrap_or(16);
     ProptestConfig {
         cases,
+        max_shrink_time: generative::shrink::max_shrink_time_ms(),
         failure_persistence: Some(Box::new(FileFailurePersistence::SourceParallel(
             "proptest-regressions",
         ))),
