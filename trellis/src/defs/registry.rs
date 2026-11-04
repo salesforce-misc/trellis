@@ -525,20 +525,36 @@ pub fn cast_target_spec(value_type: ValueType) -> Option<&'static CastTargetSpec
 
 /// The result type of `CAST(<operand> AS <target>)`, or `None` if the cast is
 /// not one of the admitted ones: an integer to a strictly wider integer, any
-/// integer to `numeric`, or a `date` to `timestamp`. Every other cast narrows
-/// (and can overflow), rounds, goes to or from a float, or reads a session
-/// setting (`timestamptz` to `timestamp`).
+/// integer to `numeric`, a `date` to `timestamp`, or a cast to the operand's
+/// own type (an integer to its own width, `numeric` to `numeric`, `timestamp`
+/// to `timestamp`). Every other cast narrows (and can overflow), rounds, goes
+/// to or from a float, or reads a session setting (`timestamptz` to
+/// `timestamp`).
+///
+/// A cast to the operand's own type is the identity in Postgres: the value
+/// and its text are unchanged, so `numeric(12,2)` `1.50` stays `1.50` (a
+/// target without a modifier adds no rounding) and a `timestamp(3)` keeps its
+/// fractional digits. That is what lets a correct `SUM(CAST(qty AS bigint))`
+/// keep defining after `qty` widens from `integer` to `bigint`. Both operand
+/// and target are modifier-free [`ValueType`]s, so the identity is the same
+/// type; the release of each admitted pair is its target's
+/// ([`CAST_TARGETS`]), declared once there.
 ///
 /// `date` to `timestamp` is exact and `IMMUTABLE`, but not total: a date past
 /// 294276 AD is out of range for `timestamp`, which is a data error (class 22)
 /// for the row that holds it.
 pub fn cast_result_type(operand: ValueType, target: ValueType) -> Option<ValueType> {
     match (operand, target) {
-        (ValueType::Integer(from), ValueType::Integer(to)) if from.range().1 < to.range().1 => {
+        (ValueType::Integer(from), ValueType::Integer(to)) if from.range().1 <= to.range().1 => {
             Some(target)
         }
-        (ValueType::Integer(_), ValueType::Numeric) => Some(ValueType::Numeric),
-        (ValueType::Other(PgType::Date), ValueType::Other(PgType::Timestamp)) => Some(target),
+        (ValueType::Integer(_) | ValueType::Numeric, ValueType::Numeric) => {
+            Some(ValueType::Numeric)
+        }
+        (
+            ValueType::Other(PgType::Date | PgType::Timestamp),
+            ValueType::Other(PgType::Timestamp),
+        ) => Some(target),
         _ => None,
     }
 }
@@ -1335,14 +1351,14 @@ mod tests {
         }
     }
 
-    /// `CAST(date AS timestamp)` is admitted; the reverse and the same-type
-    /// casts are not, and `timestamp` is a target by name.
+    /// `CAST(date AS timestamp)` is admitted, and so is a `timestamp` to its
+    /// own type; the reverse is not, and `timestamp` is a target by name.
     #[test]
     fn a_date_casts_to_a_timestamp_and_nothing_else_does() {
         const DATE: ValueType = ValueType::Other(PgType::Date);
         const TS: ValueType = ValueType::Other(PgType::Timestamp);
         assert_eq!(cast_result_type(DATE, TS), Some(TS));
-        assert_eq!(cast_result_type(TS, TS), None);
+        assert_eq!(cast_result_type(TS, TS), Some(TS));
         assert_eq!(cast_result_type(TS, DATE), None);
         assert_eq!(
             cast_result_type(ValueType::Other(PgType::TimestampTz), TS),
@@ -1351,6 +1367,71 @@ mod tests {
         assert_eq!(cast_target("TIMESTAMP"), Some(TS));
         assert_eq!(cast_target("timestamptz"), None);
         assert_eq!(cast_target("date"), None);
+    }
+
+    /// The admitted `CAST` pairs are exactly: an integer to the same or a
+    /// wider integer, an integer or `numeric` to `numeric`, and a `date` or
+    /// `timestamp` to `timestamp`. Every other pair of the types a column can
+    /// have, against every target, is refused.
+    #[test]
+    fn a_cast_is_admitted_to_the_operands_own_type_and_the_widenings_only() {
+        use IntWidth::{Int2, Int4, Int8};
+        const I2: ValueType = ValueType::Integer(Int2);
+        const I4: ValueType = ValueType::Integer(Int4);
+        const I8: ValueType = ValueType::Integer(Int8);
+        const N: ValueType = ValueType::Numeric;
+        const TS: ValueType = ValueType::Other(PgType::Timestamp);
+        let admitted = [
+            (I2, I2),
+            (I2, I4),
+            (I2, I8),
+            (I4, I4),
+            (I4, I8),
+            (I8, I8),
+            (I2, N),
+            (I4, N),
+            (I8, N),
+            (N, N),
+            (ValueType::Other(PgType::Date), TS),
+            (TS, TS),
+        ];
+        let operands = [
+            I2,
+            I4,
+            I8,
+            N,
+            ValueType::Float(FloatWidth::Float4),
+            ValueType::Float(FloatWidth::Float8),
+            ValueType::Text,
+            ValueType::Boolean,
+            ValueType::Uuid,
+            ValueType::Other(PgType::Date),
+            ValueType::Other(PgType::Time),
+            TS,
+            ValueType::Other(PgType::TimestampTz),
+            ValueType::Other(PgType::Jsonb),
+        ];
+        let targets = CAST_TARGETS
+            .iter()
+            .chain(NULL_CAST_TARGETS)
+            .map(|spec| spec.value_type);
+        for target in targets {
+            for operand in operands {
+                let expected = admitted.contains(&(operand, target)).then_some(target);
+                assert_eq!(
+                    cast_result_type(operand, target),
+                    expected,
+                    "CAST({operand} AS {target})"
+                );
+            }
+        }
+        // The identity pairs, which Postgres runs as a no-op; narrowings stay
+        // refused.
+        assert_eq!(cast_result_type(I8, I4), None);
+        assert_eq!(cast_result_type(I4, I2), None);
+        assert_eq!(cast_result_type(I4, I4), Some(I4));
+        assert_eq!(cast_result_type(I8, I8), Some(I8));
+        assert_eq!(cast_result_type(N, N), Some(N));
     }
 
     /// The list is sorted, lower-case and without repeats, which

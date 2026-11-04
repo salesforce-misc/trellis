@@ -455,8 +455,8 @@ pub enum Expr {
     /// negative [`Expr::NumberLiteral`], as Postgres reads it). The result
     /// has the operand's type.
     Negate(Box<Expr>),
-    /// `CAST(<operand> AS <target>)` for the casts (the lossless integer widenings
-    /// and `date` to `timestamp`)
+    /// `CAST(<operand> AS <target>)` for the casts (the lossless integer widenings,
+    /// a cast to the operand's own type and `date` to `timestamp`)
     /// [`super::registry::cast_result_type`] admits. A cast of a quoted
     /// literal is an [`Expr::TypedLiteral`] instead.
     Cast { expr: Box<Expr>, target: ValueType },

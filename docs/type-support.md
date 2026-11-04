@@ -262,8 +262,8 @@ operator against a live server,
 | `-a`, `ABS(a)` | any integer, `numeric` or float | the operand's type |
 | `CEIL(a)`, `FLOOR(a)`, `TRUNC(a)` | `numeric`, `double precision` | the operand's type |
 | `ROUND(a)`, `ROUND(a, n)`, `TRUNC(a, n)` | `numeric`; `n` an integer literal | `numeric`; rounds half away from zero, `TRUNC` toward zero |
-| `CAST(a AS integer)` (or `int`, `int4`), `AS bigint` (or `int8`) | a strictly narrower integer | the named integer |
-| `CAST(a AS numeric)` (or `decimal`) | any integer | `numeric` |
+| `CAST(a AS integer)` (or `int`, `int4`), `AS bigint` (or `int8`) | an integer of the same or a narrower width | the named integer; a cast to the operand's own type changes nothing |
+| `CAST(a AS numeric)` (or `decimal`) | any integer or `numeric` | `numeric`; a `numeric` keeps its scale (`1.50` stays `1.50`) |
 
 Prefix `-` binds tighter than every binary operator, and `*`, `/` and `%`
 bind tighter than `+` and `-`. A minus before a number literal is one negative
@@ -346,7 +346,7 @@ operand types (the conformance harness checks each against a live server,
 | `EXTRACT(<field> FROM d)` | a `date`; `year`, `quarter`, `month`, `week`, `day`, `dow`, `isodow`, `doy`, `isoyear`, `decade`, `century`, `millennium`, `epoch` | `numeric` |
 | `EXTRACT(<field> FROM ts)` | a `timestamp`; the date fields and `hour`, `minute`, `second`, `milliseconds`, `microseconds` | `numeric`; `epoch` is seconds since 1970-01-01 00:00 with no zone |
 | `tz AT TIME ZONE 'UTC'` | a `timestamptz`; the literal `'UTC'` only | `timestamp` |
-| `CAST(d AS timestamp)` | a `date` | `timestamp` |
+| `CAST(d AS timestamp)` | a `date` or a `timestamp` | `timestamp`; a `timestamp` keeps its fractional digits |
 
 `EXTRACT` is an unconstrained `numeric`, so `SUM` or `AVG` of one is refused for
 its undeclared scale; a bucket for an aggregate is a 1-1 field
@@ -518,7 +518,7 @@ date)`. The accepted keywords are `DATE`, `TIMESTAMP`, `TIME`, `TIMETZ`,
 literal's text must be in the type's canonical Postgres output spelling, which
 also makes the literal's spelling agree with Postgres's rendering byte for byte. A
 `CAST(<expr> AS <type>)` over a non-literal admits only the lossless integer
-widenings ([Arithmetic](#arithmetic)) and a `date` to `timestamp` ([Dates and
+widenings and an integer, `numeric` or `timestamp` cast to its own type ([Arithmetic](#arithmetic)), and a `date` to `timestamp` ([Dates and
 times](#dates-and-times)), with Postgres's `int`, `int4`, `int8` and
 `decimal` accepted as spellings of the target (and only there); every other one
 is refused by name. See

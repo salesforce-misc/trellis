@@ -358,9 +358,10 @@ pub enum ValidationError {
         text: Option<String>,
         reason: String,
     },
-    /// A `CAST` the grammar does not admit: only an integer to a strictly
-    /// wider integer, any integer to `numeric`, or a `date` to `timestamp`
-    /// converts exactly and without reading a setting.
+    /// A `CAST` the grammar does not admit: only an integer to the same or a
+    /// wider integer, any integer or `numeric` to `numeric`, or a `date` or
+    /// `timestamp` to `timestamp` converts exactly and without reading a
+    /// setting.
     UnsupportedCast {
         field: String,
         from: ValueType,
@@ -1226,9 +1227,9 @@ impl fmt::Display for ValidationError {
             ValidationError::UnsupportedCast { field, from, to } => write!(
                 f,
                 "calculated field '{field}' casts a {from} value to {to}; the only casts \
-                 admitted are an integer to a wider integer, any integer to numeric and a \
-                 date to timestamp, because only those are exact and read no session \
-                 setting (see \"Supported sources and targets\" in docs/transforms.md)"
+                 admitted are an integer to the same or a wider integer, any integer to \
+                 numeric, numeric to numeric, and a date or timestamp to timestamp, because \
+                 only those are exact and read no session setting (see \"Supported sources and targets\" in docs/transforms.md)"
             ),
             ValidationError::TemporalOperand {
                 field,
@@ -3948,18 +3949,21 @@ fn fold_constant<'f>(
             | Constant::Date(_)
             | Constant::Timestamp(_) => None,
         },
-        // A date casts to its midnight, when it is in `timestamp`'s range.
+        // A date casts to its midnight, when it is in `timestamp`'s range; a
+        // timestamp casts to itself.
         Expr::Cast {
             expr,
             target: ValueType::Other(PgType::Timestamp),
         } => match recurse(expr, field_name)? {
             Constant::Null => Some(Constant::Null),
+            constant @ Constant::Timestamp(_) => Some(constant),
             Constant::Date(days) if days <= super::date_const::MAX_TIMESTAMP_DATE_DAYS => Some(
                 Constant::Timestamp(super::date_const::midnight_micros(days)),
             ),
             _ => None,
         },
-        // A widening cast keeps the value.
+        // A widening cast, or a cast to the operand's own type, keeps the
+        // value.
         Expr::Cast { expr, .. } => recurse(expr, field_name),
         Expr::FunctionCall { name, args } if name == "ABS" && args.len() == 1 => {
             match recurse(&args[0], field_name)? {

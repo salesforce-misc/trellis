@@ -413,8 +413,10 @@ fn date_function_refusals_name_the_construct_and_the_remedy() {
 }
 
 #[test]
-fn casts_to_timestamp_admit_only_a_date() {
-    for operand in ["ts", "i4", "t", "tm"] {
+fn casts_to_timestamp_admit_only_a_date_and_a_timestamp() {
+    // A `timestamp` casts to its own type (#1642).
+    assert_type("CAST(ts AS timestamp)", TS);
+    for operand in ["i4", "t", "tm"] {
         assert_refused(&format!("CAST({operand} AS timestamp)"), &["timestamp"]);
     }
     assert_refused("CAST(tz AS timestamp)", &["CAST", "AT TIME ZONE 'UTC'"]);
@@ -533,6 +535,18 @@ fn a_constant_timestamp_from_a_cast_decides_a_case() {
     assert_type(
         "CASE WHEN CAST(DATE '2024-02-29' AS timestamp) > TIMESTAMP '2024-02-29 00:00:00.5' \
          THEN 1.0 / 0 ELSE 1.5 END",
+        ValueType::Numeric,
+    );
+    // A `timestamp` casts to itself, so the cast is transparent to the fold
+    // (#1642): the comparison is decided and the other branch is checked.
+    assert_refused(
+        "CASE WHEN CAST(TIMESTAMP '2024-02-29 12:00:00' AS timestamp) < \
+         TIMESTAMP '2024-02-29 00:00:00' THEN 1.5 ELSE 1.0 / 0 END",
+        &["zero"],
+    );
+    assert_type(
+        "CASE WHEN CAST(TIMESTAMP '2024-02-29 12:00:00' AS timestamp) > \
+         TIMESTAMP '2024-02-29 00:00:00' THEN 1.5 ELSE 1.0 / 0 END",
         ValueType::Numeric,
     );
     // A `NULL` beside a call define has no value for (`DATE_TRUNC` of

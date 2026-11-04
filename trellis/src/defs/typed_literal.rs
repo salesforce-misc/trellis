@@ -42,8 +42,9 @@
 //!   every (source, target) pair needs its own volatility verdict and its own
 //!   rendering rule, and most of the interesting pairs are not
 //!   immutable (`timestamptz` → `date` reads the `TimeZone` GUC). Each type
-//!   family decides its own cast pairs. The integers have decided theirs: a
-//!   strictly wider integer, or `numeric`
+//!   family decides its own cast pairs. The integers have decided theirs: the
+//!   same or a wider integer, or `numeric`; `numeric` and `timestamp` keep
+//!   their own type
 //!   ([`super::registry::cast_result_type`]); every other pair is refused by
 //!   name.
 //!

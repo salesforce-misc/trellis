@@ -1,5 +1,5 @@
 //! Arithmetic in the expression grammar (`-`, `*`, `/`, `%`, prefix `-`, the
-//! numeric functions, the widening `CAST`): how it parses, how it types, and
+//! numeric functions, `CAST`): how it parses, how it types, and
 //! what define refuses. The same constructs are checked against a real
 //! Postgres by the conformance harness (`generative/tests/expr_conformance.rs`);
 //! these pin the rules that need no database.
@@ -289,10 +289,11 @@ fn a_cast_alias_types_as_its_canonical_target_and_narrows_alike() {
     assert_type("CAST(i4 AS Decimal)", N);
     assert_refused("CAST(i8 AS int)", "integer");
     assert_refused("CAST(i8 AS int4)", "integer");
-    assert_refused("CAST(i4 AS int)", "integer");
     assert_refused("CAST(n AS int4)", "numeric value to integer");
-    assert_refused("CAST(n AS decimal)", "numeric value to numeric");
-    assert_refused("CAST(i8 AS int8)", "bigint");
+    // The same width through an alias is the identity, as canonically.
+    assert_type("CAST(i4 AS int)", I4);
+    assert_type("CAST(n AS decimal)", N);
+    assert_type("CAST(i8 AS int8)", I8);
 }
 
 #[test]
@@ -419,6 +420,62 @@ fn every_operator_row_has_the_postgres_result_type() {
     assert_type("CAST(i4 AS numeric)", N);
     assert_type("CAST(i8 AS numeric)", N);
     assert_type("CAST(5 AS bigint)", I8);
+    // A cast to the operand's own type is the identity (#1642).
+    assert_type("CAST(i4 AS integer)", I4);
+    assert_type("CAST(i4 AS int4)", I4);
+    assert_type("CAST(i8 AS bigint)", I8);
+    assert_type("CAST(i8 AS int8)", I8);
+    assert_type("CAST(n AS numeric)", N);
+    assert_type("CAST(n AS decimal)", N);
+    assert_type("CAST(CAST(i4 AS bigint) AS bigint) + 1", I8);
+}
+
+/// A correct `SUM(CAST(c AS bigint))` keeps defining after `c` widens from
+/// `integer` to `bigint`, which makes the cast an identity (#1642).
+#[test]
+fn an_aggregate_over_an_identity_cast_defines() {
+    let mut columns = columns();
+    columns.insert("qty".to_string(), I8);
+    for text in [
+        "SUM(CAST(qty AS bigint))",
+        "SUM(CAST(i8 AS bigint))",
+        "SUM(CAST(i4 AS integer))",
+        "SUM(CAST(n AS numeric))",
+        "AVG(CAST(n AS numeric))",
+    ] {
+        let def = parse(&format!(
+            "TRANSFORM t FROM s GROUP BY i4 SELECT {text} AS x"
+        ))
+        .unwrap_or_else(|e| panic!("`{text}` should parse: {e}"));
+        validate(&def, &columns).unwrap_or_else(|e| panic!("`{text}` was refused: {e}"));
+    }
+}
+
+/// An identity cast of a constant is transparent to the constant checks:
+/// the overflow under it is refused, and a `CASE` condition over it decides
+/// the branch the planner keeps.
+#[test]
+fn an_identity_cast_is_transparent_to_constant_folding() {
+    assert!(matches!(
+        type_of("CAST(2147483647 AS integer) + 1"),
+        Err(ValidationError::ConstantOutOfRange { .. })
+    ));
+    assert!(matches!(
+        type_of("CASE WHEN CAST(1 AS integer) = 2 THEN 1 ELSE 2147483647 + 1 END"),
+        Err(ValidationError::ConstantOutOfRange { .. })
+    ));
+    assert_type(
+        "CASE WHEN CAST(1 AS integer) = 1 THEN 1 ELSE 2147483647 + 1 END",
+        I4,
+    );
+    assert_refused(
+        "CASE WHEN CAST(1.5 AS numeric) = 2 THEN 1.5 ELSE 1.0 / 0 END",
+        "zero",
+    );
+    assert_type(
+        "CASE WHEN CAST(1.5 AS numeric) = 1.5 THEN 1.5 ELSE 1.0 / 0 END",
+        N,
+    );
 }
 
 #[test]
@@ -447,10 +504,11 @@ fn what_postgres_would_do_differently_is_refused_with_the_remedy() {
     assert_refused("t * 2", "'*'");
     // Casts that narrow, round or leave the integers.
     assert_refused("CAST(i8 AS integer)", "integer");
-    assert_refused("CAST(i4 AS integer)", "integer");
-    assert_refused("CAST(i8 AS bigint)", "bigint");
+    assert_refused("CAST(i8 AS int4)", "integer");
     assert_refused("CAST(n AS bigint)", "numeric value to bigint");
-    assert_refused("CAST(n AS numeric)", "numeric value to numeric");
+    assert_refused("CAST(n AS integer)", "numeric value to integer");
+    assert_refused("CAST(f8 AS bigint)", "double precision value to bigint");
+    assert_refused("CAST(f4 AS numeric)", "real value to numeric");
     assert_refused("CAST(f8 AS numeric)", "double precision value to numeric");
     assert_refused("CAST(t AS bigint)", "text value to bigint");
 }

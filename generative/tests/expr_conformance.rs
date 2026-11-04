@@ -409,7 +409,12 @@ fn arithmetic_rows_agree_with_postgres() {
         "ROUND(-2.5)",
         "ROUND(-2.5, 0)",
         "ROUND(na) + 2147483647",
-        // Widening casts
+        // Widening casts, and a cast to the operand's own type (#1642)
+        "CAST(i4a AS integer)",
+        "CAST(i8a AS bigint)",
+        "CAST(na AS numeric)",
+        "CAST(na AS decimal) / 3",
+        "CAST(i4a AS integer) + i4b",
         "CAST(i2a AS integer)",
         "CAST(i2a AS bigint)",
         "CAST(i4a AS bigint)",
@@ -1502,6 +1507,7 @@ fn date_rows_agree_with_postgres() {
         "da + 2147483647",
         "da - 2147483647",
         "CAST(da AS timestamp)",
+        "CAST(tsa AS timestamp)",
         "CAST(da + 1 AS timestamp) = tsa",
         "DATE_TRUNC('month', CAST(da AS timestamp))",
         "DATE_TRUNC('week', tsa)",
@@ -1751,7 +1757,6 @@ fn each_refusal_names_its_construct() {
         ("EXTRACT(year FROM tza)", "at time zone 'utc'"),
         ("EXTRACT(hour FROM tma)", "date or a timestamp"),
         ("CAST(tza AS timestamp)", "at time zone 'utc'"),
-        ("CAST(tsa AS timestamp)", "timestamp"),
         ("CAST(da AS timestamptz)", "timestamptz"),
         // A field or unit the type does not have, or is not a literal.
         ("EXTRACT(hour FROM da)", "cast(d as timestamp)"),
