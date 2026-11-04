@@ -141,13 +141,43 @@ async fn shutdown_within_timeout(
     client: EngineClient,
 ) -> Result<(), ManualBackendError> {
     let started = tokio::time::Instant::now();
-    match tokio::time::timeout(SHUTDOWN_TIMEOUT, client.shutdown()).await {
-        Ok(result) => Ok(result?),
-        Err(_) => Err(ManualBackendError::ShutdownTimeout {
+    match on_own_thread_within(SHUTDOWN_TIMEOUT, client.shutdown()).await {
+        Some(result) => Ok(result?),
+        None => Err(ManualBackendError::ShutdownTimeout {
             what,
             waited: started.elapsed(),
             activity: activity_summary(config).await,
         }),
+    }
+}
+
+/// Runs `future` on a thread and runtime of its own, waiting at most `limit`
+/// for its output: `None` on a timeout, leaving that thread behind.
+///
+/// Not a `tokio::time::timeout` on the caller's runtime: `Client::shutdown`
+/// joins its thread through `spawn_blocking`, and dropping a runtime waits
+/// with no limit for its blocking tasks. The properties keep one runtime per
+/// test thread, dropped when the thread exits after a failure, so a join
+/// left on it would hang the test before the failure was reported (#1641).
+async fn on_own_thread_within<T: Send + 'static>(
+    limit: Duration,
+    future: impl std::future::Future<Output = T> + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("generative-bounded-call".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build a runtime for a bounded call");
+            let _ = tx.send(runtime.block_on(future));
+        })
+        .expect("spawn a thread for a bounded call");
+    match tokio::time::timeout(limit, rx).await {
+        Ok(Ok(output)) => Some(output),
+        Ok(Err(_)) => panic!("a bounded call's thread panicked"),
+        Err(_) => None,
     }
 }
 
@@ -1685,5 +1715,46 @@ impl super::ConcurrentBackend for ManualBackend {
             BurstAction::Install { .. } => unreachable!("handled above"),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1641: a bounded call that times out on a blocking join leaves
+    /// nothing on the caller's runtime, so dropping that runtime (as a test
+    /// thread's exit does to the properties' thread-local one) returns. A
+    /// `tokio::time::timeout` over the same future on the caller's runtime
+    /// would leave the `spawn_blocking` join there, and the drop would wait
+    /// for it with no limit.
+    #[test]
+    fn a_timed_out_bounded_call_does_not_hold_up_the_callers_runtime() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let stuck = std::thread::spawn(|| std::thread::sleep(Duration::from_secs(3600)));
+        let output = runtime.block_on(on_own_thread_within(
+            Duration::from_millis(200),
+            async move { tokio::task::spawn_blocking(move || stuck.join()).await },
+        ));
+        assert!(output.is_none(), "the stuck join times out");
+
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(runtime);
+            let _ = dropped_tx.send(());
+        });
+        assert!(
+            dropped_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "dropping the caller's runtime waited on the timed-out call"
+        );
+    }
+
+    #[test]
+    fn a_bounded_call_that_finishes_returns_its_output() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let output = runtime.block_on(on_own_thread_within(Duration::from_secs(10), async {
+            tokio::task::spawn_blocking(|| 7).await.expect("join")
+        }));
+        assert_eq!(output, Some(7));
     }
 }
