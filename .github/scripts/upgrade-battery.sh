@@ -426,7 +426,9 @@ shapes_paused="$shapes_grammar_paused ord_paused"
 # entry each: the manifest lines it covers (each without its release, an
 # admission also without its case, `;` between them), `|`, the target's name,
 # `|`, the definition over the shapes tables. The step fails a candidate-only
-# manifest line no entry covers. Empty for 0.2.0: floors arrive in it, and
+# manifest line no entry covers. A feature that needs a table the shapes
+# schema lacks (a new primary-key or partition-key type) adds one to
+# shapes_schema below. Empty for 0.2.0: floors arrive in it, and
 # v0.1.0, which carries none, refuses its database.
 rollback_new_defs=(
 )
@@ -939,15 +941,17 @@ not_alive() { ! run_alive "$1"; }
 paused_with() { # port db name pattern: stored paused, and capture_failures.error matches
   [ "$(stored_status "$1" "$2" "$3")" = paused ] && failure_reason "$1" "$2" "$3" | grep -qE "$4"
 }
-# leftovers <port> <db> <id> <name>: rows any trellis table keeps for that
-# transform id, its hidden tables (agg_<id>, join_<id>_*, join1_<id>_*) and
-# its target's ledger.
+# leftovers <port> <db> <id> <name>: its transform_definitions row, the rows
+# any trellis table keeps for that id (by transform_id or definition_id), its
+# hidden tables (agg_<id>, join_<id>_*, join1_<id>_*) and its target's ledger.
 leftovers() {
-  scalar "$1" "$2" "select coalesce(sum((xpath('/row/c/text()', query_to_xml(format('select count(*) c from trellis.%I where transform_id = %s', c.relname, $3), false, true, '')))[1]::text::bigint), 0)
+  scalar "$1" "$2" "select coalesce(sum((xpath('/row/c/text()', query_to_xml(format('select count(*) c from trellis.%I where %I = %s', c.relname, a.attname, $3), false, true, '')))[1]::text::bigint), 0)
+      + (select count(*) from trellis.transform_definitions where id = $3)
       + (select count(*) from pg_class where relnamespace = 'trellis'::regnamespace and relname ~ ('^(agg|join|join1)_' || $3 || '(_|\$)'))
       + (to_regclass('public.$4__ledger') is not null)::int
     from pg_class c join pg_attribute a on a.attrelid = c.oid
-   where c.relnamespace = 'trellis'::regnamespace and c.relkind in ('r', 'p') and a.attname = 'transform_id' and not a.attisdropped"
+   where c.relnamespace = 'trellis'::regnamespace and c.relkind in ('r', 'p')
+     and a.attname in ('transform_id', 'definition_id') and not a.attisdropped"
 }
 
 # A release before 0.2.0 carries no floor check (ADR-0024 rule 8). It refuses

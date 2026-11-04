@@ -23,18 +23,21 @@ greater of the stored floor and its own:
    where string_to_array(version, '.')::int[] < '{X,Y,Z}';
 
 `check` fails a migration without the declaration; a raise without that
-update, or with another version; a write to `catalog_floor` under "Declares no
-catalog floor"; a raise above the crate's release; and a raise, in a migration
-the newest released tag lacks, to that tag's release or below, which that
-release would read as a catalog it can.
+update, or with another version, or that refers to `catalog_floor` otherwise;
+any reference to `catalog_floor` under "Declares no catalog floor"; a file
+refinery would run that isn't a `V<n>__<name>.sql` directly under the
+directory; a raise above the crate's release; and a raise, in a migration the
+newest released tag lacks, to that tag's release or below, which that release
+would read as a catalog it can.
 
 Feature floors. `.github/feature-floors.txt` lists every registry entry and
 type-rule case with its release, and every admission the validator's type
-rules make (trellis's `defs::floor_manifest` test keeps it equal to the code).
+rules and key-type gates make (trellis's `defs::floor_manifest` test keeps it equal to the code).
 `check` fails a line whose release is above the crate's, and a line the newest
 released tag's copy lacks (a new feature, overload or admission) whose release
 is that tag's or below: that release would run a definition using it and read
-it differently.
+it differently. It also fails a line the tag's copy has, given an earlier
+release than the tag's copy gives it.
 
 The crate's release is trellis/Cargo.toml's `major.minor.patch`, never below
 0.2.0 (`defs::floor::BASELINE`: a development build whose manifest still
@@ -62,11 +65,12 @@ GRANDFATHERED = {
 
 DECLARE_NONE = re.compile(r"^--\s*Declares no catalog floor\b")
 DECLARE_RAISE = re.compile(r"^--\s*Raises the catalog floor to (\S+?)[.,:;)]?(\s|$)")
-TOUCH = re.compile(
-    r"\b(update|insert\s+into|delete\s+from|alter\s+table|drop\s+table|truncate(\s+table)?)"
-    r"\s+(\w+\.)?catalog_floor\b",
-    re.I,
-)
+# Any reference to the table, however it is written to: an `update`, `insert`,
+# `merge`, `copy` or `DO` block alike, quoted or schema-qualified.
+TOUCH = re.compile(r"(?<![\w$])\"?catalog_floor\b", re.I)
+# What refinery embeds as a migration (refinery-core's STEM_RE): a name it
+# would run that `migration_version` doesn't read is a violation, not skipped.
+REFINERY_NAME = re.compile(r"^([U|V])(\d+(?:\.\d+)?)__(\w+)\.(rs|sql)$")
 RAISE_SQL = re.compile(
     r"\bupdate\s+catalog_floor\s+set\s+version\s*=\s*'([^']*)'\s+"
     r"where\s+string_to_array\(\s*version\s*,\s*'\.'\s*\)\s*::\s*int\[\]\s*<\s*"
@@ -88,7 +92,7 @@ def show(r):
 
 
 def migration_version(name):
-    m = re.match(r"V(\d+)__.*\.sql$", name)
+    m = re.fullmatch(r"V(\d+)__\w+\.sql", name)
     return int(m.group(1)) if m else None
 
 
@@ -133,6 +137,13 @@ def check_migrations(files, crate, tag, tag_files):
     """files: {name: text} at HEAD. tag_files: the names the newest released
     tag carries. Returns (violations, [(name, kind, floor)])."""
     bad, floors = [], []
+    for name in sorted(files):
+        base = os.path.basename(name)
+        if REFINERY_NAME.match(base) and (name != base or migration_version(base) is None):
+            bad.append(
+                f"{MIGRATIONS}/{name}: refinery runs it, but this check reads only "
+                f"V<n>__<name>.sql files directly under {MIGRATIONS}/; name it so"
+            )
     ordered = sorted(
         (n for n in files if migration_version(n) is not None), key=migration_version
     )
@@ -158,7 +169,7 @@ def check_migrations(files, crate, tag, tag_files):
         if kind == "none":
             if touches:
                 bad.append(
-                    f"{where}: declares no catalog floor but writes catalog_floor "
+                    f"{where}: declares no catalog floor but refers to catalog_floor "
                     f"({touches[0]!r}); declare the raise in its header"
                 )
             floors.append((name, "none", None))
@@ -228,6 +239,11 @@ def check_manifest(text, crate, tag, tag_text):
                 f"{tag[0]} would run a definition using it and read it differently. Give it "
                 f"a release after {show(tag[1])} (a new type rule case for a new admission)"
             )
+        elif tag is not None and identity in old and old[identity][1] and since < old[identity][1]:
+            bad.append(
+                f"{MANIFEST}: {line!r} claims release {show(since)}, but {tag[0]} declares it at "
+                f"{show(old[identity][1])}; a release before that lacks it"
+            )
     return bad
 
 
@@ -272,11 +288,14 @@ def newest_tag(crate):
 
 
 def head_migrations():
+    """{path relative to the directory: text}, every file refinery's walk sees."""
     d = os.path.join(ROOT, MIGRATIONS)
     out = {}
-    for n in os.listdir(d):
-        with open(os.path.join(d, n)) as f:
-            out[n] = f.read()
+    for dirpath, _, names in os.walk(d):
+        for n in names:
+            path = os.path.join(dirpath, n)
+            with open(path) as f:
+                out[os.path.relpath(path, d)] = f.read()
     return out
 
 
@@ -414,6 +433,16 @@ def cmd_self_test():
          {"V12__def.sql": "-- Each definition's floor.\nalter table d add column f text;\n"}, True),
         ("a grandfathered file that writes the floor",
          {"V12__def.sql": "-- x\nupdate catalog_floor set version = '0.3.0';\n"}, False),
+        ("a quoted, schema-qualified floor write without the header",
+         {"V15__r.sql": none + "update only trellis.\"catalog_floor\" set version = '0.3.0';\n"}, False),
+        ("a raise that also writes the floor another way",
+         {"V15__r.sql": raise_to("0.3.0") + "delete from only catalog_floor;\n"}, False),
+        ("a migration refinery runs that the check doesn't read: a Rust migration",
+         {"V15__r.rs": "fn migration() -> String { String::new() }\n"}, False),
+        ("... an unversioned migration", {"U15__r.sql": none}, False),
+        ("... a migration in a subdirectory", {"sub/V15__r.sql": none}, False),
+        ("... a dotted version", {"V15.1__r.sql": none}, False),
+        ("a file refinery skips is not a migration", {"README.md": "notes\n"}, True),
     ]
     failures = []
     for label, extra, ok in cases:
@@ -434,6 +463,9 @@ def cmd_self_test():
         ("a new overload claiming an old release", old + "overload ABS[Integer(Int2)] = Integer(Int2) 0.2.0\n", False),
         ("a new admission reusing a case that existed at the tag", old
          + "admit cast(Integer(Int2) as Numeric) = Some(Numeric) by Cast(IntegerToNumeric) 0.2.0\n", False),
+        ("a line the tag declares, given an earlier release",
+         "feature Function(\"ABS\") 0.1.0\n"
+         "admit cast(Integer(Int4) as Numeric) = Some(Numeric) by Cast(IntegerToNumeric) 0.2.0\n", False),
         ("an existing admission moved to another old case passes",
          "feature Function(\"ABS\") 0.2.0\n"
          "admit cast(Integer(Int4) as Numeric) = Some(Numeric) by Cast(IntegerWidening) 0.2.0\n", True),

@@ -76,22 +76,25 @@ declares the release it arrives in, and CI checks the declarations.
 
 | Change | Declaration | Checked by |
 |---|---|---|
-| A migration | Its opening comment says, on a line of its own, `-- Declares no catalog floor` (an additive change an older release ignores: a nullable or defaulted column, a new table, a `CHECK` every release's writes already meet) or `-- Raises the catalog floor to X.Y.Z` (anything an older release can't read, and any change to the shape of the capture objects on source tables). A raise carries, in its SQL, `update catalog_floor set version = 'X.Y.Z' where string_to_array(version, '.')::int[] < '{X,Y,Z}'`. | `.github/scripts/check-floors.py check`, in CI's `lint` job: it fails a migration without the declaration, a raise its SQL doesn't carry, a write to `catalog_floor` under "Declares no catalog floor", a raise above the crate's release, and a raise to the newest released tag's release or below |
+| A migration | Its opening comment says, on a line of its own, `-- Declares no catalog floor` (an additive change an older release ignores: a nullable or defaulted column, a new table, a `CHECK` every release's writes already meet) or `-- Raises the catalog floor to X.Y.Z` (anything an older release can't read, and any change to the shape of the capture objects on source tables). A raise carries, in its SQL, `update catalog_floor set version = 'X.Y.Z' where string_to_array(version, '.')::int[] < '{X,Y,Z}'`. | `.github/scripts/check-floors.py check`, in CI's `lint` job: it fails a migration without the declaration, a raise its SQL doesn't carry, any reference to `catalog_floor` under "Declares no catalog floor", a raise above the crate's release, a raise to the newest released tag's release or below, and a file refinery would run that isn't a `V<n>__<name>.sql` directly under `trellis/migrations/` |
 | A new expression node, operator, special form, key space, `JOIN` kind, option or hidden-table layout | A variant of `defs::floor::Feature` or of the enum it holds, whose release `Feature::since` gives | The compiler (an exhaustive match), and the manifest below |
 | A new function or overload, typed literal or `CAST` target | `since` in its registry entry | The manifest below |
 | A new argument value: an `EXTRACT` field, a `DATE_TRUNC` unit, an `AT TIME ZONE` zone | `since` in its `ArgValueSpec` | The manifest below |
 | Anything else the validator newly admits: a pair of operand types for an operator, a comparison, a cast, `COALESCE`/`CASE` unification, `EXTRACT`'s operand, an aggregate's argument | A new case of `registry::TypeRule`, with its release, returned with the result type (`Admitted`) | The manifest below, which fails a new admission that reuses an existing case: the older release that case dates from would run the definition and read it differently |
+| A new key type: a `GROUP BY` key, a `JOIN ... ON` or source primary key, a partition key | A new case of `registry::GroupByKeyRule`, or `since` in its entry of the join-key allowlist (`defs::join_key_types`) or the partition-key type list (`defs::partition_tree`) | The manifest below |
 | A new value of a stored enum-like word | A raise of the floor of what stores it: the catalog floor (in the migration relaxing its `CHECK`) or the definition's (a `Feature`) | Review |
 
 **The feature-floor manifest.** `.github/feature-floors.txt` lists every
 registry entry and type-rule case with its release, and every admission the
-validator's type rules make over every operand type, with the case that admits
-it. The `defs::floor_manifest` unit test fails when the file and the code
-differ, and when an admission records no type rule; regenerate the file with
+validator's type rules make over every operand type and every key type the
+`GROUP BY`, join-key and primary-key, and partition-key gates admit, with the
+case or entry that admits it. The `defs::floor_manifest` unit test fails when the file and the code
+differ, and when an admission records no type rule or key-type entry; regenerate the file with
 `TRELLIS_BLESS_FEATURE_FLOORS=1 cargo test -p trellis --lib floor_manifest`
 and review its diff. `check-floors.py check` then fails a line whose release
-is above the crate's, and a line the newest released tag's manifest lacks whose
-release is that tag's or below. Every addition the validator admits is a
+is above the crate's, a line the newest released tag's manifest lacks whose
+release is that tag's or below, and a line given an earlier release than the
+tag's manifest gives it. Every addition the validator admits is a
 feature with its own release, even one that renders the same under older
 releases: that costs rollback availability, not correctness.
 
