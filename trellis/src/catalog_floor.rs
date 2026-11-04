@@ -31,7 +31,9 @@ use crate::release_version::ReleaseVersion;
 /// A build carries its release's migrations, so it meets every floor they
 /// declare whatever its version string says: a pre-release (`0.2.0-rc.1`)
 /// or a development build that still carries the previous release's version
-/// reads the catalog its own migrations leave.
+/// reads the catalog its own migrations leave. Only that catalog: once a
+/// later build of the same release has run a migration this one lacks, the
+/// floor no longer tells them apart, and the build's own version decides.
 pub(crate) const CATALOG_FLOOR: &str = "0.2.0";
 
 /// One migration, applied (a row of refinery's history) or carried by a
@@ -165,8 +167,9 @@ fn versions_list(versions: &[i32]) -> String {
 /// `own_floor`, can attach to a catalog recording `catalog_floor` (`None`
 /// before V11 has run) and the history `applied`.
 ///
-/// The binary meets the floor when its version, or the floor its own
-/// migrations leave, is at or above it (see [`CATALOG_FLOOR`]).
+/// The binary meets the floor when its version is at or above it, or when
+/// the floor its own migrations leave is and the catalog has run no
+/// migration the binary lacks (see [`CATALOG_FLOOR`]).
 pub(crate) fn decide(
     own_version: &str,
     own_floor: &str,
@@ -185,7 +188,17 @@ pub(crate) fn decide(
                 this_version: own_version.to_string(),
             });
         };
-        let meets = own >= floor || ReleaseVersion::parse(own_floor).is_some_and(|f| f >= floor);
+        // The floor this binary's migrations declare counts only on a catalog
+        // they left: one that has run no migration this binary lacks. A
+        // pre-release or development build shares its floor with the later
+        // builds of that release, so a migration one of them added since
+        // doesn't move the floor past it.
+        let carries_every_applied = applied
+            .iter()
+            .all(|a| carried.iter().any(|c| c.version == a.version));
+        let meets = own >= floor
+            || (carries_every_applied
+                && ReleaseVersion::parse(own_floor).is_some_and(|f| f >= floor));
         if !meets {
             return Verdict::Refuse(Refusal::BelowFloor {
                 floor: floor_text.to_string(),
@@ -454,6 +467,42 @@ mod tests {
             decide("0.1.0", "0.1.0", Some("0.2.0"), &ms(1..=11), &ms(1..=11)),
             Verdict::Refuse(Refusal::BelowFloor { .. })
         ));
+    }
+
+    /// Only on the catalog its own migrations leave: `0.3.0-rc.1`, whose V12
+    /// raised the floor to 0.3.0, meets that floor until `0.3.0` adds a V13.
+    /// The floor stays 0.3.0, so it can't say whether rc.1 reads V13, and
+    /// rc.1's own version, below 0.3.0, decides.
+    #[test]
+    fn its_own_migrations_floor_does_not_cover_a_later_builds_migrations() {
+        assert_eq!(
+            decide(
+                "0.3.0-rc.1",
+                "0.3.0",
+                Some("0.3.0"),
+                &ms(1..=12),
+                &ms(1..=12)
+            ),
+            attach([])
+        );
+        assert_eq!(
+            decide(
+                "0.3.0-rc.1",
+                "0.3.0",
+                Some("0.3.0"),
+                &ms(1..=13),
+                &ms(1..=12)
+            ),
+            Verdict::Refuse(Refusal::BelowFloor {
+                floor: "0.3.0".to_string(),
+                this_version: "0.3.0-rc.1".to_string(),
+            })
+        );
+        assert_eq!(
+            decide("0.3.0", "0.3.0", Some("0.3.0"), &ms(1..=13), &ms(1..=12)),
+            attach([13]),
+            "a release at the floor still tolerates it"
+        );
     }
 
     #[test]

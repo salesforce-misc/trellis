@@ -60,7 +60,10 @@ command: the older release degrades per definition by itself.
    - A build carries its release's migrations, so it meets every floor they
      declare, whatever its version string says: a pre-release, or a
      development build that still carries the previous release's version,
-     reads the catalog its own migrations leave.
+     reads the catalog its own migrations leave. On a catalog that has run a
+     migration the build lacks, its own version decides: a later build of the
+     same release leaves the same floor, so the floor can't say whether this
+     one reads that migration.
    - A **definition floor** is the oldest release that can run one
      definition: its grammar features, its key space, its hidden-table layout
      and its per-definition state. Trellis stamps it whenever it writes the

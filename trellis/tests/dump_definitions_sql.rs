@@ -330,6 +330,8 @@ async fn a_dump_loads_as_defined_not_built() {
         "select to_jsonb(t) - 'type_oid' - 'value_oid' from definition_enum_values t \
          order by transform_id, label",
         "select to_jsonb(t) from trellis_instance t",
+        // The floor loads with the history that set it (ADR-0024).
+        "select to_jsonb(t) from catalog_floor t",
         "select to_jsonb(t) - 'applied_on' from refinery_schema_history t order by version",
         "select to_jsonb(t) - 'created_at' - 'status' - 'build' - 'build_seg' - 'fuse_rearmed_at' from transform_definitions t order by id",
     ] {

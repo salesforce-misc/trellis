@@ -303,6 +303,18 @@ async fn a_pending_migration_is_not_run_while_a_process_is_live() {
         .await
         .expect("migrates once nothing is live");
     assert_eq!(history().await, 1, "V9 ran");
+    // V11 recorded the floor and set the marker's retired format version to
+    // 2 on a catalog it upgraded, which releases before 0.2.0 refuse.
+    let marker = raw
+        .query_one(
+            "select (select version from catalog_floor), instance_format_version \
+             from trellis_instance",
+            &[],
+        )
+        .await
+        .expect("marker");
+    assert_eq!(marker.get::<_, String>(0), "0.2.0");
+    assert_eq!(marker.get::<_, i32>(1), 2);
     assert!(
         handover_pass_as(&pool, &config(&db), "probe")
             .await
@@ -353,9 +365,14 @@ async fn migrate_beside_a_newer_version_still_refuses_below_the_catalog_floor() 
     )
     .await
     .expect("a migration this binary lacks");
-    let trellis = Trellis::connect(config(&db), TrellisOptions::default())
-        .await
-        .expect("connect");
+    // A release at the floor: a development build's own version is below it,
+    // and its own migrations' floor doesn't cover one it lacks.
+    let trellis = Trellis::connect(
+        config(&db).with_binary_version("0.2.0"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
     trellis
         .migrate()
         .await

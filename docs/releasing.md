@@ -250,16 +250,17 @@ For each release, the notes carry:
   and an expression nested over 100 levels (split it into calculated fields).
   Add every case from the manual refusal check.
 - **The upgrade procedure,** from [upgrading](upgrading.md#upgrading), and
-  whether the release adds a migration (`0.2.0` adds V9, so `0.1.0`'s
+  whether the release adds a migration (`0.2.0` adds V9 to V11, and `0.1.0`'s
   `migrate` refuses a database `0.2.0` has migrated).
 - **Compatibility floors:** the floors this release raised (the catalog floor,
   and which features carry a new definition floor) and what that means for
   rolling back to the previous release
   ([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md)). For
-  `0.2.0`: the catalog floor is recorded, at `0.2.0`; rolling back to `0.1.x` means restoring a backup taken before the
-  upgrade, which also discards the application's writes since, and a `0.1.x`
-  worker started without `migrate` runs unchecked on a database `0.2.0`
-  migrated ([upgrading](upgrading.md#to-a-release-before-020)).
+  `0.2.0`: the catalog floor is recorded, at `0.2.0`; rolling back to `0.1.x`
+  means restoring a backup taken before the upgrade, which also discards the
+  application's writes since, and a `0.1.x` worker started without `migrate`
+  runs unchecked on a database `0.2.0` migrated
+  ([upgrading](upgrading.md#to-a-release-before-020)).
 - **For databases that came from a pre-release,** which the battery does not
   start from:
   - a database loaded from a `0.1.0-gamma` `structure.sql` has aggregate
