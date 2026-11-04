@@ -1287,6 +1287,48 @@ async fn interval_extremes_compare_by_the_types_equality() {
     .await;
 }
 
+/// `timestamptz`, with its infinities: one text per value (the check's own
+/// session renders both sides). A converged target reports nothing, and a
+/// value off by a microsecond or an infinity is reported.
+#[tokio::test]
+async fn timestamptz_extremes_compare_exactly() {
+    let d = start_typed(
+        "timestamptz",
+        ValueType::Other(PgType::TimestampTz),
+        "(1, 1, '-infinity'), (2, 1, '2026-01-01 00:00:00.000001+00'), (3, 1, 'infinity'), \
+         (4, 2, '2026-06-01 12:00:00+00')",
+    )
+    .await;
+    assert_planted(
+        &d,
+        &[
+            ("2026-01-01 00:00:00+00", "min", "-infinity", true),
+            ("infinity", "min", "-infinity", true),
+            ("2026-01-01 00:00:00.000001+00", "max", "infinity", true),
+        ],
+    )
+    .await;
+}
+
+/// `bigint` at its limits: a value off by one is reported.
+#[tokio::test]
+async fn bigint_extremes_compare_exactly() {
+    let d = start_typed(
+        "bigint",
+        ValueType::Integer(IntWidth::Int8),
+        "(1, 1, -9223372036854775808), (2, 1, 0), (3, 1, 9223372036854775807), (4, 2, 7)",
+    )
+    .await;
+    assert_planted(
+        &d,
+        &[
+            ("-9223372036854775807", "min", "-9223372036854775808", true),
+            ("9223372036854775806", "max", "9223372036854775807", true),
+        ],
+    )
+    .await;
+}
+
 // ------------------------------------------------------------ source lock
 
 /// The probe reads the source, so it takes the source's `ACCESS SHARE`
