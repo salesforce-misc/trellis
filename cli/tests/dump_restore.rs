@@ -16,6 +16,9 @@
 //!   was (`a_bad_file_loads_nothing`)
 //! - a database that isn't empty is refused and left as it was
 //!   (`a_database_that_is_not_empty_is_refused`)
+//! - a define that commits while pg_dump runs redoes the dump, and one
+//!   during each of three attempts fails it
+//!   (`a_define_racing_pg_dump_redoes_the_dump`)
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -271,8 +274,8 @@ async fn a_dump_restores_a_chain_and_an_aggregate_into_an_empty_database() {
     assert!(dump.ends_with(&again), "{again}");
 }
 
-/// `dump` without pg_dump's `\restrict` lines, whose key `pg_dump` 17.6 and
-/// later pick at random on every run.
+/// `dump` without pg_dump's `\restrict` lines, whose key `pg_dump` 15.14,
+/// 16.10, 17.6 and later pick at random on every run.
 fn without_restrict_keys(dump: &str) -> String {
     dump.lines()
         .filter(|line| !line.starts_with("\\restrict ") && !line.starts_with("\\unrestrict "))
@@ -442,4 +445,89 @@ async fn a_database_that_is_not_empty_is_refused() {
     );
     assert!(stderr.contains("only into an empty database"), "{stderr}");
     assert_eq!(things_in(&raw).await, before);
+}
+
+/// The `pg_dump` the test would run: the first on PATH.
+fn real_pg_dump() -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .map(|dir| dir.join("pg_dump"))
+        .find(|candidate| candidate.is_file())
+        .expect("pg_dump on PATH")
+}
+
+/// A `pg_dump` in `bin` that, on its first `defines` dumping runs, defines
+/// a new transform `<name><run>` over `orders` through the CLI before running the real
+/// `pg_dump`: a define that commits between the dump's two reads of the
+/// definitions.
+fn racing_pg_dump(bin: &Path, dsn: &str, name: &str, defines: usize) {
+    let quote = |text: &str| format!("'{}'", text.replace('\'', r"'\''"));
+    let counter = bin.join("runs");
+    let script = format!(
+        "#!/bin/sh\n\
+         if [ \"$1\" != --version ]; then\n\
+           n=$(( $(cat {counter} 2>/dev/null || echo 0) + 1 ))\n\
+           echo $n > {counter}\n\
+           if [ $n -le {defines} ]; then\n\
+             {trellis} --database-url {dsn} apply \"TRANSFORM {name}$n FROM orders SELECT a AS a$n\" \
+               >/dev/null || exit 70\n\
+           fi\n\
+         fi\n\
+         exec {pg_dump} \"$@\"\n",
+        counter = quote(counter.to_str().expect("utf8")),
+        trellis = quote(env!("CARGO_BIN_EXE_trellis")),
+        dsn = quote(dsn),
+        pg_dump = quote(real_pg_dump().to_str().expect("utf8")),
+    );
+    let fake = bin.join("pg_dump");
+    std::fs::write(&fake, script).expect("fake pg_dump");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let _ = std::fs::remove_file(&counter);
+}
+
+#[tokio::test]
+async fn a_define_racing_pg_dump_redoes_the_dump() {
+    let cluster = TestCluster::start();
+    let (source, _raw) = source_database(&cluster).await;
+    let dir = scratch("race");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("bin dir");
+    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").expect("PATH"),
+    )))
+    .expect("PATH");
+
+    // The first attempt's pg_dump sees raced1, its first read of the
+    // definitions doesn't: the second attempt has both.
+    racing_pg_dump(&bin, source.dsn(), "raced", 1);
+    let dump = succeeded(
+        &trellis_cli(source.dsn(), &["dump"], Some(Path::new(&path))),
+        "dump",
+    );
+    assert!(dump.contains("CREATE TABLE public.raced1"), "{dump}");
+    assert!(dump.contains("'public.raced1', null,"), "{dump}");
+    assert_eq!(
+        std::fs::read_to_string(bin.join("runs"))
+            .expect("runs")
+            .trim(),
+        "2",
+        "the dump was taken twice"
+    );
+
+    // A define during each of three attempts.
+    racing_pg_dump(&bin, source.dsn(), "again", 3);
+    let out = dir.join("dump.sql");
+    let stderr = failed(
+        &trellis_cli(
+            source.dsn(),
+            &["dump", "-o", out.to_str().expect("utf8")],
+            Some(Path::new(&path)),
+        ),
+        "dump racing three defines",
+    );
+    assert!(
+        stderr.contains("changed during each of 3 dumps"),
+        "{stderr}"
+    );
+    assert!(!out.exists(), "nothing is written");
 }

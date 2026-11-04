@@ -397,8 +397,11 @@ each one costs and what to expect around it
      leaves out the 1-1 targets' ledgers and the capture triggers on source
      tables, and appends one line per definition
      ([schema dumps](embedding.md#schema-dumps)). It doesn't migrate the
-     database. `--definitions-only` writes just those lines,
-     to append to a `pg_dump` you run yourself.
+     database, and refuses a database with another Trellis instance's
+     schema in it. `--definitions-only` writes just those lines, to append
+     to a dump built through the API
+     ([your own dump](embedding.md#schema-dumps)): a plain `pg_dump` keeps
+     the capture triggers, and the file doesn't load.
   2. `createdb` the new database, then `trellis restore dump.sql` against
      it. It refuses a database with anything in it but an empty `public`
      schema, loads the file with `psql` in one transaction (nothing is
@@ -412,9 +415,11 @@ each one costs and what to expect around it
   tables the dump recorded; a definition that doesn't, or whose target can't
   be adopted, fails the restore naming it. The ones before it stay restored,
   and the next command that migrates (`trellis run`, `trellis apply`)
-  restores the rest once the cause is fixed. `pg_dump` 17.6 and later write
-  `\restrict` lines with a key chosen per run, so two dumps of the same
-  database differ in those two lines; the definitions are the same bytes.
+  restores the rest once the cause is fixed. `pg_dump` 15.14, 16.10, 17.6
+  and later write `\restrict` lines with a key chosen per run, so two dumps
+  of the same database differ in those two lines; the definitions are the
+  same bytes. Loading those lines needs `psql` from the same releases on;
+  an older one loads nothing.
 * **After a crash or a failover,** `request_backfill` each unlogged source
   ([known correctness gaps](known-correctness-gaps.md#an-unlogged-source-emptied-by-a-crash-or-failover)).
 * **After an `ALTER COLUMN … TYPE … USING` that changes a read column's

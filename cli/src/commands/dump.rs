@@ -32,16 +32,19 @@ same appendix, whatever their history.
 pg_dump is the first one on PATH; it must be version 15 or later, and no
 older than the server. The definitions are read before and after it runs, and
 the dump is redone (three times at most) when a define or drop committed in
-between.
+between. A database with another Trellis instance's schema in it is refused:
+the dump can leave out only this instance's.
 
 Options:
   -o, --out <FILE>          Write the dump to FILE (replaced whole, never
                              left half written) instead of stdout.
       --definitions-only     Write only the definitions, without running
-                             pg_dump: append them to a `pg_dump
-                             --schema-only` you run yourself with the
-                             exclusions `docs/embedding.md` (Schema dumps)
-                             lists.
+                             pg_dump, to append to a dump built as
+                             `docs/embedding.md` (Schema dumps) says: its
+                             pg_dump output has to go through the API's
+                             filter_schema_dump, which takes out the
+                             capture triggers. A plain pg_dump keeps them,
+                             and the file doesn't load.
   -d, --database-url <URL>  Postgres connection string. May be given before
                              or after the subcommand name. Falls back to
                              TRELLIS_DATABASE_URL, then PGHOST/PGPORT/PGUSER/
@@ -176,6 +179,7 @@ async fn dump(
         }
         let sql = String::from_utf8(output.stdout)
             .map_err(|_| "pg_dump's output is not UTF-8; dump a UTF-8 database".to_string())?;
+        refuse_another_instance(&sql)?;
         let mut text = postgres_tools::loadable(
             &trellis
                 .filter_schema_dump(&sql)
@@ -191,6 +195,28 @@ async fn dump(
         "the definitions changed during each of {ATTEMPTS} dumps: dump when nothing is \
          defining or dropping transforms"
     ))
+}
+
+/// Refuses `pg_dump`'s output when it holds another Trellis instance's
+/// schema, recognised by its identity marker (`docs/instance-identity.md`):
+/// the dump leaves out only this instance's schema and capture triggers, so
+/// a database loaded from it would hold the other instance's tables without
+/// their rows, and every write to its source tables would fail in its
+/// capture triggers.
+fn refuse_another_instance(sql: &str) -> Result<(), String> {
+    let other = sql.lines().find_map(|line| {
+        line.strip_prefix("CREATE TABLE ")?
+            .strip_suffix(".trellis_instance (")
+    });
+    match other {
+        None => Ok(()),
+        Some(schema) => Err(format!(
+            "the database holds another Trellis instance's schema, {schema}, which trellis dump \
+             can't leave out: the dump would restore its tables without their rows and its \
+             capture triggers, which would fail every write to its source tables; dump a \
+             database with one Trellis instance"
+        )),
+    }
 }
 
 /// Writes `text` to a sibling of `path` and renames it over `path`, so a
@@ -240,6 +266,17 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn another_instance_is_refused() {
+        let ours_left_out = "CREATE TABLE public.orders (\n    id bigint\n);\n";
+        assert!(refuse_another_instance(ours_left_out).is_ok());
+        let err = refuse_another_instance(&format!(
+            "{ours_left_out}CREATE TABLE \"Other\".trellis_instance (\n    singleton boolean\n);\n"
+        ))
+        .unwrap_err();
+        assert!(err.contains("\"Other\""), "{err}");
     }
 
     #[test]

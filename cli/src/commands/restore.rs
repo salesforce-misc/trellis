@@ -4,8 +4,8 @@
 //! ([ADR-0025](../../../docs/decisions/0025-schema-dumps-restore-definitions.md)).
 //!
 //! The load runs `psql`, because the file is `pg_dump`'s plain-text output,
-//! which is a `psql` script: `pg_dump` 17.6 and later write `\restrict`
-//! meta-commands into it, which only `psql` reads. It runs in one
+//! which is a `psql` script: `pg_dump` 15.14, 16.10, 17.6 and later write
+//! `\restrict` meta-commands into it, which only `psql` reads. It runs in one
 //! transaction behind a check that the database is empty, so a file that
 //! fails to load, or a database that isn't empty, leaves the database as it
 //! was.
@@ -31,8 +31,10 @@ The database must be empty: no schema but `public`, and nothing in `public`.
 Create it first (`createdb`). The file is loaded with psql, the first one on
 PATH, in one transaction: if any statement fails, or the database isn't
 empty, nothing is loaded. A `CREATE SCHEMA public;` line in the file is run
-as `CREATE SCHEMA IF NOT EXISTS public;`. The psql has to read the `\\restrict`
-lines pg_dump 17.6 and later write (psql 17.6, 16.10, 15.14 or later).
+as `CREATE SCHEMA IF NOT EXISTS public;`. pg_dump 15.14, 16.10, 17.6 and
+later write `\\restrict` lines, which psql reads from those same releases on
+(15.14 or a later 15, 16.10 or a later 16, 17.6 or a later 17, or 18); an
+older psql stops at them and loads nothing.
 
 A definition the restore refuses (a target_schema setting that resolves a
 bare name elsewhere, or a target it can't adopt) fails the command naming it.
