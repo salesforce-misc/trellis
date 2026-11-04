@@ -172,6 +172,8 @@ pub enum Feature {
     Predicate(PredicateKind),
     /// `WITHOUT SOURCE INDEX`.
     WithoutSourceIndex,
+    /// `ADOPT EXISTING TABLE`: define builds into an existing empty target.
+    AdoptTarget,
     /// A table it reads is partitioned (ADR-0017).
     PartitionedSource,
     /// An expression node of this kind.
@@ -215,6 +217,8 @@ impl Feature {
             Feature::QualifiedTable | Feature::WithoutSourceIndex | Feature::PartitionedSource => {
                 Some(BASELINE)
             }
+            // Arrives in 0.2.0, the release floors arrive in.
+            Feature::AdoptTarget => Some(BASELINE),
             Feature::Predicate(kind) => Some(match kind {
                 PredicateKind::True => BASELINE,
             }),
@@ -339,6 +343,7 @@ pub(crate) fn features_used(def: &TransformDef, partitioned: bool) -> (Vec<Featu
         fields,
         predicate,
         without_source_index,
+        adopt_target,
     } = def;
     let mut used = Used::default();
     let (kind, join) = match key_space {
@@ -371,6 +376,9 @@ pub(crate) fn features_used(def: &TransformDef, partitioned: bool) -> (Vec<Featu
     }));
     if *without_source_index {
         used.add(Feature::WithoutSourceIndex);
+    }
+    if *adopt_target {
+        used.add(Feature::AdoptTarget);
     }
     if partitioned {
         used.add(Feature::PartitionedSource);
@@ -673,6 +681,32 @@ mod tests {
         }
         let def = parse(shapes[0]).unwrap();
         assert_eq!(floors("0.3.0", &[]).of(&def, true).to_string(), "0.2.0");
+    }
+
+    /// `ADOPT EXISTING TABLE` is a feature of its own: a definition that
+    /// writes it carries its release, and the same definition without it
+    /// doesn't.
+    #[test]
+    fn adopt_existing_table_carries_its_release() {
+        let later = floors("0.5.0", &[("AdoptTarget", "0.3.0")]);
+        assert_eq!(
+            floor_of(
+                &later,
+                "TRANSFORM t ADOPT EXISTING TABLE FROM s SELECT a AS a"
+            ),
+            "0.3.0"
+        );
+        assert_eq!(
+            floor_of(&later, "TRANSFORM t FROM s SELECT a AS a"),
+            "0.2.0"
+        );
+        assert_eq!(
+            floor_of(
+                &floors("0.2.0", &[]),
+                "TRANSFORM t ADOPT EXISTING TABLE FROM s GROUP BY g SELECT g AS g, COUNT(*) AS n"
+            ),
+            "0.2.0"
+        );
     }
 
     /// A construct registered at a later release raises the floor of a tree

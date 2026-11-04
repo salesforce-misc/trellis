@@ -474,6 +474,13 @@ impl Parser {
         self.expect_keyword("TRANSFORM")?;
         let (target, explicit_target_schema) = self.parse_table_ref()?;
 
+        let adopt_target = self.peek_is_keyword("ADOPT");
+        if adopt_target {
+            self.advance();
+            self.expect_keyword("EXISTING")?;
+            self.expect_keyword("TABLE")?;
+        }
+
         self.expect_keyword("FROM")?;
         let (source, explicit_source_schema) = self.parse_table_ref()?;
         self.source = Some(source.clone());
@@ -517,6 +524,7 @@ impl Parser {
             fields,
             predicate,
             without_source_index,
+            adopt_target,
         })
     }
 

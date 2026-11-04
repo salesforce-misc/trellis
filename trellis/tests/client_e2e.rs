@@ -89,6 +89,7 @@ fn totals_def() -> TransformDef {
         }],
         predicate: Predicate::True,
         without_source_index: false,
+        adopt_target: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     }
@@ -373,6 +374,7 @@ fn comments_calc_def() -> TransformDef {
         }],
         predicate: Predicate::True,
         without_source_index: false,
+        adopt_target: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     }

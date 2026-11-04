@@ -301,8 +301,38 @@ them has no use we can name, and the paused state already serves it.
 
 Because the target table and its columns are Trellis-owned, dropping them is Trellis's
 to do. Source tables remain user-owned and untouched. That ownership holds because
-registration only ever creates a target table: it refuses a transform whose target name
-already names any relation, so a table Trellis later drops is always one it created.
+registration creates the target table, or adopts one only when asked to: it refuses a
+transform whose target name already names any relation, unless the definition says
+`ADOPT EXISTING TABLE`, so a table Trellis later drops is always one it created or one
+the definition explicitly handed to it.
+
+An adopted target is held to what Trellis can maintain, and it refuses by default:
+
+* **Empty only.** Adopting a table with rows would leave Trellis maintaining rows it
+  never derived, the reason registration refuses an existing table at all. Emptiness is
+  checked under a lock that keeps writers and DDL out until the define commits.
+* **Exactly the shape define creates.** One rendering says what a define creates for its
+  target; a plain define runs it, and an adopting define creates it as a temporary probe
+  table and compares the two in the catalog, so the accepted shape can't drift from the
+  created one. The adopted table may carry only what users may add to any target
+  (indexes that aren't unique, grants, comments, row security policies, statistics,
+  publications, views over it). Anything else, including any object or constraint kind
+  the comparison doesn't recognise, refuses with a code naming it, so a Postgres feature
+  added later refuses until Trellis learns it.
+* **Owned and writable by the defining role.** Trellis later alters and drops the table,
+  so the defining role must own it or be a member of its owner, and hold every privilege
+  it writes the table with.
+* **Everything beside the target is Trellis's to create.** The ledger and hidden tables
+  are created by the define; one that already exists refuses it.
+
+After define an adopted target is an ordinary target: `DROP` drops it. The opt-in is part
+of the statement grammar, so a definition that uses it carries the floor of the release
+that added it ([0024](0024-compatibility-floors-and-rollback.md)).
+
+Rejected: adopting a table with rows (overwriting or merging them reopens the reason for
+the refusal); adoption as a hidden behaviour of a dump restore only (two paths that must
+agree, with no refusals of their own); marking adoptable tables with an ownership comment
+(it collides with users' own comments).
 
 ### Drops go in reverse dependency order — no cascade
 

@@ -1496,6 +1496,7 @@ mod tests {
             }],
             predicate: crate::defs::ast::Predicate::True,
             without_source_index: false,
+            adopt_target: false,
             explicit_source_schema: None,
             explicit_target_schema: Some("s1591_other".to_string()),
         };

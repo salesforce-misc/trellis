@@ -265,6 +265,7 @@ async fn compute_and_apply_spans_fire_with_batch_and_transform_fields() {
         }],
         predicate: Predicate::True,
         without_source_index: false,
+        adopt_target: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -390,6 +391,7 @@ async fn seed_orders_totals(db: &testkit::TestDatabase, client: &Client, target:
         }],
         predicate: Predicate::True,
         without_source_index: false,
+        adopt_target: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };

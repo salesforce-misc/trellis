@@ -65,6 +65,12 @@ pub struct TransformDef {
     /// walk then costs. Never set for a 1-1 target, which pages by its
     /// primary key.
     pub without_source_index: bool,
+    /// `ADOPT EXISTING TABLE` was written after the target: define builds
+    /// into a table of the target's name that already exists, is empty and
+    /// has exactly the shape define would create
+    /// (`super::adopt`), rather than refusing it. Once defined, the
+    /// target is Trellis's like any other.
+    pub adopt_target: bool,
 }
 
 /// One whole statement in Trellis's grammar, as
@@ -699,6 +705,9 @@ pub enum Operator {
 pub(crate) fn render_definition_text(def: &TransformDef) -> String {
     let mut out = String::from("TRANSFORM ");
     render_table_ref(&mut out, &def.target, def.explicit_target_schema.as_deref());
+    if def.adopt_target {
+        out.push_str(" ADOPT EXISTING TABLE");
+    }
     out.push_str(" FROM ");
     render_table_ref(&mut out, &def.source, def.explicit_source_schema.as_deref());
 

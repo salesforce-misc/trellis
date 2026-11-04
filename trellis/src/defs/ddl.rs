@@ -1466,7 +1466,9 @@ pub async fn create_target_table(
     source_columns: &HashMap<String, ValueType>,
     source_table: &str,
 ) -> Result<(), DdlError> {
-    let sql = target_table_ddl(pool, def, target_schema, pk, source_columns, source_table).await?;
+    let mut sql =
+        target_table_ddl(pool, def, target_schema, pk, source_columns, source_table).await?;
+    sql.push_str(&one_to_one_ledger_ddl(target_schema, def));
     pool.get().await?.batch_execute(&sql).await?;
     Ok(())
 }
@@ -1575,11 +1577,16 @@ pub(crate) async fn target_table_ddl(
     pk_cols.push(constraint);
     sql.push_str(&pk_cols.join(", "));
     sql.push(')');
-    // The target's ledger, created with it.
-    sql.push_str(&super::ledger::one_to_one_ledger_ddl(
-        &super::ledger::qualified_ledger_table(target_schema, &def.target),
-    ));
     Ok(sql)
+}
+
+/// A 1-1 target's ledger statements, each led by `;`, created with the
+/// target ([`target_table_ddl`]).
+pub(crate) fn one_to_one_ledger_ddl(target_schema: &str, def: &TransformDef) -> String {
+    super::ledger::one_to_one_ledger_ddl(&super::ledger::qualified_ledger_table(
+        target_schema,
+        &def.target,
+    ))
 }
 
 /// Creates an [`super::ast::KeySpace::Aggregate`] definition's neighbor
@@ -1734,6 +1741,7 @@ mod tests {
             }],
             predicate: Predicate::True,
             without_source_index: false,
+            adopt_target: false,
             explicit_source_schema: None,
             explicit_target_schema: None,
         }

@@ -149,6 +149,7 @@ fn order_totals_def() -> TransformDef {
         }],
         predicate: Predicate::True,
         without_source_index: false,
+        adopt_target: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     }
@@ -1721,6 +1722,7 @@ async fn resume_recomputes_correctly_even_when_a_sibling_column_still_throws() {
         ],
         predicate: Predicate::True,
         without_source_index: false,
+        adopt_target: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -1850,6 +1852,7 @@ async fn resume_recomputes_every_row_of_a_composite_key_target_across_chunks() {
         }],
         predicate: Predicate::True,
         without_source_index: false,
+        adopt_target: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -1966,6 +1969,7 @@ async fn a_shared_field_name_charges_only_the_sibling_whose_field_fails() {
         }],
         predicate: Predicate::True,
         without_source_index: false,
+        adopt_target: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -1993,6 +1997,7 @@ async fn a_shared_field_name_charges_only_the_sibling_whose_field_fails() {
         }],
         predicate: Predicate::True,
         without_source_index: false,
+        adopt_target: false,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };

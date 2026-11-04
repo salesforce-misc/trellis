@@ -90,6 +90,7 @@ use crate::pool::{Pool, quote_ident};
 use tokio_postgres::GenericClient;
 use tokio_postgres::types::Type;
 
+use super::adopt::TargetTableDdl;
 use super::ast::{
     AlterClause, AlterTransform, Expr, FieldDef, KeySpace, TransformDef, ValueType,
     render_definition_text,
@@ -305,13 +306,24 @@ pub enum CatalogError {
     /// Registering this definition would create its target table, but a
     /// relation with that qualified name already exists: a user
     /// table, view, materialized view, foreign table, or another Trellis
-    /// definition's target. Trellis never adopts a table it didn't create —
-    /// the user's schema belongs to the user (ADR-0005), and `DROP` drops a
-    /// definition's target (ADR-0014), so adopting a user table would hand
-    /// that table to a later `DROP`.
+    /// definition's target. Trellis adopts a table it didn't create only
+    /// when the definition asks for it (`ADOPT EXISTING TABLE`, see
+    /// [`CatalogError::TargetNotAdoptable`]): `DROP` drops a definition's
+    /// target (ADR-0014), so adopting a user table would otherwise hand that
+    /// table to a later `DROP`.
     TargetTableExists {
         /// The qualified `schema.table` spelling that already exists.
         table: String,
+    },
+    /// A define with `ADOPT EXISTING TABLE` found its target missing, or a
+    /// table Trellis can't maintain as its target: one with rows, one the
+    /// defining role can't write or alter, or one whose shape differs from
+    /// what define would create (`super::adopt::check_shape`).
+    TargetNotAdoptable {
+        /// The qualified `schema.table`.
+        table: String,
+        /// What refused it; its `code()` names the property.
+        refusal: super::adopt::NotAdoptable,
     },
     /// The definition's source would be captured by triggers,
     /// but they can't key that table's changes (see `change_keyed`): it
@@ -476,6 +488,10 @@ impl CatalogError {
             // definition's own text.
             CatalogError::TargetTableSuffixCollision { .. } => ErrorCode::Conflict,
             CatalogError::TargetTableExists { .. } => ErrorCode::Conflict,
+            CatalogError::TargetNotAdoptable { refusal, .. } => match refusal {
+                super::adopt::NotAdoptable::Missing => ErrorCode::NotFound,
+                _ => ErrorCode::Validation,
+            },
             CatalogError::SourceNotChangeKeyed { .. } => ErrorCode::Validation,
             CatalogError::PartitionedSource(_) => ErrorCode::Validation,
             CatalogError::RowSecurityApplies(_) => ErrorCode::Validation,
@@ -696,6 +712,13 @@ impl fmt::Display for CatalogError {
                  it creates, so choose a different target name or drop or rename the existing \
                  relation"
             ),
+            CatalogError::TargetNotAdoptable { table, refusal } => write!(
+                f,
+                "can't adopt target table \"{table}\" ({}): {refusal}. Trellis adopts only an \
+                 empty plain table shaped exactly as define would create it, which the \
+                 defining role owns and can write",
+                refusal.code()
+            ),
             CatalogError::SourceNotChangeKeyed { source_table } => write!(
                 f,
                 "Trellis can't capture source table \"{source_table}\"'s changes: it must be a \
@@ -799,6 +822,7 @@ impl std::error::Error for CatalogError {
             CatalogError::TargetInCatalogSchema { .. } => None,
             CatalogError::TargetTableSuffixCollision { .. } => None,
             CatalogError::TargetTableExists { .. } => None,
+            CatalogError::TargetNotAdoptable { .. } => None,
             CatalogError::SourceNotChangeKeyed { .. } => None,
             CatalogError::PartitionedSource(_) => None,
             CatalogError::RowSecurityApplies(_) => None,
@@ -951,9 +975,11 @@ fn refuse_join_fixture(source_text: &str) {
 /// neither a catalog row nor a table behind and can simply be retried. A
 /// relation that already exists under the target's qualified name, of any
 /// kind, is refused with [`CatalogError::TargetTableExists`] and left
-/// untouched: Trellis never adopts a table it didn't create (ADR-0005), since
-/// `DROP` would later drop it (ADR-0014). No build path creates the target
-/// itself.
+/// untouched, since `DROP` would later drop it (ADR-0014). The one exception
+/// is a definition that asks for it with `ADOPT EXISTING TABLE`: an empty
+/// table shaped exactly as define would create it is adopted, and anything
+/// else refused with [`CatalogError::TargetNotAdoptable`]
+/// ([`super::adopt`]). No build path creates the target itself.
 ///
 /// **Registration reads no source rows (ADR-0002).** Every
 /// definition is persisted [`TransformStatus::WaitingToBackfill`] and this
@@ -1060,6 +1086,11 @@ pub async fn install_definition(
     // `pool`, but the statement itself runs inside
     // `create_definition_inner`'s transaction, so the table
     // commits or rolls back together with the catalog row.
+    // ADR-0014: what define creates for the target, and all an adopting
+    // define (`ADOPT EXISTING TABLE`) lets the table it adopts be
+    // (`super::adopt`).
+    let qualified_target_ident = ddl::qualified_target_table(target_schema, &def);
+    let mut ledger_ddl = None;
     let target_ddl = match &def.key_space {
         KeySpace::Join(_) => {
             // Each side is held to the source rules (a primary key,
@@ -1074,7 +1105,7 @@ pub async fn install_definition(
             }
             super::join::target_ddl(
                 &def,
-                &ddl::qualified_target_table(target_schema, &def),
+                &qualified_target_ident,
                 &sides.from_columns,
                 &sides.joined_columns,
             )?
@@ -1096,7 +1127,7 @@ pub async fn install_definition(
             check_one_to_one_target_width(pk.len(), def.fields.len())?;
             super::join_one_to_one::target_ddl(
                 &def,
-                &ddl::qualified_target_table(target_schema, &def),
+                &qualified_target_ident,
                 &pk,
                 &sides.from_columns,
                 &sides.joined_columns,
@@ -1113,6 +1144,7 @@ pub async fn install_definition(
                 .map_err(CatalogError::Ddl)?;
             reject_unkeyed_source(&**pool.get().await?, &qualified_source, &def).await?;
             check_one_to_one_target_width(pk.len(), def.fields.len())?;
+            ledger_ddl = Some(ddl::one_to_one_ledger_ddl(target_schema, &def));
             ddl::target_table_ddl(
                 pool,
                 &def,
@@ -1141,6 +1173,7 @@ pub async fn install_definition(
                 .map_err(CatalogError::Ddl)?
         }
     };
+    let target_ddl = TargetTableDdl::new(&qualified_target_ident, &target_ddl, ledger_ddl);
 
     // ADR-0002: registration reads no source rows. The
     // definition waits for the staging worker's pass, which starts its build.
@@ -2938,7 +2971,7 @@ async fn create_definition_inner(
     source_columns: &HashMap<String, ValueType>,
     status: StoredStatus,
     target_schema: &str,
-    target_ddl: Option<&str>,
+    target_ddl: Option<&TargetTableDdl>,
 ) -> Result<Definition, CatalogError> {
     let def: TransformDef = parse(source_text)?;
     validate_for_define(pool, &def, source_columns).await?;
@@ -3340,6 +3373,7 @@ async fn create_definition_inner(
             &def.target,
             &qualified_target,
             ddl,
+            def.adopt_target,
         )
         .await?;
     }
@@ -3533,12 +3567,17 @@ async fn create_definition_inner(
 /// the common case; a concurrent registration that creates the same name
 /// between the check and the `create table` fails the DDL instead, which
 /// [`is_relation_name_taken`] maps to the same error.
+///
+/// With `adopt` (`ADOPT EXISTING TABLE`), the target's own name is expected
+/// to be taken instead: [`super::adopt::adopt_in_txn`] adopts the table
+/// there or refuses it, and only the ledger's name has to be free.
 async fn create_target_in_txn(
     txn: &tokio_postgres::Transaction<'_>,
     schema: &str,
     table: &str,
     qualified_target: &str,
-    ddl: &str,
+    ddl: &TargetTableDdl,
+    adopt: bool,
 ) -> Result<(), CatalogError> {
     let already_exists = |taken: &str| CatalogError::TargetTableExists {
         table: if taken == table {
@@ -3550,20 +3589,40 @@ async fn create_target_in_txn(
     // `ddl` also creates a 1-1 target's ledger, which Trellis owns
     // just the same, so its name has to be free too.
     let ledger = super::ledger::ledger_table_name(table);
+    let names: &[&str] = if adopt {
+        &[ledger.as_str()]
+    } else {
+        &[table, ledger.as_str()]
+    };
     let taken: Option<String> = txn
         .query_opt(
             "select c.relname::text from pg_catalog.pg_class c \
              join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
              where n.nspname = $1 and c.relname = any($2) \
              order by c.relname = $3 desc limit 1",
-            &[&schema, &[table, ledger.as_str()].as_slice(), &table],
+            &[&schema, &names, &table],
         )
         .await?
         .map(|row| row.get(0));
     if let Some(taken) = taken {
         return Err(already_exists(&taken));
     }
-    match txn.batch_execute(ddl).await {
+    if adopt {
+        return match super::adopt::adopt_in_txn(txn, schema, table, ddl).await {
+            Ok(()) => Ok(()),
+            Err(super::adopt::AdoptError::Refused(refusal)) => {
+                Err(CatalogError::TargetNotAdoptable {
+                    table: qualified_target.to_string(),
+                    refusal,
+                })
+            }
+            Err(super::adopt::AdoptError::Db(err)) if is_relation_name_taken(&err) => {
+                Err(already_exists(&ledger))
+            }
+            Err(super::adopt::AdoptError::Db(err)) => Err(err.into()),
+        };
+    }
+    match txn.batch_execute(&ddl.create_sql()).await {
         Ok(()) => Ok(()),
         Err(err) if is_relation_name_taken(&err) => Err(already_exists(table)),
         Err(err) => Err(CatalogError::Ddl(err.into())),

@@ -28,6 +28,7 @@
 //! Everything else is rejected at parse time with an error naming the
 //! specific unsupported construct (see [`error::ParseError`]).
 
+pub mod adopt;
 pub mod alias_readers;
 pub mod ast;
 pub mod backfill;
@@ -1126,6 +1127,41 @@ mod tests {
                 def,
                 "{text}"
             );
+        }
+    }
+
+    /// `ADOPT EXISTING TABLE` follows the target, in every key space, and a
+    /// rendered definition keeps it. Anywhere else it is a parse error.
+    #[test]
+    fn adopt_existing_table_parses_after_the_target_and_round_trips() {
+        for text in [
+            "TRANSFORM t ADOPT EXISTING TABLE FROM s SELECT a AS a",
+            "TRANSFORM app.t adopt existing table FROM app.s GROUP BY g SELECT g AS g, \
+             COUNT(*) AS n",
+            "TRANSFORM t ADOPT EXISTING TABLE FROM orders JOIN items ON orders.id = items.order_id \
+             GROUP BY orders.region SELECT orders.region AS region, SUM(items.qty) AS q",
+            "TRANSFORM t ADOPT EXISTING TABLE FROM a JOIN b ON a.k = b.k SELECT b.v AS v",
+        ] {
+            let def = parse(text).unwrap();
+            assert!(def.adopt_target, "{text}");
+            assert_eq!(
+                parse(&ast::render_definition_text(&def)).unwrap(),
+                def,
+                "{text}"
+            );
+        }
+        assert!(
+            !parse("TRANSFORM t FROM s SELECT a AS a")
+                .unwrap()
+                .adopt_target
+        );
+        for text in [
+            "TRANSFORM t ADOPT FROM s SELECT a AS a",
+            "TRANSFORM t ADOPT EXISTING FROM s SELECT a AS a",
+            "TRANSFORM t FROM s ADOPT EXISTING TABLE SELECT a AS a",
+            "TRANSFORM t FROM s SELECT a AS a ADOPT EXISTING TABLE",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
         }
     }
 

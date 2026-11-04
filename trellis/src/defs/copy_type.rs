@@ -101,6 +101,12 @@ mod tests {
              Postgres routes them",
         ),
         (
+            "defs/adopt.rs",
+            1,
+            "an adopted table's and its probe's column types, compared with their \
+             modifiers; the probe is created from what define creates",
+        ),
+        (
             "defs/catalog.rs",
             1,
             "a JOIN column's declared type, for the key allowlist and \
