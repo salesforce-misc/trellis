@@ -679,7 +679,9 @@ rewrite that leaves the values as they were (`USING b + 0`, or a column
 retyped and back between two passes), an identical `SET DEFAULT`
 re-applied in the same window as a table rewrite, and a `SET EXPRESSION` to
 an expression written differently that computes the same values (`2 * img`
-for `img * 2`), or to the expression the column already has.
+for `img * 2`), or to the expression the column already has. So does a
+rewrite (`VACUUM FULL`, `CLUSTER`) of a table with a read stored generated
+column between a major-version `pg_upgrade` and the first pass after it.
 
 ## Nested writes to the same key
 

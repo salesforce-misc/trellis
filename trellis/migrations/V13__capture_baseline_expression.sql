@@ -10,10 +10,10 @@
 -- writes the row back without acting, as it does a newly recorded one. An
 -- older release at or above the floor inserts rows without them, and updates
 -- the rest of a row in place, leaving the pair as a newer release last wrote
--- it. The pass acts on the pair only together with a file node that moved
--- since the row was written, so a pair left stale by an expression change
--- the older release missed rebuilds the readers at the next rewrite of the
--- table instead of never.
+-- it. A `SET EXPRESSION` while the older release runs is missed, as that
+-- release always missed it: the newer release's first pass writes the pair
+-- back without acting, unless the table was rewritten again since the older
+-- release's last pass, in which case it rebuilds the readers.
 alter table capture_baselines
     add column generated_stored boolean,
     add column expr_hash text;

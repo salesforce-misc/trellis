@@ -114,7 +114,10 @@
 //! readers for nothing, as does a column retyped and back between two passes
 //! (two rewrites that leave the row as it was). So does a `SET EXPRESSION`
 //! to an expression that parses differently and computes the same values
-//! (`2 * img` for `img * 2`), or to the expression the column already has.
+//! (`2 * img` for `img * 2`), or to the expression the column already has,
+//! and a rewrite of the table (`VACUUM FULL`) between a major-version
+//! `pg_upgrade` and the first pass after it, which finds every read stored
+//! generated column's expression stored anew under a moved file node.
 //!
 //! A pure widening with a `USING` that changes values (`integer` to `bigint
 //! USING b * 10`) is never R1's, and its row changed, so it isn't R3b's
@@ -1078,6 +1081,22 @@ mod tests {
             ),
             None
         );
+        // Each half of "stored generated before" counts on its own: a row
+        // that wasn't stored generated, and one that was but has no recorded
+        // expression, act on nothing.
+        let live = generated("200", 16390, "h2", "e3");
+        for was in [
+            Column {
+                generated_stored: Some(false),
+                ..generated("100", 16384, "h", "e")
+            },
+            Column {
+                expr_hash: None,
+                ..generated("100", 16384, "h", "e")
+            },
+        ] {
+            assert_eq!(compare(&was, &live), None, "{was:?}");
+        }
     }
 
     /// A row recorded before the baseline kept a column's expression is
