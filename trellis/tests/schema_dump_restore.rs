@@ -19,6 +19,9 @@
 //! - a release that meets the floor of a row stored paused rebuilds it on
 //!   `RESUME`, but a 1-1 one, which has no ledger
 //!   (`rows_restored_paused_resume_on_a_release_that_meets_their_floor`)
+//! - a refusal part way leaves the rows before it restored and the rest
+//!   queued, and the next `migrate` goes on from it
+//!   (`a_refusal_part_way_restores_the_rows_before_it_and_the_next_migrate_goes_on`)
 
 use std::process::Command;
 
@@ -670,4 +673,73 @@ async fn rows_restored_paused_resume_on_a_release_that_meets_their_floor() {
         );
     }
     forward.shutdown().await.expect("shutdown");
+}
+
+/// A refusal part way through the queue: the rows before it stay restored
+/// and leave the queue, and the next `migrate` goes on from the refused row
+/// without defining them again.
+#[tokio::test]
+async fn a_refusal_part_way_restores_the_rows_before_it_and_the_next_migrate_goes_on() {
+    let cluster = TestCluster::start();
+    // tot's row records a target its text doesn't name.
+    let loaded = load_edited(&cluster, |sql| {
+        sql.replace("'public.tot',", "'public.not_tot',")
+    })
+    .await;
+    let after = connect_raw(loaded.dsn()).await;
+    let refused = facade(loaded.dsn())
+        .await
+        .migrate()
+        .await
+        .expect_err("tot's row doesn't match its text");
+    assert!(
+        refused
+            .to_string()
+            .contains("can't restore transform public.not_tot"),
+        "{refused}"
+    );
+    assert_eq!(
+        rows_json(&after, STATUSES).await,
+        vec!["public.o1 waiting_to_backfill".to_string()],
+        "o1, before it, is restored"
+    );
+    assert_eq!(
+        rows_json(
+            &after,
+            "select to_jsonb(target_table) from trellis.restore_queue order by ordinal"
+        )
+        .await,
+        vec![
+            "\"public.not_tot\"".to_string(),
+            "\"public.oc\"".to_string()
+        ],
+        "the refused row and the rest stay queued"
+    );
+    after
+        .batch_execute(
+            "update trellis.restore_queue set target_table = 'public.tot' \
+             where target_table = 'public.not_tot'",
+        )
+        .await
+        .expect("correct the row");
+    facade(loaded.dsn())
+        .await
+        .migrate()
+        .await
+        .expect("the next migrate goes on from the refused row");
+    let statuses = rows_json(&after, STATUSES).await;
+    assert_eq!(statuses.len(), 3, "{statuses:?}");
+    assert!(
+        statuses.iter().all(|s| s.ends_with(" waiting_to_backfill")),
+        "{statuses:?}"
+    );
+    assert_eq!(
+        count(
+            &after,
+            "select (to_regclass('trellis.restore_queue') is null)::int::bigint"
+        )
+        .await,
+        1,
+        "the queue is dropped"
+    );
 }
