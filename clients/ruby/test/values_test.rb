@@ -29,7 +29,8 @@ class ValuesTest < Minitest::Test
                           last_error: "permission denied", next_attempt_at_micros: MICROS },
       capture_wait: nil, capture_failure: nil, held_keys: nil, drain_failure: nil,
       source_index_gaps: [], correcting: [], paused_upstream_columns: [],
-      build_wait_xid: nil, version_handover: nil, join: nil
+      build_wait_xid: nil, version_handover: nil, join: nil,
+      floor: "0.2.0"
     )
     assert_equal Trellis::Status.new(
       status: :waiting_to_backfill,
@@ -43,7 +44,8 @@ class ValuesTest < Minitest::Test
       drain_failure: nil,
       source_index_gaps: [],
       correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil,
-      below_catalog_floor: nil, join: nil
+      below_catalog_floor: nil, join: nil,
+      floor: "0.2.0"
     ), status
   end
 
@@ -57,7 +59,8 @@ class ValuesTest < Minitest::Test
                          error: "column \"qty\" was dropped", detected_at_micros: MICROS },
       held_keys: { count: 2, oldest_poisoned_at_micros: MICROS + 2 },
       drain_failure: nil, source_index_gaps: [], correcting: [], paused_upstream_columns: [],
-      build_wait_xid: nil, version_handover: nil, join: nil
+      build_wait_xid: nil, version_handover: nil, join: nil,
+      floor: "0.2.0"
     )
     assert_equal Trellis::Status.new(
       status: :catching_up, backfill_failure: nil,
@@ -75,7 +78,8 @@ class ValuesTest < Minitest::Test
       drain_failure: nil,
       source_index_gaps: [],
       correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil,
-      below_catalog_floor: nil, join: nil
+      below_catalog_floor: nil, join: nil,
+      floor: "0.2.0"
     ), status
   end
 
@@ -86,7 +90,8 @@ class ValuesTest < Minitest::Test
                        error: "permission denied for function audit_hook", sqlstate: "42501",
                        since_micros: MICROS, last_seen_micros: MICROS + 1, attempts: 5 },
       source_index_gaps: [], correcting: [], paused_upstream_columns: [],
-      build_wait_xid: nil, version_handover: nil, join: nil
+      build_wait_xid: nil, version_handover: nil, join: nil,
+      floor: "0.2.0"
     )
     assert_equal Trellis::DrainFailure.new(
       seg_seq: 17, tables: ["public.lines", "public.orders"],
@@ -126,7 +131,8 @@ class ValuesTest < Minitest::Test
     status = Trellis::Status.from_native(
       status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil, held_keys: nil,
       drain_failure: nil, source_index_gaps: [gap], correcting: [], paused_upstream_columns: [],
-      build_wait_xid: nil, version_handover: nil, join: nil
+      build_wait_xid: nil, version_handover: nil, join: nil,
+      floor: "0.2.0"
     )
     assert_equal [Trellis::SourceIndexGap.new(**gap)], status.source_index_gaps
   end
@@ -137,7 +143,8 @@ class ValuesTest < Minitest::Test
       held_keys: nil, drain_failure: nil, source_index_gaps: [],
       correcting: [{ node: "public.items_p1", since_micros: MICROS, keys_remaining: 5 },
                    { node: "public.items_p2", since_micros: MICROS + 1, keys_remaining: nil }],
-      paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil, join: nil
+      paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil, join: nil,
+      floor: "0.2.0"
     )
     assert_equal :backfilling, status.status
     assert_equal [
@@ -153,7 +160,8 @@ class ValuesTest < Minitest::Test
       status: :catching_up, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
       held_keys: nil, drain_failure: nil, source_index_gaps: [],
       correcting: [], paused_upstream_columns: ["t.total"],
-      build_wait_xid: nil, version_handover: nil, join: nil
+      build_wait_xid: nil, version_handover: nil, join: nil,
+      floor: "0.2.0"
     )
     assert_equal :catching_up, status.status
     assert_equal ["t.total"], status.paused_upstream_columns
@@ -164,7 +172,8 @@ class ValuesTest < Minitest::Test
       status: :backfilling, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
       held_keys: nil, drain_failure: nil, source_index_gaps: [],
       correcting: [], paused_upstream_columns: [],
-      build_wait_xid: 4_294_967_301, version_handover: nil, join: nil
+      build_wait_xid: 4_294_967_301, version_handover: nil, join: nil,
+      floor: "0.2.0"
     )
     assert_equal 4_294_967_301, status.build_wait_xid
     assert_nil status.version_handover
@@ -181,7 +190,8 @@ class ValuesTest < Minitest::Test
                     { worker_id: "trellis-host-18-cd34", version: nil }],
         unregistered_staging_worker: true, migrations_pending: false
       },
-      join: nil
+      join: nil,
+      floor: "0.2.0"
     )
     assert_nil status.build_wait_xid
     assert_equal Trellis::VersionHandover.new(
@@ -220,7 +230,8 @@ class ValuesTest < Minitest::Test
         fan_out_warning: { key: "42,eu", rows: 3_000_000_023, threshold: 250_000 },
         building: { step: :side, side: :joined, part: :leaf, leaf: "public.items_p2",
                     remaining: nil }
-      }
+      },
+      floor: "0.2.0"
     )
     assert_equal Trellis::JoinStatus.new(
       hidden_tables: [
@@ -245,13 +256,25 @@ class ValuesTest < Minitest::Test
       join: {
         hidden_tables: [], partials_warning: nil, fan_out_warning: nil,
         building: { step: :chunks, side: nil, part: nil, leaf: nil, remaining: 4_294_967_301 }
-      }
+      },
+      floor: "0.2.0"
     )
     assert_equal Trellis::JoinStatus.new(
       hidden_tables: [], partials_warning: nil, fan_out_warning: nil,
       building: Trellis::JoinBuildStep.new(step: :chunks, side: nil, part: nil, leaf: nil,
                                            remaining: 4_294_967_301)
     ), status.join
+  end
+
+  def test_a_definitions_floor_keeps_the_release_it_names
+    status = Trellis::Status.from_native(
+      status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
+      held_keys: nil, drain_failure: nil, source_index_gaps: [],
+      correcting: [], paused_upstream_columns: ["upstream.amount"], build_wait_xid: nil,
+      version_handover: nil, join: nil, floor: "0.3.1"
+    )
+    assert_equal "0.3.1", status.floor
+    assert_equal ["upstream.amount"], status.paused_upstream_columns
   end
 
   def test_a_definition_summarys_backfill_failure_becomes_a_backfill_failure

@@ -548,4 +548,76 @@ mod tests {
             .get(0);
         assert_eq!(format, 2);
     }
+
+    /// ADR-0024: the migration that adds definition floors gives every
+    /// definition already stored floor 0.2.0, the baseline.
+    #[tokio::test]
+    async fn the_floor_migration_gives_every_existing_definition_the_baseline() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_empty_database().await;
+        let config = Config::from_dsn(db.dsn().to_string()).expect("dsn");
+        let pool = Pool::new(&config).expect("pool");
+        let mut client = pool.connect_unpooled().await.expect("connect");
+        identity::prepare_attach(&mut client, &config)
+            .await
+            .expect("prepare");
+        let migrations = Migrations::embedded();
+        let floor_migration = migrations
+            .list
+            .iter()
+            .find(|migration| migration.name() == "definition_floor")
+            .expect("the floor migration")
+            .version();
+        let before = migrations
+            .list
+            .iter()
+            .map(|migration| migration.version())
+            .filter(|&version| version < floor_migration)
+            .max()
+            .expect("a migration before it");
+        run_up_to(&mut client, &migrations, before)
+            .await
+            .expect("migrate to before");
+        client
+            .batch_execute(
+                "insert into source_table_versions (source_table, version) \
+                 values ('public.s', 1), ('public.u', 1); \
+                 insert into transform_definitions \
+                 (target_table, source_table, source_version, definition_text, status) \
+                 values ('public.t', 'public.s', 1, 'TRANSFORM t FROM s SELECT a AS a', 'live'), \
+                        ('public.g', 'public.u', 1, \
+                         'TRANSFORM g FROM u GROUP BY k SELECT k AS k, COUNT(*) AS n', 'paused')",
+            )
+            .await
+            .expect("definitions stored before floors");
+
+        run_up_to_latest(&mut client, &migrations)
+            .await
+            .expect("migrate");
+
+        let floors: Vec<(String, String)> = client
+            .query(
+                "select target_table, floor_version from transform_definitions order by id",
+                &[],
+            )
+            .await
+            .expect("read the floors")
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(
+            floors,
+            [
+                ("public.t".to_string(), "0.2.0".to_string()),
+                ("public.g".to_string(), "0.2.0".to_string()),
+            ]
+        );
+        let refused = client
+            .execute(
+                "update transform_definitions set floor_version = '0.2.0-rc.1'",
+                &[],
+            )
+            .await;
+        assert!(refused.is_err(), "a floor is a release: {refused:?}");
+    }
 }

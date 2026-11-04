@@ -121,11 +121,18 @@ module Trellis
   # about the definition's status. It reports the estimated size of the
   # definition's hidden tables, the P-size warning, the fan-out warning of a
   # 1-1 JOIN and the step its build runs.
+  #
+  # floor is the oldest Trellis release that can run the definition, as
+  # "major.minor.patch": the latest release any construct, key space, option
+  # or hidden-table layout it uses arrived in. Trellis records it when the
+  # definition is defined, altered or rebuilt by a resume. Before rolling the
+  # application back to an earlier Trellis release, drop each definition
+  # whose floor is above that release, under the newer one.
   Status = Data.define(:status, :backfill_failure, :capture_wait, :capture_failure,
                        :held_keys, :drain_failure, :source_index_gaps,
                        :correcting, :paused_upstream_columns,
                        :build_wait_xid, :version_handover, :below_catalog_floor,
-                       :join) do
+                       :join, :floor) do
     def self.from_native(hash)
       failure = hash[:backfill_failure]
       wait = hash[:capture_wait]
@@ -147,7 +154,8 @@ module Trellis
           build_wait_xid: hash.fetch(:build_wait_xid),
           version_handover: version_handover && VersionHandover.from_native(version_handover),
           below_catalog_floor: below_catalog_floor && BelowCatalogFloor.new(**below_catalog_floor),
-          join: join && JoinStatus.from_native(join))
+          join: join && JoinStatus.from_native(join),
+          floor: hash.fetch(:floor))
     end
   end
 

@@ -213,7 +213,7 @@ impl fmt::Display for ParseError {
                  (docs/type-support.md)",
                 crate::defs::registry::CAST_TARGETS
                     .iter()
-                    .map(|t| t.to_string())
+                    .map(|t| t.value_type.to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
             ),

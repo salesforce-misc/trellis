@@ -109,6 +109,22 @@ migrations: one it carries that ran with another name or checksum, or a gap
 below its newest migration. A handle that connects without migrating
 doesn't check the history: `migrate` does.
 
+### Reading the floors
+
+Each definition records its **floor**: the oldest Trellis release that can
+run it, the latest release any construct, key space, option or hidden-table
+layout it uses arrived in. `status()` reports it as `floor`
+(`"major.minor.patch"`, in the Elixir and Ruby bindings too), and
+`trellis status` prints it on each definition's line as `floor=`. Trellis
+records it when a definition is defined, altered or rebuilt by a resume;
+every definition that exists when floors are introduced has floor 0.2.0.
+
+Before rolling back to an earlier release, read the floors under the newer
+release, and drop each definition whose floor is above the release you roll
+back to there. The release notes name the features each release introduces
+with a new floor
+([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md#rolling-back)).
+
 ### To a release before 0.2.0
 
 Restore a backup of the whole database taken before the upgrade. The restore

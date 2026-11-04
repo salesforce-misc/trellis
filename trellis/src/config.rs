@@ -103,6 +103,11 @@ pub struct Config {
     /// [`crate::handover::BINARY_VERSION`] unless a test injected another
     /// with `Config::with_binary_version`.
     binary_version: std::borrow::Cow<'static, str>,
+    /// Features a test gave another release than their registry entry
+    /// declares, for the definition floors this configuration's handles
+    /// stamp (ADR-0024, `defs::floor`): empty unless a test set some with
+    /// `Config::with_feature_since`.
+    feature_since: std::sync::Arc<[(String, crate::defs::floor::Release)]>,
 }
 
 impl Config {
@@ -153,6 +158,7 @@ impl Config {
             schema,
             target_schema: DEFAULT_TARGET_SCHEMA.to_string(),
             binary_version: std::borrow::Cow::Borrowed(crate::handover::BINARY_VERSION),
+            feature_since: std::sync::Arc::from([]),
         })
     }
 
@@ -195,6 +201,27 @@ impl Config {
     #[cfg(any(test, feature = "internals"))]
     pub fn with_binary_version(mut self, version: impl Into<String>) -> Self {
         self.binary_version = std::borrow::Cow::Owned(version.into());
+        self
+    }
+
+    /// The definition floors this configuration's handles stamp (ADR-0024):
+    /// against its binary version, with its features' overrides.
+    pub(crate) fn floors(&self) -> crate::defs::floor::Floors {
+        crate::defs::floor::Floors::new(&self.binary_version, self.feature_since.clone())
+    }
+
+    /// Returns `self` stamping definition floors as if `feature` (a
+    /// `defs::floor::Feature` in its `Debug` form, `Expr(Case)` or
+    /// `Function("ABS")`) had arrived in release `since`, so a test can stand
+    /// in for a release that adds it (ADR-0024). Panics if `since` isn't a
+    /// `major.minor.patch` release.
+    #[cfg(feature = "internals")]
+    pub fn with_feature_since(mut self, feature: impl Into<String>, since: &str) -> Self {
+        let since = crate::defs::floor::Release::parse(since)
+            .unwrap_or_else(|| panic!("{since:?} is not a major.minor.patch release"));
+        let mut overrides = self.feature_since.to_vec();
+        overrides.push((feature.into(), since));
+        self.feature_since = overrides.into();
         self
     }
 
@@ -278,12 +305,14 @@ impl fmt::Debug for Config {
             schema,
             target_schema,
             binary_version,
+            feature_since,
         } = self;
         f.debug_struct("Config")
             .field("dsn", &RedactedDsn(dsn))
             .field("schema", schema)
             .field("target_schema", target_schema)
             .field("binary_version", binary_version)
+            .field("feature_since", feature_since)
             .finish()
     }
 }

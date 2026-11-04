@@ -94,7 +94,10 @@ The surface mirrors the Rust crate's `BlockingTrellis`. Every function has a ban
   `Trellis.FanOutWarning`) and the step its build runs (`building`, a
   `Trellis.JoinBuildStep` with `step` and the `side`, `part`, `leaf` or
   `remaining` its kind of step carries). `join` is `nil` for any other
-  transform.
+  transform. `status/2` reports the oldest Trellis release that can run a
+  transform (`floor`, `"major.minor.patch"`), which an application reads
+  before rolling back to an earlier Trellis release
+  ([upgrading](../../docs/upgrading.md#rolling-back)).
 - `request_backfill/2`, `detect_capture_disruptions/1` (pauses now the readers
   of every table whose Trellis capture was changed outside Trellis, and
   returns the tables), `has_live_drain_workers/1`,

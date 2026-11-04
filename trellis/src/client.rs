@@ -1143,7 +1143,7 @@ mod worker_id_tests {
 // ---------------------------------------------------------------------
 
 /// Tries to take the staging-worker singleton and, if it gets it, runs one
-/// capture reconcile pass ([`capture::reconcile::reconcile`]) and starts the
+/// capture reconcile pass ([`capture::reconcile::reconcile_with_floors`]) and starts the
 /// build of every definition the pass finds ready.
 ///
 /// Returns the [`ProducerSession`] that holds the singleton, or `None` when
@@ -1189,10 +1189,15 @@ async fn first_capture_pass(
 ) -> Result<(), ClientError> {
     let tables = defs::tables_to_capture(pool).await?;
     let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
-    let outcome =
-        capture::reconcile::reconcile(session.client_mut(), config.schema(), &tables, deadline)
-            .await
-            .map_err(capture_pass_error)?;
+    let outcome = capture::reconcile::reconcile_with_floors(
+        session.client_mut(),
+        config.schema(),
+        pool.floors(),
+        &tables,
+        deadline,
+    )
+    .await
+    .map_err(capture_pass_error)?;
     release_retyped_keys(pool).await;
     release_upstream_rebuilt_keys(pool).await;
     complete_pause_cascades(pool).await;
@@ -1988,7 +1993,7 @@ impl From<IntakeError> for ReconcileError {
 
 /// Re-derives the desired source-table set from the catalog
 /// ([`defs::tables_to_capture`]), brings every table's capture triggers to
-/// it ([`capture::reconcile::reconcile`]), and starts the
+/// it ([`capture::reconcile::reconcile_with_floors`]), and starts the
 /// build of every newly registered definition whose capture is now current
 /// ([`staging::build::start_ready_builds`]). Re-run periodically, so a
 /// transform registered while this client runs is picked up without a
@@ -2013,7 +2018,14 @@ async fn reconcile_source_tables(
 ) -> Result<(), ReconcileError> {
     let desired = defs::tables_to_capture(pool).await?;
     let deadline = Instant::now() + RECONCILE_DDL_BUDGET;
-    let outcome = capture::reconcile::reconcile(client, schema, &desired, deadline).await?;
+    let outcome = capture::reconcile::reconcile_with_floors(
+        client,
+        schema,
+        pool.floors(),
+        &desired,
+        deadline,
+    )
+    .await?;
     // The steps below run on the pool, not the session. Once the session has
     // closed the lock is gone and the next leader's pass does them: each is
     // safe to overlap with another leader's, so this only skips work that is

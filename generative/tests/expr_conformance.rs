@@ -1996,7 +1996,7 @@ fn the_generator_reaches_every_registry_entry() {
         .chain(
             registry::CAST_TARGETS
                 .iter()
-                .map(|t| format!("cast to {t}")),
+                .map(|t| format!("cast to {}", t.value_type)),
         )
         .collect();
     expected.extend(

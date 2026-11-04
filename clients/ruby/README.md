@@ -104,7 +104,10 @@ Nothing in the binding uses it.
   warning (`fan_out_warning`, a `Trellis::FanOutWarning`) and the step its
   build runs (`building`, a `Trellis::JoinBuildStep` with `step` and the
   `side`, `part`, `leaf` or `remaining` its kind of step carries). `join` is
-  `nil` for any other definition.
+  `nil` for any other definition. `status` reports the oldest Trellis release
+  that can run a definition (`floor`, `"major.minor.patch"`), which an
+  application reads before rolling back to an earlier Trellis release
+  ([upgrading](../../docs/upgrading.md#rolling-back)).
 - `Trellis.request_backfill(source_table)`,
   `Trellis.detect_capture_disruptions` (pauses now the readers of every table
   whose Trellis capture was changed outside Trellis, and returns the tables),

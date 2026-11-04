@@ -715,6 +715,19 @@ define it again; the other transforms keep running. A stored definition
 can be rewritten to the current version without a rebuild. The rules are in
 [0018-grammar-versioning](decisions/0018-grammar-versioning.md).
 
+## Floors
+
+Every stored definition also records its **floor**: the oldest Trellis
+release that can run it, the latest release any grammar construct, key space,
+option or hidden-table layout it uses arrived in. Define, `ALTER TRANSFORM`
+and a resume's rebuild record it from what the definition uses then, so an
+`ALTER` that removes the only newer construct lowers it; a pause never changes
+it. `status()` reports it as `floor`, and `trellis status` prints it as
+`floor=` on each definition's line. It is what to read before rolling an
+application back to an earlier Trellis release
+([upgrading — Rolling back](upgrading.md#rolling-back),
+[0024-compatibility-floors-and-rollback](decisions/0024-compatibility-floors-and-rollback.md)).
+
 ## Scope
 
 This document describes the logical model only, not the physical storage or

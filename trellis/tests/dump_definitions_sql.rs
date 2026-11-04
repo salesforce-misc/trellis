@@ -298,6 +298,16 @@ async fn a_dump_loads_as_defined_not_built() {
         rows_json(&raw, STATUSES).await
     );
 
+    // A floor other than the default (ADR-0024), as a newer release stamps
+    // one, so the comparison below shows the dump carries it.
+    raw.execute(
+        "update transform_definitions set floor_version = '0.3.4' \
+         where id = (select min(id) from transform_definitions)",
+        &[],
+    )
+    .await
+    .expect("stamp a later floor");
+
     let schema_sql = run(
         Command::new("pg_dump")
             .args([

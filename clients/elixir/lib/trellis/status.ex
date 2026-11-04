@@ -90,6 +90,13 @@ defmodule Trellis.Status do
   transform's hidden tables, the `P`-size warning, the fan-out warning of a
   1-1 `JOIN` and the step its build runs.
 
+  `floor` is the oldest Trellis release that can run the transform, as
+  `"major.minor.patch"`: the latest release any construct, key space,
+  option or hidden-table layout it uses arrived in. Trellis records it when
+  the transform is defined, altered or rebuilt by a resume. Before rolling
+  the application back to an earlier Trellis release, drop each transform
+  whose floor is above that release, under the newer one.
+
   Every process sees them, whichever one runs the staging worker.
   """
 
@@ -110,7 +117,8 @@ defmodule Trellis.Status do
           build_wait_xid: integer() | nil,
           version_handover: Trellis.VersionHandover.t() | nil,
           below_catalog_floor: Trellis.BelowCatalogFloor.t() | nil,
-          join: Trellis.JoinStatus.t() | nil
+          join: Trellis.JoinStatus.t() | nil,
+          floor: String.t()
         }
 
   @enforce_keys [
@@ -126,7 +134,8 @@ defmodule Trellis.Status do
     :build_wait_xid,
     :version_handover,
     :below_catalog_floor,
-    :join
+    :join,
+    :floor
   ]
   defstruct @enforce_keys
 
@@ -144,7 +153,8 @@ defmodule Trellis.Status do
         build_wait_xid: build_wait_xid,
         version_handover: version_handover,
         below_catalog_floor: below_catalog_floor,
-        join: join
+        join: join,
+        floor: floor
       }) do
     %__MODULE__{
       status: status,
@@ -160,7 +170,8 @@ defmodule Trellis.Status do
       version_handover: version_handover && Trellis.VersionHandover.from_native(version_handover),
       below_catalog_floor:
         below_catalog_floor && Trellis.BelowCatalogFloor.from_native(below_catalog_floor),
-      join: join && Trellis.JoinStatus.from_native(join)
+      join: join && Trellis.JoinStatus.from_native(join),
+      floor: floor
     }
   end
 end

@@ -29,7 +29,8 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
-        join: nil
+        join: nil,
+        floor: "0.2.0"
       })
 
     assert %Trellis.Status{
@@ -73,7 +74,8 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
-        join: nil
+        join: nil,
+        floor: "0.2.0"
       })
 
     assert %Trellis.Status{
@@ -124,7 +126,8 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
-        join: nil
+        join: nil,
+        floor: "0.2.0"
       })
 
     assert status.drain_failure == %Trellis.DrainFailure{
@@ -161,7 +164,8 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
-        join: nil
+        join: nil,
+        floor: "0.2.0"
       })
 
     assert status.source_index_gaps == [
@@ -193,7 +197,8 @@ defmodule Trellis.StatusTest do
         build_wait_xid: nil,
         version_handover: nil,
         below_catalog_floor: nil,
-        join: nil
+        join: nil,
+        floor: "0.2.0"
       })
 
     assert status.paused_upstream_columns == ["t.total"]
@@ -227,7 +232,8 @@ defmodule Trellis.StatusTest do
         build_wait_xid: 4_294_967_301,
         version_handover: nil,
         below_catalog_floor: nil,
-        join: nil
+        join: nil,
+        floor: "0.2.0"
       })
 
     assert status.build_wait_xid == 4_294_967_301
@@ -257,7 +263,8 @@ defmodule Trellis.StatusTest do
           migrations_pending: false
         },
         below_catalog_floor: nil,
-        join: nil
+        join: nil,
+        floor: "0.2.0"
       })
 
     assert status.build_wait_xid == nil
@@ -326,7 +333,8 @@ defmodule Trellis.StatusTest do
             leaf: "public.items_p2",
             remaining: nil
           }
-        }
+        },
+        floor: "0.2.0"
       })
 
     assert status.join == %Trellis.JoinStatus{
@@ -389,7 +397,8 @@ defmodule Trellis.StatusTest do
             leaf: nil,
             remaining: 4_294_967_301
           }
-        }
+        },
+        floor: "0.2.0"
       })
 
     assert status.join == %Trellis.JoinStatus{
@@ -404,6 +413,28 @@ defmodule Trellis.StatusTest do
                remaining: 4_294_967_301
              }
            }
+  end
+
+  test "a transform's floor keeps the release it names" do
+    status =
+      Trellis.Status.from_native(%{
+        status: :live,
+        backfill_failure: nil,
+        capture_wait: nil,
+        capture_failure: nil,
+        held_keys: nil,
+        drain_failure: nil,
+        source_index_gaps: [],
+        correcting: [],
+        paused_upstream_columns: ["upstream.amount"],
+        build_wait_xid: nil,
+        version_handover: nil,
+        join: nil,
+        floor: "0.3.1"
+      })
+
+    assert status.floor == "0.3.1"
+    assert status.paused_upstream_columns == ["upstream.amount"]
   end
 
   test "a definition summary's halt becomes a capture failure of kind halt" do

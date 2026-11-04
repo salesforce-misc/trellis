@@ -2040,6 +2040,8 @@ pub async fn alter_transform(
         ],
     )
     .await?;
+    // ADR-0024: the edited tree's floor, which can be lower than before.
+    super::floor::stamp(&*txn, pool.floors(), current.id, &merged).await?;
 
     // The recompute is a field build: registered here, run
     // by the drain workers. See "The field build" in this function's doc
@@ -3360,14 +3362,25 @@ async fn create_definition_inner(
         .map(encode_type_map)
         .unwrap_or_default();
     let join_table = join_sides.as_ref().map(|sides| sides.joined.as_str());
+    // ADR-0024: the oldest release that can run what this define writes.
+    let read_tables: Vec<&str> = std::iter::once(qualified_source.as_str())
+        .chain(join_table)
+        .collect();
+    let floor = pool
+        .floors()
+        .of(
+            &def,
+            super::floor::any_partitioned(&*txn, &read_tables).await?,
+        )
+        .to_string();
     let id: i64 = match txn
         .query_one(
             "insert into transform_definitions
                 (target_table, source_table, source_version, definition_text, source_columns, status,
-                 grammar_version, join_table, join_columns)
+                 grammar_version, join_table, join_columns, floor_version)
              values ($1, $2, $3, $4, jsonb_object($5::text[], $6::text[]), $7, $8, $9,
                      case when $9::text is null then null
-                          else jsonb_object($10::text[], $11::text[]) end)
+                          else jsonb_object($10::text[], $11::text[]) end, $12)
              returning id",
             &[
                 &qualified_target,
@@ -3381,6 +3394,7 @@ async fn create_definition_inner(
                 &join_table,
                 &join_keys,
                 &join_vals,
+                &floor,
             ],
         )
         .await

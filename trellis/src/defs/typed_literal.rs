@@ -129,6 +129,9 @@ pub struct TypedLiteralSpec {
     /// expected shape on failure. See this module's doc comment for why the
     /// bar is canonical form and not merely "Postgres would parse it".
     pub canonical: fn(&str) -> Result<(), &'static str>,
+    /// The release this literal arrived in, which raises the floor of a
+    /// definition using it (ADR-0024, [`super::floor`]).
+    pub since: super::floor::Release,
 }
 
 /// The type keywords a typed literal may name.
@@ -245,16 +248,19 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         keyword: "DATE",
         value_type: ValueType::Other(PgType::Date),
         canonical: canonical_date,
+        since: super::floor::BASELINE,
     },
     TypedLiteralSpec {
         keyword: "TIMESTAMP",
         value_type: ValueType::Other(PgType::Timestamp),
         canonical: canonical_timestamp,
+        since: super::floor::BASELINE,
     },
     TypedLiteralSpec {
         keyword: "BYTEA",
         value_type: ValueType::Other(PgType::Bytea),
         canonical: canonical_bytea,
+        since: super::floor::BASELINE,
     },
     // `time_out` and `timetz_out` are the only two output
     // functions in the temporal block `pg_proc` marks **IMMUTABLE**
@@ -271,11 +277,13 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         keyword: "TIME",
         value_type: ValueType::Other(PgType::Time),
         canonical: canonical_time,
+        since: super::floor::BASELINE,
     },
     TypedLiteralSpec {
         keyword: "TIMETZ",
         value_type: ValueType::Other(PgType::TimeTz),
         canonical: canonical_timetz,
+        since: super::floor::BASELINE,
     },
     // `oid` clears both bars this module sets easily: `oidin`
     // and `oidout` are `IMMUTABLE` (no session state, no relative
@@ -285,6 +293,7 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         keyword: "OID",
         value_type: ValueType::Other(PgType::Oid),
         canonical: canonical_oid,
+        since: super::floor::BASELINE,
     },
     // `float4in`/`float8in` and `float4out`/`float8out` are all
     // `IMMUTABLE` (checked against `pg_proc.provolatile`), and the canonical
@@ -295,11 +304,13 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         keyword: "REAL",
         value_type: ValueType::Float(FloatWidth::Float4),
         canonical: canonical_float4,
+        since: super::floor::BASELINE,
     },
     TypedLiteralSpec {
         keyword: "DOUBLE PRECISION",
         value_type: ValueType::Float(FloatWidth::Float8),
         canonical: canonical_float8,
+        since: super::floor::BASELINE,
     },
     // Canonical form is `network_show`'s (`<col>::text`'s)
     // always-explicit-netmask spelling, not `inet_out`'s host-elided one —
@@ -309,6 +320,7 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         keyword: "INET",
         value_type: ValueType::Other(PgType::Inet),
         canonical: crate::netaddr::canonical_inet,
+        since: super::floor::BASELINE,
     },
     // `cidr_out` and the `network_show` cast agree unconditionally (a `cidr`
     // value's whole point is that the netmask matters, so neither renderer
@@ -318,16 +330,19 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         keyword: "CIDR",
         value_type: ValueType::Other(PgType::Cidr),
         canonical: crate::netaddr::canonical_cidr,
+        since: super::floor::BASELINE,
     },
     TypedLiteralSpec {
         keyword: "MACADDR",
         value_type: ValueType::Other(PgType::MacAddr),
         canonical: crate::netaddr::canonical_macaddr,
+        since: super::floor::BASELINE,
     },
     TypedLiteralSpec {
         keyword: "MACADDR8",
         value_type: ValueType::Other(PgType::MacAddr8),
         canonical: crate::netaddr::canonical_macaddr8,
+        since: super::floor::BASELINE,
     },
     // `varbit_in`/`varbit_out` are `IMMUTABLE` and read no GUC
     // (verified against `pg_proc.provolatile`), and `bit varying`'s bare
@@ -341,6 +356,7 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         keyword: "VARBIT",
         value_type: ValueType::Other(PgType::VarBit),
         canonical: canonical_varbit,
+        since: super::floor::BASELINE,
     },
     // `jsonb_in`/`jsonb_out` are `IMMUTABLE`, and
     // [`crate::jsonb::canonical_jsonb`] is the canonical-form checker — see
@@ -350,6 +366,7 @@ pub const TYPED_LITERALS: &[TypedLiteralSpec] = &[
         keyword: "JSONB",
         value_type: ValueType::Other(PgType::Jsonb),
         canonical: crate::jsonb::canonical_jsonb,
+        since: super::floor::BASELINE,
     },
 ];
 

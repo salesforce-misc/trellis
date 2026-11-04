@@ -875,7 +875,7 @@ impl Trellis {
                 .query_opt(
                     &format!(
                         "select d.status, d.id, d.source_table, d.definition_text, d.grammar_version, \
-                            d.join_table, \
+                            d.join_table, d.floor_version, \
                             {CHUNK_FAILURE_COLUMNS}, \
                             cf.source_table as capture_table, cf.columns as capture_columns, \
                             cf.error as capture_error, cf.detected_at as capture_detected_at, \
@@ -1023,6 +1023,7 @@ impl Trellis {
                     .map(|xid| BuildWait::Fence { xid }),
                 version_handover,
                 below_catalog_floor,
+                floor: row.get("floor_version"),
             }))
         })
         .await
@@ -2223,6 +2224,15 @@ pub struct DefinitionStatus {
     /// state-changing calls refuse ([`ErrorCode::VersionFloor`]). Names the
     /// floor and this binary's version. Run a version at or above the floor.
     pub below_catalog_floor: Option<crate::catalog_floor::BelowCatalogFloor>,
+    /// The oldest Trellis release that can run the definition, as
+    /// `major.minor.patch` (ADR-0024): the latest release any grammar
+    /// construct, key space, option or hidden-table layout it uses arrived
+    /// in. Trellis records it whenever it writes the definition (define,
+    /// `ALTER TRANSFORM`) or rebuilds it on a resume; a pause never changes
+    /// it. Before rolling back to an earlier release, drop each definition
+    /// whose floor is above it, under this release
+    /// (`docs/upgrading.md`, rolling back).
+    pub floor: String,
 }
 
 /// Why capture of a table a definition reads is broken; see [`DefinitionStatus::capture_failure`].

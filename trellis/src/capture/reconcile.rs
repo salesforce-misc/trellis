@@ -157,9 +157,32 @@ pub struct PassOutcome {
 ///
 /// An `Err` means the pass couldn't read the catalog; a table that fails on
 /// its own is in [`PassOutcome::failed`].
+///
+/// A resume this pass completes stamps the floor of this build
+/// ([`reconcile_with_floors`] takes a handle's).
+#[cfg(any(test, feature = "internals"))]
 pub async fn reconcile(
     client: &mut Client,
     schema: &str,
+    desired: &[String],
+    deadline: Instant,
+) -> Result<PassOutcome, CaptureError> {
+    reconcile_with_floors(
+        client,
+        schema,
+        &crate::defs::floor::Floors::of_this_binary(),
+        desired,
+        deadline,
+    )
+    .await
+}
+
+/// [`reconcile`], with the definition floors the resumes it completes
+/// stamp (ADR-0024): the handle's, whose binary version a test may inject.
+pub(crate) async fn reconcile_with_floors(
+    client: &mut Client,
+    schema: &str,
+    floors: &crate::defs::floor::Floors,
     desired: &[String],
     deadline: Instant,
 ) -> Result<PassOutcome, CaptureError> {
@@ -194,8 +217,8 @@ pub async fn reconcile(
             "the enum labels the definitions read could not be compared; retrying next pass: {err}"
         );
     }
-    crate::staging::quarantine::resume_caused_definitions(client, schema).await?;
-    crate::staging::quarantine::finish_requested_resumes(client, schema).await?;
+    crate::staging::quarantine::resume_caused_definitions(client, schema, floors).await?;
+    crate::staging::quarantine::finish_requested_resumes(client, schema, floors).await?;
     let snapshot = read_snapshot(client).await?;
     let installed = installed_tables(&*client, schema).await?;
     let database: String = client

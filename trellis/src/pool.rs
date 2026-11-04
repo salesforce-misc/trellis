@@ -377,6 +377,9 @@ pub struct Pool {
     /// A copy of the [`Config::target_schema`] this pool was built from —
     /// see [`Pool::target_schema`].
     target_schema: String,
+    /// The definition floors this pool's writes stamp, from the
+    /// [`Config`] it was built from ([`Config::floors`]).
+    floors: crate::defs::floor::Floors,
     /// The name this pool's instance logs under ([`crate::instance_log`]),
     /// for the drivers [`Pool::connect_unpooled`] spawns.
     instance: std::sync::Arc<str>,
@@ -523,6 +526,7 @@ impl Pool {
             tls,
             schema: config.schema().to_string(),
             target_schema: config.target_schema().to_string(),
+            floors: config.floors(),
             instance: crate::instance_log::name_of(config),
             wait_timeout,
             background,
@@ -666,6 +670,12 @@ impl Pool {
     /// signature.
     pub(crate) fn target_schema(&self) -> &str {
         &self.target_schema
+    }
+
+    /// The definition floors a write through this pool stamps (ADR-0024):
+    /// the [`Config`]'s binary version, and a test's feature overrides.
+    pub(crate) fn floors(&self) -> &crate::defs::floor::Floors {
+        &self.floors
     }
 }
 

@@ -3881,6 +3881,7 @@ pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyErro
     match resume_locked(
         &txn,
         pool.schema(),
+        pool.floors(),
         target,
         id,
         &fenced_source,
@@ -4208,9 +4209,11 @@ async fn request_drain(
 ///    call, `from_pass` true, returns that too if a copy drifted again
 ///    since, and its caller rolls back.
 /// 3. **Otherwise it completes the resume** ([`complete_resume`]).
+#[allow(clippy::too_many_arguments)]
 async fn resume_locked(
     txn: &Transaction<'_>,
     schema: &str,
+    floors: &crate::defs::floor::Floors,
     target: &str,
     id: i64,
     source_table: &str,
@@ -4281,6 +4284,7 @@ async fn resume_locked(
     complete_resume(
         txn,
         schema,
+        floors,
         id,
         source_table,
         status,
@@ -4382,9 +4386,11 @@ async fn set_capture_failure(
 /// ([`catalog::record_source_columns`],
 /// [`crate::defs::key_types::record_definition`]), so the capture pass
 /// compares later changes against them, and deletes any resume request.
+#[allow(clippy::too_many_arguments)]
 async fn complete_resume(
     txn: &Transaction<'_>,
     schema: &str,
+    floors: &crate::defs::floor::Floors,
     id: i64,
     source_table: &str,
     status: StoredStatus,
@@ -4503,6 +4509,9 @@ async fn complete_resume(
     if let Some(shape) = super::group_basis::route(&definition.def, &revalidated.source_columns) {
         catalog::recreate_group_table(txn, schema, id, &shape).await?;
     }
+    // ADR-0024: the rebuild writes this release's layout, so the floor is
+    // this release's for the definition as it stands.
+    crate::defs::floor::stamp(txn, floors, id, &definition.def).await?;
 
     // The staging worker's next pass starts the rebuild from
     // `waiting_to_backfill` (`super::build::start_ready_builds`): a 1-1 build
@@ -4764,6 +4773,7 @@ pub(crate) const RETYPE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration:
 pub(crate) async fn resume_caused_definitions(
     client: &mut tokio_postgres::Client,
     schema: &str,
+    floors: &crate::defs::floor::Floors,
 ) -> Result<(), tokio_postgres::Error> {
     let candidates: Vec<(i64, i64)> = client
         .query_typed(
@@ -4775,7 +4785,7 @@ pub(crate) async fn resume_caused_definitions(
         .map(|row| (row.get(0), row.get(1)))
         .collect();
     for (id, upstream) in candidates {
-        if let Err(err) = resume_caused_definition(client, schema, id, upstream).await {
+        if let Err(err) = resume_caused_definition(client, schema, floors, id, upstream).await {
             crate::instance_log::warn!(
                 transform_id = id,
                 upstream_id = upstream,
@@ -4810,6 +4820,7 @@ fn caused_candidates_sql() -> String {
 async fn resume_caused_definition(
     client: &mut tokio_postgres::Client,
     schema: &str,
+    floors: &crate::defs::floor::Floors,
     id: i64,
     upstream: i64,
 ) -> Result<(), ApplyError> {
@@ -4844,7 +4855,18 @@ async fn resume_caused_definition(
     if !status.is_frozen() || !still_waiting {
         return Ok(());
     }
-    match resume_locked(&txn, schema, &target, id, &source_table, status, false).await {
+    match resume_locked(
+        &txn,
+        schema,
+        floors,
+        &target,
+        id,
+        &source_table,
+        status,
+        false,
+    )
+    .await
+    {
         Ok(ResumeStep::Resumed) => {
             txn.commit().await?;
             crate::instance_log::info!(
@@ -4953,6 +4975,7 @@ async fn resume_caused_definition(
 pub(crate) async fn finish_requested_resumes(
     client: &mut tokio_postgres::Client,
     schema: &str,
+    floors: &crate::defs::floor::Floors,
 ) -> Result<(), tokio_postgres::Error> {
     let ids: Vec<i64> = client
         .query_typed(
@@ -4964,7 +4987,7 @@ pub(crate) async fn finish_requested_resumes(
         .map(|row| row.get(0))
         .collect();
     for id in ids {
-        if let Err(err) = finish_requested_resume(client, schema, id).await {
+        if let Err(err) = finish_requested_resume(client, schema, floors, id).await {
             crate::instance_log::warn!(
                 transform_id = id,
                 error = %err,
@@ -4979,6 +5002,7 @@ pub(crate) async fn finish_requested_resumes(
 async fn finish_requested_resume(
     client: &mut tokio_postgres::Client,
     schema: &str,
+    floors: &crate::defs::floor::Floors,
     id: i64,
 ) -> Result<(), ApplyError> {
     // What to re-type, read with the re-validation in one snapshot.
@@ -5175,7 +5199,18 @@ async fn finish_requested_resume(
     if !status.is_frozen() || !requested {
         return Ok(());
     }
-    match resume_locked(&txn, schema, &target, id, &source_table, status, true).await {
+    match resume_locked(
+        &txn,
+        schema,
+        floors,
+        &target,
+        id,
+        &source_table,
+        status,
+        true,
+    )
+    .await
+    {
         Ok(ResumeStep::Resumed) => {
             txn.commit().await?;
             crate::instance_log::info!(

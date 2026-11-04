@@ -281,7 +281,7 @@ pub fn rules() -> Vec<Rule> {
         if registry::negate_result_type(ty).is_some() {
             rules.push(Rule::Negate { ty });
         }
-        for &to in registry::CAST_TARGETS {
+        for to in registry::CAST_TARGETS.iter().map(|spec| spec.value_type) {
             if registry::cast_result_type(ty, to).is_some() {
                 rules.push(Rule::Cast { from: ty, to });
             }
@@ -494,7 +494,7 @@ pub fn constant_keyword_literals(ty: ValueType) -> Vec<Expr> {
     if ty == ValueType::Boolean {
         out.extend([Expr::BooleanLiteral(true), Expr::BooleanLiteral(false)]);
     }
-    if registry::NULL_CAST_TARGETS.contains(&ty) || registry::CAST_TARGETS.contains(&ty) {
+    if registry::cast_target_spec(ty).is_some() {
         out.push(typed_null(ty));
     }
     out
@@ -962,7 +962,7 @@ pub fn near_misses(columns: &[Column]) -> Vec<NearMiss> {
         let Some(col) = column_of(columns, ty) else {
             continue;
         };
-        for &to in registry::CAST_TARGETS {
+        for to in registry::CAST_TARGETS.iter().map(|spec| spec.value_type) {
             if registry::cast_result_type(ty, to).is_none() {
                 out.push(NearMiss {
                     kind: "cast-operand-type",

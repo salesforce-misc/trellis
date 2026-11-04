@@ -119,6 +119,49 @@ command: the older release degrades per definition by itself.
    database a later release has migrated; a handle of one that connects without
    migrating checks nothing.
 
+## Recording definition floors
+
+Each definition's floor is a `major.minor.patch` release on its catalog row.
+Every feature a definition can use declares the release it arrived in: each
+kind of expression node, operator, function, aggregate, special form
+(`COALESCE`, `NULLIF`, `EXTRACT`), typed literal and `CAST` target; each key
+space (1-1, aggregate, `JOIN`, 1-1 `JOIN`) and `JOIN` kind; the options
+(`WITHOUT SOURCE INDEX`, a schema-qualified table, the predicate); a
+partitioned table on either side; and the hidden-table layout and
+per-definition catalog state this release writes for the definition's key
+space. A definition's floor is the latest of these over everything it uses.
+The declarations are exhaustive matches over the parsed tree's node kinds
+and over the features, or a field of a function's, literal's or cast's
+registry entry, so a new one doesn't compile without its release. A layout
+change is a new layout with its own release. Every feature that exists when
+floors are introduced has floor 0.2.0, and the migration that adds the
+column gives every stored definition 0.2.0.
+
+- **When it is stamped.** Define and `ALTER TRANSFORM` stamp the floor of the
+  tree they write, and a resume stamps it as it recreates the hidden tables.
+  Each counts the layout the running release writes. A pause or a read never
+  changes it, and it goes down when an `ALTER` removes the only newer
+  feature.
+- **Never above the running release.** A binary writes only what it carries,
+  so a declared release later than the binary's is a declaration error, and
+  the floor stops at the running release rather than have the binary pause
+  what it just wrote. A build whose version is below 0.2.0 (the manifest of
+  the development line before the 0.2.0 release) counts as 0.2.0.
+- **A function's floor is the latest of its overloads'.** A call in the tree
+  doesn't record which overload it resolved to, so an overload added later
+  raises the floor of every call of that name.
+- **Only the tree is counted.** A spelling the parser folds into a node
+  another spelling also builds (`int` for `integer` in a `CAST`, `CAST('…' AS
+  date)` for `DATE '…'`) and an argument value checked later (an `EXTRACT`
+  field) have no declaration of their own. A release adding one leaves the
+  floor where it was: an older release refuses the text when it parses it,
+  and pauses the definition with that refusal. Text an older release would
+  read differently is a change in meaning, which bumps the grammar version
+  ([ADR-0018](0018-grammar-versioning.md)).
+
+`status()` reports the floor, and a dump of the definitions
+(`dump_definitions_sql`) carries it.
+
 ## Rolling back
 
 Before rolling back to an earlier release, the operator reads the floors from

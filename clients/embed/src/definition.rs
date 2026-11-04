@@ -101,6 +101,9 @@ pub struct PlainDefinitionStatus {
     /// A `JOIN` transform's hidden tables, warnings and build step; see
     /// [`DefinitionStatus::join`]. `None` for any other transform.
     pub join: Option<PlainJoinStatus>,
+    /// The oldest Trellis release that can run the definition,
+    /// `major.minor.patch`; see [`DefinitionStatus::floor`].
+    pub floor: String,
 }
 
 /// A [`JoinStatus`] flattened to plain data: how big a `JOIN` transform's
@@ -419,6 +422,7 @@ impl From<&DefinitionStatus> for PlainDefinitionStatus {
                 .as_ref()
                 .map(PlainBelowCatalogFloor::from),
             join: status.join.as_ref().map(PlainJoinStatus::from),
+            floor: status.floor.clone(),
         }
     }
 }
@@ -697,6 +701,7 @@ mod tests {
             paused_upstream_columns: Vec::new(),
             correcting: Vec::new(),
             build_wait: None,
+            floor: "0.3.1".to_string(),
         });
 
         assert_eq!(
@@ -715,6 +720,7 @@ mod tests {
                 version_handover: None,
                 below_catalog_floor: None,
                 join: None,
+                floor: "0.3.1".to_string(),
             }
         );
     }
@@ -919,6 +925,7 @@ mod tests {
                 version_handover: None,
                 below_catalog_floor: None,
                 join: None,
+                floor: "0.2.0".to_string(),
             }
         );
     }

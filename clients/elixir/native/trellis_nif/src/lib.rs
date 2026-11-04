@@ -234,6 +234,7 @@ struct StatusTerm {
     version_handover: Option<VersionHandoverTerm>,
     below_catalog_floor: Option<BelowCatalogFloorTerm>,
     join: Option<JoinStatusTerm>,
+    floor: String,
 }
 
 /// A `JOIN` transform's hidden tables, warnings and build step, as `status/2`
@@ -1169,6 +1170,7 @@ fn status<'a>(
                     .join
                     .map(|join| JoinStatusTerm::new(env, join))
                     .transpose()?,
+                floor: status.floor,
             }))
         },
     )

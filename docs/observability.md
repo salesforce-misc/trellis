@@ -615,6 +615,10 @@ A process killed without a clean shutdown keeps counting until its registry row
 ages out, up to the reclaim TTL of 30 seconds. The Elixir and Ruby bindings
 report it as `version_handover`.
 
+Every definition's status also carries its `floor`, the oldest Trellis release
+that can run it ([defining transforms — Floors](transforms.md#floors)), which
+`trellis status` prints as `floor=` and the bindings report as `floor`.
+
 ### Below the catalog floor
 
 While this binary's version is below the instance's catalog floor, the oldest

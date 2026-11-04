@@ -9,6 +9,7 @@
 //! the same source of truth rather than each hardcoding a function's shape.
 
 use super::ast::{Operator, ValueType};
+use super::floor::{BASELINE, Release};
 use super::pg_type::PgType;
 use crate::float::FloatWidth;
 use crate::integer::IntWidth;
@@ -426,13 +427,29 @@ pub fn negate_result_type(operand: ValueType) -> Option<ValueType> {
     operand.is_numeric_family().then_some(operand)
 }
 
+/// One type a `CAST` can name.
+#[derive(Debug, Clone, Copy)]
+pub struct CastTargetSpec {
+    pub value_type: ValueType,
+    /// The release a `CAST` to it arrived in, which raises the floor of a
+    /// definition casting to it (ADR-0024, [`super::floor`]).
+    pub since: Release,
+}
+
+const fn cast_to(value_type: ValueType) -> CastTargetSpec {
+    CastTargetSpec {
+        value_type,
+        since: BASELINE,
+    }
+}
+
 /// The types `CAST(<expr> AS <type>)` can name, spelled as Postgres prints
 /// them. A modifier (`numeric(10,2)`) is not a target.
-pub const CAST_TARGETS: &[ValueType] = &[
-    ValueType::Integer(IntWidth::Int4),
-    ValueType::Integer(IntWidth::Int8),
-    ValueType::Numeric,
-    ValueType::Other(PgType::Timestamp),
+pub const CAST_TARGETS: &[CastTargetSpec] = &[
+    cast_to(ValueType::Integer(IntWidth::Int4)),
+    cast_to(ValueType::Integer(IntWidth::Int8)),
+    cast_to(ValueType::Numeric),
+    cast_to(ValueType::Other(PgType::Timestamp)),
 ];
 
 /// Postgres's exact, permanent synonyms for the [`CAST_TARGETS`], accepted in
@@ -452,7 +469,7 @@ pub const CAST_TARGET_ALIASES: &[(&str, ValueType)] = &[
 pub fn cast_target(keyword: &str) -> Option<ValueType> {
     CAST_TARGETS
         .iter()
-        .copied()
+        .map(|spec| spec.value_type)
         .find(|t| t.to_string().eq_ignore_ascii_case(keyword))
         .or_else(|| {
             CAST_TARGET_ALIASES
@@ -466,25 +483,25 @@ pub fn cast_target(keyword: &str) -> Option<ValueType> {
 /// every type the grammar otherwise has a value of (a column type an
 /// operator or function takes, or a typed literal's), each by a name
 /// Postgres gives it. No value is converted, so no cast rule applies.
-pub const NULL_CAST_TARGETS: &[ValueType] = &[
-    ValueType::Integer(IntWidth::Int2),
-    ValueType::Float(FloatWidth::Float4),
-    ValueType::Float(FloatWidth::Float8),
-    ValueType::Text,
-    ValueType::Boolean,
-    ValueType::Uuid,
-    ValueType::Other(PgType::Date),
-    ValueType::Other(PgType::Time),
-    ValueType::Other(PgType::TimeTz),
-    ValueType::Other(PgType::TimestampTz),
-    ValueType::Other(PgType::Bytea),
-    ValueType::Other(PgType::Oid),
-    ValueType::Other(PgType::Inet),
-    ValueType::Other(PgType::Cidr),
-    ValueType::Other(PgType::MacAddr),
-    ValueType::Other(PgType::MacAddr8),
-    ValueType::Other(PgType::VarBit),
-    ValueType::Other(PgType::Jsonb),
+pub const NULL_CAST_TARGETS: &[CastTargetSpec] = &[
+    cast_to(ValueType::Integer(IntWidth::Int2)),
+    cast_to(ValueType::Float(FloatWidth::Float4)),
+    cast_to(ValueType::Float(FloatWidth::Float8)),
+    cast_to(ValueType::Text),
+    cast_to(ValueType::Boolean),
+    cast_to(ValueType::Uuid),
+    cast_to(ValueType::Other(PgType::Date)),
+    cast_to(ValueType::Other(PgType::Time)),
+    cast_to(ValueType::Other(PgType::TimeTz)),
+    cast_to(ValueType::Other(PgType::TimestampTz)),
+    cast_to(ValueType::Other(PgType::Bytea)),
+    cast_to(ValueType::Other(PgType::Oid)),
+    cast_to(ValueType::Other(PgType::Inet)),
+    cast_to(ValueType::Other(PgType::Cidr)),
+    cast_to(ValueType::Other(PgType::MacAddr)),
+    cast_to(ValueType::Other(PgType::MacAddr8)),
+    cast_to(ValueType::Other(PgType::VarBit)),
+    cast_to(ValueType::Other(PgType::Jsonb)),
 ];
 
 /// The target `CAST(NULL AS <keyword>)` names: a [`cast_target`], or one of
@@ -494,9 +511,18 @@ pub fn null_cast_target(keyword: &str) -> Option<ValueType> {
     cast_target(keyword).or_else(|| {
         NULL_CAST_TARGETS
             .iter()
-            .copied()
+            .map(|spec| spec.value_type)
             .find(|t| t.to_string().eq_ignore_ascii_case(keyword))
     })
+}
+
+/// The entry of `CAST` target `value_type`, from [`CAST_TARGETS`] or
+/// [`NULL_CAST_TARGETS`].
+pub fn cast_target_spec(value_type: ValueType) -> Option<&'static CastTargetSpec> {
+    CAST_TARGETS
+        .iter()
+        .chain(NULL_CAST_TARGETS)
+        .find(|spec| spec.value_type == value_type)
 }
 
 /// The result type of `CAST(<operand> AS <target>)`, or `None` if the cast is
@@ -541,6 +567,10 @@ pub struct FunctionSpec {
     pub name: &'static str,
     pub arg_types: &'static [ValueType],
     pub return_type: ValueType,
+    /// The release this overload arrived in, which raises the floor of a
+    /// definition calling it (ADR-0024, [`super::floor`]). A name's floor is
+    /// the latest of its overloads'.
+    pub since: Release,
 }
 
 /// Function names the grammar accepts as calculated-field functions,
@@ -559,101 +589,121 @@ pub const FUNCTIONS: &[FunctionSpec] = &[
         name: "STRPOS",
         arg_types: &[ValueType::Text, ValueType::Text],
         return_type: ValueType::Integer(IntWidth::Int4),
+        since: BASELINE,
     },
     FunctionSpec {
         name: "OCTET_LENGTH",
         arg_types: &[ValueType::Text],
         return_type: ValueType::Integer(IntWidth::Int4),
+        since: BASELINE,
     },
     FunctionSpec {
         name: "CHAR_LENGTH",
         arg_types: &[ValueType::Text],
         return_type: ValueType::Integer(IntWidth::Int4),
+        since: BASELINE,
     },
     FunctionSpec {
         name: "REGEXP_COUNT",
         arg_types: &[ValueType::Text, ValueType::Text],
         return_type: ValueType::Integer(IntWidth::Int4),
+        since: BASELINE,
     },
     FunctionSpec {
         name: "DATE_TRUNC",
         arg_types: &[ValueType::Text, ValueType::Other(PgType::Timestamp)],
         return_type: ValueType::Other(PgType::Timestamp),
+        since: BASELINE,
     },
     FunctionSpec {
         name: "ABS",
         arg_types: &[ValueType::Integer(IntWidth::Int2)],
         return_type: ValueType::Integer(IntWidth::Int2),
+        since: BASELINE,
     },
     FunctionSpec {
         name: "ABS",
         arg_types: &[ValueType::Integer(IntWidth::Int4)],
         return_type: ValueType::Integer(IntWidth::Int4),
+        since: BASELINE,
     },
     FunctionSpec {
         name: "ABS",
         arg_types: &[ValueType::Integer(IntWidth::Int8)],
         return_type: ValueType::Integer(IntWidth::Int8),
+        since: BASELINE,
     },
     FunctionSpec {
         name: "ABS",
         arg_types: &[ValueType::Numeric],
         return_type: ValueType::Numeric,
+        since: BASELINE,
     },
     FunctionSpec {
         name: "ABS",
         arg_types: &[ValueType::Float(FloatWidth::Float4)],
         return_type: ValueType::Float(FloatWidth::Float4),
+        since: BASELINE,
     },
     FunctionSpec {
         name: "ABS",
         arg_types: &[ValueType::Float(FloatWidth::Float8)],
         return_type: ValueType::Float(FloatWidth::Float8),
+        since: BASELINE,
     },
     FunctionSpec {
         name: "CEIL",
         arg_types: &[ValueType::Numeric],
         return_type: ValueType::Numeric,
+        since: BASELINE,
     },
     FunctionSpec {
         name: "CEIL",
         arg_types: &[ValueType::Float(FloatWidth::Float8)],
         return_type: ValueType::Float(FloatWidth::Float8),
+        since: BASELINE,
     },
     FunctionSpec {
         name: "FLOOR",
         arg_types: &[ValueType::Numeric],
         return_type: ValueType::Numeric,
+        since: BASELINE,
     },
     FunctionSpec {
         name: "FLOOR",
         arg_types: &[ValueType::Float(FloatWidth::Float8)],
         return_type: ValueType::Float(FloatWidth::Float8),
+        since: BASELINE,
     },
     FunctionSpec {
         name: "TRUNC",
         arg_types: &[ValueType::Numeric],
         return_type: ValueType::Numeric,
+        since: BASELINE,
     },
     FunctionSpec {
         name: "TRUNC",
         arg_types: &[ValueType::Float(FloatWidth::Float8)],
         return_type: ValueType::Float(FloatWidth::Float8),
+        since: BASELINE,
     },
     FunctionSpec {
         name: "ROUND",
         arg_types: &[ValueType::Numeric],
         return_type: ValueType::Numeric,
+        since: BASELINE,
     },
     FunctionSpec {
         name: "ROUND",
         arg_types: &[ValueType::Numeric, ValueType::Integer(IntWidth::Int4)],
         return_type: ValueType::Numeric,
+        since: BASELINE,
     },
     FunctionSpec {
         name: "TRUNC",
         arg_types: &[ValueType::Numeric, ValueType::Integer(IntWidth::Int4)],
         return_type: ValueType::Numeric,
+        since: BASELINE,
     },
 ];
 
@@ -785,61 +835,73 @@ pub const AGGREGATE_FUNCTION_SPECS: &[FunctionSpec] = &[
         name: "SUM",
         arg_types: &[ValueType::Numeric],
         return_type: ValueType::Numeric,
+        since: BASELINE,
     },
     FunctionSpec {
         name: "AVG",
         arg_types: &[ValueType::Numeric],
         return_type: ValueType::Numeric,
+        since: BASELINE,
     },
     FunctionSpec {
         name: "COUNT",
         arg_types: &[],
         return_type: ValueType::Integer(IntWidth::Int8),
+        since: BASELINE,
     },
     FunctionSpec {
         name: "MIN",
         arg_types: &[ValueType::Numeric],
         return_type: ValueType::Numeric,
+        since: BASELINE,
     },
     FunctionSpec {
         name: "MAX",
         arg_types: &[ValueType::Numeric],
         return_type: ValueType::Numeric,
+        since: BASELINE,
     },
     FunctionSpec {
         name: "BOOL_AND",
         arg_types: &[ValueType::Boolean],
         return_type: ValueType::Boolean,
+        since: BASELINE,
     },
     FunctionSpec {
         name: "BOOL_OR",
         arg_types: &[ValueType::Boolean],
         return_type: ValueType::Boolean,
+        since: BASELINE,
     },
     FunctionSpec {
         name: "BIT_AND",
         arg_types: &[ValueType::Other(PgType::VarBit)],
         return_type: ValueType::Other(PgType::VarBit),
+        since: BASELINE,
     },
     FunctionSpec {
         name: "BIT_OR",
         arg_types: &[ValueType::Other(PgType::VarBit)],
         return_type: ValueType::Other(PgType::VarBit),
+        since: BASELINE,
     },
     FunctionSpec {
         name: "JSONB_AGG",
         arg_types: &[ValueType::Other(PgType::Jsonb)],
         return_type: ValueType::Other(PgType::Jsonb),
+        since: BASELINE,
     },
     FunctionSpec {
         name: "ARRAY_AGG",
         arg_types: &[ValueType::Text],
         return_type: ValueType::Other(PgType::TextArray),
+        since: BASELINE,
     },
     FunctionSpec {
         name: "STRING_AGG",
         arg_types: &[ValueType::Text, ValueType::Text],
         return_type: ValueType::Text,
+        since: BASELINE,
     },
 ];
 

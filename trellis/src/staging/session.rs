@@ -211,7 +211,7 @@ impl ProducerSession {
     }
 
     /// A mutable handle to the underlying connection, for callers (e.g.
-    /// [`crate::capture::reconcile::reconcile`]) that take a plain
+    /// [`crate::capture::reconcile::reconcile_with_floors`]) that take a plain
     /// `&mut Client` rather than a whole `ProducerSession`, so the same
     /// function also works against a non-producer connection.
     pub fn client_mut(&mut self) -> &mut Client {

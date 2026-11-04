@@ -38,6 +38,7 @@ pub(crate) mod copy_type;
 mod date_const;
 pub mod ddl;
 pub mod error;
+pub mod floor;
 pub mod grammar;
 pub mod hierarchy;
 pub(crate) mod join;

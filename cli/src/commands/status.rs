@@ -131,6 +131,7 @@ async fn report(trellis: &Trellis) -> Result<String, String> {
             source_index_gaps: status.source_index_gaps,
             join: status.join,
             paused_upstream_columns: status.paused_upstream_columns,
+            floor: Some(status.floor),
         });
         listed.push((def, warnings));
     }
@@ -188,6 +189,8 @@ struct StatusWarnings {
     source_index_gaps: Vec<SourceIndexGap>,
     join: Option<JoinStatus>,
     paused_upstream_columns: Vec<String>,
+    /// The oldest release that can run the definition (ADR-0024).
+    floor: Option<String>,
 }
 
 /// One line per definition, each followed by an indented line per thing
@@ -201,8 +204,14 @@ fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> St
     definitions
         .iter()
         .map(|(def, warnings)| {
+            // The floor is what an operator reads before a rollback: each
+            // definition above the release rolled back to is dropped first.
+            let floor = warnings
+                .floor
+                .as_ref()
+                .map_or(String::new(), |floor| format!(" floor={floor}"));
             let mut line = format!(
-                "  target={} status={} created_at={}\n",
+                "  target={} status={}{floor} created_at={}\n",
                 def.target_table,
                 def.status.as_str(),
                 format_timestamp(def.created_at)
@@ -543,6 +552,26 @@ mod tests {
         assert!(formatted.contains("target=order_totals"));
         assert!(formatted.contains("status=live"));
         assert!(formatted.contains("1970-01-01 00:00:00 UTC"));
+        assert!(!formatted.contains("floor="), "got {formatted:?}");
+    }
+
+    #[test]
+    fn a_definition_shows_its_floor_on_its_line() {
+        let def = trellis::fixture!(DefinitionSummary {
+            target_table: "order_totals".to_string(),
+            status: trellis::TransformStatus::Live,
+            created_at: UNIX_EPOCH,
+            backfill_failure: None,
+            halt: None,
+        });
+        let warnings = StatusWarnings {
+            floor: Some("0.3.1".to_string()),
+            ..StatusWarnings::default()
+        };
+        assert_eq!(
+            format_definitions(&[(def, warnings)]),
+            "  target=order_totals status=live floor=0.3.1 created_at=1970-01-01 00:00:00 UTC\n"
+        );
     }
 
     #[test]
