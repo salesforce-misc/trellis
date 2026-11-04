@@ -515,7 +515,7 @@ pub fn null_cast_target(keyword: &str) -> Option<ValueType> {
 
 /// The entry of `CAST` target `value_type`, from [`CAST_TARGETS`] or
 /// [`NULL_CAST_TARGETS`].
-#[cfg(any(test, feature = "internals"))]
+#[cfg(any(test, feature = "internals", feature = "test-util"))]
 pub fn cast_target_spec(value_type: ValueType) -> Option<&'static CastTargetSpec> {
     CAST_TARGETS
         .iter()
