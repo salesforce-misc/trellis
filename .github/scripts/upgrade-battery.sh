@@ -1088,7 +1088,7 @@ rollback_with_floors() {
     for stmt in "RESUME TRANSFORM $n" "DROP TRANSFORM $n"; do
       if out=$(trellis "$port" "$db" "$old_bin" apply "$stmt" 2>&1); then
         record FAIL downgrade "$old_tag accepted $stmt above its floor"
-      elif grep -q "its floor is $floor" <<<"$out" && [ "$(stored_status "$port" "$db" "$n")" = paused ] &&
+      elif grep -qE "its floor(, the oldest Trellis release that can run it,)? is $floor" <<<"$out" && [ "$(stored_status "$port" "$db" "$n")" = paused ] &&
         [ -n "$(scalar "$port" "$db" "select to_regclass('public.$n')")" ]; then
         record PASS downgrade "$old_tag refuses $stmt, naming the floor, and changes nothing"
       else
