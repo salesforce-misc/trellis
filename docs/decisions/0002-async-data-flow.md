@@ -147,8 +147,8 @@ forced.
 | **I3** | **Ordering state at the target's grain; group values are functions of sums.** A 1-1 row's ordering state is its ledger entry. A group's is its basis and stamp; its partials are the sum of the sides applied since its last absolute write, so group updates commute between absolute writes. Images form a chain per row ([Capture](#capture-by-statement-triggers)), so a row's sides telescope to its current contribution. | In the interleaving experiment, eight workers creating the same groups at once, and a row passing through a group within one folded batch while that group rebuilds, both hold with groups as sums and no pre-lock or probe. In my group-basis model every failure I found with images that didn't chain went away once they did. |
 | **I4** | **Tombstones live until the batch watermark passes.** A deleted row's entry stays, with its `applied_lsn` and `applied_seg`, until every batch at or below its `applied_seg` is fully drained. A group whose partials are all zero and that has a basis stays until the contiguous drained prefix passes its stamp ([Convergence and status](#convergence-and-status)). | In the interleaving experiment an older update resurrects a deleted row unless the tombstone is kept. The batch-watermark form is exact under triggers because a same-key predecessor of a delete committed before the delete's trigger ran. In my group-basis model, a GC that ignored the drained prefix was wrong in every soak run, and one that tested the row count alone was wrong in a deterministic scenario. |
 | **I5** | **One lock order, taken as one sorted batch (R7).** Build chunk rows in id order, then the page row; then a page's 1-1 targets, then its aggregate targets, each in target order; per target its ledger entries, then its rows or groups, each locked in key order in one statement per class. Every statement that locks them follows it, including a truncate's wipe and a chunk's retirement. Never a per-row loop. | In the interleaving experiment a per-row loop deadlocked 19–22 times in 20 s; the sorted batch never did. The implemented paths held it in my benchmark round (no deadlock in any benchmark, and group moves and the hot-key case converge with none). In my group-basis model, a truncate wipe and a chunk retirement that locked in scan order deadlocked with pages tens of times per soak matrix; sorted, 0 times. |
-| **I6** | **Never block, and never fail, an application writer.** No Trellis transaction takes a lock an application write can queue behind, except the join and drop fences, which are bounded by `lock_timeout` and retried. A schema change to a read column never fails the application's statement. A missing ring table or a revoked privilege does, loudly ([Consequences](#consequences-and-costs)). | I measured a bare `CREATE TRIGGER` stalling every writer for 25 s; with a 50 ms `lock_timeout` retry the worst wait was 52 ms. I renamed a read column under the capture function and every insert failed until regeneration. The retire path already takes its `TRUNCATE` lock `NOWAIT`. |
-| **I7** | **No Trellis transaction waits for a lock while it holds a snapshot open.** Every lock statement runs under a `lock_timeout`; on timeout the transaction rolls back and the work is retried from outside any transaction. | In my 100M chunked-build run, a drain batch's ledger insert waited 1 h 50 min behind chunk transactions; the open transaction held back vacuum and the sealer for the whole wait. |
+| **I6** | **Never block, and never fail, an application writer.** No Trellis transaction takes a lock an application write can queue behind, except the join and drop fences, which are bounded by `lock_timeout` and retried. A `MIN`/`MAX` probe's `ACCESS SHARE` lock on the source conflicts with no row write; only an `ACCESS EXCLUSIVE` statement on the source (DDL, `TRUNCATE`, `VACUUM FULL`) queues behind it, until the probing page commits. A schema change to a read column never fails the application's statement. A missing ring table or a revoked privilege does, loudly ([Consequences](#consequences-and-costs)). | I measured a bare `CREATE TRIGGER` stalling every writer for 25 s; with a 50 ms `lock_timeout` retry the worst wait was 52 ms. I renamed a read column under the capture function and every insert failed until regeneration. The retire path already takes its `TRUNCATE` lock `NOWAIT`. |
+| **I7** | **No Trellis transaction waits for a lock while it holds a snapshot open.** Every lock statement runs under a `lock_timeout`; on timeout the transaction rolls back and the work is retried from outside any transaction. That includes a `MIN`/`MAX` probe, which takes the source's `ACCESS SHARE` lock while its page holds its groups: behind an application's `ACCESS EXCLUSIVE` lock it times out, the page rolls back with its group locks, and the drain retries the page. | In my 100M chunked-build run, a drain batch's ledger insert waited 1 h 50 min behind chunk transactions; the open transaction held back vacuum and the sealer for the whole wait. |
 | **I8** | **Memory is bounded by a batch cap, never by segment size.** A drain batch folds, re-reads and applies at most a fixed number of changes and pages through a larger bucket. | In my one-pass build, a drain held ~650 B per staged row per worker: 6.32 GB at 10M, OOM at 100M; fewer workers bound nothing because each worker then holds more buckets. |
 
 ## Capture by statement triggers
@@ -389,8 +389,12 @@ not per source row. Each group carries hidden partials, its basis (the
 `pg_snapshot` of the last absolute write to it) and its stamp (the newest
 segment that snapshot saw). Live changes reach it only as signed deltas
 computed from captured images; absolute writes reach it only through the
-group lock. Maintaining it never reads the source on the hot path and never
-needs a source index.
+group lock. Maintaining it reads the source on the hot path in one case
+only: a retraction that removes a group's current `MIN` or `MAX` re-reads
+that group's extreme with one index probe, after the group's lock
+([`MIN` and `MAX` recompute on retract](#min-and-max-recompute-on-retract)).
+Every other admitted aggregate is kept from the changes alone and needs no
+source index to stay exact.
 
 A per-row ledger is not needed for old values: the ring carries every
 change's old image. It exists for ordering, and one row's changes form a
@@ -416,10 +420,13 @@ R4 restates I4, R7 is I5, and R9 is the truncate barrier.
   ([ADR-0019](0019-join-transforms.md)), admits exactly these aggregates:
   - `COUNT(*)` and `COUNT(col)`;
   - `SUM(col)` and `AVG(col)`, where `col` is `int2`, `int4`, `int8`, or
-    `numeric(p,s)` with a declared scale (next section).
-- **Must:** an argument is a column or an expression over one row's
-  columns in the transform grammar (`SUM(a + b)`, `COUNT(<expr>)`), as long
-  as its result type is admitted. The group basis evaluates it on each
+    `numeric(p,s)` with a declared scale (next section);
+  - on a plain aggregate only, `MIN(col)` and `MAX(col)`, kept by recompute
+    on retract under rules Rx1 to Rx8
+    ([`MIN` and `MAX` recompute on retract](#min-and-max-recompute-on-retract)).
+- **Must:** an argument of `COUNT`, `SUM` or `AVG` is a column or an
+  expression over one row's columns in the transform grammar (`SUM(a + b)`,
+  `COUNT(<expr>)`), as long as its result type is admitted. The group basis evaluates it on each
   change's old and new images, so its delta is `f(new) − f(old)`, exactly
   as for a column. On a JOIN an argument may use only one side's columns; an
   argument mixing both sides is refused at define.
@@ -430,26 +437,101 @@ R4 restates I4, R7 is I5, and R9 is the truncate barrier.
 - **Must:** result types match Postgres: `count` is `bigint`,
   `sum(int2|int4)` is `bigint`, `sum(int8|numeric)` is `numeric`, and `avg`
   is `numeric`.
-- **Must:** every admitted aggregate is a function of three per-group
-  partials: the row count, each argument's non-null count, and each `SUM` or
-  `AVG` argument's sum, kept as `numeric` whatever the argument type so a
-  sum (or, on a JOIN, a product of a sum and a count) never overflows where
-  Postgres's own `sum()` wouldn't.
+- **Must:** every admitted aggregate but `MIN` and `MAX` is a function of
+  three per-group partials: the row count, each argument's non-null count,
+  and each `SUM` or `AVG` argument's sum, kept as `numeric` whatever the
+  argument type so a sum (or, on a JOIN, a product of a sum and a count)
+  never overflows where Postgres's own `sum()` wouldn't.
 - **Must:** every other aggregate is refused at define, named by family:
-  `MIN`/`MAX`; `bool_and`/`bool_or` and `bit_and`/`bit_or`; `SUM`/`AVG`
-  over a float, `interval`, unconstrained `numeric` or any other type; and
-  `array_agg`, `string_agg` and `jsonb_agg`. The
+  `MIN`/`MAX` on a JOIN; `bool_and`/`bool_or` and `bit_and`/`bit_or`;
+  `SUM`/`AVG` over a float, `interval`, unconstrained `numeric` or any other
+  type; and `array_agg`, `string_agg` and `jsonb_agg`. The
   [Supported sources and targets](../transforms.md#supported-sources-and-targets)
   table is the reference. Each can be added later, through hidden counters,
   a value-count table or a recompute, without changing what is admitted
   now.
 
-`MIN` and `MAX` would need a group recompute from the source whenever the
-current extreme leaves: the only source read on the hot path, a source index
-for every argument, and a cost that grows with the group (deleting the
-current maximum of a 100M-row group rescans the group). Keeping the per-row
-ledger for the aggregates partials can't keep would ship two aggregate
-engines with different concurrency rules.
+Keeping the per-row ledger for the aggregates partials can't keep would ship
+two aggregate engines with different concurrency rules, so `MIN` and `MAX`
+keep the group basis and add to it.
+
+### `MIN` and `MAX` recompute on retract
+
+Adding a row to a group can only lower its minimum or raise its maximum,
+which a delta handles. Removing the current extreme can't be undone from the
+group's state: the next extreme isn't stored anywhere. So a group keeps each
+extreme as a value and re-reads it from the source when a retraction reaches
+it. I modelled this (R) and a hidden value-count table per (group, value)
+(V) on Postgres 15 and 18: both were exact across 276 scenarios, ten
+necessity mutations each caught, and 680 soak runs.
+
+- **Must:** a `MIN` or `MAX` argument is a plain source column. An
+  expression argument is refused at define: a probe reads an index endpoint,
+  and Postgres matches an expression index only to the exact expression.
+- **Must:** a type whose `=` admits several textually distinct values
+  (a float, `interval`, unconstrained `numeric`) is admitted. The extreme is
+  one of the equal values, as with Postgres's own `min()`, and `self_check`
+  compares it by the type's `=`
+  ([ADR-0020](0020-type-identity.md),
+  [ADR-0013](0013-self-check-production-recompute-audit.md#comparison-semantics-exact-text-for-1-1-equal-values-for-aggregates-and-joins)).
+- **Must:** a source that is another Trellis target is refused for
+  `MIN`/`MAX`: the index the probe needs would be a long `CREATE INDEX` on a
+  large target Trellis owns.
+- **Must:** define refuses a `MIN` or `MAX` field unless the source has a
+  valid, non-partial btree whose leading columns are the `GROUP BY` columns
+  in order, then the argument, in the argument's collation. One such index
+  serves both `self_check`'s paging and the probe, and the fields reading
+  one argument share it. An index dropped after define leaves the target
+  exact: `status` warns, the probe scans the group instead, and nothing
+  pauses.
+- **Must (Rx1, hidden state):** a group keeps each extreme (one per distinct
+  call) at the argument's type, with a basis of its own, `xbasis`, and a
+  stamp of its own, `xstamp`, beside the partials' basis and stamp. One
+  basis per group is wrong: a probe that stamped the group's basis would
+  make the partials refuse the counts of a change the probe saw, and in my
+  model that mutation left wrong counts.
+- **Must (Rx2, I2 for extremes):** a (group, transaction) sum applies to the
+  extremes only when its transaction isn't visible in `xbasis`, and to the
+  partials only when it isn't visible in the basis, both above the truncate
+  floor.
+- **Must (Rx3, insertions):** an insertion moves an extreme by
+  `least`/`greatest`, and is filtered by `xbasis` like any side. `least` is
+  idempotent, but an insertion of a row since deleted, applied after the
+  deletion's probe, would bring the deleted value back. A page keeps the
+  insertion sides of a (group, transaction, statement) apart from its
+  retraction sides.
+- **Must (Rx4, the trigger):** a group is probed when a retraction side
+  reaches an extreme (at or below a minimum, at or above a maximum), or when
+  its extreme is `NULL` and it has a non-`NULL` retraction: a retraction can
+  arrive before the insertion it undoes.
+- **Must (Rx5, the probe, I1 for extremes):** the probe runs in the page's
+  transaction, after its lock statement and its apply. One statement takes
+  the snapshot and the newest segment, reads each extreme of each probed
+  group as one index endpoint (`arg is not null`; a `NULL` group key matched
+  as `NULL`, as the target's `UNIQUE NULLS NOT DISTINCT` identity does), and
+  writes the snapshot as `xbasis` and the segment as `xstamp`. A probe read
+  before the lock misses a change another page applied in between; in my
+  model that mutation was wrong. The probe takes the source's `ACCESS SHARE`
+  lock under `lock_timeout`, and a timeout retries the page (I6, I7).
+- **Must (Rx6, absolute writes):** a build, rebuild, recompute, release and
+  partition correction write the extremes, `xbasis` and `xstamp` from the
+  snapshot they write the partials from (R1, R5).
+- **Must (Rx7, the GC):** R4 holds for both stamps: a zero group is
+  collected only once the drained prefix passes its stamp and its `xstamp`.
+  A probe's snapshot can have seen an insertion whose page hasn't drained.
+- **Must (Rx8, truncate):** a truncate's wipe of the group state removes the
+  extremes with the partials.
+- **Must:** a `MIN` or `MAX` on a JOIN stays refused
+  ([ADR-0019](0019-join-transforms.md)).
+
+The drain role reads the source on the hot path, so it needs `SELECT` on
+the source, and row-level security must not apply to it.
+
+Costs accepted with R: one index per `MIN`/`MAX` argument; and on a source
+under retention deletes, vacuum must keep up, since every retracting probe
+otherwise walks the dead index entries at the extreme's end. I measured 7–9
+ms per probe after 111k deletes, repeated on every probe while an older
+snapshot is open.
 
 ### `numeric` arguments declare their scale
 
@@ -893,8 +975,10 @@ partition at 100M.
   stay until the insert.
 - **Must (R4, I4 per group):** a group whose partials are all zero and that
   has a basis stays, as a zero group, until the contiguous drained prefix
-  passes its stamp. The stamp is set by an absolute write, and only by one:
-  the newest segment holding a change its snapshot saw (R5). A zero group
+  passes its stamp, and, for a group with `MIN`/`MAX` extremes, its
+  `xstamp` too (Rx7). The stamp is set by an absolute write, and only by one:
+  the newest segment holding a change its snapshot saw (R5). The `xstamp` is
+  set the same way by an absolute write or a probe. A zero group
   with no basis protects nothing and may go at once; a group with any
   non-zero partial is never collected, whatever its row count. The GC claims
   groups `FOR UPDATE SKIP LOCKED` in key order, so it never waits on a page
@@ -1129,7 +1213,10 @@ Each alternative below is recorded with the number that rejected it.
 | **Ordering by LSN with live reads guarded by horizons and basis checks:** the recompute horizon and extinct horizon, a minimum-image LSN, the build horizon, per-key basis locks, the watermark wait before enumeration, recompute and vanished-image flags, bucketed advisory locks, a keep-every-image fold, prior image on enumeration. | Each closes one pairing of one producer against one drain order, found in review of the previous fix at roughly two new problems per fix, and the generative suite found none of them. A live read has no way to tell which commits it reflects; only a snapshot does (I2). |
 | **Visibility-only I2** on the per-row ledger, and **Apply stamping its own snapshot as the basis.** | Each fails scenarios of the interleaving experiment: visibility-only fails three, and stamping Apply's own snapshot fails two. A group basis needs no position check, because its writes to a group commute. |
 | **Group rows as absolute writes ordered by position:** forced recomputes from a live `GROUP BY`, an existence probe and pre-lock before incrementing. | Not orderable without a horizon; the probe's scan is the 40k-group cliff where nothing drains; the pre-lock deadlocks on new groups. The group basis orders the same absolute writes by a snapshot per group, taken in the statement that reads, after a sorted lock. |
-| **A per-row ledger for aggregates**: one entry per source row holding its group, contribution and ordering state. | I measured 15.1–15.3 GB of ledger for a 100M-row source in 50k groups (151–153 B per entry, its basis 33–39 B), against 5 MB of group state; a 100M build at 370–380 s and 58–71 GB of WAL against 1.4–1.9 s; a page of 100k changes at 3.2–3.35 s against 0.18–0.31 s; and a partition `DROP` of 10M rows at 45–51 s and 6.2 GB of WAL against 10–30 ms. What the ledger gave in return was self-repair on a row's next write, and the `MIN`/`MAX`-style aggregates this ADR refuses. |
+| **A per-row ledger for aggregates**: one entry per source row holding its group, contribution and ordering state. | I measured 15.1–15.3 GB of ledger for a 100M-row source in 50k groups (151–153 B per entry, its basis 33–39 B), against 5 MB of group state; a 100M build at 370–380 s and 58–71 GB of WAL against 1.4–1.9 s; a page of 100k changes at 3.2–3.35 s against 0.18–0.31 s; and a partition `DROP` of 10M rows at 45–51 s and 6.2 GB of WAL against 10–30 ms. What the ledger gave in return was self-repair on a row's next write, and `MIN`/`MAX` without a source read. |
+| **A hidden value-count table for `MIN`/`MAX`** (V): one row per (group, value) with its count, the extreme the first or last key of the group's slice of an index. | Exact in my model, like R, but its state is one row per distinct (group, value): about one per source row for a continuous argument such as an amount or a timestamp. A required source index costs less. It stays the route for `MIN`/`MAX` on a JOIN and for `COUNT(DISTINCT)`. |
+| **Choosing R or V per argument by its cardinality** (a define-time estimate from `pg_stats`). | The estimate drifts after define, and switching means rebuilding the field; R needs none of what V would add. |
+| **Deferred probes**: marking a group and re-reading its extreme after the page commits. | Unmodelled, a second producer of absolute writes, and a window in which readers see a deleted extreme. |
 | **One set-based `GROUP BY` build with changes withheld, then a go-live re-read and orphan sweep.** | The re-read is a full enumeration per build that scales with table size, not with what changed; I ran it at 100M, where it reaches `live` after 2,305 s and its drain then runs out of memory. Nothing can tell a table unchanged since the build from one changed and changed back, so the re-read could never be skipped. A 1-1 build is per-row work and its acceptance bar is linear time; an aggregate's build keeps the one-pass `GROUP BY` and drops the withholding, because its absolute write applies alongside pages from its first moment. |
 | **`catching_up` as a stored status with marker fences, generations and go-live catch-ups.** | Needed only by a build that skips changes. Every build applies from its first chunk, so there is nothing to catch up; `catching_up` is the reported state of a reader whose upstream isn't `live` ([A build](#a-build-is-re-derive-over-chunks-and-applies-from-its-first-chunk)). |
 | **A chunked aggregate build under a chunk gate:** primary-key-range chunks (a hybrid above a size threshold), or key-range chunks, each adding its region's partials under the group locks, with a gate in every page path (a page locks the chunk rows its sides fall in, before the page row; a chunk that hasn't run skips the side, a done chunk refuses what its snapshot saw, a retired one applies it), retirement once the drained prefix passes the chunk's stamp, a recompute that counts only done or retired chunks, a `NULL`-key chunk, and a truncate page that resets the chunks. | It is the only option that bounds a fresh build on a large unpartitioned source, but a chunk is paid per (chunk, cell) pair: about 5–6x the build time and 12x the WAL on many-cell shapes, against one `GROUP BY` per structure at 2–12x less in my `JOIN` model (84 s against 412–509 s; 213 s against 1,258 s), and it leaves in-place rebuilds unbounded. Key-range chunks bound locks and rows but reread the heap about 2x per chunk, so not I/O. The gate adds a lock to every page and machinery to every truncate and recompute. A build is one absolute write per structure instead, and a large source is partitioned ([#1276](https://github.com/salesforce-misc/trellis/issues/1276) keeps the bounded alternatives open). |
@@ -1164,10 +1251,17 @@ Each alternative below is recorded with the number that rejected it.
   gave.** The ledger counted each row at most once, so its counts were never
   negative; the group basis can show impossible combinations between pages
   ([Readers](#readers-see-a-group-only-while-its-row-count-is-above-0)).
-- **The aggregate surface is narrow.** `COUNT`, and `SUM`/`AVG` over
-  integers and `numeric(p,s)`; every other aggregate is refused at define,
+- **The aggregate surface is narrow.** `COUNT`, `SUM`/`AVG` over
+  integers and `numeric(p,s)`, and on a plain aggregate `MIN`/`MAX` over a
+  plain column with its index; every other aggregate is refused at define,
   and a definition using one doesn't work until its family is added. A
   plain `numeric` column must declare a scale to be summed.
+- **`MIN`/`MAX` read the source on the hot path.** A page that retracts a
+  group's extreme holds that group's lock across an index probe of the
+  source, the drain role needs `SELECT` on the source without row-level
+  security, each argument needs an index, and a source under retention
+  deletes needs vacuum to keep up
+  ([`MIN` and `MAX` recompute on retract](#min-and-max-recompute-on-retract)).
 - **Each producer of an absolute group write owns its enumeration** (R8).
   That is where a new producer's bugs would appear, so each is stated and
   tested on its own.

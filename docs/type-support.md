@@ -501,6 +501,31 @@ and rebuilds from the source, so the target reads `backfilling` until it
 converges. A re-type from an enum to `text` keeps each label as a value and
 is handled as any other re-type.
 
+## `MIN` and `MAX`
+
+The engine keeps `MIN` and `MAX` on a plain aggregate (not a `JOIN`): a
+group stores each extreme, an insertion moves it, and a retraction that
+removes it re-reads the group's extreme from the source with one index probe
+([ADR-0002](decisions/0002-async-data-flow.md#min-and-max-recompute-on-retract)).
+Define doesn't admit them yet
+([#1681](https://github.com/salesforce-misc/trellis/issues/1681)).
+
+The argument is a plain source column of type `smallint`, `integer`,
+`bigint`, `numeric`, `real`, `double precision`, `date`, `time`, `timestamp`,
+`timestamptz`, `interval` or `oid`. The result has the argument's type,
+without a modifier
+([The types of the columns Trellis creates](#the-types-of-the-columns-trellis-creates)). `NULL` arguments
+are ignored, and a group whose arguments are all `NULL` has a `NULL`
+extreme, as in Postgres.
+
+Some of these types have values that are equal but print differently: `1.0`
+and `1.00` in `numeric`, `-0` and `0` in a float, `'1 day'` and `'24 hours'`
+in `interval`. An extreme is then one of the equal values, as Postgres's own
+`min()` returns one of them, and its text may differ from what a fresh
+`GROUP BY` shows. `self_check` compares it by the type's `=`, so that is no
+divergence
+([ADR-0013](decisions/0013-self-check-production-recompute-audit.md#comparison-semantics-exact-text-for-1-1-equal-values-for-aggregates-and-joins)).
+
 ## Aggregates that are not supported
 
 An aggregate or `JOIN` transform admits `COUNT(*)`, `COUNT(col)`, and `SUM` or `AVG`

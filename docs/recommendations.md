@@ -162,8 +162,44 @@ CREATE INDEX ON orders (region);
 
 With one, a recompute reads only its groups' rows: about 1.3 ms for a
 10,000-row group, 9 ms at 100,000 rows and 80 ms at 890,000. Without one,
-each recompute scans the source. Small groups don't need it. An index you
-create or drop changes speed only, never results.
+each recompute scans the source. Define requires the index anyway, for
+`self_check`, unless the definition opts out with `WITHOUT SOURCE INDEX`
+([Keep the indexes a definition relies on](#keep-the-indexes-a-definition-relies-on)).
+An index you create or drop changes speed only, never results.
+
+## Index each `MIN`/`MAX` argument, and vacuum retention sources
+
+A `MIN` or `MAX` field (which define doesn't admit yet:
+[type support](type-support.md#min-and-max)) re-reads a group's extreme from
+the source when a deletion or update removes the current one, while the page
+holds the group's lock
+([ADR-0002](decisions/0002-async-data-flow.md#min-and-max-recompute-on-retract)).
+With an index whose leading columns are the `GROUP BY` columns, in order,
+then the argument, that read is one index entry:
+
+```sql
+-- TRANSFORM first_order FROM orders GROUP BY customer_id
+--   SELECT customer_id AS customer_id, MIN(created_at) AS first_at, MAX(created_at) AS last_at
+CREATE INDEX ON orders (customer_id, created_at);
+```
+
+One index serves `MIN` and `MAX` of the same argument, and also serves as
+the `GROUP BY` index. Without it, each such read scans the group's rows
+through the `GROUP BY` index, or the whole source when that is missing too.
+On a 1-million-row source, a page that re-read 3,334 groups' `MIN` and `MAX`
+took about 30 ms with the index and 305 ms with only the `GROUP BY` index;
+with neither, each group took about 78 ms. A missing index never changes
+results.
+
+A source whose oldest rows are deleted on a schedule (`MIN(created_at)`
+under a retention job) re-reads on nearly every deletion, and each read
+starts at the end of the index the deletions just emptied. Until vacuum
+removes those dead entries, every read walks them: about 7 to 9 ms a read
+after 111,000 deletions. Keep autovacuum
+ahead of the retention job on such a table (a lower
+`autovacuum_vacuum_scale_factor` for it, or a `VACUUM` after each retention
+batch), and avoid long-running transactions, which keep vacuum from removing
+the entries.
 
 ## Keep the indexes a definition relies on
 
@@ -202,6 +238,10 @@ has the details):
   pauses. `status()` lists a `source_index_gap`, and `self_check` refuses to
   walk the definition (unless it was defined `WITHOUT SOURCE INDEX`) until the
   index is back.
+* **A `MIN`/`MAX` argument's index** (the `GROUP BY` columns, then the
+  argument): nothing pauses and the target stays exact. `status()` lists an
+  `extreme_index_gap`, and each re-read of an extreme scans its group until
+  the index is back.
 
 ## Partition large sources
 

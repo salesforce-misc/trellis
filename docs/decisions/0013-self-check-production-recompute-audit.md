@@ -154,9 +154,16 @@ doesn't rewrite a key whose text alone changed.
 
 A sum or average kept from partials carries exactly the scale Postgres's own
 `sum()` and `avg()` show
-([ADR-0002](0002-async-data-flow.md#numeric-arguments-declare-their-scale)). An
-aggregate whose `=` admits several textually distinct representatives of one value
-(`MIN`/`MAX`, or `SUM`/`AVG` over `real` or `interval`) is refused at define.
+([ADR-0002](0002-async-data-flow.md#numeric-arguments-declare-their-scale)).
+`SUM`/`AVG` over `real` or `interval` is refused at define. A `MIN` or `MAX`
+column is compared by its type's `=`: over a float, an `interval` or an
+unconstrained `numeric` the target holds one of the equal values (`1.0` or
+`1.00`, `-0` or `0`, `'1 day'` or `'24 hours'`), as Postgres's own `min()`
+gives. `self_check` compares the visible field with the group's hidden
+extreme, and the hidden extreme with the source's extreme over the rows the
+extremes' own basis has applied
+([ADR-0002](0002-async-data-flow.md#min-and-max-recompute-on-retract)), both
+by the type's `=`.
 
 ### The audit query is rendered independently of the write path
 

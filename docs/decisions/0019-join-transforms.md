@@ -100,8 +100,8 @@ its output is one row per row of `a`, which
 
 ### The admitted aggregates are the ones partials keep exact by deltas alone
 
-A JOIN transform admits exactly the aggregates a plain aggregate admits under
-ADR-0002's group basis: `COUNT(*)`, `COUNT(col)`, and `SUM(col)` and `AVG(col)`
+A JOIN transform admits exactly the aggregates a plain aggregate keeps from
+partials alone under ADR-0002's group basis: `COUNT(*)`, `COUNT(col)`, and `SUM(col)` and `AVG(col)`
 where `col` is `int2`, `int4`, `int8` or `numeric(p,s)` with a declared scale.
 An argument may be a column or an expression over one side's columns, as long
 as its result type is admitted: it becomes a partial on that side, kept by
@@ -111,7 +111,15 @@ aggregates (`COALESCE(SUM(a.x), 0)`), computed from the target group's
 partials whenever its row is written. Result types match Postgres:
 `count` is `bigint`, `sum` over `int2`/`int4` is `bigint`, `sum` over
 `int8`/`numeric` is `numeric`, and `avg` is `numeric`. Every other aggregate is
-refused at define, as on a plain aggregate.
+refused at define, as on a plain aggregate, and so are `MIN` and `MAX`, which a
+plain aggregate admits. A plain aggregate re-reads a group's extreme from its
+source when a retraction removes it
+([ADR-0002](0002-async-data-flow.md#min-and-max-recompute-on-retract)); a JOIN
+target's extreme is the extreme of `P`'s per-key extremes over the keys `M`
+still counts, and each of those is itself a source re-read on the fact side,
+which is unmodelled. A hidden value-count table per (group, value), kept by
+deltas, is the route for a JOIN's `MIN`/`MAX`, and would give
+`COUNT(DISTINCT)` with it.
 
 Each admitted aggregate is a function of a few per-group partials (the row
 count, a non-null count, a `numeric` sum) that signed deltas keep exact, so
