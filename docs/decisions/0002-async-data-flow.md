@@ -147,7 +147,7 @@ forced.
 | **I3** | **Ordering state at the target's grain; group values are functions of sums.** A 1-1 row's ordering state is its ledger entry. A group's is its basis and stamp; its partials are the sum of the sides applied since its last absolute write, so group updates commute between absolute writes. Images form a chain per row ([Capture](#capture-by-statement-triggers)), so a row's sides telescope to its current contribution. | In the interleaving experiment, eight workers creating the same groups at once, and a row passing through a group within one folded batch while that group rebuilds, both hold with groups as sums and no pre-lock or probe. In my group-basis model every failure I found with images that didn't chain went away once they did. |
 | **I4** | **Tombstones live until the batch watermark passes.** A deleted row's entry stays, with its `applied_lsn` and `applied_seg`, until every batch at or below its `applied_seg` is fully drained. A group whose partials are all zero and that has a basis stays until the contiguous drained prefix passes its stamp ([Convergence and status](#convergence-and-status)). | In the interleaving experiment an older update resurrects a deleted row unless the tombstone is kept. The batch-watermark form is exact under triggers because a same-key predecessor of a delete committed before the delete's trigger ran. In my group-basis model, a GC that ignored the drained prefix was wrong in every soak run, and one that tested the row count alone was wrong in a deterministic scenario. |
 | **I5** | **One lock order, taken as one sorted batch (R7).** Build chunk rows in id order, then the page row; then a page's 1-1 targets, then its aggregate targets, each in target order; per target its ledger entries, then its rows or groups, each locked in key order in one statement per class. Every statement that locks them follows it, including a truncate's wipe and a chunk's retirement. Never a per-row loop. | In the interleaving experiment a per-row loop deadlocked 19–22 times in 20 s; the sorted batch never did. The implemented paths held it in my benchmark round (no deadlock in any benchmark, and group moves and the hot-key case converge with none). In my group-basis model, a truncate wipe and a chunk retirement that locked in scan order deadlocked with pages tens of times per soak matrix; sorted, 0 times. |
-| **I6** | **Never block, and never fail, an application writer.** No Trellis transaction takes a lock an application write can queue behind, except the join and drop fences, which are bounded by `lock_timeout` and retried. A `MIN`/`MAX` probe's `ACCESS SHARE` lock on the source conflicts with no row write; only an `ACCESS EXCLUSIVE` statement on the source (DDL, `TRUNCATE`, `VACUUM FULL`) queues behind it, until the probing page commits. A schema change to a read column never fails the application's statement. A missing ring table or a revoked privilege does, loudly ([Consequences](#consequences-and-costs)). | I measured a bare `CREATE TRIGGER` stalling every writer for 25 s; with a 50 ms `lock_timeout` retry the worst wait was 52 ms. I renamed a read column under the capture function and every insert failed until regeneration. The retire path already takes its `TRUNCATE` lock `NOWAIT`. |
+| **I6** | **Never block, and never fail, an application writer.** No Trellis transaction takes a lock an application write can queue behind, except the join and drop fences, which are bounded by `lock_timeout` and retried. A `MIN`/`MAX` probe's `ACCESS SHARE` lock on the source conflicts with no row write; only an `ACCESS EXCLUSIVE` statement on the source (most `ALTER TABLE` forms, `DROP`, `TRUNCATE`, `VACUUM FULL`) queues behind it, until the probing page commits, and the application's statements queued behind that one wait with it. A schema change to a read column never fails the application's statement. A missing ring table or a revoked privilege does, loudly ([Consequences](#consequences-and-costs)). | I measured a bare `CREATE TRIGGER` stalling every writer for 25 s; with a 50 ms `lock_timeout` retry the worst wait was 52 ms. I renamed a read column under the capture function and every insert failed until regeneration. The retire path already takes its `TRUNCATE` lock `NOWAIT`. |
 | **I7** | **No Trellis transaction waits for a lock while it holds a snapshot open.** Every lock statement runs under a `lock_timeout`; on timeout the transaction rolls back and the work is retried from outside any transaction. That includes a `MIN`/`MAX` probe, which takes the source's `ACCESS SHARE` lock while its page holds its groups: behind an application's `ACCESS EXCLUSIVE` lock it times out, the page rolls back with its group locks, and the drain retries the page. | In my 100M chunked-build run, a drain batch's ledger insert waited 1 h 50 min behind chunk transactions; the open transaction held back vacuum and the sealer for the whole wait. |
 | **I8** | **Memory is bounded by a batch cap, never by segment size.** A drain batch folds, re-reads and applies at most a fixed number of changes and pages through a larger bucket. | In my one-pass build, a drain held ~650 B per staged row per worker: 6.32 GB at 10M, OOM at 100M; fewer workers bound nothing because each worker then holds more buckets. |
 
@@ -462,8 +462,9 @@ which a delta handles. Removing the current extreme can't be undone from the
 group's state: the next extreme isn't stored anywhere. So a group keeps each
 extreme as a value and re-reads it from the source when a retraction reaches
 it. I modelled this (R) and a hidden value-count table per (group, value)
-(V) on Postgres 15 and 18: both were exact across 276 scenarios, ten
-necessity mutations each caught, and 680 soak runs.
+(V) on Postgres 15 and 18: both were exact in all 276 scenarios, each of
+ten necessity mutations broke at least one scenario, and both designs'
+extremes matched a fresh `GROUP BY` in all 680 soak runs.
 
 - **Must:** a `MIN` or `MAX` argument is a plain source column. An
   expression argument is refused at define: a probe reads an index endpoint,
@@ -477,17 +478,23 @@ necessity mutations each caught, and 680 soak runs.
 - **Must:** a source that is another Trellis target is refused for
   `MIN`/`MAX`: the index the probe needs would be a long `CREATE INDEX` on a
   large target Trellis owns.
-- **Must:** define refuses a `MIN` or `MAX` field unless the source has a
-  valid, non-partial btree whose leading columns are the `GROUP BY` columns
-  in order, then the argument, in the argument's collation. One such index
-  serves both `self_check`'s paging and the probe, and the fields reading
-  one argument share it. An index dropped after define leaves the target
-  exact: `status` warns, the probe scans the group instead, and nothing
-  pauses.
+- **Must:** the probe reads one endpoint of a valid, non-partial btree whose
+  leading columns are the `GROUP BY` columns in order, then the argument, in
+  the argument's collation. Define requires that index of a `MIN` or `MAX`
+  field, as it requires the `GROUP BY` index; the
+  [Supported sources and targets](../transforms.md#supported-sources-and-targets)
+  table states the refusal and what a definition defined
+  `WITHOUT SOURCE INDEX` may do. One such index serves both `self_check`'s
+  paging and the probe, and the fields reading one argument share it.
+  Without it a probe scans the group, which is exact but reads every row of
+  each probed group. An index dropped after define leaves the target exact:
+  `status` warns, the probe scans the group instead, and nothing pauses.
 - **Must (Rx1, hidden state):** a group keeps each extreme (one per distinct
-  call) at the argument's type, with a basis of its own, `xbasis`, and a
-  stamp of its own, `xstamp`, beside the partials' basis and stamp. One
-  basis per group is wrong: a probe that stamped the group's basis would
+  call) at the argument's type. The group's extremes share a basis of their
+  own, `xbasis`, and a stamp of their own, `xstamp`, beside the partials'
+  basis and stamp; one `xbasis` serves them all because a probe re-reads
+  every extreme of the group. One basis for the partials and the extremes
+  is wrong: a probe that stamped the group's basis would
   make the partials refuse the counts of a change the probe saw, and in my
   model that mutation left wrong counts.
 - **Must (Rx2, I2 for extremes):** a (group, transaction) sum applies to the

@@ -192,14 +192,16 @@ with neither, each group took about 78 ms. A missing index never changes
 results.
 
 A source whose oldest rows are deleted on a schedule (`MIN(created_at)`
-under a retention job) re-reads on nearly every deletion, and each read
-starts at the end of the index the deletions just emptied. Until vacuum
-removes those dead entries, every read walks them: about 7 to 9 ms a read
-after 111,000 deletions. Keep autovacuum
-ahead of the retention job on such a table (a lower
-`autovacuum_vacuum_scale_factor` for it, or a `VACUUM` after each retention
-batch), and avoid long-running transactions, which keep vacuum from removing
-the entries.
+under a retention job) re-reads a touched group's extreme in nearly every
+page of deletions, and each read starts at the end of the index the
+deletions just emptied. Until vacuum removes those dead entries, a read
+walks them: about 7 to 9 ms after 111,000 deletions in one group. Without
+an older transaction open, that read marks them and the next ones cost
+well under a millisecond; while a transaction older than the deletions is
+open, every read pays the full walk. Keep autovacuum ahead of the retention
+job on such a table (a lower `autovacuum_vacuum_scale_factor` for it, or a
+`VACUUM` after each retention batch), and avoid long-running transactions,
+which keep vacuum from removing the entries.
 
 ## Keep the indexes a definition relies on
 
