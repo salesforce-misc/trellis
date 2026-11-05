@@ -729,7 +729,11 @@ pub fn bound_change_names(program: &Program) -> Vec<&'static str> {
                     let new = sim.layout.slots_of_bound(bound);
                     if new == *old {
                         None
-                    } else if new.is_superset(old) {
+                    } else if matches!(sim.layout.0, PartitionStrategy::List { .. })
+                        && new.is_superset(old)
+                    {
+                        // A `HASH` table attached at a coarser modulus is a
+                        // rebound, not a widened value list.
                         Some("attach_widened")
                     } else {
                         Some("attach_rebound")
@@ -1640,6 +1644,7 @@ mod tests {
                 ("update".into(), OpOutcome::Succeeds),
             ]
         );
+        assert_eq!(bound_change_names(&program), vec!["attach_widened"]);
         assert_eq!(
             Layout(PartitionStrategy::List {
                 values: 3,
@@ -1648,6 +1653,102 @@ mod tests {
             .slots_of_bound("for values in (0, 2)"),
             BTreeSet::from([0, 2])
         );
+    }
+
+    /// Widening a `LIST` leaf's values by one whose rows the `DEFAULT` holds
+    /// is refused, as Postgres refuses it ("updated partition constraint for
+    /// default partition ... would be violated").
+    #[test]
+    fn a_widening_the_default_holds_rows_of_is_refused() {
+        let base = program(
+            PartitionStrategy::List {
+                values: 3,
+                default: true,
+            },
+            &[0, 1],
+            vec![],
+        );
+        let program = add_partition_maintenance(
+            base,
+            0,
+            &[
+                PartitionDraw::Maintenance {
+                    at: 2,
+                    pick: 2,
+                    kind: MaintenanceKind::Drop,
+                },
+                // Grain 2 now routes to the DEFAULT.
+                PartitionDraw::MoveRow {
+                    at: 2,
+                    pk: 2,
+                    grain: 2,
+                    via_leaf: false,
+                },
+                PartitionDraw::Maintenance {
+                    at: 2,
+                    pick: 0,
+                    kind: MaintenanceKind::Widen {
+                        concurrently: false,
+                    },
+                },
+            ],
+        );
+        let attach = format!(
+            "{:?}",
+            PartitionAction::Attach {
+                leaf: "t0_p0".into(),
+                bound: "for values in (0, 2)".into()
+            }
+        );
+        assert_eq!(shape(&program).last(), Some(&(attach, OpOutcome::Fails)));
+        assert!(bound_change_names(&program).is_empty());
+    }
+
+    /// A `HASH` table attached at a coarser modulus than its own counts as a
+    /// rebound, and only a `LIST` value list grown in place as widened.
+    #[test]
+    fn a_coarser_hash_attach_counts_as_a_rebound_not_a_widening() {
+        let base = program(PartitionStrategy::Hash { modulus: 4 }, &[], vec![]);
+        let program = add_partition_maintenance(
+            base,
+            0,
+            &[
+                // Detach `t0_p0` (4, 0), then drop `t0_p2` (4, 2).
+                PartitionDraw::Maintenance {
+                    at: 0,
+                    pick: 0,
+                    kind: MaintenanceKind::Detach {
+                        concurrently: false,
+                    },
+                },
+                PartitionDraw::Maintenance {
+                    at: 0,
+                    pick: 1,
+                    kind: MaintenanceKind::Drop,
+                },
+                // The coarsest free bound other than its own: (2, 0).
+                PartitionDraw::Maintenance {
+                    at: 0,
+                    pick: 0,
+                    kind: MaintenanceKind::Rebound {
+                        concurrently: false,
+                    },
+                },
+            ],
+        );
+        assert!(
+            program.ops.iter().any(|op| matches!(
+                op,
+                Op::Partition {
+                    action: PartitionAction::Attach { leaf, bound },
+                    expect: OpOutcome::Succeeds,
+                    ..
+                } if leaf == "t0_p0" && bound == "for values with (modulus 2, remainder 0)"
+            )),
+            "{:#?}",
+            program.ops
+        );
+        assert_eq!(bound_change_names(&program), vec!["attach_rebound"]);
     }
 
     /// A `HASH` leaf re-split to a multiple modulus is replaced by a leaf per
