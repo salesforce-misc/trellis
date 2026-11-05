@@ -103,6 +103,12 @@ pub struct Config {
     /// [`crate::handover::BINARY_VERSION`] unless a test injected another
     /// with `Config::with_binary_version`.
     binary_version: std::borrow::Cow<'static, str>,
+    /// The release the definition floors' running release is never below
+    /// (`defs::floor::Floors::new`): `defs::floor::DEVELOPING`, the
+    /// release this tree builds, for this build's own version, and
+    /// `defs::floor::BASELINE` once a test injects a version with
+    /// `Config::with_binary_version`, which stands for a release build of it.
+    floors_developing: crate::defs::floor::Release,
     /// Features a test gave another release than their registry entry
     /// declares, for the definition floors this configuration's handles
     /// stamp (ADR-0024, `defs::floor`): empty unless a test set some with
@@ -158,6 +164,7 @@ impl Config {
             schema,
             target_schema: DEFAULT_TARGET_SCHEMA.to_string(),
             binary_version: std::borrow::Cow::Borrowed(crate::handover::BINARY_VERSION),
+            floors_developing: crate::defs::floor::DEVELOPING,
             feature_since: std::sync::Arc::from([]),
         })
     }
@@ -203,20 +210,19 @@ impl Config {
     #[cfg(any(test, feature = "internals"))]
     pub fn with_binary_version(mut self, version: impl Into<String>) -> Self {
         self.binary_version = std::borrow::Cow::Owned(version.into());
+        self.floors_developing = crate::defs::floor::BASELINE;
         self
     }
 
     /// The definition floors this configuration's handles stamp (ADR-0024):
-    /// against its binary version, with its features' overrides. This
-    /// build's own version is only borrowed; an injected one is owned.
+    /// against its binary version, never below the release it was developed
+    /// as, with its features' overrides.
     pub(crate) fn floors(&self) -> crate::defs::floor::Floors {
-        use crate::defs::floor::Floors;
-        match &self.binary_version {
-            std::borrow::Cow::Borrowed(version) => Floors::new(version, self.feature_since.clone()),
-            std::borrow::Cow::Owned(version) => {
-                Floors::of_release(version, self.feature_since.clone())
-            }
-        }
+        crate::defs::floor::Floors::new(
+            &self.binary_version,
+            self.floors_developing,
+            self.feature_since.clone(),
+        )
     }
 
     /// Returns `self` stamping definition floors as if `feature` (a
@@ -314,6 +320,7 @@ impl fmt::Debug for Config {
             schema,
             target_schema,
             binary_version,
+            floors_developing,
             feature_since,
         } = self;
         f.debug_struct("Config")
@@ -321,6 +328,7 @@ impl fmt::Debug for Config {
             .field("schema", schema)
             .field("target_schema", target_schema)
             .field("binary_version", binary_version)
+            .field("floors_developing", floors_developing)
             .field("feature_since", feature_since)
             .finish()
     }
@@ -492,6 +500,21 @@ pub(crate) mod malformed_dsn_fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// This build's floors never run below the release its tree develops;
+    /// a version a test injects stands for a release build of it, which only
+    /// the first release carrying floors is below (ADR-0024).
+    #[test]
+    fn an_injected_version_runs_as_its_own_release() {
+        let config = Config::with_schema("host=x", "trellis").unwrap();
+        assert_eq!(config.floors_developing, crate::defs::floor::DEVELOPING);
+        let injected = config.with_binary_version("0.2.0");
+        assert_eq!(injected.floors_developing, crate::defs::floor::BASELINE);
+        assert_eq!(
+            injected.clone().floors_developing,
+            crate::defs::floor::BASELINE
+        );
+    }
 
     #[test]
     fn explicit_dsn_wins() {

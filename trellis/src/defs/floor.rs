@@ -622,26 +622,14 @@ pub struct Floors {
 }
 
 impl Floors {
-    /// The floors of a binary running as `binary_version`.
-    ///
-    /// A binary is never below [`DEVELOPING`], the release this source tree
-    /// builds: a development build whose manifest still carries the previous
-    /// release's version belongs to the one being developed.
-    pub(crate) fn new(binary_version: &str, overrides: Arc<[(String, Release)]>) -> Self {
-        Self::developed_as(binary_version, DEVELOPING, overrides)
-    }
-
-    /// The floors of a release build of `binary_version`, which a test
-    /// injects to stand for another release (`Config::with_binary_version`):
-    /// that build was developed as its own release, so only [`BASELINE`],
-    /// the first release carrying floors, is below it.
-    pub(crate) fn of_release(binary_version: &str, overrides: Arc<[(String, Release)]>) -> Self {
-        Self::developed_as(binary_version, BASELINE, overrides)
-    }
-
     /// The floors of a binary running as `binary_version`, built from a tree
-    /// developing release `developing`.
-    fn developed_as(
+    /// developing release `developing`: the running release is never below
+    /// it. This build's own floors pass [`DEVELOPING`], the release this
+    /// source tree builds, so a development build whose manifest still
+    /// carries the previous release's version belongs to the one being
+    /// developed ([`crate::config::Config`] does unless a test injected a
+    /// version).
+    pub(crate) fn new(
         binary_version: &str,
         developing: Release,
         overrides: Arc<[(String, Release)]>,
@@ -652,11 +640,20 @@ impl Floors {
         }
     }
 
+    /// The floors of a release build of `binary_version`, which a test
+    /// injects to stand for another release (`Config::with_binary_version`):
+    /// that build was developed as its own release, so only [`BASELINE`],
+    /// the first release carrying floors, is below it.
+    #[cfg(test)]
+    pub(crate) fn of_release(binary_version: &str, overrides: Arc<[(String, Release)]>) -> Self {
+        Self::new(binary_version, BASELINE, overrides)
+    }
+
     /// The floors of this build, with no overrides: a test's, which
     /// injects no version.
     #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn of_this_binary() -> Self {
-        Self::new(crate::handover::BINARY_VERSION, Arc::from([]))
+        Self::new(crate::handover::BINARY_VERSION, DEVELOPING, Arc::from([]))
     }
 
     /// The running release when a definition whose stored floor is `stored`
@@ -1319,7 +1316,7 @@ mod tests {
             ("0.1.0", "0.3.0"),
             ("0.4.0", "0.4.0"),
         ] {
-            let floors = Floors::developed_as(binary, developing, case_since());
+            let floors = Floors::new(binary, developing, case_since());
             assert_eq!(
                 floors.running.map(|r| r.to_string()).as_deref(),
                 Some(running),
@@ -1332,6 +1329,13 @@ mod tests {
         // below the first release carrying floors.
         assert!(DEVELOPING >= BASELINE);
         assert!(Floors::of_this_binary().running >= Some(DEVELOPING));
+        // A configuration's handles stamp this build's floors, and a version
+        // a test injects stands for a release build of it, which DEVELOPING
+        // doesn't raise.
+        let config = crate::config::Config::with_schema("host=x", "trellis").unwrap();
+        assert_eq!(config.floors().running, Floors::of_this_binary().running);
+        let injected = config.with_binary_version("0.2.0").floors();
+        assert_eq!(injected.running, Some(Release::new(0, 2, 0)));
     }
 
     /// A function the registries don't declare counts at the running
