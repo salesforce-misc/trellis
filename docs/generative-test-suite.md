@@ -527,7 +527,8 @@ beside them run on every `cargo test`.
   key to read their tokens in one order and lock the key in the other, and
   the tier caught it in none of 48. Its deterministic pin gates it.
 - **Partitioned-source convergence** *(ADR-0017)*. The first table of a
-  generated program is a partitioned source: `HASH` over one to four leaves,
+  generated program is a partitioned source, one level deep (no leaf is
+  itself partitioned): `HASH` over one to four leaves,
   `LIST` with a leaf per grain value or fewer and a `DEFAULT`, or `RANGE` over
   one to three bounds, partitioned by the grain column, which every
   definition reading it groups by. Its primary key is `(pk, grain)`, so its
