@@ -724,11 +724,12 @@ pub(crate) mod strategy {
     /// every 20 to 200 ms over 2 to 4 lanes. Every burst is checked once it
     /// settles, so a short burst checks soon after what it did.
     ///
-    /// - A [`KeyShape::Racing`] case (two in seven) is the aggregate JOIN
-    ///   tier's ([`crate::generate::join::join_case_strategy`]): 500 to
-    ///   [`MAX_OPS`] ops in bursts of 600 to 900, paced from the first op,
-    ///   every definition live over the empty tables first and no operator
-    ///   actions, every page stalled for seconds before its commit.
+    /// - A [`KeyShape::Racing`] case (two in seven) is shaped like the
+    ///   aggregate JOIN tier's ([`crate::generate::join::join_case_strategy`]):
+    ///   500 to [`MAX_OPS`] ops in bursts of 600 to 900, paced from the
+    ///   first op, every definition live over the empty tables first and no
+    ///   operator actions, but with every page stalled for seconds before
+    ///   its commit, its draws unpaired and its drains uncapped.
     /// - A `wide` case draws 120 to 600 ops in bursts of 260 to 600 (past
     ///   the engine's split threshold, so several workers claim one batch),
     ///   with the installs, pauses and re-reads below.

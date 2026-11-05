@@ -401,8 +401,9 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
 /// twice. A plant caught in one case in twelve is listed here too: a 24-case
 /// sweep would miss it about one time in eight.
 ///
-/// - `join1_no_j_lock`: caught 4, fired 48 (as the aggregate tier's
-///   `join_no_j_lock`, a known miss there).
+/// - `join1_no_j_lock`: caught 4, fired 48 (this tier's `racing` cases
+///   don't cap their drains or pair their ops, which is what reaches the
+///   aggregate tier's `join_no_j_lock`).
 /// - `join1_truncate_no_rebuild`: caught 4, fired 14 (it needs a `TRUNCATE
 ///   jb` late in its burst, with no `jb` write after it on its keys).
 /// - `join1_brd_no_key`: caught 1, fired 48.

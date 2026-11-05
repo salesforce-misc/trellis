@@ -434,18 +434,26 @@ beside them run on every `cargo test`.
   group-basis writer's plants that a `JOIN`'s `P` and `M` cells share (§6).
   Half its cases are the `racing` shape (40 keys, 500 to 900 ops in bursts of
   600 to 900 paced from the first op, definitions live before the first write,
-  short seals, every page stalled before its commit for up to 2 to 3.5 s), where
-  pages of one key's opposite sides are open at once with no shared cell, so
-  only the `J` and `T` locks order them. A `racing` case takes about 15 s, so a
-  sweep process of 48 cases takes about 12 minutes. `join_no_j_lock` and
-  `join_t_skip_lock` are known misses here: the `racing` shape catches each in
-  1 or 2 of 48 cases, and whether a case lines the race up depends on timing,
-  so a sweep would miss either one too often to gate it. `gb_early_zero_gc` is
-  a known miss too: it needs a zero group's rebuild stamp past the drained
-  prefix when the GC pass runs, and the GC runs every `housekeeping_interval`
-  (5 s by default, which the harness doesn't set). Their deterministic pins
-  gate all three. `gb_lsn_not_visibility` is not drawn here, as its writers are
-  single statements.
+  short seals, every page stalled before its commit for up to 250 to 437 ms),
+  where pages of one key's opposite sides are open at once with no shared
+  cell, so only the `J` and `T` locks order them. Two things line that race
+  up. The runner caps a `racing` case's drains at 8 records
+  (`drain_batch_cap`): uncapped, the segments sealed while every worker
+  stalls coalesce into one page whose cells every other page shares, and the
+  cell locks order everything. And the ops come in pairs across tables: six
+  ops after each op of a pair's first half, an op on the other table names
+  the same key, so the two land in nearby segments whose pages run at once.
+  A `racing` case takes about 10 s, so a sweep process of 48 cases takes
+  about 8 minutes. Of 48 cases the tier caught `gb_fold_sides_per_key` in
+  44, `join_drop_flip` in 34, `join_other_side_before_j` in 18,
+  `join_no_j_lock` in 17 and `join_t_skip_lock` in 16, the last two in about
+  half the `racing` cases. Every case runs housekeeping, where the zero-group
+  GC runs, every 10 ms. `gb_early_zero_gc` is a known miss even so (caught in
+  4 of 48): it needs a rebuild that leaves a group at zero while a change its
+  basis saw is still undrained, then a GC pass before that change's page, and
+  `racing` cases build nothing. Its deterministic pins gate it.
+  `gb_lsn_not_visibility` is not drawn here, as its writers are single
+  statements.
 - **1-1 JOIN convergence** (`tests/join_one_to_one_convergence.rs`, ADR-0021).
   Two tables (`ja`, `jb`), one to three `LEFT` or `INNER` 1-1 `JOIN`
   definitions over them with no `GROUP BY` (one target row per `ja` row,
@@ -458,9 +466,10 @@ beside them run on every `cargo test`.
   a `jb` row never shares its key with another live `jb` row. All of a burst's
   `jb` ops are issued from one lane (two lanes could race two rows for a key
   one is about to free) and the `ja` ops are spread over the others. Key
-  shapes, builds, pauses and resumes, re-reads, commit stalls and the
-  `racing` shape are the aggregate `JOIN` tier's, with `racing` two cases in
-  seven. Every other shape but `wide` writes in short bursts (30 to 150 ops),
+  shapes, builds, pauses and resumes, re-reads and commit stalls are the
+  aggregate `JOIN` tier's, and so is the `racing` shape, with `racing` two
+  cases in seven, except that its pages stall for up to 2 to 3.5 s, its ops
+  aren't paired across tables and its drains aren't capped. Every other shape but `wide` writes in short bursts (30 to 150 ops),
   each checked once it settles, with two to six pauses (each with its
   `RESUME`, a rebuild in place) and re-reads after the first burst, and in
   three cases in four a `TRUNCATE` of either table now and then, with two to

@@ -225,12 +225,13 @@ pub enum KeyShape {
     /// change one key from opposite sides without sharing a `P` or `M`
     /// cell, and only the `J` lock orders them.
     Wide,
-    /// Over [`RACING_KEYS`] keys, both tables written alike, and run with
-    /// short seals, paced writers and a long commit stall
-    /// (`RACING_COMMIT_STALL_MS`): pages hold a few rows each and many stay
-    /// open at once, so two pages that change one key from opposite sides
-    /// (or one `T` group) often share no `P` or `M` cell, and only the `J`
-    /// and `T` locks order them.
+    /// Over [`RACING_KEYS`] keys, both tables written alike, with draws
+    /// paired across sides ([`pair_racing_draws`]), and run with short
+    /// seals, paced writers, small drains ([`RACING_DRAIN_BATCH_CAP`]) and
+    /// a commit stall (`RACING_COMMIT_STALL_MS`): pages hold a few rows
+    /// each and many stay open at once, so two pages that change one key
+    /// from opposite sides (or one `T` group) often share no `P` or `M`
+    /// cell, and only the `J` and `T` locks order them.
     Racing,
 }
 
@@ -239,6 +240,43 @@ pub const HOT_OTHER_KEYS: u8 = 6;
 pub const FAN_OUT_KEYS: u8 = 3;
 pub const WIDE_KEYS: u8 = 64;
 pub const RACING_KEYS: u8 = 40;
+
+/// The most folded records one drain holds in a [`KeyShape::Racing`] case
+/// (`ClientOptions::drain_batch_cap`, which the runner sets). At the
+/// engine's default, the segments sealed while every worker sits in its
+/// commit stall coalesce into one large page, whose cells overlap every
+/// other page's, so the cell locks order its pages and the `J` and `T`
+/// locks never have to. Capped, a worker drains a segment or two of a few
+/// rows each, and the pages of consecutive segments run at once.
+pub const RACING_DRAIN_BATCH_CAP: usize = 8;
+
+/// How many draws apart [`pair_racing_draws`] puts the two halves of a
+/// pair: past the ops one seal interval holds, so the two halves land in
+/// different segments, and near enough that their pages run at once.
+pub const RACING_PAIR_GAP: usize = 6;
+
+/// Pairs a [`KeyShape::Racing`] case's draws across sides: in each run of
+/// `2 * RACING_PAIR_GAP` draws, the draw [`RACING_PAIR_GAP`] after each of
+/// the first half takes its join key (and `t`) and the other table, and is
+/// an insert when the first is. So a key's changes from opposite sides
+/// arrive a few segments apart, where two workers' pages of them are open
+/// at once: the race only the `J` lock orders (and, when their `T` groups
+/// meet, the `T` lock). Draws past the last whole pair are left alone.
+pub fn pair_racing_draws(draws: &mut [JoinOpDraw]) {
+    let gap = RACING_PAIR_GAP;
+    for i in 0..draws.len() {
+        if i % (2 * gap) < gap && i + gap < draws.len() {
+            let first = draws[i];
+            let second = &mut draws[i + gap];
+            second.key = first.key;
+            second.t = first.t;
+            second.joined = !first.joined;
+            if first.kind == JoinOpKind::Insert {
+                second.kind = JoinOpKind::Insert;
+            }
+        }
+    }
+}
 
 impl KeyShape {
     pub fn name(self) -> &'static str {
@@ -725,7 +763,9 @@ pub fn join_case(
 }
 
 #[cfg(feature = "proptest")]
-pub use strategy::{COMMIT_STALL_MS, MAX_OPS, RACING_COMMIT_STALL_MS, join_case_strategy};
+pub use strategy::{
+    COMMIT_STALL_MS, MAX_OPS, RACING_COMMIT_STALL_MS, RACING_STALL_DIVISOR, join_case_strategy,
+};
 
 #[cfg(feature = "proptest")]
 pub(crate) mod strategy {
@@ -839,8 +879,18 @@ pub(crate) mod strategy {
 
     /// The longest commit stall a `racing` case draws, in milliseconds. The
     /// stall is skewed toward zero, so a maximum of seconds is what keeps
-    /// many pages open at once.
+    /// many pages open at once. The 1-1 `JOIN` tier's `racing` cases stall
+    /// this long; this tier's stall an eighth of it
+    /// ([`RACING_STALL_DIVISOR`]).
     pub const RACING_COMMIT_STALL_MS: std::ops::RangeInclusive<u64> = 2000..=3500;
+
+    /// What this tier divides a `racing` case's drawn commit stall
+    /// ([`RACING_COMMIT_STALL_MS`]) by: 250 to 437 ms. Its pages are small
+    /// ([`RACING_DRAIN_BATCH_CAP`]), so there are many of them, each
+    /// stalled once per definition, and a stall of seconds would keep the
+    /// drain from settling. A page's product takes milliseconds, so a page
+    /// open this long still overlaps the pages of the next few segments.
+    pub const RACING_STALL_DIVISOR: u64 = 8;
 
     /// A JOIN-tier case: one to three definitions, each installed up front
     /// or part way through the stream, with pauses, resumes and re-reads
@@ -860,8 +910,11 @@ pub(crate) mod strategy {
     /// Half the cases are [`KeyShape::Racing`]: 500 to [`MAX_OPS`] ops in
     /// bursts of 600 to 900, paced from the first op, every definition live
     /// over the empty tables before the first write (no builds or operator
-    /// actions), at least 3 workers sealing every 20 to 40 ms, and every
-    /// page stalled before its commit ([`RACING_COMMIT_STALL_MS`]).
+    /// actions), at least 3 workers sealing every 20 to 40 ms, every page
+    /// stalled before its commit ([`RACING_COMMIT_STALL_MS`] over
+    /// [`RACING_STALL_DIVISOR`]), and the draws paired across sides
+    /// ([`pair_racing_draws`]). The runner caps its drains at
+    /// [`RACING_DRAIN_BATCH_CAP`] records.
     pub fn join_case_strategy() -> impl Strategy<Value = JoinCase> {
         prop_oneof![
             1 => Just(KeyShape::Spread),
@@ -924,6 +977,10 @@ pub(crate) mod strategy {
                         } else {
                             builds
                         };
+                        let mut draws = draws;
+                        if shape == KeyShape::Racing {
+                            pair_racing_draws(&mut draws);
+                        }
                         let mut case = join_case(
                             &specs,
                             shape,
@@ -939,8 +996,9 @@ pub(crate) mod strategy {
                         if shape == KeyShape::Racing {
                             case.seal_interval_ms = 20 + case.seal_interval_ms % 21;
                             case.workers = case.workers.max(3);
-                            case.plan.commit_stall =
-                                Some(std::time::Duration::from_millis(racing_stall_ms));
+                            case.plan.commit_stall = Some(std::time::Duration::from_millis(
+                                racing_stall_ms / RACING_STALL_DIVISOR,
+                            ));
                             case.plan.steady_load = Some(crate::model::SteadyLoad {
                                 pace: std::time::Duration::from_micros(racing_pace_micros),
                                 pace_from_start: true,
@@ -1055,6 +1113,51 @@ mod tests {
                 "insert jb Some(\"3\")",
             ]
         );
+    }
+
+    /// Each draw in the first half of a run of `2 * RACING_PAIR_GAP` gives
+    /// the draw `RACING_PAIR_GAP` after it its key and `t` on the other
+    /// table, and its insert; the rest of that draw is its own, and every
+    /// other draw is left alone.
+    #[test]
+    fn racing_draws_pair_across_sides() {
+        let gap = RACING_PAIR_GAP;
+        let len = 2 * gap + 3;
+        let original: Vec<JoinOpDraw> = (0..len)
+            .map(|i| JoinOpDraw {
+                joined: i % 3 == 0,
+                kind: if i % 2 == 0 {
+                    JoinOpKind::Insert
+                } else {
+                    JoinOpKind::Delete
+                },
+                pick: i,
+                key: u8::try_from(i * 7).unwrap(),
+                t: u8::try_from(i % 2).unwrap(),
+                group: Some(1),
+                value: Some(i8::try_from(i).unwrap()),
+                columns: 0,
+            })
+            .collect();
+        let mut draws = original.clone();
+        pair_racing_draws(&mut draws);
+        let mut seconds = Vec::new();
+        for i in (0..len).filter(|i| i % (2 * gap) < gap && i + gap < len) {
+            let (a, b, was) = (draws[i], draws[i + gap], original[i + gap]);
+            seconds.push(i + gap);
+            assert_eq!((b.key, b.t, b.joined), (a.key, a.t, !a.joined), "{i}");
+            let kind = if a.kind == JoinOpKind::Insert {
+                JoinOpKind::Insert
+            } else {
+                was.kind
+            };
+            assert_eq!(b.kind, kind, "{i}");
+            assert_eq!((b.pick, b.group, b.value), (was.pick, was.group, was.value));
+        }
+        assert_eq!(seconds.len(), gap);
+        for i in (0..len).filter(|i| !seconds.contains(i)) {
+            assert_eq!(draws[i], original[i], "{i}");
+        }
     }
 
     /// The hot-key shape puts most keys on key 0, and every shape draws a

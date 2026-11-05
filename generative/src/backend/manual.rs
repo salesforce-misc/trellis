@@ -507,6 +507,11 @@ pub struct ManualBackend {
     /// with [`ManualBackend::set_housekeeping_interval`]; the engine's
     /// default otherwise.
     housekeeping_interval: Option<Duration>,
+    /// The most folded records one drain holds
+    /// ([`ClientOptions::drain_batch_cap`]), when a caller sets one with
+    /// [`ManualBackend::set_drain_batch_cap`]; the engine's default
+    /// otherwise.
+    drain_batch_cap: Option<usize>,
     /// The reclaim TTL the engine client is started with
     /// ([`ClientOptions::reclaim_ttl`]), when a caller sets one with
     /// [`ManualBackend::set_reclaim_ttl`]; the engine's default otherwise.
@@ -668,6 +673,7 @@ impl ManualBackend {
             build_chunk_rows: None,
             reconcile_interval: None,
             housekeeping_interval: None,
+            drain_batch_cap: None,
             reclaim_ttl: None,
             strict_audit: false,
             strict_audits_converged: 0,
@@ -718,6 +724,17 @@ impl ManualBackend {
     /// [`Backend::install`](super::Backend::install).
     pub fn set_housekeeping_interval(&mut self, interval: Duration) {
         self.housekeeping_interval = Some(interval);
+    }
+
+    /// Sets the most folded records one drain holds
+    /// ([`ClientOptions::drain_batch_cap`]), which also bounds how many
+    /// sealed segments one drain coalesces. A small cap keeps a backlog of
+    /// small segments from coalescing into one large page, so several
+    /// workers' small pages run at once. Like
+    /// [`ManualBackend::set_build_chunk_rows`], it takes effect at the first
+    /// [`Backend::install`](super::Backend::install).
+    pub fn set_drain_batch_cap(&mut self, cap: usize) {
+        self.drain_batch_cap = Some(cap);
     }
 
     /// Sets how long a claim may sit unrefreshed before the engine takes it
@@ -1007,6 +1024,9 @@ impl ManualBackend {
         };
         if let Some(interval) = self.housekeeping_interval {
             options.housekeeping_interval = interval;
+        }
+        if let Some(cap) = self.drain_batch_cap {
+            options.drain_batch_cap = cap;
         }
         if let Some(ttl) = self.reclaim_ttl {
             options.reclaim_ttl = ttl;

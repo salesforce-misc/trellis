@@ -30,12 +30,17 @@
 //! - `racing` (half the cases): 40 keys, both tables written alike, 500 to
 //!   900 ops in bursts of 600 to 900 paced from the first op, every
 //!   definition live before the first write, at least 3 workers sealing
-//!   every 20 to 40 ms, and every page stalled before its commit for up to
-//!   2 to 3.5 s (the stall is skewed toward short, so that maximum keeps
-//!   many pages open at once). Pages hold a few rows each and often share
-//!   no `P` or `M` cell, so only the `J` and `T` locks order them: it is the
-//!   only shape that has caught `join_no_j_lock` or `join_t_skip_lock`, now
-//!   and then. A case takes about 15 s.
+//!   every 20 to 40 ms, every page stalled before its commit for up to 250
+//!   to 437 ms (skewed toward short), and drains capped at
+//!   `RACING_DRAIN_BATCH_CAP` records, so a worker drains a segment or two
+//!   of a few rows at a time instead of coalescing the backlog into one page
+//!   whose cells every other page shares. The ops are paired across tables
+//!   (`pair_racing_draws`): six ops after each op of a pair's first half, an
+//!   op on the other table names the same key, so the two land in nearby
+//!   segments whose pages run at once. Those pages often share no `P` or `M`
+//!   cell, so only the `J` and `T` locks order them: the shape catches
+//!   `join_no_j_lock` and `join_t_skip_lock` in about half its cases. A case
+//!   takes about 10 s.
 //!
 //! The ops are issued as the concurrent tier issues them
 //! (`generative::run::run_convergence_concurrent`): bursts of 40 to 600 ops,
@@ -89,8 +94,8 @@
 use generative::backend::{Backend, ConcurrentBackend, ManualBackend};
 use generative::generate::join::{
     BuildCoverage, JoinActionDraw, JoinActionKind, JoinBuildDraws, JoinCase, JoinDefSpec,
-    JoinField, JoinGroups, JoinKey, JoinOpDraw, JoinOpKind, KeyShape, build_coverage, join_case,
-    join_case_strategy,
+    JoinField, JoinGroups, JoinKey, JoinOpDraw, JoinOpKind, KeyShape, RACING_DRAIN_BATCH_CAP,
+    build_coverage, join_case, join_case_strategy,
 };
 use generative::model::Op;
 use generative::plant_sweep::{self, SweepTier};
@@ -285,8 +290,15 @@ fn proptest_config() -> ProptestConfig {
     }
 }
 
+/// How often the engine's housekeeping, where the zero-group GC runs, runs
+/// in every case: at the engine's 5 s default a pass almost never meets a
+/// zero group whose stamp is past the drained prefix, which is what
+/// `gb_early_zero_gc` needs.
+const HOUSEKEEPING_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Runs one case against a fresh isolated database, then checks every
-/// definition is still `live`.
+/// definition is still `live`. A `racing` case's drains are capped at
+/// [`RACING_DRAIN_BATCH_CAP`] records.
 fn run_case(case: &JoinCase) -> Result<(), String> {
     HARNESS.with(|h| {
         h.coverage.borrow_mut().record(case);
@@ -300,6 +312,10 @@ fn run_case(case: &JoinCase) -> Result<(), String> {
             .await
             .expect("connect the backend");
             backend.set_strict_audit(true);
+            backend.set_housekeeping_interval(HOUSEKEEPING_INTERVAL);
+            if case.shape == KeyShape::Racing {
+                backend.set_drain_batch_cap(RACING_DRAIN_BATCH_CAP);
+            }
             let pool =
                 Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
             let shape = format!(
@@ -369,22 +385,20 @@ proptest! {
 /// gated (the `JOIN` plants and the group-basis writer's, which `P` and `M`
 /// share); the others break paths the tier never takes.
 ///
-/// Measured (4 seeds x 12 cases, logbooks `20261024T142312-b-sweep` and
-/// `20261024T152844-b-sweep`): `join_drop_flip` caught in 34 of 48. Known
-/// misses: `join_no_j_lock` and `join_t_skip_lock` fired in 41 of 48 and were
-/// caught in 1 or 2, only in `racing` cases, and not reliably: the race needs
-/// two pages of one key's opposite sides (or one `T` group) open at once with
-/// no shared `P` or `M` cell, and whether a case lines them up depends on
-/// timing, not only on the drawn case (repro `20261024T161704-b-repro`: the
-/// catching cases caught in 9 and 5 of 10 runs), so a sweep misses either
-/// plant often enough that gating them would fail at random. Neither more
-/// groups nor a longer commit stall raised the rate (`20261024T164110-b-sweep`;
-/// a stall of seconds more times the baseline out). A sweep that catches one
-/// says so. `gb_early_zero_gc` fired in 0 of 48: it needs a rebuild whose basis
-/// stamp is past the drained prefix while the GC pass runs, and the GC pass
-/// runs every `housekeeping_interval` (5 s by default, which the harness
-/// doesn't set). The deterministic pins named in `trellis/src/plant.rs` gate
-/// all three.
+/// Measured (4 seeds x 12 cases, logbook `20261105T121210-a-sweep`, baseline
+/// clean): `gb_fold_sides_per_key` caught in 44 of 48, `join_drop_flip` in 34,
+/// `join_other_side_before_j` in 18, `join_no_j_lock` in 17 and
+/// `join_t_skip_lock` in 16 (each fired in 44). The last two are caught
+/// almost only in `racing` cases (16 of the 30 the four seeds draw): at
+/// those rates, a sweep that misses either in all 48 cases has odds under
+/// 1e-8.
+/// `gb_early_zero_gc` is a known miss: it fired in 10 of 48 and was caught
+/// in 4, too few to gate (a sweep would miss it about one time in 70). It
+/// needs a rebuild that leaves a group at zero while a change its basis saw
+/// is still undrained, then a GC pass (every [`HOUSEKEEPING_INTERVAL`])
+/// before that change's page; `racing` cases build nothing, so only the
+/// other shapes reach it. Its deterministic pins, named in
+/// `trellis/src/plant.rs`, gate it.
 fn join_sweep_tier() -> SweepTier {
     use generative::plant_sweep::{PlantPath, not_on_path};
     let mut not_gated: Vec<(&'static str, &'static str)> = vec![(
@@ -414,7 +428,7 @@ fn join_sweep_tier() -> SweepTier {
     ));
     SweepTier {
         name: generative::baseline_quarantine::JOIN_TIER,
-        known_misses: &["join_no_j_lock", "join_t_skip_lock", "gb_early_zero_gc"],
+        known_misses: &["gb_early_zero_gc"],
         not_gated,
     }
 }
