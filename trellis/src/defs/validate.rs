@@ -3806,7 +3806,9 @@ fn comparison_holds(op: super::ast::Operator, order: std::cmp::Ordering) -> bool
 /// `TRUE`, `FALSE` and `NULL` literals, or a calculated field whose expression is one, resolved
 /// as [`infer_expr`] resolves a name. `None` for anything that reads a
 /// column (except a strict operator or function call with a `NULL` constant
-/// operand, which the planner folds to `NULL` whatever the other reads), for
+/// operand, which the planner folds to `NULL` whatever the other reads, and a
+/// `NULLIF` with a `NULL` constant argument, which it folds to its first
+/// argument), for
 /// a call whose arguments are all non-`NULL` (it has no value here), and for a sum
 /// whose value Postgres could not compute (which
 /// [`check_constant_sum`] has refused). `memo` holds each calculated field
@@ -3940,15 +3942,16 @@ fn fold_constant<'f>(
                 None => Some(Constant::Null),
             }
         }
+        // A `NULL` argument is never equal to the other, so the planner
+        // replaces the call by its first argument, whatever the other reads:
+        // `NULLIF(NULL, x)` is `NULL`, `NULLIF(a, NULL)` is `a`.
         Expr::FunctionCall { name, args } if name == "NULLIF" && args.len() == 2 => {
-            let (a, b) = (
-                recurse(&args[0], field_name)?,
-                recurse(&args[1], field_name)?,
-            );
-            match (&a, &b) {
-                (Constant::Null, _) => Some(Constant::Null),
-                (_, Constant::Null) => Some(a),
-                _ => Some(if a.equals(&b)? { Constant::Null } else { a }),
+            let (a, b) = (recurse(&args[0], field_name), recurse(&args[1], field_name));
+            match (a, b) {
+                (Some(Constant::Null), _) => Some(Constant::Null),
+                (a, Some(Constant::Null)) => a,
+                (Some(a), Some(b)) => Some(if a.equals(&b)? { Constant::Null } else { a }),
+                _ => None,
             }
         }
         // An arithmetic operator is strict: a `NULL` operand makes it `NULL`,
@@ -4129,7 +4132,9 @@ impl Folding {
 /// are decided by one constant operand; a `CASE` is its first branch whose
 /// condition is constant true, past those constant false or `NULL`; a
 /// `COALESCE` is its first argument that is a constant other than `NULL`;
-/// `NULLIF` and `IS [NOT] DISTINCT FROM` fold only over constants. Every
+/// `NULLIF` is `NULL` when its first argument is the `NULL` constant and its
+/// first argument when its second is, whatever the other reads, and
+/// otherwise folds only over constants, like `IS [NOT] DISTINCT FROM`. Every
 /// function the grammar admits is immutable and strict, so a call over
 /// constants folds. `memo` holds each calculated field already classified,
 /// `fold_memo` each one already folded.
@@ -4306,14 +4311,15 @@ fn folding<'f>(
             }
             Folding::Unknown { maybe_null: true }
         }
-        // `NULLIF(a, NULL)` is `a`; otherwise it may be `NULL`.
+        // `NULLIF(a, NULL)` is `a`, whatever `a` reads (`NULLIF(NULL, b)` is
+        // folded above); otherwise it folds only over constants, maybe to
+        // `NULL`.
         Expr::FunctionCall { name, args } if name == "NULLIF" => {
             let inputs: Vec<Folding> = args.iter().map(&mut of).collect();
-            let maybe_null = match inputs.as_slice() {
-                [a, Folding::Known(Constant::Null)] => a.maybe_null(),
-                _ => true,
-            };
-            over_constants(&inputs, maybe_null)
+            match inputs.as_slice() {
+                [a, Folding::Known(Constant::Null)] => a.clone(),
+                _ => over_constants(&inputs, true),
+            }
         }
         Expr::FunctionCall { name, .. }
             if super::registry::lookup_aggregate_function(name).is_some() =>

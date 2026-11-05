@@ -700,6 +700,19 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
         "CASE WHEN ABS(STRPOS(CAST(NULL AS text), '')) IS NULL THEN 2147483647 + 1 END",
         "CASE WHEN CHAR_LENGTH(CAST(NULL AS text)) IS NOT DISTINCT FROM NULL \
          THEN 2147483647 + 1 END",
+        // `NULLIF` beside a `NULL` constant is its first argument, whatever
+        // the other reads: `NULLIF(NULL, x)` is `NULL`, `NULLIF(a, NULL)` is
+        // `a` (#1691).
+        "DATE '2024-02-29' - NULLIF(-2147483648, NULLIF(CAST(NULL AS integer), i8a))",
+        "2147483647 + NULLIF(1, NULLIF(CAST(NULL AS integer), i4a))",
+        "2147483647 + NULLIF(1, NULLIF(CAST(NULL AS bigint), i8a))",
+        "9223372036854775807 + NULLIF(1, NULLIF(NULL, i2a))",
+        "1.5 / NULLIF(0, NULLIF(CAST(NULL AS integer), i4a))",
+        "ABS(NULLIF(-2147483648, NULLIF(CAST(NULL AS integer), i4a)))",
+        "-NULLIF(-9223372036854775808, NULLIF(CAST(NULL AS bigint), i8a))",
+        "CASE WHEN NULLIF(CAST(NULL AS integer), i4a) IS NULL THEN 2147483647 + 1 END",
+        "CASE WHEN NULLIF(CAST(NULL AS integer), i4a) IS NOT NULL THEN 0 \
+         ELSE 2147483647 + 1 END",
     ];
     for text in refused {
         match check_text(text, None) {
@@ -746,6 +759,14 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
         "COALESCE(ROUND(CAST(NULL AS numeric), 2), 5, 2147483647 + 1)",
         "COALESCE(CASE WHEN 1 = 2 THEN 1 ELSE STRPOS('', CAST(NULL AS text)) END, \
          5, 2147483647 + 1)",
+        // The `NULLIF` that folds decides the guard the other way, or the
+        // one that survives compares a column (#1691).
+        "CASE WHEN NULLIF(CAST(NULL AS integer), i4a) IS NULL THEN 0 ELSE 2147483647 + 1 END",
+        "CASE WHEN NULLIF(CAST(NULL AS integer), i4a) IS DISTINCT FROM NULL \
+         THEN 2147483647 + 1 ELSE 0 END",
+        "COALESCE(NULLIF(1, NULLIF(CAST(NULL AS integer), i4a)), 2147483647 + 1)",
+        "2147483647 + NULLIF(NULLIF(1, CAST(NULL AS integer)), i4a)",
+        "2147483647 + NULLIF(i4a, NULL)",
         // A runtime divisor is left to the rows.
         "CASE WHEN i4a > 0 THEN na / i4a END",
         "i4a <> 0 AND na / i4a > 1",

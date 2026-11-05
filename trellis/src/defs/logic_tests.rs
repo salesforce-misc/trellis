@@ -1197,6 +1197,50 @@ fn a_branch_after_a_constant_define_cannot_compute_is_not_refused() {
     }
 }
 
+/// The planner folds `NULLIF` as soon as either argument is the `NULL`
+/// constant, whatever the other reads: `NULLIF(NULL, x)` is `NULL` and
+/// `NULLIF(a, NULL)` is `a`. So a constant failure above it is raised at plan
+/// time, and define refuses it (#1691). Each case is checked against Postgres.
+#[test]
+fn nullif_beside_a_null_constant_folds_whatever_the_other_argument_reads() {
+    for text in [
+        // The nightly's shape: `NULLIF(NULL, i8)` is `NULL`, so the outer
+        // `NULLIF` is its first argument and the date leaves its range.
+        "DATE '2024-02-29' - NULLIF(-2147483648, NULLIF(CAST(NULL AS integer), i8))",
+        "2147483647 + NULLIF(1, NULLIF(CAST(NULL AS integer), i4))",
+        // A typed `NULL`, and mixed integer widths on either side.
+        "2147483647 + NULLIF(1, CAST(NULL AS smallint))",
+        "2147483647 + NULLIF(1, CAST(NULL AS bigint))",
+        "2147483647 + NULLIF(1, NULLIF(CAST(NULL AS bigint), i8))",
+        "9223372036854775807 + NULLIF(1, NULLIF(NULL, i2))",
+        // A guard decided by the folded `NULL`: the branch it selects is
+        // simplified.
+        "CASE WHEN NULLIF(CAST(NULL AS integer), i4) IS NULL THEN 2147483647 + 1 END",
+        "CASE WHEN NULLIF(CAST(NULL AS integer), i4) IS NOT NULL THEN 0 \
+         ELSE 2147483647 + 1 END",
+        "COALESCE(NULLIF(CAST(NULL AS integer), i4), 2147483647 + 1)",
+        // Through a calculated field.
+        "NULLIF(CAST(NULL AS integer), i4) AS g, 2147483647 + NULLIF(1, g)",
+    ] {
+        assert_refused(text, "out of range");
+    }
+    assert_refused(
+        "1.5 / NULLIF(0, NULLIF(CAST(NULL AS integer), i4))",
+        "divides by the constant zero",
+    );
+    // Postgres keeps these: the `NULLIF` that survives compares a column, or
+    // the folded `NULL` decides a guard that drops the overflow.
+    for text in [
+        "2147483647 + NULLIF(i4, NULL)",
+        "2147483647 + NULLIF(NULLIF(1, CAST(NULL AS integer)), i4)",
+        "2147483647 + NULLIF(NULLIF(1, i4), NULL)",
+        "CASE WHEN NULLIF(CAST(NULL AS integer), i4) IS NULL THEN 0 ELSE 2147483647 + 1 END",
+        "COALESCE(NULLIF(1, NULLIF(CAST(NULL AS integer), i4)), 2147483647 + 1)",
+    ] {
+        assert_type(text, I4);
+    }
+}
+
 /// A guard is classified at any height the parser admits: a constant one
 /// nested near the limit still leaves what it guards unchecked.
 #[test]
