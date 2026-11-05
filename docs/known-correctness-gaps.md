@@ -441,8 +441,8 @@ attaching a partition.
 * a trigger or rule on a target (one define created or one it adopted) or on
   one of those tables that changes or drops the rows Trellis writes (a
   `BEFORE` trigger returning another row or `NULL`, or a rule Postgres runs in
-  their place), or the table set `UNLOGGED`, which a crash
-  or failover empties;
+  their place), or the table set `UNLOGGED`, which a crash or failover
+  empties;
 * DML, DDL or a data load into Trellis's own schema, such as another
   database's catalog rows.
 

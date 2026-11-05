@@ -668,6 +668,43 @@ async fn a_row_a_users_unique_index_refuses_holds_its_key() {
     );
 }
 
+/// An aggregate's build writes its groups together, so a user's unique
+/// constraint that refuses one of them pauses the build with a
+/// `backfill_failure` naming it, rather than holding a key.
+#[tokio::test]
+async fn a_users_unique_constraint_refusing_an_aggregates_build_pauses_it() {
+    let cluster = TestCluster::start();
+    let (_db, raw, trellis) = set_up(&cluster).await;
+    raw.batch_execute(
+        "create index on public.s (r, a); \
+         create table public.g (r text, a numeric, n bigint, \
+           unique nulls not distinct (r, a)); \
+         alter table public.g add constraint g_one_per_r unique (r)",
+    )
+    .await
+    .expect("the table to adopt");
+    trellis
+        .apply(
+            "TRANSFORM g ADOPT EXISTING TABLE FROM s GROUP BY r, a \
+             SELECT r AS r, a AS a, COUNT(*) AS n",
+        )
+        .await
+        .expect("adopted");
+    build_everything(&trellis).await;
+    let status = trellis
+        .status("g")
+        .await
+        .expect("read status")
+        .expect("g is registered");
+    assert_eq!(
+        status.status,
+        trellis::TransformStatus::Paused,
+        "{status:?}"
+    );
+    let failure = status.backfill_failure.expect("the build's failure");
+    assert!(failure.last_error.contains("g_one_per_r"), "{failure:?}");
+}
+
 /// Another table's foreign key referencing an adopted target: a delete of a
 /// referenced row holds its key, a source `TRUNCATE` (which Trellis applies
 /// as a delete of every row) holds its page back as a `drain_failure` until

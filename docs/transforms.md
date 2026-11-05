@@ -535,16 +535,21 @@ constraints, triggers, rules and foreign keys, with these outcomes:
   row's key like any value its target refuses: the key ends up held in
   quarantine, enough held keys trip the fuse and the definition reads
   `quarantined`, and rows that fail only together hold their page back as a
-  `drain_failure` (see [Status](#status)). A unique index on a column other
+  `drain_failure` (see [Status](#status)). An aggregate's or a `JOIN`'s
+  build writes its rows together, so a refusal there pauses the build with
+  a `backfill_failure` naming it instead. A unique index on a column other
   than the key is the likely case: changes to different keys apply in any
   order, so two rows can hold one value for a moment even when the source
   never does, and the index refuses one of them.
 * Another table's foreign key referencing the target fails Trellis's deletes
-  of a referenced row: the key whose row is still referenced is held. Trellis
-  never truncates a target; a source `TRUNCATE` deletes every row of it, and
-  while one of them is referenced that page is held back as a
-  `drain_failure` until the referencing rows are gone. `DROP TRANSFORM`
-  fails while the foreign key exists: drop it first.
+  of a referenced row: the key whose row is still referenced is held. A
+  source `TRUNCATE` deletes every row of the target, and while one of them
+  is referenced that page is held back as a `drain_failure` until the
+  referencing rows are gone. Two statements fail with the database's error
+  while the foreign key exists, and leave the transform as it was: `DROP
+  TRANSFORM`, and the `RESUME` that empties a 1-1 target keyed by an enum
+  column with `TRUNCATE` after one of the enum's values is relabelled. Drop
+  the foreign key first.
 * Postgres refuses `INSERT … ON CONFLICT`, which Trellis writes rows with,
   on a table with an `INSERT` or `UPDATE` rule, and refuses the deletes
   Trellis runs (`DELETE … RETURNING`, some inside a `WITH`) on a table with

@@ -119,6 +119,38 @@ async fn an_enum_keyed_one_to_one_with_nothing_pending_rebuilds_and_backfills_la
         .await;
 }
 
+/// A 1-1 keyed by an enum that another table's foreign key references: the
+/// resume empties the target with `TRUNCATE`, which Postgres refuses while
+/// the foreign key exists, so the resume fails with that error and leaves
+/// the transform paused, its rows as they were (`docs/transforms.md`,
+/// "Target tables are Trellis-owned").
+#[tokio::test]
+async fn an_enum_keyed_one_to_one_referenced_by_a_foreign_key_refuses_its_resume() {
+    let mut h = H::new(ENUM_KEYED, &["TRANSFORM kt FROM public.k SELECT n AS n"]).await;
+    h.write(
+        "create table public.kchild (tone public.tone references public.kt); \
+         insert into public.kchild values ('brisk')",
+    )
+    .await;
+    h.write(RELABEL).await;
+    h.capture_pass().await;
+    h.assert_paused_by_the_relabel(&["kt"]).await;
+    let err = h
+        .trellis
+        .apply("RESUME TRANSFORM kt")
+        .await
+        .expect_err("the truncate is refused");
+    assert!(
+        format!("{err:?}").contains("cannot truncate a table referenced in a foreign key"),
+        "{err:?}"
+    );
+    assert_eq!(h.status("kt").await, TransformStatus::Paused);
+    assert_eq!(
+        h.rows("select * from public.kt").await,
+        ["(calm,2)", "(zippy,1)"]
+    );
+}
+
 /// A 1-1 keyed by an enum with changes to the relabelled key staged across
 /// the relabel, and the resume made before they drain: it waits for the
 /// drain to skip them, then rebuilds. Without that wait, the rebuild
