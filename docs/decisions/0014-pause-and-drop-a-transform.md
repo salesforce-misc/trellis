@@ -306,7 +306,8 @@ transform whose target name already names any relation, unless the definition sa
 `ADOPT EXISTING TABLE`, so a table Trellis later drops is always one it created or one
 the definition explicitly handed to it.
 
-An adopted target is held to what Trellis can maintain, and it refuses by default:
+An adopted target is held to what Trellis can maintain, and it refuses structural
+differences:
 
 * **Empty only.** Adopting a table with rows would leave Trellis maintaining rows it
   never derived, the reason registration refuses an existing table at all. Emptiness is
@@ -314,11 +315,14 @@ An adopted target is held to what Trellis can maintain, and it refuses by defaul
 * **Exactly the shape define creates.** One rendering says what a define creates for its
   target; a plain define runs it, and an adopting define creates it as a temporary probe
   table and compares the two in the catalog, so the accepted shape can't drift from the
-  created one. The adopted table may carry only what users may add to any target
-  (indexes that aren't unique, grants, comments, row security policies, statistics,
-  publications, views over it). Anything else, including any object or constraint kind
-  the comparison doesn't recognise, refuses with a code naming it, so a Postgres feature
-  added later refuses until Trellis learns it.
+  created one. The adopted table may carry anything users may add to any target after
+  define (indexes, unique or not; constraints; triggers; rules; foreign keys, its own or
+  another table's referencing it; grants; comments; row security policies; statistics;
+  publications; views over it), with the outcomes those have on any target: what the
+  user adds is the user's. Anything structural that differs (the kind of table, a
+  column, the key, an owned sequence), and any object or constraint kind the comparison
+  doesn't recognise, refuses with a code naming it, so a Postgres feature added later
+  refuses until Trellis learns it.
 * **Owned and writable by the defining role.** Trellis later alters and drops the table,
   so the defining role must own it or inherit its owner's privileges as a member, and hold
   every privilege it writes the table with.
@@ -334,7 +338,10 @@ that added it ([0024](0024-compatibility-floors-and-rollback.md)).
 Rejected: adopting a table with rows (overwriting or merging them reopens the reason for
 the refusal); adoption as a hidden behaviour of a dump restore only (two paths that must
 agree, with no refusals of their own); marking adoptable tables with an ownership comment
-(it collides with users' own comments).
+(it collides with users' own comments); refusing what a user may add to a target after
+define, such as a unique index besides the key, or accepting only a unique index that
+covers the key (adoption would guard more strictly than a live target does, and a dump
+of a target carrying one would not restore).
 
 ### Drops go in reverse dependency order — no cascade
 

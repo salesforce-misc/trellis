@@ -438,9 +438,11 @@ attaching a partition.
   into a table Trellis keeps beside one: a 1-1 target's `<target>__ledger`,
   an aggregate's `agg_<id>`, or a `JOIN`'s `join_<id>_*` tables;
 * a target dropped and created again by hand with the same columns;
-* a trigger or rule added to a target or one of those tables that changes
-  the rows Trellis writes, or the table set `UNLOGGED`, which a crash or
-  failover empties;
+* a trigger or rule on a target (one define created or one it adopted) or on
+  one of those tables that changes or drops the rows Trellis writes (a
+  `BEFORE` trigger returning another row or `NULL`, or a rule Postgres runs in
+  their place), or the table set `UNLOGGED`, which a crash
+  or failover empties;
 * DML, DDL or a data load into Trellis's own schema, such as another
   database's catalog rows.
 

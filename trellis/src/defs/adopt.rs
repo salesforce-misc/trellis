@@ -10,15 +10,19 @@
 //! table must look like can't drift from what a define creates: Postgres
 //! itself resolves every type, collation, nullability and key the two have.
 //!
-//! **Refuse by default.** [`check_shape`] accepts exactly what a target
-//! Trellis created can look like after changes users may make to one:
-//! indexes that aren't unique, grants, comments, row security policies,
-//! extended statistics, publications, views over it, storage parameters and
-//! its replica identity. Everything else refuses with a [`NotAdoptable`]
-//! whose [`NotAdoptable::code`] names it, and an object depending on the
-//! table of a kind the check doesn't know refuses as
-//! [`NotAdoptable::Unrecognized`], so a new Postgres feature refuses until
-//! the check learns it.
+//! **Refuse structural differences.** [`check_shape`] accepts exactly what
+//! a target Trellis created can look like after anything a user may add to
+//! one: indexes (unique or not), constraints (`CHECK`, unique, exclusion,
+//! foreign keys, deferrable or not), foreign keys of other tables
+//! referencing it, triggers, rules, grants, comments, row security
+//! policies, extended statistics, publications, views over it, storage
+//! parameters and its replica identity. What those do to the rows Trellis
+//! writes is the user's, as on a target define created. A structural
+//! difference (the kind of table, its columns, its key, an owned sequence)
+//! refuses with a [`NotAdoptable`] whose [`NotAdoptable::code`] names it,
+//! and an object depending on the table of a kind the check doesn't know
+//! refuses as [`NotAdoptable::Unrecognized`], so a new Postgres feature
+//! refuses until the check learns it.
 
 use std::fmt;
 
@@ -99,10 +103,6 @@ pub struct TableDescription {
     /// Its constraints, not-null constraints aside (nullability is read off
     /// each column).
     pub constraints: Vec<ConstraintDescription>,
-    /// Its unique indexes that back no constraint, by name.
-    pub unique_indexes: Vec<String>,
-    /// Its triggers, internal ones (a foreign key's) aside, by name.
-    pub triggers: Vec<String>,
     /// Every object that depends on it, by [`Dependent::kind`].
     pub dependents: Vec<Dependent>,
 }
@@ -183,7 +183,8 @@ pub struct Dependent {
 
 /// Dependents the check accepts: what a define creates (the row type, the
 /// key and its index, the TOAST table), what's compared elsewhere (defaults,
-/// constraints, triggers), and what users may add to a target.
+/// constraints), and what users may add to a target (indexes, triggers,
+/// rules, another table's foreign key referencing it, …).
 const ACCEPTED_DEPENDENTS: &[&str] = &[
     "pg_type",
     "pg_constraint",
@@ -195,6 +196,8 @@ const ACCEPTED_DEPENDENTS: &[&str] = &[
     "index",
     "toast",
     "view",
+    "rule",
+    "referencing_constraint",
 ];
 
 /// Why a define can't adopt an existing table. [`Self::code`] names the
@@ -261,22 +264,6 @@ pub enum NotAdoptable {
         expected: String,
         found: Option<String>,
     },
-    /// A `CHECK` constraint.
-    CheckConstraint { name: String },
-    /// A unique or primary-key constraint besides the key.
-    UniqueConstraint { name: String },
-    /// An exclusion constraint.
-    ExclusionConstraint { name: String },
-    /// A foreign key on the table.
-    ForeignKey { name: String },
-    /// Another table's foreign key referencing the table.
-    ReferencedByForeignKey { description: String },
-    /// A unique index besides the key's.
-    UniqueIndex { name: String },
-    /// A trigger.
-    Trigger { name: String },
-    /// A rule.
-    Rule { description: String },
     /// A sequence owned by one of its columns.
     OwnedSequence { description: String },
     /// Something the check doesn't recognise: a constraint kind or a
@@ -310,15 +297,6 @@ impl NotAdoptable {
             NotAdoptable::GeneratedColumn { .. } => "generated_column",
             NotAdoptable::IdentityColumn { .. } => "identity_column",
             NotAdoptable::Key { .. } => "key",
-            NotAdoptable::CheckConstraint { .. } => "check_constraint",
-            NotAdoptable::UniqueConstraint { .. } => "unique_constraint",
-            NotAdoptable::ExclusionConstraint { .. } => "exclusion_constraint",
-            NotAdoptable::ForeignKey { .. } | NotAdoptable::ReferencedByForeignKey { .. } => {
-                "foreign_key"
-            }
-            NotAdoptable::UniqueIndex { .. } => "unique_index",
-            NotAdoptable::Trigger { .. } => "trigger",
-            NotAdoptable::Rule { .. } => "rule",
             NotAdoptable::OwnedSequence { .. } => "owned_sequence",
             NotAdoptable::Unrecognized { .. } => "unrecognized",
         }
@@ -417,30 +395,6 @@ impl fmt::Display for NotAdoptable {
                 Some(found) => write!(f, "it is keyed by {found}, not {expected}"),
                 None => write!(f, "it has no {expected}, the key define creates"),
             },
-            NotAdoptable::CheckConstraint { name } => {
-                write!(f, "it has CHECK constraint \"{name}\"")
-            }
-            NotAdoptable::UniqueConstraint { name } => write!(
-                f,
-                "it has unique constraint \"{name}\" besides the key define creates"
-            ),
-            NotAdoptable::ExclusionConstraint { name } => {
-                write!(f, "it has exclusion constraint \"{name}\"")
-            }
-            NotAdoptable::ForeignKey { name } => {
-                write!(f, "it has foreign key \"{name}\"")
-            }
-            NotAdoptable::ReferencedByForeignKey { description } => write!(
-                f,
-                "{description} references it, and Trellis deletes and truncates its \
-                 target's rows"
-            ),
-            NotAdoptable::UniqueIndex { name } => write!(
-                f,
-                "it has unique index \"{name}\" besides the key define creates"
-            ),
-            NotAdoptable::Trigger { name } => write!(f, "it has trigger \"{name}\""),
-            NotAdoptable::Rule { description } => write!(f, "it has {description}"),
             NotAdoptable::OwnedSequence { description } => {
                 write!(f, "{description} is owned by one of its columns")
             }
@@ -453,7 +407,7 @@ impl fmt::Display for NotAdoptable {
 }
 
 /// Whether `actual` has exactly the shape `expected` (the probe of what
-/// define creates) has, allowing only what users may add to a target.
+/// define creates) has, allowing anything users may add to a target.
 /// The first difference found refuses.
 ///
 /// Column order counts: define creates the columns in the definition's
@@ -496,20 +450,10 @@ pub fn check_shape(
     }
     check_columns(&expected.columns, &actual.columns)?;
     check_constraints(&expected.constraints, &actual.constraints)?;
-    if let Some(name) = actual.unique_indexes.first() {
-        return Err(NotAdoptable::UniqueIndex { name: name.clone() });
-    }
-    if let Some(name) = actual.triggers.first() {
-        return Err(NotAdoptable::Trigger { name: name.clone() });
-    }
     for dependent in &actual.dependents {
         let description = dependent.description.clone();
         match dependent.kind.as_str() {
             kind if ACCEPTED_DEPENDENTS.contains(&kind) => {}
-            "rule" => return Err(NotAdoptable::Rule { description }),
-            "referencing_constraint" => {
-                return Err(NotAdoptable::ReferencedByForeignKey { description });
-            }
             "sequence" => return Err(NotAdoptable::OwnedSequence { description }),
             _ => return Err(NotAdoptable::Unrecognized { description }),
         }
@@ -579,6 +523,11 @@ fn check_columns(
     Ok(())
 }
 
+/// Whether `actual` holds each key `expected` has, keyed alike
+/// ([`ConstraintDescription::keys_like`]). Any other constraint of a kind a
+/// user may add (`CHECK`, unique, primary key, exclusion, foreign key,
+/// constraint trigger) is accepted; one of another kind refuses as
+/// [`NotAdoptable::Unrecognized`].
 fn check_constraints(
     expected: &[ConstraintDescription],
     actual: &[ConstraintDescription],
@@ -592,28 +541,26 @@ fn check_constraints(
             None => {
                 return Err(NotAdoptable::Key {
                     expected: key.render(),
+                    // A key of define's kind first: another unique
+                    // constraint is a user's, and accepted.
                     found: actual
                         .iter()
-                        .find(|c| matches!(c.kind, 'p' | 'u'))
+                        .find(|c| c.kind == key.kind)
+                        .or_else(|| actual.iter().find(|c| matches!(c.kind, 'p' | 'u')))
                         .map(ConstraintDescription::render),
                 });
             }
         }
     }
-    if let Some(other) = rest.first() {
-        let name = other.name.clone();
-        return Err(match other.kind {
-            'c' => NotAdoptable::CheckConstraint { name },
-            'p' | 'u' => NotAdoptable::UniqueConstraint { name },
-            'x' => NotAdoptable::ExclusionConstraint { name },
-            'f' => NotAdoptable::ForeignKey { name },
-            't' => NotAdoptable::Trigger { name },
-            kind => NotAdoptable::Unrecognized {
-                description: format!("constraint \"{name}\" of kind '{kind}'"),
-            },
-        });
+    match rest
+        .iter()
+        .find(|c| !matches!(c.kind, 'c' | 'p' | 'u' | 'x' | 'f' | 't'))
+    {
+        Some(other) => Err(NotAdoptable::Unrecognized {
+            description: format!("constraint \"{}\" of kind '{}'", other.name, other.kind),
+        }),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 fn relkind_name(kind: char) -> &'static str {
@@ -710,30 +657,6 @@ pub(crate) async fn describe(
             nulls_not_distinct: row.get(5),
         })
         .collect();
-    let unique_indexes = client
-        .query(
-            "select ic.relname::text from pg_catalog.pg_index i \
-             join pg_catalog.pg_class ic on ic.oid = i.indexrelid \
-             where i.indrelid = $1 and i.indisunique \
-               and not exists (select from pg_catalog.pg_constraint co \
-                               where co.conrelid = $1 and co.conindid = i.indexrelid) \
-             order by ic.relname",
-            &[&oid],
-        )
-        .await?
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
-    let triggers = client
-        .query(
-            "select tgname::text from pg_catalog.pg_trigger \
-             where tgrelid = $1 and not tgisinternal order by tgname",
-            &[&oid],
-        )
-        .await?
-        .into_iter()
-        .map(|row| row.get(0))
-        .collect();
     let dependents = client
         .query(
             "select case \
@@ -778,8 +701,6 @@ pub(crate) async fn describe(
         extension: row.get(6),
         columns,
         constraints,
-        unique_indexes,
-        triggers,
         dependents,
     })
 }
@@ -987,6 +908,7 @@ mod tests {
     fn what_users_may_add_to_a_target_is_accepted() {
         let mut table = actual();
         for kind in [
+            // Indexes, unique or not, partial or on expressions.
             "index",
             "toast",
             "view",
@@ -996,10 +918,49 @@ mod tests {
             "pg_attrdef",
             "pg_constraint",
             "pg_trigger",
+            "rule",
+            // Another table's foreign key referencing it.
+            "referencing_constraint",
         ] {
             table.dependents.push(dependent(kind));
         }
         assert_eq!(check_shape(&expected(), &table), Ok(()));
+    }
+
+    #[test]
+    fn every_kind_of_constraint_a_user_may_add_is_accepted_beside_the_key() {
+        for kind in ['c', 'u', 'x', 'f', 't'] {
+            for deferrable in [false, true] {
+                let mut table = actual();
+                let mut constraint = other(kind);
+                constraint.deferrable = deferrable;
+                table.constraints.push(constraint);
+                assert_eq!(
+                    check_shape(&expected(), &table),
+                    Ok(()),
+                    "{kind}, deferrable: {deferrable}"
+                );
+            }
+        }
+        // One on the key's own columns, keyed exactly as the key is.
+        let mut table = actual();
+        let mut twin = key('u', &["id"]);
+        twin.name = "id_unique".to_string();
+        table.constraints.push(twin);
+        assert_eq!(check_shape(&expected(), &table), Ok(()));
+    }
+
+    #[test]
+    fn a_misshapen_key_is_named_over_a_users_unique_constraint() {
+        let mut table = actual();
+        table.constraints = vec![other('u'), key('p', &["id", "region"])];
+        assert_eq!(
+            check_shape(&expected(), &table),
+            Err(NotAdoptable::Key {
+                expected: "primary key (id)".to_string(),
+                found: Some("primary key (id, region)".to_string()),
+            })
+        );
     }
 
     #[test]
@@ -1088,35 +1049,16 @@ mod tests {
                 "key",
                 Box::new(|t| t.constraints[0].included = vec!["region".to_string()]),
             ),
+            // A user's unique constraint doesn't stand in for the key.
             (
-                "foreign_key",
-                Box::new(|t| t.dependents.push(dependent("referencing_constraint"))),
+                "key",
+                Box::new(|t| t.constraints = vec![other('u'), other('c')]),
             ),
             (
                 "unrecognized",
                 Box::new(|t| t.dependents.push(dependent("referencing_trigger"))),
             ),
-            (
-                "check_constraint",
-                Box::new(|t| t.constraints.push(other('c'))),
-            ),
-            (
-                "unique_constraint",
-                Box::new(|t| t.constraints.push(other('u'))),
-            ),
-            (
-                "exclusion_constraint",
-                Box::new(|t| t.constraints.push(other('x'))),
-            ),
-            ("foreign_key", Box::new(|t| t.constraints.push(other('f')))),
-            ("trigger", Box::new(|t| t.constraints.push(other('t')))),
             ("unrecognized", Box::new(|t| t.constraints.push(other('z')))),
-            (
-                "unique_index",
-                Box::new(|t| t.unique_indexes.push("u".to_string())),
-            ),
-            ("trigger", Box::new(|t| t.triggers.push("tg".to_string()))),
-            ("rule", Box::new(|t| t.dependents.push(dependent("rule")))),
             (
                 "owned_sequence",
                 Box::new(|t| t.dependents.push(dependent("sequence"))),

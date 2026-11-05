@@ -4,10 +4,13 @@
 //!
 //! Each key space adopts a table created by hand as define would create it,
 //! with an index and a grant added, and the build fills it while the index
-//! and the grant stay. Then one refusal per class of property the check
+//! and the grant stay; a table carrying everything a user may add to any
+//! target adopts too. Then one refusal per class of property the check
 //! refuses, a table with rows, a taken ledger name and a missing privilege.
-//! Builds run by hand ([`build_everything`]); nothing waits for a background
-//! pass.
+//! Last, what a user's unique index and another table's foreign key
+//! referencing the target do to the rows Trellis writes, drained by hand
+//! through `support/drain_driver.rs`. Builds run by hand
+//! ([`build_everything`]); nothing waits for a background pass.
 
 use testkit::TestCluster;
 use tokio_postgres::Client;
@@ -303,57 +306,14 @@ async fn every_class_of_property_define_would_not_create_refuses_with_its_code()
             "create table public.t (id bigint, a numeric, r text, primary key (id) \
              deferrable)",
         ),
+        // A user's unique constraint doesn't stand in for the key.
         (
-            "check_constraint",
-            "create table public.t (id bigint, a numeric, r text, primary key (id), \
-             check (a > 0))",
-        ),
-        (
-            "unique_constraint",
-            "create table public.t (id bigint, a numeric, r text, primary key (id), \
-             unique (r))",
-        ),
-        (
-            "exclusion_constraint",
-            "create table public.t (id bigint, a numeric, r text, primary key (id), \
-             exclude using btree (r with =))",
-        ),
-        (
-            "foreign_key",
-            "create table public.t (id bigint references public.s, a numeric, r text, \
-             primary key (id))",
+            "key",
+            "create table public.t (id bigint not null, a numeric, r text, unique (r))",
         ),
         (
             "key",
             "create table public.t (id bigint, a numeric, r text, primary key (id) include (r))",
-        ),
-        (
-            "foreign_key",
-            &format!(
-                "{ONE_TO_ONE_TABLE}; \
-                 create table public.child (tid bigint references public.t)"
-            ),
-        ),
-        (
-            "unique_index",
-            &format!("{ONE_TO_ONE_TABLE}; create unique index on public.t (r)"),
-        ),
-        (
-            "trigger",
-            &format!(
-                "{ONE_TO_ONE_TABLE}; \
-                 create function public.noop() returns trigger language plpgsql \
-                   as 'begin return new; end'; \
-                 create trigger t_noop before insert on public.t \
-                   for each row execute function public.noop()"
-            ),
-        ),
-        (
-            "rule",
-            &format!(
-                "{ONE_TO_ONE_TABLE}; \
-                 create rule t_nothing as on delete to public.t do instead nothing"
-            ),
         ),
         (
             "owned_sequence",
@@ -371,8 +331,7 @@ async fn every_class_of_property_define_would_not_create_refuses_with_its_code()
                  drop view public.t; \
                end if; \
              end $$; \
-             drop table if exists public.t, public.p, public.child cascade; \
-             drop function if exists public.noop(); {create}"
+             drop table if exists public.t, public.p cascade; {create}"
         ))
         .await
         .unwrap_or_else(|err| panic!("{code}: {create}: {err:?}"));
@@ -570,4 +529,205 @@ async fn a_missing_privilege_or_ownership_refuses_naming_it() {
         .await
         .expect("the table");
     trellis.apply(ONE_TO_ONE).await.expect("adopted");
+}
+
+/// Everything a user may add to any target is accepted on the table adopted:
+/// constraints of every kind beside the key (deferrable or not), a partial
+/// expression unique index, triggers, a rule and another table's foreign key
+/// referencing it. The build fills it, and each object stays.
+#[tokio::test]
+async fn everything_a_user_may_add_to_any_target_adopts() {
+    let cluster = TestCluster::start();
+    let (_db, raw, trellis) = set_up(&cluster).await;
+    raw.batch_execute(
+        "create table public.t (id bigint references public.s, a numeric, r text, \
+           primary key (id), check (a > 0), unique (a) deferrable initially deferred, \
+           exclude using btree (a with =)); \
+         create unique index t_lower_r on public.t (lower(r)) where a > 100; \
+         create function public.noop() returns trigger language plpgsql \
+           as 'begin return new; end'; \
+         create trigger t_noop before insert on public.t \
+           for each row execute function public.noop(); \
+         create constraint trigger t_later after insert on public.t deferrable \
+           for each row execute function public.noop(); \
+         create table public.child (tid bigint references public.t); \
+         create rule t_nothing as on delete to public.t do instead nothing",
+    )
+    .await
+    .expect("the table to adopt");
+    trellis
+        .apply(ONE_TO_ONE)
+        .await
+        .unwrap_or_else(|err| panic!("{ONE_TO_ONE}: {err}"));
+    // A `DELETE` rule fails the build's deletes (the docs' "Target tables
+    // are Trellis-owned"): adopted, it is the user's to drop.
+    raw.batch_execute("drop rule t_nothing on public.t")
+        .await
+        .expect("drop the rule");
+    build_everything(&trellis).await;
+    let rows: Vec<String> = raw
+        .query("select t::text from public.t t order by id", &[])
+        .await
+        .expect("read the target")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(rows, ["(1,10,x)", "(2,20,x)", "(3,5,y)"]);
+    let kept: i64 = raw
+        .query_one(
+            "select (select count(*) from pg_constraint where conrelid = 'public.t'::regclass) \
+                  + (select count(*) from pg_constraint where confrelid = 'public.t'::regclass) \
+                  + (select count(*) from pg_indexes where indexname = 't_lower_r') \
+                  + (select count(*) from pg_trigger \
+                     where tgrelid = 'public.t'::regclass and not tgisinternal)",
+            &[],
+        )
+        .await
+        .expect("count the user's objects")
+        .get(0);
+    // pkey, fkey, check, unique, exclusion and the constraint trigger's
+    // constraint; child's foreign key; the index; two triggers.
+    assert_eq!(kept, 6 + 1 + 1 + 2);
+}
+
+#[path = "support/drain_driver.rs"]
+mod drain_driver;
+
+/// A driver whose `public.nums` (keys 1 to 3, `x` equal to the key) is read
+/// by `t`, adopted from a table that carries `extra` beside the key.
+async fn adopted_with(extra: &str) -> drain_driver::Driver {
+    drain_driver::Driver::start(
+        &format!(
+            "create table public.nums (id integer primary key, x integer); \
+             insert into public.nums select g, g from generate_series(1, 3) g; \
+             create table public.t (id integer, x integer, primary key (id)); {extra}"
+        ),
+        &[
+            ("id", trellis::defs::ValueType::Numeric),
+            ("x", trellis::defs::ValueType::Numeric),
+        ],
+        &["TRANSFORM t ADOPT EXISTING TABLE FROM public.nums SELECT x AS x"],
+        &["public.nums"],
+    )
+    .await
+}
+
+/// Drains `batch` until it commits, as a drain worker retries it: each
+/// failure charges the failing keys a death, so the page commits once they
+/// are held. Bounded, not a wait for convergence.
+async fn drain_until_held(d: &drain_driver::Driver, batch: i64) {
+    for _ in 0..20 {
+        match trellis::staging::apply::drain_once(d.pool(), batch, "worker", 1, drain_driver::WAKE)
+            .await
+        {
+            Ok(Some(_)) => continue,
+            Ok(None) => return,
+            Err(_) => {}
+        }
+    }
+    panic!("the batch never drained");
+}
+
+/// The keys `t` holds in quarantine, each rendered as a row.
+async fn held(d: &drain_driver::Driver) -> Vec<String> {
+    d.rows("select key from poison order by key").await
+}
+
+/// `t`'s status, read through the facade.
+async fn status_of_t(d: &drain_driver::Driver) -> trellis::DefinitionStatus {
+    let config = Config::with_schema(d.db.dsn().to_string(), trellis::config::DEFAULT_SCHEMA)
+        .expect("config");
+    Trellis::connect(config, TrellisOptions::default())
+        .await
+        .expect("connect")
+        .status("t")
+        .await
+        .expect("read status")
+        .expect("t is registered")
+}
+
+/// A user's unique index on an adopted target refuses a row Trellis writes
+/// as on any target: the key is held, and the definition keeps running.
+#[tokio::test]
+async fn a_row_a_users_unique_index_refuses_holds_its_key() {
+    let mut d = adopted_with("create unique index t_x on public.t (x)").await;
+    d.user()
+        .await
+        .batch_execute("update public.nums set x = 3 where id = 2")
+        .await
+        .expect("write a value key 3 has");
+    let batch = d.seal().await;
+    drain_until_held(&d, batch).await;
+    assert_eq!(held(&d).await, ["(2)"]);
+    let status = status_of_t(&d).await;
+    assert_eq!(status.status, trellis::TransformStatus::Live, "{status:?}");
+    assert!(status.drain_failure.is_none(), "{status:?}");
+    assert_eq!(
+        d.rows("select * from public.t order by id").await,
+        ["(1,1)", "(2,2)", "(3,3)"]
+    );
+}
+
+/// Another table's foreign key referencing an adopted target: a delete of a
+/// referenced row holds its key, a source `TRUNCATE` (which Trellis applies
+/// as a delete of every row) holds its page back as a `drain_failure` until
+/// the referencing rows are gone, and `DROP TRANSFORM` fails while the
+/// foreign key exists.
+#[tokio::test]
+async fn a_foreign_key_referencing_an_adopted_target_fails_trellis_deletes_of_it() {
+    let mut d = adopted_with("create table public.child (tid integer references public.t)").await;
+    d.ctl
+        .batch_execute("insert into public.child values (1)")
+        .await
+        .expect("reference key 1");
+    let user = d.user().await;
+    user.batch_execute("delete from public.nums where id = 1")
+        .await
+        .expect("delete key 1");
+    let batch = d.seal().await;
+    drain_until_held(&d, batch).await;
+    assert_eq!(held(&d).await, ["(1)"]);
+
+    user.batch_execute("truncate public.nums")
+        .await
+        .expect("truncate the source");
+    let batch = d.seal().await;
+    for _ in 0..3 {
+        let err =
+            trellis::staging::apply::drain_once(d.pool(), batch, "worker", 1, drain_driver::WAKE)
+                .await
+                .expect_err("the clear is refused");
+        assert!(err.to_string().contains("child_tid_fkey"), "{err}");
+    }
+    let status = status_of_t(&d).await;
+    assert_eq!(status.status, trellis::TransformStatus::Live, "{status:?}");
+    let failure = status.drain_failure.expect("the page is held back");
+    assert_eq!(failure.sqlstate.as_deref(), Some("23503"));
+    assert_eq!(d.rows("select count(*) from public.t").await, ["(3)"]);
+
+    d.ctl
+        .batch_execute("delete from public.child")
+        .await
+        .expect("drop the reference");
+    drain_until_held(&d, batch).await;
+    assert_eq!(d.rows("select count(*) from public.t").await, ["(0)"]);
+    assert!(status_of_t(&d).await.drain_failure.is_none());
+
+    let trellis = Trellis::connect(
+        Config::with_schema(d.db.dsn().to_string(), trellis::config::DEFAULT_SCHEMA)
+            .expect("config"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect");
+    trellis.apply("PAUSE TRANSFORM t").await.expect("pause");
+    let err = trellis
+        .apply("DROP TRANSFORM t")
+        .await
+        .expect_err("the foreign key depends on the target");
+    assert!(err.to_string().contains("child_tid_fkey"), "{err}");
+    assert_eq!(
+        d.rows("select count(*) from transform_definitions").await,
+        ["(1)"]
+    );
 }
