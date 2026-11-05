@@ -345,7 +345,13 @@ beside them run on every `cargo test`.
 - **Out-of-band tampering** (`tests/self_check_cross_check.rs`). Direct writes to
   derived tables are found by `self_check`, whose SQL renderer is independently
   authored from the oracle's; the suite asserts the two agree on every generated
-  definition.
+  definition. `property_self_check_catches_tampered_extremes` does the same for
+  the `MIN`/`MAX` shape (`generate::min_max`, run serially to its end): it sets
+  one hidden extreme of a group wrong, alone or with its visible field, deletes a
+  live group's hidden row, or deletes a zero group's (which must report nothing),
+  and `self_check` must report exactly that, each extreme's recompute equal by
+  value to the oracle's. Its sweep, `extremes_tamper_planted_bugs_are_caught`,
+  gates `sc_extremes_uncompared`.
 - **Two instances** (`tests/two_instance_noise.rs`). Two Trellis instances in one
   database (or in two), each converging against its own oracle, including one
   instance reading the other's target.
@@ -371,14 +377,15 @@ beside them run on every `cargo test`.
   `generate::min_max`). One table with nullable group columns `g1` and
   `g2` and an argument of each type the engine keeps an extreme of
   (`bigint`, `numeric`, `float8`, `timestamptz`, `date`, `interval`), some
-  values equal but spelled apart (`1.0` and `1.00`, `0` and `-0`, and
-  `float8`'s infinities and `NaN`). One to three definitions group by `g1`,
+  values equal but spelled apart (`1.0` and `1.00`, `0` and `-0`,
+  `26:00:00` and `1 day 02:00:00`, and `float8`'s infinities and `NaN`). One to three definitions group by `g1`,
   `(g1, g2)` or `g2` with `COUNT(*)` and one to four `MIN`/`MAX` fields, and
   the harness creates the index of the group columns then the argument for
   each. The op stream is retention-shaped: a group's current extreme and its
   ties deleted, the oldest rows deleted (`ts` grows with each insert), whole
   groups deleted, rows moved between groups, `NULL` arguments set and
-  cleared, new extremes inserted and deleted again (half of those alone in
+  cleared, rows inserted tied with a group's extreme in another spelling,
+  new extremes inserted and deleted again (half of those alone in
   a group of their own, the delete followed by another row of the group),
   and in a quarter of the cases a `TRUNCATE`. Bursts are paced from their
   start, so a row's insertion and deletion seal into different batches, and
@@ -391,11 +398,11 @@ beside them run on every `cargo test`.
   without stalls; its sweep tier (`GENERATIVE_PLANT_TIER=min_max`) also
   stalls pages before their group lock, so a later batch's page of a group
   drains before an older one's, and gates the extremes' plants: of 48 cases
-  it caught `gbx_shared_basis` in 48, `gbx_null_key_by_equality` in 46,
-  `gbx_probe_before_lock` in 44, `gbx_absolute_write_keeps_extremes` in 30
-  and `gbx_probe_no_xbasis` in 10. `gbx_null_extreme_no_probe` and
-  `gbx_gc_ignores_xstamp` (1 of 48 each) are known misses, and the
-  `self_check` plants are left to their pins (§9).
+  it caught `gbx_shared_basis` in 48, `gbx_null_key_by_equality` in 45,
+  `gbx_probe_before_lock` in 43, `gbx_absolute_write_keeps_extremes` in 27
+  and `gbx_probe_no_xbasis` in 13. `gbx_null_extreme_no_probe` (2 of 48) and
+  `gbx_gc_ignores_xstamp` (1 of 48) are known misses, and the
+  `self_check` plants are left to the tampering tier and their pins (§9).
 - **Join convergence** (`tests/join_convergence.rs`). Two
   tables, one to three `LEFT` or `INNER` join aggregates over them (joined on one
   column or on two, grouped by the joined table's column, by a column of each
@@ -572,6 +579,10 @@ concurrency.
   rendering is pinned in a separate test.
 - **Floats within a combined absolute+relative tolerance** (~1e-9), NaN ≡ NaN. (Not
   reachable until the value language gains floats.)
+- **An aggregate's `interval` by value**, as Postgres's `=` compares it (a month
+  is 30 days, a day 24 hours): `26:00:00 ≡ 1 day 02:00:00`. An aggregate holds an
+  equal value (ADR-0020), and `MIN`/`MAX` keep one of a tie's spellings. A 1-1
+  field's `interval` stays exact text.
 - **A column present on one side and absent on the other is a divergence,** not a
   missing-key skip — this is how an unwritten derived cell surfaces.
 
@@ -615,13 +626,15 @@ The planted-bug sweep (`generative::plant_sweep`; `planted_bugs_are_caught` in
 `JOIN` tier, `one_to_one_join_planted_bugs_are_caught` in
 `generative/tests/join_one_to_one_convergence.rs` for the 1-1 `JOIN` tier,
 `chained_join_planted_bugs_are_caught` in
-`generative/tests/join_chained_convergence.rs` for the chained-reader tier) runs a tier's seeded cases once unplanted, as the baseline, then
+`generative/tests/join_chained_convergence.rs` for the chained-reader tier,
+`extremes_tamper_planted_bugs_are_caught` in
+`generative/tests/self_check_cross_check.rs` for the `MIN`/`MAX` tampering tier) runs a tier's seeded cases once unplanted, as the baseline, then
 once per planted bug, and judges each plant only on cases the baseline passed.
 **No unknown failure is accepted in a generative case**: the baseline passes
 only with **zero failures outside the quarantine list**,
 `generative/baseline-quarantine.txt`. The rule is the same for every tier
 (`cooling_key`, `hot_key`, `mid_burst`, `steady_load`, `cooling_backfill`,
-`min_max`, `join`, `join_one_to_one`, `join_chained`).
+`min_max`, `join`, `join_one_to_one`, `join_chained`, `extremes_tamper`).
 
 - **Each list entry** is one line, `<tier> <seed>:<case> #<issue> <what fails>`.
   The case numbering is the sweep's, as `GENERATIVE_PLANT_ONLY=<seed>:<case>` takes
@@ -760,7 +773,8 @@ Two structural notes for when faults enter the stream:
   the concurrent tier's `planted_bugs_are_caught`, the `JOIN` tier's
   `join_planted_bugs_are_caught`, the 1-1 `JOIN` tier's
   `one_to_one_join_planted_bugs_are_caught`, the chained-reader tier's
-  `chained_join_planted_bugs_are_caught`) re-run generated cases with a deliberate bug
+  `chained_join_planted_bugs_are_caught`, the `MIN`/`MAX` tampering tier's
+  `extremes_tamper_planted_bugs_are_caught`) re-run generated cases with a deliberate bug
   planted (`trellis/src/plant.rs`) and check the tier catches it, against an
   unplanted baseline that must have zero failures outside the quarantine list
   (§6). A plant in the tier's `known_misses` is run and reported but doesn't fail
@@ -770,16 +784,19 @@ Two structural notes for when faults enter the stream:
   of them, a `JOIN`, a 1-1 target, a 1-1 `JOIN`, a target's seam feed to its
   readers), and a tier leaves out the plants of paths its programs never
   take: the concurrent tier draws no `JOIN`, the `JOIN` tier nothing else,
-  only the concurrent tier's `min_max` shape draws `MIN`/`MAX`, and only the
+  only the concurrent tier's `min_max` shape and the tampering tier draw
+  `MIN`/`MAX`, and only the
   1-1 `JOIN` tier gates the 1-1 `JOIN`'s plants. The
   chained-reader tier gates only the seam's plants: its programs take the
   other paths too, but the tiers above gate those. `early_tombstone_gc` and `chunk_without_entry_lock` are left to
   their deterministic pins too: on a 1-1 target no tier's schedule makes either
-  diverge (each tier's `not_gated` says what was measured). So are the
-  `self_check` extremes plants (`sc_…`): two make `self_check` miss a wrong
-  extreme, which a tier's oracle finds first, and the third reports a
-  correct one only while a change is in flight, and the tiers audit a
-  target once it has settled.
+  diverge (each tier's `not_gated` says what was measured). The `self_check`
+  extremes plants (`sc_…`) are the tampering tier's: `sc_extremes_uncompared`
+  makes `self_check` miss a tampered extreme, which that tier asks it to find.
+  The other two are left to their pins: `sc_extremes_under_basis` reports a
+  correct extreme only while a change is in flight, and
+  `sc_extreme_groups_uncompared` misses a group only while a probe is ahead of
+  the partials' drain, and every tier audits a target once it has settled.
   Each group-basis, extremes, `self_check`, 1-1, `JOIN`, 1-1 `JOIN` and seam
   plant is pinned by a deterministic interleaving test that fails with it
   armed, named in its doc comment.

@@ -39,18 +39,40 @@
 //! `self_check_and_the_generative_sql_oracles_agree_the_target_is_correct`-style
 //! pins for why a hand-built pin is kept alongside a property that
 //! subsumes its *coverage* rather than replacing it.
+//!
+//! # `MIN`/`MAX`: tampering with the hidden extremes
+//!
+//! `property_self_check_catches_tampered_extremes` runs a
+//! `generative::generate::min_max` program serially to its end (its
+//! definitions admitted with the engine's test-only switch), checks it
+//! against the oracle, and then tampers with one definition's hidden table
+//! ([`ExtremeTamper`]): one hidden extreme set wrong alone or with its visible
+//! field, a live group's hidden row deleted, or a zero group's hidden row
+//! deleted (#1117's F6 shape, settled, which must report nothing). `self_check`
+//! must report exactly what the tamper broke, each hidden extreme's recompute
+//! equal by value to the oracle's. Its planted-bug sweep,
+//! `extremes_tamper_planted_bugs_are_caught` (tier `extremes_tamper`), gates
+//! `sc_extremes_uncompared`. The other two `self_check` extremes plants
+//! misreport only while a change is undrained, which a settled target never
+//! has (`EXTREMES_TAMPER_NOT_GATED`).
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use generative::backend::{Backend, ManualBackend};
+use generative::baseline_quarantine;
+use generative::generate::min_max::{
+    Arg, Grouping, MinMaxDefDraw, MinMaxDraws, PK, build_min_max_program, min_max_def,
+};
 use generative::generate::trivial_one_to_one_program_with;
-use generative::model::{NamePool, Op, OpOutcome, Program, Table};
+use generative::model::{NamePool, Op, OpOutcome, Program, Table, group_key};
 use generative::oracle::sql_oracle;
-use generative::run::run_convergence;
+use generative::plant_sweep::{self, PlantPath, SweepTier, not_on_path, plant_path};
+use generative::run::{check_program, run_convergence};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
 use testkit::TestCluster;
+use trellis::dev::config::DEFAULT_SCHEMA;
 use trellis::dev::defs::PgType;
 use trellis::dev::defs::ast::{
     Expr, FieldDef, KeySpace, Operator, Predicate, TransformDef, ValueType,
@@ -747,5 +769,621 @@ proptest! {
         (program, cell_selector, field_selector) in program_with_corruption_selectors()
     ) {
         run_swept_tampering_case(&program, cell_selector, field_selector)?;
+    }
+}
+
+// ---------------------------------------------------------------------
+// MIN/MAX: tampering with a group-basis aggregate's hidden extremes.
+// ---------------------------------------------------------------------
+
+/// How [`run_extreme_tamper_case`] tampers with a `MIN`/`MAX` definition's
+/// hidden table (`trellis::staging::group_basis`'s "Extremes"), after the
+/// program has settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtremeTamper {
+    /// One hidden extreme of a live group and its visible field, set alike
+    /// to a wrong value: the visible row agrees with the hidden one, so only
+    /// `self_check`'s comparison with the source (its side 7) shows it.
+    Alike,
+    /// One hidden extreme alone: the visible row disagrees with the hidden
+    /// one, and the hidden one with the source.
+    HiddenOnly,
+    /// A live group's hidden row deleted: every partial and extreme of it is
+    /// missing.
+    LostRow,
+    /// A zero group's hidden row deleted (#1117's F6 shape, settled): a zero
+    /// group is the same as no row, so `self_check` must report nothing.
+    /// Falls back to [`ExtremeTamper::Alike`] when no zero group is left.
+    LostZeroRow,
+}
+
+/// A `MIN`/`MAX` program ([`generative::generate::min_max`]'s definitions and
+/// op stream, run serially to its end) and what to tamper with once it has
+/// settled. The selectors are resolved against the hidden table post-settle,
+/// as [`program_with_corruption_selectors`]'s are.
+#[derive(Debug, Clone)]
+struct ExtremeTamperCase {
+    draws: MinMaxDraws,
+    tamper: ExtremeTamper,
+    def: usize,
+    group: usize,
+    column: usize,
+    /// Set the extreme to `NULL` rather than to a value no row holds, when
+    /// it isn't `NULL` already.
+    to_null: bool,
+}
+
+impl ExtremeTamperCase {
+    fn program(&self) -> Program {
+        build_min_max_program(&self.draws)
+    }
+}
+
+fn extreme_tamper_case() -> impl Strategy<Value = ExtremeTamperCase> {
+    (
+        any::<u64>(),
+        prop::collection::vec(min_max_def(), 1..=3),
+        20..=60usize,
+        100..=400usize,
+        prop_oneof![
+            3 => Just(ExtremeTamper::Alike),
+            2 => Just(ExtremeTamper::HiddenOnly),
+            2 => Just(ExtremeTamper::LostRow),
+            1 => Just(ExtremeTamper::LostZeroRow),
+        ],
+        (any::<usize>(), any::<usize>(), any::<usize>()),
+        prop::bool::weighted(0.25),
+    )
+        .prop_map(
+            |(seed, defs, seed_rows, ops, tamper, (def, group, column), to_null)| {
+                ExtremeTamperCase {
+                    draws: serial_min_max_draws(seed, defs, seed_rows, ops),
+                    tamper,
+                    def,
+                    group,
+                    column,
+                    to_null,
+                }
+            },
+        )
+}
+
+/// The draws of a `MIN`/`MAX` program run serially: no `TRUNCATE` (the
+/// floor of live rows then keeps a group to tamper with) and no deferred
+/// install. The concurrency draws are the concurrent tier's and unused here.
+fn serial_min_max_draws(
+    seed: u64,
+    defs: Vec<MinMaxDefDraw>,
+    seed_rows: usize,
+    ops: usize,
+) -> MinMaxDraws {
+    MinMaxDraws {
+        seed,
+        defs,
+        deferred: None,
+        seed_rows,
+        ops,
+        truncates: 0,
+        burst_size: 1,
+        lanes: 1,
+        workers: 1,
+        seal_interval_ms: 10,
+        housekeeping_interval_ms: 100,
+        actions: Vec::new(),
+        pace_micros: 0,
+        entry_stall_seals: None,
+        commit_stall_ms: None,
+    }
+}
+
+/// The SQL type of `arg`'s column.
+fn arg_sql_type(arg: Arg) -> &'static str {
+    match arg {
+        Arg::V => "bigint",
+        Arg::N => "numeric",
+        Arg::F => "double precision",
+        Arg::Ts => "timestamp with time zone",
+        Arg::D => "date",
+        Arg::Iv => "interval",
+    }
+}
+
+/// A value of `arg` no drawn row holds: far past every domain.
+fn arg_tamper_value(arg: Arg) -> &'static str {
+    match arg {
+        Arg::V => "999999",
+        Arg::N => "12345.5",
+        Arg::F => "1e+10",
+        Arg::Ts => "2001-02-03 04:05:06+00",
+        Arg::D => "1990-01-01",
+        Arg::Iv => "1000 days",
+    }
+}
+
+/// One hidden extreme column: its name, the argument it is an extreme of
+/// (each argument of the table has a type of its own), and the visible field
+/// that reads it.
+#[derive(Debug, Clone)]
+struct HiddenExtreme {
+    column: String,
+    arg: Arg,
+    field: String,
+}
+
+/// `def`'s hidden table, qualified, and its bare name (how `self_check`
+/// names its columns in a report: `<name>.<column>`).
+async fn hidden_table(client: &tokio_postgres::Client, def: &TransformDef) -> (String, String) {
+    let id: i64 = client
+        .query_one(
+            format!(
+                "select id from {DEFAULT_SCHEMA}.transform_definitions where target_table = $1"
+            )
+            .as_str(),
+            &[&format!("public.{}", def.target)],
+        )
+        .await
+        .expect("read the definition's id")
+        .get(0);
+    let name = format!("agg_{id}");
+    (format!("{DEFAULT_SCHEMA}.{name}"), name)
+}
+
+/// The hidden table's extreme columns, each matched to its argument by type
+/// and to the visible field of the same direction over that argument.
+async fn hidden_extremes(
+    client: &tokio_postgres::Client,
+    hidden: &str,
+    def: &TransformDef,
+) -> Vec<HiddenExtreme> {
+    let rows = client
+        .query(
+            "select attname::text, format_type(atttypid, atttypmod) from pg_attribute \
+             where attrelid = $1::text::regclass and attnum > 0 and not attisdropped \
+               and (attname like '\\_\\_min\\_%' or attname like '\\_\\_max\\_%') \
+             order by attnum",
+            &[&hidden],
+        )
+        .await
+        .expect("read the hidden table's columns");
+    rows.iter()
+        .map(|row| {
+            let column: String = row.get(0);
+            let ty: String = row.get(1);
+            let arg = *Arg::ALL
+                .iter()
+                .find(|a| arg_sql_type(**a) == ty)
+                .unwrap_or_else(|| panic!("{hidden}.{column} is {ty}, no argument's type"));
+            let direction = &column[2..5];
+            let field = format!("{direction}_{}", arg.column());
+            assert!(
+                def.fields.iter().any(|f| f.name == field),
+                "{hidden}.{column} has no visible field {field} in {}",
+                def.target
+            );
+            HiddenExtreme { column, arg, field }
+        })
+        .collect()
+}
+
+/// Whether `a` and `b` are one value of `ty` (`NULL` matching `NULL`), by
+/// Postgres's `=`: an extreme's equal spellings (`1.0`, `1.00`; `26:00:00`,
+/// `1 day 02:00:00`) are one value (ADR-0020).
+async fn same_value(
+    client: &tokio_postgres::Client,
+    ty: &str,
+    a: &Option<String>,
+    b: &Option<String>,
+) -> bool {
+    client
+        .query_one(
+            format!("select $1::text::{ty} is not distinct from $2::text::{ty}").as_str(),
+            &[a, b],
+        )
+        .await
+        .expect("compare two values")
+        .get(0)
+}
+
+/// Settles `case`'s program, checks the targets against the oracle, tampers
+/// with one definition's hidden table as `case.tamper` says, and checks that
+/// `Trellis::self_check` reports exactly what the tamper broke, each hidden
+/// extreme's recompute agreeing by value with `generative::oracle`'s.
+/// Returns the tamper it ran (see [`ExtremeTamper::LostZeroRow`]); `Err`
+/// names what went wrong.
+fn run_extreme_tamper_case(case: &ExtremeTamperCase) -> Result<ExtremeTamper, String> {
+    let program = case.program();
+    TAMPERING_HARNESS.with(|h| {
+        h.runtime.block_on(async {
+            let db = h.cluster.create_isolated_database().await;
+            trellis::dev::staging::admit_min_max_for_tests();
+            let mut backend = ManualBackend::connect(db.dsn())
+                .await
+                .expect("connect manual backend");
+            let config = Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+            let pool = Pool::new(&config).expect("pool");
+            backend.install(&program).await.expect("install program");
+            for op in &program.ops {
+                backend.apply(op).await.expect("apply op");
+            }
+            backend.quiesce().await.expect("quiesce");
+            let snapshot = backend.snapshot().await.expect("snapshot");
+            let diverged = check_program(&pool, &program, &snapshot).await?;
+            if !diverged.is_empty() {
+                return Err(format!(
+                    "the settled program diverged from the oracle before any tamper — a \
+                     convergence bug, not a self_check finding: {diverged:#?}"
+                ));
+            }
+
+            let def = &program.defs[case.def % program.defs.len()];
+            let KeySpace::Aggregate { group_by } = &def.key_space else {
+                unreachable!("a min_max definition groups");
+            };
+            let client = pool.get().await.expect("pool connection");
+            let (hidden, hidden_name) = hidden_table(&client, def).await;
+            let extremes = hidden_extremes(&client, &hidden, def).await;
+            let extreme = extremes[case.column % extremes.len()].clone();
+            let group_text: Vec<String> =
+                group_by.iter().map(|c| format!("\"{c}\"::text")).collect();
+            let groups: Vec<(Vec<Option<String>>, i64)> = client
+                .query(
+                    format!(
+                        "select array[{}]::text[], __n::bigint from {hidden} order by 1",
+                        group_text.join(", ")
+                    )
+                    .as_str(),
+                    &[],
+                )
+                .await
+                .expect("read the hidden groups")
+                .iter()
+                .map(|row| (row.get(0), row.get(1)))
+                .collect();
+            let live: Vec<&Vec<Option<String>>> = groups
+                .iter()
+                .filter(|(_, n)| *n > 0)
+                .map(|(g, _)| g)
+                .collect();
+            let zero: Vec<&Vec<Option<String>>> = groups
+                .iter()
+                .filter(|(_, n)| *n == 0)
+                .map(|(g, _)| g)
+                .collect();
+            let tamper = match case.tamper {
+                ExtremeTamper::LostZeroRow if zero.is_empty() => ExtremeTamper::Alike,
+                other => other,
+            };
+            let candidates = if tamper == ExtremeTamper::LostZeroRow {
+                &zero
+            } else {
+                &live
+            };
+            if candidates.is_empty() {
+                // The floor of live rows keeps a group; a serial program
+                // never empties the table.
+                return Err(format!("no live group in {} to tamper with", def.target));
+            }
+            let group = candidates[case.group % candidates.len()].clone();
+            // The group, by its columns' text: `$1`… bind each, `NULL` too.
+            let pred: Vec<String> = group_by
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("\"{c}\"::text is not distinct from ${}", i + 1))
+                .collect();
+            let pred = pred.join(" and ");
+            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = group
+                .iter()
+                .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+            let visible = qualified_target_table("public", def);
+            let ty = arg_sql_type(extreme.arg);
+            let current: Option<String> = client
+                .query_one(
+                    format!("select {}::text from {hidden} where {pred}", extreme.column).as_str(),
+                    &params,
+                )
+                .await
+                .expect("read the hidden extreme")
+                .get(0);
+            let value: Option<String> = if case.to_null && current.is_some() {
+                None
+            } else {
+                Some(arg_tamper_value(extreme.arg).to_string())
+            };
+            let literal = match &value {
+                Some(v) => format!("'{v}'::{ty}"),
+                None => "null".to_string(),
+            };
+            let set_hidden = format!(
+                "update {hidden} set {} = {literal} where {pred}",
+                extreme.column
+            );
+            let set_visible = format!(
+                "update {visible} set \"{}\" = {literal} where {pred}",
+                extreme.field
+            );
+            let delete_row = format!("delete from {hidden} where {pred}");
+            let statements: Vec<&String> = match tamper {
+                ExtremeTamper::Alike => vec![&set_hidden, &set_visible],
+                ExtremeTamper::HiddenOnly => vec![&set_hidden],
+                ExtremeTamper::LostRow | ExtremeTamper::LostZeroRow => vec![&delete_row],
+            };
+            for sql in statements {
+                let n = client
+                    .execute(sql.as_str(), &params)
+                    .await
+                    .unwrap_or_else(|e| panic!("tamper {sql}: {e}"));
+                assert_eq!(n, 1, "{sql} wrote {n} rows");
+            }
+
+            // The oracle's own recompute of the group, the value
+            // `self_check`'s side 7 must land on.
+            let oracle = sql_oracle(&pool, def, PK).await.expect("sql oracle");
+            let oracle_row = oracle.get(&group_key(&group));
+
+            let trellis = Trellis::connect(config, TrellisOptions::default())
+                .await
+                .expect("connect read-only trellis");
+            backend.stop_engine().await.expect("stop the engine");
+            let report = self_check_to_end(&trellis, &pool, &def.target).await;
+            let what = format!(
+                "{tamper:?} of {} group {group:?} column {} ({}) to {value:?}",
+                def.target, extreme.column, extreme.field
+            );
+            let divergences = match (report.outcome, tamper) {
+                (SelfCheckOutcome::Converged, ExtremeTamper::LostZeroRow) => return Ok(tamper),
+                (other, ExtremeTamper::LostZeroRow) => {
+                    return Err(format!(
+                        "{what}: a zero group's row is the same as none, but self_check \
+                         reported {other:?}"
+                    ));
+                }
+                (SelfCheckOutcome::Diverged(divergences), _) => divergences,
+                (other, _) => {
+                    return Err(format!(
+                        "{what}: self_check reported {other:?}, not Diverged"
+                    ));
+                }
+            };
+            let key = match &divergences[0] {
+                Divergence::Cell { key, .. }
+                | Divergence::MissingRow { key }
+                | Divergence::ExtraRow { key } => key.clone(),
+                other => return Err(format!("{what}: unexpected divergence {other:?}")),
+            };
+            if divergences.iter().any(|d| {
+                !matches!(d, Divergence::Cell { key: k, .. }
+                    | Divergence::MissingRow { key: k }
+                    | Divergence::ExtraRow { key: k } if *k == key)
+            }) {
+                return Err(format!(
+                    "{what}: the divergences name more than the tampered group: {divergences:?}"
+                ));
+            }
+            let cell = |column: &str| {
+                divergences.iter().find_map(|d| match d {
+                    Divergence::Cell {
+                        column: c,
+                        persisted,
+                        recomputed,
+                        ..
+                    } if c == column => Some((persisted.clone(), recomputed.clone())),
+                    _ => None,
+                })
+            };
+            let expected_of = |field: &str| -> Option<String> {
+                oracle_row.and_then(|row| row.get(field).cloned()).flatten()
+            };
+            // Each hidden extreme that must be reported: (column, persisted,
+            // recomputed).
+            let mut want: Vec<(String, Option<String>, Option<String>, &'static str)> = Vec::new();
+            let mut cells = 0;
+            match tamper {
+                ExtremeTamper::Alike | ExtremeTamper::HiddenOnly => {
+                    want.push((
+                        format!("{hidden_name}.{}", extreme.column),
+                        value.clone(),
+                        expected_of(&extreme.field),
+                        ty,
+                    ));
+                    cells += 1;
+                    if tamper == ExtremeTamper::HiddenOnly {
+                        // The visible row against the one the hidden partials
+                        // and extremes imply.
+                        want.push((
+                            extreme.field.clone(),
+                            expected_of(&extreme.field),
+                            value.clone(),
+                            ty,
+                        ));
+                        cells += 1;
+                    }
+                    if divergences.len() != cells {
+                        return Err(format!(
+                            "{what}: expected {cells} divergence(s), got {divergences:?}"
+                        ));
+                    }
+                }
+                ExtremeTamper::LostRow => {
+                    for x in &extremes {
+                        let expected = expected_of(&x.field);
+                        if expected.is_some() {
+                            want.push((
+                                format!("{hidden_name}.{}", x.column),
+                                None,
+                                expected,
+                                arg_sql_type(x.arg),
+                            ));
+                        }
+                    }
+                }
+                ExtremeTamper::LostZeroRow => unreachable!("judged above"),
+            }
+            for (column, persisted, recomputed, ty) in want {
+                let Some((p, r)) = cell(&column) else {
+                    return Err(format!(
+                        "{what}: no divergence on {column}, got {divergences:?}"
+                    ));
+                };
+                if !same_value(&client, ty, &p, &persisted).await {
+                    return Err(format!(
+                        "{what}: {column} read as {p:?}, but {persisted:?} is what it holds"
+                    ));
+                }
+                if !same_value(&client, ty, &r, &recomputed).await {
+                    return Err(format!(
+                        "{what}: self_check recomputed {column} as {r:?}, and \
+                         generative::oracle as {recomputed:?} — the two renderers disagree"
+                    ));
+                }
+            }
+            Ok(tamper)
+        })
+    })
+}
+
+/// A hand-picked case of each tamper: a fast, readable pin of the property
+/// below.
+#[test]
+fn self_check_catches_each_tamper_of_the_hidden_extremes() {
+    let defs = vec![
+        MinMaxDefDraw {
+            grouping: Grouping::G1,
+            extremes: vec![(false, Arg::Iv), (true, Arg::N), (true, Arg::Ts)],
+            partials: true,
+        },
+        MinMaxDefDraw {
+            grouping: Grouping::G1G2,
+            extremes: vec![(true, Arg::F), (false, Arg::D), (false, Arg::V)],
+            partials: false,
+        },
+    ];
+    for (i, tamper) in [
+        ExtremeTamper::Alike,
+        ExtremeTamper::HiddenOnly,
+        ExtremeTamper::LostRow,
+        ExtremeTamper::LostZeroRow,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let case = ExtremeTamperCase {
+            draws: serial_min_max_draws(11, defs.clone(), 30, 120),
+            tamper,
+            def: i,
+            group: 2 * i + 1,
+            column: i,
+            to_null: i == 1,
+        };
+        match run_extreme_tamper_case(&case) {
+            Ok(ran) => assert_eq!(ran, tamper, "the case has no zero group"),
+            Err(message) => panic!("{message}"),
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(tampering_proptest_config())]
+
+    /// The `MIN`/`MAX` counterpart of the tampering property above: a
+    /// `generate::min_max` program run to its end, one definition's hidden
+    /// extremes tampered with ([`ExtremeTamper`]), and `self_check` must
+    /// report exactly that, each hidden extreme's recompute agreeing by
+    /// value with `generative::oracle`'s.
+    #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
+    fn property_self_check_catches_tampered_extremes(case in extreme_tamper_case()) {
+        run_extreme_tamper_case(&case).map_err(TestCaseError::fail)?;
+    }
+}
+
+/// The `self_check` extremes plants (`PlantPath::SelfCheckExtremes`) this
+/// tier doesn't gate, each with why.
+const EXTREMES_TAMPER_NOT_GATED: &[(&str, &str)] = &[
+    (
+        "sc_extremes_under_basis",
+        "self_check reads a probed extreme wrong only while a change the probe saw is still \
+         undrained, and this tier tampers with a settled target; \
+         self_check_reads_the_extremes_under_their_own_basis pins it",
+    ),
+    (
+        "sc_extreme_groups_uncompared",
+        "a group only the source's extremes have is one whose partials a probe got ahead of, \
+         which needs a change still undrained; in a settled target the source's partials and \
+         extremes have the same groups, so no tamper reaches it; \
+         self_check_compares_the_groups_only_the_extremes_have pins it",
+    ),
+];
+
+/// The tampering tier's sweep: [`EXTREMES_TAMPER_NOT_GATED`], and every
+/// plant of another path, which the tier whose programs take it gates.
+fn extremes_tamper_sweep_tier() -> SweepTier {
+    let mut not_gated: Vec<(&'static str, &'static str)> = EXTREMES_TAMPER_NOT_GATED.to_vec();
+    not_gated.extend(not_on_path(
+        &[
+            PlantPath::OneToOne,
+            PlantPath::GroupBasis,
+            PlantPath::GroupBasisWriter,
+            PlantPath::Join,
+            PlantPath::OneToOneJoin,
+            PlantPath::Chain,
+            PlantPath::Extremes,
+        ],
+        "the tampering tier runs a settled program and gates only self_check's comparison of \
+         the extremes; the plant's own path is gated by the tier its comment names",
+    ));
+    SweepTier {
+        name: baseline_quarantine::EXTREMES_TAMPER_TIER,
+        known_misses: &[],
+        not_gated,
+    }
+}
+
+/// The planted-bug sweep of [`run_extreme_tamper_case`]: the `self_check`
+/// extremes plants make `self_check` miss a wrong extreme, which this tier
+/// asks it to find. Returns at once without `GENERATIVE_PLANTS`. Run it with:
+///
+/// ```text
+/// GENERATIVE_PLANTS=all cargo test -p generative \
+///     --test self_check_cross_check extremes_tamper_planted_bugs_are_caught \
+///     -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "planted-bug sweep: run with GENERATIVE_PLANTS=all and `--ignored`"]
+fn extremes_tamper_planted_bugs_are_caught() {
+    let strategy = extreme_tamper_case().boxed();
+    plant_sweep::sweep(
+        "extremes_tamper_planted_bugs_are_caught",
+        &extremes_tamper_sweep_tier(),
+        |seed, cases| plant_sweep::seeded_cases(&strategy, seed, cases),
+        |case: &ExtremeTamperCase| {
+            run_extreme_tamper_case(case)
+                .map(drop)
+                .map_err(|message| plant_sweep::CaseFailure {
+                    key_spaces: case
+                        .program()
+                        .defs
+                        .iter()
+                        .map(|def| Some(def.key_space.clone()))
+                        .collect(),
+                    message,
+                })
+        },
+    );
+}
+
+/// The tier gates exactly the `self_check` extremes plants it can reach.
+#[test]
+fn the_extremes_tamper_tier_runs_the_self_check_extremes_plants() {
+    use trellis::dev::plant::Plant;
+    let tier = extremes_tamper_sweep_tier();
+    for plant in Plant::ALL {
+        let name = plant.name();
+        let gated = !tier.not_gated.iter().any(|(not, _)| *not == name);
+        let reachable = plant_path(*plant) == PlantPath::SelfCheckExtremes
+            && !EXTREMES_TAMPER_NOT_GATED
+                .iter()
+                .any(|(not, _)| *not == name);
+        assert_eq!(gated, reachable, "{name}");
     }
 }

@@ -1651,14 +1651,14 @@ fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'st
 }
 
 /// The `min_max` tier's measured catch rates (4 seeds x 12 cases, logbook
-/// `20261104T183527-a-sweep`, every plant fired in 48 of 48):
-/// `gbx_shared_basis` 48, `gbx_null_key_by_equality` 46,
-/// `gbx_probe_before_lock` 44, `gbx_absolute_write_keeps_extremes` 30 and
-/// `gbx_probe_no_xbasis` 10 of 48, each caught in every seed, so the tier
+/// `20261105T085101-a-sweep`, every plant fired in 48 of 48):
+/// `gbx_shared_basis` 48, `gbx_null_key_by_equality` 45,
+/// `gbx_probe_before_lock` 43, `gbx_absolute_write_keeps_extremes` 27 and
+/// `gbx_probe_no_xbasis` 13 of 48, each caught in every seed, so the tier
 /// gates them. These are its known misses, run and reported but not
 /// failed on:
 ///
-/// - `gbx_null_extreme_no_probe`, caught in 1 of 48: it needs a deletion's
+/// - `gbx_null_extreme_no_probe`, caught in 2 of 48: it needs a deletion's
 ///   page to drain before the page of the insertion it retracts, on a group
 ///   whose extreme is `NULL` (its other rows' arguments all `NULL`), and the
 ///   wrong extreme then to outlive the burst.
@@ -1674,7 +1674,9 @@ const MIN_MAX_MISSES: &[&str] = &["gbx_null_extreme_no_probe", "gbx_gc_ignores_x
 
 /// The extremes' plants the `min_max` tier doesn't gate, each with why:
 /// `self_check`'s, which it caught in none of 48 cases though each fired in
-/// all 48. Their deterministic pins in `group_basis_min_max` gate them.
+/// all 48. The tampering tier (`self_check_cross_check.rs`) gates
+/// `sc_extremes_uncompared`, and their deterministic pins in
+/// `group_basis_min_max` gate all three.
 const MIN_MAX_NOT_GATED: &[(&str, &str)] = &[
     (
         "sc_extremes_under_basis",
@@ -1685,8 +1687,9 @@ const MIN_MAX_NOT_GATED: &[(&str, &str)] = &[
     (
         "sc_extremes_uncompared",
         "it makes self_check miss a wrong extreme, and the tier's oracle finds a wrong target \
-         before its audit could (0 of 48); self_check_compares_each_extreme_with_the_sources \
-         pins it",
+         before its audit could (0 of 48); the tampering tier \
+         (self_check_cross_check.rs, extremes_tamper_planted_bugs_are_caught) gates it, and \
+         self_check_compares_each_extreme_with_the_sources pins it",
     ),
     (
         "sc_extreme_groups_uncompared",

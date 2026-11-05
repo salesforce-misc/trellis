@@ -31,7 +31,7 @@ use std::fmt;
 use trellis::dev::defs::ast::{Expr, KeySpace, Predicate, TransformDef, ValueType};
 use trellis::dev::defs::registry;
 use trellis::dev::defs::typed_literal;
-use trellis::dev::defs::{FloatWidth, IntWidth};
+use trellis::dev::defs::{FloatWidth, IntWidth, PgType};
 use trellis::dev::pool::Pool;
 
 use crate::model::{Column, PRIMARY_KEY_VALUE_TYPE, Program, Table, group_key};
@@ -85,6 +85,12 @@ enum Comparison {
     /// converged `NaN` column doesn't report as a perpetual divergence.
     #[allow(dead_code)]
     FloatTolerance,
+    /// `interval` by value, as Postgres's `=` compares it: a month is 30
+    /// days and a day 24 hours, so `1 day 02:00:00`, `26:00:00` and
+    /// `1 day 120 minutes` are one value ([`interval_micros`]). Only an
+    /// aggregate's field compares this way (ADR-0020: it holds an equal
+    /// value); a 1-1 field holds the source's exact text.
+    IntervalByValue,
 }
 
 impl Comparison {
@@ -113,9 +119,31 @@ impl Comparison {
         }
     }
 
+    /// The comparison a field of `value_type` uses in a target of
+    /// `key_space`: [`Comparison::for_type`], but an aggregate's `interval`
+    /// by value.
+    fn for_field(value_type: ValueType, key_space: &KeySpace) -> Comparison {
+        match (value_type, key_space) {
+            (ValueType::Other(PgType::Interval), KeySpace::Aggregate { .. }) => {
+                Comparison::IntervalByValue
+            }
+            _ => Comparison::for_type(value_type),
+        }
+    }
+
     fn equal(self, expected: &Option<String>, got: &Option<String>) -> bool {
         match self {
             Comparison::Exact => expected == got,
+            Comparison::IntervalByValue => match (expected, got) {
+                (None, None) => true,
+                (Some(a), Some(b)) => match (interval_micros(a), interval_micros(b)) {
+                    (Some(a), Some(b)) => a == b,
+                    // Text this parser doesn't read compares exactly, so a
+                    // difference still surfaces.
+                    _ => a == b,
+                },
+                _ => false,
+            },
             Comparison::DecimalByValue => match (expected, got) {
                 (None, None) => true,
                 (Some(a), Some(b)) => decimal_text(a) == decimal_text(b),
@@ -135,6 +163,66 @@ impl Comparison {
             },
         }
     }
+}
+
+/// An `interval`'s text, as `IntervalStyle = postgres` prints it (the
+/// harness's connections pin it), as the one number Postgres's `=` and
+/// ordering compare (`interval_cmp_value`): microseconds, a month counting
+/// 30 days and a day 24 hours. `None` for text it doesn't read.
+///
+/// The text is a list of `<number> <unit>` pairs (`year`, `mon`, `day` and
+/// the smaller units Postgres reads on input) and at most one
+/// `[+-]HH:MM:SS[.f]`, each signed on its own (`-1 days +19:00:00` is minus
+/// five hours).
+fn interval_micros(text: &str) -> Option<i128> {
+    const DAY: i128 = 86_400_000_000;
+    let mut total: i128 = 0;
+    let mut tokens = text.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token.contains(':') {
+            let (negative, clock) = match token.as_bytes()[0] {
+                b'-' => (true, &token[1..]),
+                b'+' => (false, &token[1..]),
+                _ => (false, token),
+            };
+            let mut parts = clock.split(':');
+            let hours: i128 = parts.next()?.parse().ok()?;
+            let minutes: i128 = parts.next()?.parse().ok()?;
+            let seconds = micros_of(parts.next().unwrap_or("0"))?;
+            if parts.next().is_some() {
+                return None;
+            }
+            let span = (hours * 60 + minutes) * 60_000_000 + seconds;
+            total += if negative { -span } else { span };
+            continue;
+        }
+        let unit = tokens.next()?;
+        let unit = unit.strip_suffix('s').unwrap_or(unit);
+        let scale: i128 = match unit {
+            "year" => 12 * 30 * DAY,
+            "mon" | "month" => 30 * DAY,
+            "week" => 7 * DAY,
+            "day" => DAY,
+            "hour" => 3_600_000_000,
+            "min" | "minute" => 60_000_000,
+            "sec" | "second" => 1_000_000,
+            _ => return None,
+        };
+        let value: i128 = token.parse().ok()?;
+        total += value * scale;
+    }
+    Some(total)
+}
+
+/// `SS[.f]` (up to six digits of fraction) in microseconds.
+fn micros_of(seconds: &str) -> Option<i128> {
+    let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, ""));
+    if fraction.len() > 6 || !fraction.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let whole: i128 = whole.parse().ok()?;
+    let fraction: i128 = format!("{fraction:0<6}").parse().ok()?;
+    Some(whole * 1_000_000 + fraction)
 }
 
 /// Postgres's float equality: `NaN = NaN` is true (IEEE says false) and
@@ -686,7 +774,7 @@ pub fn compare(
     let comparison_for = |column: &str| {
         field_types
             .get(column)
-            .map(|vt| Comparison::for_type(*vt))
+            .map(|vt| Comparison::for_field(*vt, &def.key_space))
             .unwrap_or(Comparison::Exact)
     };
 
@@ -1482,6 +1570,50 @@ mod tests {
         // the decimal path does. This is why comparison is per-type.
         assert!(!Comparison::Exact.equal(&Some("1.50".into()), &Some("1.500".into())));
         assert!(Comparison::Exact.equal(&Some("hi".into()), &Some("hi".into())));
+    }
+
+    /// An aggregate's `interval` compares by value, the way Postgres's `=`
+    /// does: equal spellings of one span are equal, and a month is 30 days.
+    /// A 1-1 field's stays exact text.
+    #[test]
+    fn an_aggregates_interval_compares_by_value() {
+        let interval = ValueType::Other(PgType::Interval);
+        let aggregate = KeySpace::Aggregate {
+            group_by: vec!["g".into()],
+        };
+        let by_value = Comparison::for_field(interval, &aggregate);
+        assert_eq!(by_value, Comparison::IntervalByValue);
+        assert_eq!(
+            Comparison::for_field(interval, &KeySpace::OneToOne),
+            Comparison::Exact
+        );
+        let equal = |a: &str, b: &str| by_value.equal(&Some(a.into()), &Some(b.into()));
+        for (a, b) in [
+            ("1 day", "24:00:00"),
+            ("1 day 02:00:00", "26:00:00"),
+            ("-1 days +19:00:00", "-05:00:00"),
+            ("1 mon", "30 days"),
+            ("1 year 2 mons", "420 days"),
+            ("00:00:00", "0 days"),
+            ("00:01:30.5", "00:01:30.500"),
+            ("1 day 120 minutes", "26:00:00"),
+            ("-1 days -02:00:00", "-26:00:00"),
+        ] {
+            assert!(equal(a, b), "{a} = {b}");
+            assert!(equal(b, a), "{b} = {a}");
+        }
+        for (a, b) in [
+            ("1 day", "23:00:00"),
+            ("-1 days +19:00:00", "-1 days -19:00:00"),
+            ("00:00:00.000001", "00:00:00"),
+        ] {
+            assert!(!equal(a, b), "{a} <> {b}");
+        }
+        assert!(by_value.equal(&None, &None));
+        assert!(!by_value.equal(&Some("1 day".into()), &None));
+        // Text it doesn't read compares exactly.
+        assert!(equal("P1D", "P1D"));
+        assert!(!equal("P1D", "1 day"));
     }
 
     #[test]

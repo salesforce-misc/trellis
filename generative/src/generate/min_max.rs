@@ -11,7 +11,10 @@
 //! grows with each insert (a row's creation time). Values are drawn as
 //! ordinals in the type's order and rendered as text, some of them
 //! equal-but-distinguishable: `numeric` `1`, `1.0` and `1.00`, `float8`
-//! `0` and `-0`, and `float8`'s `Infinity`, `-Infinity` and `NaN`.
+//! `0` and `-0`, `interval` `26 hours`, `26:00:00` and `1 day 02:00:00`
+//! (Postgres keeps the days apart from the hours, so these print
+//! differently, and `=` counts a day as 24 hours), and `float8`'s
+//! `Infinity`, `-Infinity` and `NaN`.
 //!
 //! Each definition ([`MinMaxDefDraw`]) groups by `g1`, by `(g1, g2)` or by
 //! `g2`, and has `COUNT(*)` and one to four `MIN`/`MAX` fields, sometimes
@@ -29,6 +32,7 @@
 //!   whose delete is followed by an insert of another row of the group
 //!   (`NULL` arguments one time in two): #1117's F2, F5 and F6 shapes, where
 //!   the deletion's page drains before the insertion's;
+//! - an insert tied with a group's current extreme, spelled afresh;
 //! - an update of one to three arguments, to or from `NULL` too;
 //! - an update that moves a row to another group;
 //! - a delete of a group's current extreme and every row tied with it;
@@ -89,7 +93,9 @@ pub enum Arg {
     Ts,
     /// `d date`.
     D,
-    /// `iv interval`, in whole minutes, so equal values print alike.
+    /// `iv interval`, in whole hours, spelled in hours alone or in days and
+    /// hours, so equal values print differently (`26:00:00` and
+    /// `1 day 02:00:00`).
     Iv,
 }
 
@@ -130,7 +136,9 @@ impl Arg {
             Arg::F => (-40, 40),
             Arg::Ts => (0, 0),
             Arg::D => (0, 60),
-            Arg::Iv => (0, 240),
+            // Hours from one day to three: many ties, each with a spelling
+            // in days and hours as well as in hours.
+            Arg::Iv => (24, 72),
         }
     }
 
@@ -162,7 +170,21 @@ impl Arg {
                 )
             }
             Arg::D => civil_date(ordinal),
-            Arg::Iv => format!("{ordinal} minutes"),
+            Arg::Iv => {
+                let (days, hours) = (ordinal.div_euclid(24), ordinal.rem_euclid(24));
+                match spelling % 4 {
+                    0 => format!("{ordinal} hours"),
+                    1 => format!(
+                        "{}{:02}:00:00",
+                        if ordinal < 0 { "-" } else { "" },
+                        ordinal.abs()
+                    ),
+                    // Each field signed on its own: `-1 days 19:00:00` is
+                    // minus five hours.
+                    _ if hours == 0 => format!("{days} days"),
+                    _ => format!("{days} days {hours:02}:00:00"),
+                }
+            }
         }
     }
 }
@@ -427,16 +449,18 @@ impl Model {
             self.group_value(4)
         };
         let g2 = self.group_value(1);
-        self.insert_into(outlier, (g1, g2), false)
+        self.insert_into(outlier, (g1, g2), false, None)
     }
 
     /// Inserts a row into the group `(g1, g2)`; with `sparse`, each argument
-    /// but `ts` is `NULL` one time in two.
+    /// but `ts` is `NULL` one time in two; with `tie`, that argument takes
+    /// that ordinal (in a spelling of its own).
     fn insert_into(
         &mut self,
         outlier: bool,
         (g1, g2): (Option<i64>, Option<i64>),
         sparse: bool,
+        tie: Option<(Arg, i64)>,
     ) -> i64 {
         let pk = self.next_pk;
         self.next_pk += 1;
@@ -465,7 +489,9 @@ impl Model {
         };
         for arg in Arg::ALL {
             let push = pushed.iter().find(|(a, _)| *a == arg).map(|(_, up)| *up);
-            let value = if sparse && arg != Arg::Ts && self.rng.chance(1, 2) {
+            let value = if let Some((_, ordinal)) = tie.filter(|(a, _)| *a == arg) {
+                Some(ordinal)
+            } else if sparse && arg != Arg::Ts && self.rng.chance(1, 2) {
                 None
             } else {
                 self.value(arg, push.filter(|_| arg != Arg::Ts))
@@ -558,9 +584,13 @@ impl Model {
             .collect()
     }
 
-    /// Deletes a group's current extreme of one of a definition's fields,
-    /// and every row tied with it.
-    fn delete_extreme(&mut self, defs: &[MinMaxDefDraw]) {
+    /// A random group's current extreme of one of a definition's fields:
+    /// the field's argument, the group's rows with their ordinals of it, and
+    /// the extreme, if any row has one.
+    fn extreme_of_a_group(
+        &mut self,
+        defs: &[MinMaxDefDraw],
+    ) -> (Arg, Vec<(i64, i64)>, Option<i64>) {
         let def = self.rng.pick(defs).clone();
         let &(max, arg) = self.rng.pick(&def.extremes);
         let group = self.random_group(def.grouping);
@@ -575,6 +605,13 @@ impl Model {
         } else {
             values.iter().map(|(_, v)| *v).min()
         };
+        (arg, values, extreme)
+    }
+
+    /// Deletes a group's current extreme of one of a definition's fields,
+    /// and every row tied with it.
+    fn delete_extreme(&mut self, defs: &[MinMaxDefDraw]) {
+        let (_, values, extreme) = self.extreme_of_a_group(defs);
         let Some(extreme) = extreme else {
             return;
         };
@@ -583,6 +620,23 @@ impl Model {
                 self.delete(pk);
             }
         }
+    }
+
+    /// Inserts a row tied with a group's current extreme of one of a
+    /// definition's fields, in a spelling drawn afresh: equal values printed
+    /// differently (`1.0` and `1.00`, `26:00:00` and `1 day 02:00:00`) meet
+    /// at the extreme, where `MIN`/`MAX` keep one of them.
+    fn tie_extreme(&mut self, defs: &[MinMaxDefDraw]) {
+        let (arg, values, extreme) = self.extreme_of_a_group(defs);
+        let (Some(extreme), Some(&(pk, _))) = (extreme, values.first()) else {
+            return;
+        };
+        if arg == Arg::Ts {
+            return;
+        }
+        let row = self.rows.iter().find(|r| r.pk == pk).expect("a live row");
+        let group = (row.g1, row.g2);
+        self.insert_into(false, group, false, Some((arg, extreme)));
     }
 
     /// Retention: deletes the oldest one to six rows, oldest first.
@@ -702,7 +756,7 @@ pub fn build_min_max_program(draws: &MinMaxDraws) -> Program {
                 // row's insertion nets to a zero group whose extremes a
                 // probe read.
                 if replace {
-                    model.insert_into(false, group, true);
+                    model.insert_into(false, group, true, None);
                 }
                 continue;
             }
@@ -731,7 +785,8 @@ pub fn build_min_max_program(draws: &MinMaxDraws) -> Program {
                     model.pending.push((due, pk, fresh));
                 }
             }
-            22..=39 => model.update_values(),
+            22..=27 => model.tie_extreme(&draws.defs),
+            28..=39 => model.update_values(),
             40..=49 => model.move_group(),
             50..=61 => model.delete_extreme(&draws.defs),
             62..=69 => model.delete_oldest(),
@@ -798,7 +853,7 @@ pub fn build_min_max_case(draws: &MinMaxDraws) -> ConcurrentCase {
 }
 
 #[cfg(feature = "proptest")]
-pub use strategy::min_max_case;
+pub use strategy::{min_max_case, min_max_def};
 
 #[cfg(feature = "proptest")]
 mod strategy {
@@ -807,7 +862,8 @@ mod strategy {
     use super::super::ActionKind;
     use super::*;
 
-    fn def_draw() -> impl Strategy<Value = MinMaxDefDraw> {
+    /// One definition of the shape (see the module doc).
+    pub fn min_max_def() -> impl Strategy<Value = MinMaxDefDraw> {
         let grouping = prop_oneof![
             2 => Just(Grouping::G1),
             2 => Just(Grouping::G1G2),
@@ -861,7 +917,7 @@ mod strategy {
         (
             (
                 any::<u64>(),
-                prop::collection::vec(def_draw(), 1..=3),
+                prop::collection::vec(min_max_def(), 1..=3),
                 prop::option::weighted(0.4, (0..3usize, 0..=1000u16)),
                 20..=60usize,
                 500..=1_100usize,
@@ -966,7 +1022,12 @@ mod tests {
         assert_eq!(Arg::F.render(3, 0), "1.5");
         assert_eq!(Arg::N.render(-4, 2), "-4.00");
         assert_eq!(Arg::Ts.render(3_661, 0), "2026-01-01 01:01:01+00");
-        assert_eq!(Arg::Iv.render(90, 0), "90 minutes");
+        assert_eq!(Arg::Iv.render(26, 0), "26 hours");
+        assert_eq!(Arg::Iv.render(26, 1), "26:00:00");
+        assert_eq!(Arg::Iv.render(26, 2), "1 days 02:00:00");
+        assert_eq!(Arg::Iv.render(48, 3), "2 days");
+        assert_eq!(Arg::Iv.render(-5, 1), "-05:00:00");
+        assert_eq!(Arg::Iv.render(-5, 2), "-1 days 19:00:00");
     }
 
     /// The stream is a pure function of its draws, every op names a row the

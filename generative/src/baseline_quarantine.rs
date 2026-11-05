@@ -38,6 +38,9 @@ pub const JOIN_ONE_TO_ONE_TIER: &str = "join_one_to_one";
 /// The chained-reader tier's sweep tier (`join_chained_convergence.rs`).
 pub const JOIN_CHAINED_TIER: &str = "join_chained";
 
+/// The `MIN`/`MAX` tampering tier's sweep tier (`self_check_cross_check.rs`).
+pub const EXTREMES_TAMPER_TIER: &str = "extremes_tamper";
+
 /// The sweep tiers an entry can name.
 pub const TIERS: &[&str] = &[
     "cooling_key",
@@ -49,6 +52,7 @@ pub const TIERS: &[&str] = &[
     JOIN_TIER,
     JOIN_ONE_TO_ONE_TIER,
     JOIN_CHAINED_TIER,
+    EXTREMES_TAMPER_TIER,
 ];
 
 /// The repository whose issues the entries name.

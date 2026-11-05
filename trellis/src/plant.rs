@@ -52,8 +52,9 @@
 //!    the concurrent tier's `planted_bugs_are_caught`, the `JOIN` tier's
 //!    `join_planted_bugs_are_caught`, the 1-1 `JOIN` tier's
 //!    `one_to_one_join_planted_bugs_are_caught`, the chained-reader tier's
-//!    `chained_join_planted_bugs_are_caught`), list it in the `not_gated` of
-//!    the tiers that don't, and record its catch rate.
+//!    `chained_join_planted_bugs_are_caught`, the `MIN`/`MAX` tampering
+//!    tier's `extremes_tamper_planted_bugs_are_caught`), list it in the
+//!    `not_gated` of the tiers that don't, and record its catch rate.
 //!
 //! A plant is never "fixed": it is the regression the tier exists to catch.
 //! If the engine code it hooks is rewritten,
@@ -483,7 +484,9 @@ pub enum Plant {
     /// the source's (side 7's values are not checked), so a wrong extreme
     /// goes unreported.
     ///
-    /// Pinned by `group_basis_min_max`'s
+    /// Gated by the generative tampering tier
+    /// (`extremes_tamper_planted_bugs_are_caught`), and pinned by
+    /// `group_basis_min_max`'s
     /// `self_check_compares_each_extreme_with_the_sources`.
     ScExtremesUncompared,
     /// #1117 / ADR-0013: `self_check` compares only the groups the source's
