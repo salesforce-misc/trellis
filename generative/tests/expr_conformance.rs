@@ -31,6 +31,7 @@ struct Harness {
     admitted: Cell<usize>,
     refused: Cell<usize>,
     gaps: Cell<usize>,
+    over_refusals: Cell<usize>,
 }
 
 thread_local! {
@@ -47,6 +48,7 @@ thread_local! {
             admitted: Cell::new(0),
             refused: Cell::new(0),
             gaps: Cell::new(0),
+            over_refusals: Cell::new(0),
         }
     };
 }
@@ -57,9 +59,8 @@ fn check_text(text: &str, intended: Option<&Expr>) -> Result<Agreement, Divergen
         match &result {
             Ok(Agreement::Admitted) => h.admitted.set(h.admitted.get() + 1),
             Ok(Agreement::RefusedAndRaises(_)) => h.refused.set(h.refused.get() + 1),
-            Ok(Agreement::KnownGap(_) | Agreement::KnownOverRefusal(_)) => {
-                h.gaps.set(h.gaps.get() + 1)
-            }
+            Ok(Agreement::KnownGap(_)) => h.gaps.set(h.gaps.get() + 1),
+            Ok(Agreement::KnownOverRefusal(_)) => h.over_refusals.set(h.over_refusals.get() + 1),
             Err(_) => {}
         }
         result
@@ -70,10 +71,11 @@ fn report() {
     HARNESS.with(|h| {
         eprintln!(
             "expression conformance: {} admitted and agreeing, {} refused and raising, \
-             {} tolerated as known gaps",
+             {} tolerated as known gaps, {} tolerated as known over-refusals",
             h.admitted.get(),
             h.refused.get(),
-            h.gaps.get()
+            h.gaps.get(),
+            h.over_refusals.get()
         );
     });
 }
@@ -1422,6 +1424,24 @@ fn a_guarded_constant_beside_a_nullif_over_a_constant_call_is_a_known_over_refus
         match check_text(text, None) {
             Ok(Agreement::KnownOverRefusal(_)) => {}
             other => panic!("`{text}`: expected the known over-refusal, got {other:?}"),
+        }
+    }
+}
+
+/// A refusal the expression earns elsewhere still stands beside the
+/// tolerated `NULLIF`, in either operand order: here the zero divisor,
+/// which define reports first or second depending on where it sits.
+#[test]
+fn a_refusal_beside_a_nullif_over_a_constant_call_still_agrees() {
+    for text in [
+        "CASE WHEN NULLIF(NULLIF(STRPOS('a', 'a'), 1), i4a) IS NOT NULL THEN 2147483647 + 1 END \
+         + CASE WHEN i4b > 0 THEN CAST(i4b AS numeric) / 0 END",
+        "CASE WHEN i4b > 0 THEN CAST(i4b AS numeric) / 0 END \
+         + CASE WHEN NULLIF(NULLIF(STRPOS('a', 'a'), 1), i4a) IS NOT NULL THEN 2147483647 + 1 END",
+    ] {
+        match check_text(text, None) {
+            Ok(Agreement::RefusedAndRaises(_)) => {}
+            other => panic!("`{text}`: expected a refusal Postgres agrees with, got {other:?}"),
         }
     }
 }

@@ -909,7 +909,9 @@ impl Fixture {
     /// ([`KNOWN_OVER_REFUSAL_NULLIF`]) and `rewritten`, with each such
     /// `NULLIF` replaced by its first argument, is admitted and agrees with
     /// Postgres. Otherwise an unrelated false refusal beside the `NULLIF`
-    /// would be tolerated with it.
+    /// would be tolerated with it. When `rewritten` is still refused for a
+    /// reason Postgres agrees with (a zero divisor elsewhere in it), so is
+    /// the expression: define would refuse it even if it folded the `NULLIF`.
     async fn recheck_without_nullifs(
         &self,
         text: &str,
@@ -920,6 +922,7 @@ impl Fixture {
         let again = crate::expr_gen::render_text(rewritten, Default::default());
         match Box::pin(self.check(&again, Some(rewritten))).await {
             Ok(Agreement::Admitted) => Ok(Agreement::KnownOverRefusal(KNOWN_OVER_REFUSAL_NULLIF)),
+            Ok(refused @ Agreement::RefusedAndRaises(_)) => Ok(refused),
             Ok(other) => Err(diverge(
                 Property::FalseRefusal,
                 format!(
