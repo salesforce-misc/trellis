@@ -129,7 +129,9 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
 
     // The plan's steady load's stall, if any, holds for the whole run, and
     // is cleared when the run ends, however it ends.
-    let _stall = plan.steady_load.map(|load| StallGuard::set(load.stall));
+    let _stall = plan
+        .steady_load
+        .map(|load| StallGuard::set(load.stall, load.group_lock_stall));
     let _commit_stall = plan.commit_stall.map(CommitStallGuard::set);
     let pace = plan.steady_load.map(|load| load.pace);
     let paced_from_start = plan.steady_load.is_some_and(|load| load.pace_from_start);
@@ -271,8 +273,9 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
 struct StallGuard;
 
 impl StallGuard {
-    fn set(stall: std::time::Duration) -> Self {
+    fn set(stall: std::time::Duration, group_lock: bool) -> Self {
         trellis::dev::interleave::set_stall(Some(stall));
+        trellis::dev::interleave::set_group_lock_stall(group_lock);
         StallGuard
     }
 }
@@ -280,6 +283,7 @@ impl StallGuard {
 impl Drop for StallGuard {
     fn drop(&mut self) {
         trellis::dev::interleave::set_stall(None);
+        trellis::dev::interleave::set_group_lock_stall(false);
     }
 }
 

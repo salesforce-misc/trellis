@@ -789,6 +789,12 @@ fn field_value_type(expr: &Expr, source_columns: &HashMap<String, ValueType>) ->
         }
         // `EXTRACT` is an unconstrained `numeric` for any operand.
         Expr::FunctionCall { name, .. } if name == "EXTRACT" => ValueType::Numeric,
+        // `MIN`/`MAX` (#1117) are their argument's type, as Postgres's are.
+        Expr::FunctionCall { name, args }
+            if (name == "MIN" || name == "MAX") && args.len() == 1 =>
+        {
+            field_value_type(&args[0], source_columns)
+        }
         // Likewise for the aggregates — `sum(int4)` is `bigint`,
         // `sum(numeric)` is `numeric`. `COUNT` is excluded on purpose:
         // `registry::aggregate_result_type` deliberately has no row for it

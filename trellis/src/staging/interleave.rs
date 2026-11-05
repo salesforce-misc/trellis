@@ -175,6 +175,12 @@
 //! chunk racing a 1-1 page needs that page held as much as one on its own
 //! path does.
 //!
+//! With [`set_group_lock_stall`], an aggregate's page also stalls before its
+//! group lock ([`PausePoint::BeforeGroupLock`]), with its sides staged and
+//! nothing locked, so a later segment's page of the same group can take the
+//! lock, apply and commit first: the out-of-order drain the `MIN`/`MAX`
+//! extremes' basis exists for (#1117).
+//!
 //! A group-basis build or rebuild stalls the same way between its
 //! enumeration and its lock statement ([`PausePoint::AfterRebuildEnumerate`],
 //! a busy build worker), where a page that commits is seen by a snapshot
@@ -194,7 +200,7 @@
 //! sweep's own processes) and clears it when the run ends, however it ends.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -507,6 +513,18 @@ pub fn set_stall(max: Option<Duration>) {
     STALL_MAX_MICROS.store(micros, Ordering::Relaxed);
 }
 
+/// Whether the stall ([`set_stall`]) also holds a group-basis page before
+/// its group lock ([`PausePoint::BeforeGroupLock`]). See the module doc's
+/// "Stalls".
+static GROUP_LOCK_STALL: AtomicBool = AtomicBool::new(false);
+
+/// Makes the stall ([`set_stall`]) also hold a group-basis aggregate's page
+/// before its group lock, or stops it. Off by default, so the tiers that set
+/// a stall without it keep their shape.
+pub fn set_group_lock_stall(on: bool) {
+    GROUP_LOCK_STALL.store(on, Ordering::Relaxed);
+}
+
 /// The longest commit stall, in microseconds; 0 for none. See the module
 /// doc's "Stalls".
 static COMMIT_STALL_MAX_MICROS: AtomicU64 = AtomicU64::new(0);
@@ -525,6 +543,9 @@ async fn stall(point: PausePoint) {
         PausePoint::AfterPlaceholders
         | PausePoint::AfterEntryLock
         | PausePoint::AfterRebuildEnumerate => STALL_MAX_MICROS.load(Ordering::Relaxed),
+        PausePoint::BeforeGroupLock if GROUP_LOCK_STALL.load(Ordering::Relaxed) => {
+            STALL_MAX_MICROS.load(Ordering::Relaxed)
+        }
         PausePoint::BeforeCommit => COMMIT_STALL_MAX_MICROS.load(Ordering::Relaxed),
         _ => return,
     };

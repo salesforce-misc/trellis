@@ -367,6 +367,35 @@ beside them run on every `cargo test`.
   the chained-reader tier, whose readers are `JOIN`s; front-door coverage of
   an aggregate chained off a target lives in
   `trellis/tests/defs_aggregate_chained_single_column_group_key.rs`.
+- **`MIN`/`MAX` convergence** (#1117; the concurrent tier's `min_max` shape,
+  `generate::min_max`). One table with nullable group columns `g1` and
+  `g2` and an argument of each type the engine keeps an extreme of
+  (`bigint`, `numeric`, `float8`, `timestamptz`, `date`, `interval`), some
+  values equal but spelled apart (`1.0` and `1.00`, `0` and `-0`, and
+  `float8`'s infinities and `NaN`). One to three definitions group by `g1`,
+  `(g1, g2)` or `g2` with `COUNT(*)` and one to four `MIN`/`MAX` fields, and
+  the harness creates the index of the group columns then the argument for
+  each. The op stream is retention-shaped: a group's current extreme and its
+  ties deleted, the oldest rows deleted (`ts` grows with each insert), whole
+  groups deleted, rows moved between groups, `NULL` arguments set and
+  cleared, new extremes inserted and deleted again (half of those alone in
+  a group of their own, the delete followed by another row of the group),
+  and in a quarter of the cases a `TRUNCATE`. Bursts are paced from their
+  start, so a row's insertion and deletion seal into different batches, and
+  later bursts re-read the table and pause and resume a definition; one
+  definition may install part way through. The oracle is each definition's
+  own `GROUP BY`, and every burst is audited by a `Strict` `self_check`.
+  Define still refuses `MIN`/`MAX`, so the runner admits them with the
+  engine's test-only switch. Its property,
+  `property_min_max_extremes_converge_under_concurrent_drains`, runs it
+  without stalls; its sweep tier (`GENERATIVE_PLANT_TIER=min_max`) also
+  stalls pages before their group lock, so a later batch's page of a group
+  drains before an older one's, and gates the extremes' plants: of 48 cases
+  it caught `gbx_shared_basis` in 48, `gbx_null_key_by_equality` in 46,
+  `gbx_probe_before_lock` in 44, `gbx_absolute_write_keeps_extremes` in 30
+  and `gbx_probe_no_xbasis` in 10. `gbx_null_extreme_no_probe` and
+  `gbx_gc_ignores_xstamp` (1 of 48 each) are known misses, and the
+  `self_check` plants are left to their pins (§9).
 - **Join convergence** (`tests/join_convergence.rs`). Two
   tables, one to three `LEFT` or `INNER` join aggregates over them (joined on one
   column or on two, grouped by the joined table's column, by a column of each
@@ -592,7 +621,7 @@ once per planted bug, and judges each plant only on cases the baseline passed.
 only with **zero failures outside the quarantine list**,
 `generative/baseline-quarantine.txt`. The rule is the same for every tier
 (`cooling_key`, `hot_key`, `mid_burst`, `steady_load`, `cooling_backfill`,
-`join`, `join_one_to_one`, `join_chained`).
+`min_max`, `join`, `join_one_to_one`, `join_chained`).
 
 - **Each list entry** is one line, `<tier> <seed>:<case> #<issue> <what fails>`.
   The case numbering is the sweep's, as `GENERATIVE_PLANT_ONLY=<seed>:<case>` takes
@@ -737,16 +766,23 @@ Two structural notes for when faults enter the stream:
   (§6). A plant in the tier's `known_misses` is run and reported but doesn't fail
   the sweep when uncaught, and one in `not_gated` (with its reason) is left out
   of `GENERATIVE_PLANTS=all`. Each plant breaks one apply path (the group basis,
-  a `JOIN`, a 1-1 target, a 1-1 `JOIN`, a target's seam feed to its
+  a group-basis aggregate's `MIN`/`MAX` extremes or `self_check`'s comparison
+  of them, a `JOIN`, a 1-1 target, a 1-1 `JOIN`, a target's seam feed to its
   readers), and a tier leaves out the plants of paths its programs never
   take: the concurrent tier draws no `JOIN`, the `JOIN` tier nothing else,
-  and only the 1-1 `JOIN` tier gates the 1-1 `JOIN`'s plants. The
+  only the concurrent tier's `min_max` shape draws `MIN`/`MAX`, and only the
+  1-1 `JOIN` tier gates the 1-1 `JOIN`'s plants. The
   chained-reader tier gates only the seam's plants: its programs take the
   other paths too, but the tiers above gate those. `early_tombstone_gc` and `chunk_without_entry_lock` are left to
   their deterministic pins too: on a 1-1 target no tier's schedule makes either
-  diverge (each tier's `not_gated` says what was measured). Each group-basis,
-  1-1, `JOIN`, 1-1 `JOIN` and seam plant is pinned by a deterministic
-  interleaving test that fails with it armed, named in its doc comment.
+  diverge (each tier's `not_gated` says what was measured). So are the
+  `self_check` extremes plants (`sc_…`): two make `self_check` miss a wrong
+  extreme, which a tier's oracle finds first, and the third reports a
+  correct one only while a change is in flight, and the tiers audit a
+  target once it has settled.
+  Each group-basis, extremes, `self_check`, 1-1, `JOIN`, 1-1 `JOIN` and seam
+  plant is pinned by a deterministic interleaving test that fails with it
+  armed, named in its doc comment.
 - Document how to run one property alone on a clean database; every property
   bootstraps what it reads, so it never depends on run order.
 

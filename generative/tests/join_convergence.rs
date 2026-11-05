@@ -408,6 +408,10 @@ fn join_sweep_tier() -> SweepTier {
         "it breaks a target's feed to a definition reading it, which only the \
              chained-reader tier (join_chained_convergence.rs) draws",
     ));
+    not_gated.extend(not_on_path(
+        &[PlantPath::Extremes, PlantPath::SelfCheckExtremes],
+        generative::plant_sweep::NO_EXTREMES,
+    ));
     SweepTier {
         name: generative::baseline_quarantine::JOIN_TIER,
         known_misses: &["join_no_j_lock", "join_t_skip_lock", "gb_early_zero_gc"],

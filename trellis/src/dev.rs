@@ -138,6 +138,10 @@ pub mod staging {
     /// `await_converged`, for a harness that must re-check the ring once
     /// without starting another wait.
     pub use crate::staging::converge::converged_through;
+    /// Lets define admit `MIN`/`MAX` on a plain aggregate for the rest of
+    /// this process (#1117): `generative`'s `MIN`/`MAX` tier defines them
+    /// through the front door while define still refuses them by family.
+    pub use crate::staging::group_basis::admit_extremes_for_tests as admit_min_max_for_tests;
     /// The plan of a group-basis page's apply statement, for plan-shape
     /// tests.
     #[cfg(any(test, feature = "internals"))]
@@ -185,7 +189,7 @@ pub mod capture {
 pub mod interleave {
     pub use crate::staging::interleave::{
         PausePoint, PauseScope, Reached, force_join_key_moves, join_key_moves, set_commit_stall,
-        set_stall, with_scope,
+        set_group_lock_stall, set_stall, with_scope,
     };
 }
 

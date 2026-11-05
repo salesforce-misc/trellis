@@ -110,7 +110,23 @@
 //! The stall is process-wide, so neither of these two tiers has a property
 //! test: they run only in [`planted_bugs_are_caught`]'s sweep processes, one
 //! case at a time with nothing else in the process, and `run_concurrent_case`
-//! refuses a case with a steady load anywhere else.
+//! refuses a case with a stall anywhere else.
+//!
+//! The `MIN`/`MAX` tier (#1117) draws `generate::min_max::min_max_case`: one
+//! table of nullable group columns and `MIN`/`MAX` arguments of every type
+//! the engine keeps an extreme of, one to three `GROUP BY` definitions of
+//! `MIN`/`MAX` fields over it, and a retention-shaped op stream (new extremes
+//! inserted and deleted again, a group's extreme and its ties deleted, the
+//! oldest rows deleted, whole groups deleted, rows moved between groups,
+//! sometimes a `TRUNCATE`), with re-reads, pauses and resumes, and a build
+//! over rows. Define still refuses `MIN`/`MAX`, so `run_concurrent_case`
+//! admits them with the engine's test-only switch for a program that has
+//! them, and audits each of its bursts by a `Strict` `self_check`.
+//! [`property_min_max_extremes_converge_under_concurrent_drains`] runs it
+//! without stalls; the sweep tier `min_max` stalls pages before their group
+//! lock, so a later batch's page of a group drains before an older one's,
+//! and gates the extremes' plants (`MIN_MAX_MISSES` and `MIN_MAX_NOT_GATED`
+//! give the measured rates of the rest).
 //!
 //! # Planted ordering bugs
 //!
@@ -240,6 +256,7 @@ use generative::backend::{
     Backend, ConcurrentBackend, ManualBackend, SEAL_ON_DEMAND_INTERVAL, SPLIT_THRESHOLD_ROWS,
 };
 use generative::baseline_quarantine;
+use generative::generate::min_max::{self, min_max_case};
 use generative::generate::{
     ActionDraw, ActionKind, AggregateColumn, AggregateFn, ConcurrentCase, DefShape, Mutate,
     TableSpec, add_burst_actions, build_program, build_program_multi_with_shapes, concurrent_plan,
@@ -281,6 +298,8 @@ struct Harness {
     mid_burst_coverage: std::cell::RefCell<generative::run::Coverage>,
     /// The cooling-key property's own report.
     cooling_coverage: std::cell::RefCell<generative::run::Coverage>,
+    /// The `MIN`/`MAX` property's own report.
+    min_max_coverage: std::cell::RefCell<generative::run::Coverage>,
     /// A planted-bug sweep's report, printed by each
     /// sweep process for the cases it ran.
     plant_coverage: std::cell::RefCell<generative::run::Coverage>,
@@ -315,6 +334,12 @@ impl Drop for Harness {
                 self.cooling_coverage.borrow()
             );
         }
+        if self.min_max_coverage.borrow().cases > 0 {
+            eprintln!(
+                "generative: concurrent_convergence MIN/MAX tier coverage:\n{}",
+                self.min_max_coverage.borrow()
+            );
+        }
         if self.plant_coverage.borrow().cases > 0 {
             eprintln!(
                 "generative: concurrent_convergence planted-bug sweep coverage:\n{}",
@@ -332,6 +357,7 @@ thread_local! {
         hot_key_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
         mid_burst_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
         cooling_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
+        min_max_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
         plant_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
     };
 }
@@ -500,14 +526,30 @@ fn run_concurrent_case(
             // test in this process would run under it too. A sweep process
             // runs one case at a time and nothing else.
             assert!(
-                case.plan.steady_load.is_none() || std::env::var_os(PLANT_CHILD_ENV).is_some(),
-                "a steady-load case runs only in a planted-bug sweep's own process"
+                (case
+                    .plan
+                    .steady_load
+                    .is_none_or(|load| load.stall.is_zero())
+                    && case.plan.commit_stall.is_none())
+                    || std::env::var_os(PLANT_CHILD_ENV).is_some(),
+                "a steady-load or commit-stalled case runs only in a planted-bug sweep's own \
+                 process"
             );
             if let Some(rows) = case.build_chunk_rows {
                 backend.set_build_chunk_rows(rows);
             }
             if let Some(ms) = case.reconcile_interval_ms {
                 backend.set_reconcile_interval(std::time::Duration::from_millis(ms));
+            }
+            if let Some(ms) = case.housekeeping_interval_ms {
+                backend.set_housekeeping_interval(std::time::Duration::from_millis(ms));
+            }
+            // MIN/MAX (#1117) is still refused at define: the min_max shape
+            // admits it with the engine's test-only switch, and audits each
+            // burst by `self_check`, which compares the extremes too.
+            if case.program.defs.iter().any(min_max::has_extremes) {
+                trellis::dev::staging::admit_min_max_for_tests();
+                backend.set_strict_audit(true);
             }
             let pool =
                 Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
@@ -605,6 +647,14 @@ proptest! {
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_cooling_keys_converge_under_concurrent_drains(case in cooling_key_case()) {
         run_concurrent_case(&case, |h| &h.cooling_coverage)?;
+    }
+
+    /// The `MIN`/`MAX` tier (#1117), without the stalls only a sweep's own
+    /// process can take. See `generative::generate::min_max`.
+    #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
+    fn property_min_max_extremes_converge_under_concurrent_drains(case in min_max_case(false)) {
+        run_concurrent_case(&case, |h| &h.min_max_coverage)?;
     }
 }
 
@@ -1587,12 +1637,83 @@ fn not_gated(listed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'st
     for (plant, why) in not_on_path(&[PlantPath::Join], NO_JOIN)
         .chain(not_on_path(&[PlantPath::OneToOneJoin], NO_ONE_TO_ONE_JOIN))
         .chain(not_on_path(&[PlantPath::Chain], NO_CHAIN))
+        .chain(not_on_path(
+            &[PlantPath::Extremes, PlantPath::SelfCheckExtremes],
+            plant_sweep::NO_EXTREMES,
+        ))
         .chain(ONE_TO_ONE_PINNED.iter().copied())
     {
         if !out.iter().any(|(listed, _)| *listed == plant) {
             out.push((plant, why));
         }
     }
+    out
+}
+
+/// The `min_max` tier's measured catch rates (4 seeds x 12 cases, logbook
+/// `20261104T183527-a-sweep`, every plant fired in 48 of 48):
+/// `gbx_shared_basis` 48, `gbx_null_key_by_equality` 46,
+/// `gbx_probe_before_lock` 44, `gbx_absolute_write_keeps_extremes` 30 and
+/// `gbx_probe_no_xbasis` 10 of 48, each caught in every seed, so the tier
+/// gates them. These are its known misses, run and reported but not
+/// failed on:
+///
+/// - `gbx_null_extreme_no_probe`, caught in 1 of 48: it needs a deletion's
+///   page to drain before the page of the insertion it retracts, on a group
+///   whose extreme is `NULL` (its other rows' arguments all `NULL`), and the
+///   wrong extreme then to outlive the burst.
+/// - `gbx_gc_ignores_xstamp`, caught in 1 of 48: it needs that reversed
+///   drain on a group the deletion's page leaves at zero, and the
+///   housekeeping's GC to run between the two pages.
+///
+/// Their deterministic pins (`group_basis_min_max`'s
+/// `f5_an_all_null_group_gains_and_loses_a_value_in_reverse` and
+/// `f6_a_zero_group_a_probe_stamped_stays_until_the_prefix_passes_it`) gate
+/// both.
+const MIN_MAX_MISSES: &[&str] = &["gbx_null_extreme_no_probe", "gbx_gc_ignores_xstamp"];
+
+/// The extremes' plants the `min_max` tier doesn't gate, each with why:
+/// `self_check`'s, which it caught in none of 48 cases though each fired in
+/// all 48. Their deterministic pins in `group_basis_min_max` gate them.
+const MIN_MAX_NOT_GATED: &[(&str, &str)] = &[
+    (
+        "sc_extremes_under_basis",
+        "self_check reads a probed extreme wrong only while a change the probe saw is still \
+         undrained, and the tier audits each burst once it has settled (0 of 48); \
+         self_check_reads_the_extremes_under_their_own_basis pins it",
+    ),
+    (
+        "sc_extremes_uncompared",
+        "it makes self_check miss a wrong extreme, and the tier's oracle finds a wrong target \
+         before its audit could (0 of 48); self_check_compares_each_extreme_with_the_sources \
+         pins it",
+    ),
+    (
+        "sc_extreme_groups_uncompared",
+        "it makes self_check miss a group only the source's extremes have, which only a zero \
+         group's lost hidden row leaves, and the tier's oracle finds a wrong target first (0 \
+         of 48); \
+         self_check_compares_the_groups_only_the_extremes_have pins it",
+    ),
+];
+
+/// The `min_max` tier's `not_gated`: [`MIN_MAX_NOT_GATED`], and every plant
+/// of another path, which the tier whose programs take that path gates.
+fn min_max_not_gated() -> Vec<(&'static str, &'static str)> {
+    use generative::plant_sweep::{PlantPath, not_on_path};
+    let mut out: Vec<(&'static str, &'static str)> = MIN_MAX_NOT_GATED.to_vec();
+    out.extend(not_on_path(
+        &[
+            PlantPath::OneToOne,
+            PlantPath::GroupBasis,
+            PlantPath::GroupBasisWriter,
+            PlantPath::Join,
+            PlantPath::OneToOneJoin,
+            PlantPath::Chain,
+        ],
+        "the min_max tier gates the MIN/MAX extremes' plants; the plant's own path is \
+         gated by the tier its comment names",
+    ));
     out
 }
 
@@ -1660,6 +1781,14 @@ fn sweep_tier_named(name: &str) -> Option<(SweepTier, BoxedStrategy<ConcurrentCa
             },
             cooling_backfill_case().boxed(),
         ),
+        "min_max" => (
+            SweepTier {
+                name: "min_max",
+                known_misses: MIN_MAX_MISSES,
+                not_gated: min_max_not_gated(),
+            },
+            min_max_case(true).boxed(),
+        ),
         _ => return None,
     })
 }
@@ -1704,6 +1833,30 @@ fn every_tier_lists_real_plants() {
                 .all(|p| tier.not_gated.iter().any(|(name, _)| *name == p.name())),
             "the {name} tier draws no JOIN, so it gates no JOIN plant"
         );
+    }
+}
+
+/// Only the `min_max` tier runs the extremes' plants, and it runs every one
+/// but `self_check`'s, which it lists with why.
+#[test]
+fn only_the_min_max_tier_runs_the_extremes_plants() {
+    use generative::plant_sweep::{PlantPath, plant_path};
+    use trellis::dev::plant::Plant;
+    for name in baseline_quarantine::CONCURRENT_TIERS {
+        let (tier, _) = sweep_tier_named(name).expect("a sweep tier");
+        for plant in Plant::ALL {
+            let path = plant_path(*plant);
+            if !matches!(path, PlantPath::Extremes | PlantPath::SelfCheckExtremes) {
+                continue;
+            }
+            let run = !tier.not_gated.iter().any(|(not, _)| *not == plant.name());
+            assert_eq!(
+                run,
+                *name == "min_max" && path == PlantPath::Extremes,
+                "{name}: {}",
+                plant.name()
+            );
+        }
     }
 }
 

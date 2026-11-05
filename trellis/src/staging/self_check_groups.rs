@@ -388,11 +388,20 @@ fn extremes_side(
             )
         })
         .collect();
+    let column = "__xbasis";
+    // Planted bug: the source's extremes are read under the partials' basis.
+    // See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let column = if crate::plant::fires(crate::plant::Plant::ScExtremesUnderBasis, true) {
+        "__basis"
+    } else {
+        column
+    };
     let lands = Lands {
         floor_key,
         basis: Some(Basis {
             hidden,
-            column: "__xbasis",
+            column,
             columns: &shape.group_cols,
             collations: &[],
         }),
@@ -762,6 +771,29 @@ fn diff_groups(
     // (`retire::collect_zero_groups`) deletes it. The extremes' groups are
     // their own (side 7): a zero group can keep an extreme its probe saw.
     let keys: BTreeSet<&String> = src.keys().chain(hid.keys()).chain(ext.keys()).collect();
+    // Planted bug: the groups only side 7 has are not compared. See
+    // `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let keys: BTreeSet<&String> = if crate::plant::fires(
+        crate::plant::Plant::ScExtremeGroupsUncompared,
+        !extremes.is_empty(),
+    ) {
+        src.keys().chain(hid.keys()).collect()
+    } else {
+        keys
+    };
+    // Planted bug: no hidden extreme is compared with the source's. See
+    // `crate::plant`.
+    let compared = columns.len();
+    #[cfg(any(test, feature = "test-util"))]
+    let compared = if crate::plant::fires(
+        crate::plant::Plant::ScExtremesUncompared,
+        !extremes.is_empty(),
+    ) {
+        partials.len()
+    } else {
+        compared
+    };
     for key in keys {
         let expected: Vec<Option<String>> = src
             .get(key)
@@ -771,7 +803,11 @@ fn diff_groups(
             .cloned()
             .collect();
         let actual = hid.get(key).unwrap_or(&empty);
-        for (column, (r, p)) in columns.iter().zip(expected.iter().zip(actual)) {
+        let compared = columns
+            .iter()
+            .zip(expected.iter().zip(actual))
+            .take(compared);
+        for (column, (r, p)) in compared {
             if r != p {
                 divergences.push(Divergence::Cell {
                     key: key.clone(),

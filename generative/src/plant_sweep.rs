@@ -96,6 +96,15 @@ pub enum PlantPath {
     /// `join_one_to_one_over_targets`, `join_over_targets` and
     /// `group_basis_chained` pin them deterministically.
     Chain,
+    /// A group-basis aggregate's `MIN`/`MAX` extremes (#1117: their probe,
+    /// their basis, their GC and the absolute writes of them): only a
+    /// definition with `MIN` or `MAX` reaches it, which only the concurrent
+    /// tier's `min_max` shape draws.
+    Extremes,
+    /// `self_check`'s comparison of a group-basis aggregate's extremes with
+    /// the source (its side 7). Only a tier that audits a `MIN`/`MAX`
+    /// definition by `self_check` reaches it.
+    SelfCheckExtremes,
 }
 
 /// The path `plant` breaks.
@@ -138,6 +147,16 @@ pub fn plant_path(plant: Plant) -> PlantPath {
         | Plant::Join1FanOutHeldRow
         | Plant::Join1ReleaseNoRederive => PlantPath::OneToOneJoin,
         Plant::SeamTokenEarly | Plant::SeamImagelessRow => PlantPath::Chain,
+        Plant::GbxProbeNoXbasis
+        | Plant::GbxSharedBasis
+        | Plant::GbxProbeBeforeLock
+        | Plant::GbxNullExtremeNoProbe
+        | Plant::GbxNullKeyByEquality
+        | Plant::GbxGcIgnoresXstamp
+        | Plant::GbxAbsoluteWriteKeepsExtremes => PlantPath::Extremes,
+        Plant::ScExtremesUnderBasis
+        | Plant::ScExtremesUncompared
+        | Plant::ScExtremeGroupsUncompared => PlantPath::SelfCheckExtremes,
     }
 }
 
@@ -152,7 +171,7 @@ pub fn plant_reaches(plant: &str, key_space: &KeySpace) -> bool {
     let join = matches!(key_space, KeySpace::Join(_));
     match plant_path(plant) {
         PlantPath::OneToOne => !aggregate && !join,
-        PlantPath::GroupBasis => aggregate,
+        PlantPath::GroupBasis | PlantPath::Extremes | PlantPath::SelfCheckExtremes => aggregate,
         PlantPath::GroupBasisWriter => aggregate || join,
         PlantPath::Join => join,
         PlantPath::OneToOneJoin => matches!(key_space, KeySpace::JoinOneToOne(_)),
@@ -601,6 +620,10 @@ fn report(tier: &SweepTier, results: &[SweepCase], excluded: &[(u64, usize)]) ->
     out
 }
 
+/// Why a tier whose programs define no `MIN`/`MAX` doesn't run the
+/// extremes' plants ([`PlantPath::Extremes`], [`PlantPath::SelfCheckExtremes`]).
+pub const NO_EXTREMES: &str = "it breaks a MIN/MAX extreme of a group-basis aggregate, which      only the concurrent tier's min_max shape (concurrent_convergence.rs,      GENERATIVE_PLANT_TIER=min_max) draws";
+
 /// The plants whose path a tier's programs never take, each with `why`:
 /// for a tier's `not_gated`.
 pub fn not_on_path(
@@ -645,7 +668,10 @@ mod tests {
         for plant in Plant::ALL {
             let name = plant.name();
             match plant_path(*plant) {
-                PlantPath::GroupBasis | PlantPath::GroupBasisWriter => {
+                PlantPath::GroupBasis
+                | PlantPath::GroupBasisWriter
+                | PlantPath::Extremes
+                | PlantPath::SelfCheckExtremes => {
                     assert!(plant_reaches(name, &group_by), "{name}");
                     assert!(!plant_reaches(name, &one_to_one), "{name}");
                 }

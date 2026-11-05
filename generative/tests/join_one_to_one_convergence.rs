@@ -467,6 +467,10 @@ fn one_to_one_sweep_tier() -> SweepTier {
         "it breaks a target's feed to a definition reading it, which only the \
          chained-reader tier (join_chained_convergence.rs) draws",
     ));
+    not_gated.extend(not_on_path(
+        &[PlantPath::Extremes, PlantPath::SelfCheckExtremes],
+        generative::plant_sweep::NO_EXTREMES,
+    ));
     SweepTier {
         name: generative::baseline_quarantine::JOIN_ONE_TO_ONE_TIER,
         known_misses: ONE_TO_ONE_KNOWN_MISSES,

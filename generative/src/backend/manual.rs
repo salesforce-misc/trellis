@@ -244,8 +244,12 @@ async fn connect_raw(config: &Config) -> Result<tokio_postgres::Client, tokio_po
     tokio::spawn(async move {
         let _ = connection.await;
     });
+    // The engine's pool pins how `timestamptz` and `interval` print
+    // (`trellis::pool`'s deterministic text output) and the oracle reads
+    // through it, so a snapshot read here pins them the same way.
     raw.batch_execute(&format!(
-        "set search_path to {}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'",
+        "set search_path to {}, public; set datestyle to 'ISO, YMD'; set bytea_output to 'hex'; \
+         set timezone to 'UTC'; set intervalstyle to 'postgres'",
         config.schema()
     ))
     .await?;
@@ -498,6 +502,11 @@ pub struct ManualBackend {
     /// with [`ManualBackend::set_reconcile_interval`]; the engine's default
     /// otherwise.
     reconcile_interval: Option<Duration>,
+    /// How often the engine client's housekeeping runs
+    /// ([`ClientOptions::housekeeping_interval`]), when a caller sets one
+    /// with [`ManualBackend::set_housekeeping_interval`]; the engine's
+    /// default otherwise.
+    housekeeping_interval: Option<Duration>,
     /// The reclaim TTL the engine client is started with
     /// ([`ClientOptions::reclaim_ttl`]), when a caller sets one with
     /// [`ManualBackend::set_reclaim_ttl`]; the engine's default otherwise.
@@ -658,6 +667,7 @@ impl ManualBackend {
                 .unwrap_or_else(|| ClientOptions::default().maintenance_interval),
             build_chunk_rows: None,
             reconcile_interval: None,
+            housekeeping_interval: None,
             reclaim_ttl: None,
             strict_audit: false,
             strict_audits_converged: 0,
@@ -699,6 +709,15 @@ impl ManualBackend {
     /// effect at the first [`Backend::install`](super::Backend::install).
     pub fn set_reconcile_interval(&mut self, interval: Duration) {
         self.reconcile_interval = Some(interval);
+    }
+
+    /// Sets how often the engine client's housekeeping runs
+    /// ([`ClientOptions::housekeeping_interval`]), which is where the
+    /// zero-group and tombstone GC run. Like
+    /// [`ManualBackend::set_build_chunk_rows`], it takes effect at the first
+    /// [`Backend::install`](super::Backend::install).
+    pub fn set_housekeeping_interval(&mut self, interval: Duration) {
+        self.housekeeping_interval = Some(interval);
     }
 
     /// Sets how long a claim may sit unrefreshed before the engine takes it
@@ -986,6 +1005,9 @@ impl ManualBackend {
                 .unwrap_or_else(|| ClientOptions::default().reconcile_interval),
             ..Default::default()
         };
+        if let Some(interval) = self.housekeeping_interval {
+            options.housekeeping_interval = interval;
+        }
         if let Some(ttl) = self.reclaim_ttl {
             options.reclaim_ttl = ttl;
             options.heartbeat.interval = ttl / 3;

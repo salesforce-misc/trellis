@@ -407,6 +407,93 @@ pub enum Plant {
     /// and `group_basis_chained`'s
     /// `an_upstream_row_that_moves_group_leaves_its_old_group`.
     SeamImagelessRow,
+    /// #1117 Rx5 (`NOBASIS`): a group-basis aggregate's extremes probe
+    /// (`staging::group_basis`'s probe statement) writes the extremes and
+    /// their stamp but not their basis `__xbasis`. A change the probe already
+    /// read then applies to the extremes again when its page drains: an
+    /// insertion of a row since deleted brings the deleted value back.
+    ///
+    /// Pinned by `group_basis_min_max`'s
+    /// `f2_every_sequence_drained_out_of_order` and
+    /// `f5_an_all_null_group_gains_and_loses_a_value_in_reverse`.
+    GbxProbeNoXbasis,
+    /// #1117 rule 1 (`SHARED`): the extremes share the partials' basis. The
+    /// probe stamps `__basis`/`__stamp` instead of `__xbasis`/`__xstamp`, and
+    /// the apply filters the extremes by `__basis`. A change the probe saw
+    /// but whose page hasn't drained is then refused for the partials too,
+    /// and its counts are lost.
+    ///
+    /// Pinned by `group_basis_min_max`'s
+    /// `f4_an_insert_below_the_next_value_racing_the_probe` and
+    /// `f2_every_sequence_drained_out_of_order`.
+    GbxSharedBasis,
+    /// #1117 Rx5 (`PRELOCK`): a page probes its groups' extremes before its
+    /// lock statement, and not after its apply. A page of the same group
+    /// that commits in between has its change overwritten by the probe's
+    /// older read, or the probe misses the group's moved row and the
+    /// page's retraction of an extreme is never re-read.
+    ///
+    /// Pinned by `group_basis_min_max`'s
+    /// `f4p_the_next_value_deleted_and_drained_before_the_lock`.
+    GbxProbeBeforeLock,
+    /// #1117 Rx4 (`NULL`): a retraction never probes a group whose extreme
+    /// is `NULL`. A deletion that drains before its insertion, onto a group
+    /// whose arguments were all `NULL`, then leaves the insertion's value
+    /// as the extreme when it drains.
+    ///
+    /// Pinned by `group_basis_min_max`'s
+    /// `f5_an_all_null_group_gains_and_loses_a_value_in_reverse`.
+    GbxNullExtremeNoProbe,
+    /// #1117 (`NULLKEY`): the extremes probe matches a `NULL` group key by
+    /// `=`, so it finds no row of a group with a `NULL` key part and reads
+    /// its extremes as `NULL`.
+    ///
+    /// Pinned by `group_basis_min_max`'s
+    /// `f5_the_null_group_probes_its_own_rows` and
+    /// `f5_every_pattern_of_null_group_columns_probes_its_own_rows`.
+    GbxNullKeyByEquality,
+    /// #1117 Rx7 (`GCX`): the zero-group GC (`staging::retire`'s
+    /// `collect_zero_groups`) ignores the extremes' stamp `__xstamp`, so it
+    /// collects a zero group whose probe saw an insertion not yet drained.
+    /// The insertion's page then lands on a fresh row with no extremes'
+    /// basis, and the extremes lose what the probe read.
+    ///
+    /// Pinned by `group_basis_min_max`'s
+    /// `f6_a_zero_group_a_probe_stamped_stays_until_the_prefix_passes_it`.
+    GbxGcIgnoresXstamp,
+    /// #1117 Rx6 (`NORX6`): an absolute write of a group-basis aggregate (a
+    /// recompute, a release, a partition correction, a build or a rebuild)
+    /// writes the partials and their basis but leaves each extreme, and its
+    /// basis and stamp, as they were.
+    ///
+    /// Pinned by `partition_group_basis`'s
+    /// `min_and_max_through_a_leaf_truncate_are_recomputed` and
+    /// `group_basis_min_max`'s `a_build_writes_the_extremes_and_their_basis`.
+    GbxAbsoluteWriteKeepsExtremes,
+    /// #1117 / ADR-0013: `self_check` reads the source's extremes under the
+    /// partials' basis `__basis` instead of their own `__xbasis`
+    /// (`staging::self_check_groups`'s side 7). A probe that saw a change
+    /// the drain hasn't applied yet then reads as a divergence.
+    ///
+    /// Pinned by `group_basis_min_max`'s
+    /// `self_check_reads_the_extremes_under_their_own_basis` and
+    /// `self_check_agrees_at_every_step_of_f2`.
+    ScExtremesUnderBasis,
+    /// #1117 / ADR-0013: `self_check` never compares a hidden extreme with
+    /// the source's (side 7's values are not checked), so a wrong extreme
+    /// goes unreported.
+    ///
+    /// Pinned by `group_basis_min_max`'s
+    /// `self_check_compares_each_extreme_with_the_sources`.
+    ScExtremesUncompared,
+    /// #1117 / ADR-0013: `self_check` compares only the groups the source's
+    /// partials or the hidden table list, not those only side 7 (the
+    /// source's extremes) has, so a hidden row lost from a group whose
+    /// partials are zero goes unreported.
+    ///
+    /// Pinned by `group_basis_min_max`'s
+    /// `self_check_compares_the_groups_only_the_extremes_have`.
+    ScExtremeGroupsUncompared,
 }
 
 impl Plant {
@@ -449,6 +536,16 @@ impl Plant {
         Plant::Join1ReleaseNoRederive,
         Plant::SeamTokenEarly,
         Plant::SeamImagelessRow,
+        Plant::GbxProbeNoXbasis,
+        Plant::GbxSharedBasis,
+        Plant::GbxProbeBeforeLock,
+        Plant::GbxNullExtremeNoProbe,
+        Plant::GbxNullKeyByEquality,
+        Plant::GbxGcIgnoresXstamp,
+        Plant::GbxAbsoluteWriteKeepsExtremes,
+        Plant::ScExtremesUnderBasis,
+        Plant::ScExtremesUncompared,
+        Plant::ScExtremeGroupsUncompared,
     ];
 
     /// The name [`PLANT_ENV`] takes.
@@ -491,6 +588,16 @@ impl Plant {
             Plant::Join1ReleaseNoRederive => "join1_release_no_rederive",
             Plant::SeamTokenEarly => "seam_token_early",
             Plant::SeamImagelessRow => "seam_imageless_row",
+            Plant::GbxProbeNoXbasis => "gbx_probe_no_xbasis",
+            Plant::GbxSharedBasis => "gbx_shared_basis",
+            Plant::GbxProbeBeforeLock => "gbx_probe_before_lock",
+            Plant::GbxNullExtremeNoProbe => "gbx_null_extreme_no_probe",
+            Plant::GbxNullKeyByEquality => "gbx_null_key_by_equality",
+            Plant::GbxGcIgnoresXstamp => "gbx_gc_ignores_xstamp",
+            Plant::GbxAbsoluteWriteKeepsExtremes => "gbx_absolute_write_keeps_extremes",
+            Plant::ScExtremesUnderBasis => "sc_extremes_under_basis",
+            Plant::ScExtremesUncompared => "sc_extremes_uncompared",
+            Plant::ScExtremeGroupsUncompared => "sc_extreme_groups_uncompared",
         }
     }
 

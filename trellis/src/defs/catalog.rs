@@ -4958,7 +4958,14 @@ pub(crate) async fn revalidate(
     if source_columns.is_empty() {
         return Err(CatalogError::SourceTableNotFound(source.to_string()));
     }
-    validate_with_source(&definition.def, &source_columns, source)?;
+    // A test admitting `MIN`/`MAX` validates the definition with them typed
+    // away (`staging::group_basis::define_view`), as define does.
+    #[cfg(any(test, feature = "test-util"))]
+    let admitted = crate::staging::group_basis::define_view(&definition.def, &source_columns);
+    let validated = &definition.def;
+    #[cfg(any(test, feature = "test-util"))]
+    let validated = admitted.as_ref().unwrap_or(validated);
+    validate_with_source(validated, &source_columns, source)?;
     reject_virtual_generated_reads(&definition.def, None, source, &virtual_columns)?;
     let source_key = validate_live_schema(txn, schema, &definition.def, source).await?;
     if let KeySpace::OneToOne = definition.def.key_space {

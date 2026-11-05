@@ -475,6 +475,11 @@ pub struct SteadyLoad {
     /// step (`trellis::dev::interleave::set_stall`), all run long, so some
     /// pages are slow next to others, as a busy worker's are.
     pub stall: std::time::Duration,
+    /// Whether the stall also holds a group-basis aggregate's page before
+    /// its group lock (`trellis::dev::interleave::set_group_lock_stall`), so
+    /// a later segment's page of the group can drain first. Only the
+    /// `MIN`/`MAX` shape (`crate::generate::min_max`) sets it.
+    pub group_lock_stall: bool,
 }
 
 /// One burst of a [`ConcurrentPlan`]: `lanes[i]` is the `program.ops`

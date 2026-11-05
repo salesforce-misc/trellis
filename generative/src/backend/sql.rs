@@ -156,19 +156,31 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
 }
 
 /// The source indexes `def` needs, as `(table, leading columns)`: an
-/// aggregate's `GROUP BY` columns on its source, and a `JOIN` side's `ON`
-/// columns, in `ON` order, on each side. Asked of every definition, whether or
-/// not the engine requires it: the index serves a `self_check` walk either way.
+/// aggregate's `GROUP BY` columns on its source, then for each `MIN`/`MAX`
+/// argument (a plain column) the `GROUP BY` columns and the argument (#1117
+/// rule 4: the extremes' probe reads one endpoint of it per group), and a
+/// `JOIN` side's `ON` columns, in `ON` order, on each side. Asked of every
+/// definition, whether or not the engine requires it: the index serves a
+/// `self_check` walk either way.
 pub(super) fn required_source_indexes(def: &TransformDef) -> Vec<(String, Vec<String>)> {
     match &def.key_space {
         KeySpace::OneToOne | KeySpace::JoinOneToOne(_) => Vec::new(),
         KeySpace::Aggregate { group_by } => {
-            let columns: Vec<String> = group_by.to_vec();
-            if columns.len() == group_by.len() {
-                vec![(def.source.clone(), columns)]
-            } else {
-                Vec::new()
+            let mut indexes = vec![(def.source.clone(), group_by.to_vec())];
+            for field in &def.fields {
+                if let Expr::FunctionCall { name, args } = &field.expr
+                    && (name == "MIN" || name == "MAX")
+                    && let [Expr::Column(arg) | Expr::SourceColumn { column: arg, .. }] =
+                        args.as_slice()
+                {
+                    let mut columns = group_by.to_vec();
+                    columns.push(arg.clone());
+                    if !indexes.iter().any(|(_, c)| *c == columns) {
+                        indexes.push((def.source.clone(), columns));
+                    }
+                }
             }
+            indexes
         }
         KeySpace::Join(join) => [def.source.as_str(), join.right.as_str()]
             .into_iter()

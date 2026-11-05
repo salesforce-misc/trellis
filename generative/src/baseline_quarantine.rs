@@ -26,6 +26,7 @@ pub const CONCURRENT_TIERS: &[&str] = &[
     "hot_key",
     "mid_burst",
     "steady_load",
+    "min_max",
 ];
 
 /// The `JOIN` tier's sweep tier (`join_convergence.rs`).
@@ -44,6 +45,7 @@ pub const TIERS: &[&str] = &[
     "hot_key",
     "mid_burst",
     "steady_load",
+    "min_max",
     JOIN_TIER,
     JOIN_ONE_TO_ONE_TIER,
     JOIN_CHAINED_TIER,

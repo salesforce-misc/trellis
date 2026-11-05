@@ -130,6 +130,7 @@
 pub mod join;
 pub mod join_chained;
 pub mod join_one_to_one;
+pub mod min_max;
 pub mod partition;
 
 use std::collections::HashMap;
@@ -1847,6 +1848,10 @@ pub struct ConcurrentCase {
     /// How often the engine's reconcile pass runs, which is where a build
     /// starts, in milliseconds, or `None` for the engine's default (5s).
     pub reconcile_interval_ms: Option<u64>,
+    /// How often the engine's housekeeping (where the zero-group and
+    /// tombstone GC run) runs, in milliseconds, or `None` for the engine's
+    /// default.
+    pub housekeeping_interval_ms: Option<u64>,
 }
 
 /// [`build_program_multi_with_derived`] is [`build_program_multi_with_shapes_and_derived`]'s
@@ -3669,6 +3674,7 @@ mod strategy {
                         pace: std::time::Duration::from_micros(load.pace_micros),
                         pace_from_start: backfill.is_some(),
                         stall: std::time::Duration::from_millis(seal * u64::from(load.stall_seals)),
+                        group_lock_stall: false,
                     });
                     let mut plan = add_burst_actions(plan, &program, &extras.actions);
                     if let Some(backfill) = &backfill {
@@ -3687,6 +3693,7 @@ mod strategy {
                         // action that asked for it: at the engine's 5s
                         // default, long after its burst.
                         reconcile_interval_ms: load.map(|_| seal),
+                        housekeeping_interval_ms: None,
                     }
                 },
             )

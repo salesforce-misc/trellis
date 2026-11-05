@@ -553,7 +553,7 @@ fn extremes_typed_away(
 static ADMIT_EXTREMES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Turns [`ADMIT_EXTREMES`] on for the rest of this process.
-#[cfg(any(test, feature = "internals"))]
+#[cfg(any(test, feature = "test-util"))]
 pub fn admit_extremes_for_tests() {
     ADMIT_EXTREMES.store(true, std::sync::atomic::Ordering::Relaxed);
 }
@@ -909,6 +909,10 @@ pub(crate) fn collect_zero_groups_sql(
     basis: bool,
     xbasis: bool,
 ) -> String {
+    // Planted bug: the GC ignores the extremes' stamp. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    let xbasis =
+        xbasis && !crate::plant::fires(crate::plant::Plant::GbxGcIgnoresXstamp, basis && xbasis);
     let rule = match (basis, xbasis) {
         (true, true) => {
             " and (__basis is null or __stamp <= $2) and (__xbasis is null or __xstamp <= $2)"
@@ -2103,6 +2107,20 @@ impl GroupTargetPlan {
         let mut returning = returning.to_vec();
         let mut probe = Vec::with_capacity(extremes.len());
         let mut prior = Vec::with_capacity(extremes.len());
+        let xok = "(b.__xbasis is null or not pg_visible_in_snapshot(sg.__txid, b.__xbasis))";
+        // Planted bug: the extremes are filtered by the partials' basis. See
+        // `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        let xok = if crate::plant::armed() == Some(crate::plant::Plant::GbxSharedBasis) {
+            "(b.__basis is null or not pg_visible_in_snapshot(sg.__txid, b.__basis))"
+        } else {
+            xok
+        };
+        let null_probes = true;
+        // Planted bug: a `NULL` extreme is never probed. See `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        let null_probes =
+            null_probes && !crate::plant::fires(crate::plant::Plant::GbxNullExtremeNoProbe, true);
         for x in extremes {
             let (agg, plus, minus, old) = (x.aggregate(), x.plus(), x.minus(), x.named("__o"));
             let column = x.column();
@@ -2118,10 +2136,12 @@ impl GroupTargetPlan {
                 "t.{old} as {old}, u.{column} as {}",
                 x.named("__n")
             ));
-            probe.push(format!(
-                "(t.{minus} is not null and (u.{column} is null or {}))",
-                x.reaches(&format!("t.{minus}"), &format!("u.{column}"))
-            ));
+            let reached = x.reaches(&format!("t.{minus}"), &format!("u.{column}"));
+            probe.push(if null_probes {
+                format!("(t.{minus} is not null and (u.{column} is null or {reached}))")
+            } else {
+                format!("(t.{minus} is not null and coalesce({reached}, false))")
+            });
         }
         let cols = quoted(&self.shape.group_cols).join(", ");
         format!(
@@ -2129,8 +2149,7 @@ impl GroupTargetPlan {
              f as ( \
                  select sg.*, b.__hc, {prior}, \
                         (b.__basis is null or {unseen}) as __ok, \
-                        (b.__xbasis is null \
-                            or not pg_visible_in_snapshot(sg.__txid, b.__xbasis)) as __xok \
+                        {xok} as __xok \
                  from sg join b on {matched} \
              ), \
              t as ( \
@@ -2375,6 +2394,12 @@ impl GroupTargetPlan {
                 same.join(" and ")
             )));
         }
+        // Planted bug: a `NULL` group key is matched by `=` alone. See
+        // `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        if crate::plant::fires(crate::plant::Plant::GbxNullKeyByEquality, true) {
+            branches.truncate(1);
+        }
         format!(
             "(select {agg}(__v) from ({branches}) as __p)",
             agg = x.aggregate(),
@@ -2425,6 +2450,17 @@ impl GroupTargetPlan {
             ));
         }
         let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
+        let stamp = "__xbasis = snap.__snap, __xstamp = snap.__seg";
+        // Planted bugs: the probe writes no extremes' basis, or stamps the
+        // partials' basis instead. See `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        let stamp = if crate::plant::fires(crate::plant::Plant::GbxProbeNoXbasis, true) {
+            "__xstamp = snap.__seg"
+        } else if crate::plant::fires(crate::plant::Plant::GbxSharedBasis, true) {
+            "__basis = snap.__snap, __stamp = snap.__seg"
+        } else {
+            stamp
+        };
         format!(
             "with snap as materialized ({SNAPSHOT_AND_STAMP}), \
              rg as (select distinct {col_list} from {probed}), \
@@ -2434,7 +2470,7 @@ impl GroupTargetPlan {
                  cross join lateral (select {probes}) as p \
              ), \
              up as ( \
-                 update {hidden} u set {sets}, __xbasis = snap.__snap, __xstamp = snap.__seg \
+                 update {hidden} u set {sets}, {stamp} \
                  from r, snap \
                  where u.ctid = any(array(select r.__hc from r)) and u.ctid = r.__hc \
                  returning {up_groups}, {returning}, false as __probe \
@@ -2517,6 +2553,15 @@ impl GroupTargetPlan {
         // basis too.
         let extremes = self.shape.extremes();
         let mut xsets = String::new();
+        let keep = false;
+        // Planted bug: the absolute write leaves the extremes, their basis
+        // and their stamp as they were. See `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        let keep = keep
+            || crate::plant::fires(
+                crate::plant::Plant::GbxAbsoluteWriteKeepsExtremes,
+                !extremes.is_empty(),
+            );
         for x in &extremes {
             let (column, fresh_name) = (x.column(), x.named("__r"));
             old.push(format!("x.{column}"));
@@ -2527,7 +2572,9 @@ impl GroupTargetPlan {
                 self.shape.args[x.arg].sql
             ));
             zeroed.push(format!("n.{fresh_name} as {fresh_name}"));
-            sets.push(format!("{column} = r.{fresh_name}"));
+            if !keep {
+                sets.push(format!("{column} = r.{fresh_name}"));
+            }
             returning.push(format!(
                 "r.{o} as {o}, u.{column} as {}",
                 x.named("__n"),
@@ -2536,7 +2583,9 @@ impl GroupTargetPlan {
         }
         if !extremes.is_empty() {
             returning.push("false as __probe".to_string());
-            xsets = ", __xbasis = snap.__snap, __xstamp = snap.__seg".to_string();
+            if !keep {
+                xsets = ", __xbasis = snap.__snap, __xstamp = snap.__seg".to_string();
+            }
         }
         let up_groups: Vec<String> = cols.iter().map(|c| format!("u.{c}")).collect();
         let lookup_hidden = self.group_lookup(
@@ -2921,6 +2970,15 @@ impl GroupTargetPlan {
         // becomes their basis too.
         let extremes = self.shape.extremes();
         let mut xsets = String::new();
+        let keep = false;
+        // Planted bug: the absolute write leaves the extremes, their basis
+        // and their stamp as they were. See `crate::plant`.
+        #[cfg(any(test, feature = "test-util"))]
+        let keep = keep
+            || crate::plant::fires(
+                crate::plant::Plant::GbxAbsoluteWriteKeepsExtremes,
+                !extremes.is_empty(),
+            );
         for x in &extremes {
             let (column, fresh_name) = (x.column(), x.named("__r"));
             fresh.push(format!(
@@ -2929,10 +2987,12 @@ impl GroupTargetPlan {
                 self.shape.args[x.arg].sql
             ));
             kept.push(format!("a.{fresh_name} as {fresh_name}"));
-            sets.push(format!("{column} = r.{fresh_name}"));
+            if !keep {
+                sets.push(format!("{column} = r.{fresh_name}"));
+            }
             returning.push(format!("u.{column} as {}", x.named("__n")));
         }
-        if !extremes.is_empty() {
+        if !extremes.is_empty() && !keep {
             xsets = ", __xbasis = snap.__snap, __xstamp = snap.__seg".to_string();
         }
         let positions: Vec<String> = (1..=cols.len()).map(|p| p.to_string()).collect();
@@ -3453,6 +3513,21 @@ pub(crate) async fn lock_groups(
 ) -> Result<(), ApplyError> {
     stage_sides(txn, plan).await?;
     name_groups(txn, plan, &[], &plan.recompute_keys).await?;
+    // Planted bug: the page probes every group it stages before its lock
+    // statement, and not after its apply. See `crate::plant`.
+    #[cfg(any(test, feature = "test-util"))]
+    if planted_probe_before_lock(plan) {
+        let cols = quoted(&plan.shape.group_cols).join(", ");
+        txn.execute(
+            &format!(
+                "insert into {} ({cols}) select distinct {cols} from {}",
+                plan.probed, plan.staged
+            ),
+            &[],
+        )
+        .await?;
+        probe_locked_groups(txn, plan, &mut TargetMutations::new()).await?;
+    }
     // Test-only pause point: the page's sides are staged, and none of its
     // groups is locked. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
@@ -3476,6 +3551,16 @@ pub(crate) async fn lock_groups(
     }
     txn.execute(&plan.lock_sql(), &[]).await?;
     Ok(())
+}
+
+/// Whether planted bug `gbx_probe_before_lock` (`crate::plant`) fires on
+/// `plan`'s page: an aggregate's with extremes.
+#[cfg(any(test, feature = "test-util"))]
+fn planted_probe_before_lock(plan: &GroupTargetPlan) -> bool {
+    crate::plant::fires(
+        crate::plant::Plant::GbxProbeBeforeLock,
+        matches!(plan.writer, Writer::Aggregate) && !plan.shape.extremes().is_empty(),
+    )
 }
 
 /// Step 0 of a page on a group-basis target: sums the page's sides per
@@ -4213,8 +4298,12 @@ pub(crate) async fn apply_group_target(
     )
     .await?;
     let (applied, mut written, mut deleted) = apply_locked_groups(txn, plan, mutations).await?;
+    let probes = applied.iter().any(|group| group.probe);
+    // Planted bug `gbx_probe_before_lock`: probed before the lock instead.
+    #[cfg(any(test, feature = "test-util"))]
+    let probes = probes && crate::plant::armed() != Some(crate::plant::Plant::GbxProbeBeforeLock);
     // A retraction reached a group's extreme (Rx4): re-read it.
-    if applied.iter().any(|group| group.probe) {
+    if probes {
         // Test-only pause point: the page's sides are applied, and its
         // groups' extremes are not probed yet. See `super::interleave`.
         #[cfg(any(test, feature = "test-util"))]

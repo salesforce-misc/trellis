@@ -347,6 +347,8 @@ fn chained_sweep_tier() -> SweepTier {
             PlantPath::GroupBasisWriter,
             PlantPath::Join,
             PlantPath::OneToOneJoin,
+            PlantPath::Extremes,
+            PlantPath::SelfCheckExtremes,
         ],
         "it breaks a definition's own apply path, which the concurrent, JOIN and 1-1 JOIN \
          tiers gate; this tier gates the seam's feed to a JOIN reading a target",

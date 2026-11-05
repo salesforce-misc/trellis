@@ -945,6 +945,7 @@ pub(crate) mod strategy {
                                 pace: std::time::Duration::from_micros(racing_pace_micros),
                                 pace_from_start: true,
                                 stall: std::time::Duration::ZERO,
+                                group_lock_stall: false,
                             });
                         }
                         case
