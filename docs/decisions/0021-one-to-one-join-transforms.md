@@ -341,6 +341,13 @@ the target in its key order and re-derives, as an `a` Re-derive page, every
 target row no live `R` entry backs. It never deletes one by statement: a row
 re-inserted and applied between the read and the delete would be lost.
 
+Each build transaction that writes the target (a chunk, a batch of either
+sweep pass) stages its rows for the target's readers through the seam in
+that transaction, with an unknown origin, as a 1-1 build's chunks do, and so
+does a quarantine release's Re-derive. A `RESUME` and a `TRUNCATE` of `b`
+reach the readers through the build they start; a `TRUNCATE` of `a` and the
+Re-derives a producer stages, through the page that drains them.
+
 ### `self_check` compares the target, both copies and the uniqueness of `b`
 
 `self_check` reads each side as its copy has applied it, which is the source minus the ring rows the

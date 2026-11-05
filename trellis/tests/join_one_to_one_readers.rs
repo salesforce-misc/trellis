@@ -1,13 +1,17 @@
-//! Readers of a 1-1 `JOIN` target across a chunked fan-out (#1617, step A of
-//! its rule 4): a page's writes of its `a` changes' rows and of its inline
-//! fan-out, and each fan-out chunk, stage the target's changes for its
-//! readers in their own transaction, a chunk's with its marker's origin.
+//! Readers of a 1-1 `JOIN` target (#1617, rule 4): every writer of the
+//! target stages its changes for the target's readers in its own
+//! transaction. A page's writes of its `a` changes' rows and of its inline
+//! fan-out, and each fan-out chunk (with its marker's origin), are the first
+//! scenarios; the build's writers (its chunks, the rebuild sweep's stale and
+//! orphan passes, a quarantine release's Re-derive) and the writers that
+//! reach the target through a page or a build (a `TRUNCATE` of either side,
+//! a producer's Re-derives, a `RESUME`) the second.
 //!
-//! Define refuses a reader of a 1-1 `JOIN` target until every writer of one
-//! stages for readers, so these tests admit readers through the test-only
-//! switch (`admit_readers_for_tests`). The tables start empty and every row
-//! arrives through pages, so the only writers are the ones this step wires:
-//! the build writes nothing.
+//! Define refuses a reader of a 1-1 `JOIN` target until its refusals are
+//! lifted (#1713), so these tests admit readers through the test-only switch
+//! (`admit_readers_for_tests`). The tables start empty and every row arrives
+//! through pages; the build-writer scenarios then write past capture, or
+//! pause the transform, so only the writer under test finds the change.
 //!
 //! Two readers read the target: an aggregate on the group basis, which
 //! applies each change's images as a delta, and a 1-1 transform. The chunk
@@ -24,6 +28,10 @@
 //! - a second `b` change resets the cursor while the readers' rows from the
 //!   first change's chunks are half staged (some drained, some still in the
 //!   ring);
+//!
+//! - a rebuild in place, a `TRUNCATE` of `a`, a `TRUNCATE` of `b` and its
+//!   rebuild, a producer's Re-derives, a `RESUME`'s rebuild and a quarantine
+//!   release, each run to its end;
 //!
 //! each ending with every reader equal to its source and the token taken
 //! after the scenario's writes converged.
@@ -606,5 +614,224 @@ async fn a_second_b_change_resets_the_cursor_with_the_readers_rows_half_staged()
             "{kind:?}: the second change reset the cursor"
         );
         assert_exact(&mut d, kind, "two b changes").await;
+    }
+}
+
+// ------------------------------------- the build's writers (#1617 step B)
+
+/// Runs `sql` on `table` past capture: its triggers off for the write, so no
+/// change reaches the ring and only a rebuild or a Re-derive finds it.
+async fn past_capture(d: &Driver, table: &str, sql: &str) {
+    let toggle = |state: &str| {
+        format!(
+            "do $$ declare t record; begin \
+                 for t in select tgname from pg_trigger \
+                          where tgrelid = '{table}'::regclass and not tgisinternal loop \
+                     execute format('alter table {table} {state} trigger %I', t.tgname); \
+                 end loop; \
+             end $$;"
+        )
+    };
+    d.ctl
+        .batch_execute(&format!(
+            "{} {sql}; {}",
+            toggle("disable"),
+            toggle("enable always")
+        ))
+        .await
+        .expect(sql);
+}
+
+async fn trellis(d: &Driver) -> trellis::Trellis {
+    trellis::Trellis::connect(
+        trellis::config::Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        trellis::TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a Trellis")
+}
+
+/// Runs every build to its end, two rows to a chunk and sweep batch.
+async fn run_builds(d: &Driver) {
+    trellis::staging::build::settle_builds_with(d.pool(), 2).await;
+}
+
+/// The definition's status.
+async fn status(d: &Driver, kind: Kind) -> String {
+    d.ctl
+        .query_one(
+            "select status::text from transform_definitions where target_table = $1",
+            &[&kind.target()],
+        )
+        .await
+        .expect("the definition")
+        .get(0)
+}
+
+/// A rebuild in place (`request_backfill`) after writes capture never saw:
+/// the build's chunks rewrite the rows of the `a` and `b` rows that changed,
+/// and the sweep's stale pass deletes the row of the `a` row that went. Each
+/// stages its rows for the readers in its own transaction.
+#[tokio::test]
+async fn a_rebuild_reaches_the_readers() {
+    let _chunked = chunked().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        past_capture(&d, "public.a", "update public.a set x = 50 where id = 1").await;
+        past_capture(
+            &d,
+            "public.b",
+            "update public.b set w = 150, tag = 'quiet' where id = 2",
+        )
+        .await;
+        past_capture(&d, "public.a", "delete from public.a where id = 5").await;
+        trellis(&d)
+            .await
+            .request_backfill("public.b")
+            .await
+            .expect("request a rebuild");
+        assert_eq!(status(&d, kind).await, "backfilling", "{kind:?}");
+        let token = token(&d).await;
+        run_builds(&d).await;
+        assert!(
+            !converged(&d, token).await,
+            "{kind:?}: the rebuild's staged rows hold the token back"
+        );
+        assert_exact(&mut d, kind, "a rebuild").await;
+    }
+}
+
+/// A `TRUNCATE` of `a` empties the target through the page, and the readers
+/// get every row's delete; rows inserted after it reach them as before.
+#[tokio::test]
+async fn a_truncate_of_a_reaches_the_readers() {
+    let _chunked = chunked().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        step(&mut d, "truncate public.a").await;
+        assert!(
+            d.rows(&format!("select id from {}", kind.target()))
+                .await
+                .is_empty(),
+            "{kind:?}: the truncate emptied the target"
+        );
+        assert_exact(&mut d, kind, "a truncate of a").await;
+        assert!(sums(&d, kind).await.is_empty(), "{kind:?}");
+        step(
+            &mut d,
+            "insert into public.a values (1, 10, 1, 'one'), (8, 20, 8, 'eight')",
+        )
+        .await;
+        assert_exact(&mut d, kind, "inserts after a truncate of a").await;
+    }
+}
+
+/// A `TRUNCATE` of `b`, and a `b` row inserted after it, start a rebuild of
+/// the target: its chunks rewrite every row (a `LEFT` row loses its `b`
+/// columns, an `INNER` row goes, key 10's rows join the new row) and stage
+/// them for the readers.
+#[tokio::test]
+async fn a_truncate_of_b_rebuild_reaches_the_readers() {
+    let _chunked = chunked().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        step(
+            &mut d,
+            "truncate public.b; insert into public.b values (3, 10, 555, 'again')",
+        )
+        .await;
+        assert_eq!(
+            status(&d, kind).await,
+            "backfilling",
+            "{kind:?}: the truncate started a rebuild"
+        );
+        run_builds(&d).await;
+        assert_exact(&mut d, kind, "a truncate of b").await;
+    }
+}
+
+/// Re-derives a producer stages (`Recompute` rows, as a backfill, a
+/// catch-up or a column resume stage them) after writes capture never saw:
+/// an `a` row's page rewrites its row, and a `b` row's page fans out to its
+/// key's row; both reach the readers.
+#[tokio::test]
+async fn a_rederive_reaches_the_readers() {
+    let _chunked = chunked().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        past_capture(&d, "public.a", "update public.a set x = 70 where id = 9").await;
+        past_capture(&d, "public.a", "update public.a set x = 30 where id = 3").await;
+        past_capture(
+            &d,
+            "public.b",
+            "update public.b set w = 260, tag = 'redone' where id = 2",
+        )
+        .await;
+        d.stage_recomputes("public.a", &["3", "9"]).await;
+        d.stage_recomputes("public.b", &["2"]).await;
+        drain_ring(&mut d).await;
+        assert_exact(&mut d, kind, "Re-derives").await;
+    }
+}
+
+/// A `RESUME` recreates `R` and `M` empty and keeps the target, so its
+/// rebuild's chunks rewrite the rows of the changes the pause missed, and
+/// the sweep's orphan pass deletes the row of an `a` row deleted while
+/// paused. Each stages its rows for the readers, which stay live through the
+/// pause.
+#[tokio::test]
+async fn a_resume_rebuild_reaches_the_readers() {
+    let _chunked = chunked().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        let trellis = trellis(&d).await;
+        trellis
+            .apply(&format!("PAUSE TRANSFORM {}", kind.name()))
+            .await
+            .expect("pause");
+        step(
+            &mut d,
+            "update public.a set x = 60 where id = 2; delete from public.a where id = 8; \
+             update public.b set w = 110, tag = 'woke' where id = 1",
+        )
+        .await;
+        trellis
+            .apply(&format!("RESUME TRANSFORM {}", kind.name()))
+            .await
+            .expect("resume");
+        trellis::intake::harness::start_registered_builds(d.pool())
+            .await
+            .expect("start the resumed build");
+        assert_eq!(status(&d, kind).await, "backfilling", "{kind:?}");
+        run_builds(&d).await;
+        assert_exact(&mut d, kind, "a resume").await;
+    }
+}
+
+/// A row a page held (its field overflows) is released once its cause is
+/// gone: the release re-derives it in its own transaction and stages its row
+/// for the readers, before the `Recompute` it stages finds the row written.
+#[tokio::test]
+async fn a_quarantine_release_reaches_the_readers() {
+    let _chunked = chunked().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        step(&mut d, "update public.a set x = 2147483600 where id = 8").await;
+        assert_eq!(
+            d.rows("select key from poison").await,
+            ["(8)"],
+            "{kind:?}: the page held row 8"
+        );
+        step(&mut d, "update public.a set x = 18 where id = 8").await;
+        let held =
+            trellis::staging::quarantine::release_key(d.pool(), kind.name(), "public.a", "8")
+                .await
+                .expect("release the key");
+        assert_eq!(held, 1, "{kind:?}: row 8 had its parked work");
+        assert_exact(&mut d, kind, "a release").await;
+        assert!(
+            d.rows("select key from poison").await.is_empty(),
+            "{kind:?}"
+        );
     }
 }

@@ -79,19 +79,21 @@
 //! before either locks it, whatever order their statements take, and a chunk
 //! of a pending fan-out takes the same `J` row.
 //!
-//! **Readers.** A page's writes of its `a` changes' rows and of its inline
-//! fan-out, and each chunk's, are recorded in the seam
-//! (`super::target_mutations`) when something reads the target: each row is
-//! locked and its prior image read before the write ([`write_target`]), and
-//! the downstream rows are staged in the writer's own transaction. An `a`
-//! row's carries its changes' origin merged with the page's `b` changes',
-//! and a fan-out row's the `b` changes' (a chunk's: its marker's). A reader
+//! **Readers.** Every write of the target is recorded in the seam
+//! (`super::target_mutations`) when something reads the target: a page's
+//! writes of its `a` changes' rows and of its inline fan-out, each fan-out
+//! chunk's, and the build's (its chunks', its sweep's and a quarantine
+//! release's Re-derive, [`build`]). Each row is locked and its prior image
+//! read before the write ([`write_target`]), and the downstream rows are
+//! staged in the writer's own transaction. An `a` row's carries its changes'
+//! origin merged with the page's `b` changes', a fan-out row's the `b`
+//! changes' (a chunk's: its marker's), and a build's an unknown origin. A reader
 //! applies them as each page and chunk commits, so between two chunks it may
 //! see a key's rows joined partly to the old `b` row and partly to the new:
 //! the read contract, exact after `await_converged`, which the marker holds
 //! back. Define still refuses a reader, and a write refuses one at apply
-//! time, until the build's writers stage for readers too (#1617); a test
-//! admits one (`crate::defs::join_one_to_one::admit_readers_for_tests`).
+//! time (#1617); a test admits one
+//! (`crate::defs::join_one_to_one::admit_readers_for_tests`).
 //!
 //! # A `TRUNCATE` ([`truncate_sides`], [`lock_definitions`], [`start_rebuilds`])
 //!

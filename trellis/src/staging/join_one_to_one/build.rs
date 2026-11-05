@@ -25,7 +25,7 @@
 //!      and inserts their entries `on conflict do nothing`.
 //!   4. The remaining entries are locked and re-derived as a page's are.
 //!   5. Each row's target row is written from `R` and the newest live `M`
-//!      entry on its key.
+//!      entry on its key, and staged for the target's readers.
 //!
 //!   Three checks roll the chunk back with
 //!   [`ApplyError::JoinKeyMoved`], a transient failure its retry gets past
@@ -66,7 +66,9 @@ pub(crate) struct ChunkOutcome {
 /// A page of Re-derives of `keys` (encoded primary keys of `side`'s table),
 /// in `txn`, the parent module's page with every record a Re-derive.
 /// `fan_out` false leaves out the fan-out of the `M` entries it changes (the
-/// `M` pass). Returns the target rows it wrote and deleted.
+/// `M` pass). The rows it writes are staged for the target's readers in
+/// `txn`, after its last target write, so the caller takes no target row lock
+/// after it. Returns the target rows it wrote and deleted.
 pub(crate) async fn rederive(
     txn: &Transaction<'_>,
     shape: &std::sync::Arc<JoinShape>,
@@ -101,8 +103,12 @@ pub(crate) async fn rederive(
         held: Default::default(),
     };
     // A Re-derive page's segment is its read's; the page's own only stamps
-    // Applies, of which it has none.
-    apply_page(txn, &plan, 0, 0, &mut TargetMutations::new()).await
+    // Applies, of which it has none. Its target writes reach the target's
+    // readers in `txn`, with an unknown origin, as a plain 1-1 build's do.
+    let mut mutations = TargetMutations::new();
+    let counts = apply_page(txn, &plan, 0, 0, &mut mutations).await?;
+    mutations.flush(txn).await?;
+    Ok(counts)
 }
 
 /// One batch of the `M` pass: up to `limit` keys of `b` after `after` (an
@@ -410,17 +416,19 @@ pub(crate) async fn run_chunk(
         .collect();
     written_keys.sort_unstable();
     written_keys.dedup();
-    // A build's writes stage nothing for readers yet, which define refuses
-    // (#1712).
+    // The rows reach the target's readers in the chunk's transaction, with
+    // an unknown origin, as a plain 1-1 build's do.
+    let mut mutations = TargetMutations::new();
     let (written, deleted) = write_target(
         txn,
         shape,
         &written_keys,
         Entries::Changed,
         WriteOrigin::All(&held::HeldOrigin::unknown()),
-        &mut TargetMutations::new(),
+        &mut mutations,
     )
     .await?;
+    mutations.flush(txn).await?;
     Ok(ChunkOutcome {
         keys: records.len(),
         written,

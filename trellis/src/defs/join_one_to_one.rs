@@ -348,9 +348,8 @@ async fn target_key_space(
 /// Test-only admission of readers of a 1-1 `JOIN` target (#1617): define
 /// refuses them ([`reject_reader_of_target`], [`reject_target_with_reader`])
 /// and a target write refuses one at apply time, unless a test turned this
-/// on. Lifted in steps: the page writes and the fan-out chunks stage rows for
-/// readers, the build's writers don't yet, so a reader's test changes the
-/// target only through pages and chunks.
+/// on. Every writer of the target stages rows for readers; the refusals go
+/// last (#1713).
 #[cfg(any(test, feature = "test-util"))]
 static ADMIT_READERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
