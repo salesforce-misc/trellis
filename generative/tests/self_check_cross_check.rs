@@ -1014,6 +1014,13 @@ fn run_extreme_tamper_case(case: &ExtremeTamperCase) -> Result<ExtremeTamper, St
                      convergence bug, not a self_check finding: {diverged:#?}"
                 ));
             }
+            // Stopped before the tamper: the maintenance tick's GC collects
+            // zero groups (Rx7), and could take the one a `LostZeroRow` reads
+            // before its delete lands.
+            let trellis = Trellis::connect(config, TrellisOptions::default())
+                .await
+                .expect("connect read-only trellis");
+            backend.stop_engine().await.expect("stop the engine");
 
             let def = &program.defs[case.def % program.defs.len()];
             let KeySpace::Aggregate { group_by } = &def.key_space else {
@@ -1121,10 +1128,6 @@ fn run_extreme_tamper_case(case: &ExtremeTamperCase) -> Result<ExtremeTamper, St
             let oracle = sql_oracle(&pool, def, PK).await.expect("sql oracle");
             let oracle_row = oracle.get(&group_key(&group));
 
-            let trellis = Trellis::connect(config, TrellisOptions::default())
-                .await
-                .expect("connect read-only trellis");
-            backend.stop_engine().await.expect("stop the engine");
             let report = self_check_to_end(&trellis, &pool, &def.target).await;
             let what = format!(
                 "{tamper:?} of {} group {group:?} column {} ({}) to {value:?}",

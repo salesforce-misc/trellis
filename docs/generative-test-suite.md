@@ -378,11 +378,11 @@ beside them run on every `cargo test`.
   `g2` and an argument of each type the engine keeps an extreme of
   (`bigint`, `numeric`, `float8`, `timestamptz`, `date`, `interval`), some
   values equal but spelled apart (`1.0` and `1.00`, `0` and `-0`,
-  `26:00:00` and `1 day 02:00:00`, and `float8`'s infinities and `NaN`). One to three definitions group by `g1`,
-  `(g1, g2)` or `g2` with `COUNT(*)` and one to four `MIN`/`MAX` fields, and
-  the harness creates the index of the group columns then the argument for
-  each. The op stream is retention-shaped: a group's current extreme and its
-  ties deleted, the oldest rows deleted (`ts` grows with each insert), whole
+  `26:00:00` and `1 day 02:00:00`, and `float8`'s infinities and `NaN`).
+  One to three definitions group by `g1`, `(g1, g2)` or `g2` with
+  `COUNT(*)` and one to four `MIN`/`MAX` fields, and the harness creates the
+  index of the group columns then the argument for each. The op stream is
+  retention-shaped: a group's current extreme and its ties deleted, the oldest rows deleted (`ts` grows with each insert), whole
   groups deleted, rows moved between groups, `NULL` arguments set and
   cleared, rows inserted tied with a group's extreme in another spelling,
   new extremes inserted and deleted again (half of those alone in
