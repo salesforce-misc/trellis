@@ -28,7 +28,7 @@ class ValuesTest < Minitest::Test
       backfill_failure: { source_table: "public.orders", attempts: 3,
                           last_error: "permission denied", next_attempt_at_micros: MICROS },
       capture_wait: nil, capture_failure: nil, held_keys: nil, drain_failure: nil,
-      source_index_gaps: [], correcting: [], paused_upstream_columns: [],
+      source_index_gaps: [], extreme_index_gaps: [], correcting: [], paused_upstream_columns: [],
       build_wait_xid: nil, version_handover: nil, join: nil,
       floor: "0.2.0"
     )
@@ -42,7 +42,7 @@ class ValuesTest < Minitest::Test
       capture_failure: nil,
       held_keys: nil,
       drain_failure: nil,
-      source_index_gaps: [],
+      source_index_gaps: [], extreme_index_gaps: [],
       correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil,
       below_catalog_floor: nil, join: nil,
       floor: "0.2.0"
@@ -58,7 +58,7 @@ class ValuesTest < Minitest::Test
       capture_failure: { kind: :capture, source_table: "public.lines", columns: ["qty"],
                          error: "column \"qty\" was dropped", detected_at_micros: MICROS },
       held_keys: { count: 2, oldest_poisoned_at_micros: MICROS + 2 },
-      drain_failure: nil, source_index_gaps: [], correcting: [], paused_upstream_columns: [],
+      drain_failure: nil, source_index_gaps: [], extreme_index_gaps: [], correcting: [], paused_upstream_columns: [],
       build_wait_xid: nil, version_handover: nil, join: nil,
       floor: "0.2.0"
     )
@@ -76,7 +76,7 @@ class ValuesTest < Minitest::Test
       ),
       held_keys: Trellis::HeldKeys.new(count: 2, oldest_poisoned_at: Trellis::EpochMicros.to_time(MICROS + 2)),
       drain_failure: nil,
-      source_index_gaps: [],
+      source_index_gaps: [], extreme_index_gaps: [],
       correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil,
       below_catalog_floor: nil, join: nil,
       floor: "0.2.0"
@@ -89,7 +89,7 @@ class ValuesTest < Minitest::Test
       drain_failure: { seg_seq: 17, tables: ["public.lines", "public.orders"],
                        error: "permission denied for function audit_hook", sqlstate: "42501",
                        since_micros: MICROS, last_seen_micros: MICROS + 1, attempts: 5 },
-      source_index_gaps: [], correcting: [], paused_upstream_columns: [],
+      source_index_gaps: [], extreme_index_gaps: [], correcting: [], paused_upstream_columns: [],
       build_wait_xid: nil, version_handover: nil, join: nil,
       floor: "0.2.0"
     )
@@ -130,17 +130,29 @@ class ValuesTest < Minitest::Test
             fix: 'create index on "public"."orders" ("customer_id")' }
     status = Trellis::Status.from_native(
       status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil, held_keys: nil,
-      drain_failure: nil, source_index_gaps: [gap], correcting: [], paused_upstream_columns: [],
+      drain_failure: nil, source_index_gaps: [gap], extreme_index_gaps: [], correcting: [], paused_upstream_columns: [],
       build_wait_xid: nil, version_handover: nil, join: nil,
       floor: "0.2.0"
     )
     assert_equal [Trellis::SourceIndexGap.new(**gap)], status.source_index_gaps
   end
 
+  def test_an_extreme_index_gap_becomes_a_value_in_a_status
+    gap = { table: "public.src", columns: %w[g v], argument: "v", opted_out: false,
+            fix: 'create index on "public"."src" ("g", "v")' }
+    status = Trellis::Status.from_native(
+      status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil, held_keys: nil,
+      drain_failure: nil, source_index_gaps: [], extreme_index_gaps: [gap], correcting: [],
+      paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil, join: nil,
+      floor: "0.2.0"
+    )
+    assert_equal [Trellis::ExtremeIndexGap.new(**gap)], status.extreme_index_gaps
+  end
+
   def test_a_node_under_correction_becomes_a_value_with_its_queue_time
     status = Trellis::Status.from_native(
       status: :backfilling, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
-      held_keys: nil, drain_failure: nil, source_index_gaps: [],
+      held_keys: nil, drain_failure: nil, source_index_gaps: [], extreme_index_gaps: [],
       correcting: [{ node: "public.items_p1", since_micros: MICROS, keys_remaining: 5 },
                    { node: "public.items_p2", since_micros: MICROS + 1, keys_remaining: nil }],
       paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil, join: nil,
@@ -158,7 +170,7 @@ class ValuesTest < Minitest::Test
   def test_the_paused_upstream_columns_of_a_reader_are_kept_as_strings
     status = Trellis::Status.from_native(
       status: :catching_up, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
-      held_keys: nil, drain_failure: nil, source_index_gaps: [],
+      held_keys: nil, drain_failure: nil, source_index_gaps: [], extreme_index_gaps: [],
       correcting: [], paused_upstream_columns: ["t.total"],
       build_wait_xid: nil, version_handover: nil, join: nil,
       floor: "0.2.0"
@@ -170,7 +182,7 @@ class ValuesTest < Minitest::Test
   def test_a_build_waiting_on_a_fence_keeps_its_transaction_id
     status = Trellis::Status.from_native(
       status: :backfilling, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
-      held_keys: nil, drain_failure: nil, source_index_gaps: [],
+      held_keys: nil, drain_failure: nil, source_index_gaps: [], extreme_index_gaps: [],
       correcting: [], paused_upstream_columns: [],
       build_wait_xid: 4_294_967_301, version_handover: nil, join: nil,
       floor: "0.2.0"
@@ -182,7 +194,7 @@ class ValuesTest < Minitest::Test
   def test_a_version_handover_becomes_a_value_naming_the_other_processes
     status = Trellis::Status.from_native(
       status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
-      held_keys: nil, drain_failure: nil, source_index_gaps: [],
+      held_keys: nil, drain_failure: nil, source_index_gaps: [], extreme_index_gaps: [],
       correcting: [], paused_upstream_columns: [], build_wait_xid: nil,
       version_handover: {
         this_version: "0.2.0",
@@ -207,7 +219,7 @@ class ValuesTest < Minitest::Test
   def test_a_catalog_floor_becomes_a_value_naming_the_floor_and_this_version
     status = Trellis::Status.from_native(
       status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
-      held_keys: nil, drain_failure: nil, source_index_gaps: [],
+      held_keys: nil, drain_failure: nil, source_index_gaps: [], extreme_index_gaps: [],
       correcting: [], paused_upstream_columns: [], build_wait_xid: nil,
       version_handover: nil, below_catalog_floor: { floor: "0.3.0", this_version: "0.2.0" },
       join: nil, floor: "0.2.0"
@@ -219,7 +231,7 @@ class ValuesTest < Minitest::Test
   def test_a_join_status_keeps_its_tables_warnings_and_build_step
     status = Trellis::Status.from_native(
       status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
-      held_keys: nil, drain_failure: nil, source_index_gaps: [],
+      held_keys: nil, drain_failure: nil, source_index_gaps: [], extreme_index_gaps: [],
       correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil,
       join: {
         hidden_tables: [
@@ -251,7 +263,7 @@ class ValuesTest < Minitest::Test
   def test_a_one_to_one_joins_chunk_step_keeps_how_many_chunks_remain
     status = Trellis::Status.from_native(
       status: :backfilling, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
-      held_keys: nil, drain_failure: nil, source_index_gaps: [],
+      held_keys: nil, drain_failure: nil, source_index_gaps: [], extreme_index_gaps: [],
       correcting: [], paused_upstream_columns: [], build_wait_xid: nil, version_handover: nil,
       join: {
         hidden_tables: [], partials_warning: nil, fan_out_warning: nil,
@@ -269,7 +281,7 @@ class ValuesTest < Minitest::Test
   def test_a_definitions_floor_keeps_the_release_it_names
     status = Trellis::Status.from_native(
       status: :live, backfill_failure: nil, capture_wait: nil, capture_failure: nil,
-      held_keys: nil, drain_failure: nil, source_index_gaps: [],
+      held_keys: nil, drain_failure: nil, source_index_gaps: [], extreme_index_gaps: [],
       correcting: [], paused_upstream_columns: ["upstream.amount"], build_wait_xid: nil,
       version_handover: nil, below_catalog_floor: nil, join: nil, floor: "0.3.1"
     )

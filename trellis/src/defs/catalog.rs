@@ -200,6 +200,20 @@ pub enum CatalogError {
         target: String,
         missing: Vec<super::source_index::SourceIndex>,
     },
+    /// A `MIN`/`MAX` aggregate's source lacks the index its probe reads
+    /// (`super::source_index::extreme_indexes`): one on the `GROUP BY`
+    /// columns then each argument. Refused by define and by a whole-transform
+    /// resume, whether or not the definition says `WITHOUT SOURCE INDEX`
+    /// (which a `MIN`/`MAX` definition can't). Once running, a dropped one
+    /// pauses nothing (`status`'s `extreme_index_gaps`).
+    ExtremeIndexMissing {
+        target: String,
+        missing: Vec<super::source_index::SourceIndex>,
+    },
+    /// The role a drain reads a `MIN`/`MAX` aggregate's source as (the ring's
+    /// owner, which drains log in as or as a member of) lacks `SELECT` on
+    /// it: the probe that re-reads a group's extreme reads the source.
+    ExtremeSourceNotReadable { table: String, role: String },
     /// A definition's ledger table doesn't exist, though define creates one
     /// for every 1-1 definition. Only Trellis writes its
     /// tables, so an operator dropped it; the build's `start` reads it and
@@ -492,6 +506,8 @@ impl CatalogError {
             CatalogError::SourceKeyChanged { .. } => ErrorCode::Validation,
             CatalogError::VirtualGeneratedColumn { .. } => ErrorCode::Validation,
             CatalogError::SourceIndexMissing { .. } => ErrorCode::Validation,
+            CatalogError::ExtremeIndexMissing { .. } => ErrorCode::Validation,
+            CatalogError::ExtremeSourceNotReadable { .. } => ErrorCode::Validation,
             CatalogError::LedgerTableMissing { .. } => ErrorCode::Validation,
             CatalogError::TargetTableMissing { .. } => ErrorCode::Validation,
             // A target the definition may not have, like a row-security
@@ -650,6 +666,17 @@ impl fmt::Display for CatalogError {
             CatalogError::SourceIndexMissing { target, missing } => {
                 write!(f, "{}", super::source_index::refusal_text(target, missing))
             }
+            CatalogError::ExtremeIndexMissing { target, missing } => write!(
+                f,
+                "{}",
+                super::source_index::extreme_refusal_text(target, missing, false)
+            ),
+            CatalogError::ExtremeSourceNotReadable { table, role } => write!(
+                f,
+                "role \"{role}\", which Trellis's drains read sources as, lacks SELECT on \
+                 \"{table}\": a MIN/MAX re-reads a group's extreme from the source when its \
+                 row is deleted. GRANT SELECT ON {table} TO \"{role}\""
+            ),
             CatalogError::LedgerTableMissing {
                 target,
                 ledger_table,
@@ -835,6 +862,8 @@ impl std::error::Error for CatalogError {
             CatalogError::SourceKeyChanged { .. } => None,
             CatalogError::VirtualGeneratedColumn { .. } => None,
             CatalogError::SourceIndexMissing { .. } => None,
+            CatalogError::ExtremeIndexMissing { .. } => None,
+            CatalogError::ExtremeSourceNotReadable { .. } => None,
             CatalogError::LedgerTableMissing { .. } => None,
             CatalogError::TargetTableMissing { .. } => None,
             CatalogError::TargetInCatalogSchema { .. } => None,
@@ -3288,6 +3317,16 @@ async fn create_definition_inner(
             None
         }
     };
+    // The index each `MIN`/`MAX` probe reads, which also serves the walk's
+    // pages, and the drain role's read of the source the probe makes.
+    check_extremes_readable(
+        &*txn,
+        pool.schema(),
+        &def,
+        source_columns,
+        &qualified_source,
+    )
+    .await?;
     // The index a `self_check` walk of the target pages its source by.
     if !def.without_source_index {
         let missing = super::source_index::unmet_for(
@@ -4405,12 +4444,6 @@ async fn validate_for_define(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<(), CatalogError> {
-    // A test admitting `MIN`/`MAX` validates the definition with them
-    // typed away (`staging::group_basis::define_view`).
-    #[cfg(any(test, feature = "test-util"))]
-    let admitted = crate::staging::group_basis::define_view(def, source_columns);
-    #[cfg(any(test, feature = "test-util"))]
-    let def = admitted.as_ref().unwrap_or(def);
     if let KeySpace::Join(_) | KeySpace::JoinOneToOne(_) = &def.key_space {
         let sides = JoinSides::resolve(pool, def).await?;
         super::validate::validate_join(def, &sides.from_columns, &sides.joined_columns)?;
@@ -4524,18 +4557,6 @@ async fn check_aggregate_admitted(
         return Ok(());
     }
     let (columns, _) = join_columns_of(client, qualified_source).await?;
-    // A test admitting `MIN`/`MAX` checks the definition with them typed
-    // away (`staging::group_basis::define_view`).
-    #[cfg(any(test, feature = "test-util"))]
-    let admitted = crate::staging::group_basis::define_view(
-        def,
-        &columns
-            .iter()
-            .map(|(name, info)| (name.clone(), info.value_type))
-            .collect(),
-    );
-    #[cfg(any(test, feature = "test-util"))]
-    let def = admitted.as_ref().unwrap_or(def);
     Ok(super::validate::validate_aggregate_admitted(def, &columns)?)
 }
 
@@ -4958,14 +4979,7 @@ pub(crate) async fn revalidate(
     if source_columns.is_empty() {
         return Err(CatalogError::SourceTableNotFound(source.to_string()));
     }
-    // A test admitting `MIN`/`MAX` validates the definition with them typed
-    // away (`staging::group_basis::define_view`), as define does.
-    #[cfg(any(test, feature = "test-util"))]
-    let admitted = crate::staging::group_basis::define_view(&definition.def, &source_columns);
-    let validated = &definition.def;
-    #[cfg(any(test, feature = "test-util"))]
-    let validated = admitted.as_ref().unwrap_or(validated);
-    validate_with_source(validated, &source_columns, source)?;
+    validate_with_source(&definition.def, &source_columns, source)?;
     reject_virtual_generated_reads(&definition.def, None, source, &virtual_columns)?;
     let source_key = validate_live_schema(txn, schema, &definition.def, source).await?;
     if let KeySpace::OneToOne = definition.def.key_space {
@@ -5238,9 +5252,18 @@ pub(crate) async fn check_ledger_table(
 /// it was defined `WITHOUT SOURCE INDEX`.
 async fn check_source_index(
     txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
     definition: &Definition,
     revalidated: &Revalidated,
 ) -> Result<(), CatalogError> {
+    check_extremes_readable(
+        txn,
+        schema,
+        &definition.def,
+        &revalidated.source_columns,
+        &definition.source_table,
+    )
+    .await?;
     if definition.def.without_source_index {
         return Ok(());
     }
@@ -5259,6 +5282,57 @@ async fn check_source_index(
         target: definition.def.target.clone(),
         missing,
     })
+}
+
+/// Refuses a `MIN`/`MAX` aggregate whose source lacks a probe index
+/// ([`CatalogError::ExtremeIndexMissing`]), or which the ring's owner can't
+/// `SELECT` from ([`CatalogError::ExtremeSourceNotReadable`]): define's
+/// check, and a whole-transform resume's. Any other definition costs no
+/// catalog read.
+async fn check_extremes_readable(
+    client: &impl GenericClient,
+    schema: &str,
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+    source_table: &str,
+) -> Result<(), CatalogError> {
+    let needs = super::source_index::extreme_indexes(def, source_columns, source_table);
+    if needs.is_empty() {
+        return Ok(());
+    }
+    // An argument define refuses (a column of another transform's target)
+    // is refused as that, ahead of the index it would lack.
+    check_aggregate_admitted(client, def, source_table).await?;
+    let missing = super::source_index::unmet(client, needs).await?;
+    if !missing.is_empty() {
+        return Err(CatalogError::ExtremeIndexMissing {
+            target: def.target.clone(),
+            missing,
+        });
+    }
+    let row = client
+        .query_one(
+            &format!(
+                "select pg_catalog.pg_get_userbyid(o.oid)::text, \
+                        pg_catalog.has_table_privilege(o.oid, pg_catalog.to_regclass($2), \
+                                                       'SELECT') \
+                 from (select {} as oid) o",
+                crate::capture::install::RING_OWNER
+            ),
+            &[&schema, &ddl::regclass_arg(source_table)],
+        )
+        .await?;
+    // No ring (no owner) or no such table: reported elsewhere.
+    if let (Some(role), Some(false)) = (
+        row.get::<_, Option<String>>(0),
+        row.get::<_, Option<bool>>(1),
+    ) {
+        return Err(CatalogError::ExtremeSourceNotReadable {
+            table: source_table.to_string(),
+            role,
+        });
+    }
+    Ok(())
 }
 
 /// Refuses a whole-transform resume of a definition whose target table
@@ -5287,18 +5361,20 @@ pub(crate) async fn check_target_table(
 
 /// A whole-transform resume's checks that the target exists
 /// ([`check_target_table`]), that the source indexes the definition needs
-/// exist ([`check_source_index`]), and that the tables Trellis keeps beside
+/// exist, a `MIN`/`MAX` aggregate's probe indexes included
+/// ([`check_source_index`]), and that the tables Trellis keeps beside
 /// it are what define would create now: a 1-1 target's ledger exists
 /// ([`check_ledger_table`]). An aggregate or a `JOIN` keeps only hidden
 /// tables that are fully derived: the resume drops and recreates them
 /// ([`recreate_group_table`]), so there's nothing to check.
 pub(crate) async fn check_owned_tables(
     txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
     definition: &Definition,
     revalidated: &Revalidated,
 ) -> Result<(), CatalogError> {
     check_target_table(txn, definition).await?;
-    check_source_index(txn, definition, revalidated).await?;
+    check_source_index(txn, schema, definition, revalidated).await?;
     if !matches!(definition.def.key_space, KeySpace::OneToOne) {
         return Ok(());
     }

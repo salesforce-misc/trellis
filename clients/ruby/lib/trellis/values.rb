@@ -78,6 +78,13 @@ module Trellis
   # Trellis.self_check refuses to walk the target unless it opted out, when
   # the walk scans the source once per page.
   #
+  # extreme_index_gaps is a warning too: the ExtremeIndexGaps for the source
+  # indexes a MIN/MAX aggregate's probes read and the source lacks ([] when
+  # it has no MIN or MAX, or they exist). Define and a resume refuse a
+  # MIN/MAX definition without them, so a gap is an index dropped since.
+  # Nothing is paused: when a group's extreme is deleted, the next one is
+  # re-read by scanning the group instead, exact but slower.
+  #
   # correcting lists the CorrectingNodes of its partitioned source it is being
   # corrected for, oldest first ([] when none): a partition was attached,
   # detached, dropped or truncated, and the definition re-derives the keys
@@ -130,7 +137,7 @@ module Trellis
   # whose floor is above that release, under the newer one.
   Status = Data.define(:status, :backfill_failure, :capture_wait, :capture_failure,
                        :held_keys, :drain_failure, :source_index_gaps,
-                       :correcting, :paused_upstream_columns,
+                       :extreme_index_gaps, :correcting, :paused_upstream_columns,
                        :build_wait_xid, :version_handover, :below_catalog_floor,
                        :join, :floor) do
     def self.from_native(hash)
@@ -149,6 +156,7 @@ module Trellis
           held_keys: held_keys && HeldKeys.from_native(held_keys),
           drain_failure: drain_failure && DrainFailure.from_native(drain_failure),
           source_index_gaps: hash.fetch(:source_index_gaps).map { |g| SourceIndexGap.new(**g) },
+          extreme_index_gaps: hash.fetch(:extreme_index_gaps).map { |g| ExtremeIndexGap.new(**g) },
           correcting: hash.fetch(:correcting).map { |c| CorrectingNode.from_native(c) },
           paused_upstream_columns: hash.fetch(:paused_upstream_columns),
           build_wait_xid: hash.fetch(:build_wait_xid),
@@ -274,6 +282,14 @@ module Trellis
   # WITHOUT SOURCE INDEX (opted_out), and a create index statement to run
   # (fix). Trellis doesn't create indexes on your tables.
   SourceIndexGap = Data.define(:table, :columns, :role, :opted_out, :fix)
+
+  # A source index a MIN/MAX field's probe reads and the source lacks, as
+  # Trellis.status reports it: the qualified table (table), the columns the
+  # index should lead with, the GROUP BY columns then the argument (columns),
+  # the source column the MIN/MAX reads (argument), whether the definition
+  # opted out with WITHOUT SOURCE INDEX (opted_out, which define refuses for
+  # MIN/MAX), and a create index statement to run (fix).
+  ExtremeIndexGap = Data.define(:table, :columns, :argument, :opted_out, :fix)
 
   # A drain page that keeps failing with nothing charged or paused, as
   # Trellis.status and Trellis.self_check report it: the segment whose page

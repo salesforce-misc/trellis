@@ -181,11 +181,12 @@ shape:
 * `GROUP BY <col1>[, <col2>...]` (at most 32 columns, Postgres's cap on an
   index key) produces a `KeySpace::Aggregate` whose
   calculated fields may reference a grouping column directly or wrap any other
-  column in `SUM` or `AVG` (over an integer or `numeric(p,s)`; see
-  `docs/type-support.md`), resolved against a separate aggregate-function
-  registry. The grammar also parses `MIN`, `MAX`, `bool_*`, `bit_*`,
-  `array_agg`, `string_agg` and `jsonb_agg`, only so define can refuse them by
-  family ([ADR-0002](0002-async-data-flow.md)). `COUNT(*)` and
+  column in `SUM` or `AVG` (over an integer or `numeric(p,s)`), or in `MIN` or
+  `MAX` (over a number, date or time column; see `docs/type-support.md`),
+  resolved against a separate aggregate-function registry. The grammar also
+  parses `bool_*`, `bit_*`, `array_agg`, `string_agg` and `jsonb_agg`, and
+  `MIN` and `MAX` in a `JOIN`, only so define can refuse them by family
+  ([ADR-0002](0002-async-data-flow.md)). `COUNT(*)` and
   `COUNT(<expr>)` (counts non-null occurrences of `<expr>`, a
   different Postgres semantic from `COUNT(*)`) are both supported.
 * `FROM <a> <join> <b> ON <cond>`, with a required `GROUP BY`, makes a JOIN

@@ -64,12 +64,12 @@ use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, JOIN_BUILD_STEPS, JOIN_SIDE_PARTS, JOIN_SIDES, PlainApplied,
     PlainBackfillFailure, PlainBelowCatalogFloor, PlainCaptureFailure, PlainCaptureWait,
     PlainConfig, PlainCorrectingNode, PlainDefinitionStatus, PlainDefinitionSummary,
-    PlainDivergence, PlainDrainFailure, PlainError, PlainFanOutWarning, PlainHeldKeys,
-    PlainHiddenTable, PlainJoinBuildStep, PlainJoinStatus, PlainOtherProcess, PlainPartialsWarning,
-    PlainPoisonEntry, PlainQuarantineEntry, PlainSamplePage, PlainSelfCheckJob,
-    PlainSelfCheckReport, PlainSourceIndexGap, PlainVersionHandover, SELF_CHECK_MODES,
-    SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names, decode_cursor,
-    decode_watermark, encode_watermark, index_role_names, quarantine_state_names,
+    PlainDivergence, PlainDrainFailure, PlainError, PlainExtremeIndexGap, PlainFanOutWarning,
+    PlainHeldKeys, PlainHiddenTable, PlainJoinBuildStep, PlainJoinStatus, PlainOtherProcess,
+    PlainPartialsWarning, PlainPoisonEntry, PlainQuarantineEntry, PlainSamplePage,
+    PlainSelfCheckJob, PlainSelfCheckReport, PlainSourceIndexGap, PlainVersionHandover,
+    SELF_CHECK_MODES, SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names,
+    decode_cursor, decode_watermark, encode_watermark, index_role_names, quarantine_state_names,
     require_transform_statement, self_check_mode, system_time_from_epoch_micros,
     transform_status_names,
 };
@@ -935,6 +935,7 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
         .map(|failure| drain_failure_hash(ruby, failure))
         .transpose()?;
     let source_index_gaps = array(ruby, status.source_index_gaps, source_index_gap_hash)?;
+    let extreme_index_gaps = array(ruby, status.extreme_index_gaps, extreme_index_gap_hash)?;
     let correcting = array(ruby, status.correcting, correcting_hash)?;
     let paused_upstream_columns = ruby.ary_from_iter(status.paused_upstream_columns);
     let version_handover = status
@@ -959,6 +960,7 @@ fn status_hash(ruby: &Ruby, status: PlainDefinitionStatus) -> Result<RHash, Erro
             ("held_keys", ruby.into_value(held_keys)),
             ("drain_failure", ruby.into_value(drain_failure)),
             ("source_index_gaps", source_index_gaps.as_value()),
+            ("extreme_index_gaps", extreme_index_gaps.as_value()),
             ("correcting", correcting.as_value()),
             (
                 "paused_upstream_columns",
@@ -1119,6 +1121,20 @@ fn source_index_gap_hash(ruby: &Ruby, gap: PlainSourceIndexGap) -> Result<RHash,
             ("table", ruby.into_value(gap.table)),
             ("columns", ruby.into_value(gap.columns)),
             ("role", word_symbol(ruby, gap.role).as_value()),
+            ("opted_out", ruby.into_value(gap.opted_out)),
+            ("fix", ruby.into_value(gap.fix)),
+        ],
+    )
+}
+
+/// A source index a `MIN`/`MAX` field's probe reads and the source lacks.
+fn extreme_index_gap_hash(ruby: &Ruby, gap: PlainExtremeIndexGap) -> Result<RHash, Error> {
+    record(
+        ruby,
+        [
+            ("table", ruby.into_value(gap.table)),
+            ("columns", ruby.into_value(gap.columns)),
+            ("argument", ruby.into_value(gap.argument)),
             ("opted_out", ruby.into_value(gap.opted_out)),
             ("fix", ruby.into_value(gap.fix)),
         ],

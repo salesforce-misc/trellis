@@ -60,10 +60,6 @@
 //!
 //! The oracle is each definition's own `GROUP BY` query
 //! (`crate::oracle`), and every burst is audited by a `Strict` `self_check`.
-//!
-//! `MIN`/`MAX` are still refused at define for users: the runner admits them
-//! with the engine's test-only switch
-//! (`trellis::dev::staging::admit_min_max_for_tests`).
 
 use trellis::dev::defs::ast::{Expr, FieldDef, KeySpace, Predicate, TransformDef, ValueType};
 use trellis::dev::defs::{FloatWidth, IntWidth, PgType};
@@ -306,8 +302,8 @@ impl MinMaxDefDraw {
     }
 }
 
-/// Whether `def` has a `MIN` or `MAX` field: a definition define admits
-/// only once a test calls `trellis::dev::staging::admit_min_max_for_tests`.
+/// Whether `def` has a `MIN` or `MAX` field, which the runner audits by a
+/// strict `self_check`.
 pub fn has_extremes(def: &TransformDef) -> bool {
     fn any(expr: &Expr) -> bool {
         match expr {

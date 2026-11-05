@@ -175,6 +175,11 @@ pub enum Layout {
     OneToOneLedger,
     /// An aggregate's group-basis partials table (`agg_<id>`).
     GroupBasis,
+    /// A group-basis partials table that also keeps `MIN`/`MAX` extremes,
+    /// with their own basis and stamp (`__xbasis`, `__xstamp`): a release
+    /// without them can't apply such a table, and its GC would collect a
+    /// group without reading `__xstamp`.
+    GroupBasisExtremes,
     /// An aggregate `JOIN`'s hidden tables (`join_<id>_*`).
     Join,
     /// A 1-1 `JOIN`'s hidden tables (`join1_<id>_*`) and pending fan-outs.
@@ -182,10 +187,13 @@ pub enum Layout {
 }
 
 impl Layout {
-    /// The layouts this release writes for a definition of `key_space`.
-    pub(crate) fn of(key_space: &KeySpace) -> [Layout; 2] {
+    /// The layouts this release writes for a definition of `key_space`,
+    /// `extremes` when it calls `MIN` or `MAX` (which only a plain
+    /// aggregate admits): the key space alone doesn't tell.
+    pub(crate) fn of(key_space: &KeySpace, extremes: bool) -> [Layout; 2] {
         let hidden = match key_space {
             KeySpace::OneToOne => Layout::OneToOneLedger,
+            KeySpace::Aggregate { .. } if extremes => Layout::GroupBasisExtremes,
             KeySpace::Aggregate { .. } => Layout::GroupBasis,
             KeySpace::Join(_) => Layout::Join,
             KeySpace::JoinOneToOne(_) => Layout::JoinOneToOne,
@@ -321,6 +329,7 @@ impl Feature {
                 Layout::DefinitionState
                 | Layout::OneToOneLedger
                 | Layout::GroupBasis
+                | Layout::GroupBasisExtremes
                 | Layout::Join
                 | Layout::JoinOneToOne => BASELINE,
             }),
@@ -449,7 +458,11 @@ pub(crate) fn features_used(def: &TransformDef, partitioned: bool) -> (Vec<Featu
     for FieldDef { name: _, expr } in fields {
         used.expr(expr);
     }
-    for layout in Layout::of(key_space) {
+    let extremes = used
+        .features
+        .iter()
+        .any(|f| matches!(f, Feature::Function("MIN" | "MAX")));
+    for layout in Layout::of(key_space, extremes) {
         used.add(Feature::Layout(layout));
     }
     (used.features, used.unknown)
@@ -1276,6 +1289,31 @@ mod tests {
         );
         assert_eq!(
             floor_of(&later, "TRANSFORM t FROM s SELECT a AS a"),
+            "0.2.0"
+        );
+    }
+
+    /// A `MIN`/`MAX` aggregate writes the group-basis layout with extremes
+    /// (`__xbasis`, `__xstamp`), which the key space alone doesn't show: its
+    /// floor is that layout's, and an aggregate without them keeps the plain
+    /// layout's.
+    #[test]
+    fn a_min_max_aggregate_writes_the_layout_with_extremes() {
+        let later = floors("0.3.0", &[("Layout(GroupBasisExtremes)", "0.3.0")]);
+        for text in [
+            "TRANSFORM t FROM s GROUP BY g SELECT g AS g, MIN(v) AS lo",
+            "TRANSFORM t FROM s GROUP BY g SELECT g AS g, COUNT(*) + MAX(v) AS hi",
+        ] {
+            assert_eq!(floor_of(&later, text), "0.3.0", "{text}");
+            let (used, _) = features_used(&parse(text).unwrap(), false);
+            assert!(used.contains(&Feature::Layout(Layout::GroupBasisExtremes)));
+            assert!(!used.contains(&Feature::Layout(Layout::GroupBasis)));
+        }
+        assert_eq!(
+            floor_of(
+                &later,
+                "TRANSFORM t FROM s GROUP BY g SELECT g AS g, SUM(v) AS s"
+            ),
             "0.2.0"
         );
     }

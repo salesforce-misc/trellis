@@ -562,11 +562,9 @@ fn run_concurrent_case(
             if let Some(ms) = case.housekeeping_interval_ms {
                 backend.set_housekeeping_interval(std::time::Duration::from_millis(ms));
             }
-            // MIN/MAX (#1117) is still refused at define: the min_max shape
-            // admits it with the engine's test-only switch, and audits each
-            // burst by `self_check`, which compares the extremes too.
+            // The min_max shape (#1117) audits each burst by a strict
+            // `self_check`, which compares the extremes too.
             if case.program.defs.iter().any(min_max::has_extremes) {
-                trellis::dev::staging::admit_min_max_for_tests();
                 backend.set_strict_audit(true);
             }
             let pool =

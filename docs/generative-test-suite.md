@@ -392,8 +392,7 @@ beside them run on every `cargo test`.
   later bursts re-read the table and pause and resume a definition; one
   definition may install part way through. The oracle is each definition's
   own `GROUP BY`, and every burst is audited by a `Strict` `self_check`.
-  Define still refuses `MIN`/`MAX`, so the runner admits them with the
-  engine's test-only switch. Its property,
+  Its property,
   `property_min_max_extremes_converge_under_concurrent_drains`, runs it
   without stalls; its sweep tier (`GENERATIVE_PLANT_TIER=min_max`) also
   stalls pages before their group lock, so a later batch's page of a group

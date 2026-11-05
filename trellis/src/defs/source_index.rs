@@ -31,11 +31,16 @@
 //! one table's index and needs none.
 //!
 //! A `MIN`/`MAX` field's probe reads the extreme of a group as one endpoint
-//! of an index on the `GROUP BY` columns then its argument. Its statement
+//! of an index on the `GROUP BY` columns then its argument
+//! ([`extreme_indexes`]), which also serves as the `GROUP BY` index. Define
+//! and a whole-transform `RESUME` refuse a definition that lacks one
+//! ([`CatalogError::ExtremeIndexMissing`](super::catalog::CatalogError)),
+//! and `WITHOUT SOURCE INDEX` doesn't waive it. The probe's statement
 //! doesn't depend on the index: without one Postgres scans the group (by
 //! the `GROUP BY` index when there is one), which is exact and slower, so
-//! the probe never reads the catalog. `status` reports the missing index
-//! (`ExtremeIndexGap`); nothing pauses and `self_check` still walks.
+//! the probe never reads the catalog. An index dropped later is reported by
+//! `status` (`ExtremeIndexGap`); nothing pauses and `self_check` still
+//! walks.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -210,15 +215,17 @@ impl ExtremeIndexGap {
     }
 }
 
-/// The indexes `def`'s `MIN`/`MAX` probes read one endpoint of: per argument,
-/// one leading with the `GROUP BY` columns then the argument, under
-/// [`has_index`]'s rule (the probe reads it forward for `MIN`, backward for
-/// `MAX`). Empty for every definition with no `MIN` or `MAX`, which then
-/// costs no catalog read.
-fn extreme_indexes(
+/// The indexes `def`'s `MIN`/`MAX` probes read one endpoint of, on `table`:
+/// per argument, one leading with the `GROUP BY` columns then the argument,
+/// under [`has_index`]'s rule (the probe reads it forward for `MIN`,
+/// backward for `MAX`). Each also leads with the `GROUP BY` columns, so it
+/// serves `self_check`'s pages too. Empty for every definition with no
+/// `MIN` or `MAX`, which then costs no catalog read.
+pub(crate) fn extreme_indexes(
     def: &TransformDef,
     source_columns: &HashMap<String, ValueType>,
-) -> Vec<(String, Vec<String>)> {
+    table: &str,
+) -> Vec<SourceIndex> {
     let Some(shape) = crate::staging::group_basis::route(def, source_columns) else {
         return Vec::new();
     };
@@ -227,10 +234,59 @@ fn extreme_indexes(
         .into_iter()
         .map(|argument| {
             let mut columns = shape.group_columns().to_vec();
-            columns.push(argument.clone());
-            (argument, columns)
+            columns.push(argument);
+            SourceIndex {
+                table: table.to_string(),
+                columns,
+                role: IndexRole::GroupBy,
+            }
         })
         .collect()
+}
+
+/// The message of a refusal of `target`'s `MIN`/`MAX` for its probe
+/// `indexes`: missing ones, or, when it was declared `WITHOUT SOURCE INDEX`
+/// (`opted_out`), every one, since the opt-out doesn't apply to `MIN`/`MAX`.
+pub fn extreme_refusal_text(target: &str, indexes: &[SourceIndex], opted_out: bool) -> String {
+    const WHY: &str = "when a group's extreme is deleted, the next one is re-read through a \
+                       source index on the GROUP BY columns then the argument";
+    let mut text = if opted_out {
+        format!(
+            "{target} is defined WITHOUT SOURCE INDEX, which doesn't apply to MIN/MAX: {WHY}, \
+             and without one each re-read scans the group. Define it without WITHOUT SOURCE \
+             INDEX, with"
+        )
+    } else {
+        format!("{target} needs a source index for its MIN/MAX that it doesn't have: {WHY}.")
+    };
+    for (i, index) in indexes.iter().enumerate() {
+        let argument = index.columns.last().map_or("", String::as_str);
+        let columns = index.columns.join(", ");
+        let create = index.create_index();
+        let table = &index.table;
+        let _ = if opted_out {
+            write!(
+                text,
+                "{} an index on {table} leading with ({columns}) in that order, for \
+                 MIN/MAX({argument}): create one with `{create}`",
+                if i == 0 { "" } else { ";" }
+            )
+        } else {
+            write!(
+                text,
+                " {table} has none leading with ({columns}) in that order, for \
+                 MIN/MAX({argument}); create one with `{create}`."
+            )
+        };
+    }
+    if opted_out {
+        text.push('.');
+    }
+    text.push_str(" The same index serves as the GROUP BY columns' index.");
+    if !opted_out {
+        text.push_str(" WITHOUT SOURCE INDEX doesn't apply to MIN/MAX.");
+    }
+    text
 }
 
 /// The gaps in `def`'s `MIN`/`MAX` probe indexes now, for `status` (read
@@ -245,12 +301,12 @@ pub(crate) async fn extreme_gaps(
     source_table: &str,
 ) -> Result<Vec<ExtremeIndexGap>, tokio_postgres::Error> {
     let mut out = Vec::new();
-    for (argument, columns) in extreme_indexes(def, source_columns) {
-        if !is_met(client, source_table, &columns).await? {
+    for index in extreme_indexes(def, source_columns, source_table) {
+        if !is_met(client, &index.table, &index.columns).await? {
             out.push(ExtremeIndexGap {
-                table: source_table.to_string(),
-                columns,
-                argument,
+                argument: index.columns.last().cloned().unwrap_or_default(),
+                table: index.table,
+                columns: index.columns,
                 opted_out: def.without_source_index,
             });
         }

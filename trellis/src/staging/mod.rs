@@ -64,11 +64,6 @@ pub(crate) mod drift_memo;
 pub mod error;
 pub mod fold;
 pub(crate) mod group_basis;
-/// Lets define admit `MIN`/`MAX` on a plain aggregate for the rest of this
-/// process, for the engine's tests (#1117): define refuses them by family
-/// otherwise, and the engine keeps them either way.
-#[cfg(any(test, feature = "internals"))]
-pub use group_basis::admit_extremes_for_tests as admit_min_max_for_tests;
 pub(crate) mod halt;
 pub(crate) mod holdup;
 #[cfg(any(test, feature = "test-util"))]

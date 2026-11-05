@@ -15,9 +15,8 @@
 //! GC after a probe); F9 (partitioned sources) is in `partition_group_basis`.
 //! Each drives its interleaving by hand through `support/drain_driver.rs`,
 //! with pause points, and none sleeps or polls for convergence. Every source
-//! starts empty and is seeded through capture. Define refuses `MIN`/`MAX`
-//! until its gate lands, so each test admits them first
-//! (`trellis::staging::admit_min_max_for_tests`).
+//! starts empty and is seeded through capture, and is defined through the
+//! real validator, with the probe's index define requires.
 //!
 //! Each family names the necessity mutation it fails under: `NOBASIS` (the
 //! probe writes no `__xbasis`), `SHARED` (the probe stamps the partials'
@@ -55,7 +54,6 @@ fn int4() -> ValueType {
 /// `public.src (id, g, v)`, empty, with `definition` live over it on the
 /// group basis, captured by triggers, its hidden table keeping extremes.
 async fn start_with(definition: &str, source_ddl: &str, columns: &[(&str, ValueType)]) -> Driver {
-    trellis::staging::admit_min_max_for_tests();
     let d = Driver::start(source_ddl, columns, &[definition], &[SRC]).await;
     assert_eq!(
         scalar(
@@ -187,7 +185,6 @@ async fn only_a_retraction_reaching_an_extreme_probes() {
 /// after it apply against both bases.
 #[tokio::test]
 async fn a_build_writes_the_extremes_and_their_basis() {
-    trellis::staging::admit_min_max_for_tests();
     let mut d = Driver::start(
         &format!(
             "{SOURCE_DDL}; insert into public.src values \
@@ -1338,7 +1335,6 @@ async fn bigint_extremes_compare_exactly() {
 /// page applies once the application's transaction ends.
 #[tokio::test]
 async fn a_probe_behind_a_source_lock_retries_the_page() {
-    trellis::staging::admit_min_max_for_tests();
     let mut d = Driver::start_with_database_defaults(
         &[("lock_timeout", "100ms")],
         SOURCE_DDL,

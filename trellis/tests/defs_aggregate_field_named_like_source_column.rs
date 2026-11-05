@@ -108,8 +108,8 @@ fn row(
     )
 }
 
-/// The issue's example (its MIN and MAX, deferred past 0.1.0 by #1117, as a
-/// COUNT and a SUM over the same column) builds the values SQL gives.
+/// The issue's example, its MIN and MAX replaced by a COUNT and a SUM over
+/// the same column, builds the values SQL gives.
 #[tokio::test]
 async fn an_aggregate_field_named_like_a_source_column_reads_the_source_column() {
     let cluster = TestCluster::start();
@@ -197,14 +197,11 @@ async fn a_plain_aggregate_outside_the_admitted_set_is_refused_at_define_by_fami
     columns.insert("ok".to_string(), ValueType::Boolean);
 
     for (field, want) in [
-        ("MIN(val)", Some("MIN/MAX")),
-        ("MAX(grp)", Some("MIN/MAX")),
         ("BOOL_AND(ok)", Some("bool_and/bool_or/bit_and/bit_or")),
         ("ARRAY_AGG(val)", Some("array_agg/string_agg/jsonb_agg")),
         ("SUM(f)", Some("float and interval SUM/AVG")),
         ("AVG(f)", Some("float and interval SUM/AVG")),
         ("SUM(n)", None),
-        ("SUM(val) + MAX(val)", Some("MIN/MAX")),
     ] {
         let err = install_definition(
             &db.pool,

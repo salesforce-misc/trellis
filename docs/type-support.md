@@ -25,7 +25,9 @@ ordered floor to ceiling:
    Needs an immutable operator or function in the registry and, for a
    constant, a typed literal.
 5. **Aggregate target** — an aggregate calculated field has this type: `COUNT`,
-   and `SUM` or `AVG` over an integer or `numeric(p,s)` column.
+   `SUM` or `AVG` over an integer or `numeric(p,s)` column, and, on a plain
+   aggregate, `MIN` or `MAX` over a column of a number, date or time type
+   ([`MIN` and `MAX`](#min-and-max)).
 
 A `WHERE` predicate other than `TRUE` is not supported
 ([transforms](transforms.md#supported-sources-and-targets)), so no type has a
@@ -41,16 +43,16 @@ filter role.
 
 | Postgres type(s) | Passthrough | Join key | `GROUP BY` key | Primary key | Computed 1-1 | Aggregates |
 |---|---|---|---|---|---|---|
-| `smallint` `integer` `bigint` | yes | yes | yes | yes | yes | `SUM` `AVG` |
-| `oid` | yes | yes | yes | yes | typed literal only | no (no arithmetic in Postgres) |
-| `numeric` `decimal` | yes | no | yes | no | yes | `SUM` `AVG` over `numeric(p,s)` only |
-| `real` `double precision` | yes | no | no | no | yes | no |
+| `smallint` `integer` `bigint` | yes | yes | yes | yes | yes | `SUM` `AVG` `MIN` `MAX` |
+| `oid` | yes | yes | yes | yes | typed literal only | `MIN` `MAX` (no arithmetic in Postgres) |
+| `numeric` `decimal` | yes | no | yes | no | yes | `SUM` `AVG` over `numeric(p,s)` only; `MIN` `MAX` |
+| `real` `double precision` | yes | no | no | no | yes | `MIN` `MAX` |
 | `boolean` | yes | no | yes | no | yes | no |
 | `uuid` | yes | yes | yes | yes | yes | no |
 | `text` `varchar` `char(n)` | yes | `text` `varchar` only | yes | `text` `varchar` only | yes | no |
 | `bytea` | yes | yes | yes | yes | typed literal | no |
-| `date` `time` `timetz` `timestamp` `timestamptz` | yes | yes | yes | yes | yes; typed literal for all but `timestamptz` | no |
-| `interval` | yes | no | no | no | yes | no |
+| `date` `time` `timetz` `timestamp` `timestamptz` | yes | yes | yes | yes | yes; typed literal for all but `timestamptz` | `MIN` `MAX`, but not over `timetz` |
+| `interval` | yes | no | no | no | yes | `MIN` `MAX` |
 | `jsonb` | yes | no | no | no | typed literal | no |
 | `inet` | yes | no | yes | no | typed literal | no |
 | `cidr` | yes | yes | yes | yes | typed literal | no |
@@ -63,11 +65,13 @@ filter role.
 
 `COUNT(*)` and `COUNT(<expr>)` are type-agnostic and typed `bigint`, as in
 Postgres; they are omitted from the aggregate column. An aggregate or `JOIN`
-transform admits only `COUNT`, and `SUM` and `AVG` over the types above, the
-aggregates Trellis keeps exact from each change alone. Every other aggregate
-is refused at define, named by its family: `MIN`/`MAX`, `bool_and`/`bool_or`/
-`bit_and`/`bit_or`, `SUM`/`AVG` over a float, an `interval` or another type,
-and `array_agg`/`string_agg`/`jsonb_agg`
+transform admits `COUNT`, and `SUM` and `AVG` over the types above, the
+aggregates Trellis keeps exact from each change alone. A plain aggregate (not
+a `JOIN`) also admits `MIN` and `MAX` over the types above, which re-read
+the source when a group's extreme is deleted ([`MIN` and `MAX`](#min-and-max)).
+Every other aggregate is refused at define, named by its family: `MIN`/`MAX`
+on a `JOIN`, `bool_and`/`bool_or`/`bit_and`/`bit_or`, `SUM`/`AVG` over a
+float, an `interval` or another type, and `array_agg`/`string_agg`/`jsonb_agg`
 ([Aggregates that are not supported](#aggregates-that-are-not-supported)).
 
 ### The types of the columns Trellis creates
@@ -503,16 +507,19 @@ is handled as any other re-type.
 
 ## `MIN` and `MAX`
 
-The engine keeps `MIN` and `MAX` on a plain aggregate (not a `JOIN`): a
-group stores each extreme, an insertion moves it, and a retraction that
-removes it re-reads the group's extreme from the source with one index probe
+A plain aggregate (not a `JOIN`) keeps `MIN` and `MAX`: a group stores each
+extreme, an insertion moves it, and a retraction that removes it re-reads the
+group's extreme from the source with one index probe
 ([ADR-0002](decisions/0002-async-data-flow.md#min-and-max-recompute-on-retract)).
-Define doesn't admit them yet
-([#1681](https://github.com/salesforce-misc/trellis/issues/1681)).
+Define requires that index, on the `GROUP BY` columns then the argument, and
+refuses the rest of what it can't keep
+([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)).
 
 The argument is a plain source column of type `smallint`, `integer`,
 `bigint`, `numeric`, `real`, `double precision`, `date`, `time`, `timestamp`,
-`timestamptz`, `interval` or `oid`. The result has the argument's type,
+`timestamptz`, `interval` or `oid` (`UnsupportedExtremeArgument` for any
+other). `text` and `varchar` are among the refused: a collatable argument
+would need the hidden extreme and the probe to agree on a collation. The result has the argument's type,
 without a modifier
 ([The types of the columns Trellis creates](#the-types-of-the-columns-trellis-creates)). `NULL` arguments
 are ignored, and a group whose arguments are all `NULL` has a `NULL`
@@ -529,7 +536,8 @@ divergence
 ## Aggregates that are not supported
 
 An aggregate or `JOIN` transform admits `COUNT(*)`, `COUNT(col)`, and `SUM` or `AVG`
-over `smallint`, `integer`, `bigint` and `numeric(p,s)`. Every other aggregate is
+over `smallint`, `integer`, `bigint` and `numeric(p,s)`; a plain aggregate also
+admits `MIN` and `MAX` ([above](#min-and-max)). Every other aggregate is
 refused at define, by name, with the issue that tracks it: see
 [transforms — Supported sources and targets](transforms.md#supported-sources-and-targets).
 

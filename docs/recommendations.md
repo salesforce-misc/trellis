@@ -169,13 +169,14 @@ An index you create or drop changes speed only, never results.
 
 ## Index each `MIN`/`MAX` argument, and vacuum retention sources
 
-A `MIN` or `MAX` field (which define doesn't admit yet:
-[type support](type-support.md#min-and-max)) re-reads a group's extreme from
-the source when a deletion or update removes the current one, while the page
-holds the group's lock
+A `MIN` or `MAX` field ([type support](type-support.md#min-and-max))
+re-reads a group's extreme from the source when a deletion or update removes
+the current one, while the page holds the group's lock
 ([ADR-0002](decisions/0002-async-data-flow.md#min-and-max-recompute-on-retract)).
 With an index whose leading columns are the `GROUP BY` columns, in order,
-then the argument, that read is one index entry:
+then the argument, that read is one index entry. Define requires that index
+for each argument, and refuses a `MIN`/`MAX` definition `WITHOUT SOURCE
+INDEX`; a whole-transform `RESUME` refuses while one is missing:
 
 ```sql
 -- TRANSFORM first_order FROM orders GROUP BY customer_id
@@ -184,9 +185,9 @@ CREATE INDEX ON orders (customer_id, created_at);
 ```
 
 One index serves `MIN` and `MAX` of the same argument, and also serves as
-the `GROUP BY` index. Without it, each such read scans the group's rows
-through the `GROUP BY` index, or the whole source when that is missing too.
-On a 1-million-row source, a page that re-read 3,334 groups' `MIN` and `MAX`
+the `GROUP BY` index. If it is dropped later, each such read scans the
+group's rows through the `GROUP BY` index, or the whole source when that is
+missing too. On a 1-million-row source, a page that re-read 3,334 groups' `MIN` and `MAX`
 took about 30 ms with the index and 305 ms with only the `GROUP BY` index;
 with neither, each group took about 78 ms. A missing index never changes
 results.

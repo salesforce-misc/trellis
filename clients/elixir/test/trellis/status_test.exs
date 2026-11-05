@@ -24,6 +24,7 @@ defmodule Trellis.StatusTest do
         held_keys: nil,
         drain_failure: nil,
         source_index_gaps: [],
+        extreme_index_gaps: [],
         correcting: [],
         paused_upstream_columns: [],
         build_wait_xid: nil,
@@ -69,6 +70,7 @@ defmodule Trellis.StatusTest do
         held_keys: %{count: 2, oldest_poisoned_at_micros: 1_727_222_400_654_323},
         drain_failure: nil,
         source_index_gaps: [],
+        extreme_index_gaps: [],
         correcting: [],
         paused_upstream_columns: [],
         build_wait_xid: nil,
@@ -121,6 +123,7 @@ defmodule Trellis.StatusTest do
           attempts: 5
         },
         source_index_gaps: [],
+        extreme_index_gaps: [],
         correcting: [],
         paused_upstream_columns: [],
         build_wait_xid: nil,
@@ -159,6 +162,7 @@ defmodule Trellis.StatusTest do
             fix: ~s|create index on "public"."orders" ("customer_id")|
           }
         ],
+        extreme_index_gaps: [],
         correcting: [],
         paused_upstream_columns: [],
         build_wait_xid: nil,
@@ -179,6 +183,37 @@ defmodule Trellis.StatusTest do
            ]
   end
 
+  test "an extreme index gap becomes a struct" do
+    gap = %{
+      table: "public.src",
+      columns: ["g", "v"],
+      argument: "v",
+      opted_out: false,
+      fix: ~s|create index on "public"."src" ("g", "v")|
+    }
+
+    status =
+      Trellis.Status.from_native(%{
+        status: :live,
+        backfill_failure: nil,
+        capture_wait: nil,
+        capture_failure: nil,
+        held_keys: nil,
+        drain_failure: nil,
+        source_index_gaps: [],
+        extreme_index_gaps: [gap],
+        correcting: [],
+        paused_upstream_columns: [],
+        build_wait_xid: nil,
+        version_handover: nil,
+        below_catalog_floor: nil,
+        join: nil,
+        floor: "0.2.0"
+      })
+
+    assert status.extreme_index_gaps == [struct!(Trellis.ExtremeIndexGap, gap)]
+  end
+
   test "a node under correction becomes a struct with a DateTime" do
     status =
       Trellis.Status.from_native(%{
@@ -189,6 +224,7 @@ defmodule Trellis.StatusTest do
         held_keys: nil,
         drain_failure: nil,
         source_index_gaps: [],
+        extreme_index_gaps: [],
         correcting: [
           %{node: "public.items_p1", since_micros: 1_727_222_400_654_321, keys_remaining: 5},
           %{node: "public.items_p2", since_micros: 1_727_222_400_654_322, keys_remaining: nil}
@@ -227,6 +263,7 @@ defmodule Trellis.StatusTest do
         held_keys: nil,
         drain_failure: nil,
         source_index_gaps: [],
+        extreme_index_gaps: [],
         correcting: [],
         paused_upstream_columns: [],
         build_wait_xid: 4_294_967_301,
@@ -250,6 +287,7 @@ defmodule Trellis.StatusTest do
         held_keys: nil,
         drain_failure: nil,
         source_index_gaps: [],
+        extreme_index_gaps: [],
         correcting: [],
         paused_upstream_columns: [],
         build_wait_xid: nil,
@@ -290,6 +328,7 @@ defmodule Trellis.StatusTest do
         held_keys: nil,
         drain_failure: nil,
         source_index_gaps: [],
+        extreme_index_gaps: [],
         correcting: [],
         paused_upstream_columns: [],
         build_wait_xid: nil,
@@ -315,6 +354,7 @@ defmodule Trellis.StatusTest do
         held_keys: nil,
         drain_failure: nil,
         source_index_gaps: [],
+        extreme_index_gaps: [],
         correcting: [],
         paused_upstream_columns: [],
         build_wait_xid: nil,
@@ -382,6 +422,7 @@ defmodule Trellis.StatusTest do
         held_keys: nil,
         drain_failure: nil,
         source_index_gaps: [],
+        extreme_index_gaps: [],
         correcting: [],
         paused_upstream_columns: [],
         build_wait_xid: nil,
@@ -426,6 +467,7 @@ defmodule Trellis.StatusTest do
         held_keys: nil,
         drain_failure: nil,
         source_index_gaps: [],
+        extreme_index_gaps: [],
         correcting: [],
         paused_upstream_columns: ["upstream.amount"],
         build_wait_xid: nil,

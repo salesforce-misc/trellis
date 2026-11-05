@@ -41,6 +41,7 @@ feature Operator(AtTimeZone) 0.2.0
 feature Layout(DefinitionState) 0.2.0
 feature Layout(OneToOneLedger) 0.2.0
 feature Layout(GroupBasis) 0.2.0
+feature Layout(GroupBasisExtremes) 0.2.0
 feature Layout(Join) 0.2.0
 feature Layout(JoinOneToOne) 0.2.0
 feature QualifiedTable 0.2.0
@@ -145,9 +146,11 @@ feature TypeRule(Aggregate(SumFloat)) 0.2.0
 feature TypeRule(Aggregate(SumInterval)) 0.2.0
 feature TypeRule(Aggregate(AvgFloat)) 0.2.0
 feature TypeRule(Aggregate(AvgExact)) 0.2.0
+feature TypeRule(Aggregate(Extreme)) 0.2.0
 feature TypeRule(AggregateAdmission(Count)) 0.2.0
 feature TypeRule(AggregateAdmission(SumAvgInteger)) 0.2.0
 feature TypeRule(AggregateAdmission(SumAvgScaledNumeric)) 0.2.0
+feature TypeRule(AggregateAdmission(Extreme)) 0.2.0
 feature TypeRule(GroupByKey(Integer)) 0.2.0
 feature TypeRule(GroupByKey(Numeric)) 0.2.0
 feature TypeRule(GroupByKey(Text)) 0.2.0
@@ -815,6 +818,78 @@ admit aggregate_admitted(AVG, Integer(Int8) typmod -1) = Ok(()) by AggregateAdmi
 admit aggregate_admitted(AVG, Integer(Int8) typmod 786438) = Ok(()) by AggregateAdmission(SumAvgInteger) 0.2.0
 admit aggregate(AVG, Float(Float4)) = Some(Float(Float8)) by Aggregate(AvgFloat) 0.2.0
 admit aggregate(AVG, Float(Float8)) = Some(Float(Float8)) by Aggregate(AvgFloat) 0.2.0
+admit aggregate(MIN, Numeric) = Some(Numeric) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Numeric typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Numeric typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MIN, Integer(Int2)) = Some(Integer(Int2)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Integer(Int2) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Integer(Int2) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MIN, Integer(Int4)) = Some(Integer(Int4)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Integer(Int4) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Integer(Int4) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MIN, Integer(Int8)) = Some(Integer(Int8)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Integer(Int8) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Integer(Int8) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MIN, Float(Float4)) = Some(Float(Float4)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Float(Float4) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Float(Float4) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MIN, Float(Float8)) = Some(Float(Float8)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Float(Float8) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Float(Float8) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MIN, Other(Oid)) = Some(Other(Oid)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Other(Oid) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Other(Oid) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MIN, Other(Date)) = Some(Other(Date)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Other(Date) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Other(Date) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MIN, Other(Time)) = Some(Other(Time)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Other(Time) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Other(Time) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MIN, Other(Timestamp)) = Some(Other(Timestamp)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Other(Timestamp) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Other(Timestamp) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MIN, Other(TimestampTz)) = Some(Other(TimestampTz)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Other(TimestampTz) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Other(TimestampTz) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MIN, Other(Interval)) = Some(Other(Interval)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Other(Interval) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MIN, Other(Interval) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MAX, Numeric) = Some(Numeric) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Numeric typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Numeric typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MAX, Integer(Int2)) = Some(Integer(Int2)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Integer(Int2) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Integer(Int2) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MAX, Integer(Int4)) = Some(Integer(Int4)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Integer(Int4) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Integer(Int4) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MAX, Integer(Int8)) = Some(Integer(Int8)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Integer(Int8) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Integer(Int8) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MAX, Float(Float4)) = Some(Float(Float4)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Float(Float4) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Float(Float4) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MAX, Float(Float8)) = Some(Float(Float8)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Float(Float8) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Float(Float8) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MAX, Other(Oid)) = Some(Other(Oid)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Other(Oid) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Other(Oid) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MAX, Other(Date)) = Some(Other(Date)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Other(Date) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Other(Date) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MAX, Other(Time)) = Some(Other(Time)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Other(Time) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Other(Time) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MAX, Other(Timestamp)) = Some(Other(Timestamp)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Other(Timestamp) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Other(Timestamp) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MAX, Other(TimestampTz)) = Some(Other(TimestampTz)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Other(TimestampTz) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Other(TimestampTz) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate(MAX, Other(Interval)) = Some(Other(Interval)) by Aggregate(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Other(Interval) typmod -1) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
+admit aggregate_admitted(MAX, Other(Interval) typmod 786438) = Ok(()) by AggregateAdmission(Extreme) 0.2.0
 admit group_by_key(Numeric) = Ok(()) by GroupByKey(Numeric) 0.2.0
 admit group_by_key(Integer(Int2)) = Ok(()) by GroupByKey(Integer) 0.2.0
 admit group_by_key(Integer(Int4)) = Ok(()) by GroupByKey(Integer) 0.2.0

@@ -995,7 +995,6 @@ fn run_extreme_tamper_case(case: &ExtremeTamperCase) -> Result<ExtremeTamper, St
     TAMPERING_HARNESS.with(|h| {
         h.runtime.block_on(async {
             let db = h.cluster.create_isolated_database().await;
-            trellis::dev::staging::admit_min_max_for_tests();
             let mut backend = ManualBackend::connect(db.dsn())
                 .await
                 .expect("connect manual backend");

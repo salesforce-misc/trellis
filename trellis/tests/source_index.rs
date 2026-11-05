@@ -367,3 +367,114 @@ async fn a_partitioned_sources_unique_index_leading_with_the_partition_key_count
         .await
         .expect("the unique index (g, id) leads with the partition key");
 }
+
+const MIN_MAX: &str = "TRANSFORM mm FROM public.src GROUP BY g \
+                       SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n";
+
+/// A `MIN`/`MAX` aggregate needs the index its probe reads, on the
+/// `GROUP BY` columns then the argument (#1117 rule 4): define refuses
+/// without it, even with the `GROUP BY` index alone, and refuses
+/// `WITHOUT SOURCE INDEX` whatever indexes exist (#1681), naming the index
+/// to create either way. Once it exists the same definition defines, and
+/// that index also serves as its `GROUP BY` index.
+#[tokio::test]
+async fn min_max_define_needs_the_probe_index_and_refuses_the_opt_out() {
+    let (_cluster, _db, raw, trellis) = setup("create index on public.src (g)").await;
+    let create = r#"create index on "public"."src" ("g", "v")"#;
+    let message = refusal(&trellis, MIN_MAX).await;
+    assert!(
+        message.contains("mm needs a source index for its MIN/MAX")
+            && message.contains("public.src has none leading with (g, v)")
+            && message.contains(create)
+            && message.contains("WITHOUT SOURCE INDEX doesn't apply to MIN/MAX"),
+        "{message}"
+    );
+    let opted_out = "TRANSFORM mm FROM public.src GROUP BY g WITHOUT SOURCE INDEX \
+                     SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n";
+    let message = refusal(&trellis, opted_out).await;
+    assert!(
+        message.contains("mm is defined WITHOUT SOURCE INDEX, which doesn't apply to MIN/MAX")
+            && message.contains(create),
+        "{message}"
+    );
+
+    raw.batch_execute("drop index public.src_g_idx; create index on public.src (g, v)")
+        .await
+        .expect("index");
+    let message = refusal(&trellis, opted_out).await;
+    assert!(message.contains("doesn't apply to MIN/MAX"), "{message}");
+    trellis
+        .apply(MIN_MAX)
+        .await
+        .expect("the probe index exists");
+    let status = status_of(&trellis, "mm").await;
+    assert!(status.source_index_gaps.is_empty(), "{status:?}");
+    assert!(status.extreme_index_gaps.is_empty(), "{status:?}");
+}
+
+/// The define refusals of `MIN`/`MAX` besides the index (#1117 rules 3, 5
+/// and 7): a collatable argument, an expression argument and a `JOIN`. A
+/// source that is another transform's target (rule 6) is
+/// `defs::validate`'s unit test: it needs the upstream live first.
+#[tokio::test]
+async fn min_max_refuses_text_expressions_and_joins() {
+    let (_cluster, _db, _raw, trellis) = setup(
+        "alter table public.src add column t text; \
+         create index on public.src (g, t); create index on public.src (g, v); \
+         create index on public.items (order_id)",
+    )
+    .await;
+    let message = refusal(
+        &trellis,
+        "TRANSFORM mm FROM public.src GROUP BY g SELECT MIN(t) AS lo",
+    )
+    .await;
+    assert!(
+        message.contains("MIN(t) is over text") && message.contains("collation"),
+        "{message}"
+    );
+    let message = refusal(
+        &trellis,
+        "TRANSFORM mm FROM public.src GROUP BY g SELECT MAX(v + 1) AS hi",
+    )
+    .await;
+    assert!(message.contains("is over an expression"), "{message}");
+    let message = refusal(
+        &trellis,
+        "TRANSFORM mm FROM public.orders JOIN public.items ON orders.id = items.order_id \
+         GROUP BY orders.region SELECT orders.region AS region, MAX(items.qty) AS hi",
+    )
+    .await;
+    assert!(
+        message.contains("MAX is not supported: MIN/MAX is not an aggregate"),
+        "{message}"
+    );
+}
+
+/// A whole-transform `RESUME` refuses a `MIN`/`MAX` aggregate while its
+/// probe index is missing, with define's message (#1681 Q2), though the
+/// `GROUP BY` index alone exists; once the index is recreated it resumes.
+#[tokio::test]
+async fn a_min_max_resume_refuses_without_the_probe_index_and_succeeds_after_create_index() {
+    let (_cluster, _db, raw, trellis) =
+        setup("create index on public.src (g); create index src_g_v on public.src (g, v)").await;
+    trellis.apply(MIN_MAX).await.expect("define");
+    trellis.apply("PAUSE TRANSFORM mm").await.expect("pause");
+    raw.batch_execute("drop index public.src_g_v")
+        .await
+        .expect("drop");
+    let message = refusal(&trellis, "RESUME TRANSFORM mm").await;
+    assert!(
+        message.contains("mm needs a source index for its MIN/MAX")
+            && message.contains(r#"create index on "public"."src" ("g", "v")"#),
+        "{message}"
+    );
+    assert_eq!(
+        status_of(&trellis, "mm").await.status,
+        TransformStatus::Paused
+    );
+    raw.batch_execute("create index on public.src (g, v)")
+        .await
+        .expect("index");
+    trellis.apply("RESUME TRANSFORM mm").await.expect("resume");
+}

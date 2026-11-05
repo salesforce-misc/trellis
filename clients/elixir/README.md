@@ -71,7 +71,11 @@ The surface mirrors the Rust crate's `BlockingTrellis`. Every function has a ban
   `table`, `columns`, `role` (`:group_by`, `:join_from` or `:join_joined`: the part
   of the definition that needs it), `opted_out` and a `create index` statement as `fix`);
   `self_check/3` refuses such a target unless it was defined `WITHOUT SOURCE
-  INDEX`. `status/2` lists the partitions of a partitioned source a transform
+  INDEX`. `status/2` lists the source indexes a `MIN`/`MAX` aggregate's
+  probes read and the source lacks (`extreme_index_gaps`, each a
+  `Trellis.ExtremeIndexGap` with `table`, `columns`, `argument`, `opted_out`
+  and `fix`); nothing pauses, and a deleted extreme is re-read by scanning
+  its group. `status/2` lists the partitions of a partitioned source a transform
   is being corrected for while it reads `:backfilling` for them
   (`correcting`, each a `Trellis.CorrectingNode` with `node`, `since` and
   `keys_remaining`). `status/2` names what a Re-derive build waits on

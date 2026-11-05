@@ -245,9 +245,11 @@ fn type_rules() -> Vec<TypeRule> {
         T::Aggregate(AggregateRule::SumInterval),
         T::Aggregate(AggregateRule::AvgFloat),
         T::Aggregate(AggregateRule::AvgExact),
+        T::Aggregate(AggregateRule::Extreme),
         T::AggregateAdmission(AggregateAdmissionRule::Count),
         T::AggregateAdmission(AggregateAdmissionRule::SumAvgInteger),
         T::AggregateAdmission(AggregateAdmissionRule::SumAvgScaledNumeric),
+        T::AggregateAdmission(AggregateAdmissionRule::Extreme),
         T::GroupByKey(GroupByKeyRule::Integer),
         T::GroupByKey(GroupByKeyRule::Numeric),
         T::GroupByKey(GroupByKeyRule::Text),
@@ -317,11 +319,13 @@ fn type_rules() -> Vec<TypeRule> {
             AggregateRule::SumInterval => 33,
             AggregateRule::AvgFloat => 34,
             AggregateRule::AvgExact => 35,
+            AggregateRule::Extreme => 57,
         },
         T::AggregateAdmission(r) => match r {
             AggregateAdmissionRule::Count => 36,
             AggregateAdmissionRule::SumAvgInteger => 37,
             AggregateAdmissionRule::SumAvgScaledNumeric => 38,
+            AggregateAdmissionRule::Extreme => 58,
         },
         T::GroupByKey(r) => match r {
             GroupByKeyRule::Integer => 39,
@@ -416,6 +420,7 @@ fn features() -> Vec<Feature> {
         Layout::DefinitionState,
         Layout::OneToOneLedger,
         Layout::GroupBasis,
+        Layout::GroupBasisExtremes,
         Layout::Join,
         Layout::JoinOneToOne,
     ];
@@ -426,6 +431,7 @@ fn features() -> Vec<Feature> {
             Layout::GroupBasis => 2,
             Layout::Join => 3,
             Layout::JoinOneToOne => 4,
+            Layout::GroupBasisExtremes => 5,
         })
         .into_iter()
         .map(Feature::Layout),
@@ -613,7 +619,13 @@ fn manifest() -> String {
                 &mut lines,
                 format!("aggregate_admitted({name}, *)"),
                 Result::is_ok,
-                || super::validate::check_aggregate_admitted(name, None),
+                || {
+                    super::validate::check_aggregate_admitted(
+                        name,
+                        super::validate::AggregateScope::Plain,
+                        None,
+                    )
+                },
             );
         }
         for &t in &types {
@@ -630,12 +642,19 @@ fn manifest() -> String {
                     pg_type: "t",
                     typmod,
                     trellis_target: false,
+                    expression: false,
                 };
                 admissions(
                     &mut lines,
                     format!("aggregate_admitted({name}, {t:?} typmod {typmod})"),
                     Result::is_ok,
-                    || super::validate::check_aggregate_admitted(name, Some(&arg)),
+                    || {
+                        super::validate::check_aggregate_admitted(
+                            name,
+                            super::validate::AggregateScope::Plain,
+                            Some(&arg),
+                        )
+                    },
                 );
             }
         }

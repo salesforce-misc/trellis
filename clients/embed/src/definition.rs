@@ -16,9 +16,9 @@
 
 use trellis::{
     BackfillFailure, BelowCatalogFloor, BuildWait, CaptureFailure, CaptureFailureKind, CaptureWait,
-    CorrectingNode, DefinitionStatus, DefinitionSummary, DrainFailure, FanOutWarning,
-    HiddenTableSize, JoinBuildStep, JoinSide, JoinSidePart, JoinStatus, OneToOneBuildStep,
-    OtherProcess, OtherVersionLive, PartialsWarning, SourceIndexGap,
+    CorrectingNode, DefinitionStatus, DefinitionSummary, DrainFailure, ExtremeIndexGap,
+    FanOutWarning, HiddenTableSize, JoinBuildStep, JoinSide, JoinSidePart, JoinStatus,
+    OneToOneBuildStep, OtherProcess, OtherVersionLive, PartialsWarning, SourceIndexGap,
 };
 
 use crate::{PlainHeldKeys, epoch_micros, transform_status};
@@ -79,6 +79,9 @@ pub struct PlainDefinitionStatus {
     /// The source indexes a `GROUP BY` or `JOIN` target needs and lacks; see
     /// [`DefinitionStatus::source_index_gaps`].
     pub source_index_gaps: Vec<PlainSourceIndexGap>,
+    /// The source indexes a `MIN`/`MAX` aggregate's probes read and the
+    /// source lacks now; see [`DefinitionStatus::extreme_index_gaps`].
+    pub extreme_index_gaps: Vec<PlainExtremeIndexGap>,
     /// The nodes of its partitioned source the definition is being corrected
     /// for, oldest first; see [`DefinitionStatus::correcting`].
     pub correcting: Vec<PlainCorrectingNode>,
@@ -308,6 +311,23 @@ pub struct PlainSourceIndexGap {
     pub fix: String,
 }
 
+/// An [`ExtremeIndexGap`] flattened to plain data: a source index a
+/// `MIN`/`MAX` field's probe reads and the source lacks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainExtremeIndexGap {
+    /// The qualified table the index is missing on.
+    pub table: String,
+    /// The columns the index should lead with: the `GROUP BY` columns, then
+    /// [`Self::argument`].
+    pub columns: Vec<String>,
+    /// The source column the `MIN`/`MAX` reads.
+    pub argument: String,
+    /// Whether the definition opted out (`WITHOUT SOURCE INDEX`).
+    pub opted_out: bool,
+    /// What to do about it: a `create index` statement.
+    pub fix: String,
+}
+
 /// Every [`PlainSourceIndexGap::role`] word, for a binding to intern up
 /// front.
 pub fn index_role_names() -> [&'static str; 3] {
@@ -401,6 +421,11 @@ impl From<&DefinitionStatus> for PlainDefinitionStatus {
                 .source_index_gaps
                 .iter()
                 .map(PlainSourceIndexGap::from)
+                .collect(),
+            extreme_index_gaps: status
+                .extreme_index_gaps
+                .iter()
+                .map(PlainExtremeIndexGap::from)
                 .collect(),
             correcting: status
                 .correcting
@@ -531,6 +556,18 @@ impl From<&SourceIndexGap> for PlainSourceIndexGap {
             table: gap.table.clone(),
             columns: gap.columns.clone(),
             role: gap.role.as_str(),
+            opted_out: gap.opted_out,
+            fix: gap.fix(),
+        }
+    }
+}
+
+impl From<&ExtremeIndexGap> for PlainExtremeIndexGap {
+    fn from(gap: &ExtremeIndexGap) -> Self {
+        PlainExtremeIndexGap {
+            table: gap.table.clone(),
+            columns: gap.columns.clone(),
+            argument: gap.argument.clone(),
             opted_out: gap.opted_out,
             fix: gap.fix(),
         }
@@ -715,6 +752,7 @@ mod tests {
                 held_keys: None,
                 drain_failure: None,
                 source_index_gaps: Vec::new(),
+                extreme_index_gaps: Vec::new(),
                 paused_upstream_columns: Vec::new(),
                 correcting: Vec::new(),
                 build_wait_xid: None,
@@ -796,6 +834,29 @@ mod tests {
         );
         assert_eq!(trellis::IndexRole::GroupBy.as_str(), "group_by");
         assert_eq!(trellis::IndexRole::JoinFrom.as_str(), "join_from");
+    }
+
+    #[test]
+    fn an_extreme_index_gap_crosses_with_its_argument_and_fix() {
+        let gap = trellis::fixture!(ExtremeIndexGap {
+            table: "public.src".to_string(),
+            columns: vec!["g".to_string(), "v".to_string()],
+            argument: "v".to_string(),
+            opted_out: false,
+        });
+        let status = trellis::fixture!(DefinitionStatus {
+            extreme_index_gaps: vec![gap],
+        });
+        assert_eq!(
+            PlainDefinitionStatus::from(&status).extreme_index_gaps,
+            [PlainExtremeIndexGap {
+                table: "public.src".to_string(),
+                columns: vec!["g".to_string(), "v".to_string()],
+                argument: "v".to_string(),
+                opted_out: false,
+                fix: "create index on \"public\".\"src\" (\"g\", \"v\")".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -920,6 +981,7 @@ mod tests {
                 held_keys: None,
                 drain_failure: None,
                 source_index_gaps: Vec::new(),
+                extreme_index_gaps: Vec::new(),
                 paused_upstream_columns: Vec::new(),
                 correcting: Vec::new(),
                 build_wait_xid: None,

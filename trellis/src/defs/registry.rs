@@ -500,7 +500,7 @@ pub enum ExtractRule {
     Timestamp,
 }
 
-/// The argument types `SUM` and `AVG` are typed over.
+/// The argument types `SUM`, `AVG`, `MIN` and `MAX` are typed over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateRule {
     /// `SUM` of a `smallint` or `integer`: `bigint`.
@@ -515,6 +515,9 @@ pub enum AggregateRule {
     AvgFloat,
     /// `AVG` of an exact number: `numeric`.
     AvgExact,
+    /// `MIN` or `MAX` of a type with a btree order and no collation
+    /// ([`extreme_type_admitted`]): its own type.
+    Extreme,
 }
 
 /// The aggregates and argument types the group basis keeps.
@@ -526,6 +529,9 @@ pub enum AggregateAdmissionRule {
     SumAvgInteger,
     /// `SUM` or `AVG` of a `numeric` with a declared scale.
     SumAvgScaledNumeric,
+    /// `MIN` or `MAX` of a plain source column, in a plain aggregate (not a
+    /// `JOIN`), over a type [`extreme_type_admitted`] admits.
+    Extreme,
 }
 
 /// The `GROUP BY` key types the validator admits, one per type its gate
@@ -604,12 +610,14 @@ impl TypeRule {
                 | AggregateRule::SumFloat
                 | AggregateRule::SumInterval
                 | AggregateRule::AvgFloat
-                | AggregateRule::AvgExact => BASELINE,
+                | AggregateRule::AvgExact
+                | AggregateRule::Extreme => BASELINE,
             },
             TypeRule::AggregateAdmission(rule) => match rule {
                 AggregateAdmissionRule::Count
                 | AggregateAdmissionRule::SumAvgInteger
-                | AggregateAdmissionRule::SumAvgScaledNumeric => BASELINE,
+                | AggregateAdmissionRule::SumAvgScaledNumeric
+                | AggregateAdmissionRule::Extreme => BASELINE,
             },
             TypeRule::GroupByKey(rule) => match rule {
                 GroupByKeyRule::Integer
@@ -1217,11 +1225,12 @@ pub const AGGREGATE_FUNCTIONS: &[&str] = &[
 /// The aggregate functions the grammar parses, each entry's `arg_types`
 /// length its arity, which [`super::parser`] enforces. `COUNT`, `SUM` and
 /// `AVG` are the ones an [`super::ast::KeySpace::Aggregate`] or `JOIN`
-/// definition keeps; every other name is parsed only so
+/// definition keeps, and `MIN` and `MAX` the ones a plain aggregate keeps
+/// besides; every other name, and `MIN`/`MAX` in a `JOIN`, is parsed only so
 /// the validator can refuse it by family
 /// (`validate::check_aggregate_admitted`), and its declared types are a
-/// placeholder. Which argument types `SUM` and `AVG` accept, and what they
-/// return for each, is [`aggregate_result_type`]'s job.
+/// placeholder. Which argument types `SUM`, `AVG`, `MIN` and `MAX` accept,
+/// and what they return for each, is [`aggregate_result_type`]'s job.
 ///
 /// `COUNT` is the one entry whose arity isn't read from here. Its
 /// `arg_types` is empty, and [`super::parser`] special-cases both forms:
@@ -1357,6 +1366,14 @@ pub fn aggregate_result_type(name: &str, arg: ValueType) -> Option<ValueType> {
 /// [`aggregate_result_type`] with the case that admits the argument.
 pub fn aggregate_rule(name: &str, arg: ValueType) -> Option<Admitted> {
     let admitted = |value_type, rule| Some(Admitted::new(value_type, TypeRule::Aggregate(rule)));
+    // `min(x)` and `max(x)` are of `x`'s type in Postgres.
+    if matches!(name, "MIN" | "MAX") {
+        return if extreme_type_admitted(arg) {
+            admitted(arg, AggregateRule::Extreme)
+        } else {
+            None
+        };
+    }
     // A float or `interval` sum is typed so a definition reaches its family
     // refusal (`validate::check_aggregate_admitted`, #1119) rather than a
     // type error; the group basis keeps neither.
@@ -1388,6 +1405,29 @@ pub fn aggregate_rule(name: &str, arg: ValueType) -> Option<Admitted> {
         ("AVG", _) => admitted(ValueType::Numeric, AggregateRule::AvgExact),
         _ => None,
     }
+}
+
+/// Whether `MIN`/`MAX` is typed and kept over an argument of type
+/// `value_type`: a type with a btree order and no collation (the integers,
+/// `numeric`, the floats, `date`, `time`, `timestamp`, `timestamptz`,
+/// `interval` and `oid`). A collatable argument (text) needs the group
+/// basis's hidden extreme and its probe to agree on a collation, which the
+/// engine doesn't arrange yet.
+pub fn extreme_type_admitted(value_type: ValueType) -> bool {
+    matches!(
+        value_type,
+        ValueType::Integer(_)
+            | ValueType::Numeric
+            | ValueType::Float(_)
+            | ValueType::Other(
+                PgType::Date
+                    | PgType::Time
+                    | PgType::Timestamp
+                    | PgType::TimestampTz
+                    | PgType::Interval
+                    | PgType::Oid
+            )
+    )
 }
 
 /// Identifiers known to be non-immutable (depend on database/session state

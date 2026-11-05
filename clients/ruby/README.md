@@ -78,7 +78,11 @@ Nothing in the binding uses it.
   `table`, `columns`, `role` (`:group_by`, `:join_from` or `:join_joined`: the part of
   the definition that needs it), `opted_out` and a `create index` statement as `fix`);
   `self_check` refuses such a target unless it was defined `WITHOUT SOURCE
-  INDEX`. `status` lists the partitions of a partitioned source a definition
+  INDEX`. `status` lists the source indexes a `MIN`/`MAX` aggregate's probes
+  read and the source lacks (`extreme_index_gaps`, each a
+  `Trellis::ExtremeIndexGap` with `table`, `columns`, `argument`, `opted_out`
+  and `fix`); nothing pauses, and a deleted extreme is re-read by scanning
+  its group. `status` lists the partitions of a partitioned source a definition
   is being corrected for while it reads `:backfilling` for them
   (`correcting`, each a `Trellis::CorrectingNode` with `node`, `since` and
   `keys_remaining`). `status` names what a Re-derive build waits on instead

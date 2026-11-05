@@ -69,14 +69,14 @@ use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, JOIN_BUILD_STEPS, JOIN_SIDE_PARTS, JOIN_SIDES, LOG_LEVELS,
     PlainApplied, PlainBackfillFailure, PlainBelowCatalogFloor, PlainCaptureFailure,
     PlainCaptureWait, PlainConfig, PlainCorrectingNode, PlainDefinitionStatus,
-    PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainFanOutWarning,
-    PlainHeldKeys, PlainHiddenTable, PlainJoinBuildStep, PlainJoinStatus, PlainOtherProcess,
-    PlainPartialsWarning, PlainPoisonEntry, PlainQuarantineEntry, PlainSamplePage,
-    PlainSelfCheckJob, PlainSelfCheckReport, PlainSourceIndexGap, PlainVersionHandover,
-    SELF_CHECK_MODES, SELF_CHECK_OUTCOMES, SELF_CHECK_STATES, capture_failure_kind_names,
-    decode_cursor, decode_watermark, encode_watermark, index_role_names, quarantine_state_names,
-    require_transform_statement, self_check_mode, system_time_from_epoch_micros,
-    transform_status_names,
+    PlainDefinitionSummary, PlainDivergence, PlainDrainFailure, PlainError, PlainExtremeIndexGap,
+    PlainFanOutWarning, PlainHeldKeys, PlainHiddenTable, PlainJoinBuildStep, PlainJoinStatus,
+    PlainOtherProcess, PlainPartialsWarning, PlainPoisonEntry, PlainQuarantineEntry,
+    PlainSamplePage, PlainSelfCheckJob, PlainSelfCheckReport, PlainSourceIndexGap,
+    PlainVersionHandover, SELF_CHECK_MODES, SELF_CHECK_OUTCOMES, SELF_CHECK_STATES,
+    capture_failure_kind_names, decode_cursor, decode_watermark, encode_watermark,
+    index_role_names, quarantine_state_names, require_transform_statement, self_check_mode,
+    system_time_from_epoch_micros, transform_status_names,
 };
 
 /// What every NIF returns: `{:ok, T}` or `{:error, {code, message}}`.
@@ -228,6 +228,7 @@ struct StatusTerm {
     held_keys: Option<HeldKeysTerm>,
     drain_failure: Option<DrainFailureTerm>,
     source_index_gaps: Vec<SourceIndexGapTerm>,
+    extreme_index_gaps: Vec<ExtremeIndexGapTerm>,
     correcting: Vec<CorrectingNodeTerm>,
     paused_upstream_columns: Vec<String>,
     build_wait_xid: Option<i64>,
@@ -441,6 +442,29 @@ impl SourceIndexGapTerm {
             opted_out: gap.opted_out,
             fix: gap.fix,
         })
+    }
+}
+
+/// A source index a `MIN`/`MAX` field's probe reads and the source lacks,
+/// as `status/2` reports it.
+#[derive(NifMap)]
+struct ExtremeIndexGapTerm {
+    table: String,
+    columns: Vec<String>,
+    argument: String,
+    opted_out: bool,
+    fix: String,
+}
+
+impl From<PlainExtremeIndexGap> for ExtremeIndexGapTerm {
+    fn from(gap: PlainExtremeIndexGap) -> Self {
+        ExtremeIndexGapTerm {
+            table: gap.table,
+            columns: gap.columns,
+            argument: gap.argument,
+            opted_out: gap.opted_out,
+            fix: gap.fix,
+        }
     }
 }
 
@@ -1178,6 +1202,11 @@ fn status<'a>(
                     .into_iter()
                     .map(|gap| SourceIndexGapTerm::new(env, gap))
                     .collect::<NifReply<_>>()?,
+                extreme_index_gaps: status
+                    .extreme_index_gaps
+                    .into_iter()
+                    .map(ExtremeIndexGapTerm::from)
+                    .collect(),
                 correcting: status
                     .correcting
                     .into_iter()

@@ -460,14 +460,11 @@ async fn extremes(fx: &Fx) {
 /// its truncated minimum.
 #[tokio::test]
 async fn min_and_max_through_a_leaf_truncate_are_recomputed() {
-    trellis::staging::admit_min_max_for_tests();
     let mut fx = Fx::start_with(
-        &tree("range"),
+        &format!("{} create index on public.items (g, v);", tree("range")),
         SEED,
-        &[
-            "TRANSFORM agg FROM public.items GROUP BY g WITHOUT SOURCE INDEX \
-           SELECT SUM(v) AS total, COUNT(*) AS n, MIN(v) AS lo, MAX(v) AS hi",
-        ],
+        &["TRANSFORM agg FROM public.items GROUP BY g \
+           SELECT SUM(v) AS total, COUNT(*) AS n, MIN(v) AS lo, MAX(v) AS hi"],
     )
     .await;
     extremes(&fx).await;

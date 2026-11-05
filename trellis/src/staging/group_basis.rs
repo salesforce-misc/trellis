@@ -48,13 +48,13 @@
 //! # Which definitions
 //!
 //! A plain aggregate (every `GROUP BY` key a source column) whose every value field
-//! composes the admitted aggregates (`COUNT(*)`, `COUNT(x)`, and `SUM`/`AVG` over
-//! an integer argument or a `numeric` column) with literals, operators, functions
-//! and its `GROUP BY` keys. An argument may be an expression over the row (`SUM(a +
-//! b)`); a `numeric` one must be a column, whose declared scale define checks.
-//! Define refuses any other aggregate by family. The engine also keeps
-//! `MIN`/`MAX` over a plain source column of an ordered type with no
-//! collation ("Extremes" below), which define still refuses (#1117).
+//! composes the admitted aggregates (`COUNT(*)`, `COUNT(x)`, `SUM`/`AVG` over
+//! an integer argument or a `numeric` column, and `MIN`/`MAX` over a plain
+//! source column of an ordered type with no collation, "Extremes" below) with
+//! literals, operators, functions and its `GROUP BY` keys. A `SUM`/`AVG`
+//! argument may be an expression over the row (`SUM(a + b)`); a `numeric` one
+//! must be a column, whose declared scale define checks. Define refuses any
+//! other aggregate by family.
 //!
 //! # Where its state lives
 //!
@@ -456,138 +456,12 @@ impl GroupShape {
     }
 }
 
-/// Whether the group basis keeps a hidden extreme over an argument of type
-/// `value_type`: a type with a btree order and no collation. A collatable
-/// argument (text) needs the hidden column and the probe to agree on a
-/// collation, which this engine doesn't arrange yet.
-fn extreme_type_admitted(value_type: ValueType) -> bool {
-    use crate::defs::PgType;
-    matches!(
-        value_type,
-        ValueType::Integer(_)
-            | ValueType::Numeric
-            | ValueType::Float(_)
-            | ValueType::Other(
-                PgType::Date
-                    | PgType::Time
-                    | PgType::Timestamp
-                    | PgType::TimestampTz
-                    | PgType::Interval
-                    | PgType::Oid
-            )
-    )
-}
-
 /// The plain source column `MIN`/`MAX` reads, if `arg` is one.
 fn extreme_column(arg: &Expr) -> Option<&str> {
     match arg {
         Expr::Column(column) | Expr::SourceColumn { column, .. } => Some(column),
         _ => None,
     }
-}
-
-/// Whether `name` is `MIN` or `MAX`.
-fn is_extreme_name(name: &str) -> bool {
-    matches!(name.to_ascii_uppercase().as_str(), "MIN" | "MAX")
-}
-
-/// `expr` with every `MIN(x)`/`MAX(x)` call replaced by `CAST(NULL AS t)`,
-/// `t` the type of `x` over `source_columns`: an expression the validator
-/// types as Postgres types `min(x)`, for typing a definition the validator
-/// refuses by family (#1117). `None` when a call's argument has no type.
-fn without_extremes(expr: &Expr, source_columns: &HashMap<String, ValueType>) -> Option<Expr> {
-    let walk = |e: &Expr| without_extremes(e, source_columns);
-    Some(match expr {
-        Expr::FunctionCall { name, args } if is_extreme_name(name) && args.len() == 1 => {
-            Expr::Cast {
-                expr: Box::new(Expr::Null),
-                target: crate::defs::validate::infer_expr_type(&args[0], source_columns).ok()?,
-            }
-        }
-        Expr::FunctionCall { name, args } => Expr::FunctionCall {
-            name: name.clone(),
-            args: args.iter().map(walk).collect::<Option<Vec<_>>>()?,
-        },
-        Expr::BinaryOp { op, lhs, rhs } => Expr::BinaryOp {
-            op: *op,
-            lhs: Box::new(walk(lhs)?),
-            rhs: Box::new(walk(rhs)?),
-        },
-        Expr::Negate(operand) => Expr::Negate(Box::new(walk(operand)?)),
-        Expr::Cast {
-            expr: operand,
-            target,
-        } => Expr::Cast {
-            expr: Box::new(walk(operand)?),
-            target: *target,
-        },
-        Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => expr
-            .map_logic_children(|child| walk(child).ok_or(()))
-            .expect("a logic node")
-            .ok()?,
-        other => other.clone(),
-    })
-}
-
-/// Whether any field of `def` calls `MIN` or `MAX`.
-fn calls_extremes(def: &TransformDef) -> bool {
-    fn walk(expr: &Expr) -> bool {
-        match expr {
-            Expr::FunctionCall { name, args } => is_extreme_name(name) || args.iter().any(walk),
-            Expr::BinaryOp { lhs, rhs, .. } => walk(lhs) || walk(rhs),
-            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => walk(operand),
-            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
-                expr.logic_children().into_iter().any(walk)
-            }
-            _ => false,
-        }
-    }
-    def.fields.iter().any(|field| walk(&field.expr))
-}
-
-/// `def` with its `MIN`/`MAX` calls typed away ([`without_extremes`]), or
-/// `None` when it has none (or one can't be typed).
-fn extremes_typed_away(
-    def: &TransformDef,
-    source_columns: &HashMap<String, ValueType>,
-) -> Option<TransformDef> {
-    if !calls_extremes(def) {
-        return None;
-    }
-    let mut typed = def.clone();
-    for field in &mut typed.fields {
-        field.expr = without_extremes(&field.expr, source_columns)?;
-    }
-    Some(typed)
-}
-
-/// Test-only admission of `MIN`/`MAX` on a plain aggregate (#1117, step 1
-/// of its PRs): define still refuses them by family, unless a test turned
-/// this on. The engine keeps them whatever this says; only define's
-/// refusal is skipped. The define gate itself comes with a later PR.
-#[cfg(any(test, feature = "test-util"))]
-static ADMIT_EXTREMES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Turns [`ADMIT_EXTREMES`] on for the rest of this process.
-#[cfg(any(test, feature = "test-util"))]
-pub fn admit_extremes_for_tests() {
-    ADMIT_EXTREMES.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// What define validates in place of `def`: `def` itself, or, while a test
-/// admits `MIN`/`MAX` ([`admit_extremes_for_tests`]), `def` with its
-/// `MIN`/`MAX` calls typed away, so define's family refusal doesn't see them.
-#[cfg(any(test, feature = "test-util"))]
-pub(crate) fn define_view(
-    def: &TransformDef,
-    source_columns: &HashMap<String, ValueType>,
-) -> Option<TransformDef> {
-    if !ADMIT_EXTREMES.load(std::sync::atomic::Ordering::Relaxed)
-        || !matches!(def.key_space, KeySpace::Aggregate { .. })
-    {
-        return None;
-    }
-    extremes_typed_away(def, source_columns)
 }
 
 /// The column an aggregate call is read from inside a field's expression.
@@ -612,13 +486,7 @@ pub(crate) fn route(
         group_types.push(ddl::pg_type_name(*value_type).into_owned());
     }
     let substituted = crate::defs::backfill::substituted_field_exprs(def).ok()?;
-    // The validator refuses `MIN`/`MAX` by family, so a definition calling
-    // them is typed with each call as a `NULL` of its argument's type, which
-    // is the type Postgres gives `min(x)`.
-    let typed = extremes_typed_away(def, source_columns);
-    let field_types =
-        crate::defs::validate::infer_field_types(typed.as_ref().unwrap_or(def), source_columns)
-            .ok()?;
+    let field_types = crate::defs::validate::infer_field_types(def, source_columns).ok()?;
     let distinct = distinct_arguments(&def.fields, group_by, &substituted);
     let mut shape = GroupShape {
         group_cols,
@@ -685,7 +553,7 @@ fn rewrite_with(
                 (function @ ("MIN" | "MAX"), [arg]) if extremes => {
                     extreme_column(arg)?;
                     let value_type = type_of(arg)?;
-                    if !extreme_type_admitted(value_type) {
+                    if !crate::defs::registry::extreme_type_admitted(value_type) {
                         return None;
                     }
                     Agg::Extreme {

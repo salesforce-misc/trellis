@@ -4262,7 +4262,7 @@ async fn resume_locked(
             });
         }
     };
-    match catalog::check_owned_tables(txn, &definition, &revalidated).await {
+    match catalog::check_owned_tables(txn, schema, &definition, &revalidated).await {
         Ok(()) => {}
         Err(err @ (catalog::CatalogError::Db(_) | catalog::CatalogError::Pool(_))) => {
             return Err(err.into());
@@ -5076,7 +5076,9 @@ async fn finish_requested_resume(
         // re-typed under `ACCESS EXCLUSIVE` that `resume_locked` would then
         // refuse.
         let checked = match catalog::revalidate(&txn, schema, floors, &definition).await {
-            Ok(revalidated) => catalog::check_owned_tables(&txn, &definition, &revalidated).await,
+            Ok(revalidated) => {
+                catalog::check_owned_tables(&txn, schema, &definition, &revalidated).await
+            }
             Err(err) => Err(err),
         };
         match checked {

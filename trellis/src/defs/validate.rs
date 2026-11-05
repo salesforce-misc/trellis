@@ -184,10 +184,10 @@ pub enum ValidationError {
     /// definition reads (one whose source was dropped), which would then
     /// read the 1-1 `JOIN`'s target (ADR-0021).
     OneToOneJoinTargetHasReader { target: String, reader: String },
-    /// An aggregate in a deferred family (`MIN`/`MAX`, `bool_*`/`bit_*`,
-    /// float or `interval` `SUM`/`AVG`, `array_agg`/`string_agg`/`jsonb_agg`).
-    /// Only the aggregates the group basis keeps exact from signed deltas are
-    /// admitted.
+    /// An aggregate in a deferred family (`MIN`/`MAX` in a `JOIN`,
+    /// `bool_*`/`bit_*`, float or `interval` `SUM`/`AVG`,
+    /// `array_agg`/`string_agg`/`jsonb_agg`). Only the aggregates the group
+    /// basis keeps exact are admitted.
     DeferredAggregate {
         function: String,
         family: &'static str,
@@ -206,6 +206,31 @@ pub enum ValidationError {
         function: String,
         column: String,
         pg_type: String,
+    },
+    /// `MIN`/`MAX` over an argument whose type has no btree order or has a
+    /// collation (`registry::extreme_type_admitted`): the group basis keeps
+    /// an extreme only of a number, date or time type.
+    UnsupportedExtremeArgument {
+        function: String,
+        argument: String,
+        pg_type: String,
+    },
+    /// `MIN`/`MAX` over an expression rather than a plain source column: the
+    /// probe that re-reads a retracted extreme reads an index on the column
+    /// (#1117 rule 5).
+    ExtremeOfExpression { function: String, argument: String },
+    /// `MIN`/`MAX` over a column of a table Trellis creates (another
+    /// transform's target), which has no index for the probe to read
+    /// (#1117 rule 6).
+    ChainedExtreme { function: String, column: String },
+    /// A `MIN`/`MAX` definition declared `WITHOUT SOURCE INDEX`: the opt-out
+    /// doesn't apply to `MIN`/`MAX`, whose probe needs an index on the
+    /// `GROUP BY` columns then each argument (#1681). `indexes` are those
+    /// indexes, on the source as the definition names it (qualified once
+    /// define resolves it).
+    ExtremesWithoutSourceIndex {
+        target: String,
+        indexes: Vec<super::source_index::SourceIndex>,
     },
     /// The target's name ends with `suffix`, one of
     /// `super::ledger::RESERVED_TARGET_SUFFIXES`, which name the tables
@@ -924,6 +949,17 @@ impl ValidationError {
                 ambiguous.source_schema = Some(schema.to_string());
                 ValidationError::AmbiguousColumnReference(ambiguous)
             }
+            ValidationError::ExtremesWithoutSourceIndex {
+                target,
+                mut indexes,
+            } => {
+                for index in &mut indexes {
+                    if !index.table.contains('.') {
+                        index.table = format!("{schema}.{}", index.table);
+                    }
+                }
+                ValidationError::ExtremesWithoutSourceIndex { target, indexes }
+            }
             other => other,
         }
     }
@@ -1122,8 +1158,9 @@ impl fmt::Display for ValidationError {
             ValidationError::DeferredAggregate { function, family } => write!(
                 f,
                 "{function} is not supported: {family} is not an aggregate Trellis maintains; \
-                 the supported aggregates are COUNT(*), COUNT(col), and SUM/AVG over \
-                 smallint, integer, bigint or numeric(p,s) (see \"Supported sources and \
+                 the supported aggregates are COUNT(*), COUNT(col), SUM/AVG over \
+                 smallint, integer, bigint or numeric(p,s), and, in a GROUP BY without a \
+                 JOIN, MIN/MAX of a number, date or time column (see \"Supported sources and \
                  targets\" in docs/transforms.md)"
             ),
             ValidationError::UnconstrainedNumericAggregate { function, column } => write!(
@@ -1152,6 +1189,37 @@ impl fmt::Display for ValidationError {
                 f,
                 "{function}({column}) is over {pg_type}; SUM and AVG are supported over \
                  smallint, integer, bigint and numeric(p,s) only"
+            ),
+            ValidationError::UnsupportedExtremeArgument {
+                function,
+                argument,
+                pg_type,
+            } => write!(
+                f,
+                "{function}({argument}) is over {pg_type}; MIN and MAX are \
+                 supported over smallint, integer, bigint, numeric, real, double precision, \
+                 date, time, timestamp, timestamptz, interval and oid only (a type with a \
+                 collation, such as text, is not supported yet)"
+            ),
+            ValidationError::ExtremeOfExpression { function, argument } => write!(
+                f,
+                "{function}({argument}) is over an expression; MIN and MAX take a plain source \
+                 column: when a group's extreme is deleted, the next one is re-read through an \
+                 index on that column. To aggregate an expression, add it to the source as a stored \
+                 generated column, index it after the GROUP BY columns, and take the MIN/MAX \
+                 of that column"
+            ),
+            ValidationError::ChainedExtreme { function, column } => write!(
+                f,
+                "{function}({column}) is over a column of a table Trellis creates (another \
+                 transform's target), which is not supported: a MIN/MAX re-reads a group's \
+                 extreme from its source through an index on it. Take the MIN/MAX in the \
+                 transform that reads the source"
+            ),
+            ValidationError::ExtremesWithoutSourceIndex { target, indexes } => write!(
+                f,
+                "{}",
+                super::source_index::extreme_refusal_text(target, indexes, true)
             ),
             ValidationError::ReservedTargetSuffix { target, suffix } => write!(
                 f,
@@ -1749,10 +1817,41 @@ pub fn validate(
     }
 
     if let KeySpace::Aggregate { .. } = &def.key_space {
+        reject_extremes_without_source_index(def, source_columns)?;
         check_aggregate_table_widths(def, source_columns)?;
     }
 
     Ok(())
+}
+
+/// Refuses a `MIN`/`MAX` definition declared `WITHOUT SOURCE INDEX`
+/// ([`ValidationError::ExtremesWithoutSourceIndex`]): a probe without its
+/// index scans the group, and with no `GROUP BY` index either it scans the
+/// whole source, once per probed group. Define, an edit and a resume all
+/// validate through here, so the refusal holds for the definition's life.
+fn reject_extremes_without_source_index(
+    def: &TransformDef,
+    source_columns: &HashMap<String, ValueType>,
+) -> Result<(), ValidationError> {
+    if !def.without_source_index {
+        return Ok(());
+    }
+    let indexes = super::source_index::extreme_indexes(def, source_columns, &def_source_name(def));
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    Err(ValidationError::ExtremesWithoutSourceIndex {
+        target: def.target.clone(),
+        indexes,
+    })
+}
+
+/// The source as `def` names it: `schema.table` when it spells the schema.
+fn def_source_name(def: &TransformDef) -> String {
+    match &def.explicit_source_schema {
+        Some(schema) => format!("{schema}.{}", def.source),
+        None => def.source.clone(),
+    }
 }
 
 /// Refuses an aggregate whose target, or whose hidden table of partials (two
@@ -1888,24 +1987,41 @@ pub(crate) struct AggregateArg<'a> {
     pub typmod: i32,
     /// The column is a column of a table Trellis creates.
     pub trellis_target: bool,
+    /// The argument is an expression, not a plain column.
+    pub expression: bool,
+}
+
+/// Where an aggregate call sits, which decides whether `MIN`/`MAX` is
+/// admitted: a plain aggregate keeps them, a `JOIN` doesn't (#1117 rule 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AggregateScope {
+    /// A `GROUP BY` over one table.
+    Plain,
+    /// An aggregate `JOIN`.
+    Join,
 }
 
 /// The per-family refusal of aggregates outside the admitted set: whether `function` (an
 /// uppercased aggregate name) over `arg` is in the admitted set, `COUNT(*)`,
-/// `COUNT(col)`, and `SUM`/`AVG` over `smallint`/`integer`/`bigint`/
-/// `numeric(p,s)`, or else a named refusal. `arg` is `None` for `COUNT(*)`
-/// and for a call whose argument isn't a resolved column.
+/// `COUNT(col)`, `SUM`/`AVG` over `smallint`/`integer`/`bigint`/
+/// `numeric(p,s)`, and in a plain aggregate (`scope`) `MIN`/`MAX` of a
+/// plain source column of a type `registry::extreme_type_admitted` admits,
+/// or else a named refusal. `arg` is `None` for `COUNT(*)` and for the
+/// family check made before the argument is typed.
 ///
 /// Shared so every key-space refuses the same way: a `JOIN` and a plain
 /// aggregate both use it.
 pub(crate) fn check_aggregate_admitted(
     function: &str,
+    scope: AggregateScope,
     arg: Option<&AggregateArg<'_>>,
 ) -> Result<(), ValidationError> {
     let function = function.to_ascii_uppercase();
+    let extreme = matches!(function.as_str(), "MIN" | "MAX");
     if let Some((_, family)) = DEFERRED_AGGREGATES
         .iter()
         .find(|(names, _)| names.contains(&function.as_str()))
+        && !(extreme && scope == AggregateScope::Plain)
     {
         return Err(ValidationError::DeferredAggregate { function, family });
     }
@@ -1918,6 +2034,28 @@ pub(crate) fn check_aggregate_admitted(
     };
     match function.as_str() {
         "COUNT" => admitted(AggregateAdmissionRule::Count),
+        "MIN" | "MAX" => {
+            let Some(arg) = arg else { return Ok(()) };
+            if arg.expression {
+                Err(ValidationError::ExtremeOfExpression {
+                    function,
+                    argument: arg.column.to_string(),
+                })
+            } else if arg.trellis_target {
+                Err(ValidationError::ChainedExtreme {
+                    function,
+                    column: arg.column.to_string(),
+                })
+            } else if super::registry::extreme_type_admitted(arg.value_type) {
+                admitted(AggregateAdmissionRule::Extreme)
+            } else {
+                Err(ValidationError::UnsupportedExtremeArgument {
+                    function,
+                    argument: arg.column.to_string(),
+                    pg_type: arg.pg_type.to_string(),
+                })
+            }
+        }
         "SUM" | "AVG" => {
             let Some(arg) = arg else { return Ok(()) };
             match arg.value_type {
@@ -2019,7 +2157,7 @@ fn check_aggregate_calls(
                 }
                 return Ok(());
             }
-            check_aggregate_admitted(&upper, None)?;
+            check_aggregate_admitted(&upper, AggregateScope::Plain, None)?;
             let [arg] = args.as_slice() else {
                 return Ok(());
             };
@@ -2038,12 +2176,14 @@ fn check_aggregate_calls(
             };
             check_aggregate_admitted(
                 &upper,
+                AggregateScope::Plain,
                 Some(&AggregateArg {
                     column: &render_field_expr(arg),
                     value_type,
                     pg_type: &pg_type,
                     typmod,
                     trellis_target,
+                    expression: column.is_none(),
                 }),
             )
         }
@@ -2458,7 +2598,7 @@ fn check_join_field_expr<'a>(
             if in_aggregate.is_some() {
                 return Err(shape("an aggregate can't be nested in another aggregate"));
             }
-            check_aggregate_admitted(&upper, None)?;
+            check_aggregate_admitted(&upper, AggregateScope::Join, None)?;
             *aggregates += 1;
             let arg = match args.as_slice() {
                 [] if upper == "COUNT" => return Ok(()),
@@ -2510,12 +2650,14 @@ fn check_join_field_expr<'a>(
             };
             check_aggregate_admitted(
                 &upper,
+                AggregateScope::Join,
                 Some(&AggregateArg {
                     column: &render_field_expr(arg),
                     value_type,
                     pg_type: &pg_type,
                     typmod,
                     trellis_target,
+                    expression: !matches!(arg, Expr::SourceColumn { .. }),
                 }),
             )
         }
@@ -5255,7 +5397,7 @@ fn infer_expr(
             // by family, before its argument is typed: the grammar parses
             // these names only to refuse them.
             if is_deferred_aggregate_name(name) {
-                check_aggregate_admitted(&name.to_ascii_uppercase(), None)?;
+                check_aggregate_admitted(&name.to_ascii_uppercase(), AggregateScope::Plain, None)?;
             }
             let spec = super::registry::lookup_function(name).or(aggregate_spec);
             // An aggregate's argument reads source columns, not aggregate
@@ -5331,6 +5473,18 @@ fn infer_expr(
                 // (`registry::aggregate_result_type`). A scalar function's
                 // argument list stays an exact match: all four of those take
                 // `Text`, and Postgres would not coerce an integer into one.
+                // `MIN`/`MAX` is typed over the types the group basis keeps
+                // an extreme of, and refused by name over any other.
+                if is_aggregate
+                    && matches!(name.as_str(), "MIN" | "MAX")
+                    && !super::registry::extreme_type_admitted(arg_t)
+                {
+                    return Err(ValidationError::UnsupportedExtremeArgument {
+                        function: name.clone(),
+                        argument: render_field_expr(arg),
+                        pg_type: super::ddl::pg_type_name(arg_t).into_owned(),
+                    });
+                }
                 let admissible = if is_aggregate && *expected == ValueType::Numeric {
                     // A `Numeric`-declared *aggregate*
                     // argument means "any numeric type", floats included —
@@ -8510,24 +8664,207 @@ mod tests {
             pg_type: "numeric",
             typmod: -1,
             trellis_target,
+            expression: false,
         };
         for function in ["SUM", "AVG"] {
             assert!(matches!(
-                check_aggregate_admitted(function, Some(&arg(true))),
+                check_aggregate_admitted(function, AggregateScope::Plain, Some(&arg(true))),
                 Err(ValidationError::ChainedNumericAggregate { .. })
             ));
             assert!(matches!(
-                check_aggregate_admitted(function, Some(&arg(false))),
+                check_aggregate_admitted(function, AggregateScope::Plain, Some(&arg(false))),
                 Err(ValidationError::UnconstrainedNumericAggregate { .. })
             ));
         }
-        let message = check_aggregate_admitted("SUM", Some(&arg(true)))
+        let message = check_aggregate_admitted("SUM", AggregateScope::Plain, Some(&arg(true)))
             .unwrap_err()
             .to_string();
         assert!(
             message.contains("docs/transforms.md") && message.contains("no declared scale"),
             "{message}"
         );
+    }
+
+    /// `MIN`/`MAX` in a plain aggregate (#1117 rule 3, #1681): typed as its
+    /// argument, as Postgres types `min(x)`, over every type with a btree
+    /// order and no collation, equal-but-distinguishable ones (floats,
+    /// `interval`, unconstrained `numeric`) included; any other type is
+    /// refused by name.
+    #[test]
+    fn min_max_is_typed_as_its_argument_over_the_types_without_a_collation() {
+        let admitted = [
+            ValueType::Integer(IntWidth::Int2),
+            ValueType::Integer(IntWidth::Int4),
+            ValueType::Integer(IntWidth::Int8),
+            ValueType::Numeric,
+            ValueType::Float(FloatWidth::Float4),
+            ValueType::Float(FloatWidth::Float8),
+            ValueType::Other(PgType::Date),
+            ValueType::Other(PgType::Time),
+            ValueType::Other(PgType::Timestamp),
+            ValueType::Other(PgType::TimestampTz),
+            ValueType::Other(PgType::Interval),
+            ValueType::Other(PgType::Oid),
+        ];
+        let def = parsed(
+            "TRANSFORM t FROM s GROUP BY g SELECT g AS g, MIN(v) AS lo, MAX(v) AS hi, \
+             COALESCE(MAX(v), MIN(v)) AS either",
+        );
+        for value_type in admitted {
+            let columns: HashMap<String, ValueType> = [
+                ("g".to_string(), ValueType::Integer(IntWidth::Int4)),
+                ("v".to_string(), value_type),
+            ]
+            .into();
+            assert_eq!(validate(&def, &columns), Ok(()), "{value_type:?}");
+            let types = infer_field_types(&def, &columns).expect("typed");
+            for field in ["lo", "hi", "either"] {
+                assert_eq!(types[field], value_type, "{field} over {value_type:?}");
+            }
+        }
+        for value_type in [
+            ValueType::Text,
+            ValueType::Boolean,
+            ValueType::Uuid,
+            ValueType::Other(PgType::TimeTz),
+            ValueType::Other(PgType::Bytea),
+        ] {
+            let columns: HashMap<String, ValueType> = [
+                ("g".to_string(), ValueType::Integer(IntWidth::Int4)),
+                ("v".to_string(), value_type),
+            ]
+            .into();
+            let err = validate(&def, &columns).unwrap_err();
+            assert!(
+                matches!(&err, ValidationError::UnsupportedExtremeArgument { function, argument, .. }
+                    if function == "MIN" && argument == "v"),
+                "{value_type:?}: {err:?}"
+            );
+            assert!(
+                err.to_string().contains("MIN and MAX are supported over"),
+                "{err}"
+            );
+        }
+    }
+
+    /// `MIN`/`MAX` take a plain source column (#1117 rule 5) of a table that
+    /// isn't another transform's target (rule 6), each refused by name; the
+    /// plain column passes and records its admission.
+    #[test]
+    fn min_max_of_an_expression_or_of_a_targets_column_is_refused() {
+        let (_, mut items) = tables();
+        let check = |items: &HashMap<String, JoinColumnInfo>, fields: &str| {
+            let def = parse_text(&format!(
+                "TRANSFORM t FROM items GROUP BY sku SELECT sku AS sku, {fields}"
+            ))
+            .unwrap_or_else(|e| panic!("{fields}: {e}"));
+            validate_aggregate_admitted(&def, items)
+        };
+        for fields in [
+            "MIN(qty) AS lo, MAX(qty) AS hi",
+            "MIN(items.qty) AS lo, COUNT(*) + MAX(order_id) AS hi",
+            "MIN(price) AS lo, MAX(weight) AS hi",
+        ] {
+            assert_eq!(check(&items, fields), Ok(()), "{fields}");
+        }
+        for (fields, argument) in [
+            ("MIN(qty + 1) AS lo", "(qty + 1)"),
+            ("MAX(CAST(qty AS bigint)) AS hi", "CAST(qty AS bigint)"),
+            ("MAX(ABS(qty)) AS hi", "ABS(qty)"),
+        ] {
+            match check(&items, fields) {
+                Err(ValidationError::ExtremeOfExpression { argument: got, .. }) => {
+                    assert_eq!(got, argument, "{fields}");
+                }
+                other => panic!("{fields}: expected ExtremeOfExpression, got {other:?}"),
+            }
+        }
+        // A grouped calculated field is its expression.
+        let def = parse_text(
+            "TRANSFORM t FROM items GROUP BY sku, qty \
+             SELECT sku AS sku, qty AS qty, (qty + 1) AS q, MIN(q) AS lo",
+        )
+        .expect("parse");
+        assert!(matches!(
+            validate_aggregate_admitted(&def, &items),
+            Err(ValidationError::ExtremeOfExpression { .. })
+        ));
+        items.get_mut("qty").expect("qty").trellis_target = true;
+        let err = check(&items, "MAX(qty) AS hi").unwrap_err();
+        assert!(
+            matches!(&err, ValidationError::ChainedExtreme { function, column }
+                if function == "MAX" && column == "qty"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("table Trellis creates"), "{err}");
+    }
+
+    /// `WITHOUT SOURCE INDEX` doesn't apply to `MIN`/`MAX` (#1681 Q1): the
+    /// validator refuses the pair, naming the probe index to create, so
+    /// define, an edit and a resume (each validates through here) all do. An
+    /// `ALTER TRANSFORM ... ADD` can't add an aggregate at all (the clause
+    /// parses as a 1-1 field), and a merged definition carrying one is
+    /// refused the same way.
+    #[test]
+    fn without_source_index_refuses_min_max_naming_the_probe_index() {
+        let columns: HashMap<String, ValueType> = [
+            ("g".to_string(), ValueType::Integer(IntWidth::Int4)),
+            ("h".to_string(), ValueType::Integer(IntWidth::Int4)),
+            ("v".to_string(), ValueType::Other(PgType::Date)),
+            ("w".to_string(), ValueType::Integer(IntWidth::Int8)),
+        ]
+        .into();
+        let def = parsed(
+            "TRANSFORM t FROM s GROUP BY g, h WITHOUT SOURCE INDEX \
+             SELECT g AS g, h AS h, MIN(v) AS lo, MAX(v) AS hi, MAX(w) AS top",
+        );
+        let err = validate(&def, &columns).unwrap_err();
+        let ValidationError::ExtremesWithoutSourceIndex { target, indexes } = &err else {
+            panic!("expected ExtremesWithoutSourceIndex, got {err:?}");
+        };
+        assert_eq!(target, "t");
+        let wanted: Vec<(&str, Vec<&str>)> =
+            vec![("s", vec!["g", "h", "v"]), ("s", vec!["g", "h", "w"])];
+        let got: Vec<(&str, Vec<&str>)> = indexes
+            .iter()
+            .map(|i| {
+                (
+                    i.table.as_str(),
+                    i.columns.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(got, wanted);
+        // Define spells the resolved schema.
+        let message = err.with_source_schema("public").to_string();
+        assert!(
+            message.contains("WITHOUT SOURCE INDEX, which doesn't apply to MIN/MAX")
+                && message.contains(r#"`create index on "public"."s" ("g", "h", "v")`"#)
+                && message.contains(r#"`create index on "public"."s" ("g", "h", "w")`"#)
+                && message.contains("serves as the GROUP BY columns' index"),
+            "{message}"
+        );
+        // Without the opt-out, or without MIN/MAX, it validates.
+        let mut indexed = def.clone();
+        indexed.without_source_index = false;
+        assert_eq!(validate(&indexed, &columns), Ok(()));
+        let counted = parsed(
+            "TRANSFORM t FROM s GROUP BY g WITHOUT SOURCE INDEX SELECT g AS g, COUNT(*) AS n",
+        );
+        assert_eq!(validate(&counted, &columns), Ok(()));
+
+        // `ALTER TRANSFORM ... ADD` parses its field as a 1-1 one.
+        assert!(
+            crate::defs::parser::parse_statement("ALTER TRANSFORM t ADD MIN(v) AS lo").is_err()
+        );
+        // A merged definition that gains a MIN/MAX field is refused as define
+        // refuses it.
+        let mut merged = counted.clone();
+        merged.fields.push(def.fields[2].clone());
+        assert!(matches!(
+            validate(&merged, &columns),
+            Err(ValidationError::ExtremesWithoutSourceIndex { .. })
+        ));
     }
 
     /// A plain aggregate: every deferred family is
@@ -8554,8 +8891,6 @@ mod tests {
             validate_aggregate_admitted(&def, &items)
         };
         for (call, family) in [
-            ("MIN(qty)", "MIN/MAX"),
-            ("MAX(note)", "MIN/MAX"),
             ("BOOL_AND(qty > 1)", "bool_and/bool_or/bit_and/bit_or"),
             ("BIT_OR(qty)", "bool_and/bool_or/bit_and/bit_or"),
             ("SUM(weight)", "float and interval SUM/AVG"),
@@ -8563,7 +8898,10 @@ mod tests {
             ("ARRAY_AGG(note)", "array_agg/string_agg/jsonb_agg"),
             ("STRING_AGG(note, ',')", "array_agg/string_agg/jsonb_agg"),
             // Inside a composed field too.
-            ("COUNT(*) + MAX(qty)", "MIN/MAX"),
+            (
+                "COUNT(*) + BOOL_OR(qty > 1)",
+                "bool_and/bool_or/bit_and/bit_or",
+            ),
         ] {
             match check(&format!("{call} AS v")) {
                 Err(ValidationError::DeferredAggregate {
