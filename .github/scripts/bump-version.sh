@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Sets the release version everywhere a release reads it (docs/releasing.md):
 # the five crates, mix.exs, Trellis::VERSION, and the lockfiles that record
-# them, Cargo.lock and clients/ruby/Gemfile.lock. Then checks the result with
-# check-release-versions.sh. Commit what it changes as one pull request.
+# them, Cargo.lock and clients/ruby/Gemfile.lock, and the install text in the
+# four READMEs (release-pins.sh: a patch release leaves it unchanged). Then
+# checks the result with check-release-versions.sh. Commit what it changes as
+# one pull request.
 #
 # usage: bump-version.sh <version>      e.g. 0.1.0-alpha or 0.1.0
 #
@@ -26,6 +28,17 @@ for file in cli/Cargo.toml clients/embed/Cargo.toml clients/elixir/native/trelli
 done
 V="$version" perl -0pi -e 's/^  \@version "[^"]*"$/  \@version "$ENV{V}"/m' clients/elixir/mix.exs
 V="$version" perl -0pi -e 's/VERSION = "[^"]*"/VERSION = "$ENV{V}"/' clients/ruby/lib/trellis/version.rb
+
+# The READMEs' install text, from the version (release-pins.sh). Only the
+# banner's label and the version requirement on each install line change.
+. "$root/.github/scripts/release-pins.sh"
+derive_pins "$version"
+for file in README.md trellis/README.md; do
+  B="$pin_banner" C="$pin_cargo" perl -0pi \
+    -e 's/^> \*\*Version [^:*]*:\*\*/> **Version $ENV{B}:**/m; s/trellis-pg = "[^"]*"/trellis-pg = "$ENV{C}"/g' "$file"
+done
+G="$pin_gem" perl -0pi -e 's/^gem "trellis-pg", "[^"]*"/gem "trellis-pg", "$ENV{G}"/m' clients/ruby/README.md
+H="$pin_hex" perl -0pi -e 's/\{:trellis_pg, "[^"]*"\}/{:trellis_pg, "$ENV{H}"}/' clients/elixir/README.md
 
 # Rewrites only the workspace members' entries.
 cargo update --workspace --quiet

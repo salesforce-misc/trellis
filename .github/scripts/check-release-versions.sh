@@ -2,8 +2,9 @@
 # Checks that every version a release ships equals <version>: the `trellis`
 # crate (published to crates.io as `trellis-pg`), the CLI, the shared
 # embedding crate, the Elixir NIF crate and mix.exs, and the Ruby extension
-# crate and Trellis::VERSION. A `v<version>` tag releases all of them at once
-# (docs/releasing.md), so they move together. So must the lockfiles that
+# crate and Trellis::VERSION. The install text in the four READMEs follows from
+# the version too (release-pins.sh). A `v<version>` tag releases all of them at
+# once (docs/releasing.md), so they move together. So must the lockfiles that
 # record them, Cargo.lock and clients/ruby/Gemfile.lock: the release builds
 # run with --locked and a frozen bundle, and fail on a stale one.
 # bump-version.sh sets them all.
@@ -18,8 +19,10 @@ usage="usage: check-release-versions.sh <version> [<repo-root>]"
 want="${1:?$usage}"
 want="${want#v}"
 root="${2:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-# RubyGems writes a prerelease's `-` as `.pre.` (0.1.0-alpha is 0.1.0.pre.alpha).
-gem_want="$(echo "$want" | sed 's/-/.pre./g')"
+# shellcheck source=release-pins.sh
+. "$(dirname "${BASH_SOURCE[0]}")/release-pins.sh"
+derive_pins "$want"
+gem_want="$pin_gem_version"
 
 # locked_version <crate>: the version Cargo.lock records for that package.
 locked_version() {
@@ -56,6 +59,18 @@ check clients/ruby/lib/trellis/version.rb \
   "$(awk -F'"' '/VERSION = / { print $2; exit }' "$root/clients/ruby/lib/trellis/version.rb")" "$want"
 check "clients/ruby/Gemfile.lock (trellis-pg)" \
   "$(sed -n 's/^    trellis-pg (\(.*\))$/\1/p' "$root/clients/ruby/Gemfile.lock" | head -1)" "$gem_want"
+
+# The READMEs' install text. Their first match is the one the bump rewrites.
+for file in README.md trellis/README.md; do
+  check "$file banner" \
+    "$(sed -n 's/^> \*\*Version \([^:*]*\):\*\*.*/\1/p' "$root/$file" | head -1)" "$pin_banner"
+  check "$file trellis-pg" \
+    "$(sed -n 's/.*trellis-pg = "\([^"]*\)".*/\1/p' "$root/$file" | head -1)" "$pin_cargo"
+done
+check "clients/ruby/README.md gem" \
+  "$(sed -n 's/^gem "trellis-pg", "\([^"]*\)".*/\1/p' "$root/clients/ruby/README.md" | head -1)" "$pin_gem"
+check "clients/elixir/README.md dep" \
+  "$(sed -n 's/.*{:trellis_pg, "\([^"]*\)"}.*/\1/p' "$root/clients/elixir/README.md" | head -1)" "$pin_hex"
 
 if [ "$bad" -ne 0 ]; then
   echo "check-release-versions: run .github/scripts/bump-version.sh $want, and merge that, before tagging v$want" >&2

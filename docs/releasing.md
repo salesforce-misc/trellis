@@ -23,16 +23,29 @@ Every version below is the release's:
 - `@version` in `clients/elixir/mix.exs`
 - `Trellis::VERSION` in `clients/ruby/lib/trellis/version.rb`, and its entry
   in `clients/ruby/Gemfile.lock`
+- the install text in the READMEs: the banner's "Version 0.1" and the
+  `trellis-pg = "0.1"` line in `README.md` and `trellis/README.md`, the
+  `gem "trellis-pg", "~> 0.1.0"` line in `clients/ruby/README.md`, and the
+  `{:trellis_pg, "~> 0.1.0"}` line in `clients/elixir/README.md`
 
-The release builds run with `--locked` and a frozen bundle, so a lockfile
-left behind fails them. `.github/scripts/bump-version.sh <version>` sets all
+The install text pins the release's series, not its patch: `0.1.1` leaves it
+as it is, and `0.2.0` makes the banner "Version 0.2", the Rust line `"0.2"`
+and the gem and Hex lines `~> 0.2.0`.
+
+The release builds run with `--locked` and a frozen bundle, so a lockfile left
+behind fails them. `.github/scripts/bump-version.sh <version>` sets all
 of them and checks the result with `.github/scripts/check-release-versions.sh`;
-it updates no dependency. Commit what it changes as an ordinary pull request,
+it updates no dependency and rewrites only the banner's label and the version
+on those install lines. Commit what it changes as an ordinary pull request,
 and tag the merged commit on `main`.
 
 A prerelease (`0.1.0-alpha`) is released the same way, as a GitHub
 prerelease. RubyGems writes its `-` as `.pre.`, so its gems are
-`0.1.0.pre.alpha`.
+`0.1.0.pre.alpha`. Cargo, Bundler and Mix never pick a prerelease from a
+range, so the install text of a prerelease names it exactly
+(`trellis-pg = "0.1.0-alpha"`, `gem "trellis-pg", "0.1.0.pre.alpha"`,
+`{:trellis_pg, "0.1.0-alpha"}`) and the banner reads "Version 0.1.0-alpha,
+pre-release".
 
 ## Cutting a release
 
