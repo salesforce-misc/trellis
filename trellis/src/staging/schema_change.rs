@@ -1004,7 +1004,7 @@ pub(crate) async fn pause_readers_of_retyped(
         .into_iter()
         .filter(|c| c.columns_of(table).next().is_some())
         .collect();
-        let states = copies::inspect(&*client, copies).await?;
+        let mut states = copies::inspect(&*client, copies).await?;
         // The stamp was read before the comparison, so a change that
         // committed since it was read is checked again next pass.
         drift_memo::record(
@@ -1013,6 +1013,12 @@ pub(crate) async fn pause_readers_of_retyped(
             reader.id,
             stamp.filter(|_| states.iter().all(|s| !s.drifted())),
         );
+        // A column typed from both tables of a `JOIN` is the pass's of the
+        // table whose input changed type.
+        if states.iter().any(|s| s.outgrown() && reads_both(&s.copy)) {
+            let changed = changed_inputs(&*client, reader, &states).await?;
+            states.retain(|s| !(s.outgrown() && left_to_another_table(table, &s.copy, &changed)));
+        }
         checked.push(Checked {
             id: reader.id,
             columns,
@@ -1716,6 +1722,77 @@ struct Checked {
     states: Vec<copies::CopyState>,
 }
 
+/// Whether `copy`'s type comes from columns of more than one table: a
+/// column typed by an expression over both tables of a `JOIN`.
+fn reads_both(copy: &copies::TypedCopy) -> bool {
+    copy.reads.iter().any(|(t, _)| *t != copy.reads[0].0)
+}
+
+/// The source columns, as `(qualified table, column)`, that `states`' copies
+/// read and whose value type is no longer the one `reader`'s definition
+/// recorded for them (`transform_definitions.source_columns` and
+/// `join_columns`, as define or the last resume recorded): a column that
+/// widened, as opposed to one whose modifier alone changed, which is no
+/// change of value type. A column with no recorded type, or none live, is not
+/// counted.
+async fn changed_inputs(
+    client: &impl tokio_postgres::GenericClient,
+    reader: &crate::capture::columns::CaptureReader,
+    states: &[copies::CopyState],
+) -> Result<Vec<(String, String)>, CaptureError> {
+    let mut recorded: HashMap<String, HashMap<String, crate::defs::ValueType>> = HashMap::new();
+    recorded.insert(
+        reader.source.clone(),
+        crate::defs::catalog::source_columns_in(client, reader.id).await?,
+    );
+    if let Some((joined, columns)) = crate::defs::catalog::join_side_of(client, reader.id).await? {
+        recorded.insert(joined, columns);
+    }
+    let mut live: HashMap<String, HashMap<String, crate::defs::ValueType>> = HashMap::new();
+    let mut changed: Vec<(String, String)> = Vec::new();
+    for read @ (table, column) in states.iter().flat_map(|s| &s.copy.reads) {
+        if changed.contains(read) {
+            continue;
+        }
+        if !live.contains_key(table) {
+            let columns = crate::defs::catalog::column_infos(client, table).await?;
+            live.insert(
+                table.clone(),
+                columns
+                    .into_iter()
+                    .map(|(name, info)| (name, info.value_type))
+                    .collect(),
+            );
+        }
+        if let (Some(was), Some(now)) = (
+            recorded.get(table).and_then(|c| c.get(column)),
+            live[table].get(column),
+        ) && was != now
+        {
+            changed.push(read.clone());
+        }
+    }
+    Ok(changed)
+}
+
+/// Whether the pass of `table` leaves `copy`, a column typed from both tables
+/// of a `JOIN`, to the pass of the other table: none of its inputs from
+/// `table` changed value type (`changed`, [`changed_inputs`]) and one from the
+/// other did. That pass reports the table and column that moved, and, when the
+/// column is an upstream target's, finds the upstream's resume that re-typed
+/// it. Where no input changed value type (a modifier-only change) or
+/// `table`'s did, the pass of `table` reports it.
+fn left_to_another_table(
+    table: &str,
+    copy: &copies::TypedCopy,
+    changed: &[(String, String)],
+) -> bool {
+    let of_copy = |(t, c): &&(String, String)| copy.reads.contains(&(t.clone(), c.clone()));
+    let here = changed.iter().filter(of_copy).any(|(t, _)| t == table);
+    let elsewhere = changed.iter().filter(of_copy).any(|(t, _)| t != table);
+    !here && elsewhere
+}
+
 /// Every source column `states` are typed from, once each, as
 /// `schema.table.column` with its live type (`format_type`). `live` is
 /// `table`'s columns; the others are read from the catalog. Queries only
@@ -1778,9 +1855,11 @@ async fn input_types(
 /// column `states` are typed from, with its live type ([`input_types`]).
 ///
 /// It names a column as the one that widened only when it is the only
-/// column they're typed from. Otherwise it names each one with its type:
-/// nothing records an expression's input types, so the pass can't tell
-/// which of them changed, and it may be a column of another table.
+/// column they're typed from. Otherwise it names each one with its type,
+/// the other table's too: a column typed from both tables of a `JOIN` is
+/// reported by the pass of the table whose input changed value type
+/// ([`left_to_another_table`]), but names every input, since a modifier-only
+/// change names none as the one that changed.
 fn outgrown_reason(
     table: &str,
     columns: &[String],
@@ -2166,6 +2245,48 @@ mod tests {
              would give them now: public.mix.z (integer, now bigint)"
         );
         assert!(!reason.contains("widened"), "{reason}");
+    }
+
+    /// #1539: a column typed from both tables of a `JOIN` is the pass of the
+    /// table whose input changed value type, and the pass of the other table
+    /// leaves it to that one. Where no input changed value type (a
+    /// modifier-only change) or the table's own did, the table's pass
+    /// reports it.
+    #[test]
+    fn a_field_over_both_tables_is_left_to_the_pass_of_the_table_that_changed() {
+        let field = state("total", &[("public.a", "r"), ("public.b", "img")], true).copy;
+        let a = ("public.a".to_string(), "r".to_string());
+        let b = ("public.b".to_string(), "img".to_string());
+        let other = ("public.b".to_string(), "unrelated".to_string());
+        // `b.img` changed: `a`'s pass leaves it, `b`'s reports it.
+        assert!(left_to_another_table(
+            "public.a",
+            &field,
+            std::slice::from_ref(&b)
+        ));
+        assert!(!left_to_another_table(
+            "public.b",
+            &field,
+            std::slice::from_ref(&b)
+        ));
+        // `a.r` changed: the other way round.
+        assert!(!left_to_another_table(
+            "public.a",
+            &field,
+            std::slice::from_ref(&a)
+        ));
+        assert!(left_to_another_table(
+            "public.b",
+            &field,
+            std::slice::from_ref(&a)
+        ));
+        // Both changed: each pass reports its own.
+        assert!(!left_to_another_table("public.a", &field, &[a, b]));
+        // None changed (a modifier-only change): whichever pass runs reports it.
+        assert!(!left_to_another_table("public.a", &field, &[]));
+        assert!(!left_to_another_table("public.b", &field, &[]));
+        // A changed column the field doesn't read says nothing about it.
+        assert!(!left_to_another_table("public.a", &field, &[other]));
     }
 
     /// A catalog of `(source, join, text, capture_failed)` definitions,

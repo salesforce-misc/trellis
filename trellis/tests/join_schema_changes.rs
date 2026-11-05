@@ -274,3 +274,48 @@ async fn a_dropped_column_of_a_field_over_both_tables_pauses_naming_it() {
         .await;
     assert_eq!(failure, ["(public.b,{y})"]);
 }
+
+/// A field over both tables (`SUM(a.x) + SUM(b.y)`) outgrown by a widened
+/// column of one table pauses the `JOIN` against that table and column,
+/// whichever table's pass runs first: the other table's pass leaves the
+/// field to it (#1539).
+#[tokio::test]
+async fn a_widened_column_of_a_field_over_both_tables_is_reported_against_its_table() {
+    for (table, column, report) in [
+        ("public.a", "x", "(public.a,{x})"),
+        ("public.b", "y", "(public.b,{y})"),
+    ] {
+        let mut d = Driver::start(
+            DDL,
+            &[
+                ("id", ValueType::Integer(IntWidth::Int4)),
+                ("g", ValueType::Text),
+                ("k", ValueType::Text),
+                ("x", ValueType::Integer(IntWidth::Int4)),
+            ],
+            &[
+                "TRANSFORM both FROM public.a LEFT JOIN public.b ON a.k = b.k GROUP BY a.g \
+               WITHOUT SOURCE INDEX SELECT a.g AS g, SUM(a.x) + SUM(b.y) AS s",
+            ],
+            &["public.a", "public.b"],
+        )
+        .await;
+        write(
+            &d,
+            "insert into public.a values (1, 'g1', 'k1', 1); \
+             insert into public.b values (1, 'k1', 'h1', 10)",
+        )
+        .await;
+        d.settle().await;
+        write(
+            &d,
+            &format!("alter table {table} alter column {column} type bigint"),
+        )
+        .await;
+        pass(&mut d).await;
+        let failure = d
+            .rows("select f.source_table, f.columns::text from capture_failures f")
+            .await;
+        assert_eq!(failure, [report], "{table}.{column}");
+    }
+}

@@ -378,14 +378,15 @@ transform with a `capture_failure` naming the table and the column when:
   ([ADR-0020](0020-type-identity.md)). The copies are the target's key (`a`'s
   primary key), a field that names one column (typed as that column, with no
   modifier), a calculated field (typed by inference from both tables), and the
-  columns of `R`, `M` and `J` (typed as the side's column). Nothing records an
-  expression's input types, so a field over both tables is reported by the
-  pass of whichever table finds it first, naming every column it is typed
-  from with its type now. When the widened column is an upstream target's,
-  re-typed by that upstream's `RESUME`, and the other table's pass finds the
-  field first, the pause records no upstream cause, so the transform waits
-  for its own `RESUME` rather than resuming after the upstream
-  ([#1539](https://github.com/salesforce-misc/trellis/issues/1539)).
+  columns of `R`, `M` and `J` (typed as the side's column). The definition
+  records each column it reads with its value type, so a field over both
+  tables is reported by the pass of the table whose input changed value type
+  (a widening, not a change of modifier), naming that table and column and
+  every column the field is typed from with its type now; the other table's
+  pass leaves it. Where no input changed value type, whichever pass runs
+  first reports it. When the widened column is an upstream target's,
+  re-typed by that upstream's `RESUME`, the pause records the upstream as its
+  cause, so the transform resumes once the upstream is live.
 
 Either table dropped, renamed away, swapped or joining a hierarchy pauses it
 too, as for any source. `RESUME` re-validates both tables as define would

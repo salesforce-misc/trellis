@@ -283,9 +283,8 @@ async fn assert_exact(d: &mut Driver, kind: Kind, step: &str) {
 /// A column one field reads widened, on either table (`a.r`, `b.img`, both
 /// read by `total`, an `integer`): the pass pauses the transform, naming the
 /// target's column it outgrew and every column it is typed from with its
-/// type now. Nothing records an expression's input types, so, as for an
-/// aggregate `JOIN`'s field over both tables, the pass of either table may be
-/// the one that finds it, and the pause names that table. `RESUME` waits for
+/// type now. The pause names the table and column that widened, whichever
+/// table's pass runs first (#1539). `RESUME` waits for
 /// the staging worker to re-type `total` to `bigint`, then rebuilds, and a
 /// value past `integer` lands on both sides. A pass after it pauses nothing.
 #[tokio::test]
@@ -312,12 +311,7 @@ async fn a_widened_column_a_field_reads_pauses_and_resume_re_types_the_target() 
             .await;
             pass(&mut d).await;
             assert_eq!(status(&d, &target).await, "paused", "{kind:?} {table}");
-            let error: String = d
-                .ctl
-                .query_one("select error from capture_failures", &[])
-                .await
-                .expect("the reason")
-                .get(0);
+            let error = paused_for(&d, &target, table, &[column]).await;
             assert!(
                 error.contains(&format!("{target}.total (integer, now bigint)"))
                     && error.contains(&format!("{table}.{column} (bigint)"))
@@ -848,20 +842,16 @@ async fn chained_exact(d: &Driver, kind: Kind) {
 /// widening of `bsrc.w` outgrows `tb.w`, so `tb` pauses; its `RESUME` re-types
 /// `tb.w`, which outgrows the join's copies of it (`M.w` and the passthrough
 /// `w`), read from `tb` alone: the join is paused with `tb`'s resume as its
-/// cause and resumes on its own once `tb` is live. A field over both tables
-/// (`a.r + tb.w`) may instead be found by the pass of `a`, whose pause records
-/// no cause (#1539), so the join waits for its own `RESUME`. Either way it
-/// rebuilds equal to the join, and a value past `integer` lands.
+/// cause and resumes on its own once `tb` is live. So is one with a field over
+/// both tables (`a.r + tb.w`), whichever table's pass runs first: the pass of
+/// `a` leaves it to the pass of `tb`, whose input widened (#1539). It rebuilds
+/// equal to the join, and a value past `integer` lands.
 #[tokio::test]
 async fn a_widening_under_a_chained_b_side_follows_its_upstream_resume() {
     for kind in KINDS {
-        for (select, oracle, follows) in [
-            ("tb.w AS w", "b.w", true),
-            (
-                "a.r + COALESCE(tb.w, 0) AS w",
-                "a.r + coalesce(b.w, 0)",
-                false,
-            ),
+        for (select, oracle) in [
+            ("tb.w AS w", "b.w"),
+            ("a.r + COALESCE(tb.w, 0) AS w", "a.r + coalesce(b.w, 0)"),
         ] {
             let mut d = Driver::start(
                 "create table public.a (id integer primary key, bid integer, r integer); \
@@ -908,24 +898,6 @@ async fn a_widening_under_a_chained_b_side_follows_its_upstream_resume() {
                 d.settle().await;
             }
             assert_eq!(status(&d, "public.tb").await, "live", "{kind:?} {select}");
-            if follows {
-                assert_eq!(status(&d, "public.jn").await, "live", "{kind:?} {select}");
-            } else if status(&d, "public.jn").await == "paused" {
-                let causes = d
-                    .rows(
-                        "select f.source_table, f.caused_by is null from capture_failures f \
-                         join transform_definitions d on d.id = f.transform_id \
-                         where d.target_table = 'public.jn'",
-                    )
-                    .await;
-                assert_eq!(causes, ["(public.a,t)"], "{kind:?}");
-                resume(&d, "jn").await;
-                for _ in 0..3 {
-                    pass(&mut d).await;
-                    trellis::staging::build::settle_builds_with(d.pool(), 3).await;
-                    d.settle().await;
-                }
-            }
             assert_eq!(status(&d, "public.jn").await, "live", "{kind:?} {select}");
             assert_eq!(column_type(&d, "public.jn", "w").await, "bigint");
             assert_eq!(hidden_type(&d, "public.jn", "m", "w").await, "bigint");
