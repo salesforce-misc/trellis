@@ -48,7 +48,13 @@ against one committed snapshot. True iff all four hold (numbered 2–5, as in
    whose target rows a page left to chunks keeps a marker carrying the earliest
    origin of the `b` changes its remaining rows don't reflect yet
    ([ADR-0021](../decisions/0021-one-to-one-join-transforms.md#a-b-changes-fan-out-runs-in-chunks-under-a-pending-marker)).
-   It is scoped like condition 4.
+   It is scoped like condition 4. A reader of the 1-1 `JOIN` target gets each
+   chunk's rows staged with the marker's origin, as a page's fan-out rows carry
+   the page's, so the cluster-wide wait holds a token for a reader through the
+   upstream marker and through those rows. `await_converged_for` on the reader
+   stays narrowed to the reader: its only caller, `self_check`, compares the
+   reader with the 1-1 `JOIN` target's current state, which the reader matches
+   once the ring has drained, mid-fan-out or not.
 
 `origin_lsn` is the **oldest un-reflected trigger position** carried by a pending
 change. It LEAST-merges in the fold ([04](04-claiming-and-the-fold.md)) — a re-stage

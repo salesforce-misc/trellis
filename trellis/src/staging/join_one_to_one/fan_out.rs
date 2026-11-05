@@ -38,7 +38,10 @@
 //! A marker holds back every watermark token at or past its origin, as a
 //! parked row does (`super::super::converge`'s fifth condition), so a read
 //! after `await_converged` sees the fan-out done. A row a chunk holds in
-//! quarantine parks with the marker's origin and segment.
+//! quarantine parks with the marker's origin and segment, and the rows it
+//! writes reach the target's readers with that origin, staged in the chunk's
+//! transaction (`super::super::target_mutations`): a chunk that dies stages
+//! nothing.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -580,16 +583,8 @@ async fn chunk_in(
     let entries = walk(txn, shape, key, cursor.as_deref(), rows + 1).await?;
     let next = (entries.len() > rows).then(|| entries[rows - 1].clone());
     let batch = &entries[..entries.len().min(rows)];
-    super::write_fan_out(
-        txn,
-        shape,
-        batch,
-        &origin,
-        seg_seq,
-        &mut TargetMutations::new(),
-        held,
-    )
-    .await?;
+    let mut mutations = TargetMutations::new();
+    super::write_fan_out(txn, shape, batch, &origin, seg_seq, &mut mutations, held).await?;
     let n_params = n + 1;
     match &next {
         Some(next) => {
@@ -617,6 +612,9 @@ async fn chunk_in(
             .await?;
         }
     }
+    // The rows the chunk changed reach the target's readers in its own
+    // transaction, with the marker's origin (the module doc).
+    mutations.flush(txn).await?;
     // Test-only pause point. See `super::super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
     super::super::interleave::pause_at(

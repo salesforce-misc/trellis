@@ -77,9 +77,21 @@
 //! their key, which no writer of an entry can leave or reach without the
 //! same lock. So two pages that write one target row queue on a `J` row
 //! before either locks it, whatever order their statements take, and a chunk
-//! of a pending fan-out takes the same `J` row. Nothing reads a 1-1 `JOIN`
-//! target (define refuses it), so neither a page nor a chunk records anything
-//! for the seam.
+//! of a pending fan-out takes the same `J` row.
+//!
+//! **Readers.** A page's writes of its `a` changes' rows and of its inline
+//! fan-out, and each chunk's, are recorded in the seam
+//! (`super::target_mutations`) when something reads the target: each row is
+//! locked and its prior image read before the write ([`write_target`]), and
+//! the downstream rows are staged in the writer's own transaction. An `a`
+//! row's carries its changes' origin merged with the page's `b` changes',
+//! and a fan-out row's the `b` changes' (a chunk's: its marker's). A reader
+//! applies them as each page and chunk commits, so between two chunks it may
+//! see a key's rows joined partly to the old `b` row and partly to the new:
+//! the read contract, exact after `await_converged`, which the marker holds
+//! back. Define still refuses a reader, and a write refuses one at apply
+//! time, until the build's writers stage for readers too (#1617); a test
+//! admits one (`crate::defs::join_one_to_one::admit_readers_for_tests`).
 //!
 //! # A `TRUNCATE` ([`truncate_sides`], [`lock_definitions`], [`start_rebuilds`])
 //!
@@ -1615,11 +1627,12 @@ async fn write_a_changes(
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
     let shape = &*plan.shape;
+    let origin = WriteOrigin::Each(&plan.a_origins, &plan.held_origin);
     if !plan.holds_a || keys.is_empty() {
-        return write_target(txn, shape, keys, Entries::Changed, mutations).await;
+        return write_target(txn, shape, keys, Entries::Changed, origin, mutations).await;
     }
     txn.batch_execute("savepoint join1_a_write").await?;
-    match write_target(txn, shape, keys, Entries::Changed, mutations).await {
+    match write_target(txn, shape, keys, Entries::Changed, origin, mutations).await {
         Ok(counts) => {
             txn.batch_execute("release savepoint join1_a_write").await?;
             Ok(counts)
@@ -1628,7 +1641,7 @@ async fn write_a_changes(
             txn.batch_execute("rollback to savepoint join1_a_write")
                 .await?;
             let (written, deleted, rows) =
-                fan_out_failure(txn, shape, Side::From, keys, mutations).await?;
+                fan_out_failure(txn, shape, Side::From, keys, origin, mutations).await?;
             // The row's target row reflects neither its own changes nor the
             // page's `b` changes, which `M` now holds: it parks with the
             // earliest origin of both, so a token after a `b` change its row
@@ -1794,7 +1807,16 @@ async fn write_fan_out(
     txn.batch_execute("savepoint join1_fan_out").await?;
     let (mut written, mut deleted) = (0, 0);
     for batch in entries.chunks(WRITE_BATCH) {
-        match write_target(txn, shape, batch, Entries::FanOut, mutations).await {
+        match write_target(
+            txn,
+            shape,
+            batch,
+            Entries::FanOut,
+            WriteOrigin::All(origin),
+            mutations,
+        )
+        .await
+        {
             Ok((w, d)) => {
                 written += w;
                 deleted += d;
@@ -1802,8 +1824,15 @@ async fn write_fan_out(
             Err(err) if super::one_to_one_render::is_data_exception(&err) => {
                 txn.batch_execute("rollback to savepoint join1_fan_out")
                     .await?;
-                let (written, deleted, rows) =
-                    fan_out_failure(txn, shape, Side::Joined, &entries, mutations).await?;
+                let (written, deleted, rows) = fan_out_failure(
+                    txn,
+                    shape,
+                    Side::Joined,
+                    &entries,
+                    WriteOrigin::All(origin),
+                    mutations,
+                )
+                .await?;
                 let parked: Vec<_> = rows.iter().map(|row| (row, origin)).collect();
                 held::hold(txn, shape, seg_seq, Side::Joined, &parked).await?;
                 held.record(rows);
@@ -1833,6 +1862,7 @@ async fn fan_out_failure(
     shape: &JoinShape,
     side: Side,
     entries: &[&str],
+    origin: WriteOrigin<'_>,
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize, Vec<held::HeldRow>), ApplyError> {
     let written_entries = match side {
@@ -1850,7 +1880,16 @@ async fn fan_out_failure(
         }
         probes += 1;
         txn.batch_execute("savepoint join1_fan_out_probe").await?;
-        match write_target(txn, shape, &entries[lo..hi], written_entries, mutations).await {
+        match write_target(
+            txn,
+            shape,
+            &entries[lo..hi],
+            written_entries,
+            origin,
+            mutations,
+        )
+        .await
+        {
             Ok((w, d)) => {
                 written += w;
                 deleted += d;
@@ -1990,28 +2029,65 @@ impl Entries {
     }
 }
 
+/// The origin a target write records each row it changes with for the seam
+/// ([`write_target`]): what a reader's staged row carries, the earliest
+/// source change behind the row.
+#[derive(Debug, Clone, Copy)]
+enum WriteOrigin<'a> {
+    /// A page's `a` changes: each row's own changes' origin (by its key),
+    /// merged with the page's `b` changes', which its row joins too.
+    Each(&'a HashMap<String, held::HeldOrigin>, &'a held::HeldOrigin),
+    /// One origin for every row: a page's fan-out (its `b` changes') or a
+    /// chunk's (its marker's).
+    All(&'a held::HeldOrigin),
+}
+
+impl WriteOrigin<'_> {
+    /// The origin of the row whose `R` entry is `key`, as
+    /// `(origin_lsn, src_changed, hop_gen)`.
+    fn of(&self, key: &str) -> (Option<PgLsn>, Option<std::time::SystemTime>, i32) {
+        match self {
+            WriteOrigin::Each(rows, b) => rows
+                .get(key)
+                .cloned()
+                .unwrap_or_else(held::HeldOrigin::unknown)
+                .merged(b)
+                .parts(),
+            WriteOrigin::All(origin) => origin.parts(),
+        }
+    }
+}
+
 /// Writes the target rows of `keys` (`R` entries a page changed, or a batch
 /// of its fan-out; `entries` says which): each live one with a target row is
 /// upserted from `R` and the newest live `M` entry on its key, and the rest
 /// are deleted. The fields are rendered SQL. The upsert takes its rows sorted
 /// by primary key. Returns how many rows it wrote and deleted.
+///
+/// When something reads the target, the rows of `keys` are first locked in
+/// primary-key order and their images read, and each row the write changes
+/// is recorded in `mutations` with its prior image and `origin`, for the
+/// caller to stage in its transaction (`super::target_mutations`). The lock
+/// comes where the write's own would, after `J` and the entries. A write that
+/// fails records nothing, so a savepoint the caller rolls back leaves no key
+/// recorded but those an earlier write recorded, which the bisection writes
+/// again; a key recorded so keeps its first prior image, the one the
+/// rollback restored.
 async fn write_target(
     txn: &Transaction<'_>,
     shape: &JoinShape,
     keys: &[&str],
     entries: Entries,
+    origin: WriteOrigin<'_>,
     mutations: &mut TargetMutations,
 ) -> Result<(usize, usize), ApplyError> {
     if keys.is_empty() {
         return Ok((0, 0));
     }
-    // Nothing reads a 1-1 JOIN target (define refuses it), so there are no
-    // prior images to capture and nothing to record for the seam.
-    if mutations
-        .image_sql(txn, &shape.target, "t")
-        .await?
-        .is_some()
-    {
+    let image_sql = mutations.image_sql(txn, &shape.target, "t").await?;
+    // Define refuses a reader of a 1-1 JOIN target until every writer of
+    // one stages for readers (#1617); a test may admit one.
+    if image_sql.is_some() && !crate::defs::join_one_to_one::readers_admitted() {
         return Err(ApplyError::GroupBasisUnsupported {
             target: shape.target.clone(),
             what: "a reader of a 1-1 JOIN target",
@@ -2032,18 +2108,66 @@ async fn write_target(
         )?);
     }
 
+    let key_expr = ddl::pk_key_sql_expr(&shape.pk, Some("t"));
+    let matched = super::apply::MatchKeys::of(decoded.iter());
+    let mut prior_images: HashMap<String, String> = HashMap::new();
+    if let Some(image_sql) = &image_sql {
+        let order: Vec<String> = shape
+            .pk
+            .iter()
+            .map(|c| format!("t.{}", quote_ident(&c.name)))
+            .collect();
+        let mut rows = Vec::new();
+        if !matched.plain.is_empty() {
+            let columns = super::apply::transpose_pk_parts(arity, &matched.plain);
+            let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
+            rows.extend(
+                txn.query(
+                    &format!(
+                        "select {key_expr}, ({image_sql})::text from {target} as t \
+                         where exists (select 1 from {keyset} where {matches}) \
+                         order by {order} for update of t",
+                        keyset = super::apply::pk_keyset_unnest(&shape.pk, 1),
+                        matches = super::apply::pk_keyset_match(&shape.pk, "t"),
+                        order = order.join(", "),
+                    ),
+                    &params,
+                )
+                .await?,
+            );
+        }
+        for (pattern, columns) in &matched.patterns {
+            let (keyset, matches) = super::apply::null_pattern_match(&shape.pk, pattern, "t", 1);
+            let using = keyset.map_or_else(String::new, |keyset| format!(", {keyset}"));
+            let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
+            rows.extend(
+                txn.query(
+                    &format!(
+                        "select {key_expr}, ({image_sql})::text from {target} as t {using} \
+                         where {matches} order by {order} for update of t",
+                        order = order.join(", "),
+                    ),
+                    &params,
+                )
+                .await?,
+            );
+        }
+        prior_images = rows
+            .into_iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+            .collect();
+    }
+
     let mut deleted = Vec::new();
     // Rows that have no target row: delete them. The key text compares only
     // for rows the index finds by primary key.
     if entries.may_delete(shape) {
-        let key_expr = ddl::pk_key_sql_expr(&shape.pk, Some("t"));
         let unbacked = format!(
             "not exists (select 1 from {r} r where r.{key} = ({key_expr}) collate \"C\" and {has})",
             r = shape.r.ident,
             key = quote_ident(schema::KEY_COLUMN),
             has = shape.has_target_row_sql(),
         );
-        let matched = super::apply::MatchKeys::of(decoded.iter());
         if !matched.plain.is_empty() {
             let columns = super::apply::transpose_pk_parts(arity, &matched.plain);
             let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
@@ -2080,14 +2204,42 @@ async fn write_target(
     }
 
     let mut written = 0;
-    let sql = upsert_sql(shape);
+    let mut written_keys: Vec<String> = Vec::new();
+    let mut sql = upsert_sql(shape);
+    if image_sql.is_some() {
+        sql.push_str(&format!(
+            " returning {}",
+            ddl::pk_key_sql_expr(&shape.pk, None)
+        ));
+    }
     for start in (0..keys.len()).step_by(WRITE_BATCH) {
         let end = (start + WRITE_BATCH).min(keys.len());
         let columns = upsert_params(arity, &decoded[start..end], &keys[start..end]);
         let params: Vec<&(dyn ToSql + Sync)> = columns.iter().map(|c| c as _).collect();
-        // The command's row count is the rows the upsert inserted or updated,
-        // as `returning` would list them.
-        written += txn.execute(&sql, &params).await? as usize;
+        if image_sql.is_some() {
+            let rows = txn.query(&sql, &params).await?;
+            written += rows.len();
+            written_keys.extend(rows.into_iter().map(|row| row.get::<_, String>(0)));
+        } else {
+            // The command's row count is the rows the upsert inserted or
+            // updated, as `returning` would list them.
+            written += txn.execute(&sql, &params).await? as usize;
+        }
+    }
+    if image_sql.is_some() {
+        // A target row's key is its `R` entry's key: the same
+        // `ddl::pk_key_sql_expr` text.
+        for key in written_keys.iter().chain(&deleted) {
+            let (origin_lsn, src_changed, hop_gen) = origin.of(key);
+            mutations.record(
+                &shape.target,
+                key.clone(),
+                prior_images.remove(key),
+                hop_gen,
+                src_changed,
+                origin_lsn,
+            );
+        }
     }
     Ok((written, deleted.len()))
 }

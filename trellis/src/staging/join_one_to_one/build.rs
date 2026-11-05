@@ -48,8 +48,8 @@ use crate::pool::quote_ident;
 use super::super::apply::ApplyError;
 use super::super::target_mutations::TargetMutations;
 use super::{
-    Entries, JoinOneToOnePlan, JoinShape, KeyText, Record, apply_page, fold, key_of, key_set,
-    lock_keys, lock_side, rederive_read, update_side, write_target,
+    Entries, JoinOneToOnePlan, JoinShape, KeyText, Record, WriteOrigin, apply_page, fold, held,
+    key_of, key_set, lock_keys, lock_side, rederive_read, update_side, write_target,
 };
 
 /// What one build chunk did.
@@ -410,11 +410,14 @@ pub(crate) async fn run_chunk(
         .collect();
     written_keys.sort_unstable();
     written_keys.dedup();
+    // A build's writes stage nothing for readers yet, which define refuses
+    // (#1712).
     let (written, deleted) = write_target(
         txn,
         shape,
         &written_keys,
         Entries::Changed,
+        WriteOrigin::All(&held::HeldOrigin::unknown()),
         &mut TargetMutations::new(),
     )
     .await?;

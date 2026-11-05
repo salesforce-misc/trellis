@@ -345,6 +345,31 @@ async fn target_key_space(
     )
 }
 
+/// Test-only admission of readers of a 1-1 `JOIN` target (#1617): define
+/// refuses them ([`reject_reader_of_target`], [`reject_target_with_reader`])
+/// and a target write refuses one at apply time, unless a test turned this
+/// on. Lifted in steps: the page writes and the fan-out chunks stage rows for
+/// readers, the build's writers don't yet, so a reader's test changes the
+/// target only through pages and chunks.
+#[cfg(any(test, feature = "test-util"))]
+static ADMIT_READERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turns [`readers_admitted`] on for the rest of this process.
+#[cfg(any(test, feature = "test-util"))]
+#[cfg_attr(not(any(test, feature = "internals")), allow(dead_code))]
+pub fn admit_readers_for_tests() {
+    ADMIT_READERS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a test admits readers of a 1-1 `JOIN` target
+/// ([`admit_readers_for_tests`]); never outside tests.
+pub(crate) fn readers_admitted() -> bool {
+    #[cfg(any(test, feature = "test-util"))]
+    return ADMIT_READERS.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(any(test, feature = "test-util")))]
+    false
+}
+
 /// Refuses a definition that reads `tables` (qualified) when one is the
 /// target of a 1-1 `JOIN`: no transform may read one in v1
 /// ([`ValidationError::OneToOneJoinTargetRead`]). Every definition's define
@@ -354,6 +379,9 @@ pub(crate) async fn reject_reader_of_target(
     floors: &Floors,
     tables: &[&str],
 ) -> Result<(), super::catalog::CatalogError> {
+    if readers_admitted() {
+        return Ok(());
+    }
     for table in tables {
         if let Some(super::ast::KeySpace::JoinOneToOne(_)) =
             target_key_space(client, floors, table).await?
@@ -380,6 +408,9 @@ pub(crate) async fn reject_target_with_reader(
     client: &impl GenericClient,
     qualified_target: &str,
 ) -> Result<(), super::catalog::CatalogError> {
+    if readers_admitted() {
+        return Ok(());
+    }
     let reader: Option<String> = client
         .query_opt(
             "select target_table from transform_definitions \

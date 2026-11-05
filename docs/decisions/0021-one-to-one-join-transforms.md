@@ -203,8 +203,15 @@ entries:
   the marker. It recomputes the next chunk of live `R` entries after the
   cursor in key order, a range of `R`'s index on the join key and then the
   entry key, and advances the cursor, or deletes the marker after the key's
-  last entry. A chunk that dies commits nothing, and the next resumes from the
-  cursor the last commit left. A worker never queues for a `J` row: it skips a
+  last entry. Its rows reach the target's readers through the seam, staged in
+  the chunk's transaction with the marker's origin, as a page stages its
+  fan-out's rows with its `b` changes' origin. A reader applies them as each
+  chunk commits, so between two chunks it sees what a key's rows give while
+  some join the old `b` row and some the new: the read contract, exact after
+  `await_converged`, which the marker holds back. Readers don't wait for the
+  marker. A chunk that dies commits nothing, its staged rows included, and
+  the next resumes from the cursor the last commit left. A worker never
+  queues for a `J` row: it skips a
   key another holds and takes the next marker, or does nothing. Queued behind
   another worker's chunk, it would put every `a` writer on the key behind one
   more chunk, and drain no segment while it waited.
@@ -235,8 +242,7 @@ entries whose key has lost its last live `b` row.
   holds more than 250k, a key whose `b` change takes seconds to reach every
   row. The count is a sample of `R`'s join-key index, not `pg_stats`, which
   is stale after a build.
-- No transform may read a 1-1 JOIN target. Neither a page's fan-out nor a
-  chunk records its writes for the target-mutation seam.
+- No transform may read a 1-1 JOIN target.
 
 ### A row a page fails to write is held in the page
 
