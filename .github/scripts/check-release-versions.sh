@@ -6,10 +6,17 @@
 # the version too (release-pins.sh). A `v<version>` tag releases all of them at
 # once (docs/releasing.md), so they move together. So must the lockfiles that
 # record them, Cargo.lock and clients/ruby/Gemfile.lock: the release builds
-# run with --locked and a frozen bundle, and fail on a stale one.
-# bump-version.sh sets them all.
+# run with --locked and a frozen bundle, and fail on a stale one. And so must
+# the release the tree develops, `DEVELOPING` in trellis/src/defs/floor.rs:
+# <version>'s release (0.2.0 for 0.2.0 or 0.2.0-alpha), so a released binary
+# never claims a later release's floors (ADR-0024). bump-version.sh sets them
+# all.
 #
 # usage: check-release-versions.sh <version> [<repo-root>]
+#
+# With CHECK_DEVELOPING=0 it leaves DEVELOPING out: release.yml run by hand
+# checks a tree that isn't a release commit, where DEVELOPING may be the next
+# release's (docs/releasing.md).
 #
 # Prints each version it reads, and exits 1 naming every one that differs.
 # Portable to macOS's bash 3.2 (publish-packages.sh runs it there).
@@ -71,6 +78,12 @@ check "clients/ruby/README.md gem" \
   "$(sed -n 's/^gem "trellis-pg", "\([^"]*\)".*/\1/p' "$root/clients/ruby/README.md" | head -1)" "$pin_gem"
 check "clients/elixir/README.md dep" \
   "$(sed -n 's/.*{:trellis_pg, "\([^"]*\)"}.*/\1/p' "$root/clients/elixir/README.md" | head -1)" "$pin_hex"
+
+if [ "${CHECK_DEVELOPING:-1}" != 0 ]; then
+  check "trellis/src/defs/floor.rs DEVELOPING" \
+    "$(sed -n 's/^pub const DEVELOPING: Release = Release::new(\([0-9]*\), \([0-9]*\), \([0-9]*\));$/\1.\2.\3/p' \
+      "$root/trellis/src/defs/floor.rs" | head -1)" "$pin_release"
+fi
 
 if [ "$bad" -ne 0 ]; then
   echo "check-release-versions: run .github/scripts/bump-version.sh $want, and merge that, before tagging v$want" >&2

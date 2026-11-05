@@ -64,9 +64,11 @@ jobs:
         run: python3 .github/scripts/test-shards.py check
 
       - name: Check the compatibility-floor declarations
-        # Each migration's catalog-floor header against its SQL and the crate
-        # version, and .github/feature-floors.txt against the newest released
-        # tag's (ADR-0024; see the script's docstring). The self-test plants a
+        # Each migration's catalog-floor header against its SQL and the
+        # release being developed (defs::floor::DEVELOPING), which on main
+        # must be above the newest final release tag, and
+        # .github/feature-floors.txt against the newest released tag's
+        # (ADR-0024; see the script's docstring). The self-test plants a
         # violation of each rule. The release tags aren't in the shallow
         # checkout, so it fetches them (one commit each).
         run: |

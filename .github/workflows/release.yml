@@ -7,7 +7,8 @@ name: Release
 # .github/scripts/publish-packages.sh.
 #
 # - Pushing a `v<version>` tag, where <version> is the version of every
-#   crate, mix.exs and Trellis::VERSION (check-release-versions.sh), builds:
+#   crate, mix.exs and Trellis::VERSION, and its release the one
+#   defs::floor::DEVELOPING names (check-release-versions.sh), builds:
 #   - the `trellis` CLI for each target below,
 #   - the Elixir binding's precompiled NIF for every target Trellis.Native
 #     lists (rustler_precompiled downloads them from this release),
@@ -60,12 +61,14 @@ jobs:
 
       - name: Check every version equals the tag's
         # By hand, there's no tag: every version must still agree, with the
-        # engine crate's.
+        # engine crate's, but the tree needn't be a release commit, so the
+        # release it develops (DEVELOPING) may be the next one's.
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             version="$GITHUB_REF_NAME"
           else
             version="$(awk -F'"' '/^version = / { print $2; exit }' trellis/Cargo.toml)"
+            export CHECK_DEVELOPING=0
           fi
           .github/scripts/check-release-versions.sh "$version"
 

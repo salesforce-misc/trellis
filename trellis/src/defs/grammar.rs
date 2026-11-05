@@ -378,7 +378,7 @@ mod tests {
     /// One it can run parses, and fails as it always did.
     #[test]
     fn a_definition_this_binary_cant_run_is_skipped_unparsed() {
-        let floors = Floors::new("0.2.0", std::sync::Arc::from([]));
+        let floors = Floors::of_release("0.2.0", std::sync::Arc::from([]));
         let unreadable = "TRANSFORM t FROM s SELECT FROBNICATE a AS a";
         for (text, grammar, floor) in [
             (unreadable, CURRENT_GRAMMAR_VERSION, "0.3.0"),

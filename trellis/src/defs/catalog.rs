@@ -8097,7 +8097,7 @@ mod grammar_window_tests {
     }
 
     fn floors(binary: &str) -> Floors {
-        Floors::new(binary, std::sync::Arc::from([]))
+        Floors::of_release(binary, std::sync::Arc::from([]))
     }
 
     /// A pool whose binary runs as release `binary`.

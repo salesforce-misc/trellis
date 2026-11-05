@@ -197,7 +197,9 @@ impl Config {
 
     /// Returns `self` running as binary version `version` instead of this
     /// build's own, so a test can stand two versions side by side on one
-    /// database (ADR-0023).
+    /// database (ADR-0023). Its definition floors are a release build's of
+    /// `version`: the release this tree develops (`defs::floor::DEVELOPING`)
+    /// doesn't raise it, so `"0.2.0"` stands for v0.2.0 on any branch.
     #[cfg(any(test, feature = "internals"))]
     pub fn with_binary_version(mut self, version: impl Into<String>) -> Self {
         self.binary_version = std::borrow::Cow::Owned(version.into());
@@ -205,9 +207,16 @@ impl Config {
     }
 
     /// The definition floors this configuration's handles stamp (ADR-0024):
-    /// against its binary version, with its features' overrides.
+    /// against its binary version, with its features' overrides. This
+    /// build's own version is only borrowed; an injected one is owned.
     pub(crate) fn floors(&self) -> crate::defs::floor::Floors {
-        crate::defs::floor::Floors::new(&self.binary_version, self.feature_since.clone())
+        use crate::defs::floor::Floors;
+        match &self.binary_version {
+            std::borrow::Cow::Borrowed(version) => Floors::new(version, self.feature_since.clone()),
+            std::borrow::Cow::Owned(version) => {
+                Floors::of_release(version, self.feature_since.clone())
+            }
+        }
     }
 
     /// Returns `self` stamping definition floors as if `feature` (a

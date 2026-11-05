@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Sets the release version everywhere a release reads it (docs/releasing.md):
 # the five crates, mix.exs, Trellis::VERSION, and the lockfiles that record
-# them, Cargo.lock and clients/ruby/Gemfile.lock, and the install text in the
-# four READMEs (release-pins.sh: a patch release leaves it unchanged). Then
+# them, Cargo.lock and clients/ruby/Gemfile.lock, the install text in the
+# four READMEs (release-pins.sh: a patch release leaves it unchanged), and the
+# release the tree develops, `DEVELOPING` in trellis/src/defs/floor.rs (the
+# version's release: 0.2.0 for 0.2.0 and 0.2.0-alpha). Then
 # checks the result with check-release-versions.sh. Commit what it changes as
 # one pull request.
 #
@@ -40,6 +42,12 @@ for file in README.md trellis/README.md; do
 done
 G="$pin_gem" perl -0pi -e 's/^gem "trellis-pg", "[^"]*"/gem "trellis-pg", "$ENV{G}"/m' clients/ruby/README.md
 H="$pin_hex" perl -0pi -e 's/\{:trellis_pg, "[^"]*"\}/{:trellis_pg, "$ENV{H}"}/' clients/elixir/README.md
+
+# The release a build of the tagged commit runs as (ADR-0024). Raising it to
+# the next release is a commit after the tag (start-next-release.sh).
+R="$pin_release" perl -0pi -e '($a, $b, $c) = split /\./, $ENV{R};
+  s/^pub const DEVELOPING: Release = Release::new\(\d+, \d+, \d+\);$/pub const DEVELOPING: Release = Release::new($a, $b, $c);/m' \
+  trellis/src/defs/floor.rs
 
 # Rewrites only the workspace members' entries.
 cargo update --workspace --quiet

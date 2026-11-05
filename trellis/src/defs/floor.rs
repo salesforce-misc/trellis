@@ -117,6 +117,16 @@ impl fmt::Display for Release {
 /// binary carries this code, so the running release is never below it.
 pub const BASELINE: Release = Release::new(0, 2, 0);
 
+/// The release this source tree builds: the running release of a build
+/// whose version is below it (ADR-0024, "Recording definition floors").
+/// Between releases, `main`'s manifests keep the last release's version, so
+/// a development build of `main` counts as the release being developed and
+/// stamps that release's floors, which the last release refuses to run. The
+/// release commit sets it to the release's own (`bump-version.sh`), and the
+/// first commit after a final release's tag raises it to the next minor
+/// (`start-next-release.sh`; docs/releasing.md). Never below [`BASELINE`].
+pub const DEVELOPING: Release = Release::new(0, 2, 0);
+
 /// Which key space a definition is (see [`KeySpace`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeySpaceKind {
@@ -603,8 +613,9 @@ pub(crate) fn validated_features(
 /// [`crate::config::Config`] and carried by each [`crate::pool::Pool`].
 #[derive(Debug, Clone)]
 pub struct Floors {
-    /// The release this binary belongs to, never below [`BASELINE`]; `None`
-    /// when its version doesn't start with a release.
+    /// The release this binary belongs to, never below the release it was
+    /// developed as ([`DEVELOPING`]); `None` when its version doesn't start
+    /// with a release.
     running: Option<Release>,
     /// Features given another since, by [`Feature::key`].
     overrides: Arc<[(String, Release)]>,
@@ -613,12 +624,30 @@ pub struct Floors {
 impl Floors {
     /// The floors of a binary running as `binary_version`.
     ///
-    /// A binary is never below [`BASELINE`], the first release carrying
-    /// floors: a development build whose manifest still carries the previous
-    /// release's version belongs to the next one.
+    /// A binary is never below [`DEVELOPING`], the release this source tree
+    /// builds: a development build whose manifest still carries the previous
+    /// release's version belongs to the one being developed.
     pub(crate) fn new(binary_version: &str, overrides: Arc<[(String, Release)]>) -> Self {
+        Self::developed_as(binary_version, DEVELOPING, overrides)
+    }
+
+    /// The floors of a release build of `binary_version`, which a test
+    /// injects to stand for another release (`Config::with_binary_version`):
+    /// that build was developed as its own release, so only [`BASELINE`],
+    /// the first release carrying floors, is below it.
+    pub(crate) fn of_release(binary_version: &str, overrides: Arc<[(String, Release)]>) -> Self {
+        Self::developed_as(binary_version, BASELINE, overrides)
+    }
+
+    /// The floors of a binary running as `binary_version`, built from a tree
+    /// developing release `developing`.
+    fn developed_as(
+        binary_version: &str,
+        developing: Release,
+        overrides: Arc<[(String, Release)]>,
+    ) -> Self {
         Self {
-            running: Release::of_binary(binary_version).map(|release| release.max(BASELINE)),
+            running: Release::of_binary(binary_version).map(|release| release.max(developing)),
             overrides,
         }
     }
@@ -1039,8 +1068,9 @@ mod tests {
     use super::*;
     use crate::defs::parse;
 
+    /// A release build of `binary`'s floors, with `overrides`.
     fn floors(binary: &str, overrides: &[(&str, &str)]) -> Floors {
-        Floors::new(
+        Floors::of_release(
             binary,
             overrides
                 .iter()
@@ -1270,6 +1300,38 @@ mod tests {
             floor_of(&floors("0.1.0", &[("Expr(Case)", "0.4.0")]), text),
             "0.2.0"
         );
+    }
+
+    /// A build is never below the release its tree develops: `main` after
+    /// v0.2.0 still carries 0.2.0 but develops 0.3.0, so it runs as 0.3.0
+    /// and stamps a 0.3.0 feature's definition at 0.3.0, which v0.2.0
+    /// refuses. The release commit's build of 0.3.0 runs as 0.3.0, and a
+    /// pre-release as its release.
+    #[test]
+    fn a_build_runs_as_the_release_its_tree_develops() {
+        let text = "TRANSFORM t FROM s SELECT CASE WHEN f THEN a END AS b";
+        let developing = Release::new(0, 3, 0);
+        let case_since = || Arc::from([("Expr(Case)".to_string(), developing)]);
+        for (binary, running) in [
+            ("0.2.0", "0.3.0"),
+            ("0.3.0", "0.3.0"),
+            ("0.3.0-alpha", "0.3.0"),
+            ("0.1.0", "0.3.0"),
+            ("0.4.0", "0.4.0"),
+        ] {
+            let floors = Floors::developed_as(binary, developing, case_since());
+            assert_eq!(
+                floors.running.map(|r| r.to_string()).as_deref(),
+                Some(running),
+                "binary {binary}"
+            );
+            assert_eq!(floor_of(&floors, text), "0.3.0", "binary {binary}");
+            assert_eq!(floors.above_running("0.3.0"), None, "binary {binary}");
+        }
+        // The build this tree makes runs as DEVELOPING at least, and never
+        // below the first release carrying floors.
+        assert!(DEVELOPING >= BASELINE);
+        assert!(Floors::of_this_binary().running >= Some(DEVELOPING));
     }
 
     /// A function the registries don't declare counts at the running

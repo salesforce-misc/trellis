@@ -27,6 +27,9 @@ Every version below is the release's:
   `trellis-pg = "0.1"` line in `README.md` and `trellis/README.md`, the
   `gem "trellis-pg", "~> 0.1.0"` line in `clients/ruby/README.md`, and the
   `{:trellis_pg, "~> 0.1.0"}` line in `clients/elixir/README.md`
+- `DEVELOPING` in `trellis/src/defs/floor.rs`, the release the tree builds:
+  the version's release, without a prerelease tag (`0.2.0` for `0.2.0` and
+  `0.2.0-alpha`)
 
 The install text pins the release's series, not its patch: `0.1.1` leaves it
 as it is, and `0.2.0` makes the banner "Version 0.2", the Rust line `"0.2"`
@@ -39,6 +42,14 @@ it updates no dependency and rewrites only the banner's label and the version
 on those install lines. Commit what it changes as an ordinary pull request,
 and tag the merged commit on `main`.
 
+Between releases, `main` keeps the last release's version everywhere but
+`DEVELOPING`, which names the release `main` is building: a development build
+runs as that release, so the definition floors it stamps for a new feature
+are ones the last release refuses
+([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md#recording-definition-floors)).
+The release commit sets it to the release's own, and the first commit after
+a final release's tag raises it to the next release (step 4 below).
+
 A prerelease (`0.1.0-alpha`) is released the same way, as a GitHub
 prerelease. RubyGems writes its `-` as `.pre.`, so its gems are
 `0.1.0.pre.alpha`. Cargo, Bundler and Mix never pick a prerelease from a
@@ -46,6 +57,11 @@ range, so the install text of a prerelease names it exactly
 (`trellis-pg = "0.1.0-alpha"`, `gem "trellis-pg", "0.1.0.pre.alpha"`,
 `{:trellis_pg, "0.1.0-alpha"}`) and the banner reads "Version 0.1.0-alpha,
 pre-release".
+
+A prerelease belongs to its release: a `0.3.0-alpha` binary runs as 0.3.0,
+and `main` keeps developing 0.3.0 after the alpha's tag. So a feature merged
+after the alpha, declared `since = 0.3.0`, also runs on the alpha, which
+doesn't carry it: the alpha reads a definition using it as one it can run.
 
 ## Cutting a release
 
@@ -59,6 +75,14 @@ pre-release".
 2. Run the `.github/scripts/bump-version.sh <version>` command and commit the changes
 3. Push the annotated tag `v<version>` on that commit to
    `salesforce-misc/trellis`.
+4. For a final release cut from `main`, start the next release on `main`:
+   run `.github/scripts/start-next-release.sh <next>` (the next minor, e.g.
+   `0.3.0` after `v0.2.0`) and commit what it changes, `DEVELOPING` alone, as
+   an ordinary pull request. It mustn't be in the tagged commit, which would
+   then run as `<next>`. Skip it for a prerelease, whose release `main` is
+   still developing, and for a patch release cut from a release branch,
+   which `main` is already past. Until it merges, CI's floor check
+   (`check-floors.py check`) fails every change on `main`, naming this step.
 
 The tag starts `release.yml`. It checks the versions, then builds:
 
@@ -82,7 +106,8 @@ failed release can be re-run.
 
 Running the workflow by hand (Actions, "Release", Run workflow) is a dry run:
 it builds and checks everything and keeps it as workflow artifacts, touching
-no release.
+no release. Its versions are the engine crate's, and it leaves `DEVELOPING`
+unchecked, since a commit between releases develops the next one.
 
 ## Publishing the packages
 

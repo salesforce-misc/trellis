@@ -26,24 +26,36 @@ greater of the stored floor and its own:
 update, or with another version, or that refers to `catalog_floor` otherwise;
 any reference to `catalog_floor` under "Declares no catalog floor"; a file
 refinery would run that isn't a `V<n>__<name>.sql` directly under the
-directory; a raise above the crate's release; and a raise, in a migration the
+directory; a raise above the release being developed; and a raise, in a migration the
 newest released tag lacks, to that tag's release or below, which that release
 would read as a catalog it can.
 
 Feature floors. `.github/feature-floors.txt` lists every registry entry and
 type-rule case with its release, and every admission the validator's type
 rules and key-type gates make (trellis's `defs::floor_manifest` test keeps it equal to the code).
-`check` fails a line whose release is above the crate's, and a line the newest
+`check` fails a line whose release is above the release being developed, and a line the newest
 released tag's copy lacks (a new feature, overload or admission) whose release
 is that tag's or below: that release would run a definition using it and read
 it differently. It also fails a line the tag's copy has, given an earlier
 release than the tag's copy gives it.
 
-The crate's release is trellis/Cargo.toml's `major.minor.patch`, never below
-0.2.0 (`defs::floor::BASELINE`: a development build whose manifest still
-carries 0.1.0 belongs to 0.2.0, the release floors arrive in). The newest
-released tag is the highest `vX.Y.Z` tag (no pre-release) at or below it. The
-tags must be fetched (CI fetches them in the `lint` job).
+The release being developed is `defs::floor::DEVELOPING`, read from
+trellis/src/defs/floor.rs: the release a build of this tree runs as when its
+manifests carry an earlier version (between releases, `main` keeps the last
+release's). `check` fails it below the crate's release (trellis/Cargo.toml's
+`major.minor.patch`), and, on `main`, at or below the newest final release
+tag (`vX.Y.Z`, no pre-release): once a release is tagged, `main` develops the
+next one, and a build of it claiming the tagged release would stamp floors
+that release runs and misreads. The remedy is the post-tag step,
+`.github/scripts/start-next-release.sh <next>` (docs/releasing.md). A
+prerelease tag doesn't count, and neither does a branch other than `main` (a
+release branch develops the patch release it cuts): the branch is the pull
+request's base (`GITHUB_BASE_REF`) or the pushed branch (`GITHUB_REF_NAME`),
+and `main` outside GitHub Actions.
+
+The newest released tag the bounds compare against is the highest `vX.Y.Z`
+tag (no pre-release) at or below the release being developed. The tags must
+be fetched (CI fetches them in the `lint` job).
 """
 import os
 import re
@@ -53,7 +65,12 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MIGRATIONS = "trellis/migrations"
 MANIFEST = ".github/feature-floors.txt"
-BASELINE = (0, 2, 0)
+FLOOR_RS = "trellis/src/defs/floor.rs"
+CARGO_TOML = "trellis/Cargo.toml"
+NEXT_RELEASE_SCRIPT = ".github/scripts/start-next-release.sh"
+DEVELOPING_RS = re.compile(
+    r"^pub const DEVELOPING: Release = Release::new\((\d+), (\d+), (\d+)\);$", re.M
+)
 
 # Migrations from the floor migration on that predate the header rule. Their
 # text can't change: every database that ran them recorded its checksum, and
@@ -194,8 +211,8 @@ def check_migrations(files, crate, tag, tag_files):
             )
         if floor > crate:
             bad.append(
-                f"{where}: raises the catalog floor to {show(floor)}, above the crate's release "
-                f"{show(crate)}"
+                f"{where}: raises the catalog floor to {show(floor)}, above the release being "
+                f"developed, {show(crate)} ({FLOOR_RS} DEVELOPING)"
             )
         if tag is not None and name not in tag_files and floor <= tag[1]:
             bad.append(
@@ -230,8 +247,8 @@ def check_manifest(text, crate, tag, tag_text):
             continue
         if since > crate:
             bad.append(
-                f"{MANIFEST}: {line!r} arrives in {show(since)}, above the crate's release "
-                f"{show(crate)}"
+                f"{MANIFEST}: {line!r} arrives in {show(since)}, above the release being "
+                f"developed, {show(crate)} ({FLOOR_RS} DEVELOPING)"
             )
         if tag is not None and identity not in old and since <= tag[1]:
             bad.append(
@@ -245,6 +262,52 @@ def check_manifest(text, crate, tag, tag_text):
                 f"{show(old[identity][1])}; a release before that lacks it"
             )
     return bad
+
+
+def developing_of(floor_rs, cargo_toml):
+    """(DEVELOPING, the crate's release) read from floor.rs's and Cargo.toml's
+    text; exits naming the file that doesn't declare one."""
+    m = DEVELOPING_RS.search(floor_rs)
+    if not m:
+        sys.exit(
+            f"check-floors: {FLOOR_RS} declares no "
+            "`pub const DEVELOPING: Release = Release::new(X, Y, Z);`"
+        )
+    c = re.search(r'^version = "(\d+\.\d+\.\d+)', cargo_toml, re.M)
+    if not c:
+        sys.exit(f"check-floors: {CARGO_TOML} has no version X.Y.Z")
+    return tuple(int(p) for p in m.groups()), release(c.group(1))
+
+
+def check_developing(developing, crate, tags, on_main):
+    """tags: [(name, release)] of the final release tags. The violations of
+    the release being developed against the crate's release and, on `main`,
+    the newest final tag."""
+    bad = []
+    if developing < crate:
+        bad.append(
+            f"{FLOOR_RS}: DEVELOPING is {show(developing)}, below the crate's release "
+            f"{show(crate)}; .github/scripts/bump-version.sh sets both"
+        )
+    newest = max(tags, key=lambda t: t[1], default=None)
+    if on_main and newest is not None and developing <= newest[1]:
+        nxt = (newest[1][0], newest[1][1] + 1, 0)
+        bad.append(
+            f"{FLOOR_RS}: DEVELOPING is {show(developing)}, but {newest[0]} is released, so "
+            f"main develops a later release; a build of main claiming {show(developing)} "
+            f"stamps floors {newest[0]} runs. Run {NEXT_RELEASE_SCRIPT} {show(nxt)} and merge "
+            f"it (docs/releasing.md, Cutting a release)"
+        )
+    return bad
+
+
+def on_main():
+    """Whether the tree is `main`'s: a pull request's base, or the pushed
+    branch, in GitHub Actions; `main` outside it."""
+    branch = os.environ.get("GITHUB_BASE_REF") or (
+        os.environ.get("GITHUB_REF_NAME") if os.environ.get("GITHUB_REF_TYPE") == "branch" else None
+    )
+    return branch in (None, "main")
 
 
 # ------------------------------------------------------------------ git
@@ -262,26 +325,26 @@ def git_show(rev, path):
     return r.stdout if r.returncode == 0 else None
 
 
-def crate_release():
-    with open(os.path.join(ROOT, "trellis", "Cargo.toml")) as f:
-        m = re.search(r'^version = "(\d+\.\d+\.\d+)', f.read(), re.M)
-    return max(release(m.group(1)), BASELINE)
+def developing_release():
+    """(DEVELOPING, the crate's release) of the checkout."""
+    return developing_of(read(FLOOR_RS), read(CARGO_TOML))
+
+
+def final_tags(names):
+    """[(name, release)] of the tags named `vX.Y.Z`, a prerelease's left out."""
+    tags = [(t, release(t[1:])) for t in names if t.startswith("v")]
+    return sorted((t for t in tags if t[1]), key=lambda t: t[1])
 
 
 def released_tags():
-    tags = []
-    for t in git("tag", "--list", "v*").split():
-        r = release(t[1:])
-        if r:
-            tags.append((t, r))
-    return sorted(tags, key=lambda t: t[1])
+    return final_tags(git("tag", "--list", "v*").split())
 
 
 def newest_tag(crate):
     tags = [t for t in released_tags() if t[1] <= crate]
     if not tags:
         sys.exit(
-            "check-floors: no released tag vX.Y.Z at or below the crate's release "
+            "check-floors: no released tag vX.Y.Z at or below the release being developed, "
             f"{show(crate)}; fetch the tags (git fetch --tags)"
         )
     return tags[-1]
@@ -312,21 +375,23 @@ def read(path):
 
 
 def cmd_check():
-    crate = crate_release()
+    crate, cargo = developing_release()
     tag = newest_tag(crate)
-    bad, _ = check_migrations(head_migrations(), crate, tag, set(tag_migrations(tag[0])))
+    bad = check_developing(crate, cargo, released_tags(), on_main())
+    more, _ = check_migrations(head_migrations(), crate, tag, set(tag_migrations(tag[0])))
+    bad += more
     bad += check_manifest(read(MANIFEST), crate, tag, git_show(tag[0], MANIFEST))
     for b in bad:
         print(f"FAIL {b}")
     print(
-        f"check-floors: {len(bad)} violation(s); crate release {show(crate)}, "
-        f"newest released tag {tag[0]}"
+        f"check-floors: {len(bad)} violation(s); developing {show(crate)} (crate "
+        f"{show(cargo)}), newest released tag {tag[0]}{'' if on_main() else ', not main'}"
     )
     return 1 if bad else 0
 
 
 def cmd_notes(tag_name):
-    crate = crate_release()
+    crate, _ = developing_release()
     if tag_name:
         r = release(tag_name.lstrip("v"))
         if not r:
@@ -413,7 +478,7 @@ def cmd_self_test():
 
     base = {"V11__floor.sql": floor_mig, "V13__a.sql": none, "V14__cause.sql": v14}
     cases = [
-        ("passes: none, V14 as #1606 writes it, a raise to the crate's release",
+        ("passes: none, V14 as #1606 writes it, a raise to the release being developed",
          {"V15__r.sql": raise_to("0.3.0")}, True),
         ("a migration without the header",
          {"V15__r.sql": "-- A column.\nalter table t add column c int;\n"}, False),
@@ -425,7 +490,7 @@ def cmd_self_test():
          {"V15__r.sql": raise_to("0.3.0", sql_v="0.2.5")}, False),
         ("a floor update whose guard names another version",
          {"V15__r.sql": raise_to("0.3.0", guard="{0,2,0}")}, False),
-        ("a raise above the crate's release",
+        ("a raise above the release being developed",
          {"V15__r.sql": raise_to("0.4.0")}, False),
         ("a raise, new since the tag, to the tag's release",
          {"V15__r.sql": raise_to("0.2.0")}, False),
@@ -458,7 +523,7 @@ def cmd_self_test():
         ("passes: the tag's lines, and new ones after the tag", old
          + "feature Function(\"SIGN\") 0.3.0\n"
          + "admit cast(Integer(Int2) as Numeric) = Some(Numeric) by Cast(Int2ToNumeric) 0.3.0\n", True),
-        ("a since above the crate's release", old + "feature Function(\"SIGN\") 0.4.0\n", False),
+        ("a since above the release being developed", old + "feature Function(\"SIGN\") 0.4.0\n", False),
         ("a new registry entry claiming the tag's release", old + "feature Function(\"SIGN\") 0.2.0\n", False),
         ("a new overload claiming an old release", old + "overload ABS[Integer(Int2)] = Integer(Int2) 0.2.0\n", False),
         ("a new admission reusing a case that existed at the tag", old
@@ -479,9 +544,46 @@ def cmd_self_test():
         failures.append("manifest: lines at 0.2.0 against v0.1.0 (no manifest) should pass")
     if not check_manifest("feature X 0.1.0\n", crate, ("v0.1.0", (0, 1, 0)), None):
         failures.append("manifest: a line claiming 0.1.0 against v0.1.0 should fail")
+    # The release being developed. A final tag at or above it fails on main,
+    # naming the post-tag step; a prerelease tag doesn't count, nor does a
+    # branch other than main.
+    v020 = ("v0.2.0", (0, 2, 0))
+    dcases = [
+        ("passes: main develops the release after the newest tag",
+         (0, 3, 0), (0, 2, 0), [v020], True, True),
+        ("main still developing the newest final tag's release",
+         (0, 2, 0), (0, 2, 0), [v020], True, False),
+        ("main developing a release before the newest final tag's",
+         (0, 2, 0), (0, 2, 0), [v020, ("v0.3.0", (0, 3, 0))], True, False),
+        ("a prerelease tag of the release being developed passes",
+         (0, 3, 0), (0, 3, 0), final_tags(["v0.2.0", "v0.3.0-alpha", "v0.3.0-rc.1"]), True, True),
+        ("... but its final tag fails",
+         (0, 3, 0), (0, 3, 0), final_tags(["v0.2.0", "v0.3.0-alpha", "v0.3.0"]), True, False),
+        ("a release branch developing its tagged release passes",
+         (0, 2, 0), (0, 2, 0), [v020], False, True),
+        ("DEVELOPING below the crate's release",
+         (0, 2, 0), (0, 3, 0), [("v0.1.0", (0, 1, 0))], True, False),
+    ]
+    for label, developing, crate_v, tags, main, ok in dcases:
+        bad = check_developing(developing, crate_v, tags, main)
+        if (not bad) != ok:
+            failures.append(f"developing: {label}: expected {'pass' if ok else 'a violation'}, got {bad}")
+    if not any(NEXT_RELEASE_SCRIPT + " 0.3.0" in b for b in check_developing((0, 2, 0), (0, 2, 0), [v020], True)):
+        failures.append("developing: the failure names the post-tag step for 0.3.0")
+    # Bound 1 reads DEVELOPING, not the crate's version: main after v0.2.0
+    # carries 0.2.0 and develops 0.3.0, so a 0.3.0 line passes there.
+    rs = "pub const BASELINE: Release = Release::new(0, 2, 0);\npub const DEVELOPING: Release = Release::new(0, 3, 0);\n"
+    developing, crate_v = developing_of(rs, '[package]\nname = "trellis"\nversion = "0.2.0"\n')
+    if (developing, crate_v) != ((0, 3, 0), (0, 2, 0)):
+        failures.append(f"developing: read {developing}, {crate_v} from floor.rs and Cargo.toml")
+    if check_manifest(old + "feature Function(\"SIGN\") 0.3.0\n", developing, v020, old):
+        failures.append("developing: a 0.3.0 line on a tree developing 0.3.0 at crate 0.2.0 should pass")
+    if not check_manifest(old + "feature Function(\"SIGN\") 0.4.0\n", developing, v020, old):
+        failures.append("developing: a 0.4.0 line on a tree developing 0.3.0 should fail")
+    total = len(cases) + len(mcases) + 2 + len(dcases) + 4
     for f in failures:
         print(f"FAIL {f}")
-    print(f"check-floors self-test: {len(cases) + len(mcases) + 2 - len(failures)} passed, {len(failures)} failed")
+    print(f"check-floors self-test: {total - len(failures)} passed, {len(failures)} failed")
     return 1 if failures else 0
 
 

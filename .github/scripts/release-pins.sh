@@ -7,12 +7,15 @@
 # A prerelease names itself exactly, since Cargo, Bundler and Mix never pick
 # one from a range; RubyGems writes its `-` as `.pre.` (0.2.0-alpha is
 # 0.2.0.pre.alpha). Sets:
+#   pin_release       the release it belongs to, without a prerelease tag
+#                     (0.2.0 for 0.2.0-alpha): defs::floor::DEVELOPING's
 #   pin_gem_version   what Trellis::VERSION and Gemfile.lock hold
 #   pin_banner        the README banner's label: "Version <pin_banner>:"
 #   pin_cargo         the Rust dependency requirement
 #   pin_gem           the Gemfile requirement
 #   pin_hex           the mix.exs requirement
 derive_pins() {
+  pin_release="${1%%-*}"
   pin_gem_version="$(echo "$1" | sed 's/-/.pre./g')"
   case "$1" in
     *-*)

@@ -199,8 +199,19 @@ cost doesn't depend on table size.
 - **Never above the running release.** A binary writes only what it carries,
   so a declared release later than the binary's is a declaration error, and
   the floor stops at the running release rather than have the binary pause
-  what it just wrote. A build whose version is below 0.2.0 (the manifest of
-  the development line before the 0.2.0 release) counts as 0.2.0.
+  what it just wrote. The running release is the binary's version's
+  release, never below the release its source tree develops
+  (`defs::floor::DEVELOPING`). Between releases `main`'s manifests keep the
+  last release's version, so a development build of `main` counts as the
+  release being developed: after v0.2.0 it runs as 0.3.0 and stamps a 0.3.0
+  feature's definition at 0.3.0, which v0.2.0 pauses. The release commit
+  sets `DEVELOPING` to the release's own, so a released binary never claims
+  a later release, and the first commit on `main` after a final release's
+  tag raises it to the next release; CI fails `main` while it is at or below
+  the newest final release tag
+  ([releasing](../releasing.md#cutting-a-release)). A prerelease belongs to
+  its release: a 0.3.0-alpha binary runs as 0.3.0, so a feature merged after
+  the alpha with `since = 0.3.0` also runs on the alpha.
 - **A function's floor is the latest of its overloads'.** A call in the tree
   doesn't record which overload it resolved to, so an overload added later
   raises the floor of every call of that name.
