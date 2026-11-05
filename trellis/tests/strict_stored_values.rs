@@ -347,12 +347,12 @@ async fn a_cursor_tag_a_newer_release_wrote_pauses_its_definition() {
     assert!(legacy.capture_failure.is_none());
 }
 
-/// Migration V15 clears the cursor of every unfinished 1-1 sweep that starts
-/// with U+0001: a release before the tagged sweep cursors stored a ledger key
-/// bare, so one of the tagged shape, a tag this release knows or not, would
-/// read as a tag. Every other job keeps its cursor: a sweep's bare key, a
-/// finished sweep, another kind of job, and a 1-1 `JOIN`'s sweep, whose
-/// cursors are always tagged. The database is put back to before V15, with
+/// Migration V15 clears the cursor of every 1-1 sweep, finished or not, that
+/// starts with U+0001: a release before the tagged sweep cursors stored a
+/// ledger key bare, so one of the tagged shape, a tag this release knows or
+/// not, would read as a tag. Every other job keeps its cursor: a sweep's bare
+/// key, another kind of job, and a 1-1 `JOIN`'s sweep, whose cursors are
+/// always tagged. The database is put back to before V15, with
 /// the jobs an earlier release left, and `migrate` runs it.
 #[tokio::test]
 async fn migration_v15_restarts_the_sweeps_whose_cursor_reads_as_a_tag() {
@@ -413,13 +413,24 @@ async fn migration_v15_restarts_the_sweeps_whose_cursor_reads_as_a_tag() {
         ),
         ("t_plain", "sweep", "chr(1) || '7'", false, true),
         ("t_plain", "sweep", "'X'", false, false),
+        // A finished sweep keeps its last cursor until its build completes:
+        // nothing reads it, but an unknown tag there would pause the
+        // definition, so V15 clears a finished sweep's cursor too.
         (
             "t_plain",
             "sweep",
             "chr(1) || 'ledger' || chr(1) || 'X'",
             true,
-            false,
+            true,
         ),
+        (
+            "t_plain",
+            "sweep",
+            "chr(1) || 'foo' || chr(1) || 'Y'",
+            true,
+            true,
+        ),
+        ("t_plain", "sweep", "'Y'", true, false),
         (
             "t_plain",
             "plan",

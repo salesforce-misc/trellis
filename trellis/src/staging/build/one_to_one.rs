@@ -525,8 +525,8 @@ pub async fn sweep_batch(
 /// Every stored 1-1 sweep cursor that starts with U+0001 is tagged (a 1-1
 /// `JOIN`'s cursors, `super::join_one_to_one`, always are). A release before
 /// the tags stored every ledger key bare, U+0001 first or not; migration V15
-/// cleared every unfinished sweep's cursor that started with U+0001, the only
-/// stored values that broke this, so those sweeps start again. A U+0001 value
+/// cleared every 1-1 sweep's cursor that started with U+0001, the only stored
+/// values that broke this, so the unfinished ones start again. A U+0001 value
 /// that isn't tag-shaped still reads as a bare ledger key. A new cursor shape
 /// takes a new tag, which raises the definition floor (ADR-0024 rule 6), and
 /// never needs a migration: a tag not in [`SWEEP_TAGS`] was written by a
