@@ -1237,36 +1237,31 @@ mod tests {
     use crate::defs::ast::ValueType;
     use crate::integer::IntWidth;
 
-    /// A fenced transaction left idle past the reclaim TTL loses its lock
-    /// (`idle_in_transaction_session_timeout`, set by [`ClaimFence::hold`]):
-    /// the stale-claim sweep skips the chunk while the session holds it, and
-    /// reclaims it once the server has ended the session. The session is kept
-    /// busy on an advisory lock until the first sweep has looked, so the
-    /// timeout cannot fire early under load, and the test waits for the
-    /// session's end with a lock request its lock blocks, not a poll.
-    #[tokio::test]
-    async fn a_fenced_transaction_left_idle_loses_its_lock_and_the_chunk_is_reclaimed() {
-        let cluster = testkit::TestCluster::start();
-        let db = cluster.create_isolated_database().await;
-        let config = crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid dsn");
+    /// A session on `dsn` with Trellis's schema on its search path.
+    async fn connect(dsn: &str) -> tokio_postgres::Client {
+        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!(
+                "set search_path to {}, public",
+                crate::config::DEFAULT_SCHEMA
+            ))
+            .await
+            .expect("set search_path");
+        client
+    }
+
+    /// A build over a seeded source whose plan job `holder` has claimed and
+    /// whose claim is aged an hour: returns the pool, a raw session and the
+    /// job's chunk id.
+    async fn aged_plan_job_claimed_by_holder(dsn: &str) -> (Pool, tokio_postgres::Client, i64) {
+        let config = crate::config::Config::from_dsn(dsn.to_string()).expect("valid dsn");
         let pool = Pool::new(&config).expect("build a same-crate pool");
-        let connect = || async {
-            let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
-                .await
-                .expect("connect");
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            client
-                .batch_execute(&format!(
-                    "set search_path to {}, public",
-                    crate::config::DEFAULT_SCHEMA
-                ))
-                .await
-                .expect("set search_path");
-            client
-        };
-        let mut raw = connect().await;
+        let mut raw = connect(dsn).await;
         raw.batch_execute(
             "create table public.nums (id bigint primary key, x integer); \
              insert into public.nums select i, i from generate_series(1, 30) i",
@@ -1301,6 +1296,22 @@ mod tests {
         )
         .await
         .expect("age the claim");
+        (pool, raw, id)
+    }
+
+    /// A fenced transaction left idle past the reclaim TTL loses its lock
+    /// (`idle_in_transaction_session_timeout`, set by [`ClaimFence::hold`]):
+    /// the stale-claim sweep skips the chunk while the session holds it, and
+    /// reclaims it once the server has ended the session. The session is kept
+    /// busy on an advisory lock until the first sweep has looked, so the
+    /// timeout cannot fire early under load, and the test waits for the
+    /// session's end with a lock request its lock blocks, not a poll.
+    #[tokio::test]
+    async fn a_fenced_transaction_left_idle_loses_its_lock_and_the_chunk_is_reclaimed() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw, id) = aged_plan_job_claimed_by_holder(db.dsn()).await;
+        let connect = || connect(db.dsn());
 
         // The fenced session waits on an advisory lock `gate` holds, so it is
         // busy, not idle, until the sweep has looked: the 300 ms timeout
@@ -1363,5 +1374,47 @@ mod tests {
             txn.query("select 1", &[]).await.is_err(),
             "the idle session was ended"
         );
+    }
+
+    /// The heartbeat's refresh moves `claimed_at` while the chunk's own
+    /// transaction holds its fence ([`ClaimFence::hold`]'s `for key share`):
+    /// the refresh is a plain non-key update, which that lock does not
+    /// conflict with, so it neither waits behind the transaction nor is
+    /// skipped (#1472). The refresh runs under a timeout only so a
+    /// regression fails instead of hanging the test.
+    #[tokio::test]
+    async fn the_heartbeat_refreshes_a_claim_while_its_chunk_transaction_holds_the_row() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (pool, raw, id) = aged_plan_job_claimed_by_holder(db.dsn()).await;
+        let mut holder = connect(db.dsn()).await;
+        let txn = holder.transaction().await.expect("begin");
+        let fence = ClaimFence::new(id, "holder", Duration::from_secs(30));
+        assert!(fence.hold(&txn).await.expect("hold"), "the claim holds");
+        let age = || async {
+            raw.query_one(
+                "select extract(epoch from now() - claimed_at)::float8 \
+                 from backfill_chunks where id = $1",
+                &[&id],
+            )
+            .await
+            .expect("read the claim")
+            .get::<_, f64>(0)
+        };
+        assert!(age().await > 3000.0, "the claim starts an hour old");
+
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            touch_chunk_claim(&pool, id, "holder"),
+        )
+        .await
+        .expect("the refresh does not wait behind the chunk's transaction");
+
+        assert!(
+            age().await < 60.0,
+            "the refresh moved claimed_at while the transaction held the row"
+        );
+        // And the transaction is still open, holding the claim.
+        assert!(fence.hold(&txn).await.expect("hold again"));
     }
 }
