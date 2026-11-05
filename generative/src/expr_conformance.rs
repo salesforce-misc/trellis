@@ -272,6 +272,11 @@ pub enum Agreement {
     /// then the sum around it, and define has no value for the call to fold
     /// (see [`KNOWN_GAP_CONSTANT_CALL`]).
     KnownGap(&'static str),
+    /// Refused at define by a range refusal, though Postgres plans it
+    /// without error, and the expression holds a `NULLIF` define reads as
+    /// reading its second argument (see [`KNOWN_OVER_REFUSAL_NULLIF`]).
+    /// ADR-0022 allows the over-refusal.
+    KnownOverRefusal(&'static str),
 }
 
 /// SQLSTATE `invalid_regular_expression`.
@@ -281,6 +286,57 @@ const INVALID_REGEX: &str = "2201B";
 /// Filed as #1446.
 pub const KNOWN_GAP_CONSTANT_CALL: &str = "constant function calls are folded by Postgres at plan \
      time, so a range overflow around one is not refused at define";
+
+/// The over-refusal the property tolerates (#1693, decided as option (b)):
+/// Postgres folds a `NULLIF` whose constant first argument is `NULL` to
+/// `NULL` whatever the second reads, so it drops a guarded constant that
+/// define, which has no value for the first argument, treats as read.
+pub const KNOWN_OVER_REFUSAL_NULLIF: &str = "a NULLIF whose first argument is a constant call is \
+     treated as reading its second argument, though the planner folds it to NULL";
+
+/// `expr` with each `NULLIF` whose first argument is a constant function
+/// call (no column, as [`has_constant_call`] recognises) and whose second
+/// argument reads a column replaced by its first argument; `None` when it
+/// holds no such `NULLIF`. The replacement is the expression define would
+/// judge if it could fold the `NULLIF` the way the planner does.
+pub fn without_constant_call_nullifs(expr: &Expr) -> Option<Expr> {
+    fn replace(expr: &mut Expr) -> bool {
+        let mut changed = false;
+        match expr {
+            Expr::BinaryOp { lhs, rhs, .. } => {
+                changed |= replace(lhs);
+                changed |= replace(rhs);
+            }
+            Expr::Negate(operand) | Expr::Cast { expr: operand, .. } => {
+                changed |= replace(operand);
+            }
+            Expr::Not(_) | Expr::IsNull { .. } | Expr::Case { .. } => {
+                for child in expr.logic_children_mut() {
+                    changed |= replace(child);
+                }
+            }
+            Expr::FunctionCall { args, .. } => {
+                for arg in args.iter_mut() {
+                    changed |= replace(arg);
+                }
+            }
+            _ => {}
+        }
+        if let Expr::FunctionCall { name, args } = &*expr
+            && name == "NULLIF"
+            && let [first, second] = args.as_slice()
+            && !reads_column(first)
+            && has_constant_call(first)
+            && reads_column(second)
+        {
+            *expr = first.clone();
+            changed = true;
+        }
+        changed
+    }
+    let mut rewritten = expr.clone();
+    replace(&mut rewritten).then_some(rewritten)
+}
 
 /// Whether `expr` holds a function call (not `COALESCE`) with no column in
 /// it, which Postgres evaluates while planning.
@@ -542,10 +598,16 @@ impl Fixture {
                     Property::FalseRefusal,
                     format!("refused ({err}) but Postgres raises {code}, not class 22"),
                 )),
-                None => Err(diverge(
-                    Property::FalseRefusal,
-                    format!("refused ({err}) but Postgres plans it without error"),
-                )),
+                None => match without_constant_call_nullifs(&expr) {
+                    Some(rewritten) => {
+                        self.recheck_without_nullifs(text, &err, &rewritten, &diverge)
+                            .await
+                    }
+                    None => Err(diverge(
+                        Property::FalseRefusal,
+                        format!("refused ({err}) but Postgres plans it without error"),
+                    )),
+                },
             },
             Err(err) => Err(diverge(
                 Property::FalseRefusal,
@@ -842,6 +904,41 @@ impl Fixture {
         }
     }
 
+    /// A range refusal Postgres plans without error is tolerated when the
+    /// expression holds a `NULLIF` over a constant call
+    /// ([`KNOWN_OVER_REFUSAL_NULLIF`]) and `rewritten`, with each such
+    /// `NULLIF` replaced by its first argument, is admitted and agrees with
+    /// Postgres. Otherwise an unrelated false refusal beside the `NULLIF`
+    /// would be tolerated with it.
+    async fn recheck_without_nullifs(
+        &self,
+        text: &str,
+        err: &ValidationError,
+        rewritten: &Expr,
+        diverge: &impl Fn(Property, String) -> Divergence,
+    ) -> Result<Agreement, Divergence> {
+        let again = crate::expr_gen::render_text(rewritten, Default::default());
+        match Box::pin(self.check(&again, Some(rewritten))).await {
+            Ok(Agreement::Admitted) => Ok(Agreement::KnownOverRefusal(KNOWN_OVER_REFUSAL_NULLIF)),
+            Ok(other) => Err(diverge(
+                Property::FalseRefusal,
+                format!(
+                    "refused ({err}) but Postgres plans it without error; with its constant-call \
+                     NULLIFs replaced, as `{again}`, it is {other:?}, not admitted"
+                ),
+            )),
+            Err(d) => Err(Divergence {
+                detail: format!(
+                    "refused ({err}) beside the known over-refusal `{KNOWN_OVER_REFUSAL_NULLIF}`, \
+                     as `{again}`: {}",
+                    d.detail
+                ),
+                text: text.to_string(),
+                ..d
+            }),
+        }
+    }
+
     /// The refusal define gives `expr` when a `REGEXP_COUNT` pattern literal
     /// in it is one Postgres rejects (`2201B`): the probe define runs, here
     /// run on the harness's own connection.
@@ -1060,5 +1157,56 @@ fn describe(result: &Result<Vec<Option<String>>, String>) -> String {
     match result {
         Ok(rows) => format!("returns {} rows", rows.len()),
         Err(code) => format!("raises {code}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn field_expr(text: &str) -> Expr {
+        parse(&format!("TRANSFORM t FROM x SELECT {text} AS v"))
+            .unwrap_or_else(|e| panic!("`{text}` does not parse: {e}"))
+            .fields
+            .remove(0)
+            .expr
+    }
+
+    /// The `NULLIF` shape the tolerance covers is a constant call first and
+    /// a column read second, anywhere in the expression.
+    #[test]
+    fn only_a_nullif_over_a_constant_call_and_a_column_is_replaced() {
+        for text in [
+            "CASE WHEN NULLIF(NULLIF(STRPOS('a', 'a'), 1), i4a) IS NOT NULL THEN 2147483647 + 1 END",
+            "CASE WHEN NULLIF(NULLIF(STRPOS('a', 'a'), 1), i4a) IS NULL THEN 0 ELSE 2147483647 + 1 END",
+            "NULLIF(NULLIF(STRPOS('a', 'a'), 1), i4a) IS NOT NULL AND 2147483647 + 1 = 1",
+            "NULLIF(STRPOS('a', 'a'), i4a)",
+        ] {
+            let rewritten = without_constant_call_nullifs(&field_expr(text))
+                .unwrap_or_else(|| panic!("`{text}` should hold the shape"));
+            assert!(
+                !format!("{rewritten:?}").contains("i4a"),
+                "`{text}` kept its column read: {rewritten:?}"
+            );
+        }
+        // Each of these is a false refusal the property must still fail on.
+        for text in [
+            "CASE WHEN STRPOS('a', 'a') = 2 THEN 2147483647 + 1 END",
+            // A first argument that is not a call.
+            "NULLIF(1, i4a)",
+            "NULLIF(NULL, i4a)",
+            // A first argument that reads a column.
+            "NULLIF(i4a, STRPOS('a', 'a'))",
+            "NULLIF(i4a + STRPOS('a', 'a'), i4b)",
+            // A second argument that reads none.
+            "NULLIF(STRPOS('a', 'a'), 1)",
+            "COALESCE(i4a, 2147483647 + 1)",
+        ] {
+            assert_eq!(
+                without_constant_call_nullifs(&field_expr(text)),
+                None,
+                "`{text}` is not the shape"
+            );
+        }
     }
 }

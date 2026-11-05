@@ -57,7 +57,9 @@ fn check_text(text: &str, intended: Option<&Expr>) -> Result<Agreement, Divergen
         match &result {
             Ok(Agreement::Admitted) => h.admitted.set(h.admitted.get() + 1),
             Ok(Agreement::RefusedAndRaises(_)) => h.refused.set(h.refused.get() + 1),
-            Ok(Agreement::KnownGap(_)) => h.gaps.set(h.gaps.get() + 1),
+            Ok(Agreement::KnownGap(_) | Agreement::KnownOverRefusal(_)) => {
+                h.gaps.set(h.gaps.get() + 1)
+            }
             Err(_) => {}
         }
         result
@@ -1401,6 +1403,44 @@ fn a_range_overflow_around_a_constant_call_is_a_known_gap() {
         match check_text(text, None) {
             Ok(Agreement::KnownGap(_)) => {}
             other => panic!("`{text}`: expected the known gap, got {other:?}"),
+        }
+    }
+}
+
+/// Define reads `NULLIF(<constant call>, <column>)` as reading the column,
+/// though Postgres folds it to `NULL` when the call does, so it refuses a
+/// guarded constant Postgres drops (#1693: ADR-0022 allows that). The checker
+/// tolerates it as a named over-refusal, and only when the expression agrees
+/// with Postgres once the `NULLIF` is replaced by its first argument.
+#[test]
+fn a_guarded_constant_beside_a_nullif_over_a_constant_call_is_a_known_over_refusal() {
+    for text in [
+        "CASE WHEN NULLIF(NULLIF(STRPOS('a', 'a'), 1), i4a) IS NOT NULL THEN 2147483647 + 1 END",
+        "CASE WHEN NULLIF(NULLIF(STRPOS('a', 'a'), 1), i4a) IS NULL THEN 0 ELSE 2147483647 + 1 END",
+        "NULLIF(NULLIF(STRPOS('a', 'a'), 1), i4a) IS NOT NULL AND 2147483647 + 1 = 1",
+    ] {
+        match check_text(text, None) {
+            Ok(Agreement::KnownOverRefusal(_)) => {}
+            other => panic!("`{text}`: expected the known over-refusal, got {other:?}"),
+        }
+    }
+}
+
+/// The tolerance is not a blanket one: a guarded overflow Postgres does raise
+/// (the call folds to a value, not `NULL`) stays a refusal Postgres agrees
+/// with or a known gap, never a `KnownOverRefusal`.
+#[test]
+fn the_nullif_over_refusal_tolerance_does_not_cover_what_postgres_raises() {
+    for text in [
+        "CASE WHEN NULLIF(NULLIF(STRPOS('a', 'a'), 2), i4a) IS NOT NULL THEN 2147483647 + 1 END",
+        "2147483647 + 1",
+    ] {
+        match check_text(text, None) {
+            Ok(Agreement::KnownOverRefusal(_)) => {
+                panic!("`{text}` is tolerated as an over-refusal, but Postgres raises")
+            }
+            Ok(_) => {}
+            Err(d) => panic!("{d}"),
         }
     }
 }
