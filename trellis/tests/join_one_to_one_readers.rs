@@ -163,7 +163,7 @@ async fn start(kind: Kind) -> Driver {
             kind.target()
         ),
         format!(
-            "TRANSFORM {}_copy FROM {} SELECT total * 2 AS twice, tag AS tag",
+            "TRANSFORM {}_copy FROM {} SELECT total - 1 AS less, tag AS tag",
             kind.name(),
             kind.target()
         ),
@@ -284,13 +284,13 @@ async fn assert_exact(d: &mut Driver, kind: Kind, after: &str) {
     );
     let copy = d
         .rows(&format!(
-            "select id, twice, tag from {} order by id",
+            "select id, less, tag from {} order by id",
             kind.copy()
         ))
         .await;
     let copy_source = d
         .rows(&format!(
-            "select id, total * 2, tag from {} order by id",
+            "select id, total - 1, tag from {} order by id",
             kind.target()
         ))
         .await;
@@ -459,6 +459,115 @@ async fn a_chunk_killed_after_the_seam_staged_nothing() {
             "{kind:?}: the next chunk staged the same rows"
         );
         assert_exact(&mut d, kind, "a killed chunk").await;
+    }
+}
+
+/// A page with a `b` change on key 20 and, committed after it, an `a` change
+/// on that key's one row: the page writes the row from its `a` change, which
+/// already joins the new `b` row, so its inline fan-out leaves the row as it
+/// is and records nothing. The row's staged change carries the `b` change's
+/// origin too: a token taken between the two commits waits for the readers.
+#[tokio::test]
+async fn an_a_rows_staged_change_carries_the_pages_b_origin() {
+    let _chunked = chunked().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        write(&d, "update public.b set w = 250, tag = 'late' where id = 2").await;
+        let between = token(&d).await;
+        write(&d, "update public.a set x = 80 where id = 8").await;
+        let batch = d.seal().await;
+        d.drain(batch, "page").await;
+        assert_eq!(
+            staged(&d, kind).await.len(),
+            1,
+            "{kind:?}: the page staged row 8 once"
+        );
+        assert!(
+            !converged(&d, between).await,
+            "{kind:?}: a token after the b change waits for the readers' row 8"
+        );
+        assert_exact(&mut d, kind, "an a change after a b change").await;
+    }
+}
+
+/// `b` rows going and coming on a chunked key: an `INNER` target loses the
+/// key's rows and gains them back, a `LEFT` one rewrites them, chunk by
+/// chunk, and the readers apply each delete and insert from its images.
+#[tokio::test]
+async fn b_rows_going_and_coming_reach_the_readers() {
+    let _chunked = chunked().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        step(&mut d, "delete from public.b where id = 1").await;
+        one_chunk(&d).await;
+        drain_ring(&mut d).await;
+        assert_eq!(
+            sums(&d, kind).await,
+            sums_of_source(&d, kind).await,
+            "{kind:?}: mid fan-out of the delete"
+        );
+        assert_exact(&mut d, kind, "a b delete").await;
+        step(&mut d, "insert into public.b values (3, 10, 300, 'back')").await;
+        one_chunk(&d).await;
+        drain_ring(&mut d).await;
+        assert_eq!(
+            sums(&d, kind).await,
+            sums_of_source(&d, kind).await,
+            "{kind:?}: mid fan-out of the insert"
+        );
+        assert_exact(&mut d, kind, "a b insert").await;
+    }
+}
+
+/// A chunk whose rows include one a field fails on: the chunk's write rolls
+/// back to its savepoint, the bisection writes the rest and holds the row,
+/// and the readers get the rows the chunk wrote, each once, from the image
+/// the rollback restored. The held row stays as it was, in the target and in
+/// the readers.
+#[tokio::test]
+async fn a_chunk_holding_a_row_stages_the_rest() {
+    let _chunked = chunked().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        step(&mut d, "update public.a set x = 2147483000 where id = 3").await;
+        assert_exact(&mut d, kind, "a large x").await;
+        step(
+            &mut d,
+            "update public.b set w = 1000, tag = 'big' where id = 1",
+        )
+        .await;
+        while !markers(&d, kind).await.is_empty() {
+            one_chunk(&d).await;
+            drain_ring(&mut d).await;
+        }
+        // The held row keeps the pipeline from quiescing, so drain what the
+        // ring holds rather than settle.
+        drain_ring(&mut d).await;
+        let held: Vec<String> = d
+            .rows(&format!(
+                "select id, tag from {} where id = 3",
+                kind.target()
+            ))
+            .await;
+        assert_eq!(held, ["(3,ten)"], "{kind:?}: row 3 is held as it was");
+        assert_eq!(
+            sums(&d, kind).await,
+            sums_of_source(&d, kind).await,
+            "{kind:?}: the aggregate reader (left) differs from its source (right)"
+        );
+        let copy = d
+            .rows(&format!(
+                "select id, less, tag from {} order by id",
+                kind.copy()
+            ))
+            .await;
+        let copy_source = d
+            .rows(&format!(
+                "select id, total - 1, tag from {} order by id",
+                kind.target()
+            ))
+            .await;
+        assert_eq!(copy, copy_source, "{kind:?}: the 1-1 reader");
     }
 }
 
