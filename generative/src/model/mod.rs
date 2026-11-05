@@ -649,14 +649,21 @@ pub struct DbAdminPlan {
 /// How a [`RestorePlan`] backs the source cluster up. Trellis's
 /// catalog, ring, capture triggers and targets all live in the backed-up
 /// database, so a restore rolls them all back together.
+///
+/// There is no `pg_basebackup` kind. A physical restore of any kind is a
+/// transactionally consistent snapshot of ordinary logged tables and the
+/// engine holds nothing outside them, so a base backup restores to the same
+/// kind of state a cold copy does and would exercise Postgres's recovery,
+/// not Trellis. (The one difference, an unlogged source emptied by the
+/// recovery a base backup goes through, is a documented gap and not something
+/// the generator draws.) The upgrade battery's `basebackup` scenario restores
+/// one taken while writers ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackupKind {
     /// A file-level copy of the whole data directory, taken while the
     /// server is stopped. Capture carries on from the restored point with no
     /// pause.
     ColdCopy,
-    // TODO: `BaseBackup`, a `pg_basebackup` restore. Capture state
-    // lives in ordinary tables, so it should behave like `ColdCopy`.
 }
 
 /// A backup-and-restore schedule for one program run, driven by

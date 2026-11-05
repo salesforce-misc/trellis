@@ -713,8 +713,10 @@ The actions, cheapest-first (every one below is built):
    `run::run_convergence_with_restore`, swept by `tests/backup_restore.rs`):
    back up right after op *k* with its change in flight, run to the end,
    restore into a fresh cluster, replay *k+1..n*, converge with no pause (§8
-   has the decision behind that). The `pg_basebackup` variant is not
-   generated ([#1422](https://github.com/salesforce-misc/trellis/issues/1422)).
+   has the decision behind that). There is no `pg_basebackup` variant: a base
+   backup restores a transactionally consistent snapshot of the same ordinary
+   logged tables, so it would test Postgres's recovery rather than Trellis (the
+   upgrade battery's `basebackup` scenario restores one taken while writers ran).
 6. **Out-of-band tampering** (bucket 1, detection) — direct writes to derived
    tables, found by `self_check` (`tests/self_check_cross_check.rs`).
 
@@ -748,8 +750,9 @@ Two structural notes for when faults enter the stream:
   targets in the database it reads, so a restore rolls them all back to one
   point and what comes back is consistent with itself. Layer 3's
   backup/restore action checks that assumption: the cold-copy case
-  (restore, replay, converge, no pause) is generated; the `pg_basebackup`
-  case is not ([#1422](https://github.com/salesforce-misc/trellis/issues/1422)). One thing a
+  (restore, replay, converge, no pause) is generated; a `pg_basebackup` restore
+  is the same snapshot of the same tables and is covered by the upgrade battery
+  instead. One thing a
   server stop does carry over is a claim a worker took just
   before it: the claim's worker can't run the job or give it back, so only
   the stale-claim sweep frees it, a reclaim TTL later. The restore and

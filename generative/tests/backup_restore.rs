@@ -9,8 +9,6 @@
 //! ring back with everything else. See
 //! `generative::run::run_convergence_with_restore`.
 //!
-//! The `pg_basebackup` variant is held for #1422.
-//!
 //! Every hand-built pin owns its cluster. The property shares one per thread
 //! like the other properties; the backup stops it, which is harmless to
 //! earlier cases' leftovers since those cases are finished. Each case's

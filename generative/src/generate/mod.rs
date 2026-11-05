@@ -3818,8 +3818,8 @@ mod strategy {
     }
 
     /// A backup-and-restore plan for `program`, backing up after
-    /// any of its ops. Every plan is a [`BackupKind::ColdCopy`] today; the
-    /// `pg_basebackup` kind is held for #1422 (see [`BackupKind`]).
+    /// any of its ops. Every plan is a [`BackupKind::ColdCopy`] (see
+    /// [`BackupKind`] for why there is no other kind).
     pub fn restore_plan_for(program: &Program) -> impl Strategy<Value = RestorePlan> + use<> {
         (0..program.ops.len()).prop_map(|backup_op| RestorePlan {
             backup_op,
