@@ -83,6 +83,21 @@ pub enum MaintenanceKind {
     /// attached with them. When every bound is held, a leaf is dropped
     /// first and the new one takes its bound.
     Create { rows: u8, standalone: bool },
+    /// Attach a detached table under a free bound other than its own (with
+    /// none detached, a leaf is detached first, `CONCURRENTLY` when
+    /// `concurrently` and Postgres allows it). Its rows are first moved to
+    /// the new bound's smallest grain by partition-key updates named on it,
+    /// which a `CHECK` constraint a concurrent detach left refuses. With no
+    /// such bound free, another leaf is dropped first.
+    Rebound { concurrently: bool },
+    /// `LIST` only: a non-`DEFAULT` table detached (as for `Rebound`), then
+    /// attached again with its value list widened by a value no leaf holds;
+    /// with none free, another leaf is dropped first.
+    Widen { concurrently: bool },
+    /// `HASH` only: a leaf over more than one slot detached and replaced by
+    /// new leaves over its remainders at a multiple of its modulus, each
+    /// with `rows` rows.
+    Resplit { rows: u8 },
 }
 
 /// One draw [`add_partition_maintenance`] layers on a program's partitioned
@@ -114,17 +129,28 @@ pub enum PartitionDraw {
     ViaLeaf { at: usize, detached: bool },
 }
 
-/// How a [`PartitionStrategy`] lays out its bounds: one slot per bound, the
-/// `DEFAULT` last. Slot `i` is the `i`-th leaf `partitioned_source_ddl`
-/// creates, so the leaf it starts with is `<root>_p<i>` (`<root>_pd` for the
-/// `DEFAULT`).
+/// How a [`PartitionStrategy`] lays out its bounds: a bound is a set of
+/// slots, the finest regions the tree can be cut into. `LIST` and `RANGE`
+/// have a slot per value or range of the initial tree, the `DEFAULT` last;
+/// `HASH` has a slot per remainder of the finest modulus a re-split reaches
+/// ([`hash_slots`]), and a leaf of modulus `m` and remainder `r` holds every
+/// slot `s` with `s % m == r`. The `i`-th leaf `partitioned_source_ddl`
+/// creates is `<root>_p<i>` (`<root>_pd` for the `DEFAULT`).
 #[derive(Debug, Clone, Copy)]
 struct Layout(PartitionStrategy);
+
+/// The finest `HASH` modulus a tree of `modulus` is cut into: every modulus
+/// [`HASH_REMAINDERS`] tabulates that the initial one divides or is divided
+/// by, so any mix of them is one Postgres accepts (each a factor of the next
+/// larger).
+fn hash_slots(modulus: u8) -> usize {
+    if modulus == 3 { 3 } else { 4 }
+}
 
 impl Layout {
     fn slots(self) -> usize {
         match self.0 {
-            PartitionStrategy::Hash { modulus } => modulus as usize,
+            PartitionStrategy::Hash { modulus } => hash_slots(modulus),
             PartitionStrategy::List { values, default } => values as usize + usize::from(default),
             PartitionStrategy::Range { bounds } => bounds as usize,
         }
@@ -140,6 +166,39 @@ impl Layout {
         }
     }
 
+    /// How many leaves `partitioned_source_ddl` creates.
+    fn initial_leaves(self) -> usize {
+        match self.0 {
+            PartitionStrategy::Hash { modulus } => modulus as usize,
+            _ => self.slots(),
+        }
+    }
+
+    /// The slots of the `i`-th leaf `partitioned_source_ddl` creates.
+    fn initial(self, i: usize) -> BTreeSet<usize> {
+        match self.0 {
+            PartitionStrategy::Hash { modulus } => (0..self.slots())
+                .filter(|s| s % modulus as usize == i)
+                .collect(),
+            _ => BTreeSet::from([i]),
+        }
+    }
+
+    /// Every bound a new leaf may take, coarsest first: for `HASH`, each
+    /// remainder of each modulus dividing the finest; otherwise each slot.
+    fn bounds(self) -> Vec<BTreeSet<usize>> {
+        match self.0 {
+            PartitionStrategy::Hash { .. } => {
+                let slots = self.slots();
+                (1..=slots)
+                    .filter(|m| slots.is_multiple_of(*m))
+                    .flat_map(|m| (0..m).map(move |r| (0..slots).filter(|s| s % m == r).collect()))
+                    .collect()
+            }
+            _ => (0..self.slots()).map(|s| BTreeSet::from([s])).collect(),
+        }
+    }
+
     /// The non-`DEFAULT` slot whose bound holds `grain`, if any.
     fn slot_of(self, grain: i64) -> Option<usize> {
         match self.0 {
@@ -152,7 +211,7 @@ impl Layout {
                             "the partition model routes grains 0..={ROUTED_GRAIN_MAX}, not {grain}"
                         )
                     });
-                Some(HASH_REMAINDERS[modulus as usize - 1][grain] as usize)
+                Some(HASH_REMAINDERS[hash_slots(modulus) - 1][grain] as usize)
             }
             PartitionStrategy::List { values, .. } => (0..i64::from(values))
                 .contains(&grain)
@@ -163,50 +222,94 @@ impl Layout {
         }
     }
 
-    /// Slot `slot`'s bound clause, as `partitioned_source_ddl` writes it.
-    fn bound(self, slot: usize) -> String {
+    /// The `HASH` modulus of a bound over `slots`.
+    fn hash_modulus(self, slots: &BTreeSet<usize>) -> usize {
+        self.slots() / slots.len()
+    }
+
+    /// The bound clause over `slots`, as `partitioned_source_ddl` writes a
+    /// one-slot bound.
+    fn bound(self, slots: &BTreeSet<usize>) -> String {
+        let first = *slots
+            .first()
+            .expect("a bound holds a slot — a generator bug");
         match self.0 {
-            PartitionStrategy::Hash { modulus } => {
-                format!("for values with (modulus {modulus}, remainder {slot})")
+            PartitionStrategy::Hash { .. } => {
+                let modulus = self.hash_modulus(slots);
+                assert!(
+                    self.slots().is_multiple_of(slots.len())
+                        && slots.iter().all(|s| s % modulus == first % modulus),
+                    "{slots:?} is no HASH bound — a generator bug"
+                );
+                format!(
+                    "for values with (modulus {modulus}, remainder {})",
+                    first % modulus
+                )
             }
-            PartitionStrategy::List { .. } if Some(slot) == self.default_slot() => {
+            PartitionStrategy::List { .. }
+                if self.default_slot().is_some_and(|d| slots.contains(&d)) =>
+            {
+                assert_eq!(slots.len(), 1, "a DEFAULT with values — a generator bug");
                 "default".to_string()
             }
-            PartitionStrategy::List { .. } => format!("for values in ({slot})"),
+            PartitionStrategy::List { .. } => {
+                let values: Vec<String> = slots.iter().map(usize::to_string).collect();
+                format!("for values in ({})", values.join(", "))
+            }
             PartitionStrategy::Range { bounds } => {
-                let from = if slot == 0 {
+                assert_eq!(
+                    slots.len(),
+                    1,
+                    "a RANGE bound over several slots — a generator bug"
+                );
+                let from = if first == 0 {
                     "minvalue".to_string()
                 } else {
-                    slot.to_string()
+                    first.to_string()
                 };
-                let to = if slot + 1 == bounds as usize {
+                let to = if first + 1 == bounds as usize {
                     "maxvalue".to_string()
                 } else {
-                    (slot + 1).to_string()
+                    (first + 1).to_string()
                 };
                 format!("for values from ({from}) to ({to})")
             }
         }
     }
 
-    fn slot_of_bound(self, bound: &str) -> usize {
-        (0..self.slots())
-            .find(|&s| self.bound(s) == bound)
-            .unwrap_or_else(|| panic!("no slot has the bound {bound:?} — a generator bug"))
+    /// The slots of a bound clause [`Layout::bound`] wrote.
+    fn slots_of_bound(self, bound: &str) -> BTreeSet<usize> {
+        let found = match self.0 {
+            PartitionStrategy::List { .. } => bound
+                .strip_prefix("for values in (")
+                .and_then(|b| b.strip_suffix(')'))
+                .map(|values| {
+                    values
+                        .split(", ")
+                        .map(|v| v.parse().expect("a LIST value is a slot"))
+                        .collect()
+                })
+                .or_else(|| {
+                    (bound == "default").then(|| self.default_slot().into_iter().collect())
+                }),
+            _ => self.bounds().into_iter().find(|s| self.bound(s) == bound),
+        };
+        found.unwrap_or_else(|| panic!("no slots have the bound {bound:?} — a generator bug"))
     }
 }
 
-/// One table that is, or was, a leaf: its bound's slot, whether it is in
+/// One table that is, or was, a leaf: its bound's slots, whether it is in
 /// the tree, and its rows' `(pk, grain)` keys.
 #[derive(Debug, Clone)]
 struct SimTable {
     name: String,
-    slot: usize,
+    slots: BTreeSet<usize>,
     attached: bool,
-    /// Whether the table carries its bound as a `CHECK` constraint, which a
-    /// `DETACH ... CONCURRENTLY` of a `LIST` or `RANGE` leaf adds and
-    /// nothing here removes.
-    checked: bool,
+    /// The bounds the table carries as `CHECK` constraints: a `DETACH ...
+    /// CONCURRENTLY` of a `LIST` or `RANGE` leaf adds one for the bound it
+    /// had, which stays when the table is attached again, under any bound,
+    /// and refuses every row outside it.
+    checks: Vec<BTreeSet<usize>>,
     rows: BTreeSet<(i64, i64)>,
 }
 
@@ -239,16 +342,16 @@ impl PartitionSim {
             .as_ref()
             .expect("PartitionSim models a partitioned table");
         let layout = Layout(partitioning.strategy);
-        let tables = (0..layout.slots())
-            .map(|slot| SimTable {
-                name: if Some(slot) == layout.default_slot() {
+        let tables = (0..layout.initial_leaves())
+            .map(|leaf| SimTable {
+                name: if Some(leaf) == layout.default_slot() {
                     format!("{}_pd", table.name)
                 } else {
-                    format!("{}_p{slot}", table.name)
+                    format!("{}_p{leaf}", table.name)
                 },
-                slot,
+                slots: layout.initial(leaf),
                 attached: true,
-                checked: false,
+                checks: Vec::new(),
                 rows: BTreeSet::new(),
             })
             .collect();
@@ -265,7 +368,45 @@ impl PartitionSim {
     fn occupant(&self, slot: usize) -> Option<usize> {
         self.tables
             .iter()
-            .position(|t| t.attached && t.slot == slot)
+            .position(|t| t.attached && t.slots.contains(&slot))
+    }
+
+    /// Whether no leaf of the tree holds any of `slots`.
+    fn free(&self, slots: &BTreeSet<usize>) -> bool {
+        slots.iter().all(|&s| self.occupant(s).is_none())
+    }
+
+    /// Every bound a leaf may take in the tree as it is: one no leaf
+    /// overlaps.
+    fn free_bounds(&self) -> Vec<BTreeSet<usize>> {
+        self.layout
+            .bounds()
+            .into_iter()
+            .filter(|b| self.free(b))
+            .collect()
+    }
+
+    /// Whether a row with `grain` passes table `t`'s `CHECK` constraints.
+    fn passes_checks(&self, t: usize, grain: i64) -> bool {
+        let slot = self.layout.slot_of(grain);
+        self.tables[t]
+            .checks
+            .iter()
+            .all(|check| slot.is_some_and(|s| check.contains(&s)))
+    }
+
+    /// The smallest grain a leaf over `slots` holds in the tree as it is (for
+    /// a `DEFAULT`, one no other leaf takes), if any.
+    fn grain_for(&self, slots: &BTreeSet<usize>) -> Option<i64> {
+        let default = self
+            .layout
+            .default_slot()
+            .is_some_and(|d| slots.contains(&d));
+        (0..=PARTITION_GRAIN_MAX).find(|&g| match self.layout.slot_of(g) {
+            Some(s) if !default => slots.contains(&s),
+            Some(s) => self.occupant(s).is_none(),
+            None => default,
+        })
     }
 
     /// The leaf a row with `grain` routes to: its bound's, else the
@@ -277,27 +418,25 @@ impl PartitionSim {
             .or_else(|| self.layout.default_slot().and_then(|s| self.occupant(s)))
     }
 
-    /// Whether a row with `grain` may live in table `t`: in the tree, one
-    /// that routes there; outside it, any row, unless the table checks its
-    /// bound.
+    /// Whether a row with `grain` may live in table `t`: one its `CHECK`
+    /// constraints pass and, in the tree, that routes there.
     fn holds(&self, t: usize, grain: i64) -> bool {
-        let table = &self.tables[t];
-        if table.attached {
-            self.route(grain) == Some(t)
-        } else {
-            !table.checked || self.layout.slot_of(grain) == Some(table.slot)
-        }
+        (!self.tables[t].attached || self.route(grain) == Some(t)) && self.passes_checks(t, grain)
     }
 
-    /// Whether table `t`'s rows all fit slot `slot`'s bound in the tree as it
-    /// is, and the `DEFAULT` holds none that would (the checks Postgres makes
-    /// to attach or create a leaf there).
-    fn may_take_slot(&self, slot: usize, rows: &BTreeSet<(i64, i64)>) -> bool {
+    /// Whether `rows` all fit the bound over `slots` in the tree as it is,
+    /// and the `DEFAULT` holds none that would (the checks Postgres makes to
+    /// attach or create a leaf there).
+    fn may_take_slots(&self, slots: &BTreeSet<usize>, rows: &BTreeSet<(i64, i64)>) -> bool {
         let fits = |grain: i64| match self.layout.slot_of(grain) {
-            Some(s) => s == slot,
+            Some(s) => slots.contains(&s),
             None => false,
         };
-        if Some(slot) == self.layout.default_slot() {
+        if self
+            .layout
+            .default_slot()
+            .is_some_and(|d| slots.contains(&d))
+        {
             return rows.iter().all(|&(_, g)| {
                 self.layout
                     .slot_of(g)
@@ -340,14 +479,12 @@ impl PartitionSim {
     /// routes to), as Postgres would.
     fn insert(&mut self, t: Option<usize>, row: &[(String, Option<String>)]) -> OpOutcome {
         let (pk, grain) = self.key(row);
-        let t = match t {
-            Some(t) if self.holds(t, grain) => t,
-            Some(_) => return OpOutcome::Fails,
-            None => match self.route(grain) {
-                Some(t) => t,
-                None => return OpOutcome::Fails,
-            },
+        let Some(t) = t.or_else(|| self.route(grain)) else {
+            return OpOutcome::Fails;
         };
+        if !self.holds(t, grain) {
+            return OpOutcome::Fails;
+        }
         if self.tables[t].rows.insert((pk, grain)) {
             OpOutcome::Succeeds
         } else {
@@ -392,8 +529,8 @@ impl PartitionSim {
                 // moves there; named on a leaf, it must stay.
                 let dest = match within {
                     None => match self.route(new) {
-                        Some(dest) => dest,
-                        None => return OpOutcome::Fails,
+                        Some(dest) if self.passes_checks(dest, new) => dest,
+                        _ => return OpOutcome::Fails,
                     },
                     Some(_) if self.holds(t, new) => t,
                     Some(_) => return OpOutcome::Fails,
@@ -501,21 +638,24 @@ impl PartitionSim {
                 );
                 self.tables[t].attached = false;
                 // Postgres adds no such constraint for a `HASH` bound.
-                self.tables[t].checked |=
-                    *concurrently && !matches!(self.layout.0, PartitionStrategy::Hash { .. });
+                if *concurrently && !matches!(self.layout.0, PartitionStrategy::Hash { .. }) {
+                    let bound = self.tables[t].slots.clone();
+                    self.tables[t].checks.push(bound);
+                }
                 OpOutcome::Succeeds
             }
-            PartitionAction::Attach { leaf, .. } => {
+            PartitionAction::Attach { leaf, bound } => {
                 let t = self.table_named(leaf);
-                let slot = self.tables[t].slot;
+                let slots = self.layout.slots_of_bound(bound);
                 assert!(
-                    !self.tables[t].attached && self.occupant(slot).is_none(),
+                    !self.tables[t].attached && self.free(&slots),
                     "attach of {leaf} to a bound a leaf holds — a generator bug"
                 );
-                if !self.may_take_slot(slot, &self.tables[t].rows) {
+                if !self.may_take_slots(&slots, &self.tables[t].rows) {
                     return OpOutcome::Fails;
                 }
                 self.tables[t].attached = true;
+                self.tables[t].slots = slots;
                 OpOutcome::Succeeds
             }
             PartitionAction::Drop { leaf } => {
@@ -526,9 +666,9 @@ impl PartitionSim {
             PartitionAction::Create {
                 leaf, bound, rows, ..
             } => {
-                let slot = self.layout.slot_of_bound(bound);
+                let slots = self.layout.slots_of_bound(bound);
                 assert!(
-                    self.occupant(slot).is_none(),
+                    self.free(&slots),
                     "a new leaf for a bound a leaf holds — a generator bug"
                 );
                 let mut keys = BTreeSet::new();
@@ -537,14 +677,14 @@ impl PartitionSim {
                         return OpOutcome::Fails;
                     }
                 }
-                if !self.may_take_slot(slot, &keys) {
+                if !self.may_take_slots(&slots, &keys) {
                     return OpOutcome::Fails;
                 }
                 self.tables.push(SimTable {
                     name: leaf.clone(),
-                    slot,
+                    slots,
                     attached: true,
-                    checked: false,
+                    checks: Vec::new(),
                     rows: keys,
                 });
                 OpOutcome::Succeeds
@@ -567,6 +707,56 @@ pub fn resimulate(program: &mut Program, table: usize) {
         let outcome = sim.apply(op);
         op.set_expect(outcome);
     }
+}
+
+/// The coverage names of the ops on `program`'s partitioned tables that
+/// change a bound, each one Postgres accepts: `attach_rebound` (a table
+/// attached under a bound other than the one it last had), `attach_widened`
+/// (a `LIST` table attached with values added to its own), and
+/// `create_resplit` (a new `HASH` leaf at a modulus other than the tree's
+/// initial one).
+pub fn bound_change_names(program: &Program) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    for table in program.tables.iter().filter(|t| t.partitioning.is_some()) {
+        let mut sim = PartitionSim::new(table);
+        for op in program.ops.iter().filter(|op| op.table() == table.name) {
+            let name = match op {
+                Op::Partition {
+                    action: PartitionAction::Attach { leaf, bound },
+                    ..
+                } => {
+                    let old = &sim.tables[sim.table_named(leaf)].slots;
+                    let new = sim.layout.slots_of_bound(bound);
+                    if new == *old {
+                        None
+                    } else if new.is_superset(old) {
+                        Some("attach_widened")
+                    } else {
+                        Some("attach_rebound")
+                    }
+                }
+                Op::Partition {
+                    action: PartitionAction::Create { bound, .. },
+                    ..
+                } => match sim.layout.0 {
+                    PartitionStrategy::Hash { modulus }
+                        if sim.layout.hash_modulus(&sim.layout.slots_of_bound(bound))
+                            != modulus as usize =>
+                    {
+                        Some("create_resplit")
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if sim.apply(op) == OpOutcome::Succeeds
+                && let Some(name) = name
+            {
+                names.push(name);
+            }
+        }
+    }
+    names
 }
 
 /// Layers `draws` on `program`, whose table `table` is a partitioned source
@@ -597,27 +787,11 @@ pub fn add_partition_maintenance(
     let slots = count + 1;
     let mut sim = PartitionSim::new(&spec);
     let mut out = Vec::with_capacity(count + draws.len());
-    let emit = |sim: &mut PartitionSim, mut op: Op, out: &mut Vec<Op>| {
-        let outcome = sim.apply(&op);
-        op.set_expect(outcome);
-        out.push(op);
-    };
     for (index, op) in ops.into_iter().map(Some).chain([None]).enumerate() {
         for draw in draws {
             match *draw {
                 PartitionDraw::Maintenance { at, pick, kind } if at % slots == index => {
-                    // A new leaf needs a bound no leaf holds: with none free,
-                    // it replaces a leaf, dropped first.
-                    if matches!(kind, MaintenanceKind::Create { .. })
-                        && (0..sim.layout.slots()).all(|s| sim.occupant(s).is_some())
-                        && let Some(op) =
-                            maintenance_op(&mut sim, &spec, pick, MaintenanceKind::Drop)
-                    {
-                        emit(&mut sim, op, &mut out);
-                    }
-                    if let Some(op) = maintenance_op(&mut sim, &spec, pick, kind) {
-                        emit(&mut sim, op, &mut out);
-                    }
+                    maintenance(&mut sim, &spec, pick, kind, &mut out);
                 }
                 PartitionDraw::MoveRow {
                     at,
@@ -660,6 +834,245 @@ pub fn add_partition_maintenance(
     program
 }
 
+/// Applies `op` to `sim`, sets its expectation from it and appends it.
+fn emit(sim: &mut PartitionSim, mut op: Op, out: &mut Vec<Op>) {
+    let outcome = sim.apply(&op);
+    op.set_expect(outcome);
+    out.push(op);
+}
+
+/// Appends the ops a [`PartitionDraw::Maintenance`] becomes in the tree
+/// `sim` models (none if the kind has nothing to act on there), applying
+/// each to `sim`.
+fn maintenance(
+    sim: &mut PartitionSim,
+    table: &Table,
+    pick: usize,
+    kind: MaintenanceKind,
+    out: &mut Vec<Op>,
+) {
+    let choose = |candidates: Vec<usize>| -> Option<usize> {
+        (!candidates.is_empty()).then(|| candidates[pick % candidates.len()])
+    };
+    let partition = |action: PartitionAction| Op::Partition {
+        table: table.name.clone(),
+        action,
+        expect: OpOutcome::Succeeds,
+    };
+    let is_default = |sim: &PartitionSim, t: usize| {
+        sim.layout
+            .default_slot()
+            .is_some_and(|d| sim.tables[t].slots.contains(&d))
+    };
+    // A detached table `keep` accepts, or with none, a leaf it accepts,
+    // detached now: its name.
+    let detached_or_detach =
+        |sim: &mut PartitionSim,
+         out: &mut Vec<Op>,
+         concurrently: bool,
+         keep: &dyn Fn(&PartitionSim, usize) -> bool| {
+            let outside: Vec<usize> = (0..sim.tables.len())
+                .filter(|&t| !sim.tables[t].attached && keep(sim, t))
+                .collect();
+            if let Some(t) = choose(outside) {
+                return Some(sim.tables[t].name.clone());
+            }
+            let t = choose(
+                (0..sim.tables.len())
+                    .filter(|&t| sim.tables[t].attached && keep(sim, t))
+                    .collect(),
+            )?;
+            let name = sim.tables[t].name.clone();
+            emit(sim, partition(detach_action(sim, &name, concurrently)), out);
+            Some(name)
+        };
+    // Drops a leaf of the tree other than `spare` (and, when given, only one
+    // `keep` accepts).
+    let drop_other = |sim: &mut PartitionSim,
+                      out: &mut Vec<Op>,
+                      spare: &str,
+                      keep: &dyn Fn(&PartitionSim, usize) -> bool| {
+        if let Some(t) = choose(
+            (0..sim.tables.len())
+                .filter(|&t| sim.tables[t].attached && sim.tables[t].name != spare && keep(sim, t))
+                .collect(),
+        ) {
+            let leaf = sim.tables[t].name.clone();
+            emit(sim, partition(PartitionAction::Drop { leaf }), out);
+        }
+    };
+    match kind {
+        MaintenanceKind::Create { .. } => {
+            // A new leaf needs a bound no leaf holds: with none free, it
+            // replaces a leaf, dropped first.
+            if sim.free_bounds().is_empty()
+                && let Some(op) = maintenance_op(sim, table, pick, MaintenanceKind::Drop)
+            {
+                emit(sim, op, out);
+            }
+            if let Some(op) = maintenance_op(sim, table, pick, kind) {
+                emit(sim, op, out);
+            }
+        }
+        MaintenanceKind::Rebound { concurrently } => {
+            let Some(leaf) = detached_or_detach(sim, out, concurrently, &|_, _| true) else {
+                return;
+            };
+            let others = |sim: &PartitionSim| -> Vec<BTreeSet<usize>> {
+                let own = &sim.tables[sim.table_named(&leaf)].slots;
+                sim.free_bounds().into_iter().filter(|b| b != own).collect()
+            };
+            if others(sim).is_empty() {
+                drop_other(sim, out, &leaf, &|_, _| true);
+            }
+            let free = others(sim);
+            if free.is_empty() {
+                return;
+            }
+            let bound = free[pick % free.len()].clone();
+            let Some(grain) = sim.grain_for(&bound) else {
+                return;
+            };
+            let t = sim.table_named(&leaf);
+            let pks: BTreeSet<i64> = sim.tables[t].rows.iter().map(|&(pk, _)| pk).collect();
+            let grain_col = &table.partitioning.as_ref().expect("partitioned").column;
+            for pk in pks {
+                let update = Op::Update {
+                    table: table.name.clone(),
+                    pk: pk.to_string(),
+                    changes: vec![(grain_col.clone(), Some(grain.to_string()))],
+                    expect: OpOutcome::Succeeds,
+                };
+                emit(
+                    sim,
+                    Op::Leaf {
+                        leaf: leaf.clone(),
+                        op: Box::new(update),
+                    },
+                    out,
+                );
+            }
+            let bound = sim.layout.bound(&bound);
+            emit(sim, partition(PartitionAction::Attach { leaf, bound }), out);
+        }
+        MaintenanceKind::Widen { concurrently } => {
+            if !matches!(sim.layout.0, PartitionStrategy::List { .. }) {
+                return;
+            }
+            let Some(leaf) =
+                detached_or_detach(sim, out, concurrently, &|sim, t| !is_default(sim, t))
+            else {
+                return;
+            };
+            let values = |sim: &PartitionSim| -> Vec<usize> {
+                let own = &sim.tables[sim.table_named(&leaf)].slots;
+                (0..sim.layout.slots())
+                    .filter(|&s| {
+                        Some(s) != sim.layout.default_slot()
+                            && !own.contains(&s)
+                            && sim.occupant(s).is_none()
+                    })
+                    .collect()
+            };
+            if values(sim).is_empty() {
+                drop_other(sim, out, &leaf, &|sim, t| !is_default(sim, t));
+            }
+            let free = values(sim);
+            if free.is_empty() {
+                return;
+            }
+            let t = sim.table_named(&leaf);
+            let mut bound = sim.tables[t].slots.clone();
+            bound.insert(free[pick % free.len()]);
+            let bound = sim.layout.bound(&bound);
+            emit(sim, partition(PartitionAction::Attach { leaf, bound }), out);
+        }
+        MaintenanceKind::Resplit { rows } => {
+            if !matches!(sim.layout.0, PartitionStrategy::Hash { .. }) {
+                return;
+            }
+            let Some(t) = choose(
+                (0..sim.tables.len())
+                    .filter(|&t| sim.tables[t].attached && sim.tables[t].slots.len() > 1)
+                    .collect(),
+            ) else {
+                return;
+            };
+            let slots = sim.tables[t].slots.clone();
+            let leaf = sim.tables[t].name.clone();
+            let finest = sim.layout.slots();
+            let modulus = sim.layout.hash_modulus(&slots);
+            let split = if finest.is_multiple_of(2 * modulus) {
+                2 * modulus
+            } else {
+                finest
+            };
+            emit(sim, partition(detach_action(sim, &leaf, false)), out);
+            let remainder = slots.first().expect("a bound holds a slot") % modulus;
+            for r in (0..split).filter(|r| r % modulus == remainder) {
+                let part: BTreeSet<usize> =
+                    slots.iter().copied().filter(|s| s % split == r).collect();
+                if let Some(op) = new_leaf(sim, table, &part, rows, false) {
+                    emit(sim, op, out);
+                }
+            }
+        }
+        _ => {
+            if let Some(op) = maintenance_op(sim, table, pick, kind) {
+                emit(sim, op, out);
+            }
+        }
+    }
+}
+
+/// A detach of `leaf`, `CONCURRENTLY` when asked and the tree has no
+/// `DEFAULT` (Postgres refuses it then).
+fn detach_action(sim: &PartitionSim, leaf: &str, concurrently: bool) -> PartitionAction {
+    let has_default = sim
+        .layout
+        .default_slot()
+        .and_then(|s| sim.occupant(s))
+        .is_some();
+    PartitionAction::Detach {
+        leaf: leaf.to_string(),
+        concurrently: concurrently && !has_default,
+    }
+}
+
+/// A new leaf over `slots` holding `rows` rows (primary keys `1..=rows`, at
+/// the bound's smallest grain), or `None` if no grain fits it.
+fn new_leaf(
+    sim: &mut PartitionSim,
+    table: &Table,
+    slots: &BTreeSet<usize>,
+    rows: u8,
+    standalone: bool,
+) -> Option<Op> {
+    let grain = sim.grain_for(slots)?;
+    sim.created += 1;
+    let leaf = format!("{}_n{}", table.name, sim.created);
+    let grain_col = &table.partitioning.as_ref().expect("partitioned").column;
+    let rows = (1..=i64::from(rows))
+        .map(|pk| {
+            vec![
+                (table.pk_col.clone(), Some(pk.to_string())),
+                (table.columns[1].name.clone(), Some(pk.to_string())),
+                (grain_col.clone(), Some(grain.to_string())),
+            ]
+        })
+        .collect();
+    Some(Op::Partition {
+        table: table.name.clone(),
+        action: PartitionAction::Create {
+            leaf,
+            bound: sim.layout.bound(slots),
+            rows,
+            standalone,
+        },
+        expect: OpOutcome::Succeeds,
+    })
+}
+
 /// `op`, a write through the root, named on the table its row lives in (a
 /// detached one, if `detached` and one holds it), or for an insert, the leaf
 /// it routes to. Unchanged when there is no such table (an insert that
@@ -698,8 +1111,8 @@ fn on_leaf(sim: &PartitionSim, op: Op, detached: bool) -> Op {
     }
 }
 
-/// The op a [`PartitionDraw::Maintenance`] becomes in the tree `sim` models,
-/// or `None` if the kind has nothing to act on.
+/// The op a single-op [`PartitionDraw::Maintenance`] becomes in the tree
+/// `sim` models, or `None` if the kind has nothing to act on.
 fn maintenance_op(
     sim: &mut PartitionSim,
     table: &Table,
@@ -720,15 +1133,7 @@ fn maintenance_op(
     let op = match kind {
         MaintenanceKind::Detach { concurrently } => {
             let t = choose(attached)?;
-            let has_default = sim
-                .layout
-                .default_slot()
-                .and_then(|s| sim.occupant(s))
-                .is_some();
-            partition(PartitionAction::Detach {
-                leaf: sim.tables[t].name.clone(),
-                concurrently: concurrently && !has_default,
-            })
+            partition(detach_action(sim, &sim.tables[t].name, concurrently))
         }
         MaintenanceKind::Drop => {
             let t = choose(attached)?;
@@ -749,45 +1154,23 @@ fn maintenance_op(
         MaintenanceKind::Attach => {
             let t = choose(
                 (0..sim.tables.len())
-                    .filter(|&t| {
-                        !sim.tables[t].attached && sim.occupant(sim.tables[t].slot).is_none()
-                    })
+                    .filter(|&t| !sim.tables[t].attached && sim.free(&sim.tables[t].slots))
                     .collect(),
             )?;
             partition(PartitionAction::Attach {
                 leaf: sim.tables[t].name.clone(),
-                bound: sim.layout.bound(sim.tables[t].slot),
+                bound: sim.layout.bound(&sim.tables[t].slots),
             })
         }
         MaintenanceKind::Create { rows, standalone } => {
-            let slot = choose(
-                (0..sim.layout.slots())
-                    .filter(|&s| sim.occupant(s).is_none())
-                    .collect(),
-            )?;
-            let grain = (0..=PARTITION_GRAIN_MAX).find(|&g| match sim.layout.slot_of(g) {
-                Some(s) if Some(slot) != sim.layout.default_slot() => s == slot,
-                Some(s) => sim.occupant(s).is_none(),
-                None => Some(slot) == sim.layout.default_slot(),
-            })?;
-            sim.created += 1;
-            let leaf = format!("{}_n{}", table.name, sim.created);
-            let grain_col = &table.partitioning.as_ref().expect("partitioned").column;
-            let rows = (1..=i64::from(rows))
-                .map(|pk| {
-                    vec![
-                        (table.pk_col.clone(), Some(pk.to_string())),
-                        (table.columns[1].name.clone(), Some(pk.to_string())),
-                        (grain_col.clone(), Some(grain.to_string())),
-                    ]
-                })
-                .collect();
-            partition(PartitionAction::Create {
-                leaf,
-                bound: sim.layout.bound(slot),
-                rows,
-                standalone,
-            })
+            let free = sim.free_bounds();
+            let slots = (!free.is_empty()).then(|| free[pick % free.len()].clone())?;
+            return new_leaf(sim, table, &slots, rows, standalone);
+        }
+        MaintenanceKind::Rebound { .. }
+        | MaintenanceKind::Widen { .. }
+        | MaintenanceKind::Resplit { .. } => {
+            unreachable!("maintenance() resolves the compound kinds")
         }
     };
     Some(op)
@@ -1084,5 +1467,229 @@ mod tests {
                 ("update on t0_pd".into(), OpOutcome::Fails),
             ]
         );
+    }
+
+    fn shape(program: &Program) -> Vec<(String, OpOutcome)> {
+        program
+            .ops
+            .iter()
+            .map(|op| (describe(op), op.expect().clone()))
+            .collect()
+    }
+
+    /// A detached leaf attached under another free bound takes its rows
+    /// along once they are moved into it; after a concurrent detach its
+    /// `CHECK` constraint refuses the move, so the attach fails, and an
+    /// empty one attaches but refuses the new bound's rows.
+    #[test]
+    fn a_leaf_attached_under_another_bound_keeps_its_check() {
+        let list = PartitionStrategy::List {
+            values: 3,
+            default: false,
+        };
+        let draws = |concurrently| {
+            vec![
+                PartitionDraw::Maintenance {
+                    at: 2,
+                    pick: 2,
+                    kind: MaintenanceKind::Drop,
+                },
+                PartitionDraw::Maintenance {
+                    at: 2,
+                    pick: 0,
+                    kind: MaintenanceKind::Rebound { concurrently },
+                },
+                PartitionDraw::MoveRow {
+                    at: 2,
+                    pk: 2,
+                    grain: 2,
+                    via_leaf: false,
+                },
+            ]
+        };
+        let drop = format!(
+            "{:?}",
+            PartitionAction::Drop {
+                leaf: "t0_p2".into()
+            }
+        );
+        let detach = |concurrently| {
+            format!(
+                "{:?}",
+                PartitionAction::Detach {
+                    leaf: "t0_p0".into(),
+                    concurrently
+                }
+            )
+        };
+        let attach = format!(
+            "{:?}",
+            PartitionAction::Attach {
+                leaf: "t0_p0".into(),
+                bound: "for values in (2)".into()
+            }
+        );
+        // ops: insert pk1 (g0), insert pk2 (g1).
+        let plain = add_partition_maintenance(program(list, &[0, 1], vec![]), 0, &draws(false));
+        assert_eq!(
+            shape(&plain),
+            vec![
+                ("insert".into(), OpOutcome::Succeeds),
+                ("insert".into(), OpOutcome::Succeeds),
+                (drop.clone(), OpOutcome::Succeeds),
+                (detach(false), OpOutcome::Succeeds),
+                ("update on t0_p0".into(), OpOutcome::Succeeds),
+                (attach.clone(), OpOutcome::Succeeds),
+                // Grain 2 now routes to t0_p0.
+                ("update".into(), OpOutcome::Succeeds),
+            ]
+        );
+        let checked = add_partition_maintenance(program(list, &[0, 1], vec![]), 0, &draws(true));
+        assert_eq!(
+            shape(&checked),
+            vec![
+                ("insert".into(), OpOutcome::Succeeds),
+                ("insert".into(), OpOutcome::Succeeds),
+                (drop.clone(), OpOutcome::Succeeds),
+                (detach(true), OpOutcome::Succeeds),
+                // The CHECK holds the row at grain 0, outside the new bound.
+                ("update on t0_p0".into(), OpOutcome::Fails),
+                (attach.clone(), OpOutcome::Fails),
+                ("update".into(), OpOutcome::Fails),
+            ]
+        );
+        // ops: insert pk1 (g1), insert pk2 (g1); t0_p0 is empty.
+        let empty = add_partition_maintenance(program(list, &[1, 1], vec![]), 0, &draws(true));
+        assert_eq!(
+            shape(&empty),
+            vec![
+                ("insert".into(), OpOutcome::Succeeds),
+                ("insert".into(), OpOutcome::Succeeds),
+                (drop, OpOutcome::Succeeds),
+                (detach(true), OpOutcome::Succeeds),
+                (attach, OpOutcome::Succeeds),
+                // Grain 2 routes to t0_p0, whose CHECK refuses it.
+                ("update".into(), OpOutcome::Fails),
+            ]
+        );
+    }
+
+    /// A `LIST` leaf detached and attached again with a value list widened
+    /// by a free value takes that value's rows.
+    #[test]
+    fn a_widened_list_leaf_takes_the_new_values_rows() {
+        let base = program(
+            PartitionStrategy::List {
+                values: 3,
+                default: true,
+            },
+            &[0, 1],
+            vec![],
+        );
+        let program = add_partition_maintenance(
+            base,
+            0,
+            &[
+                PartitionDraw::Maintenance {
+                    at: 2,
+                    pick: 2,
+                    kind: MaintenanceKind::Drop,
+                },
+                PartitionDraw::Maintenance {
+                    at: 2,
+                    pick: 0,
+                    kind: MaintenanceKind::Widen { concurrently: true },
+                },
+                PartitionDraw::MoveRow {
+                    at: 2,
+                    pk: 2,
+                    grain: 2,
+                    via_leaf: false,
+                },
+            ],
+        );
+        let detach = format!(
+            "{:?}",
+            PartitionAction::Detach {
+                leaf: "t0_p0".into(),
+                // Refused beside a DEFAULT, so drawn plain.
+                concurrently: false,
+            }
+        );
+        let attach = format!(
+            "{:?}",
+            PartitionAction::Attach {
+                leaf: "t0_p0".into(),
+                bound: "for values in (0, 2)".into()
+            }
+        );
+        let drop = format!(
+            "{:?}",
+            PartitionAction::Drop {
+                leaf: "t0_p2".into()
+            }
+        );
+        assert_eq!(
+            shape(&program),
+            vec![
+                ("insert".into(), OpOutcome::Succeeds),
+                ("insert".into(), OpOutcome::Succeeds),
+                (drop, OpOutcome::Succeeds),
+                (detach, OpOutcome::Succeeds),
+                (attach, OpOutcome::Succeeds),
+                ("update".into(), OpOutcome::Succeeds),
+            ]
+        );
+        assert_eq!(
+            Layout(PartitionStrategy::List {
+                values: 3,
+                default: true
+            })
+            .slots_of_bound("for values in (0, 2)"),
+            BTreeSet::from([0, 2])
+        );
+    }
+
+    /// A `HASH` leaf re-split to a multiple modulus is replaced by a leaf per
+    /// remainder it covered, and rows route to them.
+    #[test]
+    fn a_hash_resplit_replaces_a_leaf_by_its_remainders_at_a_multiple_modulus() {
+        let base = program(PartitionStrategy::Hash { modulus: 2 }, &[0], vec![]);
+        let program = add_partition_maintenance(
+            base,
+            0,
+            &[PartitionDraw::Maintenance {
+                at: 1,
+                pick: 0,
+                kind: MaintenanceKind::Resplit { rows: 1 },
+            }],
+        );
+        let bounds: Vec<String> = program
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Partition {
+                    action: PartitionAction::Create { bound, .. },
+                    expect: OpOutcome::Succeeds,
+                    ..
+                } => Some(bound.clone()),
+                _ => None,
+            })
+            .collect();
+        // Grain 0 hashes to remainder 0 of modulus 2: leaf t0_p0.
+        assert_eq!(
+            bounds,
+            vec![
+                "for values with (modulus 4, remainder 0)".to_string(),
+                "for values with (modulus 4, remainder 2)".to_string(),
+            ]
+        );
+        assert!(matches!(
+            &program.ops[1],
+            Op::Partition {
+                action: PartitionAction::Detach { leaf, .. },
+                ..
+            } if leaf == "t0_p0"
+        ));
     }
 }

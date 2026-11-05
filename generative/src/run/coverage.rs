@@ -107,7 +107,10 @@ pub struct Coverage {
     /// `"create_written"` or `"create_attached"`), writes named on a leaf
     /// (`"leaf_insert"`, `"leaf_update"`, `"leaf_delete"`), and
     /// partition-key updates through the root that move a row
-    /// (`"key_update"`) or are refused (`"key_update_refused"`).
+    /// (`"key_update"`) or are refused (`"key_update_refused"`). On top,
+    /// the bound changes Postgres accepted, by
+    /// [`crate::generate::partition::bound_change_names`]
+    /// (`"attach_rebound"`, `"attach_widened"`, `"create_resplit"`).
     pub partition_ops: HashMap<&'static str, usize>,
     /// Bursts recorded by [`Coverage::record_concurrent_plan`].
     pub concurrent_bursts: usize,
@@ -143,6 +146,9 @@ impl Coverage {
     pub fn record_program(&mut self, program: &Program) {
         self.cases += 1;
 
+        for name in crate::generate::partition::bound_change_names(program) {
+            *self.partition_ops.entry(name).or_insert(0) += 1;
+        }
         for op in &program.ops {
             if let Some(name) = partition_op_name(program, op) {
                 *self.partition_ops.entry(name).or_insert(0) += 1;

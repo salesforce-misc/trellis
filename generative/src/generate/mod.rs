@@ -2922,7 +2922,9 @@ mod strategy {
     /// ([`partition::add_partition_maintenance`]): partition maintenance
     /// (a leaf detached, also `CONCURRENTLY`, attached again with its rows,
     /// dropped, truncated, or a new leaf created empty, written directly, or
-    /// built outside the tree and attached), partition-key updates that move
+    /// built outside the tree and attached; a table attached under another
+    /// bound, a `LIST` value list widened, a `HASH` leaf re-split at a
+    /// multiple modulus), partition-key updates that move
     /// a row to another partition, and writes named on a leaf, or on a
     /// detached table, rather than the root.
     pub fn partitioned_program() -> impl Strategy<Value = Program> {
@@ -3000,6 +3002,9 @@ mod strategy {
             // An empty new leaf as often as a written one.
             (prop_oneof![Just(0u8), 1u8..=3], any::<bool>())
                 .prop_map(|(rows, standalone)| MaintenanceKind::Create { rows, standalone }),
+            any::<bool>().prop_map(|concurrently| MaintenanceKind::Rebound { concurrently }),
+            any::<bool>().prop_map(|concurrently| MaintenanceKind::Widen { concurrently }),
+            (0u8..=2).prop_map(|rows| MaintenanceKind::Resplit { rows }),
         ];
         prop_oneof![
             3 => (0..=op_count, 0..8usize, kind)
