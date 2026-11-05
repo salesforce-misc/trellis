@@ -622,7 +622,9 @@ fn report(tier: &SweepTier, results: &[SweepCase], excluded: &[(u64, usize)]) ->
 
 /// Why a tier whose programs define no `MIN`/`MAX` doesn't run the
 /// extremes' plants ([`PlantPath::Extremes`], [`PlantPath::SelfCheckExtremes`]).
-pub const NO_EXTREMES: &str = "it breaks a MIN/MAX extreme of a group-basis aggregate, which      only the concurrent tier's min_max shape (concurrent_convergence.rs,      GENERATIVE_PLANT_TIER=min_max) draws";
+pub const NO_EXTREMES: &str = "it breaks a MIN/MAX extreme of a group-basis aggregate, which \
+     only the concurrent tier's min_max shape (concurrent_convergence.rs, \
+     GENERATIVE_PLANT_TIER=min_max) draws";
 
 /// The plants whose path a tier's programs never take, each with `why`:
 /// for a tier's `not_gated`.
