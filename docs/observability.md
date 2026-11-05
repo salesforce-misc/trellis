@@ -561,16 +561,17 @@ is one field for every target kind. The CLI's `trellis status` prints one warnin
 entry. Which indexes a target needs is in
 [Supported sources and targets](transforms.md#supported-sources-and-targets).
 
-`extreme_index_gaps` on `DefinitionStatus` lists, for a `GROUP BY` transform with
-`MIN` or `MAX` fields, the source index each such argument's probe reads and the source
-lacks: an index leading with the `GROUP BY` columns, then the argument (`columns`,
-`argument`, `opted_out`, and `ExtremeIndexGap::fix`, a `create index` Trellis doesn't
-run). A retraction that removes a group's minimum or maximum re-reads the group's
-extreme from the source; with the index that is one index entry, and without it the
-read scans the group's rows. It is a warning: the target stays exact, nothing is
-paused and `self_check` still walks. It is read from the catalog on each call, so it
-clears once the index exists, and it is empty for every other transform. The CLI's
-`trellis status` prints one warning line per entry.
+`extreme_index_gaps` on `DefinitionStatus` lists, for a `GROUP BY` transform with `MIN`
+or `MAX` fields, the source index each such argument's probe reads and the source lacks:
+an index leading with the `GROUP BY` columns, then the argument (`columns`, `argument`,
+`opted_out`, and `ExtremeIndexGap::fix`, a `create index` Trellis doesn't run). A
+retraction that removes a group's minimum or maximum re-reads the group's extreme from
+the source; with the index that is one index entry, and without it the read scans the
+group's rows, or the whole source for each such group and extreme when the `GROUP BY`
+index is missing too (a `source_index_gaps` entry). It is a warning: the target stays
+exact, nothing is paused and `self_check` still walks. It is read from the catalog on
+each call, so it clears once the index exists, and it is empty for every other
+transform. The CLI's `trellis status` prints one warning line per entry.
 
 `join` on `DefinitionStatus` is set for a `JOIN` transform (aggregate or 1-1) and `None` for any
 other. It reports three things, none of which changes the transform's status:

@@ -2259,8 +2259,9 @@ pub struct DefinitionStatus {
     /// the `GROUP BY` columns then the argument. A warning: nothing is
     /// paused, the target stays exact and `self_check` still walks, but
     /// each probe (a retraction that reaches a group's extreme) scans the
-    /// group's rows instead of reading one index entry.
-    /// [`ExtremeIndexGap::fix`] is a `create index` to run; Trellis never
+    /// group's rows instead of reading one index entry (the whole source,
+    /// when the `GROUP BY` index of [`Self::source_index_gaps`] is missing
+    /// too). [`ExtremeIndexGap::fix`] is a `create index` to run; Trellis never
     /// creates one. Read live on each call; it clears once the index
     /// exists. Empty for every definition with no `MIN` or `MAX`.
     pub extreme_index_gaps: Vec<ExtremeIndexGap>,

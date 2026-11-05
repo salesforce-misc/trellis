@@ -37,8 +37,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use trellis::{
     CaptureFailure, CaptureFailureKind, Config, CorrectingNode, DefinitionSummary, DrainFailure,
-    ExtremeIndexGap, JoinBuildStep, JoinSide, JoinSidePart, JoinStatus, OneToOneBuildStep,
-    SourceIndexGap, Trellis, TrellisOptions,
+    ExtremeIndexGap, IndexRole, JoinBuildStep, JoinSide, JoinSidePart, JoinStatus,
+    OneToOneBuildStep, SourceIndexGap, Trellis, TrellisOptions,
 };
 
 use super::release::shell_quote;
@@ -282,8 +282,13 @@ fn format_definitions(definitions: &[(DefinitionSummary, StatusWarnings)]) -> St
                 line.push_str(&format_source_index_gap(gap));
             }
             // A source index a `MIN`/`MAX` probe reads one entry of.
+            // Without the `GROUP BY` index too, each probe scans the source.
+            let no_group_index = warnings
+                .source_index_gaps
+                .iter()
+                .any(|gap| gap.role == IndexRole::GroupBy);
             for gap in &warnings.extreme_index_gaps {
-                line.push_str(&format_extreme_index_gap(gap));
+                line.push_str(&format_extreme_index_gap(gap, no_group_index));
             }
             // Why a `live` definition reads `catching_up`: it reads
             // a paused column of an upstream target, and resuming that column
@@ -335,15 +340,22 @@ fn format_source_index_gap(gap: &SourceIndexGap) -> String {
     }
 }
 
-fn format_extreme_index_gap(gap: &ExtremeIndexGap) -> String {
+/// `no_group_index`: the source lacks the `GROUP BY` index as well, so each
+/// probe scans the whole source rather than the group's rows.
+fn format_extreme_index_gap(gap: &ExtremeIndexGap, no_group_index: bool) -> String {
     let opted_out = if gap.opted_out {
         ", as defined WITHOUT SOURCE INDEX"
     } else {
         ""
     };
+    let scanned = if no_group_index {
+        "the whole source"
+    } else {
+        "the group's rows"
+    };
     format!(
         "    warning: no source index on {} ({}) for MIN/MAX({}){opted_out}; a retraction of a \
-         group's extreme scans the group's rows instead of reading one index entry; {}\n",
+         group's extreme scans {scanned} instead of reading one index entry; {}\n",
         gap.table,
         gap.columns.join(", "),
         gap.argument,
@@ -822,12 +834,15 @@ mod tests {
     #[test]
     fn a_missing_min_max_index_names_the_argument_and_the_cost() {
         let gap = |opted_out| {
-            format_extreme_index_gap(&trellis::fixture!(ExtremeIndexGap {
-                table: "public.orders".to_string(),
-                columns: vec!["region".to_string(), "placed_at".to_string()],
-                argument: "placed_at".to_string(),
+            format_extreme_index_gap(
+                &trellis::fixture!(ExtremeIndexGap {
+                    table: "public.orders".to_string(),
+                    columns: vec!["region".to_string(), "placed_at".to_string()],
+                    argument: "placed_at".to_string(),
+                    opted_out,
+                }),
                 opted_out,
-            }))
+            )
         };
         assert_eq!(
             gap(false),
@@ -836,7 +851,26 @@ mod tests {
              instead of reading one index entry; \
              create index on \"public\".\"orders\" (\"region\", \"placed_at\")\n"
         );
-        assert!(gap(true).contains("(placed_at), as defined WITHOUT SOURCE INDEX; a retraction"));
+        assert!(gap(true).contains(
+            "(placed_at), as defined WITHOUT SOURCE INDEX; a retraction of a group's extreme \
+             scans the whole source instead"
+        ));
+        // The statement quotes each name; the message shows them as named.
+        let odd = trellis::fixture!(ExtremeIndexGap {
+            table: "Sales.Order".to_string(),
+            columns: vec!["select".to_string(), "a\"b".to_string()],
+            argument: "a\"b".to_string(),
+            opted_out: false,
+        });
+        assert!(
+            format_extreme_index_gap(&odd, false).ends_with(
+                "Sales.Order (select, a\"b) for MIN/MAX(a\"b); a retraction of a group's \
+                 extreme scans the group's rows instead of reading one index entry; \
+                 create index on \"Sales\".\"Order\" (\"select\", \"a\"\"b\")\n"
+            ),
+            "{}",
+            format_extreme_index_gap(&odd, false)
+        );
     }
 
     #[test]

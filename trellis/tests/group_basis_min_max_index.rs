@@ -338,3 +338,91 @@ async fn a_definition_without_min_or_max_reports_no_gap() {
     assert!(s.extreme_index_gaps.is_empty(), "{s:?}");
     assert!(s.source_index_gaps.is_empty(), "{s:?}");
 }
+
+/// Two `GROUP BY` columns, one text under a collation other than the
+/// database's: with the index on both then the argument, every branch of
+/// the probe (the all-`=` one and each `NULL` pattern's) reads one endpoint,
+/// `NULL` groups' included, and the target stays exact. Without it the
+/// same probe scans the group, still exactly.
+#[tokio::test]
+async fn two_group_columns_read_one_endpoint_per_null_pattern() {
+    const AGG2: &str = "TRANSFORM agg FROM public.src GROUP BY g, h \
+                        SELECT MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS n";
+    const ACTUAL2: &str = "select g, h, lo, hi, n from public.agg order by g, h";
+    const EXPECTED2: &str = "select g, h, min(v), max(v), count(*) from public.src \
+                             group by g, h order by g, h";
+    trellis::staging::admit_min_max_for_tests();
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g integer, h text collate \"C\", \
+         v integer); \
+         create index src_g_h_idx on public.src (g, h); \
+         create index src_g_h_v_idx on public.src (g, h, v)",
+        &[
+            ("id", int4()),
+            ("g", int4()),
+            ("h", ValueType::Text),
+            ("v", int4()),
+        ],
+        &[AGG2],
+        &[SRC],
+    )
+    .await;
+    let t = handle(&d).await;
+    let step2 = async |d: &mut Driver, sql: &str| {
+        write(d, sql).await;
+        let batch = d.seal().await;
+        d.drain(batch, "step").await;
+        assert_eq!(d.rows(ACTUAL2).await, d.rows(EXPECTED2).await, "{sql}");
+    };
+    step2(
+        &mut d,
+        "insert into public.src values \
+         (1, 1, 'a', 1), (2, 1, 'a', 9), (3, null, 'a', 2), (4, null, 'a', 8), \
+         (5, 1, null, 3), (6, 1, null, 7), (7, null, null, 4), (8, null, null, 6), \
+         (9, null, null, null)",
+    )
+    .await;
+    assert!(status(&t).await.extreme_index_gaps.is_empty());
+    let plan = probe_plan(&d).await;
+    assert_endpoint(&plan, "src_g_h_v_idx");
+    assert_eq!(
+        source_reads(&plan).len(),
+        8,
+        "4 branches per extreme:\n{plan}"
+    );
+    step2(&mut d, "delete from public.src where id in (1, 4, 5, 8)").await;
+
+    write(&d, "drop index public.src_g_h_v_idx").await;
+    let gaps = status(&t).await.extreme_index_gaps;
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert_eq!(gaps[0].columns, ["g", "h", "v"]);
+    assert_group_scan(&probe_plan(&d).await, "src_g_h_v_idx");
+    step2(&mut d, "delete from public.src where id in (2, 3, 6, 7)").await;
+}
+
+/// Which other index shapes count, read from `status` alone: a unique index
+/// on the columns counts; the argument as an `INCLUDE` column, as an
+/// expression, or a hash or BRIN index on the columns doesn't.
+#[tokio::test]
+async fn which_index_shapes_count_for_the_probe() {
+    let d = start(
+        AGG,
+        "create table public.src (id integer primary key, g integer, v integer); \
+         create index src_g_idx on public.src (g)",
+        int4(),
+    )
+    .await;
+    let t = handle(&d).await;
+    for ddl in [
+        "create index x on public.src (g) include (v)",
+        "create index x on public.src (g, (v + 0))",
+        "create index x on public.src using hash (g)",
+        "create index x on public.src using brin (g, v)",
+    ] {
+        write(&d, ddl).await;
+        assert_one_gap(&status(&t).await, false);
+        write(&d, "drop index public.x").await;
+    }
+    write(&d, "create unique index x on public.src (g, v, id)").await;
+    assert!(status(&t).await.extreme_index_gaps.is_empty());
+}
