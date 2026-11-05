@@ -10,9 +10,9 @@ use std::collections::HashSet;
 
 use generative::generate::{
     Mutate, build_program, bulk_insert_program, checkpoint_plan_for, concurrent_plan,
-    cooling_key_case, hot_key_case, mid_burst_case, noise_plan_for, partitioned_program,
-    program_with_client_restart, program_with_mid_stream_def_install, program_with_scale_out,
-    table_streams, trivial_program, trivial_program_with,
+    cooling_key_case, hot_key_case, mid_burst_case, noise_plan_for, partitioned_hot_key_case,
+    partitioned_program, program_with_client_restart, program_with_mid_stream_def_install,
+    program_with_scale_out, table_streams, trivial_program, trivial_program_with,
 };
 use generative::model::{NoiseAction, NoiseEventKind, Op, Program, Table};
 use generative::run::{ConcurrentShape, Coverage};
@@ -1288,6 +1288,46 @@ fn the_hot_key_tier_draws_every_concurrent_shape() {
             reached * 2 >= SAMPLES,
             "hot_key_case must reach {} in at least half of {SAMPLES} cases, got {reached}: \
              {after}",
+            shape.name()
+        );
+    }
+}
+
+/// The partitioned hot-key cases (#1331) reach every hot-key
+/// [`ConcurrentShape`] as the unpartitioned ones do, over all three
+/// partition strategies, and take no mid-burst action.
+#[test]
+fn the_partitioned_hot_key_tier_draws_every_concurrent_shape() {
+    const SAMPLES: usize = 40;
+    let mut runner = TestRunner::deterministic();
+    let mut coverage = generative::run::Coverage::new();
+    let strategy = partitioned_hot_key_case();
+    for _ in 0..SAMPLES {
+        let case = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        coverage.record_program(&case.program);
+        coverage.record_concurrent_plan(&case.program, &case.plan);
+    }
+    eprintln!(
+        "partitioned hot-key shapes over {SAMPLES} cases: {:?}",
+        coverage.concurrent_shape_cases
+    );
+    assert!(
+        coverage.concurrent_actions.is_empty(),
+        "partitioned_hot_key_case takes no mid-burst action: {coverage}"
+    );
+    for shape in ConcurrentShape::HOT_KEY {
+        let reached = coverage
+            .concurrent_shape_cases
+            .get(shape.name())
+            .copied()
+            .unwrap_or(0);
+        assert!(
+            reached * 2 >= SAMPLES,
+            "partitioned_hot_key_case must reach {} in at least half of {SAMPLES} cases, got \
+             {reached}: {coverage}",
             shape.name()
         );
     }

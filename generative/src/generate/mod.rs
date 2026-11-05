@@ -225,6 +225,11 @@ pub const HOT_GROUP_EPOCH: usize = 150;
 /// How far the group window slides each [`HOT_GROUP_EPOCH`].
 pub const HOT_GROUP_SLIDE: i64 = 2;
 
+/// The largest grain a hot-key [`Mutate::MoveGroup`] writes: the top of the
+/// group window once it has slid for the last of [`HOT_MUTATES`].
+pub const HOT_WINDOW_GRAIN_MAX: i64 =
+    HOT_GRAIN_MAX + ((*HOT_MUTATES.end() - 1) / HOT_GROUP_EPOCH) as i64 * HOT_GROUP_SLIDE;
+
 /// The range of ops per burst the hot-key shape draws: at least twice the
 /// engine's split threshold (256 rows in one sealed batch), so a burst can
 /// seal into several batches that are each large enough to split, and small
@@ -3126,6 +3131,43 @@ mod strategy {
         hot_key_case_with(Just(CaseExtras::None).boxed())
     }
 
+    /// The concurrent tier's partitioned hot-key case (ADR-0017): a
+    /// [`hot_key_case`] whose hot table is a partitioned source
+    /// ([`partition_table`]), routed by the grain, so the rows of one hot
+    /// group move between partitions ([`Mutate::MoveGroup`] over the sliding
+    /// group window) while several workers drain the lanes that race.
+    ///
+    /// Every definition over the hot table is a `GROUP BY` its grain: a
+    /// drawn 1-1 definition over it is dropped (refused at define). It
+    /// draws no partition maintenance, which would pin the hot table to one
+    /// lane ([`concurrent_plan`]); [`partitioned_program`] draws that. The
+    /// strategy is [`hot_partition_strategy`]'s.
+    pub fn partitioned_hot_key_case() -> impl Strategy<Value = ConcurrentCase> {
+        hot_key_case_with(
+            hot_partition_strategy()
+                .prop_map(CaseExtras::Partitioned)
+                .boxed(),
+        )
+    }
+
+    /// How [`partitioned_hot_key_case`] routes its hot table, over the whole
+    /// sliding group window (`0..=`[`HOT_WINDOW_GRAIN_MAX`]): `HASH` over one
+    /// to four leaves, `LIST` with a leaf for each of the first one to
+    /// [`HOT_GRAIN_MAX`] grains and a `DEFAULT` for the rest, or `RANGE`
+    /// over two to [`HOT_GRAIN_MAX`] bounds, the last unbounded above. A
+    /// `LIST` without a `DEFAULT` would refuse most moves once the window
+    /// slides past its values.
+    fn hot_partition_strategy() -> impl Strategy<Value = PartitionStrategy> {
+        prop_oneof![
+            (1u8..=4).prop_map(|modulus| PartitionStrategy::Hash { modulus }),
+            (1u8..=HOT_GRAIN_MAX as u8).prop_map(|values| PartitionStrategy::List {
+                values,
+                default: true,
+            }),
+            (2u8..=HOT_GRAIN_MAX as u8).prop_map(|bounds| PartitionStrategy::Range { bounds }),
+        ]
+    }
+
     /// The concurrent tier's mid-burst case: a
     /// [`hot_key_case`] whose bursts also stage re-reads while CDC for the
     /// same keys is in flight.
@@ -3232,6 +3274,8 @@ mod strategy {
         MidBurst(MidBurstDraws),
         Cooling(CoolingDraws),
         CoolingBackfill(CoolingBackfillDraws),
+        /// The hot table is a partitioned source.
+        Partitioned(PartitionStrategy),
     }
 
     /// What [`cooling_backfill_case`] adds to a [`hot_key_case`].
@@ -3590,12 +3634,22 @@ mod strategy {
                     seal,
                     extras,
                 )| {
+                    let mut partitioned = None;
                     let (extras, cooling, backfill) = match extras {
                         CaseExtras::None => (None, None, None),
                         CaseExtras::MidBurst(extras) => (Some(extras), None, None),
                         CaseExtras::Cooling(cooling) => (None, Some(cooling), None),
                         CaseExtras::CoolingBackfill(draws) => {
                             (None, Some(draws.cooling.clone()), Some(draws))
+                        }
+                        CaseExtras::Partitioned(strategy) => {
+                            // A 1-1 transform over a partitioned source is
+                            // refused at define.
+                            extra.retain(|(source, shape, _)| {
+                                *source != 0 || !matches!(shape, DefShape::OneToOne)
+                            });
+                            partitioned = Some(strategy);
+                            (None, None, None)
                         }
                     };
                     if backfill.is_some() {
@@ -3662,6 +3716,9 @@ mod strategy {
                             interleave_tables(program, &schedule)
                         }
                     };
+                    if let Some(strategy) = partitioned {
+                        program = partition_table(program, 0, strategy);
+                    }
                     if let Some((_, at)) = extras.deferred {
                         let (def, ops) = (program.defs.len() - 1, program.ops.len());
                         let after_op = 1 + usize::from(at) * (ops - 2) / 1000;
@@ -3692,7 +3749,12 @@ mod strategy {
                         // A build starts at the reconcile pass after the
                         // action that asked for it: at the engine's 5s
                         // default, long after its burst.
-                        reconcile_interval_ms: load.map(|_| seal),
+                        // A check over a partitioned source waits for the
+                        // reconcile pass that records its tree.
+                        reconcile_interval_ms: load
+                            .map(|_| seal)
+                            .or(partitioned
+                                .map(|_| partition::RECONCILE_INTERVAL.as_millis() as u64)),
                         housekeeping_interval_ms: None,
                     }
                 },
@@ -4027,9 +4089,9 @@ pub use strategy::{
     COOLING_BACKFILL_AT, COOLING_BACKFILL_LAG, LOAD_CHUNK_ROWS, LOAD_PACE_MICROS, LOAD_STALL_SEALS,
     MAX_ACTION_DRAWS, bulk_insert_program, checkpoint_plan_for, cooling_backfill_case,
     cooling_key_case, db_admin_plan_for, hot_key_case, mid_burst_case, noise_plan_for,
-    partitioned_program, program_with_client_restart, program_with_mid_stream_def_install,
-    program_with_scale_out, restore_plan_for, steady_load_case, trivial_one_to_one_program_with,
-    trivial_program, trivial_program_with,
+    partitioned_hot_key_case, partitioned_program, program_with_client_restart,
+    program_with_mid_stream_def_install, program_with_scale_out, restore_plan_for,
+    steady_load_case, trivial_one_to_one_program_with, trivial_program, trivial_program_with,
 };
 
 #[cfg(test)]
@@ -5053,6 +5115,72 @@ mod tests {
                 highest_group > HOT_GRAIN_MAX + HOT_GROUP_SLIDE,
                 "the group window must slide past its first position: highest group \
                  {highest_group}"
+            );
+        }
+
+        #[cfg(feature = "proptest")]
+        /// The drawn partitioned hot-key cases (#1331): the hot table is
+        /// partitioned by its grain and read only grouped by it, its ops
+        /// still race over several lanes (no op pins it to one), and every
+        /// strategy routes the whole sliding window, `HASH` included, so a
+        /// move to a group above the serial tier's grains lands.
+        #[test]
+        fn partitioned_hot_key_cases_route_the_whole_group_window_over_racing_lanes() {
+            use proptest::strategy::{Strategy, ValueTree};
+            use proptest::test_runner::TestRunner;
+
+            let mut runner = TestRunner::deterministic();
+            let mut strategies = std::collections::BTreeSet::new();
+            let mut hash_moves_above = 0;
+            for _ in 0..24 {
+                let case = partitioned_hot_key_case()
+                    .new_tree(&mut runner)
+                    .expect("a case")
+                    .current();
+                let hot = &case.program.tables[0];
+                let partitioning = hot.partitioning.as_ref().expect("a partitioned hot table");
+                let grain = &hot.columns[6].name;
+                assert_eq!(&partitioning.column, grain);
+                strategies.insert(match partitioning.strategy {
+                    PartitionStrategy::Hash { .. } => "hash",
+                    PartitionStrategy::List { .. } => "list",
+                    PartitionStrategy::Range { .. } => "range",
+                });
+                for def in case.program.defs.iter().filter(|d| d.source == hot.name) {
+                    assert!(
+                        matches!(&def.key_space, KeySpace::Aggregate { group_by }
+                            if group_by.as_slice() == std::slice::from_ref(grain)),
+                        "{} reads the hot table other than grouped by its grain",
+                        def.target
+                    );
+                }
+                assert!(
+                    case.plan.bursts.iter().any(|b| b.lanes.len() >= 2),
+                    "the hot table's ops race over several lanes"
+                );
+                let hash = matches!(partitioning.strategy, PartitionStrategy::Hash { .. });
+                for op in &case.program.ops {
+                    if let Op::Update {
+                        table,
+                        changes,
+                        expect: OpOutcome::Succeeds,
+                        ..
+                    } = op
+                        && hash
+                        && *table == hot.name
+                        && changes[0].0 == *grain
+                        && changes[0].1.as_deref().is_some_and(|g| {
+                            g.parse::<i64>().unwrap() > partition::PARTITION_GRAIN_MAX
+                        })
+                    {
+                        hash_moves_above += 1;
+                    }
+                }
+            }
+            assert_eq!(strategies.len(), 3, "HASH, LIST and RANGE are all drawn");
+            assert!(
+                hash_moves_above > 0,
+                "a HASH-partitioned hot row moves to a group above the serial tier's grains"
             );
         }
 

@@ -47,6 +47,14 @@
 //! really split across workers; the first only says the program gave the
 //! engine the chance.
 //!
+//! [`property_partitioned_hot_keys_converge_under_concurrent_drains`] is the
+//! hot-key tier over a partitioned source (ADR-0017). It draws
+//! `generate::partitioned_hot_key_case`: the same hot table, partitioned by
+//! its grain (`HASH`, `LIST` with a `DEFAULT`, or `RANGE`), so every
+//! `MoveGroup` over the sliding group window moves a row between partitions
+//! while the lanes race. Every definition over it groups by the grain, and
+//! it draws no partition maintenance, which would pin the table to one lane.
+//!
 //! [`property_mid_burst_rereads_converge_under_concurrent_drains`] is the
 //! mid-burst tier. It draws `generate::mid_burst_case`:
 //! a hot-key case whose bursts also stage re-reads while CDC for the same
@@ -261,7 +269,8 @@ use generative::generate::{
     ActionDraw, ActionKind, AggregateColumn, AggregateFn, ConcurrentCase, DefShape, Mutate,
     TableSpec, add_burst_actions, build_program, build_program_multi_with_shapes, concurrent_plan,
     cooling_backfill_case, cooling_key_case, defer_def_install, hot_key_case, mid_burst_case,
-    partitioned_program, schedule_restart, schedule_scale_out, steady_load_case, trivial_program,
+    partitioned_hot_key_case, partitioned_program, schedule_restart, schedule_scale_out,
+    steady_load_case, trivial_program,
 };
 use generative::plant_sweep::{self, PLANT_CHILD_ENV, PLANT_TIER_ENV, SweepTier};
 use generative::run::{
@@ -294,6 +303,8 @@ struct Harness {
     /// The hot-key property's own report, kept apart from
     /// `coverage` so each property's numbers read on their own.
     hot_key_coverage: std::cell::RefCell<generative::run::Coverage>,
+    /// The partitioned hot-key property's own report.
+    partitioned_hot_key_coverage: std::cell::RefCell<generative::run::Coverage>,
     /// The mid-burst property's own report.
     mid_burst_coverage: std::cell::RefCell<generative::run::Coverage>,
     /// The cooling-key property's own report.
@@ -320,6 +331,12 @@ impl Drop for Harness {
             eprintln!(
                 "generative: concurrent_convergence hot-key tier coverage:\n{}",
                 self.hot_key_coverage.borrow()
+            );
+        }
+        if self.partitioned_hot_key_coverage.borrow().cases > 0 {
+            eprintln!(
+                "generative: concurrent_convergence partitioned hot-key tier coverage:\n{}",
+                self.partitioned_hot_key_coverage.borrow()
             );
         }
         if self.mid_burst_coverage.borrow().cases > 0 {
@@ -355,6 +372,7 @@ thread_local! {
         cluster: start_cluster(),
         coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
         hot_key_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
+        partitioned_hot_key_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
         mid_burst_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
         cooling_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
         min_max_coverage: std::cell::RefCell::new(generative::run::Coverage::new()),
@@ -632,6 +650,17 @@ proptest! {
     #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
     fn property_hot_keys_converge_under_concurrent_drains(case in hot_key_case()) {
         run_concurrent_case(&case, |h| &h.hot_key_coverage)?;
+    }
+
+    /// The partitioned hot-key tier (ADR-0017): the hot-key tier over a
+    /// partitioned hot table, so a hot group's rows move between
+    /// partitions while the lanes race. See the module doc comment.
+    #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
+    fn property_partitioned_hot_keys_converge_under_concurrent_drains(
+        case in partitioned_hot_key_case(),
+    ) {
+        run_concurrent_case(&case, |h| &h.partitioned_hot_key_coverage)?;
     }
 
     /// The mid-burst tier. See the module doc comment.

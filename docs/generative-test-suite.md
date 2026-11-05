@@ -358,7 +358,7 @@ beside them run on every `cargo test`.
 - **Concurrent convergence** (`tests/concurrent_convergence.rs`). The same
   programs and oracle against the real worker pool and multi-worker claiming, in
   tiers: small programs; hot keys and groups taking bursts from several
-  connections; mid-burst re-reads, pauses, resumes and installs while change
+  connections, also over a partitioned source; mid-burst re-reads, pauses, resumes and installs while change
   capture for the same keys is in flight; cooling keys whose last write lands
   mid-burst; and sweep-only steady-load and cooling-backfill tiers that stall
   pages and build chunks at their entry-lock step (the stall is process-wide, so
@@ -555,9 +555,17 @@ beside them run on every `cargo test`.
   over a source that may have a `DEFAULT` it never both brings a leaf in
   (created or attached) and removes it: that is the short-lived-leaf gap in
   [known correctness gaps](known-correctness-gaps.md#a-short-lived-leaf-beside-a-default-partition).
-  The `partition_ops` line counts each kind drawn. The hot-key tier has no
+  The `partition_ops` line counts each kind drawn. The hot-key tier has a
   partitioned variant
-  ([#1331](https://github.com/salesforce-misc/trellis/issues/1331)).
+  (`property_partitioned_hot_keys_converge_under_concurrent_drains` in
+  `tests/concurrent_convergence.rs`): its hot table is partitioned by the
+  grain, by `HASH` over one to four leaves, `LIST` with a leaf for each of
+  the first one to seven grains and a `DEFAULT`, or `RANGE` over two to
+  seven bounds, and the model routes every grain its sliding group window
+  reaches. So a hot group's rows move between partitions while the lanes
+  race and several workers drain them. Every definition over the hot table
+  groups by the grain, and the variant draws no partition maintenance,
+  which would put the hot table in one lane.
 
 ### Two runtimes, one oracle
 

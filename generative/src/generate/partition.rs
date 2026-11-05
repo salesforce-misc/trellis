@@ -12,7 +12,7 @@
 //! grain, or to the `DEFAULT`, or nowhere) and sets every op's
 //! [`Op::expect`] from that.
 //!
-//! The model routes grains `0..=`[`PARTITION_GRAIN_MAX`]. `HASH` routing is
+//! The model routes grains `0..=`[`ROUTED_GRAIN_MAX`]. `HASH` routing is
 //! Postgres's own hash of a `bigint`, which [`HASH_REMAINDERS`] tabulates;
 //! a database test checks the table against `satisfies_hash_partition`.
 
@@ -26,6 +26,16 @@ use crate::model::{Op, OpOutcome, PartitionAction, PartitionStrategy, Program, T
 /// remainder has a value.
 pub const PARTITION_GRAIN_MAX: i64 = 7;
 
+/// The largest grain the model routes: [`PARTITION_GRAIN_MAX`], or the top
+/// of the hot-key shape's sliding group window
+/// ([`super::HOT_WINDOW_GRAIN_MAX`]) for a partitioned hot table
+/// (`partitioned_hot_key_case`), whichever is higher.
+pub const ROUTED_GRAIN_MAX: i64 = if super::HOT_WINDOW_GRAIN_MAX > PARTITION_GRAIN_MAX {
+    super::HOT_WINDOW_GRAIN_MAX
+} else {
+    PARTITION_GRAIN_MAX
+};
+
 /// The reconcile interval a run over a partitioned source sets
 /// (`ManualBackend::set_reconcile_interval`): each check after partition
 /// maintenance waits for the pass that records it, which the engine's
@@ -36,11 +46,23 @@ pub const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 /// `bigint` grain routes to, for each modulus [`super::strategy`] draws
 /// (`1..=4`). Postgres's partition hash is seeded with a constant, so it is
 /// the same on every server and version.
-pub const HASH_REMAINDERS: [[u8; PARTITION_GRAIN_MAX as usize + 1]; 4] = [
-    [0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 1, 1, 1, 1, 1],
-    [2, 2, 0, 1, 0, 2, 0, 1],
-    [0, 0, 2, 1, 3, 1, 3, 3],
+pub const HASH_REMAINDERS: [[u8; ROUTED_GRAIN_MAX as usize + 1]; 4] = [
+    [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+    ],
+    [
+        0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 0, 0, 1,
+        0, 1, 0, 1, 0, 1, 1, 1,
+    ],
+    [
+        2, 2, 0, 1, 0, 2, 0, 1, 0, 2, 1, 2, 2, 1, 1, 0, 0, 2, 0, 0, 0, 1, 2, 2, 2, 1, 1, 0, 2, 0,
+        2, 2, 2, 0, 0, 2, 1, 2,
+    ],
+    [
+        0, 0, 2, 1, 3, 1, 3, 3, 1, 1, 3, 1, 0, 2, 0, 3, 0, 0, 2, 1, 1, 1, 3, 2, 3, 2, 0, 2, 0, 3,
+        0, 1, 0, 3, 0, 1, 1, 1,
+    ],
 ];
 
 /// One partition-maintenance draw, resolved against the modelled tree when
@@ -124,9 +146,11 @@ impl Layout {
             PartitionStrategy::Hash { modulus } => {
                 let grain = usize::try_from(grain)
                     .ok()
-                    .filter(|&g| g <= PARTITION_GRAIN_MAX as usize)
+                    .filter(|&g| g <= ROUTED_GRAIN_MAX as usize)
                     .unwrap_or_else(|| {
-                        panic!("the partition model routes grains 0..={PARTITION_GRAIN_MAX}, not {grain}")
+                        panic!(
+                            "the partition model routes grains 0..={ROUTED_GRAIN_MAX}, not {grain}"
+                        )
                     });
                 Some(HASH_REMAINDERS[modulus as usize - 1][grain] as usize)
             }

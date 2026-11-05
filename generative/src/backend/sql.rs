@@ -1526,7 +1526,7 @@ mod tests {
     /// Postgres computes, for every modulus and grain it covers.
     #[tokio::test]
     async fn the_hash_remainders_are_postgres_own() {
-        use crate::generate::partition::{HASH_REMAINDERS, PARTITION_GRAIN_MAX};
+        use crate::generate::partition::{HASH_REMAINDERS, ROUTED_GRAIN_MAX};
         let cluster = testkit::TestCluster::start();
         let db = cluster.create_isolated_database().await;
         let raw = session(db.dsn()).await;
@@ -1548,7 +1548,7 @@ mod tests {
                 assert_eq!(
                     found,
                     i32::from(remainder),
-                    "modulus {modulus}, grain {grain} (of 0..={PARTITION_GRAIN_MAX})"
+                    "modulus {modulus}, grain {grain} (of 0..={ROUTED_GRAIN_MAX})"
                 );
             }
         }
