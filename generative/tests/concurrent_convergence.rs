@@ -687,6 +687,72 @@ proptest! {
     }
 }
 
+/// ADR-0017: a leaf detached, its row moved, and attached again under
+/// another bound, all in one burst, converges. The bound it takes was freed
+/// by a drop in the burst before, so no gone leaf's correction covers it in
+/// this pass: only the pass reading the leaf as re-attached (its bound
+/// changed) brings its row in. The partitioned property draws this order
+/// rarely, so it is pinned here.
+#[test]
+fn a_leaf_attached_under_another_bound_within_one_pass_converges() {
+    use generative::generate::partition::{
+        MaintenanceKind, PartitionDraw, add_partition_maintenance,
+    };
+    use generative::generate::partition_table;
+    use generative::model::{Op, PartitionAction, PartitionStrategy};
+    let mut spec = TableSpec::numeric_only(vec![(Some(10), Some(1)), (Some(20), Some(2))], vec![]);
+    spec.grain_values = vec![Some("0".into()), Some("1".into())];
+    let base = partition_table(
+        build_program_multi_with_shapes(
+            &[spec],
+            &[(
+                0,
+                DefShape::Aggregate {
+                    functions: vec![AggregateFn::Count],
+                },
+            )],
+        ),
+        0,
+        PartitionStrategy::List {
+            values: 3,
+            default: false,
+        },
+    );
+    // ops: insert pk1 (g0), insert pk2 (g1), drop t0_p2 | detach t0_p0,
+    // update pk1 on t0_p0 to g2, attach t0_p0 for values in (2).
+    let program = add_partition_maintenance(
+        base,
+        0,
+        &[
+            PartitionDraw::Maintenance {
+                at: 2,
+                pick: 2,
+                kind: MaintenanceKind::Drop,
+            },
+            PartitionDraw::Maintenance {
+                at: 2,
+                pick: 0,
+                kind: MaintenanceKind::Rebound {
+                    concurrently: false,
+                },
+            },
+        ],
+    );
+    assert!(
+        matches!(
+            &program.ops[5],
+            Op::Partition {
+                action: PartitionAction::Attach { leaf, bound },
+                expect: generative::model::OpOutcome::Succeeds,
+                ..
+            } if leaf == "t0_p0" && bound == "for values in (2)"
+        ),
+        "{:#?}",
+        program.ops
+    );
+    run_one(&program, 3).unwrap_or_else(|err| panic!("{err}"));
+}
+
 /// The concurrent runtime's own "first end-to-end green" (mirroring
 /// `tests/convergence.rs`'s `a_hand_built_program_converges_end_to_end`): a
 /// small, fully-worked program driven through
