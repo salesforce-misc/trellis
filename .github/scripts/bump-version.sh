@@ -31,6 +31,7 @@ V="$version" perl -0pi -e 's/VERSION = "[^"]*"/VERSION = "$ENV{V}"/' clients/rub
 
 # The READMEs' install text, from the version (release-pins.sh). Only the
 # banner's label and the version requirement on each install line change.
+# shellcheck source=release-pins.sh
 . "$root/.github/scripts/release-pins.sh"
 derive_pins "$version"
 for file in README.md trellis/README.md; do
