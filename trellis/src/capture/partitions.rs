@@ -192,6 +192,12 @@ pub struct Key {
 }
 
 /// The state recorded for one source: the tree as the pass last saw it.
+///
+/// Its stored JSON (`partition_sources.nodes`) is read without
+/// `deny_unknown_fields`, here and on [`Node`] and [`Key`]: an extra field a
+/// newer release adds is additive, and this release reads the record as it
+/// would its own. A newer release that adds one an older release mustn't
+/// ignore raises the catalog floor ([`parse_recorded`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recorded {
     pub nodes: Vec<Node>,

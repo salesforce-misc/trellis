@@ -520,12 +520,17 @@ pub async fn sweep_batch(
 /// is U+0001, the tag (a lowercase ASCII letter, then lowercase letters and
 /// `-`), U+0001, then the rest. So a stored cursor of that shape is a tagged
 /// one, and any other is a bare ledger key: an untagged cursor, as every
-/// release writes a ledger key that doesn't start with U+0001, and as a
-/// release before the orphan cursor wrote every one. The one exception is
-/// a bare key such a release stored that is itself of the tagged shape: it
-/// reads as tagged. A tag not in
-/// [`SWEEP_TAGS`] was written by a newer release, and reads as
-/// [`UnknownCursorTag`], never as a ledger key (ADR-0024 rule 6);
+/// release writes a ledger key that doesn't start with U+0001.
+///
+/// Every stored 1-1 sweep cursor that starts with U+0001 is tagged (a 1-1
+/// `JOIN`'s cursors, `super::join_one_to_one`, always are). A release before
+/// the tags stored every ledger key bare, U+0001 first or not; migration V15
+/// cleared every unfinished sweep's cursor that started with U+0001, the only
+/// stored values that broke this, so those sweeps start again. A U+0001 value
+/// that isn't tag-shaped still reads as a bare ledger key. A new cursor shape
+/// takes a new tag, which raises the definition floor (ADR-0024 rule 6), and
+/// never needs a migration: a tag not in [`SWEEP_TAGS`] was written by a
+/// newer release, and reads as [`UnknownCursorTag`], never as a ledger key;
 /// `defs::floor::unknown_value_sql` finds it from SQL with the same shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SweepCursor<'a> {

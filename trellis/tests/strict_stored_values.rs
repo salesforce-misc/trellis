@@ -6,6 +6,10 @@
 //!
 //! A test stands in for the newer release: it relaxes the check constraints
 //! as that release's migration would, and writes the values it would write.
+//!
+//! Migration V15 clears the one kind of value an earlier release stored that
+//! would read as a tag this release writes: a 1-1 sweep's bare cursor of the
+//! tagged shape.
 
 use testkit::TestCluster;
 use tokio_postgres::Client;
@@ -341,4 +345,136 @@ async fn a_cursor_tag_a_newer_release_wrote_pauses_its_definition() {
         .expect("defined");
     assert_eq!(legacy.status, TransformStatus::Live);
     assert!(legacy.capture_failure.is_none());
+}
+
+/// Migration V15 clears the cursor of every unfinished 1-1 sweep that starts
+/// with U+0001: a release before the tagged sweep cursors stored a ledger key
+/// bare, so one of the tagged shape, a tag this release knows or not, would
+/// read as a tag. Every other job keeps its cursor: a sweep's bare key, a
+/// finished sweep, another kind of job, and a 1-1 `JOIN`'s sweep, whose
+/// cursors are always tagged. The database is put back to before V15, with
+/// the jobs an earlier release left, and `migrate` runs it.
+#[tokio::test]
+async fn migration_v15_restarts_the_sweeps_whose_cursor_reads_as_a_tag() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    raw.batch_execute(
+        "create table public.s (id integer primary key, a integer); \
+         insert into public.s values (1, 1), (2, 2); \
+         create table public.b (id integer primary key, k integer, img integer); \
+         create unique index on public.b (k); \
+         insert into public.b values (1, 1, 10)",
+    )
+    .await
+    .expect("sources");
+    let trellis = handle(&db).await;
+    for text in [
+        "TRANSFORM t_plain FROM s SELECT a AS a",
+        "TRANSFORM t_join FROM public.s LEFT JOIN public.b ON s.a = b.k \
+         SELECT s.a AS a, b.img AS img",
+    ] {
+        trellis.apply(text).await.expect(text);
+    }
+    trellis::intake::harness::start_registered_builds(trellis.pool())
+        .await
+        .expect("dispatch the builds");
+    trellis::staging::build::settle_builds(trellis.pool()).await;
+
+    // (definition, kind, cursor, done, whether V15 clears it)
+    let jobs = [
+        (
+            "t_plain",
+            "sweep",
+            "chr(1) || 'foo' || chr(1) || 'X'",
+            false,
+            true,
+        ),
+        (
+            "t_plain",
+            "sweep",
+            "chr(1) || 'ledger' || chr(1) || 'X'",
+            false,
+            true,
+        ),
+        (
+            "t_plain",
+            "sweep",
+            "chr(1) || 'orphans' || chr(1) || 'X'",
+            false,
+            true,
+        ),
+        (
+            "t_plain",
+            "sweep",
+            "chr(1) || 'orphan-nulls' || chr(1)",
+            false,
+            true,
+        ),
+        ("t_plain", "sweep", "chr(1) || '7'", false, true),
+        ("t_plain", "sweep", "'X'", false, false),
+        (
+            "t_plain",
+            "sweep",
+            "chr(1) || 'ledger' || chr(1) || 'X'",
+            true,
+            false,
+        ),
+        (
+            "t_plain",
+            "plan",
+            "chr(1) || 'ledger' || chr(1) || 'X'",
+            false,
+            false,
+        ),
+        ("t_join", "sweep", "chr(1) || 'r:X'", false, false),
+        ("t_join", "plan", "chr(1) || 'a:X'", false, false),
+    ];
+    let mut seeded = Vec::new();
+    for &(target, kind, cursor, done, cleared) in &jobs {
+        let id: i64 = raw
+            .query_one(
+                &format!(
+                    "insert into backfill_chunks (definition_id, kind, lo, done) \
+                     select id, '{kind}', {cursor}, $2 from transform_definitions \
+                     where split_part(target_table, '.', 2) = $1 returning id"
+                ),
+                &[&target, &done],
+            )
+            .await
+            .expect(cursor)
+            .get(0);
+        let stored: String = raw
+            .query_one("select lo from backfill_chunks where id = $1", &[&id])
+            .await
+            .expect("the stored cursor")
+            .get(0);
+        seeded.push((id, stored, target, kind, done, cleared));
+    }
+    raw.batch_execute("delete from refinery_schema_history where version = 15")
+        .await
+        .expect("a database before V15");
+
+    trellis::migrate::migrate_with_pool(&db.pool, &Config::from_dsn(db.dsn().to_string()).unwrap())
+        .await
+        .expect("migrate runs V15");
+    for (id, stored, target, kind, done, cleared) in seeded {
+        let lo: Option<String> = raw
+            .query_one("select lo from backfill_chunks where id = $1", &[&id])
+            .await
+            .expect("the job")
+            .get(0);
+        let expected = (!cleared).then_some(stored.clone());
+        assert_eq!(lo, expected, "{target} {kind} done={done} {stored:?}");
+    }
+    let plain = trellis
+        .status("t_plain")
+        .await
+        .expect("status")
+        .expect("defined");
+    assert!(
+        plain.capture_failure.is_none(),
+        "an earlier release's bare key no longer reads as an unknown tag: {:?}",
+        plain.capture_failure
+    );
 }

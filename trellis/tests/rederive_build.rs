@@ -931,11 +931,59 @@ async fn without_its_sweep_a_one_to_one_rebuild_keeps_a_deleted_key() {
     );
 }
 
-/// A 1-1 rebuild's sweep job whose cursor a release before the tagged
-/// cursors wrote resumes from it: a bare ledger key reads as a position in
-/// the ledger, whatever it starts with. This one starts with U+0001, the
-/// tags' lead, but isn't shaped as a tag, and sorts before every key, so the
-/// sweep reaches the key deleted while paused.
+/// Migration V15 restarts a 1-1 sweep a release before the tagged cursors
+/// left in flight with a bare key of the tagged shape: read as the `ledger`
+/// tag, this one would resume past every key, the one deleted while paused
+/// among them. Its cursor is cleared, and the sweep walks from the start and
+/// retires that key.
+#[tokio::test]
+async fn a_one_to_one_sweep_whose_tag_shaped_cursor_v15_resets_finishes() {
+    let mut f = Fixture::new(30, &[ONE]).await;
+    f.pass().await;
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    let trellis = f.trellis().await;
+    trellis.apply("PAUSE TRANSFORM one").await.expect("pause");
+    f.raw
+        .batch_execute("delete from public.src where id = 5")
+        .await
+        .expect("delete while paused");
+    f.drain().await;
+    trellis.apply("RESUME TRANSFORM one").await.expect("resume");
+    f.pass().await;
+    f.raw
+        .batch_execute(
+            "update backfill_chunks set lo = chr(1) || 'ledger' || chr(1) || '99' \
+             where kind = 'sweep'",
+        )
+        .await
+        .expect("the earlier release's tag-shaped cursor");
+    f.raw
+        .batch_execute(include_str!(
+            "../migrations/V15__reset_tag_shaped_sweep_cursors.sql"
+        ))
+        .await
+        .expect("migration V15");
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where kind = 'sweep' and lo is null")
+            .await,
+        1,
+        "V15 clears the cursor"
+    );
+    f.run("one").await;
+    assert_eq!(f.status("one").await.as_deref(), Some("live"));
+    assert_eq!(
+        f.count("select count(*) from backfill_chunks where kind = 'sweep' and not done")
+            .await,
+        0
+    );
+    f.assert_one_oracle().await;
+}
+
+/// A 1-1 rebuild's sweep job whose stored cursor starts with U+0001 but isn't
+/// shaped as a tag resumes from it, as a bare ledger key: a position in the
+/// ledger. This one sorts before every key, so the sweep reaches the key
+/// deleted while paused.
 #[tokio::test]
 async fn a_one_to_one_sweep_resumes_from_an_untagged_cursor() {
     let mut f = Fixture::new(30, &[ONE]).await;
