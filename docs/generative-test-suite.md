@@ -469,8 +469,9 @@ beside them run on every `cargo test`.
   shapes, builds, pauses and resumes, re-reads and commit stalls are the
   aggregate `JOIN` tier's, and so is the `racing` shape, with `racing` two
   cases in seven, except that its pages stall for up to 2 to 3.5 s, its ops
-  aren't paired across tables and its drains aren't capped. Every other shape but `wide` writes in short bursts (30 to 150 ops),
-  each checked once it settles, with two to six pauses (each with its
+  aren't paired across tables and its drains aren't capped. Every other shape
+  but `wide` writes in short bursts (30 to 150 ops), each checked once it
+  settles, with two to six pauses (each with its
   `RESUME`, a rebuild in place) and re-reads after the first burst, and in
   three cases in four a `TRUNCATE` of either table now and then, with two to
   four more in the last few ops of a burst: the planted bugs of a truncate, a
