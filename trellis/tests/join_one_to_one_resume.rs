@@ -398,7 +398,9 @@ async fn a_refused_resume_leaves_the_definition_paused_and_untouched() {
             .expect_err("the resume checks a's key");
         let message = err.to_string();
         assert!(
-            message.contains("primary key of public.a is now (id, s)"),
+            message.contains("table 'public.a'")
+                && message.contains("recorded for it at define (id)")
+                && message.contains("a_pkey (id, s), the primary key"),
             "{kind:?}: {message}"
         );
         assert_eq!(status(&d, &kind.target()).await, "paused", "{kind:?}");

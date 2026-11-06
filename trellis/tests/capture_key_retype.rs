@@ -1034,7 +1034,8 @@ async fn resume_refuses_a_definition_define_would_refuse_now() {
 }
 
 /// A 1-1 definition whose source key was redefined is paused by the
-/// capture pass, and its resume refuses with the remedy: the target
+/// capture pass, and its resume refuses with the remedy, naming the key
+/// define recorded for the source and the key it has now (#1719): the target
 /// is keyed by the old key, so only restoring it, or a drop and redefine,
 /// gets it going again.
 #[tokio::test]
@@ -1055,9 +1056,10 @@ async fn resume_refuses_a_redefined_source_key() {
     assert_eq!(status(&raw, "item_names").await, TransformStatus::Paused);
     let refused = resume_refused(&trellis, "item_names").await;
     assert!(
-        refused.contains("primary key of public.items is now (name)")
-            && refused.contains("keyed by (id)")
-            && refused.contains("`DROP TRANSFORM` and define it again"),
+        refused.contains("table 'public.items'")
+            && refused.contains("recorded for it at define (id)")
+            && refused.contains("items_pkey (name), the primary key")
+            && refused.contains("drop the transform and define it again"),
         "{refused}"
     );
     // Define would accept this definition: only a resume refuses it.

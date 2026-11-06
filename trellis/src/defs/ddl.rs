@@ -213,6 +213,19 @@ pub(crate) fn pin_key_collations(pk: &mut [PrimaryKeyColumn], recorded: Option<&
 pub enum DdlError {
     /// The source table has no primary key at all.
     NoPrimaryKey { source_table: String },
+    /// `table` has no valid primary key or qualifying unique index over the
+    /// key columns Trellis recorded for it when a definition first keyed by
+    /// it (`definition_keys`, `defs::recorded_keys`): the index was
+    /// dropped, or a restore never created it. Trellis doesn't key the table
+    /// by another index instead.
+    RecordedKeyMissing {
+        table: String,
+        /// The recorded key columns, in key order.
+        recorded: Vec<String>,
+        /// Each unique index the table has now, as `name (columns)` with
+        /// what keeps it from serving (`invalid`, `partial`, ...).
+        indexes: Vec<String>,
+    },
     /// A composite primary-key identity string (U+001F-joined, matching
     /// `join_pk_key`'s composite-key encoding) split into a different number
     /// of parts than the source table's current primary key has columns —
@@ -282,9 +295,9 @@ impl DdlError {
         match self {
             // The source table's key can't identify its rows — a rejected
             // definition, same category as any other validation failure.
-            DdlError::NoPrimaryKey { .. } | DdlError::UnsupportedPrimaryKeyType { .. } => {
-                ErrorCode::Validation
-            }
+            DdlError::NoPrimaryKey { .. }
+            | DdlError::UnsupportedPrimaryKeyType { .. }
+            | DdlError::RecordedKeyMissing { .. } => ErrorCode::Validation,
             // Staged-data corruption or a provenance bug, not a rejection of
             // the current call's input.
             DdlError::MalformedCompositeKey { .. } | DdlError::UnroutedAggregate { .. } => {
@@ -303,6 +316,26 @@ impl fmt::Display for DdlError {
         match self {
             DdlError::NoPrimaryKey { source_table } => {
                 write!(f, "source table '{source_table}' has no primary key")
+            }
+            DdlError::RecordedKeyMissing {
+                table,
+                recorded,
+                indexes,
+            } => {
+                let found = if indexes.is_empty() {
+                    "it has no unique index".to_string()
+                } else {
+                    format!("its unique indexes are {}", indexes.join(", "))
+                };
+                write!(
+                    f,
+                    "table '{table}' has no valid primary key or unique index over the key \
+                     Trellis recorded for it at define ({}), and Trellis doesn't key its rows \
+                     by another one; {found}. Create a primary key or unique index over \
+                     exactly those columns again (`unique nulls not distinct` if one can be \
+                     NULL), or drop the transform and define it again",
+                    recorded.join(", ")
+                )
             }
             DdlError::MalformedCompositeKey {
                 source_table,
@@ -355,6 +388,7 @@ impl std::error::Error for DdlError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             DdlError::NoPrimaryKey { .. }
+            | DdlError::RecordedKeyMissing { .. }
             | DdlError::UnsupportedPrimaryKeyType { .. }
             | DdlError::MalformedCompositeKey { .. }
             | DdlError::UnroutedAggregate { .. } => None,
@@ -467,6 +501,9 @@ pub(crate) async fn admitted_primary_key(
 ) -> Result<(Vec<PrimaryKeyColumn>, Vec<super::join_key_types::JoinKey>), DdlError> {
     let columns = identity_key_columns(client, source_table).await?;
     if columns.is_empty() {
+        if let Some(missing) = super::recorded_keys::missing(client, source_table).await? {
+            return Err(missing);
+        }
         return Err(DdlError::NoPrimaryKey {
             source_table: source_table.to_string(),
         });
@@ -505,12 +542,28 @@ pub(crate) async fn admitted_primary_key(
 }
 
 /// The catalog half of [`source_primary_key_in_txn`], with none of its
-/// definition-time policy: `table`'s row-identity key columns (its `PRIMARY
-/// KEY`, else the qualifying `UNIQUE` index — an aggregate target's `UNIQUE
-/// NULLS NOT DISTINCT` grouping columns), in declared order, each
-/// with its nullability. A unique index over an expression is never the
-/// key. Empty when `table` has no such index; no key-type
-/// gate. `table` is an unquoted `schema.table` identity ([`regclass_arg`]).
+/// definition-time policy: `table`'s row-identity key columns, in key order,
+/// each with its nullability. `table` is an unquoted `schema.table` identity
+/// ([`regclass_arg`]). Empty when `table` has no such index; no key-type
+/// gate.
+///
+/// The key is the one Trellis recorded for `table` when a definition first
+/// keyed by it (`definition_keys`, [`super::recorded_keys`]): the valid
+/// primary key or qualifying unique index whose key columns are exactly the
+/// recorded ones, whatever other unique indexes the table has and in
+/// whatever order their OIDs fall. With a record and no such index, it is
+/// empty: Trellis doesn't key a table by a guess, and a resume or build
+/// refuses, naming the indexes ([`super::recorded_keys::check`]). A table
+/// with no record (the source of a first define) is keyed by its `PRIMARY
+/// KEY`, else its oldest qualifying `UNIQUE` index (an aggregate target's
+/// `UNIQUE NULLS NOT DISTINCT` grouping columns).
+///
+/// A partial or deferrable unique index, and one over an expression, is
+/// never the key. The key's columns are the index's key columns only: its
+/// `INCLUDE` columns aren't part of it.
+///
+/// The record is read in the same statement as the index, so a caller pays
+/// no extra round trip for it.
 ///
 /// Split out for `intake::harness::enumerate_and_append`,
 /// which must enumerate every table a fixture can name — aggregate targets
@@ -523,8 +576,21 @@ pub(crate) async fn identity_key_columns(
     let rows = client
         .query_typed(
             &format!(
-                "with chosen_index as (
-                 select i.indexrelid
+                "with recorded as (
+                 select k.key_columns
+                 from definition_keys k
+                 where k.table_name = $2
+                 order by k.transform_id
+                 limit 1
+             ),
+             candidate as (
+                 select i.indexrelid, i.indisprimary, i.indisvalid,
+                        array(select a.attname::text
+                              from unnest(i.indkey::int2[]) with ordinality k(attnum, ord)
+                              join pg_attribute a
+                                on a.attrelid = i.indrelid and a.attnum = k.attnum
+                              where k.ord <= i.indnkeyatts
+                              order by k.ord) as key_columns
                  from pg_index i
                  where i.indrelid = pg_catalog.to_regclass($1)
                    and (
@@ -538,21 +604,31 @@ pub(crate) async fn identity_key_columns(
                        -- A plain (nulls-distinct) UNIQUE index doesn't reject
                        -- duplicate NULLs, so it isn't a true identity unless
                        -- either NULLS NOT DISTINCT (like create_aggregate_target_table's
-                       -- grouping-column constraint) or every indexed column is
-                       -- NOT NULL, in which case no NULL can ever occur.
+                       -- grouping-column constraint) or every key column is
+                       -- NOT NULL, in which case no NULL can ever occur. An
+                       -- INCLUDE column is no key column, so its NULLs don't
+                       -- matter.
                        and (
                          i.indnullsnotdistinct
                          or not exists (
                            select 1
-                           from pg_attribute a
-                           where a.attrelid = i.indrelid
-                             and a.attnum = any(i.indkey)
+                           from unnest(i.indkey::int2[]) with ordinality k(attnum, ord)
+                           join pg_attribute a
+                             on a.attrelid = i.indrelid and a.attnum = k.attnum
+                           where k.ord <= i.indnkeyatts
                              and not a.attnotnull
                          )
                        )
                      )
                    )
-                 order by i.indisprimary desc, i.indexrelid asc
+             ),
+             chosen_index as (
+                 select c.indexrelid
+                 from candidate c
+                 left join recorded r on true
+                 where r.key_columns is null
+                    or (c.indisvalid and c.key_columns = r.key_columns)
+                 order by c.indisprimary desc, c.indexrelid asc
                  limit 1
              )
              select a.attname::text,
@@ -561,19 +637,19 @@ pub(crate) async fn identity_key_columns(
                     (select pg_catalog.format('%I.%I', n.nspname, co.collname)
                      from pg_catalog.pg_collation co
                      join pg_catalog.pg_namespace n on n.oid = co.collnamespace
-                     -- `indkey` and `indcollation` are vectors subscripted
-                     -- from 0, which `array_position` returns.
-                     where co.oid = i.indcollation[
-                         pg_catalog.array_position(i.indkey, a.attnum)])
+                     -- `indcollation` is a vector subscripted from 0, and
+                     -- covers the key columns only.
+                     where co.oid = i.indcollation[k.ord - 1])
              from pg_index i
              join chosen_index c on c.indexrelid = i.indexrelid
+             cross join unnest(i.indkey::int2[]) with ordinality k(attnum, ord)
              join pg_attribute a
-               on a.attrelid = i.indrelid and a.attnum = any(i.indkey)
-             where i.indrelid = pg_catalog.to_regclass($1)
-             order by array_position(i.indkey, a.attnum)",
+               on a.attrelid = i.indrelid and a.attnum = k.attnum
+             where k.ord <= i.indnkeyatts
+             order by k.ord",
                 super::copy_type::type_sql("a.atttypid")
             ),
-            &[(&regclass_arg(table), Type::TEXT)],
+            &[(&regclass_arg(table), Type::TEXT), (&table, Type::TEXT)],
         )
         .await?;
     Ok(rows
@@ -1919,6 +1995,10 @@ mod tests {
         tokio::spawn(async move {
             let _ = connection.await;
         });
+        client
+            .batch_execute(crate::defs::recorded_keys::TEST_TABLE_DDL)
+            .await
+            .expect("definition_keys");
         let collations = ["default", "C", "POSIX", "und-x-icu"];
         let mut ddl = String::from(
             "create table public.l (__from_key text collate \"C\" primary key); \
@@ -2605,6 +2685,46 @@ mod tests {
         }
     }
 
+    /// A key index's `INCLUDE` columns are not key columns (#1722): a
+    /// primary key's, and those of the unique index a table without one is
+    /// keyed by. A nullable `INCLUDE` column doesn't keep a unique index over
+    /// `NOT NULL` key columns from qualifying.
+    #[tokio::test]
+    async fn an_include_column_is_never_part_of_the_key() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(crate::defs::recorded_keys::TEST_TABLE_DDL)
+            .await
+            .expect("definition_keys");
+        client
+            .batch_execute(
+                "create table public.p (id integer, x integer, y integer, \
+                     primary key (id) include (x)); \
+                 create table public.u (a integer not null, b integer not null, x integer, \
+                     unique (b, a) include (x)); \
+                 create table public.n (a integer not null, x integer, \
+                     unique (a) include (x));",
+            )
+            .await
+            .expect("the tables");
+        for (table, expected) in [
+            ("public.p", vec!["id"]),
+            ("public.u", vec!["b", "a"]),
+            ("public.n", vec!["a"]),
+        ] {
+            let key = identity_key_columns(&client, table).await.expect("the key");
+            let names: Vec<&str> = key.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(names, expected, "{table}");
+        }
+    }
+
     /// A unique index over an expression is no row identity, whether it
     /// covers only the expression or plain columns beside it: the key is the
     /// table's next qualifying index (#1719).
@@ -2618,6 +2738,10 @@ mod tests {
         tokio::spawn(async move {
             let _ = connection.await;
         });
+        client
+            .batch_execute(crate::defs::recorded_keys::TEST_TABLE_DDL)
+            .await
+            .expect("definition_keys");
         client
             .batch_execute(
                 "create table public.t (r text, a integer not null, n integer); \

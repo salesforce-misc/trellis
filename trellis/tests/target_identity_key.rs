@@ -5,10 +5,10 @@
 //! earlier; the `RESUME`'s rebuild that follows must still key the target by
 //! the definition's key.
 //!
-//! An expression unique index is never a key. The tests of a user's
-//! `unique nulls not distinct` constraint older than the key are ignored
-//! until #1719's design decision picks how a target's key is told apart
-//! from one.
+//! An expression unique index is never a key, and a user's `unique nulls
+//! not distinct` constraint older than the key isn't either: define records
+//! the key it chose for each table (`definition_keys`), and the identity is
+//! the index over exactly those columns.
 //!
 //! Every test drives the pipeline by hand through `support/drain_driver.rs`.
 //! None sleeps or polls for convergence.
@@ -198,7 +198,6 @@ async fn an_aggregate_keeps_its_group_key_beside_an_older_expression_unique_inde
 
 /// A user's `unique nulls not distinct` constraint over other columns.
 #[tokio::test]
-#[ignore = "#1719: a unique constraint older than the key awaits its design decision"]
 async fn an_aggregate_keeps_its_group_key_beside_an_older_unique_constraint() {
     aggregate_case(
         "alter table public.agg add constraint agg_user unique nulls not distinct (n, ga)",
@@ -212,7 +211,6 @@ async fn a_join_keeps_its_group_key_beside_an_older_expression_unique_index() {
 }
 
 #[tokio::test]
-#[ignore = "#1719: a unique constraint older than the key awaits its design decision"]
 async fn a_join_keeps_its_group_key_beside_an_older_unique_constraint() {
     join_case("alter table public.j add constraint j_user unique nulls not distinct (n, ga)").await;
 }
@@ -220,7 +218,6 @@ async fn a_join_keeps_its_group_key_beside_an_older_unique_constraint() {
 /// A 1-1 target over an aggregate is keyed by the aggregate's nullable
 /// group key, with a `unique nulls not distinct` key of its own.
 #[tokio::test]
-#[ignore = "#1719: a unique constraint older than the key awaits its design decision"]
 async fn a_one_to_one_target_without_a_primary_key_keeps_its_key() {
     let mut d = start_chain().await;
     reindex_key_after(
@@ -260,7 +257,6 @@ async fn a_one_to_one_target_keeps_its_primary_key() {
 /// A definition reading the aggregate's target keys its source by the same
 /// key the aggregate writes by: the group key, not the user's constraint.
 #[tokio::test]
-#[ignore = "#1719: a unique constraint older than the key awaits its design decision"]
 async fn a_reader_of_an_aggregate_target_keys_it_by_the_group_key() {
     let mut d = start_chain().await;
     reindex_key_after(
@@ -277,4 +273,150 @@ async fn a_reader_of_an_aggregate_target_keys_it_by_the_group_key() {
     assert_live(&d).await;
     assert_eq!(d.rows(AGG_ACTUAL).await, d.rows(AGG_EXPECTED).await);
     assert_eq!(d.rows(MIRROR_ACTUAL).await, d.rows(AGG_ACTUAL).await);
+}
+
+/// The source columns of `public.a`, for a define the test runs itself.
+fn a_columns() -> std::collections::HashMap<String, ValueType> {
+    std::collections::HashMap::from([
+        ("id".to_string(), int4()),
+        ("ga".to_string(), int4()),
+        ("k".to_string(), int4()),
+        ("x".to_string(), int4()),
+    ])
+}
+
+/// An adopted target whose user created a `unique nulls not distinct`
+/// constraint before the group key: the target is keyed by the group key.
+#[tokio::test]
+async fn an_adopted_aggregate_keeps_its_group_key_beside_an_older_user_constraint() {
+    let mut d = start(&[]).await;
+    exec(
+        &d,
+        "create table public.agg (ga integer, n bigint, sx bigint, \
+             constraint agg_user unique nulls not distinct (n, ga)); \
+         alter table public.agg add constraint agg_key unique nulls not distinct (ga)",
+    )
+    .await;
+    trellis::defs::install_definition(
+        d.pool(),
+        "TRANSFORM agg ADOPT EXISTING TABLE FROM public.a GROUP BY ga WITHOUT SOURCE INDEX \
+         SELECT COUNT(*) AS n, SUM(x) AS sx",
+        &a_columns(),
+        "public",
+    )
+    .await
+    .expect("adopt");
+    let pool = d.pool().clone();
+    trellis::client::reconcile_pass(&mut d.ctl, &pool, DEFAULT_SCHEMA)
+        .await
+        .expect("reconcile pass");
+    build::settle_builds(d.pool()).await;
+    d.settle().await;
+    assert_live(&d).await;
+    assert_eq!(d.rows(AGG_ACTUAL).await, d.rows(AGG_EXPECTED).await);
+    write_more(&mut d).await;
+    assert_live(&d).await;
+    assert_eq!(d.rows(AGG_ACTUAL).await, d.rows(AGG_EXPECTED).await);
+}
+
+const RECORDED: &str = "select d.target_table, k.table_name, k.key_columns::text \
+                        from definition_keys k join transform_definitions d \
+                          on d.id = k.transform_id order by 1, 2";
+
+/// Define records the key of every table a definition keys by, and a
+/// definition stored before the record existed gets the same record when a
+/// binary carrying it attaches, from its parsed text: its target's group
+/// key even where the oldest unique index is a user's, and the source key
+/// of a reader of that target from the aggregate's record.
+#[tokio::test]
+async fn an_existing_definition_gets_its_key_record_at_attach() {
+    let d = start_chain().await;
+    let defined = d.rows(RECORDED).await;
+    assert_eq!(
+        defined,
+        [
+            "(public.agg,public.a,{id})",
+            "(public.agg,public.agg,{ga})",
+            "(public.mirror,public.agg,{ga})",
+            "(public.mirror,public.mirror,{ga})",
+        ]
+    );
+    reindex_key_after(
+        &d,
+        "public.agg",
+        "alter table public.agg add constraint agg_user unique nulls not distinct (n, ga)",
+    )
+    .await;
+    d.ctl
+        .batch_execute("delete from definition_keys")
+        .await
+        .expect("a catalog from before the record");
+    let config = trellis::Config::from_dsn(d.db.dsn().to_string()).expect("config");
+    trellis::migrate::migrate_with_pool(d.pool(), &config)
+        .await
+        .expect("attach");
+    assert_eq!(d.rows(RECORDED).await, defined);
+    assert_live(&d).await;
+}
+
+/// The recorded key's index dropped: `RESUME` refuses, naming the table,
+/// the recorded key and the index left, rather than key the target by the
+/// user's constraint. Restored, it resumes; dropped again before the
+/// rebuild starts, the start pauses the definition with the same reason.
+#[tokio::test]
+async fn a_resume_and_a_build_refuse_when_the_recorded_key_has_no_index() {
+    let mut d = start(&[AGG]).await;
+    let key = key_index(&d, "public.agg").await;
+    exec(
+        &d,
+        &format!(
+            "alter table public.agg add constraint agg_user unique nulls not distinct (n, ga); \
+             alter table public.agg drop constraint {key}"
+        ),
+    )
+    .await;
+    d.ctl
+        .execute(
+            "update transform_definitions set status = 'paused' where target_table = 'public.agg'",
+            &[],
+        )
+        .await
+        .expect("pause");
+    let refusal = trellis::staging::quarantine::resume_transform(d.pool(), "agg")
+        .await
+        .expect_err("the resume is refused")
+        .to_string();
+    for part in [
+        "table 'public.agg'",
+        "at define (ga)",
+        "its unique indexes are agg_user (n, ga)",
+    ] {
+        assert!(refusal.contains(part), "{part:?} in {refusal}");
+    }
+
+    exec(
+        &d,
+        "alter table public.agg add constraint agg_ga_key unique nulls not distinct (ga)",
+    )
+    .await;
+    trellis::staging::quarantine::resume_transform(d.pool(), "agg")
+        .await
+        .expect("resumes with the key back");
+    exec(&d, "alter table public.agg drop constraint agg_ga_key").await;
+    let pool = d.pool().clone();
+    trellis::client::reconcile_pass(&mut d.ctl, &pool, DEFAULT_SCHEMA)
+        .await
+        .expect("reconcile pass");
+    let paused = d
+        .rows(
+            "select d.status, cf.error from transform_definitions d \
+             join capture_failures cf on cf.transform_id = d.id \
+             where d.target_table = 'public.agg'",
+        )
+        .await;
+    assert_eq!(paused.len(), 1, "{paused:?}");
+    assert!(
+        paused[0].starts_with("(paused,") && paused[0].contains("at define (ga)"),
+        "the start paused it by name: {paused:?}"
+    );
 }

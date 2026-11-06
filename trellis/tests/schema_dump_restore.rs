@@ -1256,6 +1256,80 @@ async fn a_restored_target_keeps_the_objects_a_user_added_and_builds() {
     );
 }
 
+/// A restore creates a target's constraints in name order, so a user's
+/// `unique nulls not distinct` constraint whose name sorts before the group
+/// key's comes back older than it (#1719). The restored definition records
+/// its group key at define, and builds and applies keyed by it.
+#[tokio::test]
+async fn a_restored_aggregate_keeps_its_group_key_beside_a_constraint_named_before_it() {
+    let cluster = TestCluster::start();
+    let source = cluster.create_isolated_database().await;
+    let raw = connect_raw(source.dsn()).await;
+    raw.batch_execute("create table public.orders (id bigint primary key, g bigint, a bigint)")
+        .await
+        .expect("source ddl");
+    let t = facade(source.dsn()).await;
+    t.apply(
+        "TRANSFORM og FROM orders GROUP BY g WITHOUT SOURCE INDEX \
+         SELECT COUNT(*) AS n, SUM(a) AS total",
+    )
+    .await
+    .expect("og");
+    build_everything(t.pool()).await;
+    raw.batch_execute(
+        "alter table public.og add constraint og_a_user unique nulls not distinct (n, g)",
+    )
+    .await
+    .expect("the user's constraint");
+
+    let structure = structure_file(&t, source.dsn()).await;
+    let loaded = cluster.create_empty_database().await;
+    load(loaded.dsn(), &structure);
+    let mut after = connect_raw(loaded.dsn()).await;
+    assert_eq!(
+        rows_json(
+            &after,
+            "select conname from pg_constraint \
+             where conrelid = 'public.og'::regclass order by conindid"
+        )
+        .await,
+        ["og_a_user", "og_g_key"],
+        "the restore made the user's constraint first"
+    );
+    let t2 = facade(loaded.dsn()).await;
+    t2.migrate().await.expect("migrate restores og");
+    trellis::client::reconcile_pass(&mut after, t2.pool(), SCHEMA)
+        .await
+        .expect("reconcile pass on the restored database");
+    after
+        .batch_execute("insert into public.orders values (1, 1, 10), (2, 1, 20), (3, 2, 30)")
+        .await
+        .expect("source rows after the restore");
+    for _ in 0..3 {
+        build_everything(t2.pool()).await;
+        trellis::client::reconcile_pass(&mut after, t2.pool(), SCHEMA)
+            .await
+            .expect("reconcile pass");
+        drain_to_quiescence(t2.pool(), &mut after).await;
+    }
+    after
+        .batch_execute(
+            "update public.orders set g = 2 where id = 1; delete from public.orders where id = 2",
+        )
+        .await
+        .expect("more writes");
+    trellis::client::reconcile_pass(&mut after, t2.pool(), SCHEMA)
+        .await
+        .expect("reconcile pass");
+    drain_to_quiescence(t2.pool(), &mut after).await;
+    assert_eq!(rows_json(&after, STATUSES).await, ["public.og live"]);
+    assert_eq!(
+        rows_json(&after, "select to_jsonb(t) from public.og t order by g").await,
+        [r#"{"g": 2, "n": 2, "total": 40}"#],
+        "the target is what the source computes"
+    );
+}
+
 /// Builds, captures and drains `t`'s database until every definition settles.
 async fn settle(t: &Trellis, raw: &mut Client) {
     for _ in 0..3 {

@@ -406,6 +406,20 @@ pub(crate) async fn pause_for_relabel(
         == 1)
 }
 
+/// Pauses definition `id`, which an earlier release built over its source
+/// key's `INCLUDE` columns (#1722, [`super::recorded_keys::backfill_in`]),
+/// recording `error` as its `capture_failure`, kind `capture`: only an
+/// operator's `RESUME`, which re-keys it, resumes it. A definition already
+/// paused keeps the reason it has. Returns whether this call paused it.
+pub(crate) async fn pause_for_included_key(
+    txn: &Transaction<'_>,
+    id: i64,
+    source_table: &str,
+    error: &str,
+) -> Result<bool, CatalogError> {
+    pause_with_record(txn, id, source_table, &[], error, "capture", None).await
+}
+
 /// Pauses definition `id` because it was written under a grammar version
 /// outside this binary's window (ADR-0018), recording `error` as its
 /// `capture_failure`. Returns whether this call paused it.

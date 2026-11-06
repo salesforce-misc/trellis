@@ -82,9 +82,11 @@ enum Seed {
 fn seed(err: &ApplyError) -> Option<Seed> {
     match quarantine::innermost_apply_error(err) {
         ApplyError::Ddl(DdlError::NoPrimaryKey { source_table })
-        | ApplyError::Ddl(DdlError::UnsupportedPrimaryKeyType { source_table, .. }) => {
-            Some(Seed::Tables(vec![source_table.clone()]))
-        }
+        | ApplyError::Ddl(DdlError::UnsupportedPrimaryKeyType { source_table, .. })
+        | ApplyError::Ddl(DdlError::RecordedKeyMissing {
+            table: source_table,
+            ..
+        }) => Some(Seed::Tables(vec![source_table.clone()])),
         ApplyError::HopBoundExceeded { tables, .. } => Some(Seed::Tables(tables.clone())),
         ApplyError::TruncateWithoutLsn { src_table } => Some(Seed::Tables(vec![src_table.clone()])),
         ApplyError::GroupBasisUnsupported { target, .. }

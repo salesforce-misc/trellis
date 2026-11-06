@@ -200,6 +200,7 @@ pub(crate) async fn pause_readers_of_redefined_keys(
                      join pg_catalog.pg_attribute a \
                        on a.attrelid = i.indrelid and a.attnum = k.n \
                      where i.indrelid = pg_catalog.to_regclass(e.r) and i.indisprimary \
+                       and k.o <= i.indnkeyatts \
                      order by k.o) as live) l \
              where pg_catalog.cardinality(l.live) > 0 \
                and l.live is distinct from array( \

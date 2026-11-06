@@ -152,7 +152,9 @@ pub fn classify(err: &ApplyError) -> FailureClass {
         // one at a time for a failure none of them individually caused. A
         // composite (multi-column) primary key is not one: every 1-1
         // consumer keys on the source's full primary key.
+        // So is a table whose key define recorded has no index now (#1719).
         ApplyError::Ddl(DdlError::NoPrimaryKey { .. })
+        | ApplyError::Ddl(DdlError::RecordedKeyMissing { .. })
         | ApplyError::Ddl(DdlError::UnsupportedPrimaryKeyType { .. }) => FailureClass::Halting,
         // Postgres refused the drain's role a read or write, for
         // row-level security (every Trellis session runs with `row_security
@@ -4249,6 +4251,21 @@ async fn resume_locked(
             request_drain(txn, id, source_table).await?;
         }
         return Ok(ResumeStep::Draining);
+    }
+    // A 1-1 target an earlier release keyed by its source key's `INCLUDE`
+    // columns is re-keyed in place first, so the re-validation and the
+    // rebuild see the key define would create now (#1722).
+    match crate::defs::recorded_keys::repair_target_key(txn, &definition, source_table).await {
+        Ok(_) => {}
+        Err(err @ (catalog::CatalogError::Db(_) | catalog::CatalogError::Pool(_))) => {
+            return Err(err.into());
+        }
+        Err(reason) => {
+            return Err(ApplyError::ResumeRefused {
+                transform: target.to_string(),
+                reason: Box::new(reason),
+            });
+        }
     }
     let revalidated = match catalog::revalidate(txn, schema, floors, &definition).await {
         Ok(revalidated) => revalidated,

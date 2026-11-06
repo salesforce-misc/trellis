@@ -163,6 +163,17 @@ pub enum CatalogError {
         lacks_schema_usage: bool,
         lacks_table_privilege: bool,
     },
+    /// A resume's re-keying of a 1-1 target an earlier release built over its
+    /// source key's `INCLUDE` columns
+    /// (`defs::recorded_keys::repair_target_key`) would drop `column`,
+    /// which the definition no longer creates, and `dependents` (a user's
+    /// view, index, ...) depend on it. The repair is to drop them, or to drop
+    /// the definition and define it again.
+    KeyRepairBlocked {
+        table: String,
+        column: String,
+        dependents: Vec<String>,
+    },
     /// A 1-1 definition's source was given another row-identity key after
     /// define: its target is keyed by the old one, so a
     /// resume can't rebuild into it. `revalidate` refuses it; the repair
@@ -518,6 +529,7 @@ impl CatalogError {
             // `RowSecurityApplies`: the fix is a grant.
             CatalogError::TableNotAccessible { .. } => ErrorCode::Validation,
             CatalogError::SourceKeyChanged { .. } => ErrorCode::Validation,
+            CatalogError::KeyRepairBlocked { .. } => ErrorCode::Validation,
             CatalogError::VirtualGeneratedColumn { .. } => ErrorCode::Validation,
             CatalogError::SourceIndexMissing { .. } => ErrorCode::Validation,
             CatalogError::ExtremeIndexMissing { .. } => ErrorCode::Validation,
@@ -584,6 +596,8 @@ impl CatalogError {
         !matches!(
             self,
             CatalogError::SourceKeyChanged { .. }
+                | CatalogError::KeyRepairBlocked { .. }
+                | CatalogError::Ddl(DdlError::RecordedKeyMissing { .. })
                 | CatalogError::LedgerTableMissing { .. }
                 | CatalogError::TargetTableMissing { .. }
                 | CatalogError::TargetInCatalogSchema { .. }
@@ -656,6 +670,18 @@ impl fmt::Display for CatalogError {
                      \"One Trellis role\" in docs/recommendations.md"
                 )
             }
+            CatalogError::KeyRepairBlocked {
+                table,
+                column,
+                dependents,
+            } => write!(
+                f,
+                "re-keying {table} drops its column {column:?}, which was part of its key only \
+                 as an INCLUDE column of its source's key and which the transform no longer \
+                 creates, and {} depend on it. Drop them and resume again, or `DROP TRANSFORM` \
+                 and define it again",
+                dependents.join(", ")
+            ),
             CatalogError::SourceKeyChanged {
                 source_table,
                 target_key,
@@ -807,6 +833,8 @@ impl fmt::Display for CatalogError {
             CatalogError::PartitionedSource(refusal) => write!(f, "{refusal}"),
             CatalogError::RowSecurityApplies(rls) => write!(f, "{rls}"),
             CatalogError::Subscribed(sub) => write!(f, "{sub}"),
+            // A key a table lost is no failure to create anything.
+            CatalogError::Ddl(err @ DdlError::RecordedKeyMissing { .. }) => write!(f, "{err}"),
             CatalogError::Ddl(err) => write!(f, "failed to create target table: {err}"),
             CatalogError::DirectBackfill(err) => write!(f, "direct backfill failed: {err}"),
             CatalogError::TransformNotFound { transform } => {
@@ -895,6 +923,7 @@ impl std::error::Error for CatalogError {
             CatalogError::InvalidRegexPattern { .. } => None,
             CatalogError::TableNotAccessible { .. } => None,
             CatalogError::SourceKeyChanged { .. } => None,
+            CatalogError::KeyRepairBlocked { .. } => None,
             CatalogError::VirtualGeneratedColumn { .. } => None,
             CatalogError::SourceIndexMissing { .. } => None,
             CatalogError::ExtremeIndexMissing { .. } => None,
@@ -3746,6 +3775,17 @@ async fn create_definition_inner(
     // capture pass to compare against (`super::key_types`).
     super::key_types::record_definition(&*txn, id, &def, &qualified_source, join_table, false)
         .await?;
+    // The key space this define chose for each table it keys by, which
+    // every later read of their identities keeps to (#1719).
+    super::recorded_keys::record(
+        &*txn,
+        id,
+        &def,
+        &qualified_source,
+        join_table,
+        &qualified_target,
+    )
+    .await?;
     // A JOIN's hidden tables, in the catalog schema,
     // named by this definition's id, created empty with its row.
     if let Some(sides) = &join_sides {
@@ -5037,6 +5077,9 @@ pub(crate) async fn revalidate(
 ) -> Result<Revalidated, CatalogError> {
     let source = definition.source_table.as_str();
     reject_target_in_catalog_schema(txn, schema, &definition.target_table).await?;
+    // Every table the definition keys by still has an index over the key
+    // define recorded for it (#1719): it is never keyed by a guess.
+    super::recorded_keys::check(txn, definition.id).await?;
     let joined = join_table_of(txn, definition.id).await?;
     if let Some(joined) = joined {
         return revalidate_join(txn, schema, floors, definition, joined).await;

@@ -294,7 +294,7 @@ For each release, the notes carry:
   and an expression nested over 100 levels (split it into calculated fields).
   Add every case from the manual refusal check.
 - **The upgrade procedure,** from [upgrading](upgrading.md#upgrading), and
-  whether the release adds a migration (`0.2.0` adds V9 to V15, and `0.1.0`'s
+  whether the release adds a migration (`0.2.0` adds V9 to V16, and `0.1.0`'s
   `migrate` refuses a database `0.2.0` has migrated).
 - **Compatibility floors:** the floors this release raised (the catalog floor,
   and which features carry a new definition floor) and what that means for
