@@ -154,12 +154,31 @@ impl RssSummary {
 }
 
 struct Shared {
+    /// When [`RssSampler::start`] ran: the zero of `peak_at_ms` and of the
+    /// progress lines.
+    start: Instant,
     stop: AtomicBool,
     peak: AtomicU64,
     phase_peak: AtomicU64,
     peak_at_ms: AtomicU64,
     samples: AtomicU64,
     phases: Mutex<Vec<(&'static str, u64)>>,
+}
+
+impl Shared {
+    /// One sample: reads `VmRSS` and folds it into the sample count, the
+    /// phase peak and the overall peak. The sampler thread's loop body, and
+    /// the test's `sample_now`. `None` off Linux (nothing recorded).
+    fn sample(&self) -> Option<u64> {
+        let rss = rss_bytes()?;
+        self.samples.fetch_add(1, Ordering::Relaxed);
+        self.phase_peak.fetch_max(rss, Ordering::Relaxed);
+        if self.peak.fetch_max(rss, Ordering::Relaxed) < rss {
+            self.peak_at_ms
+                .store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
+        }
+        Some(rss)
+    }
 }
 
 /// Samples this process's `VmRSS` on its own thread until [`finish`](Self::finish).
@@ -175,6 +194,7 @@ impl RssSampler {
     pub fn start(interval: Duration, progress: Option<(Duration, &'static str)>) -> Self {
         let cgroup_peak = cgroup_memory_peak_since_now();
         let shared = Arc::new(Shared {
+            start: Instant::now(),
             stop: AtomicBool::new(false),
             peak: AtomicU64::new(0),
             phase_peak: AtomicU64::new(0),
@@ -187,27 +207,19 @@ impl RssSampler {
             .name("rss-sampler".into())
             .spawn(move || {
                 let s = thread_shared;
-                let start = Instant::now();
-                let mut next_progress = progress.map(|(every, _)| start + every);
+                let mut next_progress = progress.map(|(every, _)| s.start + every);
                 while !s.stop.load(Ordering::Relaxed) {
-                    if let Some(rss) = rss_bytes() {
-                        s.samples.fetch_add(1, Ordering::Relaxed);
-                        s.phase_peak.fetch_max(rss, Ordering::Relaxed);
-                        if s.peak.fetch_max(rss, Ordering::Relaxed) < rss {
-                            s.peak_at_ms
-                                .store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
-                        }
-                        if let (Some(at), Some((every, label))) = (next_progress, progress)
-                            && Instant::now() >= at
-                        {
-                            eprintln!(
-                                "{label}: +{:.0}s rss {:.0} MB (peak {:.0} MB)",
-                                start.elapsed().as_secs_f64(),
-                                mb(rss),
-                                mb(s.peak.load(Ordering::Relaxed)),
-                            );
-                            next_progress = Some(at + every);
-                        }
+                    if let Some(rss) = s.sample()
+                        && let (Some(at), Some((every, label))) = (next_progress, progress)
+                        && Instant::now() >= at
+                    {
+                        eprintln!(
+                            "{label}: +{:.0}s rss {:.0} MB (peak {:.0} MB)",
+                            s.start.elapsed().as_secs_f64(),
+                            mb(rss),
+                            mb(s.peak.load(Ordering::Relaxed)),
+                        );
+                        next_progress = Some(at + every);
                     }
                     std::thread::sleep(interval);
                 }
@@ -218,6 +230,16 @@ impl RssSampler {
             thread: Some(thread),
             cgroup_peak,
         }
+    }
+
+    /// Takes one sample on the calling thread, before returning: for a test
+    /// that needs a sample at a known point (while it holds a ballast)
+    /// instead of hoping the 5 ms sampler thread is scheduled inside the
+    /// window. Runs the same step as the thread, so the counters it feeds
+    /// are the production ones.
+    #[cfg(test)]
+    fn sample_now(&self) {
+        self.shared.sample();
     }
 
     /// Closes the current phase: records its peak sampled RSS under `name`
@@ -287,9 +309,12 @@ mod tests {
     #[test]
     fn a_sampler_reports_this_process_and_its_phases() {
         let sampler = RssSampler::start(Duration::from_millis(5), None);
-        // 32 MB, every page touched, inside the sampled window.
+        // 32 MB, every page touched.
         let ballast = std::hint::black_box(vec![1u8; 32 << 20]);
-        std::thread::sleep(Duration::from_millis(30));
+        // The thread's own samples are best-effort (a loaded runner can leave
+        // it unscheduled for the whole window, #1737): take one here, with
+        // the ballast held, and have it recorded before the ballast goes.
+        sampler.sample_now();
         drop(ballast);
         sampler.end_phase("first");
         sampler.end_phase("second");
@@ -303,10 +328,13 @@ mod tests {
             ["first", "second"]
         );
         assert!(s.phases.iter().all(|&(_, b)| b > 0 && b <= s.peak_bytes));
-        // Both saw the ballast. Not `hwm >= peak`: the kernel's high-water
+        // The overall peak and the first phase (which ended after the
+        // ballast was sampled) saw the ballast; the second phase started from
+        // the post-free RSS. Not `hwm >= peak`: the kernel's high-water
         // mark comes from approximate per-CPU RSS counters, and after a large
         // free it can read a little under a sampled (exact) `VmRSS`.
         assert!(s.peak_bytes >= 32 << 20, "{s:?}");
+        assert!(s.phases[0].1 >= 32 << 20, "{s:?}");
         assert!(s.hwm_bytes.unwrap() >= 32 << 20, "{s:?}");
         // The cgroup's peak since start includes the ballast (where this
         // kernel lets the sampler reset its own watermark at all).
