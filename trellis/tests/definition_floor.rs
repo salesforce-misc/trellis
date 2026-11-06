@@ -1072,3 +1072,51 @@ async fn a_join_with_table_aliases_carries_their_release() {
     assert_eq!(floor(&raw, &later, "aliased").await, "0.3.0");
     assert_eq!(floor(&raw, &later, "plain").await, "0.2.0");
 }
+
+/// A `MIN`/`MAX` aggregate writes the group-basis layout with extremes
+/// (`Layout(GroupBasisExtremes)`), which the key space alone doesn't show:
+/// under a release that added it in 0.3.0 its definition is stamped 0.3.0,
+/// which 0.2.0 refuses to drop, while an aggregate without `MIN`/`MAX` keeps
+/// the plain layout's floor and drops there.
+#[tokio::test]
+async fn a_min_max_aggregate_carries_the_extremes_layouts_release() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = raw(&db).await;
+    raw.batch_execute(
+        "create table public.s (id integer primary key, g integer, v integer); \
+         create index on public.s (g, v)",
+    )
+    .await
+    .expect("source");
+    let later = [("Layout(GroupBasisExtremes)", "0.3.0")];
+    let newer = handle(&db, "0.3.0", &later).await;
+    newer
+        .apply("TRANSFORM mm FROM s GROUP BY g SELECT MIN(v) AS lo, MAX(v) AS hi")
+        .await
+        .expect("define the MIN/MAX");
+    newer
+        .apply("TRANSFORM total FROM s GROUP BY g SELECT SUM(v) AS t, COUNT(*) AS n")
+        .await
+        .expect("define the SUM");
+    assert_eq!(floor(&raw, &newer, "mm").await, "0.3.0");
+    assert_eq!(floor(&raw, &newer, "total").await, "0.2.0");
+
+    let older = handle(&db, "0.2.0", &later).await;
+    for target in ["mm", "total"] {
+        older
+            .apply(&format!("PAUSE TRANSFORM {target}"))
+            .await
+            .expect("pause");
+    }
+    let refused = older
+        .apply("DROP TRANSFORM mm")
+        .await
+        .expect_err("0.2.0 can't run the MIN/MAX")
+        .to_string();
+    assert!(refused.contains("0.3.0"), "{refused}");
+    older
+        .apply("DROP TRANSFORM total")
+        .await
+        .expect("0.2.0 runs the SUM");
+}
