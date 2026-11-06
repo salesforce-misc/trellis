@@ -496,8 +496,14 @@ beside them run on every `cargo test`.
   of the target check, and a definition that isn't `live` or has a build
   chunk not done is skipped. An end-state check misses a lost update that
   later writes overwrite before the burst settles, and a sample sees it
-  while it lasts. `GENERATIVE_JOIN1_INVARIANT=off` turns it off; a number
-  sets the pause between rounds in milliseconds.
+  while it lasts. In a 4 × 12 sweep its samples were the first to catch
+  `join1_brd_no_key`, `join1_rd_no_key`, `join1_lsn_only` and
+  `join1_snapshot_after_read` once each, one of `join1_no_j_lock`'s five
+  catches and five of `join1_m_before_j`'s eleven. No known miss reaches the
+  rate gating takes. The tier's keys never hold the 10k rows a pending
+  fan-out needs, so the marker exemption is never exercised here.
+  `GENERATIVE_JOIN1_INVARIANT=off` turns the invariant off; a number sets the
+  pause between rounds in milliseconds.
   A side that is another transform's target is drawn by the chained-reader
   tier below, not here, nor is a value that makes a field fail (a held row:
   `join_one_to_one_quarantine`). Run it with `cargo test -p generative --test

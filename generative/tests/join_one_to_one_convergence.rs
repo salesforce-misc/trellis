@@ -441,6 +441,16 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
 /// twice. A plant caught in one case in twelve is listed here too: a 24-case
 /// sweep would miss it about one time in eight.
 ///
+/// With the in-run invariant on (`generative::invariant`), a 4 × 12 sweep
+/// (seeds 1 to 4, twelve cases each) caught, of 48 cases, with the cases its
+/// samples caught first in brackets: `join1_no_j_lock` 5 (1),
+/// `join1_vis_only` 3 (0), `join1_brd_no_key` 1 (1, a key with no `J` row),
+/// `join1_rd_no_key` 1 (1, the same), `join1_lsn_only` 1 (1, an `R` entry off
+/// `ja`), `join1_snapshot_after_read` 1 (1, an `M` entry off `jb`),
+/// `join1_no_entry_lock` 1 (0), `join1_no_recheck` 0 and
+/// `join1_truncate_keeps_m` 0; and the gated `join1_m_before_j` 11 (5). None
+/// reaches the one case in five that gating takes, so the list stands.
+///
 /// - `join1_no_j_lock`: caught 4, fired 48 (this tier's `racing` cases
 ///   don't cap their drains or pair their ops, which is what reaches the
 ///   aggregate tier's `join_no_j_lock`).
