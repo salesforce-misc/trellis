@@ -500,10 +500,13 @@ beside them run on every `cargo test`.
   `join1_lsn_only` and `join1_snapshot_after_read` (an `R` or `M` entry off
   its table), and with it on, mid-burst samples catch each in one to three
   cases of 48. For the lost updates that later writes repair before the
-  burst settles, it adds no reach the sweeps can measure: off and on,
-  `join1_no_j_lock` is caught in 4 and 5 cases of 48, `join1_vis_only` in 3
-  and 3, `join1_m_before_j` in 8 and 10 or 11, and a sample catching such a
-  case first is often a case the end-state check catches too. No known miss
+  burst settles, the sweeps measure no gain: with it off, then in two sweeps
+  with it on, `join1_no_j_lock` is caught in 4, then 5 and 5 cases of 48,
+  `join1_vis_only` in 3, then 3 and 3, and `join1_m_before_j` in 8, then 11
+  and 10. That is within run-to-run noise, though sweeps this size would
+  show only a gain of about two and a half times the rate or more, and a
+  sample that catches such a case first may be catching one the end-state
+  check catches too. No known miss
   reaches the rate gating takes (the per-plant numbers are in the tier's
   `ONE_TO_ONE_KNOWN_MISSES`). The tier's keys never hold the 10k rows a pending
   fan-out needs, so the marker exemption is never exercised here; the

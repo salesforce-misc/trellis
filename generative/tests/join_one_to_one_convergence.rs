@@ -448,11 +448,12 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
 /// sweep would miss it about one time in eight.
 ///
 /// The in-run invariant (`generative::invariant`) reaches the plants that
-/// leave hidden state wrong where the target can't show it, and adds no
+/// leave hidden state wrong where the target can't show it, and shows no
 /// measurable reach for the lost updates later writes repair. Over 4 × 12
 /// sweeps (seeds 1 to 4, twelve cases each), caught of 48 with it off, then
-/// with it on in two sweeps (its mid-burst samples' first catches in
-/// brackets):
+/// with it on in two sweeps (in brackets, the cases one of its samples
+/// caught first: in the second sweep each was a mid-burst sample; the first
+/// sweep didn't record which):
 ///
 /// - a join key with no `J` row: `join1_brd_no_key` 0; 1 (1), 3 (3);
 ///   `join1_rd_no_key` 0; 1 (1), 3 (3); `join1_chunk_no_key` 1 (1) in the
@@ -461,11 +462,13 @@ const ONE_TO_ONE_NOT_GATED: &[(&str, &str)] = &[
 ///   1 (1), 1 (1); `join1_snapshot_after_read` 0; 1 (1), 1 (1).
 /// - a lost update: `join1_no_j_lock` 4; 5 (1), 5 (2); `join1_vis_only` 3;
 ///   3 (0), 3 (1); the gated `join1_m_before_j` 8; 11 (5), 10 (3). Each
-///   catch of `join1_no_j_lock` is one of the 15 `racing` cases. A sample
-///   catching first doesn't mean the end-state check would have missed it:
-///   with the invariant off, the oracle caught `join1_no_j_lock`'s case 1:8
-///   and `join1_m_before_j`'s case 1:12, which a sample catches first with
-///   it on.
+///   catch of `join1_no_j_lock` is one of the 15 `racing` cases. The
+///   differences are within run-to-run noise (Fisher's exact test, p > 0.5
+///   for each), and sweeps this size would show only a gain of about two and
+///   a half times the rate or more. A sample catching first doesn't mean the
+///   end-state check would have missed it: with the invariant off, the
+///   oracle caught `join1_no_j_lock`'s case 1:8 and `join1_m_before_j`'s
+///   case 1:12, which a sample catches first with it on.
 /// - `join1_no_entry_lock` 0; 1 (0), 0; `join1_no_recheck` 0, 0;
 ///   `join1_truncate_keeps_m` 0, 0 (both measured with it on only).
 ///
