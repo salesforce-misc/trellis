@@ -14,7 +14,9 @@
 //! - [`run`] — drives a program through a backend, asserts the properties.
 //!
 //! [`baseline_quarantine`] sits beside them: the planted-bug sweep's baseline
-//! bar and its checked-in list of known, filed failures.
+//! bar and its checked-in list of known, filed failures. So does
+//! [`invariant`], the 1-1 `JOIN` tier's in-run check of hidden state, which
+//! reads that state through `trellis::dev` and judges it in pure code.
 //!
 //! `generate`/`oracle`/`run` are skeletons today; [`model`] and [`backend`]
 //! are this issue's substance.
@@ -39,6 +41,8 @@ pub mod expr_conformance;
 pub mod expr_gen;
 #[cfg(feature = "engine-access")]
 pub mod generate;
+#[cfg(feature = "engine-access")]
+pub mod invariant;
 #[cfg(feature = "engine-access")]
 pub mod model;
 #[cfg(feature = "engine-access")]

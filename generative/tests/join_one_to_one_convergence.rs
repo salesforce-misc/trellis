@@ -43,7 +43,11 @@
 //! (`generative::run::run_convergence_concurrent`). Every burst is checked once
 //! it settles (against the oracle, then by a `Strict` `self_check` of every
 //! definition, which audits the hidden ledgers the oracle cannot see), and at
-//! the end every definition must still be `live`.
+//! the end every definition must still be `live`. While a burst runs, and once
+//! it settles, the in-run invariant (`generative::invariant`) reads each
+//! definition's hidden state under one snapshot and checks it against itself
+//! and the tables as applied; `GENERATIVE_JOIN1_INVARIANT` turns it off or sets
+//! its interval.
 //!
 //! The model of a correct target is the one the seam-fed families use
 //! (`trellis/tests/join_one_to_one_over_targets.rs`): after each step the
@@ -76,9 +80,12 @@ use generative::generate::join::{
 use generative::generate::join_one_to_one::{
     OnShape, OneToOneField, OneToOneOpDraw, OneToOneSpec, one_to_one_case, one_to_one_case_strategy,
 };
+use generative::invariant::{self, Clause, InRunInvariant};
 use generative::model::Op;
 use generative::plant_sweep::{self, SweepTier};
-use generative::run::{RunError, check_program, run_convergence_concurrent};
+use generative::run::{
+    RunError, check_program, run_convergence_concurrent, run_convergence_concurrent_sampled,
+};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence, TestCaseError};
 use testkit::TestCluster;
@@ -105,6 +112,8 @@ struct OneToOneCoverage {
     cases_engine_built: usize,
     engine_build_rows: u64,
     cases_over_rows_engine_silent: usize,
+    /// The in-run invariant's samples, over the passed cases.
+    invariant: invariant::SampleStats,
     coverage: generative::run::Coverage,
 }
 
@@ -232,6 +241,12 @@ impl std::fmt::Display for OneToOneCoverage {
              over rows in the model wrote none",
             self.engine_build_rows, self.cases_engine_built, self.cases_over_rows_engine_silent
         )?;
+        writeln!(
+            f,
+            "in-run invariant: {} snapshots checked, {} skipped, {} R entries exempted by a \
+             pending fan-out",
+            self.invariant.checked, self.invariant.skipped, self.invariant.exempt
+        )?;
         write!(f, "{}", self.coverage)
     }
 }
@@ -306,11 +321,20 @@ fn run_case(case: &JoinCase) -> Result<(), String> {
                 case.seal_interval_ms
             );
             let build_rows_before = engine_build_rows();
-            match run_convergence_concurrent(&mut backend, &pool, &case.program, &case.plan).await {
+            match run_convergence_concurrent_sampled(
+                &mut backend,
+                &pool,
+                &case.program,
+                &case.plan,
+                InRunInvariant::from_env(),
+            )
+            .await
+            {
                 Ok(run) => {
                     let build_rows = engine_build_rows().saturating_sub(build_rows_before);
                     let mut coverage = h.coverage.borrow_mut();
                     coverage.coverage.record_drain(&run.drain);
+                    coverage.invariant.add(&run.invariant);
                     coverage.record_engine_builds(case, build_rows);
                     drop(coverage);
                     if !run.outcome.as_pass() {
@@ -332,6 +356,22 @@ fn run_case(case: &JoinCase) -> Result<(), String> {
                         "Strict self_check found a divergence the oracle did not, after burst \
                          {burst} ({shape}):\n{}",
                         failures.join("\n")
+                    ));
+                }
+                Err(RunError::InRunInvariant {
+                    burst,
+                    failure: Ok(failure),
+                }) => {
+                    return Err(format!(
+                        "the in-run hidden-state invariant broke during burst {burst} ({shape}), \
+                         target {}:\n{}",
+                        failure.target,
+                        failure
+                            .violations
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n")
                     ));
                 }
                 Err(other) => return Err(format!("run error ({shape}): {other:?}")),
@@ -759,6 +799,120 @@ fn the_strict_audit_catches_a_corrupted_one_to_one_join_ledger() {
             );
             let failures = backend.strict_audit(&targets).await.expect("audit");
             assert!(!failures.is_empty(), "the audit missed the damaged R");
+        })
+    });
+}
+
+/// The in-run invariant reads a hand-built case's hidden state clean while it
+/// runs and once it settles, and tells each kind of damage to the settled
+/// state from a good one: a target cell changed and put back, then every `J`
+/// row, every live `M` entry and every live `R` entry deleted by hand, each
+/// on top of the last.
+#[test]
+fn the_in_run_invariant_reads_a_run_clean_and_catches_damaged_hidden_state() {
+    let case = hand_built_case(false);
+    HARNESS.with(|h| {
+        h.runtime.block_on(async {
+            let db = h.cluster.create_isolated_database().await;
+            let mut backend = ManualBackend::connect_with_options(db.dsn(), 2, None)
+                .await
+                .expect("connect the backend");
+            let pool =
+                Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
+            let run = run_convergence_concurrent_sampled(
+                &mut backend,
+                &pool,
+                &case.program,
+                &case.plan,
+                Some(InRunInvariant {
+                    interval: std::time::Duration::from_millis(5),
+                }),
+            )
+            .await
+            .expect("the hand-built case keeps the invariant");
+            assert!(run.invariant.checked > 0, "{:?}", run.invariant);
+            async fn clauses(pool: &Pool, target: &str) -> Vec<Clause> {
+                let mut stats = invariant::SampleStats::default();
+                let mut found: Vec<Clause> = invariant::sample(pool, target, &mut stats)
+                    .await
+                    .expect("sample")
+                    .map(|f| f.violations.iter().map(|v| v.clause).collect())
+                    .unwrap_or_default();
+                assert_eq!(stats.checked, 1, "a settled live definition is checked");
+                found.sort();
+                found.dedup();
+                found
+            }
+            // Runs `sql` with `%I.%I` naming each definition's hidden table
+            // `part` (`r`, `m` or `j`), then checks `j0`.
+            async fn damaged(
+                backend: &mut ManualBackend,
+                pool: &Pool,
+                part: &str,
+                sql: &str,
+            ) -> Vec<Clause> {
+                backend
+                    .execute_raw(&format!(
+                        "do $$ declare r record; begin \
+                         for r in select schemaname, tablename from pg_tables \
+                                  where tablename ~ '^join1_[0-9]+_{part}$' loop \
+                           execute format('{sql}', r.schemaname, r.tablename); \
+                         end loop; end $$"
+                    ))
+                    .await
+                    .expect("damage a hidden table");
+                clauses(pool, "j0").await
+            }
+            assert_eq!(clauses(&pool, "j0").await, []);
+            assert_eq!(clauses(&pool, "j1").await, []);
+
+            // A target cell.
+            backend
+                .execute_raw(
+                    "update public.j0 set co_xy = co_xy::int + 1 \
+                     where id = (select min(id) from public.j0)",
+                )
+                .await
+                .expect("corrupt a cell");
+            assert_eq!(clauses(&pool, "j0").await, [Clause::Target]);
+            backend
+                .execute_raw(
+                    "update public.j0 set co_xy = co_xy::int - 1 \
+                     where id = (select min(id) from public.j0)",
+                )
+                .await
+                .expect("restore the cell");
+            assert_eq!(clauses(&pool, "j0").await, []);
+
+            // Every `J` row.
+            assert_eq!(
+                damaged(&mut backend, &pool, "j", "delete from %I.%I").await,
+                [Clause::KeyRow]
+            );
+            // Every live `M` entry, on top: `M` no longer matches `jb`, and
+            // the target rows joined to them no longer match `R` and `M`.
+            assert_eq!(
+                damaged(
+                    &mut backend,
+                    &pool,
+                    "m",
+                    "delete from %I.%I where not __tombstone"
+                )
+                .await,
+                [Clause::JoinedEntry, Clause::Target, Clause::KeyRow]
+            );
+            // Every live `R` entry, on top: the same for `ja`, and every
+            // target row is extra. No live entry is left to need a `J` row.
+            assert_eq!(
+                damaged(
+                    &mut backend,
+                    &pool,
+                    "r",
+                    "delete from %I.%I where not __tombstone"
+                )
+                .await,
+                [Clause::FromEntry, Clause::JoinedEntry, Clause::Target]
+            );
         })
     });
 }

@@ -745,7 +745,7 @@ pub(crate) async fn findings(pool: &Pool, def: &Definition) -> Result<Findings, 
 /// as the source's (`ddl::target_table_ddl`), so they pair by name; a source
 /// key column with no namesake there was renamed since define, which pauses
 /// the transform, and keeps its own collation meanwhile.
-async fn walk_key(
+pub(super) async fn walk_key(
     pool: &Pool,
     def: &Definition,
 ) -> Result<Vec<ddl::PrimaryKeyColumn>, SelfCheckError> {
@@ -1513,7 +1513,7 @@ pub(super) fn diff_page(
 /// too, for the same layering reason: see that pair's own doc comments).
 ///
 /// Closed over `def`'s alias readers, as that original is.
-async fn paused_columns(
+pub(super) async fn paused_columns(
     pool: &Pool,
     def: &crate::defs::ast::TransformDef,
 ) -> Result<HashSet<String>, SelfCheckError> {

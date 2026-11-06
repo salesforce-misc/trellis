@@ -480,6 +480,24 @@ beside them run on every `cargo test`.
   oracle is the definition's own query without the `GROUP BY`
   (`render_join_one_to_one_select`), compared byte for byte; every burst is
   also audited by a `Strict` `self_check`, which reads the hidden ledgers.
+  While a burst's lanes run, and once more after it settles, the tier checks
+  an in-run hidden-state invariant (`generative::invariant`): in rounds 10 ms
+  apart it reads each definition's `R`, `M`, `J`, target, pending fan-out
+  markers and both tables as `R` and `M` have applied them under one
+  `REPEATABLE READ` snapshot (`trellis::dev::staging::one_to_one_join_snapshot`),
+  after taking `ACCESS SHARE` on the ring, both tables, the hidden tables and
+  the target, so that no `TRUNCATE`, ring retirement or `RESUME` commits
+  inside the read. It checks that `R` and `M` are their tables as applied
+  (the live rows minus the ring's unapplied changes, as `self_check`
+  subtracts them), that each target row is its `R` entry's fields over the
+  newest live `M` entry on its key (with `INNER` dropping a row with none),
+  and that every join key a live entry holds has its `J` row. The rows of a
+  key with a pending fan-out marker that come after its cursor are left out
+  of the target check, and a definition that isn't `live` or has a build
+  chunk not done is skipped. An end-state check misses a lost update that
+  later writes overwrite before the burst settles, and a sample sees it
+  while it lasts. `GENERATIVE_JOIN1_INVARIANT=off` turns it off; a number
+  sets the pause between rounds in milliseconds.
   A side that is another transform's target is drawn by the chained-reader
   tier below, not here, nor is a value that makes a field fail (a held row:
   `join_one_to_one_quarantine`). Run it with `cargo test -p generative --test

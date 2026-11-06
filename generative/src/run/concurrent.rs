@@ -12,14 +12,17 @@ use trellis::dev::pool::Pool;
 
 use super::{Outcome, RunError, check_op_outcome, quiesce_snapshot_and_check};
 use crate::backend::{ConcurrentBackend, DrainAudit, OpApplier};
+use crate::invariant::{self, InRunInvariant, SampleStats};
 use crate::model::{BurstAction, ConcurrentPlan, Op, Program};
 
 /// What [`run_convergence_concurrent`] reports alongside [`Outcome::Ran`]:
-/// how the engine actually sealed and claimed the run's batches.
+/// how the engine actually sealed and claimed the run's batches, and what
+/// the in-run invariant's samples did.
 #[derive(Debug)]
 pub struct ConcurrentRun {
     pub outcome: Outcome,
     pub drain: DrainAudit,
+    pub invariant: SampleStats,
 }
 
 /// Installs `program`, then runs `plan`'s bursts one after another. Within a
@@ -65,6 +68,26 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
     program: &Program,
     plan: &ConcurrentPlan,
 ) -> Result<ConcurrentRun, RunError> {
+    run_convergence_concurrent_sampled(backend, pool, program, plan, None).await
+}
+
+/// [`run_convergence_concurrent`], and with `invariant`, the in-run
+/// hidden-state invariant ([`crate::invariant`]) of every 1-1 `JOIN`
+/// definition installed so far: sampled through `pool` while each burst's
+/// lanes and actions run, a round of every such definition every
+/// [`InRunInvariant::interval`], and once more after the burst settles and
+/// its oracle check passes. A sample that breaks it is
+/// [`RunError::InRunInvariant`], reported ahead of any error the burst's lanes
+/// or actions hit. The sampler draws nothing, so the plan is the same with or
+/// without it.
+pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
+    backend: &mut B,
+    pool: &Pool,
+    program: &Program,
+    plan: &ConcurrentPlan,
+    invariant: Option<InRunInvariant>,
+) -> Result<ConcurrentRun, RunError> {
+    let mut stats = SampleStats::default();
     let mut covered: Vec<usize> = plan.bursts.iter().flat_map(|b| b.ops()).collect();
     covered.sort_unstable();
     assert!(
@@ -187,64 +210,113 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
             });
         }
 
-        let mut action_error: Option<RunError> = None;
-        let mut applied = progress.subscribe();
-        for timed in &burst.actions {
-            applied
-                .wait_for(|&n| n >= timed.after)
-                .await
-                .expect("this task holds the sender");
-            if timed.action.starts_build() {
-                building.store(true, Ordering::Relaxed);
-            }
-            if let Err(e) = backend.act(program, &timed.action).await {
-                action_error = Some(RunError::BurstAction {
-                    burst: index,
-                    action: timed.action.clone(),
-                    error: format!("{e:?}"),
-                });
-                break;
-            }
-            match &timed.action {
-                BurstAction::Install { def } => installed.push(program.defs[*def].clone()),
-                // The oracle checks the definition as the statement left it.
-                BurstAction::Alter { def, .. } => {
-                    let at = installed
-                        .iter()
-                        .position(|d| d.target == def.target)
-                        .expect("an ALTER names an installed definition — a generator bug");
-                    installed[at] = (**def).clone();
+        let sampled: std::cell::RefCell<Vec<String>> =
+            std::cell::RefCell::new(join1_targets(&installed));
+        let done = std::cell::Cell::new(false);
+        let burst_run = async {
+            let mut action_error: Option<RunError> = None;
+            let mut applied = progress.subscribe();
+            for timed in &burst.actions {
+                applied
+                    .wait_for(|&n| n >= timed.after)
+                    .await
+                    .expect("this task holds the sender");
+                if timed.action.starts_build() {
+                    building.store(true, Ordering::Relaxed);
                 }
-                _ => {}
+                if let Err(e) = backend.act(program, &timed.action).await {
+                    action_error = Some(RunError::BurstAction {
+                        burst: index,
+                        action: timed.action.clone(),
+                        error: format!("{e:?}"),
+                    });
+                    break;
+                }
+                match &timed.action {
+                    BurstAction::Install { def } => {
+                        installed.push(program.defs[*def].clone());
+                        *sampled.borrow_mut() = join1_targets(&installed);
+                    }
+                    // The oracle checks the definition as the statement left it.
+                    BurstAction::Alter { def, .. } => {
+                        let at = installed
+                            .iter()
+                            .position(|d| d.target == def.target)
+                            .expect("an ALTER names an installed definition — a generator bug");
+                        installed[at] = (**def).clone();
+                    }
+                    _ => {}
+                }
             }
-        }
 
-        // Every lane runs to completion (or its own first failure) before
-        // any error is reported, so no task outlives the burst.
-        let mut first_error: Option<RunError> = None;
-        while let Some(joined) = tasks.join_next().await {
-            let (lane_index, applier, result) = joined.expect("a lane task panicked");
-            appliers[lane_index] = Some(applier);
-            if let Err(e) = result {
-                let earlier = match (&first_error, &e) {
-                    (
-                        Some(RunError::UnexpectedOpOutcome { op_index: a, .. }),
-                        RunError::UnexpectedOpOutcome { op_index: b, .. },
-                    ) => b < a,
-                    (None, _) => true,
-                    _ => false,
-                };
-                if earlier {
-                    first_error = Some(e);
+            // Every lane runs to completion (or its own first failure) before
+            // any error is reported, so no task outlives the burst.
+            let mut first_error: Option<RunError> = None;
+            while let Some(joined) = tasks.join_next().await {
+                let (lane_index, applier, result) = joined.expect("a lane task panicked");
+                appliers[lane_index] = Some(applier);
+                if let Err(e) = result {
+                    let earlier = match (&first_error, &e) {
+                        (
+                            Some(RunError::UnexpectedOpOutcome { op_index: a, .. }),
+                            RunError::UnexpectedOpOutcome { op_index: b, .. },
+                        ) => b < a,
+                        (None, _) => true,
+                        _ => false,
+                    };
+                    if earlier {
+                        first_error = Some(e);
+                    }
                 }
             }
+            done.set(true);
+            first_error.or(action_error)
+        };
+        let sampler = async {
+            let Some(invariant) = invariant else {
+                return (SampleStats::default(), None);
+            };
+            let mut stats = SampleStats::default();
+            while !done.get() {
+                let targets = sampled.borrow().clone();
+                for target in &targets {
+                    match invariant::sample(pool, target, &mut stats).await {
+                        Ok(None) => {}
+                        Ok(Some(failure)) => return (stats, Some(Ok(failure))),
+                        Err(e) => return (stats, Some(Err(e))),
+                    }
+                }
+                tokio::time::sleep(invariant.interval).await;
+            }
+            (stats, None)
+        };
+        let (burst_error, (burst_stats, sampled_failure)) = tokio::join!(burst_run, sampler);
+        stats.add(&burst_stats);
+        if let Some(failure) = sampled_failure {
+            return Err(RunError::InRunInvariant {
+                burst: index,
+                failure,
+            });
         }
-        if let Some(e) = first_error.or(action_error) {
+        if let Some(e) = burst_error {
             return Err(e);
         }
 
         quiesce_snapshot_and_check(backend, pool, program, last_op, &installed, timing_enabled)
             .await?;
+        if invariant.is_some() {
+            for target in join1_targets(&installed) {
+                let failure = match invariant::sample(pool, &target, &mut stats).await {
+                    Ok(None) => continue,
+                    Ok(Some(failure)) => Ok(failure),
+                    Err(e) => Err(e),
+                };
+                return Err(RunError::InRunInvariant {
+                    burst: index,
+                    failure,
+                });
+            }
+        }
         let targets: Vec<String> = installed.iter().map(|d| d.target.clone()).collect();
         let failures = backend
             .strict_audit(&targets)
@@ -265,7 +337,23 @@ pub async fn run_convergence_concurrent<B: ConcurrentBackend>(
     Ok(ConcurrentRun {
         outcome: Outcome::Ran,
         drain,
+        invariant: stats,
     })
+}
+
+/// The targets of `installed`'s 1-1 `JOIN` definitions, which the in-run
+/// invariant samples.
+fn join1_targets(installed: &[TransformDef]) -> Vec<String> {
+    installed
+        .iter()
+        .filter(|def| {
+            matches!(
+                def.key_space,
+                trellis::dev::defs::ast::KeySpace::JoinOneToOne(_)
+            )
+        })
+        .map(|def| def.target.clone())
+        .collect()
 }
 
 /// Sets a stall (`trellis::dev::interleave::set_stall`) for as long as it

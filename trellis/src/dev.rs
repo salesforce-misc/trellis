@@ -154,6 +154,10 @@ pub mod staging {
     /// recompute and its rebuild), for plan-shape tests.
     #[cfg(any(test, feature = "internals"))]
     pub use crate::staging::group_basis::explain_whole_source_reads;
+    /// A 1-1 `JOIN` definition's `R`, `M`, `J`, target and sources as
+    /// applied, read under one snapshot, for the 1-1 `JOIN` tier's in-run
+    /// invariant (#1709).
+    pub use crate::staging::one_to_one_join_snapshot;
     /// One page of a `self_check` walk, for `benchmark`'s `self-check-walk`:
     /// it walks a JOIN target's `P` and `M` parts alone, from the
     /// cursor `p`, which the job (it walks `T` first) can't.

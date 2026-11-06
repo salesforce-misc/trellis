@@ -89,6 +89,9 @@ use super::self_check_joins::render;
 use super::self_check_keyset::{Keyset, recollated_pairs};
 use super::self_check_ring::Ring;
 
+#[cfg(any(test, feature = "test-util"))]
+pub mod snapshot;
+
 /// One part of the walk (the module doc), in walk order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Part {

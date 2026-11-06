@@ -23,7 +23,9 @@ mod noise;
 mod restore;
 mod two_instance;
 
-pub use concurrent::{ConcurrentRun, run_convergence_concurrent};
+pub use concurrent::{
+    ConcurrentRun, run_convergence_concurrent, run_convergence_concurrent_sampled,
+};
 pub use coverage::{ConcurrentShape, Coverage, HOT_WRITES};
 pub use db_admin::run_convergence_with_db_admin;
 pub use noise::run_convergence_with_noise;
@@ -232,6 +234,14 @@ pub enum RunError {
     Audit {
         burst: usize,
         failures: Vec<String>,
+    },
+    /// A sample of the in-run hidden-state invariant
+    /// ([`crate::invariant`]) during burst `burst` (or once it settled)
+    /// found a 1-1 `JOIN`'s hidden state inconsistent at a committed
+    /// snapshot, or couldn't read it.
+    InRunInvariant {
+        burst: usize,
+        failure: Result<crate::invariant::Failure, String>,
     },
 }
 

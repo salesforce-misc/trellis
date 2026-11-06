@@ -102,6 +102,10 @@ pub mod self_check;
 mod self_check_groups;
 pub mod self_check_job;
 mod self_check_join_one_to_one;
+/// A 1-1 `JOIN` definition's hidden state under one snapshot, for the
+/// generative suite's in-run invariant (#1709).
+#[cfg(any(test, feature = "test-util"))]
+pub use self_check_join_one_to_one::snapshot as one_to_one_join_snapshot;
 mod self_check_joins;
 mod self_check_keyset;
 mod self_check_ring;
