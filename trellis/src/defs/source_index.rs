@@ -410,54 +410,77 @@ pub(crate) async fn has_index(
 /// Whether `table` has an index leading with `columns`. A table or a column that no
 /// longer exists is reported elsewhere (the definition's capture failure or
 /// resume refusal) and counts as met: there is no index to create.
+///
+/// One statement reads the wanted columns' attribute numbers and collations
+/// together with the table's indexes, so one catalog snapshot: a caller under
+/// `READ COMMITTED` (a pooled client, or a transaction) gets a fresh snapshot
+/// per statement, and a collation-changing `ALTER COLUMN TYPE` that committed
+/// between two reads would pair the old collation with the rebuilt index and
+/// report a valid index missing. The statement always returns one row: the
+/// columns aggregate to `NULL` when none is found, and the indexes' fields
+/// are `NULL` when the table has no qualifying index.
 async fn is_met(
     client: &impl GenericClient,
     table: &str,
     columns: &[String],
 ) -> Result<bool, tokio_postgres::Error> {
     let regclass = regclass_arg(table);
-    let found = client
+    let rows = client
         .query(
-            "select a.attname, a.attnum, a.attcollation::oid \
-             from pg_catalog.pg_attribute a \
-             where a.attrelid = pg_catalog.to_regclass($1) and a.attname = any($2) \
-               and a.attnum > 0 and not a.attisdropped",
+            "with cols as ( \
+                 select array_agg(a.attname::text) as names, \
+                        array_agg(a.attnum) as attnums, \
+                        array_agg(a.attcollation::oid) as collations \
+                 from pg_catalog.pg_attribute a \
+                 where a.attrelid = pg_catalog.to_regclass($1) and a.attname = any($2) \
+                   and a.attnum > 0 and not a.attisdropped) \
+             select cols.names, cols.attnums, cols.collations, \
+                    idx.indkey, idx.indcollation, idx.indnkeyatts, idx.indoption, idx.defaults \
+             from cols \
+             left join lateral ( \
+                 select i.indkey::int2[] as indkey, i.indcollation::oid[] as indcollation, \
+                        i.indnkeyatts::int4 as indnkeyatts, i.indoption::int2[] as indoption, \
+                        array(select oc.opcdefault \
+                              from unnest(i.indclass::oid[]) with ordinality as u(opclass, n) \
+                              join pg_catalog.pg_opclass oc on oc.oid = u.opclass \
+                              order by u.n) as defaults \
+                 from pg_catalog.pg_index i \
+                 join pg_catalog.pg_class c on c.oid = i.indexrelid \
+                 join pg_catalog.pg_am am on am.oid = c.relam \
+                 where i.indrelid = pg_catalog.to_regclass($1) and am.amname = 'btree' \
+                   and i.indisvalid and i.indisready and i.indislive and i.indpred is null \
+             ) idx on true",
             &[&regclass, &columns],
         )
         .await?;
-    let mut by_name: HashMap<String, (i16, u32)> = HashMap::new();
-    for row in &found {
-        by_name.insert(row.get(0), (row.get(1), row.get(2)));
-    }
+    let Some(first) = rows.first() else {
+        return Ok(true);
+    };
+    let names: Vec<String> = first.get::<_, Option<Vec<String>>>(0).unwrap_or_default();
+    let attnums: Vec<i16> = first.get::<_, Option<Vec<i16>>>(1).unwrap_or_default();
+    let attcollations: Vec<u32> = first.get::<_, Option<Vec<u32>>>(2).unwrap_or_default();
+    let by_name: HashMap<&str, (i16, u32)> = names
+        .iter()
+        .map(String::as_str)
+        .zip(attnums.into_iter().zip(attcollations))
+        .collect();
     let mut want = Vec::with_capacity(columns.len());
     for column in columns {
-        match by_name.get(column) {
+        match by_name.get(column.as_str()) {
             Some(found) => want.push(*found),
             None => return Ok(true),
         }
     }
-    let indexes = client
-        .query(
-            "select i.indkey::int2[], i.indcollation::oid[], i.indnkeyatts::int4, \
-                    i.indoption::int2[], \
-                    array(select oc.opcdefault \
-                          from unnest(i.indclass::oid[]) with ordinality as u(opclass, n) \
-                          join pg_catalog.pg_opclass oc on oc.oid = u.opclass \
-                          order by u.n) \
-             from pg_catalog.pg_index i \
-             join pg_catalog.pg_class c on c.oid = i.indexrelid \
-             join pg_catalog.pg_am am on am.oid = c.relam \
-             where i.indrelid = pg_catalog.to_regclass($1) and am.amname = 'btree' \
-               and i.indisvalid and i.indisready and i.indislive and i.indpred is null",
-            &[&regclass],
-        )
-        .await?;
+    let indexes: Vec<&tokio_postgres::Row> = rows
+        .iter()
+        .filter(|row| row.get::<_, Option<Vec<i16>>>(3).is_some())
+        .collect();
     Ok(indexes.iter().any(|row| {
-        let mut attnums: Vec<i16> = row.get(0);
-        let mut collations: Vec<u32> = row.get(1);
-        let keys: i32 = row.get(2);
-        let mut options: Vec<i16> = row.get(3);
-        let default_opclass: Vec<bool> = row.get(4);
+        let mut attnums: Vec<i16> = row.get(3);
+        let mut collations: Vec<u32> = row.get(4);
+        let keys: i32 = row.get(5);
+        let mut options: Vec<i16> = row.get(6);
+        let default_opclass: Vec<bool> = row.get(7);
         attnums.truncate(keys.max(0) as usize);
         collations.truncate(keys.max(0) as usize);
         options.truncate(keys.max(0) as usize);
@@ -718,5 +741,103 @@ mod tests {
         let def = crate::defs::parse("TRANSFORM v FROM a LEFT JOIN b ON a.k = b.k SELECT b.x AS x")
             .unwrap();
         assert!(required(&def, &HashMap::new(), "public.a", Some("public.b")).is_empty());
+    }
+}
+
+/// [`is_met`] reads the wanted columns and the table's indexes in one
+/// statement, so one catalog snapshot. Two statements under READ COMMITTED
+/// are two snapshots: a collation-changing `ALTER COLUMN TYPE` committing
+/// between them would leave the first read's old collation against the
+/// second read's rebuilt index, and a valid index would read as missing.
+#[cfg(test)]
+mod one_snapshot_tests {
+    use super::*;
+    use tokio_postgres::{Client, NoTls};
+
+    /// Held by the checking session until its hook runs; the other session
+    /// takes it, so it learns the check is mid-read.
+    const READY: i64 = 7_311_001;
+    /// Held by the other session until its `ALTER` has committed; the hook
+    /// waits on it.
+    const GO: i64 = 7_311_002;
+
+    async fn connect(dsn: &str) -> Client {
+        let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+    }
+
+    /// The pause point, without a line of production code: an `=` between two
+    /// `name`s in schema `hook`, which a session whose
+    /// `search_path` puts `hook` ahead of `pg_catalog` resolves instead of
+    /// the built-in. The column read filters `attname = any($2)` through it,
+    /// so the first time it runs the check is inside that read, after its
+    /// snapshot: it releases [`READY`] (the other session is waiting for
+    /// that) and waits for [`GO`].
+    const HOOK: &str = "create schema hook; \
+        create function hook.name_eq_name(name, name) returns boolean \
+        language plpgsql as $$ \
+        begin \
+          if pg_catalog.pg_advisory_unlock(7311001) then \
+            perform pg_catalog.pg_advisory_lock(7311002); \
+            perform pg_catalog.pg_advisory_unlock(7311002); \
+          end if; \
+          return $1 operator(pg_catalog.=) $2; \
+        end $$; \
+        create operator hook.= (leftarg = name, rightarg = name, \
+                                function = hook.name_eq_name);";
+
+    #[tokio::test]
+    async fn a_collation_change_committing_mid_check_leaves_a_valid_index_met() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_empty_database().await;
+        let other = connect(db.dsn()).await;
+        other
+            .batch_execute(
+                "create table public.t (g text not null, v integer not null); \
+                 create index t_g_v on public.t (g, v);",
+            )
+            .await
+            .expect("table and index");
+        other.batch_execute(HOOK).await.expect("hook");
+        let checker = connect(db.dsn()).await;
+        checker
+            .batch_execute(&format!(
+                "set search_path to hook, pg_catalog; set lock_timeout to '10s'; \
+                 select pg_advisory_lock({READY})"
+            ))
+            .await
+            .expect("checker takes READY");
+        other
+            .batch_execute(&format!(
+                "set lock_timeout to '10s'; select pg_advisory_lock({GO})"
+            ))
+            .await
+            .expect("other takes GO");
+        let columns = ["g".to_string(), "v".to_string()];
+
+        let check = is_met(&checker, "public.t", &columns);
+        let alter = async {
+            // Waits until the check's hook has released READY: the check is
+            // inside its column read.
+            other
+                .batch_execute(&format!(
+                    "select pg_advisory_lock({READY}); \
+                     alter table public.t alter column g type text collate \"C\"; \
+                     select pg_advisory_unlock({GO})"
+                ))
+                .await
+                .expect("the check reaches its pause point, then the ALTER commits");
+        };
+        let (met, ()) = tokio::join!(check, alter);
+
+        assert!(
+            met.expect("check"),
+            "the index was valid before and after the ALTER, so it is met"
+        );
+        // The collation did change: a later check reads the rebuilt index.
+        assert!(is_met(&checker, "public.t", &columns).await.expect("again"));
     }
 }
