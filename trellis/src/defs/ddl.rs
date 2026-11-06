@@ -486,7 +486,8 @@ pub(crate) async fn source_primary_key_in_txn(
 /// definition-time policy: `table`'s row-identity key columns (its `PRIMARY
 /// KEY`, else the qualifying `UNIQUE` index — an aggregate target's `UNIQUE
 /// NULLS NOT DISTINCT` grouping columns), in declared order, each
-/// with its nullability. Empty when `table` has no such index; no key-type
+/// with its nullability. A unique index over an expression is never the
+/// key. Empty when `table` has no such index; no key-type
 /// gate. `table` is an unquoted `schema.table` identity ([`regclass_arg`]).
 ///
 /// Split out for `intake::harness::enumerate_and_append`,
@@ -508,6 +509,10 @@ pub(crate) async fn identity_key_columns(
                      i.indisprimary
                      or (
                        i.indisunique and i.indimmediate and i.indpred is null
+                       -- An expression's values are no column a key can
+                       -- name: an index over one is no row identity, even
+                       -- when it also covers plain columns.
+                       and i.indexprs is null
                        -- A plain (nulls-distinct) UNIQUE index doesn't reject
                        -- duplicate NULLs, so it isn't a true identity unless
                        -- either NULLS NOT DISTINCT (like create_aggregate_target_table's
@@ -2433,5 +2438,43 @@ mod tests {
             pin_key_collations(&mut pk, recorded.as_deref());
             assert_eq!(pk, now, "{recorded:?}");
         }
+    }
+
+    /// A unique index over an expression is no row identity, whether it
+    /// covers only the expression or plain columns beside it: the key is the
+    /// table's next qualifying index (#1719).
+    #[tokio::test]
+    async fn a_unique_index_over_an_expression_is_never_the_key() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create table public.t (r text, a integer not null, n integer); \
+                 create unique index t_expr on public.t ((lower(r))); \
+                 create unique index t_mixed on public.t (a, (lower(r))); \
+                 alter table public.t add unique nulls not distinct (r); \
+                 create table public.e (r text not null); \
+                 create unique index e_expr on public.e ((lower(r)));",
+            )
+            .await
+            .expect("the tables");
+        let key = identity_key_columns(&client, "public.t")
+            .await
+            .expect("the key");
+        let names: Vec<&str> = key.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["r"]);
+        assert!(
+            identity_key_columns(&client, "public.e")
+                .await
+                .expect("the key")
+                .is_empty(),
+            "an expression index alone keys nothing"
+        );
     }
 }
