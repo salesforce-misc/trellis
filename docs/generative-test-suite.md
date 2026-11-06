@@ -493,13 +493,19 @@ beside them run on every `cargo test`.
   and that every join key a live entry holds has its `J` row. The rows of a
   key with a pending fan-out marker that come after its cursor are left out
   of the target check, and a definition that isn't `live` or has a build
-  chunk not done is skipped. An end-state check misses a lost update that
-  later writes overwrite before the burst settles, and a sample sees it
-  while it lasts. In a 4 × 12 sweep its samples were the first to catch
-  `join1_brd_no_key`, `join1_rd_no_key`, `join1_lsn_only` and
-  `join1_snapshot_after_read` once each, one of `join1_no_j_lock`'s five
-  catches and five of `join1_m_before_j`'s eleven. No known miss reaches the
-  rate gating takes. The tier's keys never hold the 10k rows a pending
+  chunk not done is skipped. A failure says whether a mid-burst sample or
+  the one after the burst settled found it. Its reach is in hidden state the
+  target doesn't show: with it off, 4 × 12 sweeps catch none of
+  `join1_brd_no_key`, `join1_rd_no_key` (a join key with no `J` row),
+  `join1_lsn_only` and `join1_snapshot_after_read` (an `R` or `M` entry off
+  its table), and with it on, mid-burst samples catch each in one to three
+  cases of 48. For the lost updates that later writes repair before the
+  burst settles, it adds no reach the sweeps can measure: off and on,
+  `join1_no_j_lock` is caught in 4 and 5 cases of 48, `join1_vis_only` in 3
+  and 3, `join1_m_before_j` in 8 and 10 or 11, and a sample catching such a
+  case first is often a case the end-state check catches too. No known miss
+  reaches the rate gating takes (the per-plant numbers are in the tier's
+  `ONE_TO_ONE_KNOWN_MISSES`). The tier's keys never hold the 10k rows a pending
   fan-out needs, so the marker exemption is never exercised here; the
   checker's unit tests cover it, and
   `trellis/tests/join_one_to_one_fan_out.rs` reads the snapshot under a
