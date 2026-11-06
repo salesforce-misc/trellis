@@ -10,6 +10,11 @@
 //!   out, loads with `psql`, and `migrate` restores every definition, which
 //!   builds the same targets; a user's index and grant on a target survive
 //!   (`a_restored_dump_builds_its_definitions`)
+//! - a target that carries what a user may add to any target (unique indexes
+//!   beside the key, a deferrable unique and a check constraint, foreign keys
+//!   both ways, a trigger) is restored with all of it, builds, and a row its
+//!   unique index refuses holds its key
+//!   (`a_restored_target_keeps_the_objects_a_user_added_and_builds`)
 //! - two databases with the same definitions and different histories dump
 //!   the same appendix (`the_appendix_is_the_same_for_the_same_definitions`)
 //! - a different `target_schema` setting refuses and leaves the queue for
@@ -1060,4 +1065,191 @@ async fn the_refusal_names_a_way_out_that_works_and_every_recorded_field_counts(
             "oc is built from the queued text"
         );
     }
+}
+
+/// What a user added to `o1` after the fact: unique indexes beside the key
+/// (plain, partial, expression), a deferrable unique and a `CHECK`
+/// constraint, a foreign key to another table and another table's foreign
+/// key to it, and an audit trigger.
+const USER_OBJECTS: &str = "\
+    create table public.groups (g bigint primary key); \
+    create table public.o1_audit (id bigint, op text); \
+    create function public.audit_o1() returns trigger language plpgsql as \
+      $$ begin insert into public.o1_audit values (new.id, tg_op); return new; end $$; \
+    create trigger o1_audit after insert or update on public.o1 \
+      for each row execute function public.audit_o1(); \
+    create unique index o1_b_unique_ix on public.o1 (b); \
+    create unique index o1_g_for_big_b on public.o1 (g) where b > 25; \
+    create unique index o1_double_b on public.o1 ((b * 2)); \
+    alter table public.o1 add constraint o1_b_deferred unique (b) deferrable initially deferred; \
+    alter table public.o1 add constraint o1_b_positive check (b > 0); \
+    alter table public.o1 add constraint o1_g_fkey foreign key (g) references public.groups (g); \
+    create table public.o1_notes (id bigint primary key, o1_id bigint references public.o1 (id))";
+
+/// Everything on `o1` that the user added: its indexes (the key's included),
+/// its constraints and the foreign keys referencing it (not PostgreSQL 18's
+/// `NOT NULL` entries), and its triggers (not a foreign key's internal ones
+/// or the capture triggers a reader would install).
+const O1_USER_OBJECTS: &str = "\
+    select indexdef from pg_indexes where schemaname = 'public' and tablename = 'o1' \
+    union all \
+    select conrelid::regclass || ' ' || conname || ' ' || pg_get_constraintdef(oid) \
+      from pg_constraint \
+      where (conrelid = 'public.o1'::regclass or confrelid = 'public.o1'::regclass) \
+        and contype <> 'n' \
+    union all \
+    select pg_get_triggerdef(oid) from pg_trigger \
+      where tgrelid = 'public.o1'::regclass and not tgisinternal \
+        and tgname not like 'trellis_capture_%' \
+    order by 1";
+
+/// Seals what the capture pass staged and drains it as a drain worker does,
+/// retrying a failing page until the keys it fails on are held and it
+/// commits. Bounded, not a wait for convergence.
+async fn drain_until_committed(pool: &trellis::pool::Pool, client: &mut Client) {
+    let outcome = seal::seal_phase1_waiting(client).await;
+    seal::seal_phase2(client, outcome.sealed_seg_seq, "wake")
+        .await
+        .expect("seal phase 2");
+    for _ in 0..20 {
+        match apply::drain_once(
+            pool,
+            outcome.sealed_seg_seq,
+            "dump_test",
+            1,
+            "dump_test_wake",
+        )
+        .await
+        {
+            Ok(Some(_)) => continue,
+            Ok(None) => {
+                retire_drained_segments(client).await.expect("retire");
+                return;
+            }
+            Err(_) => {}
+        }
+    }
+    panic!("the page never committed");
+}
+
+/// What a dump of a target the user added unique indexes, constraints,
+/// foreign keys and a trigger to carries, and what `migrate` does with it:
+/// the definition is adopted with every one of those objects, builds, and
+/// the user's trigger and indexes act on what Trellis writes.
+#[tokio::test]
+async fn a_restored_target_keeps_the_objects_a_user_added_and_builds() {
+    let cluster = TestCluster::start();
+    let source = cluster.create_isolated_database().await;
+    let raw = connect_raw(source.dsn()).await;
+    raw.batch_execute("create table public.orders (id bigint primary key, g bigint, a bigint)")
+        .await
+        .expect("source ddl");
+    let t = facade(source.dsn()).await;
+    t.apply("TRANSFORM o1 FROM orders SELECT g AS g, a + 1 AS b")
+        .await
+        .expect("o1");
+    build_everything(t.pool()).await;
+    raw.batch_execute(USER_OBJECTS).await.expect("user objects");
+    let objects = rows_json(&raw, O1_USER_OBJECTS).await;
+    for name in [
+        "o1_b_unique_ix",
+        "o1_g_for_big_b",
+        "o1_double_b",
+        "o1_b_deferred",
+        "o1_b_positive",
+        "o1_g_fkey",
+        "o1_notes_o1_id_fkey",
+        "TRIGGER o1_audit",
+    ] {
+        assert!(
+            objects.iter().any(|object| object.contains(name)),
+            "the source's o1 has {name}: {objects:#?}"
+        );
+    }
+
+    let structure = structure_file(&t, source.dsn()).await;
+    let loaded = cluster.create_empty_database().await;
+    load(loaded.dsn(), &structure);
+    let mut after = connect_raw(loaded.dsn()).await;
+    let t2 = facade(loaded.dsn()).await;
+    t2.migrate()
+        .await
+        .expect("migrate adopts the dumped target");
+    assert_eq!(
+        rows_json(&after, STATUSES).await,
+        ["public.o1 waiting_to_backfill"]
+    );
+    assert_eq!(rows_json(&after, O1_USER_OBJECTS).await, objects);
+
+    // The restored database is empty: the application's rows arrive, and
+    // the definition builds from them.
+    trellis::client::reconcile_pass(&mut after, t2.pool(), SCHEMA)
+        .await
+        .expect("reconcile pass on the restored database");
+    after
+        .batch_execute(
+            "insert into public.groups values (1), (2); \
+             insert into public.orders values (1, 1, 10), (2, 1, 20), (3, 2, 30)",
+        )
+        .await
+        .expect("source rows after the restore");
+    for _ in 0..3 {
+        build_everything(t2.pool()).await;
+        trellis::client::reconcile_pass(&mut after, t2.pool(), SCHEMA)
+            .await
+            .expect("reconcile pass");
+        drain_to_quiescence(t2.pool(), &mut after).await;
+    }
+    assert_eq!(
+        rows_json(&after, STATUSES).await,
+        ["public.o1 live"],
+        "the definition is live"
+    );
+    assert_eq!(
+        rows_json(&after, "select to_jsonb(t) from public.o1 t order by id").await,
+        [
+            r#"{"b": 11, "g": 1, "id": 1}"#,
+            r#"{"b": 21, "g": 1, "id": 2}"#,
+            r#"{"b": 31, "g": 2, "id": 3}"#
+        ],
+        "the target is what the source computes"
+    );
+    assert_eq!(
+        count(
+            &after,
+            "select count(*) from public.o1_audit where op = 'INSERT'"
+        )
+        .await,
+        3,
+        "the user's trigger fired for what Trellis wrote"
+    );
+    assert_eq!(rows_json(&after, O1_USER_OBJECTS).await, objects);
+
+    // A value key 2 has: the unique index refuses the write, the key is
+    // held, and the definition keeps running.
+    after
+        .batch_execute("update public.orders set a = 20 where id = 3")
+        .await
+        .expect("a value another key has");
+    trellis::client::reconcile_pass(&mut after, t2.pool(), SCHEMA)
+        .await
+        .expect("capture pass");
+    drain_until_committed(t2.pool(), &mut after).await;
+    assert_eq!(
+        rows_json(&after, "select key from poison order by key").await,
+        ["3"],
+        "the refused row's key is held"
+    );
+    let status = t2
+        .status("o1")
+        .await
+        .expect("read status")
+        .expect("o1 is registered");
+    assert_eq!(status.status, trellis::TransformStatus::Live, "{status:?}");
+    assert!(status.drain_failure.is_none(), "{status:?}");
+    assert_eq!(
+        count(&after, "select b from public.o1 where id = 3").await,
+        31,
+        "the held key keeps its last value"
+    );
 }

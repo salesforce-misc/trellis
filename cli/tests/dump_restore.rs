@@ -6,6 +6,11 @@
 //!   database restores both definitions as recorded, the reader after its
 //!   upstream, with a user's index on a target
 //!   (`a_dump_restores_a_chain_and_an_aggregate_into_an_empty_database`)
+//! - a dump of a target that carries what a user may add to any target (unique
+//!   indexes beside the key, a deferrable unique and a check constraint,
+//!   foreign keys both ways, a trigger) restores, and the restored target
+//!   carries every one of them
+//!   (`a_restore_keeps_the_unique_indexes_constraints_and_trigger_a_user_added_to_a_target`)
 //! - two dumps of the same definitions are the same bytes
 //!   (`two_dumps_of_the_same_definitions_are_the_same`)
 //! - `--definitions-only` writes just the appendix, without pg_dump
@@ -113,6 +118,45 @@ async fn source_database(cluster: &TestCluster) -> (testkit::TestDatabase, Clien
         .expect("a user's index on a target");
     (source, raw)
 }
+
+/// What a user added to `o1`, the chain's upstream target, after the fact:
+/// unique indexes beside the key (plain, partial, expression), a deferrable
+/// unique and a `CHECK` constraint, a foreign key to another table and
+/// another table's foreign key to it, and an audit trigger.
+const USER_OBJECTS: &str = "\
+    create table public.groups (g bigint primary key); \
+    insert into public.groups values (1), (2); \
+    create table public.o1_audit (id bigint, op text); \
+    create function public.audit_o1() returns trigger language plpgsql as \
+      $$ begin insert into public.o1_audit values (new.id, tg_op); return new; end $$; \
+    create trigger o1_audit after insert or update on public.o1 \
+      for each row execute function public.audit_o1(); \
+    create unique index o1_b_unique_ix on public.o1 (b); \
+    create unique index o1_g_for_big_b on public.o1 (g) where b > 25; \
+    create unique index o1_double_b on public.o1 ((b * 2)); \
+    alter table public.o1 add constraint o1_b_deferred unique (b) deferrable initially deferred; \
+    alter table public.o1 add constraint o1_b_positive check (b > 0); \
+    alter table public.o1 add constraint o1_g_fkey foreign key (g) references public.groups (g); \
+    create table public.o1_notes (id bigint primary key, o1_id bigint references public.o1 (id)); \
+    insert into public.o1_notes values (1, 1)";
+
+/// Everything on `o1` that the user added and that isn't Trellis's: its
+/// indexes (the key's included, so a changed key shows too), its
+/// constraints and the foreign keys referencing it (not PostgreSQL 18's
+/// `NOT NULL` entries), and its triggers (not a foreign key's internal ones
+/// or the capture triggers the chain's reader installs).
+const O1_USER_OBJECTS: &str = "\
+    select indexdef from pg_indexes where schemaname = 'public' and tablename = 'o1' \
+    union all \
+    select conrelid::regclass || ' ' || conname || ' ' || pg_get_constraintdef(oid) \
+      from pg_constraint \
+      where (conrelid = 'public.o1'::regclass or confrelid = 'public.o1'::regclass) \
+        and contype <> 'n' \
+    union all \
+    select pg_get_triggerdef(oid) from pg_trigger \
+      where tgrelid = 'public.o1'::regclass and not tgisinternal \
+        and tgname not like 'trellis_capture_%' \
+    order by 1";
 
 /// Polls `status` until `target` is `live`, as an operator does.
 async fn wait_for_live(trellis: &Trellis, target: &str) {
@@ -272,6 +316,64 @@ async fn a_dump_restores_a_chain_and_an_aggregate_into_an_empty_database() {
         "dump of the restored database",
     );
     assert!(dump.ends_with(&again), "{again}");
+}
+
+#[tokio::test]
+async fn a_restore_keeps_the_unique_indexes_constraints_and_trigger_a_user_added_to_a_target() {
+    let cluster = TestCluster::start();
+    let (source, raw) = source_database(&cluster).await;
+    raw.batch_execute(USER_OBJECTS).await.expect("user objects");
+    let recorded = strings(&raw, RECORDED).await;
+    let objects = strings(&raw, O1_USER_OBJECTS).await;
+    for name in [
+        "o1_b_unique_ix",
+        "o1_g_for_big_b",
+        "o1_double_b",
+        "o1_b_deferred",
+        "o1_b_positive",
+        "o1_g_fkey",
+        "o1_notes_o1_id_fkey",
+        "TRIGGER o1_audit",
+    ] {
+        assert!(
+            objects.iter().any(|object| object.contains(name)),
+            "the source's o1 has {name}: {objects:#?}"
+        );
+    }
+
+    let dir = scratch("user_objects");
+    let file = dir.join("dump.sql");
+    let file_arg = file.to_str().expect("utf8 path");
+    succeeded(
+        &trellis_cli(source.dsn(), &["dump", "--out", file_arg], None),
+        "dump",
+    );
+    let loaded = cluster.create_empty_database().await;
+    let stdout = succeeded(
+        &trellis_cli(loaded.dsn(), &["restore", file_arg], None),
+        "restore",
+    );
+    assert!(stdout.contains("restored 2 definition(s)"), "{stdout}");
+
+    let after = connect(loaded.dsn()).await;
+    assert_eq!(
+        strings(&after, RECORDED).await,
+        recorded,
+        "both definitions are restored as recorded"
+    );
+    assert_eq!(
+        strings(&after, O1_USER_OBJECTS).await,
+        objects,
+        "the adopted target keeps every object the user added"
+    );
+    assert_eq!(
+        strings(
+            &after,
+            "select status from trellis.transform_definitions order by id"
+        )
+        .await,
+        ["waiting_to_backfill", "waiting_to_backfill"]
+    );
 }
 
 /// `dump` without pg_dump's `\restrict` lines, whose key `pg_dump` 15.14,
