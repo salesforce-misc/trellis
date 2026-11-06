@@ -841,3 +841,66 @@ mod one_snapshot_tests {
         assert!(is_met(&checker, "public.t", &columns).await.expect("again"));
     }
 }
+
+/// [`is_met`]'s decoding of its one row per index, or one row of `NULL`s
+/// when the table or the columns are not there or the table has no
+/// qualifying index.
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use tokio_postgres::NoTls;
+
+    fn columns(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn an_absent_table_or_column_is_met_and_a_table_without_a_qualifying_index_is_not() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_empty_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create table public.bare (g text, v integer); \
+                 create table public.t (g text, v integer, w integer); \
+                 create index on public.t (v, g); \
+                 create index on public.t (g, v) where v > 0; \
+                 create index on public.t using hash (g); \
+                 create index on public.t (g, v);",
+            )
+            .await
+            .expect("tables");
+        let gv = columns(&["g", "v"]);
+        assert!(
+            is_met(&client, "public.absent", &gv)
+                .await
+                .expect("absent table")
+        );
+        assert!(
+            is_met(&client, "public.t", &columns(&["g", "gone"]))
+                .await
+                .expect("absent column")
+        );
+        assert!(
+            is_met(&client, "public.bare", &columns(&["gone"]))
+                .await
+                .expect("absent column, no index")
+        );
+        assert!(!is_met(&client, "public.bare", &gv).await.expect("no index"));
+        assert!(
+            is_met(&client, "public.t", &gv)
+                .await
+                .expect("one qualifying index of four")
+        );
+        assert!(
+            !is_met(&client, "public.t", &columns(&["w"]))
+                .await
+                .expect("none leads with w")
+        );
+    }
+}
