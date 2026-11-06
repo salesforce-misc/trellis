@@ -538,9 +538,8 @@ fn virtual_column_error(table: &str, column: &str, expression: &str) -> String {
 /// drops the old index before the new one exists pauses when a pass lands
 /// between the two; one that creates the new index first never does. A
 /// resume re-validates the definition as define would, so it is refused
-/// until the key is back, and then rebuilds the target, `R` and `M`. Nothing
-/// is downstream of the definition: no transform may read a 1-1 `JOIN`'s
-/// target (`defs::join_one_to_one::reject_reader_of_target`).
+/// until the key is back, and then rebuilds the target, `R` and `M`, staging
+/// the rows it rewrites for the target's readers.
 ///
 /// One catalog query per such definition, skipped while `table`'s
 /// fingerprint (`drift`, read before any check) is the one its last check

@@ -3267,13 +3267,6 @@ async fn create_definition_inner(
     // The authoritative check (`install_definition` repeats it
     // earlier, before any DDL, as a fail-fast).
     reject_non_live_upstream(&*txn, &qualified_source, restoring.is_some()).await?;
-    // No transform reads a 1-1 JOIN's target (ADR-0021).
-    super::join_one_to_one::reject_reader_of_target(
-        &*txn,
-        pool.floors(),
-        &[qualified_source.as_str()],
-    )
-    .await?;
     // A JOIN's joined table resolves the way its `FROM` does, and is
     // held to the same checks. Its columns are read here, in this
     // transaction, for the catalog row and the hidden tables.
@@ -3294,12 +3287,6 @@ async fn create_definition_inner(
                 },
             };
             reject_non_live_upstream(&*txn, &joined, restoring.is_some()).await?;
-            super::join_one_to_one::reject_reader_of_target(
-                &*txn,
-                pool.floors(),
-                &[joined.as_str()],
-            )
-            .await?;
             let sides = JoinSides::read(&*txn, qualified_source.clone(), joined).await?;
             super::validate::validate_join(&def, &sides.from_columns, &sides.joined_columns)?;
             reject_virtual_join_reads(&def, &sides)?;
@@ -3427,11 +3414,6 @@ async fn create_definition_inner(
     // Not in a catalog schema, this instance's or another's. Before
     // any DDL, so nothing is created there.
     reject_target_in_catalog_schema(&*txn, pool.schema(), &qualified_target).await?;
-    // No transform reads a 1-1 JOIN's target (ADR-0021), even one defined
-    // over a table of the target's name that has since been dropped.
-    if super::join::is_one_to_one(&def) {
-        super::join_one_to_one::reject_target_with_reader(&*txn, &qualified_target).await?;
-    }
     // The test-fixture entry points (`target_ddl` is `None`) register against
     // a target their caller already created; `install_definition` creates it
     // below, after every check on the definition itself.
@@ -4982,11 +4964,6 @@ pub(crate) async fn revalidate(
     let source = definition.source_table.as_str();
     reject_target_in_catalog_schema(txn, schema, &definition.target_table).await?;
     let joined = join_table_of(txn, definition.id).await?;
-    // No transform reads a 1-1 JOIN's target (ADR-0021), even one whose
-    // table took the name of a source dropped while this one was paused.
-    let mut read = vec![source];
-    read.extend(joined.as_deref());
-    super::join_one_to_one::reject_reader_of_target(txn, floors, &read).await?;
     if let Some(joined) = joined {
         return revalidate_join(txn, schema, floors, definition, joined).await;
     }

@@ -242,7 +242,6 @@ entries whose key has lost its last live `b` row.
   holds more than 250k, a key whose `b` change takes seconds to reach every
   row. The count is a sample of `R`'s join-key index, not `pg_stats`, which
   is stale after a build.
-- No transform may read a 1-1 JOIN target.
 
 ### A row a page fails to write is held in the page
 

@@ -433,7 +433,7 @@ async fn make_live(raw: &Client, target: &str) {
 }
 
 #[tokio::test]
-async fn a_one_to_one_target_side_needs_its_primary_key_and_no_transform_reads_a_one_to_one_join_target()
+async fn a_one_to_one_target_side_needs_its_primary_key_and_any_transform_reads_a_one_to_one_join_target()
  {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
@@ -490,8 +490,12 @@ async fn a_one_to_one_target_side_needs_its_primary_key_and_no_transform_reads_a
     );
     assert!(err.to_string().contains("primary key"), "{err}");
 
-    // Nothing reads a 1-1 JOIN's target, whatever the reader's key space.
+    // Any key space reads a 1-1 JOIN's target: a 1-1 reader, an aggregate,
+    // and a JOIN of either kind that joins it on its primary key.
     make_live(&raw, "by_pk").await;
+    raw.batch_execute("create index on public.by_pk (who)")
+        .await
+        .expect("index the aggregate reader's GROUP BY column");
     let columns = HashMap::from([
         (
             "id".to_string(),
@@ -507,17 +511,9 @@ async fn a_one_to_one_target_side_needs_its_primary_key_and_no_transform_reads_a
         "TRANSFORM rd4 FROM customers LEFT JOIN by_pk ON customers.id = by_pk.id \
          SELECT by_pk.who AS w",
     ] {
-        let err = install_definition(&db.pool, text, &columns, "public")
+        install_definition(&db.pool, text, &columns, "public")
             .await
-            .expect_err("a reader of a 1-1 JOIN target is refused");
-        assert!(
-            matches!(
-                err,
-                CatalogError::Validate(ValidationError::OneToOneJoinTargetRead { .. })
-            ),
-            "{text}: {err:?}"
-        );
-        assert!(err.to_string().contains("1-1 JOIN"), "{err}");
+            .unwrap_or_else(|err| panic!("{text}: a reader of a 1-1 JOIN target defines: {err}"));
     }
 }
 
@@ -1389,83 +1385,107 @@ async fn a_resume_waits_out_an_in_flight_chunk_before_recreating_the_hidden_tabl
     );
 }
 
-/// No transform reads a 1-1 JOIN target, however it came to: a 1-1 JOIN
-/// whose target would take the name of a table another definition reads (its
-/// `FROM` or its joined table, dropped since) is refused at define and
-/// leaves nothing, whether that reader is still running (the staging worker
-/// would never pause it for its dropped source once the name is a target's)
-/// or paused (its `RESUME` would read the target). With the readers dropped,
-/// it defines.
+/// The rows of `table` as `id:who`.
+async fn id_who(raw: &Client, table: &str) -> Vec<String> {
+    raw.query(
+        &format!("select id::text || ':' || coalesce(who, '') from {table} order by id"),
+        &[],
+    )
+    .await
+    .expect("read id and who")
+    .iter()
+    .map(|row| row.get(0))
+    .collect()
+}
+
+/// A 1-1 JOIN may take the name of a table another definition reads (its
+/// `FROM`, dropped since) like any other target: here the reader is paused
+/// first, so its `RESUME` rebuilds it from the 1-1 JOIN's target, dropping
+/// the rows of the table that went. (A reader still running when the name is
+/// taken keeps them: `docs/known-correctness-gaps.md`.)
 #[tokio::test]
-async fn a_one_to_one_join_whose_target_takes_the_name_of_a_read_table_is_refused() {
+async fn a_one_to_one_join_may_take_the_name_of_a_paused_readers_dropped_source() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
-    let raw = connect_raw(db.dsn()).await;
+    let mut raw = connect_raw(db.dsn()).await;
     raw.batch_execute(TABLES).await.expect("seed");
-    raw.batch_execute("create table public.shadow (id integer primary key, who text)")
-        .await
-        .expect("the readers' table");
+    raw.batch_execute(
+        "create table public.shadow (id integer primary key, who text); \
+         insert into public.shadow values (1, 'old1'), (7, 'old7')",
+    )
+    .await
+    .expect("the reader's table");
     let trellis = define_only(db.dsn()).await;
     trellis
         .apply("TRANSFORM shadow_copy FROM shadow SELECT who AS who")
         .await
-        .expect("define the FROM reader");
-    trellis
-        .apply(
-            "TRANSFORM by_who FROM orders JOIN shadow ON orders.cust = shadow.id \
-             GROUP BY shadow.who WITHOUT SOURCE INDEX SELECT shadow.who AS who, COUNT(*) AS n",
-        )
-        .await
-        .expect("define the joined-table reader");
-    raw.batch_execute("drop table public.shadow")
-        .await
-        .expect("drop the readers' table");
-    const TAKES_THE_NAME: &str = "TRANSFORM shadow FROM orders LEFT JOIN customers \
-                                  ON orders.cust = customers.id SELECT customers.name AS who";
-    let refused = |reader: &'static str| {
-        move |err: CatalogError| {
-            assert!(
-                matches!(
-                    &err,
-                    CatalogError::Validate(ValidationError::OneToOneJoinTargetHasReader {
-                        target, reader: r,
-                    }) if target == "public.shadow" && r == &format!("public.{reader}")
-                ),
-                "{err:?}"
-            );
-        }
-    };
-
-    refused("shadow_copy")(define_err(&db.pool, TAKES_THE_NAME).await);
-    assert_nothing_registered(&db.pool, "shadow").await;
+        .expect("define the reader");
+    pass(&mut raw, &db.pool).await;
+    pass(&mut raw, &db.pool).await;
+    trellis::staging::build::settle_builds(&db.pool).await;
+    assert_eq!(
+        id_who(&raw, "public.shadow_copy").await,
+        ["1:old1", "7:old7"]
+    );
     trellis
         .apply("PAUSE TRANSFORM shadow_copy")
         .await
-        .expect("pause the FROM reader");
-    refused("shadow_copy")(define_err(&db.pool, TAKES_THE_NAME).await);
+        .expect("pause the reader");
+    raw.batch_execute("drop table public.shadow")
+        .await
+        .expect("drop the reader's table");
     trellis
-        .apply("DROP TRANSFORM shadow_copy")
+        .apply(
+            "TRANSFORM shadow FROM orders LEFT JOIN customers \
+             ON orders.cust = customers.id SELECT customers.name AS who",
+        )
         .await
-        .expect("drop the FROM reader");
-    refused("by_who")(define_err(&db.pool, TAKES_THE_NAME).await);
-    assert_nothing_registered(&db.pool, "shadow").await;
+        .expect("the 1-1 JOIN takes the name");
+    pass(&mut raw, &db.pool).await;
+    pass(&mut raw, &db.pool).await;
+    trellis::staging::build::settle_builds(&db.pool).await;
+    drain(&mut raw, &db.pool).await;
+    assert_eq!(
+        status(&trellis, "shadow").await,
+        Some(TransformStatus::Live)
+    );
     trellis
-        .apply("PAUSE TRANSFORM by_who")
+        .apply("RESUME TRANSFORM shadow_copy")
         .await
-        .expect("pause the joined-table reader");
-    trellis
-        .apply("DROP TRANSFORM by_who")
+        .expect("resume the reader");
+    for _ in 0..2 {
+        pass(&mut raw, &db.pool).await;
+        trellis::staging::build::settle_builds(&db.pool).await;
+        drain(&mut raw, &db.pool).await;
+    }
+    assert_eq!(
+        status(&trellis, "shadow_copy").await,
+        Some(TransformStatus::Live)
+    );
+    assert_eq!(
+        id_who(&raw, "public.shadow").await,
+        ["1:ann", "2:bob", "3:"]
+    );
+    assert_eq!(
+        id_who(&raw, "public.shadow_copy").await,
+        id_who(&raw, "public.shadow").await,
+        "the resumed reader reads the 1-1 JOIN's target"
+    );
+    // The reader now follows the target's changes.
+    raw.batch_execute("update public.customers set name = 'anne' where id = 1")
         .await
-        .expect("drop the joined-table reader");
-    install_definition(&db.pool, TAKES_THE_NAME, &HashMap::new(), "public")
+        .expect("a b change");
+    drain(&mut raw, &db.pool).await;
+    trellis::staging::one_to_one_join_run_pending_fan_outs(&db.pool)
         .await
-        .expect("with no reader of the name, the 1-1 JOIN defines");
+        .expect("run the fan-out");
+    drain(&mut raw, &db.pool).await;
+    assert_eq!(
+        id_who(&raw, "public.shadow_copy").await,
+        ["1:anne", "2:bob", "3:"]
+    );
 }
 
-/// A rebuild of a live 1-1 JOIN in place (`request_backfill`, which also
-/// starts a rebuild after an uncaptured change) re-derives every entry and
-/// turns the ones whose rows are gone into tombstones: the target ends equal
-/// to the live join, and the definition goes live again with no sweep job.
 #[tokio::test]
 async fn a_rebuild_in_place_drops_the_entries_whose_rows_are_gone() {
     let cluster = TestCluster::start();
@@ -1583,4 +1603,73 @@ async fn a_qualified_read_of_a_reserved_word_column_is_copied_under_its_name() {
     .await;
     assert!(err.to_string().contains("elsewhere.order"), "{err}");
     assert_nothing_registered(&db.pool, "neither").await;
+}
+
+/// A reader of a 1-1 JOIN target is altered like any reader, and keeps the
+/// 1-1 JOIN from being dropped until it is dropped itself.
+#[tokio::test]
+async fn a_reader_of_a_one_to_one_join_alters_and_blocks_its_drop() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect_raw(db.dsn()).await;
+    raw.batch_execute(TABLES).await.expect("seed");
+    let trellis = define_only(db.dsn()).await;
+    trellis.apply(LEFT_JOIN).await.expect("define the 1-1 JOIN");
+    pass(&mut raw, &db.pool).await;
+    pass(&mut raw, &db.pool).await;
+    trellis::staging::build::settle_builds(&db.pool).await;
+    trellis
+        .apply("TRANSFORM rd FROM order_view SELECT who AS w")
+        .await
+        .expect("define the reader");
+    pass(&mut raw, &db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
+    drain(&mut raw, &db.pool).await;
+    trellis
+        .apply("ALTER TRANSFORM rd ADD doubled AS d")
+        .await
+        .expect("alter the reader");
+    pass(&mut raw, &db.pool).await;
+    trellis::intake::harness::settle_builds(&db.pool).await;
+    drain(&mut raw, &db.pool).await;
+    assert_eq!(
+        raw.query("select id, w, d::text from public.rd order by id", &[])
+            .await
+            .expect("the reader")
+            .iter()
+            .map(|row| (
+                row.get::<_, i32>(0),
+                row.get::<_, Option<String>>(1),
+                row.get::<_, String>(2)
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, Some("ann".to_string()), "20.00".to_string()),
+            (2, Some("bob".to_string()), "11.00".to_string()),
+            (3, None, "2.50".to_string()),
+        ]
+    );
+    trellis
+        .apply("PAUSE TRANSFORM order_view")
+        .await
+        .expect("pause the 1-1 JOIN");
+    let err = trellis
+        .apply("DROP TRANSFORM order_view")
+        .await
+        .expect_err("a reader blocks the drop");
+    assert!(
+        matches!(
+            &err,
+            trellis::TrellisError::Catalog(CatalogError::DependentsBlockDrop { dependents, .. })
+                if dependents == &["rd".to_string()]
+        ),
+        "{err:?}"
+    );
+    for statement in [
+        "PAUSE TRANSFORM rd",
+        "DROP TRANSFORM rd",
+        "DROP TRANSFORM order_view",
+    ] {
+        trellis.apply(statement).await.expect(statement);
+    }
 }

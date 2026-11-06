@@ -91,9 +91,7 @@
 //! applies them as each page and chunk commits, so between two chunks it may
 //! see a key's rows joined partly to the old `b` row and partly to the new:
 //! the read contract, exact after `await_converged`, which the marker holds
-//! back. Define still refuses a reader, and a write refuses one at apply
-//! time (#1617); a test admits one
-//! (`crate::defs::join_one_to_one::admit_readers_for_tests`).
+//! back.
 //!
 //! # A `TRUNCATE` ([`truncate_sides`], [`lock_definitions`], [`start_rebuilds`])
 //!
@@ -2087,14 +2085,6 @@ async fn write_target(
         return Ok((0, 0));
     }
     let image_sql = mutations.image_sql(txn, &shape.target, "t").await?;
-    // Define refuses a reader of a 1-1 JOIN target until every writer of
-    // one stages for readers (#1617); a test may admit one.
-    if image_sql.is_some() && !crate::defs::join_one_to_one::readers_admitted() {
-        return Err(ApplyError::GroupBasisUnsupported {
-            target: shape.target.clone(),
-            what: "a reader of a 1-1 JOIN target",
-        });
-    }
     let arity = shape.pk.len();
     let target = ddl::qualified_target_table_ident(&shape.target);
     // A key with a `NULL` part is a row of an `a` that is keyed by a nullable

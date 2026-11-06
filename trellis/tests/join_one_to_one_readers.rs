@@ -7,18 +7,19 @@
 //! reach the target through a page or a build (a `TRUNCATE` of either side,
 //! a producer's Re-derives, a `RESUME`) the second.
 //!
-//! Define refuses a reader of a 1-1 `JOIN` target until its refusals are
-//! lifted (#1713), so these tests admit readers through the test-only switch
-//! (`admit_readers_for_tests`). The tables start empty and every row arrives
-//! through pages; the build-writer scenarios then write past capture, or
-//! pause the transform, so only the writer under test finds the change.
+//! The readers are defined through define, as any transform is. The tables
+//! start empty and every row arrives through pages; the build-writer
+//! scenarios then write past capture, or pause the transform, so only the
+//! writer under test finds the change.
 //!
-//! Two readers read the target: an aggregate on the group basis, which
-//! applies each change's images as a delta, and a 1-1 transform. The chunk
-//! is shrunk to two rows over a key of seven `a` rows, and pages and chunks
-//! are driven by hand (`support/drain_driver.rs`), frozen at a
-//! [`PausePoint`] where a scenario needs it. Nothing sleeps or polls for
-//! convergence. Each scenario runs on both join kinds.
+//! Four readers read the target: an aggregate on the group basis, which
+//! applies each change's images as a delta, a 1-1 transform, an aggregate of
+//! that 1-1 transform (a chain), and a 1-1 `JOIN` of `a` with the target on
+//! its primary key (the target as a `b` side). The chunk is shrunk to two
+//! rows over a key of seven `a` rows, and pages and chunks are driven by hand
+//! (`support/drain_driver.rs`), frozen at a [`PausePoint`] where a scenario
+//! needs it. Nothing sleeps or polls for convergence. Each scenario runs on
+//! both join kinds.
 //!
 //! - a reader's page races a chunk both ways: a chunk frozen before its
 //!   commit while the reader drains the rows the last chunk staged, and the
@@ -32,14 +33,19 @@
 //! - a rebuild in place, a `TRUNCATE` of `a`, a `TRUNCATE` of `b` and its
 //!   rebuild, a producer's Re-derives, a `RESUME`'s rebuild and a quarantine
 //!   release, each run to its end;
+//! - a widening of a column the target copies, whose `RESUME` pauses and
+//!   resumes the readers down the chain;
 //!
-//! each ending with every reader equal to its source and the token taken
-//! after the scenario's writes converged.
+//! each ending with every reader equal to its source, `self_check` clean on
+//! the target and every reader, and the token taken after the scenario's
+//! writes converged. A reader's own field failing on a row the target holds
+//! holds that key for that reader alone, as for a reader of any target.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use drain_driver::Driver;
 use trellis::defs::ValueType;
@@ -47,6 +53,7 @@ use trellis::dev::defs::set_one_to_one_join_fan_out_chunk_rows;
 use trellis::integer::IntWidth;
 use trellis::staging::OneToOneJoinFanOutStep;
 use trellis::staging::interleave::PausePoint;
+use trellis::staging::self_check::{SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page};
 
 const DDL: &str = "create table public.a (id integer primary key, k integer, x integer, \
                        y text); \
@@ -82,7 +89,6 @@ impl Drop for Chunked {
 async fn chunked() -> Chunked {
     let serial = SERIAL.lock().await;
     set_one_to_one_join_fan_out_chunk_rows(CHUNK);
-    trellis::defs::join_one_to_one::admit_readers_for_tests();
     Chunked { _serial: serial }
 }
 
@@ -126,12 +132,35 @@ impl Kind {
     fn copy(self) -> String {
         format!("public.{}_copy", self.name())
     }
+
+    /// The reader of the 1-1 reader: an aggregate.
+    fn chain(self) -> String {
+        format!("public.{}_chain", self.name())
+    }
+
+    /// The `LEFT` 1-1 `JOIN` of `a` with the target, on its primary key.
+    fn over(self) -> String {
+        format!("public.{}_over", self.name())
+    }
+
+    /// Every target the scenarios keep exact.
+    fn targets(self) -> [String; 5] {
+        [
+            self.target(),
+            self.sums(),
+            self.copy(),
+            self.chain(),
+            self.over(),
+        ]
+    }
 }
 
-/// `kind` and its two readers over empty tables, built and live, `a` and
-/// `b` captured; then `a`'s rows and `b`'s, each a page of its own, and
+/// `kind` and its readers over empty tables, built and live, `a` and `b`
+/// captured; then `a`'s rows and `b`'s, each a page of its own, and
 /// everything settled. The `b` page fans key 20 out itself and leaves key 10
-/// to chunks.
+/// to chunks. The readers: an aggregate and a 1-1 transform of the target, an
+/// aggregate of that 1-1 reader (a chain), and a 1-1 `JOIN` of `a` with the
+/// target on its primary key (the target as a `b` side).
 async fn start(kind: Kind) -> Driver {
     let columns = [
         ("id", int4()),
@@ -175,10 +204,32 @@ async fn start(kind: Kind) -> Driver {
             kind.name(),
             kind.target()
         ),
+        format!(
+            "TRANSFORM {}_chain FROM {} GROUP BY tag \
+             SELECT tag AS tag, SUM(less) AS s, COUNT(*) AS n",
+            kind.name(),
+            kind.copy()
+        ),
+        format!(
+            "TRANSFORM {name}_over FROM public.a LEFT JOIN {target} ON a.id = {name}.id \
+             SELECT {name}.total AS t, a.y AS y",
+            name = kind.name(),
+            target = kind.target()
+        ),
     ] {
+        let mut columns = columns.clone();
+        if reader.contains("_chain") {
+            d.ctl
+                .batch_execute(&format!("create index on {} (tag)", kind.copy()))
+                .await
+                .expect("index the 1-1 reader's tag");
+            columns.insert("less".to_string(), int4());
+        }
         trellis::defs::install_definition(d.pool(), &reader, &columns, "public")
             .await
-            .expect("define a reader");
+            .unwrap_or_else(|err| panic!("define a reader: {reader}: {err}"));
+        // The chain reads the 1-1 reader, which must be live first.
+        trellis::intake::harness::settle_builds(d.pool()).await;
     }
     trellis::intake::harness::settle_builds(d.pool()).await;
     d.settle().await;
@@ -306,6 +357,73 @@ async fn assert_exact(d: &mut Driver, kind: Kind, after: &str) {
         copy, copy_source,
         "{kind:?}: the 1-1 reader (left) differs from its source (right) after {after}"
     );
+    let chain = d
+        .rows(&format!(
+            "select tag, s, n from {} order by tag",
+            kind.chain()
+        ))
+        .await;
+    let chain_source = d
+        .rows(&format!(
+            "select tag, sum(less), count(*) from {} group by tag order by tag",
+            kind.copy()
+        ))
+        .await;
+    assert_eq!(
+        chain, chain_source,
+        "{kind:?}: the chained reader (left) differs from its source (right) after {after}"
+    );
+    let over = d
+        .rows(&format!("select id, t, y from {} order by id", kind.over()))
+        .await;
+    let over_source = d
+        .rows(&format!(
+            "select a.id, j.total, a.y from public.a a left join {} j on a.id = j.id \
+             order by a.id",
+            kind.target()
+        ))
+        .await;
+    assert_eq!(
+        over, over_source,
+        "{kind:?}: the 1-1 JOIN over the target (left) differs from its join (right) after \
+         {after}"
+    );
+    for target in kind.targets() {
+        assert_self_check_clean(d, &target, after).await;
+    }
+}
+
+/// Every page of `target`'s `self_check` comparison finds nothing.
+async fn assert_self_check_clean(d: &Driver, target: &str, after: &str) {
+    let mut scope_after = None;
+    loop {
+        let page = check_page(
+            d.pool(),
+            target,
+            SelfCheckScope {
+                after: scope_after,
+                limit: 3,
+            },
+            SelfCheckMode::Standard,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("a page of {target}'s check after {after}: {err}"));
+        assert_eq!(
+            page.outcome,
+            SelfCheckOutcome::Converged,
+            "{target}: self_check after {after}"
+        );
+        assert!(
+            page.held_keys.is_none(),
+            "{target}: no held key after {after}: {:?}",
+            page.held_keys
+        );
+        scope_after = page.next_after;
+        if scope_after.is_none() {
+            return;
+        }
+    }
 }
 
 /// The current WAL insert position: a watermark token for every commit so far.
@@ -685,12 +803,18 @@ async fn a_rebuild_reaches_the_readers() {
         )
         .await;
         past_capture(&d, "public.a", "delete from public.a where id = 5").await;
-        trellis(&d)
-            .await
+        let trellis = trellis(&d).await;
+        trellis
             .request_backfill("public.b")
             .await
             .expect("request a rebuild");
         assert_eq!(status(&d, kind).await, "backfilling", "{kind:?}");
+        // The 1-1 JOIN over the target reads `a` too, and capture missed
+        // `a`'s delete for it as well.
+        trellis
+            .request_backfill("public.a")
+            .await
+            .expect("request a rebuild of a's readers");
         let token = token(&d).await;
         run_builds(&d).await;
         assert!(
@@ -833,5 +957,172 @@ async fn a_quarantine_release_reaches_the_readers() {
             d.rows("select key from poison").await.is_empty(),
             "{kind:?}"
         );
+    }
+}
+
+/// A reader's own field failing on a row the 1-1 `JOIN` wrote (`total * 2`
+/// overflows `int4`) holds that key for that reader alone, as for a reader
+/// of any target: each failed drain charges the key, the drain at the death
+/// threshold evicts it and commits the rest, and the other readers apply the
+/// row. Once the cause is gone, a release brings the reader back to its
+/// source.
+#[tokio::test]
+async fn a_readers_failing_field_holds_the_key_for_that_reader_alone() {
+    let _chunked = chunked().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        let double = format!("{}_double", kind.name());
+        let columns: HashMap<String, ValueType> = [("total".to_string(), int4())].into();
+        trellis::defs::install_definition(
+            d.pool(),
+            &format!(
+                "TRANSFORM {double} FROM {} SELECT total * 2 AS twice",
+                kind.target()
+            ),
+            &columns,
+            "public",
+        )
+        .await
+        .expect("define the doubling reader");
+        trellis::intake::harness::settle_builds(d.pool()).await;
+        d.settle().await;
+
+        // The 1-1 JOIN writes row 8 (`total` fits), and stages it.
+        step(&mut d, "update public.a set x = 1500000000 where id = 8").await;
+        let batch = d.seal().await;
+        let mut failures = 0;
+        loop {
+            match trellis::staging::apply::drain_once(
+                d.pool(),
+                batch,
+                "readers",
+                1,
+                drain_driver::WAKE,
+            )
+            .await
+            {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(err) => {
+                    assert!(
+                        err.to_string().contains("integer out of range"),
+                        "{kind:?}: {err}"
+                    );
+                    failures += 1;
+                    assert!(failures < 20, "{kind:?}: the batch never drained");
+                }
+            }
+        }
+        assert_eq!(
+            failures,
+            trellis::staging::DEFAULT_DEATH_THRESHOLD as usize - 1,
+            "{kind:?}: the drains before the threshold surface the failure, the one at it \
+             evicts the key"
+        );
+        let double_id: i64 = d
+            .ctl
+            .query_one(
+                "select id from transform_definitions where target_table = $1",
+                &[&format!("public.{double}")],
+            )
+            .await
+            .expect("the doubling reader")
+            .get(0);
+        assert_eq!(
+            d.rows("select transform_id, src_table, key from poison")
+                .await,
+            [format!("({double_id},{},8)", kind.target())],
+            "{kind:?}: key 8 is held for the doubling reader alone"
+        );
+        let copy = d
+            .rows(&format!("select less from {} where id = 8", kind.copy()))
+            .await;
+        assert_eq!(
+            copy,
+            ["(1500000199)"],
+            "{kind:?}: the 1-1 reader applied row 8"
+        );
+
+        // The cause goes; the release re-derives the key for the reader.
+        step(&mut d, "update public.a set x = 8 where id = 8").await;
+        drain_ring(&mut d).await;
+        let held =
+            trellis::staging::quarantine::release_key(d.pool(), &double, &kind.target(), "8")
+                .await
+                .expect("release the key");
+        assert_eq!(held, 1, "{kind:?}: row 8 had its parked work");
+        assert_exact(&mut d, kind, "a release of the reader's key").await;
+        assert_eq!(
+            d.rows(&format!(
+                "select id, twice from public.{double} order by id"
+            ))
+            .await,
+            d.rows(&format!(
+                "select id, total * 2 from {} order by id",
+                kind.target()
+            ))
+            .await,
+            "{kind:?}: the doubling reader equals its source"
+        );
+        assert_self_check_clean(&d, &format!("public.{double}"), "the release").await;
+    }
+}
+
+/// Every definition's status, in definition order.
+async fn statuses(d: &Driver) -> Vec<String> {
+    d.rows("select status::text from transform_definitions order by id")
+        .await
+}
+
+/// Runs the staging worker's capture pass twice.
+async fn capture_passes(d: &mut Driver) {
+    let pool = d.pool().clone();
+    for _ in 0..2 {
+        trellis::client::reconcile_pass(&mut d.ctl, &pool, trellis::config::DEFAULT_SCHEMA)
+            .await
+            .expect("a capture pass");
+    }
+}
+
+/// A widening of a column the 1-1 `JOIN` copies (`a.x`, into `total`) pauses
+/// it. Its `RESUME` re-types the target's column, which pauses the readers
+/// whose own columns it outgrew, and each resumes on its own once its
+/// upstream is live, down the chain; then a value only the wider type holds
+/// reaches every reader.
+#[tokio::test]
+async fn a_widening_resumes_down_the_readers() {
+    let _chunked = chunked().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        d.ctl
+            .batch_execute("alter table public.a alter column x type bigint")
+            .await
+            .expect("widen a.x");
+        capture_passes(&mut d).await;
+        assert_eq!(
+            statuses(&d).await,
+            ["(paused)", "(live)", "(live)", "(live)", "(live)"],
+            "{kind:?}: the widening paused the 1-1 JOIN"
+        );
+        trellis(&d)
+            .await
+            .apply(&format!("RESUME TRANSFORM {}", kind.name()))
+            .await
+            .expect("resume");
+        for _ in 0..3 {
+            capture_passes(&mut d).await;
+            trellis::intake::harness::start_registered_builds(d.pool())
+                .await
+                .expect("start the resumed builds");
+            run_builds(&d).await;
+            d.settle().await;
+        }
+        assert_eq!(
+            statuses(&d).await,
+            ["(live)"; 5],
+            "{kind:?}: every reader resumed"
+        );
+        step(&mut d, "update public.a set x = 3000000000 where id = 1").await;
+        assert_exact(&mut d, kind, "a widening").await;
     }
 }

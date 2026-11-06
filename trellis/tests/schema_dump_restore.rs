@@ -38,6 +38,8 @@
 //! - a row differing only in its `JOIN` table or grammar version refuses
 //!   too, and the way out the refusal names works end to end
 //!   (`the_refusal_names_a_way_out_that_works_and_every_recorded_field_counts`)
+//! - readers of a 1-1 `JOIN` target are queued after it and restore and
+//!   build like any chain (`readers_of_a_one_to_one_join_restore_after_it`)
 
 use std::process::Command;
 
@@ -1252,4 +1254,87 @@ async fn a_restored_target_keeps_the_objects_a_user_added_and_builds() {
         31,
         "the held key keeps its last value"
     );
+}
+
+/// Builds, captures and drains `t`'s database until every definition settles.
+async fn settle(t: &Trellis, raw: &mut Client) {
+    for _ in 0..3 {
+        build_everything(t.pool()).await;
+        trellis::client::reconcile_pass(raw, t.pool(), SCHEMA)
+            .await
+            .expect("capture pass");
+        drain_to_quiescence(t.pool(), raw).await;
+    }
+}
+
+/// An aggregate and a 1-1 reader of a 1-1 `JOIN`'s target are dumped after
+/// it, and restore and build the rows the source database has.
+#[tokio::test]
+async fn readers_of_a_one_to_one_join_restore_after_it() {
+    let cluster = TestCluster::start();
+    let source = cluster.create_isolated_database().await;
+    let mut raw = connect_raw(source.dsn()).await;
+    raw.batch_execute(SOURCE_DDL).await.expect("source ddl");
+    raw.batch_execute(SOURCE_ROWS).await.expect("source rows");
+    let t = facade(source.dsn()).await;
+    t.apply(
+        "TRANSFORM ov FROM orders LEFT JOIN cats ON orders.cat_id = cats.id \
+         SELECT cats.name AS who, orders.a * 2 AS twice",
+    )
+    .await
+    .expect("ov");
+    settle(&t, &mut raw).await;
+    for statement in [
+        "TRANSFORM ov_sums FROM ov GROUP BY who WITHOUT SOURCE INDEX \
+         SELECT who AS who, SUM(twice) AS total",
+        "TRANSFORM ov_copy FROM ov SELECT twice + 1 AS more",
+    ] {
+        t.apply(statement).await.expect(statement);
+    }
+    settle(&t, &mut raw).await;
+    let statuses = rows_json(&raw, STATUSES).await;
+    assert!(
+        statuses.iter().all(|s| s.ends_with(" live")),
+        "{statuses:?}"
+    );
+
+    let structure = structure_file(&t, source.dsn()).await;
+    let appendix = structure
+        .split_once("-- Trellis definitions (")
+        .expect("appendix")
+        .1;
+    let ov_at = appendix.find("'public.ov',").expect("ov row");
+    for reader in ["'public.ov_sums'", "'public.ov_copy'"] {
+        let at = appendix
+            .find(reader)
+            .unwrap_or_else(|| panic!("{reader}: {appendix}"));
+        assert!(ov_at < at, "{reader} after ov: {appendix}");
+    }
+
+    let loaded = cluster.create_empty_database().await;
+    load(loaded.dsn(), &structure);
+    let mut after = connect_raw(loaded.dsn()).await;
+    let t2 = facade(loaded.dsn()).await;
+    t2.migrate().await.expect("migrate restores the queue");
+    after
+        .batch_execute(SOURCE_ROWS)
+        .await
+        .expect("source rows after the restore");
+    for _ in 0..2 {
+        settle(&t2, &mut after).await;
+    }
+    let statuses = rows_json(&after, STATUSES).await;
+    assert!(
+        statuses.iter().all(|s| s.ends_with(" live")),
+        "{statuses:?}"
+    );
+    for target in ["ov", "ov_sums", "ov_copy"] {
+        let sql = format!("select to_jsonb(t) from public.{target} t");
+        let mut want = rows_json(&raw, &sql).await;
+        assert!(!want.is_empty(), "the source's {target} has rows");
+        want.sort();
+        let mut got = rows_json(&after, &sql).await;
+        got.sort();
+        assert_eq!(got, want, "{target}");
+    }
 }

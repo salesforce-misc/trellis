@@ -31,6 +31,7 @@ wrong rows, on the targets it compares
 | [An enum label renamed and added again](#an-enum-label-renamed-and-added-again) | `self_check` | documented |
 | [A read column's name swapped with another's and back within one pass](#a-read-columns-name-swapped-with-anothers-and-back-within-one-pass) | `self_check` | [#1586](https://github.com/salesforce-misc/trellis/issues/1586) |
 | [A read column given a nondeterministic collation](#a-read-column-given-a-nondeterministic-collation) | `self_check` | [#1643](https://github.com/salesforce-misc/trellis/issues/1643) (research) |
+| [A read table dropped and its name taken by a target within one pass](#a-read-table-dropped-and-its-name-taken-by-a-target-within-one-pass) | `self_check` | [#1723](https://github.com/salesforce-misc/trellis/issues/1723) (research) |
 | **Writes past a unique key** | | |
 | [A duplicate in `b` past a deferrable key under `session_replication_role = replica`](#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica) | `self_check` | documented |
 | **Writes capture never sees** | | |
@@ -80,6 +81,9 @@ while every rule holds.
 * **Change a read column to a nondeterministic collation only while the
   transforms that read it are paused**
   ([below](#a-read-column-given-a-nondeterministic-collation)).
+* **Give a transform's target the name of a dropped table only once the
+  transforms that read that table are paused**
+  ([below](#a-read-table-dropped-and-its-name-taken-by-a-target-within-one-pass)).
 * **Don't write a 1-1 `JOIN`'s `b` under `session_replication_role =
   replica`** when its key on the `ON` columns is a deferrable constraint
   ([below](#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica)).
@@ -244,6 +248,36 @@ read the column before changing its collation.
 
 **Ends with:** [#1643](https://github.com/salesforce-misc/trellis/issues/1643),
 research on detecting a collation change the way a retype is detected.
+
+### A read table dropped and its name taken by a target within one pass
+
+**When:** a table a definition reads (its `FROM` or joined table) is dropped,
+and before the next reconcile pass another transform is defined whose target
+takes the table's name:
+
+```sql
+DROP TABLE public.shadow;
+-- before the next pass:
+-- TRANSFORM shadow FROM customers SELECT name AS who
+```
+
+A pass that sees the table gone first pauses its readers, and a paused
+reader's `RESUME` rebuilds it from the new target, which is exact.
+
+**What goes wrong:** the pass never pauses a reader for its dropped source
+once the name is a target's, so the reader goes on reading the new target.
+The new target's build stages its rows for the reader, and the reader keeps
+every row it derived from the dropped table that the new target has no key
+for. It reads `live`.
+
+**Detected by:** `self_check` of the reader.
+
+**Repair:** `PAUSE`/`RESUME` the reader. To avoid it, pause the transforms
+that read a table before you drop it and give its name to a target.
+
+**Ends with:** [#1723](https://github.com/salesforce-misc/trellis/issues/1723)
+weighs refusing such a target at define, pausing the readers there, or
+detecting the replaced table in the reconcile pass.
 
 ## Writes past a unique key
 

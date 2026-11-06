@@ -177,13 +177,6 @@ pub enum ValidationError {
     OneToOneJoinKeyNotUnique { table: String, columns: Vec<String> },
     /// A construct a 1-1 `JOIN` doesn't take, with the remedy.
     OneToOneJoinUnsupported { what: String, remedy: String },
-    /// A definition reads the target of a 1-1 `JOIN`, which no transform may
-    /// until the seam can stream a large fan-out (ADR-0021).
-    OneToOneJoinTargetRead { table: String },
-    /// A 1-1 `JOIN` whose target would take the name of a table another
-    /// definition reads (one whose source was dropped), which would then
-    /// read the 1-1 `JOIN`'s target (ADR-0021).
-    OneToOneJoinTargetHasReader { target: String, reader: String },
     /// An aggregate in a deferred family (`MIN`/`MAX` in a `JOIN`,
     /// `bool_*`/`bit_*`, float or `interval` `SUM`/`AVG`,
     /// `array_agg`/`string_agg`/`jsonb_agg`). Only the aggregates the group
@@ -1137,20 +1130,6 @@ impl fmt::Display for ValidationError {
                  lies within them. Add a unique constraint on those columns, or join on a \
                  column set that is unique (the group key of an aggregate target works)",
                 columns.join(", ")
-            ),
-            ValidationError::OneToOneJoinTargetRead { table } => write!(
-                f,
-                "'{table}' is the target of a 1-1 JOIN, which no transform can read yet: a \
-                 change on the joined table rewrites every target row on its key, and the \
-                 target-mutation seam holds each changed key's prior image in memory until \
-                 commit (about 300 MB per million rows). Read the sources of the 1-1 JOIN \
-                 instead"
-            ),
-            ValidationError::OneToOneJoinTargetHasReader { target, reader } => write!(
-                f,
-                "the 1-1 JOIN's target '{target}' would take the name of a table the transform \
-                 '{reader}' reads, and no transform can read a 1-1 JOIN's target yet. Drop \
-                 '{reader}' first, or give the 1-1 JOIN another target name"
             ),
             ValidationError::OneToOneJoinUnsupported { what, remedy } => {
                 write!(f, "a 1-1 JOIN doesn't take {what}: {remedy}")
