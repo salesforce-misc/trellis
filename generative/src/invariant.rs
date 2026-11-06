@@ -36,6 +36,14 @@
 //!   `NULL` part has its `J` row, which each writer inserts before it locks it
 //!   and nothing deletes while the definition is live.
 //!
+//! The check compares join keys, entry keys and values by their `::text`,
+//! where the snapshot's join of `R` to `M` uses `=`. The two agree on a join
+//! key: define admits only the text-stable key types (`join_key_types`), the
+//! same type and collation on both sides of `ON`, and no nondeterministic
+//! collation, so two keys are `=` exactly when their texts are equal. A value
+//! is compared with a copy of itself, or with the same expression over the
+//! same values, so its text is the same.
+//!
 //! # What a pending fan-out exempts
 //!
 //! A `b` change's page recomputes the target rows of a key that fits its

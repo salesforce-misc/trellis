@@ -24,7 +24,9 @@
 //!   rebuild is exact; a paused transform's markers wait;
 //! - a row a chunk fails on is held in quarantine with the marker's origin;
 //! - `self_check` doesn't vouch for a target with a pending fan-out, and
-//!   waits for it.
+//!   waits for it;
+//! - the generative suite's hidden-state snapshot reads the marker, with the
+//!   key's rows exact up to its cursor and stale past it.
 
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
@@ -701,5 +703,83 @@ async fn self_check_reads_a_pending_fan_out_as_not_caught_up() {
         assert_eq!(page(&d).await, SelfCheckOutcome::NotCaughtUp, "{kind:?}");
         d.run_fan_outs().await;
         assert_eq!(page(&d).await, SelfCheckOutcome::Converged, "{kind:?}");
+    }
+}
+
+/// The generative suite's in-run hidden-state snapshot (#1709,
+/// `one_to_one_join_snapshot`) under a pending fan-out: it reads the marker
+/// and its cursor, and the rows of the key at or before the cursor are their
+/// `R` entry joined to the newest live `M` entry, while those after it (every
+/// row, while the cursor is at the start) still hold the old `b` row. That
+/// is exactly the rows the invariant's marker exemption leaves out, and no
+/// others; the other keys' rows are exact throughout.
+#[tokio::test]
+async fn the_hidden_snapshot_under_a_pending_fan_out_is_exact_up_to_its_cursor() {
+    use trellis::staging::one_to_one_join_snapshot::hidden_snapshot;
+    let _chunked = chunked().await;
+    for kind in KINDS {
+        let mut d = start(kind).await;
+        step(
+            &mut d,
+            "update public.b set w = 900, tag = 'new' where id = 1",
+        )
+        .await;
+        for (chunks, cursor) in [None, Some("2"), Some("4"), Some("6")]
+            .into_iter()
+            .enumerate()
+        {
+            let s = hidden_snapshot(d.pool(), &kind.target())
+                .await
+                .expect("a snapshot")
+                .expect("no lock is held, so the read isn't skipped");
+            assert_eq!(s.status, "live", "{kind:?}");
+            assert!(!s.building, "{kind:?}");
+            assert_eq!(s.markers.len(), 1, "{kind:?} after {chunks} chunks");
+            assert_eq!(s.markers[0].join_key, ["10"], "{kind:?}");
+            assert_eq!(
+                s.markers[0].cursor.as_deref(),
+                cursor,
+                "{kind:?} after {chunks} chunks"
+            );
+            let on_key: std::collections::BTreeSet<&str> = s
+                .from_entries
+                .iter()
+                .filter(|e| !e.tombstone && e.join_key == [Some("10".to_string())])
+                .map(|e| e.key.as_str())
+                .collect();
+            assert_eq!(on_key.len(), 7, "{kind:?}");
+            for joined in &s.joined_rows {
+                let row = s.rows.iter().find(|r| r.key == joined.key);
+                if !s.left && joined.joined.is_none() {
+                    assert_eq!(row, None, "{kind:?}: row {} has no b row", joined.key);
+                    continue;
+                }
+                let row =
+                    row.unwrap_or_else(|| panic!("{kind:?}: a target row for {}", joined.key));
+                let exempt = on_key.contains(joined.key.as_str())
+                    && cursor.is_none_or(|c| joined.key.as_str() > c);
+                assert_eq!(
+                    row.values != joined.values,
+                    exempt,
+                    "{kind:?} after {chunks} chunks, row {}: the target holds {:?}, R and M \
+                     give {:?}",
+                    joined.key,
+                    row.values,
+                    joined.values
+                );
+            }
+            one_chunk(&d).await;
+        }
+        let s = hidden_snapshot(d.pool(), &kind.target())
+            .await
+            .expect("a snapshot")
+            .expect("not skipped");
+        assert!(s.markers.is_empty(), "{kind:?}: the last chunk");
+        for joined in &s.joined_rows {
+            let row = s.rows.iter().find(|r| r.key == joined.key);
+            let want = (s.left || joined.joined.is_some()).then_some(&joined.values);
+            assert_eq!(row.map(|r| &r.values), want, "{kind:?}");
+        }
+        assert_exact(&mut d, kind, "the fan-out").await;
     }
 }

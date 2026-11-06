@@ -501,7 +501,11 @@ beside them run on every `cargo test`.
   `join1_snapshot_after_read` once each, one of `join1_no_j_lock`'s five
   catches and five of `join1_m_before_j`'s eleven. No known miss reaches the
   rate gating takes. The tier's keys never hold the 10k rows a pending
-  fan-out needs, so the marker exemption is never exercised here.
+  fan-out needs, so the marker exemption is never exercised here; the
+  checker's unit tests cover it, and
+  `trellis/tests/join_one_to_one_fan_out.rs` reads the snapshot under a
+  pending fan-out, chunk by chunk, to show that its rows are exact up to the
+  cursor and stale past it.
   `GENERATIVE_JOIN1_INVARIANT=off` turns the invariant off; a number sets the
   pause between rounds in milliseconds.
   A side that is another transform's target is drawn by the chained-reader
