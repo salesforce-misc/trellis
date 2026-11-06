@@ -280,6 +280,43 @@ async fn an_index_under_another_collation_counts_as_missing() {
     step(&mut d, "delete from public.src where id in (2, 3)").await;
 }
 
+/// A source that loses both its indexes after define, the probe's and the
+/// `GROUP BY` one, probes by the same statement, which then scans for the
+/// group: exact, `NULL` group included. `status` reports both gaps and
+/// nothing pauses. Once the probe's index exists again, both gaps clear
+/// (it leads with the `GROUP BY` columns) and the probe reads the endpoint.
+#[tokio::test]
+async fn a_source_without_any_index_probes_by_scanning_for_the_group() {
+    let mut d = start(AGG, INDEXED, int4()).await;
+    write(
+        &d,
+        "drop index public.src_g_v_idx; drop index public.src_g_idx",
+    )
+    .await;
+    let t = handle(&d).await;
+    step(&mut d, SEED).await;
+    let bare = status(&t).await;
+    assert_one_gap(&bare);
+    assert_eq!(bare.source_index_gaps.len(), 1, "{bare:?}");
+    assert!(!bare.source_index_gaps[0].opted_out);
+    assert_group_scan(&probe_plan(&d).await, "src_g_v_idx");
+    for sql in [
+        "delete from public.src where id = 3",
+        "delete from public.src where id = 4",
+        "delete from public.src where id = 7",
+    ] {
+        step(&mut d, sql).await;
+    }
+    assert_eq!(status(&t).await.status, TransformStatus::Live);
+
+    write(&d, "create index src_g_v_idx on public.src (g, v)").await;
+    let indexed = status(&t).await;
+    assert!(indexed.extreme_index_gaps.is_empty(), "{indexed:?}");
+    assert!(indexed.source_index_gaps.is_empty(), "{indexed:?}");
+    assert_endpoint(&probe_plan(&d).await, "src_g_v_idx");
+    step(&mut d, "delete from public.src where id in (1, 6)").await;
+}
+
 /// A definition with no `MIN` or `MAX` reports no such gap and reads no
 /// index for it, whatever indexes its source has.
 #[tokio::test]
