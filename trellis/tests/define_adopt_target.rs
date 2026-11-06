@@ -575,7 +575,8 @@ async fn everything_a_user_may_add_to_any_target_adopts() {
     assert_eq!(rows, ["(1,10,x)", "(2,20,x)", "(3,5,y)"]);
     let kept: i64 = raw
         .query_one(
-            "select (select count(*) from pg_constraint where conrelid = 'public.t'::regclass) \
+            "select (select count(*) from pg_constraint \
+                   where conrelid = 'public.t'::regclass and contype <> 'n') \
                   + (select count(*) from pg_constraint where confrelid = 'public.t'::regclass) \
                   + (select count(*) from pg_indexes where indexname = 't_lower_r') \
                   + (select count(*) from pg_trigger \
@@ -586,7 +587,8 @@ async fn everything_a_user_may_add_to_any_target_adopts() {
         .expect("count the user's objects")
         .get(0);
     // pkey, fkey, check, unique, exclusion and the constraint trigger's
-    // constraint; child's foreign key; the index; two triggers.
+    // constraint (not the `NOT NULL` entries PostgreSQL 18 also keeps in
+    // `pg_constraint`); child's foreign key; the index; two triggers.
     assert_eq!(kept, 6 + 1 + 1 + 2);
 }
 
