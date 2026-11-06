@@ -200,9 +200,13 @@ pub(crate) async fn check(client: &impl GenericClient, id: i64) -> Result<(), Ca
     Ok(())
 }
 
-/// `table`'s `INCLUDE` columns (an unquoted `schema.table`) on the index its
-/// row identity is: the primary key or unique index whose key columns are
-/// `key`, in index order. Empty when it has none.
+/// `table`'s `INCLUDE` columns (an unquoted `schema.table`), in index order,
+/// that an earlier release read as key columns: those of the index that
+/// release keyed `table` by (its primary key, else its oldest immediate,
+/// non-partial unique index that is `NULLS NOT DISTINCT` or over `NOT NULL`
+/// columns only, `INCLUDE` columns counted), when that index's key columns
+/// are `key`. Empty otherwise: any other index with `INCLUDE` columns, a
+/// covering index beside the key among them, never keyed anything.
 async fn included_columns(
     client: &impl GenericClient,
     table: &str,
@@ -217,17 +221,26 @@ async fn included_columns(
                           where k.ord > i.indnkeyatts \
                             and a.attname::text <> all($2) \
                           order by k.ord) \
-             from pg_catalog.pg_index i \
-             where i.indrelid = pg_catalog.to_regclass($1) \
-               and i.indnatts > i.indnkeyatts \
+             from (select i.* from pg_catalog.pg_index i \
+                   where i.indrelid = pg_catalog.to_regclass($1) \
+                     and (i.indisprimary \
+                          or (i.indisunique and i.indimmediate and i.indpred is null \
+                              and i.indexprs is null \
+                              and (i.indnullsnotdistinct \
+                                   or not exists ( \
+                                       select 1 from pg_catalog.pg_attribute a \
+                                       where a.attrelid = i.indrelid \
+                                         and a.attnum = any(i.indkey) \
+                                         and not a.attnotnull)))) \
+                   order by i.indisprimary desc, i.indexrelid \
+                   limit 1) i \
+             where i.indnatts > i.indnkeyatts \
                and array(select a.attname::text \
                          from unnest(i.indkey::int2[]) with ordinality k(attnum, ord) \
                          join pg_catalog.pg_attribute a \
                            on a.attrelid = i.indrelid and a.attnum = k.attnum \
                          where k.ord <= i.indnkeyatts \
-                         order by k.ord) = $2 \
-             order by i.indisprimary desc, i.indexrelid \
-             limit 1",
+                         order by k.ord) = $2",
             &[
                 (&ddl::regclass_arg(table), Type::TEXT),
                 (&key, Type::TEXT_ARRAY),

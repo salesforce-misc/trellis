@@ -239,3 +239,43 @@ async fn a_definition_built_over_an_include_column_pauses_and_resume_re_keys_it(
     settle(&mut d).await;
     assert_converged(&d).await;
 }
+
+/// Only the index an earlier release keyed the source by counts: a source
+/// whose primary key has no `INCLUDE` columns, with a covering index (unique
+/// or not) over the key's columns that has one, was never built over it, so
+/// attaching pauses nothing.
+#[tokio::test]
+async fn a_covering_index_beside_the_key_pauses_nothing_at_attach() {
+    let mut d = Driver::start(
+        "create table public.inc (id integer not null, ga integer, x integer, \
+             y integer, primary key (id))",
+        &[("id", int4()), ("ga", int4()), ("x", int4()), ("y", int4())],
+        &[ONE, AGG],
+        &["public.inc"],
+    )
+    .await;
+    exec(
+        &d,
+        "insert into public.inc values (1, 1, 10, 1), (2, 1, 20, 2); \
+         create index inc_cover on public.inc (id) include (x); \
+         create unique index inc_cover_u on public.inc (id) include (y)",
+    )
+    .await;
+    d.settle().await;
+    assert_converged(&d).await;
+    d.ctl
+        .batch_execute("delete from definition_keys")
+        .await
+        .expect("a catalog from before the record");
+    let config = trellis::Config::from_dsn(d.db.dsn().to_string()).expect("config");
+    trellis::migrate::migrate_with_pool(d.pool(), &config)
+        .await
+        .expect("attach");
+    assert_eq!(
+        statuses(&d).await,
+        ["(public.one,live)", "(public.g,live)"],
+        "{:?}",
+        d.rows("select transform_id, error from capture_failures")
+            .await
+    );
+}
