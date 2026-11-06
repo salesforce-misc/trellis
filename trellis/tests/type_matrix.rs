@@ -1398,3 +1398,44 @@ async fn paired_string_keys_of_different_bounds_never_truncate() {
     assert_eq!(status_of(&trellis, "d").await, "Live");
     trellis.shutdown().await.expect("shutdown");
 }
+
+/// #1117 rule 6: `MIN`/`MAX` over a column of another transform's target is
+/// refused as chained, `WITHOUT SOURCE INDEX` or not, never with an index to
+/// create on the target; over the source itself, the opt-out's refusal
+/// names the index on the resolved, qualified source.
+#[tokio::test]
+async fn a_chained_min_max_is_refused_by_name_with_or_without_the_opt_out() {
+    let d = Driver::start(
+        "create table public.t (id integer primary key, g integer, price numeric(10,2))",
+        &[("id", int4()), ("g", int4()), ("price", ValueType::Numeric)],
+        &["TRANSFORM up FROM public.t SELECT g AS g, id AS i"],
+        &["public.t"],
+    )
+    .await;
+    let trellis = facade(d.db.dsn()).await;
+    for chained in [
+        "TRANSFORM agg FROM public.up GROUP BY g WITHOUT SOURCE INDEX SELECT MIN(i) AS lo",
+        "TRANSFORM agg FROM public.up GROUP BY g SELECT MAX(i) AS hi",
+    ] {
+        let error = trellis
+            .apply(chained)
+            .await
+            .expect_err("a chained MIN/MAX")
+            .to_string();
+        assert!(
+            error.contains("a table Trellis creates") && !error.contains("create index"),
+            "{chained}: {error}"
+        );
+    }
+    let error = trellis
+        .apply("TRANSFORM agg FROM t GROUP BY g WITHOUT SOURCE INDEX SELECT MIN(id) AS lo")
+        .await
+        .expect_err("the opt-out with MIN")
+        .to_string();
+    assert!(
+        error.contains("doesn't apply to MIN/MAX")
+            && error.contains(r#"`create index on "public"."t" ("g", "id")`"#),
+        "{error}"
+    );
+    trellis.shutdown().await.expect("shutdown");
+}

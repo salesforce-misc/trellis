@@ -4466,6 +4466,21 @@ async fn validate_for_define(
             };
             Err(err.into())
         }
+        Err(err @ ValidationError::ExtremesWithoutSourceIndex { .. }) => {
+            let err = match resolve_source_for_install(pool, def).await {
+                Ok(qualified) => {
+                    // A `MIN`/`MAX` of another transform's target is refused
+                    // as that, never with an index to create on the target.
+                    check_aggregate_admitted(&**pool.get().await?, def, &qualified).await?;
+                    match schema_of(&qualified) {
+                        Some(schema) => err.with_source_schema(schema),
+                        None => err,
+                    }
+                }
+                Err(_) => err,
+            };
+            Err(err.into())
+        }
         result => Ok(result?),
     }
 }
@@ -4979,7 +4994,14 @@ pub(crate) async fn revalidate(
     if source_columns.is_empty() {
         return Err(CatalogError::SourceTableNotFound(source.to_string()));
     }
-    validate_with_source(&definition.def, &source_columns, source)?;
+    if let Err(err) = validate_with_source(&definition.def, &source_columns, source) {
+        // A `MIN`/`MAX` of another transform's target is refused as that,
+        // never with an index to create on the target.
+        if let ValidationError::ExtremesWithoutSourceIndex { .. } = err {
+            check_aggregate_admitted(txn, &definition.def, source).await?;
+        }
+        return Err(err.into());
+    }
     reject_virtual_generated_reads(&definition.def, None, source, &virtual_columns)?;
     let source_key = validate_live_schema(txn, schema, &definition.def, source).await?;
     if let KeySpace::OneToOne = definition.def.key_space {
