@@ -360,11 +360,17 @@ fn run_case(case: &JoinCase) -> Result<(), String> {
                 }
                 Err(RunError::InRunInvariant {
                     burst,
+                    settled,
                     failure: Ok(failure),
                 }) => {
+                    let when = if settled {
+                        "once it settled"
+                    } else {
+                        "mid-burst"
+                    };
                     return Err(format!(
-                        "the in-run hidden-state invariant broke during burst {burst} ({shape}), \
-                         target {}:\n{}",
+                        "the in-run hidden-state invariant broke in burst {burst}, {when} \
+                         ({shape}), target {}:\n{}",
                         failure.target,
                         failure
                             .violations

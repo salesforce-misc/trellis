@@ -295,6 +295,7 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
         if let Some(failure) = sampled_failure {
             return Err(RunError::InRunInvariant {
                 burst: index,
+                settled: false,
                 failure,
             });
         }
@@ -313,6 +314,7 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
                 };
                 return Err(RunError::InRunInvariant {
                     burst: index,
+                    settled: true,
                     failure,
                 });
             }

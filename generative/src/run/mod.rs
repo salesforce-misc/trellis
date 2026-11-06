@@ -236,11 +236,12 @@ pub enum RunError {
         failures: Vec<String>,
     },
     /// A sample of the in-run hidden-state invariant
-    /// ([`crate::invariant`]) during burst `burst` (or once it settled)
-    /// found a 1-1 `JOIN`'s hidden state inconsistent at a committed
-    /// snapshot, or couldn't read it.
+    /// ([`crate::invariant`]) during burst `burst` (or, with `settled`,
+    /// once it settled and the oracle passed it) found a 1-1 `JOIN`'s hidden
+    /// state inconsistent at a committed snapshot, or couldn't read it.
     InRunInvariant {
         burst: usize,
+        settled: bool,
         failure: Result<crate::invariant::Failure, String>,
     },
 }
