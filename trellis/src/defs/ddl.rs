@@ -438,7 +438,7 @@ impl From<super::backfill::BackfillError> for DdlError {
 /// *zero*-column arity (no primary key, and no qualifying unique index
 /// either — [`DdlError::NoPrimaryKey`]); a composite (multi-column) primary
 /// key is returned in full, in the key's own declared column order
-/// (`array_position(i.indkey, a.attnum)`, the same ordinal-position
+/// (the key columns' positions in `i.indkey`, the same ordinal-position
 /// convention the capture trigger's key expression follows for the
 /// identical reason) — every consumer takes the key at whatever arity it has.
 /// Also gates every resolved column's *type*: only
@@ -1043,7 +1043,7 @@ pub(crate) fn decode_key_part(part: &str) -> Option<Cow<'_, str>> {
 /// looks up the wrong row (or, if the parts' types differ, fails the batch).
 /// It means the order the `PRIMARY KEY (...)`/`UNIQUE (...)` constraint
 /// itself lists its columns in — `pg_index.indkey`'s own order, which is what
-/// [`source_primary_key`] sorts by (`array_position(i.indkey, a.attnum)`) and
+/// [`source_primary_key`] sorts by (each key column's position in `i.indkey`) and
 /// therefore the order of the `pk` slice every function here receives. It is
 /// deliberately *not* the table's physical column-declaration order
 /// (`attnum`), which Postgres allows to differ:

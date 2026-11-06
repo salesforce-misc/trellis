@@ -55,6 +55,22 @@ async fn key_names(
         .collect())
 }
 
+/// `table`'s row identity's key columns, or, when it has none, the key
+/// recorded for it: a reader's backfill ([`backfill_in`]) of a 1-1 target
+/// an earlier release keyed by its source key's `INCLUDE` columns, which has
+/// no index over its recorded key until its `RESUME` re-keys it. A define
+/// never gets that far without an identity.
+async fn admitted_key(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<Vec<String>, tokio_postgres::Error> {
+    let key = key_names(client, table).await?;
+    if !key.is_empty() {
+        return Ok(key);
+    }
+    Ok(recorded_for(client, table).await?.unwrap_or_default())
+}
+
 /// Records, for definition `id`, the key of each table it keys by: its
 /// qualified `source`, a `JOIN`'s qualified `joined` table (each its
 /// row-identity key now, which is the recorded one when another definition
@@ -69,13 +85,13 @@ pub(crate) async fn record(
     joined: Option<&str>,
     target: &str,
 ) -> Result<(), tokio_postgres::Error> {
-    let source_key = key_names(client, source).await?;
+    let source_key = admitted_key(client, source).await?;
     let mut keys = vec![
         (target.to_string(), target_key(def, &source_key)),
         (source.to_string(), source_key),
     ];
     if let Some(joined) = joined {
-        keys.push((joined.to_string(), key_names(client, joined).await?));
+        keys.push((joined.to_string(), admitted_key(client, joined).await?));
     }
     for (table, key) in keys {
         if key.is_empty() {
@@ -253,6 +269,26 @@ async fn included_columns(
         .unwrap_or_default())
 }
 
+/// The `capture_failure` of a 1-1 definition reading `source`, a 1-1 target
+/// an earlier release keyed by `table`'s key with its `INCLUDE` columns
+/// (#1722), so that release keyed this target by them too.
+pub(crate) fn included_upstream_reason(
+    target: &str,
+    source: &str,
+    table: &str,
+    included: &[String],
+) -> String {
+    format!(
+        "transform {target} reads {source}, which an earlier release built over {table}'s key \
+         with its INCLUDE columns ({}) as if they were key columns, so it keyed {target} by \
+         them too; they are not part of the key. RESUME {source} first, then RESUME this \
+         transform, which re-keys it and rebuilds it (its target keeps its rows, user indexes \
+         and grants, and loses the columns it no longer creates), or drop the transform and \
+         define it again",
+        included.join(", ")
+    )
+}
+
 /// The `capture_failure` of a definition an earlier release built over the
 /// `INCLUDE` columns of `table`'s key (#1722).
 pub(crate) fn included_key_reason(target: &str, table: &str, included: &[String]) -> String {
@@ -280,8 +316,10 @@ pub(crate) fn included_key_reason(target: &str, table: &str, included: &[String]
 ///
 /// A definition whose source or joined table's key index has `INCLUDE`
 /// columns was built over them as key columns (#1722): it is paused with a
-/// `capture_failure` naming them ([`included_key_reason`]). Returns how many
-/// it paused.
+/// `capture_failure` naming them ([`included_key_reason`]). So is a 1-1
+/// definition reading such a definition's 1-1 target, at any depth, whose
+/// target that release keyed by the same columns
+/// ([`included_upstream_reason`]). Returns how many it paused.
 pub(crate) async fn backfill_in(
     txn: &tokio_postgres::Transaction<'_>,
     floors: &Floors,
@@ -299,6 +337,9 @@ pub(crate) async fn backfill_in(
         )
         .await?;
     let mut paused = 0;
+    // The 1-1 targets an earlier release keyed by an `INCLUDE` column, with
+    // the table and the columns: a 1-1 reader of one is keyed by them too.
+    let mut mis_keyed: Vec<(String, String, Vec<String>)> = Vec::new();
     for row in &rows {
         let (id, source, target, joined): (i64, String, String, Option<String>) =
             (row.get(0), row.get(1), row.get(2), row.get(3));
@@ -322,28 +363,56 @@ pub(crate) async fn backfill_in(
                 included.push((table.clone(), columns));
             }
         }
-        if let Some((table, columns)) = included.first() {
-            let reason = included_key_reason(&target, table, columns);
-            if super::lifecycle::pause_for_included_key(txn, id, &source, &reason).await? {
-                paused += 1;
+        let one_to_one = matches!(
+            def.key_space,
+            KeySpace::OneToOne | KeySpace::JoinOneToOne(_)
+        );
+        let upstream = mis_keyed
+            .iter()
+            .find(|(upstream, _, _)| *upstream == source)
+            .filter(|_| one_to_one)
+            .map(|(_, table, columns)| (table.clone(), columns.clone()));
+        let reason = if let Some((table, columns)) = &upstream {
+            Some(included_upstream_reason(&target, &source, table, columns))
+        } else {
+            included
+                .first()
+                .map(|(table, columns)| included_key_reason(&target, table, columns))
+        };
+        if one_to_one {
+            let from = upstream.or_else(|| {
+                included
+                    .iter()
+                    .find(|(table, _)| *table == source)
+                    .map(|(table, columns)| (table.clone(), columns.clone()))
+            });
+            if let Some((table, columns)) = from {
+                mis_keyed.push((target.clone(), table, columns));
             }
+        }
+        if let Some(reason) = reason
+            && super::lifecycle::pause_for_included_key(txn, id, &source, &reason).await?
+        {
+            paused += 1;
         }
     }
     Ok(paused)
 }
 
 /// Re-keys a 1-1 target (plain or `JOIN`) an earlier release built over its
-/// source key's `INCLUDE` columns (#1722), in `txn`, before a resume
-/// re-validates it: the target's key constraint over the old identity (the
-/// recorded key followed by the source key index's `INCLUDE` columns) is
-/// replaced in place by one over the recorded key, and each former key column
-/// the definition doesn't create (not a field) is dropped. The table, its
+/// source key's `INCLUDE` columns (#1722), or over those of the 1-1 target it
+/// reads, in `txn`, before a resume re-validates it: the target's key
+/// constraint over the old identity (the recorded key followed by columns
+/// the definition doesn't create, which only that release's key adds) is
+/// replaced in place by one over the recorded key, and each of those former
+/// key columns is dropped. The table, its
 /// rows, the user's indexes and grants stay. Its ledger's entries, keyed by
 /// the old key's text, are deleted: the rebuild re-derives every row, and
 /// its sweep removes the target rows no source row backs.
 ///
-/// Does nothing unless the target has no index over its recorded key and has
-/// exactly that old key. Refuses, naming them, when an object other than the
+/// Does nothing unless the target has no index over its recorded key, its
+/// source's row identity is the recorded key, and the target has that old
+/// key. Refuses, naming them, when an object other than the
 /// key depends on a column it would drop: a user's view or index.
 pub(crate) async fn repair_target_key(
     txn: &tokio_postgres::Transaction<'_>,
@@ -371,47 +440,61 @@ pub(crate) async fn repair_target_key(
     if !ddl::identity_key_columns(txn, target).await?.is_empty() {
         return Ok(false);
     }
-    let source_key = key_names(txn, source).await?;
-    let included = included_columns(txn, source, &source_key).await?;
-    if included.is_empty() || source_key != recorded {
+    if key_names(txn, source).await? != recorded {
         return Ok(false);
     }
-    let old: Vec<String> = recorded.iter().chain(&included).cloned().collect();
-    // The target's key constraint over exactly the old identity.
-    let Some(row) = txn
-        .query_typed_opt(
-            "select c.oid, c.conname::text, c.conindid \
-             from pg_catalog.pg_constraint c \
-             join pg_catalog.pg_index i on i.indexrelid = c.conindid \
-             where c.conrelid = pg_catalog.to_regclass($1) and c.contype in ('p', 'u') \
-               and array(select a.attname::text \
-                         from unnest(i.indkey::int2[]) with ordinality k(attnum, ord) \
-                         join pg_catalog.pg_attribute a \
-                           on a.attrelid = i.indrelid and a.attnum = k.attnum \
-                         where k.ord <= i.indnkeyatts \
-                         order by k.ord) = $2 \
-             order by c.contype, c.oid limit 1",
-            &[
-                (&ddl::regclass_arg(target), Type::TEXT),
-                (&old, Type::TEXT_ARRAY),
-            ],
-        )
-        .await?
-    else {
-        return Ok(false);
-    };
-    let (constraint_oid, constraint, index_oid): (u32, String, u32) =
-        (row.get(0), row.get(1), row.get(2));
     let fields: Vec<&str> = definition
         .def
         .fields
         .iter()
         .map(|f| f.name.as_str())
         .collect();
-    let dropped: Vec<&String> = included
-        .iter()
-        .filter(|c| !fields.contains(&c.as_str()) && !recorded.contains(c))
-        .collect();
+    // The target's key constraint over the old identity: the recorded key
+    // followed by columns that are neither key columns nor fields. Define
+    // creates no other column, so only an earlier release's key over its
+    // source key's `INCLUDE` columns (or, for a reader of such a target, over
+    // that target's) has them.
+    let mut old = None;
+    for row in txn
+        .query_typed(
+            "select c.oid, c.conname::text, c.conindid, \
+                    array(select a.attname::text \
+                          from unnest(i.indkey::int2[]) with ordinality k(attnum, ord) \
+                          join pg_catalog.pg_attribute a \
+                            on a.attrelid = i.indrelid and a.attnum = k.attnum \
+                          where k.ord <= i.indnkeyatts \
+                          order by k.ord) \
+             from pg_catalog.pg_constraint c \
+             join pg_catalog.pg_index i on i.indexrelid = c.conindid \
+             where c.conrelid = pg_catalog.to_regclass($1) and c.contype in ('p', 'u') \
+               and i.indexprs is null \
+             order by c.contype, c.oid",
+            &[(&ddl::regclass_arg(target), Type::TEXT)],
+        )
+        .await?
+    {
+        let key: Vec<String> = row.get(3);
+        let Some(extra) = key.strip_prefix(recorded.as_slice()) else {
+            continue;
+        };
+        if !extra.is_empty()
+            && extra
+                .iter()
+                .all(|c| !fields.contains(&c.as_str()) && !recorded.contains(c))
+        {
+            old = Some((
+                row.get::<_, u32>(0),
+                row.get::<_, String>(1),
+                row.get::<_, u32>(2),
+                extra.to_vec(),
+            ));
+            break;
+        }
+    }
+    let Some((constraint_oid, constraint, index_oid, extra)) = old else {
+        return Ok(false);
+    };
+    let dropped: Vec<&String> = extra.iter().collect();
     for column in &dropped {
         // Every object depending on the column but the key constraint, its
         // index and the column's own `NOT NULL`: a user's view (through its

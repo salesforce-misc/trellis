@@ -279,3 +279,114 @@ async fn a_covering_index_beside_the_key_pauses_nothing_at_attach() {
             .await
     );
 }
+
+/// A 1-1 transform reading the 1-1 target an earlier release keyed by
+/// `(id, x)` was keyed by `(id, x)` too. Attaching pauses it as well, naming
+/// the upstream. Its `RESUME` waits for the upstream's, then re-keys it the
+/// same way.
+#[tokio::test]
+async fn a_one_to_one_reader_of_a_mis_keyed_target_pauses_and_resume_re_keys_it() {
+    const TWO: &str = "TRANSFORM two FROM public.one SELECT ga AS ga, y AS y";
+    const TWO_ACTUAL: &str = "select id, ga, y from public.two order by id";
+    let mut d = Driver::start(
+        "create table public.inc (id integer not null, ga integer, x integer not null, \
+             y integer, primary key (id, x))",
+        &[("id", int4()), ("ga", int4()), ("x", int4()), ("y", int4())],
+        &[ONE],
+        &["public.inc"],
+    )
+    .await;
+    exec(
+        &d,
+        "insert into public.inc values (1, 1, 10, 1), (2, 1, 20, 2)",
+    )
+    .await;
+    d.settle().await;
+    let columns = std::collections::HashMap::from([
+        ("id".to_string(), int4()),
+        ("x".to_string(), int4()),
+        ("ga".to_string(), int4()),
+        ("y".to_string(), int4()),
+    ]);
+    trellis::defs::install_definition(d.pool(), TWO, &columns, "public")
+        .await
+        .expect("install two");
+    trellis::intake::harness::settle_builds(d.pool()).await;
+    settle(&mut d).await;
+    assert_eq!(
+        statuses(&d).await,
+        ["(public.one,live)", "(public.two,live)"]
+    );
+
+    exec(
+        &d,
+        "alter table public.inc drop constraint inc_pkey, add primary key (id) include (x)",
+    )
+    .await;
+    d.ctl
+        .batch_execute("delete from definition_keys")
+        .await
+        .expect("a catalog from before the record");
+    let config = trellis::Config::from_dsn(d.db.dsn().to_string()).expect("config");
+    trellis::migrate::migrate_with_pool(d.pool(), &config)
+        .await
+        .expect("attach");
+    assert_eq!(
+        statuses(&d).await,
+        ["(public.one,paused)", "(public.two,paused)"]
+    );
+    let reason = d
+        .rows("select error from capture_failures order by transform_id offset 1")
+        .await;
+    assert!(
+        reason[0].contains("transform public.two reads public.one")
+            && reason[0].contains("public.inc's key with its INCLUDE columns (x)")
+            && reason[0].contains("RESUME public.one first"),
+        "{reason:?}"
+    );
+    assert_eq!(
+        d.rows(
+            "select table_name, key_columns::text from definition_keys \
+             where transform_id = 2 order by 1"
+        )
+        .await,
+        ["(public.one,{id})", "(public.two,{id})"],
+        "the reader's corrected key is recorded"
+    );
+
+    exec(&d, "update public.inc set y = 70 where id = 1").await;
+    settle(&mut d).await;
+    // The reader's resume waits for its upstream to be live, and re-keys
+    // it then.
+    for name in ["two", "one"] {
+        trellis::staging::quarantine::resume_transform(d.pool(), name)
+            .await
+            .expect("resume");
+    }
+    settle(&mut d).await;
+    settle(&mut d).await;
+    exec(
+        &d,
+        "update public.inc set x = x + 1, y = 80 where id = 2; \
+         insert into public.inc values (3, 2, 30, 3)",
+    )
+    .await;
+    settle(&mut d).await;
+    assert_eq!(
+        statuses(&d).await,
+        ["(public.one,live)", "(public.two,live)"],
+        "{:?}",
+        d.rows("select transform_id, error from capture_failures")
+            .await
+    );
+    assert_eq!(d.rows(TWO_ACTUAL).await, d.rows(ONE_EXPECTED).await);
+    assert_eq!(
+        d.rows(
+            "select pg_get_constraintdef(oid) from pg_constraint \
+             where conrelid = 'public.two'::regclass and contype in ('p', 'u')"
+        )
+        .await,
+        ["(\"PRIMARY KEY (id)\")"],
+        "re-keyed in place"
+    );
+}

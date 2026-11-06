@@ -5037,7 +5037,7 @@ async fn finish_requested_resume(
 ) -> Result<(), ApplyError> {
     // What to re-type, read with the re-validation in one snapshot.
     let (source_table, target, statements, retrying) = {
-        let txn = client.transaction().await?;
+        let mut txn = client.transaction().await?;
         let row = txn
             .query_opt(
                 "select source_table, split_part(target_table, '.', 2), status \
@@ -5091,12 +5091,30 @@ async fn finish_requested_resume(
         }
         // A 1-1 target's ledger is checked here too, before anything is
         // re-typed under `ACCESS EXCLUSIVE` that `resume_locked` would then
-        // refuse.
-        let checked = match catalog::revalidate(&txn, schema, floors, &definition).await {
-            Ok(revalidated) => {
-                catalog::check_owned_tables(&txn, schema, &definition, &revalidated).await
-            }
-            Err(err) => Err(err),
+        // refuse. It re-validates the target as `resume_locked`'s re-keying
+        // of one an earlier release keyed by an `INCLUDE` column leaves it
+        // (#1722), which it undoes here: `resume_locked` re-keys it under
+        // the definition's row lock.
+        let checked = {
+            let rekeyed = txn.savepoint("resume_precheck").await?;
+            let checked = match crate::defs::recorded_keys::repair_target_key(
+                &rekeyed,
+                &definition,
+                &source_table,
+            )
+            .await
+            {
+                Ok(_) => match catalog::revalidate(&rekeyed, schema, floors, &definition).await {
+                    Ok(revalidated) => {
+                        catalog::check_owned_tables(&rekeyed, schema, &definition, &revalidated)
+                            .await
+                    }
+                    Err(err) => Err(err),
+                },
+                Err(err) => Err(err),
+            };
+            rekeyed.rollback().await?;
+            checked
         };
         match checked {
             Ok(()) => {}
