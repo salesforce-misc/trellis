@@ -414,8 +414,8 @@ async fn min_max_define_needs_the_probe_index_and_refuses_the_opt_out() {
 
 /// The define refusals of `MIN`/`MAX` besides the index (#1117 rules 3, 5
 /// and 7): a collatable argument, an expression argument and a `JOIN`. A
-/// source that is another transform's target (rule 6) is
-/// `defs::validate`'s unit test: it needs the upstream live first.
+/// source that is another transform's target (rule 6) is `type_matrix`'s
+/// `a_chained_min_max_is_refused_by_name_with_or_without_the_opt_out`.
 #[tokio::test]
 async fn min_max_refuses_text_expressions_and_joins() {
     let (_cluster, _db, _raw, trellis) = setup(
