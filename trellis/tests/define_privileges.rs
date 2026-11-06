@@ -293,3 +293,73 @@ async fn request_backfill_names_the_missing_privilege_too() {
         "{err:?}"
     );
 }
+
+/// A `MIN`/`MAX` aggregate's drains re-read a group's extreme from the
+/// source, as the ring's owner: define and a whole-transform `RESUME`
+/// refuse while that role lacks `SELECT` on it (`ExtremeSourceNotReadable`),
+/// naming the grant, and accept once it holds it. Here the ring's owner is
+/// `trellis`, a member of the source's owner, which revoked its own
+/// `SELECT`.
+#[tokio::test]
+async fn a_min_max_source_the_ring_owner_cannot_select_from_is_refused_naming_the_grant() {
+    const MIN_MAX: &str = "TRANSFORM by_customer FROM public.orders GROUP BY customer_id \
+         SELECT MIN(amount) AS lo, MAX(amount) AS hi";
+    let cluster = TestCluster::start();
+    let (_db, admin, _pool, trellis) = set_up(&cluster).await;
+    admin
+        .batch_execute(
+            "create index on public.orders (customer_id, amount); \
+             revoke select on public.orders from app_owner",
+        )
+        .await
+        .expect("an index, and the owner's SELECT revoked");
+    let refused = |statement: &'static str| {
+        let trellis = &trellis;
+        async move {
+            let err = trellis
+                .apply(statement)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{statement}: accepted"));
+            // Define returns the catalog error; a resume wraps it as its reason.
+            let debug = format!("{err:?}");
+            assert!(
+                debug.contains(
+                    r#"ExtremeSourceNotReadable { table: "public.orders", role: "trellis" }"#
+                ),
+                "{statement}: {debug}"
+            );
+            assert!(
+                err.to_string()
+                    .contains(r#"GRANT SELECT ON public.orders TO "trellis""#),
+                "{err}"
+            );
+            assert_eq!(err.code(), ErrorCode::Validation);
+        }
+    };
+    refused(MIN_MAX).await;
+
+    admin
+        .batch_execute("grant select on public.orders to app_owner")
+        .await
+        .expect("grant");
+    trellis.apply(MIN_MAX).await.expect("define");
+    trellis
+        .apply("PAUSE TRANSFORM by_customer")
+        .await
+        .expect("pause");
+    admin
+        .batch_execute("revoke select on public.orders from app_owner")
+        .await
+        .expect("revoke");
+    refused("RESUME TRANSFORM by_customer").await;
+    admin
+        .batch_execute("grant select on public.orders to trellis")
+        .await
+        .expect("grant the ring's owner itself");
+    trellis
+        .apply("RESUME TRANSFORM by_customer")
+        .await
+        .expect("resume");
+    trellis.shutdown().await.expect("shutdown");
+}
