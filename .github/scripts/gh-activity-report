@@ -450,6 +450,7 @@ HTML_TEMPLATE = """<!doctype html>
     padding: 20px 20px 8px; position: relative;
   }}
   .mini-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }}
+  .stat-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-top: 16px; }}
   .chart-card.mini {{ padding: 16px 16px 12px; }}
   .mini-title {{ font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 8px; }}
   .mini-total {{ margin-bottom: 8px; }}
@@ -497,7 +498,7 @@ HTML_TEMPLATE = """<!doctype html>
   td {{ padding: 6px 12px; text-align: right; font-variant-numeric: tabular-nums; border-bottom: 1px solid var(--gridline); }}
 
   @media (max-width: 640px) {{
-    .mini-grid {{ grid-template-columns: 1fr; }}
+    .mini-grid, .stat-grid {{ grid-template-columns: 1fr; }}
   }}
 </style>
 </head>
@@ -530,6 +531,17 @@ HTML_TEMPLATE = """<!doctype html>
     <div class="legend" id="legend"></div>
     <svg class="chart" id="chart" viewBox="0 0 900 320" preserveAspectRatio="none"></svg>
     <div class="tooltip" id="tooltip" hidden></div>
+  </div>
+
+  <div class="stat-grid">
+    <div class="chart-card mini">
+      <div class="mini-title">Issues closed</div>
+      <div class="mini-total"><div class="value" id="totalIssuesClosed"></div><div class="caption">Total, since the start of the project</div></div>
+    </div>
+    <div class="chart-card mini">
+      <div class="mini-title">PRs merged</div>
+      <div class="mini-total"><div class="value" id="totalPrsMerged"></div><div class="caption">Total, since the start of the project</div></div>
+    </div>
   </div>
 
   <div class="table-wrap" id="tableWrap" hidden>
@@ -614,6 +626,12 @@ HTML_TEMPLATE = """<!doctype html>
   }};
   var ALL_DAYS = JSON.parse(document.getElementById("activity-data").textContent);
   var ALL_LOGBOOK_DAYS = JSON.parse(document.getElementById("logbook-data").textContent);
+
+  // All-time totals: independent of the range filter.
+  ["closed_issues", "merged_prs"].forEach(function (key) {{
+    var total = ALL_DAYS.reduce(function (acc, d) {{ return acc + d[key]; }}, 0);
+    document.getElementById(key === "closed_issues" ? "totalIssuesClosed" : "totalPrsMerged").textContent = total.toLocaleString();
+  }});
 
   var state = {{ range: "all", granularity: "day" }};
   var svgNS = "http://www.w3.org/2000/svg";
