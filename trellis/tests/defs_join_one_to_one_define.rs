@@ -1486,6 +1486,10 @@ async fn a_one_to_one_join_may_take_the_name_of_a_paused_readers_dropped_source(
     );
 }
 
+/// A rebuild of a live 1-1 JOIN in place (`request_backfill`, which also
+/// starts a rebuild after an uncaptured change) re-derives every entry and
+/// turns the ones whose rows are gone into tombstones: the target ends equal
+/// to the live join, and the definition goes live again with no sweep job.
 #[tokio::test]
 async fn a_rebuild_in_place_drops_the_entries_whose_rows_are_gone() {
     let cluster = TestCluster::start();
