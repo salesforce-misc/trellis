@@ -480,7 +480,7 @@ pause are arcs of one lifecycle:
   before the enum relabel or re-type to drain" first of all for a relabel,
   and, before the re-type, "re-record `<table>`'s key as (`<columns>`)" for a
   table whose primary key changed while an aggregate or `JOIN` reading it was
-  paused, and "re-key
+  paused, or one read with `KEY (…)` that was created again, and "re-key
   `<target>` by (`<columns>`) in place, dropping the former key column …" for
   a 1-1 target an earlier release keyed by its source key's `INCLUDE`
   columns), or "RESUME would refuse: …" naming what blocks it (anything define
