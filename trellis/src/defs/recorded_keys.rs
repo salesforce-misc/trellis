@@ -562,12 +562,25 @@ pub(crate) async fn rekey(
 }
 
 /// Records `rerecords` ([`rekey`]) in `txn` and nothing else: a resume's
-/// outcome does it under a savepoint it rolls back, so the re-validation it
+/// outcome does it in a transaction it rolls back, so the re-validation it
 /// reports reads the keys a resume's would (`staging::pause_message`).
+///
+/// Every record's row lock is taken first, without waiting: a record
+/// another transaction holds (a resume or define writing it) fails it with
+/// `lock_not_available` at once. Holding one record while it waits for
+/// another could close a deadlock with a resume writing the same two
+/// records in the other order (two `JOIN`s over one pair of tables), whose
+/// deadlock check, having waited first, would fail the resume.
 pub(crate) async fn write_rerecords(
     txn: &tokio_postgres::Transaction<'_>,
     rerecords: &[Rerecord],
 ) -> Result<(), tokio_postgres::Error> {
+    let tables: Vec<&str> = rerecords.iter().map(|r| r.table.as_str()).collect();
+    txn.execute(
+        "select 1 from definition_keys where table_name = any($1) for update nowait",
+        &[&tables],
+    )
+    .await?;
     for r in rerecords {
         write(txn, &r.table, &r.columns).await?;
     }
@@ -1347,5 +1360,54 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// A resume outcome's re-records ([`write_rerecords`]) of two records,
+    /// the second held by another transaction (a resume that wrote it and
+    /// is about to write the first): they fail at once, rather than hold
+    /// the first while they wait for the second, which would deadlock with
+    /// that resume.
+    #[tokio::test]
+    async fn rerecords_fail_at_once_on_a_record_another_transaction_holds() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let mut client = connect(db.dsn()).await;
+        let mut holder = connect(db.dsn()).await;
+        client
+            .batch_execute(
+                "create table public.a (x int primary key); \
+                 create table public.b (x int primary key); \
+                 insert into public.definition_keys values \
+                     ('public.a', '{y}', 'public.a'::regclass, 0), \
+                     ('public.b', '{y}', 'public.b'::regclass, 0)",
+            )
+            .await
+            .expect("the tables and their records");
+        let held = holder.transaction().await.expect("begin");
+        held.batch_execute(
+            "update public.definition_keys set key_columns = '{x}' where table_name = 'public.b'",
+        )
+        .await
+        .expect("hold b's record");
+        let rerecords = ["public.a", "public.b"].map(|table| Rerecord {
+            table: table.to_string(),
+            old: vec!["y".to_string()],
+            columns: vec!["x".to_string()],
+        });
+        let txn = client.transaction().await.expect("begin");
+        let written = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            write_rerecords(&txn, &rerecords),
+        )
+        .await
+        .expect("the re-records don't wait for b's record");
+        let err = written.expect_err("b's record is held");
+        assert_eq!(
+            err.code(),
+            Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+            "{err}"
+        );
+        txn.rollback().await.expect("rollback");
+        held.rollback().await.expect("release b's record");
     }
 }

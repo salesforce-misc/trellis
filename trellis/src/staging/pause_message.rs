@@ -426,8 +426,8 @@ pub(crate) async fn refresh_paused(
 /// with `stamp`, unless its record changed meanwhile, when the next pass
 /// evaluates it instead. Its record is read and evaluated in a transaction
 /// it rolls back, and written in another under the record's row lock: no
-/// lock is waited for while a resume is worked out, but a key record the
-/// outcome re-records ([`rekeying`]), for at most its lock timeout.
+/// lock is waited for while a resume is worked out (a key record the
+/// outcome re-records is taken without waiting, [`rekeying`]).
 async fn refresh(
     client: &mut tokio_postgres::Client,
     schema: &str,
@@ -621,6 +621,22 @@ async fn resume_outcome(
         return Ok(None);
     };
     let mut outcome = ResumeOutcome::default();
+    let state = txn
+        .query_opt(
+            "select restored, relabel_lsn is not null from capture_failures \
+             where transform_id = $1",
+            &[&id],
+        )
+        .await?;
+    let (restored, relabelled) = state.map_or((false, false), |row| (row.get(0), row.get(1)));
+    // A relabel's: the changes staged with the old label drain first, before
+    // anything else a resume does.
+    if relabelled {
+        outcome.step(
+            "wait for the changes staged before the enum relabel or re-type to drain, since \
+             they name the old label",
+        );
+    }
     // The re-keying a resume does before it re-validates.
     rekeying(txn, &definition, &mut outcome).await?;
     if outcome.refuses() {
@@ -646,21 +662,6 @@ async fn resume_outcome(
     }
     if outcome.refuses() {
         return Ok(Some(outcome));
-    }
-    let state = txn
-        .query_opt(
-            "select restored, relabel_lsn is not null from capture_failures \
-             where transform_id = $1",
-            &[&id],
-        )
-        .await?;
-    let (restored, relabelled) = state.map_or((false, false), |row| (row.get(0), row.get(1)));
-    // A relabel's: the changes staged with the old label drain first.
-    if relabelled {
-        outcome.step(
-            "wait for the changes staged before the enum relabel or re-type to drain, since \
-             they name the old label",
-        );
     }
     // Typed copies whose type define would give differently now.
     let copies = crate::defs::copies::typed_copies(
@@ -713,9 +714,11 @@ async fn resume_outcome(
 /// table whose key changed while the definition was paused has its key
 /// re-recorded ([`recorded_keys::rekey`]); or the resume refuses. The
 /// re-recorded keys are written in `txn` for the providers after this one,
-/// under a short lock timeout: one held by a concurrent resume or define
-/// fails the pass's evaluation of this definition, which the next pass
-/// repeats, rather than waiting for it.
+/// without waiting for their row locks ([`recorded_keys::write_rerecords`]):
+/// one held by a concurrent resume or define fails the pass's evaluation of
+/// this definition, which the next pass repeats. Until `txn` rolls back, a
+/// resume, define or drop writing the same record waits for this
+/// evaluation to finish.
 async fn rekeying(
     txn: &Transaction<'_>,
     definition: &crate::defs::model::Definition,
@@ -756,7 +759,6 @@ async fn rekeying(
         ));
     }
     if !rerecords.is_empty() {
-        txn.batch_execute("set local lock_timeout = '1s'").await?;
         recorded_keys::write_rerecords(txn, &rerecords).await?;
     }
     Ok(())

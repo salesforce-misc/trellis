@@ -477,9 +477,10 @@ pause are arcs of one lifecycle:
   give them now (`<column>` from `<type>` to `<type>`), then rebuild
   `<target>` from `<source>`" (with "reset the ordering state the dump brought
   from the original database" for a restore, "wait for the changes staged
-  before the enum relabel or re-type to drain" for a relabel, and, first of
-  all, "re-record `<table>`'s key as (`<columns>`)" for a table whose primary
-  key changed while an aggregate or `JOIN` reading it was paused, and "re-key
+  before the enum relabel or re-type to drain" first of all for a relabel,
+  and, before the re-type, "re-record `<table>`'s key as (`<columns>`)" for a
+  table whose primary key changed while an aggregate or `JOIN` reading it was
+  paused, and "re-key
   `<target>` by (`<columns>`) in place, dropping the former key column …" for
   a 1-1 target an earlier release keyed by its source key's `INCLUDE`
   columns), or "RESUME would refuse: …" naming what blocks it (anything define
@@ -514,10 +515,12 @@ pause are arcs of one lifecycle:
   something it can't use), the
   resume fails with `ApplyError::ResumeRefused`, whose message is define's own
   error naming the column and what to change, and the transform stays paused,
-  untouched. The resume also refuses in three cases define doesn't, where define
-  would accept the transform and the message says to drop it and define it again:
-  its target table is missing, its 1-1 source key was redefined, or its ledger
-  table is missing
+  untouched. The resume also refuses in cases define doesn't, where define
+  would accept the transform: its target or ledger table is missing, or a key
+  it uses changed in a way it can't re-record (its 1-1 source key was
+  redefined, a table it reads has no primary key left to take, its target lost
+  the index over its key, or a user's object depends on a column re-keying its
+  target would drop)
   ([operations — `PAUSE` and `RESUME`](operations.md#pause-and-resume)). A field resume
   (`RESUME TRANSFORM t.col`) runs the same validation, but not the ledger
   check, since it rebuilds nothing. Otherwise the resume returns it to
