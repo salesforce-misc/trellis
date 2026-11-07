@@ -54,6 +54,9 @@ pub struct CaptureReader {
     /// Until it resumes, which rebuilds it, it reads nothing, so its columns
     /// don't count and the table's capture can drop a column only it read.
     pub capture_failed: bool,
+    /// The stamp its paused message was written at
+    /// (`staging::pause_message::stamp`), when it is paused with a record.
+    pub refresh_stamp: Option<String>,
     /// The qualified `target_table` it writes.
     pub target: String,
     /// A `JOIN`'s qualified joined table, its second source.
@@ -172,6 +175,7 @@ pub async fn load_catalog_for(
             source: row.source,
             def: row.def,
             capture_failed: row.capture_failed,
+            refresh_stamp: row.refresh_stamp,
             target: row.target,
             join: row.join,
         })
@@ -350,6 +354,7 @@ mod tests {
                     source: source.to_string(),
                     def: def(text),
                     capture_failed: false,
+                    refresh_stamp: None,
                     target: format!("public.target_{}", i + 1),
                     join: None,
                 })

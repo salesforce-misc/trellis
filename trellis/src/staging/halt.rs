@@ -414,6 +414,7 @@ mod tests {
                     source: source.to_string(),
                     def: parse(text).unwrap_or_else(|e| panic!("{text}: {e:?}")),
                     capture_failed: false,
+                    refresh_stamp: None,
                     target: target.to_string(),
                     join: None,
                 })

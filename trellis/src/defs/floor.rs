@@ -53,6 +53,7 @@
 //! attaching pauses it with [`Unrunnable::reason`], and `RESUME`, `ALTER`
 //! and `DROP` refuse it.
 
+use crate::staging::pause_message::Reason;
 use std::fmt;
 use std::sync::Arc;
 
@@ -793,11 +794,6 @@ pub(crate) enum Unrunnable {
 /// an earlier attach recorded and replaces it rather than adding another.
 const UNRUNNABLE_PREFIX: &str = "this release can't run transform ";
 
-/// What joins a pause's reason to the reason the definition was already
-/// paused for, as the other pauses that keep an earlier reason write it
-/// (`lifecycle::pause_for_relabel`).
-const ALREADY_PAUSED: &str = " It was already paused: ";
-
 impl Unrunnable {
     /// The `capture_failure` of definition `target` paused because this
     /// binary can't run it: what it needs, what this binary is, and the
@@ -877,29 +873,18 @@ pub(crate) fn unknown_value_sql(d: &str) -> String {
     )
 }
 
-/// The `capture_failure` error a definition paused for `reason` (an
-/// [`Unrunnable::reason`]) gets when its record holds `existing`, or `None`
-/// when the record already says it. A reason an earlier attach recorded
-/// (a different running release, say) is replaced, and every other reason is
-/// kept after it (ADR-0024 rule 3: pausing an already-paused definition keeps
-/// its reasons).
-pub(crate) fn unrunnable_error(existing: Option<&str>, reason: &str) -> Option<String> {
-    let Some(existing) = existing else {
-        return Some(reason.to_string());
-    };
-    let earlier = if existing.starts_with(UNRUNNABLE_PREFIX) {
-        existing
-            .split_once(ALREADY_PAUSED)
-            .map_or("", |(_, earlier)| earlier)
-    } else {
-        existing
-    };
-    let error = if earlier.is_empty() {
-        reason.to_string()
-    } else {
-        format!("{reason}{ALREADY_PAUSED}{earlier}")
-    };
-    (error != existing).then_some(error)
+/// Puts `reason` (an [`Unrunnable::reason`]) on a definition paused for
+/// `reasons` (oldest first), as the newest: a reason an earlier attach
+/// recorded (a different running release, say) gives way to it, and every
+/// other reason is kept (ADR-0024 rule 3: pausing an already-paused
+/// definition keeps its reasons). Changes nothing when it is already the
+/// newest.
+pub(crate) fn put_unrunnable_reason(reasons: &mut Vec<Reason>, source_table: &str, reason: &str) {
+    if reasons.last().is_some_and(|r| r.text == reason) {
+        return;
+    }
+    reasons.retain(|r| !r.text.starts_with(UNRUNNABLE_PREFIX));
+    reasons.push(Reason::standing(source_table, &[], reason));
 }
 
 /// The floor of `def`, which reads `source` and, for a `JOIN`, `joined`,
@@ -1541,32 +1526,39 @@ mod tests {
         );
     }
 
-    /// (current `capture_failure`, the pause's reason) → the record's new
-    /// error: an unpaused definition gets the reason; a paused one keeps its
-    /// reasons after it; a later attach replaces the reason an earlier one
-    /// recorded, and one that finds it already recorded changes nothing.
+    /// (current reasons, the pause's reason) → the record's new message: an
+    /// unpaused definition gets the reason; a paused one keeps its reasons
+    /// after it; a later attach replaces the reason an earlier one recorded,
+    /// and one that finds it already recorded changes nothing.
     #[test]
     fn pausing_keeps_earlier_reasons_and_never_adds_its_own_twice() {
+        use crate::staging::pause_message::compose;
         let floors_02 = floors("0.2.0", &[]);
         let at_020 = floors_02.unrunnable("0.3.0", 1).unwrap().reason("public.t");
         let at_021 = floors("0.2.1", &[])
             .unrunnable("0.3.0", 1)
             .unwrap()
             .reason("public.t");
-        assert_eq!(unrunnable_error(None, &at_020), Some(at_020.clone()));
-        assert_eq!(unrunnable_error(Some(&at_020), &at_020), None);
-        assert_eq!(
-            unrunnable_error(Some(&at_020), &at_021),
-            Some(at_021.clone())
-        );
+        let put = |reasons: &[Reason], reason: &str| {
+            let mut reasons = reasons.to_vec();
+            put_unrunnable_reason(&mut reasons, "public.s", reason);
+            reasons
+        };
+        let alone = put(&[], &at_020);
+        assert_eq!(compose(&alone, None), at_020);
+        assert_eq!(put(&alone, &at_020), alone);
+        assert_eq!(compose(&put(&alone, &at_021), None), at_021);
 
-        let operator = "paused by the operator";
-        let both = unrunnable_error(Some(operator), &at_020).unwrap();
-        assert_eq!(both, format!("{at_020} It was already paused: {operator}"));
-        assert_eq!(unrunnable_error(Some(&both), &at_020), None);
+        let operator = [Reason::standing("public.s", &[], "paused by the operator")];
+        let both = put(&operator, &at_020);
         assert_eq!(
-            unrunnable_error(Some(&both), &at_021),
-            Some(format!("{at_021} It was already paused: {operator}"))
+            compose(&both, None),
+            format!("{at_020}. It was already paused: paused by the operator")
+        );
+        assert_eq!(put(&both, &at_020), both);
+        assert_eq!(
+            compose(&put(&both, &at_021), None),
+            format!("{at_021}. It was already paused: paused by the operator")
         );
     }
 

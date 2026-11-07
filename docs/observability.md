@@ -466,15 +466,61 @@ pause are arcs of one lifecycle:
     to the drain's role): the definitions it reaches
     and everything downstream of them are paused, with the cause on `capture_failure`.
 
+  A transform can be paused for several of these at once (a restore while a
+  column it reads is renamed, a key change and a re-type in one migration).
+  Each reason is kept, with the state its `RESUME` needs (a restore's reset of
+  the ordering state, a relabel's wait for the old labels to drain), and
+  `RESUME` honours all of them. `capture_failure.error` is one message: every
+  reason, the newest first, each older one after "It was already paused:",
+  then what `RESUME` would do now, as the staging worker's pass worked it out:
+  "RESUME would re-type the columns Trellis created to the types define would
+  give them now (`<column>` from `<type>` to `<type>`), then rebuild
+  `<target>` from `<source>`" (with "reset the ordering state the dump brought
+  from the original database" for a restore, "wait for the changes staged
+  before the enum relabel or re-type to drain" first of all for a relabel,
+  and, before the re-type, "re-record `<table>`'s key as (`<columns>`)" for a
+  table whose primary key changed while an aggregate or `JOIN` reading it was
+  paused, and "re-key
+  `<target>` by (`<columns>`) in place, dropping the former key column …" for
+  a 1-1 target an earlier release keyed by its source key's `INCLUDE`
+  columns), or "RESUME would refuse: …" naming what blocks it (anything define
+  would refuse now, a key it can't re-record, a missing target or ledger
+  table). `capture_failure.reasons` lists the
+  reasons alone and `capture_failure.resume_outcome` the outcome alone, which
+  is unset just after a pause, until the next pass, and while a `RESUME` is
+  in progress (its "resuming: …" message reports it). A transform this
+  release can't run gets no outcome: its reason says what to do instead.
+
+  The pass keeps the message current. Its one fingerprint query covers the
+  tables a paused transform reads, and it evaluates a paused transform again
+  only when one of their columns or indexes changed since its message was
+  written, so a paused transform whose tables don't change costs nothing. On
+  a change it checks each reason it can read from the schema: a renamed or
+  dropped column that is back, or a redefined primary key that is put back,
+  leaves the message, a key redefined again is named as it is now, and a
+  column it reads that is gone now is added as a reason. With no reason left
+  the message reads "the cause it was paused for is gone", followed by what
+  `RESUME` would do. The refresh only rewrites the message: it never resumes,
+  reinstalls or rebuilds anything, and the transform stays paused until
+  `RESUME`. A change the fingerprint doesn't see (a view created on the
+  target, a grant, a row-security policy, an upstream going `live`) doesn't
+  refresh it; `RESUME` checks those itself and refuses naming them. Running
+  `RESUME` accepts what it does then, which re-validates everything define
+  would and acts on the schema as it is at that moment, not on the message: a
+  change made in the seconds since the last pass is acted on without having
+  been shown.
+
   `RESUME TRANSFORM` first re-runs define's validation against the live schema. While
   define would refuse the transform (a column it reads is gone or retyped into
   something it can't use), the
   resume fails with `ApplyError::ResumeRefused`, whose message is define's own
   error naming the column and what to change, and the transform stays paused,
-  untouched. The resume also refuses in three cases define doesn't, where define
-  would accept the transform and the message says to drop it and define it again:
-  its target table is missing, its 1-1 source key was redefined, or its ledger
-  table is missing
+  untouched. The resume also refuses in cases define doesn't, where define
+  would accept the transform: its target or ledger table is missing, or a key
+  it uses changed in a way it can't re-record (its 1-1 source key was
+  redefined, a table it reads has no primary key left to take, its target lost
+  the index over its key, or a user's object depends on a column re-keying its
+  target would drop)
   ([operations — `PAUSE` and `RESUME`](operations.md#pause-and-resume)). A field resume
   (`RESUME TRANSFORM t.col`) runs the same validation, but not the ledger
   check, since it rebuilds nothing. Otherwise the resume returns it to

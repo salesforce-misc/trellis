@@ -139,13 +139,29 @@ async fn a_definition_built_over_an_include_column_pauses_and_resume_re_keys_it(
 
     // A write the capture an earlier release installed stages, keyed by
     // `(id, x)`; then the staging worker's passes regenerate the source's
-    // capture over the corrected key, and keep the reason.
+    // capture over the corrected key, and keep the reason, adding what a
+    // RESUME would do: the 1-1 target is re-keyed in place before its
+    // rebuild (the re-keying the resumes below make), and the aggregate,
+    // whose key the attach already recorded, is rebuilt.
     exec(&d, "update public.inc set y = 7 where id = 3").await;
     settle(&mut d).await;
+    let outcomes = [
+        "RESUME would re-key public.one by (id) in place, dropping the former key column x, \
+         then rebuild public.one from public.inc",
+        "RESUME would rebuild public.g from public.inc",
+    ];
+    let with_outcomes: Vec<String> = reasons
+        .iter()
+        .zip(outcomes)
+        .map(|(reason, outcome)| {
+            let text = reason.strip_suffix("\")").expect("a quoted row");
+            format!("{text}. {outcome}\")")
+        })
+        .collect();
     assert_eq!(
         d.rows("select error from capture_failures order by transform_id")
             .await,
-        reasons
+        with_outcomes
     );
 
     // The source changes while the definitions are paused.

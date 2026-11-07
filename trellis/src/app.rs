@@ -804,7 +804,7 @@ impl Trellis {
                             {CHUNK_FAILURE_COLUMNS}, \
                             cf.source_table as capture_table, cf.columns as capture_columns, \
                             cf.error as capture_error, cf.detected_at as capture_detected_at, \
-                            cf.kind as capture_kind \
+                            cf.kind as capture_kind, {CAPTURE_REASONS_COLUMNS} \
                      from transform_definitions d \
                      {CHUNK_FAILURE_JOIN} \
                      left join capture_failures cf \
@@ -933,7 +933,7 @@ impl Trellis {
                             {CHUNK_FAILURE_COLUMNS}, \
                             cf.source_table as capture_table, cf.columns as capture_columns, \
                             cf.error as capture_error, cf.detected_at as capture_detected_at, \
-                            cf.kind as capture_kind, \
+                            cf.kind as capture_kind, {CAPTURE_REASONS_COLUMNS}, \
                             exists (select 1 from column_status cs \
                                     where cs.transform_table = split_part(d.target_table, '.', 2) \
                                     and cs.awaiting_capture) \
@@ -1170,7 +1170,9 @@ impl Trellis {
                 kind: CaptureFailureKind::Capture,
                 source_table: row.get(0),
                 columns: row.get(7),
+                reasons: vec![error.clone()],
                 error,
+                resume_outcome: None,
                 detected_at: row.get(1),
             })
         });
@@ -2102,14 +2104,39 @@ pub enum BuildWait {
 /// `capture_detected_at` from a left join on the definition's id.
 fn capture_failure(row: &tokio_postgres::Row) -> Option<CaptureFailure> {
     row.get::<_, Option<String>>("capture_table")
-        .map(|source_table| CaptureFailure {
-            kind: CaptureFailureKind::from_persisted(row.get("capture_kind")),
-            source_table,
-            columns: row.get("capture_columns"),
-            error: row.get("capture_error"),
-            detected_at: row.get("capture_detected_at"),
+        .map(|source_table| {
+            let error: String = row.get("capture_error");
+            let resume_outcome: Option<String> = row.get("capture_resume_outcome");
+            let mut reasons: Vec<String> = row.get("capture_reasons");
+            // A message this release didn't compose from its reasons (an
+            // older release wrote it) is one reason, as
+            // `staging::pause_message` reads it.
+            let composed =
+                crate::staging::pause_message::compose_texts(&reasons, resume_outcome.as_deref());
+            let resume_outcome = if composed == error {
+                resume_outcome
+            } else {
+                reasons = vec![error.clone()];
+                None
+            };
+            CaptureFailure {
+                kind: CaptureFailureKind::from_persisted(row.get("capture_kind")),
+                source_table,
+                columns: row.get("capture_columns"),
+                error,
+                reasons,
+                resume_outcome,
+                detected_at: row.get("capture_detected_at"),
+            }
         })
 }
+
+/// The columns [`capture_failure`] reads besides `capture_failures`' own:
+/// the record's reasons, the newest first, and its `RESUME` outcome.
+const CAPTURE_REASONS_COLUMNS: &str = "\
+    array(select r.reason from capture_failure_reasons r \
+          where r.transform_id = cf.transform_id order by r.position desc) as capture_reasons, \
+    cf.resume_outcome as capture_resume_outcome";
 
 /// The live processes of another version that hold this binary back
 /// (ADR-0023), or `None` when there are none.
@@ -2344,8 +2371,26 @@ pub struct CaptureFailure {
     /// columns, or the missing column an install names. Empty
     /// for a failure that isn't about a column, and for a halt.
     pub columns: Vec<String>,
-    /// A sentence naming the cause and, for a pause, what to do.
+    /// The message: every reason the definition is paused for, the newest
+    /// first and each older one after "It was already paused:", then, once
+    /// the staging worker's pass has worked it out, what `RESUME` would do
+    /// now ([`Self::resume_outcome`]). A reason names its cause and what to
+    /// do. With no reason left (each cause was fixed while it stayed paused)
+    /// it reads "the cause it was paused for is gone", and the definition
+    /// stays paused until `RESUME`.
     pub error: String,
+    /// Each reason the definition is paused for, the newest first: the
+    /// sentences [`Self::error`] joins. Empty once every cause is gone.
+    pub reasons: Vec<String>,
+    /// What `RESUME` would do now, as the staging worker's pass last worked
+    /// it out ("RESUME would rebuild ..."), or what makes it refuse
+    /// ("RESUME would refuse: ..."), naming the columns it would re-type and
+    /// the tables it would rebuild. The pass writes it again whenever a
+    /// relation the definition reads changes. `None` until the pass has
+    /// worked it out (just after a pause), and while a `RESUME` is in
+    /// progress, which reports itself. `RESUME` re-validates everything
+    /// itself and acts on what it finds then, not on this text.
+    pub resume_outcome: Option<String>,
     /// When the drain or the staging worker first found it.
     pub detected_at: SystemTime,
 }

@@ -68,6 +68,7 @@ use tokio_postgres::Transaction;
 use super::catalog::CatalogError;
 use super::model::{EdgeKind, StoredStatus};
 use crate::pool::{Pool, quote_ident};
+use crate::staging::pause_message::{self, Reason, Recheck};
 
 /// What [`pause_transform`] actually did — returned so a caller (and a test)
 /// can tell a real transition from the idempotent no-op, even though both are
@@ -204,9 +205,13 @@ async fn withdraw_resume(txn: &Transaction<'_>, id: i64) -> Result<bool, Catalog
         )
         .await?
         == 1;
+    // Under the record's row lock, which every writer of its reasons takes
+    // before it reads them (`staging::pause_message`): the reasons rewritten
+    // below are the ones a refresh that committed meanwhile left.
     let record = txn
         .query_opt(
-            "select error, caused_by is not null from capture_failures where transform_id = $1",
+            "select source_table, caused_by is not null from capture_failures \
+             where transform_id = $1 for update",
             &[&id],
         )
         .await?;
@@ -214,20 +219,31 @@ async fn withdraw_resume(txn: &Transaction<'_>, id: i64) -> Result<bool, Catalog
     if !requested && !caused {
         return Ok(false);
     }
-    let error = match record {
-        Some(row) if caused => {
-            let error: String = row.get(0);
-            let reason = error
-                .split_once(crate::staging::schema_change::CAUSED_RESUMES_ON_ITS_OWN)
-                .map_or(error.as_str(), |(reason, _)| reason);
-            format!("{reason}{WITHDRAWN_CAUSE}")
-        }
-        _ => WITHDRAWN_REQUEST.to_string(),
-    };
+    if caused {
+        pause_message::rewrite_reasons(txn, id, |reasons| {
+            for reason in reasons.iter_mut() {
+                if let Some((own, _)) = reason
+                    .text
+                    .split_once(crate::staging::schema_change::CAUSED_RESUMES_ON_ITS_OWN)
+                {
+                    reason.text = format!("{own}{WITHDRAWN_CAUSE}");
+                }
+            }
+        })
+        .await?;
+    } else if let Some(row) = &record {
+        let source_table: String = row.get(0);
+        pause_message::replace_reasons(
+            txn,
+            id,
+            &[Reason::standing(&source_table, &[], WITHDRAWN_REQUEST)],
+        )
+        .await?;
+    }
     txn.execute(
-        "update capture_failures set error = $2, caused_by = null, detected_at = now() \
+        "update capture_failures set caused_by = null, detected_at = now() \
          where transform_id = $1",
-        &[&id, &error],
+        &[&id],
     )
     .await?;
     Ok(true)
@@ -254,7 +270,8 @@ const WITHDRAWN_REQUEST: &str = "paused by the operator, which withdrew its resu
 ///
 /// A definition already frozen keeps its status (a quarantined one stays
 /// quarantined) but still gets the record, since its resume is the same
-/// rebuild. An existing record is kept, so the first detection stands.
+/// rebuild. An existing record keeps its kind and state, and its reasons
+/// after this one ([`crate::staging::pause_message`]).
 /// Returns whether this call paused it.
 ///
 /// `caused_by` is the definition whose resume re-typed the columns of its
@@ -269,7 +286,28 @@ pub(crate) async fn pause_for_capture_failure(
     error: &str,
     caused_by: Option<i64>,
 ) -> Result<bool, CatalogError> {
-    pause_with_record(txn, id, source_table, columns, error, "capture", caused_by).await
+    let reason = Reason::standing(source_table, columns, error);
+    pause_with_record(txn, id, reason, "capture", caused_by).await
+}
+
+/// [`pause_for_capture_failure`] for a schema change whose cause the
+/// capture pass can read again while the definition stays paused
+/// (`recheck`): columns renamed or dropped, or a primary key redefined.
+/// The pass drops the reason once its cause is gone, and rewrites it when
+/// it changes ([`crate::staging::pause_message`]).
+pub(crate) async fn pause_for_schema_change(
+    txn: &Transaction<'_>,
+    id: i64,
+    source_table: &str,
+    columns: &[String],
+    error: &str,
+    recheck: Recheck,
+) -> Result<bool, CatalogError> {
+    let reason = Reason {
+        recheck,
+        ..Reason::standing(source_table, columns, error)
+    };
+    pause_with_record(txn, id, reason, "capture", None).await
 }
 
 /// Pauses definition `id` because Trellis's capture of a table it reads was
@@ -305,7 +343,14 @@ pub(crate) async fn pause_for_disruption(
     } else {
         "capture"
     };
-    pause_with_record(txn, id, source_table, &[], error, kind, None).await
+    pause_with_record(
+        txn,
+        id,
+        Reason::standing(source_table, &[], error),
+        kind,
+        None,
+    )
+    .await
 }
 
 /// Pauses definition `id` because the database was restored from a logical
@@ -336,17 +381,23 @@ pub(crate) async fn pause_for_restore(
     } else {
         "capture"
     };
+    let already = txn
+        .query_opt(
+            "select restored from capture_failures where transform_id = $1",
+            &[&id],
+        )
+        .await?
+        .is_some_and(|row| row.get::<_, bool>(0));
     txn.execute(
         "insert into capture_failures (transform_id, source_table, columns, error, kind, restored) \
          values ($1, $2, '{}', $3, $4, true) \
-         on conflict (transform_id) do update \
-         set restored = true, caused_by = null, \
-             error = case when capture_failures.restored then capture_failures.error \
-                          else excluded.error || ' It was already paused: ' \
-                               || capture_failures.error end",
-        &[&id, &source_table, &error, &kind],
+         on conflict (transform_id) do update set restored = true, caused_by = null",
+        &[&id, &source_table, &pause_message::NO_REASON_YET, &kind],
     )
     .await?;
+    if !already {
+        pause_message::add_reason(txn, id, Reason::standing(source_table, &[], error)).await?;
+    }
     Ok(txn
         .execute(
             "update transform_definitions set status = $2 where id = $1 and status = any($3)",
@@ -380,19 +431,30 @@ pub(crate) async fn pause_for_relabel(
     error: &str,
     lsn: crate::PgLsn,
 ) -> Result<bool, CatalogError> {
+    let Some(row) = txn
+        .query_opt(
+            "select f.relabel_lsn is not null from transform_definitions d \
+             left join capture_failures f on f.transform_id = d.id \
+             where d.id = $1",
+            &[&id],
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    let relabelled = row.get::<_, Option<bool>>(0) == Some(true);
     txn.execute(
         "insert into capture_failures \
              (transform_id, source_table, columns, error, kind, relabel_lsn) \
-         select id, $2, '{}', $3, 'capture', $4 from transform_definitions where id = $1 \
+         values ($1, $2, '{}', $3, 'capture', $4) \
          on conflict (transform_id) do update \
-         set relabel_lsn = greatest(capture_failures.relabel_lsn, excluded.relabel_lsn), \
-             error = case when capture_failures.relabel_lsn is not null \
-                          then capture_failures.error \
-                          else excluded.error || ' It was already paused: ' \
-                               || capture_failures.error end",
-        &[&id, &source_table, &error, &lsn],
+         set relabel_lsn = greatest(capture_failures.relabel_lsn, excluded.relabel_lsn)",
+        &[&id, &source_table, &pause_message::NO_REASON_YET, &lsn],
     )
     .await?;
+    if !relabelled {
+        pause_message::add_reason(txn, id, Reason::standing(source_table, &[], error)).await?;
+    }
     Ok(txn
         .execute(
             "update transform_definitions set status = $2 where id = $1 and status = any($3)",
@@ -417,7 +479,8 @@ pub(crate) async fn pause_for_included_key(
     source_table: &str,
     error: &str,
 ) -> Result<bool, CatalogError> {
-    pause_with_record(txn, id, source_table, &[], error, "capture", None).await
+    let reason = Reason::standing(source_table, &[], error);
+    pause_with_record(txn, id, reason, "capture", None).await
 }
 
 /// Pauses definition `id` because it was written under a grammar version
@@ -429,14 +492,15 @@ pub(crate) async fn pause_for_grammar_version(
     source_table: &str,
     error: &str,
 ) -> Result<bool, CatalogError> {
-    pause_with_record(txn, id, source_table, &[], error, "capture", None).await
+    let reason = Reason::standing(source_table, &[], error);
+    pause_with_record(txn, id, reason, "capture", None).await
 }
 
 /// Pauses definition `id`, which this binary can't run (ADR-0024 rules 3
 /// and 6), recording `reason` (an [`super::floor::Unrunnable::reason`]) as its
 /// `capture_failure`, kind `capture`: only an operator's `RESUME` under a
 /// release that runs it resumes it. A definition already paused keeps its
-/// reasons after this one ([`super::floor::unrunnable_error`]), and loses any
+/// reasons after this one ([`super::floor::put_unrunnable_reason`]), and loses any
 /// resume that would complete without the operator: a pending resume request
 /// and an upstream cause. Returns whether this changed anything, so a later
 /// attach that finds it already recorded changes nothing.
@@ -448,7 +512,7 @@ pub(crate) async fn pause_for_unrunnable(
 ) -> Result<bool, CatalogError> {
     let Some(row) = txn
         .query_opt(
-            "select cf.error, cf.caused_by is not null \
+            "select cf.caused_by is not null \
              from transform_definitions d \
              left join capture_failures cf on cf.transform_id = d.id \
              where d.id = $1 for update of d",
@@ -458,8 +522,7 @@ pub(crate) async fn pause_for_unrunnable(
     else {
         return Ok(false);
     };
-    let existing: Option<String> = row.get(0);
-    let mut changed = row.get::<_, Option<bool>>(1) == Some(true);
+    let mut changed = row.get::<_, Option<bool>>(0) == Some(true);
     changed |= txn
         .execute(
             "delete from resume_requests where transform_id = $1",
@@ -467,15 +530,16 @@ pub(crate) async fn pause_for_unrunnable(
         )
         .await?
         == 1;
-    let error = super::floor::unrunnable_error(existing.as_deref(), reason);
-    if let Some(error) = &error {
+    insert_record(txn, id, source_table, "capture", None).await?;
+    let recorded = pause_message::rewrite_reasons(txn, id, |reasons| {
+        super::floor::put_unrunnable_reason(reasons, source_table, reason);
+    })
+    .await?;
+    if recorded {
         txn.execute(
-            "insert into capture_failures (transform_id, source_table, columns, error, kind) \
-             values ($1, $2, '{}', $3, 'capture') \
-             on conflict (transform_id) do update \
-             set error = excluded.error, kind = 'capture', caused_by = null, \
-                 detected_at = now()",
-            &[&id, &source_table, error],
+            "update capture_failures set kind = 'capture', caused_by = null, detected_at = now() \
+             where transform_id = $1",
+            &[&id],
         )
         .await?;
     } else if changed {
@@ -485,7 +549,7 @@ pub(crate) async fn pause_for_unrunnable(
         )
         .await?;
     }
-    changed |= error.is_some();
+    changed |= recorded;
     // A status a newer release wrote is paused over too (ADR-0024 rule 6):
     // nothing in this release can read it, and the record's reason says
     // which it was.
@@ -517,28 +581,31 @@ pub(crate) async fn pause_for_halt(
     source_table: &str,
     error: &str,
 ) -> Result<bool, CatalogError> {
-    pause_with_record(txn, id, source_table, &[], error, "halt", None).await
+    pause_with_record(
+        txn,
+        id,
+        Reason::standing(source_table, &[], error),
+        "halt",
+        None,
+    )
+    .await
 }
 
 /// Records why `id` pauses in `capture_failures`, under `kind` and with
-/// its upstream cause, unless a record already stands, and pauses it unless
-/// it's frozen. Returns whether it paused it.
+/// its upstream cause, and pauses it unless it's frozen. A record that
+/// already stands keeps its kind and its state (its cause, a restore's, a
+/// relabel's), and gets this reason before its own
+/// ([`crate::staging::pause_message::add_reason`]). Returns whether it
+/// paused it.
 async fn pause_with_record(
     txn: &Transaction<'_>,
     id: i64,
-    source_table: &str,
-    columns: &[String],
-    error: &str,
+    reason: Reason,
     kind: &str,
     caused_by: Option<i64>,
 ) -> Result<bool, CatalogError> {
-    txn.execute(
-        "insert into capture_failures (transform_id, source_table, columns, error, kind, caused_by) \
-         select id, $2, $3, $4, $5, $6 from transform_definitions where id = $1 \
-         on conflict (transform_id) do nothing",
-        &[&id, &source_table, &columns, &error, &kind, &caused_by],
-    )
-    .await?;
+    insert_record(txn, id, &reason.source_table, kind, caused_by).await?;
+    pause_message::add_reason(txn, id, reason).await?;
     let paused = txn
         .execute(
             "update transform_definitions set status = $2 \
@@ -552,6 +619,32 @@ async fn pause_with_record(
         .await?
         == 1;
     Ok(paused)
+}
+
+/// Inserts definition `id`'s `capture_failures` record, if it exists and
+/// has none, with no reason yet, under `kind` and with its upstream cause;
+/// an existing record is locked and left as it is.
+async fn insert_record(
+    txn: &Transaction<'_>,
+    id: i64,
+    source_table: &str,
+    kind: &str,
+    caused_by: Option<i64>,
+) -> Result<(), CatalogError> {
+    txn.execute(
+        "insert into capture_failures (transform_id, source_table, columns, error, kind, caused_by) \
+         select id, $2, '{}', $3, $4, $5 from transform_definitions where id = $1 \
+         on conflict (transform_id) do update set transform_id = excluded.transform_id",
+        &[
+            &id,
+            &source_table,
+            &pause_message::NO_REASON_YET,
+            &kind,
+            &caused_by,
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Removes `target`'s definition — ADR-0014's terminal reap.

@@ -89,14 +89,16 @@ pub(crate) struct Fingerprints {
 
 impl Fingerprints {
     /// Reads the fingerprints of every relation the checks of `catalog`'s
-    /// unpaused definitions read: one query, however many definitions.
+    /// definitions read: one query, however many definitions. A paused
+    /// definition's are read too, for the refresh of its message
+    /// (`staging::pause_message`).
     pub(crate) async fn read(
         client: &impl GenericClient,
         schema: &str,
         catalog: &CaptureCatalog,
     ) -> Result<Fingerprints, tokio_postgres::Error> {
         let mut names: BTreeSet<String> = BTreeSet::new();
-        for reader in catalog.definitions.iter().filter(|r| !r.capture_failed) {
+        for reader in &catalog.definitions {
             names.extend(inputs_of(schema, reader));
         }
         let names: Vec<String> = names.into_iter().collect();
@@ -131,8 +133,8 @@ impl Fingerprints {
     }
 
     /// The [`fingerprint`] of `relation`, named as SQL resolves it
-    /// ([`crate::defs::ddl::regclass_arg`]), when an unpaused definition's
-    /// check reads it.
+    /// ([`crate::defs::ddl::regclass_arg`]), when a definition's check reads
+    /// it.
     pub(crate) fn of(&self, relation: &str) -> Option<&str> {
         self.relations.get(relation).map(String::as_str)
     }

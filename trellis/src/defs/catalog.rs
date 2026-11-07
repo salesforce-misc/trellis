@@ -4033,6 +4033,9 @@ pub(crate) struct CaptureReaderRow {
     pub def: TransformDef,
     /// A `schema_changed` marker paused it (C6, `capture_failures`).
     pub capture_failed: bool,
+    /// The stamp its paused message was written at
+    /// (`capture_failures.refresh_stamp`, `staging::pause_message`).
+    pub refresh_stamp: Option<String>,
     /// The qualified `target_table`.
     pub target: String,
     /// A `JOIN`'s qualified joined table.
@@ -4060,7 +4063,8 @@ pub(crate) async fn capture_readers(
         .query_typed(
             "select d.id, d.source_table, d.definition_text, \
                     exists (select 1 from capture_failures f where f.transform_id = d.id), \
-                    d.target_table, d.grammar_version, d.join_table, d.floor_version \
+                    d.target_table, d.grammar_version, d.join_table, d.floor_version, \
+                    (select f.refresh_stamp from capture_failures f where f.transform_id = d.id) \
              from transform_definitions d order by d.id",
             &[],
         )
@@ -4073,6 +4077,7 @@ pub(crate) async fn capture_readers(
                     source: row.get(1),
                     def,
                     capture_failed: row.get(3),
+                    refresh_stamp: row.get(8),
                     target: row.get(4),
                     join: row.get(6),
                 })),
@@ -5119,12 +5124,30 @@ pub(crate) async fn revalidate(
     floors: &Floors,
     definition: &Definition,
 ) -> Result<Revalidated, CatalogError> {
+    revalidate_keyed(txn, schema, floors, definition, true).await
+}
+
+/// [`revalidate`] after a resume's re-keying has been decided: without
+/// `check_keys`, the tables' keys aren't checked again
+/// ([`super::recorded_keys::check`]). A resume's outcome
+/// (`staging::pause_message`) decides the re-keying itself
+/// ([`super::recorded_keys::rekey`]), which refuses as the check would
+/// after it, and reports a target's re-keying it hasn't made.
+pub(crate) async fn revalidate_keyed(
+    txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+    floors: &Floors,
+    definition: &Definition,
+    check_keys: bool,
+) -> Result<Revalidated, CatalogError> {
     let source = definition.source_table.as_str();
     reject_target_in_catalog_schema(txn, schema, &definition.target_table).await?;
     // Every table the definition keys by has a key it can key by: an index
     // over the recorded key, or a key a resume takes (#1719). It is never
     // keyed by a guess.
-    super::recorded_keys::check(txn, definition).await?;
+    if check_keys {
+        super::recorded_keys::check(txn, definition).await?;
+    }
     let joined = join_table_of(txn, definition.id).await?;
     if let Some(joined) = joined {
         return revalidate_join(txn, schema, floors, definition, joined).await;

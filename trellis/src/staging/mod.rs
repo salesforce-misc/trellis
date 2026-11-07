@@ -88,6 +88,7 @@ pub(crate) mod one_to_one_ledger;
 pub(crate) mod one_to_one_render;
 pub(crate) mod page;
 pub mod partition_correction;
+pub(crate) mod pause_message;
 pub mod quarantine;
 pub mod retire;
 pub(crate) mod ring_gauges;
@@ -135,6 +136,8 @@ pub use liveness::{
 };
 #[cfg(any(test, feature = "internals"))]
 pub use one_to_one_ledger::explain_page as explain_one_to_one_ledger_page;
+#[cfg(any(test, feature = "internals"))]
+pub use pause_message::refreshes as pause_message_refreshes;
 pub use retire::{collect_tombstones, retire_drained_segments};
 pub use seal::{SealConfig, recover_stuck_seals, seal_if_active_nonempty};
 // `self_check`'s non-error types are reached through `lib.rs`'s own
