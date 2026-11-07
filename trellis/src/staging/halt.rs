@@ -86,6 +86,10 @@ fn seed(err: &ApplyError) -> Option<Seed> {
         | ApplyError::Ddl(DdlError::RecordedKeyMissing {
             table: source_table,
             ..
+        })
+        | ApplyError::Ddl(DdlError::DeferrablePrimaryKey {
+            table: source_table,
+            ..
         }) => Some(Seed::Tables(vec![source_table.clone()])),
         ApplyError::HopBoundExceeded { tables, .. } => Some(Seed::Tables(tables.clone())),
         ApplyError::TruncateWithoutLsn { src_table } => Some(Seed::Tables(vec![src_table.clone()])),

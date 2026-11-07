@@ -214,6 +214,17 @@ pub enum DdlError {
     /// The source table has no primary key, and the definition names no
     /// `KEY (...)` for it (ADR-0026).
     NoPrimaryKey { source_table: String },
+    /// The table's primary key is deferrable (`DEFERRABLE`, initially
+    /// immediate or deferred), and the definition names no `KEY (...)` for
+    /// it: a deferrable key can hold duplicates inside a transaction, so
+    /// Trellis doesn't key a table by one (ADR-0026).
+    DeferrablePrimaryKey {
+        table: String,
+        /// The primary key's constraint name.
+        constraint: String,
+        /// Its key columns, in key order.
+        key: Vec<String>,
+    },
     /// A definition names a `KEY (...)` for another transform's target,
     /// which is keyed by the key Trellis gave it (ADR-0026).
     KeyOnTrellisTarget { table: String, key: Vec<String> },
@@ -339,6 +350,7 @@ impl DdlError {
             // The source table's key can't identify its rows — a rejected
             // definition, same category as any other validation failure.
             DdlError::NoPrimaryKey { .. }
+            | DdlError::DeferrablePrimaryKey { .. }
             | DdlError::KeyOnTrellisTarget { .. }
             | DdlError::KeyNotBacked { .. }
             | DdlError::KeyDiffersFromReaders { .. }
@@ -367,6 +379,19 @@ fn found_indexes(indexes: &[String]) -> String {
     }
 }
 
+/// The remedy for `table`'s deferrable primary key (`constraint`, over
+/// `key`): recreate it not deferrable, in one statement, or key the table by
+/// a `KEY (...)` over a non-deferrable unique index. Postgres can't alter a
+/// primary key's deferrability in place (`ALTER CONSTRAINT` refuses one).
+fn deferrable_key_remedy(table: &str, constraint: &str, key: &[String]) -> String {
+    format!(
+        "Recreate it not deferrable, in one statement (ALTER TABLE {table} DROP CONSTRAINT \
+         {constraint}, ADD PRIMARY KEY ({})), or key the table by KEY (column, ...) over a \
+         unique index that isn't deferrable",
+        key.join(", ")
+    )
+}
+
 impl fmt::Display for DdlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -376,6 +401,18 @@ impl fmt::Display for DdlError {
                  it by with KEY (column, ...) directly after the table, backed by a unique \
                  index over exactly those columns, or add one (ALTER TABLE ... ADD PRIMARY \
                  KEY, or ADD PRIMARY KEY USING INDEX over an existing unique index)"
+            ),
+            DdlError::DeferrablePrimaryKey {
+                table,
+                constraint,
+                key,
+            } => write!(
+                f,
+                "the primary key of '{table}' ({}) is deferrable, and Trellis doesn't key a \
+                 table by a deferrable key: one can hold duplicate keys inside a transaction. \
+                 {}",
+                key.join(", "),
+                deferrable_key_remedy(table, constraint, key)
             ),
             DdlError::KeyOnTrellisTarget { table, key } => write!(
                 f,
@@ -522,6 +559,7 @@ impl std::error::Error for DdlError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             DdlError::NoPrimaryKey { .. }
+            | DdlError::DeferrablePrimaryKey { .. }
             | DdlError::KeyOnTrellisTarget { .. }
             | DdlError::KeyNotBacked { .. }
             | DdlError::KeyDiffersFromReaders { .. }
@@ -646,6 +684,12 @@ pub(crate) async fn admitted_primary_key(
         if let Some(missing) = super::recorded_keys::missing(client, source_table).await? {
             return Err(missing);
         }
+        // A deferrable primary key is no key ([`identity_key_columns`]).
+        if let Some(deferrable) =
+            super::source_key::deferrable_primary_key(client, source_table).await?
+        {
+            return Err(deferrable);
+        }
         return Err(DdlError::NoPrimaryKey {
             source_table: source_table.to_string(),
         });
@@ -719,8 +763,9 @@ pub(crate) async fn admit_key_types(
 /// records every table it keys by and refuses a user table with neither a
 /// primary key nor a `KEY`, so only a Trellis target falls back.
 ///
-/// A partial or deferrable unique index, and one over an expression, is
-/// never the key. The key's columns are the index's key columns only: its
+/// A deferrable primary key or unique index, a partial unique index, and
+/// one over an expression, is never the key: define refuses a table whose
+/// primary key is deferrable ([`DdlError::DeferrablePrimaryKey`]). The key's columns are the index's key columns only: its
 /// `INCLUDE` columns aren't part of it.
 ///
 /// The record is read in the same statement as the index, so a caller pays
@@ -768,10 +813,13 @@ pub(crate) async fn identity_key_columns_over(
                               order by k.ord) as key_columns
                  from pg_index i
                  where i.indrelid = pg_catalog.to_regclass($1)
+                   -- A deferrable key, primary or not, can hold duplicates
+                   -- inside a transaction: it is never the key (ADR-0026).
+                   and i.indimmediate
                    and (
                      i.indisprimary
                      or (
-                       i.indisunique and i.indimmediate and i.indpred is null
+                       i.indisunique and i.indpred is null
                        -- An expression's values are no column a key can
                        -- name: an index over one is no row identity, even
                        -- when it also covers plain columns.
@@ -2954,5 +3002,73 @@ mod tests {
                 .is_empty(),
             "an expression index alone keys nothing"
         );
+    }
+
+    /// A deferrable primary key, initially immediate or deferred, is never
+    /// the key (#1742): the identity reads none, with or without a record
+    /// over its columns, and a source's key refuses it by name rather than
+    /// fall back to another unique index.
+    #[tokio::test]
+    async fn a_deferrable_primary_key_is_never_the_key() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(crate::defs::recorded_keys::TEST_TABLE_DDL)
+            .await
+            .expect("definition_keys");
+        client
+            .batch_execute(
+                "create table public.transform_definitions (target_table text); \
+                 create table public.di (id integer primary key deferrable initially immediate); \
+                 create table public.dd (id integer, \
+                     constraint dd_key primary key (id) deferrable initially deferred); \
+                 create table public.dr (id integer primary key deferrable); \
+                 insert into public.definition_keys \
+                     values ('public.dr', '{id}', 'public.dr'::regclass, \
+                             'public.definition_keys'::regclass); \
+                 create table public.dk (id integer primary key deferrable, \
+                     k integer not null unique);",
+            )
+            .await
+            .expect("the tables");
+        for table in ["public.di", "public.dd", "public.dr"] {
+            assert!(
+                identity_key_columns(&client, table)
+                    .await
+                    .expect("the key")
+                    .is_empty(),
+                "{table}"
+            );
+        }
+        for (table, constraint) in [
+            ("public.di", "di_pkey"),
+            ("public.dd", "dd_key"),
+            ("public.dr", "dr_pkey"),
+            ("public.dk", "dk_pkey"),
+        ] {
+            let err = super::super::source_key::admitted_key(&client, table, None)
+                .await
+                .expect_err(table);
+            assert!(
+                matches!(
+                    &err,
+                    DdlError::DeferrablePrimaryKey { table: t, constraint: c, key }
+                        if t == table && c == constraint && key == &["id"]
+                ),
+                "{table}: {err:?}"
+            );
+        }
+        // A KEY over the unique index beside it is the key.
+        let key = super::super::source_key::admitted_key(&client, "public.dk", Some(&["k".into()]))
+            .await
+            .expect("KEY (k) is backed")
+            .0;
+        assert_eq!(key[0].name, "k");
     }
 }

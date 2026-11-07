@@ -44,7 +44,9 @@
 //! guess ([`check`], [`super::ddl::DdlError::RecordedKeyMissing`]).
 //!
 //! Definitions stored before the record existed get theirs at attach
-//! ([`backfill_in`]), from their parsed text. A definition built over a source
+//! ([`backfill_in`]), from their parsed text; one over a table whose primary
+//! key is deferrable, which an earlier release keyed it by, is paused with
+//! the remedy instead ([`deferrable_key_reason`]). A definition built over a source
 //! key with `INCLUDE` columns was built by an earlier release over the
 //! included columns too (#1722): the backfill records the corrected key and
 //! pauses it, and its `RESUME` re-keys a 1-1 target in place
@@ -330,12 +332,31 @@ pub(crate) async fn missing(
     if !ddl::identity_key_columns(client, table).await?.is_empty() {
         return Ok(None);
     }
+    let trellis_target = super::source_key::is_trellis_target(client, table).await?;
+    // The recorded key's index is there, as a deferrable primary key (made
+    // deferrable after define, or defined by an earlier release): that is
+    // the refusal, with its remedy.
+    if !trellis_target
+        && let Some(deferrable) = super::source_key::deferrable_primary_key(client, table).await?
+        && let DdlError::DeferrablePrimaryKey { key, .. } = &deferrable
+        && same_columns(key, &recorded)
+    {
+        return Ok(Some(deferrable));
+    }
     Ok(Some(DdlError::RecordedKeyMissing {
         table: table.to_string(),
         indexes: unique_indexes(client, table).await?,
-        trellis_target: super::source_key::is_trellis_target(client, table).await?,
+        trellis_target,
         recorded,
     }))
+}
+
+/// Whether `a` and `b` are the same key columns, in any order.
+fn same_columns(a: &[String], b: &[String]) -> bool {
+    let (mut a, mut b) = (a.to_vec(), b.to_vec());
+    a.sort();
+    b.sort();
+    a == b
 }
 
 /// What a resume reads of one table a definition keys by ([`decide`]).
@@ -995,6 +1016,27 @@ pub(crate) fn rebuilt_key_reason(
     )
 }
 
+/// The `capture_failure` of a definition reading `table`, whose primary key
+/// (`constraint`, over `key`) is deferrable: an earlier release keyed a
+/// table by one, and Trellis now refuses it ([`DdlError::DeferrablePrimaryKey`]).
+pub(crate) fn deferrable_key_reason(
+    target: &str,
+    table: &str,
+    constraint: &str,
+    key: &[String],
+) -> String {
+    format!(
+        "transform {target} reads {table}, whose primary key ({}) is deferrable. An earlier \
+         release keyed it by that key; Trellis no longer keys a table by a deferrable key, \
+         which can hold duplicate keys inside a transaction. Recreate it not deferrable, in \
+         one statement (ALTER TABLE {table} DROP CONSTRAINT {constraint}, ADD PRIMARY KEY \
+         ({})), and RESUME this transform, or DROP TRANSFORM and define it again with KEY (...) \
+         over a unique index that isn't deferrable",
+        key.join(", "),
+        key.join(", "),
+    )
+}
+
 /// `table`'s primary key columns, in key order; none when it has no primary
 /// key or doesn't exist.
 async fn primary_key_names(
@@ -1026,8 +1068,11 @@ async fn primary_key_names(
 /// allowlist), so it keeps running on the same key (ADR-0026, #1745 rule
 /// 8). Otherwise returns the table and its unique indexes, and nothing is
 /// written: [`backfill_in`] pauses the definition with the returned
-/// reason. A table that has a primary key, a `KEY` the definition declares
-/// already, or that is another transform's target, is left as it is.
+/// reason. A table whose primary key is deferrable is returned the same
+/// way, with [`deferrable_key_reason`]: no key is taken for it, and adding
+/// a primary key that isn't deferrable and `RESUME` repairs it. Any other
+/// table that has a primary key, a `KEY` the definition declares already,
+/// or that is another transform's target, is left as it is.
 ///
 /// A 1-1 target (plain or `JOIN`) is keyed by its source's key as it was
 /// at define, its primary key and its ledger over the same columns. Its
@@ -1056,6 +1101,17 @@ async fn declare_released_keys(
             || super::source_key::is_trellis_target(txn, table).await?
         {
             continue;
+        }
+        // A deferrable primary key keys nothing now: the definition pauses,
+        // and nothing is recorded for the table.
+        if let Some(DdlError::DeferrablePrimaryKey {
+            constraint, key, ..
+        }) = super::source_key::deferrable_primary_key(txn, table).await?
+        {
+            return Ok(Some((
+                table.to_string(),
+                deferrable_key_reason(target, table, &constraint, &key),
+            )));
         }
         let has_primary_key: Option<bool> = txn
             .query_opt(

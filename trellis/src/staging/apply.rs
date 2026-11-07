@@ -2591,6 +2591,7 @@ fn is_key_gate(err: &DdlError) -> bool {
         err,
         DdlError::NoPrimaryKey { .. }
             | DdlError::RecordedKeyMissing { .. }
+            | DdlError::DeferrablePrimaryKey { .. }
             | DdlError::UnsupportedPrimaryKeyType { .. }
     )
 }

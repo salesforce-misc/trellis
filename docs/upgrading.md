@@ -69,6 +69,17 @@ must also be over that key's columns. Otherwise it pauses, with a
 target is keyed by: add a primary key (for a 1-1 transform, that key back) and
 `RESUME`, or `DROP TRANSFORM` and define it again with a valid `KEY (…)`.
 
+A definition an earlier release kept over a source or joined table whose
+primary key is deferrable (`DEFERRABLE`, initially immediate or deferred) was
+keyed by that key. This release doesn't key a table by a deferrable key, which
+can hold duplicate keys inside a transaction, and no other unique index stands
+in for it. At the takeover the definition pauses, with a `capture_failure`
+naming the table, its key and the remedy: recreate the key not deferrable, in
+one statement (`ALTER TABLE … DROP CONSTRAINT …, ADD PRIMARY KEY (…)`;
+Postgres can't change a primary key's deferrability in place), then `RESUME`;
+or `DROP TRANSFORM` and define it again with a `KEY (…)` over a unique index
+that isn't deferrable.
+
 For an embedded fleet, [Rolling deploys](embedding.md#rolling-deploys) covers
 the handover in detail, and
 [Migrations and transactions](embedding.md#migrations-and-transactions) the

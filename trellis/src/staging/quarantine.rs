@@ -152,9 +152,11 @@ pub fn classify(err: &ApplyError) -> FailureClass {
         // one at a time for a failure none of them individually caused. A
         // composite (multi-column) primary key is not one: every 1-1
         // consumer keys on the source's full primary key.
-        // So is a table whose key define recorded has no index now (#1719).
+        // So is a table whose key define recorded has no index now (#1719),
+        // or only a deferrable primary key (#1742).
         ApplyError::Ddl(DdlError::NoPrimaryKey { .. })
         | ApplyError::Ddl(DdlError::RecordedKeyMissing { .. })
+        | ApplyError::Ddl(DdlError::DeferrablePrimaryKey { .. })
         | ApplyError::Ddl(DdlError::UnsupportedPrimaryKeyType { .. }) => FailureClass::Halting,
         // Postgres refused the drain's role a read or write, for
         // row-level security (every Trellis session runs with `row_security

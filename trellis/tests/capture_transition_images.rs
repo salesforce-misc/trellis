@@ -741,7 +741,9 @@ async fn an_insert_that_writes_a_key_twice_sums_once() {
 
 /// A key swap under a deferrable primary key, with and without a nested
 /// write: each key is on both sides once, and pairs with the row that now
-/// holds it.
+/// holds it. Define refuses a deferrable key (ADR-0026), so no transform's
+/// source swaps keys within a statement; this drives capture alone, which
+/// images the swap correctly whatever the key's deferrability (#1749).
 #[tokio::test]
 async fn a_key_swap_sums_once() {
     let cluster = TestCluster::start();

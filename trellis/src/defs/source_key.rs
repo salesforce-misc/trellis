@@ -1,7 +1,8 @@
 //! The key a definition keys each table it reads by (ADR-0026, #1745).
 //!
 //! A user table is keyed by its primary key, unless the definition names
-//! another key with `KEY (<column>, ...)` directly after the table. With
+//! another key with `KEY (<column>, ...)` directly after the table. Neither
+//! may be deferrable ([`DdlError::DeferrablePrimaryKey`], [`backing`]). With
 //! neither, define refuses ([`DdlError::NoPrimaryKey`]): Trellis never keys a
 //! user table by a unique index it picked itself. A `KEY` must be backed by a
 //! unique index over exactly its columns ([`backing`]), matched by shape,
@@ -167,6 +168,38 @@ async fn has_primary_key(
         .get(0))
 }
 
+/// `table`'s primary key (an unquoted `schema.table`) when it is deferrable
+/// (`DEFERRABLE`, initially immediate or deferred), as the refusal names it:
+/// its constraint name and key columns, in key order. `None` when it has no
+/// primary key, or one that isn't deferrable.
+pub(crate) async fn deferrable_primary_key(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<Option<DdlError>, tokio_postgres::Error> {
+    Ok(client
+        .query_typed_opt(
+            "select co.conname::text, \
+                    array(select a.attname::text \
+                          from pg_catalog.unnest(i.indkey::int2[]) with ordinality k(attnum, ord) \
+                          join pg_catalog.pg_attribute a \
+                            on a.attrelid = i.indrelid and a.attnum = k.attnum \
+                          where k.ord <= i.indnkeyatts \
+                          order by k.ord) \
+             from pg_catalog.pg_index i \
+             join pg_catalog.pg_constraint co \
+               on co.conindid = i.indexrelid and co.conrelid = i.indrelid and co.contype = 'p' \
+             where i.indrelid = pg_catalog.to_regclass($1) \
+               and i.indisprimary and not i.indimmediate",
+            &[(&ddl::regclass_arg(table), Type::TEXT)],
+        )
+        .await?
+        .map(|row| DdlError::DeferrablePrimaryKey {
+            table: table.to_string(),
+            constraint: row.get(0),
+            key: row.get(1),
+        }))
+}
+
 /// Whether `table` (an unquoted `schema.table`) is a definition's target.
 pub(crate) async fn is_trellis_target(
     client: &impl GenericClient,
@@ -204,8 +237,8 @@ async fn is_partitioned(
 ///   ([`ddl::admitted_primary_key`]); a declared key is refused.
 /// - A declared key: the columns as declared, read through the index that
 ///   backs them ([`backing`]); refused when none does.
-/// - Otherwise the table's primary key, which must exist: no unique index
-///   stands in for one.
+/// - Otherwise the table's primary key, which must exist and not be
+///   deferrable: no unique index stands in for one.
 pub(crate) async fn admitted_key(
     client: &impl GenericClient,
     table: &str,
@@ -241,6 +274,11 @@ pub(crate) async fn admitted_key(
         return Err(DdlError::NoPrimaryKey {
             source_table: table.to_string(),
         });
+    }
+    // A deferrable primary key is never the key (ADR-0026): the identity
+    // doesn't read one, and would otherwise fall back to a unique index.
+    if let Some(deferrable) = deferrable_primary_key(client, table).await? {
+        return Err(deferrable);
     }
     ddl::admitted_primary_key(client, table).await
 }
