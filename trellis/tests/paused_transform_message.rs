@@ -398,3 +398,102 @@ async fn an_unchanged_paused_definition_is_not_evaluated_again() {
     assert_eq!(refreshes(), before + 2);
     assert!(paused(&trellis, "t").await.resume_outcome.is_some());
 }
+
+/// What the message says `RESUME` would do is what it does, for three kinds
+/// of pause: a re-type (the copies are re-typed, then the target is
+/// rebuilt), a primary key redefined (the 1-1 reader's `RESUME` refuses
+/// with the very refusal the message names; the aggregate's rebuilds), and a
+/// column dropped (refused, naming the column).
+#[tokio::test]
+async fn the_outcome_is_what_resume_does() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+    let outcome_of = async |target: &str| {
+        paused(&trellis, target)
+            .await
+            .resume_outcome
+            .unwrap_or_else(|| panic!("{target}'s outcome"))
+    };
+    let column_type = async |table: &str, column: &str| -> String {
+        app.query_one(
+            "select format_type(atttypid, atttypmod) from pg_attribute \
+             where attrelid = $1::text::regclass and attname = $2",
+            &[&table, &column],
+        )
+        .await
+        .expect("read the column type")
+        .get(0)
+    };
+
+    // A re-type: the message names the copy and its types, and RESUME
+    // re-types it before the rebuild.
+    app.batch_execute("alter table public.u alter column a type bigint")
+        .await
+        .expect("re-type");
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    let retype = outcome_of("t").await;
+    assert!(
+        retype.starts_with("RESUME would re-type the columns Trellis created")
+            && retype.contains("from integer to bigint")
+            && retype.ends_with(", then rebuild public.t from public.u"),
+        "{retype}"
+    );
+    assert_eq!(column_type("public.t", "a").await, "integer");
+    trellis.apply("RESUME TRANSFORM t").await.expect("resume t");
+    bring_live(&mut raw, &db.pool, "t").await;
+    assert_eq!(column_type("public.t", "a").await, "bigint");
+
+    // A key redefined: the 1-1 reader's RESUME refuses as its message says;
+    // the aggregate's rebuilds.
+    app.batch_execute("alter table public.u drop constraint u_pkey, add primary key (id, g)")
+        .await
+        .expect("redefine the key");
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    let refused = outcome_of("t").await;
+    let refusal = refused
+        .strip_prefix("RESUME would refuse: ")
+        .unwrap_or_else(|| panic!("{refused}"));
+    let err = trellis
+        .apply("RESUME TRANSFORM t")
+        .await
+        .expect_err("the 1-1 resume refuses");
+    let shown = err.to_string();
+    let named = refusal
+        .strip_prefix("define would refuse the definition as the schema stands now: ")
+        .unwrap_or(refusal);
+    assert!(shown.contains(named), "{shown} vs {refused}");
+    assert_eq!(
+        outcome_of("s").await,
+        "RESUME would rebuild public.s from public.u"
+    );
+    trellis.apply("RESUME TRANSFORM s").await.expect("resume s");
+    bring_live(&mut raw, &db.pool, "s").await;
+
+    // A column dropped: the refusal names it, and RESUME refuses.
+    app.batch_execute("alter table public.u drop column b")
+        .await
+        .expect("drop a column");
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    let dropped = outcome_of("s").await;
+    assert!(
+        dropped.starts_with("RESUME would refuse: ") && dropped.contains("'b'"),
+        "{dropped}"
+    );
+    let err = trellis
+        .apply("RESUME TRANSFORM s")
+        .await
+        .expect_err("the resume refuses while the column is gone");
+    let named = dropped
+        .strip_prefix(
+            "RESUME would refuse: define would refuse the definition as the schema stands now: ",
+        )
+        .unwrap_or_else(|| panic!("{dropped}"));
+    assert!(err.to_string().contains(named), "{err} vs {dropped}");
+    assert_eq!(stored_status(&raw, "s").await, TransformStatus::Paused);
+}
