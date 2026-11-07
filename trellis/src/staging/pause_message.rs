@@ -833,9 +833,15 @@ fn rekey_step(repair: &recorded_keys::TargetRepair) -> String {
         ));
         // A 1-1 `JOIN` takes no `ALTER TRANSFORM`.
         if repair.alterable {
+            let adds: Vec<String> = repair
+                .dropped
+                .iter()
+                .map(|c| format!("ADD {c} AS {c}"))
+                .collect();
             step.push_str(&format!(
-                " (ALTER TRANSFORM ... ADD {0} AS {0} once it is live adds it back as a field)",
-                repair.dropped[0]
+                " (ALTER TRANSFORM ... {} once it is live adds {} back as a field)",
+                adds.join(", "),
+                if adds.len() == 1 { "it" } else { "them" }
             ));
         }
     }
