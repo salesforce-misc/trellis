@@ -462,7 +462,8 @@ async fn migration_v15_restarts_the_sweeps_whose_cursor_reads_as_a_tag() {
             .get(0);
         seeded.push((id, stored, target, kind, done, cleared));
     }
-    raw.batch_execute("delete from refinery_schema_history where version = 15")
+    // Every later migration runs again too: each runs again harmlessly.
+    raw.batch_execute("delete from refinery_schema_history where version >= 15")
         .await
         .expect("a database before V15");
 

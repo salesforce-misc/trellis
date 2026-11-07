@@ -243,6 +243,8 @@ pub mod fixtures {
             source_table: String::new(),
             columns: Vec::new(),
             error: String::new(),
+            reasons: Vec::new(),
+            resume_outcome: None,
             detected_at: SystemTime::UNIX_EPOCH,
         }
     }

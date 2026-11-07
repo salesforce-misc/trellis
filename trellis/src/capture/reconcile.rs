@@ -468,6 +468,25 @@ pub(crate) async fn reconcile_with_floors(
         }
     }
 
+    // A paused definition's message is evaluated again when a relation it
+    // reads changed (`staging::pause_message`), against the fingerprints read
+    // before the checks above. It changes only the message, so a failure is
+    // retried by the next pass and stops nothing else.
+    if let Err(err) = crate::staging::pause_message::refresh_paused(
+        client,
+        schema,
+        floors,
+        instance,
+        &snapshot.catalog,
+        &drift,
+    )
+    .await
+    {
+        crate::instance_log::warn!(
+            "the messages of paused definitions could not be refreshed; retrying next pass: {err}"
+        );
+    }
+
     let desired_set: HashSet<&String> = desired.iter().collect();
     // A table another definition targets isn't in `desired` (the
     // seam feeds it, not a trigger), but its readers read it as the

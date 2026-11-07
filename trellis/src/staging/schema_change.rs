@@ -48,6 +48,7 @@ use tokio_postgres::Client;
 
 use super::apply::ApplyError;
 use super::drift_memo::{self, Fingerprints};
+use super::pause_message::Recheck;
 use crate::capture::CaptureError;
 use crate::capture::columns::{CaptureCatalog, load_catalog_for, read_columns, readers_of};
 use crate::capture::install::{Installed, installed};
@@ -235,7 +236,8 @@ pub(crate) async fn pause_readers_of_redefined_keys(
 }
 
 /// Pauses each of `readers` of `table` for `missing`, recording why
-/// ([`crate::defs::lifecycle::pause_for_capture_failure`]).
+/// ([`crate::defs::lifecycle::pause_for_schema_change`]): a reason the
+/// capture pass checks again while the definition stays paused.
 async fn pause(
     txn: &tokio_postgres::Transaction<'_>,
     catalog: &CaptureCatalog,
@@ -244,8 +246,12 @@ async fn pause(
     readers: &[i64],
 ) -> Result<(), CatalogError> {
     for &id in readers {
-        let (columns, error) = match &missing.key_changed {
-            Some((old, new)) => (old.clone(), key_changed_error(table, old, new)),
+        let (columns, error, recheck) = match &missing.key_changed {
+            Some((old, new)) => (
+                old.clone(),
+                key_changed_error(table, old, new),
+                Recheck::Key,
+            ),
             None => {
                 // The columns this definition reads, or every missing one
                 // when it pauses only because the key went.
@@ -262,11 +268,13 @@ async fn pause(
                     columns = missing.columns.iter().cloned().collect();
                 }
                 let error = missing_columns_error(table, &columns);
-                (columns, error)
+                (columns, error, Recheck::Columns)
             }
         };
-        if crate::defs::lifecycle::pause_for_capture_failure(txn, id, table, &columns, &error, None)
-            .await?
+        if crate::defs::lifecycle::pause_for_schema_change(
+            txn, id, table, &columns, &error, recheck,
+        )
+        .await?
         {
             crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
         }
@@ -276,7 +284,7 @@ async fn pause(
 
 /// The `capture_failure` sentence for a definition paused because `columns`
 /// of `table` it reads were renamed or dropped.
-fn missing_columns_error(table: &str, columns: &[String]) -> String {
+pub(crate) fn missing_columns_error(table: &str, columns: &[String]) -> String {
     format!(
         "column {} of {table}, which this definition reads, was renamed or dropped; its \
          capture now leaves it out. Restore the column and resume the definition to rebuild \
@@ -287,7 +295,7 @@ fn missing_columns_error(table: &str, columns: &[String]) -> String {
 
 /// The `capture_failure` sentence for a definition paused because `table`'s
 /// primary key changed from `old` to `new`.
-fn key_changed_error(table: &str, old: &[String], new: &[String]) -> String {
+pub(crate) fn key_changed_error(table: &str, old: &[String], new: &[String]) -> String {
     format!(
         "the primary key of {table} changed from ({}) to ({}), and this definition's rows \
          are keyed by the old one. Restore the key and resume the definition to rebuild it, \
@@ -2301,6 +2309,7 @@ mod tests {
                         source: source.to_string(),
                         def: crate::defs::parse(text).unwrap_or_else(|e| panic!("{text}: {e:?}")),
                         capture_failed: *capture_failed,
+                        refresh_stamp: None,
                         target: format!("public.t{}", i + 1),
                         join: join.map(str::to_string),
                     }

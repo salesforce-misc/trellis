@@ -3973,6 +3973,9 @@ pub(crate) struct CaptureReaderRow {
     pub def: TransformDef,
     /// A `schema_changed` marker paused it (C6, `capture_failures`).
     pub capture_failed: bool,
+    /// The stamp its paused message was written at
+    /// (`capture_failures.refresh_stamp`, `staging::pause_message`).
+    pub refresh_stamp: Option<String>,
     /// The qualified `target_table`.
     pub target: String,
     /// A `JOIN`'s qualified joined table.
@@ -4000,7 +4003,8 @@ pub(crate) async fn capture_readers(
         .query_typed(
             "select d.id, d.source_table, d.definition_text, \
                     exists (select 1 from capture_failures f where f.transform_id = d.id), \
-                    d.target_table, d.grammar_version, d.join_table, d.floor_version \
+                    d.target_table, d.grammar_version, d.join_table, d.floor_version, \
+                    (select f.refresh_stamp from capture_failures f where f.transform_id = d.id) \
              from transform_definitions d order by d.id",
             &[],
         )
@@ -4013,6 +4017,7 @@ pub(crate) async fn capture_readers(
                     source: row.get(1),
                     def,
                     capture_failed: row.get(3),
+                    refresh_stamp: row.get(8),
                     target: row.get(4),
                     join: row.get(6),
                 })),

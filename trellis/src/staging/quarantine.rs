@@ -4365,8 +4365,8 @@ fn retyping_failure<'a>(
     (columns, error)
 }
 
-/// Sets definition `id`'s `capture_failure` (kind `capture`), replacing any
-/// it has: what a resume in progress, or one the staging worker couldn't
+/// Sets definition `id`'s `capture_failure` (kind `capture`), replacing
+/// every reason it has with `error`: what a resume in progress, or one the staging worker couldn't
 /// finish, reports. It drops any upstream resume recorded as the pause's
 /// cause (`caused_by`, #828): the definition has been resumed, by the
 /// operator or by the capture pass ([`resume_caused_definitions`]), so what
@@ -4384,11 +4384,25 @@ async fn set_capture_failure(
              values ($1, $2, $3, $4, 'capture') \
              on conflict (transform_id) do update \
              set source_table = excluded.source_table, columns = excluded.columns, \
-                 error = excluded.error, kind = excluded.kind, caused_by = null, \
-                 detected_at = now()",
-            &[&id, &source_table, &columns, &error],
+                 kind = excluded.kind, caused_by = null, detected_at = now()",
+            &[
+                &id,
+                &source_table,
+                &columns,
+                &super::pause_message::NO_REASON_YET,
+            ],
         )
         .await?;
+    super::pause_message::replace_reasons(
+        client,
+        id,
+        &[super::pause_message::Reason::standing(
+            source_table,
+            columns,
+            error,
+        )],
+    )
+    .await?;
     Ok(())
 }
 

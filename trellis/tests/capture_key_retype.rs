@@ -186,8 +186,8 @@ async fn rows(raw: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
         .collect()
 }
 
-/// The reason `target` is paused with, asserting it's paused for a capture
-/// failure on `table` about `columns`.
+/// The reasons `target` is paused with, asserting it's paused for a
+/// capture failure on `table` about `columns`.
 async fn paused_for(trellis: &Trellis, target: &str, table: &str, columns: &[&str]) -> String {
     let reported = trellis.status(target).await.expect("status").expect(target);
     assert_eq!(reported.status, TransformStatus::Paused, "{target}");
@@ -200,7 +200,16 @@ async fn paused_for(trellis: &Trellis, target: &str, table: &str, columns: &[&st
         columns.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
         "{target}"
     );
-    failure.error
+    // The reasons, without what the pass found `RESUME` would do after them,
+    // which it writes again whenever a relation the definition reads changes.
+    match &failure.resume_outcome {
+        Some(outcome) => failure
+            .error
+            .strip_suffix(&format!(". {outcome}"))
+            .unwrap_or_else(|| panic!("{target}: the message ends with the outcome"))
+            .to_string(),
+        None => failure.error,
+    }
 }
 
 /// `RESUME TRANSFORM target`, which must succeed.
