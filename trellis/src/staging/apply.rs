@@ -1647,6 +1647,10 @@ mod tests {
             let _ = connection.await;
         });
         client
+            .batch_execute(crate::defs::recorded_keys::TEST_TABLE_DDL)
+            .await
+            .expect("definition_keys");
+        client
             .batch_execute(
                 "create table single (g int, total int, unique nulls not distinct (g)); \
                  insert into single select g, g from generate_series(1, 200000) g; \
@@ -1773,6 +1777,10 @@ mod tests {
         tokio::spawn(async move {
             let _ = connection.await;
         });
+        client
+            .batch_execute(crate::defs::recorded_keys::TEST_TABLE_DDL)
+            .await
+            .expect("definition_keys");
         client
             .batch_execute(
                 "create table single (id int primary key, total int) \
@@ -1960,6 +1968,10 @@ mod tests {
             let _ = connection.await;
         });
         client
+            .batch_execute(crate::defs::recorded_keys::TEST_TABLE_DDL)
+            .await
+            .expect("definition_keys");
+        client
             .batch_execute(
                 "create table fresh (a int, b text, c int, d text, total int, \
                                      primary key (a, b, c, d)) \
@@ -2088,6 +2100,10 @@ mod tests {
             let _ = connection.await;
         });
         client
+            .batch_execute(crate::defs::recorded_keys::TEST_TABLE_DDL)
+            .await
+            .expect("definition_keys");
+        client
             .batch_execute(
                 "create table stale (id int primary key, total int) \
                      with (autovacuum_enabled = false); \
@@ -2182,6 +2198,10 @@ mod tests {
         tokio::spawn(async move {
             let _ = connection.await;
         });
+        client
+            .batch_execute(crate::defs::recorded_keys::TEST_TABLE_DDL)
+            .await
+            .expect("definition_keys");
         client
             .batch_execute(
                 "create table stale (id int primary key, total int) \
@@ -2563,11 +2583,14 @@ async fn source_key_for_apply(
 }
 
 /// Whether `err`, from [`ddl::source_primary_key`], is its key gate: the
-/// table has no usable key (none, or one of a type off the allowlist).
+/// table has no usable key (none, none over the key define recorded, or one
+/// of a type off the allowlist).
 fn is_key_gate(err: &DdlError) -> bool {
     matches!(
         err,
-        DdlError::NoPrimaryKey { .. } | DdlError::UnsupportedPrimaryKeyType { .. }
+        DdlError::NoPrimaryKey { .. }
+            | DdlError::RecordedKeyMissing { .. }
+            | DdlError::UnsupportedPrimaryKeyType { .. }
     )
 }
 

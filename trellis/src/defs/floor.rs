@@ -1012,6 +1012,7 @@ pub(crate) async fn live_key_features(
             Ok((_, admitted_by)) => admitted_by,
             Err(
                 super::ddl::DdlError::NoPrimaryKey { .. }
+                | super::ddl::DdlError::RecordedKeyMissing { .. }
                 | super::ddl::DdlError::UnsupportedPrimaryKeyType { .. },
             ) => return Ok(None),
             Err(other) => return Err(super::catalog::CatalogError::Ddl(other)),

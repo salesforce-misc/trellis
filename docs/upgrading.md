@@ -45,6 +45,15 @@ refuses pauses, with a `capture_failure` naming the refusal and the remedy:
 `DROP TRANSFORM`, then define it again in the current grammar. Each release's
 notes list these cases. Every other definition carries on.
 
+A definition an earlier release built over a source key with `INCLUDE`
+columns (`primary key (id) include (x)`), which that release read as key
+columns, pauses too, naming the table and the columns, and so does a 1-1
+transform reading its 1-1 target, which that release keyed by them as well.
+`RESUME` re-keys each and rebuilds it ([when a definition needs
+you](operations.md#when-a-definition-needs-you)). Those releases kept such a
+target's rows right, but failed to apply a change that left an `INCLUDE`
+column of a 1-1 transform's source `NULL`.
+
 For an embedded fleet, [Rolling deploys](embedding.md#rolling-deploys) covers
 the handover in detail, and
 [Migrations and transactions](embedding.md#migrations-and-transactions) the

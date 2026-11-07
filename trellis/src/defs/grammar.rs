@@ -161,6 +161,12 @@ pub(crate) async fn pause_unloadable_in(
             }
         }
     }
+    // The key each definition stored before the record existed keys by
+    // (#1719), and a pause of each one an earlier release built over its
+    // source key's `INCLUDE` columns (#1722).
+    paused += super::recorded_keys::backfill_in(txn, floors, oldest, current)
+        .await
+        .map_err(incompatible)?;
     Ok((paused, unrunnable))
 }
 

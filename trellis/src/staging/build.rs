@@ -645,6 +645,10 @@ async fn start(
         txn.rollback().await?;
         return Ok(None);
     }
+    // A table the definition keys by that has lost the index over its
+    // recorded key fails the start, naming it, and the caller pauses the
+    // definition with that reason (#1719).
+    crate::defs::recorded_keys::check(&txn, definition).await?;
     let ledger = ddl::qualified_target_table_ident(&crate::defs::ledger::ledger_table_name(
         &definition.target_table,
     ));
@@ -653,6 +657,9 @@ async fn start(
     // recreates `R` and `M` empty and keeps the target, whose rows of `a`
     // rows deleted while it was paused only the sweep's orphan pass removes.
     let join1 = crate::defs::join::is_one_to_one(&definition.def);
+    // A plain 1-1 target with rows and an empty ledger is swept too: a
+    // resume that re-keyed it (`recorded_keys::repair_target_key`) emptied
+    // the ledger and kept the rows.
     let empty: bool = if join1 {
         txn.query_one(
             &format!(
@@ -666,7 +673,14 @@ async fn start(
     } else {
         takes_group_basis(definition)
             || txn
-                .query_one(&format!("select not exists (select 1 from {ledger})"), &[])
+                .query_one(
+                    &format!(
+                        "select not exists (select 1 from {ledger}) \
+                         and not exists (select 1 from {})",
+                        ddl::qualified_target_table_ident(&definition.target_table)
+                    ),
+                    &[],
+                )
                 .await?
                 .get(0)
     };

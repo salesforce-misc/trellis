@@ -784,6 +784,10 @@ mod tests {
             let _ = connection.await;
         });
         client
+            .batch_execute(crate::defs::recorded_keys::TEST_TABLE_DDL)
+            .await
+            .expect("definition_keys");
+        client
     }
 
     async fn wal_insert_lsn(client: &impl tokio_postgres::GenericClient) -> PgLsn {

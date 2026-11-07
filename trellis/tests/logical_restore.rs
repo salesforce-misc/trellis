@@ -585,6 +585,21 @@ async fn a_logical_restore_behind_the_original_pauses_everything_and_resume_conv
 
     capture_pass(&mut raw, &restored.pool).await;
     assert_paused_by_the_restore(&raw, &trellis).await;
+    // The recorded keys came with the tables at their names, and are tied to
+    // the restored tables, so a drop and create after the restore unties
+    // them.
+    assert!(count(&raw, "select count(*) from definition_keys").await > 0);
+    assert_eq!(
+        count(
+            &raw,
+            "select count(*) from definition_keys \
+             where relation_oid is distinct from to_regclass(table_name)::oid \
+                or catalog_oid <> tableoid"
+        )
+        .await,
+        0,
+        "every record is tied to the restored table"
+    );
     // Nothing rebuilds by itself, and a second pass finds nothing more.
     capture_pass(&mut raw, &restored.pool).await;
     assert_paused_by_the_restore(&raw, &trellis).await;

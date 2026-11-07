@@ -102,6 +102,14 @@ pub const CLASSIFICATION: &[(&str, Class)] = &[
     ("definition_key_types", Class::Definition { reset: NONE }),
     ("definition_types", Class::Definition { reset: NONE }),
     ("definition_enum_values", Class::Definition { reset: NONE }),
+    // Its oids are the dumped database's: reset, the loaded rows hold by
+    // name until attach ties them to the loaded tables.
+    (
+        "definition_keys",
+        Class::Definition {
+            reset: r#"{"relation_oid":0,"catalog_oid":0}"#,
+        },
+    ),
     // A migration inserts one row; every later row is runtime.
     (
         "halting_stops",

@@ -184,7 +184,8 @@ pub async fn load_catalog_for(
 }
 
 /// `table`'s live columns by name, with their attribute numbers, and its
-/// primary key's columns in key order (empty when it has none). Both
+/// primary key's key columns in key order, never its `INCLUDE` columns
+/// (empty when it has none). Both
 /// [`capture_spec`] and the reconcile pass's schema-change check
 /// (`staging::schema_change::pause_readers_of_missing`) read the key here,
 /// so they can't disagree about it.
@@ -200,6 +201,7 @@ pub(crate) async fn live_columns(
              left join pg_catalog.pg_index i \
                on i.indrelid = a.attrelid and i.indisprimary \
               and a.attnum = any(i.indkey) \
+              and pg_catalog.array_position(i.indkey, a.attnum) < i.indnkeyatts \
              where a.attrelid = pg_catalog.to_regclass($1) \
                and a.attnum > 0 and not a.attisdropped",
             &[(&crate::defs::ddl::regclass_arg(table), Type::TEXT)],

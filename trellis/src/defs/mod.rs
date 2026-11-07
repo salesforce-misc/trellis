@@ -54,6 +54,7 @@ pub mod oracle;
 mod parser;
 pub mod partition_tree;
 pub mod pg_type;
+pub(crate) mod recorded_keys;
 pub mod registry;
 pub mod row_security;
 pub mod source_index;

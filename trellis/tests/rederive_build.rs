@@ -1103,8 +1103,11 @@ async fn a_one_to_one_whose_source_lost_its_key_fails_through_its_plan_job() {
             .backfill_failure
             .expect("status reports the failing plan job");
         assert_eq!(failure.attempts, charge);
+        // The key recorded for the source has no index now, and the
+        // error names it (#1719).
         assert!(
-            failure.last_error.contains("no primary key"),
+            failure.last_error.contains("table 'public.src'")
+                && failure.last_error.contains("recorded for it (id)"),
             "the error names the cause, got {:?}",
             failure.last_error
         );
@@ -1141,7 +1144,7 @@ async fn a_one_to_one_whose_source_lost_its_key_fails_through_its_plan_job() {
         .backfill_failure
         .expect("the pause carries the error");
     assert_eq!(failure.attempts, MAX_CHARGED_ATTEMPTS);
-    assert!(failure.last_error.contains("no primary key"));
+    assert!(failure.last_error.contains("recorded for it (id)"));
 
     // Nothing more runs: no chunk was planned, a paused definition's plan
     // job isn't claimed, and the target is empty.

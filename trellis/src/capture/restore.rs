@@ -162,6 +162,9 @@ pub(crate) async fn respond(client: &mut Client, recheck: bool) -> Result<bool, 
          delete from capture_gates",
     )
     .await?;
+    // The recorded keys came with the tables at their names: tied to them
+    // again, so a later drop and create unties them.
+    crate::defs::recorded_keys::retie_restored(&txn).await?;
     txn.commit().await?;
     Ok(true)
 }

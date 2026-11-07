@@ -462,10 +462,13 @@ async fn migration_v15_restarts_the_sweeps_whose_cursor_reads_as_a_tag() {
             .get(0);
         seeded.push((id, stored, target, kind, done, cleared));
     }
-    // Every later migration runs again too: each runs again harmlessly.
-    raw.batch_execute("delete from refinery_schema_history where version >= 15")
-        .await
-        .expect("a database before V15");
+    // Every migration from V15 on is undone, so `migrate` runs them again.
+    raw.batch_execute(
+        "delete from refinery_schema_history where version >= 15; \
+         drop table definition_keys",
+    )
+    .await
+    .expect("a database before V15");
 
     trellis::migrate::migrate_with_pool(&db.pool, &Config::from_dsn(db.dsn().to_string()).unwrap())
         .await

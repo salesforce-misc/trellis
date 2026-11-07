@@ -152,7 +152,9 @@ pub fn classify(err: &ApplyError) -> FailureClass {
         // one at a time for a failure none of them individually caused. A
         // composite (multi-column) primary key is not one: every 1-1
         // consumer keys on the source's full primary key.
+        // So is a table whose key define recorded has no index now (#1719).
         ApplyError::Ddl(DdlError::NoPrimaryKey { .. })
+        | ApplyError::Ddl(DdlError::RecordedKeyMissing { .. })
         | ApplyError::Ddl(DdlError::UnsupportedPrimaryKeyType { .. }) => FailureClass::Halting,
         // Postgres refused the drain's role a read or write, for
         // row-level security (every Trellis session runs with `row_security
@@ -4250,30 +4252,38 @@ async fn resume_locked(
         }
         return Ok(ResumeStep::Draining);
     }
-    let revalidated = match catalog::revalidate(txn, schema, floors, &definition).await {
-        Ok(revalidated) => revalidated,
+    // Before the re-validation: a 1-1 target an earlier release keyed by
+    // its source key's `INCLUDE` columns is re-keyed in place (#1722), and a
+    // table whose key changed while the definition was paused has it
+    // re-recorded or refuses (#1719), so the re-validation and the rebuild
+    // see the key define would key by now. Under a savepoint: a refusal
+    // keeps none of it, and the caller still records the refusal in `txn`.
+    txn.batch_execute("savepoint resume_rekey").await?;
+    let checked = async {
+        crate::defs::recorded_keys::repair_target_key(txn, &definition, source_table).await?;
+        crate::defs::recorded_keys::rekey_for_resume(txn, &definition).await?;
+        let revalidated = catalog::revalidate(txn, schema, floors, &definition).await?;
+        catalog::check_owned_tables(txn, schema, &definition, &revalidated).await?;
+        Ok::<_, catalog::CatalogError>(revalidated)
+    }
+    .await;
+    let revalidated = match checked {
+        Ok(revalidated) => {
+            txn.batch_execute("release savepoint resume_rekey").await?;
+            revalidated
+        }
         Err(err @ (catalog::CatalogError::Db(_) | catalog::CatalogError::Pool(_))) => {
             return Err(err.into());
         }
         Err(reason) => {
+            txn.batch_execute("rollback to savepoint resume_rekey")
+                .await?;
             return Err(ApplyError::ResumeRefused {
                 transform: target.to_string(),
                 reason: Box::new(reason),
             });
         }
     };
-    match catalog::check_owned_tables(txn, schema, &definition, &revalidated).await {
-        Ok(()) => {}
-        Err(err @ (catalog::CatalogError::Db(_) | catalog::CatalogError::Pool(_))) => {
-            return Err(err.into());
-        }
-        Err(reason) => {
-            return Err(ApplyError::ResumeRefused {
-                transform: target.to_string(),
-                reason: Box::new(reason),
-            });
-        }
-    }
     let copies = crate::defs::copies::typed_copies(
         txn,
         schema,
@@ -5034,7 +5044,7 @@ async fn finish_requested_resume(
 ) -> Result<(), ApplyError> {
     // What to re-type, read with the re-validation in one snapshot.
     let (source_table, target, statements, retrying) = {
-        let txn = client.transaction().await?;
+        let mut txn = client.transaction().await?;
         let row = txn
             .query_opt(
                 "select source_table, split_part(target_table, '.', 2), status \
@@ -5088,12 +5098,24 @@ async fn finish_requested_resume(
         }
         // A 1-1 target's ledger is checked here too, before anything is
         // re-typed under `ACCESS EXCLUSIVE` that `resume_locked` would then
-        // refuse.
-        let checked = match catalog::revalidate(&txn, schema, floors, &definition).await {
-            Ok(revalidated) => {
-                catalog::check_owned_tables(&txn, schema, &definition, &revalidated).await
+        // refuse. It re-validates the definition as `resume_locked`'s
+        // re-keying leaves it (a 1-1 target an earlier release keyed by an
+        // `INCLUDE` column, #1722, and a key that changed while it was
+        // paused, #1719), which it undoes here: `resume_locked` re-keys it
+        // under the definition's row lock.
+        let checked = {
+            let rekeyed = txn.savepoint("resume_precheck").await?;
+            let checked = async {
+                crate::defs::recorded_keys::repair_target_key(&rekeyed, &definition, &source_table)
+                    .await?;
+                crate::defs::recorded_keys::rekey_for_resume(&rekeyed, &definition).await?;
+                let revalidated =
+                    catalog::revalidate(&rekeyed, schema, floors, &definition).await?;
+                catalog::check_owned_tables(&rekeyed, schema, &definition, &revalidated).await
             }
-            Err(err) => Err(err),
+            .await;
+            rekeyed.rollback().await?;
+            checked
         };
         match checked {
             Ok(()) => {}

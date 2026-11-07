@@ -4989,6 +4989,10 @@ mod tests {
         tokio::spawn(async move {
             let _ = connection.await;
         });
+        client
+            .batch_execute(crate::defs::recorded_keys::TEST_TABLE_DDL)
+            .await
+            .expect("definition_keys");
         let def =
             crate::defs::parse("TRANSFORM t FROM s GROUP BY g SELECT SUM(a) AS s").expect("parses");
         let shape = route(&def, &columns()).expect("admitted");
@@ -5101,6 +5105,10 @@ mod tests {
         tokio::spawn(async move {
             let _ = connection.await;
         });
+        client
+            .batch_execute(crate::defs::recorded_keys::TEST_TABLE_DDL)
+            .await
+            .expect("definition_keys");
         let def = crate::defs::parse(
             "TRANSFORM t FROM s GROUP BY g, h SELECT COUNT(*) AS n, COUNT(h) AS c, AVG(b) AS v",
         )
