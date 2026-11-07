@@ -205,10 +205,13 @@ async fn withdraw_resume(txn: &Transaction<'_>, id: i64) -> Result<bool, Catalog
         )
         .await?
         == 1;
+    // Under the record's row lock, which every writer of its reasons takes
+    // before it reads them (`staging::pause_message`): the reasons rewritten
+    // below are the ones a refresh that committed meanwhile left.
     let record = txn
         .query_opt(
             "select source_table, caused_by is not null from capture_failures \
-             where transform_id = $1",
+             where transform_id = $1 for update",
             &[&id],
         )
         .await?;

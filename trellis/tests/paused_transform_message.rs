@@ -552,3 +552,98 @@ async fn a_second_pause_adds_its_reason_and_keeps_the_first() {
         .collect();
     assert_eq!(totals, vec![(0, 60), (1, 40)]);
 }
+
+/// An operator's `PAUSE` that withdraws a pending resume, while the pass's
+/// refresh is writing the same definition's message: the `PAUSE` waits for
+/// the record's row lock, then rewrites the reasons as the refresh left
+/// them, rather than writing over reasons it read before the refresh
+/// committed (which collided with the refresh's rows).
+#[tokio::test]
+async fn a_pause_that_withdraws_a_resume_waits_for_a_refresh_writing_the_message() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    app.batch_execute("alter table public.u rename column a to a2")
+        .await
+        .expect("rename");
+    capture_pass(&mut raw, &db.pool).await;
+    paused(&trellis, "t").await;
+    let id = id_of(&raw, "t").await;
+    raw.execute(
+        "insert into resume_requests (transform_id) values ($1)",
+        &[&id],
+    )
+    .await
+    .expect("a pending resume");
+
+    // A refresh's write, held open under the record's row lock.
+    let mut refresher = connect(db.dsn()).await;
+    let refresh = refresher.transaction().await.expect("begin");
+    refresh
+        .query_one(
+            "select error from capture_failures where transform_id = $1 for update",
+            &[&id],
+        )
+        .await
+        .expect("the record's row lock");
+    refresh
+        .execute(
+            "delete from capture_failure_reasons where transform_id = $1",
+            &[&id],
+        )
+        .await
+        .expect("delete the reasons");
+    refresh
+        .execute(
+            "insert into capture_failure_reasons \
+                 (transform_id, position, source_table, columns, reason) \
+             values ($1, 1, 'public.u', '{}', 'refreshed')",
+            &[&id],
+        )
+        .await
+        .expect("write the refreshed reason");
+    refresh
+        .execute(
+            "update capture_failures set error = 'refreshed' where transform_id = $1",
+            &[&id],
+        )
+        .await
+        .expect("write the refreshed message");
+
+    let pausing = {
+        let dsn = db.dsn().to_string();
+        tokio::spawn(async move { definer(&dsn).await.apply("PAUSE TRANSFORM t").await })
+    };
+    // The PAUSE is blocked on a lock the refresh holds.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let blocked: bool = app
+            .query_one(
+                "select exists (select 1 from pg_stat_activity \
+                 where wait_event_type = 'Lock' and datname = current_database())",
+                &[],
+            )
+            .await
+            .expect("read pg_stat_activity")
+            .get(0);
+        if blocked {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the PAUSE never waited");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    refresh.commit().await.expect("commit the refresh");
+    pausing
+        .await
+        .expect("the PAUSE task")
+        .expect("the PAUSE withdraws the resume");
+    let withdrawn = paused(&trellis, "t").await;
+    assert_eq!(withdrawn.reasons.len(), 1, "{withdrawn:?}");
+    assert!(
+        withdrawn.error.starts_with("paused by the operator"),
+        "{withdrawn:?}"
+    );
+}
