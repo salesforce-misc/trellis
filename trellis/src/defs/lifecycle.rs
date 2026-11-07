@@ -735,6 +735,15 @@ pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutc
     // together in this same transaction either way.
     txn.execute("delete from transform_definitions where id = $1", &[&id])
         .await?;
+    // A table's recorded key goes with its last definition: a define over it
+    // later records it again.
+    txn.execute(
+        "delete from definition_keys k where not exists ( \
+             select 1 from transform_definitions d \
+             where k.table_name in (d.source_table, d.target_table, d.join_table))",
+        &[],
+    )
+    .await?;
 
     // Edges *into* the target node are the ones this definition owns: its
     // `source` edge from its own source table, plus a `JOIN`'s `join` edge

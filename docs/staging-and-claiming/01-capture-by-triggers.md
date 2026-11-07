@@ -277,6 +277,13 @@ page, and on a mismatch runs the pass's pause for that table
 compute then applies none of those rows, and nothing is charged to
 quarantine for them.
 
+A `RESUME` of an aggregate or `JOIN` reading the table takes its new primary
+key as the table's key, for every transform that reads it
+(`defs::recorded_keys`). Once that key is recorded, neither the pass nor a
+page pauses for it: the pass regenerates the functions over it before the
+resumed transform's rebuild starts. A 1-1 transform's target is keyed by the
+old key, so its `RESUME` refuses the new one.
+
 ## A re-typed key column, or an outgrown copy
 
 `ALTER COLUMN ... TYPE` rewrites the table but keeps its triggers, and the

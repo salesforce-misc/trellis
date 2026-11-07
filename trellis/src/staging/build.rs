@@ -648,7 +648,7 @@ async fn start(
     // A table the definition keys by that has lost the index over its
     // recorded key fails the start, naming it, and the caller pauses the
     // definition with that reason (#1719).
-    crate::defs::recorded_keys::check(&txn, definition.id).await?;
+    crate::defs::recorded_keys::check(&txn, definition).await?;
     let ledger = ddl::qualified_target_table_ident(&crate::defs::ledger::ledger_table_name(
         &definition.target_table,
     ));

@@ -598,6 +598,7 @@ impl CatalogError {
             CatalogError::SourceKeyChanged { .. }
                 | CatalogError::KeyRepairBlocked { .. }
                 | CatalogError::Ddl(DdlError::RecordedKeyMissing { .. })
+                | CatalogError::Ddl(DdlError::NoPrimaryKeyToRecord { .. })
                 | CatalogError::LedgerTableMissing { .. }
                 | CatalogError::TargetTableMissing { .. }
                 | CatalogError::TargetInCatalogSchema { .. }
@@ -834,7 +835,9 @@ impl fmt::Display for CatalogError {
             CatalogError::RowSecurityApplies(rls) => write!(f, "{rls}"),
             CatalogError::Subscribed(sub) => write!(f, "{sub}"),
             // A key a table lost is no failure to create anything.
-            CatalogError::Ddl(err @ DdlError::RecordedKeyMissing { .. }) => write!(f, "{err}"),
+            CatalogError::Ddl(
+                err @ (DdlError::RecordedKeyMissing { .. } | DdlError::NoPrimaryKeyToRecord { .. }),
+            ) => write!(f, "{err}"),
             CatalogError::Ddl(err) => write!(f, "failed to create target table: {err}"),
             CatalogError::DirectBackfill(err) => write!(f, "direct backfill failed: {err}"),
             CatalogError::TransformNotFound { transform } => {
@@ -3775,11 +3778,10 @@ async fn create_definition_inner(
     // capture pass to compare against (`super::key_types`).
     super::key_types::record_definition(&*txn, id, &def, &qualified_source, join_table, false)
         .await?;
-    // The key space this define chose for each table it keys by, which
-    // every later read of their identities keeps to (#1719).
+    // The key of each table it keys by, which every later read of their
+    // identities keeps to (#1719).
     super::recorded_keys::record(
         &*txn,
-        id,
         &def,
         &qualified_source,
         join_table,
@@ -5077,9 +5079,10 @@ pub(crate) async fn revalidate(
 ) -> Result<Revalidated, CatalogError> {
     let source = definition.source_table.as_str();
     reject_target_in_catalog_schema(txn, schema, &definition.target_table).await?;
-    // Every table the definition keys by still has an index over the key
-    // define recorded for it (#1719): it is never keyed by a guess.
-    super::recorded_keys::check(txn, definition.id).await?;
+    // Every table the definition keys by has a key it can key by: an index
+    // over the recorded key, or a key a resume takes (#1719). It is never
+    // keyed by a guess.
+    super::recorded_keys::check(txn, definition).await?;
     let joined = join_table_of(txn, definition.id).await?;
     if let Some(joined) = joined {
         return revalidate_join(txn, schema, floors, definition, joined).await;

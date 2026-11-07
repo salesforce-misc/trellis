@@ -291,7 +291,8 @@ fn missing_columns_error(table: &str, columns: &[String]) -> String {
 fn key_changed_error(table: &str, old: &[String], new: &[String]) -> String {
     format!(
         "the primary key of {table} changed from ({}) to ({}), and this definition's rows \
-         are keyed by the old one. Restore the key and resume the definition to rebuild it, \
+         are keyed by the old one. RESUME rebuilds an aggregate or JOIN over the new key; a \
+         1-1 transform's target is keyed by the old one, so restore the key and resume it, \
          or drop the definition and define it again",
         quoted_list(old),
         quoted_list(new)
@@ -352,7 +353,17 @@ pub(crate) async fn pause_readers_of_missing(
         missing.key_missing = !spec.key().iter().all(present);
         // A table with no primary key now fails `capture_spec`, and the
         // pass reports that; the installed functions keep imaging it.
-        if !missing.key_missing && !key.is_empty() && spec.key() != key.as_slice() {
+        // A key a resume has re-recorded for the table is every reader's
+        // key now (`defs::recorded_keys::decide`): the functions are
+        // regenerated over it below, before the resumed reader's rebuild.
+        if !missing.key_missing
+            && !key.is_empty()
+            && spec.key() != key.as_slice()
+            && crate::defs::recorded_keys::recorded_for(&*client, table)
+                .await?
+                .as_deref()
+                != Some(key.as_slice())
+        {
             missing.key_changed = Some((spec.key().to_vec(), key));
         }
         missing

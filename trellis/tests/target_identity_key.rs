@@ -319,9 +319,7 @@ async fn an_adopted_aggregate_keeps_its_group_key_beside_an_older_user_constrain
     assert_eq!(d.rows(AGG_ACTUAL).await, d.rows(AGG_EXPECTED).await);
 }
 
-const RECORDED: &str = "select d.target_table, k.table_name, k.key_columns::text \
-                        from definition_keys k join transform_definitions d \
-                          on d.id = k.transform_id order by 1, 2";
+const RECORDED: &str = "select table_name, key_columns::text from definition_keys order by 1";
 
 /// Define records the key of every table a definition keys by, and a
 /// definition stored before the record existed gets the same record when a
@@ -335,10 +333,9 @@ async fn an_existing_definition_gets_its_key_record_at_attach() {
     assert_eq!(
         defined,
         [
-            "(public.agg,public.a,{id})",
-            "(public.agg,public.agg,{ga})",
-            "(public.mirror,public.agg,{ga})",
-            "(public.mirror,public.mirror,{ga})",
+            "(public.a,{id})",
+            "(public.agg,{ga})",
+            "(public.mirror,{ga})"
         ]
     );
     reindex_key_after(
@@ -388,8 +385,9 @@ async fn a_resume_and_a_build_refuse_when_the_recorded_key_has_no_index() {
         .to_string();
     for part in [
         "table 'public.agg'",
-        "at define (ga)",
+        "recorded for it (ga)",
         "its unique indexes are agg_user (n, ga)",
+        "It is a Trellis target",
     ] {
         assert!(refusal.contains(part), "{part:?} in {refusal}");
     }
@@ -416,7 +414,7 @@ async fn a_resume_and_a_build_refuse_when_the_recorded_key_has_no_index() {
         .await;
     assert_eq!(paused.len(), 1, "{paused:?}");
     assert!(
-        paused[0].starts_with("(paused,") && paused[0].contains("at define (ga)"),
+        paused[0].starts_with("(paused,") && paused[0].contains("recorded for it (ga)"),
         "the start paused it by name: {paused:?}"
     );
 }

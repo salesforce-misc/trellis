@@ -122,18 +122,9 @@ async fn a_definition_built_over_an_include_column_pauses_and_resume_re_keys_it(
         );
     }
     assert_eq!(
-        d.rows(
-            "select d.target_table, k.table_name, k.key_columns::text \
-             from definition_keys k join transform_definitions d on d.id = k.transform_id \
-             order by d.id, 2"
-        )
-        .await,
-        [
-            "(public.one,public.inc,{id})",
-            "(public.one,public.one,{id})",
-            "(public.g,public.g,{ga})",
-            "(public.g,public.inc,{id})",
-        ],
+        d.rows("select table_name, key_columns::text from definition_keys order by 1")
+            .await,
+        ["(public.g,{ga})", "(public.inc,{id})", "(public.one,{id})"],
         "the corrected key is recorded"
     );
     // A second attach changes nothing.
@@ -347,7 +338,7 @@ async fn a_one_to_one_reader_of_a_mis_keyed_target_pauses_and_resume_re_keys_it(
     assert_eq!(
         d.rows(
             "select table_name, key_columns::text from definition_keys \
-             where transform_id = 2 order by 1"
+             where table_name in ('public.one', 'public.two') order by 1"
         )
         .await,
         ["(public.one,{id})", "(public.two,{id})"],

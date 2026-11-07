@@ -214,16 +214,31 @@ pub enum DdlError {
     /// The source table has no primary key at all.
     NoPrimaryKey { source_table: String },
     /// `table` has no valid primary key or qualifying unique index over the
-    /// key columns Trellis recorded for it when a definition first keyed by
-    /// it (`definition_keys`, `defs::recorded_keys`): the index was
-    /// dropped, or a restore never created it. Trellis doesn't key the table
-    /// by another index instead.
+    /// key columns Trellis recorded for it (`definition_keys`,
+    /// `defs::recorded_keys`): the index was dropped, or a restore never
+    /// created it. Trellis doesn't key the table by another index instead.
     RecordedKeyMissing {
         table: String,
         /// The recorded key columns, in key order.
         recorded: Vec<String>,
         /// Each unique index the table has now, as `name (columns)` with
         /// what keeps it from serving (`invalid`, `partial`, ...).
+        indexes: Vec<String>,
+        /// Whether `table` is a Trellis target, whose key comes from its
+        /// definition: only its index coming back repairs it. A user table's
+        /// readers can instead take its primary key now on `RESUME`.
+        trellis_target: bool,
+    },
+    /// A resume found `table`'s key changed since Trellis recorded it
+    /// (`recorded`): its primary key was redefined or the table created
+    /// again. A re-recorded key is the table's primary key, and it has none:
+    /// Trellis doesn't take another unique index as its key.
+    NoPrimaryKeyToRecord {
+        table: String,
+        /// The key columns recorded before the change, in key order.
+        recorded: Vec<String>,
+        /// Each unique index the table has now, as for
+        /// [`DdlError::RecordedKeyMissing`].
         indexes: Vec<String>,
     },
     /// A composite primary-key identity string (U+001F-joined, matching
@@ -297,7 +312,8 @@ impl DdlError {
             // definition, same category as any other validation failure.
             DdlError::NoPrimaryKey { .. }
             | DdlError::UnsupportedPrimaryKeyType { .. }
-            | DdlError::RecordedKeyMissing { .. } => ErrorCode::Validation,
+            | DdlError::RecordedKeyMissing { .. }
+            | DdlError::NoPrimaryKeyToRecord { .. } => ErrorCode::Validation,
             // Staged-data corruption or a provenance bug, not a rejection of
             // the current call's input.
             DdlError::MalformedCompositeKey { .. } | DdlError::UnroutedAggregate { .. } => {
@@ -311,6 +327,15 @@ impl DdlError {
     }
 }
 
+/// "its unique indexes are ...", or that it has none, for a key refusal.
+fn found_indexes(indexes: &[String]) -> String {
+    if indexes.is_empty() {
+        "it has no unique index".to_string()
+    } else {
+        format!("its unique indexes are {}", indexes.join(", "))
+    }
+}
+
 impl fmt::Display for DdlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -321,22 +346,46 @@ impl fmt::Display for DdlError {
                 table,
                 recorded,
                 indexes,
+                trellis_target,
             } => {
-                let found = if indexes.is_empty() {
-                    "it has no unique index".to_string()
-                } else {
-                    format!("its unique indexes are {}", indexes.join(", "))
-                };
                 write!(
                     f,
                     "table '{table}' has no valid primary key or unique index over the key \
-                     Trellis recorded for it at define ({}), and Trellis doesn't key its rows \
-                     by another one; {found}. Create a primary key or unique index over \
-                     exactly those columns again (`unique nulls not distinct` if one can be \
-                     NULL), or drop the transform and define it again",
-                    recorded.join(", ")
-                )
+                     Trellis recorded for it ({}), and Trellis doesn't key its rows by \
+                     another one; {}. ",
+                    recorded.join(", "),
+                    found_indexes(indexes)
+                )?;
+                if *trellis_target {
+                    write!(
+                        f,
+                        "It is a Trellis target, keyed by its definition: create a unique \
+                         index over exactly those columns again (`unique nulls not distinct` \
+                         if one can be NULL), or drop the transform and define it again"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "RESUME an aggregate or JOIN transform reading it to take the table's \
+                         primary key as its key now, or create a primary key or unique index \
+                         over exactly those columns again"
+                    )
+                }
             }
+            DdlError::NoPrimaryKeyToRecord {
+                table,
+                recorded,
+                indexes,
+            } => write!(
+                f,
+                "the key of table '{table}' changed since Trellis recorded it ({}): its \
+                 primary key was redefined or the table created again. A resume takes the \
+                 table's primary key as its key now, and it has none; Trellis doesn't take \
+                 another unique index as a key ({}). Add a primary key and resume again, or \
+                 drop the transform and define it again",
+                recorded.join(", "),
+                found_indexes(indexes)
+            ),
             DdlError::MalformedCompositeKey {
                 source_table,
                 key,
@@ -389,6 +438,7 @@ impl std::error::Error for DdlError {
         match self {
             DdlError::NoPrimaryKey { .. }
             | DdlError::RecordedKeyMissing { .. }
+            | DdlError::NoPrimaryKeyToRecord { .. }
             | DdlError::UnsupportedPrimaryKeyType { .. }
             | DdlError::MalformedCompositeKey { .. }
             | DdlError::UnroutedAggregate { .. } => None,
@@ -547,13 +597,14 @@ pub(crate) async fn admitted_primary_key(
 /// ([`regclass_arg`]). Empty when `table` has no such index; no key-type
 /// gate.
 ///
-/// The key is the one Trellis recorded for `table` when a definition first
-/// keyed by it (`definition_keys`, [`super::recorded_keys`]): the valid
-/// primary key or qualifying unique index whose key columns are exactly the
-/// recorded ones, whatever other unique indexes the table has and in
-/// whatever order their OIDs fall. With a record and no such index, it is
-/// empty: Trellis doesn't key a table by a guess, and a resume or build
-/// refuses, naming the indexes ([`super::recorded_keys::check`]). A table
+/// The key is the one Trellis recorded for `table` (`definition_keys`,
+/// [`super::recorded_keys`]): the valid primary key or qualifying unique
+/// index whose key columns are exactly the recorded ones, whatever other
+/// unique indexes the table has and in whatever order their OIDs fall. With
+/// a record and no such index, it is empty: Trellis doesn't key a table by a
+/// guess, and a build refuses, naming the indexes, while a resume re-records
+/// or refuses ([`super::recorded_keys::decide`]). A record taken from a
+/// table since dropped is no record of the table at the name now. A table
 /// with no record (the source of a first define) is keyed by its `PRIMARY
 /// KEY`, else its oldest qualifying `UNIQUE` index (an aggregate target's
 /// `UNIQUE NULLS NOT DISTINCT` grouping columns).
@@ -573,15 +624,29 @@ pub(crate) async fn identity_key_columns(
     client: &impl GenericClient,
     table: &str,
 ) -> Result<Vec<PrimaryKeyColumn>, tokio_postgres::Error> {
+    identity_key_columns_over(client, table, None).await
+}
+
+/// [`identity_key_columns`] keyed by `over` instead of `table`'s record when
+/// it is `Some`: the valid primary key or qualifying unique index whose key
+/// columns are exactly those, or empty when `table` has none. A resume asks
+/// it whether a record taken from a table at the same name still has its
+/// index ([`super::recorded_keys::decide`]).
+pub(crate) async fn identity_key_columns_over(
+    client: &impl GenericClient,
+    table: &str,
+    over: Option<&[String]>,
+) -> Result<Vec<PrimaryKeyColumn>, tokio_postgres::Error> {
+    let over: Option<Vec<String>> = over.map(<[String]>::to_vec);
     let rows = client
         .query_typed(
             &format!(
                 "with recorded as (
-                 select k.key_columns
-                 from definition_keys k
-                 where k.table_name = $2
-                 order by k.transform_id
-                 limit 1
+                 select coalesce($3::text[], (
+                     select k.key_columns
+                     from definition_keys k
+                     where k.table_name = $2 and {}
+                 )) as key_columns
              ),
              candidate as (
                  select i.indexrelid, i.indisprimary, i.indisvalid,
@@ -625,7 +690,7 @@ pub(crate) async fn identity_key_columns(
              chosen_index as (
                  select c.indexrelid
                  from candidate c
-                 left join recorded r on true
+                 cross join recorded r
                  where r.key_columns is null
                     or (c.indisvalid and c.key_columns = r.key_columns)
                  order by c.indisprimary desc, c.indexrelid asc
@@ -647,9 +712,14 @@ pub(crate) async fn identity_key_columns(
                on a.attrelid = i.indrelid and a.attnum = k.attnum
              where k.ord <= i.indnkeyatts
              order by k.ord",
+                super::recorded_keys::tied_to("$1"),
                 super::copy_type::type_sql("a.atttypid")
             ),
-            &[(&regclass_arg(table), Type::TEXT), (&table, Type::TEXT)],
+            &[
+                (&regclass_arg(table), Type::TEXT),
+                (&table, Type::TEXT),
+                (&over, Type::TEXT_ARRAY),
+            ],
         )
         .await?;
     Ok(rows
