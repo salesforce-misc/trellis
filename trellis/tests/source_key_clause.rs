@@ -156,6 +156,59 @@ async fn resume_needs_an_index_backing_the_key_again() {
     assert_eq!(rows(&raw, AGG_ACTUAL).await, rows(&raw, AGG_ORACLE).await);
 }
 
+/// A paused reader of a table keyed by `KEY` whose backing index is gone:
+/// the outcome the pass works out is the very refusal its `RESUME` makes,
+/// never a re-key to the table's primary key, which a `KEY` table isn't
+/// keyed by even once it has one.
+#[tokio::test]
+async fn an_unbacked_key_outcome_is_the_resume_refusal() {
+    let cluster = TestCluster::start();
+    let (db, mut raw, trellis) = setup(&cluster, KEYLESS, &[AGG]).await;
+    raw.batch_execute("drop index public.s_key; insert into public.s values (9, 90, 1, 9)")
+        .await
+        .unwrap();
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        status(&trellis, "s_sums").await.status,
+        TransformStatus::Paused
+    );
+    // A primary key over other columns gives the resume nothing to key by.
+    raw.batch_execute("alter table public.s add primary key (k2)")
+        .await
+        .unwrap();
+    full_pass(&mut raw, &db.pool).await;
+    full_pass(&mut raw, &db.pool).await;
+    let outcome = status(&trellis, "s_sums")
+        .await
+        .capture_failure
+        .expect("s_sums reports why it is paused")
+        .resume_outcome
+        .expect("the pass worked out the outcome");
+    let err = trellis::staging::quarantine::resume_transform(&db.pool, "s_sums")
+        .await
+        .expect_err("no index backs the key");
+    let reason = std::error::Error::source(&err)
+        .expect("the refusal's reason")
+        .to_string();
+    assert!(
+        reason.contains("no unique index backs KEY (k1, k2) on 'public.s'"),
+        "{reason}"
+    );
+    // Define refuses an unbacked `KEY` too, so the outcome says so.
+    assert_eq!(
+        outcome,
+        format!(
+            "RESUME would refuse: define would refuse the definition as the schema stands \
+             now: {reason}"
+        )
+    );
+    assert_eq!(
+        recorded(&raw, "public.s").await,
+        [[Some("{k1,k2}".to_string())]]
+    );
+}
+
 /// The readers of a table keyed by `KEY (k)` are keyed by it whatever its
 /// primary key does (#1744's finding: the primary-key change detectors are
 /// scoped to readers keyed by the primary key). The primary key redefined
