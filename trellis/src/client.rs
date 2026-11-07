@@ -1420,6 +1420,14 @@ async fn maintenance_loop(config: MaintenanceConfig, mut shutdown_rx: watch::Rec
                     if database.is_none() {
                         database = database_of(&taken).await;
                     }
+                    // A leader that takes over starts the capture pass's
+                    // memory of the instance afresh, as a new process would:
+                    // a `MIN`/`MAX` probe index's missing-since clock from an
+                    // earlier lead was never reset by the checks another
+                    // leader ran meanwhile (`staging::drift_memo`).
+                    if let Some(database) = &database {
+                        capture::reconcile::forget_instance(database, &schema);
+                    }
                     session = Some(taken);
                     // A new leader's first pass is a capture pass, at once.
                     next_reconcile = Instant::now();
@@ -4059,6 +4067,74 @@ mod maintenance_failure_tests {
                 assert!(
                     Instant::now() < deadline,
                     "the seal failure was never logged"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            shutdown_tx.send(true).expect("signal shutdown");
+        };
+        tokio::join!(maintenance_loop(config, shutdown_rx), watcher);
+    }
+
+    /// A worker that takes the staging-worker lock starts the capture pass's
+    /// memory of its instance afresh (#1708 rule 2): a `MIN`/`MAX` probe
+    /// index's missing-since clock left from an earlier lead in this process
+    /// would otherwise pause the definition on the first miss of the new
+    /// lead, though another leader's checks may have found the index in
+    /// between.
+    #[tokio::test]
+    async fn taking_the_lock_forgets_an_earlier_leads_probe_clock() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let schema = "no_trellis_here";
+        let pool = crate::pool::Pool::new(
+            &crate::config::Config::from_dsn(db.dsn().to_string()).expect("valid config"),
+        )
+        .expect("build a same-crate pool");
+        let database: String = pool
+            .get()
+            .await
+            .expect("a connection")
+            .query_one("select pg_catalog.current_database()::text", &[])
+            .await
+            .expect("the database")
+            .get(0);
+        let instance = capture::reconcile::instance_key(&database, schema);
+        let stale = staging::drift_memo::ProbeMemo {
+            met_at: None,
+            missing_since: [(vec!["g".to_string(), "v".to_string()], Instant::now())]
+                .into_iter()
+                .collect(),
+        };
+        staging::drift_memo::record_probe(&instance, "public.src", 1, stale);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = MaintenanceConfig {
+            dsn: db.dsn().to_string(),
+            schema: schema.to_string(),
+            process: BackgroundProcess::for_test(pool.clone(), schema).await,
+            active: watch::channel(true).1,
+            pool,
+            standby: false,
+            session: None,
+            wake_channel: "wake".to_string(),
+            interval: Duration::from_millis(20),
+            housekeeping_interval: Duration::from_secs(5),
+            reclaim_ttl: Duration::from_secs(30),
+            drainer_window: staging::DEFAULT_DRAINER_WINDOW,
+            reconcile_interval: Duration::from_secs(3600),
+            held_key_retry: None,
+            drain_batch_cap: staging::DEFAULT_DRAIN_BATCH_CAP,
+        };
+        let watcher = async {
+            // An event, not a convergence budget: the bound only turns a
+            // hang into a failure.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !staging::drift_memo::probe_memo(&instance, "public.src", 1)
+                .missing_since
+                .is_empty()
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "the new lead kept the earlier lead's clock"
                 );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
