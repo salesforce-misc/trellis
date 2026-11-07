@@ -93,10 +93,20 @@ fn partial_columns(shape: &GroupShape) -> Vec<String> {
 }
 
 /// A partial as the text both sides compare: counts as they are, a sum
-/// without trailing zeros.
+/// without trailing zeros, its `NaN` count (the multiple of
+/// `group_basis::NAN_WEIGHT` it holds) apart, as `3.75 (+ 2 NaN)`, so a
+/// divergence names it in a few digits rather than in 2,100.
 pub(super) fn partial_text(column: &str, expr: &str) -> String {
     if column.starts_with("__sum_") {
-        format!("pg_catalog.trim_scale(({expr}))::text")
+        let digits = &group_basis::NAN_WEIGHT[2..];
+        let nans = format!("round(({expr}), -{digits})");
+        format!(
+            "(case when ({expr}) = 'NaN'::numeric or {nans} = 0 \
+                   then pg_catalog.trim_scale(({expr}))::text \
+                   else pg_catalog.trim_scale(({expr}) - {nans})::text || ' (+ ' || \
+                        pg_catalog.trim_scale({nans} / {weight})::text || ' NaN)' end)",
+            weight = group_basis::NAN_WEIGHT
+        )
     } else {
         format!("({expr})::text")
     }

@@ -19,12 +19,15 @@ mod drain_driver;
 use std::time::Duration;
 
 use drain_driver::Driver;
-use trellis::config::DEFAULT_SCHEMA;
+use trellis::config::{Config, DEFAULT_SCHEMA};
 use trellis::defs::ValueType;
+use trellis::defs::chunk_queue;
 use trellis::integer::IntWidth;
+use trellis::staging::build::{self, WorkerOptions};
 use trellis::staging::self_check::{
     SelfCheckMode, SelfCheckOutcome, SelfCheckScope, check_page, compare_page,
 };
+use trellis::{Trellis, TrellisOptions};
 
 fn int4() -> ValueType {
     ValueType::Integer(IntWidth::Int4)
@@ -333,4 +336,169 @@ async fn a_nan_not_applied_yet_is_subtracted_from_the_sources() {
             );
         }
     }
+}
+
+/// The widest `numeric(p,s)` there is, `numeric(1000, -1000)` (values below
+/// `10^2000`), beside `NaN`s, read by fields composed over the `SUM` and
+/// `AVG`: the finite sum never reaches the `NaN` weight, and every composed
+/// field sees `NaN` exactly while Postgres does.
+#[tokio::test]
+async fn the_widest_numeric_and_fields_composed_over_the_sum() {
+    let mut d = Driver::start(
+        "create table public.src (id integer primary key, g integer, x numeric(1000, -1000)); \
+         create index on public.src (g)",
+        &[("id", int4()), ("g", int4()), ("x", ValueType::Numeric)],
+        &[
+            "TRANSFORM agg FROM public.src GROUP BY g WITHOUT SOURCE INDEX \
+           SELECT g AS g, SUM(x) AS total, SUM(x) / 2 AS half, SUM(x) + 1 AS plus, \
+                  AVG(x) * 2 AS twice, COALESCE(SUM(x), 0) AS zeroed, COUNT(*) AS n",
+        ],
+        &["public.src"],
+    )
+    .await;
+    let big = format!("9{}", "0".repeat(1999));
+    let rows = "select g, total, half, plus, twice, zeroed, n from public.agg";
+    let expected = "select g, sum(x), sum(x) / 2, sum(x) + 1, avg(x) * 2, \
+                    coalesce(sum(x), 0), count(*) from public.src group by g";
+    let steps = [
+        format!(
+            "insert into public.src values (1, 1, {big}), (2, 1, {big}), (3, 1, 'NaN'), \
+                                           (4, 2, -{big}), (5, 2, 'NaN'), (6, 2, 'NaN')"
+        ),
+        "delete from public.src where id = 3".to_string(),
+        "update public.src set x = -x where id = 1".to_string(),
+        "delete from public.src where id = 5".to_string(),
+        format!("update public.src set x = {big} where id = 6"),
+        "update public.src set x = 'NaN' where id in (1, 2, 4)".to_string(),
+        "update public.src set x = null where id in (1, 2)".to_string(),
+    ];
+    let steps: Vec<&str> = steps.iter().map(String::as_str).collect();
+    run(&mut d, &steps, &[("agg", rows, expected)]).await;
+}
+
+/// A `NaN` matched twice in one `JOIN` group counts twice, and the group
+/// shows the sum of the rest once both matches, or the `NaN`, leave.
+#[tokio::test]
+async fn a_nan_matched_twice_in_one_join_group() {
+    let mut d = Driver::start(
+        JOIN_DDL,
+        &[("id", int4()), ("k", int4()), ("x", ValueType::Numeric)],
+        &[INNER, LEFT],
+        &["public.o", "public.c"],
+    )
+    .await;
+    run(
+        &mut d,
+        &[
+            "insert into public.c values (1, 1, 'a'), (2, 1, 'a'), (3, 2, 'a')",
+            "insert into public.o values (1, 1, 'NaN'), (2, 1, 1.25), (3, 2, 'NaN'), (4, 2, 3)",
+            "delete from public.c where id = 1",
+            "delete from public.c where id = 3",
+            "insert into public.c values (1, 1, 'a'), (3, 2, 'a')",
+            "delete from public.o where id = 1",
+            "update public.c set region = 'b' where id = 2",
+            "update public.o set x = 2 where id = 3",
+        ],
+        &[
+            ("ij", INNER_ROWS, INNER_EXPECTED),
+            ("lj", LEFT_ROWS, LEFT_EXPECTED),
+        ],
+    )
+    .await;
+}
+
+/// A hidden sum stored as `NaN` itself, as a release that summed a `NaN`
+/// into it left it: the group reads `NaN` after the `NaN` leaves, and
+/// `self_check` reports the sum; a rebuild (`request_backfill`) rewrites it
+/// counted. A wrong sum of a group that counts a `NaN` is reported with the
+/// count apart, in a few digits.
+#[tokio::test]
+async fn a_sum_stored_as_nan_is_reported_and_a_rebuild_repairs_it() {
+    let mut d = start_agg().await;
+    step(
+        &mut d,
+        "insert into public.src values (1, 1, 1.50), (2, 1, 2.25), (3, 1, 'NaN'), (4, 2, 1)",
+    )
+    .await;
+    let id = definition_id(&d, "agg").await;
+    let hidden = format!("{DEFAULT_SCHEMA}.agg_{id}");
+    d.ctl
+        .batch_execute(&format!(
+            "update {hidden} set __sum_1 = __sum_1 + 1 where g = 1"
+        ))
+        .await
+        .expect("plant a wrong sum");
+    let found = self_check(&d, "agg").await;
+    assert!(
+        found.iter().any(|f| f.contains(&format!(
+            "agg_{id}.__sum_1\", persisted: Some(\"4.75 (+ 1 NaN)\"), \
+             recomputed: Some(\"3.75 (+ 1 NaN)\")"
+        ))),
+        "{found:?}"
+    );
+
+    d.ctl
+        .batch_execute(&format!("update {hidden} set __sum_1 = 'NaN' where g = 1"))
+        .await
+        .expect("a sum stored as NaN");
+    step(&mut d, "delete from public.src where id = 3").await;
+    assert_eq!(
+        d.rows("select total from public.agg where g = 1").await,
+        ["(NaN)"],
+        "a sum stored as NaN keeps reading NaN"
+    );
+    let found = self_check(&d, "agg").await;
+    assert!(
+        found.iter().any(|f| f.contains(&format!(
+            "agg_{id}.__sum_1\", persisted: Some(\"NaN\"), recomputed: Some(\"3.75\")"
+        ))),
+        "{found:?}"
+    );
+
+    let trellis = Trellis::connect(
+        Config::from_dsn(d.db.dsn().to_string()).expect("valid dsn"),
+        TrellisOptions::default(),
+    )
+    .await
+    .expect("connect a Trellis");
+    trellis
+        .request_backfill("src")
+        .await
+        .expect("request a rebuild");
+    d.run_frozen(&[], |pool| async move {
+        let claimed = chunk_queue::claim_chunks_of(
+            &**pool.get().await.expect("pool"),
+            "rebuild",
+            1,
+            &[chunk_queue::KIND_SWEEP],
+        )
+        .await
+        .expect("claim the rebuild");
+        assert_eq!(claimed.len(), 1, "one rebuild job to claim");
+        let options = WorkerOptions {
+            chunk_rows: 1_000,
+            drain_batch_cap: usize::MAX,
+            heartbeat_interval: Duration::from_secs(5),
+            reclaim_ttl: Duration::from_secs(60),
+        };
+        build::run_claimed(&pool, &claimed[0], "rebuild", &options).await;
+        Ok(())
+    })
+    .await
+    .finish()
+    .await;
+    assert_eq!(
+        difference(&d, AGG_ROWS, AGG_EXPECTED).await,
+        Vec::<String>::new()
+    );
+    assert_eq!(self_check(&d, "agg").await, Vec::<String>::new());
+    run(
+        &mut d,
+        &[
+            "insert into public.src values (3, 1, 'NaN')",
+            "delete from public.src where id = 3",
+        ],
+        &[("agg", AGG_ROWS, AGG_EXPECTED)],
+    )
+    .await;
 }
