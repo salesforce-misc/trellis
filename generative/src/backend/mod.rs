@@ -13,6 +13,7 @@
 //! comment.
 
 mod manual;
+mod ring_wait;
 mod sql;
 mod subprocess;
 

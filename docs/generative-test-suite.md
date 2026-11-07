@@ -103,7 +103,9 @@ One module drives the engine, and its job is narrow:
   until derived state converges past it. Not a `sleep`. Over a
   partitioned source it first waits for the reconcile pass to record the tree
   and for each correction it queued to finish, since partition maintenance
-  reaches a target only through a correction.
+  reaches a target only through a correction. It gives up once the ring has
+  made no progress for 30 s (180 s at most), printing the database's state
+  first.
 - `snapshot()` — read back merged source+derived state as a deterministic,
   **ordered** map (table → pk → column), so diffs and equality are stable.
 
@@ -817,7 +819,7 @@ Two structural notes for when faults enter the stream:
   before it: the claim's worker can't run the job or give it back, so only
   the stale-claim sweep frees it, a reclaim TTL later. The restore and
   restart runs give the engine a 10 s TTL so that recovery fits well inside
-  the 30 s quiesce.
+  the quiesce's 30 s no-progress window.
 
 ## 9. Operational shape
 
