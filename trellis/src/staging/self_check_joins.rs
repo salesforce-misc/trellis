@@ -933,9 +933,10 @@ impl Audit<'_> {
 /// Renders a visible field of a `JOIN` over the weighted pairs of
 /// [`Audit::target_page`] (aliased `__g`): each aggregate sums the pairs'
 /// weights, `COUNT(*)` their weights, `COUNT(x)` those where `x` isn't
-/// `NULL`, `SUM(x)` the positive pairs' `x` less the negative ones' (`NULL`
-/// while that count is 0, as `sum()` is) and `AVG(x)` that sum over that
-/// count, as Postgres's `avg()` divides. `args` are the pairs' `__x<i>`
+/// `NULL`, `SUM(x)` the positive pairs' finite `x` less the negative ones'
+/// (`NULL` while that count is 0, as `sum()` is; `NaN` while the weighted
+/// `NaN`s don't cancel out, as `NaN − NaN` would not) and `AVG(x)` that sum
+/// over that count, as Postgres's `avg()` divides. `args` are the pairs' `__x<i>`
 /// columns, in order. [`render`]'s twin for weighted rows, written fresh
 /// here, not shared with the apply path.
 fn render_signed(def: &TransformDef, expr: &Expr, args: &[Expr]) -> Result<String, String> {
@@ -952,9 +953,16 @@ fn render_signed(def: &TransformDef, expr: &Expr, args: &[Expr]) -> Result<Strin
                         .ok_or_else(|| format!("{aggregate} of an expression it doesn't read"))?;
                     let x = format!("__x{}", i + 1);
                     let count = format!("sum({w} * ({x} is not null)::int)");
+                    // The finite pairs' `x`, positive less negative, in
+                    // `sum()`'s own type (`bigint` over `integer`), plus a
+                    // `NaN` while the weighted `NaN`s don't cancel out
+                    // (`0` of that type otherwise).
+                    let nan = format!("(({x})::numeric = 'NaN'::numeric)");
                     let sum = format!(
-                        "(coalesce(sum({x}) filter (where {w} > 0), 0) \
-                          - coalesce(sum({x}) filter (where {w} < 0), 0))"
+                        "(coalesce(sum({x}) filter (where {w} > 0 and not {nan}), 0) \
+                          - coalesce(sum({x}) filter (where {w} < 0 and not {nan}), 0) \
+                          + coalesce(case when sum({w} * {nan}::int) <> 0 \
+                                     then min({x}) filter (where {nan}) end, 0))"
                     );
                     match aggregate {
                         "COUNT" => count,

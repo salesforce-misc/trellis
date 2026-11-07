@@ -93,13 +93,45 @@ fn partial_columns(shape: &GroupShape) -> Vec<String> {
 }
 
 /// A partial as the text both sides compare: counts as they are, a sum
-/// without trailing zeros.
+/// without trailing zeros, its `NaN` count (the multiple of
+/// `group_basis::NAN_WEIGHT` it holds) apart, as `3.75 (+ 2 NaN)`, so a
+/// divergence names it in a few digits rather than in 2,100.
 pub(super) fn partial_text(column: &str, expr: &str) -> String {
     if column.starts_with("__sum_") {
-        format!("pg_catalog.trim_scale(({expr}))::text")
+        let digits = &group_basis::NAN_WEIGHT[2..];
+        let nans = format!("round(({expr}), -{digits})");
+        format!(
+            "(case when ({expr}) = 'NaN'::numeric or {nans} = 0 \
+                   then pg_catalog.trim_scale(({expr}))::text \
+                   else pg_catalog.trim_scale(({expr}) - {nans})::text || ' (+ ' || \
+                        pg_catalog.trim_scale({nans} / {weight})::text || ' NaN)' end)",
+            weight = group_basis::NAN_WEIGHT
+        )
     } else {
         format!("({expr})::text")
     }
+}
+
+/// What the value `arg` adds to a partial sum, `0` for `NULL`: a `NaN`
+/// adds `group_basis::NAN_WEIGHT`, so the sum counts `NaN`s apart from the
+/// finite values (`group_basis::summand`, written separately here). An
+/// integer is never `NaN`.
+pub(super) fn nan_counted(arg: &str) -> String {
+    format!(
+        "(case when ({arg})::numeric = 'NaN'::numeric then {weight} \
+              else coalesce(({arg})::numeric, 0) end)",
+        weight = group_basis::NAN_WEIGHT
+    )
+}
+
+/// The value the partial sum `sum` stands for: `NaN` while it counts a
+/// `NaN` (its nearest multiple of `group_basis::NAN_WEIGHT` isn't 0), else
+/// itself.
+pub(super) fn sum_value(sum: &str) -> String {
+    format!(
+        "(case when round({sum}, -{digits}) <> 0 then 'NaN'::numeric else {sum} end)",
+        digits = &group_basis::NAN_WEIGHT[2..]
+    )
 }
 
 /// The aggregate `agg` of a group over its hidden partials' columns.
@@ -108,12 +140,14 @@ fn agg_sql(agg: &Agg) -> String {
         Agg::CountStar => "__n".to_string(),
         Agg::Count(i) => format!("__count_{}", i + 1),
         Agg::Sum(i, cast) => format!(
-            "case when __count_{n} = 0 then null else (__sum_{n})::{cast} end",
-            n = i + 1
+            "case when __count_{n} = 0 then null else {s}::{cast} end",
+            n = i + 1,
+            s = sum_value(&format!("__sum_{}", i + 1))
         ),
         Agg::Avg(i) => format!(
-            "case when __count_{n} = 0 then null else (__sum_{n}) / (__count_{n})::numeric end",
-            n = i + 1
+            "case when __count_{n} = 0 then null else {s} / (__count_{n})::numeric end",
+            n = i + 1,
+            s = sum_value(&format!("__sum_{}", i + 1))
         ),
         // The hidden extreme, which side 7 compares with the source.
         Agg::Extreme { max, arg, .. } => {
@@ -439,7 +473,7 @@ pub(super) fn weighted_partials(args: &[(String, bool)]) -> (Vec<String>, String
         if *summed {
             values.push((
                 format!("__sum_{}", i + 1),
-                format!("coalesce(sum({w} * coalesce({arg}, 0)::numeric), 0)"),
+                format!("coalesce(sum({w} * {}), 0)", nan_counted(arg)),
             ));
         }
     }
