@@ -1762,7 +1762,7 @@ mod tests {
 
         let engine = session(db.dsn()).await;
         let engine_side = tokio::spawn(async move {
-            for step in 0.. {
+            for step in 0..=i64::MAX {
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 commit_a_page(&engine, step).await;
             }
