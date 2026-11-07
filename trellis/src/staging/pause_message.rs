@@ -73,6 +73,10 @@ pub(crate) enum Recheck {
     /// reason's columns; its cause is gone once one does
     /// (`defs::source_key::backing`).
     Backing,
+    /// No valid index on the table leads with the reason's columns, which a
+    /// `MIN`/`MAX` definition's probe reads; its cause is gone once one does
+    /// (`defs::source_index::has_index`).
+    Index,
 }
 
 impl Recheck {
@@ -82,6 +86,7 @@ impl Recheck {
             Recheck::Columns => Some("columns"),
             Recheck::Key => Some("key"),
             Recheck::Backing => Some("backing"),
+            Recheck::Index => Some("index"),
         }
     }
 
@@ -91,6 +96,7 @@ impl Recheck {
             Some("columns") => Recheck::Columns,
             Some("key") => Recheck::Key,
             Some("backing") => Recheck::Backing,
+            Some("index") => Recheck::Index,
             _ => Recheck::Stands,
         }
     }
@@ -528,6 +534,10 @@ async fn recheck(
                     .await?
                     .is_some()
             }
+            Recheck::Index => {
+                crate::defs::source_index::has_index(client, &reason.source_table, &reason.columns)
+                    .await?
+            }
             Recheck::Stands | Recheck::Columns | Recheck::Key => false,
         };
         if found {
@@ -552,8 +562,8 @@ async fn recheck(
 
 /// [`recheck`] over `live`, which gives a table's column names and primary
 /// key now, or `None` when it doesn't exist, and `met`, which says whether
-/// the index a [`Recheck::Backing`] reason is about exists now on a table, over
-/// its columns.
+/// the index a [`Recheck::Backing`] or [`Recheck::Index`] reason is about
+/// exists now on a table, over its columns.
 fn recheck_against(
     reader: &CaptureReader,
     reasons: &[Reason],
@@ -601,7 +611,7 @@ fn recheck_against(
                 }
                 out.push(reason);
             }
-            Recheck::Backing => {
+            Recheck::Backing | Recheck::Index => {
                 if !met(reason.recheck, table, &reason.columns) {
                     out.push(reason.clone());
                 }
@@ -1056,6 +1066,7 @@ mod tests {
             Recheck::Columns,
             Recheck::Key,
             Recheck::Backing,
+            Recheck::Index,
         ] {
             assert_eq!(Recheck::from_stored(recheck.as_stored()), recheck);
         }

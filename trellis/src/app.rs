@@ -2283,12 +2283,12 @@ pub struct DefinitionStatus {
     pub source_index_gaps: Vec<SourceIndexGap>,
     /// The source indexes a `MIN`/`MAX` field's probe reads one endpoint of
     /// and that the source lacks now: one entry per argument, an index on
-    /// the `GROUP BY` columns then the argument. A warning: nothing is
-    /// paused, the target stays exact and `self_check` still walks, but
-    /// each probe (a retraction that reaches a group's extreme) scans the
-    /// group's rows instead of reading one index entry (the whole source,
-    /// when the `GROUP BY` index of [`Self::source_index_gaps`] is missing
-    /// too). [`ExtremeIndexGap::fix`] is a `create index` to run; Trellis never
+    /// the `GROUP BY` columns then the argument. A warning: the target stays
+    /// exact and `self_check` still walks, but each probe (a retraction that
+    /// reaches a group's extreme) scans the group's rows instead of reading
+    /// one index entry (the whole source, when the `GROUP BY` index of
+    /// [`Self::source_index_gaps`] is missing too). The staging worker pauses
+    /// the definition once the index has been missing for 5 minutes. [`ExtremeIndexGap::fix`] is a `create index` to run; Trellis never
     /// creates one. Read live on each call; it clears once the index
     /// exists. Empty for every definition with no `MIN` or `MAX`.
     pub extreme_index_gaps: Vec<ExtremeIndexGap>,

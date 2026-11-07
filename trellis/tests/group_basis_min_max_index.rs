@@ -6,9 +6,10 @@
 //! dropped after define, or replaced by one that doesn't serve the probe
 //! (partial, invalid, other leading columns, another direction or
 //! collation), the same probe scans the group instead: the target stays
-//! exact, `status` warns (`extreme_index_gaps`) and nothing pauses. The
-//! warning clears, and the probe reads the endpoint again, once the index
-//! exists.
+//! exact, `status` warns (`extreme_index_gaps`), and nothing pauses within
+//! the probe index's grace (`tests/probe_index_grace.rs` covers what happens
+//! after it). The warning clears, and the probe reads the endpoint again,
+//! once the index exists.
 //!
 //! Every test steps its pages by hand through `support/drain_driver.rs` and
 //! reads `status` and the probe's plan directly: nothing sleeps or polls.

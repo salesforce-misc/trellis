@@ -488,7 +488,11 @@ extremes matched a fresh `GROUP BY` in all 680 soak runs.
   paging and the probe, and the fields reading one argument share it.
   Without it a probe scans the group, which is exact but reads every row of
   each probed group. An index dropped after define leaves the target exact:
-  `status` warns, the probe scans the group instead, and nothing pauses.
+  `status` warns and the probe scans the group instead. Once no valid such
+  index has existed on any staging-worker pass for a fixed 5 minutes of
+  wall-clock time, the pass pauses the definition, since a probe scanning a
+  large group can outrun `statement_timeout`; the grace lets a rebuild that
+  drops the old index first finish without a pause.
 - **Must (Rx1, hidden state):** a group keeps each extreme (one per distinct
   call) at the argument's type. The group's extremes share a basis of their
   own, `xbasis`, and a stamp of their own, `xstamp`, beside the partials'

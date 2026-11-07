@@ -215,8 +215,10 @@ pub enum CatalogError {
     /// (`super::source_index::extreme_indexes`): one on the `GROUP BY`
     /// columns then each argument. Refused by define and by a whole-transform
     /// resume, whether or not the definition says `WITHOUT SOURCE INDEX`
-    /// (which a `MIN`/`MAX` definition can't). Once running, a dropped one
-    /// pauses nothing (`status`'s `extreme_index_gaps`).
+    /// (which a `MIN`/`MAX` definition can't). Once running, a dropped one is
+    /// `status`'s `extreme_index_gaps`, and pauses the definition once it has
+    /// been missing for a grace
+    /// (`staging::schema_change::pause_readers_of_missing_probe_index`).
     ExtremeIndexMissing {
         target: String,
         missing: Vec<super::source_index::SourceIndex>,

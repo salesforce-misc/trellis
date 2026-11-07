@@ -813,6 +813,148 @@ fn unbacked_key_error(table: &str, key: &[String], shape: UnbackedShape) -> Stri
     text
 }
 
+/// The staging worker's capture pass's check of a `MIN`/`MAX` definition's
+/// probe indexes on `table`, its source (#1708 rule 2): per argument, an
+/// index leading with the `GROUP BY` columns then the argument
+/// (`defs::source_index::extreme_indexes`), by define's rule
+/// (`defs::source_index::has_index`, matched by shape in one statement).
+/// Pauses a definition that isn't paused for a capture failure yet once one
+/// of its probe indexes has read missing or invalid on every check for
+/// [`drift_memo::EXTREME_INDEX_GRACE`] of wall-clock time, recording why with
+/// a reason the pass checks again while it stays paused ([`Recheck::Index`]).
+/// Returns whether it paused any, in which case the caller leaves the table
+/// for the next pass.
+///
+/// Without the index, every re-read of a group's extreme scans the group:
+/// the target stays exact, but a page can outrun `statement_timeout` on a
+/// large group. A rebuild that drops the old index before it builds the new
+/// one leaves no index for the build's length, so the grace lets one finish:
+/// any check that reads the index met resets the clock
+/// ([`drift_memo::grace`]). The time a miss was first seen lives in this
+/// process ([`drift_memo::ProbeMemo`]): a restart or a new leader starts it
+/// again. A resume re-validates the definition as define would, so it is
+/// refused until the index is back.
+///
+/// Skipped, for a definition, while `table`'s fingerprint (`drift`, read
+/// before any check) is the one its last check found every probe index met
+/// at, so steady state costs nothing; it runs after an index change on the
+/// table, and on every pass while a clock runs. Reads none of `table`'s rows.
+/// `instance` is the capture pass's key for its database and schema.
+pub(crate) async fn pause_readers_of_missing_probe_index(
+    client: &mut Client,
+    instance: &str,
+    catalog: &CaptureCatalog,
+    drift: &Fingerprints,
+    table: &str,
+) -> Result<bool, CaptureError> {
+    use crate::defs::ast::KeySpace;
+    let aggregates: Vec<_> = catalog
+        .definitions
+        .iter()
+        .filter(|r| {
+            !r.capture_failed
+                && r.source == table
+                && r.join.is_none()
+                && matches!(r.def.key_space, KeySpace::Aggregate { .. })
+        })
+        .collect();
+    let ids: Vec<i64> = aggregates.iter().map(|r| r.id).collect();
+    drift_memo::retain_probe_readers(instance, table, &ids);
+    if aggregates.is_empty() {
+        return Ok(false);
+    }
+    let fingerprint = drift.of(&crate::defs::ddl::regclass_arg(table));
+    let grace = drift_memo::extreme_index_grace(instance);
+    let mut passed: Vec<(i64, crate::defs::source_index::SourceIndex)> = Vec::new();
+    for reader in aggregates {
+        let stamp = fingerprint.map(|f| format!("{f}|{:?}", reader.def));
+        let memo = drift_memo::probe_memo(instance, table, reader.id);
+        if memo.missing_since.is_empty() && stamp.is_some() && memo.met_at == stamp {
+            continue;
+        }
+        let source_columns = crate::defs::catalog::source_columns_in(&*client, reader.id).await?;
+        let now = std::time::Instant::now();
+        let mut next = drift_memo::ProbeMemo::default();
+        for index in crate::defs::source_index::extreme_indexes(&reader.def, &source_columns, table)
+        {
+            let met = crate::defs::source_index::has_index(&*client, table, &index.columns).await?;
+            let since = memo.missing_since.get(&index.columns).copied();
+            match drift_memo::grace(since, now, met, grace) {
+                drift_memo::Grace::Met => {}
+                drift_memo::Grace::Running { since } => {
+                    next.missing_since.insert(index.columns.clone(), since);
+                }
+                drift_memo::Grace::Passed { since } => {
+                    next.missing_since.insert(index.columns.clone(), since);
+                    passed.push((reader.id, index));
+                }
+            }
+        }
+        // The stamp was read before the check, so a change that committed
+        // since it was read is checked again next pass.
+        if next.missing_since.is_empty() {
+            next.met_at = stamp;
+        }
+        drift_memo::record_probe(instance, table, reader.id, next);
+    }
+    if passed.is_empty() {
+        return Ok(false);
+    }
+    let partitioned: bool = client
+        .query_typed_one(
+            "select coalesce((select c.relkind = 'p' from pg_catalog.pg_class c \
+                              where c.oid = pg_catalog.to_regclass($1)), false)",
+            &[(&crate::defs::ddl::regclass_arg(table), Type::TEXT)],
+        )
+        .await?
+        .get(0);
+    let txn = client.transaction().await?;
+    for (id, index) in &passed {
+        let error = missing_probe_index_error(index, partitioned);
+        if crate::defs::lifecycle::pause_for_schema_change(
+            &txn,
+            *id,
+            table,
+            &index.columns,
+            &error,
+            Recheck::Index,
+        )
+        .await?
+        {
+            crate::instance_log::warn!(transform_id = *id, table = %table, "definition paused: {error}");
+        }
+    }
+    txn.commit().await?;
+    Ok(true)
+}
+
+/// The `capture_failure` sentence for a `MIN`/`MAX` definition paused
+/// because its probe `index` has been missing or invalid for the grace.
+fn missing_probe_index_error(
+    index: &crate::defs::source_index::SourceIndex,
+    partitioned: bool,
+) -> String {
+    let argument = index.columns.last().map_or("", String::as_str);
+    let mut text = format!(
+        "no valid index on {table} has led with ({columns}) in that order for {minutes} \
+         minutes, which this definition's MIN/MAX({argument}) re-reads a group's extreme \
+         through: without one each re-read scans the group. Create one with `{create}`, then \
+         resume the definition to rebuild it. To replace the index, build the replacement \
+         before dropping the old one",
+        table = index.table,
+        columns = index.columns.join(", "),
+        minutes = drift_memo::EXTREME_INDEX_GRACE.as_secs() / 60,
+        create = index.create_index(),
+    );
+    if partitioned {
+        text.push_str(
+            ". On a partitioned table, the root's index stays invalid after a leaf's index is \
+             repaired: re-run ALTER INDEX ... ATTACH PARTITION for the repaired leaf's index",
+        );
+    }
+    text
+}
+
 /// The staging worker's capture pass's check for a table Trellis can't read
 /// or write correctly. It pauses every definition that reads `table` and
 /// isn't paused for a capture failure yet, recording why in

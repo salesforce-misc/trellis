@@ -63,6 +63,14 @@
 //! ([`key_skippable`]), in a memo of its own, and so does its check of the
 //! index backing a table's declared `KEY (...)` ([`backing_skippable`]).
 //!
+//! Its check of a `MIN`/`MAX` definition's probe indexes skips the same way
+//! while every probe index was met, and it also holds, for each index it
+//! found missing or invalid, the time it first found it so
+//! ([`ProbeMemo`]): the definition pauses only once the index has read
+//! missing on every check for [`EXTREME_INDEX_GRACE`] ([`grace`]). That time
+//! lives in this process only, so a restart, or another process taking over
+//! the staging worker, starts the clock again, which can only delay a pause.
+//!
 //! Nothing resets the memo for correctness: every input of the comparison is
 //! in the stamp. It is dropped for a definition when its comparison finds a
 //! column drifted, when it is paused (its table is checked without it), and
@@ -72,6 +80,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use tokio_postgres::GenericClient;
 use tokio_postgres::types::Type;
@@ -223,6 +232,7 @@ pub(crate) fn retain_tables(instance: &str, known: &BTreeSet<&str>) {
     with_memo(|memo| memo.retain(|(i, t, _), _| i != instance || known.contains(t.as_str())));
     with_keys(|memo| memo.retain(|(i, t, _), _| i != instance || known.contains(t.as_str())));
     with_backings(|memo| memo.retain(|(i, t), _| i != instance || known.contains(t.as_str())));
+    with_probes(|memo| memo.retain(|(i, t, _), _| i != instance || known.contains(t.as_str())));
 }
 
 /// Forgets everything remembered for `instance`: its staging worker in this
@@ -231,6 +241,7 @@ pub(crate) fn forget_instance(instance: &str) {
     with_memo(|memo| memo.retain(|(i, _, _), _| i != instance));
     with_keys(|memo| memo.retain(|(i, _, _), _| i != instance));
     with_backings(|memo| memo.retain(|(i, _), _| i != instance));
+    with_probes(|memo| memo.retain(|(i, _, _), _| i != instance));
 }
 
 /// The same skip for the capture pass's re-check of a 1-1 `JOIN`'s unique
@@ -323,6 +334,127 @@ pub(crate) fn forget_backing(instance: &str, table: &str) {
     with_backings(|memo| memo.remove(&(instance.to_string(), table.to_string())));
 }
 
+/// How long a `MIN`/`MAX` definition's probe index may read missing or
+/// invalid on every check before the capture pass pauses the definition
+/// (`schema_change::pause_readers_of_missing_probe_index`): long enough for a
+/// rebuild that drops the old index before it builds the new one on most
+/// tables. Wall-clock time, not a count of passes, whose interval is
+/// configurable. A fixed constant, not an option.
+pub(crate) const EXTREME_INDEX_GRACE: Duration = Duration::from_secs(5 * 60);
+
+/// Where one check of a probe index leaves its grace ([`grace`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Grace {
+    /// The index is there: no clock runs.
+    Met,
+    /// Missing or invalid on every check since `since`, for less than the
+    /// grace.
+    Running { since: Instant },
+    /// Missing or invalid on every check since `since`, for the grace or
+    /// longer: the definition pauses.
+    Passed { since: Instant },
+}
+
+/// One check of a probe index at `now`: `met` is what it read, and
+/// `missing_since` the time the checks before it first read it missing, if
+/// they still do. A met check resets the clock; a first missed check starts
+/// it at `now`.
+pub(crate) fn grace(
+    missing_since: Option<Instant>,
+    now: Instant,
+    met: bool,
+    grace: Duration,
+) -> Grace {
+    if met {
+        return Grace::Met;
+    }
+    let since = missing_since.unwrap_or(now);
+    if now.saturating_duration_since(since) >= grace {
+        Grace::Passed { since }
+    } else {
+        Grace::Running { since }
+    }
+}
+
+/// The grace the capture pass of instance `instance` gives a probe index:
+/// [`EXTREME_INDEX_GRACE`], unless a test set another
+/// ([`set_extreme_index_grace`]).
+pub(crate) fn extreme_index_grace(instance: &str) -> Duration {
+    #[cfg(any(test, feature = "internals"))]
+    if let Some(grace) = GRACE_OVERRIDES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(instance)
+    {
+        return *grace;
+    }
+    let _ = instance;
+    EXTREME_INDEX_GRACE
+}
+
+#[cfg(any(test, feature = "internals"))]
+static GRACE_OVERRIDES: Mutex<BTreeMap<String, Duration>> = Mutex::new(BTreeMap::new());
+
+/// Sets the grace a probe index gets on the instance with schema `schema` in
+/// database `database`, in this process, for tests that would otherwise wait
+/// [`EXTREME_INDEX_GRACE`]. Never an option of a running instance.
+#[cfg(any(test, feature = "internals"))]
+pub fn set_extreme_index_grace(database: &str, schema: &str, grace: Duration) {
+    GRACE_OVERRIDES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(
+            crate::capture::reconcile::instance_key(database, schema),
+            grace,
+        );
+}
+
+/// What the capture pass remembers of one `MIN`/`MAX` definition's probe
+/// indexes on one table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProbeMemo {
+    /// The stamp (the table's fingerprint and the definition) its last check
+    /// found every probe index met at.
+    pub(crate) met_at: Option<String>,
+    /// Each probe index (by its columns) its checks have read missing or
+    /// invalid since the time given, every check since.
+    pub(crate) missing_since: BTreeMap<Vec<String>, Instant>,
+}
+
+/// By capture instance, table and definition id.
+static PROBES: Mutex<BTreeMap<(String, String, i64), ProbeMemo>> = Mutex::new(BTreeMap::new());
+
+fn with_probes<T>(f: impl FnOnce(&mut BTreeMap<(String, String, i64), ProbeMemo>) -> T) -> T {
+    f(&mut PROBES.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// What the capture pass remembers of definition `id`'s probe indexes on
+/// `table`.
+pub(crate) fn probe_memo(instance: &str, table: &str, id: i64) -> ProbeMemo {
+    with_probes(|memo| {
+        memo.get(&(instance.to_string(), table.to_string(), id))
+            .cloned()
+            .unwrap_or_default()
+    })
+}
+
+/// Records one check of definition `id`'s probe indexes on `table`.
+pub(crate) fn record_probe(instance: &str, table: &str, id: i64, found: ProbeMemo) {
+    with_probes(|memo| {
+        memo.insert((instance.to_string(), table.to_string(), id), found);
+    });
+    #[cfg(any(test, feature = "internals"))]
+    probe::count_probe(instance, id);
+}
+
+/// Keeps only the probe entries of `table` for the definitions in `ids`: a
+/// paused or dropped definition's clock is forgotten.
+pub(crate) fn retain_probe_readers(instance: &str, table: &str, ids: &[i64]) {
+    with_probes(|memo| {
+        memo.retain(|(i, t, id), _| i != instance || t != table || ids.contains(id));
+    });
+}
+
 /// How many times the capture pass has run the full comparison for a
 /// definition, for tests that pin the skip. Compiled only under
 /// `cfg(any(test, feature = "internals"))`.
@@ -369,6 +501,25 @@ mod probe {
             .unwrap_or(0)
     }
 
+    static PROBE_CHECKS: Mutex<BTreeMap<(String, i64), u64>> = Mutex::new(BTreeMap::new());
+
+    pub(super) fn count_probe(instance: &str, id: i64) {
+        *PROBE_CHECKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry((instance.to_string(), id))
+            .or_default() += 1;
+    }
+
+    pub(super) fn get_probe(instance: &str, id: i64) -> u64 {
+        PROBE_CHECKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(instance.to_string(), id))
+            .copied()
+            .unwrap_or(0)
+    }
+
     static BACKING_CHECKS: Mutex<BTreeMap<(String, String), u64>> = Mutex::new(BTreeMap::new());
 
     pub(super) fn count_backing(instance: &str, table: &str) {
@@ -387,6 +538,17 @@ mod probe {
             .copied()
             .unwrap_or(0)
     }
+}
+
+/// The number of checks the capture pass has run of `MIN`/`MAX` definition
+/// `id`'s probe indexes, for the instance with schema `schema` in database
+/// `database`, for tests that pin the skip.
+#[cfg(any(test, feature = "internals"))]
+pub fn probe_index_checks(database: &str, schema: &str, id: i64) -> u64 {
+    probe::get_probe(
+        &crate::capture::reconcile::instance_key(database, schema),
+        id,
+    )
 }
 
 /// The number of checks the capture pass has run of the index backing
@@ -444,6 +606,60 @@ mod tests {
         record("i2", "public.a", 1, current("s1"));
         record("i2", "public.a", 1, None);
         assert!(!skippable("i2", "public.a", 1, "s1"));
+    }
+
+    /// The grace as a function of (missing since, now, met): a met check
+    /// resets the clock, a first miss starts it, and only misses on every
+    /// check for the whole grace pass it.
+    #[test]
+    fn the_probe_grace_runs_only_through_unbroken_misses() {
+        let grace_len = Duration::from_secs(300);
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+
+        assert_eq!(grace(None, at(0), true, grace_len), Grace::Met);
+        assert_eq!(grace(Some(at(0)), at(400), true, grace_len), Grace::Met);
+        assert_eq!(
+            grace(None, at(10), false, grace_len),
+            Grace::Running { since: at(10) },
+            "a first miss starts the clock"
+        );
+        assert_eq!(
+            grace(Some(at(10)), at(309), false, grace_len),
+            Grace::Running { since: at(10) }
+        );
+        assert_eq!(
+            grace(Some(at(10)), at(310), false, grace_len),
+            Grace::Passed { since: at(10) },
+            "missed on every check for the whole grace"
+        );
+        // A met check in between resets: the next miss starts again.
+        assert_eq!(grace(Some(at(10)), at(200), true, grace_len), Grace::Met);
+        assert_eq!(
+            grace(None, at(400), false, grace_len),
+            Grace::Running { since: at(400) }
+        );
+        // A clock that reads earlier than the start never passes early.
+        assert_eq!(
+            grace(Some(at(10)), at(5), false, grace_len),
+            Grace::Running { since: at(10) }
+        );
+        // No grace: the first miss passes.
+        assert_eq!(
+            grace(None, at(1), false, Duration::ZERO),
+            Grace::Passed { since: at(1) }
+        );
+    }
+
+    #[test]
+    fn the_grace_is_five_minutes_unless_a_test_sets_another() {
+        assert_eq!(EXTREME_INDEX_GRACE, Duration::from_secs(300));
+        assert_eq!(extreme_index_grace("no-override"), EXTREME_INDEX_GRACE);
+        set_extreme_index_grace("db", "s", Duration::ZERO);
+        assert_eq!(
+            extreme_index_grace(&crate::capture::reconcile::instance_key("db", "s")),
+            Duration::ZERO
+        );
     }
 
     #[test]

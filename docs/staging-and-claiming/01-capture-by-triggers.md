@@ -686,6 +686,9 @@ them:
   - a table read with a `KEY (…)` left with no valid unique index backing
     it (an index dropped, a failed build's `INVALID` index, a partitioned
     root's index left invalid), by the pass, which matches it by shape;
+  - a `MIN`/`MAX` transform's probe index (its `GROUP BY` columns, then the
+    argument) found missing or invalid on every pass for 5 minutes, by the
+    pass;
   - a read column changed so define would refuse a definition reading it, so
     it would evaluate the column as another type, or so a `numeric` column
     Trellis created must be re-typed;

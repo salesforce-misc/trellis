@@ -400,6 +400,24 @@ pub(crate) async fn reconcile_with_floors(
                 continue;
             }
         }
+        // A `MIN`/`MAX` definition whose probe index has been missing or
+        // invalid on every check for its grace pauses.
+        match crate::staging::schema_change::pause_readers_of_missing_probe_index(
+            client,
+            instance,
+            &snapshot.catalog,
+            &drift,
+            table,
+        )
+        .await
+        {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(err) => {
+                outcome.failed.push((table.clone(), err));
+                continue;
+            }
+        }
         // A key column whose type or collation define would
         // refuse now, a join pair that no longer matches, a type change that
         // renders the stored keys differently, or a widening past a typed

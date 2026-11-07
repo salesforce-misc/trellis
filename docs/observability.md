@@ -615,7 +615,10 @@ retraction that removes a group's minimum or maximum re-reads the group's extrem
 the source; with the index that is one index entry, and without it the read scans the
 group's rows, or the whole source for each such group and extreme when the `GROUP BY`
 index is missing too (a `source_index_gaps` entry). It is a warning: the target stays
-exact, nothing is paused and `self_check` still walks. Define and a whole-transform
+exact and `self_check` still walks. Once the index has been missing on every staging
+worker pass for 5 minutes, the pass pauses the transform
+([Supported sources and targets](transforms.md#supported-sources-and-targets), the
+`MIN`/`MAX` row). Define and a whole-transform
 `RESUME` refuse a definition that lacks one, so an entry is an index dropped or
 invalidated since. It is read from the catalog on
 each call, so it clears once the index exists, and it is empty for every other

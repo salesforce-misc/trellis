@@ -39,8 +39,10 @@
 //! doesn't depend on the index: without one Postgres scans the group (by
 //! the `GROUP BY` index when there is one), which is exact and slower, so
 //! the probe never reads the catalog. An index dropped later is reported by
-//! `status` (`ExtremeIndexGap`); nothing pauses and `self_check` still
-//! walks.
+//! `status` (`ExtremeIndexGap`) and `self_check` still walks; once it has
+//! been missing on every check of the staging worker's pass for a grace,
+//! the pass pauses the definition
+//! (`staging::schema_change::pause_readers_of_missing_probe_index`).
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
