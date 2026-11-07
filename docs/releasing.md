@@ -33,7 +33,20 @@ Every version below is the release's:
 
 The install text pins the release's series, not its patch: `0.1.1` leaves it
 as it is, and `0.2.0` makes the banner "Version 0.2", the Rust line `"0.2"`
-and the gem and Hex lines `~> 0.2.0`.
+and the gem and Hex lines `~> 0.2.0`. All three allow the same range. Before
+1.0 the minor is the unit that may break, so the range is the minor series
+(`>= 0.2.0, < 0.3.0`). From 1.0 on a minor doesn't break, so the text pins
+the series' lower bound and allows later minors of the major: `1.2.3` makes
+the Rust line `"1.2"` and the gem and Hex lines `~> 1.2` (`>= 1.2.0, < 2.0.0`).
+A minor release can raise the catalog floor
+([ADR-0024](decisions/0024-compatibility-floors-and-rollback.md)), which
+limits rolling back across it; the lockfile, not the README line, fixes the
+version a deployed application runs.
+
+The bump changes only the banner's label, not its prose. The sentence "the
+API may change between 0.x minor releases, before 1.0" is false from 1.0 on,
+and `check-release-versions.sh` doesn't catch it, so the `1.0.0` release
+commit edits it by hand.
 
 The release builds run with `--locked` and a frozen bundle, so a lockfile left
 behind fails them. `.github/scripts/bump-version.sh <version>` sets all

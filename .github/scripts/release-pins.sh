@@ -3,7 +3,10 @@
 #
 # derive_pins <version>: the install text the READMEs carry for a release
 # (docs/releasing.md). A stable X.Y.Z is named by its series, so a patch
-# release leaves the text alone: Cargo's "X.Y", Bundler and Mix's "~> X.Y.0".
+# release leaves the text alone. Cargo's "X.Y" means >= X.Y.0, < (X+1).0.0 for
+# major 1 and up, and < 0.(Y+1).0 for major 0. Bundler and Mix's "~> X.Y.0"
+# is the 0.x range, and "~> X.Y" the 1.x and later one, so the three allow the
+# same range: the minor series for major 0, later minors of the major after.
 # A prerelease names itself exactly, since Cargo, Bundler and Mix never pick
 # one from a range; RubyGems writes its `-` as `.pre.` (0.2.0-alpha is
 # 0.2.0.pre.alpha). Sets:
@@ -27,8 +30,11 @@ derive_pins() {
     *)
       pin_banner="${1%.*}"
       pin_cargo="${1%.*}"
-      pin_gem="~> ${1%.*}.0"
-      pin_hex="~> ${1%.*}.0"
+      case "$1" in
+        0.*) pin_gem="~> ${1%.*}.0" ;;
+        *) pin_gem="~> ${1%.*}" ;;
+      esac
+      pin_hex="$pin_gem"
       ;;
   esac
 }
