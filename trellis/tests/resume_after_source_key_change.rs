@@ -476,6 +476,68 @@ async fn a_one_to_one_resume_refuses_what_re_keying_would_take() {
     assert_eq!(rows(&raw, COPY_ACTUAL).await, rows(&raw, COPY_ORACLE).await);
 }
 
+/// The re-keying deletes the rows no new key can hold while the target still
+/// has its old key and columns. A target published for its deletes (as a
+/// `FOR ALL TABLES` publication publishes every table) needs its replica
+/// identity, its primary key, for a delete; a user's trigger on the target
+/// reads the row it deletes, including a former key column the re-keying
+/// drops. Either failed the resume with a Postgres error when the delete ran
+/// after the key constraint and the column were dropped.
+#[tokio::test]
+async fn a_one_to_one_resume_deletes_rows_before_it_alters_the_target() {
+    let cluster = TestCluster::start();
+    // Widened, the target published for its deletes.
+    let (db, mut raw, trellis) = setup(&cluster, SOURCE, &[COPY]).await;
+    raw.batch_execute("create publication c_copy_pub for table public.c_copy")
+        .await
+        .unwrap();
+    raw.batch_execute(RECREATED).await.unwrap();
+    capture_pass(&mut raw, &db.pool).await;
+    trellis.apply("RESUME TRANSFORM c_copy").await.unwrap();
+    bring_live(&mut raw, &db.pool, &trellis, &["c_copy"]).await;
+    assert_eq!(rows(&raw, COPY_ACTUAL).await, rows(&raw, COPY_ORACLE).await);
+    drop((db, raw, trellis));
+
+    // Narrowed, with two target rows of `id` 1, and a user's trigger
+    // reading the former key column `pid` of each row deleted.
+    let (db, mut raw, trellis) = setup(
+        &cluster,
+        "create table public.c (id int not null, pid int not null, amount int, \
+             primary key (pid, id)); \
+         insert into public.c select i, i % 3, i from generate_series(1, 6) i; \
+         insert into public.c values (1, 5, 50)",
+        &[COPY],
+    )
+    .await;
+    raw.batch_execute(
+        "create table public.audit (pid int); \
+         create function public.audit_delete() returns trigger language plpgsql as \
+             $$ begin insert into public.audit values (old.pid); return old; end $$; \
+         create trigger audit_delete after delete on public.c_copy \
+             for each row execute function public.audit_delete()",
+    )
+    .await
+    .unwrap();
+    trellis.apply("PAUSE TRANSFORM c_copy").await.unwrap();
+    raw.batch_execute(
+        "delete from public.c where id = 1 and pid = 1; \
+         alter table public.c drop constraint c_pkey, add primary key (id)",
+    )
+    .await
+    .unwrap();
+    capture_pass(&mut raw, &db.pool).await;
+    trellis.apply("RESUME TRANSFORM c_copy").await.unwrap();
+    assert_eq!(
+        rows(&raw, "select pid::text from public.audit order by 1").await,
+        [[Some("1".into())], [Some("5".into())]],
+        "both rows of id 1 deleted, read with their pid"
+    );
+    assert_eq!(
+        key_of(&raw, "public.c_copy").await,
+        [[Some("PRIMARY KEY (id)".into())]]
+    );
+}
+
 /// A plain source converted to a partitioned one (the routine case): a
 /// partitioned table's key must hold the partition key, so the conversion
 /// widens it. The resume rebuilds onto the tree, and capture covers the

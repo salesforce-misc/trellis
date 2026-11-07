@@ -1238,14 +1238,14 @@ async fn declare_released_keys(
 /// a target an earlier release built over its source key's `INCLUDE`
 /// columns (#1722).
 ///
-/// Under the `ACCESS EXCLUSIVE` lock its `ALTER TABLE` takes, the target's
-/// key constraint is replaced in place by one over the new key, a new key
+/// Under an `ACCESS EXCLUSIVE` lock on the target, the rows no new key can
+/// hold are deleted first, while the target still has its old key and
+/// columns: every row when a key column is added (none has a value for it),
+/// else the rows whose new key is repeated. Then the target's key
+/// constraint is replaced in place by one over the new key, a new key
 /// column is added as define creates one (its type with no modifier, and
-/// its collation), a former key column the definition doesn't create is
-/// dropped, and one it keeps as a field becomes nullable, as define creates
-/// a field. The table, the user's indexes and grants stay. Rows no key can
-/// hold go first: every row when a key column is added (none has a value
-/// for it), else the rows whose new key is repeated. The rebuild writes
+/// its collation), and a former key column the definition doesn't create is
+/// dropped. The table, the user's indexes and grants stay. The rebuild writes
 /// them again, re-derives every row and sweeps the target rows no source
 /// row backs. A plain 1-1 target's ledger, keyed by the old key's text, is
 /// emptied; a 1-1 `JOIN`'s hidden tables are recreated by the resume.
@@ -1267,7 +1267,6 @@ pub(crate) async fn repair_target_key(
         added,
         dropped,
         nullable,
-        made_nullable,
         ..
     } = &repair;
     let table = ddl::qualified_target_table_ident(target);
@@ -1293,18 +1292,19 @@ pub(crate) async fn repair_target_key(
             .iter()
             .map(|c| format!("drop column {}", quote_ident(c))),
     );
-    actions.extend(
-        made_nullable
-            .iter()
-            .map(|c| format!("alter column {} drop not null", quote_ident(c))),
-    );
-    txn.batch_execute(&format!("alter table {table} {}", actions.join(", ")))
-        .await?;
     let key_list = key
         .iter()
         .map(|c| quote_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
+    // The lock first, as the `ALTER TABLE` would take it, so the delete
+    // never upgrades a weaker one. The delete runs while the target still
+    // has its old shape and key: a `NOT NULL` key column can then be added,
+    // a publication of the target's deletes still finds its replica
+    // identity, and a trigger on the target (capture of a transform
+    // reading it, or the user's) still sees every column.
+    txn.batch_execute(&format!("lock table {table} in access exclusive mode"))
+        .await?;
     if !added.is_empty() {
         txn.batch_execute(&format!("delete from {table}")).await?;
     } else {
@@ -1319,6 +1319,8 @@ pub(crate) async fn repair_target_key(
         ))
         .await?;
     }
+    txn.batch_execute(&format!("alter table {table} {}", actions.join(", ")))
+        .await?;
     txn.batch_execute(&format!(
         "alter table {table} add {} ({key_list})",
         if *nullable {
@@ -1359,9 +1361,6 @@ pub(crate) struct TargetRepair {
     /// Whether a key column can be NULL: the new key is then a
     /// `unique nulls not distinct` constraint rather than a primary key.
     nullable: bool,
-    /// The former key columns it keeps as the definition's fields, which
-    /// it makes nullable.
-    made_nullable: Vec<String>,
     /// Whether the transform takes an `ALTER TRANSFORM` (a plain 1-1, not a
     /// 1-1 `JOIN`), which adds a dropped column back as a field.
     pub(crate) alterable: bool,
@@ -1559,11 +1558,14 @@ pub(crate) async fn target_repair(
         }
         added.push(column.clone());
     }
-    let (made_nullable, dropped): (Vec<String>, Vec<String>) = old
+    // A field never has a key column's name (define and `ALTER TRANSFORM`
+    // refuse one, `FieldNamedAfterPrimaryKey`), so every former key column
+    // is one the definition doesn't create; a field is never dropped.
+    let dropped: Vec<String> = old
         .iter()
-        .filter(|c| !key.contains(c))
+        .filter(|c| !key.contains(c) && !fields.contains(&c.as_str()))
         .cloned()
-        .partition(|c| fields.contains(&c.as_str()));
+        .collect();
     for column in &dropped {
         let blocking = dependents(client, target, Some(column), constraint_oid, index_oid).await?;
         if !blocking.is_empty() {
@@ -1589,7 +1591,6 @@ pub(crate) async fn target_repair(
         constraint,
         added,
         dropped,
-        made_nullable,
         alterable: matches!(definition.def.key_space, KeySpace::OneToOne),
     }))
 }
