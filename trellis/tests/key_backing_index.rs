@@ -10,7 +10,9 @@
 #[path = "support/resume_passes.rs"]
 mod resume_passes;
 
-use resume_passes::{SCHEMA, bring_live, drain_to_quiescence, full_pass, rows, setup, status};
+use resume_passes::{
+    SCHEMA, bring_live, connect, drain_to_quiescence, full_pass, rows, setup, status,
+};
 use testkit::TestCluster;
 use trellis::defs::TransformStatus;
 
@@ -183,6 +185,148 @@ async fn routine_maintenance_of_the_key_index_pauses_nothing() {
         assert_live(&trellis, &["s_one", "s_sums"], &step.join("; ")).await;
         converged(&raw).await;
     }
+}
+
+/// More of #1744's matrix rows, on the real pass: a replacement build of the
+/// key's own shape left invalid beside the valid index (a cancelled
+/// `CREATE UNIQUE INDEX CONCURRENTLY`), and rewrites, moves and primary-key
+/// operations that keep the backing index valid at every committed instant,
+/// including a key column retyped (its index rebuilt in the `ALTER`). Each
+/// pauses nothing, and the reader keeps converging through writes.
+#[tokio::test]
+async fn an_invalid_copy_beside_the_index_and_other_routine_operations_pause_nothing() {
+    let cluster = TestCluster::start();
+    let (db, mut raw, trellis) = setup(&cluster, KEYLESS, &[AGG]).await;
+    // An open snapshot holds the build in its last wait, where the timeout
+    // cancels it and leaves its index invalid.
+    let holder = connect(db.dsn()).await;
+    holder
+        .batch_execute("begin isolation level repeatable read; select count(*) from public.s")
+        .await
+        .unwrap();
+    raw.batch_execute("set statement_timeout = '500ms'")
+        .await
+        .unwrap();
+    raw.batch_execute("create unique index concurrently s_copy on public.s (k1, k2)")
+        .await
+        .expect_err("cancelled while the snapshot is open");
+    raw.batch_execute("reset statement_timeout").await.unwrap();
+    holder.batch_execute("commit").await.unwrap();
+    assert_eq!(
+        rows(
+            &raw,
+            "select indisvalid::text from pg_catalog.pg_index \
+             where indexrelid = 'public.s_copy'::regclass"
+        )
+        .await,
+        [[Some("false".to_string())]]
+    );
+    for (n, statement) in [
+        "select 1",
+        "vacuum full public.s",
+        "cluster public.s using s_key",
+        "alter index public.s_key set tablespace pg_default",
+        "reindex table public.s",
+        "reindex index concurrently public.s_copy",
+        "drop index public.s_copy",
+        // A primary key over other columns, added through an index, then
+        // dropped, then added again in place: the key is the `KEY`'s.
+        "create unique index concurrently s_k2 on public.s (k2)",
+        "alter table public.s add primary key using index s_k2",
+        "alter table public.s drop constraint s_k2",
+        "alter table public.s add primary key (k1)",
+        "alter table public.s alter column k1 type bigint",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        raw.batch_execute(statement)
+            .await
+            .unwrap_or_else(|e| panic!("{statement}: {e}"));
+        full_pass(&mut raw, &db.pool).await;
+        assert_live(&trellis, &["s_sums"], statement).await;
+        let next = 100 + n;
+        raw.batch_execute(&format!(
+            "insert into public.s values ({next}, {next}, 1, {next}); \
+             update public.s set v = v + 1 where k1 = 2"
+        ))
+        .await
+        .unwrap();
+        drain_to_quiescence(&db.pool, &mut raw).await;
+        full_pass(&mut raw, &db.pool).await;
+        assert_live(&trellis, &["s_sums"], statement).await;
+    }
+    assert_eq!(
+        rows(
+            &raw,
+            "select g::text, n::text, total::text from public.s_sums order by g"
+        )
+        .await,
+        rows(
+            &raw,
+            "select g::text, count(*)::text, sum(v)::text from public.s group by g order by g"
+        )
+        .await
+    );
+}
+
+/// A text key's column moved to another collation: the `ALTER` rebuilds the
+/// index under the column's new collation in the same transaction, so the
+/// index keeps backing the key and the `KEY` check pauses nothing.
+#[tokio::test]
+async fn a_key_column_recollated_keeps_its_index_backing_the_key() {
+    let cluster = TestCluster::start();
+    let (db, mut raw, trellis) = setup(
+        &cluster,
+        "create table public.c (k text not null, g int); \
+         create unique index c_key on public.c (k); \
+         insert into public.c select 'k' || i, i % 2 from generate_series(1, 6) i",
+        &[
+            "TRANSFORM c_sums FROM public.c KEY (k) GROUP BY g WITHOUT SOURCE INDEX \
+           SELECT COUNT(*) AS n",
+        ],
+    )
+    .await;
+    raw.batch_execute("alter table public.c alter column k type text collate \"C\"")
+        .await
+        .unwrap();
+    full_pass(&mut raw, &db.pool).await;
+    let reasons = status(&trellis, "c_sums")
+        .await
+        .capture_failure
+        .map(|failure| failure.reasons)
+        .unwrap_or_default();
+    assert!(
+        !reasons.iter().any(|r| r.contains("backs KEY")),
+        "{reasons:?}"
+    );
+}
+
+/// A key column made nullable under an index that is not `NULLS NOT
+/// DISTINCT` no longer backs the key: two rows can share it through a
+/// `NULL`. The column's nullability is in the table's fingerprint, so the
+/// next pass checks and pauses, and the message's index is `NULLS NOT
+/// DISTINCT`.
+#[tokio::test]
+async fn a_key_column_made_nullable_pauses() {
+    let cluster = TestCluster::start();
+    let (db, mut raw, trellis) = setup(&cluster, KEYLESS, &[AGG]).await;
+    full_pass(&mut raw, &db.pool).await;
+    raw.batch_execute("alter table public.s alter column k2 drop not null")
+        .await
+        .unwrap();
+    full_pass(&mut raw, &db.pool).await;
+    let reported = status(&trellis, "s_sums").await;
+    assert_eq!(reported.status, TransformStatus::Paused);
+    let reasons = reported.capture_failure.expect("why").reasons;
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].contains(
+            "`create unique index concurrently on \"public\".\"s\" (\"k1\", \"k2\") \
+             nulls not distinct`"
+        ),
+        "{reasons:?}"
+    );
 }
 
 /// A drop-first swap whose build fails (`CREATE UNIQUE INDEX CONCURRENTLY`
