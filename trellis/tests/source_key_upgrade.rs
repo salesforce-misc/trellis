@@ -258,10 +258,11 @@ async fn a_released_one_to_one_whose_dropped_key_differs_from_the_chosen_index_p
 /// A released definition over a table whose primary key is deferrable
 /// (#1742): an earlier release keyed the table by it, and Trellis no longer
 /// keys a table by a deferrable key. At attach each definition pauses,
-/// naming the key and the remedy; nothing is recorded for the table, and a
-/// unique index over the same columns that isn't deferrable never stands in
-/// for the key. `RESUME` refuses until the key is recreated not deferrable,
-/// then rebuilds.
+/// naming the key and the remedy. The key's columns are recorded as the
+/// table's, never another unique index's, and a unique index over the same
+/// columns that isn't deferrable doesn't stand in for the primary key:
+/// `RESUME` refuses until the key is recreated not deferrable, then
+/// rebuilds.
 #[tokio::test]
 async fn a_released_definition_over_a_deferrable_primary_key_pauses() {
     let mut d = Driver::start(
@@ -307,12 +308,12 @@ async fn a_released_definition_over_a_deferrable_primary_key_pauses() {
     );
     assert_eq!(
         d.rows(
-            "select table_name from definition_keys \
-             where table_name in ('public.s', 'public.u')"
+            "select table_name, key_columns::text from definition_keys \
+             where table_name in ('public.s', 'public.u') order by 1"
         )
         .await,
-        Vec::<String>::new(),
-        "no key is recorded for a table with a deferrable primary key"
+        ["(public.s,{id})", "(public.u,{id})"],
+        "the deferrable key's columns are recorded"
     );
     let reasons = d
         .rows("select error from capture_failures order by transform_id")
@@ -365,4 +366,82 @@ async fn a_released_definition_over_a_deferrable_primary_key_pauses() {
     );
     assert_eq!(d.rows(ONE_ACTUAL).await, d.rows(ONE_EXPECTED).await);
     assert_eq!(d.rows(SUMS_ACTUAL).await, d.rows(SUMS_EXPECTED).await);
+}
+
+/// A released `JOIN` with a cause on each table: its `FROM` table's primary
+/// key is deferrable, and its joined table has no primary key and a unique
+/// index that backs a key. At attach the joined table's index becomes the
+/// definition's `KEY`, as for any released definition over a table with no
+/// primary key, and the definition pauses for the deferrable key alone; once
+/// that is recreated not deferrable, `RESUME` rebuilds it.
+#[tokio::test]
+async fn a_released_join_over_a_deferrable_key_and_a_table_with_none_takes_both() {
+    const JOIN: &str = "TRANSFORM j FROM public.a JOIN public.b ON a.bk = b.id \
+                        GROUP BY a.g WITHOUT SOURCE INDEX SELECT COUNT(*) AS n";
+    const ACTUAL: &str = "select g, n from public.j order by g";
+    const EXPECTED: &str = "select a.g, count(*) from public.a join public.b on a.bk = b.id \
+                            group by a.g order by a.g";
+    let mut d = Driver::start(
+        "create table public.a (id integer primary key, g integer, bk integer); \
+         create table public.b (id integer not null, primary key (id)); \
+         create unique index b_id on public.b (id); \
+         create index b_on on public.b (id); create index a_on on public.a (bk)",
+        &[("id", int4()), ("g", int4()), ("bk", int4())],
+        &[JOIN],
+        &["public.a", "public.b"],
+    )
+    .await;
+    exec(
+        &d,
+        "insert into public.b values (1), (2); \
+         insert into public.a values (1, 1, 1), (2, 1, 2), (3, 2, 1)",
+    )
+    .await;
+    d.settle().await;
+    assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
+
+    exec(
+        &d,
+        "alter table public.a drop constraint a_pkey, add primary key (id) deferrable; \
+         alter table public.b drop constraint b_pkey",
+    )
+    .await;
+    d.ctl
+        .batch_execute("delete from definition_keys")
+        .await
+        .expect("a catalog from before the record");
+    let config = trellis::Config::from_dsn(d.db.dsn().to_string()).expect("config");
+    trellis::migrate::migrate_with_pool(d.pool(), &config)
+        .await
+        .expect("attach");
+    assert_eq!(statuses(&d).await, ["(public.j,paused)"]);
+    assert_eq!(
+        d.rows("select definition_text from transform_definitions")
+            .await,
+        [
+            "(\"TRANSFORM j FROM public.a INNER JOIN public.b KEY (id) ON a.bk = b.id GROUP BY a.g \
+             WITHOUT SOURCE INDEX SELECT COUNT(*) AS n\")"
+        ]
+    );
+    let reasons = d.rows("select error from capture_failures").await;
+    assert!(
+        reasons.len() == 1
+            && reasons[0].contains(
+                "transform public.j reads public.a, whose primary key (id) is deferrable"
+            ),
+        "{reasons:?}"
+    );
+
+    exec(
+        &d,
+        "alter table public.a drop constraint a_pkey, add primary key (id); \
+         insert into public.a values (4, 2, 2)",
+    )
+    .await;
+    trellis::staging::quarantine::resume_transform(d.pool(), "j")
+        .await
+        .expect("resume");
+    settle(&mut d).await;
+    assert_eq!(statuses(&d).await, ["(public.j,live)"]);
+    assert_eq!(d.rows(ACTUAL).await, d.rows(EXPECTED).await);
 }

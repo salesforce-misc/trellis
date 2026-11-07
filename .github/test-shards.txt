@@ -185,6 +185,7 @@ test:key_backing_index 1.0
 test:probe_index_grace 1.0
 test:source_key_clause 1.0
 test:source_key_upgrade 0.5
+test:deferrable_key 1.0
 bin:trellis-testkit 1.0  # not in the log (no tests ran, or the log is partial)
 test:capture_ssi 1.0  # not in the log (no tests ran, or the log is partial)
 test:pg_partman 1.0  # not in the log (no tests ran, or the log is partial)

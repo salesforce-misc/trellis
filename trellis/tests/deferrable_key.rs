@@ -252,3 +252,59 @@ async fn a_primary_key_made_deferrable_halts_its_readers() {
     assert_eq!(rows(&raw, ONE.0).await, rows(&raw, ONE.1).await);
     assert_eq!(rows(&raw, SUMS.0).await, rows(&raw, SUMS.1).await);
 }
+
+/// A 1-1 `JOIN`'s `ON`-uniqueness check on `b` is separate from `b`'s row
+/// identity: it accepts a deferrable key, the primary key among them, while
+/// `b` is keyed by a key that isn't deferrable (its primary key, or a `KEY
+/// (...)`). Both definitions converge.
+#[tokio::test]
+async fn a_one_to_one_join_on_a_deferrable_unique_key_defines() {
+    let cluster = TestCluster::start();
+    let (db, mut raw, trellis) = setup(
+        &cluster,
+        "create table public.base (id int primary key, bk int); \
+         create table public.dpk (id int primary key deferrable initially deferred, \
+             k int not null unique, v int); \
+         create table public.du (id int primary key, \
+             u int unique deferrable initially immediate, v int); \
+         insert into public.base select i, i % 4 from generate_series(1, 8) i; \
+         insert into public.dpk select i, 100 + i, i from generate_series(0, 3) i; \
+         insert into public.du select i, i, 10 * i from generate_series(0, 3) i",
+        &[
+            "TRANSFORM by_pk FROM public.base LEFT JOIN public.dpk KEY (k) \
+             ON base.bk = dpk.id SELECT dpk.v AS v",
+            "TRANSFORM by_u FROM public.base LEFT JOIN public.du \
+             ON base.bk = du.u SELECT du.v AS v",
+        ],
+    )
+    .await;
+    raw.batch_execute(
+        "update public.dpk set v = 50 where id = 1; update public.du set v = 70 where u = 2; \
+         insert into public.base values (9, 3)",
+    )
+    .await
+    .unwrap();
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    for (target, actual, expected) in [
+        (
+            "by_pk",
+            "select id::text, v::text from public.by_pk order by id",
+            "select base.id::text, dpk.v::text from public.base \
+             left join public.dpk on base.bk = dpk.id order by base.id",
+        ),
+        (
+            "by_u",
+            "select id::text, v::text from public.by_u order by id",
+            "select base.id::text, du.v::text from public.base \
+             left join public.du on base.bk = du.u order by base.id",
+        ),
+    ] {
+        assert_eq!(status(&trellis, target).await.status, TransformStatus::Live);
+        assert_eq!(
+            rows(&raw, actual).await,
+            rows(&raw, expected).await,
+            "{target}"
+        );
+    }
+}

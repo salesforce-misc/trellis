@@ -397,3 +397,87 @@ async fn a_one_to_one_reader_of_a_mis_keyed_target_pauses_and_resume_re_keys_it(
         "re-keyed in place"
     );
 }
+
+/// A source key that is deferrable and has `INCLUDE` columns: an earlier
+/// release keyed the source by both, so a definition it built has two
+/// causes. Attaching pauses each definition with both reasons, the
+/// deferrable key's and the `INCLUDE` column's; once the key is recreated
+/// not deferrable (the remedy the reason names), `RESUME` re-keys the 1-1
+/// target in place and rebuilds both.
+#[tokio::test]
+async fn a_deferrable_key_with_an_include_column_pauses_with_both_reasons() {
+    let mut d = Driver::start(
+        "create table public.inc (id integer not null, ga integer, x integer not null, \
+             y integer, primary key (id, x))",
+        &[("id", int4()), ("ga", int4()), ("x", int4()), ("y", int4())],
+        &[ONE, AGG],
+        &["public.inc"],
+    )
+    .await;
+    exec(
+        &d,
+        "insert into public.inc values (1, 1, 10, 1), (2, 1, 20, 2), (3, 2, 30, 3)",
+    )
+    .await;
+    d.settle().await;
+    assert_converged(&d).await;
+
+    exec(
+        &d,
+        "alter table public.inc drop constraint inc_pkey, \
+             add primary key (id) include (x) deferrable",
+    )
+    .await;
+    d.ctl
+        .batch_execute("delete from definition_keys")
+        .await
+        .expect("a catalog from before the record");
+    let config = trellis::Config::from_dsn(d.db.dsn().to_string()).expect("config");
+    trellis::migrate::migrate_with_pool(d.pool(), &config)
+        .await
+        .expect("attach");
+    assert_eq!(
+        statuses(&d).await,
+        ["(public.one,paused)", "(public.g,paused)"]
+    );
+    let reasons = d
+        .rows("select error from capture_failures order by transform_id")
+        .await;
+    assert_eq!(reasons.len(), 2, "{reasons:?}");
+    for reason in &reasons {
+        assert!(
+            reason.contains("whose primary key (id) is deferrable")
+                && reason.contains("public.inc's key with its INCLUDE columns (x)"),
+            "{reason}"
+        );
+    }
+    assert_eq!(
+        d.rows("select table_name, key_columns::text from definition_keys order by 1")
+            .await,
+        ["(public.g,{ga})", "(public.inc,{id})", "(public.one,{id})"],
+        "the key columns are recorded, not the INCLUDE column"
+    );
+
+    exec(
+        &d,
+        "alter table public.inc drop constraint inc_pkey, add primary key (id); \
+         update public.inc set y = 9 where id = 1",
+    )
+    .await;
+    for name in ["one", "g"] {
+        trellis::staging::quarantine::resume_transform(d.pool(), name)
+            .await
+            .expect(name);
+    }
+    settle(&mut d).await;
+    assert_converged(&d).await;
+    assert_eq!(
+        d.rows(
+            "select pg_get_constraintdef(oid) from pg_constraint \
+             where conrelid = 'public.one'::regclass and contype in ('p', 'u')"
+        )
+        .await,
+        ["(\"PRIMARY KEY (id)\")"],
+        "re-keyed in place"
+    );
+}
