@@ -494,25 +494,12 @@ pub(crate) async fn rekey_for_resume(
     txn: &tokio_postgres::Transaction<'_>,
     definition: &Definition,
 ) -> Result<(), CatalogError> {
-    let mut records = Vec::new();
-    for (table, keys_target) in tables_of(txn, definition).await? {
-        let Some(key) = table_key(txn, &table).await? else {
-            continue;
-        };
-        match decide(&key, keys_target) {
-            Rekey::Keep => {}
-            Rekey::Record(columns) => {
-                let old = key.recorded.map(|(old, _)| old).unwrap_or_default();
-                records.push((table, old, columns));
-            }
-            rekey => {
-                if let Some(err) = refusal(txn, &table, rekey).await? {
-                    return Err(err);
-                }
-            }
-        }
-    }
-    for (table, old, columns) in records {
+    for Rerecord {
+        table,
+        old,
+        columns,
+    } in rekey(txn, definition, None).await?
+    {
         write(txn, &table, &columns).await?;
         if old != columns {
             pause_running_readers(txn, definition.id, &table, &old, &columns).await?;
@@ -523,6 +510,66 @@ pub(crate) async fn rekey_for_resume(
             key = %columns.join(", "),
             "recorded the key of a table whose key changed while its reader was paused"
         );
+    }
+    Ok(())
+}
+
+/// A key [`rekey_for_resume`] records for a table ([`Rekey::Record`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Rerecord {
+    /// The table (an unquoted `schema.table`).
+    pub(crate) table: String,
+    /// Its recorded key columns now.
+    pub(crate) old: Vec<String>,
+    /// The key columns recorded for it.
+    pub(crate) columns: Vec<String>,
+}
+
+/// What [`rekey_for_resume`] does with `definition`'s keys, reading only:
+/// the key it records for each table whose [`decide`] is a record, or the
+/// refusal it makes. `repaired` names a target [`repair_target_key`] re-keys
+/// first ([`target_repair`]): it then has the index over its recorded key.
+/// A resume's outcome reports it before the rest of the re-validation
+/// (`staging::pause_message`).
+pub(crate) async fn rekey(
+    client: &impl GenericClient,
+    definition: &Definition,
+    repaired: Option<&str>,
+) -> Result<Vec<Rerecord>, CatalogError> {
+    let mut records = Vec::new();
+    for (table, keys_target) in tables_of(client, definition).await? {
+        let Some(mut key) = table_key(client, &table).await? else {
+            continue;
+        };
+        if repaired == Some(table.as_str()) {
+            key.resolves = true;
+        }
+        match decide(&key, keys_target) {
+            Rekey::Keep => {}
+            Rekey::Record(columns) => records.push(Rerecord {
+                old: key.recorded.map(|(old, _)| old).unwrap_or_default(),
+                table,
+                columns,
+            }),
+            rekey => {
+                if let Some(err) = refusal(client, &table, rekey).await? {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    Ok(records)
+}
+
+/// Records `rerecords` ([`rekey`]) in `txn` and nothing else: a resume's
+/// outcome does it under a savepoint it rolls back, so the re-validation it
+/// reports reads the keys a resume's would (`staging::pause_message`).
+pub(crate) async fn write_rerecords(
+    txn: &tokio_postgres::Transaction<'_>,
+    rerecords: &[Rerecord],
+) -> Result<(), tokio_postgres::Error> {
+    for r in rerecords {
+        write(txn, &r.table, &r.columns).await?;
     }
     Ok(())
 }
@@ -803,21 +850,100 @@ pub(crate) async fn repair_target_key(
     definition: &Definition,
     source: &str,
 ) -> Result<bool, CatalogError> {
+    let Some(repair) = target_repair(txn, definition, source).await? else {
+        return Ok(false);
+    };
+    let TargetRepair {
+        target,
+        recorded,
+        constraint,
+        dropped,
+        nullable,
+        ..
+    } = &repair;
+    let mut actions = vec![
+        format!("drop constraint {}", quote_ident(constraint)),
+        format!(
+            "add {} ({})",
+            if *nullable {
+                "unique nulls not distinct"
+            } else {
+                "primary key"
+            },
+            recorded
+                .iter()
+                .map(|c| quote_ident(c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    ];
+    actions.extend(
+        dropped
+            .iter()
+            .map(|c| format!("drop column {}", quote_ident(c))),
+    );
+    txn.batch_execute(&format!(
+        "alter table {} {}",
+        ddl::qualified_target_table_ident(target),
+        actions.join(", ")
+    ))
+    .await?;
+    // A plain 1-1 target's ledger is keyed by the old key's text; a 1-1
+    // `JOIN`'s hidden tables are recreated by the resume.
+    if matches!(definition.def.key_space, KeySpace::OneToOne) {
+        let ledger = ddl::qualified_target_table_ident(&super::ledger::ledger_table_name(target));
+        txn.batch_execute(&format!("delete from {ledger}")).await?;
+    }
+    crate::instance_log::warn!(
+        transform = %target,
+        key = %recorded.join(", "),
+        dropped = ?dropped,
+        "re-keyed a 1-1 target an earlier release built over its source key's INCLUDE columns"
+    );
+    Ok(true)
+}
+
+/// The re-keying [`repair_target_key`] makes of a 1-1 target an earlier
+/// release built over its source key's `INCLUDE` columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TargetRepair {
+    /// The target (an unquoted `schema.table`).
+    pub(crate) target: String,
+    /// Its recorded key, which the new key constraint is over.
+    pub(crate) recorded: Vec<String>,
+    /// The key constraint over the old identity, which is replaced.
+    constraint: String,
+    /// The former key columns it drops.
+    pub(crate) dropped: Vec<String>,
+    /// Whether a recorded key column can be NULL: the new key is then a
+    /// `unique nulls not distinct` constraint rather than a primary key.
+    nullable: bool,
+}
+
+/// What [`repair_target_key`] would do to `definition`'s target, reading
+/// only: `None` when it does nothing, the refusal when a user's object
+/// depends on a column it would drop. A resume's outcome reports it
+/// (`staging::pause_message`).
+pub(crate) async fn target_repair(
+    client: &impl GenericClient,
+    definition: &Definition,
+    source: &str,
+) -> Result<Option<TargetRepair>, CatalogError> {
     if !matches!(
         definition.def.key_space,
         KeySpace::OneToOne | KeySpace::JoinOneToOne(_)
     ) {
-        return Ok(false);
+        return Ok(None);
     }
     let target = definition.target_table.as_str();
-    let Some(recorded) = recorded_for(txn, target).await? else {
-        return Ok(false);
+    let Some(recorded) = recorded_for(client, target).await? else {
+        return Ok(None);
     };
-    if !ddl::identity_key_columns(txn, target).await?.is_empty() {
-        return Ok(false);
+    if !ddl::identity_key_columns(client, target).await?.is_empty() {
+        return Ok(None);
     }
-    if key_names(txn, source).await? != recorded {
-        return Ok(false);
+    if key_names(client, source).await? != recorded {
+        return Ok(None);
     }
     let fields: Vec<&str> = definition
         .def
@@ -831,7 +957,7 @@ pub(crate) async fn repair_target_key(
     // source key's `INCLUDE` columns (or, for a reader of such a target, over
     // that target's) has them.
     let mut old = None;
-    for row in txn
+    for row in client
         .query_typed(
             "select c.oid, c.conname::text, c.conindid, \
                     array(select a.attname::text \
@@ -868,14 +994,13 @@ pub(crate) async fn repair_target_key(
         }
     }
     let Some((constraint_oid, constraint, index_oid, extra)) = old else {
-        return Ok(false);
+        return Ok(None);
     };
-    let dropped: Vec<&String> = extra.iter().collect();
-    for column in &dropped {
+    for column in &extra {
         // Every object depending on the column but the key constraint, its
         // index and the column's own `NOT NULL`: a user's view (through its
         // rewrite rule), index, constraint or statistics object.
-        let blocking: Vec<String> = txn
+        let blocking: Vec<String> = client
             .query_typed(
                 "select distinct case \
                      when r.oid is not null then pg_catalog.pg_describe_object( \
@@ -911,12 +1036,12 @@ pub(crate) async fn repair_target_key(
         if !blocking.is_empty() {
             return Err(CatalogError::KeyRepairBlocked {
                 table: target.to_string(),
-                column: (*column).clone(),
+                column: column.clone(),
                 dependents: blocking,
             });
         }
     }
-    let nullable: bool = txn
+    let nullable: bool = client
         .query_typed_one(
             "select exists (select 1 from pg_catalog.pg_attribute a \
                             where a.attrelid = pg_catalog.to_regclass($1) \
@@ -928,46 +1053,13 @@ pub(crate) async fn repair_target_key(
         )
         .await?
         .get(0);
-    let mut actions = vec![
-        format!("drop constraint {}", quote_ident(&constraint)),
-        format!(
-            "add {} ({})",
-            if nullable {
-                "unique nulls not distinct"
-            } else {
-                "primary key"
-            },
-            recorded
-                .iter()
-                .map(|c| quote_ident(c))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    ];
-    actions.extend(
-        dropped
-            .iter()
-            .map(|c| format!("drop column {}", quote_ident(c))),
-    );
-    txn.batch_execute(&format!(
-        "alter table {} {}",
-        ddl::qualified_target_table_ident(target),
-        actions.join(", ")
-    ))
-    .await?;
-    // A plain 1-1 target's ledger is keyed by the old key's text; a 1-1
-    // `JOIN`'s hidden tables are recreated by the resume.
-    if matches!(definition.def.key_space, KeySpace::OneToOne) {
-        let ledger = ddl::qualified_target_table_ident(&super::ledger::ledger_table_name(target));
-        txn.batch_execute(&format!("delete from {ledger}")).await?;
-    }
-    crate::instance_log::warn!(
-        transform = %target,
-        key = %recorded.join(", "),
-        dropped = ?dropped,
-        "re-keyed a 1-1 target an earlier release built over its source key's INCLUDE columns"
-    );
-    Ok(true)
+    Ok(Some(TargetRepair {
+        target: target.to_string(),
+        recorded,
+        constraint,
+        dropped: extra,
+        nullable,
+    }))
 }
 
 /// For a unit test on a bare database, which has no catalog: an empty

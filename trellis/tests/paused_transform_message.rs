@@ -467,9 +467,11 @@ async fn the_outcome_is_what_resume_does() {
         .strip_prefix("define would refuse the definition as the schema stands now: ")
         .unwrap_or(refusal);
     assert!(shown.contains(named), "{shown} vs {refused}");
+    // The aggregate's RESUME re-records the source's key as its new primary
+    // key before it rebuilds, so the outcome names that step first.
     assert_eq!(
         outcome_of("s").await,
-        "RESUME would rebuild public.s from public.u"
+        "RESUME would re-record public.u's key as (id, g), then rebuild public.s from public.u"
     );
     trellis.apply("RESUME TRANSFORM s").await.expect("resume s");
     bring_live(&mut raw, &db.pool, "s").await;
@@ -496,6 +498,150 @@ async fn the_outcome_is_what_resume_does() {
         .unwrap_or_else(|| panic!("{dropped}"));
     assert!(err.to_string().contains(named), "{err} vs {dropped}");
     assert_eq!(stored_status(&raw, "s").await, TransformStatus::Paused);
+}
+
+/// `public.u`'s recorded key, as `definition_keys` holds it.
+async fn recorded_key(raw: &Client) -> String {
+    raw.query_one(
+        "select key_columns::text from definition_keys where table_name = 'public.u'",
+        &[],
+    )
+    .await
+    .expect("read the record")
+    .get(0)
+}
+
+/// The outcome's re-keying for each thing a resume's re-keying decides
+/// (`defs::recorded_keys::decide`): a moved primary key is re-recorded for
+/// the aggregate, which then rebuilds; nothing the outcome works out is
+/// kept, so the record changes only with the RESUME.
+#[tokio::test]
+async fn a_moved_key_outcome_re_records_it_then_rebuilds() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    app.batch_execute("alter table public.u drop constraint u_pkey, add primary key (id, g)")
+        .await
+        .expect("redefine the key");
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        paused(&trellis, "s").await.resume_outcome.as_deref(),
+        Some(
+            "RESUME would re-record public.u's key as (id, g), then rebuild public.s from public.u"
+        )
+    );
+    assert_eq!(
+        recorded_key(&raw).await,
+        "{id}",
+        "the outcome keeps nothing"
+    );
+    trellis.apply("RESUME TRANSFORM s").await.expect("resume s");
+    assert_eq!(
+        recorded_key(&raw).await,
+        "{id,g}",
+        "the resume re-recorded it"
+    );
+    bring_live(&mut raw, &db.pool, "s").await;
+}
+
+/// A key the outcome would re-record is locked by another transaction (a
+/// concurrent resume or define): the pass doesn't wait for it or fail, and
+/// writes no outcome; the next pass after it commits does.
+#[tokio::test]
+async fn a_locked_key_record_defers_the_outcome_to_a_later_pass() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+    let mut holder = connect(db.dsn()).await;
+    let (database, id) = (database(&raw).await, id_of(&raw, "s").await);
+    let refreshes = || trellis::staging::pause_message_refreshes(&database, SCHEMA, id);
+    let before = refreshes();
+
+    let lock = holder.transaction().await.expect("begin");
+    lock.batch_execute("select 1 from definition_keys where table_name = 'public.u' for update")
+        .await
+        .expect("lock the record");
+    app.batch_execute("alter table public.u drop constraint u_pkey, add primary key (id, g)")
+        .await
+        .expect("redefine the key");
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(paused(&trellis, "s").await.resume_outcome, None);
+    // The refresh returned, rather than failing the rest of the pass.
+    assert!(refreshes() > before, "s was evaluated");
+    lock.commit().await.expect("release the record");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        paused(&trellis, "s").await.resume_outcome.as_deref(),
+        Some(
+            "RESUME would re-record public.u's key as (id, g), then rebuild public.s from public.u"
+        )
+    );
+}
+
+/// A 1-1 transform's source whose primary key moved: the outcome's refusal
+/// is the very reason the RESUME refuses with.
+#[tokio::test]
+async fn a_moved_key_outcome_of_a_one_to_one_is_the_resume_refusal() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    app.batch_execute("alter table public.u drop constraint u_pkey, add primary key (id, g)")
+        .await
+        .expect("redefine the key");
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    let outcome = paused(&trellis, "t").await.resume_outcome.expect("outcome");
+    let err = trellis::staging::quarantine::resume_transform(&db.pool, "t")
+        .await
+        .expect_err("the 1-1 resume refuses");
+    let reason = std::error::Error::source(&err)
+        .expect("the refusal's reason")
+        .to_string();
+    assert!(reason.contains("(id, g)"), "{reason}");
+    assert_eq!(outcome, format!("RESUME would refuse: {reason}"));
+    assert_eq!(stored_status(&raw, "t").await, TransformStatus::Paused);
+}
+
+/// A source created again with no primary key, only a unique index: the
+/// aggregate's outcome refuses as its RESUME does, since no other index is
+/// taken as the key.
+#[tokio::test]
+async fn a_dropped_key_outcome_is_the_resume_refusal() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    app.batch_execute(
+        "drop table public.u; \
+         create table public.u (id int not null, g int not null, a int, b int); \
+         create unique index u_id_g on public.u (id, g)",
+    )
+    .await
+    .expect("create the source again");
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    let outcome = paused(&trellis, "s").await.resume_outcome.expect("outcome");
+    let err = trellis::staging::quarantine::resume_transform(&db.pool, "s")
+        .await
+        .expect_err("the resume refuses");
+    let reason = std::error::Error::source(&err)
+        .expect("the refusal's reason")
+        .to_string();
+    assert!(reason.contains("u_id_g"), "{reason}");
+    assert_eq!(outcome, format!("RESUME would refuse: {reason}"));
+    assert_eq!(recorded_key(&raw).await, "{id}");
 }
 
 /// A definition already paused with a record is paused again by another
@@ -536,10 +682,15 @@ async fn a_second_pause_adds_its_reason_and_keeps_the_first() {
         both.columns, keyed.columns,
         "the record keeps the first reason's columns"
     );
-    let outcome = both.resume_outcome.clone().expect("outcome");
-    assert!(
-        outcome.contains("reset the ordering state") && outcome.contains("rebuild public.s"),
-        "{outcome}"
+    // Both reasons' resume steps, in the order the resume takes them: the
+    // key change's re-record (before the re-validation), the restore's
+    // reset, then the rebuild.
+    assert_eq!(
+        both.resume_outcome.as_deref(),
+        Some(
+            "RESUME would re-record public.u's key as (id, g), then reset the ordering state \
+             the dump brought from the original database, then rebuild public.s from public.u"
+        )
     );
     trellis.apply("RESUME TRANSFORM s").await.expect("resume s");
     bring_live(&mut raw, &db.pool, "s").await;

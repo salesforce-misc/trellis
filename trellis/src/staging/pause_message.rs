@@ -47,6 +47,7 @@ use crate::capture::CaptureError;
 use crate::capture::columns::{CaptureCatalog, CaptureReader};
 use crate::defs::catalog::{self, CatalogError};
 use crate::defs::floor::Floors;
+use crate::defs::recorded_keys;
 
 /// What joins one reason, ended with a full stop, to the older one after
 /// it.
@@ -424,8 +425,9 @@ pub(crate) async fn refresh_paused(
 /// Evaluates paused `reader`'s reasons and outcome again, and writes them
 /// with `stamp`, unless its record changed meanwhile, when the next pass
 /// evaluates it instead. Its record is read and evaluated in a transaction
-/// that changes nothing, and written in another under the record's row
-/// lock: nothing is locked while a resume is worked out.
+/// it rolls back, and written in another under the record's row lock: no
+/// lock is waited for while a resume is worked out, but a key record the
+/// outcome re-records ([`rekeying`]), for at most its lock timeout.
 async fn refresh(
     client: &mut tokio_postgres::Client,
     schema: &str,
@@ -458,7 +460,19 @@ async fn refresh(
         (stored.reasons.clone(), stored.outcome.clone())
     } else {
         let reasons = recheck(&txn, reader, &stored.reasons).await?;
-        let outcome = resume_outcome(&txn, schema, floors, id).await?;
+        let outcome = match resume_outcome(&txn, schema, floors, id).await {
+            Ok(outcome) => outcome,
+            // A key the outcome re-records is locked by a concurrent resume
+            // or define ([`rekeying`]): nothing is written, so the next
+            // pass evaluates the definition again.
+            Err(CatalogError::Db(err))
+                if err.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE) =>
+            {
+                txn.rollback().await?;
+                return Ok(());
+            }
+            Err(err) => return Err(err.into()),
+        };
         (reasons, outcome.map(|o| o.sentence()))
     };
     txn.rollback().await?;
@@ -593,7 +607,10 @@ fn recheck_against(
 /// gone. Each provider below adds the parts its state gives, in the order
 /// a resume acts (`staging::quarantine::resume_locked`); a new kind of
 /// pause whose resume does something of its own adds a provider here.
-/// Reads only.
+///
+/// Changes nothing that outlives `txn`, which the caller rolls back: the
+/// keys a resume would re-record are written in it ([`rekeying`]), so the
+/// re-validation reads the keys a resume's would.
 async fn resume_outcome(
     txn: &Transaction<'_>,
     schema: &str,
@@ -604,9 +621,15 @@ async fn resume_outcome(
         return Ok(None);
     };
     let mut outcome = ResumeOutcome::default();
+    // The re-keying a resume does before it re-validates.
+    rekeying(txn, &definition, &mut outcome).await?;
+    if outcome.refuses() {
+        return Ok(Some(outcome));
+    }
     // Define's validation against the schema as it stands, and the tables
-    // Trellis owns for the definition.
-    let revalidated = match catalog::revalidate(txn, schema, floors, &definition).await {
+    // Trellis owns for the definition. The keys were decided above.
+    let revalidated = match catalog::revalidate_keyed(txn, schema, floors, &definition, false).await
+    {
         Ok(revalidated) => Some(revalidated),
         Err(err @ (CatalogError::Db(_) | CatalogError::Pool(_))) => return Err(err),
         Err(reason) => {
@@ -680,6 +703,63 @@ async fn resume_outcome(
         }
     ));
     Ok(Some(outcome))
+}
+
+/// The resume outcome's re-keying provider: what a resume does with
+/// `definition`'s keys before it re-validates
+/// (`staging::quarantine::resume_locked`), decided as it decides them. A
+/// 1-1 target an earlier release built over its source key's `INCLUDE`
+/// columns is re-keyed in place ([`recorded_keys::target_repair`]); each
+/// table whose key changed while the definition was paused has its key
+/// re-recorded ([`recorded_keys::rekey`]); or the resume refuses. The
+/// re-recorded keys are written in `txn` for the providers after this one,
+/// under a short lock timeout: one held by a concurrent resume or define
+/// fails the pass's evaluation of this definition, which the next pass
+/// repeats, rather than waiting for it.
+async fn rekeying(
+    txn: &Transaction<'_>,
+    definition: &crate::defs::model::Definition,
+    outcome: &mut ResumeOutcome,
+) -> Result<(), CatalogError> {
+    let repair = match recorded_keys::target_repair(txn, definition, &definition.source_table).await
+    {
+        Ok(repair) => repair,
+        Err(err @ (CatalogError::Db(_) | CatalogError::Pool(_))) => return Err(err),
+        Err(reason) => {
+            outcome.refuse(refusal(&reason));
+            return Ok(());
+        }
+    };
+    let repaired = repair.as_ref().map(|r| r.target.as_str());
+    let rerecords = match recorded_keys::rekey(txn, definition, repaired).await {
+        Ok(rerecords) => rerecords,
+        Err(err @ (CatalogError::Db(_) | CatalogError::Pool(_))) => return Err(err),
+        Err(reason) => {
+            outcome.refuse(refusal(&reason));
+            return Ok(());
+        }
+    };
+    if let Some(repair) = &repair {
+        outcome.step(format!(
+            "re-key {} by ({}) in place, dropping the former key column{} {}",
+            repair.target,
+            repair.recorded.join(", "),
+            if repair.dropped.len() == 1 { "" } else { "s" },
+            repair.dropped.join(", ")
+        ));
+    }
+    for r in &rerecords {
+        outcome.step(format!(
+            "re-record {}'s key as ({})",
+            r.table,
+            r.columns.join(", ")
+        ));
+    }
+    if !rerecords.is_empty() {
+        txn.batch_execute("set local lock_timeout = '1s'").await?;
+        recorded_keys::write_rerecords(txn, &rerecords).await?;
+    }
+    Ok(())
 }
 
 /// The sentence of a resume refusal: define's own, fixed in the schema, or

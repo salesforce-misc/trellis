@@ -479,7 +479,8 @@ pub(crate) async fn pause_for_included_key(
     source_table: &str,
     error: &str,
 ) -> Result<bool, CatalogError> {
-    pause_with_record(txn, id, source_table, &[], error, "capture", None).await
+    let reason = Reason::standing(source_table, &[], error);
+    pause_with_record(txn, id, reason, "capture", None).await
 }
 
 /// Pauses definition `id` because it was written under a grammar version

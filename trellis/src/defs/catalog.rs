@@ -5082,12 +5082,30 @@ pub(crate) async fn revalidate(
     floors: &Floors,
     definition: &Definition,
 ) -> Result<Revalidated, CatalogError> {
+    revalidate_keyed(txn, schema, floors, definition, true).await
+}
+
+/// [`revalidate`] after a resume's re-keying has been decided: without
+/// `check_keys`, the tables' keys aren't checked again
+/// ([`super::recorded_keys::check`]). A resume's outcome
+/// (`staging::pause_message`) decides the re-keying itself
+/// ([`super::recorded_keys::rekey`]), which refuses as the check would
+/// after it, and reports a target's re-keying it hasn't made.
+pub(crate) async fn revalidate_keyed(
+    txn: &tokio_postgres::Transaction<'_>,
+    schema: &str,
+    floors: &Floors,
+    definition: &Definition,
+    check_keys: bool,
+) -> Result<Revalidated, CatalogError> {
     let source = definition.source_table.as_str();
     reject_target_in_catalog_schema(txn, schema, &definition.target_table).await?;
     // Every table the definition keys by has a key it can key by: an index
     // over the recorded key, or a key a resume takes (#1719). It is never
     // keyed by a guess.
-    super::recorded_keys::check(txn, definition).await?;
+    if check_keys {
+        super::recorded_keys::check(txn, definition).await?;
+    }
     let joined = join_table_of(txn, definition.id).await?;
     if let Some(joined) = joined {
         return revalidate_join(txn, schema, floors, definition, joined).await;

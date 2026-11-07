@@ -476,10 +476,15 @@ pause are arcs of one lifecycle:
   "RESUME would re-type the columns Trellis created to the types define would
   give them now (`<column>` from `<type>` to `<type>`), then rebuild
   `<target>` from `<source>`" (with "reset the ordering state the dump brought
-  from the original database" for a restore, and "wait for the changes staged
-  before the enum relabel or re-type to drain" for a relabel), or "RESUME
-  would refuse: …" naming what blocks it (anything define would refuse now, a
-  missing target or ledger table). `capture_failure.reasons` lists the
+  from the original database" for a restore, "wait for the changes staged
+  before the enum relabel or re-type to drain" for a relabel, and, first of
+  all, "re-record `<table>`'s key as (`<columns>`)" for a table whose primary
+  key changed while an aggregate or `JOIN` reading it was paused, and "re-key
+  `<target>` by (`<columns>`) in place, dropping the former key column …" for
+  a 1-1 target an earlier release keyed by its source key's `INCLUDE`
+  columns), or "RESUME would refuse: …" naming what blocks it (anything define
+  would refuse now, a key it can't re-record, a missing target or ledger
+  table). `capture_failure.reasons` lists the
   reasons alone and `capture_failure.resume_outcome` the outcome alone, which
   is unset just after a pause, until the next pass, and while a `RESUME` is
   in progress (its "resuming: …" message reports it). A transform this
