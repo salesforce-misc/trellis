@@ -128,6 +128,11 @@ pub struct CaptureSpec {
     /// functions are unchanged. Not part of the function's comment: the
     /// catalog says it (`relkind = 'p'`).
     partitioned: bool,
+    /// Whether `key` is a `KEY (...)` its readers declare (ADR-0026), not
+    /// the table's primary key: a primary key other than `key` is then no
+    /// key change (`staging::schema_change`). Recorded in the comment only
+    /// when set, so a primary-key capture's comment is what it always was.
+    declared: bool,
 }
 
 impl CaptureSpec {
@@ -150,7 +155,22 @@ impl CaptureSpec {
             key,
             columns: columns.into_iter().collect(),
             partitioned: false,
+            declared: false,
         })
+    }
+
+    /// The same spec, its key a `KEY (...)` its readers declare when
+    /// `declared` (ADR-0026).
+    #[must_use]
+    pub fn with_declared_key(mut self, declared: bool) -> Self {
+        self.declared = declared;
+        self
+    }
+
+    /// Whether the key is a declared `KEY (...)`, not the primary key.
+    #[cfg(any(test, feature = "internals"))]
+    pub fn declared_key(&self) -> bool {
+        self.declared
     }
 
     /// The same spec, marked as the capture of a partitioned root.
@@ -485,10 +505,15 @@ pub fn comment_text(schema: &str, spec: &CaptureSpec, event: CaptureEvent) -> St
         format!("[{}]", items.join(","))
     };
     format!(
-        "{{\"trellis_capture\":1,\"table\":{},\"event\":{},\"key\":{},\"columns\":{},\"body\":\"{}\"}}",
+        "{{\"trellis_capture\":1,\"table\":{},\"event\":{},\"key\":{},{}\"columns\":{},\"body\":\"{}\"}}",
         crate::intake::json_string(&spec.table),
         crate::intake::json_string(event.as_str()),
         list(&spec.key),
+        if spec.declared {
+            "\"declared\":true,"
+        } else {
+            ""
+        },
         list(&spec.columns),
         body_hash(&function_source(schema, spec, event)),
     )

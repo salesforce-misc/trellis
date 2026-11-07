@@ -21,9 +21,10 @@ calls a function generated for that table and event
 (`capture::sql`), which appends the statement's changes to the active ring
 segment with one `INSERT … SELECT`:
 
-- **Keys.** Every ring row is keyed by the table's primary key, in declared
-  order, joined with `\x1f` for a composite key. A table without a primary
-  key, a partitioned table, or a table in a partition or inheritance
+- **Keys.** Every ring row is keyed by the table's key, in declared
+  order, joined with `\x1f` for a composite key: its primary key, or the
+  `KEY (…)` its definitions name ([ADR-0026](../decisions/0026-source-keys.md)).
+  A table with neither, a partitioned table without a primary key, or a table in a partition or inheritance
   hierarchy is refused (see
   [supported sources and targets](../transforms.md#supported-sources-and-targets)).
   A table can join a hierarchy after define (`ATTACH PARTITION`, `INHERIT`),
@@ -275,7 +276,10 @@ functions record with the table's primary key now, one catalog read per
 page, and on a mismatch runs the pass's pause for that table
 (`staging::schema_change::pause_readers_of_redefined_keys`). The page's
 compute then applies none of those rows, and nothing is charged to
-quarantine for them.
+quarantine for them. A table its transforms key by a `KEY (…)` is keyed by
+it whatever its primary key is: its functions' comment records that the key
+is declared, and neither this check nor the pass's pauses on a primary key
+that differs from it or changes.
 
 A `RESUME` of an aggregate or `JOIN` reading the table takes its new primary
 key as the table's key, for every transform that reads it

@@ -360,6 +360,7 @@ pub async fn installed(
                         select pg_catalog.jsonb_array_elements_text(c.j -> 'key')) end, \
                     case when c.j is not null then array( \
                         select pg_catalog.jsonb_array_elements_text(c.j -> 'columns')) end, \
+                    coalesce((c.j ->> 'declared')::boolean, false), \
                     t.oid is not null, t.tgenabled::text, t.tgfoid = p.oid, \
                     case when e.ord = 1 and exists ( \
                         select 1 from pg_catalog.pg_class r \
@@ -392,7 +393,7 @@ pub async fn installed(
             ],
         )
         .await?;
-    let partitioned: bool = rows.first().is_some_and(|row| row.get(10));
+    let partitioned: bool = rows.first().is_some_and(|row| row.get(11));
     let mut present = false;
     let mut current = true;
     let mut faults = Vec::new();
@@ -404,7 +405,7 @@ pub async fn installed(
         .zip(&rows)
     {
         let has_function: bool = row.get(0);
-        let has_trigger: bool = row.get(6);
+        let has_trigger: bool = row.get(7);
         present |= has_function || has_trigger;
         let what = event.as_str();
         if !has_function {
@@ -413,8 +414,12 @@ pub async fn installed(
             ));
         } else {
             let recorded =
-                recorded_spec(table, what, row.get(2), row.get(3), row.get(4), row.get(5))
-                    .map(|spec| spec.with_partitioned(partitioned));
+                recorded_spec(table, what, row.get(2), row.get(3), row.get(4), row.get(5)).map(
+                    |spec| {
+                        spec.with_partitioned(partitioned)
+                            .with_declared_key(row.get(6))
+                    },
+                );
             match recorded {
                 Some(spec) => {
                     let source: String = row.get(1);
@@ -431,14 +436,14 @@ pub async fn installed(
                 "the {what} trigger {trigger} on {table} is missing"
             ));
         } else {
-            let enabled: String = row.get(7);
+            let enabled: String = row.get(8);
             if enabled != "A" {
                 faults.push(format!(
                     "the {what} trigger {trigger} on {table} is not ENABLE ALWAYS \
                      (tgenabled = {enabled})"
                 ));
             }
-            if row.get::<_, Option<bool>>(8) != Some(true) {
+            if row.get::<_, Option<bool>>(9) != Some(true) {
                 faults.push(format!(
                     "the {what} trigger {trigger} on {table} doesn't call {schema}.{function}"
                 ));
@@ -452,7 +457,7 @@ pub async fn installed(
     // show the root whole and a node bare.
     let missing = rows
         .first()
-        .and_then(|row| row.get::<_, Option<Vec<String>>>(9))
+        .and_then(|row| row.get::<_, Option<Vec<String>>>(10))
         .unwrap_or_default();
     if !missing.is_empty() {
         faults.push(format!(

@@ -1330,6 +1330,7 @@ pub(crate) async fn install_definition_restoring(
         reject_fields_named_after_primary_key(
             &**client,
             &qualified_source,
+            def.source_key.as_deref(),
             &def.fields,
             source_columns,
         )
@@ -1401,9 +1402,14 @@ pub(crate) async fn install_definition_restoring(
             for side in [&sides.from, &sides.joined] {
                 reject_unkeyed_source(&**pool.get().await?, side, &def).await?;
             }
-            let pk = ddl::source_primary_key(pool, &sides.from)
-                .await
-                .map_err(CatalogError::Ddl)?;
+            let pk = super::source_key::admitted_key(
+                &**pool.get().await?,
+                &sides.from,
+                super::source_key::declared_on(&def, Some(super::join::Side::From)),
+            )
+            .await
+            .map_err(CatalogError::Ddl)?
+            .0;
             let pk_names: Vec<&str> = pk.iter().map(|c| c.name.as_str()).collect();
             reject_primary_key_named_fields(&def.fields, &pk_names)?;
             check_one_to_one_target_width(pk.len(), def.fields.len())?;
@@ -1421,9 +1427,14 @@ pub(crate) async fn install_definition_restoring(
             // rather than narrowing to a single column. `target_table_ddl`
             // renders a composite `pk` as a real, multi-column `primary key
             // (...)` constraint.
-            let pk = ddl::source_primary_key(pool, &qualified_source)
-                .await
-                .map_err(CatalogError::Ddl)?;
+            let pk = super::source_key::admitted_key(
+                &**pool.get().await?,
+                &qualified_source,
+                def.source_key.as_deref(),
+            )
+            .await
+            .map_err(CatalogError::Ddl)?
+            .0;
             reject_unkeyed_source(&**pool.get().await?, &qualified_source, &def).await?;
             check_one_to_one_target_width(pk.len(), def.fields.len())?;
             ledger_ddl = Some(ddl::one_to_one_ledger_ddl(target_schema, &def));
@@ -1443,9 +1454,13 @@ pub(crate) async fn install_definition_restoring(
             // `ddl::source_primary_key` for an aggregate too, and a key type
             // it refuses halts its readers there. Refuse it here instead,
             // before any DDL, exactly as the 1-1 arm above does.
-            ddl::source_primary_key(pool, &qualified_source)
-                .await
-                .map_err(CatalogError::Ddl)?;
+            super::source_key::admitted_key(
+                &**pool.get().await?,
+                &qualified_source,
+                def.source_key.as_deref(),
+            )
+            .await
+            .map_err(CatalogError::Ddl)?;
             reject_unkeyed_source(&**pool.get().await?, &qualified_source, &def).await?;
             // An aggregate outside the admitted set is
             // refused by family, before the DDL (which only renders what the
@@ -2486,7 +2501,8 @@ async fn validate_edit(
     }
     // An added field can't take a key column's name, exactly as
     // at install. Ahead of `validate` for the same reason as there.
-    reject_fields_named_after_primary_key(client, source_table, real_adds, &source_columns).await?;
+    reject_fields_named_after_primary_key(client, source_table, None, real_adds, &source_columns)
+        .await?;
     // Reuse the exact validator (and, inside it, the exact column-cycle
     // detector) a first `define` runs — see `alter_transform`'s own doc
     // comment on why the table-level whole-graph check is deliberately not
@@ -3662,9 +3678,9 @@ async fn create_definition_inner(
     // used to be accepted here and then halt on its first live change.
     // The same checks every resume runs again ([`validate_live_schema`]).
     match &join_sides {
-        Some(sides) => validate_live_join_schema(&txn, pool.schema(), &def, sides).await?,
+        Some(sides) => validate_live_join_schema(&txn, pool.schema(), &def, sides, None).await?,
         None => {
-            validate_live_schema(&txn, pool.schema(), &def, &qualified_source).await?;
+            validate_live_schema(&txn, pool.schema(), &def, &qualified_source, None).await?;
         }
     }
 
@@ -3732,6 +3748,18 @@ async fn create_definition_inner(
         .map(encode_type_map)
         .unwrap_or_default();
     let join_table = join_sides.as_ref().map(|sides| sides.joined.as_str());
+    // The key of each table it keys by, which every later read of their
+    // identities keeps to (#1719): first, so the floor's key types, the
+    // recorded key types and everything after read a declared `KEY`
+    // (ADR-0026), not the table's primary key.
+    super::recorded_keys::record(
+        &*txn,
+        &def,
+        &qualified_source,
+        join_table,
+        &qualified_target,
+    )
+    .await?;
     // ADR-0024: the oldest release that can run what this define writes,
     // over the column types it was just validated against.
     let floor = super::floor::of_live(&*txn, pool.floors(), &def, &qualified_source, join_table)
@@ -3778,16 +3806,6 @@ async fn create_definition_inner(
     // capture pass to compare against (`super::key_types`).
     super::key_types::record_definition(&*txn, id, &def, &qualified_source, join_table, false)
         .await?;
-    // The key of each table it keys by, which every later read of their
-    // identities keeps to (#1719).
-    super::recorded_keys::record(
-        &*txn,
-        &def,
-        &qualified_source,
-        join_table,
-        &qualified_target,
-    )
-    .await?;
     // A JOIN's hidden tables, in the catalog schema,
     // named by this definition's id, created empty with its row.
     if let Some(sides) = &join_sides {
@@ -4379,16 +4397,25 @@ async fn confirm_qualified_source(
 async fn reject_fields_named_after_primary_key(
     client: &impl GenericClient,
     qualified_source: &str,
+    declared: Option<&[String]>,
     fields: &[FieldDef],
     source_columns: &HashMap<String, ValueType>,
 ) -> Result<(), CatalogError> {
     if !fields.iter().any(|f| source_columns.contains_key(&f.name)) {
         return Ok(());
     }
-    let pk = ddl::source_primary_key_in_txn(client, qualified_source)
-        .await
-        .map_err(CatalogError::Ddl)?;
-    let pk_names: Vec<&str> = pk.iter().map(|c| c.name.as_str()).collect();
+    // A declared `KEY` names the key's columns itself; whether an index
+    // backs it is the define's check (`source_key::admitted_key`).
+    let pk = match declared {
+        Some(key) => key.to_vec(),
+        None => ddl::source_primary_key_in_txn(client, qualified_source)
+            .await
+            .map_err(CatalogError::Ddl)?
+            .into_iter()
+            .map(|c| c.name)
+            .collect(),
+    };
+    let pk_names: Vec<&str> = pk.iter().map(String::as_str).collect();
     reject_primary_key_named_fields(fields, &pk_names)?;
     Ok(())
 }
@@ -4913,8 +4940,14 @@ pub(crate) async fn validate_live_schema(
     schema: &str,
     def: &TransformDef,
     qualified_source: &str,
+    this: Option<&str>,
 ) -> Result<Vec<ddl::PrimaryKeyColumn>, CatalogError> {
-    let source_key = ddl::source_primary_key_in_txn(txn, qualified_source)
+    let declared = def.source_key.as_deref();
+    let source_key = super::source_key::admitted_key(txn, qualified_source, declared)
+        .await
+        .map_err(CatalogError::Ddl)?
+        .0;
+    super::source_key::check_one_key(txn, qualified_source, declared, this)
         .await
         .map_err(CatalogError::Ddl)?;
     assert_deterministic_definition_keys(txn, def, qualified_source, &source_key).await?;
@@ -4943,9 +4976,18 @@ pub(crate) async fn validate_live_join_schema(
     schema: &str,
     def: &TransformDef,
     sides: &JoinSides,
+    this: Option<&str>,
 ) -> Result<(), CatalogError> {
-    for side in [&sides.from, &sides.joined] {
-        let key = ddl::source_primary_key_in_txn(txn, side)
+    for (side, which) in [
+        (&sides.from, super::join::Side::From),
+        (&sides.joined, super::join::Side::Joined),
+    ] {
+        let declared = super::source_key::declared_on(def, Some(which));
+        let key = super::source_key::admitted_key(txn, side, declared)
+            .await
+            .map_err(CatalogError::Ddl)?
+            .0;
+        super::source_key::check_one_key(txn, side, declared, this)
             .await
             .map_err(CatalogError::Ddl)?;
         assert_deterministic_definition_keys(txn, def, side, &key).await?;
@@ -5100,7 +5142,14 @@ pub(crate) async fn revalidate(
         return Err(err.into());
     }
     reject_virtual_generated_reads(&definition.def, None, source, &virtual_columns)?;
-    let source_key = validate_live_schema(txn, schema, &definition.def, source).await?;
+    let source_key = validate_live_schema(
+        txn,
+        schema,
+        &definition.def,
+        source,
+        Some(&definition.target_table),
+    )
+    .await?;
     if let KeySpace::OneToOne = definition.def.key_space {
         let target_key: Vec<String> = ddl::identity_key_columns(txn, &definition.target_table)
             .await?
@@ -5156,7 +5205,14 @@ async fn revalidate_join(
     }
     super::validate::validate_join(&definition.def, &sides.from_columns, &sides.joined_columns)?;
     reject_virtual_join_reads(&definition.def, &sides)?;
-    validate_live_join_schema(txn, schema, &definition.def, &sides).await?;
+    validate_live_join_schema(
+        txn,
+        schema,
+        &definition.def,
+        &sides,
+        Some(&definition.target_table),
+    )
+    .await?;
     if super::join::is_one_to_one(&definition.def) {
         // The joined table's `ON` columns are still unique, and the target
         // is still keyed by `a`'s key; a changed key's only repair is to
@@ -5809,10 +5865,11 @@ async fn has_primary_key(
 }
 
 /// Whether trigger capture can key `schema.table`'s changes:
-/// it is a plain table (`relkind = 'r'`) with a primary key. Every ring row a
-/// capture trigger writes is keyed by the primary key, so a table without
-/// one can't be captured, whatever unique index it has. That also rules out
-/// a key mismatch between a unique index and the primary key.
+/// it is a plain table (`relkind = 'r'`) with a primary key, or one the
+/// definition names a `KEY (...)` for (`declared`, ADR-0026), whose backing
+/// index define checks. Every ring row a capture trigger writes is keyed by
+/// the table's key, so a table with neither can't be captured, whatever
+/// unique index it has: Trellis never picks one as the key itself.
 ///
 /// A table in a partition or inheritance hierarchy (a partitioned table, a
 /// partition, an inheritance parent or an inheritance child) is refused as
@@ -5824,16 +5881,17 @@ pub(crate) async fn change_keyed(
     client: &impl GenericClient,
     schema: &str,
     table: &str,
+    declared: bool,
 ) -> Result<bool, tokio_postgres::Error> {
     let regclass = format!("{}.{}", quote_ident(schema), quote_ident(table));
     let keyed: Option<bool> = client
         .query_opt(
             "select c.relkind = 'r' \
-                 and exists ( \
+                 and ($2 or exists ( \
                      select 1 from pg_catalog.pg_index i \
-                     where i.indrelid = c.oid and i.indisprimary) \
+                     where i.indrelid = c.oid and i.indisprimary)) \
              from pg_catalog.pg_class c where c.oid = pg_catalog.to_regclass($1)",
-            &[&regclass],
+            &[&regclass, &declared],
         )
         .await?
         .map(|row| row.get(0));
@@ -5884,10 +5942,15 @@ async fn reject_unkeyed_source(
         // The plain-table rule's primary key holds for a partitioned root
         // too: `ddl::source_primary_key` also takes a qualifying unique
         // index, which [`change_keyed`] doesn't.
-        if !has_primary_key(client, qualified_source).await? {
-            return Err(CatalogError::SourceNotChangeKeyed {
+        // A partitioned root is keyed as a plain table is: by its primary
+        // key or a `KEY (...)`, never by a unique index Trellis picks
+        // (ADR-0026).
+        if super::source_key::declared_for(def, qualified_source).is_none()
+            && !has_primary_key(client, qualified_source).await?
+        {
+            return Err(CatalogError::Ddl(DdlError::NoPrimaryKey {
                 source_table: qualified_source.to_string(),
-            });
+            }));
         }
         let refusal = match &def.key_space {
             // ADR-0019: a side's partials are a single-table aggregate keyed
@@ -5921,8 +5984,28 @@ async fn reject_unkeyed_source(
         }
         return Ok(());
     }
-    if change_keyed(client, schema, table).await? {
+    let declared = super::source_key::declared_for(def, qualified_source).is_some();
+    if change_keyed(client, schema, table, declared).await? {
         return Ok(());
+    }
+    // A plain table outside any hierarchy is refused only for its key, with
+    // the remedies (ADR-0026).
+    if !declared
+        && super::hierarchy::hierarchy(client, qualified_source)
+            .await?
+            .is_empty()
+        && client
+            .query_one(
+                "select exists (select 1 from pg_catalog.pg_class \
+                     where oid = pg_catalog.to_regclass($1) and relkind = 'r')",
+                &[&ddl::regclass_arg(qualified_source)],
+            )
+            .await?
+            .get::<_, bool>(0)
+    {
+        return Err(CatalogError::Ddl(DdlError::NoPrimaryKey {
+            source_table: qualified_source.to_string(),
+        }));
     }
     Err(CatalogError::SourceNotChangeKeyed {
         source_table: qualified_source.to_string(),

@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use testkit::TestCluster;
 use tokio_postgres::{Client, NoTls};
 use trellis::config::DEFAULT_SCHEMA;
+use trellis::defs::ddl::DdlError;
 use trellis::defs::{CatalogError, ValueType, install_definition, tables_to_capture};
 use trellis::integer::IntWidth;
 use trellis::pool::Pool;
@@ -128,12 +129,15 @@ async fn table_exists(client: &Client, qualified: &str) -> bool {
         .get(0)
 }
 
+/// Instance A's aggregate target is a plain table with no primary key to
+/// instance B, which refuses it as it does any table with no primary key
+/// and no `KEY (...)` naming its key (ADR-0026).
 fn assert_rejected_as_unkeyed(result: Result<trellis::defs::model::Definition, CatalogError>) {
     match result {
-        Err(CatalogError::SourceNotChangeKeyed { source_table }) => {
+        Err(CatalogError::Ddl(DdlError::NoPrimaryKey { source_table })) => {
             assert_eq!(source_table, "public.sku_totals");
         }
-        Err(other) => panic!("expected SourceNotChangeKeyed, got {other:?}"),
+        Err(other) => panic!("expected NoPrimaryKey, got {other:?}"),
         Ok(def) => panic!(
             "instance B accepted a definition over instance A's aggregate target: {}",
             def.target_table
@@ -290,10 +294,10 @@ async fn another_instances_one_to_one_target_over_an_aggregate_is_rejected() {
     )
     .await;
     match result {
-        Err(CatalogError::SourceNotChangeKeyed { source_table }) => {
+        Err(CatalogError::Ddl(DdlError::NoPrimaryKey { source_table })) => {
             assert_eq!(source_table, "public.sku_copy");
         }
-        other => panic!("expected SourceNotChangeKeyed, got {other:?}"),
+        other => panic!("expected NoPrimaryKey, got {other:?}"),
     }
     reconcile_b(&pool_b, &mut b).await;
     assert!(!b_captures(&b, "sku_copy").await);
@@ -302,8 +306,9 @@ async fn another_instances_one_to_one_target_over_an_aggregate_is_rejected() {
 
 /// The keying rule is about the table, not its owner, so a plain source table the
 /// capture triggers can't key is held to it too: every ring
-/// row is keyed by the primary key, so a table without one is refused even
-/// with a unique constraint or unique index on its key columns, and so is a
+/// row is keyed by the table's key, so a table without a primary key is
+/// refused even with a unique constraint or unique index on its key columns
+/// unless the definition names it with `KEY (...)` (ADR-0026), and so is a
 /// partitioned table, which statement triggers on its parent would capture
 /// only partially. So is every table in a partition or inheritance hierarchy,
 /// primary key or not: a statement trigger fires only for the table the
@@ -346,10 +351,17 @@ async fn a_plain_source_is_held_to_the_same_keying_rule() {
         )
         .await;
         match result {
-            Err(CatalogError::SourceNotChangeKeyed { source_table }) => {
+            Err(CatalogError::Ddl(DdlError::NoPrimaryKey { source_table }))
+                if source.starts_with("unique") =>
+            {
                 assert_eq!(source_table, format!("public.{source}"));
             }
-            other => panic!("expected SourceNotChangeKeyed for {source}, got {other:?}"),
+            Err(CatalogError::SourceNotChangeKeyed { source_table })
+                if !source.starts_with("unique") =>
+            {
+                assert_eq!(source_table, format!("public.{source}"));
+            }
+            other => panic!("expected a refusal of {source}'s key, got {other:?}"),
         }
     }
 

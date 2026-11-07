@@ -203,6 +203,7 @@ pub(crate) async fn pause_readers_of_redefined_keys(
                        and k.o <= i.indnkeyatts \
                      order by k.o) as live) l \
              where pg_catalog.cardinality(l.live) > 0 \
+               and coalesce((d.description::jsonb ->> 'declared')::boolean, false) is false \
                and l.live is distinct from array( \
                    select pg_catalog.jsonb_array_elements_text( \
                        d.description::jsonb -> 'key'))",
@@ -356,7 +357,19 @@ pub(crate) async fn pause_readers_of_missing(
         // A key a resume has re-recorded for the table is every reader's
         // key now (`defs::recorded_keys::decide`): the functions are
         // regenerated over it below, before the resumed reader's rebuild.
+        // A table its readers key by a declared `KEY (...)` (ADR-0026) is
+        // keyed by it whatever its primary key is: a primary key that
+        // changes, or differs from the key, changes nothing for them. Only
+        // the index backing the `KEY` matters, whose detector is gated on
+        // the false-positive study #1744 (#1745 rule 6, #1708 rule 3).
+        //
+        // SEAM (#1745 rule 6): the `KEY`-backing-index detector goes here,
+        // for a table with a declared key: pause every reader of the table,
+        // with no grace, on the first pass that finds no index backing it,
+        // matched by shape (`defs::source_key::backing`, one statement).
+        let declared = crate::capture::columns::declared_key(catalog, table).is_some();
         if !missing.key_missing
+            && !declared
             && !key.is_empty()
             && spec.key() != key.as_slice()
             && crate::defs::recorded_keys::recorded_for(&*client, table)

@@ -211,8 +211,35 @@ pub(crate) fn pin_key_collations(pk: &mut [PrimaryKeyColumn], recorded: Option<&
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum DdlError {
-    /// The source table has no primary key at all.
+    /// The source table has no primary key, and the definition names no
+    /// `KEY (...)` for it (ADR-0026).
     NoPrimaryKey { source_table: String },
+    /// A definition names a `KEY (...)` for another transform's target,
+    /// which is keyed by the key Trellis gave it (ADR-0026).
+    KeyOnTrellisTarget { table: String, key: Vec<String> },
+    /// No unique index backs a definition's `KEY (...)` for `table`: none
+    /// is a valid, immediate, non-partial unique index over exactly those
+    /// columns and no expression, with every column `NOT NULL` or the index
+    /// `NULLS NOT DISTINCT` (ADR-0026).
+    KeyNotBacked {
+        table: String,
+        key: Vec<String>,
+        /// Each unique index the table has, as for
+        /// [`DdlError::RecordedKeyMissing`].
+        indexes: Vec<String>,
+        /// Whether `table` is partitioned, whose unique indexes must hold
+        /// the partition key.
+        partitioned: bool,
+    },
+    /// A table is keyed one way for every transform that reads it, and
+    /// another definition (`reader`, its target) keys `table` by `theirs`,
+    /// not `written` (ADR-0026).
+    KeyDiffersFromReaders {
+        table: String,
+        written: super::source_key::KeyForm,
+        theirs: super::source_key::KeyForm,
+        reader: String,
+    },
     /// `table` has no valid primary key or qualifying unique index over the
     /// key columns Trellis recorded for it (`definition_keys`,
     /// `defs::recorded_keys`): the index was dropped, or a restore never
@@ -311,6 +338,9 @@ impl DdlError {
             // The source table's key can't identify its rows — a rejected
             // definition, same category as any other validation failure.
             DdlError::NoPrimaryKey { .. }
+            | DdlError::KeyOnTrellisTarget { .. }
+            | DdlError::KeyNotBacked { .. }
+            | DdlError::KeyDiffersFromReaders { .. }
             | DdlError::UnsupportedPrimaryKeyType { .. }
             | DdlError::RecordedKeyMissing { .. }
             | DdlError::NoPrimaryKeyToRecord { .. } => ErrorCode::Validation,
@@ -339,9 +369,61 @@ fn found_indexes(indexes: &[String]) -> String {
 impl fmt::Display for DdlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DdlError::NoPrimaryKey { source_table } => {
-                write!(f, "source table '{source_table}' has no primary key")
+            DdlError::NoPrimaryKey { source_table } => write!(
+                f,
+                "source table '{source_table}' has no primary key. Name the key Trellis keys \
+                 it by with KEY (column, ...) directly after the table, backed by a unique \
+                 index over exactly those columns, or add one (ALTER TABLE ... ADD PRIMARY \
+                 KEY, or ADD PRIMARY KEY USING INDEX over an existing unique index)"
+            ),
+            DdlError::KeyOnTrellisTarget { table, key } => write!(
+                f,
+                "KEY ({}) names a key for '{table}', which is another transform's target: \
+                 Trellis keys a target by the key it gave it (its group key, or a 1-1 \
+                 target's primary key); remove the KEY",
+                key.join(", ")
+            ),
+            DdlError::KeyNotBacked {
+                table,
+                key,
+                indexes,
+                partitioned,
+            } => {
+                write!(
+                    f,
+                    "no unique index backs KEY ({}) on '{table}': it needs a valid, \
+                     immediate (not deferrable), non-partial unique index over exactly those \
+                     columns and no expression, with every column NOT NULL or the index \
+                     NULLS NOT DISTINCT; {}. Create one (create unique index concurrently \
+                     ... on {table} ({}))",
+                    key.join(", "),
+                    found_indexes(indexes),
+                    key.join(", ")
+                )?;
+                if *partitioned {
+                    write!(
+                        f,
+                        ". A partitioned table's unique index must hold its partition key, \
+                         so the KEY must name the partition key's columns too"
+                    )?;
+                }
+                Ok(())
             }
+            DdlError::KeyDiffersFromReaders {
+                table,
+                written,
+                theirs,
+                reader,
+            } => write!(
+                f,
+                "'{table}' is keyed by {theirs} for its other transforms ({reader}), and a \
+                 table is keyed one way for every transform that reads it: write {} after \
+                 it here, not {written}",
+                match theirs {
+                    super::source_key::KeyForm::PrimaryKey => "no KEY".to_string(),
+                    other => other.to_string(),
+                }
+            ),
             DdlError::RecordedKeyMissing {
                 table,
                 recorded,
@@ -368,7 +450,8 @@ impl fmt::Display for DdlError {
                         f,
                         "RESUME an aggregate or JOIN transform reading it to take the table's \
                          primary key as its key now, or create a primary key or unique index \
-                         over exactly those columns again"
+                         over exactly those columns again (a table its transforms key by \
+                         KEY (...) needs a unique index over that key again)"
                     )
                 }
             }
@@ -437,6 +520,9 @@ impl std::error::Error for DdlError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             DdlError::NoPrimaryKey { .. }
+            | DdlError::KeyOnTrellisTarget { .. }
+            | DdlError::KeyNotBacked { .. }
+            | DdlError::KeyDiffersFromReaders { .. }
             | DdlError::RecordedKeyMissing { .. }
             | DdlError::NoPrimaryKeyToRecord { .. }
             | DdlError::UnsupportedPrimaryKeyType { .. }
@@ -497,8 +583,12 @@ impl From<super::backfill::BackfillError> for DdlError {
 /// — every caller of this function ultimately compares the returned key via
 /// `::text` casts, so an unsafe type here would risk the same silent
 /// divergence a `JOIN` key is already guarded against.
-/// Falls back to `source_table`'s own unique constraint when it has no
-/// `PRIMARY KEY`. [`create_aggregate_target_table`] keys its
+/// The key is the table's record (`definition_keys`): a declared `KEY (...)`
+/// or the primary key define admitted for a user table
+/// (`super::source_key::admitted_key`, ADR-0026), the key Trellis gave a
+/// target. A table with no record falls back to its own unique constraint
+/// when it has no `PRIMARY KEY`; define records every table it keys by, so
+/// only a Trellis target is ever read that way. [`create_aggregate_target_table`] keys its
 /// grouping columns with a `UNIQUE NULLS NOT DISTINCT` constraint rather than
 /// a `PRIMARY KEY`, precisely so a NULL grouping value is representable
 /// (`PRIMARY KEY` forbids `NULL` outright) — so an aggregate target chained
@@ -558,8 +648,22 @@ pub(crate) async fn admitted_primary_key(
             source_table: source_table.to_string(),
         });
     }
+    let admitted_by = admit_key_types(client, source_table, &columns).await?;
+    Ok((columns, admitted_by))
+}
+
+/// The allowlist entry that admits each of `columns`' types as a key of
+/// `source_table`, in order; refuses the first type it doesn't admit
+/// ([`DdlError::UnsupportedPrimaryKeyType`]). Every key Trellis keys a
+/// table by passes it: a primary key's and a declared `KEY`'s
+/// (`super::source_key::admitted_key`).
+pub(crate) async fn admit_key_types(
+    client: &impl GenericClient,
+    source_table: &str,
+    columns: &[PrimaryKeyColumn],
+) -> Result<Vec<super::join_key_types::JoinKey>, DdlError> {
     let mut admitted_by = Vec::with_capacity(columns.len());
-    for column in &columns {
+    for column in columns {
         // A live enum type joins the static allowlist above via
         // the same dynamic `to_regtype`-based check a `JOIN` key's gets — see
         // `join_key_types::is_enum_type_name`'s own doc comment for why admitting
@@ -588,7 +692,7 @@ pub(crate) async fn admitted_primary_key(
             });
         }
     }
-    Ok((columns, admitted_by))
+    Ok(admitted_by)
 }
 
 /// The catalog half of [`source_primary_key_in_txn`], with none of its
@@ -603,11 +707,15 @@ pub(crate) async fn admitted_primary_key(
 /// unique indexes the table has and in whatever order their OIDs fall. With
 /// a record and no such index, it is empty: Trellis doesn't key a table by a
 /// guess, and a build refuses, naming the indexes, while a resume re-records
-/// or refuses ([`super::recorded_keys::decide`]). A record taken from a
-/// table since dropped is no record of the table at the name now. A table
-/// with no record (the source of a first define) is keyed by its `PRIMARY
-/// KEY`, else its oldest qualifying `UNIQUE` index (an aggregate target's
-/// `UNIQUE NULLS NOT DISTINCT` grouping columns).
+/// or refuses ([`super::recorded_keys::decide`]). The index's key columns
+/// match the record in any order, and the key is the record's order: a
+/// declared `KEY (...)` is keyed in the order written, whichever equivalent
+/// index backs it (ADR-0026). A record taken from a table since dropped is
+/// no record of the table at the name now. A table with no record is keyed
+/// by its `PRIMARY KEY`, else its oldest qualifying `UNIQUE` index (an
+/// aggregate target's `UNIQUE NULLS NOT DISTINCT` grouping columns): define
+/// records every table it keys by and refuses a user table with neither a
+/// primary key nor a `KEY`, so only a Trellis target falls back.
 ///
 /// A partial or deferrable unique index, and one over an expression, is
 /// never the key. The key's columns are the index's key columns only: its
@@ -692,7 +800,11 @@ pub(crate) async fn identity_key_columns_over(
                  from candidate c
                  cross join recorded r
                  where r.key_columns is null
-                    or (c.indisvalid and c.key_columns = r.key_columns)
+                    or (c.indisvalid
+                        and (select pg_catalog.array_agg(x order by x)
+                             from unnest(c.key_columns) x)
+                            = (select pg_catalog.array_agg(x order by x)
+                               from unnest(r.key_columns) x))
                  order by c.indisprimary desc, c.indexrelid asc
                  limit 1
              )
@@ -707,11 +819,15 @@ pub(crate) async fn identity_key_columns_over(
                      where co.oid = i.indcollation[k.ord - 1])
              from pg_index i
              join chosen_index c on c.indexrelid = i.indexrelid
+             cross join recorded r
              cross join unnest(i.indkey::int2[]) with ordinality k(attnum, ord)
              join pg_attribute a
                on a.attrelid = i.indrelid and a.attnum = k.attnum
              where k.ord <= i.indnkeyatts
-             order by k.ord",
+             -- A recorded key is in its own order, whatever the order of
+             -- the index over it (a declared KEY's, ADR-0026).
+             order by coalesce(pg_catalog.array_position(r.key_columns, a.attname::text),
+                               k.ord)",
                 super::recorded_keys::tied_to("$1"),
                 super::copy_type::type_sql("a.atttypid")
             ),
@@ -1911,6 +2027,7 @@ mod tests {
             predicate: Predicate::True,
             without_source_index: false,
             adopt_target: false,
+            source_key: None,
             explicit_source_schema: None,
             explicit_target_schema: None,
         }

@@ -444,6 +444,7 @@ fn features() -> Vec<Feature> {
         Feature::AdoptTarget,
         Feature::PartitionedSource,
         Feature::TableAlias,
+        Feature::TableKey,
     ];
     features.extend(every(&units, |f| match f {
         Feature::QualifiedTable => 0,
@@ -451,6 +452,7 @@ fn features() -> Vec<Feature> {
         Feature::AdoptTarget => 2,
         Feature::PartitionedSource => 3,
         Feature::TableAlias => 4,
+        Feature::TableKey => 5,
         // Listed above or below.
         Feature::KeySpace(_)
         | Feature::JoinKind(_)

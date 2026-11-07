@@ -228,9 +228,13 @@ Each requirement, and what dropping it does
 ([transforms — Supported sources and targets](transforms.md#supported-sources-and-targets)
 has the details):
 
-* **A source's primary key**, or the unique index standing in for one: the
-  staging worker can no longer capture the table, and `status()` says so.
-  The transforms that read it pause when Trellis next applies a change of it.
+* **A source's primary key**: the staging worker can no longer capture the
+  table, and `status()` says so. The transforms that read it pause when
+  Trellis next applies a change of it.
+* **The unique index backing a source's `KEY (…)`**: build its replacement
+  before dropping it. Any equivalent index backs the key; with none, the
+  transforms reading the table pause when Trellis next applies a change of
+  it, and `RESUME` refuses until one is built again.
 * **The unique key on a 1-1 `JOIN`'s `b` `ON` columns:** the staging worker's
   next reconcile pass pauses the transform, naming `b` and its `ON` columns,
   whether or not a duplicate arrived. So does a swap that drops the old index

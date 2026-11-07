@@ -220,6 +220,9 @@ pub enum Feature {
     AdoptTarget,
     /// A `JOIN`'s table given an alias (`FROM <table> [AS] <alias>`).
     TableAlias,
+    /// A table's key named with `KEY (...)` after the `FROM` or `JOIN`
+    /// table (ADR-0026).
+    TableKey,
     /// A table it reads is partitioned (ADR-0017).
     PartitionedSource,
     /// An expression node of this kind.
@@ -281,6 +284,8 @@ impl Feature {
             Feature::AdoptTarget => Some(BASELINE),
             // Arrives in 0.2.0, the release floors arrive in.
             Feature::TableAlias => Some(BASELINE),
+            // Arrives in 0.2.0, the release floors arrive in.
+            Feature::TableKey => Some(BASELINE),
             Feature::Predicate(kind) => Some(match kind {
                 PredicateKind::True => BASELINE,
             }),
@@ -406,6 +411,7 @@ pub(crate) fn features_used(def: &TransformDef, partitioned: bool) -> (Vec<Featu
         explicit_target_schema,
         source: _,
         explicit_source_schema,
+        source_key,
         key_space,
         fields,
         predicate,
@@ -425,11 +431,15 @@ pub(crate) fn features_used(def: &TransformDef, partitioned: bool) -> (Vec<Featu
         source_alias,
         right: _,
         explicit_right_schema,
+        right_key,
         right_alias,
         on,
         group_by: _,
     }) = join
     {
+        if right_key.is_some() {
+            used.add(Feature::TableKey);
+        }
         used.add(Feature::JoinKind(*kind));
         if explicit_right_schema.is_some() {
             used.add(Feature::QualifiedTable);
@@ -439,6 +449,9 @@ pub(crate) fn features_used(def: &TransformDef, partitioned: bool) -> (Vec<Featu
         }
         // An `ON` term is two columns, which every `JOIN` has.
         for JoinOn { lhs: _, rhs: _ } in on {}
+    }
+    if source_key.is_some() {
+        used.add(Feature::TableKey);
     }
     if explicit_target_schema.is_some() || explicit_source_schema.is_some() {
         used.add(Feature::QualifiedTable);
@@ -1185,6 +1198,33 @@ mod tests {
             floor_of(
                 &floors("0.2.0", &[]),
                 "TRANSFORM t ADOPT EXISTING TABLE FROM s GROUP BY g SELECT g AS g, COUNT(*) AS n"
+            ),
+            "0.2.0"
+        );
+    }
+
+    /// A `KEY (...)` on the `FROM` or the joined table is a feature of its
+    /// own (ADR-0026): a definition naming one carries its release, and the
+    /// same definition without it doesn't.
+    #[test]
+    fn a_table_key_carries_its_release() {
+        let later = floors("0.5.0", &[("TableKey", "0.3.0")]);
+        for keyed in [
+            "TRANSFORM t FROM s KEY (k) SELECT a AS a",
+            "TRANSFORM t FROM s KEY (g, k) GROUP BY g SELECT g AS g, COUNT(*) AS n",
+            "TRANSFORM t FROM s JOIN u KEY (k) ON s.k = u.k GROUP BY s.g SELECT s.g AS g, \
+             COUNT(*) AS n",
+        ] {
+            assert_eq!(floor_of(&later, keyed), "0.3.0", "{keyed}");
+        }
+        assert_eq!(
+            floor_of(&later, "TRANSFORM t FROM s SELECT a AS a"),
+            "0.2.0"
+        );
+        assert_eq!(
+            floor_of(
+                &floors("0.2.0", &[]),
+                "TRANSFORM t FROM s KEY (k) SELECT a AS a"
             ),
             "0.2.0"
         );

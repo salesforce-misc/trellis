@@ -545,7 +545,8 @@ fixes and what it costs:
 ## Not gaps
 
 * **Everything Trellis refuses at define, or pauses on when it appears
-  later:** a source without a primary key, row-level security on a role
+  later:** a source with neither a primary key nor a `KEY (…)` backed by a
+  unique index, row-level security on a role
   Trellis runs as,
   a logical-replication subscription into a source, a source
   in a hierarchy

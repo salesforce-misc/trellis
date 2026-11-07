@@ -217,7 +217,8 @@ pub(crate) async fn live_columns(
 }
 
 /// The [`CaptureSpec`] for `table` (an unquoted `schema.table` identity):
-/// its primary key plus [`read_columns`], checked against the table's live
+/// its key (the `KEY (...)` its readers declare, [`declared_key`], else its
+/// primary key) plus [`read_columns`], checked against the table's live
 /// columns.
 ///
 /// Fails with [`CaptureError::NoPrimaryKey`] for a table without a primary
@@ -251,10 +252,21 @@ pub async fn capture_spec(
         )
         .await?
         .get(0);
-    let (attnums, key) = live_columns(client, table).await?;
+    let (attnums, primary_key) = live_columns(client, table).await?;
+    let declared = declared_key(catalog, table);
+    let key = declared.clone().unwrap_or(primary_key);
     if key.is_empty() {
         return Err(CaptureError::NoPrimaryKey {
             table: table.to_string(),
+        });
+    }
+    // A declared key's column dropped or renamed: the readers pause on it
+    // (`staging::schema_change::pause_readers_of_missing`, its key missing)
+    // and the installed functions stay.
+    if let Some(column) = key.iter().find(|c| !attnums.contains_key(*c)) {
+        return Err(CaptureError::MissingColumn {
+            table: table.to_string(),
+            column: column.clone(),
         });
     }
 
@@ -291,7 +303,28 @@ pub async fn capture_spec(
         // left.
         read.columns.retain(|c| !missing.contains(c));
     }
-    Ok(CaptureSpec::new(table, key, read.columns)?.with_partitioned(partitioned))
+    Ok(CaptureSpec::new(table, key, read.columns)?
+        .with_partitioned(partitioned)
+        .with_declared_key(declared.is_some()))
+}
+
+/// The `KEY (...)` `catalog`'s readers declare for `table` (ADR-0026), in
+/// the order written: the key its capture images and every reader keys it
+/// by, whatever its primary key is. A table is keyed one way for all its
+/// readers (define refuses another, `defs::source_key::check_one_key`), so
+/// the first reader that declares one says it. `None` when they key it by
+/// its primary key. Every reader counts, a paused one too: its resume
+/// rebuilds over the same key.
+pub(crate) fn declared_key(catalog: &CaptureCatalog, table: &str) -> Option<Vec<String>> {
+    catalog.definitions.iter().find_map(|reader| {
+        crate::defs::source_key::declared_by_reader(
+            &reader.def,
+            &reader.source,
+            reader.join.as_deref(),
+            table,
+        )
+        .map(<[String]>::to_vec)
+    })
 }
 
 #[cfg(test)]

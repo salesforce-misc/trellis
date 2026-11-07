@@ -143,10 +143,13 @@ async fn write(
 }
 
 /// Records the key of each table a define of `def` keys by: its qualified
-/// `source` and a `JOIN`'s qualified `joined` table (each its row-identity
-/// key now, unless the table has a record already, which it keeps) and its
-/// qualified `target` ([`target_key`]), which the define keys and whose
-/// record is always its own.
+/// `source` and a `JOIN`'s qualified `joined` table (the `KEY (...)` `def`
+/// declares for it, else its row-identity key now unless the table has a
+/// record already, which it keeps) and its qualified `target`
+/// ([`target_key`]), which the define keys and whose record is always its
+/// own. A declared key is the table's for every reader of it: define
+/// refuses one that differs from another reader's
+/// ([`super::source_key::check_one_key`]).
 pub(crate) async fn record(
     client: &impl GenericClient,
     def: &TransformDef,
@@ -154,12 +157,43 @@ pub(crate) async fn record(
     joined: Option<&str>,
     target: &str,
 ) -> Result<(), tokio_postgres::Error> {
+    record_except(client, def, source, joined, target, None).await
+}
+
+/// [`record`], recording nothing for `unkeyed`: a table an earlier release
+/// keyed by a unique index that backs no key now ([`backfill_in`]), which
+/// is no key to record.
+async fn record_except(
+    client: &impl GenericClient,
+    def: &TransformDef,
+    source: &str,
+    joined: Option<&str>,
+    target: &str,
+    unkeyed: Option<&str>,
+) -> Result<(), tokio_postgres::Error> {
     for table in std::iter::once(source).chain(joined) {
-        if recorded_for(client, table).await?.is_none() {
-            write(client, table, &key_names(client, table).await?).await?;
+        if unkeyed == Some(table) {
+            continue;
+        }
+        let declared = super::source_key::declared_by_reader(def, source, joined, table);
+        let recorded = recorded_for(client, table).await?;
+        match declared {
+            Some(key) if recorded.as_deref() != Some(key) => write(client, table, key).await?,
+            Some(_) => {}
+            None if recorded.is_none() => {
+                write(client, table, &key_names(client, table).await?).await?;
+            }
+            None => {}
         }
     }
-    let source_key = key_of(client, source).await?;
+    // A 1-1 target over a source left unkeyed is keyed by its own primary
+    // key, the key its source had at define, not by whatever the source's
+    // identity reads as now.
+    let source_key = if unkeyed == Some(source) && keys_target_by_source(def) {
+        primary_key_names(client, target).await?
+    } else {
+        key_of(client, source).await?
+    };
     write(client, target, &target_key(def, &source_key)).await
 }
 
@@ -218,7 +252,7 @@ pub(crate) async fn retie_restored(
 
 /// `table`'s unique indexes, oldest first, each as `name (key columns)` with
 /// its `INCLUDE` columns and whatever keeps it from being a row identity.
-async fn unique_indexes(
+pub(crate) async fn unique_indexes(
     client: &impl GenericClient,
     table: &str,
 ) -> Result<Vec<String>, tokio_postgres::Error> {
@@ -245,7 +279,14 @@ async fn unique_indexes(
                         case when i.indisprimary then ', the primary key' end, \
                         case when not i.indisvalid then ', invalid' end, \
                         case when i.indpred is not null then ', partial' end, \
-                        case when not i.indimmediate then ', deferrable' end)) \
+                        case when not i.indimmediate then ', deferrable' end, \
+                        case when not i.indnullsnotdistinct and exists ( \
+                                 select 1 \
+                                 from unnest(i.indkey::int2[]) with ordinality k(attnum, ord) \
+                                 join pg_catalog.pg_attribute a \
+                                   on a.attrelid = i.indrelid and a.attnum = k.attnum \
+                                 where k.ord <= i.indnkeyatts and not a.attnotnull) \
+                             then ', over a nullable column and not NULLS NOT DISTINCT' end)) \
              from pg_catalog.pg_index i \
              join pg_catalog.pg_class c on c.oid = i.indexrelid \
              where i.indrelid = pg_catalog.to_regclass($1) and i.indisunique \
@@ -256,20 +297,6 @@ async fn unique_indexes(
         .into_iter()
         .map(|row| row.get(0))
         .collect())
-}
-
-/// Whether `table` (an unquoted `schema.table`) is a definition's target.
-async fn is_trellis_target(
-    client: &impl GenericClient,
-    table: &str,
-) -> Result<bool, tokio_postgres::Error> {
-    Ok(client
-        .query_one(
-            "select exists (select 1 from transform_definitions where target_table = $1)",
-            &[&table],
-        )
-        .await?
-        .get(0))
 }
 
 /// The refusal for `table` (an unquoted `schema.table`) when it has a record
@@ -289,7 +316,7 @@ pub(crate) async fn missing(
     Ok(Some(DdlError::RecordedKeyMissing {
         table: table.to_string(),
         indexes: unique_indexes(client, table).await?,
-        trellis_target: is_trellis_target(client, table).await?,
+        trellis_target: super::source_key::is_trellis_target(client, table).await?,
         recorded,
     }))
 }
@@ -309,6 +336,10 @@ pub(crate) struct TableKey {
     pub(crate) primary_key: Vec<String>,
     /// Whether the table is a definition's target, keyed by its definition.
     pub(crate) trellis_target: bool,
+    /// The `KEY (...)` the definition declares for the table (ADR-0026):
+    /// its key whatever the table's primary key is, and `resolves` is then
+    /// whether an index backs it ([`super::source_key::backing`]).
+    pub(crate) declared: Option<Vec<String>>,
 }
 
 /// What a resume does with one table's key ([`decide`]).
@@ -325,6 +356,9 @@ pub(crate) enum Rekey {
     /// A user table's key changed, and it has no primary key to take: no
     /// other unique index is taken instead.
     NoPrimaryKey { recorded: Vec<String> },
+    /// No index backs the table's declared `KEY (...)`: only one built
+    /// again repairs it.
+    Unbacked { declared: Vec<String> },
     /// A 1-1 transform's source has another key than its target is keyed by.
     Changed {
         recorded: Vec<String>,
@@ -346,6 +380,20 @@ pub(crate) enum Rekey {
 /// the recorded key. A user table with no record at all is keyed by its row
 /// identity and keeps it.
 pub(crate) fn decide(key: &TableKey, keys_target: bool) -> Rekey {
+    // A declared `KEY` is the table's key while an index backs it, whatever
+    // its primary key does: it is recorded again for a table at the name
+    // that isn't the one recorded, and never replaced by the primary key.
+    if let Some(declared) = &key.declared {
+        if !key.resolves {
+            return Rekey::Unbacked {
+                declared: declared.clone(),
+            };
+        }
+        return match &key.recorded {
+            Some((recorded, true)) if recorded == declared => Rekey::Keep,
+            _ => Rekey::Record(declared.clone()),
+        };
+    }
     let Some((recorded, tied)) = &key.recorded else {
         return Rekey::Keep;
     };
@@ -385,6 +433,7 @@ pub(crate) fn decide(key: &TableKey, keys_target: bool) -> Rekey {
 async fn table_key(
     client: &impl GenericClient,
     table: &str,
+    declared: Option<&[String]>,
 ) -> Result<Option<TableKey>, tokio_postgres::Error> {
     let regclass = ddl::regclass_arg(table);
     let Some(row) = client
@@ -414,34 +463,50 @@ async fn table_key(
         return Ok(None);
     };
     let recorded: Option<Vec<String>> = row.get(0);
-    let resolves = match &recorded {
-        Some(columns) => !ddl::identity_key_columns_over(client, table, Some(columns))
+    let resolves = match (declared, &recorded) {
+        (Some(key), _) => super::source_key::backing(client, table, key)
+            .await?
+            .is_some(),
+        (None, Some(columns)) => !ddl::identity_key_columns_over(client, table, Some(columns))
             .await?
             .is_empty(),
-        None => false,
+        (None, None) => false,
     };
     Ok(Some(TableKey {
         recorded: recorded.map(|columns| (columns, row.get(1))),
         resolves,
         primary_key: row.get(3),
         trellis_target: row.get(2),
+        declared: declared.map(<[String]>::to_vec),
     }))
 }
 
 /// The tables `definition` keys by, each with whether its target is keyed by
-/// that table's key: its source, a `JOIN`'s joined table and its target.
+/// that table's key and the `KEY (...)` it declares for it: its source, a
+/// `JOIN`'s joined table and its target.
 async fn tables_of(
     client: &impl GenericClient,
     definition: &Definition,
-) -> Result<Vec<(String, bool)>, CatalogError> {
+) -> Result<Vec<(String, bool, Option<Vec<String>>)>, CatalogError> {
+    let def = &definition.def;
     let mut tables = vec![(
         definition.source_table.clone(),
-        keys_target_by_source(&definition.def),
+        keys_target_by_source(def),
+        super::source_key::declared_on(
+            def,
+            super::join::spec(def).map(|_| super::join::Side::From),
+        )
+        .map(<[String]>::to_vec),
     )];
     if let Some(joined) = super::catalog::join_table_of(client, definition.id).await? {
-        tables.push((joined, false));
+        tables.push((
+            joined,
+            false,
+            super::source_key::declared_on(def, Some(super::join::Side::Joined))
+                .map(<[String]>::to_vec),
+        ));
     }
-    tables.push((definition.target_table.clone(), false));
+    tables.push((definition.target_table.clone(), false, None));
     Ok(tables)
 }
 
@@ -467,6 +532,19 @@ async fn refusal(
                 indexes: unique_indexes(client, table).await?,
             }))
         }
+        Rekey::Unbacked { declared } => Some(CatalogError::Ddl(DdlError::KeyNotBacked {
+            table: table.to_string(),
+            indexes: unique_indexes(client, table).await?,
+            partitioned: client
+                .query_one(
+                    "select exists (select 1 from pg_catalog.pg_class \
+                         where oid = pg_catalog.to_regclass($1) and relkind = 'p')",
+                    &[&ddl::regclass_arg(table)],
+                )
+                .await?
+                .get(0),
+            key: declared,
+        })),
         Rekey::Changed {
             recorded,
             primary_key,
@@ -495,8 +573,8 @@ pub(crate) async fn rekey_for_resume(
     definition: &Definition,
 ) -> Result<(), CatalogError> {
     let mut records = Vec::new();
-    for (table, keys_target) in tables_of(txn, definition).await? {
-        let Some(key) = table_key(txn, &table).await? else {
+    for (table, keys_target, declared) in tables_of(txn, definition).await? {
+        let Some(key) = table_key(txn, &table, declared.as_deref()).await? else {
             continue;
         };
         match decide(&key, keys_target) {
@@ -573,8 +651,8 @@ pub(crate) async fn check(
     client: &impl GenericClient,
     definition: &Definition,
 ) -> Result<(), CatalogError> {
-    for (table, keys_target) in tables_of(client, definition).await? {
-        let Some(key) = table_key(client, &table).await? else {
+    for (table, keys_target, declared) in tables_of(client, definition).await? {
+        let Some(key) = table_key(client, &table, declared.as_deref()).await? else {
             continue;
         };
         let tied = key.recorded.as_ref().is_some_and(|(_, tied)| *tied);
@@ -735,10 +813,25 @@ pub(crate) async fn backfill_in(
         {
             continue;
         }
-        let Ok(def) = super::grammar::load_in(text, grammar_version, oldest, current) else {
+        let Ok(mut def) = super::grammar::load_in(text, grammar_version, oldest, current) else {
             continue;
         };
-        record(txn, &def, &source, joined.as_deref(), &target).await?;
+        let unkeyed =
+            declare_released_keys(txn, id, &mut def, &source, joined.as_deref(), &target).await?;
+        record_except(
+            txn,
+            &def,
+            &source,
+            joined.as_deref(),
+            &target,
+            unkeyed.as_ref().map(|(table, _)| table.as_str()),
+        )
+        .await?;
+        if let Some((_, reason)) = &unkeyed
+            && super::lifecycle::pause_for_included_key(txn, id, &source, reason).await?
+        {
+            paused += 1;
+        }
         let mut included = Vec::new();
         for table in std::iter::once(&source).chain(joined.as_ref()) {
             let key = key_names(txn, table).await?;
@@ -781,6 +874,187 @@ pub(crate) async fn backfill_in(
         }
     }
     Ok(paused)
+}
+
+/// The `capture_failure` of a definition reading `table`, which has no
+/// primary key and which an earlier release keyed by a unique index that
+/// backs no key now (ADR-0026); `indexes` are its unique indexes.
+pub(crate) fn unkeyed_reason(target: &str, table: &str, indexes: &[String]) -> String {
+    format!(
+        "transform {target} reads {table}, which has no primary key. An earlier release \
+         keyed it by a unique index it chose; Trellis now keys a table by its primary key or \
+         by a KEY (column, ...) the definition names, backed by a valid, immediate, \
+         non-partial unique index over exactly those columns and no expression, every \
+         column NOT NULL or the index NULLS NOT DISTINCT, and none of {table}'s does ({}). \
+         Add a primary key (ALTER TABLE {table} ADD PRIMARY KEY ...) and RESUME this \
+         transform, or DROP TRANSFORM and define it again with a valid KEY (...)",
+        if indexes.is_empty() {
+            "it has no unique index".to_string()
+        } else {
+            indexes.join(", ")
+        }
+    )
+}
+
+/// The `capture_failure` of a 1-1 definition reading `table`, which has no
+/// primary key, whose target is keyed by `built_on` (the primary key
+/// `table` had at define) while the index an earlier release chose for
+/// `table` is over `chosen` ([`declare_released_keys`]).
+pub(crate) fn rebuilt_key_reason(
+    target: &str,
+    table: &str,
+    chosen: &[String],
+    built_on: &[String],
+) -> String {
+    format!(
+        "transform {target} reads {table}, which has no primary key. Its target is keyed by \
+         ({}), the key {table} had when the transform was defined, and the unique index an \
+         earlier release chose for {table} is over ({}), another key. Add the primary key \
+         back (ALTER TABLE {table} ADD PRIMARY KEY ({})) and RESUME this transform, or \
+         DROP TRANSFORM and define it again with a valid KEY (...)",
+        built_on.join(", "),
+        chosen.join(", "),
+        built_on.join(", "),
+    )
+}
+
+/// `table`'s primary key columns, in key order; none when it has no primary
+/// key or doesn't exist.
+async fn primary_key_names(
+    client: &impl GenericClient,
+    table: &str,
+) -> Result<Vec<String>, tokio_postgres::Error> {
+    Ok(client
+        .query_one(
+            "select array( \
+                 select a.attname::text \
+                 from pg_catalog.pg_index i \
+                 cross join unnest(i.indkey::int2[]) with ordinality k(attnum, ord) \
+                 join pg_catalog.pg_attribute a \
+                   on a.attrelid = i.indrelid and a.attnum = k.attnum \
+                 where i.indrelid = pg_catalog.to_regclass($1) and i.indisprimary \
+                   and k.ord <= i.indnkeyatts \
+                 order by k.ord)",
+            &[&ddl::regclass_arg(table)],
+        )
+        .await?
+        .get(0))
+}
+
+/// A released definition over a user table with no primary key, which an
+/// earlier release keyed by a unique index it chose (its oldest qualifying
+/// one): the definition `id` gets that index's key columns as an explicit
+/// `KEY (...)` for the table, written into its stored text, when that index
+/// backs a key now ([`super::source_key::backing`], and the key types'
+/// allowlist), so it keeps running on the same key (ADR-0026, #1745 rule
+/// 8). Otherwise returns the table and its unique indexes, and nothing is
+/// written: [`backfill_in`] pauses the definition with the returned
+/// reason. A table that has a primary key, a `KEY` the definition declares
+/// already, or that is another transform's target, is left as it is.
+///
+/// A 1-1 target (plain or `JOIN`) is keyed by its source's key as it was
+/// at define, its primary key and its ledger over the same columns. Its
+/// source can have no primary key now only because that key was dropped
+/// after define, so the index the earlier release chose may be over other
+/// columns than the target was built on. The index is taken only when its
+/// columns are the target's primary key's; otherwise the definition is
+/// paused, and adding the primary key back and `RESUME` repairs it. An
+/// aggregate's or `JOIN`'s target is keyed by its group columns, which a
+/// rebuild-free change of its source's key leaves alone.
+async fn declare_released_keys(
+    txn: &tokio_postgres::Transaction<'_>,
+    id: i64,
+    def: &mut TransformDef,
+    source: &str,
+    joined: Option<&str>,
+    target: &str,
+) -> Result<Option<(String, String)>, CatalogError> {
+    use super::join::Side;
+    let join = super::join::spec(def).is_some();
+    let sides = std::iter::once((source, join.then_some(Side::From)))
+        .chain(joined.map(|table| (table, Some(Side::Joined))));
+    let mut declared = Vec::new();
+    for (table, side) in sides {
+        if super::source_key::declared_on(def, side).is_some()
+            || super::source_key::is_trellis_target(txn, table).await?
+        {
+            continue;
+        }
+        let has_primary_key: Option<bool> = txn
+            .query_opt(
+                "select exists (select 1 from pg_catalog.pg_index i \
+                     where i.indrelid = c.oid and i.indisprimary) \
+                 from pg_catalog.pg_class c where c.oid = pg_catalog.to_regclass($1)",
+                &[&ddl::regclass_arg(table)],
+            )
+            .await?
+            .map(|row| row.get(0));
+        if has_primary_key != Some(false) {
+            continue;
+        }
+        // The index the earlier release chose: with no record yet, the
+        // identity's fallback (the oldest qualifying unique index, no
+        // expression, its key columns only), or the record an earlier
+        // definition over the same table was just given here.
+        let chosen = key_names(txn, table).await?;
+        let backs = if chosen.is_empty() {
+            None
+        } else {
+            super::source_key::backing(txn, table, &chosen).await?
+        };
+        let admitted = match &backs {
+            Some(columns) => ddl::admit_key_types(txn, table, columns).await.is_ok(),
+            None => false,
+        };
+        if !admitted {
+            let indexes = unique_indexes(txn, table).await?;
+            return Ok(Some((
+                table.to_string(),
+                unkeyed_reason(target, table, &indexes),
+            )));
+        }
+        if keys_target_by_source(def) && side != Some(Side::Joined) {
+            let built_on = primary_key_names(txn, target).await?;
+            let mut chosen_set = chosen.clone();
+            chosen_set.sort();
+            let mut built_set = built_on.clone();
+            built_set.sort();
+            if chosen_set != built_set {
+                return Ok(Some((
+                    table.to_string(),
+                    rebuilt_key_reason(target, table, &chosen, &built_on),
+                )));
+            }
+        }
+        declared.push((side, chosen));
+    }
+    if declared.is_empty() {
+        return Ok(None);
+    }
+    for (side, key) in declared {
+        match side {
+            None | Some(Side::From) => def.source_key = Some(key),
+            Some(Side::Joined) => {
+                if let super::ast::KeySpace::Join(join) | super::ast::KeySpace::JoinOneToOne(join) =
+                    &mut def.key_space
+                {
+                    join.right_key = Some(key);
+                }
+            }
+        }
+    }
+    let text = super::ast::render_definition_text(def);
+    txn.execute(
+        "update transform_definitions set definition_text = $2 where id = $1",
+        &[&id, &text],
+    )
+    .await?;
+    crate::instance_log::info!(
+        transform_id = id,
+        definition = %text,
+        "named the key an earlier release keyed a table with no primary key by, as KEY (...)"
+    );
+    Ok(None)
 }
 
 /// Re-keys a 1-1 target (plain or `JOIN`) an earlier release built over its
@@ -1169,6 +1443,47 @@ mod tests {
             resolves,
             primary_key: names(pk),
             trellis_target: false,
+            declared: None,
+        }
+    }
+
+    /// A declared `KEY` (ADR-0026) is the table's key while an index backs
+    /// it, whatever its primary key is or becomes: a resume keeps it, ties
+    /// it again to a table created again at the name, and never takes the
+    /// primary key instead; with no index backing it, it refuses, for every
+    /// kind of reader.
+    #[test]
+    fn a_resume_keeps_a_declared_key_and_never_takes_the_primary_key() {
+        let k: &[&str] = &["k"];
+        let declared = |recorded, resolves, pk| TableKey {
+            declared: Some(cols(k)),
+            ..table(recorded, resolves, pk)
+        };
+        for keys_target in [false, true] {
+            for pk in [&[][..], &["id"][..], &["id", "g"][..], k] {
+                assert_eq!(
+                    decide(&declared(Some((k, true)), true, pk), keys_target),
+                    Rekey::Keep,
+                    "{pk:?}"
+                );
+                assert_eq!(
+                    decide(&declared(Some((k, false)), true, pk), keys_target),
+                    Rekey::Record(cols(k)),
+                    "{pk:?}"
+                );
+                assert_eq!(
+                    decide(&declared(None, true, pk), keys_target),
+                    Rekey::Record(cols(k)),
+                    "{pk:?}"
+                );
+                for recorded in [Some((k, true)), Some((k, false)), None] {
+                    assert_eq!(
+                        decide(&declared(recorded, false, pk), keys_target),
+                        Rekey::Unbacked { declared: cols(k) },
+                        "{pk:?}"
+                    );
+                }
+            }
         }
     }
 

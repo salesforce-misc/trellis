@@ -54,6 +54,21 @@ you](operations.md#when-a-definition-needs-you)). Those releases kept such a
 target's rows right, but failed to apply a change that left an `INCLUDE`
 column of a 1-1 transform's source `NULL`.
 
+A definition an earlier release kept over a table with no primary key (its
+primary key dropped after define) was keyed by a unique index that release
+chose. This release keys a table only by its primary key or a `KEY (…)` the
+definition names ([Supported sources and targets](transforms.md#supported-sources-and-targets)).
+At the takeover, when that index backs a key now (valid, not deferrable, not
+partial, over plain columns that are `NOT NULL` or `NULLS NOT DISTINCT`), its
+key columns are written into the stored definition as an explicit `KEY (…)`,
+and the definition keeps running; `status()` and a schema dump show the new
+text. A 1-1 transform's target is keyed by the primary key its source had at
+define, so for a 1-1 transform (plain or `JOIN`, its `FROM` table) the index
+must also be over that key's columns. Otherwise it pauses, with a
+`capture_failure` naming the table and its unique indexes, or the key its
+target is keyed by: add a primary key (for a 1-1 transform, that key back) and
+`RESUME`, or `DROP TRANSFORM` and define it again with a valid `KEY (…)`.
+
 For an embedded fleet, [Rolling deploys](embedding.md#rolling-deploys) covers
 the handover in detail, and
 [Migrations and transactions](embedding.md#migrations-and-transactions) the

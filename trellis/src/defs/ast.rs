@@ -56,6 +56,12 @@ pub struct TransformDef {
     /// ([`super::catalog::resolve_source_schema_in_txn`]) does. `None` for a
     /// bare `FROM <source>`.
     pub explicit_source_schema: Option<String>,
+    /// `KEY (<column>, ...)` written directly after the `FROM` table: the
+    /// columns Trellis keys that table by, in the order written, instead of
+    /// its primary key (`docs/decisions/0026-source-keys.md`). `None` keys it
+    /// by its primary key, or, for another transform's target, by the key
+    /// Trellis gave that target.
+    pub source_key: Option<Vec<String>>,
     pub key_space: KeySpace,
     pub fields: Vec<FieldDef>,
     pub predicate: Predicate,
@@ -353,6 +359,9 @@ pub struct JoinSpec {
     /// `Some(schema)` when the joined table was written `<schema>.<table>`;
     /// the twin of [`TransformDef::explicit_source_schema`].
     pub explicit_right_schema: Option<String>,
+    /// `KEY (<column>, ...)` written directly after the joined table: the
+    /// twin of [`TransformDef::source_key`].
+    pub right_key: Option<Vec<String>>,
     /// The alias the joined table was given (`JOIN <table> [AS] <alias>`),
     /// as written.
     pub right_alias: Option<String>,
@@ -723,6 +732,7 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
     }
     out.push_str(" FROM ");
     render_table_ref(&mut out, &def.source, def.explicit_source_schema.as_deref());
+    render_key(&mut out, def.source_key.as_deref());
     let aliases = Aliases::of(def);
 
     match &def.key_space {
@@ -741,6 +751,7 @@ pub(crate) fn render_definition_text(def: &TransformDef) -> String {
                 JoinKind::Left => " LEFT JOIN ",
             });
             render_table_ref(&mut out, &join.right, join.explicit_right_schema.as_deref());
+            render_key(&mut out, join.right_key.as_deref());
             render_alias(&mut out, join.right_alias.as_deref());
             out.push_str(" ON ");
             let terms: Vec<String> = join
@@ -784,6 +795,15 @@ fn render_table_ref(out: &mut String, table: &str, explicit_schema: Option<&str>
         out.push('.');
     }
     out.push_str(table);
+}
+
+/// ` KEY (<column>, ...)`, a table's declared key, or nothing.
+fn render_key(out: &mut String, key: Option<&[String]>) {
+    if let Some(key) = key {
+        out.push_str(" KEY (");
+        out.push_str(&key.join(", "));
+        out.push(')');
+    }
 }
 
 /// ` AS <alias>`, the canonical spelling of a table alias, or nothing.

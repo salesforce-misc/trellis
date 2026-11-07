@@ -243,10 +243,11 @@ identity. Inside the owning instance that never
 matters, because an instance hands each write to one of its own targets on to
 that target's readers in the writing transaction, without capture triggers.
 That internal path stops at the instance boundary. The reading instance's only
-view of the table is its own capture triggers, and they have no primary key
-to identify a change by, so `CREATE TRANSFORM` rejects the definition with
-`SourceNotChangeKeyed`. To chain off an aggregate target, or a 1-1 target over one, define
-the downstream transform in the instance that owns it.
+view of the table is its own capture triggers, and the table has no primary key
+to identify a change by, so define rejects the definition with
+`NoPrimaryKey`. To chain off an aggregate target, or a 1-1 target over one, define
+the downstream transform in the instance that owns it, or name its group key
+with `KEY (…)` after the table ([source keys](decisions/0026-source-keys.md)).
 
 ## Convergence waits
 

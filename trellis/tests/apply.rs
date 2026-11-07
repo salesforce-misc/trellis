@@ -160,6 +160,7 @@ fn order_totals_def() -> TransformDef {
         predicate: Predicate::True,
         without_source_index: false,
         adopt_target: false,
+        source_key: None,
         explicit_source_schema: None,
         explicit_target_schema: None,
     }
@@ -1509,6 +1510,7 @@ async fn a_text_column_passthrough_round_trips_through_compute() {
         predicate: Predicate::True,
         without_source_index: false,
         adopt_target: false,
+        source_key: None,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -1601,6 +1603,7 @@ async fn a_string_literal_field_writes_its_value_through_compute() {
         predicate: Predicate::True,
         without_source_index: false,
         adopt_target: false,
+        source_key: None,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -1665,6 +1668,7 @@ async fn a_boolean_column_passthrough_round_trips_through_compute() {
         predicate: Predicate::True,
         without_source_index: false,
         adopt_target: false,
+        source_key: None,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -1758,6 +1762,7 @@ async fn a_jsonb_column_passthrough_round_trips_through_compute() {
         predicate: Predicate::True,
         without_source_index: false,
         adopt_target: false,
+        source_key: None,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -1887,6 +1892,7 @@ async fn a_function_call_composed_with_greater_than_round_trips_through_compute(
         predicate: Predicate::True,
         without_source_index: false,
         adopt_target: false,
+        source_key: None,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };

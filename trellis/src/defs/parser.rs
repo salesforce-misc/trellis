@@ -585,6 +585,7 @@ impl Parser {
         self.expect_keyword("FROM")?;
         let (source, explicit_source_schema) = self.parse_table_ref()?;
         self.source = Some(source.clone());
+        let source_key = self.parse_table_key()?;
         self.source_alias = self.parse_table_alias()?;
 
         let key_space = self.parse_key_space_clause()?;
@@ -622,6 +623,7 @@ impl Parser {
             explicit_target_schema,
             source,
             explicit_source_schema,
+            source_key,
             key_space,
             fields,
             predicate,
@@ -630,6 +632,40 @@ impl Parser {
         };
         resolve_aliases(&mut def)?;
         Ok(def)
+    }
+
+    /// Parses `KEY (<column>[, <column>...])` directly after a `FROM` or
+    /// `JOIN` table, if it follows: the columns Trellis keys that table by,
+    /// in the order written. Trellis's statement language, not the
+    /// expression grammar. `KEY` not followed by `(` is no key clause: Postgres
+    /// doesn't reserve the word, so it is an alias there, as before. A column
+    /// named twice is refused, since a key names each column once.
+    fn parse_table_key(&mut self) -> Result<Option<Vec<String>>, ParseError> {
+        if !(self.peek_is_keyword("KEY") && matches!(self.peek_at(1), Token::Symbol('('))) {
+            return Ok(None);
+        }
+        self.advance();
+        self.advance();
+        let mut columns = vec![self.expect_ident()?];
+        while self.peek_is_symbol(',') {
+            self.advance();
+            columns.push(self.expect_ident()?);
+        }
+        self.expect_symbol(')')?;
+        if let Some(repeated) = columns
+            .iter()
+            .enumerate()
+            .find(|(i, c)| columns[..*i].contains(c))
+            .map(|(_, c)| c.clone())
+        {
+            return Err(ParseError::UnsupportedKeySpace {
+                construct: "KEY".to_string(),
+                detail: format!(
+                    "KEY names column '{repeated}' twice; a key names each column once"
+                ),
+            });
+        }
+        Ok(Some(columns))
     }
 
     /// Parses the alias after a `FROM` or `JOIN` table, if one follows:
@@ -834,6 +870,7 @@ impl Parser {
                 ),
             ));
         }
+        let right_key = self.parse_table_key()?;
         let right_alias = self.parse_table_alias()?;
         self.check_aliases(&right, right_alias.as_deref())?;
         if self.peek_is_keyword("USING") {
@@ -876,6 +913,7 @@ impl Parser {
                     source_alias: self.source_alias.clone(),
                     right,
                     explicit_right_schema,
+                    right_key,
                     right_alias,
                     on,
                     group_by: Vec::new(),
@@ -897,6 +935,7 @@ impl Parser {
                 source_alias: self.source_alias.clone(),
                 right,
                 explicit_right_schema,
+                right_key,
                 right_alias,
                 on,
                 group_by,

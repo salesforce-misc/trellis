@@ -440,6 +440,7 @@ pub fn chain_off(program: &Program) -> Option<Program> {
             predicate: Predicate::True,
             without_source_index: false,
             adopt_target: false,
+            source_key: None,
         });
         tables.push(Table {
             name: def.target.clone(),

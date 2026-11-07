@@ -419,10 +419,10 @@ async fn a_partition_a_hierarchy_and_a_one_to_one_from_stay_refused() {
     ));
 }
 
-/// A partitioned root is held to the plain-table rule's primary key: one
-/// keyed only by a unique index on not-null columns, which
-/// `ddl::source_primary_key` would take, is refused before its shape is
-/// read, as a source and as a `JOIN`'s joined side.
+/// A partitioned root is held to the plain-table rule's key: one keyed
+/// only by a unique index on not-null columns, and no `KEY (...)` naming
+/// it, is refused with `NoPrimaryKey` before its shape is read, as a source
+/// and as a `JOIN`'s joined side (ADR-0026).
 #[tokio::test]
 async fn a_partitioned_root_without_a_primary_key_is_refused_as_unkeyed() {
     let cluster = TestCluster::start();
@@ -436,10 +436,10 @@ async fn a_partitioned_root_without_a_primary_key_is_refused_as_unkeyed() {
     )
     .await;
     match refusal(&it, &aggregate("public.lines", "order_id")).await {
-        CatalogError::SourceNotChangeKeyed { source_table } => {
+        CatalogError::Ddl(trellis::defs::ddl::DdlError::NoPrimaryKey { source_table }) => {
             assert_eq!(source_table, "public.lines")
         }
-        other => panic!("expected SourceNotChangeKeyed, got {other:?}"),
+        other => panic!("expected NoPrimaryKey, got {other:?}"),
     }
     match refusal(
         &it,
@@ -448,10 +448,10 @@ async fn a_partitioned_root_without_a_primary_key_is_refused_as_unkeyed() {
     )
     .await
     {
-        CatalogError::SourceNotChangeKeyed { source_table } => {
+        CatalogError::Ddl(trellis::defs::ddl::DdlError::NoPrimaryKey { source_table }) => {
             assert_eq!(source_table, "public.lines")
         }
-        other => panic!("expected SourceNotChangeKeyed, got {other:?}"),
+        other => panic!("expected NoPrimaryKey, got {other:?}"),
     }
     let _ = &it.db;
 }

@@ -49,6 +49,7 @@ feature WithoutSourceIndex 0.2.0
 feature AdoptTarget 0.2.0
 feature PartitionedSource 0.2.0
 feature TableAlias 0.2.0
+feature TableKey 0.2.0
 feature Function("STRPOS") 0.2.0
 feature Function("OCTET_LENGTH") 0.2.0
 feature Function("CHAR_LENGTH") 0.2.0

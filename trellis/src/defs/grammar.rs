@@ -75,7 +75,7 @@ pub(crate) fn load_stored(
 
 /// Loads stored definition text written under grammar `stored`, in the current
 /// grammar's terms, whatever its floor: only [`load_stored`] calls it.
-fn load(text: &str, stored: i32) -> Result<TransformDef, ParseError> {
+pub(crate) fn load(text: &str, stored: i32) -> Result<TransformDef, ParseError> {
     load_in(
         text,
         stored,

@@ -6265,6 +6265,7 @@ mod tests {
             predicate: Predicate::True,
             without_source_index: false,
             adopt_target: false,
+            source_key: None,
             explicit_source_schema: None,
             explicit_target_schema: None,
         }
@@ -7533,6 +7534,7 @@ mod tests {
             predicate: Predicate::True,
             without_source_index: false,
             adopt_target: false,
+            source_key: None,
             explicit_source_schema: None,
             explicit_target_schema: None,
         }

@@ -58,6 +58,7 @@ pub(crate) mod recorded_keys;
 pub mod registry;
 pub mod row_security;
 pub mod source_index;
+pub mod source_key;
 pub mod subscription;
 pub mod typed_literal;
 pub mod validate;
@@ -138,6 +139,8 @@ mod literal_tests;
 mod logic_tests;
 #[cfg(test)]
 mod table_alias_tests;
+#[cfg(test)]
+mod table_key_tests;
 
 #[cfg(test)]
 mod tests {

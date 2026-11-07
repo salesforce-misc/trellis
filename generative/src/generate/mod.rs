@@ -983,6 +983,7 @@ pub fn build_program_multi_with_shapes(
                 predicate: Predicate::True,
                 without_source_index: false,
                 adopt_target: false,
+                source_key: None,
                 explicit_source_schema: None,
                 explicit_target_schema: None,
             }
@@ -2066,6 +2067,7 @@ pub fn build_bulk_insert_program(row_count: usize) -> Program {
         predicate: Predicate::True,
         without_source_index: false,
         adopt_target: false,
+        source_key: None,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
@@ -2086,6 +2088,7 @@ pub fn build_bulk_insert_program(row_count: usize) -> Program {
         predicate: Predicate::True,
         without_source_index: false,
         adopt_target: false,
+        source_key: None,
         explicit_source_schema: None,
         explicit_target_schema: None,
     };
