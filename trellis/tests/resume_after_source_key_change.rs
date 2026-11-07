@@ -606,6 +606,21 @@ async fn an_aggregate_of_many_groups_resumes_onto_a_wider_key() {
 async fn a_one_to_one_resume_onto_its_source_converted_to_a_partitioned_table_refuses() {
     let cluster = TestCluster::start();
     let (db, mut raw, trellis) = setup(&cluster, SOURCE, &[COPY]).await;
+    raw.batch_execute(
+        "create index c_copy_amount on public.c_copy (amount); \
+         grant select on public.c_copy to public",
+    )
+    .await
+    .unwrap();
+    // The re-keying runs (it adds `pid`, deleting every row) before define's
+    // refusal, under the resume's savepoint: the refusal undoes all of it.
+    let shape = "select (select string_agg(attname || ':' || attnotnull, ',' order by attnum) \
+                         from pg_attribute where attrelid = 'public.c_copy'::regclass \
+                          and attnum > 0 and not attisdropped), \
+                        (select string_agg(pg_get_indexdef(indexrelid), ';' order by 1) \
+                         from pg_index where indrelid = 'public.c_copy'::regclass), \
+                        (select relacl::text from pg_class where oid = 'public.c_copy'::regclass)";
+    let shape_before = rows(&raw, shape).await;
     let before = rows(
         &raw,
         "select id::text, amount::text from public.c_copy order by 1",
@@ -633,6 +648,11 @@ async fn a_one_to_one_resume_onto_its_source_converted_to_a_partitioned_table_re
         )
         .await,
         before
+    );
+    assert_eq!(
+        rows(&raw, shape).await,
+        shape_before,
+        "columns, indexes, grants"
     );
     assert_eq!(
         status(&trellis, "c_copy").await.status,
