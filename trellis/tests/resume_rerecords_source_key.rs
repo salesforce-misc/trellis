@@ -253,18 +253,30 @@ async fn a_re_record_pauses_the_readers_still_running_on_the_old_key() {
         rows(&raw, COUNTS_ORACLE).await
     );
 
-    // The aggregate resumes onto the recorded key; the 1-1 refuses it, its
-    // target keyed by the old one.
+    // The aggregate resumes onto the recorded key; the 1-1 too, its target
+    // re-keyed in place to it, `pid` added as a key column.
     trellis.apply("RESUME TRANSFORM c_sums").await.unwrap();
     bring_live(&mut raw, &db.pool, &trellis, &["c_sums", "c_counts"]).await;
     assert_eq!(rows(&raw, SUMS_ACTUAL).await, rows(&raw, SUMS_ORACLE).await);
-    trellis
-        .apply("RESUME TRANSFORM c_copy")
-        .await
-        .expect_err("a 1-1 target keyed by the old key");
+    trellis.apply("RESUME TRANSFORM c_copy").await.unwrap();
+    bring_live(
+        &mut raw,
+        &db.pool,
+        &trellis,
+        &["c_copy", "c_sums", "c_counts"],
+    )
+    .await;
     assert_eq!(
-        status(&trellis, "c_copy").await.status,
-        TransformStatus::Paused
+        rows(
+            &raw,
+            "select id::text, pid::text, amount::text from public.c_copy order by 1, 2"
+        )
+        .await,
+        rows(
+            &raw,
+            "select id::text, pid::text, amount::text from public.c order by 1, 2"
+        )
+        .await
     );
 }
 

@@ -59,12 +59,15 @@ live schema, and refuses while define would, leaving the definition paused;
 the error names the column and what to change. A whole-transform resume also
 refuses, as define does, while a source index the definition's `self_check`
 pages by is missing, unless it was defined `WITHOUT SOURCE INDEX`; create the
-index the message names, then resume. It also refuses in three cases
+index the message names, then resume. It also refuses in two cases
 define doesn't, where the only repair is to `DROP TRANSFORM` and define again:
 
-* a 1-1 definition's source key was redefined;
 * its target table is missing;
 * its ledger table is missing.
+
+A 1-1 definition whose source key changed while it was paused has its target
+re-keyed in place to the new key first, or the resume refuses naming what
+blocks it ([the key row](transforms.md#supported-sources-and-targets)).
 
 A `JOIN` has no ledger. Its resume drops and recreates its hidden tables
 instead, keeps the target, and rebuilds both sides and the target's groups

@@ -146,8 +146,9 @@ async fn a_definition_built_over_an_include_column_pauses_and_resume_re_keys_it(
     exec(&d, "update public.inc set y = 7 where id = 3").await;
     settle(&mut d).await;
     let outcomes = [
-        "RESUME would re-key public.one by (id) in place, dropping the former key column x, \
-         then rebuild public.one from public.inc",
+        "RESUME would re-key public.one by (id) in place, dropping the former key column x \
+         (ALTER TRANSFORM ... ADD x AS x once it is live adds it back as a field), then \
+         rebuild public.one from public.inc",
         "RESUME would rebuild public.g from public.inc",
     ];
     let with_outcomes: Vec<String> = reasons

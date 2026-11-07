@@ -479,13 +479,16 @@ pause are arcs of one lifecycle:
   from the original database" for a restore, "wait for the changes staged
   before the enum relabel or re-type to drain" first of all for a relabel,
   and, before the re-type, "re-record `<table>`'s key as (`<columns>`)" for a
-  table whose primary key changed while an aggregate or `JOIN` reading it was
-  paused, or one read with `KEY (…)` that was created again, and "re-key
-  `<target>` by (`<columns>`) in place, dropping the former key column …" for
-  a 1-1 target an earlier release keyed by its source key's `INCLUDE`
-  columns), or "RESUME would refuse: …" naming what blocks it (anything define
-  would refuse now, a key it can't re-record, a missing target or ledger
-  table). `capture_failure.reasons` lists the
+  table whose primary key changed while a transform reading it was paused,
+  or one read with `KEY (…)` that was created again, and, first of all,
+  "re-key `<target>` by (`<columns>`) in place, adding the key column …,
+  which empties it until the rebuild, dropping the former key column …" for
+  a 1-1 target its source's key changed under, or that an earlier release
+  keyed by its source key's `INCLUDE` columns), or "RESUME would refuse: …"
+  naming what blocks it (anything define would refuse now, a key it can't
+  re-record, a key column whose name a column of the target has, an object
+  of yours over a column or key constraint the re-keying would drop, a
+  missing target or ledger table). `capture_failure.reasons` lists the
   reasons alone and `capture_failure.resume_outcome` the outcome alone, which
   is unset just after a pause, until the next pass, and while a `RESUME` is
   in progress (its "resuming: …" message reports it). A transform this
@@ -517,10 +520,11 @@ pause are arcs of one lifecycle:
   error naming the column and what to change, and the transform stays paused,
   untouched. The resume also refuses in cases define doesn't, where define
   would accept the transform: its target or ledger table is missing, or a key
-  it uses changed in a way it can't re-record (its 1-1 source key was
-  redefined, a table it reads has no primary key left to take, its target lost
-  the index over its key, or a user's object depends on a column re-keying its
-  target would drop)
+  it uses changed in a way it can't re-record (a table it reads has no
+  primary key left to take, its target lost the index over its key, or
+  re-keying a 1-1 target to its source's new key would take a column name
+  the target already has, or drop a column or key constraint a user's
+  object depends on)
   ([operations — `PAUSE` and `RESUME`](operations.md#pause-and-resume)). A field resume
   (`RESUME TRANSFORM t.col`) runs the same validation, but not the ledger
   check, since it rebuilds nothing. Otherwise the resume returns it to

@@ -1042,12 +1042,12 @@ async fn resume_refuses_a_definition_define_would_refuse_now() {
     assert_item_names_match(&raw).await;
 }
 
-/// A 1-1 definition whose source key was redefined is paused by the
-/// capture pass, and its resume refuses with the remedy: the target
-/// is keyed by the old key, so only restoring it, or a drop and redefine,
-/// gets it going again.
+/// A 1-1 definition whose source key was redefined to `(name)` is paused by
+/// the capture pass, and its resume re-keys its target to the new key, but
+/// the definition's field `name` has the new key column's name: the resume
+/// refuses, naming the field, with the remedies.
 #[tokio::test]
-async fn resume_refuses_a_redefined_source_key() {
+async fn resume_refuses_a_redefined_source_key_whose_column_is_a_field() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
@@ -1064,13 +1064,11 @@ async fn resume_refuses_a_redefined_source_key() {
     assert_eq!(status(&raw, "item_names").await, TransformStatus::Paused);
     let refused = resume_refused(&trellis, "item_names").await;
     assert!(
-        refused.contains("primary key of public.items is now (name)")
-            && refused.contains("keyed by (id)")
+        refused.contains("adds its key column \"name\"")
+            && refused.contains("field \"name\"")
             && refused.contains("`DROP TRANSFORM` and define it again"),
         "{refused}"
     );
-    // Define would accept this definition: only a resume refuses it.
-    assert!(!refused.contains("define would refuse"), "{refused}");
     assert_eq!(status(&raw, "item_names").await, TransformStatus::Paused);
 }
 

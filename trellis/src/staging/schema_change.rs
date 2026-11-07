@@ -302,9 +302,8 @@ pub(crate) fn missing_columns_error(table: &str, columns: &[String]) -> String {
 pub(crate) fn key_changed_error(table: &str, old: &[String], new: &[String]) -> String {
     format!(
         "the primary key of {table} changed from ({}) to ({}), and this definition's rows \
-         are keyed by the old one. RESUME rebuilds an aggregate or JOIN over the new key; a \
-         1-1 transform's target is keyed by the old one, so restore the key and resume it, \
-         or drop the definition and define it again",
+         are keyed by the old one. RESUME rebuilds it over the new key, re-keying a 1-1 \
+         transform's target to it in place first",
         quoted_list(old),
         quoted_list(new)
     )

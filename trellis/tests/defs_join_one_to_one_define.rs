@@ -1005,24 +1005,31 @@ async fn a_one_to_one_join_pauses_resumes_revalidates_and_drops_with_its_hidden_
         .await
         .expect("pause");
 
-    // The target is keyed by `a`'s key as define found it: a redefined key
-    // refuses the resume, as for a plain 1-1 target.
+    // The target is keyed by `a`'s key: a redefined key re-keys it in place
+    // on the resume, as for a plain 1-1 target, adding `region`.
     raw.batch_execute(
         "alter table public.orders drop constraint orders_pkey, add primary key (id, region)",
     )
     .await
     .expect("redefine a's key");
-    let err = trellis
+    trellis
         .apply("RESUME TRANSFORM order_view")
         .await
-        .expect_err("the resume checks a's key");
-    assert!(err.to_string().contains("orders"), "{err}");
-    assert!(err.to_string().contains("region"), "{err}");
-    raw.batch_execute(
-        "alter table public.orders drop constraint orders_pkey, add primary key (id)",
-    )
-    .await
-    .expect("restore a's key");
+        .expect("the resume re-keys the target");
+    let key: String = raw
+        .query_one(
+            "select pg_get_constraintdef(oid) from pg_constraint \
+             where conrelid = 'public.order_view'::regclass and contype = 'p'",
+            &[],
+        )
+        .await
+        .expect("the target's key")
+        .get(0);
+    assert_eq!(key, "PRIMARY KEY (id, region)");
+    trellis
+        .apply("PAUSE TRANSFORM order_view")
+        .await
+        .expect("pause");
 
     // DROP takes the target, the hidden tables, the floors of `R` and `M`,
     // the row and its edges.

@@ -401,9 +401,10 @@ async fn an_unchanged_paused_definition_is_not_evaluated_again() {
 
 /// What the message says `RESUME` would do is what it does, for three kinds
 /// of pause: a re-type (the copies are re-typed, then the target is
-/// rebuilt), a primary key redefined (the 1-1 reader's `RESUME` refuses
-/// with the very refusal the message names; the aggregate's rebuilds), and a
-/// column dropped (refused, naming the column).
+/// rebuilt), a primary key redefined (the 1-1 reader's `RESUME` re-keys its
+/// target in place, adding the new key column, and the aggregate's
+/// re-records the key; both rebuild), and a column dropped (refused, naming
+/// the column).
 #[tokio::test]
 async fn the_outcome_is_what_resume_does() {
     let cluster = TestCluster::start();
@@ -447,32 +448,28 @@ async fn the_outcome_is_what_resume_does() {
     bring_live(&mut raw, &db.pool, "t").await;
     assert_eq!(column_type("public.t", "a").await, "bigint");
 
-    // A key redefined: the 1-1 reader's RESUME refuses as its message says;
-    // the aggregate's rebuilds.
+    // A key redefined: the 1-1 reader's RESUME re-keys its target as its
+    // message says; the aggregate's re-records the source's key as its new
+    // primary key before it rebuilds, so the outcome names that step first.
     app.batch_execute("alter table public.u drop constraint u_pkey, add primary key (id, g)")
         .await
         .expect("redefine the key");
     capture_pass(&mut raw, &db.pool).await;
     capture_pass(&mut raw, &db.pool).await;
-    let refused = outcome_of("t").await;
-    let refusal = refused
-        .strip_prefix("RESUME would refuse: ")
-        .unwrap_or_else(|| panic!("{refused}"));
-    let err = trellis
-        .apply("RESUME TRANSFORM t")
-        .await
-        .expect_err("the 1-1 resume refuses");
-    let shown = err.to_string();
-    let named = refusal
-        .strip_prefix("define would refuse the definition as the schema stands now: ")
-        .unwrap_or(refusal);
-    assert!(shown.contains(named), "{shown} vs {refused}");
-    // The aggregate's RESUME re-records the source's key as its new primary
-    // key before it rebuilds, so the outcome names that step first.
+    assert_eq!(
+        outcome_of("t").await,
+        format!("RESUME would {WIDEN_T}, then rebuild public.t from public.u")
+    );
     assert_eq!(
         outcome_of("s").await,
         "RESUME would re-record public.u's key as (id, g), then rebuild public.s from public.u"
     );
+    trellis.apply("RESUME TRANSFORM t").await.expect("resume t");
+    assert_eq!(
+        key_and_columns(&app, "public.t").await,
+        ("PRIMARY KEY (id, g)".into(), "{id,a,b,g}".into())
+    );
+    bring_live(&mut raw, &db.pool, "t").await;
     trellis.apply("RESUME TRANSFORM s").await.expect("resume s");
     bring_live(&mut raw, &db.pool, "s").await;
 
@@ -585,31 +582,132 @@ async fn a_locked_key_record_defers_the_outcome_to_a_later_pass() {
     );
 }
 
-/// A 1-1 transform's source whose primary key moved: the outcome's refusal
-/// is the very reason the RESUME refuses with.
+/// What a 1-1 `t`'s RESUME does once `public.u`'s key is `(id, g)`: `g`,
+/// which `t` doesn't select, is added to its key.
+const WIDEN_T: &str = "re-key public.t by (id, g) in place, adding the key column g, which \
+     empties it until the rebuild, then re-record public.u's key as (id, g), then re-record \
+     public.t's key as (id, g)";
+
+/// `table`'s key constraint and its columns, in order.
+async fn key_and_columns(client: &Client, table: &str) -> (String, String) {
+    let row = client
+        .query_one(
+            "select (select pg_get_constraintdef(oid) from pg_constraint \
+                     where conrelid = $1::text::regclass and contype in ('p', 'u')), \
+                    array(select attname::text from pg_attribute \
+                          where attrelid = $1::text::regclass and attnum > 0 \
+                            and not attisdropped order by attnum)::text",
+            &[&table],
+        )
+        .await
+        .expect("read the key and columns");
+    (row.get(0), row.get(1))
+}
+
+/// `target`'s outcome is the refusal its RESUME makes, and the RESUME
+/// leaves it paused.
+async fn assert_outcome_is_the_refusal(
+    trellis: &Trellis,
+    raw: &Client,
+    pool: &trellis::pool::Pool,
+    target: &str,
+    names: &str,
+) {
+    let outcome = paused(trellis, target)
+        .await
+        .resume_outcome
+        .expect("outcome");
+    let err = trellis::staging::quarantine::resume_transform(pool, target)
+        .await
+        .expect_err("the resume refuses");
+    let reason = std::error::Error::source(&err)
+        .expect("the refusal's reason")
+        .to_string();
+    assert!(reason.contains(names), "{reason}");
+    assert_eq!(outcome, format!("RESUME would refuse: {reason}"));
+    assert_eq!(stored_status(raw, target).await, TransformStatus::Paused);
+}
+
+/// A 1-1 transform's source whose primary key moved: what its outcome says
+/// the re-keying of its target does is what the RESUME does, for each kind:
+/// a key column added (the key widened to `(id, g)`), a former key column
+/// dropped (narrowed back to `(id)`), and the two refusals, a user's view
+/// over the column a narrowing drops and a column of the new key column's
+/// name the user added to the target, each the very refusal the RESUME
+/// makes.
 #[tokio::test]
-async fn a_moved_key_outcome_of_a_one_to_one_is_the_resume_refusal() {
+async fn a_re_keying_outcome_of_a_one_to_one_is_what_resume_does() {
     let cluster = TestCluster::start();
     let db = cluster.create_isolated_database().await;
     let mut raw = connect(db.dsn()).await;
     let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
     let app = connect(db.dsn()).await;
+    let outcome = async |target: &str| {
+        paused(&trellis, target)
+            .await
+            .resume_outcome
+            .unwrap_or_else(|| panic!("{target}'s outcome"))
+    };
 
+    // Widened: g is added to the key.
     app.batch_execute("alter table public.u drop constraint u_pkey, add primary key (id, g)")
         .await
-        .expect("redefine the key");
+        .expect("widen the key");
     capture_pass(&mut raw, &db.pool).await;
     capture_pass(&mut raw, &db.pool).await;
-    let outcome = paused(&trellis, "t").await.resume_outcome.expect("outcome");
-    let err = trellis::staging::quarantine::resume_transform(&db.pool, "t")
+    assert_eq!(
+        outcome("t").await,
+        format!("RESUME would {WIDEN_T}, then rebuild public.t from public.u")
+    );
+    trellis.apply("RESUME TRANSFORM t").await.expect("resume t");
+    assert_eq!(
+        key_and_columns(&app, "public.t").await,
+        ("PRIMARY KEY (id, g)".into(), "{id,a,b,g}".into())
+    );
+    bring_live(&mut raw, &db.pool, "t").await;
+
+    // Narrowed with a view over g: refused, naming the view.
+    app.batch_execute(
+        "create view public.t_g as select g from public.t; \
+         alter table public.u drop constraint u_pkey, add primary key (id)",
+    )
+    .await
+    .expect("narrow the key");
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_outcome_is_the_refusal(&trellis, &raw, &db.pool, "t", "view public.t_g").await;
+
+    // Without the view: g is dropped.
+    app.batch_execute("drop view public.t_g; alter table public.u alter column a set not null")
         .await
-        .expect_err("the 1-1 resume refuses");
-    let reason = std::error::Error::source(&err)
-        .expect("the refusal's reason")
-        .to_string();
-    assert!(reason.contains("(id, g)"), "{reason}");
-    assert_eq!(outcome, format!("RESUME would refuse: {reason}"));
-    assert_eq!(stored_status(&raw, "t").await, TransformStatus::Paused);
+        .expect("drop the view");
+    capture_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        outcome("t").await,
+        "RESUME would re-key public.t by (id) in place, dropping the former key column g \
+         (ALTER TRANSFORM ... ADD g AS g once it is live adds it back as a field), then \
+         re-record public.u's key as (id), then re-record public.t's key as (id), then \
+         rebuild public.t from public.u"
+    );
+    trellis.apply("RESUME TRANSFORM t").await.expect("resume t");
+    assert_eq!(
+        key_and_columns(&app, "public.t").await,
+        ("PRIMARY KEY (id)".into(), "{id,a,b}".into())
+    );
+    bring_live(&mut raw, &db.pool, "t").await;
+
+    // Widened again, over a column g the user added to the target: refused,
+    // naming it.
+    app.batch_execute(
+        "alter table public.t add column g int; \
+         alter table public.u drop constraint u_pkey, add primary key (id, g)",
+    )
+    .await
+    .expect("widen the key");
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    assert_outcome_is_the_refusal(&trellis, &raw, &db.pool, "t", "Trellis didn't create").await;
+    assert_eq!(recorded_key(&raw).await, "{id}");
 }
 
 /// A source created again with no primary key, only a unique index: the

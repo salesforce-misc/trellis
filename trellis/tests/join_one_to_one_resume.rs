@@ -349,8 +349,8 @@ async fn a_resume_of_both_joins_over_the_same_tables_is_exact() {
 /// of what it holds: not the target, `R` or `M`. It names the table, and once
 /// the cause is undone the resume goes through and the rebuild is exact.
 /// (1) `b`'s `ON` columns lose the unique index they rested on, (2) `a`'s
-/// primary key is redefined, which the target, keyed by `a`'s key as define
-/// found it, cannot follow.
+/// primary key is redefined to `(id, s)`, whose column `s` the re-keying of
+/// the target would add, and which the definition's field `s` is named.
 #[tokio::test]
 async fn a_refused_resume_leaves_the_definition_paused_and_untouched() {
     for kind in KINDS {
@@ -398,7 +398,7 @@ async fn a_refused_resume_leaves_the_definition_paused_and_untouched() {
             .expect_err("the resume checks a's key");
         let message = err.to_string();
         assert!(
-            message.contains("primary key of public.a is now (id, s)"),
+            message.contains("adds its key column \"s\"") && message.contains("field \"s\""),
             "{kind:?}: {message}"
         );
         assert_eq!(status(&d, &kind.target()).await, "paused", "{kind:?}");

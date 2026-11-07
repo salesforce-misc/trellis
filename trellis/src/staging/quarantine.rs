@@ -4254,15 +4254,14 @@ async fn resume_locked(
         }
         return Ok(ResumeStep::Draining);
     }
-    // Before the re-validation: a 1-1 target an earlier release keyed by
-    // its source key's `INCLUDE` columns is re-keyed in place (#1722), and a
-    // table whose key changed while the definition was paused has it
-    // re-recorded or refuses (#1719), so the re-validation and the rebuild
-    // see the key define would key by now. Under a savepoint: a refusal
-    // keeps none of it, and the caller still records the refusal in `txn`.
+    // Before the re-validation: a 1-1 target keyed by another key than its
+    // source's now is re-keyed in place (#1746, #1722), and a table whose
+    // key changed while the definition was paused has it re-recorded or
+    // refuses (#1719), so the re-validation and the rebuild see the key
+    // define would key by now. Under a savepoint: a refusal keeps none of
+    // it, and the caller still records the refusal in `txn`.
     txn.batch_execute("savepoint resume_rekey").await?;
     let checked = async {
-        crate::defs::recorded_keys::repair_target_key(txn, &definition, source_table).await?;
         crate::defs::recorded_keys::rekey_for_resume(txn, &definition).await?;
         let revalidated = catalog::revalidate(txn, schema, floors, &definition).await?;
         catalog::check_owned_tables(txn, schema, &definition, &revalidated).await?;
@@ -5101,15 +5100,13 @@ async fn finish_requested_resume(
         // A 1-1 target's ledger is checked here too, before anything is
         // re-typed under `ACCESS EXCLUSIVE` that `resume_locked` would then
         // refuse. It re-validates the definition as `resume_locked`'s
-        // re-keying leaves it (a 1-1 target an earlier release keyed by an
-        // `INCLUDE` column, #1722, and a key that changed while it was
-        // paused, #1719), which it undoes here: `resume_locked` re-keys it
-        // under the definition's row lock.
+        // re-keying leaves it (a 1-1 target re-keyed to its source's key,
+        // #1746, and a key that changed while it was paused, #1719), which
+        // it undoes here: `resume_locked` re-keys it under the definition's
+        // row lock.
         let checked = {
             let rekeyed = txn.savepoint("resume_precheck").await?;
             let checked = async {
-                crate::defs::recorded_keys::repair_target_key(&rekeyed, &definition, &source_table)
-                    .await?;
                 crate::defs::recorded_keys::rekey_for_resume(&rekeyed, &definition).await?;
                 let revalidated =
                     catalog::revalidate(&rekeyed, schema, floors, &definition).await?;

@@ -756,8 +756,9 @@ async fn resume_outcome(
 /// The resume outcome's re-keying provider: what a resume does with
 /// `definition`'s keys before it re-validates
 /// (`staging::quarantine::resume_locked`), decided as it decides them. A
-/// 1-1 target an earlier release built over its source key's `INCLUDE`
-/// columns is re-keyed in place ([`recorded_keys::target_repair`]); each
+/// 1-1 target keyed by another key than its source's now is re-keyed in
+/// place ([`recorded_keys::target_repair`]), naming the columns it adds and
+/// drops; each
 /// table whose key changed while the definition was paused has its key
 /// re-recorded ([`recorded_keys::rekey`]); or the resume refuses. The
 /// re-recorded keys are written in `txn` for the providers after this one,
@@ -771,8 +772,7 @@ async fn rekeying(
     definition: &crate::defs::model::Definition,
     outcome: &mut ResumeOutcome,
 ) -> Result<(), CatalogError> {
-    let repair = match recorded_keys::target_repair(txn, definition, &definition.source_table).await
-    {
+    let repair = match recorded_keys::target_repair(txn, definition).await {
         Ok(repair) => repair,
         Err(err @ (CatalogError::Db(_) | CatalogError::Pool(_))) => return Err(err),
         Err(reason) => {
@@ -780,8 +780,7 @@ async fn rekeying(
             return Ok(());
         }
     };
-    let repaired = repair.as_ref().map(|r| r.target.as_str());
-    let rerecords = match recorded_keys::rekey(txn, definition, repaired).await {
+    let rerecords = match recorded_keys::rekey(txn, definition, repair.as_ref()).await {
         Ok(rerecords) => rerecords,
         Err(err @ (CatalogError::Db(_) | CatalogError::Pool(_))) => return Err(err),
         Err(reason) => {
@@ -790,13 +789,7 @@ async fn rekeying(
         }
     };
     if let Some(repair) = &repair {
-        outcome.step(format!(
-            "re-key {} by ({}) in place, dropping the former key column{} {}",
-            repair.target,
-            repair.recorded.join(", "),
-            if repair.dropped.len() == 1 { "" } else { "s" },
-            repair.dropped.join(", ")
-        ));
+        outcome.step(rekey_step(repair));
     }
     for r in &rerecords {
         outcome.step(format!(
@@ -809,6 +802,44 @@ async fn rekeying(
         recorded_keys::write_rerecords(txn, &rerecords).await?;
     }
     Ok(())
+}
+
+/// The step a resume's re-keying of a 1-1 target in place takes: the key,
+/// the key columns it adds (which empty the target until the rebuild: no
+/// row has a value for them) and the former key columns it drops, with the
+/// way to have one back. An `ALTER TRANSFORM` needs the transform live, so
+/// it adds a dropped column back as a field after the resume, of a plain 1-1
+/// transform only.
+fn rekey_step(repair: &recorded_keys::TargetRepair) -> String {
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let mut step = format!(
+        "re-key {} by ({}) in place",
+        repair.target,
+        repair.key.join(", ")
+    );
+    if !repair.added.is_empty() {
+        let added: Vec<&str> = repair.added.iter().map(|c| c.name.as_str()).collect();
+        step.push_str(&format!(
+            ", adding the key column{} {}, which empties it until the rebuild",
+            plural(added.len()),
+            added.join(", ")
+        ));
+    }
+    if !repair.dropped.is_empty() {
+        step.push_str(&format!(
+            ", dropping the former key column{} {}",
+            plural(repair.dropped.len()),
+            repair.dropped.join(", "),
+        ));
+        // A 1-1 `JOIN` takes no `ALTER TRANSFORM`.
+        if repair.alterable {
+            step.push_str(&format!(
+                " (ALTER TRANSFORM ... ADD {0} AS {0} once it is live adds it back as a field)",
+                repair.dropped[0]
+            ));
+        }
+    }
+    step
 }
 
 /// The sentence of a resume refusal: define's own, fixed in the schema, or

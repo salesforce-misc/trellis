@@ -34,12 +34,14 @@
 //!
 //! With no index over the recorded columns (dropped or redefined in place),
 //! or a record of a dropped table, a resume decides ([`decide`]): a Trellis
-//! target's key comes back only with its index; an aggregate or `JOIN`
-//! reading a user table takes the table's primary key now (it re-records it
-//! for every reader of the table, and rebuilds), and refuses when the table
-//! has none rather than take another unique index; a 1-1 transform, whose
-//! target is keyed by its source's key, refuses a different key
-//! ([`CatalogError::SourceKeyChanged`]). Anything else that reads the key
+//! target's key comes back only with its index; a reader of a user table
+//! takes the table's primary key now (it re-records it for every reader of
+//! the table, and rebuilds), and refuses when the table has none rather than
+//! take another unique index. A 1-1 transform's target is keyed by its
+//! source's key, so its resume re-keys the target in place to the key it
+//! takes ([`repair_target_key`]), adding and dropping key columns as define
+//! would create the target now, and records the target's new key, which
+//! pauses the transforms reading the target until their own resume. Anything else that reads the key
 //! (a build's start, a drain) refuses by name rather than key the table by a
 //! guess ([`check`], [`super::ddl::DdlError::RecordedKeyMissing`]).
 //!
@@ -49,7 +51,7 @@
 //! key's columns and is paused with the remedy ([`deferrable_reasons`]). A
 //! definition built over a source key with `INCLUDE` columns was built by an earlier release over the
 //! included columns too (#1722): the backfill records the corrected key and
-//! pauses it, and its `RESUME` re-keys a 1-1 target in place
+//! pauses it, and its `RESUME` re-keys a 1-1 target in place the same way
 //! ([`repair_target_key`]) and rebuilds.
 
 use tokio_postgres::GenericClient;
@@ -415,27 +417,21 @@ pub(crate) enum Rekey {
     /// No index backs the table's declared `KEY (...)`: only one built
     /// again repairs it.
     Unbacked { declared: Vec<String> },
-    /// A 1-1 transform's source has another key than its target is keyed by.
-    Changed {
-        recorded: Vec<String>,
-        primary_key: Vec<String>,
-    },
 }
 
 /// What a resume of a definition does with the key of one table it keys by,
-/// `key`: the rules of a key that changed (see the module doc). With
-/// `keys_target`, the table is the source a 1-1 target is keyed by.
+/// `key`: the rules of a key that changed (see the module doc).
 ///
 /// A record that holds (tied to the table, with its index) is kept. A
 /// Trellis target keeps the key its definition gave it: the record is tied
 /// again to a table with its index, and refused without one. A user table
 /// whose key changed (no index over the record, a record of a dropped
 /// table, or a primary key other than the record, whatever unique index
-/// over the recorded columns is left) takes its primary key now, and
-/// refuses without one; a 1-1 transform refuses a primary key other than
-/// the recorded key. A user table with no record at all is keyed by its row
-/// identity and keeps it.
-pub(crate) fn decide(key: &TableKey, keys_target: bool) -> Rekey {
+/// over the recorded columns is left) takes its primary key now, for every
+/// kind of reader, and refuses without one: a 1-1 target keyed by the old
+/// key is re-keyed to it ([`target_repair`]). A user table with no record
+/// at all is keyed by its row identity and keeps it.
+pub(crate) fn decide(key: &TableKey) -> Rekey {
     // A declared `KEY` is the table's key while an index backs it, whatever
     // its primary key does: it is recorded again for a table at the name
     // that isn't the one recorded, and never replaced by the primary key.
@@ -473,12 +469,6 @@ pub(crate) fn decide(key: &TableKey, keys_target: bool) -> Rekey {
     if key.primary_key.is_empty() {
         return Rekey::NoPrimaryKey {
             recorded: recorded.clone(),
-        };
-    }
-    if keys_target && key.primary_key != *recorded {
-        return Rekey::Changed {
-            recorded: recorded.clone(),
-            primary_key: key.primary_key.clone(),
         };
     }
     Rekey::Record(key.primary_key.clone())
@@ -537,32 +527,33 @@ async fn table_key(
     }))
 }
 
-/// The tables `definition` keys by, each with whether its target is keyed by
-/// that table's key and the `KEY (...)` it declares for it: its source, a
-/// `JOIN`'s joined table and its target.
+/// The `KEY (...)` `definition` declares for its source (a `JOIN`'s `FROM`
+/// table), if any.
+fn declared_on_source(definition: &Definition) -> Option<Vec<String>> {
+    let def = &definition.def;
+    super::source_key::declared_on(def, super::join::spec(def).map(|_| super::join::Side::From))
+        .map(<[String]>::to_vec)
+}
+
+/// The tables `definition` keys by, each with the `KEY (...)` it declares
+/// for it: its source, a `JOIN`'s joined table and its target, in that
+/// order.
 async fn tables_of(
     client: &impl GenericClient,
     definition: &Definition,
-) -> Result<Vec<(String, bool, Option<Vec<String>>)>, CatalogError> {
-    let def = &definition.def;
+) -> Result<Vec<(String, Option<Vec<String>>)>, CatalogError> {
     let mut tables = vec![(
         definition.source_table.clone(),
-        keys_target_by_source(def),
-        super::source_key::declared_on(
-            def,
-            super::join::spec(def).map(|_| super::join::Side::From),
-        )
-        .map(<[String]>::to_vec),
+        declared_on_source(definition),
     )];
     if let Some(joined) = super::catalog::join_table_of(client, definition.id).await? {
         tables.push((
             joined,
-            false,
-            super::source_key::declared_on(def, Some(super::join::Side::Joined))
+            super::source_key::declared_on(&definition.def, Some(super::join::Side::Joined))
                 .map(<[String]>::to_vec),
         ));
     }
-    tables.push((definition.target_table.clone(), false, None));
+    tables.push((definition.target_table.clone(), None));
     Ok(tables)
 }
 
@@ -601,21 +592,15 @@ async fn refusal(
                 .get(0),
             key: declared,
         })),
-        Rekey::Changed {
-            recorded,
-            primary_key,
-        } => Some(CatalogError::SourceKeyChanged {
-            source_table: table.to_string(),
-            target_key: recorded,
-            source_key: primary_key,
-        }),
     })
 }
 
 /// A resume's re-keying of `definition`, in `txn`, before it re-validates:
-/// for each table it keys by, what [`decide`] says. A re-recorded key is the
-/// table's, for every reader of it, so it commits only with the resume.
-/// Refuses as [`decide`] does, writing nothing more.
+/// a 1-1 target keyed by another key than its source's now is re-keyed in
+/// place ([`repair_target_key`]), then each table it keys by has what
+/// [`decide`] says. A re-recorded key is the table's, for every reader of
+/// it, so it commits only with the resume. Refuses as [`target_repair`] and
+/// [`decide`] do; the caller's savepoint undoes what was made before.
 ///
 /// A re-recorded key that differs from the recorded one also pauses every
 /// other reader of the table still running ([`pause_running_readers`]): the
@@ -623,16 +608,19 @@ async fn refusal(
 /// reader's key (`staging::schema_change::pause_readers_of_missing`), so a
 /// reader that wasn't paused when the key changed (this one was paused for
 /// another reason, and resumed before the pass saw the change) would
-/// otherwise read rows keyed by the new key into state keyed by the old.
+/// otherwise read rows keyed by the new key into state keyed by the old. A
+/// re-keyed 1-1 target's own record is one of them: the transforms reading
+/// it are paused, and their own resume follows these rules over its new key.
 pub(crate) async fn rekey_for_resume(
     txn: &tokio_postgres::Transaction<'_>,
     definition: &Definition,
 ) -> Result<(), CatalogError> {
+    let repaired = repair_target_key(txn, definition).await?;
     for Rerecord {
         table,
         old,
         columns,
-    } in rekey(txn, definition, None).await?
+    } in rekey(txn, definition, repaired.as_ref()).await?
     {
         write(txn, &table, &columns).await?;
         if old != columns {
@@ -661,24 +649,33 @@ pub(crate) struct Rerecord {
 
 /// What [`rekey_for_resume`] does with `definition`'s keys, reading only:
 /// the key it records for each table whose [`decide`] is a record, or the
-/// refusal it makes. `repaired` names a target [`repair_target_key`] re-keys
-/// first ([`target_repair`]): it then has the index over its recorded key.
+/// refusal it makes. `repaired` is the re-keying [`repair_target_key`]
+/// makes of the target first ([`target_repair`]): the target then has the
+/// index over the repair's key, which is recorded for it.
 /// A resume's outcome reports it before the rest of the re-validation
 /// (`staging::pause_message`).
 pub(crate) async fn rekey(
     client: &impl GenericClient,
     definition: &Definition,
-    repaired: Option<&str>,
+    repaired: Option<&TargetRepair>,
 ) -> Result<Vec<Rerecord>, CatalogError> {
     let mut records = Vec::new();
-    for (table, keys_target, declared) in tables_of(client, definition).await? {
-        let Some(mut key) = table_key(client, &table, declared.as_deref()).await? else {
+    for (table, declared) in tables_of(client, definition).await? {
+        let Some(key) = table_key(client, &table, declared.as_deref()).await? else {
             continue;
         };
-        if repaired == Some(table.as_str()) {
-            key.resolves = true;
+        if let Some(repair) = repaired.filter(|r| r.target == table) {
+            let old = key.recorded.map(|(old, _)| old).unwrap_or_default();
+            if old != repair.key {
+                records.push(Rerecord {
+                    table,
+                    old,
+                    columns: repair.key.clone(),
+                });
+            }
+            continue;
         }
-        match decide(&key, keys_target) {
+        match decide(&key) {
             Rekey::Keep => {}
             Rekey::Record(columns) => records.push(Rerecord {
                 old: key.recorded.map(|(old, _)| old).unwrap_or_default(),
@@ -767,12 +764,12 @@ pub(crate) async fn check(
     client: &impl GenericClient,
     definition: &Definition,
 ) -> Result<(), CatalogError> {
-    for (table, keys_target, declared) in tables_of(client, definition).await? {
+    for (table, declared) in tables_of(client, definition).await? {
         let Some(key) = table_key(client, &table, declared.as_deref()).await? else {
             continue;
         };
         let tied = key.recorded.as_ref().is_some_and(|(_, tied)| *tied);
-        match decide(&key, keys_target) {
+        match decide(&key) {
             Rekey::Keep => {}
             Rekey::Record(_) if !tied => {}
             Rekey::Record(_) => {
@@ -1232,133 +1229,268 @@ async fn declare_released_keys(
     Ok(None)
 }
 
-/// Re-keys a 1-1 target (plain or `JOIN`) an earlier release built over its
-/// source key's `INCLUDE` columns (#1722), or over those of the 1-1 target it
-/// reads, in `txn`, before a resume re-validates it: the target's key
-/// constraint over the old identity (the recorded key followed by columns
-/// the definition doesn't create, which only that release's key adds) is
-/// replaced in place by one over the recorded key, and each of those former
-/// key columns is dropped. The table, its
-/// rows, the user's indexes and grants stay. Its ledger's entries, keyed by
-/// the old key's text, are deleted: the rebuild re-derives every row, and
-/// its sweep removes the target rows no source row backs.
+/// Re-keys `definition`'s 1-1 target (plain or `JOIN`) in place, in `txn`,
+/// before a resume re-validates it, to the key define would key it by now:
+/// its source's key (a `JOIN`'s `FROM` table's) as the resume keys the
+/// source ([`target_repair`]). That covers a source whose key changed while
+/// the transform was paused (redefined in place, or the table created again
+/// with another key, as a conversion to a partitioned table does, #1746) and
+/// a target an earlier release built over its source key's `INCLUDE`
+/// columns (#1722).
 ///
-/// Does nothing unless the target has no index over its recorded key, its
-/// source's row identity is the recorded key, and the target has that old
-/// key. Refuses, naming them, when an object other than the
-/// key depends on a column it would drop: a user's view or index.
+/// Under the `ACCESS EXCLUSIVE` lock its `ALTER TABLE` takes, the target's
+/// key constraint is replaced in place by one over the new key, a new key
+/// column is added as define creates one (its type with no modifier, and
+/// its collation), a former key column the definition doesn't create is
+/// dropped, and one it keeps as a field becomes nullable, as define creates
+/// a field. The table, the user's indexes and grants stay. Rows no key can
+/// hold go first: every row when a key column is added (none has a value
+/// for it), else the rows whose new key is repeated. The rebuild writes
+/// them again, re-derives every row and sweeps the target rows no source
+/// row backs. A plain 1-1 target's ledger, keyed by the old key's text, is
+/// emptied; a 1-1 `JOIN`'s hidden tables are recreated by the resume.
+///
+/// Returns the re-keying, which [`rekey`] records the target's key from;
+/// `None` when the target is keyed by its source's key already. Refuses as
+/// [`target_repair`] does.
 pub(crate) async fn repair_target_key(
     txn: &tokio_postgres::Transaction<'_>,
     definition: &Definition,
-    source: &str,
-) -> Result<bool, CatalogError> {
-    let Some(repair) = target_repair(txn, definition, source).await? else {
-        return Ok(false);
+) -> Result<Option<TargetRepair>, CatalogError> {
+    let Some(repair) = target_repair(txn, definition).await? else {
+        return Ok(None);
     };
     let TargetRepair {
         target,
-        recorded,
+        key,
         constraint,
+        added,
         dropped,
         nullable,
+        made_nullable,
         ..
     } = &repair;
-    let mut actions = vec![
-        format!("drop constraint {}", quote_ident(constraint)),
-        format!(
-            "add {} ({})",
-            if *nullable {
-                "unique nulls not distinct"
-            } else {
-                "primary key"
-            },
-            recorded
-                .iter()
-                .map(|c| quote_ident(c))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    ];
+    let table = ddl::qualified_target_table_ident(target);
+    let mut actions: Vec<String> = added
+        .iter()
+        .map(|c| {
+            // As define declares a key column ([`ddl::pk_columns_ddl`]): in
+            // a nullable key, each column not null that is on the source.
+            format!(
+                "add column {}{}",
+                ddl::pk_columns_ddl(std::slice::from_ref(c)).0[0],
+                if *nullable && !c.nullable {
+                    " not null"
+                } else {
+                    ""
+                }
+            )
+        })
+        .collect();
+    actions.push(format!("drop constraint {}", quote_ident(constraint)));
     actions.extend(
         dropped
             .iter()
             .map(|c| format!("drop column {}", quote_ident(c))),
     );
+    actions.extend(
+        made_nullable
+            .iter()
+            .map(|c| format!("alter column {} drop not null", quote_ident(c))),
+    );
+    txn.batch_execute(&format!("alter table {table} {}", actions.join(", ")))
+        .await?;
+    let key_list = key
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !added.is_empty() {
+        txn.batch_execute(&format!("delete from {table}")).await?;
+    } else {
+        let same = key
+            .iter()
+            .map(|c| format!("t.{0} is not distinct from r.{0}", quote_ident(c)))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        txn.batch_execute(&format!(
+            "delete from {table} t using (select {key_list} from {table} \
+             group by {key_list} having count(*) > 1) r where {same}"
+        ))
+        .await?;
+    }
     txn.batch_execute(&format!(
-        "alter table {} {}",
-        ddl::qualified_target_table_ident(target),
-        actions.join(", ")
+        "alter table {table} add {} ({key_list})",
+        if *nullable {
+            "unique nulls not distinct"
+        } else {
+            "primary key"
+        }
     ))
     .await?;
-    // A plain 1-1 target's ledger is keyed by the old key's text; a 1-1
-    // `JOIN`'s hidden tables are recreated by the resume.
     if matches!(definition.def.key_space, KeySpace::OneToOne) {
         let ledger = ddl::qualified_target_table_ident(&super::ledger::ledger_table_name(target));
         txn.batch_execute(&format!("delete from {ledger}")).await?;
     }
     crate::instance_log::warn!(
         transform = %target,
-        key = %recorded.join(", "),
+        key = %key.join(", "),
+        added = ?added.iter().map(|c| &c.name).collect::<Vec<_>>(),
         dropped = ?dropped,
-        "re-keyed a 1-1 target an earlier release built over its source key's INCLUDE columns"
+        "re-keyed a 1-1 target in place to its source's key"
     );
-    Ok(true)
+    Ok(Some(repair))
 }
 
-/// The re-keying [`repair_target_key`] makes of a 1-1 target an earlier
-/// release built over its source key's `INCLUDE` columns.
+/// The re-keying [`repair_target_key`] makes of a 1-1 target keyed by
+/// another key than its source's now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TargetRepair {
     /// The target (an unquoted `schema.table`).
     pub(crate) target: String,
-    /// Its recorded key, which the new key constraint is over.
-    pub(crate) recorded: Vec<String>,
-    /// The key constraint over the old identity, which is replaced.
+    /// The key it is re-keyed by: its source's, in key order.
+    pub(crate) key: Vec<String>,
+    /// The key constraint over the old key, which is replaced.
     constraint: String,
+    /// The new key columns it adds, as define creates them.
+    pub(crate) added: Vec<ddl::PrimaryKeyColumn>,
     /// The former key columns it drops.
     pub(crate) dropped: Vec<String>,
-    /// Whether a recorded key column can be NULL: the new key is then a
+    /// Whether a key column can be NULL: the new key is then a
     /// `unique nulls not distinct` constraint rather than a primary key.
     nullable: bool,
+    /// The former key columns it keeps as the definition's fields, which
+    /// it makes nullable.
+    made_nullable: Vec<String>,
+    /// Whether the transform takes an `ALTER TRANSFORM` (a plain 1-1, not a
+    /// 1-1 `JOIN`), which adds a dropped column back as a field.
+    pub(crate) alterable: bool,
+}
+
+/// The key `definition`'s source (a `JOIN`'s `FROM` table) has once a
+/// resume has re-keyed it: the one [`decide`] keeps or records, with each
+/// column as a copy declares it. `None` when [`decide`] refuses it, which
+/// [`rekey`] reports, or no index is over it.
+async fn source_key_now(
+    client: &impl GenericClient,
+    definition: &Definition,
+) -> Result<Option<Vec<ddl::PrimaryKeyColumn>>, tokio_postgres::Error> {
+    let source = definition.source_table.as_str();
+    let declared = declared_on_source(definition);
+    let Some(key) = table_key(client, source, declared.as_deref()).await? else {
+        return Ok(None);
+    };
+    let columns = match decide(&key) {
+        Rekey::Keep => match key.recorded {
+            Some((recorded, _)) => recorded,
+            None => key_names(client, source).await?,
+        },
+        Rekey::Record(columns) => columns,
+        _ => return Ok(None),
+    };
+    let pk = ddl::identity_key_columns_over(client, source, Some(&columns)).await?;
+    Ok((!pk.is_empty()).then_some(pk))
+}
+
+/// Every object depending on `table`'s column `column`, or (with `column`
+/// `None`) on its key constraint `constraint` or that constraint's index
+/// `index`, but those and the column's own `NOT NULL`: a user's view
+/// (through its rewrite rule), index, constraint, foreign key or statistics
+/// object, named with its schema whatever the `search_path`, so a resume's
+/// outcome names it as the resume does.
+async fn dependents(
+    client: &impl GenericClient,
+    table: &str,
+    column: Option<&str>,
+    constraint: u32,
+    index: u32,
+) -> Result<Vec<String>, tokio_postgres::Error> {
+    Ok(client
+        .query_typed(
+            "select distinct o.type || ' ' || o.identity \
+             from pg_catalog.pg_depend d \
+             left join pg_catalog.pg_rewrite r \
+               on d.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass \
+              and r.oid = d.objid \
+             cross join lateral pg_catalog.pg_identify_object( \
+                 case when r.oid is not null then 'pg_catalog.pg_class'::pg_catalog.regclass \
+                      else d.classid end, \
+                 coalesce(r.ev_class, d.objid), \
+                 case when r.oid is not null then 0 else d.objsubid end) o \
+             where case when $2::text is null then \
+                       d.deptype = 'n' \
+                       and ((d.refclassid = 'pg_catalog.pg_constraint'::pg_catalog.regclass \
+                             and d.refobjid = $3) \
+                            or (d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass \
+                                and d.refobjid = $4)) \
+                   else d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass \
+                       and d.refobjid = pg_catalog.to_regclass($1) \
+                       and exists (select 1 from pg_catalog.pg_attribute a \
+                                   where a.attrelid = d.refobjid \
+                                     and a.attnum = d.refobjsubid and a.attname = $2) end \
+               and not (d.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass \
+                        and (d.objid = $3 or exists ( \
+                            select 1 from pg_catalog.pg_constraint c \
+                            where c.oid = d.objid and c.contype = 'n'))) \
+               and not (d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass \
+                        and d.objid = $4) \
+             order by 1",
+            &[
+                (&ddl::regclass_arg(table), Type::TEXT),
+                (&column, Type::TEXT),
+                (&constraint, Type::OID),
+                (&index, Type::OID),
+            ],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect())
 }
 
 /// What [`repair_target_key`] would do to `definition`'s target, reading
-/// only: `None` when it does nothing, the refusal when a user's object
-/// depends on a column it would drop. A resume's outcome reports it
+/// only: `None` when it does nothing (not a 1-1 transform, its target
+/// keyed by its source's key now, or no key constraint over its recorded
+/// key, which [`check`] refuses). A resume's outcome reports it
 /// (`staging::pause_message`).
+///
+/// The target's key constraint is the one over its recorded key, or, for a
+/// target an earlier release built over its source key's `INCLUDE` columns
+/// (or over those of the 1-1 target it reads), the one over the recorded key
+/// followed by columns that are neither key columns nor fields: define
+/// creates no other column, so only that release's key has them.
+///
+/// Refuses, naming them, as define of the definition would refuse the
+/// target's shape now, or where re-keying would take what isn't Trellis's: a
+/// new key column whose name a target column other than a former key column
+/// already has (a field of that name, or a column the user added,
+/// [`CatalogError::KeyColumnTaken`]), and an object other than the key that
+/// depends on a column it would drop or on the key constraint it replaces (a
+/// user's view, index or foreign key, [`CatalogError::KeyRepairBlocked`],
+/// [`CatalogError::KeyConstraintBlocked`]).
 pub(crate) async fn target_repair(
     client: &impl GenericClient,
     definition: &Definition,
-    source: &str,
 ) -> Result<Option<TargetRepair>, CatalogError> {
-    if !matches!(
-        definition.def.key_space,
-        KeySpace::OneToOne | KeySpace::JoinOneToOne(_)
-    ) {
+    if !keys_target_by_source(&definition.def) {
         return Ok(None);
     }
     let target = definition.target_table.as_str();
     let Some(recorded) = recorded_for(client, target).await? else {
         return Ok(None);
     };
-    if !ddl::identity_key_columns(client, target).await?.is_empty() {
+    let Some(source_key) = source_key_now(client, definition).await? else {
         return Ok(None);
-    }
-    if key_names(client, source).await? != recorded {
-        return Ok(None);
-    }
+    };
+    let key: Vec<String> = source_key.iter().map(|c| c.name.clone()).collect();
     let fields: Vec<&str> = definition
         .def
         .fields
         .iter()
         .map(|f| f.name.as_str())
         .collect();
-    // The target's key constraint over the old identity: the recorded key
-    // followed by columns that are neither key columns nor fields. Define
-    // creates no other column, so only an earlier release's key over its
-    // source key's `INCLUDE` columns (or, for a reader of such a target, over
-    // that target's) has them.
-    let mut old = None;
+    let mut exact = None;
+    let mut legacy = None;
     for row in client
         .query_typed(
             "select c.oid, c.conname::text, c.conindid, \
@@ -1377,64 +1509,63 @@ pub(crate) async fn target_repair(
         )
         .await?
     {
-        let key: Vec<String> = row.get(3);
-        let Some(extra) = key.strip_prefix(recorded.as_slice()) else {
-            continue;
-        };
-        if !extra.is_empty()
+        let columns: Vec<String> = row.get(3);
+        let found = (
+            row.get::<_, u32>(0),
+            row.get::<_, String>(1),
+            row.get::<_, u32>(2),
+            columns.clone(),
+        );
+        if columns == recorded {
+            exact.get_or_insert(found);
+        } else if let Some(extra) = columns.strip_prefix(recorded.as_slice())
+            && !extra.is_empty()
             && extra
                 .iter()
                 .all(|c| !fields.contains(&c.as_str()) && !recorded.contains(c))
         {
-            old = Some((
-                row.get::<_, u32>(0),
-                row.get::<_, String>(1),
-                row.get::<_, u32>(2),
-                extra.to_vec(),
-            ));
-            break;
+            legacy.get_or_insert(found);
         }
     }
-    let Some((constraint_oid, constraint, index_oid, extra)) = old else {
+    let Some((constraint_oid, constraint, index_oid, old)) = exact.or(legacy) else {
         return Ok(None);
     };
-    for column in &extra {
-        // Every object depending on the column but the key constraint, its
-        // index and the column's own `NOT NULL`: a user's view (through its
-        // rewrite rule), index, constraint or statistics object.
-        let blocking: Vec<String> = client
-            .query_typed(
-                "select distinct case \
-                     when r.oid is not null then pg_catalog.pg_describe_object( \
-                         'pg_catalog.pg_class'::pg_catalog.regclass, r.ev_class, 0) \
-                     else pg_catalog.pg_describe_object(d.classid, d.objid, d.objsubid) end \
-                 from pg_catalog.pg_depend d \
-                 join pg_catalog.pg_attribute a \
-                   on a.attrelid = d.refobjid and a.attnum = d.refobjsubid \
-                 left join pg_catalog.pg_rewrite r \
-                   on d.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass \
-                  and r.oid = d.objid \
-                 where d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass \
-                   and d.refobjid = pg_catalog.to_regclass($1) \
-                   and a.attname = $2 \
-                   and not (d.classid = 'pg_catalog.pg_constraint'::pg_catalog.regclass \
-                            and (d.objid = $3 or exists ( \
-                                select 1 from pg_catalog.pg_constraint c \
-                                where c.oid = d.objid and c.contype = 'n'))) \
-                   and not (d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass \
-                            and d.objid = $4) \
-                 order by 1",
-                &[
-                    (&ddl::regclass_arg(target), Type::TEXT),
-                    (column, Type::TEXT),
-                    (&constraint_oid, Type::OID),
-                    (&index_oid, Type::OID),
-                ],
-            )
-            .await?
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect();
+    if old == key {
+        return Ok(None);
+    }
+    let columns: Vec<String> = client
+        .query_typed(
+            "select a.attname::text from pg_catalog.pg_attribute a \
+             where a.attrelid = pg_catalog.to_regclass($1) and a.attnum > 0 \
+               and not a.attisdropped",
+            &[(&ddl::regclass_arg(target), Type::TEXT)],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    let mut added = Vec::new();
+    for column in &source_key {
+        if old.contains(&column.name) {
+            continue;
+        }
+        if columns.contains(&column.name) {
+            return Err(CatalogError::KeyColumnTaken {
+                table: target.to_string(),
+                column: column.name.clone(),
+                source_table: definition.source_table.clone(),
+                field: fields.contains(&column.name.as_str()),
+            });
+        }
+        added.push(column.clone());
+    }
+    let (made_nullable, dropped): (Vec<String>, Vec<String>) = old
+        .iter()
+        .filter(|c| !key.contains(c))
+        .cloned()
+        .partition(|c| fields.contains(&c.as_str()));
+    for column in &dropped {
+        let blocking = dependents(client, target, Some(column), constraint_oid, index_oid).await?;
         if !blocking.is_empty() {
             return Err(CatalogError::KeyRepairBlocked {
                 table: target.to_string(),
@@ -1443,24 +1574,23 @@ pub(crate) async fn target_repair(
             });
         }
     }
-    let nullable: bool = client
-        .query_typed_one(
-            "select exists (select 1 from pg_catalog.pg_attribute a \
-                            where a.attrelid = pg_catalog.to_regclass($1) \
-                              and a.attname = any($2) and not a.attnotnull)",
-            &[
-                (&ddl::regclass_arg(target), Type::TEXT),
-                (&recorded, Type::TEXT_ARRAY),
-            ],
-        )
-        .await?
-        .get(0);
+    let blocking = dependents(client, target, None, constraint_oid, index_oid).await?;
+    if !blocking.is_empty() {
+        return Err(CatalogError::KeyConstraintBlocked {
+            table: target.to_string(),
+            constraint,
+            dependents: blocking,
+        });
+    }
     Ok(Some(TargetRepair {
         target: target.to_string(),
-        recorded,
+        nullable: source_key.iter().any(|c| c.nullable),
+        key,
         constraint,
-        dropped: extra,
-        nullable,
+        added,
+        dropped,
+        made_nullable,
+        alterable: matches!(definition.def.key_space, KeySpace::OneToOne),
     }))
 }
 
@@ -1679,30 +1809,28 @@ mod tests {
             declared: Some(cols(k)),
             ..table(recorded, resolves, pk)
         };
-        for keys_target in [false, true] {
-            for pk in [&[][..], &["id"][..], &["id", "g"][..], k] {
+        for pk in [&[][..], &["id"][..], &["id", "g"][..], k] {
+            assert_eq!(
+                decide(&declared(Some((k, true)), true, pk)),
+                Rekey::Keep,
+                "{pk:?}"
+            );
+            assert_eq!(
+                decide(&declared(Some((k, false)), true, pk)),
+                Rekey::Record(cols(k)),
+                "{pk:?}"
+            );
+            assert_eq!(
+                decide(&declared(None, true, pk)),
+                Rekey::Record(cols(k)),
+                "{pk:?}"
+            );
+            for recorded in [Some((k, true)), Some((k, false)), None] {
                 assert_eq!(
-                    decide(&declared(Some((k, true)), true, pk), keys_target),
-                    Rekey::Keep,
+                    decide(&declared(recorded, false, pk)),
+                    Rekey::Unbacked { declared: cols(k) },
                     "{pk:?}"
                 );
-                assert_eq!(
-                    decide(&declared(Some((k, false)), true, pk), keys_target),
-                    Rekey::Record(cols(k)),
-                    "{pk:?}"
-                );
-                assert_eq!(
-                    decide(&declared(None, true, pk), keys_target),
-                    Rekey::Record(cols(k)),
-                    "{pk:?}"
-                );
-                for recorded in [Some((k, true)), Some((k, false)), None] {
-                    assert_eq!(
-                        decide(&declared(recorded, false, pk), keys_target),
-                        Rekey::Unbacked { declared: cols(k) },
-                        "{pk:?}"
-                    );
-                }
             }
         }
     }
@@ -1716,60 +1844,40 @@ mod tests {
     fn a_resume_keeps_re_records_or_refuses_a_key() {
         let id: &[&str] = &["id"];
         let wide: &[&str] = &["pid", "id"];
-        // A record that holds is kept, by every kind of reader.
-        for keys_target in [false, true] {
-            assert_eq!(
-                decide(&table(Some((id, true)), true, id), keys_target),
-                Rekey::Keep
-            );
-        }
+        // A record that holds is kept.
+        assert_eq!(decide(&table(Some((id, true)), true, id)), Rekey::Keep);
         // A primary key redefined in place, or the table created again with
-        // another one: an aggregate or `JOIN` takes it, a 1-1 refuses it.
+        // another one: every reader takes it, a 1-1 transform re-keying its
+        // target to it (`target_repair`).
         for tied in [true, false] {
             let changed = table(Some((id, tied)), false, wide);
-            assert_eq!(decide(&changed, false), Rekey::Record(cols(wide)));
-            assert_eq!(
-                decide(&changed, true),
-                Rekey::Changed {
-                    recorded: cols(id),
-                    primary_key: cols(wide)
-                }
-            );
+            assert_eq!(decide(&changed), Rekey::Record(cols(wide)));
         }
-        // Created again with the same key: tied to the new table, by any
-        // reader, even with another unique index over the old columns left.
-        for keys_target in [false, true] {
-            assert_eq!(
-                decide(&table(Some((id, false)), false, id), keys_target),
-                Rekey::Record(cols(id))
-            );
-        }
+        // Created again with the same key: tied to the new table, even with
+        // another unique index over the old columns left.
         assert_eq!(
-            decide(&table(Some((id, false)), true, wide), false),
+            decide(&table(Some((id, false)), false, id)),
+            Rekey::Record(cols(id))
+        );
+        assert_eq!(
+            decide(&table(Some((id, false)), true, wide)),
             Rekey::Record(cols(wide)),
             "a new table's primary key, not the old key's surviving unique index"
         );
         // The primary key moved in place with a unique index over the old
-        // columns left: capture keys the table by the primary key, so an
-        // aggregate or `JOIN` takes it and a 1-1 refuses it.
+        // columns left: capture keys the table by the primary key, so it is
+        // taken.
         let moved = table(Some((id, true)), true, &["u"]);
-        assert_eq!(decide(&moved, false), Rekey::Record(cols(&["u"])));
-        assert_eq!(
-            decide(&moved, true),
-            Rekey::Changed {
-                recorded: cols(id),
-                primary_key: cols(&["u"])
-            }
-        );
+        assert_eq!(decide(&moved), Rekey::Record(cols(&["u"])));
         // No primary key to take: refused, whatever unique index it has.
         for (tied, resolves) in [(true, false), (false, false), (false, true)] {
             assert_eq!(
-                decide(&table(Some((id, tied)), resolves, &[]), false),
+                decide(&table(Some((id, tied)), resolves, &[])),
                 Rekey::NoPrimaryKey { recorded: cols(id) }
             );
         }
         // No record: keyed by its row identity, as before.
-        assert_eq!(decide(&table(None, false, &[]), false), Rekey::Keep);
+        assert_eq!(decide(&table(None, false, &[])), Rekey::Keep);
 
         // A Trellis target keeps its definition's key: tied again when it
         // has its index, refused without, whatever primary key it has.
@@ -1777,14 +1885,14 @@ mod tests {
             trellis_target: true,
             ..table(Some((&["ga"], tied)), resolves, pk)
         };
-        assert_eq!(decide(&target(true, true, &[]), false), Rekey::Keep);
+        assert_eq!(decide(&target(true, true, &[])), Rekey::Keep);
         assert_eq!(
-            decide(&target(false, true, &[]), false),
+            decide(&target(false, true, &[])),
             Rekey::Record(cols(&["ga"]))
         );
         for tied in [true, false] {
             assert_eq!(
-                decide(&target(tied, false, &["n"]), false),
+                decide(&target(tied, false, &["n"])),
                 Rekey::Missing {
                     recorded: cols(&["ga"])
                 }

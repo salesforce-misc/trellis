@@ -163,21 +163,42 @@ pub enum CatalogError {
         lacks_schema_usage: bool,
         lacks_table_privilege: bool,
     },
-    /// A resume's re-keying of a 1-1 target an earlier release built over its
-    /// source key's `INCLUDE` columns
-    /// (`defs::recorded_keys::repair_target_key`) would drop `column`,
-    /// which the definition no longer creates, and `dependents` (a user's
-    /// view, index, ...) depend on it. The repair is to drop them, or to drop
-    /// the definition and define it again.
+    /// A resume's re-keying of a 1-1 target to its source's key now
+    /// (`defs::recorded_keys::repair_target_key`) would drop `column`, a
+    /// former key column the definition doesn't create, and `dependents` (a
+    /// user's view, index, ...) depend on it. The repair is to drop them, or
+    /// to drop the definition and define it again.
     KeyRepairBlocked {
         table: String,
         column: String,
         dependents: Vec<String>,
     },
-    /// A 1-1 definition's source was given another row-identity key after
-    /// define: its target is keyed by the old one, so a
-    /// resume can't rebuild into it. `revalidate` refuses it; the repair
-    /// is to restore the key, or to drop the definition and define it again.
+    /// A resume's re-keying of a 1-1 target to its source's key now would
+    /// replace its key constraint `constraint`, and `dependents` (a user's
+    /// foreign key or view) depend on it. The repair is to drop them, or to
+    /// drop the definition and define it again.
+    KeyConstraintBlocked {
+        table: String,
+        constraint: String,
+        dependents: Vec<String>,
+    },
+    /// A resume's re-keying of a 1-1 target would add `column`, a column of
+    /// `source_table`'s key now, as a key column, and the target has a column
+    /// of that name that isn't a copy of it: the definition's field of that
+    /// name (`field`), or a column the user added. The repair is to drop or
+    /// rename the user's column; for a field, which no `ALTER TRANSFORM` of
+    /// the paused transform can rename, to restore the key first; or to drop
+    /// the definition and define it again.
+    KeyColumnTaken {
+        table: String,
+        column: String,
+        source_table: String,
+        field: bool,
+    },
+    /// A 1-1 definition's target is keyed by another key than its source's,
+    /// and a resume found no key constraint over the target's recorded key
+    /// to re-key in place (`defs::recorded_keys::target_repair`). `revalidate`
+    /// refuses it; the repair is to drop the definition and define it again.
     SourceKeyChanged {
         source_table: String,
         /// The target's key columns: the source key define found.
@@ -532,6 +553,8 @@ impl CatalogError {
             CatalogError::TableNotAccessible { .. } => ErrorCode::Validation,
             CatalogError::SourceKeyChanged { .. } => ErrorCode::Validation,
             CatalogError::KeyRepairBlocked { .. } => ErrorCode::Validation,
+            CatalogError::KeyConstraintBlocked { .. } => ErrorCode::Validation,
+            CatalogError::KeyColumnTaken { .. } => ErrorCode::Validation,
             CatalogError::VirtualGeneratedColumn { .. } => ErrorCode::Validation,
             CatalogError::SourceIndexMissing { .. } => ErrorCode::Validation,
             CatalogError::ExtremeIndexMissing { .. } => ErrorCode::Validation,
@@ -599,6 +622,8 @@ impl CatalogError {
             self,
             CatalogError::SourceKeyChanged { .. }
                 | CatalogError::KeyRepairBlocked { .. }
+                | CatalogError::KeyConstraintBlocked { .. }
+                | CatalogError::KeyColumnTaken { .. }
                 | CatalogError::Ddl(DdlError::RecordedKeyMissing { .. })
                 | CatalogError::Ddl(DdlError::NoPrimaryKeyToRecord { .. })
                 | CatalogError::LedgerTableMissing { .. }
@@ -679,11 +704,44 @@ impl fmt::Display for CatalogError {
                 dependents,
             } => write!(
                 f,
-                "re-keying {table} drops its column {column:?}, which was part of its key only \
-                 as an INCLUDE column of its source's key and which the transform no longer \
-                 creates, and {} depend on it. Drop them and resume again, or `DROP TRANSFORM` \
-                 and define it again",
+                "re-keying {table} to its source's key drops its former key column {column:?}, \
+                 which the transform doesn't create, and {} depend on it. Drop them and resume \
+                 again, or `DROP TRANSFORM` and define it again",
                 dependents.join(", ")
+            ),
+            CatalogError::KeyConstraintBlocked {
+                table,
+                constraint,
+                dependents,
+            } => write!(
+                f,
+                "re-keying {table} to its source's key replaces its key constraint \
+                 {constraint:?}, and {} depend on it. Drop them and resume again, or \
+                 `DROP TRANSFORM` and define it again",
+                dependents.join(", ")
+            ),
+            CatalogError::KeyColumnTaken {
+                table,
+                column,
+                source_table,
+                field: true,
+            } => write!(
+                f,
+                "re-keying {table} to the key of {source_table} adds its key column {column:?}, \
+                 and the transform's field {column:?} has that name. Restore the key and \
+                 resume, then give the field another name (`ALTER TRANSFORM`), or \
+                 `DROP TRANSFORM` and define it again"
+            ),
+            CatalogError::KeyColumnTaken {
+                table,
+                column,
+                source_table,
+                field: false,
+            } => write!(
+                f,
+                "re-keying {table} to the key of {source_table} adds its key column {column:?}, \
+                 and {table} has a column of that name Trellis didn't create. Drop or rename \
+                 that column, then resume, or `DROP TRANSFORM` and define it again"
             ),
             CatalogError::SourceKeyChanged {
                 source_table,
@@ -929,6 +987,8 @@ impl std::error::Error for CatalogError {
             CatalogError::TableNotAccessible { .. } => None,
             CatalogError::SourceKeyChanged { .. } => None,
             CatalogError::KeyRepairBlocked { .. } => None,
+            CatalogError::KeyConstraintBlocked { .. } => None,
+            CatalogError::KeyColumnTaken { .. } => None,
             CatalogError::VirtualGeneratedColumn { .. } => None,
             CatalogError::SourceIndexMissing { .. } => None,
             CatalogError::ExtremeIndexMissing { .. } => None,
@@ -5116,10 +5176,10 @@ pub(crate) struct Revalidated {
 /// schema has drifted from is then refused for what define would refuse
 /// it for, naming the column and what to change.
 ///
-/// One check is a resume's own: a 1-1 target is keyed by the source key
-/// define found, so a source whose key has since been redefined fails with
-/// [`CatalogError::SourceKeyChanged`], whose only repair is to drop and
-/// define again.
+/// One check is a resume's own: a 1-1 target is keyed by its source's key,
+/// which a resume re-keys it to first
+/// ([`super::recorded_keys::rekey_for_resume`]), so a target still keyed by
+/// another one fails with [`CatalogError::SourceKeyChanged`].
 pub(crate) async fn revalidate(
     txn: &tokio_postgres::Transaction<'_>,
     schema: &str,

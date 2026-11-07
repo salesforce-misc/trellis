@@ -282,15 +282,17 @@ is declared, and neither this check nor the pass's pauses on a primary key
 that differs from it or changes. The pass checks the unique index backing
 the `KEY` instead (`staging::schema_change::pause_readers_of_unbacked_key`).
 
-A `RESUME` of an aggregate or `JOIN` reading the table takes its new primary
-key as the table's key, for every transform that reads it
+A `RESUME` of a transform reading the table takes its new primary key as
+the table's key, for every transform that reads it
 (`defs::recorded_keys`), and pauses every other transform reading the table
 that is still running, keyed by the old one (as when the resumed transform
 was paused for another reason and resumed before any pass saw the change).
 Once that key is recorded, neither the pass nor a page pauses for it: the
 pass regenerates the functions over it before the resumed transform's
-rebuild starts. A 1-1 transform's target is keyed by the
-old key, so its `RESUME` refuses the new one.
+rebuild starts. A 1-1 transform's target is keyed by its source's key, so
+its `RESUME` re-keys the target in place to the new one first, and records
+the target's new key, which pauses the transforms reading the target in turn
+([the key row](../transforms.md#supported-sources-and-targets)).
 
 ## A re-typed key column, or an outgrown copy
 
