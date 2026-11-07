@@ -225,6 +225,17 @@ likewise one equal value: a `SUM` over `numeric` may render `1.5` or `1.50`.
 results, by the type's `=`
 ([ADR-0013](decisions/0013-self-check-production-recompute-audit.md)).
 
+A `numeric(p,s)` column admits `NaN` (never `Infinity` or `-Infinity`:
+Postgres refuses them for a column with a precision). As in Postgres, a
+group's `SUM` and `AVG` are `NaN` while it holds a `NaN` and the sum and
+average of its other values once the `NaN` leaves, by a delete, an update
+or a move to another group; in a `JOIN`, a `NaN` counts once per match, and
+not at all for a key with none. A running sum can't subtract `NaN` back out,
+so the hidden partial counts each `NaN` apart from the finite values, in the
+same `__sum_<i>` column: a `NaN` adds `10^2100`, beyond any finite sum a
+`numeric(p,s)` column can reach. Checked in
+`trellis/tests/group_basis_numeric_nan.rs`.
+
 `real` and `double precision` are `ValueType::Float` (`trellis/src/float.rs`).
 Postgres, not IEEE 754, is the oracle: `NaN = NaN` is true, `NaN` sorts above
 `Infinity`, and `-0 = 0`. Operators follow Postgres's families: `real + real`

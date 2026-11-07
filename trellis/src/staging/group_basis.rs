@@ -65,7 +65,9 @@
 //! `agg_<id>`, beside a `JOIN`'s `join_<id>_*` tables): the row count
 //! `__n`, and per distinct aggregate argument `i` (1-based, in
 //! [`distinct_arguments`]' order) its non-null count `__count_<i>` and,
-//! when a `SUM` or `AVG` reads it, its sum `__sum_<i>` as `numeric`. A group
+//! when a `SUM` or `AVG` reads it, its sum `__sum_<i>` as `numeric`, which
+//! counts a `numeric` argument's `NaN`s apart from its finite values
+//! ([`NAN_WEIGHT`]: a `NaN` can't be subtracted back out of a sum). A group
 //! row is visible in the target only while `__n > 0`; a zero group stays in
 //! the hidden table until the GC collects it (below).
 //!
@@ -386,6 +388,9 @@ pub(super) struct Arg {
     pub(super) expr: Expr,
     /// Whether a `SUM` or `AVG` reads it, so it has a `__sum_<i>`.
     pub(super) summed: bool,
+    /// Whether it is a `numeric` column a `SUM` or `AVG` reads, which may
+    /// hold `NaN`: its sum counts each `NaN` as [`NAN_WEIGHT`] ([`summand`]).
+    pub(super) numeric: bool,
 }
 
 /// What a group-basis definition's target looks like ([`route`]).
@@ -497,6 +502,7 @@ pub(crate) fn route(
                 sql: render_qualified_expr_sql(arg, "s"),
                 expr: arg.clone(),
                 summed: false,
+                numeric: false,
             })
             .collect(),
         aggs: Vec::new(),
@@ -585,6 +591,7 @@ fn rewrite_with(
                         _ => return None,
                     };
                     shape.args[i].summed = true;
+                    shape.args[i].numeric |= value_type == ValueType::Numeric;
                     if function == "SUM" {
                         Agg::Sum(i, cast)
                     } else {
@@ -707,6 +714,39 @@ pub(crate) fn hidden_table_ident(schema: &str, id: i64) -> String {
         quote_ident(schema),
         quote_ident(&hidden_table_name(id))
     )
+}
+
+/// What a `NaN` adds to a `numeric` argument's `__sum_<i>`: `10^2100`.
+/// A `numeric(p,s)` value is below `10^(p-s)`, at most `10^2000`, so every
+/// finite sum a partial or a `JOIN` product holds (under `2^63` rows on a
+/// side, times as many matches) stays below `10^2040`, far under half of
+/// it. A sum is then `f + c × NAN_WEIGHT` for a finite `f` and a `NaN`
+/// count `c`, and stays so under every partial's arithmetic (sums,
+/// differences, products by counts): a `NaN` leaving takes back exactly
+/// what it added, and a count times no match is 0, where `NaN` itself is
+/// absorbing. `±Infinity` never reaches a sum: a `numeric(p,s)` column
+/// refuses it, and an unconstrained `numeric` is refused at define.
+pub(crate) const NAN_WEIGHT: &str = "1e2100";
+
+/// What the row value `value` of an argument adds to its sum, `0` for
+/// `NULL`: with `numeric` ([`Arg::numeric`]) a `NaN` counts as
+/// [`NAN_WEIGHT`] (`NaN` sorts above every number, so `least` maps it
+/// alone).
+pub(crate) fn summand(value: &str, numeric: bool) -> String {
+    if numeric {
+        format!("least(coalesce(({value})::numeric, 0), {NAN_WEIGHT})")
+    } else {
+        format!("coalesce(({value})::numeric, 0)")
+    }
+}
+
+/// The value a sum of [`summand`]s, `sum` (a `__sum_<i>` or an expression
+/// over partials), stands for: `NaN` while it counts a `NaN` (its
+/// magnitude is at least half of [`NAN_WEIGHT`]), else itself. A sum
+/// written as `NaN` before `NaN`s were counted reads as `NaN` until a
+/// rebuild rewrites it.
+pub(crate) fn visible_sum(sum: &str) -> String {
+    format!("(case when abs({sum}) >= 5e2099 then 'NaN'::numeric else {sum} end)")
 }
 
 /// The columns of the hidden table `shape` gives a definition, in order:
@@ -1625,7 +1665,10 @@ impl GroupTargetPlan {
             values.push(format!("{} as __a{i}", arg.sql));
             sums.push(format!("sum(__sgn * (__a{i} is not null)::int)::bigint"));
             if arg.summed {
-                sums.push(format!("sum(__sgn * coalesce(__a{i}, 0)::numeric)"));
+                sums.push(format!(
+                    "sum(__sgn * {})",
+                    summand(&format!("__a{i}"), arg.numeric)
+                ));
             }
         }
         for extreme in self.shape.extremes() {
@@ -1763,14 +1806,14 @@ impl GroupTargetPlan {
             Agg::CountStar => n.to_string(),
             Agg::Count(i) => count(i + 1),
             Agg::Sum(i, cast) => format!(
-                "case when {c} = 0 then null else ({s})::{cast} end",
+                "case when {c} = 0 then null else {s}::{cast} end",
                 c = count(i + 1),
-                s = sum(i + 1)
+                s = visible_sum(&sum(i + 1))
             ),
             Agg::Avg(i) => format!(
-                "case when {c} = 0 then null else ({s}) / ({c})::numeric end",
+                "case when {c} = 0 then null else {s} / ({c})::numeric end",
                 c = count(i + 1),
-                s = sum(i + 1)
+                s = visible_sum(&sum(i + 1))
             ),
         }
     }
@@ -2423,8 +2466,8 @@ impl GroupTargetPlan {
                 old.push(format!("x.__sum_{i}"));
                 old_names.push(format!("__os{i}"));
                 fresh.push(format!(
-                    "coalesce(sum(({})::numeric), 0) as __rs{i}",
-                    arg.sql
+                    "coalesce(sum({}), 0) as __rs{i}",
+                    summand(&arg.sql, arg.numeric)
                 ));
                 sets.push(format!("__sum_{i} = r.__rs{i}"));
                 zeroed.push(format!("coalesce(n.__rs{i}, 0) as __rs{i}"));
@@ -2560,8 +2603,8 @@ impl GroupTargetPlan {
             nulls.push("null".to_string());
             if arg.summed {
                 fresh.push(format!(
-                    "coalesce(sum(({})::numeric), 0) as __rs{i}",
-                    arg.sql
+                    "coalesce(sum({}), 0) as __rs{i}",
+                    summand(&arg.sql, arg.numeric)
                 ));
                 nulls.push("null".to_string());
             }
@@ -2842,8 +2885,8 @@ impl GroupTargetPlan {
             returning.push(format!("u.__count_{i} as __nc{i}"));
             if arg.summed {
                 fresh.push(format!(
-                    "coalesce(sum(({})::numeric), 0) as __rs{i}",
-                    arg.sql
+                    "coalesce(sum({}), 0) as __rs{i}",
+                    summand(&arg.sql, arg.numeric)
                 ));
                 kept.push(format!("coalesce(a.__rs{i}, 0) as __rs{i}"));
                 sets.push(format!("__sum_{i} = r.__rs{i}"));
@@ -2974,8 +3017,8 @@ impl GroupTargetPlan {
             ));
             if arg.summed {
                 fresh.push(format!(
-                    "coalesce(sum(({})::numeric), 0) as __rs{i}",
-                    arg.sql
+                    "coalesce(sum({}), 0) as __rs{i}",
+                    summand(&arg.sql, arg.numeric)
                 ));
             }
         }
@@ -5205,12 +5248,14 @@ mod tests {
                 Arg {
                     sql: "s.\"a\"".to_string(),
                     expr: Expr::Column("a".to_string()),
-                    summed: true
+                    summed: true,
+                    numeric: false,
                 },
                 Arg {
                     sql: "s.\"b\"".to_string(),
                     expr: Expr::Column("b".to_string()),
-                    summed: false
+                    summed: false,
+                    numeric: false,
                 },
             ]
         );
