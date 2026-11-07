@@ -29,9 +29,22 @@ harness overhead: cluster startup, per-case database provisioning, install,
 apply, snapshot and the oracle's recompute together are a small fraction of
 wall-clock. A quiesce's floor is mostly the staging worker's
 `reconcile_interval` (5s), which a new registration waits out before its
-build starts. Set `GENERATIVE_QUIESCE_TIMING=1` for per-op quiesce timing
-(`ManualBackend::quiesce`) and `GENERATIVE_COST_TIMING=1` for the cost split
-by phase.
+build starts. Set `GENERATIVE_QUIESCE_TIMING=1` for per-call quiesce timing
+(`ManualBackend::quiesce`: one `QUIESCE_TIMING <ms> ring_ms=<ms>
+progress_restarts=<n> ok=<bool>` line on stderr per quiesce) and
+`GENERATIVE_COST_TIMING=1` for the cost split by phase.
+
+A quiesce gives up once the ring has made no progress for 30 s, and in any
+case after 180 s. Progress is any change to the ring's drain state: a drain
+page's cursor or bucket bit, a seal or retire, a 1-1 `JOIN` fan-out step, a
+key entering or leaving quarantine. So a slow drain is waited out (the 1-1
+`JOIN` tier's racing cases stall each drain page for seconds while it holds
+the `segments` row lock, and those stalls run one after another), and a
+stuck one still fails 30 s after it stopped. Every quiesce timeout first
+prints the database's state to stderr, one `QUIESCE_DUMP` line per row: the
+ring, segments, claims, cursors, holdups, drainer heartbeats, definition
+status, quarantine, pending fan-outs, and every backend's wait event and
+locks.
 
 Because paying that cost for every property on every push/PR would be
 expensive — and because a contributor's (or agent's) first reflex is a plain

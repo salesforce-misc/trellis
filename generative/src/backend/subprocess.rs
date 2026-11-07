@@ -50,14 +50,23 @@ use trellis::dev::pool::Pool;
 use trellis::dev::staging::StagingError;
 
 use super::Snapshot;
+use super::ring_wait::QuiesceBudget;
 use super::sql;
 use crate::model::{Op, Program, Table};
 
-/// How long [`SubprocessBackend::quiesce`] waits, in total, for definitions
-/// to settle, partition maintenance to be corrected and the ring to converge before
-/// giving up — same value and rationale as
-/// `ManualBackend::QUIESCE_TIMEOUT`.
+/// How long [`SubprocessBackend::quiesce`] waits for definitions to settle,
+/// partition maintenance to be corrected and the ring to converge without
+/// the ring making any progress, before giving up — same value and rationale
+/// as `ManualBackend::QUIESCE_TIMEOUT`.
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// [`SubprocessBackend::quiesce`]'s budget, the same as
+/// `ManualBackend::QUIESCE_BUDGET`: [`QUIESCE_TIMEOUT`] without progress,
+/// three minutes in all.
+const QUIESCE_BUDGET: QuiesceBudget = QuiesceBudget {
+    no_progress: QUIESCE_TIMEOUT,
+    cap: Duration::from_secs(180),
+};
 
 /// How long [`SubprocessBackend`] waits for a freshly spawned
 /// `engine_subprocess` to write its readiness marker (i.e. for
@@ -551,7 +560,7 @@ impl super::Backend for SubprocessBackend {
 
     async fn quiesce(&mut self) -> Result<(), SubprocessBackendError> {
         // The same composed wait `ManualBackend::quiesce` runs.
-        Ok(sql::quiesce(&self.raw, &self.defs, QUIESCE_TIMEOUT).await?)
+        Ok(sql::quiesce(&self.raw, &self.defs, QUIESCE_BUDGET).await?)
     }
 
     async fn snapshot(&mut self) -> Result<Snapshot, SubprocessBackendError> {

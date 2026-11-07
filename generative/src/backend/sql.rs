@@ -25,7 +25,11 @@ use trellis::dev::defs::ast::{
     Expr, FieldDef, JoinKind, KeySpace, Operator, Predicate, QualifiedColumn, TransformDef,
     ValueType,
 };
-use trellis::dev::staging::{StagingError, await_converged, converged_through, watermark_token};
+use trellis::dev::staging::{StagingError, converged_through, watermark_token};
+
+use super::ring_wait::{
+    Expiry, ProgressDeadline, QuiesceBudget, await_ring, dump_state, expiry_reason,
+};
 
 use crate::model::{Column, Op, PartitionAction, PartitionStrategy, Partitioning, Table};
 
@@ -904,7 +908,7 @@ pub(super) enum QuiesceError {
     /// failure rather than an unwind from inside a wait loop.
     Db(tokio_postgres::Error),
     /// The ring's own wait failed: taking the watermark token, or
-    /// [`await_converged`] (a query failure or its named
+    /// [`await_ring`] (a query failure or its named
     /// `ConvergenceTimeout`).
     Staging(StagingError),
     /// `unsettled` names every target table (`def.target`) whose
@@ -1054,9 +1058,14 @@ where
 /// overshooting the moment it happens.
 const SETTLE_POLL: Duration = Duration::from_millis(20);
 
-/// Waits, within one `timeout` budget, until the engine has no work left
-/// that could still change a target. Shared by both backends'
-/// `Backend::quiesce`.
+/// Waits until the engine has no work left that could still change a
+/// target. Shared by both backends' `Backend::quiesce`.
+///
+/// `budget` bounds the wait two ways ([`ProgressDeadline`]): it fails once
+/// the ring has made no progress for `budget.no_progress`, and in any case at
+/// `budget.cap`. A slow drain that keeps committing pages is waited out; a
+/// stuck one fails a no-progress window after it stopped, with the
+/// database's state printed to stderr.
 ///
 /// A two-way check, the same one an operator makes (ADR-0002, "What `live`
 /// promises"): every definition reports `live` (or a terminal `paused` /
@@ -1073,7 +1082,7 @@ const SETTLE_POLL: Duration = Duration::from_millis(20);
 ///   any of these. `catching_up` is never stored: a reader of an upstream
 ///   that is not `live` reports it, and the upstream's own stored status is
 ///   what this check waits on.
-/// - **Caught up to the token.** [`await_converged`] against a token taken
+/// - **Caught up to the token.** [`await_converged`](trellis::dev::staging::await_converged) against a token taken
 ///   after the mutations of interest: the public read-your-writes path, so
 ///   every quiesce in the suite exercises it.
 ///
@@ -1100,25 +1109,63 @@ const SETTLE_POLL: Duration = Duration::from_millis(20);
 pub(super) async fn quiesce(
     raw: &tokio_postgres::Client,
     defs: &[TransformDef],
-    timeout: Duration,
+    budget: QuiesceBudget,
 ) -> Result<(), QuiesceError> {
-    let started = Instant::now();
+    let mut deadline = ProgressDeadline::new(budget, Instant::now());
+    quiesce_within(raw, defs, &mut deadline).await
+}
+
+/// [`quiesce`] within a caller's `deadline`, which the caller can read
+/// afterwards for how long the ring wait took and how often the ring's
+/// progress extended it.
+///
+/// The ring wait ([`await_ring`]) is the only part that extends the
+/// deadline: each time the ring's drain state moves, the no-progress window
+/// restarts, up to the budget's cap. The status and partition waits get the
+/// current window. Any timeout prints the database's state to stderr first.
+pub(super) async fn quiesce_within(
+    raw: &tokio_postgres::Client,
+    defs: &[TransformDef],
+    deadline: &mut ProgressDeadline,
+) -> Result<(), QuiesceError> {
+    let result = quiesce_passes(raw, defs, deadline).await;
+    if let Err(
+        QuiesceError::DefinitionsUnsettled { .. } | QuiesceError::PartitionsUnsettled { .. },
+    ) = &result
+    {
+        let expiry = deadline
+            .expired(Instant::now())
+            .unwrap_or(Expiry::NoProgress);
+        dump_state(raw, None, &expiry_reason(expiry, deadline)).await;
+    }
+    result
+}
+
+async fn quiesce_passes(
+    raw: &tokio_postgres::Client,
+    defs: &[TransformDef],
+    deadline: &mut ProgressDeadline,
+) -> Result<(), QuiesceError> {
     loop {
-        poll_until_empty(started, timeout, || unsettled_partitions(raw))
-            .await?
-            .map_err(|(unsettled, waited)| QuiesceError::PartitionsUnsettled {
-                unsettled,
-                waited,
-            })?;
-        poll_until_empty(started, timeout, || unsettled_definitions(raw, defs))
-            .await?
-            .map_err(|(unsettled, waited)| QuiesceError::DefinitionsUnsettled {
-                unsettled,
-                waited,
-            })?;
+        poll_until_empty(deadline.window_start(), deadline.window_budget(), || {
+            unsettled_partitions(raw)
+        })
+        .await?
+        .map_err(|(unsettled, _)| QuiesceError::PartitionsUnsettled {
+            unsettled,
+            waited: deadline.started().elapsed(),
+        })?;
+        poll_until_empty(deadline.window_start(), deadline.window_budget(), || {
+            unsettled_definitions(raw, defs)
+        })
+        .await?
+        .map_err(|(unsettled, _)| QuiesceError::DefinitionsUnsettled {
+            unsettled,
+            waited: deadline.started().elapsed(),
+        })?;
 
         let token = watermark_token(raw).await?;
-        await_converged(raw, token, timeout.saturating_sub(started.elapsed())).await?;
+        await_ring(raw, token, deadline).await?;
 
         let unsettled = unsettled_definitions(raw, defs).await?;
         if unsettled.is_empty() && unsettled_partitions(raw).await?.is_empty() {
@@ -1132,9 +1179,11 @@ pub(super) async fn quiesce(
         }
         // Every wait above checks at least once even with the budget spent,
         // so without this a state that keeps reappearing would loop forever.
-        let waited = started.elapsed();
-        if waited >= timeout {
-            return Err(QuiesceError::DefinitionsUnsettled { unsettled, waited });
+        if deadline.expired(Instant::now()).is_some() {
+            return Err(QuiesceError::DefinitionsUnsettled {
+                unsettled,
+                waited: deadline.started().elapsed(),
+            });
         }
     }
 }
@@ -1406,9 +1455,7 @@ mod tests {
             drain_ring(&engine).await
         });
 
-        quiesce(&raw, &[def], Duration::from_secs(30))
-            .await
-            .expect("quiesce");
+        quiesce(&raw, &[def], TEST_BUDGET).await.expect("quiesce");
         let returned_at = Instant::now();
         let drained_at = engine_side.await.expect("engine side");
         assert!(
@@ -1436,9 +1483,7 @@ mod tests {
             drain_ring(&engine).await
         });
 
-        quiesce(&raw, &[def], Duration::from_secs(30))
-            .await
-            .expect("quiesce");
+        quiesce(&raw, &[def], TEST_BUDGET).await.expect("quiesce");
         let returned_at = Instant::now();
         let drained_at = engine_side.await.expect("engine side");
         assert!(
@@ -1482,9 +1527,7 @@ mod tests {
             drain_ring(&engine).await
         });
 
-        quiesce(&raw, &[def], Duration::from_secs(30))
-            .await
-            .expect("quiesce");
+        quiesce(&raw, &[def], TEST_BUDGET).await.expect("quiesce");
         let returned_at = Instant::now();
         let drained_at = engine_side.await.expect("engine side");
         assert!(
@@ -1503,7 +1546,11 @@ mod tests {
         let raw = session(db.dsn()).await;
         let def = catalog_definition(&raw, "backfilling").await;
 
-        match quiesce(&raw, &[def], Duration::from_millis(300)).await {
+        let budget = QuiesceBudget {
+            no_progress: Duration::from_millis(300),
+            cap: Duration::from_millis(300),
+        };
+        match quiesce(&raw, &[def], budget).await {
             Err(QuiesceError::DefinitionsUnsettled { unsettled, .. }) => {
                 assert_eq!(unsettled, vec!["t".to_string()]);
             }
@@ -1603,5 +1650,163 @@ mod tests {
             unsettled_partitions(&raw).await.expect("probe"),
             vec!["public.r".to_string()]
         );
+    }
+
+    /// A budget no test reaches: these tests' engine side finishes in
+    /// well under a second.
+    const TEST_BUDGET: QuiesceBudget = QuiesceBudget {
+        no_progress: Duration::from_secs(30),
+        cap: Duration::from_secs(180),
+    };
+
+    /// A short budget for the progress tests, so a window passes quickly.
+    const SHORT_WINDOW: QuiesceBudget = QuiesceBudget {
+        no_progress: Duration::from_secs(2),
+        cap: Duration::from_secs(20),
+    };
+
+    /// Stands in for one committed drain page: moves bucket 0's
+    /// `drain_cursor` row of the first segment to key `step`, as a page
+    /// with more of its bucket left does.
+    async fn commit_a_page(client: &tokio_postgres::Client, step: i64) {
+        client
+            .execute(
+                "insert into drain_cursor (seg_seq, bucket, after_route, after_src_table, after_key) \
+                 values (1, 0, $1, 'public.s', $2) \
+                 on conflict (seg_seq, bucket) do update \
+                 set after_route = excluded.after_route, after_key = excluded.after_key",
+                &[&step, &step.to_string()],
+            )
+            .await
+            .expect("move the cursor");
+    }
+
+    fn assert_ring_timeout(result: Result<(), QuiesceError>) -> Duration {
+        let err = result.expect_err("the quiesce must time out");
+        let shape = format!("{err:?}");
+        assert!(
+            shape.starts_with("Staging(ConvergenceTimeout { token: "),
+            "a ring timeout keeps its error shape: {shape}"
+        );
+        match err {
+            QuiesceError::Staging(StagingError::ConvergenceTimeout { waited, .. }) => waited,
+            other => unreachable!("{other:?}"),
+        }
+    }
+
+    /// A ring that never drains and whose drain state never moves (a stuck
+    /// page, a held key) fails one no-progress window after the quiesce
+    /// started, as a fixed budget of that length did.
+    #[tokio::test]
+    async fn a_ring_that_never_moves_fails_after_one_no_progress_window() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let raw = session(db.dsn()).await;
+        let def = catalog_definition(&raw, "live").await;
+        raw.execute(STAGE_ENUMERATION, &[]).await.expect("stage");
+
+        let started = Instant::now();
+        let waited = assert_ring_timeout(quiesce(&raw, &[def], SHORT_WINDOW).await);
+        let elapsed = started.elapsed();
+        assert!(
+            waited >= SHORT_WINDOW.no_progress - Duration::from_millis(500),
+            "gave up early: {waited:?}"
+        );
+        assert!(
+            elapsed < SHORT_WINDOW.no_progress + Duration::from_secs(3),
+            "a quiesce with no progress must not be extended: {elapsed:?}"
+        );
+    }
+
+    /// A drain that keeps committing pages, for longer than a window in all,
+    /// is waited out: each committed page restarts the window.
+    #[tokio::test]
+    async fn a_ring_that_keeps_draining_is_waited_out_past_the_window() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let raw = session(db.dsn()).await;
+        let def = catalog_definition(&raw, "live").await;
+        raw.execute(STAGE_ENUMERATION, &[]).await.expect("stage");
+
+        let engine = session(db.dsn()).await;
+        let engine_side = tokio::spawn(async move {
+            for step in 0..10 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                commit_a_page(&engine, step).await;
+            }
+            drain_ring(&engine).await
+        });
+
+        let started = Instant::now();
+        quiesce(&raw, &[def], SHORT_WINDOW)
+            .await
+            .expect("a drain that keeps committing pages converges");
+        let returned_at = Instant::now();
+        let drained_at = engine_side.await.expect("engine side");
+        assert!(returned_at >= drained_at);
+        assert!(
+            started.elapsed() > SHORT_WINDOW.no_progress * 2,
+            "the drain ran past the window, so the wait must have too"
+        );
+    }
+
+    /// However long the ring keeps advancing, the quiesce gives up at the
+    /// cap.
+    #[tokio::test]
+    async fn a_ring_that_keeps_moving_without_draining_fails_at_the_cap() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let raw = session(db.dsn()).await;
+        let def = catalog_definition(&raw, "live").await;
+        raw.execute(STAGE_ENUMERATION, &[]).await.expect("stage");
+
+        let engine = session(db.dsn()).await;
+        let engine_side = tokio::spawn(async move {
+            for step in 0..=i64::MAX {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                commit_a_page(&engine, step).await;
+            }
+        });
+
+        let budget = QuiesceBudget {
+            no_progress: Duration::from_secs(2),
+            cap: Duration::from_secs(6),
+        };
+        let started = Instant::now();
+        assert_ring_timeout(quiesce(&raw, &[def], budget).await);
+        let elapsed = started.elapsed();
+        engine_side.abort();
+        assert!(
+            elapsed >= budget.cap - Duration::from_millis(500)
+                && elapsed < budget.cap + Duration::from_secs(3),
+            "ended at {elapsed:?}, not the cap"
+        );
+    }
+
+    /// A session holding the ring's bookkeeping table locked blocks the
+    /// convergence poll and the progress sample alike. Both are bounded, so
+    /// the quiesce still fails one window in, and the state dump doesn't
+    /// hang on the lock either.
+    #[tokio::test]
+    async fn a_held_lock_on_the_ring_still_fails_after_one_window() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_isolated_database().await;
+        let raw = session(db.dsn()).await;
+        let def = catalog_definition(&raw, "live").await;
+        raw.execute(STAGE_ENUMERATION, &[]).await.expect("stage");
+        let holder = session(db.dsn()).await;
+        holder
+            .batch_execute("begin; lock table segments in access exclusive mode")
+            .await
+            .expect("hold the lock");
+
+        let started = Instant::now();
+        assert_ring_timeout(quiesce(&raw, &[def], SHORT_WINDOW).await);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < SHORT_WINDOW.no_progress + Duration::from_secs(12),
+            "a held lock must not stretch the wait: {elapsed:?}"
+        );
+        holder.batch_execute("rollback").await.expect("release");
     }
 }

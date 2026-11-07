@@ -48,16 +48,29 @@ use trellis::dev::staging::{
 use trellis::{Client as EngineClient, ClientError, ClientOptions, Config};
 
 use super::Snapshot;
+use super::ring_wait::{ProgressDeadline, QuiesceBudget};
 use super::sql::{self, quote_ident};
 use crate::model::{
     BurstAction, Column, NoiseAction, NoiseEvent, NoiseEventKind, Op, Program, Table,
 };
 
-/// How long [`ManualBackend::quiesce`] waits for convergence before giving
-/// up. Generous: this backend targets correctness, not latency, and a
-/// genuinely stuck pipeline is exactly what should time out loudly rather
-/// than hang the test suite forever.
+/// How long [`ManualBackend::quiesce`] waits without the ring making any
+/// progress before giving up, and the bound on this backend's other waits.
+/// Generous: this backend targets correctness, not latency, and a genuinely
+/// stuck pipeline is exactly what should time out loudly rather than hang
+/// the test suite forever.
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `ManualBackend::quiesce`'s budget: [`QUIESCE_TIMEOUT`] without progress,
+/// restarted whenever the ring's drain state moves, and three minutes in
+/// all. A drain whose pages stall at a commit-time pause point while holding
+/// the `segments` row lock converges in about the sum of its stalls, which
+/// can run past a fixed 30 s while every page still commits
+/// (`sql::quiesce`).
+const QUIESCE_BUDGET: QuiesceBudget = QuiesceBudget {
+    no_progress: QUIESCE_TIMEOUT,
+    cap: Duration::from_secs(180),
+};
 
 /// The reclaim TTL a run that stops Postgres under a running engine gives
 /// its engine clients ([`ManualBackend::set_reclaim_ttl`]).
@@ -976,8 +989,11 @@ impl ManualBackend {
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
-        let remaining = QUIESCE_TIMEOUT.saturating_sub(started.elapsed());
-        Ok(sql::quiesce(&self.raw, &self.defs, remaining).await?)
+        let budget = QuiesceBudget {
+            no_progress: QUIESCE_TIMEOUT.saturating_sub(started.elapsed()),
+            cap: QUIESCE_BUDGET.cap.saturating_sub(started.elapsed()),
+        };
+        Ok(sql::quiesce(&self.raw, &self.defs, budget).await?)
     }
 
     /// The channel a seal notifies (`seal_phase2` `pg_notify`s it
@@ -1348,23 +1364,28 @@ impl super::Backend for ManualBackend {
     }
 
     async fn quiesce(&mut self) -> Result<(), ManualBackendError> {
-        // Opt-in per-call timing
-        // around the whole quiesce (the settle and partition
-        // waits as well as the watermark -> converge round trip), to test the
-        // hypothesis that the convergence property's wall-clock variance came
-        // from a ~10s pipeline stall. Silent and free unless
-        // `GENERATIVE_QUIESCE_TIMING` is set: the env lookup happens once per
-        // call so the default (unset) path pays exactly one `var_os` check
-        // and no clock reads.
+        // Opt-in per-call timing: the whole quiesce (the settle and
+        // partition waits as well as the watermark -> converge round trip),
+        // the ring wait's share of it, and how often the ring's progress
+        // extended the deadline past a no-progress window. Silent and free
+        // unless `GENERATIVE_QUIESCE_TIMING` is set: the env lookup happens
+        // once per call.
         let timing_enabled = std::env::var_os("GENERATIVE_QUIESCE_TIMING").is_some();
-        let start = timing_enabled.then(std::time::Instant::now);
+        let start = std::time::Instant::now();
+        let mut deadline = ProgressDeadline::new(QUIESCE_BUDGET, start);
 
         // Partition maintenance, definition status and the ring,
         // in that order — see `sql::quiesce` for why the order matters.
-        let result = sql::quiesce(&self.raw, &self.defs, QUIESCE_TIMEOUT).await;
+        let result = sql::quiesce_within(&self.raw, &self.defs, &mut deadline).await;
 
-        if let Some(start) = start {
-            eprintln!("QUIESCE_TIMING {}", start.elapsed().as_millis());
+        if timing_enabled {
+            eprintln!(
+                "QUIESCE_TIMING {} ring_ms={} progress_restarts={} ok={}",
+                start.elapsed().as_millis(),
+                deadline.ring_waited().as_millis(),
+                deadline.restarts(),
+                result.is_ok()
+            );
         }
         Ok(result?)
     }
