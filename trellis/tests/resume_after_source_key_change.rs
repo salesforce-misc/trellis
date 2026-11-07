@@ -660,27 +660,39 @@ async fn a_one_to_one_resume_onto_its_source_converted_to_a_partitioned_table_re
     );
 }
 
-/// Transforms chained off a re-keyed 1-1 target, an aggregate and another
-/// 1-1: the 1-1's resume re-records its target's key, which pauses them
-/// (their source's key changed), and each one's own resume follows the same
-/// rules over it: the aggregate rebuilds, the chained 1-1 adds `pid` to its
-/// own target's key. Both converge, and so do later changes.
+/// Transforms chained off a re-keyed 1-1 target, an aggregate, another 1-1
+/// and a 1-1 `JOIN` reading it as its `FROM` side: the 1-1's resume
+/// re-records its target's key, which pauses them (their source's key
+/// changed), and each one's own resume follows the same rules over it: the
+/// aggregate rebuilds, the chained 1-1 and the `JOIN` add `pid` to their own
+/// targets' keys. All converge, and so do later changes.
 #[tokio::test]
 async fn transforms_chained_off_a_re_keyed_one_to_one_target_resume_after_it() {
     let cluster = TestCluster::start();
-    let (db, mut raw, trellis) = setup(&cluster, SOURCE, &[COPY]).await;
+    let (db, mut raw, trellis) = setup(
+        &cluster,
+        &format!(
+            "{SOURCE}; create table public.n (pid int primary key, label text); \
+             insert into public.n select i, 'n' || i from generate_series(0, 1100) i"
+        ),
+        &[COPY],
+    )
+    .await;
+    let chained = ["c_tot", "c_copy2", "c_named"];
     for text in [
         "TRANSFORM c_tot FROM public.c_copy GROUP BY amount WITHOUT SOURCE INDEX \
          SELECT SUM(id) AS ids",
         "TRANSFORM c_copy2 FROM public.c_copy SELECT amount AS amount",
+        "TRANSFORM c_named FROM public.c_copy LEFT JOIN public.n ON c_copy.amount = n.pid \
+         SELECT c_copy.amount AS amount, n.label AS label",
     ] {
         trellis.apply(text).await.expect(text);
     }
-    bring_live(&mut raw, &db.pool, &trellis, &["c_tot", "c_copy2"]).await;
+    bring_live(&mut raw, &db.pool, &trellis, &chained).await;
     raw.batch_execute(RECREATED).await.unwrap();
     capture_pass(&mut raw, &db.pool).await;
     trellis.apply("RESUME TRANSFORM c_copy").await.unwrap();
-    for target in ["c_tot", "c_copy2"] {
+    for target in chained {
         let reported = status(&trellis, target).await;
         assert_eq!(reported.status, TransformStatus::Paused, "{target}");
         let reason = reported.capture_failure.expect("a reason").error;
@@ -690,30 +702,41 @@ async fn transforms_chained_off_a_re_keyed_one_to_one_target_resume_after_it() {
         );
     }
     bring_live(&mut raw, &db.pool, &trellis, &["c_copy"]).await;
-    trellis.apply("RESUME TRANSFORM c_tot").await.unwrap();
-    trellis.apply("RESUME TRANSFORM c_copy2").await.unwrap();
-    assert_eq!(
-        key_of(&raw, "public.c_copy2").await,
-        [[Some("PRIMARY KEY (pid, id)".into())]]
-    );
+    for target in chained {
+        trellis
+            .apply(&format!("RESUME TRANSFORM {target}"))
+            .await
+            .unwrap_or_else(|e| panic!("{target}: {e}"));
+    }
+    for target in ["public.c_copy2", "public.c_named"] {
+        assert_eq!(
+            key_of(&raw, target).await,
+            [[Some("PRIMARY KEY (pid, id)".into())]],
+            "{target}"
+        );
+    }
     let tot_actual = "select amount::text, ids::text from public.c_tot order by 1";
     let tot_oracle = "select amount::text, sum(id)::text from public.c group by amount order by 1";
     let copy2_actual = "select pid::text, id::text, amount::text from public.c_copy2 order by 1, 2";
-    bring_live(
-        &mut raw,
-        &db.pool,
-        &trellis,
-        &["c_copy", "c_tot", "c_copy2"],
-    )
-    .await;
+    let named_actual = "select pid::text, id::text, amount::text, label from public.c_named \
+                        order by 1, 2";
+    let named_oracle = "select c.pid::text, c.id::text, c.amount::text, n.label from public.c c \
+                        left join public.n n on c.amount = n.pid order by 1, 2";
+    let all = ["c_copy", "c_tot", "c_copy2", "c_named"];
+    bring_live(&mut raw, &db.pool, &trellis, &all).await;
     assert_eq!(rows(&raw, tot_actual).await, rows(&raw, tot_oracle).await);
     assert_eq!(
         rows(&raw, copy2_actual).await,
         rows(&raw, COPY_ORACLE).await
     );
+    assert_eq!(
+        rows(&raw, named_actual).await,
+        rows(&raw, named_oracle).await
+    );
     raw.batch_execute(
         "insert into public.c values (4, 8, 40), (1, 8, 2); delete from public.c where id = 2; \
-         update public.c set amount = 1000 where id = 1 and pid = 7",
+         update public.c set amount = 1000 where id = 1 and pid = 7; \
+         update public.n set label = 'forty' where pid = 40",
     )
     .await
     .unwrap();
@@ -725,6 +748,10 @@ async fn transforms_chained_off_a_re_keyed_one_to_one_target_resume_after_it() {
     assert_eq!(
         rows(&raw, copy2_actual).await,
         rows(&raw, COPY_ORACLE).await
+    );
+    assert_eq!(
+        rows(&raw, named_actual).await,
+        rows(&raw, named_oracle).await
     );
 }
 
