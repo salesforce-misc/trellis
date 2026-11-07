@@ -232,9 +232,15 @@ has the details):
   table, and `status()` says so. The transforms that read it pause when
   Trellis next applies a change of it.
 * **The unique index backing a source's `KEY (…)`**: build its replacement
-  before dropping it. Any equivalent index backs the key; with none, the
-  transforms reading the table pause when Trellis next applies a change of
-  it, and `RESUME` refuses until one is built again.
+  before dropping it. Any equivalent index backs the key, so `REINDEX
+  CONCURRENTLY`, a rename, pg_repack and `ADD PRIMARY KEY USING INDEX` change
+  nothing. With none valid, the staging worker's next reconcile pass pauses
+  every transform reading the table, whether or not a write arrived, and the
+  message gives the `CREATE UNIQUE INDEX` to run. So does a swap that drops the
+  old index before it builds the new one, when a pass runs between the two.
+  On a partitioned table, a root index whose leaf index was repaired stays
+  invalid until `ALTER INDEX … ATTACH PARTITION` is run again for that leaf.
+  `RESUME` refuses until an index backs the key, then rebuilds.
 * **The unique key on a 1-1 `JOIN`'s `b` `ON` columns:** the staging worker's
   next reconcile pass pauses the transform, naming `b` and its `ON` columns,
   whether or not a duplicate arrived. So does a swap that drops the old index

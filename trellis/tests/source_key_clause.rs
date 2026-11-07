@@ -119,17 +119,13 @@ async fn a_table_with_no_primary_key_is_keyed_by_its_key() {
     converged(&raw).await;
 }
 
-/// With the index backing a `KEY` dropped, the reader pauses on the table's
-/// next change, and `RESUME` re-validates the `KEY` against the table now:
-/// with no index backing it, it refuses by name, and once one is built
-/// again it rebuilds.
+/// With the index backing a `KEY` dropped, the reader pauses, and `RESUME`
+/// re-validates the `KEY` against the table now: with no index backing it,
+/// it refuses by name, and once one is built again it rebuilds.
 #[tokio::test]
 async fn resume_needs_an_index_backing_the_key_again() {
     let cluster = TestCluster::start();
     let (db, mut raw, trellis) = setup(&cluster, KEYLESS, &[AGG]).await;
-    // Until the backing-index detector exists (#1745 rule 6, gated on
-    // #1744), the drain pauses the reader on the table's next change: it
-    // keys no row by a guess.
     raw.batch_execute("drop index public.s_key; insert into public.s values (9, 90, 1, 9)")
         .await
         .unwrap();

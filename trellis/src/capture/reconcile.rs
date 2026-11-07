@@ -34,7 +34,10 @@
 //! ([`crate::staging::schema_change::pause_readers_of_uncapturable`]), and
 //! for a 1-1 `JOIN` whose joined table no longer has a unique key within its
 //! `ON` columns, by define's rule
-//! ([`crate::staging::schema_change::pause_joins_without_unique_key`]). The
+//! ([`crate::staging::schema_change::pause_joins_without_unique_key`]), and
+//! for every reader of a table whose declared `KEY (...)` no unique index
+//! backs any more
+//! ([`crate::staging::schema_change::pause_readers_of_unbacked_key`]). The
 //! row-level security and subscription checks also run on
 //! each table another definition targets, which the pass doesn't capture
 //! (the target-mutation seam feeds it) but its readers still read. There the
@@ -363,6 +366,25 @@ pub(crate) async fn reconcile_with_floors(
         // within its `ON` columns (an index dropped) pauses: the table can
         // take two rows on one join key now, which the target can't hold.
         match crate::staging::schema_change::pause_joins_without_unique_key(
+            client,
+            instance,
+            &snapshot.catalog,
+            &drift,
+            table,
+        )
+        .await
+        {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(err) => {
+                outcome.failed.push((table.clone(), err));
+                continue;
+            }
+        }
+        // A table keyed by a declared `KEY (...)` with no unique index
+        // backing it any more (dropped, or invalid) pauses every reader, with
+        // no grace: the table can take two rows with one key now.
+        match crate::staging::schema_change::pause_readers_of_unbacked_key(
             client,
             instance,
             &snapshot.catalog,

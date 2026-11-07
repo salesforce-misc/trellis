@@ -58,7 +58,7 @@ pub(crate) const ALREADY_PAUSED: &str = " It was already paused: ";
 pub(crate) const CAUSE_GONE: &str = "the cause it was paused for is gone";
 
 /// How the pass tells whether a reason's cause is still there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Recheck {
     /// It stands until a resume: a restore, a relabel, a halt, a disruption
     /// of capture, an operator's resume withdrawn.
@@ -69,6 +69,10 @@ pub(crate) enum Recheck {
     /// The table's primary key was redefined from the reason's columns; its
     /// cause is gone once the key is those columns again.
     Key,
+    /// No unique index backs the table's declared `KEY (...)` over the
+    /// reason's columns; its cause is gone once one does
+    /// (`defs::source_key::backing`).
+    Backing,
 }
 
 impl Recheck {
@@ -77,6 +81,7 @@ impl Recheck {
             Recheck::Stands => None,
             Recheck::Columns => Some("columns"),
             Recheck::Key => Some("key"),
+            Recheck::Backing => Some("backing"),
         }
     }
 
@@ -85,6 +90,7 @@ impl Recheck {
         match stored {
             Some("columns") => Recheck::Columns,
             Some("key") => Recheck::Key,
+            Some("backing") => Recheck::Backing,
             _ => Recheck::Stands,
         }
     }
@@ -514,19 +520,45 @@ async fn recheck(
         let columns = crate::capture::columns::live_columns(client, table).await?;
         live.insert(table.to_string(), columns);
     }
-    Ok(recheck_against(reader, reasons, |table| {
-        live.get(table)
-            .filter(|(attnums, _)| !attnums.is_empty())
-            .map(|(attnums, key)| (attnums.keys().cloned().collect(), key.clone()))
-    }))
+    let mut met = std::collections::HashSet::new();
+    for reason in reasons {
+        let found = match reason.recheck {
+            Recheck::Backing => {
+                crate::defs::source_key::backing(client, &reason.source_table, &reason.columns)
+                    .await?
+                    .is_some()
+            }
+            Recheck::Stands | Recheck::Columns | Recheck::Key => false,
+        };
+        if found {
+            met.insert((
+                reason.recheck,
+                reason.source_table.clone(),
+                reason.columns.clone(),
+            ));
+        }
+    }
+    Ok(recheck_against(
+        reader,
+        reasons,
+        |table| {
+            live.get(table)
+                .filter(|(attnums, _)| !attnums.is_empty())
+                .map(|(attnums, key)| (attnums.keys().cloned().collect(), key.clone()))
+        },
+        |recheck, table, columns| met.contains(&(recheck, table.to_string(), columns.to_vec())),
+    ))
 }
 
 /// [`recheck`] over `live`, which gives a table's column names and primary
-/// key now, or `None` when it doesn't exist.
+/// key now, or `None` when it doesn't exist, and `met`, which says whether
+/// the index a [`Recheck::Backing`] reason is about exists now on a table, over
+/// its columns.
 fn recheck_against(
     reader: &CaptureReader,
     reasons: &[Reason],
     live: impl Fn(&str) -> Option<(BTreeSet<String>, Vec<String>)>,
+    met: impl Fn(Recheck, &str, &[String]) -> bool,
 ) -> Vec<Reason> {
     let mut out: Vec<Reason> = Vec::with_capacity(reasons.len());
     for reason in reasons {
@@ -568,6 +600,11 @@ fn recheck_against(
                         super::schema_change::key_changed_error(table, &reason.columns, &key);
                 }
                 out.push(reason);
+            }
+            Recheck::Backing => {
+                if !met(reason.recheck, table, &reason.columns) {
+                    out.push(reason.clone());
+                }
             }
         }
     }
@@ -910,6 +947,15 @@ mod tests {
         ))
     }
 
+    /// [`recheck_against`] where no index a reason is about exists.
+    fn against(
+        reader: &CaptureReader,
+        reasons: &[Reason],
+        live: impl Fn(&str) -> Option<(BTreeSet<String>, Vec<String>)>,
+    ) -> Vec<Reason> {
+        recheck_against(reader, reasons, live, |_, _, _| false)
+    }
+
     fn rechecked(name: &str, columns: &[&str], recheck: Recheck) -> Reason {
         let columns: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
         Reason {
@@ -930,10 +976,10 @@ mod tests {
         let key = rechecked("key changed", &["id"], Recheck::Key);
         let reasons = [restored.clone(), missing.clone(), key.clone()];
 
-        let fixed = recheck_against(&reader, &reasons, |_| table(&["id", "b", "g"], &["id"]));
+        let fixed = against(&reader, &reasons, |_| table(&["id", "b", "g"], &["id"]));
         assert_eq!(fixed, vec![restored.clone()]);
 
-        let unchanged = recheck_against(&reader, &reasons, |_| table(&["id", "g"], &["id", "g"]));
+        let unchanged = against(&reader, &reasons, |_| table(&["id", "g"], &["id", "g"]));
         assert_eq!(unchanged[..2], [restored.clone(), missing.clone()]);
         assert_eq!(
             unchanged[2].text,
@@ -946,7 +992,7 @@ mod tests {
         assert_eq!(unchanged[2].columns, vec!["id".to_string()]);
 
         // A table that is gone leaves every reason as it is.
-        assert_eq!(recheck_against(&reader, &reasons, |_| None), reasons);
+        assert_eq!(against(&reader, &reasons, |_| None), reasons);
     }
 
     /// A column the definition reads that is gone now is a new reason,
@@ -956,7 +1002,7 @@ mod tests {
     fn a_column_gone_while_paused_is_added_as_a_reason() {
         let reader = reader("TRANSFORM t FROM s SELECT id AS id, b AS b, c AS c");
         let restored = rechecked("restored", &[], Recheck::Stands);
-        let found = recheck_against(&reader, std::slice::from_ref(&restored), |_| {
+        let found = against(&reader, std::slice::from_ref(&restored), |_| {
             table(&["id"], &["id"])
         });
         assert_eq!(found.len(), 2);
@@ -965,7 +1011,7 @@ mod tests {
         assert_eq!(found[1].columns, vec!["b".to_string(), "c".to_string()]);
 
         let missing_b = rechecked("b missing", &["b"], Recheck::Columns);
-        let found = recheck_against(&reader, std::slice::from_ref(&missing_b), |_| {
+        let found = against(&reader, std::slice::from_ref(&missing_b), |_| {
             table(&["id"], &["id"])
         });
         assert_eq!(found[0], missing_b);
@@ -973,7 +1019,7 @@ mod tests {
 
         // Only `c` back: the reason names what is still missing.
         let both = rechecked("b, c missing", &["b", "c"], Recheck::Columns);
-        let found = recheck_against(&reader, &[both], |_| table(&["id", "c"], &["id"]));
+        let found = against(&reader, &[both], |_| table(&["id", "c"], &["id"]));
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].columns, vec!["b".to_string()]);
         assert_eq!(
@@ -982,9 +1028,35 @@ mod tests {
         );
     }
 
+    /// A `KEY`'s backing index back on its table drops the reason; while
+    /// none backs it, or the table is gone, the reason stays.
+    #[test]
+    fn a_key_backed_again_drops_its_reason() {
+        let reader = reader("TRANSFORM t FROM s KEY (k) SELECT id AS id");
+        let unbacked = rechecked("no index backs KEY (k)", &["k"], Recheck::Backing);
+        let reasons = std::slice::from_ref(&unbacked);
+        let live = |_: &str| table(&["id", "k"], &[]);
+        assert_eq!(
+            recheck_against(&reader, reasons, live, |recheck, table, columns| {
+                recheck == Recheck::Backing && table == "public.s" && columns == ["k"]
+            }),
+            Vec::<Reason>::new()
+        );
+        assert_eq!(against(&reader, reasons, live), reasons);
+        assert_eq!(
+            recheck_against(&reader, reasons, |_| None, |_, _, _| true),
+            [unbacked]
+        );
+    }
+
     #[test]
     fn a_recheck_word_round_trips_and_an_unknown_one_stands() {
-        for recheck in [Recheck::Stands, Recheck::Columns, Recheck::Key] {
+        for recheck in [
+            Recheck::Stands,
+            Recheck::Columns,
+            Recheck::Key,
+            Recheck::Backing,
+        ] {
             assert_eq!(Recheck::from_stored(recheck.as_stored()), recheck);
         }
         assert_eq!(Recheck::from_stored(Some("newer")), Recheck::Stands);

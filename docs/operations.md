@@ -221,7 +221,12 @@ that sets the expression the column already has.
 
 A rewrite that leaves every value as it was rebuilds nothing: `VACUUM FULL`,
 `CLUSTER`, and an `ADD COLUMN` with a volatile default such as
-`clock_timestamp()`.
+`clock_timestamp()`. Neither does pg_repack, in table or index mode, on a
+source or a target: it keeps an equivalent valid index at every moment, so no
+index a transform relies on goes missing. Its table mode refuses an
+aggregate target whose group column can be `NULL` (the target has no primary
+key and no `NOT NULL` unique key); its index mode (`pg_repack -i`) works on
+it.
 
 ## What a repair costs
 

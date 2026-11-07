@@ -92,10 +92,22 @@ reader's primary key redefined, or the table created again with another one.
 A change to a key the transform does not use pauses nothing: a primary key
 added, redefined or dropped on a table whose readers use `KEY`.
 
-A `KEY`'s backing index going missing pauses every reader of the table, with
-no grace. That detector is built only once a false-positive study of the
-key-rule pauses against routine maintenance and migrations is posted and
-decided.
+A `KEY`'s backing index going missing or invalid pauses every reader of the
+table on the staging worker's next pass, with no grace: while no unique index
+enforces the key, the table can take two rows with one key. The check matches
+by shape, in one catalog snapshot, never by an index's oid or name. A
+false-positive study of the key-rule pauses against routine maintenance and
+migrations found that it fires only when no index enforces the key: every
+operation that keeps an equivalent valid index at every committed instant
+(`REINDEX CONCURRENTLY`, a build-then-drop swap, a rename, pg_repack,
+`ADD PRIMARY KEY USING INDEX`, partition maintenance) never trips it, while a
+drop-then-build swap pauses when a pass lands between the two. Its message
+says to build the replacement before dropping the old index and, for a
+partitioned table, to re-run `ALTER INDEX … ATTACH PARTITION` after
+repairing a leaf, whose repair alone leaves the root's index invalid. A
+re-check over two passes was rejected: it would only lengthen a window in
+which nothing enforces the key. Another transform's target gets no such
+check: no supported operation drops the key Trellis gave it.
 
 `RESUME` re-validates everything define validates, against the table as it is
 now, and if that passes, re-records the key and rebuilds. An aggregate or

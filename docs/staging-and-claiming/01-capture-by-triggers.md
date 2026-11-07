@@ -279,7 +279,8 @@ compute then applies none of those rows, and nothing is charged to
 quarantine for them. A table its transforms key by a `KEY (…)` is keyed by
 it whatever its primary key is: its functions' comment records that the key
 is declared, and neither this check nor the pass's pauses on a primary key
-that differs from it or changes.
+that differs from it or changes. The pass checks the unique index backing
+the `KEY` instead (`staging::schema_change::pause_readers_of_unbacked_key`).
 
 A `RESUME` of an aggregate or `JOIN` reading the table takes its new primary
 key as the table's key, for every transform that reads it
@@ -682,6 +683,9 @@ them:
   - a 1-1 `JOIN`'s `b` left with no unique key within its `ON` columns (an
     index dropped, or left `INVALID` by a failed build), by the pass, which
     checks it by define's rule;
+  - a table read with a `KEY (…)` left with no valid unique index backing
+    it (an index dropped, a failed build's `INVALID` index, a partitioned
+    root's index left invalid), by the pass, which matches it by shape;
   - a read column changed so define would refuse a definition reading it, so
     it would evaluate the column as another type, or so a `numeric` column
     Trellis created must be re-typed;

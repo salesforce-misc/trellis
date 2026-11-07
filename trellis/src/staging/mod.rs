@@ -127,6 +127,8 @@ pub use claim::{
     DEFAULT_DRAINER_WINDOW, claim, count_live_drainers, reclaim_stale_drainers, register_drainers,
 };
 #[cfg(any(test, feature = "internals"))]
+pub use drift_memo::backing_checks as key_backing_checks;
+#[cfg(any(test, feature = "internals"))]
 pub use drift_memo::checks as drift_checks;
 #[cfg(any(test, feature = "internals"))]
 pub use drift_memo::key_checks as unique_key_checks;

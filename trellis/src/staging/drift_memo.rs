@@ -60,7 +60,8 @@
 //!
 //! The capture pass's re-check of a 1-1 `JOIN`'s unique key on its joined
 //! table skips the same way, on that table's fingerprint alone
-//! ([`key_skippable`]), in a memo of its own.
+//! ([`key_skippable`]), in a memo of its own, and so does its check of the
+//! index backing a table's declared `KEY (...)` ([`backing_skippable`]).
 //!
 //! Nothing resets the memo for correctness: every input of the comparison is
 //! in the stamp. It is dropped for a definition when its comparison finds a
@@ -221,6 +222,7 @@ pub(crate) fn retain_readers(instance: &str, table: &str, ids: &[i64]) {
 pub(crate) fn retain_tables(instance: &str, known: &BTreeSet<&str>) {
     with_memo(|memo| memo.retain(|(i, t, _), _| i != instance || known.contains(t.as_str())));
     with_keys(|memo| memo.retain(|(i, t, _), _| i != instance || known.contains(t.as_str())));
+    with_backings(|memo| memo.retain(|(i, t), _| i != instance || known.contains(t.as_str())));
 }
 
 /// Forgets everything remembered for `instance`: its staging worker in this
@@ -228,6 +230,7 @@ pub(crate) fn retain_tables(instance: &str, known: &BTreeSet<&str>) {
 pub(crate) fn forget_instance(instance: &str) {
     with_memo(|memo| memo.retain(|(i, _, _), _| i != instance));
     with_keys(|memo| memo.retain(|(i, _, _), _| i != instance));
+    with_backings(|memo| memo.retain(|(i, _), _| i != instance));
 }
 
 /// The same skip for the capture pass's re-check of a 1-1 `JOIN`'s unique
@@ -276,6 +279,50 @@ pub(crate) fn record_key(instance: &str, table: &str, id: i64, found: Option<Str
     probe::count_key(instance, id);
 }
 
+/// The same skip for the capture pass's check of the unique index backing
+/// a table's declared `KEY (...)`
+/// (`schema_change::pause_readers_of_unbacked_key`): by capture instance and
+/// table, the stamp (the table's [`fingerprint`] and the key's columns) at
+/// which the last check found an index backing the key. The key is the
+/// table's, not a definition's: every transform reading a table keys it one
+/// way (ADR-0026).
+static BACKINGS: Mutex<BTreeMap<(String, String), String>> = Mutex::new(BTreeMap::new());
+
+fn with_backings<T>(f: impl FnOnce(&mut BTreeMap<(String, String), String>) -> T) -> T {
+    f(&mut BACKINGS.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// Whether the last check of `table`'s `KEY` found it backed at `stamp`.
+pub(crate) fn backing_skippable(instance: &str, table: &str, stamp: &str) -> bool {
+    with_backings(|memo| {
+        memo.get(&(instance.to_string(), table.to_string()))
+            .is_some_and(|found| found == stamp)
+    })
+}
+
+/// Records the outcome of one check of `table`'s `KEY`: `Some` of the
+/// stamp (read before the check) when an index backed it, `None` when none
+/// did.
+pub(crate) fn record_backing(instance: &str, table: &str, found: Option<String>) {
+    let key = (instance.to_string(), table.to_string());
+    with_backings(|memo| match found {
+        Some(stamp) => {
+            memo.insert(key, stamp);
+        }
+        None => {
+            memo.remove(&key);
+        }
+    });
+    #[cfg(any(test, feature = "internals"))]
+    probe::count_backing(instance, table);
+}
+
+/// Forgets the last check of `table`'s `KEY`: no running transform keys
+/// the table by one now.
+pub(crate) fn forget_backing(instance: &str, table: &str) {
+    with_backings(|memo| memo.remove(&(instance.to_string(), table.to_string())));
+}
+
 /// How many times the capture pass has run the full comparison for a
 /// definition, for tests that pin the skip. Compiled only under
 /// `cfg(any(test, feature = "internals"))`.
@@ -321,6 +368,36 @@ mod probe {
             .copied()
             .unwrap_or(0)
     }
+
+    static BACKING_CHECKS: Mutex<BTreeMap<(String, String), u64>> = Mutex::new(BTreeMap::new());
+
+    pub(super) fn count_backing(instance: &str, table: &str) {
+        *BACKING_CHECKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry((instance.to_string(), table.to_string()))
+            .or_default() += 1;
+    }
+
+    pub(super) fn get_backing(instance: &str, table: &str) -> u64 {
+        BACKING_CHECKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(instance.to_string(), table.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// The number of checks the capture pass has run of the index backing
+/// `table`'s declared `KEY`, for the instance with schema `schema` in
+/// database `database`, for tests that pin the skip.
+#[cfg(any(test, feature = "internals"))]
+pub fn backing_checks(database: &str, schema: &str, table: &str) -> u64 {
+    probe::get_backing(
+        &crate::capture::reconcile::instance_key(database, schema),
+        table,
+    )
 }
 
 /// The number of unique-key checks the capture pass has run for 1-1 `JOIN`
