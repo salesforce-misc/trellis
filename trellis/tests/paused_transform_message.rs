@@ -497,3 +497,58 @@ async fn the_outcome_is_what_resume_does() {
     assert!(err.to_string().contains(named), "{err} vs {dropped}");
     assert_eq!(stored_status(&raw, "s").await, TransformStatus::Paused);
 }
+
+/// A definition already paused with a record is paused again by another
+/// writer (a restore after a key change): the second reason is added in
+/// front of the first, which stays with its own state, and `RESUME`
+/// honours both.
+#[tokio::test]
+async fn a_second_pause_adds_its_reason_and_keeps_the_first() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let mut raw = connect(db.dsn()).await;
+    let trellis = setup(db.dsn(), &mut raw, &db.pool).await;
+    let app = connect(db.dsn()).await;
+
+    app.batch_execute("alter table public.u drop constraint u_pkey, add primary key (id, g)")
+        .await
+        .expect("redefine the key");
+    capture_pass(&mut raw, &db.pool).await;
+    let keyed = paused(&trellis, "s").await;
+    assert_eq!(keyed.reasons.len(), 1, "{keyed:?}");
+
+    app.batch_execute(
+        "update capture_triggers set catalog_oid = (catalog_oid::bigint + 1000)::oid \
+         where table_name = 'public.u'",
+    )
+    .await
+    .expect("look restored");
+    capture_pass(&mut raw, &db.pool).await;
+    capture_pass(&mut raw, &db.pool).await;
+    let both = paused(&trellis, "s").await;
+    assert_eq!(both.reasons.len(), 2, "{both:?}");
+    assert!(
+        both.reasons[0].contains("restored from a logical dump"),
+        "{both:?}"
+    );
+    assert_eq!(both.reasons[1], keyed.reasons[0], "{both:?}");
+    assert_eq!(
+        both.columns, keyed.columns,
+        "the record keeps the first reason's columns"
+    );
+    let outcome = both.resume_outcome.clone().expect("outcome");
+    assert!(
+        outcome.contains("reset the ordering state") && outcome.contains("rebuild public.s"),
+        "{outcome}"
+    );
+    trellis.apply("RESUME TRANSFORM s").await.expect("resume s");
+    bring_live(&mut raw, &db.pool, "s").await;
+    let totals: Vec<(i32, i64)> = raw
+        .query("select g, total::bigint from public.s order by g", &[])
+        .await
+        .expect("read s")
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(totals, vec![(0, 60), (1, 40)]);
+}
