@@ -215,3 +215,121 @@ async fn a_resume_takes_no_unique_index_as_a_changed_key() {
     bring_live(&mut raw, &db.pool, &trellis, &["c_sums"]).await;
     assert_eq!(rows(&raw, SUMS_ACTUAL).await, rows(&raw, SUMS_ORACLE).await);
 }
+
+const COPY: &str = "TRANSFORM c_copy FROM public.c SELECT amount AS amount";
+
+/// The primary key redefined in place while one reader is paused for
+/// another reason (an operator's `PAUSE`) and the others run, and that
+/// reader resumed before any pass sees the change: its resume re-records
+/// the key for the table, and pauses the readers still running, which are
+/// keyed by the old one. Otherwise the pass, which takes a recorded primary
+/// key as every reader's, regenerates capture over the new key under them.
+#[tokio::test]
+async fn a_re_record_pauses_the_readers_still_running_on_the_old_key() {
+    let cluster = TestCluster::start();
+    let (db, mut raw, trellis) = setup(&cluster, SOURCE, &[SUMS, COPY, COUNTS]).await;
+    trellis.apply("PAUSE TRANSFORM c_counts").await.unwrap();
+    raw.batch_execute("alter table public.c drop constraint c_pkey, add primary key (id, pid)")
+        .await
+        .unwrap();
+    trellis.apply("RESUME TRANSFORM c_counts").await.unwrap();
+    assert_eq!(recorded(&raw).await, [[Some("{id,pid}".to_string())]]);
+    for target in ["c_sums", "c_copy"] {
+        let status = status(&trellis, target).await;
+        assert_eq!(status.status, TransformStatus::Paused, "{target}");
+        let reason = status.capture_failure.expect("a reason").error;
+        assert!(
+            reason.contains("changed from (\"id\") to (\"id\", \"pid\")"),
+            "{reason}"
+        );
+    }
+    bring_live(&mut raw, &db.pool, &trellis, &["c_counts"]).await;
+    raw.batch_execute("insert into public.c values (100, 2, 7); delete from public.c where id = 1")
+        .await
+        .unwrap();
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        rows(&raw, COUNTS_ACTUAL).await,
+        rows(&raw, COUNTS_ORACLE).await
+    );
+
+    // The aggregate resumes onto the recorded key; the 1-1 refuses it, its
+    // target keyed by the old one.
+    trellis.apply("RESUME TRANSFORM c_sums").await.unwrap();
+    bring_live(&mut raw, &db.pool, &trellis, &["c_sums", "c_counts"]).await;
+    assert_eq!(rows(&raw, SUMS_ACTUAL).await, rows(&raw, SUMS_ORACLE).await);
+    trellis
+        .apply("RESUME TRANSFORM c_copy")
+        .await
+        .expect_err("a 1-1 target keyed by the old key");
+    assert_eq!(
+        status(&trellis, "c_copy").await.status,
+        TransformStatus::Paused
+    );
+}
+
+/// The primary key moved in place to other columns while a unique index
+/// over the old key's columns is left: capture keys the table by its primary
+/// key, so the resume takes it rather than keep the record because an index
+/// still covers it, and the next pass doesn't pause the aggregate again.
+#[tokio::test]
+async fn an_aggregate_resumes_onto_a_primary_key_moved_beside_the_old_key_s_index() {
+    let cluster = TestCluster::start();
+    let (db, mut raw, trellis) = setup(&cluster, SOURCE, &[SUMS]).await;
+    raw.batch_execute(
+        "alter table public.c add column u int; update public.c set u = id * 10; \
+         alter table public.c alter column u set not null; \
+         create unique index c_id_key on public.c (id); \
+         alter table public.c drop constraint c_pkey, add primary key (u)",
+    )
+    .await
+    .unwrap();
+    full_pass(&mut raw, &db.pool).await;
+    assert_eq!(
+        status(&trellis, "c_sums").await.status,
+        TransformStatus::Paused
+    );
+    trellis.apply("RESUME TRANSFORM c_sums").await.unwrap();
+    assert_eq!(recorded(&raw).await, [[Some("{u}".to_string())]]);
+    bring_live(&mut raw, &db.pool, &trellis, &["c_sums"]).await;
+    assert_eq!(rows(&raw, SUMS_ACTUAL).await, rows(&raw, SUMS_ORACLE).await);
+    raw.batch_execute(
+        "insert into public.c values (100, 2, 7, 1000); delete from public.c where id = 1; \
+         update public.c set amount = 50 where id = 2",
+    )
+    .await
+    .unwrap();
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    assert_eq!(
+        status(&trellis, "c_sums").await.status,
+        TransformStatus::Live
+    );
+    assert_eq!(rows(&raw, SUMS_ACTUAL).await, rows(&raw, SUMS_ORACLE).await);
+}
+
+/// A resume the re-validation refuses after the key was re-recorded (the
+/// recreated source lacks a column the aggregate reads) keeps none of the
+/// re-keying: the record is still the old table's.
+#[tokio::test]
+async fn a_refused_resume_keeps_the_old_record() {
+    let cluster = TestCluster::start();
+    let (db, mut raw, trellis) = setup(&cluster, SOURCE, &[SUMS]).await;
+    raw.batch_execute(
+        "drop table public.c; \
+         create table public.c (id int not null, pid int not null, primary key (pid, id)); \
+         insert into public.c values (1, 7)",
+    )
+    .await
+    .unwrap();
+    full_pass(&mut raw, &db.pool).await;
+    trellis
+        .apply("RESUME TRANSFORM c_sums")
+        .await
+        .expect_err("amount is gone");
+    assert_eq!(recorded(&raw).await, [[Some("{id}".to_string())]]);
+    assert_eq!(
+        status(&trellis, "c_sums").await.status,
+        TransformStatus::Paused
+    );
+}

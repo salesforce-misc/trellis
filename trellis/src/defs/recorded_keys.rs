@@ -339,15 +339,22 @@ pub(crate) enum Rekey {
 /// A record that holds (tied to the table, with its index) is kept. A
 /// Trellis target keeps the key its definition gave it: the record is tied
 /// again to a table with its index, and refused without one. A user table
-/// whose key changed (no index over the record, or a record of a dropped
-/// table) takes its primary key now, and refuses without one; a 1-1
-/// transform refuses a primary key other than the recorded key. A user
-/// table with no record at all is keyed by its row identity and keeps it.
+/// whose key changed (no index over the record, a record of a dropped
+/// table, or a primary key other than the record, whatever unique index
+/// over the recorded columns is left) takes its primary key now, and
+/// refuses without one; a 1-1 transform refuses a primary key other than
+/// the recorded key. A user table with no record at all is keyed by its row
+/// identity and keeps it.
 pub(crate) fn decide(key: &TableKey, keys_target: bool) -> Rekey {
     let Some((recorded, tied)) = &key.recorded else {
         return Rekey::Keep;
     };
-    if key.resolves && (*tied || key.trellis_target) {
+    // A user table's primary key is what capture keys it by: one other than
+    // the record is a changed key even while a unique index over the
+    // recorded columns is left.
+    let primary_key_moved =
+        !key.trellis_target && !key.primary_key.is_empty() && key.primary_key != *recorded;
+    if key.resolves && (*tied || key.trellis_target) && !primary_key_moved {
         return if *tied {
             Rekey::Keep
         } else {
@@ -475,8 +482,16 @@ async fn refusal(
 /// for each table it keys by, what [`decide`] says. A re-recorded key is the
 /// table's, for every reader of it, so it commits only with the resume.
 /// Refuses as [`decide`] does, writing nothing more.
+///
+/// A re-recorded key that differs from the recorded one also pauses every
+/// other reader of the table still running ([`pause_running_readers`]): the
+/// capture pass takes a primary key that is the table's record as every
+/// reader's key (`staging::schema_change::pause_readers_of_missing`), so a
+/// reader that wasn't paused when the key changed (this one was paused for
+/// another reason, and resumed before the pass saw the change) would
+/// otherwise read rows keyed by the new key into state keyed by the old.
 pub(crate) async fn rekey_for_resume(
-    txn: &impl GenericClient,
+    txn: &tokio_postgres::Transaction<'_>,
     definition: &Definition,
 ) -> Result<(), CatalogError> {
     let mut records = Vec::new();
@@ -486,7 +501,10 @@ pub(crate) async fn rekey_for_resume(
         };
         match decide(&key, keys_target) {
             Rekey::Keep => {}
-            Rekey::Record(columns) => records.push((table, columns)),
+            Rekey::Record(columns) => {
+                let old = key.recorded.map(|(old, _)| old).unwrap_or_default();
+                records.push((table, old, columns));
+            }
             rekey => {
                 if let Some(err) = refusal(txn, &table, rekey).await? {
                     return Err(err);
@@ -494,14 +512,53 @@ pub(crate) async fn rekey_for_resume(
             }
         }
     }
-    for (table, columns) in records {
+    for (table, old, columns) in records {
         write(txn, &table, &columns).await?;
+        if old != columns {
+            pause_running_readers(txn, definition.id, &table, &old, &columns).await?;
+        }
         crate::instance_log::info!(
             transform = %definition.target_table,
             table = %table,
             key = %columns.join(", "),
             "recorded the key of a table whose key changed while its reader was paused"
         );
+    }
+    Ok(())
+}
+
+/// Pauses every definition but `resumed` that reads `table` (its source or
+/// a `JOIN`'s joined table) and is still running, as the capture pass pauses
+/// the readers of a primary key redefined from `old` to `new`: they are
+/// keyed by `old`, and their own resume rebuilds them over `new`. A paused
+/// reader is left alone, so this never waits on a concurrent resume of one.
+async fn pause_running_readers(
+    txn: &tokio_postgres::Transaction<'_>,
+    resumed: i64,
+    table: &str,
+    old: &[String],
+    new: &[String],
+) -> Result<(), CatalogError> {
+    let running: Vec<i64> = txn
+        .query(
+            "select id from transform_definitions \
+             where id <> $1 and (source_table = $2 or join_table = $2) and status = any($3) \
+             order by id",
+            &[
+                &resumed,
+                &table,
+                &super::model::StoredStatus::dispatchable(),
+            ],
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    let error = crate::staging::schema_change::key_changed_error(table, old, new);
+    for id in running {
+        if super::lifecycle::pause_for_capture_failure(txn, id, table, old, &error, None).await? {
+            crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
+        }
     }
     Ok(())
 }
@@ -1156,6 +1213,18 @@ mod tests {
             decide(&table(Some((id, false)), true, wide), false),
             Rekey::Record(cols(wide)),
             "a new table's primary key, not the old key's surviving unique index"
+        );
+        // The primary key moved in place with a unique index over the old
+        // columns left: capture keys the table by the primary key, so an
+        // aggregate or `JOIN` takes it and a 1-1 refuses it.
+        let moved = table(Some((id, true)), true, &["u"]);
+        assert_eq!(decide(&moved, false), Rekey::Record(cols(&["u"])));
+        assert_eq!(
+            decide(&moved, true),
+            Rekey::Changed {
+                recorded: cols(id),
+                primary_key: cols(&["u"])
+            }
         );
         // No primary key to take: refused, whatever unique index it has.
         for (tied, resolves) in [(true, false), (false, false), (false, true)] {

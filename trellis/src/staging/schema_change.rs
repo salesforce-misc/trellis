@@ -288,7 +288,7 @@ fn missing_columns_error(table: &str, columns: &[String]) -> String {
 
 /// The `capture_failure` sentence for a definition paused because `table`'s
 /// primary key changed from `old` to `new`.
-fn key_changed_error(table: &str, old: &[String], new: &[String]) -> String {
+pub(crate) fn key_changed_error(table: &str, old: &[String], new: &[String]) -> String {
     format!(
         "the primary key of {table} changed from ({}) to ({}), and this definition's rows \
          are keyed by the old one. RESUME rebuilds an aggregate or JOIN over the new key; a \

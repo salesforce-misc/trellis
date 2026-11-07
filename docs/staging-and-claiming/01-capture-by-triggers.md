@@ -279,9 +279,12 @@ quarantine for them.
 
 A `RESUME` of an aggregate or `JOIN` reading the table takes its new primary
 key as the table's key, for every transform that reads it
-(`defs::recorded_keys`). Once that key is recorded, neither the pass nor a
-page pauses for it: the pass regenerates the functions over it before the
-resumed transform's rebuild starts. A 1-1 transform's target is keyed by the
+(`defs::recorded_keys`), and pauses every other transform reading the table
+that is still running, keyed by the old one (as when the resumed transform
+was paused for another reason and resumed before any pass saw the change).
+Once that key is recorded, neither the pass nor a page pauses for it: the
+pass regenerates the functions over it before the resumed transform's
+rebuild starts. A 1-1 transform's target is keyed by the
 old key, so its `RESUME` refuses the new one.
 
 ## A re-typed key column, or an outgrown copy
