@@ -71,8 +71,10 @@ pub(crate) fn declared_by_reader<'a>(
 ///
 /// An index backs a key when it is a unique index whose key columns are
 /// exactly `columns`, in any order (an `INCLUDE` column is no key column),
-/// and it is valid, immediate, not partial and over no expression, and every
-/// key column is `NOT NULL` or the index is `NULLS NOT DISTINCT`. Any such
+/// and it is valid, immediate, not partial and over no expression, every
+/// key column is under its type's default operator class and its own
+/// collation, and every key column is `NOT NULL` or the index is
+/// `NULLS NOT DISTINCT`. Any such
 /// index does: the match is by shape, never by the index's name or oid, so
 /// one built to replace it serves as well. One statement, so one snapshot.
 pub(crate) async fn backing(
@@ -103,6 +105,17 @@ pub(crate) async fn backing(
                               join pg_catalog.pg_attribute a \
                                 on a.attrelid = i.indrelid and a.attnum = k.attnum \
                               where k.ord <= i.indnkeyatts and not a.attnotnull)) \
+                       and not exists ( \
+                              select 1 \
+                              from rows from (pg_catalog.unnest(i.indkey::int2[]), \
+                                              pg_catalog.unnest(i.indclass::oid[]), \
+                                              pg_catalog.unnest(i.indcollation::oid[])) \
+                                   with ordinality k(attnum, opclass, coll, ord) \
+                              join pg_catalog.pg_attribute a \
+                                on a.attrelid = i.indrelid and a.attnum = k.attnum \
+                              join pg_catalog.pg_opclass oc on oc.oid = k.opclass \
+                              where k.ord <= i.indnkeyatts \
+                                and (not oc.opcdefault or k.coll <> a.attcollation)) \
                      order by i.indisprimary desc, i.indexrelid \
                      limit 1) \
                  select a.attname::text, {}, not a.attnotnull, \

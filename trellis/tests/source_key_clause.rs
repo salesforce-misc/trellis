@@ -312,7 +312,9 @@ async fn a_primary_key_change_on_a_table_keyed_by_key_pauses_nothing() {
 }
 
 /// Every define refusal of a key: none at all, a `KEY` no index backs (none
-/// over its columns, a partial, expression, nullable or deferrable one), a
+/// over its columns, a partial, expression, nullable or deferrable one, one
+/// under a non-default operator class or another collation than its
+/// column's), a
 /// deferrable primary key named as a `KEY`, a `KEY` on another transform's target,
 /// and a key other than the one the table's other transforms use.
 #[tokio::test]
@@ -340,7 +342,11 @@ async fn define_refuses_a_key_it_cannot_key_by() {
          create table public.deferred_pk (id int primary key deferrable, v int); \
          create table public.both (id int primary key, k int not null unique, \
              j int not null unique, v int); \
-         create table public.other (id int primary key, bk int)",
+         create table public.other (id int primary key, bk int); \
+         create table public.opclass (a text not null, v int); \
+         create unique index opclass_a on public.opclass (a text_pattern_ops); \
+         create table public.collated (a text not null, v int); \
+         create unique index collated_a on public.collated (a collate \"C\")",
     )
     .await
     .unwrap();
@@ -385,6 +391,14 @@ async fn define_refuses_a_key_it_cannot_key_by() {
         (
             "TRANSFORM def_copy FROM public.deferred KEY (a) SELECT v AS v",
             "deferrable",
+        ),
+        (
+            "TRANSFORM opc_copy FROM public.opclass KEY (a) SELECT v AS v",
+            "under a non-default operator class",
+        ),
+        (
+            "TRANSFORM coll_copy FROM public.collated KEY (a) SELECT v AS v",
+            "under a collation other than its column's",
         ),
     ] {
         let message = refused(text).await;

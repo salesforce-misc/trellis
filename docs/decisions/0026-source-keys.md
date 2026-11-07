@@ -52,8 +52,11 @@ keep it. A definition using it carries the floor of the release it arrived in
 
 A `KEY` must be backed by a unique index whose key columns are exactly the
 named columns, in any order (`INCLUDE` columns are not key columns),
-that is valid, immediate, not partial and over no expression, with every
-column `NOT NULL` or the index `NULLS NOT DISTINCT`. Its column types go
+that is valid, immediate, not partial and over no expression, with each
+column under its type's default operator class and the column's own
+collation, and every column `NOT NULL` or the index `NULLS NOT DISTINCT`. An
+index under another operator class or collation could compare keys more
+finely than Trellis does and admit two rows with one key. Its column types go
 through the key-type allowlist a primary key's do.
 
 Any equivalent index backs it: the match is by shape, never by an index's oid

@@ -280,6 +280,23 @@ pub(crate) async fn unique_indexes(
                         case when not i.indisvalid then ', invalid' end, \
                         case when i.indpred is not null then ', partial' end, \
                         case when not i.indimmediate then ', deferrable' end, \
+                        case when exists ( \
+                                 select 1 \
+                                 from unnest(i.indkey::int2[], i.indclass::oid[]) \
+                                      with ordinality k(attnum, opclass, ord) \
+                                 join pg_catalog.pg_opclass oc on oc.oid = k.opclass \
+                                 where k.ord <= i.indnkeyatts and k.attnum <> 0 \
+                                   and not oc.opcdefault) \
+                             then ', under a non-default operator class' end, \
+                        case when exists ( \
+                                 select 1 \
+                                 from unnest(i.indkey::int2[], i.indcollation::oid[]) \
+                                      with ordinality k(attnum, coll, ord) \
+                                 join pg_catalog.pg_attribute a \
+                                   on a.attrelid = i.indrelid and a.attnum = k.attnum \
+                                 where k.ord <= i.indnkeyatts \
+                                   and k.coll <> a.attcollation) \
+                             then ', under a collation other than its column''s' end, \
                         case when not i.indnullsnotdistinct and exists ( \
                                  select 1 \
                                  from unnest(i.indkey::int2[]) with ordinality k(attnum, ord) \

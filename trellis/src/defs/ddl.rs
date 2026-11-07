@@ -219,7 +219,8 @@ pub enum DdlError {
     KeyOnTrellisTarget { table: String, key: Vec<String> },
     /// No unique index backs a definition's `KEY (...)` for `table`: none
     /// is a valid, immediate, non-partial unique index over exactly those
-    /// columns and no expression, with every column `NOT NULL` or the index
+    /// columns and no expression, each under its type's default operator
+    /// class and its own collation, with every column `NOT NULL` or the index
     /// `NULLS NOT DISTINCT` (ADR-0026).
     KeyNotBacked {
         table: String,
@@ -393,7 +394,8 @@ impl fmt::Display for DdlError {
                     f,
                     "no unique index backs KEY ({}) on '{table}': it needs a valid, \
                      immediate (not deferrable), non-partial unique index over exactly those \
-                     columns and no expression, with every column NOT NULL or the index \
+                     columns and no expression, each under its type's default operator class \
+                     and its own collation, with every column NOT NULL or the index \
                      NULLS NOT DISTINCT; {}. Create one (create unique index concurrently \
                      ... on {table} ({}))",
                     key.join(", "),
