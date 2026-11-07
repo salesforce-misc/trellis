@@ -209,6 +209,54 @@ async fn an_unbacked_key_outcome_is_the_resume_refusal() {
     );
 }
 
+/// A paused reader of a table keyed by `KEY`, created again at its name
+/// with the key's index and a primary key over another column: the outcome
+/// the pass works out re-records the declared key for the new table, never
+/// its primary key, and `RESUME` does just that and rebuilds.
+#[tokio::test]
+async fn a_key_table_created_again_outcome_re_records_the_declared_key() {
+    let cluster = TestCluster::start();
+    let (db, mut raw, trellis) = setup(&cluster, KEYLESS, &[AGG]).await;
+    raw.batch_execute(
+        "drop table public.s; \
+         create table public.s (k1 int not null, k2 int not null, g int, v int primary key); \
+         create unique index s_key on public.s (k2, k1); \
+         insert into public.s select i, i * 10, i % 2, i from generate_series(1, 4) i",
+    )
+    .await
+    .unwrap();
+    full_pass(&mut raw, &db.pool).await;
+    drain_to_quiescence(&db.pool, &mut raw).await;
+    full_pass(&mut raw, &db.pool).await;
+    full_pass(&mut raw, &db.pool).await;
+    let reported = status(&trellis, "s_sums").await;
+    assert_eq!(reported.status, TransformStatus::Paused);
+    let outcome = reported
+        .capture_failure
+        .expect("s_sums reports why it is paused")
+        .resume_outcome
+        .expect("the pass worked out the outcome");
+    assert_eq!(
+        outcome,
+        "RESUME would re-record public.s's key as (k1, k2), then rebuild public.s_sums \
+         from public.s"
+    );
+    trellis.apply("RESUME TRANSFORM s_sums").await.unwrap();
+    assert_eq!(
+        rows(
+            &raw,
+            "select key_columns::text, (relation_oid = 'public.s'::regclass::oid)::text \
+             from trellis.definition_keys where table_name = 'public.s'"
+        )
+        .await,
+        [[Some("{k1,k2}".to_string()), Some("true".to_string())]],
+        "the declared key, tied to the new table"
+    );
+    bring_live(&mut raw, &db.pool, &trellis, &["s_sums"]).await;
+    assert_eq!(rows(&raw, AGG_ACTUAL).await, rows(&raw, AGG_ORACLE).await);
+    assert_eq!(capture_key(&raw, "public.s").await, "k1,k2");
+}
+
 /// The readers of a table keyed by `KEY (k)` are keyed by it whatever its
 /// primary key does (#1744's finding: the primary-key change detectors are
 /// scoped to readers keyed by the primary key). The primary key redefined
