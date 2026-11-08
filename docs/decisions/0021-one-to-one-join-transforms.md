@@ -6,8 +6,8 @@ deciders: Michael Ries
 
 # 1-1 JOIN Transforms
 
-Some queries join two tables without changing the grain. They bring columns of
-both into one row per row of the first, often to compute a value from both:
+Some queries join tables without changing the grain. They bring columns of
+each into one row per row of the first, often to compute a value from them:
 
 ```sql
 SELECT a.id, COALESCE(ag.total_words, 0) AS total_words,
@@ -24,23 +24,46 @@ This ADR adds 1-1 JOIN transforms:
 
 ```text
 TRANSFORM <target>
-FROM <a> [INNER | LEFT] JOIN <b> ON <a>.<col> = <b>.<col> [AND ...]
-SELECT <expressions over a's row and the matched b row>
+FROM <a> [INNER | LEFT] JOIN <b1> ON <a>.<col> = <b1>.<col> [AND ...]
+        [[INNER | LEFT] JOIN <b2> ON <a>.<col> = <b2>.<col> [AND ...] ...]
+SELECT <expressions over a's row and the matched row of each joined table>
 ```
 
 It settles their scope, the hidden state behind them, and the locks and
 ordering rules that keep them exact. It builds on
 [ADR-0002](0002-async-data-flow.md)'s 1-1 ledger, which orders every per-row
 write, and takes ADR-0019's side, qualification, join-kind and `ON` rules and
-its `J` lock. Three or more tables, a non-unique `b` key and `WHERE` are out of
+its `J` lock.
+
+The root `a` is joined to one or more tables, a star. Each joined table has a
+**position**, `1` for the first `JOIN` and up to `4`, and `n` is the number of
+tables, the root included. Below, `b` names the joined table at any one
+position, and a rule stated for `b` holds at every position. The two-table
+JOIN is the one-position case of the same design: it takes the same locks
+and has no rules of its own. A non-unique `b` key and `WHERE` are out of
 scope.
 
 ## Decisions
 
-### A 1-1 JOIN keeps one row per row of `a`, joined to at most one row of `b`
+### A 1-1 JOIN keeps one row per row of `a`, joined to at most one row of each joined table
 
 - **No `GROUP BY`.** The target is keyed by `a`'s primary key. `INNER` drops an
-  `a` row with no match; `LEFT` keeps it with `NULL` `b` columns.
+  `a` row with no match; `LEFT` keeps it with `NULL` `b` columns. Each
+  position has its own kind.
+- **A star of at most 5 tables.** `a` is joined to up to 4 tables, each
+  `INNER` or `LEFT`, and each `ON` compares columns of `a` to a unique key of
+  that table. Define refuses, by name:
+  - more than 5 tables;
+  - a snowflake, an `ON` that reads a table joined earlier rather than `a`;
+  - a table that appears twice;
+  - `RIGHT`, `FULL`, `CROSS` and `LATERAL` joins;
+  - a partitioned `a` or joined table.
+
+  Correctness needs no cap: the argument below holds for any number of
+  positions, since no rule relies on a lock of a third position. 5 is the
+  largest `n` a model confirmed (#1459), and the cost per change grows with
+  `n` (Consequences), so a later release can raise it without changing the
+  design.
 - **`b`'s `ON` columns are unique**: `b`'s primary key, a unique constraint,
   or the group key of an upstream aggregate or JOIN target. A non-unique `b`
   would give one row per pair, keyed by both sides, which is a different
@@ -50,7 +73,7 @@ scope.
   ([known correctness gaps](../known-correctness-gaps.md#a-duplicate-in-b-past-a-deferrable-key-under-session_replication_role--replica)
   has the one duplicate it can't see).
 - **Fields** are any expression the 1-1 path admits, over `a`'s row and the
-  matched `b` row, of any type a 1-1 field admits (floats and text included).
+  matched row at every position, of any type a 1-1 field admits (floats and text included).
   A row is recomputed from its current inputs and never maintained by deltas,
   so none of the aggregate restrictions apply.
 - Sides, qualification, join kinds and `ON` follow ADR-0019.
@@ -86,21 +109,49 @@ below holds for them as it does for a captured side.
   other, so it starts no rebuild, and it fans out over every `a` row those
   rows match, in chunks, as below.
 
-### Each side keeps a Trellis-owned copy, ordered by ADR-0002's 1-1 ledger
+### Each table keeps a Trellis-owned copy, ordered by ADR-0002's 1-1 ledger
 
 - **`R`**, one entry per `a` row: the 1-1 ledger's ordering state, plus the
-  row's join key and the `a` columns the fields read. It is filled from
-  captured images and indexed on the join key and then the entry key, which
-  is how a `b` change finds its rows and its chunks walk them. It is about the
-  size of `a`.
-- **`M`**, one entry per `b` row, keyed by `b`'s primary key and indexed on the
-  join key: the ledger's ordering state plus the `b` columns the fields read.
-  It is about the size of `b`. Keyed by `b`'s primary key rather than by join
-  key, it applies a key's hand-off from one `b` row to another in either
-  order. For the moment the two are applied out of order, a key can hold two
-  live entries, and a read takes the newest.
-- **`J`**, one lock row per join key, and the pair's truncate lock row, both
-  as in ADR-0019.
+  row's join key at every position and the `a` columns the fields read. It is
+  filled from captured images and has one index per position, on that
+  position's join key and then the entry key, which is how a `b` change finds
+  its rows and its chunks walk them. It is about the size of `a`, plus one
+  key index per position.
+- **`M`**, one per position, one entry per `b` row, keyed by `b`'s primary key
+  and indexed on the join key: the ledger's ordering state plus the `b`
+  columns the fields read. It is about the size of `b`. Keyed by `b`'s
+  primary key rather than by join key, it applies a key's hand-off from one
+  `b` row to another in either order. For the moment the two are applied out
+  of order, a key can hold two live entries, and a read takes the newest.
+- **`J`**, one shared lock table with one row per `(position, key)`, and the
+  transform's truncate lock row, both as in ADR-0019. Its layout:
+  - A `position` column, checked to lie between `1` and the number of
+    positions, and one group of key columns per position, typed as that
+    position's `ON` columns of `a` with no modifiers
+    ([ADR-0020](0020-type-identity.md)). A row's columns of every other
+    position are `NULL`. `J` has no primary key.
+  - Per position, a partial unique index on that position's key columns
+    `WHERE position = i`, and a check that a row of position `i` has no
+    `NULL` key column. A partial unique index doesn't make its columns
+    `NOT NULL`, and a `NULL` key would let two rows hold one key, so two
+    writers would lock different rows. The check makes that an error rather
+    than a silent second row, which is why it is chosen over `NULLS NOT
+    DISTINCT`.
+  - A page inserts its keys at every position in one statement, sorted by
+    `(position, key)`, with `ON CONFLICT DO NOTHING` and no conflict target,
+    so every position's unique index is an arbiter. It then locks them in one
+    sorted `FOR UPDATE` over every position, each position's predicate using
+    that position's index. Keys are cast per type, so keys equal by value
+    share a row.
+  - Every other reader of `J` (a fan-out chunk, a build chunk, `self_check`)
+    names one position and its key columns.
+
+  One table rather than one per position puts every `J` lock in one sorted
+  statement, so the lock order can't split by position, and it is one table
+  to create and drop; one table per position was 1.32x slower at 8 workers
+  (#1459). A key text form shared by every position was rejected: it adds an
+  identity rule beside ADR-0020, and loses updates for any type it renders
+  wrong (#1765).
 
 `R` and `M` entries take the 1-1 ledger's lock pattern: a placeholder insert,
 then one sorted `FOR UPDATE`, then the applied-position check. Without the
@@ -108,61 +159,131 @@ placeholder, an older page waiting on a newer page's uncommitted insert of the
 same entry overwrote it. Without the position check, an out-of-order page put
 an older state over a newer one.
 
-Both `R` and `M` take ADR-0002's full I2: an Apply runs only if its txid is
+Both `R` and every `M` take ADR-0002's full I2: an Apply runs only if its txid is
 not in the entry's basis, its position is past the entry's applied position,
-and it is above its side's truncate floor. Each check alone was wrong in
-some interleaving (#1375). A Re-derive of either side is what every producer
+and it is above its table's truncate floor. Each check alone was wrong in
+some interleaving (#1375). A Re-derive of any table is what every producer
 stages (a build chunk, a rebuild, `request_backfill`, a quarantine release,
 catch-up, and a page whose segment predates the build):
 
-- Before its `J` lock, the page reads the row's live join key, unlocked, and
-  adds it to its key set alongside the key the entry holds.
+- Before its `J` lock, the page reads the row's live join keys, unlocked, and
+  adds them to its key set alongside the keys the entry holds: every
+  position's key for an `a` row, its own position's key for a `b` row.
 - After its entry lock, one statement reads the live row and
   `pg_current_snapshot()`, which becomes the entry's basis. A snapshot taken a
   statement later was wrong in 22 families.
-- If that read finds a key outside the locked set (the row moved between the
-  two reads), the page rolls back and retries. Not retrying was wrong in
-  910 of 1,716 schedules for each side. Taking the late key's `J` after the
-  read was exact but deadlocked, because it breaks lock sorting.
-- It reads `M` only after its `J` lock.
+- If that read finds a key outside the locked set at any position (the row
+  moved between the two reads), the page rolls back and retries: the late-key
+  retry covers every key of the row. Not retrying was wrong in 910 of 1,716
+  schedules for each side, and skipping it at one position of a star was
+  wrong too (#1459). Taking the late key's `J` after the read was exact but
+  deadlocked, because it breaks lock sorting.
+- It reads any `M` only after its `J` lock.
 
-### Neither side reads the other's source, only its copy under `J`
+### No writer reads another table's source, only its copy, under `J` and the row's `R` entry
 
-- **An `a` change** locks `J` for its new key and the key `R` holds, sorted,
-  insert-then-lock. It then locks its `R` entries and re-checks that each one's
-  key is in the locked set, rolling back and retrying if a key moved. It reads
-  `M` only after the `J` lock, and writes `R` and the target row in one
-  transaction.
-- **A `b` change** locks `J` for its new key, its old key from the image, and
-  the key `M` holds. It then locks and re-checks its `M` entries, applies them,
-  and recomputes the target row of every `R` entry on those keys.
-- Both sides take `J` `FOR UPDATE`. `FOR SHARE` on the `a` side is also exact,
-  but it starved the `b` side: 24 `b` changes in 20 s against 1,925.
+- **An `a` change** locks `J` at every position, for its new key and the key
+  `R` holds, sorted, insert-then-lock. It then locks its `R` entries and
+  re-checks that every key each one holds is in the locked set, rolling back
+  and retrying if a key moved. It reads each `M` only after the `J` lock, and
+  writes `R` and the target row in one transaction.
+- **A `b` change** locks its own position's `J` for its new key, its old key
+  from the image, and the key `M` holds. It takes no other position's `J`.
+  Then:
+  1. It locks the `R` entries of every row on those keys, found through `R`'s
+     index after the `J` lock, `FOR UPDATE` and sorted, in **one `R` lock
+     statement over every position the page touches, together with the
+     page's own `a` entries**. Any split of that statement, per position or
+     into any grouping of positions, deadlocks: two pages that reach the same
+     two rows through different positions lock them in different
+     statements, so they take the rows in opposite orders (#1459, at
+     `n = 3`, 4 and 5).
+  2. Only then does it read any `M`, its own position's or another's.
+  3. It locks and re-checks its `M` entries against the page's **fan-out
+     keys** at its position: the keys whose `R` entries step 1 locked. A key
+     in the page's `J` set only because an `a` change of the page holds it
+     doesn't count, since its rows' `R` entries weren't locked for the
+     fan-out. The re-check covers the key an entry holds at its lock and a
+     Re-derive's live key, and a key outside the set rolls the page back to
+     retry.
+  4. It applies its `M` entries and recomputes the target row of every `R`
+     entry on those keys.
+- Every writer takes `J` `FOR UPDATE`. `FOR SHARE` on the `a` side is also
+  exact, but it starved the `b` side: 24 `b` changes in 20 s against 1,925.
+- The target may be written in a batch per position, as a fan-out's keyset
+  batches are: the `R` entries already order every writer of a row, so the
+  batches need no merging by root key.
 
-The race that defeats live reads of a second table can't arise: every writer
-of either side holds `J[k]` exclusively while it reads the other side's copy
-and writes. In a model on PG 16.8, 17.10 and 18.2, 8,064 deterministic
-interleavings per version and 240 randomized soak runs were exact. Each
-necessary rule was shown necessary by an ablation that removes it (#1371).
+**Why it is exact.** Three invariants hold, each enforced by locks that name
+one position `i`:
 
-A page carrying changes and Re-derives of both tables takes one `J` lock
-statement over the union of both sides' key sets. Its lock order is the
-truncate lock row, `J`, then `R` entries, then `M` entries, then target rows,
-each sorted. A truncate page holds the lock row `FOR UPDATE`, empties its
-side's hidden table and raises its floor. It empties the table with a
-`DELETE`: a build step reads `R` or `M` before it takes the lock row, so a
-`TRUNCATE`, whose lock waits for that read, would deadlock with it.
-ADR-0019's barrier orders the page against other pages; without the
-barrier, four of eight truncate families were wrong. With both rules, 60
-families × 2 join kinds (102,312 schedules per version on PG 16.8, 17.10 and
-18.2) and 48 soak runs, with builds starting mid-run, were exact (#1375).
+- **(A)** A root row's key at position `i` changes only under `J` at
+  position `i` for its old key and its new key: an `a` writer and a build
+  chunk lock both and re-check, and a Re-derive retries on a late key at any
+  position.
+- **(B)** An `M` entry at position `i` on key `k` changes, and a row is
+  recomputed through `k`, only under `J[i, k]` and then the `R` entries of
+  every row whose key at position `i` is `k`. By (A), that set of rows can't
+  change while `J[i, k]` is held, and the fan-out-key re-check makes `k` the
+  key the entry really holds.
+- **(C)** Every transaction that writes a target row holds the row's `R`
+  entry `FOR UPDATE` from before its first `M` read until it commits.
+
+So any two transactions that affect one target row (an `a` writer of the row,
+a writer of an `M` entry on one of its keys, a recompute of it) both hold the
+row's `R` entry across their reads and their write. The entry orders them,
+and under READ COMMITTED the later one reads everything the earlier one
+committed, so on every commit a target row is the join of its `R` entry with
+the newest live `M` entry on its key at every position. The lock that orders
+a pair names at most one position, never a third, so the argument doesn't
+depend on the number of positions, and no writer needs another position's
+`J`.
+
+A model of the star (#1459) was exact under these rules and showed each one
+necessary at every position by an ablation that removes it: 138,988
+deterministic schedules per version at `n = 3` and 504,036 at `n = 4`, on
+PG 16, 17 and 18, a spot check of 174,684 at `n = 5`, and soak runs at each,
+for every combination of `INNER` and `LEFT`. A `b` writer that held only its
+own `J` lost updates (1,988 of 18,748 schedules at `n = 3`), and so did one
+that locked the target rows instead of the `R` entries (405, where an `INNER`
+row doesn't exist yet), or read another `M` before its `R` lock. Locking
+every other position's `J` for the rows a fan-out reaches is also exact, but
+holds them for the whole fan-out (every `J` row of the other position over
+a 1M-row fan-out), which stalls every `a` writer and every writer of that
+position until it ends.
+
+With one position the `R` entry lock is redundant, since `J[1, k]` already
+orders the only two writer kinds: in a model on PG 16.8, 17.10 and 18.2,
+8,064 deterministic interleavings per version and 240 randomized soak runs
+of the two-table rules without it were exact (#1371). The two-table JOIN
+takes it anyway, so one code path serves every `n`, at about 8% of its
+fan-out's time.
+
+**Lock order.** A page carrying changes and Re-derives of several tables
+takes each lock class in one sorted statement over the union of its key
+sets, in one global order: the truncate lock row; `J`, by `(position, key)`;
+the `R` entries, in one statement; the `M` entries, by `(position, id)`; then
+the target rows. Placeholder inserts follow the same order, so no two
+transactions take two rows of one class in opposite orders.
+
+A truncate page holds the lock row `FOR UPDATE`, empties its table's hidden
+table and raises its floor. It empties the table with a `DELETE`: a build
+step reads `R` or `M` before it takes the lock row, so a `TRUNCATE`, whose
+lock waits for that read, would deadlock with it. ADR-0019's barrier orders
+the page against other pages, over every table of the transform: a page
+waits for every earlier truncate page of any of its tables, and a truncate
+page for every earlier page of its own table. Without the barrier, four of
+eight truncate families were wrong. With both rules, 60 families × 2 join
+kinds (102,312 schedules per version on PG 16.8, 17.10 and 18.2) and 48
+soak runs, with builds starting mid-run, were exact (#1375).
 
 A page settles its truncate before its changes, so a change after the truncate
-in the same batch applies to the emptied side:
+in the same batch applies to the emptied table:
 
 - **`TRUNCATE a`** empties `R` and raises its floor, and deletes every target
-  row in the page. `M` and `J` are untouched.
-- **`TRUNCATE b`** empties `M` and raises its floor. It changes every target
+  row in the page. Every `M` and `J` is untouched.
+- **`TRUNCATE b`**, at any position, empties that position's `M` and raises
+  its floor. It changes every target
   row, so it starts a target rebuild rather than recomputing in the page. A
   rebuild's start takes the definition rows of everything it rebuilds, in id
   order, then their lock rows, then the segment pointer. So the page takes
@@ -174,34 +295,41 @@ in the same batch applies to the emptied side:
   build's chunk reaches it, an `INNER` row stays, and a change of `a` before
   then joins the emptied `M`. A definition that does not apply (paused since
   the page began) starts no rebuild, and its `RESUME` re-derives every row.
-- A page that truncates both sides does both.
+- A page that truncates several tables does each. However many joined tables
+  it truncates, it takes the definition row once, before the lock row, and
+  starts one rebuild.
 
-A change of either side that was staged before a truncate and reaches a page
-after it is below the side's floor and refused, by the same I2 check as a
+A change of any table that was staged before a truncate and reaches a page
+after it is below the table's floor and refused, by the same I2 check as a
 change older than an entry's applied position.
 
 ### A `b` change's fan-out runs in chunks under a pending marker
 
 A `b` change rewrites every target row on its key, each recomputed from `R`
-and the newest live `M` entry while the writer holds `J[k]`, and an `a` change
-on that key waits for `J[k]`. Fan-out in chunks that each take `J[k]` again is
-exact (#1375 Y5), so no transaction recomputes more than one chunk of 10k `R`
-entries:
+and the newest live `M` entry at every position while the writer holds
+`J[i, k]` and the rows' `R` entries, and an `a` change on that key waits for
+`J[i, k]`. Fan-out in chunks that each take `J[i, k]` and their rows' `R`
+entries again is exact (#1375 Y5, #1459), so no transaction recomputes more
+than one chunk of 10k `R` entries:
 
-- **The page** counts the entries on each key its `b` changes reach, each
-  count stopping one past the budget left, and recomputes itself the keys
-  that fit one chunk between them. For every other key it writes a pending
-  marker `(k, gen, cursor)` in its own transaction, at the key's start, with
+- **The page** counts the entries on each key its `b` changes reach, at
+  every position, against one budget for the page, summed over positions,
+  each count stopping one past the budget left, and recomputes itself the
+  keys that fit one chunk between them. For every other key it writes a
+  pending marker `(position, k, gen, cursor)` in its own transaction, at the key's start, with
   the earliest origin of the page's `b` changes. A key the page recomputes
   whole loses its marker. A later page on a pending key sets the cursor back
   to the start and keeps the earlier origin: the rows behind the cursor joined
   the older `b` row, and every row must join the newer one.
 - **A chunk** is one transaction, run by a drain worker as build work, after
   its segments and before any build chunk. In the page's lock order it takes
-  both tables' version fences, the definition row `FOR KEY SHARE` (a chunk may
-  hold a row, as a page's fan-out may), the lock row `FOR SHARE`, `J[k]` and
-  the marker. It recomputes the next chunk of live `R` entries after the
-  cursor in key order, a range of `R`'s index on the join key and then the
+  every table's version fence, the definition row `FOR KEY SHARE` (a chunk
+  may hold a row, as a page's fan-out may), the lock row `FOR SHARE`,
+  `J[i, k]`, the marker, and then the `R` entries of its batch, before it
+  reads any `M`. A chunk that recomputed its batch without re-taking those
+  entries lost updates against a writer at another position (#1459). It
+  recomputes the next chunk of live `R` entries after the cursor in key
+  order, a range of `R`'s index on position `i`'s join key and then the
   entry key, and advances the cursor, or deletes the marker after the key's
   last entry. Its rows reach the target's readers through the seam, staged in
   the chunk's transaction with the marker's origin, as a page stages its
@@ -215,7 +343,8 @@ entries:
   key another holds and takes the next marker, or does nothing. Queued behind
   another worker's chunk, it would put every `a` writer on the key behind one
   more chunk, and drain no segment while it waited.
-- Every recompute reads `R` and `M` under `J[k]`, so the result is exact
+- Every recompute reads `R` and each `M` under `J[i, k]` and its rows' `R`
+  entries, so the result is exact
   whatever ran between two chunks: an `a` change writes its own row from the
   same state, and a row that joins the key behind the cursor, or leaves it,
   is written by its own page.
@@ -223,12 +352,20 @@ entries:
   parked row does, so a read after `await_converged` sees the fan-out done,
   and `self_check` re-checks a divergence of the target while one is pending.
   A row a chunk fails to write is held as a page's fan-out holds it, parked
-  with the marker's origin and segment. A `TRUNCATE` of either side deletes
-  the definition's markers (a `TRUNCATE b` starts a rebuild, and a `TRUNCATE
-  a` leaves no row to recompute), and so does `RESUME`, whose build
+  with the marker's origin and segment. A `TRUNCATE` of any table deletes
+  the definition's markers at every position (a `TRUNCATE b` starts a
+  rebuild, which recomputes every row whatever position its marker named,
+  and a `TRUNCATE a` leaves no row to recompute), and so does `RESUME`, whose build
   recomputes every row.
-- The index the chunks walk holds the `ON` columns and the entry key, so a 1-1
-  JOIN's `ON` has at most 31 columns.
+- The index the chunks walk holds a position's `ON` columns and the entry
+  key, so each `ON` of a 1-1 JOIN has at most 31 columns.
+- **The fan-out never halts.** However many rows a key reaches, the page
+  defers what doesn't fit its budget to chunks, so a position with few keys
+  and many rows on each (a lookup table) is admitted at any position, with no
+  threshold. Such a position turns one edit of its table into many target
+  writes, and slows the root's apply while the chunks run; the
+  [recommendations](../recommendations.md#join-small-often-edited-tables-at-query-time)
+  weigh it against joining at query time.
 
 The benchmark (`one-to-one-join-fan-out`, 1M `a` rows on one key, a `LEFT`
 join) measures the page at 0.03 s and the whole fan-out at about 10.6 s, from
@@ -238,9 +375,9 @@ lands in a median 0.17 s, against 4.4 s behind one transaction. An `INNER`
 join's fan-out costs more, since each batch also deletes the target rows of
 entries whose key has lost its last live `b` row.
 
-- A `status()` warning names the join key with the most `a` rows when it
-  holds more than 250k, a key whose `b` change takes seconds to reach every
-  row. The count is a sample of `R`'s join-key index, not `pg_stats`, which
+- A `status()` warning names, per position, the position and the join key
+  with the most `a` rows when it holds more than 250k, a key whose `b` change takes seconds to reach every
+  row. The count is a sample of the position's index on `R`, not `pg_stats`, which
   is stale after a build.
 
 ### A row a page fails to write is held in the page
@@ -287,34 +424,36 @@ fails, so isolation would charge nothing and the page would fail forever.
   the hold, and stages a `Recompute` as well. A `b` change on its key that
   drained before the `Recompute` would otherwise read the `R` entry the hold
   left, and hold the row again.
-- A pause of a field, by hand or by its fuse, and its resume bump both
-  tables' version fences, since the pages of either side write the fields.
+- A pause of a field, by hand or by its fuse, and its resume bump every
+  table's version fence, since the pages of any table write the fields.
   A 1-1 `JOIN` has no field build, so the resume rebuilds the target in
   place, which writes the field on the rows its pages left as they were.
 
-### A build fills `M`, then `R` and the target
+### A build fills every `M`, then `R` and the target
 
-A build re-derives every key of `b` ∪ `M` into `M` first: `b`'s rows in
+A build re-derives every key of `b` ∪ `M` into `M` first, at every position: `b`'s rows in
 batches of its primary key, those whose key has a `NULL` part (a `b` that is
 an aggregate's target, keyed by a nullable group column) in batches of their
 own, then `M`'s live entries whose `b` row is gone, which become tombstones.
 Each batch is a page of `b` Re-derives with its fan-out left out: the chunks
 that follow write every target row, none starts before the last batch
-commits, and so none joins an `a` row to a `b` row that is gone. Each batch
+commits, and so none joins an `a` row to a `b` row that is gone. Every
+position's `M` is filled before the first chunk of `R`. Each batch
 commits with the build's cursor, so a batch that fails (a page holding a `J`
 row longer than the batch waits) or a worker that dies resumes from the last
 batch that committed. It then fills `R` and the target
 in chunks of `a`'s primary-key range. Each chunk:
 
-1. Holds the lock row `FOR SHARE`, and locks `J` for the live keys in its
-   range plus the keys `R` holds for its rows.
+1. Holds the lock row `FOR SHARE`, and locks `J` at every position for the
+   live keys in its range plus the keys `R` holds for its rows.
 2. Inserts the missing entries in one statement that reads `a` live, with
    `pg_current_snapshot()` as their basis.
 3. Locks and re-derives the remaining entries.
-4. Writes each row's target row from `R` and the newest live `M` entry on its
-   key.
-5. Retries if any read finds a key outside its locked set. Without the retry,
-   378 of 1,716 schedules were wrong.
+4. Writes each row's target row from `R` and the newest live entry of each
+   `M` on its key at that position.
+5. Retries if any read finds a key outside its locked set at any position.
+   Without the retry, 378 of 1,716 schedules were wrong, and skipping one
+   position's keys was wrong too (#1459).
 
 A chunk's range is a row comparison, which is `NULL` wherever a `NULL` part
 decides it, so no chunk reaches an `a` row whose primary key has one (an `a`
@@ -347,16 +486,17 @@ does a quarantine release's Re-derive. A `RESUME` and a `TRUNCATE` of `b`
 reach the readers through the build they start; a `TRUNCATE` of `a` and the
 Re-derives a producer stages, through the page that drains them.
 
-### `self_check` compares the target, both copies and the uniqueness of `b`
+### `self_check` compares the target, every copy and the uniqueness of each joined table
 
-`self_check` reads each side as its copy has applied it, which is the source minus the ring rows the
+`self_check` reads each table as its copy has applied it, which is the source minus the ring rows the
 copy hasn't applied yet, as the 1-1 and aggregate checks do (ADR-0013). It audits, in order:
 
-- **The target**: each row against `a` as `R` has applied it, joined to `b` as `M` has applied it,
-  on the newest live `M` entry of a key when there are several.
-- **`R` and `M`**: each against its source, in both directions: a row with no live entry or other
+- **The target**: each row against the full query, every `JOIN` of it: `a` as `R` has applied it,
+  joined at every position to `b` as that position's `M` has applied it, on the newest live `M`
+  entry of a key when there are several.
+- **`R` and every `M`**: each against its source, in both directions: a row with no live entry or other
   values, and a live entry with no row.
-- **A join key with more than one live `M` entry.** The target reads the newest entry of a key, which
+- **A join key with more than one live entry in any `M`.** The target reads the newest entry of a key, which
   masks a duplicate, so this is where `b` losing its uniqueness shows while the transform runs. A
   hand-off of a key between two `b` rows applied out of order holds two entries
   for a moment as well, so what this check finds while `b`'s ring holds an unapplied row is
@@ -366,22 +506,24 @@ It reports and never repairs.
 
 ### Pause and `RESUME`
 
-`RESUME` recreates `R`, `M`, `J` and the lock row at define's current shape,
-after waiting out the chunks in flight, and keeps the target, so readers see
-every row throughout. The build that follows re-derives `b` and every `a`
+`RESUME` recreates `R`, every `M`, `J` and the lock row at define's current
+shape, after waiting out the chunks in flight, and keeps the target, so
+readers see every row throughout. The build that follows re-derives every
+joined table and every `a`
 row that exists, and its sweep's orphan pass removes the target rows of `a`
 rows deleted while the transform was paused. Until the sweep reaches them
 those rows stay in the target, and the transform reads `backfilling`.
 
-### A schema change of either table pauses the whole transform
+### A schema change of any table pauses the whole transform
 
 A 1-1 `JOIN` takes an aggregate `JOIN`'s schema-change rules
-([ADR-0019](0019-join-transforms.md)) on both tables. The staging worker's
+([ADR-0019](0019-join-transforms.md)) on every table, the root and each
+position's. The staging worker's
 pass, or the drain on a write that marks a missing column, pauses the whole
 transform with a `capture_failure` naming the table and the column when:
 
-- a column the fields or `ON` read from either table is dropped or renamed;
-- a key column of either table (`a`'s primary key, an `ON` column) is
+- a column the fields or an `ON` read from any table is dropped or renamed;
+- a key column of any table (`a`'s primary key, an `ON` column) is
   retyped so the keys Trellis stored render differently, or one column of an
   `ON` pair is retyped so the pair no longer has one type;
 - a column is retyped to a type the fields evaluate as another type
@@ -389,23 +531,23 @@ transform with a `capture_failure` naming the table and the column when:
 - a column Trellis keeps a typed copy of widens past the copy
   ([ADR-0020](0020-type-identity.md)). The copies are the target's key (`a`'s
   primary key), a field that names one column (typed as that column, with no
-  modifier), a calculated field (typed by inference from both tables), and the
-  columns of `R`, `M` and `J` (typed as the side's column). The definition
-  records each column it reads with its value type, so a field over both
-  tables is reported by the pass of the table whose input changed value type
+  modifier), a calculated field (typed by inference from the tables it reads), and the
+  columns of `R`, each `M` and each position's group of `J` (typed as the
+  table's column). The definition records each column it reads with its
+  value type, so a field over several tables is reported by the pass of the table whose input changed value type
   (a widening, not a change of modifier), naming that table and column and
-  every column the field is typed from with its type now; the other table's
-  pass leaves it. Where no input changed value type, whichever pass runs
+  every column the field is typed from with its type now; the other tables'
+  passes leave it. Where no input changed value type, whichever pass runs
   first reports it. When the widened column is an upstream target's,
   re-typed by that upstream's `RESUME`, the pause records the upstream as its
   cause, so the transform resumes once the upstream is live.
 
-Either table dropped, renamed away, swapped or joining a hierarchy pauses it
-too, as for any source. `RESUME` re-validates both tables as define would
+Any of its tables dropped, renamed away, swapped or joining a hierarchy
+pauses it too, as for any source. `RESUME` re-validates every table as define would
 and refuses while define would. Otherwise the staging worker re-types the
 target's drifted copies first, and the resume then creates `R`, `M` and `J`
-again at the types define gives them now, so `J` takes an `ON` pair's new
-type, and rebuilds as above.
+again at the types define gives them now, so each position's group of `J` takes
+its `ON` pairs' new types, and rebuilds as above.
 
 ## Consequences
 
@@ -416,4 +558,13 @@ type, and rebuilds as above.
 - Parallel pages whose key sets overlap queue on `J`: with 1,000-change pages
   over 100k keys, 8 workers gave 1.18x one worker's throughput. JOIN
   transforms share this.
-- `J` keeps a row for every join key either table has held, as in ADR-0019.
+- `J` keeps a row for every `(position, key)` any table has held, as in
+  ADR-0019, and its rows are never deleted while the definition lives.
+- **A star costs more per change as it grows.** An `a` change costs about
+  1.61x, 2.22x and 2.92x a two-table change at `n` = 3, 4 and 5, with a page
+  of 100 changes locking `100 × (n − 1) + 50` `J` rows, and a fan-out row
+  about 5.3, 6.7 and 7.9 µs against 3.9 µs (#1459's model). The hidden state
+  grows by about 55 MB per position per 1M root rows (an `R` key index plus
+  that position's `M` and `J`). A star is cheaper than a chain of two-table
+  JOINs over the same tables: at `n = 4`, 2.3x the chain's throughput and
+  0.42x its hidden state.
