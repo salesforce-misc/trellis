@@ -166,8 +166,14 @@ incompatibility is found at release time, not in the pull request that
 introduced it, and each finding is filed as its own issue, labelled
 `Next Release` when it blocks the release.
 
-The starting point is the previous release (for `0.2.0`, `v0.1.0`). A
-pre-release is not a supported starting point.
+The starting points are the releases of the previous line: the battery runs
+once from each (`--old-tag v0.1.0`, and again with `--old-tag v0.1.1` when
+`0.1.1` is released before `0.2.0`). A pre-release is not a supported starting
+point. To try a starting point before it is tagged, pass `--old-src
+<checkout>` (for example a checkout of `0.1.0-dev`) with `--build-old`, or
+with `--old-bin <cli>` for a CLI built from it. `--old-tag` then only names it
+in the output, and the `migrations` step compares the candidate's migration
+files with the checkout's commit.
 
 ### Running it
 
@@ -211,9 +217,9 @@ running for a manual step.
 
 | Step | What it checks | How |
 |---|---|---|
-| `migrations` | A database the old build created opens under the candidate: no checksum mismatch, the old build's history rows unchanged, and only the candidate's new migrations added. The old tag's migration files are byte-identical at the candidate; a file the candidate adds (for `0.2.0`, `V9__worker_versions.sql`) is reported as `INFO`, since it changes the upgrade path and rules out downgrade, and the release notes say so. A changed or removed file of the old tag fails. Control: with one stored checksum altered the candidate refuses. | Script |
+| `migrations` | A database the old build created opens under the candidate: no checksum mismatch, the old build's history rows unchanged, and only the candidate's new migrations added. The old tag's migration files are byte-identical at the candidate; a file the candidate adds (for `0.2.0`, `V9__worker_versions.sql` to `V18__capture_failure_reasons_recheck_index.sql`) is reported as `INFO`, since it changes the upgrade path and rules out downgrade, and the release notes say so. A changed or removed file of the old tag fails. Control: with one stored checksum altered the candidate refuses. | Script |
 | `definitions` | One of each shape the release supports, built under the old build with writers running and undrained ring segments in flight: a plain 1-1, a chained 1-1, a 1-1 with a paused column, a group-basis aggregate, an aggregate over a `JOIN` (inner and `LEFT`), an aggregate and a `JOIN` over a hash-partitioned source, a 1-1 with a held key, and a paused transform. Under the candidate each resumes, converges and has a clean `self_check`; the held key and the pauses are unchanged; nothing else pauses. A plain recompute of two targets in SQL cross-checks `self_check`. | Script |
-| `grammar` | A definition the old build accepted and the candidate refuses pauses with a reason that names the remedy, not an error loop and not silent staleness, and the remedy works: a bare reserved word as a column name, and an expression nested over 100 levels (as a chain and as parentheses). | Script, plus the manual cases below |
+| `grammar` | A definition the old build accepted and the candidate refuses pauses with a reason that names the remedy, not an error loop and not silent staleness, and the remedy works: a bare reserved word as a column name, and an expression nested over 100 levels (as a chain and as parentheses). Sources the candidate keys differently ([upgrading](upgrading.md#upgrading)): a key with `INCLUDE` columns, a deferrable primary key, and a primary key dropped after define with a unique index left over a nullable column each pause naming the remedy, and the remedy (`RESUME`; recreating the key not deferrable, then `RESUME`; adding a primary key, then `RESUME`) brings each back with a clean `self_check`. A primary key dropped after define with a unique index left over its columns keeps running, with `KEY (…)` written into the stored definition. | Script, plus the manual cases below |
 | `inflight` | Upgrading while a definition is mid-build, mid-rebuild (a `RESUME`), waiting for capture, paused, or holding a key: each continues to `live`, or stays as it was. A held key stands for quarantine: the script does not trip the whole-definition fuse, so no definition is `quarantined` at the upgrade. | Script |
 | `structure` | A `structure.sql` made by the old build (a `pg_dump --schema-only` of the Trellis schema and `public`, plus the old build's `dump_definitions_sql`) loads into an empty database and every definition builds. Covers the older format only (see the [release notes checklist](#release-notes-checklist)). | Script |
 | `pgrestore` | A `pg_dump` and `pg_restore` of the old database opens under the candidate, pauses every definition with the documented reason ([operations — runbooks](operations.md#runbooks)), and `RESUME` brings each back to `live` with a clean `self_check`. | Script |
@@ -259,7 +265,8 @@ gh release download v0.1.0 --repo salesforce-misc/trellis -p 'trellis-pg-0.1.0-x
 
 The three runs print the same definitions and statuses, and `migrate` raises
 no error. A client that cannot open the database, or a gem or package that
-does not build, is a finding.
+does not build, is a finding. `bundle install` may add a `bundler` line to
+`clients/ruby/Gemfile.lock`; discard it.
 
 **Refusals the script does not build (step 3).** The script constructs the
 refusals it can build with the old CLI. Check the rest by reading the
@@ -306,9 +313,24 @@ For each release, the notes carry:
   reserved word as a column name (`SELECT order AS o`; write `table.order`),
   and an expression nested over 100 levels (split it into calculated fields).
   Add every case from the manual refusal check.
+- **Definitions that pause because the new version keys a table
+  differently,** each with its remedy, from [upgrading](upgrading.md#upgrading).
+  For `0.2.0`: a source whose key has `INCLUDE` columns (`RESUME` re-keys it in
+  place); a source whose primary key was dropped after define, unless a unique
+  index that backs a key now is left (add a primary key and `RESUME`, or `DROP
+  TRANSFORM` and define it again with a valid `KEY (…)`); a deferrable primary
+  key (recreate it not deferrable, then `RESUME`); and a definition whose
+  recorded key no longer has a matching valid index (`RESUME` refuses until the
+  index is back).
+- **Changes an upgrade makes that users don't see,** so a question about them
+  has an answer. For `0.2.0`: an in-flight 1-1 rebuild sweep whose cursor
+  began with U+0001 restarts from the start.
 - **The upgrade procedure,** from [upgrading](upgrading.md#upgrading), and
-  whether the release adds a migration (`0.2.0` adds V9 to V17, and `0.1.0`'s
-  `migrate` refuses a database `0.2.0` has migrated).
+  whether the release adds a migration (`0.2.0` adds V9 to V18, and `0.1.0`'s
+  `migrate` refuses a database `0.2.0` has migrated). Stop every process of
+  the old release before starting a release of the same line that carries no
+  migration (`0.1.0` to `0.1.1`): releases before `0.2.0` have no version
+  handover, so two of them must not overlap.
 - **Compatibility floors:** the floors this release raised (the catalog floor,
   and which features carry a new definition floor) and what that means for
   rolling back to the previous release

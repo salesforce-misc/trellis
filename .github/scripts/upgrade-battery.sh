@@ -11,7 +11,7 @@
 # Steps (default: all, in this order):
 #   migrations    1. the tag's files and history rows unchanged; refuses a tampered checksum (control)
 #   definitions   2. every shape resumes, converges, self_check is clean
-#   grammar       3. definitions the candidate refuses pause with a remedy, and it works
+#   grammar       3. definitions the candidate refuses or keys differently pause with a remedy, and it works
 #   inflight      4. mid-build, mid-rebuild, paused, held key, waiting for capture
 #   structure     5a. a structure.sql dumped by v0.1.0 loads and builds
 #   pgrestore     5b. a pg_dump/pg_restore of a v0.1.0 database (documented pauses, then RESUME)
@@ -202,6 +202,9 @@ wait_all() { wait_for "${WAIT:-180}" "$5... $4" all_status "$@"; } # port db bin
 
 failure_reason() { # port db name -> capture_failures.error
   scalar "$1" "$2" "select cf.error from trellis.capture_failures cf join trellis.transform_definitions d on d.id = cf.transform_id where d.target_table = 'public.$3'"
+}
+paused_with() { # port db name pattern: stored paused, and capture_failures.error matches
+  [ "$(stored_status "$1" "$2" "$3")" = paused ] && failure_reason "$1" "$2" "$3" | grep -qE "$4"
 }
 history() { scalar "$1" "$2" "select version, name, checksum, applied_on from trellis.refinery_schema_history order by version"; }
 
@@ -412,7 +415,7 @@ mkdir -p "$work/cluster-a"
 start_cluster "$work/cluster-a" "$port"
 pg_major=$("$pg_bin/psql" -X -At -h 127.0.0.1 -p "$port" -U postgres -d postgres -c "show server_version_num")
 [ "$pg_major" -ge 150000 ] || die "PostgreSQL 15 or later is required (partitioned sources); this is $pg_major"
-for d in shapes inflight ctl mixed clients; do sql "$port" postgres -c "create database $d"; done
+for d in shapes inflight ctl mixed clients keys; do sql "$port" postgres -c "create database $d"; done
 
 # ---------------------------------------------------------------- prep: shapes
 say "building the $old_tag databases"
@@ -551,6 +554,42 @@ sql "$port" ctl -c "create table t(id bigint primary key, v bigint not null)"
 apply_old ctl 'TRANSFORM tc FROM t SELECT v AS v2'
 pre_ctl_history=$(history "$port" ctl)
 
+# keys: sources the candidate keys differently from a release before 0.2.0
+# (docs/upgrading.md): a key with INCLUDE columns, a deferrable primary key,
+# and a primary key dropped after define with a unique index left that backs a
+# key now (k_uniq) or none (k_none, over a nullable column).
+keys_defs="k_inc_copy k_def_tot k_uniq_tot k_uniq_copy k_none_copy"
+if want grammar; then
+  sql "$port" keys <<'EOF'
+create table k_inc(id bigint, x bigint, v bigint not null, primary key (id) include (x));
+create table k_def(id bigint primary key deferrable, v bigint not null);
+create index on k_def(v);
+create table k_uniq(id bigint primary key, v bigint not null);
+create unique index k_uniq_id on k_uniq(id);
+create index on k_uniq(v);
+create table k_none(id bigint primary key, e text unique, v bigint not null);
+insert into k_inc select g, g % 3, g from generate_series(1,200) g;
+insert into k_def select g, g % 10 from generate_series(1,200) g;
+insert into k_uniq select g, g % 10 from generate_series(1,200) g;
+insert into k_none select g, 'e'||g, g from generate_series(1,200) g;
+EOF
+  seed_rows=$((seed_rows + 800))
+  apply_old keys 'TRANSFORM k_inc_copy FROM k_inc SELECT v AS v'
+  apply_old keys 'TRANSFORM k_def_tot FROM k_def GROUP BY v SELECT v AS v, COUNT(*) AS n'
+  apply_old keys 'TRANSFORM k_uniq_tot FROM k_uniq GROUP BY v SELECT v AS v, COUNT(*) AS n'
+  apply_old keys 'TRANSFORM k_uniq_copy FROM k_uniq SELECT v AS v'
+  apply_old keys 'TRANSFORM k_none_copy FROM k_none SELECT v AS v'
+  run_bg old-keys "$port" keys "$old_bin"
+  # shellcheck disable=SC2086
+  WAIT=120 wait_all "$port" keys "$old_bin" live $keys_defs || die "the keys definitions did not go live (see $logs/run-old-keys.log)"
+  sql "$port" keys -c "alter table k_uniq drop constraint k_uniq_pkey" -c "alter table k_none drop constraint k_none_pkey"
+  sql "$port" keys -c "update k_inc set v = v + 1 where id <= 20" -c "update k_def set v = (v + 1) % 10 where id <= 20" \
+    -c "update k_uniq set v = (v + 1) % 10 where id <= 20" -c "update k_none set v = v + 1 where id <= 20"
+  sleep 5
+  pre_keys_status=$(status_lines "$port" keys "$old_bin" | tr '\n' ' ')
+  stop_run old-keys
+fi
+
 # clients: built and run by the old CLI only, for the manual client step; the
 # candidate never opens it, so the old client opens it first.
 if want clients; then
@@ -569,6 +608,7 @@ say "upgrading: stop $old_tag, start the candidate (writers keep running)"
 stop_run old-shapes
 run_bg new-shapes "$port" shapes "$candidate_bin"
 run_bg new-inflight "$port" inflight "$candidate_bin"
+! want grammar || run_bg new-keys "$port" keys "$candidate_bin"
 sleep 8
 stop_writers
 live_shapes=$shapes_expected_live
@@ -606,14 +646,21 @@ missing_status() { # port db bin status names...: the names not at that status
 
 if want migrations; then
   say "1. migrations"
-  if git -C "$cand_src" rev-parse -q --verify "$old_tag^{commit}" >/dev/null 2>&1; then
+  # The old build's migration files: the tag's, or, for a starting point not
+  # tagged yet (--old-src), its checkout's commit.
+  mig_ref=""
+  if git -C "$cand_src" rev-parse -q --verify "$old_tag^{commit}" >/dev/null 2>&1; then mig_ref=$old_tag
+  elif [ -n "$old_src_dir" ] && c=$(git -C "$old_src_dir" rev-parse -q --verify HEAD 2>/dev/null) &&
+    git -C "$cand_src" rev-parse -q --verify "$c^{commit}" >/dev/null 2>&1; then mig_ref=$c
+  fi
+  if [ -n "$mig_ref" ]; then
     # The candidate's files as they are on disk (a directory candidate may hold
     # uncommitted or untracked migrations), against the tag's.
-    old_mig_n=$(git -C "$cand_src" ls-tree --name-only "$old_tag" trellis/migrations/ | wc -l | tr -d ' ')
+    old_mig_n=$(git -C "$cand_src" ls-tree --name-only "$mig_ref" trellis/migrations/ | wc -l | tr -d ' ')
     # Every file the tag shipped must be unchanged; files the candidate adds
     # are new migrations (for 0.2.0, V9), reported for the release notes.
-    mig_changed=$(git -C "$cand_src" diff --name-status --diff-filter=a "$old_tag" -- trellis/migrations | tr '\t' ' ' | tr '\n' ';')
-    mig_added=$( (git -C "$cand_src" diff --name-only --diff-filter=A "$old_tag" -- trellis/migrations; git -C "$cand_src" ls-files --others --exclude-standard -- trellis/migrations) | grep . | xargs -r -n1 basename | tr '\n' ' ')
+    mig_changed=$(git -C "$cand_src" diff --name-status --diff-filter=a "$mig_ref" -- trellis/migrations | tr '\t' ' ' | tr '\n' ';')
+    mig_added=$( (git -C "$cand_src" diff --name-only --diff-filter=A "$mig_ref" -- trellis/migrations; git -C "$cand_src" ls-files --others --exclude-standard -- trellis/migrations) | grep . | xargs -r -n1 basename | sort -V | tr '\n' ' ')
     if [ "$old_mig_n" -eq 0 ]; then
       record FAIL migrations "$old_tag has no files in trellis/migrations: the script's migrations path is out of date, so nothing was compared"
     elif [ -n "$mig_changed" ]; then
@@ -624,7 +671,7 @@ if want migrations; then
         record INFO migrations "the candidate adds migrations: ${mig_added% } (the upgrade path runs them; $old_tag can't open a database they ran on, so downgrade is ruled out)"
     fi
   else
-    record SKIP migrations "the candidate checkout does not have tag $old_tag, so its migration files were not compared"
+    record SKIP migrations "the candidate checkout has neither tag $old_tag nor the --old-src commit, so its migration files were not compared"
   fi
   post_history=$(history "$port" shapes)
   pre_n=$(wc -l <<<"$pre_history" | tr -d ' ')
@@ -694,6 +741,57 @@ else
   record SKIP definitions "not selected"
 fi
 
+# keys_grammar: the keys database (prep: keys). Each source the candidate keys
+# differently pauses naming the table and the remedy, and the remedy works; a
+# dropped primary key whose unique index backs a key now keeps running, with
+# that key written into the stored definition as KEY (...).
+keys_grammar() {
+  local p=$port d=keys n pat st reason
+  echo "keys before the upgrade: $pre_keys_status"
+  WAIT=120 wait_all "$p" "$d" "$candidate_bin" live k_uniq_tot k_uniq_copy || true
+  for n in k_uniq_tot k_uniq_copy; do
+    st=$(stored_status "$p" "$d" "$n")
+    reason=$(scalar "$p" "$d" "select definition_text from trellis.transform_definitions where target_table = 'public.$n'")
+    if [ "$st" = live ] && grep -qiE 'KEY \(id\)' <<<"$reason"; then
+      record PASS grammar "$n (its source's primary key dropped, a unique index over it left) keeps running, its definition now with KEY (id)"
+    else
+      record FAIL grammar "$n is '$st', definition: ${reason:0:160}; reason: $(failure_reason "$p" "$d" "$n" | head -c 200)"
+    fi
+  done
+  for kv in 'k_inc_copy|INCLUDE|include' 'k_def_tot|deferrable' 'k_none_copy|has no primary key'; do
+    n=${kv%%|*}; pat=${kv#*|}
+    wait_for 60 "$n to pause" paused_with "$p" "$d" "$n" "$pat" || true
+    st=$(stored_status "$p" "$d" "$n")
+    reason=$(failure_reason "$p" "$d" "$n")
+    if [ "$st" = paused ] && grep -qE "$pat" <<<"$reason" && grep -q RESUME <<<"$reason"; then
+      record PASS grammar "$n pauses naming the remedy: ${reason:0:150}..."
+    else
+      record FAIL grammar "$n is '$st' (reason: ${reason:-none})"
+    fi
+  done
+  # The remedies: RESUME (INCLUDE); recreate the key not deferrable, RESUME;
+  # add the primary key, RESUME.
+  if rem=$(sql "$p" "$d" -c "alter table k_def drop constraint k_def_pkey, add primary key (id)" \
+      -c "alter table k_none add primary key (id)" 2>&1 &&
+    trellis "$p" "$d" "$candidate_bin" apply 'RESUME TRANSFORM k_inc_copy' 2>&1 &&
+    trellis "$p" "$d" "$candidate_bin" apply 'RESUME TRANSFORM k_def_tot' 2>&1 &&
+    trellis "$p" "$d" "$candidate_bin" apply 'RESUME TRANSFORM k_none_copy' 2>&1); then
+    sql "$p" "$d" -c "update k_inc set v = v + 1 where id > 180" -c "update k_def set v = (v + 1) % 10 where id > 180" \
+      -c "update k_uniq set v = (v + 1) % 10 where id > 180" -c "update k_none set v = v + 1 where id > 180"
+    # shellcheck disable=SC2086
+    if WAIT=120 wait_all "$p" "$d" "$candidate_bin" live $keys_defs; then
+      record PASS grammar "the key remedies (RESUME; a non-deferrable key, RESUME; a primary key, RESUME) bring each back to live"
+      # shellcheck disable=SC2086
+      check_self "$p" "$d" grammar $keys_defs
+    else
+      record FAIL grammar "after the key remedies, not live:$(missing_status "$p" "$d" "$candidate_bin" live $keys_defs)"
+    fi
+  else
+    record FAIL grammar "a key remedy did not apply: $(tr '\n' ' ' <<<"$rem" | cut -c1-300)"
+  fi
+  stop_run new-keys
+}
+
 if want grammar; then
   say "3. definitions the candidate refuses that $old_tag accepted"
   for n in ledger_copy deep deep2; do
@@ -721,7 +819,8 @@ if want grammar; then
   else
     record FAIL grammar "the remedy did not apply: $rem"
   fi
-  record MANUAL grammar "not exercised: an index over more than 32 key columns, a table over 1600 columns (v0.1.0 cannot build either here), and any refusal added after this script; see the runbook"
+  keys_grammar
+  record MANUAL grammar "not exercised: an index over more than 32 key columns, a table over 1600 columns ($old_tag cannot build either here), and any refusal added after this script; see the runbook"
 else
   record SKIP grammar "not selected"
 fi
@@ -938,9 +1037,6 @@ manifest_ids() {
   done <"$1"
 }
 not_alive() { ! run_alive "$1"; }
-paused_with() { # port db name pattern: stored paused, and capture_failures.error matches
-  [ "$(stored_status "$1" "$2" "$3")" = paused ] && failure_reason "$1" "$2" "$3" | grep -qE "$4"
-}
 # leftovers <port> <db> <id> <name>: its transform_definitions row, the rows
 # any trellis table keeps for that id (by transform_id or definition_id), its
 # hidden tables (agg_<id>, join_<id>_*, join1_<id>_*) and its target's ledger.
@@ -1173,6 +1269,6 @@ for r in "${results[@]}"; do
 done
 echo "PASS=$npass FAIL=$nfail INFO=$ninfo MANUAL=$nman SKIP=$nskip"
 if [ "$keep" -eq 1 ]; then
-  echo "kept: the cluster on port $port ($work/cluster-a/data; databases shapes, inflight, ctl, mixed, clients, loaded, restored) and, if the basebackup step ran, the clone on port '$port_b' stay running; stop with $pg_bin/pg_ctl -D $work/cluster-a/data stop"
+  echo "kept: the cluster on port $port ($work/cluster-a/data; databases shapes, inflight, ctl, mixed, clients, keys, loaded, restored) and, if the basebackup step ran, the clone on port '$port_b' stay running; stop with $pg_bin/pg_ctl -D $work/cluster-a/data stop"
 fi
 [ "$nfail" -eq 0 ] || exit 1
