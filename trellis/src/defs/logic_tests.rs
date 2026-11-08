@@ -1352,6 +1352,43 @@ fn a_strict_call_beside_a_null_constant_drops_the_division_by_zero_in_its_other_
     );
 }
 
+/// An aggregate's argument is computed for each row by the statements that
+/// maintain the aggregate, apart from the expression around the call, so
+/// nothing Postgres would drop around the call (a `NULL` constant beside it, a
+/// constant `COALESCE` argument before it) spares a refusal in the argument.
+#[test]
+fn an_aggregate_argument_is_checked_whatever_surrounds_the_call() {
+    let validated = |field: &str| {
+        let text = format!("TRANSFORM t FROM s GROUP BY i4 SELECT {field} AS x");
+        let def = parse(&text).unwrap_or_else(|e| panic!("`{text}` should parse: {e}"));
+        validate(&def, &columns())
+    };
+    for (field, needle) in [
+        ("SUM(n / 0) + NULL", "divides by the constant zero"),
+        ("COUNT(n / 0) * NULL", "divides by the constant zero"),
+        ("ABS(SUM(n / 0)) + NULL", "divides by the constant zero"),
+        ("MAX(n / 0) = NULL", "divides by the constant zero"),
+        ("COALESCE(5, SUM(n / 0))", "divides by the constant zero"),
+        ("COALESCE(5, SUM(1.5 / 0))", "divides by the constant zero"),
+        ("COALESCE(5, SUM(2147483647 + 1))", "out of range"),
+        (
+            "CASE WHEN 1 = 2 THEN SUM(1.5 / 0) END",
+            "divides by the constant zero",
+        ),
+    ] {
+        match validated(field) {
+            Ok(()) => panic!("`{field}` was admitted"),
+            Err(e) => assert!(
+                e.to_string().contains(needle),
+                "`{field}` was refused without naming `{needle}`: {e}"
+            ),
+        }
+    }
+    // Inside the argument, the planner drops what a strict call beside a
+    // `NULL` constant would run, in the statements that compute it too.
+    validated("SUM(n / 0 + NULL)").unwrap_or_else(|e| panic!("refused: {e}"));
+}
+
 /// A guard is classified at any height the parser admits: a constant one
 /// nested near the limit still leaves what it guards unchecked.
 #[test]

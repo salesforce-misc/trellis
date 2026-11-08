@@ -5577,7 +5577,7 @@ fn infer_expr(
                         fields_by_name,
                         types,
                         in_progress,
-                        folded,
+                        Reach::Planned,
                     )?;
                 }
                 return Ok(spec.return_type);
@@ -5585,7 +5585,14 @@ fn infer_expr(
             let mut arg_types: Vec<ValueType> = Vec::with_capacity(args.len());
             // A scalar function is strict: a `NULL` constant argument makes
             // the call `NULL` once the planner has simplified the arguments.
-            let arg_reach = if is_aggregate || folded != Reach::Planned {
+            // An aggregate's argument is computed for each row by the
+            // statements that maintain the aggregate, apart from the
+            // expression around the call (`staging::group_basis`,
+            // `staging::join`), so whatever Postgres would drop around it,
+            // the argument is evaluated.
+            let arg_reach = if is_aggregate {
+                Reach::Planned
+            } else if folded != Reach::Planned {
                 folded
             } else {
                 folded.beside_null(
