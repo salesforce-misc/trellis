@@ -6,23 +6,38 @@
 //! keyed by `ja`'s primary key, and copies `jb`'s columns onto it. The oracle
 //! is the definition's own query ([`crate::oracle::render_join_one_to_one_select`]).
 //!
+//! The same code draws the star tier's programs (#1460, #1781): a root `ja`
+//! joined to two to four tables, one per position ([`JOINED_TABLES`]: `jb`
+//! at position 1, then `jc`, `jd`, `je`), each `LEFT` or `INNER`
+//! ([`StarCase`], [`star_case_strategy`]). The two-table JOIN is the
+//! one-position case: a draw names its table by position
+//! ([`OneToOneOpDraw::position`], `0` for `ja`), and a definition lists its
+//! positions past the first in [`OneToOneSpec::more`]. Whether the star tier
+//! runs is [`star_tier_enabled`].
+//!
 //! The tables share their names with the aggregate JOIN tier's ([`super::join`]),
 //! so its build draws, operator actions and coverage are reused as they are;
 //! their columns differ:
 //!
 //! - `ja (id bigint pk, t int, k bigint, c1 int, c2 int, s text, x int)`:
 //!   the `FROM` side. `k`, `(c1, c2)` and `s` are one drawn key spelled as a
-//!   bigint, a pair of ints and a text.
+//!   bigint, a pair of ints and a text. A star's `ja` also has `k2` up to
+//!   `k4`, a bigint key of its own for each position from 2
+//!   ([`star_tables`]).
 //! - `jb (id bigint pk, t int, u bigint unique, c1 int, c2 int, s text unique,
 //!   y int, w text, unique (c1, c2))`: the joined side. A 1-1 JOIN needs the
 //!   `ON` columns of `jb` to hold a unique key, and every [`OnShape`] below
-//!   does: its primary key, `u`, `(c1, c2)` or `s`, alone or with `t`.
+//!   does: its primary key, `u`, `(c1, c2)` or `s`, alone or with `t`. A
+//!   star's other joined tables have `jb`'s columns.
 //!
 //! Each definition ([`OneToOneSpec`]) is `LEFT` or `INNER`, joins on one of
 //! the [`OnShape`]s (`a` on its primary key or on a plain column; one
 //! column, two columns with the extra one a plain column, a composite
 //! unique key, a text key), and selects a draw of [`OneToOneField`]s that
-//! read either side, with `NULL`s for an unmatched `LEFT` row.
+//! read either side, with `NULL`s for an unmatched `LEFT` row. A star's
+//! position from 2 ([`StarPosition`]) draws its own kind and shape, reads
+//! `ja`'s shared columns (`id`, `(c1, c2)`, `s`, `t`) or its own `k{p}`, and
+//! selects fields that read its table.
 //!
 //! The model of a correct target is the same as the pins' of the seam-fed
 //! families (`trellis/tests/join_one_to_one_over_targets.rs`): after each
@@ -40,7 +55,8 @@
 //! writes to both tables race into the same sealed batches. `jb`'s ids come
 //! from as many values as there are keys, and `ja`'s from [`A_IDS`], so a
 //! `jb` row has many `ja` rows on its key under [`KeyShape::FanOut`]: one
-//! change fans out over many target rows.
+//! change fans out over many target rows. A star's joined tables are each
+//! written the same way, each on a lane of its own per burst.
 //!
 //! Builds, pauses, resumes and re-reads are drawn as the aggregate JOIN tier
 //! draws them ([`super::join::JoinBuildDraws`]).
@@ -61,16 +77,78 @@ use crate::model::{Column, Op, OpOutcome, PRIMARY_KEY_VALUE_TYPE, Program, Table
 pub const FROM_TABLE: &str = super::join::FROM_TABLE;
 /// The joined table.
 pub const JOINED_TABLE: &str = super::join::JOINED_TABLE;
+/// The joined tables of a star, by position: `JOINED_TABLES[p - 1]` is at
+/// position `p`.
+pub const JOINED_TABLES: [&str; 4] = [JOINED_TABLE, "jc", "jd", "je"];
+/// The most tables a star joins, the root included (#1459's cap).
+pub const MAX_TABLES: usize = 1 + JOINED_TABLES.len();
 /// How many ids `ja` draws its rows' primary keys from. A row id comes back
 /// after a delete, so a key's `ja` rows are rewritten, deleted and
 /// re-inserted under one id.
 pub const A_IDS: u8 = 64;
 
+/// Whether the star tier runs: the development knob `TRELLIS_DEV_STAR_JOIN`
+/// is on, and the engine runs a star's pages and builds. This is the one
+/// gate of the star tier's property, sweep and metamorphic check; with it
+/// off they return at once, and nothing else the 1-1 JOIN tier draws or
+/// checks changes.
+///
+/// A star defines behind the knob, but its first page or build halts
+/// ("whose apply is not built yet") until the joined apply lands (#1774,
+/// sub-step 3.8 of #1460), which sets `ENGINE_RUNS_A_STAR` here.
+pub fn star_tier_enabled() -> bool {
+    const ENGINE_RUNS_A_STAR: bool = false;
+    ENGINE_RUNS_A_STAR && trellis::dev::defs::star_join_enabled()
+}
+
+/// The table at `position`: `ja` at 0, then [`JOINED_TABLES`].
+///
+/// # Panics
+///
+/// Past the last position.
+pub fn table_at(position: u8) -> &'static str {
+    match position {
+        0 => FROM_TABLE,
+        p => JOINED_TABLES[usize::from(p) - 1],
+    }
+}
+
+/// The position of `table`, if it is a star's.
+pub fn position_of(table: &str) -> Option<u8> {
+    if table == FROM_TABLE {
+        return Some(0);
+    }
+    JOINED_TABLES
+        .iter()
+        .position(|t| *t == table)
+        .map(|i| i as u8 + 1)
+}
+
+/// `ja`'s own key column for position `position`, from 2: `k2` to `k4`.
+pub fn own_key_column(position: u8) -> String {
+    format!("k{position}")
+}
+
 /// The two tables, empty.
 pub fn one_to_one_tables() -> Vec<Table> {
+    star_tables(2)
+}
+
+/// A star's `tables` tables, empty: `ja` with an own key column per position
+/// from 2, and a joined table per position with `jb`'s columns. Two tables
+/// are [`one_to_one_tables`].
+///
+/// # Panics
+///
+/// Outside 2 to [`MAX_TABLES`].
+pub fn star_tables(tables: usize) -> Vec<Table> {
+    assert!(
+        (2..=MAX_TABLES).contains(&tables),
+        "a star has 2 to {MAX_TABLES} tables, not {tables}"
+    );
     let int4 = ValueType::Integer(IntWidth::Int4);
     let int8 = ValueType::Integer(IntWidth::Int8);
-    let table = |name: &str, columns: &[(&str, ValueType)]| Table {
+    let table = |name: &str, columns: &[(String, ValueType)]| Table {
         name: name.to_string(),
         pk_col: "id".to_string(),
         columns: std::iter::once(Column {
@@ -78,7 +156,7 @@ pub fn one_to_one_tables() -> Vec<Table> {
             value_type: PRIMARY_KEY_VALUE_TYPE,
         })
         .chain(columns.iter().map(|(c, value_type)| Column {
-            name: (*c).to_string(),
+            name: c.clone(),
             value_type: *value_type,
         }))
         .collect(),
@@ -86,32 +164,39 @@ pub fn one_to_one_tables() -> Vec<Table> {
         unique_sets: Vec::new(),
         partitioning: None,
     };
-    let ja = table(
-        FROM_TABLE,
-        &[
-            ("t", int4),
-            ("k", int8),
-            ("c1", int4),
-            ("c2", int4),
-            ("s", ValueType::Text),
-            ("x", int4),
-        ],
-    );
-    let mut jb = table(
-        JOINED_TABLE,
-        &[
-            ("t", int4),
-            ("u", int8),
-            ("c1", int4),
-            ("c2", int4),
-            ("s", ValueType::Text),
-            ("y", int4),
-            ("w", ValueType::Text),
-        ],
-    );
-    jb.unique_cols = vec!["u".to_string(), "s".to_string()];
-    jb.unique_sets = vec![vec!["c1".to_string(), "c2".to_string()]];
-    vec![ja, jb]
+    let named = |columns: &[(&str, ValueType)]| -> Vec<(String, ValueType)> {
+        columns
+            .iter()
+            .map(|(c, value_type)| ((*c).to_string(), *value_type))
+            .collect()
+    };
+    let mut root = named(&[("t", int4), ("k", int8)]);
+    root.extend((2..tables as u8).map(|p| (own_key_column(p), int8)));
+    root.extend(named(&[
+        ("c1", int4),
+        ("c2", int4),
+        ("s", ValueType::Text),
+        ("x", int4),
+    ]));
+    let mut out = vec![table(FROM_TABLE, &root)];
+    for joined in &JOINED_TABLES[..tables - 1] {
+        let mut jb = table(
+            joined,
+            &named(&[
+                ("t", int4),
+                ("u", int8),
+                ("c1", int4),
+                ("c2", int4),
+                ("s", ValueType::Text),
+                ("y", int4),
+                ("w", ValueType::Text),
+            ]),
+        );
+        jb.unique_cols = vec!["u".to_string(), "s".to_string()];
+        jb.unique_sets = vec![vec!["c1".to_string(), "c2".to_string()]];
+        out.push(jb);
+    }
+    out
 }
 
 /// What a definition joins on. `jb`'s side of every shape holds a unique
@@ -147,16 +232,27 @@ impl OnShape {
         OnShape::Text,
     ];
 
-    fn text(self) -> &'static str {
+    /// The `ON` text joining `joined`, with `ja`'s bigint key spelled `key`
+    /// (`k`, or a star position's own `k{p}`).
+    fn text_at(self, joined: &str, key: &str) -> String {
+        let b = joined;
         match self {
-            OnShape::PkPk => "ja.id = jb.id",
-            OnShape::KeyPk => "ja.k = jb.id",
-            OnShape::KeyUnique => "ja.k = jb.u",
-            OnShape::PkPlusT => "ja.k = jb.id AND ja.t = jb.t",
-            OnShape::UniquePlusT => "ja.t = jb.t AND ja.k = jb.u",
-            OnShape::Composite => "ja.c1 = jb.c1 AND ja.c2 = jb.c2",
-            OnShape::Text => "ja.s = jb.s",
+            OnShape::PkPk => format!("ja.id = {b}.id"),
+            OnShape::KeyPk => format!("ja.{key} = {b}.id"),
+            OnShape::KeyUnique => format!("ja.{key} = {b}.u"),
+            OnShape::PkPlusT => format!("ja.{key} = {b}.id AND ja.t = {b}.t"),
+            OnShape::UniquePlusT => format!("ja.t = {b}.t AND ja.{key} = {b}.u"),
+            OnShape::Composite => format!("ja.c1 = {b}.c1 AND ja.c2 = {b}.c2"),
+            OnShape::Text => format!("ja.s = {b}.s"),
         }
+    }
+
+    /// Whether the shape reads `ja`'s bigint key (`k`, or a position's own).
+    pub fn reads_root_key(self) -> bool {
+        matches!(
+            self,
+            OnShape::KeyPk | OnShape::KeyUnique | OnShape::PkPlusT | OnShape::UniquePlusT
+        )
     }
 }
 
@@ -196,17 +292,39 @@ impl OneToOneField {
         OneToOneField::DiffYx,
     ];
 
-    fn select(self) -> &'static str {
+    /// The fields that read the joined table: what a star position from 2
+    /// selects.
+    pub const JOINED: [OneToOneField; 7] = [
+        OneToOneField::BId,
+        OneToOneField::BY,
+        OneToOneField::BW,
+        OneToOneField::SumXy,
+        OneToOneField::CoalesceXy,
+        OneToOneField::CaseW,
+        OneToOneField::DiffYx,
+    ];
+
+    /// Whether the field reads the joined table.
+    pub fn reads_joined(self) -> bool {
+        !matches!(self, OneToOneField::AX | OneToOneField::AS)
+    }
+
+    /// The select item over `joined`, its name ending in `suffix` (`""` at
+    /// position 1, `_p{p}` past it).
+    fn select_at(self, joined: &str, suffix: &str) -> String {
+        let b = joined;
         match self {
-            OneToOneField::BId => "jb.id AS b_id",
-            OneToOneField::BY => "jb.y AS b_y",
-            OneToOneField::BW => "jb.w AS b_w",
-            OneToOneField::AX => "ja.x AS a_x",
-            OneToOneField::AS => "ja.s AS a_s",
-            OneToOneField::SumXy => "ja.x + jb.y AS sum_xy",
-            OneToOneField::CoalesceXy => "ja.x + COALESCE(jb.y, 0) AS co_xy",
-            OneToOneField::CaseW => "CASE WHEN jb.id IS NULL THEN 'none' ELSE jb.w END AS case_w",
-            OneToOneField::DiffYx => "jb.y - ja.x AS diff_yx",
+            OneToOneField::BId => format!("{b}.id AS b_id{suffix}"),
+            OneToOneField::BY => format!("{b}.y AS b_y{suffix}"),
+            OneToOneField::BW => format!("{b}.w AS b_w{suffix}"),
+            OneToOneField::AX => "ja.x AS a_x".to_string(),
+            OneToOneField::AS => "ja.s AS a_s".to_string(),
+            OneToOneField::SumXy => format!("ja.x + {b}.y AS sum_xy{suffix}"),
+            OneToOneField::CoalesceXy => format!("ja.x + COALESCE({b}.y, 0) AS co_xy{suffix}"),
+            OneToOneField::CaseW => {
+                format!("CASE WHEN {b}.id IS NULL THEN 'none' ELSE {b}.w END AS case_w{suffix}")
+            }
+            OneToOneField::DiffYx => format!("{b}.y - ja.x AS diff_yx{suffix}"),
         }
     }
 }
@@ -214,26 +332,119 @@ impl OneToOneField {
 /// One 1-1 `JOIN` definition's shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OneToOneSpec {
+    /// Position 1's kind.
     pub left: bool,
+    /// Position 1's `ON`, over `ja.k`.
     pub on: OnShape,
     /// The fields, in order, without repeats.
     pub fields: Vec<OneToOneField>,
+    /// A star's positions from 2, in order: empty for the two-table JOIN.
+    pub more: Vec<StarPosition>,
+}
+
+/// One position of a star past the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StarPosition {
+    pub left: bool,
+    pub on: OnShape,
+    /// Whether a shape that reads `ja`'s bigint key reads the position's own
+    /// `k{p}` rather than the `k` position 1 reads.
+    pub own_key: bool,
+    /// The fields over this position's table ([`OneToOneField::JOINED`];
+    /// any other is left out), named with a `_p{p}` suffix.
+    pub fields: Vec<OneToOneField>,
+}
+
+impl OneToOneSpec {
+    /// The tables the definition joins, the root included.
+    pub fn tables(&self) -> usize {
+        2 + self.more.len()
+    }
+
+    /// Whether position `p` (from 1) is a `LEFT` join.
+    pub fn left_at(&self, p: u8) -> bool {
+        match p {
+            1 => self.left,
+            p => self.more[usize::from(p) - 2].left,
+        }
+    }
+
+    /// Position `p`'s `ON` text.
+    fn on_at(&self, p: u8) -> String {
+        match p {
+            1 => self.on.text_at(JOINED_TABLE, "k"),
+            p => {
+                let position = &self.more[usize::from(p) - 2];
+                let key = if position.own_key {
+                    own_key_column(p)
+                } else {
+                    "k".to_string()
+                };
+                position.on.text_at(table_at(p), &key)
+            }
+        }
+    }
 }
 
 /// The definition text of `spec`, targeting `name`.
 pub fn one_to_one_definition_text(name: &str, spec: &OneToOneSpec) -> String {
-    let mut seen = Vec::new();
+    let order: Vec<u8> = (1..spec.tables() as u8).collect();
+    star_definition_text(name, spec, &order)
+}
+
+/// The definition text of `spec`, targeting `name`, with its `JOIN` clauses
+/// in `order` (a permutation of the positions `1..tables`): the metamorphic
+/// case's twin. The select list and each clause's table, kind and `ON` stay
+/// as `spec` has them, so only the clauses' order (and so the engine's
+/// numbering of the positions) changes.
+///
+/// # Panics
+///
+/// When `order` isn't a permutation of the positions.
+pub fn star_definition_text(name: &str, spec: &OneToOneSpec, order: &[u8]) -> String {
+    let mut sorted = order.to_vec();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        (1..spec.tables() as u8).collect::<Vec<_>>(),
+        "{order:?} isn't an order of {spec:?}'s positions"
+    );
     let mut select = Vec::new();
+    let mut seen = Vec::new();
     for field in &spec.fields {
         if !seen.contains(field) {
             seen.push(*field);
-            select.push(field.select());
+            select.push(field.select_at(JOINED_TABLE, ""));
         }
     }
+    for (i, position) in spec.more.iter().enumerate() {
+        let p = i as u8 + 2;
+        let mut seen = Vec::new();
+        for field in position.fields.iter().filter(|f| f.reads_joined()) {
+            if !seen.contains(field) {
+                seen.push(*field);
+                select.push(field.select_at(table_at(p), &format!("_p{p}")));
+            }
+        }
+    }
+    let joins: Vec<String> = order
+        .iter()
+        .map(|&p| {
+            format!(
+                "{} {} ON {}",
+                if spec.left_at(p) {
+                    "LEFT JOIN"
+                } else {
+                    "INNER JOIN"
+                },
+                table_at(p),
+                spec.on_at(p)
+            )
+        })
+        .collect();
     format!(
-        "TRANSFORM {name} FROM {FROM_TABLE} {} {JOINED_TABLE} ON {} SELECT {}",
-        if spec.left { "LEFT JOIN" } else { "INNER JOIN" },
-        spec.on.text(),
+        "TRANSFORM {name} FROM {FROM_TABLE} {} SELECT {}",
+        joins.join(" "),
         select.join(", ")
     )
 }
@@ -253,8 +464,9 @@ pub fn one_to_one_definition(name: &str, spec: &OneToOneSpec) -> TransformDef {
 /// insert into `ja` of small values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OneToOneOpDraw {
-    /// `jb` rather than `ja`.
-    pub joined: bool,
+    /// The table: `0` for `ja`, `p` for the joined table at position `p`
+    /// (`1` for `jb`), modulo the program's tables.
+    pub position: u8,
     pub kind: JoinOpKind,
     /// Which live row an update or delete names, modulo how many there are.
     pub pick: usize,
@@ -269,9 +481,14 @@ pub struct OneToOneOpDraw {
     /// The value column (`x` or `y`), or `NULL`.
     pub value: Option<i8>,
     /// Which columns an update sets: bit 0 the key (`k`/`u`, `c1`, `c2`,
-    /// `s`), 1 `t`, 2 only `c2` (to `NULL` or back), 3 the value (and `w`).
-    /// No bit set means the value.
+    /// `s`, and a star's `k2` to `k4`), 1 `t`, 2 only `c2` (to `NULL` or
+    /// back), 3 the value (and `w`). No bit set means the value.
     pub columns: u8,
+    /// A star's `ja` keys at positions 2 to 4 (`k2` to `k4`), through
+    /// [`KeyShape`] as `key` is; unread below three tables. The star tier
+    /// draws each equal to `key` half the time, so a root row is hot at two
+    /// or more positions at once.
+    pub own_keys: [u8; 3],
 }
 
 /// The number of join keys a [`KeyShape`] draws over.
@@ -282,6 +499,7 @@ pub fn key_count(shape: KeyShape) -> u8 {
         KeyShape::FanOut => super::join::FAN_OUT_KEYS,
         KeyShape::Wide => super::join::WIDE_KEYS,
         KeyShape::Racing => super::join::RACING_KEYS,
+        KeyShape::Star => super::join::STAR_KEYS,
     }
 }
 
@@ -319,6 +537,21 @@ fn key_columns(joined: bool, key: Option<u8>, half_null: bool) -> Vec<(String, O
     ]
 }
 
+/// A star `ja` row's own keys, `k2` up to the last position's: none below
+/// three tables.
+fn own_key_columns(
+    draw: &OneToOneOpDraw,
+    shape: KeyShape,
+    tables: usize,
+) -> Vec<(String, Option<String>)> {
+    (2..tables as u8)
+        .map(|p| {
+            let raw = draw.own_keys[usize::from(p) - 2];
+            (own_key_column(p), shape.key(raw).map(|k| k.to_string()))
+        })
+        .collect()
+}
+
 /// The first of `from`, `from + 1`, … (modulo `range`) that `taken` doesn't
 /// hold, or `None` when it holds them all.
 fn first_free(from: u8, range: u8, taken: impl Fn(u8) -> bool) -> Option<u8> {
@@ -343,35 +576,61 @@ pub fn build_one_to_one_program(
     draws: &[OneToOneOpDraw],
     installs: &[u16],
 ) -> Program {
-    let tables = one_to_one_tables();
+    build_star_program(specs, 2, shape, draws, installs)
+}
+
+/// [`build_one_to_one_program`] over a star's `tables` tables
+/// ([`star_tables`]): a draw writes the table at its position, modulo
+/// `tables`, and each joined table's keys stay unique among its live rows.
+///
+/// # Panics
+///
+/// When a spec joins another number of tables.
+pub fn build_star_program(
+    specs: &[OneToOneSpec],
+    tables: usize,
+    shape: KeyShape,
+    draws: &[OneToOneOpDraw],
+    installs: &[u16],
+) -> Program {
+    for spec in specs {
+        assert_eq!(spec.tables(), tables, "{spec:?}");
+    }
+    let schema = star_tables(tables);
     let keys = key_count(shape);
-    let mut live: [Vec<Live>; 2] = [Vec::new(), Vec::new()];
+    let mut live: Vec<Vec<Live>> = vec![Vec::new(); tables];
     let text = |v: Option<i64>| v.map(|v| v.to_string());
     let mut ops = Vec::with_capacity(draws.len());
     for draw in draws {
-        let side = usize::from(draw.joined);
-        let (table, value_col) = if draw.joined {
-            (JOINED_TABLE, "y")
-        } else {
-            (FROM_TABLE, "x")
-        };
-        let ids = if draw.joined { keys } else { A_IDS };
+        let side = usize::from(draw.position) % tables;
+        let joined = side > 0;
+        let table = table_at(side as u8);
+        let value_col = if joined { "y" } else { "x" };
+        let ids = if joined { keys } else { A_IDS };
         let t = (draw.t < 240).then(|| (draw.t % 2).to_string());
         let value = text(draw.value.map(i64::from));
         let payload = draw
             .value
             .map(|v| format!("w{}", v.rem_euclid(5)))
-            .filter(|_| draw.joined);
-        // The key this op writes: any for `ja`, a free one for `jb`.
+            .filter(|_| joined);
+        // The key this op writes: any for `ja`, a free one for a joined table.
         let key_for = |live: &[Live], own: Option<i64>| -> Option<u8> {
             let drawn = shape.key(draw.key)?;
-            if !draw.joined {
+            if !joined {
                 return Some(drawn);
             }
             first_free(drawn, keys, |candidate| {
                 live.iter()
                     .any(|row| Some(row.id) != own && row.key == Some(candidate))
             })
+        };
+        // Every key column a key update of this table sets.
+        let keyed = |key: Option<u8>| {
+            let mut columns = key_columns(joined, key, draw.half_null);
+            if !joined {
+                columns.extend(own_key_columns(draw, shape, tables));
+            }
+            columns
         };
         let mut kind = if live[side].is_empty() {
             JoinOpKind::Insert
@@ -396,9 +655,9 @@ pub fn build_one_to_one_program(
                     ("id".to_string(), Some(id.to_string())),
                     ("t".to_string(), t),
                 ];
-                row.extend(key_columns(draw.joined, key, draw.half_null));
+                row.extend(keyed(key));
                 row.push((value_col.to_string(), value));
-                if draw.joined {
+                if joined {
                     row.push(("w".to_string(), payload));
                 }
                 Op::Insert {
@@ -414,7 +673,7 @@ pub fn build_one_to_one_program(
                 if draw.columns & 1 != 0 {
                     let key = key_for(&live[side], Some(row.id));
                     live[side][at].key = key;
-                    changes.extend(key_columns(draw.joined, key, draw.half_null));
+                    changes.extend(keyed(key));
                 }
                 if draw.columns & 2 != 0 {
                     changes.push(("t".to_string(), t));
@@ -428,7 +687,7 @@ pub fn build_one_to_one_program(
                 }
                 if draw.columns & 8 != 0 || changes.is_empty() {
                     changes.push((value_col.to_string(), value));
-                    if draw.joined {
+                    if joined {
                         changes.push(("w".to_string(), payload));
                     }
                 }
@@ -440,7 +699,8 @@ pub fn build_one_to_one_program(
                 }
             }
             JoinOpKind::Delete => {
-                let row = live[side].swap_remove(draw.pick % live[side].len());
+                let at = draw.pick % live[side].len();
+                let row = live[side].swap_remove(at);
                 Op::Delete {
                     table: table.to_string(),
                     pk: row.id.to_string(),
@@ -463,7 +723,7 @@ pub fn build_one_to_one_program(
                 if draw.columns & 1 != 0 {
                     let key = key_for(&live[side], Some(id));
                     live[side][at].key = key;
-                    changes.extend(key_columns(draw.joined, key, draw.half_null));
+                    changes.extend(keyed(key));
                 }
                 Op::Update {
                     table: table.to_string(),
@@ -481,7 +741,7 @@ pub fn build_one_to_one_program(
         .map(|(i, spec)| one_to_one_definition(&format!("j{i}"), spec))
         .collect();
     Program {
-        tables,
+        tables: schema,
         def_install_after_op: (0..defs.len())
             .map(|i| {
                 let thousandths = usize::from(installs.get(i).copied().unwrap_or(0).min(999));
@@ -495,46 +755,53 @@ pub fn build_one_to_one_program(
     }
 }
 
-/// `plan` with every one of a burst's `jb` ops on one lane, in program order.
+/// `plan` with every one of a burst's ops on a joined table on one lane, in
+/// program order: one lane per joined table (a star's tables may share one).
 ///
-/// `jb`'s join key is unique, so two `jb` rows on two lanes could race for a
-/// key one is about to free (the program's order frees it first, the lanes'
-/// need not): the plan keeps the table's ops together. The `ja` ops stay
-/// spread over the other lanes by primary key.
+/// A joined table's join key is unique, so two of its rows on two lanes
+/// could race for a key one is about to free (the program's order frees it
+/// first, the lanes' need not): the plan keeps the table's ops together. The
+/// `ja` ops stay spread over the other lanes by primary key.
 pub fn one_joined_lane(
     mut plan: crate::model::ConcurrentPlan,
     program: &Program,
 ) -> crate::model::ConcurrentPlan {
-    let joined = |index: usize| match &program.ops[index] {
+    let table_of = |index: usize| match &program.ops[index] {
         Op::Insert { table, .. }
         | Op::Update { table, .. }
         | Op::Delete { table, .. }
-        | Op::Truncate { table, .. } => table == JOINED_TABLE,
+        | Op::Truncate { table, .. } => table.as_str(),
         other => unreachable!("the 1-1 JOIN tier draws no {other:?}"),
     };
     for burst in &mut plan.bursts {
-        let Some(target) = burst
-            .lanes
-            .iter()
-            .position(|lane| lane.iter().any(|&index| joined(index)))
-        else {
-            continue;
-        };
-        let mut moved = Vec::new();
-        for (n, lane) in burst.lanes.iter_mut().enumerate() {
-            if n != target {
-                lane.retain(|&index| {
-                    let is_joined = joined(index);
-                    if is_joined {
-                        moved.push(index);
-                    }
-                    !is_joined
-                });
+        let mut moved_any = false;
+        for joined in JOINED_TABLES {
+            let Some(target) = burst
+                .lanes
+                .iter()
+                .position(|lane| lane.iter().any(|&index| table_of(index) == joined))
+            else {
+                continue;
+            };
+            moved_any = true;
+            let mut moved = Vec::new();
+            for (n, lane) in burst.lanes.iter_mut().enumerate() {
+                if n != target {
+                    lane.retain(|&index| {
+                        let is_joined = table_of(index) == joined;
+                        if is_joined {
+                            moved.push(index);
+                        }
+                        !is_joined
+                    });
+                }
             }
+            burst.lanes[target].extend(moved);
+            burst.lanes[target].sort_unstable();
         }
-        burst.lanes[target].extend(moved);
-        burst.lanes[target].sort_unstable();
-        burst.lanes.retain(|lane| !lane.is_empty());
+        if moved_any {
+            burst.lanes.retain(|lane| !lane.is_empty());
+        }
     }
     plan
 }
@@ -554,6 +821,27 @@ pub fn one_to_one_case(
     seal_interval_ms: u64,
 ) -> JoinCase {
     let program = build_one_to_one_program(specs, shape, draws, &builds.installs);
+    planned_case(
+        program,
+        shape,
+        builds,
+        burst_size,
+        lanes,
+        workers,
+        seal_interval_ms,
+    )
+}
+
+/// `program` planned as [`one_to_one_case`] plans it.
+fn planned_case(
+    program: Program,
+    shape: KeyShape,
+    builds: &super::join::JoinBuildDraws,
+    burst_size: usize,
+    lanes: usize,
+    workers: usize,
+    seal_interval_ms: u64,
+) -> JoinCase {
     let mut plan = super::concurrent_plan(&program, burst_size, lanes);
     plan = one_joined_lane(plan, &program);
     plan = super::join::add_join_actions(plan, &program, &builds.actions);
@@ -575,8 +863,8 @@ pub fn one_to_one_case(
 pub struct TailTruncate {
     /// Picks the burst, modulo how many there are.
     pub burst: usize,
-    /// `jb` rather than `ja`.
-    pub joined: bool,
+    /// The table's position, as [`OneToOneOpDraw::position`].
+    pub position: u8,
     /// How many ops before the burst's last one it lands.
     pub back: u8,
 }
@@ -598,12 +886,179 @@ pub fn place_tail_truncates(
         let end = ((burst + 1) * burst_size).min(draws.len());
         let at = end - 1 - usize::from(tail.back).min(end - 1 - burst * burst_size);
         draws[at].kind = JoinOpKind::Truncate;
-        draws[at].joined = tail.joined;
+        draws[at].position = tail.position;
+    }
+}
+
+/// The workers a star case drains with (#1464 section 4).
+pub const STAR_WORKERS: usize = 8;
+/// The longest stall a star case's pages take at a lock step.
+pub const STAR_LOCK_STEP_STALL_MS: u64 = 3;
+/// The share of lock steps a star case stalls at, in thousandths.
+pub const STAR_STALLED_LOCK_STEPS_PER_MILLE: u16 = 300;
+/// The share of pages a star case re-derives, in thousandths.
+pub const STAR_REDERIVED_PAGES_PER_MILLE: u16 = 120;
+/// The largest page a star case drains, in rows.
+pub const STAR_MAX_PAGE_ROWS: usize = 15;
+
+/// How a star case's engine runs (#1464 section 4's generator changes 3
+/// to 5), for the runner to apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StarKnobs {
+    /// The most rows a drain holds (`ManualBackend::set_drain_batch_cap`):
+    /// pages of 1 to [`STAR_MAX_PAGE_ROWS`] rows.
+    pub drain_batch_cap: usize,
+    /// The longest stall a page takes at a lock step.
+    pub lock_step_stall: std::time::Duration,
+    /// The share of lock steps that stall, in thousandths.
+    pub stalled_lock_steps_per_mille: u16,
+    /// The share of pages re-derived, in thousandths.
+    pub rederived_pages_per_mille: u16,
+    /// The "late" position (#1459's F11 orientation): in a mixed page its
+    /// draws come last ([`shape_pages`]).
+    pub late_position: u8,
+    /// Whether the case also runs its metamorphic twin
+    /// ([`StarCase::permuted_program`]).
+    pub metamorphic: bool,
+}
+
+/// One drawn page of the stream ([`shape_pages`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageDraw {
+    /// Its draws: 1 to [`STAR_MAX_PAGE_ROWS`].
+    pub rows: u8,
+    /// Whether its draws span the positions on one root key.
+    pub mixed: bool,
+    /// Seeds its shuffle.
+    pub shuffle: u64,
+}
+
+/// SplitMix64: the shuffle's numbers, from a drawn seed.
+fn split_mix(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Cuts `draws` into the pages `pages` draws, in turn, and shuffles each
+/// (#1464 section 4, change 3). In a `mixed` page of two or more draws every
+/// draw takes the page's first key, the draws cycle over the positions
+/// (`ja` first, then each joined table), a `ja` draw takes the key at every
+/// position of its own too, and the draws at `late` come after the others:
+/// one root key changed at every position, with the late position's change
+/// last, in rows a drain of [`StarKnobs::drain_batch_cap`] rows takes
+/// together.
+pub fn shape_pages(draws: &mut [OneToOneOpDraw], pages: &[PageDraw], tables: usize, late: u8) {
+    if pages.is_empty() {
+        return;
+    }
+    let mut start = 0;
+    for page in pages.iter().cycle() {
+        if start >= draws.len() {
+            break;
+        }
+        let end = (start + usize::from(page.rows.max(1))).min(draws.len());
+        let chunk = &mut draws[start..end];
+        let mixed = page.mixed && chunk.len() >= 2;
+        if mixed {
+            let key = chunk[0].key;
+            for (i, draw) in chunk.iter_mut().enumerate() {
+                draw.position = (i % tables) as u8;
+                draw.key = key;
+                if draw.position == 0 {
+                    draw.own_keys = [key; 3];
+                }
+            }
+        }
+        let mut state = page.shuffle;
+        for i in (1..chunk.len()).rev() {
+            let j = (split_mix(&mut state) % (i as u64 + 1)) as usize;
+            chunk.swap(i, j);
+        }
+        if mixed {
+            // Stable: the late position's draws move to the end.
+            chunk.sort_by_key(|draw| draw.position == late);
+        }
+        start = end;
+    }
+}
+
+/// A star tier case (#1781): a [`JoinCase`] over `tables` tables, the specs
+/// its definitions were drawn from, how its engine runs, and the `JOIN`
+/// order of its metamorphic twin.
+#[derive(Debug, Clone)]
+pub struct StarCase {
+    pub case: JoinCase,
+    pub tables: usize,
+    pub specs: Vec<OneToOneSpec>,
+    pub knobs: StarKnobs,
+    /// A permutation of the positions `1..tables`: the `JOIN` clauses' order
+    /// in [`StarCase::permuted_program`].
+    pub join_order: Vec<u8>,
+}
+
+impl StarCase {
+    /// The metamorphic twin (#1464 section 4, change 7): the same tables, ops
+    /// and plan, with each definition's `JOIN` clauses in
+    /// [`StarCase::join_order`]. It reaches the same targets: each `ON` is a
+    /// null-rejecting equality over the root and one table, so the clauses'
+    /// order changes nothing a row joins, only the engine's numbering of the
+    /// positions (and so its `(position, key)` lock order).
+    pub fn permuted_program(&self) -> Program {
+        let mut program = self.case.program.clone();
+        program.defs = self
+            .specs
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| {
+                let text = star_definition_text(&format!("j{i}"), spec, &self.join_order);
+                trellis::dev::defs::parse(&text).unwrap_or_else(|e| panic!("{text}: {e:?}"))
+            })
+            .collect();
+        program
+    }
+}
+
+/// A star case: [`build_star_program`] over `tables` tables under
+/// [`KeyShape::Star`], planned as [`one_to_one_case`] plans it, drained by
+/// [`STAR_WORKERS`] workers with a commit stall of up to
+/// [`STAR_LOCK_STEP_STALL_MS`].
+#[allow(clippy::too_many_arguments)]
+pub fn star_case(
+    specs: &[OneToOneSpec],
+    tables: usize,
+    draws: &[OneToOneOpDraw],
+    builds: &super::join::JoinBuildDraws,
+    burst_size: usize,
+    lanes: usize,
+    seal_interval_ms: u64,
+    knobs: StarKnobs,
+    join_order: Vec<u8>,
+) -> StarCase {
+    let program = build_star_program(specs, tables, KeyShape::Star, draws, &builds.installs);
+    let mut case = planned_case(
+        program,
+        KeyShape::Star,
+        builds,
+        burst_size,
+        lanes,
+        STAR_WORKERS,
+        seal_interval_ms,
+    );
+    case.plan.commit_stall = Some(knobs.lock_step_stall);
+    StarCase {
+        case,
+        tables,
+        specs: specs.to_vec(),
+        knobs,
+        join_order,
     }
 }
 
 #[cfg(feature = "proptest")]
-pub use strategy::one_to_one_case_strategy;
+pub use strategy::{one_to_one_case_strategy, star_case_strategy};
 
 #[cfg(feature = "proptest")]
 pub(crate) mod strategy {
@@ -620,7 +1075,12 @@ pub(crate) mod strategy {
             proptest::sample::select(OnShape::ALL.to_vec()),
             proptest::sample::subsequence(OneToOneField::ALL.to_vec(), 1..=4),
         )
-            .prop_map(|(left, on, fields)| OneToOneSpec { left, on, fields })
+            .prop_map(|(left, on, fields)| OneToOneSpec {
+                left,
+                on,
+                fields,
+                more: Vec::new(),
+            })
     }
 
     fn action() -> impl Strategy<Value = JoinActionDraw> {
@@ -672,8 +1132,8 @@ pub(crate) mod strategy {
     ) -> impl Strategy<Value = OneToOneOpDraw> {
         (
             prop_oneof![
-                10 - joined_weight => Just(false),
-                joined_weight => Just(true),
+                10 - joined_weight => Just(0u8),
+                joined_weight => Just(1u8),
             ],
             prop_oneof![
                 40 => Just(JoinOpKind::Insert),
@@ -692,8 +1152,8 @@ pub(crate) mod strategy {
             0u8..16,
         )
             .prop_map(
-                move |(joined, kind, pick, key, id, t, half_null, value, columns)| OneToOneOpDraw {
-                    joined,
+                move |(position, kind, pick, key, id, t, half_null, value, columns)| OneToOneOpDraw {
+                    position,
                     kind: if kind == JoinOpKind::Truncate && !truncating {
                         JoinOpKind::Delete
                     } else {
@@ -706,6 +1166,7 @@ pub(crate) mod strategy {
                     half_null,
                     value,
                     columns,
+                    own_keys: [0; 3],
                 },
             )
     }
@@ -713,7 +1174,7 @@ pub(crate) mod strategy {
     pub(crate) fn tail_truncate() -> impl Strategy<Value = TailTruncate> {
         (any::<usize>(), any::<bool>(), 0u8..4).prop_map(|(burst, joined, back)| TailTruncate {
             burst,
-            joined,
+            position: u8::from(joined),
             back,
         })
     }
@@ -837,6 +1298,130 @@ pub(crate) mod strategy {
                 )
         })
     }
+
+    fn star_position() -> impl Strategy<Value = StarPosition> {
+        (
+            any::<bool>(),
+            proptest::sample::select(OnShape::ALL.to_vec()),
+            any::<bool>(),
+            proptest::sample::subsequence(OneToOneField::JOINED.to_vec(), 0..=2),
+        )
+            .prop_map(|(left, on, own_key, fields)| StarPosition {
+                left,
+                on,
+                own_key,
+                fields,
+            })
+    }
+
+    /// A star definition over `tables` tables: a kind, an `ON` shape and
+    /// fields per position.
+    pub(crate) fn star_spec(tables: usize) -> impl Strategy<Value = OneToOneSpec> {
+        (
+            spec(),
+            proptest::collection::vec(star_position(), tables - 2),
+        )
+            .prop_map(|(spec, more)| OneToOneSpec { more, ..spec })
+    }
+
+    /// One star op draw over `tables` tables: two in five on `ja`, the rest
+    /// spread over the positions, and each of `ja`'s own keys equal to `key`
+    /// half the time (a root row hot at two or more positions at once).
+    pub(crate) fn star_draw(tables: usize) -> impl Strategy<Value = OneToOneOpDraw> {
+        let own = || prop_oneof![1 => Just(None), 1 => any::<u8>().prop_map(Some)];
+        (
+            draw(5, true),
+            prop_oneof![2 => Just(0u8), 3 => 1u8..tables as u8],
+            [own(), own(), own()],
+        )
+            .prop_map(|(draw, position, own)| OneToOneOpDraw {
+                position,
+                own_keys: own.map(|raw| raw.unwrap_or(draw.key)),
+                ..draw
+            })
+    }
+
+    fn page() -> impl Strategy<Value = PageDraw> {
+        (
+            1u8..=STAR_MAX_PAGE_ROWS as u8,
+            prop_oneof![1 => Just(false), 1 => Just(true)],
+            any::<u64>(),
+        )
+            .prop_map(|(rows, mixed, shuffle)| PageDraw {
+                rows,
+                mixed,
+                shuffle,
+            })
+    }
+
+    /// A star tier case (#1781, #1464 section 4): 2 to [`MAX_TABLES`]
+    /// tables (the two-table JOIN is the one-position case), one or two
+    /// definitions, each with a kind and an `ON` shape per position, and 200
+    /// to 600 writes over every table under [`KeyShape::Star`]'s narrow key
+    /// space, cut into shuffled pages of 1 to [`STAR_MAX_PAGE_ROWS`] draws of
+    /// which half span the positions on one root key ([`shape_pages`]), with
+    /// a drawn "late" position. [`STAR_WORKERS`] workers drain pages of at
+    /// most a drawn 1 to 15 rows, sealing every 20 to 200 ms over 2 to 4
+    /// lanes, stalling up to [`STAR_LOCK_STEP_STALL_MS`] before each commit;
+    /// the knobs carry the share of stalled lock steps and re-derived pages.
+    /// Builds, pauses and re-reads are the two-table tier's ([`builds`]), and
+    /// about one op in a hundred is a `TRUNCATE` of any table. One case in
+    /// four also runs its metamorphic twin, under a drawn `JOIN` order.
+    pub fn star_case_strategy() -> impl Strategy<Value = StarCase> {
+        (2usize..=MAX_TABLES).prop_flat_map(|tables| {
+            let positions = (1..tables as u8).collect::<Vec<u8>>();
+            (
+                proptest::collection::vec(star_spec(tables), 1..=2),
+                proptest::collection::vec(star_draw(tables), 200..=600),
+                proptest::collection::vec(page(), 8..=32),
+                proptest::sample::select(positions.clone()),
+                1usize..=STAR_MAX_PAGE_ROWS,
+                Just(positions).prop_shuffle(),
+                30usize..=150,
+                2usize..=4,
+                20u64..=200,
+                builds(),
+                0u64..=STAR_LOCK_STEP_STALL_MS,
+                prop_oneof![3 => Just(false), 1 => Just(true)],
+            )
+                .prop_map(
+                    move |(
+                        specs,
+                        mut draws,
+                        pages,
+                        late_position,
+                        drain_batch_cap,
+                        join_order,
+                        burst_size,
+                        lanes,
+                        seal_interval_ms,
+                        builds,
+                        stall_ms,
+                        metamorphic,
+                    )| {
+                        shape_pages(&mut draws, &pages, tables, late_position);
+                        star_case(
+                            &specs,
+                            tables,
+                            &draws,
+                            &builds,
+                            burst_size,
+                            lanes,
+                            seal_interval_ms,
+                            StarKnobs {
+                                drain_batch_cap,
+                                lock_step_stall: std::time::Duration::from_millis(stall_ms),
+                                stalled_lock_steps_per_mille: STAR_STALLED_LOCK_STEPS_PER_MILLE,
+                                rederived_pages_per_mille: STAR_REDERIVED_PAGES_PER_MILLE,
+                                late_position,
+                                metamorphic,
+                            },
+                            join_order,
+                        )
+                    },
+                )
+        })
+    }
 }
 
 #[cfg(test)]
@@ -851,6 +1436,7 @@ mod tests {
                     left,
                     on,
                     fields: OneToOneField::ALL.to_vec(),
+                    more: Vec::new(),
                 });
             }
         }
@@ -918,7 +1504,7 @@ mod tests {
 
     fn draw(joined: bool, kind: JoinOpKind, pick: usize, key: u8, id: u8) -> OneToOneOpDraw {
         OneToOneOpDraw {
-            joined,
+            position: u8::from(joined),
             kind,
             pick,
             key,
@@ -927,6 +1513,7 @@ mod tests {
             half_null: false,
             value: Some(2),
             columns: 0,
+            own_keys: [0; 3],
         }
     }
 
@@ -1004,9 +1591,9 @@ mod tests {
         let mut draws: Vec<OneToOneOpDraw> = (0..25u8)
             .map(|i| draw(false, JoinOpKind::Insert, 0, i, i))
             .collect();
-        let tail = |burst, joined, back| TailTruncate {
+        let tail = |burst, joined: bool, back| TailTruncate {
             burst,
-            joined,
+            position: u8::from(joined),
             back,
         };
         place_tail_truncates(
@@ -1018,7 +1605,7 @@ mod tests {
             .iter()
             .enumerate()
             .filter(|(_, d)| d.kind == JoinOpKind::Truncate)
-            .map(|(i, d)| (i, d.joined))
+            .map(|(i, d)| (i, d.position == 1))
             .collect();
         // Burst 0 ends at 9; burst 4 % 3 = 1 ends at 19; burst 2 (20..25)
         // ends at 24.
@@ -1163,5 +1750,183 @@ mod tests {
         }
         assert!(jb_writes > 10_000, "{jb_writes}");
         assert!(half_null_writes > 100, "{half_null_writes}");
+    }
+
+    /// A star over `tables` tables with every position `LEFT` or `INNER` in
+    /// turn, on the shapes in turn, every other one on its own key.
+    fn star_spec(tables: usize, offset: usize) -> OneToOneSpec {
+        OneToOneSpec {
+            left: offset % 2 == 0,
+            on: OnShape::ALL[offset % OnShape::ALL.len()],
+            fields: vec![OneToOneField::AX, OneToOneField::BY],
+            more: (2..tables)
+                .map(|p| StarPosition {
+                    left: (p + offset) % 2 == 1,
+                    on: OnShape::ALL[(p + offset) % OnShape::ALL.len()],
+                    own_key: p % 2 == 0,
+                    fields: vec![OneToOneField::BId, OneToOneField::AX, OneToOneField::CaseW],
+                })
+                .collect(),
+        }
+    }
+
+    /// Every star shape parses as a 1-1 `JOIN` of one clause per position,
+    /// each position's fields named apart (a position's root-only field is
+    /// left out), and its permuted twin parses with the clauses in the
+    /// drawn order.
+    #[test]
+    fn every_star_definition_parses_in_any_join_order() {
+        use trellis::dev::defs::ast::KeySpace;
+        for tables in 3..=MAX_TABLES {
+            for offset in 0..OnShape::ALL.len() {
+                let spec = star_spec(tables, offset);
+                let def = one_to_one_definition("j", &spec);
+                let KeySpace::JoinOneToOne(join) = &def.key_space else {
+                    panic!("{spec:?}")
+                };
+                let rights: Vec<&str> = join.joins.iter().map(|j| j.right.as_str()).collect();
+                assert_eq!(rights, JOINED_TABLES[..tables - 1], "{spec:?}");
+                assert_eq!(def.fields.len(), 2 + 2 * (tables - 2), "{spec:?}");
+                let order: Vec<u8> = (1..tables as u8).rev().collect();
+                let text = star_definition_text("j", &spec, &order);
+                let twin = trellis::dev::defs::parse(&text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+                let KeySpace::JoinOneToOne(twin_join) = &twin.key_space else {
+                    panic!("{text}")
+                };
+                let twin_rights: Vec<&str> =
+                    twin_join.joins.iter().map(|j| j.right.as_str()).collect();
+                let mut reversed = JOINED_TABLES[..tables - 1].to_vec();
+                reversed.reverse();
+                assert_eq!(twin_rights, reversed, "{text}");
+                assert_eq!(twin.fields, def.fields, "{text}");
+            }
+        }
+    }
+
+    /// The star's oracle is its own multi-join query: a clause per position,
+    /// in the definition's order, each with its kind and `ON`.
+    #[test]
+    fn the_oracle_of_a_star_joins_every_position_in_order() {
+        let spec = OneToOneSpec {
+            left: true,
+            on: OnShape::KeyUnique,
+            fields: vec![OneToOneField::AX, OneToOneField::BY],
+            more: vec![
+                StarPosition {
+                    left: false,
+                    on: OnShape::KeyPk,
+                    own_key: true,
+                    fields: vec![OneToOneField::BW],
+                },
+                StarPosition {
+                    left: true,
+                    on: OnShape::Text,
+                    own_key: false,
+                    fields: vec![OneToOneField::SumXy],
+                },
+            ],
+        };
+        let def = one_to_one_definition("j", &spec);
+        let select = r#"select "ja"."id"::text, ("ja"."x")::text as "a_x", ("jb"."y")::text as "b_y", ("jc"."w")::text as "b_w_p2", (("ja"."x" + "jd"."y"))::text as "sum_xy_p3" from "ja""#;
+        assert_eq!(
+            crate::oracle::render_join_one_to_one_select(&def, "id"),
+            format!(
+                r#"{select} left join "jb" on "ja"."k" = "jb"."u" join "jc" on "ja"."k2" = "jc"."id" left join "jd" on "ja"."s" = "jd"."s""#
+            )
+        );
+        let twin = trellis::dev::defs::parse(&star_definition_text("j", &spec, &[3, 1, 2]))
+            .expect("the twin parses");
+        assert_eq!(
+            crate::oracle::render_join_one_to_one_select(&twin, "id"),
+            format!(
+                r#"{select} left join "jd" on "ja"."s" = "jd"."s" left join "jb" on "ja"."k" = "jb"."u" join "jc" on "ja"."k2" = "jc"."id""#
+            )
+        );
+    }
+
+    /// A star's `ja` rows carry a key per own-key position, and a key update
+    /// sets them too; each joined table's keys stay unique among its rows.
+    #[test]
+    fn a_star_program_writes_every_position() {
+        let mut draws = Vec::new();
+        for i in 0..20u8 {
+            let mut d = draw(false, JoinOpKind::Insert, 0, i % 3, i);
+            d.position = i % 4;
+            d.own_keys = [i % 3, 150, 251];
+            draws.push(d);
+        }
+        let program = build_star_program(&[], 4, KeyShape::Star, &draws, &[]);
+        let tables: Vec<&str> = program.tables.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(tables, ["ja", "jb", "jc", "jd"]);
+        let ja: Vec<&str> = program.tables[0]
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(ja, ["id", "t", "k", "k2", "k3", "c1", "c2", "s", "x"]);
+        let Op::Insert { row, .. } = &program.ops[0] else {
+            panic!("{:?}", program.ops[0])
+        };
+        assert_eq!(key_of(row, "k2"), Some("0".to_string()));
+        // 150 is past the hot draws: key 3 + 150 % 77.
+        assert_eq!(key_of(row, "k3"), Some("76".to_string()));
+        for position in 1..4u8 {
+            let keys: Vec<Option<String>> = program
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    Op::Insert { table, row, .. } if table == table_at(position) => {
+                        Some(key_of(row, "u"))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(keys.len(), 5, "{position}");
+            let mut unique = keys.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(unique.len(), keys.len(), "{position}: {keys:?}");
+        }
+    }
+
+    /// A mixed page spans the positions on its first key, with the late
+    /// position's draws last; a plain page is only shuffled.
+    #[test]
+    fn a_mixed_page_spans_the_positions_with_the_late_one_last() {
+        let mut draws: Vec<OneToOneOpDraw> = (0..12u8)
+            .map(|i| draw(false, JoinOpKind::Insert, 0, i, i))
+            .collect();
+        let pages = [
+            PageDraw {
+                rows: 8,
+                mixed: true,
+                shuffle: 7,
+            },
+            PageDraw {
+                rows: 4,
+                mixed: false,
+                shuffle: 9,
+            },
+        ];
+        shape_pages(&mut draws, &pages, 4, 2);
+        let mixed = &draws[..8];
+        assert!(mixed.iter().all(|d| d.key == mixed[0].key), "{mixed:?}");
+        let positions: Vec<u8> = mixed.iter().map(|d| d.position).collect();
+        assert_eq!(positions[6..], [2, 2], "{positions:?}");
+        for p in 0..4 {
+            assert!(positions.contains(&p), "{positions:?}");
+        }
+        assert!(mixed.iter().filter(|d| d.position == 0).all(|d| d.own_keys == [d.key; 3]));
+        let mut plain: Vec<u8> = draws[8..].iter().map(|d| d.key).collect();
+        assert!(draws[8..].iter().all(|d| d.position == 0));
+        plain.sort_unstable();
+        assert_eq!(plain, [8, 9, 10, 11]);
+    }
+
+    /// The star tier stays off until the engine runs a star, whatever the
+    /// knob says (sub-step 3.8 of #1460 turns it on, and this test with it).
+    #[test]
+    fn the_star_tier_is_off_until_the_engine_runs_a_star() {
+        assert!(!star_tier_enabled());
     }
 }

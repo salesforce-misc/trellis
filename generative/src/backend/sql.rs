@@ -120,23 +120,29 @@ pub(super) fn render_definition(def: &TransformDef) -> String {
                     .join(", ")
             )
         }
-        // The 1-1 JOIN tier: the same clause without `GROUP BY`.
+        // The 1-1 JOIN tier: the same clause without `GROUP BY`, once per
+        // position of a star, in the definition's order.
         KeySpace::JoinOneToOne(join) => {
             let qualified = |c: &QualifiedColumn| format!("{}.{}", c.table, c.column);
-            format!(
-                " {} {} ON {}",
-                match join.joins[0].kind {
-                    JoinKind::Inner => "INNER JOIN",
-                    JoinKind::Left => "LEFT JOIN",
-                },
-                join.joins[0].right,
-                join.joins[0]
-                    .on
-                    .iter()
-                    .map(|on| format!("{} = {}", qualified(&on.lhs), qualified(&on.rhs)))
-                    .collect::<Vec<_>>()
-                    .join(" AND "),
-            )
+            join.joins
+                .iter()
+                .map(|joined| {
+                    format!(
+                        " {} {} ON {}",
+                        match joined.kind {
+                            JoinKind::Inner => "INNER JOIN",
+                            JoinKind::Left => "LEFT JOIN",
+                        },
+                        joined.right,
+                        joined
+                            .on
+                            .iter()
+                            .map(|on| format!("{} = {}", qualified(&on.lhs), qualified(&on.rhs)))
+                            .collect::<Vec<_>>()
+                            .join(" AND "),
+                    )
+                })
+                .collect::<String>()
         }
         KeySpace::OneToOne => String::new(),
         KeySpace::Aggregate { group_by } => format!(

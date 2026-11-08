@@ -343,15 +343,16 @@ pub async fn run_convergence_concurrent_sampled<B: ConcurrentBackend>(
     })
 }
 
-/// The targets of `installed`'s 1-1 `JOIN` definitions, which the in-run
-/// invariant samples.
+/// The targets of `installed`'s two-table 1-1 `JOIN` definitions, which the
+/// in-run invariant samples. A star's is left out: the snapshot read covers
+/// position 1 alone, and `invariant::check_star` takes every position's.
 fn join1_targets(installed: &[TransformDef]) -> Vec<String> {
     installed
         .iter()
         .filter(|def| {
             matches!(
-                def.key_space,
-                trellis::dev::defs::ast::KeySpace::JoinOneToOne(_)
+                &def.key_space,
+                trellis::dev::defs::ast::KeySpace::JoinOneToOne(join) if join.joins.len() == 1
             )
         })
         .map(|def| def.target.clone())

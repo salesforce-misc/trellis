@@ -537,11 +537,13 @@ fn hand_built_one_to_one_case() -> JoinCase {
                 OneToOneField::CoalesceXy,
                 OneToOneField::CaseW,
             ],
+            more: Vec::new(),
         },
         OneToOneSpec {
             left: false,
             on: OnShape::PkPk,
             fields: vec![OneToOneField::SumXy, OneToOneField::AX, OneToOneField::BW],
+            more: Vec::new(),
         },
     ];
     let chain = ChainSpec {
@@ -563,7 +565,7 @@ fn hand_built_one_to_one_case() -> JoinCase {
             _ => JoinOpKind::Delete,
         };
         draws.push(OneToOneOpDraw {
-            joined,
+            position: u8::from(joined),
             kind,
             pick: usize::from(i) * 7,
             key: i.wrapping_mul(37) % 12,
@@ -572,6 +574,7 @@ fn hand_built_one_to_one_case() -> JoinCase {
             half_null: i % 9 == 4,
             value: (i % 11 != 0).then_some(i as i8 - 10),
             columns: i % 16,
+            own_keys: [0; 3],
         });
     }
     one_to_one_chained_case(

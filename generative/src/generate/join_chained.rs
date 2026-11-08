@@ -833,7 +833,7 @@ mod strategy {
                             );
                             let joined = chain.joined;
                             rekey_every(&mut draws, every, |d: &mut OneToOneOpDraw| {
-                                (d.joined == joined).then_some(&mut d.kind)
+                                (d.position == u8::from(joined)).then_some(&mut d.kind)
                             });
                             let mut case = one_to_one_chained_case(
                                 &specs,

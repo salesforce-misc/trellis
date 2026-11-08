@@ -264,6 +264,11 @@ pub enum KeyShape {
     /// from opposite sides (or one `T` group) often share no `P` or `M`
     /// cell, and only the `J` and `T` locks order them.
     Racing,
+    /// Over [`STAR_KEYS`] keys, [`STAR_HOT_KEYS`] of which take two draws in
+    /// five: the star tier's narrow key space (#1464 section 4), where a hot
+    /// key's root rows and its rows at every position meet in pages that run
+    /// at once. Only the 1-1 JOIN tier's star cases draw it.
+    Star,
 }
 
 pub const SPREAD_KEYS: u8 = 12;
@@ -271,6 +276,8 @@ pub const HOT_OTHER_KEYS: u8 = 6;
 pub const FAN_OUT_KEYS: u8 = 3;
 pub const WIDE_KEYS: u8 = 64;
 pub const RACING_KEYS: u8 = 40;
+pub const STAR_KEYS: u8 = 80;
+pub const STAR_HOT_KEYS: u8 = 3;
 
 /// The most folded records one drain holds in a [`KeyShape::Racing`] case
 /// (`ClientOptions::drain_batch_cap`, which the runner sets). At the
@@ -317,6 +324,7 @@ impl KeyShape {
             KeyShape::FanOut => "fan_out",
             KeyShape::Wide => "wide",
             KeyShape::Racing => "racing",
+            KeyShape::Star => "star",
         }
     }
 
@@ -333,6 +341,9 @@ impl KeyShape {
             KeyShape::FanOut => raw % FAN_OUT_KEYS,
             KeyShape::Wide => raw % WIDE_KEYS,
             KeyShape::Racing => raw % RACING_KEYS,
+            // 100 of the 250 non-`NULL` draws.
+            KeyShape::Star if raw < 100 => raw % STAR_HOT_KEYS,
+            KeyShape::Star => STAR_HOT_KEYS + raw % (STAR_KEYS - STAR_HOT_KEYS),
         })
     }
 }

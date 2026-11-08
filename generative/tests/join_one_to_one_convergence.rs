@@ -647,11 +647,13 @@ fn hand_built_case(with_builds: bool) -> JoinCase {
                 OneToOneField::CoalesceXy,
                 OneToOneField::CaseW,
             ],
+            more: Vec::new(),
         },
         OneToOneSpec {
             left: false,
             on: OnShape::Composite,
             fields: vec![OneToOneField::SumXy, OneToOneField::AS, OneToOneField::BW],
+            more: Vec::new(),
         },
     ];
     let mut draws = Vec::new();
@@ -664,7 +666,7 @@ fn hand_built_case(with_builds: bool) -> JoinCase {
             _ => JoinOpKind::Delete,
         };
         draws.push(OneToOneOpDraw {
-            joined,
+            position: u8::from(joined),
             kind,
             pick: usize::from(i) * 7,
             key: i.wrapping_mul(37) % 12,
@@ -673,6 +675,7 @@ fn hand_built_case(with_builds: bool) -> JoinCase {
             half_null: i % 9 == 4,
             value: (i % 11 != 0).then_some(i as i8 - 10),
             columns: i % 16,
+            own_keys: [0; 3],
         });
     }
     let action = |kind, target| JoinActionDraw {

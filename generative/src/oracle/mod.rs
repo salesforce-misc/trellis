@@ -1053,7 +1053,9 @@ fn render_join_select_over(
 /// `select … from a [left] join b on …` with no `GROUP BY`, `a`'s primary key
 /// first as text, then every field as text. One row per `FROM` row that the
 /// join keeps: every one for a `LEFT` join, only the matched ones for an
-/// `INNER` join.
+/// `INNER` join. A star joins every position's table in the definition's
+/// order, each clause with its own kind and `ON`, and keeps a `FROM` row
+/// that every `INNER` position matches.
 ///
 /// # Panics
 ///
@@ -1085,30 +1087,40 @@ fn render_join_one_to_one_select_over(
             quote_ident(&field.name)
         ));
     }
-    let on: Vec<String> = join.joins[0]
-        .on
+    // One clause per position, in the definition's order: each joins one
+    // table to the root, so the clauses' order changes no row (the star's
+    // metamorphic check, `generate::join_one_to_one::StarCase`).
+    let joins: Vec<String> = join
+        .joins
         .iter()
-        .map(|on| {
+        .map(|joined| {
+            let on: Vec<String> = joined
+                .on
+                .iter()
+                .map(|on| {
+                    format!(
+                        "{} = {}",
+                        column(&on.lhs.table, &on.lhs.column),
+                        column(&on.rhs.table, &on.rhs.column)
+                    )
+                })
+                .collect();
             format!(
-                "{} = {}",
-                column(&on.lhs.table, &on.lhs.column),
-                column(&on.rhs.table, &on.rhs.column)
+                "{} {} on {}",
+                match joined.kind {
+                    trellis::dev::defs::ast::JoinKind::Inner => "join",
+                    trellis::dev::defs::ast::JoinKind::Left => "left join",
+                },
+                relation(&joined.right, joined.explicit_right_schema.as_deref()),
+                on.join(" and ")
             )
         })
         .collect();
     format!(
-        "select {} from {} {} {} on {}",
+        "select {} from {} {}",
         select.join(", "),
         relation(&def.source, def.explicit_source_schema.as_deref()),
-        match join.joins[0].kind {
-            trellis::dev::defs::ast::JoinKind::Inner => "join",
-            trellis::dev::defs::ast::JoinKind::Left => "left join",
-        },
-        relation(
-            &join.joins[0].right,
-            join.joins[0].explicit_right_schema.as_deref()
-        ),
-        on.join(" and "),
+        joins.join(" ")
     )
 }
 
