@@ -876,7 +876,7 @@ pub(crate) mod strategy {
     }
 
     /// [`draw`], and with `nan` a value now and then the numeric `NaN`
-    /// ([`JOIN_NAN`]), about one in forty.
+    /// ([`JOIN_NAN`]), about one in twenty-five.
     pub(crate) fn draw_with(
         joined_weight: u32,
         truncating: bool,

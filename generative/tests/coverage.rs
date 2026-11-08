@@ -330,6 +330,69 @@ fn awkward_values_draw_numeric_nan_on_insert_and_update_only_when_on() {
     );
 }
 
+/// The `JOIN` tier's cases draw the numeric `NaN` only into the aggregate
+/// arguments of a case whose `ja.x`/`jb.y` are `numeric` (an `integer`
+/// column refuses it), such a case carries no `SUM(ja.x + 1)` (define
+/// refuses a sum over an unconstrained `numeric`), and both kinds of case
+/// are drawn.
+#[test]
+fn join_cases_draw_nan_only_into_numeric_arguments() {
+    let mut runner = TestRunner::default();
+    let strategy = generative::generate::join::join_case_strategy();
+    let (mut numeric_cases, mut integer_cases, mut nans) = (0usize, 0usize, 0usize);
+    for _ in 0..200 {
+        let case = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        let program = &case.program;
+        let column_type = |table: &str, column: &str| {
+            program
+                .tables
+                .iter()
+                .find(|t| t.name == table)
+                .and_then(|t| t.columns.iter().find(|c| c.name == column))
+                .map(|c| c.value_type)
+        };
+        let numeric = column_type("ja", "x") == Some(ValueType::Numeric);
+        assert_eq!(numeric, column_type("jb", "y") == Some(ValueType::Numeric));
+        if numeric {
+            numeric_cases += 1;
+            assert!(
+                program
+                    .defs
+                    .iter()
+                    .all(|def| def.fields.iter().all(|f| f.name != "sx1")),
+                "a numeric case keeps SUM(ja.x + 1)"
+            );
+        } else {
+            integer_cases += 1;
+        }
+        for op in &program.ops {
+            let (table, cells) = match op {
+                Op::Insert { table, row, .. } => (table, row),
+                Op::Update { table, changes, .. } => (table, changes),
+                _ => continue,
+            };
+            for (column, value) in cells {
+                if value.as_deref() == Some("NaN") {
+                    nans += 1;
+                    assert_eq!(
+                        column_type(table, column),
+                        Some(ValueType::Numeric),
+                        "NaN written to {table}.{column}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        numeric_cases > 0 && integer_cases > numeric_cases,
+        "{numeric_cases} numeric of 200"
+    );
+    assert!(nans > 0, "no NaN in {numeric_cases} numeric cases");
+}
+
 /// A grouping (grain) value's `NULL` draw
 /// actually appears, and does so **regardless of `awkward_values`** —
 /// unlike every other awkward-value column, `generate::strategy::grain_value`

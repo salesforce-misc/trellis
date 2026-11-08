@@ -415,8 +415,8 @@ beside them run on every `cargo test`.
   an expression argument and composed fields), and inserts, updates and deletes
   on both tables with `NULL` keys, groups and values now and then (in a quarter
   of the cases the argument columns `ja.x` and `jb.y` are `numeric(14,2)`, with
-  the numeric `NaN` among the values, and no expression-argument `SUM`, which
-  define refuses over a `numeric`). The join keys
+  the numeric `NaN` among the values, and no `SUM(ja.x + 1)`: `ja.x + 1` is an
+  unconstrained `numeric`, whose `SUM` define refuses). The join keys
   spread over a dozen values, land mostly on one hot key, fan out over three
   keys that both tables keep writing, or spread so wide (64 keys) that two
   workers' pages of one batch change a key from opposite sides without sharing
