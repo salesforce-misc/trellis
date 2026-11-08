@@ -315,13 +315,16 @@ For each release, the notes carry:
   Add every case from the manual refusal check.
 - **Definitions that pause because the new version keys a table
   differently,** each with its remedy, from [upgrading](upgrading.md#upgrading).
-  For `0.2.0`: a source whose key has `INCLUDE` columns (`RESUME` re-keys it in
-  place); a source whose primary key was dropped after define, unless a unique
-  index that backs a key now is left (add a primary key and `RESUME`, or `DROP
-  TRANSFORM` and define it again with a valid `KEY (…)`); a deferrable primary
-  key (recreate it not deferrable, then `RESUME`); and a definition whose
-  recorded key no longer has a matching valid index (`RESUME` refuses until the
-  index is back).
+  For `0.2.0`: a source whose key has `INCLUDE` columns (`RESUME` re-keys and
+  rebuilds it); a source whose primary key was dropped after define, unless a
+  unique index that backs a key now is left (add a primary key and `RESUME`, or
+  `DROP TRANSFORM` and define it again with a valid `KEY (…)`); and a
+  deferrable primary key (recreate it not deferrable, then `RESUME`). Also
+  that, after the upgrade, Trellis never keys a table by a unique index it
+  picks: when a table's primary key is redefined or dropped, the transforms
+  that key it by that key pause, and `RESUME` takes its primary key now and
+  refuses while it has none
+  ([the key row](transforms.md#supported-sources-and-targets)).
 - **Changes an upgrade makes that users don't see,** so a question about them
   has an answer. For `0.2.0`: an in-flight 1-1 rebuild sweep whose cursor
   began with U+0001 restarts from the start.

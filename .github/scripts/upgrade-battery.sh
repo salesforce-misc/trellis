@@ -30,7 +30,8 @@
 #                         tree under test, and nothing is committed. `none`
 #                         builds the tree with the version it carries.
 #   --candidate-bin PATH  use this CLI binary; the candidate's source is still
-#                         needed (--candidate) for the library probe
+#                         needed (--candidate) for the library probe, which is
+#                         built reporting the binary's version
 #   --old-tag TAG         the released version to start from (default v0.1.0)
 #   --old-bin PATH        use this CLI binary instead of the tag's release asset
 #   --old-src DIR         the old build's source tree, for the library probe and
@@ -318,7 +319,13 @@ say "building the candidate"
 # built reporting the release version, set in a scratch checkout: the tree under
 # test is never touched and nothing is committed.
 override_version=""
-if [ "$cand_ver_req" != none ] && [ -z "$candidate_bin" ]; then override_version=$cand_ver_req; fi
+cand_prebuilt=0
+if [ -n "$candidate_bin" ]; then
+  cand_prebuilt=1
+  # The probe opens the database beside the binary, so it reports its version.
+  override_version=$("$candidate_bin" --version) || die "$candidate_bin --version failed"
+  override_version=${override_version#trellis }
+elif [ "$cand_ver_req" != none ]; then override_version=$cand_ver_req; fi
 cand_dirty=""
 if [ -d "$candidate" ] && [ -z "$override_version" ]; then
   cand_src=$(cd "$candidate" && pwd)
@@ -372,8 +379,8 @@ cand_version=$("$candidate_bin" --version)
 cand_ver=${cand_version#trellis }
 [ -z "$override_version" ] || [ "$cand_ver" = "$override_version" ] ||
   die "the candidate binary reports version '$cand_ver', not $override_version"
-if [ -n "$override_version" ]; then cand_built="built as version $override_version, set in a scratch checkout, never committed"
-elif [ "$cand_ver_req" != none ]; then cand_built="a prebuilt binary: version $cand_ver as it is (--candidate-version applies to builds)"
+if [ "$cand_prebuilt" -eq 1 ]; then cand_built="a prebuilt binary: version $cand_ver as it is (--candidate-version applies to builds; the probe is built as $cand_ver)"
+elif [ -n "$override_version" ]; then cand_built="built as version $override_version, set in a scratch checkout, never committed"
 else cand_built="built with the version the tree carries"; fi
 echo "candidate: $candidate_bin ($cand_version) at $cand_rev$cand_dirty, $cand_built"
 
@@ -646,12 +653,13 @@ missing_status() { # port db bin status names...: the names not at that status
 
 if want migrations; then
   say "1. migrations"
-  # The old build's migration files: the tag's, or, for a starting point not
-  # tagged yet (--old-src), its checkout's commit.
+  # The old build's migration files: with --old-src, its checkout's commit
+  # (the tree the old build came from, tagged or not); otherwise the tag's.
   mig_ref=""
-  if git -C "$cand_src" rev-parse -q --verify "$old_tag^{commit}" >/dev/null 2>&1; then mig_ref=$old_tag
-  elif [ -n "$old_src_dir" ] && c=$(git -C "$old_src_dir" rev-parse -q --verify HEAD 2>/dev/null) &&
-    git -C "$cand_src" rev-parse -q --verify "$c^{commit}" >/dev/null 2>&1; then mig_ref=$c
+  if [ -n "$old_src_dir" ]; then
+    if c=$(git -C "$old_src_dir" rev-parse -q --verify HEAD 2>/dev/null) &&
+      git -C "$cand_src" rev-parse -q --verify "$c^{commit}" >/dev/null 2>&1; then mig_ref=$c; fi
+  elif git -C "$cand_src" rev-parse -q --verify "$old_tag^{commit}" >/dev/null 2>&1; then mig_ref=$old_tag
   fi
   if [ -n "$mig_ref" ]; then
     # The candidate's files as they are on disk (a directory candidate may hold
@@ -671,7 +679,7 @@ if want migrations; then
         record INFO migrations "the candidate adds migrations: ${mig_added% } (the upgrade path runs them; $old_tag can't open a database they ran on, so downgrade is ruled out)"
     fi
   else
-    record SKIP migrations "the candidate checkout has neither tag $old_tag nor the --old-src commit, so its migration files were not compared"
+    record SKIP migrations "the candidate checkout does not have the old build's commit (${old_src_dir:+the HEAD of $old_src_dir}${old_src_dir:-tag $old_tag}), so its migration files were not compared"
   fi
   post_history=$(history "$port" shapes)
   pre_n=$(wc -l <<<"$pre_history" | tr -d ' ')
