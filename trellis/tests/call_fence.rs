@@ -14,7 +14,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use testkit::{TestCluster, TestDatabase};
 use tokio::task::JoinHandle;
@@ -392,11 +392,10 @@ async fn work_outside_a_call_is_not_fenced() {
     raw.execute("select pg_advisory_lock($1)", &[&handover_key()])
         .await
         .expect("migrate's handover lock");
-    // A fence here would wait out this, and fail.
+    // A fence here would wait out this lock timeout, and fail.
     let impatient =
         Config::from_dsn(format!("{} options='-c lock_timeout=2s'", db.dsn())).expect("config");
     let pool = trellis::pool::Pool::new(&impatient).expect("pool");
-    let started = Instant::now();
     trellis::defs::install_definition(
         &pool,
         "TRANSFORM m_restored FROM m SELECT g AS g",
@@ -419,7 +418,6 @@ async fn work_outside_a_call_is_not_fenced() {
             .expect("a background cascade takes no fence"),
         1
     );
-    assert!(started.elapsed() < Duration::from_secs(2));
     raw.execute("select pg_advisory_unlock($1)", &[&handover_key()])
         .await
         .expect("let go");
@@ -472,11 +470,13 @@ async fn probe_every_table(raw: &Client) {
 
 /// Rules 2 and 3, and the Decision's test (e): every write a state-changing
 /// call commits to the instance's catalog, through each entry point and the
-/// transactions after its first (a cascade, a resume's pairs, an edit's
-/// follow-ups, a disruption's pause), is made under the handover lock, which
-/// only the call's fence takes in it. The probe refuses any other; and every
-/// fence checks that it is its transaction's first lock (in test builds).
-/// Setup and the engine's own passes run on unmarked sessions.
+/// transactions after its first (a cascade, a resume's pairs and the pause
+/// it holds for a frozen reader, an edit's follow-ups, a disruption's pause,
+/// a capture's record, a restore's response), is made under the handover
+/// lock, which only the call's fence takes in it. The probe refuses any
+/// other; and every fence checks that it is its transaction's first lock (in
+/// test builds). It sees only the paths the test walks. Setup and the
+/// engine's own passes run on unmarked sessions.
 #[tokio::test]
 async fn every_write_of_every_state_changing_call_is_fenced() {
     let cluster = TestCluster::start();
@@ -520,8 +520,26 @@ async fn every_write_of_every_state_changing_call_is_fenced() {
     );
     assert_eq!(column_pause(&raw, "m_sum", "total").await, Some(false));
     fenced!(
-        "a column resume and its pairs",
+        "a whole pause of the cascade's reader",
+        caller.apply("PAUSE TRANSFORM m_sum")
+    );
+    fenced!(
+        "a column resume and its pairs, one held as an orphaned pause",
         caller.apply("RESUME TRANSFORM m_copy.v")
+    );
+    assert_eq!(
+        column_pause(&raw, "m_sum", "total").await,
+        Some(false),
+        "the paused reader's pair is held as a pause of its own"
+    );
+    fenced!(
+        "a whole resume of the reader",
+        caller.apply("RESUME TRANSFORM m_sum")
+    );
+    bring_live(&mut raw, &db.pool).await;
+    fenced!(
+        "a column resume of the held pair",
+        caller.apply("RESUME TRANSFORM m_sum.total")
     );
     assert_eq!(column_pause(&raw, "m_sum", "total").await, None);
     bring_live(&mut raw, &db.pool).await;
@@ -552,6 +570,21 @@ async fn every_write_of_every_state_changing_call_is_fenced() {
     .await
     .expect("hold a key");
     fenced!("release_key", caller.release_key("m_agg", "public.m", "1"));
+    // A capture with no record, recorded as it stands.
+    raw.execute("delete from capture_triggers", &[])
+        .await
+        .expect("no records");
+    let recorded = fenced!(
+        "detect_capture_disruptions recording a capture",
+        caller.detect_capture_disruptions()
+    );
+    assert_eq!(recorded, Vec::<String>::new());
+    let records: i64 = raw
+        .query_one("select count(*) from capture_triggers", &[])
+        .await
+        .expect("count the records")
+        .get(0);
+    assert!(records > 0, "the capture is recorded again");
     raw.batch_execute(
         "alter table public.m disable trigger all; alter table public.m enable trigger all",
     )
@@ -569,6 +602,18 @@ async fn every_write_of_every_state_changing_call_is_fenced() {
     );
     fenced!("drop", caller.apply("DROP TRANSFORM m_sum"));
     assert_eq!(definitions(&raw).await, ["m_agg", "m_copy"]);
+    // A logical restore's response, which pauses every definition.
+    raw.execute(
+        "update capture_triggers set catalog_oid = (catalog_oid::bigint + 1000)::oid",
+        &[],
+    )
+    .await
+    .expect("records from another database");
+    let restored = fenced!(
+        "detect_capture_disruptions after a restore",
+        caller.detect_capture_disruptions()
+    );
+    assert_eq!(restored, ["public.m"]);
 
     // The probe catches what it is for: the same write, unfenced.
     let marked = raw_marked(&db).await;
