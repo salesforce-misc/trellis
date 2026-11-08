@@ -563,14 +563,17 @@ beside them run on every `cargo test`.
   definition's `JOIN` clauses in a drawn order, which renumbers the
   positions and so changes the engine's `(position, key)` lock order but no
   row. The oracle is the star's multi-join in the definition's order
-  (`render_join_one_to_one_select`), and the in-run invariant's star check
+  (`render_join_one_to_one_select`). The invariant's star check
   (`invariant::check_star`) runs every clause at each position against that
   position's `M_p`, `J` rows and table, with a target row only where every
-  `INNER` position matched. The tier runs only when
+  `INNER` position matched; the in-run sampler doesn't run it, since the
+  snapshot read covers position 1 alone, so it samples no star's target.
+  The tier runs only when
   `join_one_to_one::star_tier_enabled` says so: the development knob
   `TRELLIS_DEV_STAR_JOIN` is on and the engine runs a star's pages and
-  builds. Until then its property and its planted-bug sweep,
-  `star_join_planted_bugs_are_caught`, return at once, and the two-table
+  builds. Until then its property passes every case without running it and
+  its planted-bug sweep, `star_join_planted_bugs_are_caught`, returns at
+  once, so a green run of either says nothing about a star; the two-table
   tiers draw and check exactly what they did without it
   (`tests/join_star_tier.rs` holds their draws' digests). The same file
   checks, with no engine apply running, that the strategy reaches every
@@ -579,8 +582,8 @@ beside them run on every `cargo test`.
   the file's own model of a star, under any `JOIN` order; and that define,
   with the knob on, admits every drawn star definition. The sweep's tier,
   `join_star`, leaves out the plants the two-table tier does, for the same
-  reasons, and starts from that tier's known misses until its own sweep
-  records the star's rates.
+  reasons, and takes that tier's known misses as an unmeasured placeholder
+  until its own sweep records the star's rates.
 - **Chained-reader convergence** (`tests/join_chained_convergence.rs`,
   ADR-0002 "Multi-hop"). A `JOIN`, aggregate or 1-1, one of whose sides is
   another definition's target in the same instance, so the target-mutation

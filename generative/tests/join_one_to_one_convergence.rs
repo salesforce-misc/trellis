@@ -598,7 +598,9 @@ fn star_sweep_tier() -> SweepTier {
 }
 
 /// The star tier's known misses: the two-table tier's
-/// ([`ONE_TO_ONE_KNOWN_MISSES`]) until the star tier's reach sweep
+/// ([`ONE_TO_ONE_KNOWN_MISSES`]), a placeholder no star sweep has measured
+/// (no star case runs while `star_tier_enabled` is off), until the star
+/// tier's reach sweep
 /// (`star_join_planted_bugs_are_caught`, 4 seeds × 12 cases) records its
 /// own fired and caught counts here.
 const STAR_KNOWN_MISSES: &[&str] = ONE_TO_ONE_KNOWN_MISSES;

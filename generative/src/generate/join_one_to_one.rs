@@ -964,8 +964,9 @@ fn split_mix(state: &mut u64) -> u64 {
 /// the key (or names one, which takes it), and the draws at `late` come
 /// after the others:
 /// one root key changed at every position, with the late position's change
-/// last, in rows a drain of [`StarKnobs::drain_batch_cap`] rows takes
-/// together.
+/// last in program order. The plan still spreads a page's ops over lanes
+/// (each joined table's on one), so their commit order, and which of them a
+/// drain of [`StarKnobs::drain_batch_cap`] rows takes together, is the run's.
 pub fn shape_pages(draws: &mut [OneToOneOpDraw], pages: &[PageDraw], tables: usize, late: u8) {
     if pages.is_empty() {
         return;

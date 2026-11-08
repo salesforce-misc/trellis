@@ -394,3 +394,33 @@ impl Drop for CommitStallGuard {
         trellis::dev::interleave::set_commit_stall(None);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::generate::join_one_to_one::{
+        OnShape, OneToOneField, OneToOneSpec, StarPosition, one_to_one_definition,
+    };
+
+    /// The in-run invariant samples a two-table 1-1 JOIN's target and no
+    /// star's: the snapshot read covers position 1 alone.
+    #[test]
+    fn the_sampler_leaves_stars_out() {
+        let spec = |more: Vec<StarPosition>| OneToOneSpec {
+            left: true,
+            on: OnShape::KeyPk,
+            fields: vec![OneToOneField::AX, OneToOneField::BY],
+            more,
+        };
+        let two = one_to_one_definition("two", &spec(Vec::new()));
+        let star = one_to_one_definition(
+            "star",
+            &spec(vec![StarPosition {
+                left: false,
+                on: OnShape::KeyUnique,
+                own_key: true,
+                fields: vec![OneToOneField::BW],
+            }]),
+        );
+        assert_eq!(super::join1_targets(&[two, star]), ["two"]);
+    }
+}
