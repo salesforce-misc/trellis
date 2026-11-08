@@ -1274,6 +1274,84 @@ fn at_time_zone_over_a_null_constant_folds_to_null() {
     }
 }
 
+/// A strict operator or function with a `NULL` constant input is `NULL` once
+/// the planner has simplified its inputs: what only the rows would evaluate in
+/// the others, a division of a column by the constant zero, never runs. A
+/// constant that raises at plan time still does, and an operator that is not
+/// strict (`IS [NOT] DISTINCT FROM`, `AND`, `OR`, `COALESCE`, `NULLIF` with a
+/// `NULL` second argument) evaluates its other inputs. Each case is checked
+/// against Postgres (#1795).
+#[test]
+fn a_strict_call_beside_a_null_constant_drops_the_division_by_zero_in_its_other_input() {
+    for text in [
+        // The soak's expression.
+        "((n / 0) - (NULL - CAST(NULL AS real))) IS DISTINCT FROM 0",
+        "(n / 0) + NULL",
+        "n / 0 * CAST(NULL AS integer)",
+        "(n % 0) + NULL",
+        "(n / 0) = NULL",
+        "n / 0 < CAST(NULL AS numeric)",
+        // The zero divisor is below other nodes of the dropped input.
+        "((n / 0) - 1) * NULL",
+        "(n / 0 + 1) * NULL",
+        "-(n / 0) + NULL",
+        "ABS(n / 0) + NULL",
+        "ROUND(n / 0, 2) + NULL",
+        "CAST(n / 0 AS numeric) + NULL",
+        "COALESCE(n / 0, 1) + NULL",
+        "(CASE WHEN i4 > 0 THEN n / 0 END) + NULL",
+        "(f8 / 0) + CAST(NULL AS double precision)",
+        // The `NULL` is folded: another operator, `NULLIF`, a `CASE`.
+        "(n / 0) + (NULL - CAST(NULL AS numeric))",
+        "(n / 0) - NULLIF(1, 1)",
+        "(n / 0 + 1) * (CASE WHEN true THEN CAST(NULL AS numeric) END)",
+        // A strict function.
+        "STRPOS(CASE WHEN n / 0 > 1 THEN 't' END, CAST(NULL AS text))",
+        // `NULLIF(NULL, x)` is `NULL` whatever `x` reads.
+        "NULLIF(CAST(NULL AS numeric), n / 0)",
+        // Through a calculated field.
+        "NULL - CAST(NULL AS numeric) AS g, (n / 0) + g",
+    ] {
+        match type_of(text) {
+            Ok(_) => {}
+            Err(e) => panic!("`{text}` was refused: {e}"),
+        }
+    }
+    // Postgres still divides: the other input is not dropped.
+    for text in [
+        // Not strict.
+        "(n / 0) IS DISTINCT FROM CAST(NULL AS numeric)",
+        "(n / 0) IS NOT DISTINCT FROM NULL",
+        "(n / 0 > 1) IS DISTINCT FROM (CAST(NULL AS numeric) > 1)",
+        "COALESCE(n / 0, CAST(NULL AS numeric))",
+        "NULLIF(n / 0, CAST(NULL AS numeric))",
+        "(n / 0 > 1) OR (CAST(NULL AS numeric) > 1)",
+        "(n / 0 > 1) AND (CAST(NULL AS numeric) > 1)",
+        "(n / 0) IS NULL",
+        "CASE WHEN CAST(NULL AS numeric) IS NULL THEN n / 0 END",
+        // No `NULL` constant beside it.
+        "(n / 0) + 1",
+        "((n / 0) - (1 - 1)) IS DISTINCT FROM 0",
+        "(n / 0) + COALESCE(CAST(NULL AS numeric), 1)",
+        "(n / 0) + NULLIF(1, i4)",
+    ] {
+        assert_refused(text, "divides by the constant zero");
+    }
+    // A constant dividend divides at plan time, beside the `NULL` or not, and
+    // so does any other constant that raises.
+    for text in [
+        "(CAST(1 AS numeric) / 0) + CAST(NULL AS integer)",
+        "(1.5 / 0) + NULL",
+        "(n / 0) + (1.5 / 0 + CAST(NULL AS numeric))",
+    ] {
+        assert_refused(text, "divides by the constant zero");
+    }
+    assert_refused(
+        "((n / 0) + (2147483647 + 1)) * CAST(NULL AS numeric)",
+        "out of range",
+    );
+}
+
 /// A guard is classified at any height the parser admits: a constant one
 /// nested near the limit still leaves what it guards unchecked.
 #[test]

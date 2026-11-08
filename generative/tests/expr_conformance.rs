@@ -798,6 +798,74 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
     }
 }
 
+/// A strict operator or function with a `NULL` constant input is `NULL` once
+/// the planner has simplified its inputs, so a division of a column by the
+/// constant zero in another input never runs (#1795). A constant that raises
+/// at plan time still does, and the operators that are not strict
+/// (`IS [NOT] DISTINCT FROM`, `AND`, `OR`, `COALESCE`, `NULLIF`'s first
+/// argument) evaluate their other inputs.
+#[test]
+fn a_strict_call_beside_a_null_constant_drops_a_division_by_zero_the_rows_would_run() {
+    let admitted = [
+        "((na / 0) - (NULL - CAST(NULL AS real))) IS DISTINCT FROM 0",
+        "(na / 0) + NULL",
+        "na / 0 * CAST(NULL AS integer)",
+        "(na % 0) + NULL",
+        "(na / 0) = NULL",
+        "na / 0 < CAST(NULL AS numeric)",
+        "((na / 0) - 1) * NULL",
+        "-(na / 0) + NULL",
+        "ABS(na / 0) + NULL",
+        "ROUND(na / 0, 2) + NULL",
+        "CAST(na / 0 AS numeric) + NULL",
+        "COALESCE(na / 0, 1) + NULL",
+        "(CASE WHEN i4a > 0 THEN na / 0 END) + NULL",
+        "(f8a / 0) + CAST(NULL AS double precision)",
+        "(na / 0) + (NULL - CAST(NULL AS numeric))",
+        "(na / 0) - NULLIF(1, 1)",
+        "(na / 0 + 1) * (CASE WHEN true THEN CAST(NULL AS numeric) END)",
+        "STRPOS(CASE WHEN na / 0 > 1 THEN ta END, CAST(NULL AS text))",
+        "NULLIF(CAST(NULL AS numeric), na / 0)",
+    ];
+    for text in admitted {
+        match check_text(text, None) {
+            Ok(Agreement::Admitted) => {}
+            Ok(other) => panic!("`{text}` should be admitted, got {other:?}"),
+            Err(d) => panic!("{d}"),
+        }
+    }
+    let refused = [
+        // Not strict.
+        "(na / 0) IS DISTINCT FROM CAST(NULL AS numeric)",
+        "(na / 0) IS NOT DISTINCT FROM NULL",
+        "(na / 0 > 1) IS DISTINCT FROM (CAST(NULL AS numeric) > 1)",
+        "COALESCE(na / 0, CAST(NULL AS numeric))",
+        "NULLIF(na / 0, CAST(NULL AS numeric))",
+        "(na / 0 > 1) OR (CAST(NULL AS numeric) > 1)",
+        "(na / 0 > 1) AND (CAST(NULL AS numeric) > 1)",
+        "(na / 0) IS NULL",
+        "CASE WHEN CAST(NULL AS numeric) IS NULL THEN na / 0 END",
+        // No `NULL` constant beside it.
+        "(na / 0) + 1",
+        "((na / 0) - (1 - 1)) IS DISTINCT FROM 0",
+        "(na / 0) + COALESCE(CAST(NULL AS numeric), 1)",
+        "(na / 0) + NULLIF(1, i4a)",
+        // A constant dividend, or another constant that raises, fails at
+        // plan time beside the `NULL`.
+        "(CAST(1 AS numeric) / 0) + CAST(NULL AS integer)",
+        "(1.5 / 0) + NULL",
+        "(na / 0) + (1.5 / 0 + CAST(NULL AS numeric))",
+        "((na / 0) + (2147483647 + 1)) * CAST(NULL AS numeric)",
+    ];
+    for text in refused {
+        match check_text(text, None) {
+            Ok(Agreement::RefusedAndRaises(_)) => {}
+            Ok(other) => panic!("`{text}` should be refused and raise, got {other:?}"),
+            Err(d) => panic!("{d}"),
+        }
+    }
+}
+
 /// Define folds a call with a `NULL` argument to `NULL`, as the planner folds
 /// a strict function. That holds only while every function the grammar
 /// admits (bar `COALESCE` and `NULLIF`, which define folds by their own
