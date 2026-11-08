@@ -383,6 +383,7 @@ impl JoinTargetPlan {
                 sql: render_qualified_expr_sql(arg, "s"),
                 expr: arg.clone(),
                 summed: false,
+                numeric: false,
             })
             .collect();
         let t_groups: Vec<(Side, String)> = join

@@ -449,6 +449,15 @@ places, so over such a column the mismatch can't arise.
   check that compares a definition's columns with the live schema. A resume
   re-validates: it refuses unconstrained `numeric`, and rebuilds at a new
   scale.
+- **Must:** a `numeric(p,s)` column admits `NaN`, which no running sum can
+  subtract back out (`NaN − NaN` is `NaN`, and so is `NaN × 0` in a JOIN
+  product). A sum partial counts its `NaN`s apart from its finite values,
+  so every rule above holds for them: the visible `SUM` and `AVG` are `NaN`
+  exactly while the count is above zero, a JOIN product multiplies the count
+  by the match count, and a group whose rows all left is zero and collected.
+  The count lives in the sum's own column, as a multiple of a weight beyond
+  any finite sum of a `numeric(p,s)` column, so a definition's hidden
+  layout doesn't change.
 
 Keeping a counter per scale would make unconstrained `numeric` exact too; it
 is additive, so it can come later without changing this rule.
