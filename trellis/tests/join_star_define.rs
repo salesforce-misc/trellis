@@ -61,6 +61,31 @@ async fn definitions(raw: &Client) -> i64 {
     count(raw, "select count(*) from transform_definitions").await
 }
 
+/// Asserts a refused define left nothing: no definition, no joined-table
+/// row, no hidden table, no target.
+async fn assert_nothing_left(raw: &Client, text: &str) {
+    assert_eq!(definitions(raw).await, 0, "{text} left a definition");
+    assert_eq!(
+        count(raw, "select count(*) from definition_join_tables").await,
+        0,
+        "{text} left a joined-table row"
+    );
+    assert_eq!(
+        count(
+            raw,
+            &format!(
+                "select count(*) from pg_catalog.pg_class c \
+                 join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+                 where (n.nspname = '{DEFAULT_SCHEMA}' and c.relname ~ '^join1_[0-9]+_') \
+                    or (n.nspname = 'public' and c.relname in ('v', 'six'))"
+            )
+        )
+        .await,
+        0,
+        "{text} left a hidden table or a target"
+    );
+}
+
 async fn definition_id(raw: &Client, target: &str) -> i64 {
     raw.query_one(
         "select id from transform_definitions where split_part(target_table, '.', 2) = $1",
@@ -157,7 +182,7 @@ async fn u2_a_star_of_five_defines_and_drops_every_hidden_table_and_six_are_refu
         "{err:?}"
     );
     assert!(err.to_string().contains("at most 5"), "{err}");
-    assert_eq!(definitions(&raw).await, 0);
+    assert_nothing_left(&raw, "six").await;
 
     trellis
         .apply(&star("five", 4))
@@ -253,6 +278,35 @@ async fn a_stars_shape_refusals_are_named() {
                 )
             }),
         ),
+        // Position 1's ON reads a later joined table.
+        (
+            "TRANSFORM v FROM a JOIN b1 ON a.k1 = b2.id JOIN b2 ON a.k2 = b2.id \
+             SELECT b1.x AS x",
+            Box::new(|err| {
+                matches!(
+                    err,
+                    CatalogError::Validate(ValidationError::JoinOnReadsAnotherJoinedTable {
+                        table,
+                        other,
+                        ..
+                    }) if table == "b1" && other == "b2"
+                )
+            }),
+        ),
+        // USING, a comma join and LATERAL at a later position.
+        (
+            "TRANSFORM v FROM a JOIN b1 ON a.k1 = b1.id JOIN b2 USING (id) SELECT b1.x AS x",
+            Box::new(refused("JOIN USING")),
+        ),
+        (
+            "TRANSFORM v FROM a JOIN b1 ON a.k1 = b1.id, b2 SELECT b1.x AS x",
+            Box::new(refused("comma join")),
+        ),
+        (
+            "TRANSFORM v FROM a JOIN b1 ON a.k1 = b1.id JOIN LATERAL b2 ON a.k2 = b2.id \
+             SELECT b1.x AS x",
+            Box::new(refused("JOIN LATERAL")),
+        ),
         // A table joined twice, under another alias.
         (
             "TRANSFORM v FROM a JOIN b1 ON a.k1 = b1.id JOIN b1 AS again ON a.k2 = again.id \
@@ -340,7 +394,7 @@ async fn a_stars_shape_refusals_are_named() {
     for (text, check) in cases {
         let err = define_err(&db.pool, text).await;
         assert!(check(&err), "{text}: {err:?} / {err}");
-        assert_eq!(definitions(&raw).await, 0, "{text} left a definition");
+        assert_nothing_left(&raw, text).await;
     }
 }
 
@@ -364,7 +418,7 @@ async fn the_knob_gates_a_star_at_define_and_resume() {
         ),
         "{err:?}"
     );
-    assert_eq!(definitions(&raw).await, 0);
+    assert_nothing_left(&raw, "the star with the knob off").await;
     // The two-table JOIN doesn't need it.
     trellis
         .apply(&star("two", 1))

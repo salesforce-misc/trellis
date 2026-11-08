@@ -409,6 +409,67 @@ mod tests {
         );
     }
 
+    /// `JOIN LATERAL` is refused by name in grammar 2, at any position, as
+    /// Postgres reserves `LATERAL`; grammar 1, which never reserved it,
+    /// still reads stored text naming a table `LATERAL` as it always did.
+    #[test]
+    fn join_lateral_is_refused_in_grammar_2_and_a_table_name_in_grammar_1() {
+        let one = "TRANSFORM t FROM a JOIN LATERAL b ON a.k = b.k SELECT b.x AS x";
+        let second = "TRANSFORM t FROM a JOIN c ON a.j = c.j \
+                      JOIN LATERAL b ON a.k = b.k SELECT b.x AS x";
+        for text in [one, second] {
+            assert!(
+                matches!(
+                    load(text, CURRENT_GRAMMAR_VERSION),
+                    Err(ParseError::UnsupportedKeySpace { ref construct, .. })
+                        if construct == "JOIN LATERAL"
+                ),
+                "{text}"
+            );
+        }
+        let stored = load(one, 1).expect("grammar 1 reads LATERAL as a table name");
+        let join = super::super::join::spec(&stored).expect("a JOIN");
+        assert_eq!(join.joins[0].right, "LATERAL");
+        assert_eq!(join.joins[0].right_alias.as_deref(), Some("b"));
+    }
+
+    /// Each joined table's name folds in grammar 2 as the first one's does,
+    /// a quoted one kept exact; grammar 1 keeps each as written and lower-
+    /// cases every alias.
+    #[test]
+    fn every_joined_tables_name_folds_alike() {
+        let names = |def: &TransformDef| -> Vec<(String, Option<String>)> {
+            super::super::join::spec(def)
+                .expect("a JOIN")
+                .joins
+                .iter()
+                .map(|j| (j.right.clone(), j.right_alias.clone()))
+                .collect()
+        };
+        let folded = "TRANSFORM t FROM a JOIN B1 ON a.k = B1.id \
+                      LEFT JOIN \"B2\" ON a.j = \"B2\".id JOIN B3 AS X3 ON a.i = X3.id \
+                      SELECT B1.x AS x";
+        assert_eq!(
+            names(&load(folded, CURRENT_GRAMMAR_VERSION).unwrap()),
+            [
+                ("b1".to_string(), None),
+                ("B2".to_string(), None),
+                ("b3".to_string(), Some("x3".to_string()))
+            ]
+        );
+        let exact = "TRANSFORM t FROM a JOIN B1 ON a.k = B1.id \
+                     LEFT JOIN B2 ON a.j = B2.id JOIN B3 AS X3 ON a.i = X3.id \
+                     SELECT B1.x AS x";
+        assert_eq!(
+            names(&load(exact, 1).unwrap()),
+            [
+                ("B1".to_string(), None),
+                ("B2".to_string(), None),
+                ("B3".to_string(), Some("x3".to_string()))
+            ]
+        );
+    }
+
     #[test]
     fn older_version_inside_the_window_parses() {
         assert!(load_in(TEXT, 2, 2, 4).is_ok());
