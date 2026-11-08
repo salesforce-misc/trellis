@@ -717,6 +717,14 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
         "CASE WHEN NULLIF(CAST(NULL AS integer), i4a) IS NULL THEN 2147483647 + 1 END",
         "CASE WHEN NULLIF(CAST(NULL AS integer), i4a) IS NOT NULL THEN 0 \
          ELSE 2147483647 + 1 END",
+        // `AT TIME ZONE` is strict too: over a `NULL` constant it folds to
+        // `NULL`, though define does not compute the operator (#1785).
+        "CASE WHEN CAST(NULL AS timestamptz) AT TIME ZONE 'UTC' IS NOT DISTINCT FROM \
+         TIMESTAMP '2024-02-29 12:00:00' THEN 0 ELSE 2147483647 + 1 END",
+        "CASE WHEN CAST(NULL AS timestamptz) AT TIME ZONE 'UTC' IS NULL \
+         THEN 2147483647 + 1 END",
+        "CASE WHEN CAST(NULL AS timestamptz) AT TIME ZONE 'UTC' IS DISTINCT FROM NULL \
+         THEN 0 ELSE 2147483647 + 1 END",
     ];
     for text in refused {
         match check_text(text, None) {
@@ -771,6 +779,11 @@ fn constants_in_branches_are_refused_exactly_where_postgres_folds_them() {
         "COALESCE(NULLIF(1, NULLIF(CAST(NULL AS integer), i4a)), 2147483647 + 1)",
         "2147483647 + NULLIF(NULLIF(1, CAST(NULL AS integer)), i4a)",
         "2147483647 + NULLIF(i4a, NULL)",
+        // The folded `NULL` selects the branch without the overflow (#1785).
+        "CASE WHEN CAST(NULL AS timestamptz) AT TIME ZONE 'UTC' IS NULL \
+         THEN 0 ELSE 2147483647 + 1 END",
+        "CASE WHEN CAST(NULL AS timestamptz) AT TIME ZONE 'UTC' IS NOT NULL \
+         THEN 2147483647 + 1 END",
         // A runtime divisor is left to the rows.
         "CASE WHEN i4a > 0 THEN na / i4a END",
         "i4a <> 0 AND na / i4a > 1",

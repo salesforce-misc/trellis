@@ -4075,15 +4075,16 @@ fn fold_constant<'f>(
                 _ => None,
             }
         }
-        // An arithmetic operator is strict: a `NULL` operand makes it `NULL`,
-        // whatever the other operand reads.
+        // The remaining operators (arithmetic, `AT TIME ZONE`) are strict: a
+        // `NULL` operand makes them `NULL`, whatever the other operand reads
+        // and whether or not this check can compute the operator.
         Expr::BinaryOp { op, lhs, rhs } => {
             let operator = *op;
-            let op = ConstOp::of_operator(*op)?;
             let (a, b) = (recurse(lhs, field_name), recurse(rhs, field_name));
             if matches!(a, Some(Constant::Null)) || matches!(b, Some(Constant::Null)) {
                 return Some(Constant::Null);
             }
+            let op = ConstOp::of_operator(operator)?;
             match (a?, b?) {
                 (
                     a @ (Constant::Date(_) | Constant::Exact(_)),

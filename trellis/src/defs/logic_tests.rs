@@ -1241,6 +1241,33 @@ fn nullif_beside_a_null_constant_folds_whatever_the_other_argument_reads() {
     }
 }
 
+/// `AT TIME ZONE` is strict like the arithmetic operators: the planner folds
+/// it to `NULL` when its input is the `NULL` constant, so a guard over it is
+/// decided and define refuses the overflow the planner still reaches (#1785).
+/// Each case is checked against Postgres.
+#[test]
+fn at_time_zone_over_a_null_constant_folds_to_null() {
+    for text in [
+        "CASE WHEN CAST(NULL AS timestamptz) AT TIME ZONE 'UTC' IS NOT DISTINCT FROM \
+         TIMESTAMP '2024-02-29 12:00:00' THEN 0 ELSE 2147483647 + 1 END",
+        "CASE WHEN CAST(NULL AS timestamptz) AT TIME ZONE 'UTC' IS NULL \
+         THEN 2147483647 + 1 END",
+        "CASE WHEN CAST(NULL AS timestamptz) AT TIME ZONE 'UTC' IS DISTINCT FROM NULL \
+         THEN 0 ELSE 2147483647 + 1 END",
+    ] {
+        assert_refused(text, "out of range");
+    }
+    // The guard selects the branch without the overflow.
+    for text in [
+        "CASE WHEN CAST(NULL AS timestamptz) AT TIME ZONE 'UTC' IS NULL \
+         THEN 0 ELSE 2147483647 + 1 END",
+        "CASE WHEN CAST(NULL AS timestamptz) AT TIME ZONE 'UTC' IS NOT NULL \
+         THEN 2147483647 + 1 END",
+    ] {
+        assert_type(text, I4);
+    }
+}
+
 /// A guard is classified at any height the parser admits: a constant one
 /// nested near the limit still leaves what it guards unchecked.
 #[test]
