@@ -76,7 +76,8 @@ scope.
   matched row at every position, of any type a 1-1 field admits (floats and text included).
   A row is recomputed from its current inputs and never maintained by deltas,
   so none of the aggregate restrictions apply.
-- Sides, qualification, join kinds and `ON` follow ADR-0019.
+- Sides, qualification, join kinds and `ON` follow ADR-0019 at every
+  position, except that ADR-0019's single join becomes up to 4.
 
 ### A side that is another transform's target is read from its change feed
 
@@ -143,8 +144,9 @@ below holds for them as it does for a captured side.
     sorted `FOR UPDATE` over every position, each position's predicate using
     that position's index. Keys are cast per type, so keys equal by value
     share a row.
-  - Every other reader of `J` (a fan-out chunk, a build chunk, `self_check`)
-    names one position and its key columns.
+  - Every other reader of `J` (a fan-out chunk, a build chunk, `self_check`,
+    `status()`) selects a position's rows by `position = i` and that
+    position's key columns, so it reads through that position's index.
 
   One table rather than one per position puts every `J` lock in one sorted
   statement, so the lock order can't split by position, and it is one table
@@ -194,10 +196,12 @@ catch-up, and a page whose segment predates the build):
      index after the `J` lock, `FOR UPDATE` and sorted, in **one `R` lock
      statement over every position the page touches, together with the
      page's own `a` entries**. Any split of that statement, per position or
-     into any grouping of positions, deadlocks: two pages that reach the same
-     two rows through different positions lock them in different
-     statements, so they take the rows in opposite orders (#1459, at
-     `n = 3`, 4 and 5).
+     into any grouping of positions, deadlocks: each statement is sorted, but
+     the statements run in position order, not row order. A page that reaches
+     row `r2` through position 1 and `r1` through position 2 takes `r2` first,
+     a page that reaches them the other way round takes `r1` first, and the
+     two pages hold different `J` rows, so nothing orders them before they
+     meet on `R` (#1459, at `n = 3`, 4 and 5).
   2. Only then does it read any `M`, its own position's or another's.
   3. It locks and re-checks its `M` entries against the page's **fan-out
      keys** at its position: the keys whose `R` entries step 1 locked. A key
@@ -260,11 +264,15 @@ takes it anyway, so one code path serves every `n`, at about 8% of its
 fan-out's time.
 
 **Lock order.** A page carrying changes and Re-derives of several tables
-takes each lock class in one sorted statement over the union of its key
-sets, in one global order: the truncate lock row; `J`, by `(position, key)`;
-the `R` entries, in one statement; the `M` entries, by `(position, id)`; then
+takes the lock classes in one global order, over the union of its key sets:
+the truncate lock row; `J`, in one statement sorted by `(position, key)`;
+the `R` entries, in one statement sorted by entry key; the `M` entries,
+sorted by `(position, id)`, in statements that follow that order; then
 the target rows. Placeholder inserts follow the same order, so no two
-transactions take two rows of one class in opposite orders.
+transactions take two rows of `J`, `R` or `M` in opposite orders. The target
+rows need no such order: every writer of a target row holds its `R` entry
+first (C), so two writers of one row queue on that entry before either
+reaches the row.
 
 A truncate page holds the lock row `FOR UPDATE`, empties its table's hidden
 table and raises its floor. It empties the table with a `DELETE`: a build
@@ -275,7 +283,10 @@ waits for every earlier truncate page of any of its tables, and a truncate
 page for every earlier page of its own table. Without the barrier, four of
 eight truncate families were wrong. With both rules, 60 families × 2 join
 kinds (102,312 schedules per version on PG 16.8, 17.10 and 18.2) and 48
-soak runs, with builds starting mid-run, were exact (#1375).
+soak runs, with builds starting mid-run, were exact (#1375). The star's
+model (#1459) applied a truncate as a per-entry floor and recomputed a
+joined table's truncate in the page, so for more than two tables the
+barrier and the rebuild below rest on this argument, not on a model.
 
 A page settles its truncate before its changes, so a change after the truncate
 in the same batch applies to the emptied table:
@@ -452,8 +463,9 @@ in chunks of `a`'s primary-key range. Each chunk:
 4. Writes each row's target row from `R` and the newest live entry of each
    `M` on its key at that position.
 5. Retries if any read finds a key outside its locked set at any position.
-   Without the retry, 378 of 1,716 schedules were wrong, and skipping one
-   position's keys was wrong too (#1459).
+   Without the retry, 378 of 1,716 schedules were wrong. A chunk that left
+   out one position's keys would move a row's key at that position without
+   its `J`, breaking (A).
 
 A chunk's range is a row comparison, which is `NULL` wherever a `NULL` part
 decides it, so no chunk reaches an `a` row whose primary key has one (an `a`
@@ -551,20 +563,21 @@ its `ON` pairs' new types, and rebuilds as above.
 
 ## Consequences
 
-- An `a` change costs about 1.6–1.8x a plain 1-1 change on one worker, and its
-  hidden state is about 1.6x a plain 1-1 transform's. It is cheaper than a
-  `GROUP BY a.id` JOIN transform over the same tables on throughput, WAL,
-  hidden state and build time.
-- Parallel pages whose key sets overlap queue on `J`: with 1,000-change pages
-  over 100k keys, 8 workers gave 1.18x one worker's throughput. JOIN
-  transforms share this.
+- In a two-table 1-1 JOIN, an `a` change costs about 1.6–1.8x a plain 1-1
+  change on one worker, and its hidden state is about 1.6x a plain 1-1
+  transform's. It is cheaper than a `GROUP BY a.id` JOIN transform over the
+  same tables on throughput, WAL, hidden state and build time.
+- Parallel pages whose key sets overlap queue on `J`: in a two-table 1-1
+  JOIN with 1,000-change pages over 100k keys, 8 workers gave 1.18x one
+  worker's throughput. JOIN transforms share this.
 - `J` keeps a row for every `(position, key)` any table has held, as in
   ADR-0019, and its rows are never deleted while the definition lives.
 - **A star costs more per change as it grows.** An `a` change costs about
-  1.61x, 2.22x and 2.92x a two-table change at `n` = 3, 4 and 5, with a page
-  of 100 changes locking `100 × (n − 1) + 50` `J` rows, and a fan-out row
-  about 5.3, 6.7 and 7.9 µs against 3.9 µs (#1459's model). The hidden state
-  grows by about 55 MB per position per 1M root rows (an `R` key index plus
-  that position's `M` and `J`). A star is cheaper than a chain of two-table
+  1.61x, 2.22x and 2.92x a two-table change at `n` = 3, 4 and 5 (one worker,
+  100-change pages), with a page of 100 changes locking
+  `100 × (n − 1) + 50` `J` rows, and a fan-out row about 5.3, 6.7 and 7.9 µs
+  against 3.9 µs (#1459's model). The hidden state grows by about 55 MB per
+  position per 1M root rows and 100k keys at that position (an `R` key index
+  plus that position's `M` and `J`). A star is cheaper than a chain of two-table
   JOINs over the same tables: at `n = 4`, 2.3x the chain's throughput and
   0.42x its hidden state.
