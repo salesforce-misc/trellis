@@ -78,7 +78,8 @@ use generative::generate::join::{
     build_coverage,
 };
 use generative::generate::join_one_to_one::{
-    OnShape, OneToOneField, OneToOneOpDraw, OneToOneSpec, one_to_one_case, one_to_one_case_strategy,
+    OnShape, OneToOneField, OneToOneOpDraw, OneToOneSpec, StarCase, one_to_one_case,
+    one_to_one_case_strategy, star_case_strategy, star_tier_enabled,
 };
 use generative::invariant::{self, Clause, InRunInvariant};
 use generative::model::Op;
@@ -143,7 +144,7 @@ impl OneToOneCoverage {
                 Op::Insert { table, row, .. } => (table, Some(row)),
                 Op::Update { table, .. } | Op::Delete { table, .. } => (table, None),
                 Op::Truncate { table, .. } => {
-                    if table == "jb" {
+                    if table != "ja" {
                         self.truncates_joined += 1;
                     } else {
                         self.truncates_from += 1;
@@ -152,7 +153,7 @@ impl OneToOneCoverage {
                 }
                 other => unreachable!("the 1-1 JOIN tier draws no {other:?}"),
             };
-            if table == "jb" {
+            if table != "ja" {
                 self.joined_ops += 1;
             } else {
                 self.from_ops += 1;
@@ -297,6 +298,12 @@ fn proptest_config() -> ProptestConfig {
 /// Runs one case against a fresh isolated database, then checks every
 /// definition is still `live`.
 fn run_case(case: &JoinCase) -> Result<(), String> {
+    run_case_with(case, None)
+}
+
+/// [`run_case`] with each drain holding at most `drain_batch_cap` records,
+/// when set.
+fn run_case_with(case: &JoinCase, drain_batch_cap: Option<usize>) -> Result<(), String> {
     HARNESS.with(|h| {
         h.coverage.borrow_mut().record(case);
         h.runtime.block_on(async {
@@ -309,6 +316,9 @@ fn run_case(case: &JoinCase) -> Result<(), String> {
             .await
             .expect("connect the backend");
             backend.set_strict_audit(true);
+            if let Some(cap) = drain_batch_cap {
+                backend.set_drain_batch_cap(cap);
+            }
             let pool =
                 Pool::new(&Config::from_dsn(db.dsn().to_string()).expect("config")).expect("pool");
             let shape = format!(
@@ -394,6 +404,32 @@ fn run_case(case: &JoinCase) -> Result<(), String> {
     })
 }
 
+/// Runs one star tier case (`generate::join_one_to_one::star_case_strategy`)
+/// as [`run_case`] runs a case, its drains capped at the case's page size,
+/// and then, when it draws one, its metamorphic twin: the same program with
+/// every definition's `JOIN` clauses permuted, which must converge to its
+/// own oracle (the same rows: `join_star_tier.rs` checks the two oracles
+/// agree). The knobs' shares of stalled lock steps and re-derived pages
+/// await engine hooks that stall or re-derive a share of them; the case's
+/// commit stall bounds every page's.
+fn run_star_case(case: &StarCase) -> Result<(), String> {
+    let cap = Some(case.knobs.drain_batch_cap);
+    run_case_with(&case.case, cap)?;
+    if case.knobs.metamorphic {
+        let twin = JoinCase {
+            program: case.permuted_program(),
+            ..case.case.clone()
+        };
+        run_case_with(&twin, cap).map_err(|message| {
+            format!(
+                "the metamorphic twin (JOIN order {:?}) of a case that converged: {message}",
+                case.join_order
+            )
+        })?;
+    }
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(proptest_config())]
 
@@ -404,6 +440,18 @@ proptest! {
         case in one_to_one_case_strategy()
     ) {
         run_case(&case).map_err(TestCaseError::fail)?;
+    }
+
+    /// The star tier (see the module doc comment). Every case passes at once
+    /// while `star_tier_enabled` is off.
+    #[test]
+    #[ignore = "deep-lane property: run with `cargo test -p generative -- --ignored`"]
+    fn property_star_join_targets_converge_under_concurrent_drains(
+        case in star_case_strategy()
+    ) {
+        if star_tier_enabled() {
+            run_star_case(&case).map_err(TestCaseError::fail)?;
+        }
     }
 }
 
@@ -529,6 +577,36 @@ const ONE_TO_ONE_KNOWN_MISSES: &[&str] = &[
 /// [`ONE_TO_ONE_KNOWN_MISSES`], and leaves out [`ONE_TO_ONE_NOT_GATED`] and
 /// every plant of another path.
 fn one_to_one_sweep_tier() -> SweepTier {
+    sweep_tier(
+        generative::baseline_quarantine::JOIN_ONE_TO_ONE_TIER,
+        ONE_TO_ONE_KNOWN_MISSES,
+    )
+}
+
+/// The star tier's sweep (#1781): the 1-1 `JOIN` plants over
+/// [`star_case_strategy`]'s cases, each plant on any position. It leaves out
+/// [`ONE_TO_ONE_NOT_GATED`] for the reasons listed there: the star tier runs
+/// the same runner, which draws no held row, no uncaptured write and no
+/// page claimed out of order, and `star_j_unsorted`'s failure is a deadlock
+/// the engine retries. Until the reach sweep measures the star tier, its
+/// known misses are [`STAR_KNOWN_MISSES`].
+fn star_sweep_tier() -> SweepTier {
+    sweep_tier(
+        generative::baseline_quarantine::JOIN_STAR_TIER,
+        STAR_KNOWN_MISSES,
+    )
+}
+
+/// The star tier's known misses: the two-table tier's
+/// ([`ONE_TO_ONE_KNOWN_MISSES`]) until the star tier's reach sweep
+/// (`star_join_planted_bugs_are_caught`, 4 seeds × 12 cases) records its
+/// own fired and caught counts here.
+const STAR_KNOWN_MISSES: &[&str] = ONE_TO_ONE_KNOWN_MISSES;
+
+/// A 1-1 `JOIN` sweep tier named `name`: it gates every 1-1 `JOIN` plant but
+/// `known_misses` and [`ONE_TO_ONE_NOT_GATED`], and leaves out every plant of
+/// another path.
+fn sweep_tier(name: &'static str, known_misses: &'static [&'static str]) -> SweepTier {
     use generative::plant_sweep::{PlantPath, not_on_path};
     let mut not_gated: Vec<(&'static str, &'static str)> = ONE_TO_ONE_NOT_GATED.to_vec();
     not_gated.extend(not_on_path(
@@ -555,8 +633,8 @@ fn one_to_one_sweep_tier() -> SweepTier {
         generative::plant_sweep::NO_EXTREMES,
     ));
     SweepTier {
-        name: generative::baseline_quarantine::JOIN_ONE_TO_ONE_TIER,
-        known_misses: ONE_TO_ONE_KNOWN_MISSES,
+        name,
+        known_misses,
         not_gated,
     }
 }
@@ -598,14 +676,57 @@ fn one_to_one_join_planted_bugs_are_caught() {
     );
 }
 
+/// The star tier's reach sweep (#1781, #1464 section 4): the sweep above
+/// over [`star_case_strategy`]'s seeded cases. Returns at once without
+/// `GENERATIVE_PLANTS`, and while `star_tier_enabled` is off. Run it with:
+///
+/// ```text
+/// TRELLIS_DEV_STAR_JOIN=1 GENERATIVE_PLANTS=all cargo test -p generative \
+///     --test join_one_to_one_convergence star_join_planted_bugs_are_caught \
+///     -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "planted-bug sweep: run with GENERATIVE_PLANTS=all and `--ignored`"]
+fn star_join_planted_bugs_are_caught() {
+    if !star_tier_enabled() {
+        eprintln!("star_join_planted_bugs_are_caught: skipped, the star tier is off");
+        return;
+    }
+    let strategy = star_case_strategy().boxed();
+    plant_sweep::sweep(
+        "star_join_planted_bugs_are_caught",
+        &star_sweep_tier(),
+        |seed, cases| plant_sweep::seeded_cases(&strategy, seed, cases),
+        |case: &StarCase| {
+            run_star_case(case).map_err(|message| plant_sweep::CaseFailure {
+                key_spaces: case
+                    .case
+                    .program
+                    .defs
+                    .iter()
+                    .map(|def| Some(def.key_space.clone()))
+                    .collect(),
+                message,
+            })
+        },
+    );
+}
+
 /// The tier runs every 1-1 `JOIN` plant but the ones it lists as not gated
 /// with a reason, and nothing else; its known misses are 1-1 `JOIN` plants it
-/// runs.
+/// runs. The star tier's lists are the same.
 #[test]
 fn the_one_to_one_join_tier_runs_every_one_to_one_join_plant() {
     use generative::plant_sweep::{PlantPath, plant_path};
     use trellis::dev::plant::Plant;
+    let star = star_sweep_tier();
     let tier = one_to_one_sweep_tier();
+    assert_eq!(star.not_gated, tier.not_gated);
+    assert_eq!(star.name, "join_star");
+    for name in star.known_misses {
+        let plant = Plant::from_name(name).unwrap_or_else(|| panic!("{name} names no plant"));
+        assert_eq!(plant_path(plant), PlantPath::OneToOneJoin, "{name}");
+    }
     for plant in Plant::ALL {
         let name = plant.name();
         let gated = !tier.not_gated.iter().any(|(not, _)| *not == name);
@@ -676,6 +797,7 @@ fn hand_built_case(with_builds: bool) -> JoinCase {
             value: (i % 11 != 0).then_some(i as i8 - 10),
             columns: i % 16,
             own_keys: [0; 3],
+            on_key: false,
         });
     }
     let action = |kind, target| JoinActionDraw {

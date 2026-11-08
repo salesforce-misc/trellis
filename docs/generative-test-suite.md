@@ -540,6 +540,47 @@ beside them run on every `cargo test`.
   in its `ONE_TO_ONE_KNOWN_MISSES`, and leaves four out, each with why (a held
   row, a write past capture, a page the barrier never lets drain late). Their
   deterministic pins gate all of them.
+- **Star 1-1 JOIN convergence** (the star tier: `tests/join_one_to_one_convergence.rs`'s
+  `property_star_join_targets_converge_under_concurrent_drains`, drawn by
+  `generate::join_one_to_one::star_case_strategy`). The same generator over a
+  root `ja` and one to four joined tables, one per position (`jb`, then `jc`,
+  `jd`, `je`; at most 5 tables), each `LEFT` or `INNER` on its own drawn `ON`
+  shape. The two-table JOIN is its one-position case: an op names its table
+  by position, every position's table is written, truncates included, and
+  each joined table's ops are issued from one lane per burst. A position past
+  the first reads `ja`'s shared columns (`id`, `(c1, c2)`, `s`, `t`) or a
+  bigint key of its own (`k2` to `k4`), and selects fields over its table.
+  The tier draws what reaches races across positions: a narrow key space
+  (80 keys, 3 of them taking two draws in five) in which a root row's own
+  keys equal its `k` half the time, so it is hot at two or more positions at
+  once; the stream cut into shuffled pages of 1 to 15 draws, half of them
+  mixed (one root key written at the root and at every position, the
+  drawn "late" position's write last); drains capped at a drawn 1 to 15
+  rows; 8 workers and a commit stall of up to 3 ms. The case also carries
+  the shares of lock steps to stall (30%) and pages to re-derive (12%),
+  which wait for engine hooks that stall or re-derive a share of them. One
+  case in four runs its metamorphic twin too: the same program with every
+  definition's `JOIN` clauses in a drawn order, which renumbers the
+  positions and so changes the engine's `(position, key)` lock order but no
+  row. The oracle is the star's multi-join in the definition's order
+  (`render_join_one_to_one_select`), and the in-run invariant's star check
+  (`invariant::check_star`) runs every clause at each position against that
+  position's `M_p`, `J` rows and table, with a target row only where every
+  `INNER` position matched. The tier runs only when
+  `join_one_to_one::star_tier_enabled` says so: the development knob
+  `TRELLIS_DEV_STAR_JOIN` is on and the engine runs a star's pages and
+  builds. Until then its property and its planted-bug sweep,
+  `star_join_planted_bugs_are_caught`, return at once, and the two-table
+  tiers draw and check exactly what they did without it
+  (`tests/join_star_tier.rs` holds their draws' digests). The same file
+  checks, with no engine apply running, that the strategy reaches every
+  table count, kind, position, hot-key overlap, mixed page and knob; that the
+  oracle is the multi-join over a real Postgres at 3, 4 and 5 tables, against
+  the file's own model of a star, under any `JOIN` order; and that define,
+  with the knob on, admits every drawn star definition. The sweep's tier,
+  `join_star`, leaves out the plants the two-table tier does, for the same
+  reasons, and starts from that tier's known misses until its own sweep
+  records the star's rates.
 - **Chained-reader convergence** (`tests/join_chained_convergence.rs`,
   ADR-0002 "Multi-hop"). A `JOIN`, aggregate or 1-1, one of whose sides is
   another definition's target in the same instance, so the target-mutation
@@ -695,6 +736,7 @@ The planted-bug sweep (`generative::plant_sweep`; `planted_bugs_are_caught` in
 `join_planted_bugs_are_caught` in `generative/tests/join_convergence.rs` for the
 `JOIN` tier, `one_to_one_join_planted_bugs_are_caught` in
 `generative/tests/join_one_to_one_convergence.rs` for the 1-1 `JOIN` tier,
+`star_join_planted_bugs_are_caught` in the same file for its star tier,
 `chained_join_planted_bugs_are_caught` in
 `generative/tests/join_chained_convergence.rs` for the chained-reader tier,
 `extremes_tamper_planted_bugs_are_caught` in
@@ -704,7 +746,8 @@ once per planted bug, and judges each plant only on cases the baseline passed.
 only with **zero failures outside the quarantine list**,
 `generative/baseline-quarantine.txt`. The rule is the same for every tier
 (`cooling_key`, `hot_key`, `mid_burst`, `steady_load`, `cooling_backfill`,
-`min_max`, `join`, `join_one_to_one`, `join_chained`, `extremes_tamper`).
+`min_max`, `join`, `join_one_to_one`, `join_star`, `join_chained`,
+`extremes_tamper`).
 
 - **Each list entry** is one line, `<tier> <seed>:<case> #<issue> <what fails>`.
   The case numbering is the sweep's, as `GENERATIVE_PLANT_ONLY=<seed>:<case>` takes
@@ -845,7 +888,8 @@ Two structural notes for when faults enter the stream:
 - **Planted-bug sweeps and their baseline.** The sweeps (`generative::plant_sweep`:
   the concurrent tier's `planted_bugs_are_caught`, the `JOIN` tier's
   `join_planted_bugs_are_caught`, the 1-1 `JOIN` tier's
-  `one_to_one_join_planted_bugs_are_caught`, the chained-reader tier's
+  `one_to_one_join_planted_bugs_are_caught` and its star tier's
+  `star_join_planted_bugs_are_caught`, the chained-reader tier's
   `chained_join_planted_bugs_are_caught`, the `MIN`/`MAX` tampering tier's
   `extremes_tamper_planted_bugs_are_caught`) re-run generated cases with a deliberate bug
   planted (`trellis/src/plant.rs`) and check the tier catches it, against an

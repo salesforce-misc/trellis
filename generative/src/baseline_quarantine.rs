@@ -35,6 +35,10 @@ pub const JOIN_TIER: &str = "join";
 /// The 1-1 `JOIN` tier's sweep tier (`join_one_to_one_convergence.rs`).
 pub const JOIN_ONE_TO_ONE_TIER: &str = "join_one_to_one";
 
+/// The 1-1 `JOIN` tier's star sweep tier (`join_one_to_one_convergence.rs`,
+/// #1781).
+pub const JOIN_STAR_TIER: &str = "join_star";
+
 /// The chained-reader tier's sweep tier (`join_chained_convergence.rs`).
 pub const JOIN_CHAINED_TIER: &str = "join_chained";
 
@@ -51,6 +55,7 @@ pub const TIERS: &[&str] = &[
     "min_max",
     JOIN_TIER,
     JOIN_ONE_TO_ONE_TIER,
+    JOIN_STAR_TIER,
     JOIN_CHAINED_TIER,
     EXTREMES_TAMPER_TIER,
 ];

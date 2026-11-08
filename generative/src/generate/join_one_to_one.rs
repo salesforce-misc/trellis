@@ -489,6 +489,10 @@ pub struct OneToOneOpDraw {
     /// draws each equal to `key` half the time, so a root row is hot at two
     /// or more positions at once.
     pub own_keys: [u8; 3],
+    /// Whether an update or delete names the live row holding its drawn key
+    /// (`pick` names one when none does): a mixed page's way to write one
+    /// key at every position ([`shape_pages`]).
+    pub on_key: bool,
 }
 
 /// The number of join keys a [`KeyShape`] draws over.
@@ -632,6 +636,16 @@ pub fn build_star_program(
             }
             columns
         };
+        // The live row an update or delete names.
+        let pick = |live: &[Live]| -> usize {
+            let holder = shape
+                .key(draw.key)
+                .and_then(|key| live.iter().position(|row| row.key == Some(key)));
+            match holder {
+                Some(at) if draw.on_key => at,
+                _ => draw.pick % live.len(),
+            }
+        };
         let mut kind = if live[side].is_empty() {
             JoinOpKind::Insert
         } else {
@@ -667,7 +681,7 @@ pub fn build_star_program(
                 }
             }
             JoinOpKind::Update => {
-                let at = draw.pick % live[side].len();
+                let at = pick(&live[side]);
                 let row = live[side][at];
                 let mut changes = Vec::new();
                 if draw.columns & 1 != 0 {
@@ -699,7 +713,7 @@ pub fn build_star_program(
                 }
             }
             JoinOpKind::Delete => {
-                let at = draw.pick % live[side].len();
+                let at = pick(&live[side]);
                 let row = live[side].swap_remove(at);
                 Op::Delete {
                     table: table.to_string(),
@@ -944,9 +958,11 @@ fn split_mix(state: &mut u64) -> u64 {
 
 /// Cuts `draws` into the pages `pages` draws, in turn, and shuffles each
 /// (#1464 section 4, change 3). In a `mixed` page of two or more draws every
-/// draw takes the page's first key, the draws cycle over the positions
-/// (`ja` first, then each joined table), a `ja` draw takes the key at every
-/// position of its own too, and the draws at `late` come after the others:
+/// draw takes the page's first key and writes it, the draws cycle over the
+/// positions (`ja` first, then each joined table), a `ja` draw takes the key
+/// at every position of its own too, a joined draw updates the row holding
+/// the key (or names one, which takes it), and the draws at `late` come
+/// after the others:
 /// one root key changed at every position, with the late position's change
 /// last, in rows a drain of [`StarKnobs::drain_batch_cap`] rows takes
 /// together.
@@ -967,8 +983,15 @@ pub fn shape_pages(draws: &mut [OneToOneOpDraw], pages: &[PageDraw], tables: usi
             for (i, draw) in chunk.iter_mut().enumerate() {
                 draw.position = (i % tables) as u8;
                 draw.key = key;
+                draw.on_key = true;
+                // Every write sets the key: an insert or update of `ja`, and
+                // at a joined position an update of the row holding it (an
+                // insert would probe past the key when a row holds it).
+                draw.columns |= 1;
                 if draw.position == 0 {
                     draw.own_keys = [key; 3];
+                } else if draw.kind == JoinOpKind::Insert {
+                    draw.kind = JoinOpKind::Update;
                 }
             }
         }
@@ -1152,21 +1175,24 @@ pub(crate) mod strategy {
             0u8..16,
         )
             .prop_map(
-                move |(position, kind, pick, key, id, t, half_null, value, columns)| OneToOneOpDraw {
-                    position,
-                    kind: if kind == JoinOpKind::Truncate && !truncating {
-                        JoinOpKind::Delete
-                    } else {
-                        kind
-                    },
-                    pick,
-                    key,
-                    id,
-                    t,
-                    half_null,
-                    value,
-                    columns,
-                    own_keys: [0; 3],
+                move |(position, kind, pick, key, id, t, half_null, value, columns)| {
+                    OneToOneOpDraw {
+                        position,
+                        kind: if kind == JoinOpKind::Truncate && !truncating {
+                            JoinOpKind::Delete
+                        } else {
+                            kind
+                        },
+                        pick,
+                        key,
+                        id,
+                        t,
+                        half_null,
+                        value,
+                        columns,
+                        own_keys: [0; 3],
+                        on_key: false,
+                    }
                 },
             )
     }
@@ -1514,6 +1540,7 @@ mod tests {
             value: Some(2),
             columns: 0,
             own_keys: [0; 3],
+            on_key: false,
         }
     }
 
@@ -1756,7 +1783,7 @@ mod tests {
     /// turn, on the shapes in turn, every other one on its own key.
     fn star_spec(tables: usize, offset: usize) -> OneToOneSpec {
         OneToOneSpec {
-            left: offset % 2 == 0,
+            left: offset.is_multiple_of(2),
             on: OnShape::ALL[offset % OnShape::ALL.len()],
             fields: vec![OneToOneField::AX, OneToOneField::BY],
             more: (2..tables)
@@ -1789,7 +1816,8 @@ mod tests {
                 assert_eq!(def.fields.len(), 2 + 2 * (tables - 2), "{spec:?}");
                 let order: Vec<u8> = (1..tables as u8).rev().collect();
                 let text = star_definition_text("j", &spec, &order);
-                let twin = trellis::dev::defs::parse(&text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+                let twin =
+                    trellis::dev::defs::parse(&text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
                 let KeySpace::JoinOneToOne(twin_join) = &twin.key_space else {
                     panic!("{text}")
                 };
@@ -1916,7 +1944,12 @@ mod tests {
         for p in 0..4 {
             assert!(positions.contains(&p), "{positions:?}");
         }
-        assert!(mixed.iter().filter(|d| d.position == 0).all(|d| d.own_keys == [d.key; 3]));
+        assert!(
+            mixed
+                .iter()
+                .filter(|d| d.position == 0)
+                .all(|d| d.own_keys == [d.key; 3])
+        );
         let mut plain: Vec<u8> = draws[8..].iter().map(|d| d.key).collect();
         assert!(draws[8..].iter().all(|d| d.position == 0));
         plain.sort_unstable();

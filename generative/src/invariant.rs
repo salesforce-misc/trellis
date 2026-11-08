@@ -554,7 +554,9 @@ fn target_clause(s: &StarSnapshot, out: &mut Vec<Violation>) -> usize {
             continue;
         };
         for (p, (position, key)) in s.positions.iter().zip(&keys).enumerate() {
-            let pick = key.as_ref().and_then(|k| newest(&position.joined_entries, k));
+            let pick = key
+                .as_ref()
+                .and_then(|k| newest(&position.joined_entries, k));
             let read = joined.joined.get(p).cloned().flatten();
             if pick.map(|m| m.key.as_str()) != read.as_deref() {
                 out.push(Violation {
@@ -575,7 +577,9 @@ fn target_clause(s: &StarSnapshot, out: &mut Vec<Violation>) -> usize {
             .positions
             .iter()
             .enumerate()
-            .find(|(p, position)| !position.left && joined.joined.get(*p).cloned().flatten().is_none())
+            .find(|(p, position)| {
+                !position.left && joined.joined.get(*p).cloned().flatten().is_none()
+            })
             .map(|(p, _)| p);
         let expected = unmatched.is_none().then_some(&joined.values);
         let picks = show_picks(&joined.joined);
@@ -1082,7 +1086,12 @@ mod tests {
         s.rows[1] = row("2", &["a2b7c8-old"]);
         assert_eq!(star_found(&s), [(Clause::Target, None)]);
         let v = check_star(&s);
-        assert!(v.violations()[0].detail.contains(r#"[Some("7"), Some("8")]"#), "{v:?}");
+        assert!(
+            v.violations()[0]
+                .detail
+                .contains(r#"[Some("7"), Some("8")]"#),
+            "{v:?}"
+        );
     }
 
     #[test]
@@ -1178,7 +1187,9 @@ mod tests {
         s.positions[2].keys.clear();
         assert_eq!(star_found(&s), [(Clause::KeyRow, Some(3))]);
         s.positions[2].keys.push(some(&["30"]));
-        s.positions[2].joined_entries.push(entry("10", "30", "d10", 7));
+        s.positions[2]
+            .joined_entries
+            .push(entry("10", "30", "d10", 7));
         s.positions[2]
             .joined_applied
             .rows
