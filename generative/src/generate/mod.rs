@@ -147,7 +147,8 @@ use crate::model::{
 /// The inclusive upper bound of the calculated-field value domain.
 ///
 /// **Numeric-path pairing (design doc §3, a load-bearing invariant).** The
-/// generator only ever emits small non-negative *integers* here, and the sole
+/// generator only ever emits small non-negative *integers* here (and, with
+/// awkward values on, [`NUMERIC_NAN`]), and the sole
 /// derivation is `c1 + c2`. Both the engine (`trellis::numeric::Numeric`) and
 /// the SQL oracle (Postgres `numeric`) are arbitrary-precision base-10: an
 /// integer sum has one exact representation on both sides, with no rounding
@@ -159,6 +160,13 @@ use crate::model::{
 /// fractional/negative values, only together with the comparison-semantics
 /// review the widening implies.
 pub const VALUE_MAX: i64 = 99;
+
+/// A `c1`/`c2`/`x` value standing for the numeric `'NaN'`: below the
+/// `0..=VALUE_MAX` range every other drawn value lies in, and rendered as
+/// `NaN` ([`render`]). A `numeric(p,s)` column admits `NaN` but refuses
+/// `Infinity`, so `NaN` is the only special numeric value drawn. Only a draw
+/// with awkward values on ever produces it.
+pub const NUMERIC_NAN: i64 = -1;
 
 /// The most rows the trivial generator seeds before mutating. Kept tiny: each
 /// op costs a full apply → quiesce → snapshot → compare round trip, and a
@@ -285,7 +293,13 @@ pub const COOLING_SEAL_INTERVAL_MS: std::ops::RangeInclusive<u64> = 5..=20;
 /// Renders an `Option<i64>` value to the rendered-text form
 /// [`crate::model::Op`] wants: `None` (SQL `NULL`) stays `None`.
 fn render(value: Option<i64>) -> Option<String> {
-    value.map(|v| v.to_string())
+    value.map(|v| {
+        if v == NUMERIC_NAN {
+            "NaN".to_string()
+        } else {
+            v.to_string()
+        }
+    })
 }
 
 /// One post-seed mutation, parameterized only by primary-key integers and
@@ -2423,11 +2437,18 @@ mod strategy {
     /// exercise the plain numeric path.
     const NULL_WEIGHT: u32 = 1;
     const VALUE_WEIGHT: u32 = 4;
+    /// [`value`]'s weights: a plain value, `NULL` (the same four-to-one share
+    /// as `VALUE_WEIGHT` to `NULL_WEIGHT`) and the numeric `NaN`
+    /// ([`NUMERIC_NAN`]), about one draw in twenty-six.
+    const NUMERIC_PLAIN_WEIGHT: u32 = 40;
+    const NUMERIC_NULL_WEIGHT: u32 = 10;
+    const NUMERIC_NAN_WEIGHT: u32 = 2;
 
     /// A single calculated-field / column value: a small non-negative integer
     /// (see [`VALUE_MAX`]'s numeric-path pairing), or — when `awkward_values`
     /// is set — occasionally `None` (SQL `NULL`, see the module doc comment's
-    /// "awkward values" note).
+    /// "awkward values" note) or `NaN` ([`NUMERIC_NAN`]: every generated
+    /// `Numeric` source column is `numeric(14,2)`, which admits it).
     ///
     /// When `awkward_values` is unset this is *exactly* the strategy the
     /// generator used before awkward values (a bare `0..=VALUE_MAX` draw, just
@@ -2437,8 +2458,9 @@ mod strategy {
     fn value(awkward_values: bool) -> BoxedStrategy<Option<i64>> {
         if awkward_values {
             prop_oneof![
-                VALUE_WEIGHT => (0..=VALUE_MAX).prop_map(Some),
-                NULL_WEIGHT => Just(None),
+                NUMERIC_PLAIN_WEIGHT => (0..=VALUE_MAX).prop_map(Some),
+                NUMERIC_NULL_WEIGHT => Just(None),
+                NUMERIC_NAN_WEIGHT => Just(Some(NUMERIC_NAN)),
             ]
             .boxed()
         } else {
@@ -4105,6 +4127,25 @@ pub use strategy::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `NaN` stand-in renders as Postgres's `numeric` `NaN` literal, in
+    /// a seed row and in an update, and a plain value is unchanged.
+    #[test]
+    fn numeric_nan_renders_as_nan() {
+        assert_eq!(render(Some(NUMERIC_NAN)).as_deref(), Some("NaN"));
+        assert_eq!(render(Some(0)).as_deref(), Some("0"));
+        assert_eq!(render(None), None);
+        let program = build_program(
+            &[(Some(NUMERIC_NAN), Some(3))],
+            &[Mutate::Update {
+                pk: 1,
+                c1: Some(2),
+                c2: Some(NUMERIC_NAN),
+            }],
+        );
+        let rendered = format!("{:?}", program.ops);
+        assert_eq!(rendered.matches("Some(\"NaN\")").count(), 2, "{rendered}");
+    }
 
     fn one_table_program(shape: DefShape, grain: Option<&str>) -> Program {
         build_program_multi_with_shapes(

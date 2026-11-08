@@ -95,6 +95,11 @@ pub struct Coverage {
     /// [`crate::generate::bulk_insert_program`], not just that a small one
     /// occasionally shows up.
     pub max_bulk_insert_rows: usize,
+    /// How many `NaN` values the recorded programs write to a `Numeric`
+    /// column, in inserts and updates (a `numeric(p,s)` column admits `NaN`,
+    /// and the group basis's `SUM`/`AVG` count it apart from the sum). Zero
+    /// means no case drew one.
+    pub numeric_nan_writes: usize,
     /// How many partitioned source tables (ADR-0017) the recorded programs
     /// drew, by [`PartitionStrategy`]: `"hash"`, `"list"` (a leaf per
     /// value), `"list_default"` (fewer leaves and a `DEFAULT`) and
@@ -192,6 +197,10 @@ impl Coverage {
         // Scheduled client restarts and scale-outs.
         self.client_restarts += program.restart_after_ops.len();
         self.client_scale_outs += program.scale_out_after_ops.len();
+        // Numeric NaN writes.
+        for op in &program.ops {
+            self.numeric_nan_writes += numeric_nan_writes(program, op);
+        }
         // Bulk inserts.
         for op in &program.ops {
             if let Op::BulkInsert { rows, .. } = op {
@@ -760,6 +769,32 @@ fn burst_action_shapes(
     out
 }
 
+/// The `NaN` values `op` writes to a `Numeric` column of `program`'s tables.
+fn numeric_nan_writes(program: &Program, op: &Op) -> usize {
+    let nans = |table: &str, cells: &[(String, Option<String>)]| {
+        let Some(table) = program.tables.iter().find(|t| t.name == table) else {
+            return 0;
+        };
+        cells
+            .iter()
+            .filter(|(name, value)| {
+                value.as_deref() == Some("NaN")
+                    && table
+                        .columns
+                        .iter()
+                        .any(|c| &c.name == name && c.value_type == ValueType::Numeric)
+            })
+            .count()
+    };
+    match op {
+        Op::Insert { table, row, .. } => nans(table, row),
+        Op::Update { table, changes, .. } => nans(table, changes),
+        Op::BulkInsert { table, rows, .. } => rows.iter().map(|row| nans(table, row)).sum(),
+        Op::Leaf { op, .. } => numeric_nan_writes(program, op),
+        _ => 0,
+    }
+}
+
 fn op_kind(op: &Op) -> &'static str {
     match op {
         Op::Insert { .. } => "Insert",
@@ -968,6 +1003,7 @@ impl fmt::Display for Coverage {
         writeln!(f, "client_restarts: {}", self.client_restarts)?;
         writeln!(f, "client_scale_outs: {}", self.client_scale_outs)?;
         writeln!(f, "max_bulk_insert_rows: {}", self.max_bulk_insert_rows)?;
+        writeln!(f, "numeric_nan_writes: {}", self.numeric_nan_writes)?;
         write!(f, "partition_strategies:")?;
         for (name, count) in sorted_counts(&self.partition_strategies) {
             write!(f, " {name}={count}")?;
@@ -1183,6 +1219,21 @@ mod tests {
         assert!(coverage.operators.contains("Add"));
         assert!(coverage.types_exercised.contains("numeric"));
         assert_eq!(coverage.key_spaces.get("OneToOne"), Some(&1));
+    }
+
+    #[test]
+    fn record_program_counts_numeric_nan_writes() {
+        let mut coverage = Coverage::new();
+        coverage.record_program(&build_program(
+            &[(Some(crate::generate::NUMERIC_NAN), Some(2))],
+            &[Mutate::Update {
+                pk: 1,
+                c1: Some(1),
+                c2: Some(crate::generate::NUMERIC_NAN),
+            }],
+        ));
+        assert_eq!(coverage.numeric_nan_writes, 2);
+        assert!(format!("{coverage}").contains("numeric_nan_writes: 2"));
     }
 
     #[test]

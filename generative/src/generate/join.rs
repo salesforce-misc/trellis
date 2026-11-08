@@ -49,6 +49,11 @@
 //! a case's program and plan, the builds that run over rows, so a run can show
 //! that they happen.
 //!
+//! In a quarter of the cases the aggregate arguments `ja.x` and `jb.y` are
+//! `numeric(14,2)` instead of `integer` ([`with_numeric_args`]) and a value is
+//! the numeric `NaN` now and then ([`JOIN_NAN`]), so `SUM`/`AVG` over a
+//! column that admits `NaN` runs through the join's partials too.
+//!
 //! The tables are unpartitioned and no definition reads another's target;
 //! partitioned sides are a separate draw dimension, and the chained-reader
 //! tier ([`super::join_chained`]) reads one side through another
@@ -90,6 +95,32 @@ pub fn join_tables() -> Vec<Table> {
         table(FROM_TABLE, &["ga", "t", "k", "x"]),
         table(JOINED_TABLE, &["t", "k", "gb", "y"]),
     ]
+}
+
+/// A [`JoinOpDraw::value`] standing for the numeric `NaN`, below every other
+/// drawn value. Only a case whose aggregate arguments are `numeric(p,s)`
+/// ([`with_numeric_args`]) draws it: an `integer` column refuses `NaN`.
+pub const JOIN_NAN: i8 = i8::MIN;
+
+/// `program` with the two aggregate arguments, `ja.x` and `jb.y`, `numeric`
+/// (declared `numeric(14,2)`) instead of `integer`: the same small values,
+/// plus the `NaN` a [`JOIN_NAN`] draw writes. A `numeric(p,s)` column admits
+/// `NaN` but refuses `Infinity`, and its `SUM`/`AVG` count `NaN` apart from
+/// the running sum, through the join's `P`, `M` and `J` partials too (a `NaN`
+/// on a key with no match, or whose match has left).
+pub fn with_numeric_args(mut program: Program) -> Program {
+    for (table, column) in [(FROM_TABLE, "x"), (JOINED_TABLE, "y")] {
+        for col in program
+            .tables
+            .iter_mut()
+            .filter(|t| t.name == table)
+            .flat_map(|t| t.columns.iter_mut())
+            .filter(|c| c.name == column)
+        {
+            col.value_type = ValueType::Numeric;
+        }
+    }
+    program
 }
 
 /// What a definition joins on.
@@ -375,7 +406,13 @@ pub fn build_join_program(
         let key = text(shape.key(draw.key).map(i64::from));
         let t = text(Some(i64::from(draw.t % 2)));
         let group = text(draw.group.map(|g| i64::from(g % 4)));
-        let value = text(draw.value.map(i64::from));
+        let value = draw.value.map(|v| {
+            if v == JOIN_NAN {
+                "NaN".to_string()
+            } else {
+                v.to_string()
+            }
+        });
         let kind = if live[side].is_empty() {
             JoinOpKind::Insert
         } else {
@@ -835,6 +872,26 @@ pub(crate) mod strategy {
 
     /// One op draw. Without `truncating`, a drawn truncate is a delete.
     pub(crate) fn draw(joined_weight: u32, truncating: bool) -> impl Strategy<Value = JoinOpDraw> {
+        draw_with(joined_weight, truncating, false)
+    }
+
+    /// [`draw`], and with `nan` a value now and then the numeric `NaN`
+    /// ([`JOIN_NAN`]), about one in forty.
+    pub(crate) fn draw_with(
+        joined_weight: u32,
+        truncating: bool,
+        nan: bool,
+    ) -> impl Strategy<Value = JoinOpDraw> {
+        let value = if nan {
+            prop_oneof![
+                10 => Just(None),
+                4 => Just(Some(JOIN_NAN)),
+                86 => (-20i8..60).prop_map(Some)
+            ]
+            .boxed()
+        } else {
+            prop_oneof![1 => Just(None), 9 => (-20i8..60).prop_map(Some)].boxed()
+        };
         (
             prop_oneof![
                 10 - joined_weight => Just(false),
@@ -850,7 +907,7 @@ pub(crate) mod strategy {
             any::<u8>(),
             0u8..2,
             prop_oneof![1 => Just(None), 9 => (0u8..4).prop_map(Some)],
-            prop_oneof![1 => Just(None), 9 => (-20i8..60).prop_map(Some)],
+            value,
             0u8..16,
         )
             .prop_map(move |(joined, kind, pick, key, t, group, value, columns)| {
@@ -923,8 +980,14 @@ pub(crate) mod strategy {
             1 => Just(KeyShape::Wide),
             4 => Just(KeyShape::Racing)
         ]
-        .prop_flat_map(|shape| (Just(shape), any::<bool>()))
-        .prop_flat_map(|(shape, truncating)| {
+        .prop_flat_map(|shape| {
+            (
+                Just(shape),
+                any::<bool>(),
+                prop_oneof![3 => Just(false), 1 => Just(true)],
+            )
+        })
+        .prop_flat_map(|(shape, truncating, numeric_args)| {
             let joined_weight =
                 if matches!(shape, KeyShape::FanOut | KeyShape::Wide | KeyShape::Racing) {
                     5
@@ -942,7 +1005,7 @@ pub(crate) mod strategy {
             };
             (
                 proptest::collection::vec(spec(), 1..=3),
-                proptest::collection::vec(draw(joined_weight, truncating), ops),
+                proptest::collection::vec(draw_with(joined_weight, truncating, numeric_args), ops),
                 burst_size,
                 2usize..=4,
                 2usize..=6,
@@ -981,6 +1044,14 @@ pub(crate) mod strategy {
                         if shape == KeyShape::Racing {
                             pair_racing_draws(&mut draws);
                         }
+                        let mut specs = specs;
+                        if numeric_args {
+                            // `SUM(ja.x + 1)` is a sum over an unconstrained
+                            // `numeric`, which define refuses.
+                            for spec in &mut specs {
+                                spec.fields.retain(|f| *f != JoinField::SumXPlusOne);
+                            }
+                        }
                         let mut case = join_case(
                             &specs,
                             shape,
@@ -991,6 +1062,9 @@ pub(crate) mod strategy {
                             workers,
                             seal_interval_ms,
                         );
+                        if numeric_args {
+                            case.program = with_numeric_args(case.program);
+                        }
                         case.plan.commit_stall =
                             commit_stall_ms.map(std::time::Duration::from_millis);
                         if shape == KeyShape::Racing {
@@ -1053,6 +1127,45 @@ mod tests {
                     }
             );
         }
+    }
+
+    /// A [`JOIN_NAN`] draw is written as `NaN`, and [`with_numeric_args`]
+    /// makes exactly the two aggregate arguments `numeric`.
+    #[test]
+    fn numeric_args_take_nan_and_nothing_else_changes_type() {
+        let draw = |joined| JoinOpDraw {
+            joined,
+            kind: JoinOpKind::Insert,
+            pick: 0,
+            key: 1,
+            t: 0,
+            group: Some(1),
+            value: Some(JOIN_NAN),
+            columns: 0,
+        };
+        let program = build_join_program(&[], KeyShape::Spread, &[draw(false), draw(true)], &[]);
+        let nan_cells: Vec<_> = program
+            .ops
+            .iter()
+            .map(|op| match op {
+                Op::Insert { row, .. } => row.last().unwrap().1.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(nan_cells, vec![Some("NaN".to_string()); 2]);
+
+        let program = with_numeric_args(program);
+        let numeric: Vec<_> = program
+            .tables
+            .iter()
+            .flat_map(|t| {
+                t.columns
+                    .iter()
+                    .filter(|c| c.value_type == ValueType::Numeric)
+                    .map(|c| format!("{}.{}", t.name, c.name))
+            })
+            .collect();
+        assert_eq!(numeric, vec!["ja.x", "jb.y"]);
     }
 
     /// An update, delete or truncate always names a live row of its own

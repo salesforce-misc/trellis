@@ -1494,6 +1494,21 @@ mod tests {
         assert!(!Comparison::DecimalByValue.equal(&Some("2.5".into()), &None));
     }
 
+    /// A numeric `NaN` equals `NaN` and nothing else, as Postgres's `=` has it
+    /// for `numeric` (so a converged `NaN` aggregate or column isn't a
+    /// perpetual divergence), whichever side holds it.
+    #[test]
+    fn numeric_nan_equals_only_nan() {
+        let eq = |a: Option<&str>, b: Option<&str>| {
+            Comparison::DecimalByValue.equal(&a.map(String::from), &b.map(String::from))
+        };
+        assert!(eq(Some("NaN"), Some("NaN")));
+        assert!(!eq(Some("NaN"), Some("0")));
+        assert!(!eq(Some("0.00"), Some("NaN")));
+        assert!(!eq(Some("NaN"), None));
+        assert!(!eq(Some("NaN"), Some("Infinity")));
+    }
+
     /// The decimal comparison normalizes scale, leading zeros and the sign of
     /// zero, and nothing else: a different value, a different sign or a
     /// non-decimal spelling (`NaN`, `Infinity`) still compares by its text.

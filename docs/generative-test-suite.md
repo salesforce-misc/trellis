@@ -153,7 +153,9 @@ invisibly, and breaks shrinking. We generate within the rules:
   `numeric.rs` exact-decimal type; domains keep them on the same path.
 - **Deliberately generate the awkward values:** nulls in every nullable column,
   empty strings (distinct from NULL), the literal text `"NULL"`, strings
-  containing any key-encoding delimiter.
+  containing any key-encoding delimiter, and the numeric `NaN` (a
+  `numeric(p,s)` column admits it, where `±Infinity` is refused, so it is the
+  only special numeric value drawn for the columns `SUM`/`AVG` read).
 
 Two rules protect the suite from lying to itself:
 
@@ -370,7 +372,9 @@ beside them run on every `cargo test`.
   delta maintenance. Grain domains stay *tiny* (`0`, `1`, `2`, plus occasional
   `NULL` — see `generative::generate::strategy::grain_value`'s doc comment) so many
   rows share a group and deletes really kill groups. A `NULL` grouping value is
-  drawn unconditionally. The suite generates a *chained* definition (one
+  drawn unconditionally. The numeric `NaN` is drawn for `c1`/`c2` (a few values
+  in a hundred, inserted and updated), which the group basis counts apart from a
+  group's running sum. The suite generates a *chained* definition (one
   `TRANSFORM` reading another's target) only in the two-instance property and
   the chained-reader tier, whose readers are `JOIN`s; front-door coverage of
   an aggregate chained off a target lives in
@@ -409,7 +413,10 @@ beside them run on every `cargo test`.
   column or on two, grouped by the joined table's column, by a column of each
   table, or by the `FROM` table's alone, with `COUNT`/`SUM`/`AVG` on either side,
   an expression argument and composed fields), and inserts, updates and deletes
-  on both tables with `NULL` keys, groups and values now and then. The join keys
+  on both tables with `NULL` keys, groups and values now and then (in a quarter
+  of the cases the argument columns `ja.x` and `jb.y` are `numeric(14,2)`, with
+  the numeric `NaN` among the values, and no expression-argument `SUM`, which
+  define refuses over a `numeric`). The join keys
   spread over a dozen values, land mostly on one hot key, fan out over three
   keys that both tables keep writing, or spread so wide (64 keys) that two
   workers' pages of one batch change a key from opposite sides without sharing
@@ -637,8 +644,9 @@ concurrency.
 ## 5. Comparison semantics: exactness is a per-type decision
 
 - **Exact equality** for integers, text, dates, timestamps, UUIDs, booleans.
-- **Exact decimals compared by value, ignoring scale** (`2.50 ≡ 2.5`). Byte-level
-  rendering is pinned in a separate test.
+- **Exact decimals compared by value, ignoring scale** (`2.50 ≡ 2.5`), and
+  `NaN ≡ NaN` as Postgres's `=` has it for `numeric`. Byte-level rendering is
+  pinned in a separate test.
 - **Floats within a combined absolute+relative tolerance** (~1e-9), NaN ≡ NaN. (Not
   reachable until the value language gains floats.)
 - **An aggregate's `interval` by value**, as Postgres's `=` compares it (a month
