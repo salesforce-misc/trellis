@@ -261,6 +261,47 @@ has the details):
   old index first pauses if the new one takes longer than 5 minutes to
   build, which on a large table or beside a long-running transaction it can.
 
+## Join small, often-edited tables at query time
+
+A `JOIN` transform copies the joined table's columns into its target, so one
+edit of a joined row rewrites every target row joined to it. When the joined
+table has few distinct keys, such as a status, currency or country lookup of 5
+to 100 rows, one edit of the lookup is a fan-out over a large share of the
+target. Trellis writes the fan-out in chunks of 10,000 rows, each its own
+transaction, and never halts the transform for it. Each chunk is still a
+cascade of writes: target rows, WAL, and the work of every transform that reads
+the target.
+
+The cost, measured on a 1-1 `JOIN` of 1,000,000 root rows against a 5-key
+lookup: one edit of the lookup rewrites about 200,000 target rows, which takes
+about 1.8 s of chunks. While the chunks run, root apply proceeds at 0.52 to
+0.59 times its usual rate, and with 8 apply workers the transform is 30 to 38%
+slower than the same transform without the lookup.
+
+`status()` reports a key that fans out widely: `join.fan_out_warning` names the
+key, the number of root rows on it and the threshold, which is 250,000 rows per
+key unless `TRELLIS_ONE_TO_ONE_JOIN_FAN_OUT_WARNING` sets another
+([observability](observability.md#transform-status-lifecycle)). `trellis
+status` prints it as a warning line. The warning fires on a key that is already
+large; a lookup under the threshold still costs its fan-out on every edit.
+
+Materializing a join pays on every write to the joined table, and joining at
+query time pays on every read of the joined data. Which is cheaper depends on
+the read load against the write load, and on how often the joined data changes
+compared with how often the target is read. A table that is rarely edited and
+read by a hot query is fine to materialize. A table that is edited often, or
+that is joined to a very large root, is usually better joined at query time:
+leave it out of the transform and join the target to it in the reading query.
+
+* An `orders` transform that joins a `statuses` lookup. A lookup that is
+  edited once a quarter is fine to materialize. One whose rows are edited all
+  day, such as a status with a running counter, rewrites every order with that
+  status on each edit, so leave it out and join it in the query.
+* A `currency_rates` table updated every minute. Each update rewrites every
+  row in that currency. Join it at query time.
+* A `customers` table with one row for every few orders. An edit of a customer
+  rewrites a few orders, so materialize it.
+
 ## Partition large sources
 
 This applies to an aggregate kept on the group basis and to a `JOIN` (see the

@@ -367,6 +367,10 @@ The same read contract applies: a value read before `await_converged` may be
 inconsistent, and is exact after it
 ([Reading derived data](data-flow.md#reading-derived-data)).
 
+A joined table that is edited often, or that has few distinct keys, fans each
+edit out over many target rows; see [Join small, often-edited tables at query
+time](recommendations.md#join-small-often-edited-tables-at-query-time).
+
 ## Calculated Fields
 
 Every target table has a set of **calculated fields** — non-key columns populated
