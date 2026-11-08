@@ -826,6 +826,9 @@ fn a_strict_call_beside_a_null_constant_drops_a_division_by_zero_the_rows_would_
         "(na / 0 + 1) * (CASE WHEN true THEN CAST(NULL AS numeric) END)",
         "STRPOS(CASE WHEN na / 0 > 1 THEN ta END, CAST(NULL AS text))",
         "NULLIF(CAST(NULL AS numeric), na / 0)",
+        // The soak's second: a float division by a typed zero literal, under
+        // a non-strict comparison that wraps the strict subtree.
+        "((i8a / REAL '0') - CAST(NULL AS smallint)) IS NOT DISTINCT FROM f4a",
     ];
     for text in admitted {
         match check_text(text, None) {
