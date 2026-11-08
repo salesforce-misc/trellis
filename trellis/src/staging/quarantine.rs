@@ -2774,15 +2774,17 @@ async fn cascade_pause(
         }
     }
 
-    pool.get()
-        .await?
-        .execute(
-            "update column_status set cascade_pending = false \
-             where transform_table = $1 and column_name = $2 and cascade_pending \
-               and xmin::text = $3",
-            &[&transform, &column, &mark],
-        )
-        .await?;
+    let mut client = pool.get().await?;
+    let txn = client.transaction().await?;
+    crate::locks::fence_call_txn(&*txn).await?;
+    txn.execute(
+        "update column_status set cascade_pending = false \
+         where transform_table = $1 and column_name = $2 and cascade_pending \
+           and xmin::text = $3",
+        &[&transform, &column, &mark],
+    )
+    .await?;
+    txn.commit().await?;
     Ok(())
 }
 
@@ -2843,6 +2845,7 @@ async fn pause_dependent(
     if let Some(timeout) = lock_timeout {
         crate::locks::set_local_lock_timeout(&*txn, timeout).await?;
     }
+    crate::locks::fence_call_txn(&*txn).await?;
     bump_pause_fence(&*txn, &fence).await?;
     // Test-only pause point. See `super::interleave`.
     #[cfg(any(test, feature = "test-util"))]
@@ -3082,6 +3085,7 @@ pub async fn pause_column(pool: &Pool, transform: &str, column: &str) -> Result<
         let fence = pause_fence(pool, transform).await?;
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
+        crate::locks::fence_call_txn(&*txn).await?;
         bump_pause_fence(&*txn, &fence).await?;
         crate::locks::lock_column_pauses(
             &*txn,
@@ -3239,18 +3243,25 @@ pub async fn resume_column(
             refuse_unless_valid(pool, transform, &def).await?;
         }
 
-        client
-            .execute(
+        {
+            // One transaction, fenced as every write of a state-changing call
+            // is (`crate::locks::fence_call_txn`), committed before the
+            // locked one below takes its own fence.
+            let mut client = client;
+            let txn = client.transaction().await?;
+            crate::locks::fence_call_txn(&*txn).await?;
+            txn.execute(
                 "delete from column_deaths where transform_table = $1 and column_name = $2",
                 &[&transform, &column],
             )
             .await?;
-        client
-            .execute(
+            txn.execute(
                 "delete from column_failures where transform_table = $1 and column_name = $2",
                 &[&transform, &column],
             )
             .await?;
+            txn.commit().await?;
+        }
 
         // Whether it stays paused with a sibling, read and acted on under
         // the column-pause lock: a resume of that sibling running at
@@ -3262,6 +3273,7 @@ pub async fn resume_column(
         // no paused state, so it takes no fence.
         let mut locked = pool.get().await?;
         let txn = locked.transaction().await?;
+        crate::locks::fence_call_txn(&*txn).await?;
         crate::locks::lock_column_pauses(
             &*txn,
             pool.schema(),
@@ -3487,6 +3499,8 @@ pub(crate) async fn resume_pairs(
         let fence = pause_fence(pool, &t).await?;
         let mut client = pool.get().await?;
         let txn = client.transaction().await?;
+        // A state-changing call's fence first (`crate::locks::fence_call_txn`).
+        crate::locks::fence_call_txn(&*txn).await?;
         // The unpause and the field build's registration commit together:
         // the column applies from this commit, and the build's
         // chunks rewrite it under the keys' entry lock, so nothing needs a
@@ -3701,6 +3715,7 @@ async fn hold_orphaned_pause(
 ) -> Result<(), ApplyError> {
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
+    crate::locks::fence_call_txn(&*txn).await?;
     crate::locks::lock_column_pauses(
         &*txn,
         pool.schema(),
@@ -3852,6 +3867,7 @@ async fn reads_paused_sibling(
 pub async fn resume_transform(pool: &Pool, target: &str) -> Result<(), ApplyError> {
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
+    crate::locks::fence_call_txn(&*txn).await?;
 
     // `target` is the transform's name in either spelling
     // ([`catalog::target_match_sql`]); everything below is keyed by the bare
@@ -5823,7 +5839,10 @@ async fn release_key_as(
     let names = canonical_and_raw(pool, src_table).await?;
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
-    // The first lock: see the doc comment's "Concurrency". `names[0]`
+    // A state-changing call's fence (`crate::locks::fence_call_txn`), before
+    // the fence bump; a held-key retry runs outside any call and skips it.
+    crate::locks::fence_call_txn(&*txn).await?;
+    // The first lock after that: see the doc comment's "Concurrency". `names[0]`
     // is the canonical name, the one a page's fence read set keys the
     // table's changes on. A name that resolves to no table bumps a fence no
     // page reads, and the release then refuses and rolls it back.

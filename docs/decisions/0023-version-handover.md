@@ -73,6 +73,16 @@ stage, drain or change state side by side.
    `version_handover`, and its message names this binary's version, the other
    versions and their worker ids. Read-only calls (`status`, the listings, the
    health checks, `watermark_token`, `await_converged`) keep working.
+   The call checks before it starts, and again in each of its write
+   transactions, under the instance's handover lock taken shared as the
+   transaction's first lock. `migrate` and every handover pass take that lock
+   exclusive, so neither a takeover nor a migration can land between a
+   transaction's check and its commit. The handover lock's key is part of the
+   cross-version protocol and never changes. A call of several transactions
+   that another version overtakes between two of them refuses on the next
+   one, with the earlier ones committed, as a process stopped mid-call leaves
+   them; each step is idempotent, so a retry under the new release finishes
+   the call.
 7. **Visible.** `status()` carries `version_handover` while another version is
    live, naming this binary's version and the other processes by worker id and
    version. A background process logs when it starts standing by, why, and when
@@ -127,5 +137,11 @@ the new version takes over, migrating first where its migrations are pending
   stopped.
 * A stale row left by a killed process delays the takeover by up to the
   reclaim TTL.
-* Every state-changing call reads the registry and `pg_locks` once more, and
-  every background process writes its row once per standby poll.
+* Every state-changing call reads the registry and `pg_locks` before it
+  starts and again in each of its write transactions, with the handover lock
+  held shared, and every background process writes its row once per standby
+  poll. A call's transaction waiting on a lock holds the handover lock shared
+  meanwhile, so a pass or `migrate` that queues behind it waits as long
+  (rarely seconds).
+* A call that another version overtakes part way refuses with its earlier
+  transactions committed.

@@ -407,6 +407,16 @@ pub enum PausePoint {
     /// definition's target (`super::build`'s rebuild job). Waits as
     /// [`pause_between_transactions`] does, holding no snapshot.
     BetweenRebuildStructures,
+    /// In a state-changing call's write transaction, before its fence
+    /// (`crate::locks::fence_call_txn`) takes the handover lock: the
+    /// transaction is open and holds nothing yet. The target is
+    /// `call-fence-<n>`, `n` counting the call's fenced transactions from 1.
+    BeforeCallFence,
+    /// In a state-changing call's write transaction, once its fence holds
+    /// the handover lock shared and passed the floor and handover re-check,
+    /// before anything else. The target is as for
+    /// [`PausePoint::BeforeCallFence`].
+    AfterCallFence,
 }
 
 /// What a frozen worker reports when it reaches its armed point.

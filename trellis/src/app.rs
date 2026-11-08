@@ -479,30 +479,32 @@ impl Trellis {
     pub async fn apply(&self, statement_text: &str) -> Result<Applied, TrellisError> {
         self.call(async {
             let statement = defs::parse_statement(statement_text)?;
-            self.refuse_while_another_version_is_live().await?;
-            match statement {
-                defs::Statement::DefineTransform(parsed) => {
-                    let source_columns = self.source_columns(&parsed).await?;
-                    // Hands the *text* on rather than the `TransformDef` just
-                    // parsed: `install_definition` persists `definition_text` as
-                    // the definition's own record of itself (every later re-parse
-                    // reads it back), so the text is the input it needs, not a
-                    // redundant re-derivation of it.
-                    let definition = defs::install_definition(
-                        &self.pool,
-                        statement_text,
-                        &source_columns,
-                        self.config.target_schema(),
-                    )
-                    .await
-                    .map_err(TrellisError::Catalog)?;
-                    Ok(Applied::TransformDefined(definition.target_table))
+            self.state_changing(async {
+                match statement {
+                    defs::Statement::DefineTransform(parsed) => {
+                        let source_columns = self.source_columns(&parsed).await?;
+                        // Hands the *text* on rather than the `TransformDef` just
+                        // parsed: `install_definition` persists `definition_text` as
+                        // the definition's own record of itself (every later re-parse
+                        // reads it back), so the text is the input it needs, not a
+                        // redundant re-derivation of it.
+                        let definition = defs::install_definition(
+                            &self.pool,
+                            statement_text,
+                            &source_columns,
+                            self.config.target_schema(),
+                        )
+                        .await
+                        .map_err(TrellisError::Catalog)?;
+                        Ok(Applied::TransformDefined(definition.target_table))
+                    }
+                    defs::Statement::Pause(reference) => self.apply_pause(reference).await,
+                    defs::Statement::Resume(reference) => self.apply_resume(reference).await,
+                    defs::Statement::Drop(reference) => self.apply_drop(reference).await,
+                    defs::Statement::AlterTransform(alter) => self.apply_alter(&alter).await,
                 }
-                defs::Statement::Pause(reference) => self.apply_pause(reference).await,
-                defs::Statement::Resume(reference) => self.apply_resume(reference).await,
-                defs::Statement::Drop(reference) => self.apply_drop(reference).await,
-                defs::Statement::AlterTransform(alter) => self.apply_alter(&alter).await,
-            }
+            })
+            .await
         })
         .await
     }
@@ -521,6 +523,34 @@ impl Trellis {
     /// live before it pauses, as a background process's takeover does: a
     /// release that can run them, taking over meanwhile, is never paused
     /// under. Once they are paused, that changes nothing.
+    ///
+    /// That pre-check runs before `body`, the call's work, on a connection of
+    /// its own, so a newer release's `migrate` or takeover could land between
+    /// it and the call's writes. So `body` runs as a state-changing call
+    /// ([`crate::locks::in_state_changing_call`]): each of its write
+    /// transactions checks again under the handover lock, taken shared as its
+    /// first statement ([`crate::locks::fence_call_txn`]), and a refusal there
+    /// is the call's error.
+    async fn state_changing<T>(
+        &self,
+        body: impl std::future::Future<Output = Result<T, TrellisError>>,
+    ) -> Result<T, TrellisError> {
+        self.refuse_while_another_version_is_live().await?;
+        let (result, refused) = crate::locks::in_state_changing_call(
+            self.config.schema(),
+            self.config.binary_version(),
+            body,
+        )
+        .await;
+        match refused {
+            Some(refused) => Err(refused.into()),
+            None => result,
+        }
+    }
+
+    /// The pre-check of [`Trellis::state_changing`]: ADR-0023, rule 6, and
+    /// ADR-0024, rule 2, before the call's body runs, and the pause of what
+    /// this release can't run.
     async fn refuse_while_another_version_is_live(&self) -> Result<(), TrellisError> {
         let mut client = self.pool.get().await?;
         if let Some(refused) = crate::migrate::below_catalog_floor(
@@ -1112,8 +1142,7 @@ impl Trellis {
     /// nothing, and runs beside a worker. A `RESUME` of each paused
     /// definition is still the caller's.
     pub async fn detect_capture_disruptions(&self) -> Result<Vec<String>, TrellisError> {
-        self.call(async {
-            self.refuse_while_another_version_is_live().await?;
+        self.call(self.state_changing(async {
             let desired = crate::defs::tables_to_capture(&self.pool).await?;
             let mut client = self.pool.get().await?;
             crate::capture::reconcile::detect_disruptions(
@@ -1124,7 +1153,7 @@ impl Trellis {
             )
             .await
             .map_err(|err| TrellisError::Client(crate::client::capture_pass_error(err)))
-        })
+        }))
         .await
     }
 
@@ -1200,8 +1229,7 @@ impl Trellis {
     /// table's first reader backfills it in full anyway. The check is the
     /// catalog's, not the triggers'.
     pub async fn request_backfill(&self, source_table: &str) -> Result<(), TrellisError> {
-        self.call(async {
-            self.refuse_while_another_version_is_live().await?;
+        self.call(self.state_changing(async {
             let mut client = self.pool.get().await?;
             let captured = crate::defs::tables_to_capture(&self.pool).await?;
             let qualified = match resolve_backfill_table(&captured, source_table)? {
@@ -1245,6 +1273,7 @@ impl Trellis {
 
             // A failure to park is a plain `Db` error.
             let txn = client.transaction().await?;
+            crate::locks::fence_call_txn(&*txn).await?;
             let rebuilt = crate::intake::catch_up::park_table_catch_ups(
                 &*txn,
                 self.pool.floors(),
@@ -1260,7 +1289,7 @@ impl Trellis {
             crate::staging::build::stamp_rebuild_seg(&*txn, &rebuilt).await?;
             txn.commit().await?;
             Ok(())
-        })
+        }))
         .await
     }
 
@@ -1588,8 +1617,7 @@ impl Trellis {
         source_table: &str,
         key: &str,
     ) -> Result<(), TrellisError> {
-        self.call(async {
-            self.refuse_while_another_version_is_live().await?;
+        self.call(self.state_changing(async {
             match quarantine::release_key(&self.pool, transform, source_table, key).await {
                 Ok(_) => Ok(()),
                 Err(ApplyError::TransformNotFound { transform }) => {
@@ -1597,7 +1625,7 @@ impl Trellis {
                 }
                 Err(err) => Err(TrellisError::Apply(err)),
             }
-        })
+        }))
         .await
     }
 
@@ -1863,12 +1891,11 @@ impl Trellis {
         mode: SelfCheckMode,
         timeout: Duration,
     ) -> Result<SelfCheckJob, TrellisError> {
-        self.call(async {
-            self.refuse_while_another_version_is_live().await?;
+        self.call(self.state_changing(async {
             self_check_job::start(&self.pool, target_table, mode, timeout)
                 .await
                 .map_err(TrellisError::SelfCheck)
-        })
+        }))
         .await
     }
 
@@ -3097,6 +3124,17 @@ impl From<crate::error::Error> for TrellisError {
 impl From<tokio_postgres::Error> for TrellisError {
     fn from(err: tokio_postgres::Error) -> Self {
         TrellisError::Db(err)
+    }
+}
+
+/// A call's fence refuses with the error its pre-check returns for the same
+/// state ([`Trellis::refuse_while_another_version_is_live`]).
+impl From<crate::locks::CallRefused> for TrellisError {
+    fn from(refused: crate::locks::CallRefused) -> Self {
+        match refused {
+            crate::locks::CallRefused::Floor(refused) => refused.into_error().into(),
+            crate::locks::CallRefused::Handover(seen) => TrellisError::OtherVersionLive(seen),
+        }
     }
 }
 

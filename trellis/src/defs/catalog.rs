@@ -2177,10 +2177,14 @@ pub async fn alter_transform(
 
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
+    // A state-changing call's fence (`crate::locks::fence_call_txn`), the
+    // one lock before the bump: every exclusive holder of it takes it
+    // holding nothing, so no drain waits on it.
+    crate::locks::fence_call_txn(&*txn).await?;
 
     // The same version-fence bump `create_definition_inner` makes for a
     // brand-new definition — see this function's own doc comment. It is
-    // this transaction's first lock. The bump waits for every drain in
+    // this transaction's first lock after the call's fence. The bump waits for every drain in
     // flight that holds the row `for share` (a drain's Phase 3 takes it
     // first and holds it to its commit), so it must hold nothing such a
     // drain could be waiting on, directly or through a third transaction.
@@ -3363,6 +3367,10 @@ async fn create_definition_inner(
     let bare_schemas = bare_name_schemas(pool);
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
+    // A state-changing call's fence (`crate::locks::fence_call_txn`); a
+    // restore of a queued schema dump runs under `migrate`, outside any
+    // call, and skips it.
+    crate::locks::fence_call_txn(&*txn).await?;
 
     // ADR-0011: resolve `def.source` — always a bare table
     // name (see [`super::ast::TransformDef`]'s own doc comment for why the

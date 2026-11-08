@@ -118,7 +118,10 @@ and versions match exactly: any change of release is a handover.
 its definitions. While the new version stands by, the refusal of
 state-changing calls covers a web process's handle as much as the worker's;
 `status()`, the listings and the health checks keep working. A killed
-process's registry row stays live for up to the 30-second reclaim TTL.
+process's registry row stays live for up to the 30-second reclaim TTL. An old
+web process's call that the takeover, or a `migrate` raising the catalog floor,
+overtakes part way refuses at its next write with the steps before it
+committed; making it again under the new release finishes it.
 
 **Rolled back below the catalog floor,** a worker that only connects, and
 never runs `migrate`, is covered too: every handle checks the

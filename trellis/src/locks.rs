@@ -247,14 +247,16 @@ pub enum ColumnPauseLockError {
 /// **Lock order.** A transaction that needs it takes these in this order,
 /// and holds each to its commit:
 ///
-/// 1. its source's version fence (`staging::build::bump_version_fence`),
+/// 1. in a state-changing call, the handover lock shared, as the
+///    transaction's first statement ([`fence_call_txn`]);
+/// 2. its source's version fence (`staging::build::bump_version_fence`),
 ///    when it needs one: the wait there can last the whole `lock_timeout`
-///    behind busy writers, so nothing else is held for it;
-/// 2. this lock;
-/// 3. the fuse gate (`transform_fuse_gate`), when it needs one. No column-pause
+///    behind busy writers, so nothing else is held for it but the first;
+/// 3. this lock;
+/// 4. the fuse gate (`transform_fuse_gate`), when it needs one. No column-pause
 ///    site takes the gate today; `evict_for` takes it and then the definition
 ///    row without this lock;
-/// 4. definition rows and `column_status` / cascade-edge rows.
+/// 5. definition rows and `column_status` / cascade-edge rows.
 ///
 /// With one lock for every writer and reader of the pause state, no two of
 /// these transactions can each hold a row the other waits for: the second to
@@ -287,6 +289,208 @@ pub async fn lock_column_pauses(
         }
         Err(err) => Err(ColumnPauseLockError::Db(err)),
     }
+}
+
+/// The SQLSTATE a [`fence_call_txn`] that refuses aborts its transaction
+/// with. Nothing outside Trellis sees it: the call returns the refusal itself
+/// ([`CallRefused`]).
+pub(crate) const CALL_FENCE_REFUSED_SQLSTATE: &str = "TRVFR";
+
+/// Why a state-changing call's fence ([`fence_call_txn`]) refused one of its
+/// transactions.
+#[derive(Debug, Clone)]
+pub(crate) enum CallRefused {
+    /// The binary is below the catalog floor (ADR-0024, rule 2).
+    Floor(crate::catalog_floor::FloorRefused),
+    /// A process of another version is live on the instance (ADR-0023,
+    /// rule 6).
+    Handover(crate::handover::OtherVersionLive),
+}
+
+impl std::fmt::Display for CallRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallRefused::Floor(refused) => write!(f, "{}", refused.clone().into_error()),
+            CallRefused::Handover(seen) => write!(f, "refused: {seen}"),
+        }
+    }
+}
+
+/// The state-changing call this task is running: the instance and version its
+/// fences check against, and the first refusal one of them made.
+struct CallScope {
+    schema: String,
+    binary_version: String,
+    refused: std::sync::Mutex<Option<CallRefused>>,
+    fenced: std::sync::atomic::AtomicUsize,
+}
+
+tokio::task_local! {
+    static CALL_SCOPE: std::sync::Arc<CallScope>;
+}
+
+/// Runs `call`, a state-changing call's body, with [`fence_call_txn`] armed
+/// for every transaction it opens in this task, against the instance whose
+/// catalog schema is `schema` as a binary of `binary_version`. Returns the
+/// body's output and, when a fence refused, the first refusal: the call's
+/// error whatever the body returned, since a refused transaction wrote
+/// nothing.
+///
+/// The facade's state-changing calls are its only caller. A background
+/// process running the same functions (a cascade, the capture pass) and
+/// `migrate` restoring a queued schema dump run outside any call, so their
+/// transactions are not fenced: they are under the handover protocol
+/// already, and `migrate` holds the handover lock exclusive while it
+/// restores, so a shared fence there would wait on `migrate` itself.
+pub(crate) async fn in_state_changing_call<F: std::future::Future>(
+    schema: &str,
+    binary_version: &str,
+    call: F,
+) -> (F::Output, Option<CallRefused>) {
+    let scope = std::sync::Arc::new(CallScope {
+        schema: schema.to_string(),
+        binary_version: binary_version.to_string(),
+        refused: std::sync::Mutex::new(None),
+        fenced: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let output = CALL_SCOPE.scope(scope.clone(), call).await;
+    let refused = scope.refused.lock().expect("call scope lock").take();
+    (output, refused)
+}
+
+/// The fence of one write transaction of a state-changing call (ADR-0023,
+/// rule 6; ADR-0024, rule 2): the transaction's first statement takes the
+/// instance's handover lock shared, then it checks the catalog floor and
+/// for a live process of another version, under that lock and in that
+/// transaction. A no-op outside a state-changing call
+/// ([`in_state_changing_call`]).
+///
+/// `migrate` and every handover pass take the handover lock exclusive, so
+/// neither can land between this check and the transaction's commit: a
+/// migration that raises the floor, or another version taking over, waits
+/// for the commit, and the call's next transaction refuses. The call's
+/// pre-check, before its body runs, stays for the fast refusal and for
+/// pausing what this release can't run; this closes the window between
+/// that check and each write.
+///
+/// On a refusal it records it for the call and aborts the transaction with
+/// [`CALL_FENCE_REFUSED_SQLSTATE`], so the error travels out through the
+/// caller's own error type as any failed statement's does, and the call
+/// returns the refusal in its place. A call of several transactions
+/// overtaken between two of them keeps the ones that committed, as a process
+/// stopped mid-call does; each step is idempotent, and a retry under the new
+/// release finishes it.
+///
+/// **Lock order.** It is the first statement of its transaction, before
+/// every other lock: a call's write transaction takes, in this order and
+/// each held to its commit,
+///
+/// 1. the handover lock, shared (this);
+/// 2. its source's version fence (`staging::build::bump_version_fence`);
+/// 3. the column-pause lock ([`lock_column_pauses`]);
+/// 4. the fuse gate (`transform_fuse_gate`);
+/// 5. rows.
+///
+/// Every exclusive holder of the handover lock takes it holding nothing
+/// else, so a fence waiting here (behind a queued `migrate` or pass) is in
+/// no cycle. Taken after any of the others, a fence could wait on `migrate`
+/// while `migrate` waits on a row or table the transaction holds.
+pub(crate) async fn fence_call_txn(
+    txn: &impl tokio_postgres::GenericClient,
+) -> Result<(), tokio_postgres::Error> {
+    let Ok(scope) = CALL_SCOPE.try_with(std::sync::Arc::clone) else {
+        return Ok(());
+    };
+    let ordinal = scope
+        .fenced
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
+    #[cfg(any(test, feature = "test-util"))]
+    let gate = format!("call-fence-{ordinal}");
+    #[cfg(not(any(test, feature = "test-util")))]
+    let _ = ordinal;
+    #[cfg(any(test, feature = "test-util"))]
+    assert_first_lock(txn).await?;
+    #[cfg(any(test, feature = "test-util"))]
+    crate::staging::interleave::pause_at(
+        txn,
+        crate::staging::interleave::PausePoint::BeforeCallFence,
+        &gate,
+    )
+    .await?;
+    txn.execute(
+        "select pg_advisory_xact_lock_shared($1)",
+        &[&crate::handover::handover_lock_key(&scope.schema)],
+    )
+    .await?;
+    let (floor, observed) = tokio::try_join!(
+        crate::migrate::below_catalog_floor(txn, &scope.schema, &scope.binary_version),
+        crate::handover::observe(txn, &scope.schema, false),
+    )?;
+    let refused = match floor {
+        Some(refused) => Some(CallRefused::Floor(refused)),
+        None => match crate::handover::decide(
+            &scope.binary_version,
+            &observed,
+            crate::handover::Asker::Call,
+        ) {
+            crate::handover::Verdict::Refuse(seen) => Some(CallRefused::Handover(seen)),
+            crate::handover::Verdict::TakeOver | crate::handover::Verdict::StandBy(_) => None,
+        },
+    };
+    if let Some(refused) = refused {
+        let message = refused.to_string();
+        scope
+            .refused
+            .lock()
+            .expect("call scope lock")
+            .get_or_insert(refused);
+        txn.batch_execute(&format!(
+            "do $fence$ begin raise exception using errcode = '{CALL_FENCE_REFUSED_SQLSTATE}', \
+             message = {}; end $fence$",
+            crate::pool::quote_literal(&message)
+        ))
+        .await?;
+        // A raise always fails; this only gives the arm its type.
+        return txn.query_one("select 1 where false", &[]).await.map(|_| ());
+    }
+    #[cfg(any(test, feature = "test-util"))]
+    crate::staging::interleave::pause_at(
+        txn,
+        crate::staging::interleave::PausePoint::AfterCallFence,
+        &gate,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Test builds only: panics unless the transaction holds no lock yet but its
+/// own virtual transaction id, so every test that runs a state-changing call
+/// checks [`fence_call_txn`]'s place in the lock order. A transaction id
+/// held would mean a write before the fence.
+#[cfg(any(test, feature = "test-util"))]
+async fn assert_first_lock(
+    txn: &impl tokio_postgres::GenericClient,
+) -> Result<(), tokio_postgres::Error> {
+    let held: Vec<String> = txn
+        .query(
+            "select locktype || coalesce(' ' || relation::regclass::text, '') \
+                 || coalesce(' ' || objid::text, '') || ' ' || mode \
+             from pg_catalog.pg_locks \
+             where pid = pg_catalog.pg_backend_pid() and locktype <> 'virtualxid' \
+               and relation is distinct from 'pg_catalog.pg_locks'::regclass \
+             order by 1",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(
+        held.is_empty(),
+        "a state-changing call's fence must be its transaction's first lock; held: {held:?}"
+    );
+    Ok(())
 }
 
 /// The retry loop for DDL on a user table (I6): `CREATE`/`DROP TRIGGER`,

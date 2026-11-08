@@ -318,6 +318,7 @@ pub async fn start(
     let mut client = pool.get().await?;
     let id = loop {
         let txn = client.transaction().await?;
+        crate::locks::fence_call_txn(&*txn).await?;
         // The previous check's result goes; this one replaces it.
         txn.execute(
             "delete from self_check_jobs \

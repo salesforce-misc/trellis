@@ -95,8 +95,10 @@ by construction.
   new target's rows, and defines don't wait on each other. It holds the lock for its
   catalog transaction only: validation, the definition and edge rows, and the read of its
   upstreams' pauses. It never holds it across the build or backfill it starts.
-- **Order.** A transaction takes, in this order: its source's version fence, when it needs
-  one; the lock; the fuse gate, when it needs one; definition and `column_status` rows.
+- **Order.** A transaction takes, in this order: in a state-changing call, the handover
+  lock shared ([ADR-0023](0023-version-handover.md), rule 6); its source's version fence,
+  when it needs one; the lock; the fuse gate, when it needs one; definition and
+  `column_status` rows.
   The lock comes after the fence wait so that a pause waiting up to the lock timeout on
   busy writers never holds it, and before the definition row, which the fuse and
   `evict_for` take after the gate. No site that takes this lock takes the gate today.

@@ -139,6 +139,7 @@ pub(crate) async fn pause_transform(
 ) -> Result<PauseOutcome, CatalogError> {
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
+    crate::locks::fence_call_txn(&*txn).await?;
 
     let Some(locked) = locked_definition(&txn, target).await? else {
         return Err(CatalogError::TransformNotFound {
@@ -692,6 +693,9 @@ async fn insert_record(
 pub(crate) async fn drop_transform(pool: &Pool, target: &str) -> Result<DropOutcome, CatalogError> {
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
+    // A state-changing call's fence (`crate::locks::fence_call_txn`), before
+    // the version fences below.
+    crate::locks::fence_call_txn(&*txn).await?;
 
     // The version fence of every table the definition reads, bumped as this
     // transaction's first lock. A frozen definition is out of

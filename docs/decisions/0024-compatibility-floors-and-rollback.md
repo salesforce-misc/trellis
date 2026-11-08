@@ -74,9 +74,12 @@ command: the older release degrades per definition by itself.
    the floor and its own version. Every handle runs the check, a define-only
    one included, not only `migrate` ([ADR-0010](0010-embeddable-clients.md)):
    before it starts background work, which stands by below the floor and
-   checks again every standby poll, and before each state-changing call,
-   which refuses. Read-only calls keep working, and `status` names the
-   floor. A binary at or above the floor
+   checks again every standby poll, and in each of a state-changing call's
+   write transactions, which refuse (before the call starts, and under the
+   handover lock taken shared, so a migration that raises the floor can't
+   land between the check and the write:
+   [ADR-0023](0023-version-handover.md), rule 6). Read-only calls keep
+   working, and `status` names the floor. A binary at or above the floor
    tolerates applied migrations it doesn't carry, runs none of them, and runs
    none of its own again: it classifies the applied history before refinery
    runs, and refinery's blanket `abort_missing` is off. A name or checksum

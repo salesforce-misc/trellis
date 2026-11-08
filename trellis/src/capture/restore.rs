@@ -100,6 +100,9 @@ pub(crate) async fn detect(client: &mut Client) -> Result<bool, CaptureError> {
 /// nothing to do and this returns `false`.
 pub(crate) async fn respond(client: &mut Client, recheck: bool) -> Result<bool, CaptureError> {
     let txn = client.transaction().await?;
+    // A state-changing call's fence (`crate::locks::fence_call_txn`):
+    // `Trellis::detect_capture_disruptions` responds too.
+    crate::locks::fence_call_txn(&txn).await?;
     // Two passes responding at once take turns, and a seal waits.
     txn.execute("select 1 from segment_pointer for update", &[])
         .await?;

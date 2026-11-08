@@ -441,6 +441,18 @@ fn gone_error(table: &str) -> String {
     )
 }
 
+/// A transaction for one of [`check`]'s writes, fenced as every write
+/// transaction of a state-changing call is (`crate::locks::fence_call_txn`;
+/// `Trellis::detect_capture_disruptions` runs [`check`]). The capture pass
+/// runs it outside any call, where the fence is a no-op.
+async fn fenced_transaction(
+    client: &mut Client,
+) -> Result<tokio_postgres::Transaction<'_>, CaptureError> {
+    let txn = client.transaction().await?;
+    crate::locks::fence_call_txn(&txn).await?;
+    Ok(txn)
+}
+
 /// Pauses each definition that reads `table` and isn't paused for a capture
 /// failure yet, with `error`.
 async fn pause_readers(
@@ -453,7 +465,7 @@ async fn pause_readers(
     if readers.is_empty() {
         return Ok(());
     }
-    let txn = client.transaction().await?;
+    let txn = fenced_transaction(client).await?;
     for id in readers {
         if crate::defs::lifecycle::pause_for_disruption(&txn, id, table, error).await? {
             crate::instance_log::warn!(transform_id = id, table = %table, "definition paused: {error}");
@@ -693,7 +705,9 @@ pub(crate) async fn check(
     let partitioned = kind.as_deref() == Some("p");
     // Rows recorded for nothing at the name now: nothing recorded applies.
     if !recorded.is_empty() && !matches!(kind.as_deref(), Some("r" | "p")) {
-        forget(&*client, table).await?;
+        let txn = fenced_transaction(client).await?;
+        forget(&txn, table).await?;
+        txn.commit().await?;
         return Ok(false);
     }
     // Rows recorded for the other kind of table than the one at the name now
@@ -702,7 +716,9 @@ pub(crate) async fn check(
     // created again, unless the rows came from another cluster.
     if recorded.keys().any(|node| (*node == 0) == partitioned) {
         if restored(&*client, table).await? {
-            forget(&*client, table).await?;
+            let txn = fenced_transaction(client).await?;
+            forget(&txn, table).await?;
+            txn.commit().await?;
             return Ok(false);
         }
         pause_readers(
@@ -715,7 +731,9 @@ pub(crate) async fn check(
         return Ok(true);
     }
     if !recorded.is_empty() && restored(&*client, table).await? {
-        forget(&*client, table).await?;
+        let txn = fenced_transaction(client).await?;
+        forget(&txn, table).await?;
+        txn.commit().await?;
         recorded.clear();
     }
     if recorded.is_empty() {
@@ -723,7 +741,9 @@ pub(crate) async fn check(
             super::install::installed(&*client, schema, table).await?,
             super::install::Installed::Complete { .. }
         ) {
-            record(&*client, schema, table, Mode::Overwrite, Covers::Whole).await?;
+            let txn = fenced_transaction(client).await?;
+            record(&txn, schema, table, Mode::Overwrite, Covers::Whole).await?;
+            txn.commit().await?;
         }
         return Ok(false);
     }
@@ -733,13 +753,18 @@ pub(crate) async fn check(
         let oids: Vec<u32> = tree.iter().map(|(oid, _)| *oid).collect();
         let live = live_triggers(&*client, schema, &oids).await?;
         let report = tree_findings(&tree, &recorded, &live, &functions);
-        if !report.departed.is_empty() {
-            forget_nodes(&*client, table, &report.departed).await?;
-        }
-        if report.found.is_empty() {
-            for (_, name) in &report.unrecorded {
-                record(&*client, schema, table, Mode::Overwrite, Covers::Node(name)).await?;
+        let records = report.found.is_empty() && !report.unrecorded.is_empty();
+        if !report.departed.is_empty() || records {
+            let txn = fenced_transaction(client).await?;
+            if !report.departed.is_empty() {
+                forget_nodes(&txn, table, &report.departed).await?;
             }
+            if records {
+                for (_, name) in &report.unrecorded {
+                    record(&txn, schema, table, Mode::Overwrite, Covers::Node(name)).await?;
+                }
+            }
+            txn.commit().await?;
         }
         report.found
     } else {

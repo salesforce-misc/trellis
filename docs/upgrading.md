@@ -33,6 +33,12 @@ Trellis:
    changes nothing: it succeeds, or refuses with the same code when it would
    have to pause a definition.
 
+A state-changing call an old-release process is in the middle of when the new
+release takes over, or when `migrate` raises the [catalog
+floor](#the-catalog-floor), refuses at its next write with the
+`version_handover` or `version_floor` code, and keeps the steps it had already
+committed; making the call again under the new release finishes it.
+
 While the new release stands by, `status()` carries `version_handover`, naming
 this binary's version and each live process of the old release by worker id
 ([observability](observability.md#another-version-is-live)); `trellis status`
