@@ -1098,6 +1098,10 @@ mod tests {
             .await
             .expect("table");
 
+        // Per column: the hashed row with `opts` standing in for its
+        // options, the hashed live row, `to_jsonb(a)`, the live options, and
+        // `to_jsonb(a)` with its options replaced by the live ones minus
+        // any version (built without the macro under test).
         let row = |column: &'static str, opts: Option<&'static [&'static str]>| {
             let client = &client;
             async move {
@@ -1108,33 +1112,85 @@ mod tests {
                     attribute_row!("$2::text[]"),
                     ", ",
                     attribute_row!("a.attoptions"),
-                    ", pg_catalog.to_jsonb(a)::text, a.attoptions \
+                    ", pg_catalog.to_jsonb(a)::text, a.attoptions, \
+                     pg_catalog.jsonb_set(pg_catalog.to_jsonb(a), '{attoptions}', \
+                       coalesce(pg_catalog.to_jsonb(nullif(array(select o \
+                         from pg_catalog.unnest(a.attoptions) with ordinality u(o, i) \
+                         where o not like 'pg\\_attver=%' order by i), '{}')), \
+                         'null'::jsonb))::text \
                      from pg_catalog.pg_attribute a \
                      where a.attrelid = 't'::regclass and a.attname = $1"
                 );
                 let r = client.query_one(sql, &[&column, &opts]).await.expect("row");
-                let (with, live, raw, live_opts): (String, String, String, Option<Vec<String>>) =
-                    (r.get(0), r.get(1), r.get(2), r.get(3));
-                (with, live, raw, live_opts)
+                let (with, live, raw, live_opts, unversioned): (
+                    String,
+                    String,
+                    String,
+                    Option<Vec<String>>,
+                    String,
+                ) = (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4));
+                (with, live, raw, live_opts, unversioned)
             }
         };
 
-        // The live rows: unchanged from `to_jsonb(a)`, with and without
-        // options (no server this test runs on writes a version).
-        let (_, plain, plain_raw, plain_opts) = row("plain", None).await;
-        assert_eq!(plain, plain_raw);
-        let (_, tuned, tuned_raw, tuned_opts) = row("tuned", None).await;
-        assert_eq!(tuned, tuned_raw);
-        assert_eq!(plain_opts, None);
-        assert_eq!(
-            tuned_opts.as_deref(),
-            Some(
-                &[
-                    "n_distinct=100".to_string(),
-                    "n_distinct_inherited=5".to_string()
-                ][..]
-            )
-        );
+        // The live rows leave out a version and nothing else. A server that
+        // stamps one (the 2026-11 minors do, at CREATE TABLE and ADD COLUMN)
+        // is told by the entry itself, not by its version number.
+        let check_live = || async {
+            let mut stamped = false;
+            for (column, options) in [
+                ("plain", None),
+                (
+                    "tuned",
+                    Some(&["n_distinct=100", "n_distinct_inherited=5"][..]),
+                ),
+            ] {
+                let (_, live, raw, live_opts, unversioned) = row(column, None).await;
+                let live_opts = live_opts.unwrap_or_default();
+                let (versions, others): (Vec<_>, Vec<_>) = live_opts
+                    .iter()
+                    .cloned()
+                    .partition(|o| o.starts_with("pg_attver="));
+                stamped |= !versions.is_empty();
+                assert_eq!(live, unversioned, "{column}");
+                assert_eq!(
+                    others,
+                    options
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|o| o.to_string())
+                        .collect::<Vec<_>>(),
+                    "{column}"
+                );
+                if versions.is_empty() {
+                    // A row with no version renders as `to_jsonb(a)` did, so
+                    // baselines recorded before the version was left out
+                    // still match.
+                    assert_eq!(live, raw, "{column}");
+                } else {
+                    assert_ne!(live, raw, "{column}");
+                }
+            }
+            stamped
+        };
+        let natural = check_live().await;
+
+        // Stamp both columns the way a versioned server does, on a server
+        // that does not, and the same rows hold.
+        if !natural {
+            client
+                .batch_execute(
+                    "update pg_catalog.pg_attribute \
+                     set attoptions = pg_catalog.array_append(coalesce(attoptions, '{}'), \
+                       'pg_attver=' || (pg_catalog.pg_current_wal_insert_lsn() - '0/0')::text) \
+                     where attrelid = 't'::regclass and attname in ('plain', 'tuned')",
+                )
+                .await
+                .expect("stamp");
+            assert!(check_live().await, "the stamp took");
+        }
+        let (_, plain, _, _, _) = row("plain", None).await;
+        let (_, tuned, _, _, _) = row("tuned", None).await;
 
         // A version alone reads as no options at all.
         assert_eq!(row("plain", Some(&["pg_attver=24379568"])).await.0, plain);
