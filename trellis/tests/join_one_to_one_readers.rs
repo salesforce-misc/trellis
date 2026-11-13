@@ -41,6 +41,8 @@
 //! writes converged. A reader's own field failing on a row the target holds
 //! holds that key for that reader alone, as for a reader of any target.
 
+#[path = "support/attver.rs"]
+mod attver;
 #[path = "support/drain_driver.rs"]
 mod drain_driver;
 
@@ -1088,20 +1090,24 @@ async fn capture_passes(d: &mut Driver) {
 /// it. Its `RESUME` re-types the target's column, which pauses the readers
 /// whose own columns it outgrew, and each resumes on its own once its
 /// upstream is live, down the chain; then a value only the wider type holds
-/// reaches every reader.
+/// reaches every reader. The widening rewrites `a`, and PostgreSQL's 2026-11
+/// minors re-version `y`, after `x`, so the reader of `a.y` rebuilds
+/// (`support/attver.rs`).
 #[tokio::test]
 async fn a_widening_resumes_down_the_readers() {
     let _chunked = chunked().await;
     for kind in KINDS {
         let mut d = start(kind).await;
-        d.ctl
-            .batch_execute("alter table public.a alter column x type bigint")
+        let widen = "alter table public.a alter column x type bigint";
+        d.ctl.batch_execute(widen).await.expect("widen a.x");
+        attver::Attver::probe(&d.ctl)
             .await
-            .expect("widen a.x");
+            .after(&d.ctl, widen)
+            .await;
         capture_passes(&mut d).await;
         assert_eq!(
             statuses(&d).await,
-            ["(paused)", "(live)", "(live)", "(live)", "(live)"],
+            ["(paused)", "(live)", "(live)", "(live)", "(backfilling)"],
             "{kind:?}: the widening paused the 1-1 JOIN"
         );
         trellis(&d)

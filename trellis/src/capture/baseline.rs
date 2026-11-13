@@ -30,8 +30,10 @@
 //!   land in the same pass window, as framework migrations often do. So R3b
 //!   also requires the rest of the row, with the column's default
 //!   expression, to be unchanged ([`Column::hash`]): a rewrite that changed
-//!   nothing else about the column. A catalog freeze doesn't change the
-//!   `xmin` a query reads.
+//!   nothing else about the column. The row's attribute version, which
+//!   PostgreSQL 15.20, 16.16, 17.12 and 18.7 move on every `ALTER COLUMN ...
+//!   TYPE` (`pg_attver` in `attoptions`), is left out of the hash. A catalog
+//!   freeze doesn't change the `xmin` a query reads.
 //! - **A stored generated column's expression replaced.** `ALTER COLUMN g
 //!   SET EXPRESSION AS (...)` (PostgreSQL 17 and later) rewrites the table
 //!   with every value of `g` computed by the new expression, with no DML
@@ -128,7 +130,12 @@
 //! (`2 * img` for `img * 2`), or to the expression the column already has,
 //! and a rewrite of the table (`VACUUM FULL`) between a major-version
 //! `pg_upgrade` and the first pass after it, which finds every read stored
-//! generated column's expression stored anew under a moved file node.
+//! generated column's expression stored anew under a moved file node. On a
+//! server that keeps attribute versions, so does an `ALTER COLUMN ... TYPE`
+//! that rebuilds nothing itself (of an unread column, a pure widening, or
+//! one that pauses every reader of the column) with a rewrite of the table,
+//! its own or another in the same window: it moves the row of every column
+//! after it.
 //!
 //! A pure widening with a `USING` that changes values (`integer` to `bigint
 //! USING b * 10`) is never R1's, and its row changed, so it isn't R3b's
@@ -161,8 +168,9 @@ struct Column {
     /// The `xmin` of the column's `pg_attribute` row, as text: compared
     /// for equality only.
     xmin: String,
-    /// A hash of the column's whole `pg_attribute` row and its default
-    /// expression. The expression's `:location` fields (parse offsets into
+    /// A hash of the column's whole `pg_attribute` row, its attribute
+    /// version left out (`attribute_row!`), and its default expression.
+    /// The expression's `:location` fields (parse offsets into
     /// the statement that set it) are left out: PostgreSQL 16 and earlier
     /// store a column's default again on every `ALTER COLUMN ... TYPE`, with
     /// each location reset to -1, so the same expression would otherwise
@@ -187,11 +195,39 @@ impl Column {
 /// Columns by node oid and name.
 type Columns = BTreeMap<(u32, String), Column>;
 
+/// The `pg_attribute` row `a` as `jsonb` text, without its attribute
+/// version, with `$opts` standing in for its `attoptions`. The version is
+/// the `pg_attver=<LSN in decimal>` entry PostgreSQL's 2026-11 minors
+/// (15.20, 16.16, 17.12, 18.7) keep in `attoptions`, or the `attversion`
+/// field PostgreSQL 20 gives the row. It moves on every `ALTER COLUMN ... TYPE` of the
+/// column or one before it, so a row hashed with it would never read as
+/// unchanged after a rewrite. A row with no version renders exactly as
+/// `to_jsonb(a)` does.
+macro_rules! attribute_row {
+    ($opts:literal) => {
+        concat!(
+            "pg_catalog.jsonb_set(pg_catalog.to_jsonb(a) - 'attversion', '{attoptions}', \
+             coalesce(pg_catalog.to_jsonb(case \
+               when exists (select from pg_catalog.unnest(",
+            $opts,
+            ") o where pg_catalog.starts_with(o, 'pg_attver=')) \
+               then nullif(array(select o from pg_catalog.unnest(",
+            $opts,
+            ") with ordinality u(o, i) \
+                 where not pg_catalog.starts_with(o, 'pg_attver=') order by i), '{}') \
+               else ",
+            $opts,
+            " end), 'null'::jsonb))::text"
+        )
+    };
+}
+
 /// The live state of `columns` on every node of the captured table `$1`
 /// (an unquoted `schema.table`): the table itself, or every leaf under a
 /// partitioned root, walked through `pg_inherits` (not `pg_partition_tree`,
 /// which locks every node).
-const LIVE_COLUMNS: &str = "\
+const LIVE_COLUMNS: &str = concat!(
+    "\
     with recursive tree(relid, relkind) as ( \
         select c.oid, c.relkind from pg_catalog.pg_class c \
         where c.oid = pg_catalog.to_regclass($1) \
@@ -203,8 +239,9 @@ const LIVE_COLUMNS: &str = "\
     select t.relid, pg_catalog.pg_relation_filenode(t.relid), a.attname::text, a.attnum, \
            a.atttypid, n.nspname::text || '.' || ty.typname::text, a.atttypmod, \
            pg_catalog.format_type(a.atttypid, a.atttypmod), a.xmin::text, \
-           pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to( \
-               pg_catalog.to_jsonb(a)::text || coalesce(pg_catalog.regexp_replace( \
+           pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to( ",
+    attribute_row!("a.attoptions"),
+    " || coalesce(pg_catalog.regexp_replace( \
                    d.adbin::text, ' :location -?[0-9]+', '', 'g'), ''), 'UTF8')), 'hex'), \
            a.attgenerated = 's', \
            pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(pg_catalog.regexp_replace( \
@@ -216,7 +253,8 @@ const LIVE_COLUMNS: &str = "\
     join pg_catalog.pg_type ty on ty.oid = a.atttypid \
     join pg_catalog.pg_namespace n on n.oid = ty.typnamespace \
     left join pg_catalog.pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum \
-    where t.relkind <> 'p'";
+    where t.relkind <> 'p'"
+);
 
 async fn live(
     client: &impl GenericClient,
@@ -1037,6 +1075,111 @@ async fn respond(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A column's hashed row ignores an attribute version in `attoptions`
+    /// on any server minor, keeps every other option, and renders a row
+    /// with no version exactly as `to_jsonb(a)` did, so baselines recorded
+    /// before the version was left out still match.
+    #[tokio::test]
+    async fn the_hashed_row_leaves_out_only_the_attribute_version() {
+        let cluster = testkit::TestCluster::start();
+        let db = cluster.create_empty_database().await;
+        let (client, connection) = tokio_postgres::connect(db.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(
+                "create table t (plain integer, tuned integer); \
+                 alter table t alter column tuned set (n_distinct = 100, n_distinct_inherited = 5)",
+            )
+            .await
+            .expect("table");
+
+        let row = |column: &'static str, opts: Option<&'static [&'static str]>| {
+            let client = &client;
+            async move {
+                let opts: Option<Vec<String>> =
+                    opts.map(|o| o.iter().map(|s| s.to_string()).collect());
+                let sql = concat!(
+                    "select ",
+                    attribute_row!("$2::text[]"),
+                    ", ",
+                    attribute_row!("a.attoptions"),
+                    ", pg_catalog.to_jsonb(a)::text, a.attoptions \
+                     from pg_catalog.pg_attribute a \
+                     where a.attrelid = 't'::regclass and a.attname = $1"
+                );
+                let r = client.query_one(sql, &[&column, &opts]).await.expect("row");
+                let (with, live, raw, live_opts): (String, String, String, Option<Vec<String>>) =
+                    (r.get(0), r.get(1), r.get(2), r.get(3));
+                (with, live, raw, live_opts)
+            }
+        };
+
+        // The live rows: unchanged from `to_jsonb(a)`, with and without
+        // options (no server this test runs on writes a version).
+        let (_, plain, plain_raw, plain_opts) = row("plain", None).await;
+        assert_eq!(plain, plain_raw);
+        let (_, tuned, tuned_raw, tuned_opts) = row("tuned", None).await;
+        assert_eq!(tuned, tuned_raw);
+        assert_eq!(plain_opts, None);
+        assert_eq!(
+            tuned_opts.as_deref(),
+            Some(
+                &[
+                    "n_distinct=100".to_string(),
+                    "n_distinct_inherited=5".to_string()
+                ][..]
+            )
+        );
+
+        // A version alone reads as no options at all.
+        assert_eq!(row("plain", Some(&["pg_attver=24379568"])).await.0, plain);
+        assert_eq!(row("plain", Some(&["pg_attver=123"])).await.0, plain);
+        // A version beside real options, wherever it sits, reads as those
+        // options alone.
+        for opts in [
+            &["n_distinct=100", "n_distinct_inherited=5", "pg_attver=123"][..],
+            &[
+                "pg_attver=23803712",
+                "n_distinct=100",
+                "n_distinct_inherited=5",
+            ][..],
+            &["n_distinct=100", "pg_attver=1", "n_distinct_inherited=5"][..],
+        ] {
+            assert_eq!(row("tuned", Some(opts)).await.0, tuned, "{opts:?}");
+        }
+        // Every other option still counts.
+        assert_ne!(row("plain", Some(&["n_distinct=100"])).await.0, plain);
+        assert_ne!(
+            row("tuned", Some(&["n_distinct=50", "pg_attver=123"]))
+                .await
+                .0,
+            tuned
+        );
+        assert_ne!(row("tuned", Some(&["n_distinct=100"])).await.0, tuned);
+
+        // A version kept in its own `attversion` field (PostgreSQL 20 and
+        // later), stood in for here by a row with that field added.
+        let versioned: String = client
+            .query_one(
+                concat!(
+                    "select ",
+                    attribute_row!("a.attoptions"),
+                    " from pg_catalog.pg_attribute p, \
+                     lateral (select p.*, 24379568::bigint as attversion) a \
+                     where p.attrelid = 't'::regclass and p.attname = 'tuned'"
+                ),
+                &[],
+            )
+            .await
+            .expect("versioned row")
+            .get(0);
+        assert_eq!(versioned, tuned);
+    }
 
     fn column(attnum: i16, ty: &str, typmod: i32, xmin: &str, filenode: u32, hash: &str) -> Column {
         let type_oid = match ty {

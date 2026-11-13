@@ -443,8 +443,10 @@ acted on once (`capture::baseline`). It costs two catalog reads per table.
   migration often does one of each in a transaction (`add_column ...
   default: -> { 'gen_random_uuid()' }` beside a `change_column_default`), so
   the rewrite counts only when the rest of the column's row, its default
-  expression included, is what it was. A catalog freeze leaves the `xmin` a
-  query reads as it was.
+  expression included, is what it was. The row's attribute version is left
+  out: PostgreSQL 15.20, 16.16, 17.12 and 18.7 move it (`pg_attver` in
+  `attoptions`) on every `ALTER COLUMN ... TYPE`. A catalog freeze leaves
+  the `xmin` a query reads as it was.
 - **A stored generated column's expression replaced is the column stored
   generated before and after, the node's file node moved, and its
   expression's hash changed.** The expression is hashed as stored, with the
@@ -725,7 +727,12 @@ re-applied in the same window as a table rewrite, and a `SET EXPRESSION` to
 an expression written differently that computes the same values (`2 * img`
 for `img * 2`), or to the expression the column already has. So does a
 rewrite (`VACUUM FULL`, `CLUSTER`) of a table with a read stored generated
-column between a major-version `pg_upgrade` and the first pass after it.
+column between a major-version `pg_upgrade` and the first pass after it,
+and, on a server that keeps attribute versions, an `ALTER COLUMN ... TYPE`
+that rebuilds nothing itself (of a column no definition reads, a pure
+widening, or one that pauses every reader of the column) with a rewrite of
+the table, its own or another in the same window: it moves the version of
+every column after it.
 
 ## Nested writes to the same key
 

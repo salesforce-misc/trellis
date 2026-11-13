@@ -15,6 +15,9 @@ use tokio_postgres::{Client, NoTls};
 use trellis::defs::TransformStatus;
 use trellis::{Config, Trellis, TrellisOptions};
 
+#[path = "support/attver.rs"]
+mod attver;
+
 const SCHEMA: &str = "trellis";
 
 async fn connect(dsn: &str) -> Client {
@@ -270,8 +273,10 @@ async fn bigint_key_release(dsn: &str) -> Trellis {
 
 /// A retype of a source's primary-key column re-stamps the floor with the
 /// entry that admits the new key type (#1660): an aggregate's source key
-/// widened from `integer` to `bigint`, which no copy holds, stays live, and
-/// its floor rises to `bigint`'s release.
+/// widened from `integer` to `bigint`, which no copy holds, doesn't pause,
+/// and its floor rises to `bigint`'s release. (It rebuilds: the widening
+/// rewrites the table, and PostgreSQL's 2026-11 minors re-version `g`, read
+/// after `id`; `support/attver.rs`.)
 #[tokio::test]
 async fn a_primary_key_retype_restamps_the_floor_with_the_new_key_type() {
     let cluster = TestCluster::start();
@@ -297,14 +302,14 @@ async fn a_primary_key_retype_restamps_the_floor_with_the_new_key_type() {
         (TransformStatus::Live, "0.2.0".to_string(), None)
     );
 
-    raw.batch_execute("alter table public.k1 alter column id type bigint")
-        .await
-        .expect("retype the key");
+    let retype = "alter table public.k1 alter column id type bigint";
+    raw.batch_execute(retype).await.expect("retype the key");
+    attver::Attver::probe(&raw).await.after(&raw, retype).await;
     pass(&mut raw, &trellis).await;
     pass(&mut raw, &trellis).await;
     assert_eq!(
         state(&raw, "r_k1").await,
-        (TransformStatus::Live, "0.3.0".to_string(), None)
+        (TransformStatus::Backfilling, "0.3.0".to_string(), None)
     );
 }
 

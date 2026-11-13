@@ -19,6 +19,9 @@ use trellis::capture::reconcile;
 use trellis::defs::TransformStatus;
 use trellis::{Config, Trellis, TrellisOptions};
 
+#[path = "support/attver.rs"]
+mod attver;
+
 const SCHEMA: &str = "trellis";
 
 async fn connect(dsn: &str) -> Client {
@@ -176,8 +179,12 @@ enum Expect {
     PausedR,
     /// `s` paused, `r` untouched.
     PausedS,
-    /// Both paused.
+    /// Both paused, with no rebuild.
     PausedBoth,
+    /// Any other pair of statuses, reached with at least one rebuild: one
+    /// reader rebuilt where the retype alone would have left it, or both
+    /// paused after a rebuild.
+    Statuses(TransformStatus, TransformStatus),
 }
 
 /// One study row: its id, its statements (`{t}` the case's table) with
@@ -218,6 +225,7 @@ async fn run_cases(cases: &[Case]) {
     bring_live(&mut raw, &db.pool).await;
 
     let app = connect(db.dsn()).await;
+    let attver = attver::Attver::probe(&app).await;
     let mut failures = Vec::new();
     for (id, script, expect) in cases {
         let t = format!("t_{}", id.to_lowercase());
@@ -227,6 +235,7 @@ async fn run_cases(cases: &[Case]) {
                 app.batch_execute(statement)
                     .await
                     .unwrap_or_else(|e| panic!("{id}: {statement}: {e}"));
+                attver.after(&app, statement).await;
             }
             capture_pass(&mut raw, &db.pool).await;
         }
@@ -263,6 +272,7 @@ async fn run_cases(cases: &[Case]) {
             (TransformStatus::Paused, TransformStatus::Paused) if rebuilds == 0 => {
                 Some(Expect::PausedBoth)
             }
+            (r, s) if rebuilds > 0 => Some(Expect::Statuses(r, s)),
             _ => None,
         };
         if got != Some(*expect) {
@@ -396,11 +406,13 @@ fn single_migration_cases() -> Vec<Case> {
             "alter table public.{t} alter column v type text",
             Expect::Nothing,
         ),
-        // The passthrough's `integer` copy is outgrown.
+        // The passthrough's `integer` copy is outgrown. PostgreSQL's 2026-11
+        // minors version attributes on every retype, so `b`, read by `s`,
+        // reads as a same-type rewrite (R3b) after it: `s` rebuilds.
         (
             "D9",
             "alter table public.{t} alter column a type bigint",
-            Expect::PausedR,
+            Expect::Statuses(TransformStatus::Paused, TransformStatus::Backfilling),
         ),
         (
             "D10",
@@ -469,17 +481,20 @@ fn single_migration_cases() -> Vec<Case> {
         ),
         // R1: a narrowed modifier. Every definition is still valid, and the
         // passthrough's copy holds every value, so the readers
-        // rebuild.
+        // rebuild. Versioned attributes add R3b for `n`, the read column
+        // after `v`, so a `value_rewrite` is counted too (and named here, as
+        // it comes first).
         (
             "D22",
             "alter table public.{t} alter column v type varchar(10)",
-            Expect::Rebuilt("column_changed"),
+            Expect::Rebuilt("value_rewrite"),
         ),
-        // `s`'s `GROUP BY` copy is outgrown.
+        // `s`'s `GROUP BY` copy is outgrown. Versioned attributes make `a`,
+        // after `g` and read by `r`, an R3b rewrite: `r` rebuilds.
         (
             "D23",
             "alter table public.{t} alter column g type bigint",
-            Expect::PausedS,
+            Expect::Statuses(TransformStatus::Backfilling, TransformStatus::Paused),
         ),
         // R1: a narrower scale renders the stored values with another number
         // of fractional digits (`1.50` as `1.5`): the readers of the column
@@ -524,11 +539,14 @@ fn paired_migration_cases() -> Vec<Case> {
              alter table public.{t} add column z double precision default random(); commit",
             Expect::Nothing,
         ),
+        // The widening rewrites nothing, but the volatile default moves the
+        // file node, and versioned attributes re-stamp `n`, read after `v`:
+        // R3b rebuilds the readers.
         (
             "P3",
             "begin; alter table public.{t} alter column v type varchar(255); \
              alter table public.{t} add column z double precision default random(); commit",
-            Expect::Nothing,
+            Expect::Rebuilt("value_rewrite"),
         ),
         (
             "P4",
@@ -587,10 +605,11 @@ fn paired_migration_cases() -> Vec<Case> {
             "alter table public.{t} rename constraint {t}_pkey to {t}_pk_renamed",
             Expect::Nothing,
         ),
+        // As P3, with `VACUUM FULL` moving the file node.
         (
             "X8",
             "alter table public.{t} alter column v type varchar(255); vacuum full public.{t}",
-            Expect::Nothing,
+            Expect::Rebuilt("value_rewrite"),
         ),
         (
             "X9",
@@ -629,11 +648,13 @@ fn real_change_cases() -> Vec<Case> {
         ),
         // A pure widening R1 leaves alone; the copy-type check pauses both readers, whose
         // copies of `b` it outgrew. A reader with no such copy misses the
-        // values (docs/known-correctness-gaps.md).
+        // values (docs/known-correctness-gaps.md). Versioned attributes also
+        // make the read columns after `b` an R3b rewrite, a rebuild counted
+        // before the pauses.
         (
             "C2",
             "alter table public.{t} alter column b type bigint using b * 10",
-            Expect::PausedBoth,
+            Expect::Statuses(TransformStatus::Paused, TransformStatus::Paused),
         ),
         // R3b.
         (
@@ -718,7 +739,11 @@ fn real_change_cases() -> Vec<Case> {
              alter table public.{t} alter column b type int using b * 10; commit",
             Expect::Rebuilt("value_rewrite"),
         ),
-        // The documented misses. A column added with a constant default
+        // The documented misses. PostgreSQL's 2026-11 minors version
+        // attributes on every retype, so where a read column follows the
+        // retyped one (`F2`, `Z1` to `Z3`) it reads as a same-type rewrite
+        // (R3b) and the table's readers rebuild; `F1`'s `x` is the last
+        // column, so it stays missed. A column added with a constant default
         // keeps it in its `pg_attribute` row until the table is rewritten,
         // and the rewrite clears it: a rewrite of the column then changed
         // its row. (Any rewrite clears it, `VACUUM FULL` included, which is
@@ -735,26 +760,26 @@ fn real_change_cases() -> Vec<Case> {
             "F2",
             "alter table public.{t} alter column v set compression pglz -- PASS \
              alter table public.{t} alter column v type varchar(50) using v || '!'",
-            Expect::Nothing,
+            Expect::Rebuilt("value_rewrite"),
         ),
         // A metadata change to the same column in the rewrite's window.
         (
             "Z1",
             "begin; alter table public.{t} alter column b set default 3; \
              alter table public.{t} alter column b type int using b * 10; commit",
-            Expect::Nothing,
+            Expect::Rebuilt("value_rewrite"),
         ),
         (
             "Z2",
             "alter table public.{t} alter column b set statistics 500; \
              alter table public.{t} alter column b type int using b * 10",
-            Expect::Nothing,
+            Expect::Rebuilt("value_rewrite"),
         ),
         (
             "Z3",
             "alter table public.{t} alter column b type int using b * 10; \
              alter table public.{t} alter column b set statistics 500",
-            Expect::Nothing,
+            Expect::Rebuilt("value_rewrite"),
         ),
     ]
 }
