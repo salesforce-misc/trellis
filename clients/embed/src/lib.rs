@@ -40,16 +40,19 @@
 //!
 //! | a `tracing` event | level word + target + message | [`PlainLogRecord`] |
 //!
-//! One piece of shared logic isn't flattening: [`require_transform_statement`]
+//! Three pieces of shared logic aren't flattening. [`require_transform_statement`]
 //! is the check a binding's `define` makes before calling `apply`, so that a
 //! `DROP` or `PAUSE` handed to `define` is refused rather than carried out. It
 //! asks [`trellis::statement_kind`], so the form is `apply`'s own parser's
 //! answer, and only the refusal's wording lives here.
 //!
-//! The other is [`install_log_bridge`], the `tracing` subscriber a binding
+//! [`install_log_bridge`] is the `tracing` subscriber a binding
 //! installs on the host's behalf so the engine's log lines reach the host's
 //! logger. It only queues [`PlainLogRecord`]s; each binding drains them from
 //! a thread its host VM owns (`src/log.rs` explains why it pulls).
+//!
+//! [`metrics_http`] is the scrape listener the Ruby binding's `metrics_bind`
+//! and the CLI's `trellis run --prometheus-bind` share.
 
 mod applied;
 mod config;
@@ -57,6 +60,7 @@ mod cursor;
 mod definition;
 mod error;
 mod log;
+pub mod metrics_http;
 mod quarantine;
 mod self_check;
 mod statement;

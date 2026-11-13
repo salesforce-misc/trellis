@@ -15,6 +15,9 @@ trellis = { path = "../../trellis" }
 # same facade `trellis` emits through, and nothing more (no
 # `tracing-subscriber`; the bridge's subscriber is a queue push).
 tracing = "0.1"
+# The metrics scrape listener (`metrics_http`), shared with the CLI. Already
+# in the tree through `trellis` and `tokio-postgres`, so this adds no crate.
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros", "sync"] }
 
 [dev-dependencies]
 # `test-util` opens `trellis::dev`, whose `defs::parse` is the only way to

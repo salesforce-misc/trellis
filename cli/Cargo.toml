@@ -17,12 +17,14 @@ path = "src/main.rs"
 
 [dependencies]
 trellis = { path = "../trellis" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util", "time"] }
+# The `--prometheus-bind` listener, shared with the Ruby binding.
+trellis-embed = { path = "../clients/embed" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
 
 [dev-dependencies]
-# `test-util` opens `trellis::dev::metrics`, which the metrics-endpoint test
-# uses to record one observation. A dev-dependency's features stay out of
-# every non-test build (resolver 2), so this never reaches the release binary
+# `test-util` compiles in `trellis::dev`, which `testkit` below builds on. A
+# dev-dependency's features stay out of every non-test build (resolver 2), so
+# this never reaches the release binary
 # (`.github/scripts/check-release-binary.sh` checks it).
 trellis = { path = "../trellis", features = ["test-util"] }
 # The dump/restore tests spawn the binary against a database on a test

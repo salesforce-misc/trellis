@@ -2379,6 +2379,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "trellis",
+ "trellis-embed",
 ]
 
 [[package]]
@@ -2386,6 +2387,7 @@ name = "trellis-embed"
 version = "0.2.0"
 dependencies = [
  "proptest",
+ "tokio",
  "tracing",
  "trellis",
 ]

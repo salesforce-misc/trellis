@@ -40,16 +40,15 @@
 //! `render_prometheus()` reads is the *same* one this process's pipeline is
 //! actually populating.
 //!
-//! There's deliberately no real HTTP parsing, matching the old standalone
-//! command's approach — see [`handle_metrics_connection`]'s doc comment.
+//! The listener itself is [`trellis_embed::metrics_http`], shared with the
+//! Ruby binding's `metrics_bind`.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use trellis::Metrics;
+use tokio::net::TcpListener;
 use trellis::{Config, ErrorCode, Trellis, TrellisError, TrellisOptions};
+use trellis_embed::metrics_http;
 
 /// Help text for `trellis run -h`/`--help`, and prefixed to any
 /// argument-parsing error so a mistake also shows correct usage.
@@ -324,133 +323,23 @@ async fn migrate_once_no_other_version_is_live(migrator: &Trellis) -> Result<boo
     }
 }
 
-/// Blocks until Ctrl-C. If `listener` is `Some`, also accepts and serves
-/// metrics connections on it (each in its own spawned task) concurrently,
-/// exactly like the old standalone `trellis prometheus` subcommand's serve
-/// loop — the only difference is this loop shares the process with the
+/// Blocks until Ctrl-C. If `listener` is `Some`, also serves metrics
+/// connections on it ([`metrics_http::serve`]) meanwhile, alongside the
 /// pipeline `run` above is already running.
 async fn wait_for_shutdown_signal(listener: Option<TcpListener>) -> Result<(), String> {
-    let Some(listener) = listener else {
-        return tokio::signal::ctrl_c()
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
             .await
-            .map_err(|err| format!("failed to listen for Ctrl-C: {err}"));
+            .map_err(|err| format!("failed to listen for Ctrl-C: {err}"))
     };
-
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                match accepted {
-                    Ok((stream, _peer_addr)) => {
-                        tokio::spawn(async move {
-                            if let Err(err) = handle_metrics_connection(stream).await {
-                                eprintln!("trellis run: metrics connection error: {err}");
-                            }
-                        });
-                    }
-                    // A single failed accept (e.g. the peer reset before we
-                    // finished accepting it) shouldn't take the whole
-                    // listener down — log it and keep serving.
-                    Err(err) => {
-                        eprintln!("trellis run: metrics accept error: {err}");
-                    }
-                }
-            }
-            ctrl_c = tokio::signal::ctrl_c() => {
-                return ctrl_c.map_err(|err| format!("failed to listen for Ctrl-C: {err}"));
-            }
-        }
-    }
-}
-
-/// The largest number of request bytes a single metrics connection is
-/// allowed to send before this gives up reading and just responds anyway.
-/// Real requests (a scraper's bare `GET / HTTP/1.1` plus a few headers) are a
-/// few hundred bytes at most; this cap just bounds memory/time spent on a
-/// client that never sends a terminator, without needing a real HTTP parser
-/// to know when the headers are "done".
-const MAX_REQUEST_BYTES: usize = 8 * 1024;
-
-/// How long a single metrics connection is allowed to spend before this
-/// gives up reading its request and responds anyway — bounds a slow/silent
-/// client's hold on a spawned task (though not on `accept`, since each
-/// connection runs in its own task).
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The `Content-Type` Prometheus's own text exposition format expects
-/// (https://github.com/prometheus/docs/blob/main/content/docs/instrumenting/exposition_formats.md).
-const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
-
-/// Drains (a bounded amount of) the request off `stream`, then writes back
-/// this process's registry — rendered fresh for this request via
-/// [`Metrics::render_prometheus`] — as a `200 OK` and closes the connection.
-/// Any I/O error here is this single connection's problem, not the server's
-/// — the caller logs and moves on rather than propagating anything that
-/// would affect other connections.
-///
-/// There's deliberately no real HTTP parsing, matching the old standalone
-/// `trellis prometheus` command's approach: a Prometheus scraper (or `curl`)
-/// sends a bare `GET / HTTP/1.1` with a handful of headers and nothing else
-/// worth reading, so this only drains enough to know the client is done
-/// sending (or gives up under [`MAX_REQUEST_BYTES`]/[`READ_TIMEOUT`]) before
-/// writing back a fixed-status, rendered-body response.
-async fn handle_metrics_connection(mut stream: TcpStream) -> Result<(), String> {
-    read_metrics_request(&mut stream).await?;
-    let body = Metrics::new().render_prometheus();
-    let response = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: {PROMETHEUS_CONTENT_TYPE}\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-    );
-    // Bounded the same way `read_metrics_request` is: a client that stops
-    // reading mid-response (TCP backpressure) shouldn't be able to pin this
-    // connection's spawned task open indefinitely.
-    tokio::time::timeout(READ_TIMEOUT, stream.write_all(response.as_bytes()))
-        .await
-        .map_err(|_| "timed out writing response".to_string())?
-        .map_err(|err| format!("failed to write response: {err}"))?;
-    stream
-        .shutdown()
-        .await
-        .map_err(|err| format!("failed to close connection: {err}"))
-}
-
-/// Reads off `stream` until the request headers look complete (a
-/// `\r\n\r\n` terminator has appeared), the client closes its write side, or
-/// [`MAX_REQUEST_BYTES`]/[`READ_TIMEOUT`] is hit — whichever comes first.
-/// There's no real HTTP parsing here (see [`handle_metrics_connection`]'s
-/// doc comment): this only needs to avoid hanging on, or being wedged open
-/// by, a client that never finishes sending.
-async fn read_metrics_request(stream: &mut TcpStream) -> Result<(), String> {
-    let drain = async {
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 512];
-        while buf.len() < MAX_REQUEST_BYTES {
-            let n = stream
-                .read(&mut chunk)
-                .await
-                .map_err(|err| format!("failed to read request: {err}"))?;
-            if n == 0 {
-                // Client closed its write side (or sent nothing) — nothing
-                // more to drain.
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if buf.windows(4).any(|window| window == b"\r\n\r\n") {
-                break;
-            }
-        }
-        Ok::<(), String>(())
+    let Some(listener) = listener else {
+        return ctrl_c.await;
     };
-
-    match tokio::time::timeout(READ_TIMEOUT, drain).await {
-        Ok(result) => result,
-        // A client that never finishes sending headers within the timeout
-        // still gets a response — we just stop waiting on it.
-        Err(_) => Ok(()),
+    tokio::select! {
+        never = metrics_http::serve(listener, |message| eprintln!("trellis run: {message}")) => {
+            match never {}
+        }
+        ctrl_c = ctrl_c => ctrl_c,
     }
 }
 
@@ -619,59 +508,5 @@ mod tests {
         ];
         let err = parse(&args).unwrap_err();
         assert!(err.contains("only be specified once"));
-    }
-
-    /// End-to-end (within this process) check that `--prometheus-bind`'s
-    /// listener really does serve this process's registry: records one
-    /// observation directly against `trellis::metrics` (the same global
-    /// registry `Metrics::render_prometheus` reads — no `Trellis`/Postgres
-    /// connection needed for this), drives `handle_metrics_connection` over
-    /// a real loopback socket, and checks the response is a `200 OK` with
-    /// the Prometheus content type whose body contains that observation.
-    #[tokio::test]
-    async fn serves_the_rendered_registry_as_a_200_with_the_prometheus_content_type() {
-        trellis::dev::metrics::increment_changes_applied("run_cli_test_target", 1);
-
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind an ephemeral loopback port");
-        let addr = listener.local_addr().expect("listener has a local address");
-        tokio::spawn(async move {
-            let (stream, _peer_addr) = listener.accept().await.expect("accept one connection");
-            handle_metrics_connection(stream)
-                .await
-                .expect("handle_metrics_connection succeeds");
-        });
-
-        let mut stream = TcpStream::connect(addr)
-            .await
-            .expect("connect to the listener");
-        stream
-            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .await
-            .expect("write the request");
-        let mut buf = Vec::new();
-        stream
-            .read_to_end(&mut buf)
-            .await
-            .expect("read the whole response before the server closes the connection");
-        let response = String::from_utf8(buf).expect("response is valid utf-8");
-
-        assert!(
-            response.starts_with("HTTP/1.1 200 OK"),
-            "expected a 200, got: {response}"
-        );
-        assert!(
-            response.contains(&format!("Content-Type: {PROMETHEUS_CONTENT_TYPE}")),
-            "missing the Prometheus content type header: {response}"
-        );
-        assert!(
-            response.contains("trellis_changes_applied_total"),
-            "response body missing the recorded metric: {response}"
-        );
-        assert!(
-            response.contains("run_cli_test_target"),
-            "response body missing the recorded label: {response}"
-        );
     }
 }
