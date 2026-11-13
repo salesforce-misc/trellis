@@ -42,7 +42,7 @@ require_relative "metrics"
 # The surface mirrors the Rust crate's BlockingTrellis, and is documented on
 # Trellis::Instance:
 #
-# - Lifecycle: connect, connected?, migrate, config, shutdown.
+# - Lifecycle: connect, connected?, migrate, config, metrics_address, shutdown.
 # - Every statement form: apply, and define for a TRANSFORM statement alone.
 # - Reads: status, definitions, schema_dump, filter_schema_dump,
 #   dump_definitions_sql.

@@ -61,14 +61,16 @@ pub(crate) fn check() -> Result<(), ForkedWhileRunning> {
     Ok(())
 }
 
-/// One count in [`ENGINES`]. There is no `Drop`: a lease that is lost rather
+/// One count in [`ENGINES`]: an engine's, or the metrics listener's (whose
+/// thread takes the registry's lock as an engine's threads do; see the
+/// [`metrics`](crate::metrics) module). There is no `Drop`: a lease that is lost rather
 /// than [released](Lease::release) keeps its count for good, which only
 /// ever makes a later child refuse to connect, never lets one connect when
 /// it shouldn't.
-struct Lease(());
+pub(crate) struct Lease(());
 
 impl Lease {
-    fn take() -> Result<Lease, ForkedWhileRunning> {
+    pub(crate) fn take() -> Result<Lease, ForkedWhileRunning> {
         let me = std::process::id();
         let mut word = ENGINES.load(Ordering::SeqCst);
         loop {
@@ -89,7 +91,7 @@ impl Lease {
     }
 
     /// Only once every thread the engine started has exited.
-    fn release(self) {
+    pub(crate) fn release(self) {
         ENGINES.fetch_sub(1, Ordering::SeqCst);
     }
 }

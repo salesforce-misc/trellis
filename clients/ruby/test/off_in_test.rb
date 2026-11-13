@@ -99,6 +99,22 @@ class OffInTest < Minitest::Test
     end
   end
 
+  # Nothing connects, so config.trellis.connect's metrics_bind binds nothing.
+  def test_metrics_bind_serves_nothing_in_an_off_environment
+    free = TCPServer.new("127.0.0.1", 0)
+    port = free.addr[1]
+    free.close
+    TrellisTestApp.config.trellis.connect = { url: TestCluster.dsn, metrics_bind: "127.0.0.1:#{port}" }
+    in_environment("test") do
+      capture_io { assert_nil Trellis::Railtie.connect }
+      assert_raises(Errno::ECONNREFUSED) { TCPSocket.new("127.0.0.1", port).close }
+    end
+    in_environment("development") do
+      Trellis::Railtie.connect
+      assert_equal "127.0.0.1:#{port}", Trellis.metrics_address
+    end
+  end
+
   # Run in the off environment itself (`RAILS_ENV=test bin/rails
   # db:migrate`), the helpers refuse; run from an environment Trellis is on
   # in (`db:prepare` in development migrates the test database too), they

@@ -18,6 +18,7 @@ class ForkTest < Minitest::Test
     "define" => -> { Trellis.define("TRANSFORM t FROM no_such_source SELECT a AS a") },
     "apply" => -> { Trellis.apply("PAUSE TRANSFORM t") },
     "config" => -> { Trellis.config },
+    "metrics_address" => -> { Trellis.metrics_address },
     "definitions" => -> { Trellis.definitions },
     "dump_definitions_sql" => -> { Trellis.dump_definitions_sql },
     "schema_dump" => -> { Trellis.schema_dump },

@@ -59,7 +59,7 @@ module Trellis
   # delegates to its default instance (see Trellis.connect). The surface
   # mirrors the Rust crate's BlockingTrellis:
   #
-  # - Lifecycle: connect, connected?, migrate, config, shutdown.
+  # - Lifecycle: connect, connected?, migrate, config, metrics_address, shutdown.
   # - Every statement form: apply runs one statement of Trellis's grammar
   #   (TRANSFORM, PAUSE TRANSFORM, RESUME TRANSFORM, DROP TRANSFORM, ALTER
   #   TRANSFORM) and reports what it did
@@ -140,13 +140,22 @@ module Trellis
       # - call_pool_wait_timeout_ms: how long a call waits for a free call-pool
       #   connection before failing with a ConnectivityError.
       #
+      # - metrics_bind: an "IP:port" to serve this process's metrics registry
+      #   on over HTTP (Trellis::Metrics; README, Metrics), for a process with
+      #   no web server to mount Trellis::Metrics::RackApp in. One listener per
+      #   process: a later instance passing the same address shares it, one
+      #   passing another raises ValidationError, and it closes when the last
+      #   instance that passed it shuts down. Port 0 picks a free port
+      #   (#metrics_address). Raises ValidationError, connecting nothing, if
+      #   the address can't be bound. nil (the default) serves nothing.
+      #
       # The defaults (staging: false, drain_threads: 0) run nothing in the
       # background, which is what a migration step or a console wants. The
       # staging worker reads Trellis's tables as it starts, so a staging: true
       # connect to an unmigrated schema fails: migrate first.
       def connect(url:, schema: "trellis", target_schema: "public", staging: false,
                   drain_threads: 0, worker_threads: 2, max_call_pool_size: 20,
-                  call_pool_wait_timeout_ms: 30_000)
+                  call_pool_wait_timeout_ms: 30_000, metrics_bind: nil)
         string_option!(:url, url)
         string_option!(:schema, schema)
         string_option!(:target_schema, target_schema)
@@ -173,9 +182,11 @@ module Trellis
                 "#{call_pool_wait_timeout_ms.inspect}"
         end
 
+        string_option!(:metrics_bind, metrics_bind) unless metrics_bind.nil?
+
         LogBridge.ensure_running
         handle = Native.connect(url, schema, target_schema, staging, drain_threads, worker_threads,
-                                max_call_pool_size, call_pool_wait_timeout_ms)
+                                max_call_pool_size, call_pool_wait_timeout_ms, metrics_bind)
         instance = new(handle, schema)
         register(instance)
         instance
@@ -576,6 +587,13 @@ module Trellis
         end
       end
       nil
+    end
+
+    # The "IP:port" this process serves its metrics on, if this instance was
+    # connected with metrics_bind (the port the OS picked for port 0), else
+    # nil.
+    def metrics_address
+      handle.metrics_address
     end
 
     # Shows the schema, never the connection string.

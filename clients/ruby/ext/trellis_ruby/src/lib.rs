@@ -44,6 +44,7 @@
 #![cfg(feature = "ruby")]
 
 mod engine;
+mod metrics;
 
 use std::ffi::c_void;
 use std::future::Future;
@@ -59,6 +60,7 @@ use magnus::{
     Error, Exception, ExceptionClass, IntoValue, RArray, RClass, RHash, RModule, Ruby,
     StaticSymbol, Value, function, method,
 };
+use metrics::MetricsUse;
 use trellis::{BlockingTrellis, Config, ErrorCode, PendingCall, TrellisOptions};
 use trellis_embed::{
     DIVERGENCE_KINDS, ERROR_CODES, JOIN_BUILD_STEPS, JOIN_SIDE_PARTS, JOIN_SIDES, LOG_LEVELS,
@@ -96,6 +98,11 @@ struct Handle {
     trellis: Shared,
     /// The OS process that connected (ADR-0010 decision 3's pid guard).
     owner_pid: u32,
+    /// Its share of the process's metrics listener, if it was connected with
+    /// `metrics_bind`. `shutdown` gives it back.
+    metrics: Mutex<Option<MetricsUse>>,
+    /// The address that listener is bound to.
+    metrics_address: Option<String>,
 }
 
 impl Drop for Handle {
@@ -169,6 +176,14 @@ impl Handle {
 
     fn owner_pid(&self) -> u32 {
         self.owner_pid
+    }
+
+    /// The address the process's metrics listener is bound to, if this
+    /// handle was connected with `metrics_bind`; the port the OS picked for
+    /// port 0.
+    fn metrics_address(ruby: &Ruby, rb_self: &Self) -> Result<Option<String>, Error> {
+        rb_self.check_pid(ruby)?;
+        Ok(rb_self.metrics_address.clone())
     }
 
     fn migrate(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
@@ -443,6 +458,14 @@ impl Handle {
     /// on a thread of its own (see [`engine::Stopping`]).
     fn shutdown(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
         rb_self.check_pid(ruby)?;
+        // Given back once the engine has stopped (or the wait for it was
+        // interrupted), as this returns: the last handle to give it back
+        // stops the listener.
+        let _metrics = rb_self
+            .metrics
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         let engine = rb_self
             .trellis
             .write()
@@ -476,8 +499,27 @@ fn connect(
     worker_threads: usize,
     max_call_pool_size: usize,
     call_pool_wait_timeout_ms: u64,
+    metrics_bind: Option<String>,
 ) -> Result<Handle, Error> {
     engine::check().map_err(|err| forked_handle_error(ruby, forked_while_running(&err)))?;
+    // Bound before connecting, so a port that can't be served fails the
+    // connect before anything has started. Given back if the connect fails.
+    let metrics = metrics_bind
+        .map(|text| {
+            let addr = text.parse().map_err(|_| {
+                PlainError::new(
+                    ErrorCode::Validation,
+                    format!(
+                        "metrics_bind expects an IP address and a port, e.g. \"127.0.0.1:9464\", \
+                         got: {text:?}"
+                    ),
+                )
+            })?;
+            MetricsUse::acquire(addr)
+                .map_err(|message| PlainError::new(ErrorCode::Validation, message))
+        })
+        .transpose()
+        .map_err(|err| raise(ruby, err))?;
     // Connecting can wait on the database (a staging worker installs its
     // triggers before it reports ready), and `BlockingTrellis::connect` is a
     // bare blocking wait, so it runs on a thread of its own while this Ruby
@@ -529,6 +571,8 @@ fn connect(
     Ok(Handle {
         trellis: Arc::new(RwLock::new(Some(trellis))),
         owner_pid: std::process::id(),
+        metrics_address: metrics.as_ref().map(|used| used.local_addr().to_string()),
+        metrics: Mutex::new(metrics),
     })
 }
 
@@ -1522,7 +1566,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     }
 
     let native = ruby.define_module("Trellis")?.define_module("Native")?;
-    native.define_module_function("connect", function!(connect, 8))?;
+    native.define_module_function("connect", function!(connect, 9))?;
     native.define_module_function("error_codes", function!(error_codes, 0))?;
     native.define_module_function("status_names", function!(status_names, 0))?;
     native.define_module_function("quarantine_states", function!(quarantine_states, 0))?;
@@ -1545,6 +1589,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
 
     let handle = native.define_class("Handle", ruby.class_object())?;
     handle.define_method("owner_pid", method!(Handle::owner_pid, 0))?;
+    handle.define_method("metrics_address", method!(Handle::metrics_address, 0))?;
     handle.define_method("migrate", method!(Handle::migrate, 0))?;
     handle.define_method("define", method!(Handle::define, 1))?;
     handle.define_method("apply", method!(Handle::apply, 1))?;
