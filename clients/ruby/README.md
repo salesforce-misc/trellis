@@ -131,9 +131,10 @@ Nothing in the binding uses it.
   transform was dropped. With no drain worker anywhere in the fleet a job
   stays `:queued`.
 - `Trellis::Metrics.render_prometheus`: the process-wide metrics registry as
-  Prometheus text, for a `/metrics` route the app already serves (the
-  binding opens no port; `Trellis::Metrics::RackApp` is a mountable route;
-  see [Metrics](#metrics)). It needs no handle.
+  Prometheus text, for a `/metrics` route the app already serves
+  (`Trellis::Metrics::RackApp` is a mountable route; `connect`'s
+  `metrics_bind:` serves it on a port instead; see [Metrics](#metrics)). It
+  needs no handle.
 
 ```ruby
 require "trellis/pg"
@@ -177,6 +178,7 @@ Trellis.shutdown
 | `worker_threads:` | `2` | the threads of each Rust runtime a handle owns (its calls', and its background client's), invisible to Ruby's own sizing |
 | `max_call_pool_size:` | `20` | the most connections the handle's call pool opens; the background pool is sized by `staging:` and `drain_threads:` |
 | `call_pool_wait_timeout_ms:` | `30_000` | how long a call waits for a free call-pool connection before a `ConnectivityError` |
+| `metrics_bind:` | `nil` | an `"IP:port"` to serve this process's metrics on (see [Metrics](#metrics)) |
 
 The defaults run nothing in the background. Some process in a fleet must set
 `staging: true` and some process must run drain threads, or no definition ever
@@ -213,8 +215,8 @@ Prometheus's text format. Every series carries a `trellis_instance` label
 shuts down. The metrics themselves are listed in
 [`docs/observability.md`](../../docs/observability.md).
 
-The binding opens no port. `Trellis::Metrics::RackApp` is a Rack app that
-serves the text, so a Rails app mounts it:
+`Trellis::Metrics::RackApp` is a Rack app that serves the text, so a Rails
+app mounts it:
 
 ```ruby
 # config/routes.rb
@@ -230,12 +232,38 @@ schema and transforms: keep it off a public port.
 `staging_segments` gauges are set only in the process whose `staging: true`
 handle leads (one per instance; the others stand by), and the latency
 histograms and `changes_applied_total` only in processes with drain threads.
-A web process with neither holds `trellis_instance_up` and none of these. The
-gem can't yet serve a worker that runs no web server (`bin/rails runner`, a
-script). Under a forking server each worker process has its own registry, so
+A web process with neither holds `trellis_instance_up` and none of these.
+Under a forking server each worker process has its own registry, so
 Prometheus scrapes each. A process forked while its parent had a handle
 running can't render the registry: it raises `Trellis::ForkedHandleError`
 (see [Forking servers](#forking-servers)).
+
+A worker that runs no web server (`bin/rails runner`, a script) serves the
+registry on a port of its own instead, the listener `trellis run
+--prometheus-bind` uses:
+
+```ruby
+Trellis.connect(url: ENV.fetch("DATABASE_URL"), staging: true, drain_threads: 2,
+                metrics_bind: "0.0.0.0:9464")
+```
+
+It answers every request with the registry, whatever the method or path. One
+listener serves the whole process: another instance passing the same address
+shares it, one passing another raises `Trellis::ValidationError`, and it closes
+when the last instance that passed it shuts down. `connect` raises
+`Trellis::ValidationError`, connecting nothing, when the address can't be
+bound: in use (a sibling worker serving it, say), not local, or not permitted.
+So pass it in the one process that serves, or a different port in each; in a
+Rails app, whose `config.trellis.connect` every process uses, read it from the
+worker's environment (`metrics_bind: ENV["TRELLIS_METRICS_BIND"]`; `nil` serves
+nothing). A child forked while its parent serves can't connect at all (see
+[Forking servers](#forking-servers)), so it never takes the parent's port. Port
+0 picks a free port; `metrics_address` returns the one bound.
+
+The listener is unauthenticated and names the database, catalog schema and
+transforms. `127.0.0.1` keeps it to the host; `0.0.0.0`, which a container
+needs for Prometheus to reach it, exposes it on every interface, so keep the
+port on a private network.
 
 An app with an exporter of its own (`prometheus-client`,
 `prometheus_exporter`, Yabeda) can serve that body followed by

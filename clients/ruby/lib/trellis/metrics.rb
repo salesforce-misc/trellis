@@ -13,8 +13,9 @@ module Trellis
   # running handle and 0 after its last one shuts down; the other gauges of a
   # stopped instance disappear after 60 seconds. See docs/observability.md.
   #
-  # The binding opens no port; Trellis::Metrics::RackApp serves the text from
-  # a route the app already has. Most series are set only in the process
+  # Trellis::Metrics::RackApp serves the text from a route the app already
+  # has; Trellis.connect's metrics_bind serves it on a port of its own, for a
+  # process with no web server. Most series are set only in the process
   # running the staging or drain work, so scrape that one (README, Metrics).
   #
   # A process forked while its parent had an engine running may have

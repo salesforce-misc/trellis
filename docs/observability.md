@@ -303,13 +303,15 @@ The registry is process-wide, so mount `render_prometheus()` from inside the
 process running the engine — a separate scrape-only process renders an empty
 registry. Mount it once per process: any handle's `metrics()` renders every
 handle's series (see [above](#several-instances-in-one-process)).
-`cli/src/commands/run.rs`'s `--prometheus-bind <ADDR>` flag is a minimal
-template: a small TCP listener alongside the live pipeline answering each
-request with the rendered registry. The bindings expose the same render as
+The bindings expose the same render as
 `Trellis.Metrics.render_prometheus/0` (Elixir) and
 `Trellis::Metrics.render_prometheus` (Ruby), each for a route the host app
 already serves; Ruby also ships `Trellis::Metrics::RackApp`, a mountable Rack
-route.
+route. For a process with no HTTP stack, `trellis run --prometheus-bind
+<ADDR>` and the Ruby binding's `metrics_bind:` serve the registry from one
+small TCP listener in `trellis-embed`
+([`metrics_http.rs`](../clients/embed/src/metrics_http.rs)), alongside the
+live pipeline.
 
 ### Retention: left to Prometheus, not Trellis
 
