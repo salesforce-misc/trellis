@@ -7,6 +7,8 @@
 //!
 //! Every pass and drain is stepped by hand. Nothing polls for convergence.
 
+#[path = "support/attver.rs"]
+mod attver;
 #[path = "support/resume_passes.rs"]
 mod resume_passes;
 
@@ -192,7 +194,9 @@ async fn routine_maintenance_of_the_key_index_pauses_nothing() {
 /// `CREATE UNIQUE INDEX CONCURRENTLY`), and rewrites, moves and primary-key
 /// operations that keep the backing index valid at every committed instant,
 /// including a key column retyped (its index rebuilt in the `ALTER`). Each
-/// pauses nothing, and the reader keeps converging through writes.
+/// pauses nothing, and the reader keeps converging through writes. The
+/// retype rewrites the table, and PostgreSQL's 2026-11 minors re-version the
+/// columns after `k1`, so the reader rebuilds (`support/attver.rs`).
 #[tokio::test]
 async fn an_invalid_copy_beside_the_index_and_other_routine_operations_pause_nothing() {
     let cluster = TestCluster::start();
@@ -221,6 +225,7 @@ async fn an_invalid_copy_beside_the_index_and_other_routine_operations_pause_not
         .await,
         [[Some("false".to_string())]]
     );
+    let attver = attver::Attver::probe(&raw).await;
     for (n, statement) in [
         "select 1",
         "vacuum full public.s",
@@ -243,7 +248,14 @@ async fn an_invalid_copy_beside_the_index_and_other_routine_operations_pause_not
         raw.batch_execute(statement)
             .await
             .unwrap_or_else(|e| panic!("{statement}: {e}"));
+        attver.after(&raw, statement).await;
         full_pass(&mut raw, &db.pool).await;
+        if statement.contains(" type ") {
+            let reported = status(&trellis, "s_sums").await;
+            assert_eq!(reported.capture_failure, None, "{statement}");
+            assert_eq!(reported.status, TransformStatus::Backfilling, "{statement}");
+            bring_live(&mut raw, &db.pool, &trellis, &["s_sums"]).await;
+        }
         assert_live(&trellis, &["s_sums"], statement).await;
         let next = 100 + n;
         raw.batch_execute(&format!(
