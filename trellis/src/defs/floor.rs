@@ -126,7 +126,7 @@ pub const BASELINE: Release = Release::new(0, 2, 0);
 /// release commit sets it to the release's own (`bump-version.sh`), and the
 /// first commit after a final release's tag raises it to the next minor
 /// (`start-next-release.sh`; docs/releasing.md). Never below [`BASELINE`].
-pub const DEVELOPING: Release = Release::new(0, 2, 0);
+pub const DEVELOPING: Release = Release::new(0, 2, 1);
 
 /// Which key space a definition is (see [`KeySpace`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
