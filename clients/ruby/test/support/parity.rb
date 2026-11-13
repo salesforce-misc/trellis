@@ -70,7 +70,9 @@ module Parity
     # shared fixture has nothing to shape; test/schema_dump_test.rb runs it.
     "dump_definitions_sql" => "SQL text for the schema-dump hook, tested by test/schema_dump_test.rb",
     "schema_dump" => "pg_dump arguments and SQL text for the schema-dump hook, tested by test/schema_dump_test.rb",
-    "filter_schema_dump" => "rewrites pg_dump output for the schema-dump hook, tested by test/schema_dump_test.rb"
+    "filter_schema_dump" => "rewrites pg_dump output for the schema-dump hook, tested by test/schema_dump_test.rb",
+    # Elixir has no metrics_bind yet; test/metrics_bind_test.rb runs it.
+    "metrics_address" => "the address of connect's metrics_bind listener, Ruby only, tested by test/metrics_bind_test.rb"
   }.freeze
 
   # The Rails integration's public calls outside the migration helpers, none
