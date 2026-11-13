@@ -4,10 +4,13 @@
 //! [`Metrics::render_prometheus`]. The registry is process-wide, so it serves
 //! whatever the process's pipeline records, never another process's.
 //!
-//! There is deliberately no HTTP parsing. A scraper (or `curl`) sends a bare
-//! `GET` with a few headers and nothing worth reading, so a connection drains
-//! a bounded amount of request ([`MAX_REQUEST_BYTES`], [`IO_TIMEOUT`]) and
-//! gets a `200 OK` with the body, whatever its method or path, and is closed.
+//! There is deliberately no HTTP parsing beyond the method. A scraper (or
+//! `curl`) sends a bare `GET` with a few headers and nothing worth reading, so
+//! a connection drains a bounded amount of request ([`MAX_REQUEST_BYTES`],
+//! [`IO_TIMEOUT`]) and is answered and closed, whatever its path: `GET` gets
+//! a `200 OK` with the body, `HEAD` the same headers alone, and anything else
+//! (a request that never names its method included) a `405`, as
+//! `Trellis::Metrics::RackApp` answers.
 //!
 //! [`serve`] is the loop, for a caller already on a `tokio` runtime (the
 //! CLI's). [`MetricsListener`] runs it on a thread of its own with its own
@@ -58,20 +61,11 @@ pub async fn serve(listener: TcpListener, report: fn(&str)) -> Infallible {
     }
 }
 
-/// Drains the request, then writes the rendered registry back as a `200 OK`
-/// and closes the connection.
+/// Drains the request, then writes the response for its method (see the
+/// module doc) and closes the connection.
 async fn answer(mut stream: TcpStream) -> Result<(), String> {
-    drain_request(&mut stream).await?;
-    let body = Metrics::new().render_prometheus();
-    let response = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: {PROMETHEUS_CONTENT_TYPE}\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len(),
-    );
+    let request = drain_request(&mut stream).await?;
+    let response = respond(method(&request));
     tokio::time::timeout(IO_TIMEOUT, stream.write_all(response.as_bytes()))
         .await
         .map_err(|_| "timed out writing response".to_string())?
@@ -82,11 +76,47 @@ async fn answer(mut stream: TcpStream) -> Result<(), String> {
         .map_err(|err| format!("failed to close connection: {err}"))
 }
 
+/// The request's method: its bytes up to the first space.
+fn method(request: &[u8]) -> &[u8] {
+    request
+        .split(|&byte| byte == b' ')
+        .next()
+        .unwrap_or_default()
+}
+
+/// The whole response to a request with `method`.
+fn respond(method: &[u8]) -> String {
+    let (head_only, status) = match method {
+        b"GET" => (false, "200 OK"),
+        b"HEAD" => (true, "200 OK"),
+        _ => {
+            return "HTTP/1.1 405 Method Not Allowed\r\n\
+                    Allow: GET, HEAD\r\n\
+                    Content-Length: 0\r\n\
+                    Connection: close\r\n\
+                    \r\n"
+                .to_string();
+        }
+    };
+    let body = Metrics::new().render_prometheus();
+    format!(
+        "HTTP/1.1 {status}\r\n\
+         Content-Type: {PROMETHEUS_CONTENT_TYPE}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        if head_only { "" } else { &body },
+    )
+}
+
 /// Reads until the headers look complete (`\r\n\r\n`), the client stops
-/// sending, or [`MAX_REQUEST_BYTES`] or [`IO_TIMEOUT`] is reached.
-async fn drain_request(stream: &mut TcpStream) -> Result<(), String> {
+/// sending, or [`MAX_REQUEST_BYTES`] or [`IO_TIMEOUT`] is reached, and returns
+/// what it read.
+async fn drain_request(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
     let drain = async {
-        let mut buf = Vec::new();
         let mut chunk = [0u8; 512];
         while buf.len() < MAX_REQUEST_BYTES {
             let n = stream
@@ -106,7 +136,8 @@ async fn drain_request(stream: &mut TcpStream) -> Result<(), String> {
     // A client still sending at the timeout is answered anyway.
     tokio::time::timeout(IO_TIMEOUT, drain)
         .await
-        .unwrap_or(Ok(()))
+        .unwrap_or(Ok(()))?;
+    Ok(buf)
 }
 
 /// [`serve`] on a thread of its own, from [`bind`](MetricsListener::bind)
@@ -222,26 +253,62 @@ mod tests {
         );
     }
 
-    /// No HTTP parsing: any method and path gets the registry.
+    /// `HEAD` gets `GET`'s headers alone; every path is answered alike.
     #[test]
-    fn answers_every_method_and_path_alike() {
+    fn head_gets_the_headers_alone() {
+        trellis::dev::metrics::increment_changes_applied("metrics_http_head_target", 1);
         let listener = MetricsListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
 
-        let response = request(listener.local_addr(), "POST /elsewhere HTTP/1.1\r\n\r\n");
+        let get = request(listener.local_addr(), "GET /elsewhere HTTP/1.1\r\n\r\n");
+        let head = request(listener.local_addr(), "HEAD / HTTP/1.1\r\n\r\n");
 
-        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        let (get_head, get_body) = get.split_once("\r\n\r\n").unwrap();
+        assert!(get_head.starts_with("HTTP/1.1 200 OK\r\n"), "{get}");
+        assert!(!get_body.is_empty(), "{get}");
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert!(head.ends_with("\r\n\r\n"), "a body after HEAD: {head}");
+        assert!(
+            head.contains(&format!("Content-Type: {PROMETHEUS_CONTENT_TYPE}\r\n")),
+            "{head}"
+        );
     }
 
-    /// A client that closes its side without a request is still answered.
+    /// Any other method, or none, is refused as `Trellis::Metrics::RackApp`
+    /// refuses it.
     #[test]
-    fn a_client_that_closes_without_a_request_is_still_answered() {
+    fn other_methods_get_a_405() {
         let listener = MetricsListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let refusal = "HTTP/1.1 405 Method Not Allowed\r\n\
+                       Allow: GET, HEAD\r\n\
+                       Content-Length: 0\r\n\
+                       Connection: close\r\n\r\n";
+
+        for text in ["POST /metrics HTTP/1.1\r\n\r\n", "get / HTTP/1.1\r\n\r\n"] {
+            assert_eq!(request(listener.local_addr(), text), refusal, "{text}");
+        }
+
+        // A client that closes its side without a request is answered too.
         let mut stream = std::net::TcpStream::connect(listener.local_addr()).unwrap();
         stream.shutdown(std::net::Shutdown::Write).unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
+        assert_eq!(response, refusal);
+    }
 
-        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    /// A client that connects and sends nothing doesn't hold `stop` up for
+    /// its read timeout: its connection is dropped with the runtime.
+    #[test]
+    fn stopping_does_not_wait_for_a_silent_client() {
+        let mut listener = MetricsListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let _silent = std::net::TcpStream::connect(listener.local_addr()).unwrap();
+        // Accepted in order, so once this is answered the silent one has been
+        // accepted and its task is waiting on it.
+        request(listener.local_addr(), "GET / HTTP/1.1\r\n\r\n");
+
+        let started = std::time::Instant::now();
+        listener.stop();
+
+        assert!(started.elapsed() < IO_TIMEOUT, "{:?}", started.elapsed());
     }
 
     #[test]

@@ -247,8 +247,8 @@ Trellis.connect(url: ENV.fetch("DATABASE_URL"), staging: true, drain_threads: 2,
                 metrics_bind: "0.0.0.0:9464")
 ```
 
-It answers every request with the registry, whatever the method or path. One
-listener serves the whole process: another instance passing the same address
+It answers `GET` and `HEAD` on any path, and other methods with a 405, as
+`RackApp` does. One listener serves the whole process: another instance passing the same address
 shares it, one passing another raises `Trellis::ValidationError`, and it closes
 when the last instance that passed it shuts down. `connect` raises
 `Trellis::ValidationError`, connecting nothing, when the address can't be
@@ -257,8 +257,9 @@ So pass it in the one process that serves, or a different port in each; in a
 Rails app, whose `config.trellis.connect` every process uses, read it from the
 worker's environment (`metrics_bind: ENV["TRELLIS_METRICS_BIND"]`; `nil` serves
 nothing). A child forked while its parent serves can't connect at all (see
-[Forking servers](#forking-servers)), so it never takes the parent's port. Port
-0 picks a free port; `metrics_address` returns the one bound.
+[Forking servers](#forking-servers)), so it never serves the parent's port, but
+it holds the socket open until it exits: shut down before forking. Port 0 picks
+a free port; `metrics_address` returns the one bound.
 
 The listener is unauthenticated and names the database, catalog schema and
 transforms. `127.0.0.1` keeps it to the host; `0.0.0.0`, which a container

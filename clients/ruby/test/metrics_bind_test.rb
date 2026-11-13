@@ -26,13 +26,17 @@ class MetricsBindTest < Minitest::Test
     assert_match(%r{^trellis_instance_up\{trellis_instance="[^"/]+/metrics_bind_serve"\} 1$}, response.body)
   end
 
-  # No routing, as the CLI's listener: every method and path gets the body.
-  def test_answers_every_method_and_path_alike
+  # As RackApp: GET and HEAD on any path, a 405 for any other method.
+  def test_answers_get_and_head_on_any_path_and_refuses_other_methods
     address = connect("metrics_bind_any", "127.0.0.1:0").metrics_address
 
-    response = http(address) { |h| h.post("/elsewhere", "") }
-    assert_equal "200", response.code
-    assert_equal CONTENT_TYPE, response["content-type"]
+    get = http(address) { |h| h.get("/elsewhere") }
+    assert_equal "200", get.code
+    head = http(address) { |h| h.head("/") }
+    assert_equal ["200", CONTENT_TYPE], [head.code, head["content-type"]]
+    assert_nil head.body
+    post = http(address) { |h| h.post("/metrics", "") }
+    assert_equal ["405", "GET, HEAD"], [post.code, post["allow"]]
   end
 
   def test_an_instance_without_metrics_bind_serves_nothing
@@ -49,6 +53,21 @@ class MetricsBindTest < Minitest::Test
     assert_empty Trellis::Instance.connected
   ensure
     held&.close
+  end
+
+  # Bound before the engine connects, and given back when that fails.
+  def test_a_connect_failing_after_the_bind_releases_the_port
+    held = TCPServer.new("127.0.0.1", 0)
+    address = "127.0.0.1:#{held.addr[1]}"
+    held.close
+
+    # The staging worker reads Trellis's tables as it starts: unmigrated, it fails.
+    assert_raises(Trellis::Error) do
+      Trellis::Instance.connect(url: TestCluster.dsn, schema: "metrics_bind_unmigrated", staging: true,
+                                metrics_bind: address)
+    end
+    assert_raises(Errno::ECONNREFUSED) { TCPSocket.new(*host_port(address)).close }
+    assert_equal address, connect("metrics_bind_after_failure", address).metrics_address
   end
 
   def test_metrics_bind_is_an_ip_and_port
