@@ -1192,6 +1192,22 @@ mod tests {
         let (_, plain, _, _, _) = row("plain", None).await;
         let (_, tuned, _, _, _) = row("tuned", None).await;
 
+        // Strip the versions, as on a row from before the server stamped
+        // any: the rows hold, and they hash as the stamped ones did.
+        client
+            .batch_execute(
+                "update pg_catalog.pg_attribute \
+                 set attoptions = nullif(array(select o \
+                   from pg_catalog.unnest(attoptions) with ordinality u(o, i) \
+                   where not pg_catalog.starts_with(o, 'pg_attver=') order by i), '{}') \
+                 where attrelid = 't'::regclass and attname in ('plain', 'tuned')",
+            )
+            .await
+            .expect("strip");
+        assert!(!check_live().await, "the strip took");
+        assert_eq!(row("plain", None).await.1, plain);
+        assert_eq!(row("tuned", None).await.1, tuned);
+
         // A version alone reads as no options at all.
         assert_eq!(row("plain", Some(&["pg_attver=24379568"])).await.0, plain);
         assert_eq!(row("plain", Some(&["pg_attver=123"])).await.0, plain);
