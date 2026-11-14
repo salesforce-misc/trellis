@@ -431,9 +431,7 @@ pub enum ValidationError {
     /// was pinned identically on every connection Trellis opens rather than
     /// varying by session.
     ///
-    /// The typed key index
-    /// (`docs/type-support.md`'s "Cross-cutting concerns") is what lifts it
-    /// per family.
+    /// The typed key index (docs/glossary.md) is what lifts it per family.
     UnsupportedGroupByKeyType {
         column: String,
         value_type: ValueType,

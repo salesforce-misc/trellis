@@ -66,6 +66,12 @@ jobs:
         # see .github/scripts/check-rule-ids.py.
         run: python3 .github/scripts/check-rule-ids.py
 
+      - name: Check the module map
+        # docs/architecture.md lists every module of trellis/src/staging and
+        # trellis/src/defs, and names only modules; see
+        # .github/scripts/check-module-map.py.
+        run: python3 .github/scripts/check-module-map.py
+
       - name: Check doc links and anchors
         # Relative Markdown links, their #fragments, and `docs/....md#anchor`
         # references in source; see .github/scripts/check-doc-links.py.

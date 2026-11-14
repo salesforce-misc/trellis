@@ -9,7 +9,8 @@ The intent and goal of open sourcing this project is to increase the contributor
 # Getting started
 
 Feel free to clone the project, run some [examples](https://github.com/mmmries/trellis-examples) or go build your own.
-The `docs` directory is a great place to get to grips with the current state of the project and the general direction we're headed.
+The `docs` directory is a great place to get to grips with the current state of the project and the general direction we're headed:
+[docs/README.md](docs/README.md) indexes it, [docs/glossary.md](docs/glossary.md) defines the terms and [docs/architecture.md](docs/architecture.md) says which module owns which concept.
 
 # Issues, requests & ideas
 

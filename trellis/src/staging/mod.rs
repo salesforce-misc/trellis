@@ -1,54 +1,81 @@
-//! The staging ring (stage 02 of
+//! The staging ring and what drains it (stages 02 to 07 of
 //! docs/staging-and-claiming/README.md): the append-only substrate every
-//! producer writes into and every consumer (sealing, claiming — later
-//! stages) reads out of.
+//! producer writes into, and the sealing, claiming, apply, build and failure
+//! machinery that reads it out. docs/architecture.md maps each module to its
+//! concept and catalog tables; the groups below follow the stages.
 //!
+//! The ring (stages 02 and 03):
 //! - [`append`] is the blind append path plus the `RingFull` predicate.
 //! - [`session`] is the producer singleton the staging worker must hold.
 //! - [`state`] is the segment lifecycle's one legal-transition graph.
-//! - [`seal`] is stage 03: the fence, the two-phase seal, the
-//!   guards, seal-on-demand, and age-gated crash recovery.
-//! - [`fold`] is stage 04's claim-time fold: collapsing a
-//!   sealed batch's fenced window into one record per key.
-//! - [`claim`] is stage 04's bucket partitioning and multi-worker claims:
-//!   deciding a batch's bucket count at seal, the drainer
-//!   registry as the share denominator, and the one-statement claim + flip.
-//! - [`liveness`] is stage 04's claim-liveness half: the
-//!   out-of-band heartbeat daemon, release-on-error, reclaim-on-TTL, and
-//!   the consecutive-fence-miss backoff.
-//! - [`apply`] is stage 05's apply ∪ mark-drained: the three-phase drain
-//!   (claim, then fold, compute, apply ∪ mark-drained per page), the version
-//!   fence, and downstream propagation. A page's 1-1 targets settle on
-//!   `one_to_one_ledger`, its aggregates on `group_basis`, and its `JOIN`
-//!   and 1-1 `JOIN` targets in `join` and `join_one_to_one`.
-//! - [`page`] is where an oversized share's pages come from:
-//!   the page-source interface and the `drain_cursor` read-back.
-//! - [`schema_change`] is the drain's barrier for a capture function's
-//!   `schema_changed` marker: it pauses the definitions that read
-//!   a renamed or dropped column before anything later applies to them.
-//! - [`halt`] is what a halting failure parks: every definition it
-//!   reaches, so the rest of the drain's page commits.
-//! - [`retire`] is stage 06's retirement half: freeing a
-//!   `drained` segment's ring slot once nobody can still need it.
-//! - [`quarantine`] is stage 06's other half: isolate, evict,
-//!   park, release — failure classification, per-key isolation and
-//!   eviction, parked work as the source of truth for an excluded key's
-//!   later healthy changes, operator-driven release, and the one sanctioned
-//!   exception to immutability (a dropped source table's purge).
-//! - [`worker_registry`] is the worker-level liveness registry:
-//!   one row per live drain worker, independent of whether it currently
-//!   holds a claim — the read behind `Trellis::has_live_drain_workers`.
-//! - [`self_check`] is the production recompute audit
-//!   (ADR-0013): a read-only, keyset-bounded comparison of a persisted 1-1
-//!   target against an independently-rendered Postgres recompute.
-//!   [`self_check_job`] is the background job around it that
-//!   [`crate::app::Trellis::self_check`] starts.
-//!   [`capture_audit`] is the check of every captured table's triggers,
-//!   functions and privileges it runs first.
-//! - [`error`] is this module's error type.
+//! - [`seal`] is the seal fence, the two-phase seal, the guards,
+//!   seal-on-demand and age-gated crash recovery.
 //!
-//! What this module does *not* do: capture (stage 01, [`crate::capture`]) —
-//! see
+//! Claiming (stage 04):
+//! - [`mod@claim`] is bucket partitioning and the one-statement claim: the bucket
+//!   count decided at seal, the drainer registry as the share denominator.
+//! - [`liveness`] keeps a claim alive: the heartbeat daemon, release-on-error,
+//!   reclaim-on-TTL and the consecutive-fence-miss backoff.
+//! - [`fold`] is the claim-time fold: a sealed batch's fenced window collapsed
+//!   to one record per key.
+//! - `page` is where an oversized share's pages come from: the page-source
+//!   interface and the `drain_cursor` read-back. `keyset` matches a batch of
+//!   keys through the key's index for the statements that need it.
+//!
+//! Apply (stage 05):
+//! - [`apply`] is the drain: claim, then fold, compute, and apply ∪
+//!   mark-drained per page, with the version fence and downstream propagation.
+//!   It settles a page's 1-1 targets on `one_to_one_ledger` (with `ledger`,
+//!   the statements the writers share, and `one_to_one_render`, a definition's
+//!   fields as SQL), its aggregates on `group_basis`, and its `JOIN` and 1-1
+//!   `JOIN` targets on `join` and `join_one_to_one`.
+//! - `target_mutations` is the one seam every write to a target goes through,
+//!   which stages it for the target's readers.
+//!
+//! Builds:
+//! - [`build`] is the scheduled build: the plan job, a 1-1 target's chunks,
+//!   an aggregate's or a `JOIN`'s structure writes, and the build fence. A 1-1
+//!   `JOIN`'s build, `b`-change fan-out and held rows are in
+//!   `join_one_to_one`.
+//! - [`partition_correction`] is the correction engine for aggregates and
+//!   `JOIN` targets over a partitioned source.
+//!
+//! Cleanup, failures and convergence (stages 06 and 07):
+//! - [`retire`] frees a `drained` segment's ring slot once nobody can still
+//!   need it, and collects tombstones and zero groups.
+//! - [`quarantine`] is isolate, evict, park, release: failure classification,
+//!   per-key isolation and eviction, parked work as the source of truth for an
+//!   excluded key's later healthy changes, operator-driven release, and the
+//!   one sanctioned exception to immutability (a dropped source table's
+//!   purge).
+//! - `halt` is what a halting failure parks: every definition it reaches, so
+//!   the rest of the drain's page commits. `holdup` records a page the drain
+//!   keeps failing on while charging no key and pausing nothing.
+//! - `schema_change` is the drain's barrier for a capture function's
+//!   `schema_changed` marker, and the pauses of readers of a changed table;
+//!   `drift_memo` is the pass's memo of which typed copies it found current,
+//!   and `pause_message` the message of a paused definition.
+//! - [`converge`] is the read-your-writes predicate (`await_converged`).
+//! - [`worker_registry`] is the worker-level liveness registry: one row per
+//!   live process, independent of whether it holds a claim, behind
+//!   [`crate::app::Trellis::has_live_drain_workers`] and the version handover.
+//!
+//! `self_check` and status:
+//! - [`self_check`] is the production recompute audit (ADR-0013): a read-only,
+//!   keyset-bounded comparison of a target against an independently-rendered
+//!   Postgres recompute, with `self_check_groups`, `self_check_joins` and
+//!   `self_check_join_one_to_one` for each target shape, and `self_check_keyset`
+//!   and `self_check_ring` for its paging and its unapplied ring rows.
+//!   [`self_check_job`] is the background job around it that
+//!   [`crate::app::Trellis::self_check`] starts. [`capture_audit`] is the
+//!   check of every captured table's triggers, functions and privileges it
+//!   runs first.
+//! - `status_gauges`, `ring_gauges`, `join_status` and `join_one_to_one_status`
+//!   are the gauges and status fields read on the staging worker's pass.
+//! - [`error`] is this module's error type; `golden_sql`, `keyset_golden` and
+//!   `interleave` are test support.
+//!
+//! What this module does *not* do: capture (stage 01, [`crate::capture`]); see
 //! docs/staging-and-claiming/02-the-staging-ring.md,
 //! docs/staging-and-claiming/03-sealing-and-the-fence.md,
 //! docs/staging-and-claiming/04-claiming-and-the-fold.md, and
