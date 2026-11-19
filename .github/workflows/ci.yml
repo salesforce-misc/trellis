@@ -339,6 +339,12 @@ jobs:
           mix local.rebar --force
           mix deps.get
 
+      - name: Audit Mix dependencies
+        # Fails on locked packages with published advisories or that are
+        # retired; fix by bumping mix.lock (`mix deps.update <package>`).
+        working-directory: clients/elixir
+        run: mix hex.audit
+
       - name: Check Elixir formatting
         working-directory: clients/elixir
         run: mix format --check-formatted
