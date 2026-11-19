@@ -453,6 +453,17 @@ jobs:
           BUNDLE_PATH: vendor/bundle
         run: bundle install
 
+      - name: Audit gems
+        # The lockfile against the ruby-advisory-db. The gemspec's only
+        # runtime dependency is rb_sys; the rest is the test group, so a hit
+        # here is dev hygiene, not a user exposure. A new advisory fails this
+        # step until the lock is bumped.
+        working-directory: clients/ruby
+        env:
+          BUNDLE_FROZEN: "true"
+          BUNDLE_PATH: vendor/bundle
+        run: bundle exec bundle-audit check --update
+
       - name: Test
         # `rake test` first builds the extension from source, through the
         # extconf.rb the source gem installs with (debug, into the
