@@ -504,7 +504,11 @@ beside them run on every `cargo test`.
   oracle and a `Strict` `self_check`, so a failure names its epoch. A failing
   chain shrinks whole epochs first, then within the epochs left.
   `GENERATIVE_MAX_EPOCHS` (default 12) sets the longest chain; a deep run sets
-  50 or more.
+  50 or more. The residue property (`residue::property_*`) laps the ring and
+  checks, at each quiet point after the engine settles: no dead tuples and
+  bounded pages in any Trellis table; an empty ring; each ledger and group
+  table holding the rows the oracle expects; and catalog, registry, capture
+  triggers and functions naming only what is defined (`run::hidden`).
 - **Two instances** (`tests/two_instance_noise.rs`). Two Trellis instances in one
   database (or in two), each converging against its own oracle, including one
   instance reading the other's target.

@@ -55,6 +55,9 @@ pub struct ResidueReport {
     pub widths: BTreeMap<String, i64>,
     /// The tables checked at the last quiet point.
     pub last: Vec<TableResidue>,
+    /// What the hidden-row checks saw at the last quiet point
+    /// ([`super::hidden`]).
+    pub hidden: super::hidden::HiddenReport,
 }
 
 impl ResidueReport {
@@ -212,6 +215,17 @@ pub async fn run_epochs_lapping(
         report.seals = sealed_segments(config, roles)
             .await
             .map_err(|e| in_epoch(index)(RunError::Quiesce(format!("seal count: {e}"))))?;
+        report.hidden = super::hidden::check_hidden(
+            config,
+            roles,
+            pool,
+            program,
+            &defined,
+            &ever,
+            super::hidden::SETTLE,
+        )
+        .await
+        .map_err(in_epoch(index))?;
         report.last = check_residue(config, roles, &defined, &ever, &peaks, &mut report.widths)
             .await
             .map_err(in_epoch(index))?;

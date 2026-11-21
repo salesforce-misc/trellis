@@ -40,7 +40,9 @@
 //! - a drop leaves the source's capture to the staging worker's reconcile
 //!   (`dropping_leaves_capture_to_the_staging_worker`)
 //! - the target's `schema_nodes` row is actually reaped, not merely
-//!   unreachable (`dropping_reaps_the_targets_schema_nodes_row`)
+//!   unreachable (`dropping_reaps_the_targets_schema_nodes_row`), and so are
+//!   its read tables' once nothing else names them
+//!   (`dropping_the_last_reader_reaps_the_read_tables_nodes`)
 
 use crate::support::pipeline;
 
@@ -643,6 +645,69 @@ async fn dropping_reaps_the_targets_schema_nodes_row() {
         0,
         "the target's schema_nodes row is actually reaped, not left orphaned"
     );
+}
+
+/// A read table's `schema_nodes` row goes with its last reader (#2238): a
+/// source another definition still reads keeps it, and a `JOIN`'s source
+/// and joined table both lose theirs with the `JOIN`.
+#[tokio::test]
+async fn dropping_the_last_reader_reaps_the_read_tables_nodes() {
+    let cluster = TestCluster::start();
+    let db = cluster.create_isolated_database().await;
+    let raw = connect_raw(db.dsn()).await;
+    seed_source(&raw, "orders", 3).await;
+    raw.batch_execute(
+        "create table c (id bigint primary key, pid bigint, amount numeric); create index on c (pid); \
+         create table p (id bigint primary key, name text); \
+         insert into p values (1, 'a'); insert into c values (1, 1, 5);",
+    )
+    .await
+    .expect("join tables");
+    let trellis = definer(db.dsn()).await;
+    for def in [
+        "TRANSFORM by_g FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT sum(a) AS total",
+        "TRANSFORM by_g2 FROM orders GROUP BY g WITHOUT SOURCE INDEX SELECT count(*) AS n",
+        "TRANSFORM c_by_p FROM c JOIN p ON c.pid = p.id GROUP BY p.name \
+         SELECT sum(c.amount) AS total",
+    ] {
+        trellis.apply(def).await.expect("define");
+    }
+    for name in ["by_g", "by_g2", "c_by_p"] {
+        trellis
+            .apply(&format!("PAUSE TRANSFORM {name}"))
+            .await
+            .expect("pause");
+        trellis
+            .apply(&format!("DROP TRANSFORM {name}"))
+            .await
+            .expect("drop");
+        let left: Vec<String> = raw
+            .query("select table_name from schema_nodes order by 1", &[])
+            .await
+            .expect("nodes")
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        let expected: Vec<String> = match name {
+            // `by_g2` still reads `orders`.
+            "by_g" => vec![
+                format!("{DEFAULT_TARGET_SCHEMA}.by_g2"),
+                format!("{DEFAULT_TARGET_SCHEMA}.c_by_p"),
+                format!("{DEFAULT_SCHEMA}.c"),
+                format!("{DEFAULT_SCHEMA}.orders"),
+                format!("{DEFAULT_SCHEMA}.p"),
+            ],
+            "by_g2" => vec![
+                format!("{DEFAULT_TARGET_SCHEMA}.c_by_p"),
+                format!("{DEFAULT_SCHEMA}.c"),
+                format!("{DEFAULT_SCHEMA}.p"),
+            ],
+            _ => Vec::new(),
+        };
+        let mut expected = expected;
+        expected.sort();
+        assert_eq!(left, expected, "after dropping {name}");
+    }
 }
 
 /// ADR-0014, "Drops go in reverse dependency order — no cascade": Trellis
